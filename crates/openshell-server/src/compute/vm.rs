@@ -60,7 +60,8 @@ const COMPUTE_DRIVER_SOCKET_RUN_DIR: &str = "run";
 const COMPUTE_DRIVER_SOCKET_NAME: &str = "compute-driver.sock";
 
 /// Configuration for launching and talking to the VM compute driver.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct VmComputeConfig {
     /// Working directory for VM driver sandbox state.
     pub state_dir: PathBuf,

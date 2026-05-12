@@ -3,7 +3,8 @@
 
 //! Shared CLI entrypoint for the gateway binaries.
 
-use clap::{ArgAction, Command, CommandFactory, FromArgMatches, Parser};
+use clap::parser::ValueSource;
+use clap::{ArgAction, ArgMatches, Command, CommandFactory, FromArgMatches, Parser};
 use miette::{IntoDiagnostic, Result};
 use openshell_core::ComputeDriverKind;
 use openshell_core::config::{DEFAULT_DOCKER_NETWORK_NAME, DEFAULT_SERVER_PORT, DEFAULT_SSH_PORT};
@@ -14,6 +15,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::certgen;
 use crate::compute::{DockerComputeConfig, VmComputeConfig};
+use crate::config_file::{self, ConfigFile, GatewayFileSection};
 use crate::{run_server, tracing_bus::TracingLogBus};
 
 /// `OpenShell` gateway process - gRPC and HTTP server with protocol multiplexing.
@@ -41,6 +43,14 @@ enum Commands {
 #[derive(clap::Args, Debug)]
 #[allow(clippy::struct_excessive_bools)]
 struct RunArgs {
+    /// Path to a TOML configuration file (see RFC 0003).
+    ///
+    /// When set, gateway-wide settings and per-driver tables are read from
+    /// the file. Command-line flags and `OPENSHELL_*` environment variables
+    /// continue to take precedence over file values.
+    #[arg(long, env = "OPENSHELL_GATEWAY_CONFIG")]
+    config: Option<PathBuf>,
+
     /// IP address to bind the server, health, and metrics listeners to.
     #[arg(long, default_value = "127.0.0.1", env = "OPENSHELL_BIND_ADDRESS")]
     bind_address: IpAddr,
@@ -319,15 +329,28 @@ pub async fn run_cli() -> Result<()> {
         .install_default()
         .map_err(|e| miette::miette!("failed to install rustls crypto provider: {e:?}"))?;
 
-    let cli = Cli::from_arg_matches(&command().get_matches()).expect("clap validated args");
+    let matches = command().get_matches();
+    let cli = Cli::from_arg_matches(&matches).expect("clap validated args");
 
     match cli.command {
         Some(Commands::GenerateCerts(args)) => certgen::run(args).await,
-        None => Box::pin(run_from_args(cli.run)).await,
+        None => Box::pin(run_from_args(cli.run, matches)).await,
     }
 }
 
-async fn run_from_args(args: RunArgs) -> Result<()> {
+async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
+    // Load TOML file when --config / OPENSHELL_GATEWAY_CONFIG is set.
+    // File values are applied below for any argument that is still at its
+    // built-in default — CLI flags and OPENSHELL_* env vars always win.
+    let file: Option<ConfigFile> = if let Some(path) = args.config.clone() {
+        Some(config_file::load(&path).map_err(|e| miette::miette!("{e}"))?)
+    } else {
+        None
+    };
+    if let Some(file) = file.as_ref() {
+        merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+    }
+
     let tracing_log_bus = TracingLogBus::new();
     tracing_log_bus.install_subscriber(
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level)),
@@ -338,15 +361,15 @@ async fn run_from_args(args: RunArgs) -> Result<()> {
     let tls = if args.disable_tls {
         None
     } else {
-        let cert_path = args.tls_cert.ok_or_else(|| {
+        let cert_path = args.tls_cert.clone().ok_or_else(|| {
             miette::miette!(
                 "--tls-cert is required when TLS is enabled (use --disable-tls to skip)"
             )
         })?;
-        let key_path = args.tls_key.ok_or_else(|| {
+        let key_path = args.tls_key.clone().ok_or_else(|| {
             miette::miette!("--tls-key is required when TLS is enabled (use --disable-tls to skip)")
         })?;
-        let client_ca_path = args.tls_client_ca.ok_or_else(|| {
+        let client_ca_path = args.tls_client_ca.clone().ok_or_else(|| {
             miette::miette!(
                 "--tls-client-ca is required when TLS is enabled (use --disable-tls to skip)"
             )
@@ -361,6 +384,7 @@ async fn run_from_args(args: RunArgs) -> Result<()> {
 
     let db_url = args
         .db_url
+        .clone()
         .ok_or_else(|| miette::miette!("--db-url is required (or set OPENSHELL_DB_URL)"))?;
 
     let mut config = openshell_core::Config::new(tls)
@@ -397,68 +421,50 @@ async fn run_from_args(args: RunArgs) -> Result<()> {
 
     config = config
         .with_database_url(db_url)
-        .with_compute_drivers(args.drivers)
-        .with_sandbox_namespace(args.sandbox_namespace)
-        .with_ssh_gateway_host(args.ssh_gateway_host)
+        .with_compute_drivers(args.drivers.clone())
+        .with_sandbox_namespace(args.sandbox_namespace.clone())
+        .with_ssh_gateway_host(args.ssh_gateway_host.clone())
         .with_ssh_gateway_port(args.ssh_gateway_port)
         .with_sandbox_ssh_port(args.sandbox_ssh_port)
-        .with_server_sans(args.server_sans)
+        .with_server_sans(args.server_sans.clone())
         .with_loopback_service_http(args.enable_loopback_service_http);
 
-    if let Some(image) = args.sandbox_image {
+    if let Some(image) = args.sandbox_image.clone() {
         config = config.with_sandbox_image(image);
     }
 
-    if let Some(policy) = args.sandbox_image_pull_policy {
+    if let Some(policy) = args.sandbox_image_pull_policy.clone() {
         config = config.with_sandbox_image_pull_policy(policy);
     }
 
-    if let Some(endpoint) = args.grpc_endpoint {
+    if let Some(endpoint) = args.grpc_endpoint.clone() {
         config = config.with_grpc_endpoint(endpoint);
     }
 
-    if let Some(name) = args.client_tls_secret_name {
+    if let Some(name) = args.client_tls_secret_name.clone() {
         config = config.with_client_tls_secret_name(name);
     }
 
-    if let Some(ip) = args.host_gateway_ip {
+    if let Some(ip) = args.host_gateway_ip.clone() {
         config = config.with_host_gateway_ip(ip);
     }
 
-    if let Some(issuer) = args.oidc_issuer {
+    if let Some(issuer) = args.oidc_issuer.clone() {
         config = config.with_oidc(openshell_core::OidcConfig {
             issuer,
-            audience: args.oidc_audience,
+            audience: args.oidc_audience.clone(),
             jwks_ttl_secs: args.oidc_jwks_ttl,
-            roles_claim: args.oidc_roles_claim,
-            admin_role: args.oidc_admin_role,
-            user_role: args.oidc_user_role,
-            scopes_claim: args.oidc_scopes_claim,
+            roles_claim: args.oidc_roles_claim.clone(),
+            admin_role: args.oidc_admin_role.clone(),
+            user_role: args.oidc_user_role.clone(),
+            scopes_claim: args.oidc_scopes_claim.clone(),
         });
     }
 
     config.enable_user_namespaces = args.enable_user_namespaces;
 
-    let vm_config = VmComputeConfig {
-        state_dir: args.vm_driver_state_dir,
-        driver_dir: args.driver_dir,
-        default_image: config.sandbox_image.clone(),
-        krun_log_level: args.vm_krun_log_level,
-        vcpus: args.vm_vcpus,
-        mem_mib: args.vm_mem_mib,
-        guest_tls_ca: args.vm_tls_ca,
-        guest_tls_cert: args.vm_tls_cert,
-        guest_tls_key: args.vm_tls_key,
-    };
-
-    let docker_config = DockerComputeConfig {
-        supervisor_bin: args.docker_supervisor_bin,
-        supervisor_image: args.docker_supervisor_image,
-        guest_tls_ca: args.docker_tls_ca,
-        guest_tls_cert: args.docker_tls_cert,
-        guest_tls_key: args.docker_tls_key,
-        network_name: args.docker_network_name,
-    };
+    let vm_config = build_vm_config(&args, &matches, &config, file.as_ref())?;
+    let docker_config = build_docker_config(&args, &matches, file.as_ref())?;
 
     if args.disable_tls {
         info!("TLS disabled — listening on plaintext HTTP");
@@ -468,13 +474,261 @@ async fn run_from_args(args: RunArgs) -> Result<()> {
 
     info!(bind = %config.bind_address, "Starting OpenShell server");
 
-    run_server(config, vm_config, docker_config, tracing_log_bus)
-        .await
-        .into_diagnostic()
+    Box::pin(run_server(
+        config,
+        vm_config,
+        docker_config,
+        file,
+        tracing_log_bus,
+    ))
+    .await
+    .into_diagnostic()
 }
 
 fn parse_compute_driver(value: &str) -> std::result::Result<ComputeDriverKind, String> {
     value.parse()
+}
+
+/// Returns `true` when an argument's value came from clap's built-in default
+/// (or was never supplied at all). When the predicate is `true`, the loader
+/// is free to replace the value with one read from the TOML config file.
+fn arg_defaulted(matches: &ArgMatches, id: &str) -> bool {
+    matches!(
+        matches.value_source(id),
+        None | Some(ValueSource::DefaultValue)
+    )
+}
+
+/// Apply gateway-wide values from `[openshell.gateway]` onto `RunArgs` for
+/// every argument that is still sourced from clap's built-in default.
+///
+/// The function intentionally does not touch `database_url` — that secret is
+/// env-only and the loader already rejected it when it appears in the file.
+fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: &ArgMatches) {
+    if let Some(addr) = file.bind_address {
+        if arg_defaulted(matches, "bind_address") {
+            args.bind_address = addr.ip();
+        }
+        if arg_defaulted(matches, "port") {
+            args.port = addr.port();
+        }
+    }
+    if let Some(addr) = file.health_bind_address
+        && arg_defaulted(matches, "health_port")
+    {
+        args.health_port = addr.port();
+    }
+    if let Some(addr) = file.metrics_bind_address
+        && arg_defaulted(matches, "metrics_port")
+    {
+        args.metrics_port = addr.port();
+    }
+    if let Some(level) = &file.log_level
+        && arg_defaulted(matches, "log_level")
+    {
+        args.log_level.clone_from(level);
+    }
+    if let Some(drivers) = &file.compute_drivers
+        && arg_defaulted(matches, "drivers")
+    {
+        args.drivers.clone_from(drivers);
+    }
+    if let Some(ns) = &file.sandbox_namespace
+        && arg_defaulted(matches, "sandbox_namespace")
+    {
+        args.sandbox_namespace.clone_from(ns);
+    }
+    if let Some(port) = file.sandbox_ssh_port
+        && arg_defaulted(matches, "sandbox_ssh_port")
+    {
+        args.sandbox_ssh_port = port;
+    }
+    if let Some(host) = &file.ssh_gateway_host
+        && arg_defaulted(matches, "ssh_gateway_host")
+    {
+        args.ssh_gateway_host.clone_from(host);
+    }
+    if let Some(port) = file.ssh_gateway_port
+        && arg_defaulted(matches, "ssh_gateway_port")
+    {
+        args.ssh_gateway_port = port;
+    }
+    if let Some(image) = &file.default_image
+        && args.sandbox_image.is_none()
+        && arg_defaulted(matches, "sandbox_image")
+    {
+        args.sandbox_image = Some(image.clone());
+    }
+    if let Some(policy) = &file.image_pull_policy
+        && args.sandbox_image_pull_policy.is_none()
+        && arg_defaulted(matches, "sandbox_image_pull_policy")
+    {
+        args.sandbox_image_pull_policy = Some(policy.clone());
+    }
+    if let Some(secret) = &file.client_tls_secret_name
+        && args.client_tls_secret_name.is_none()
+        && arg_defaulted(matches, "client_tls_secret_name")
+    {
+        args.client_tls_secret_name = Some(secret.clone());
+    }
+    if let Some(ip) = &file.host_gateway_ip
+        && args.host_gateway_ip.is_none()
+        && arg_defaulted(matches, "host_gateway_ip")
+    {
+        args.host_gateway_ip = Some(ip.clone());
+    }
+    if let Some(enabled) = file.enable_user_namespaces
+        && arg_defaulted(matches, "enable_user_namespaces")
+    {
+        args.enable_user_namespaces = enabled;
+    }
+    if let Some(sans) = &file.server_sans
+        && args.server_sans.is_empty()
+        && arg_defaulted(matches, "server_sans")
+    {
+        args.server_sans.clone_from(sans);
+    }
+    if let Some(enabled) = file.enable_loopback_service_http
+        && arg_defaulted(matches, "enable_loopback_service_http")
+    {
+        args.enable_loopback_service_http = enabled;
+    }
+    // TLS gateway listener fields
+    if let Some(tls) = &file.tls {
+        if args.tls_cert.is_none() && arg_defaulted(matches, "tls_cert") {
+            args.tls_cert = Some(tls.cert_path.clone());
+        }
+        if args.tls_key.is_none() && arg_defaulted(matches, "tls_key") {
+            args.tls_key = Some(tls.key_path.clone());
+        }
+        if args.tls_client_ca.is_none() && arg_defaulted(matches, "tls_client_ca") {
+            args.tls_client_ca = Some(tls.client_ca_path.clone());
+        }
+        if tls.allow_unauthenticated && arg_defaulted(matches, "disable_gateway_auth") {
+            args.disable_gateway_auth = true;
+        }
+    }
+    // OIDC fields
+    if let Some(oidc) = &file.oidc {
+        if args.oidc_issuer.is_none() && arg_defaulted(matches, "oidc_issuer") {
+            args.oidc_issuer = Some(oidc.issuer.clone());
+        }
+        if arg_defaulted(matches, "oidc_audience") {
+            args.oidc_audience.clone_from(&oidc.audience);
+        }
+        if arg_defaulted(matches, "oidc_jwks_ttl") {
+            args.oidc_jwks_ttl = oidc.jwks_ttl_secs;
+        }
+        if arg_defaulted(matches, "oidc_roles_claim") {
+            args.oidc_roles_claim.clone_from(&oidc.roles_claim);
+        }
+        if arg_defaulted(matches, "oidc_admin_role") {
+            args.oidc_admin_role.clone_from(&oidc.admin_role);
+        }
+        if arg_defaulted(matches, "oidc_user_role") {
+            args.oidc_user_role.clone_from(&oidc.user_role);
+        }
+        if arg_defaulted(matches, "oidc_scopes_claim") {
+            args.oidc_scopes_claim.clone_from(&oidc.scopes_claim);
+        }
+    }
+}
+
+/// Build [`VmComputeConfig`] by overlaying CLI args on top of the
+/// `[openshell.drivers.vm]` table inherited from `[openshell.gateway]`.
+fn build_vm_config(
+    args: &RunArgs,
+    matches: &ArgMatches,
+    config: &openshell_core::Config,
+    file: Option<&ConfigFile>,
+) -> Result<VmComputeConfig> {
+    let mut cfg = if let Some(file) = file {
+        let merged = config_file::driver_table(
+            ComputeDriverKind::Vm,
+            &file.openshell.gateway,
+            file.openshell.drivers.get("vm"),
+        );
+        merged
+            .try_into::<VmComputeConfig>()
+            .map_err(|e| miette::miette!("invalid [openshell.drivers.vm] table: {e}"))?
+    } else {
+        VmComputeConfig::default()
+    };
+
+    // CLI/env overrides — and `state_dir` is also pulled from RunArgs when the
+    // file did not set it, so the gateway always has a working directory.
+    if !arg_defaulted(matches, "vm_driver_state_dir") || cfg.state_dir.as_os_str().is_empty() {
+        cfg.state_dir.clone_from(&args.vm_driver_state_dir);
+    }
+    if !arg_defaulted(matches, "driver_dir") || cfg.driver_dir.is_none() {
+        cfg.driver_dir.clone_from(&args.driver_dir);
+    }
+    if !arg_defaulted(matches, "vm_krun_log_level") {
+        cfg.krun_log_level = args.vm_krun_log_level;
+    }
+    if !arg_defaulted(matches, "vm_vcpus") {
+        cfg.vcpus = args.vm_vcpus;
+    }
+    if !arg_defaulted(matches, "vm_mem_mib") {
+        cfg.mem_mib = args.vm_mem_mib;
+    }
+    if let Some(p) = args.vm_tls_ca.clone() {
+        cfg.guest_tls_ca = Some(p);
+    }
+    if let Some(p) = args.vm_tls_cert.clone() {
+        cfg.guest_tls_cert = Some(p);
+    }
+    if let Some(p) = args.vm_tls_key.clone() {
+        cfg.guest_tls_key = Some(p);
+    }
+    // Fall through: image inherited from gateway-wide `sandbox_image` when
+    // the merged table did not supply `default_image`.
+    if cfg.default_image.is_empty() {
+        cfg.default_image.clone_from(&config.sandbox_image);
+    }
+    Ok(cfg)
+}
+
+/// Build [`DockerComputeConfig`] using the same inheritance pattern as
+/// [`build_vm_config`].
+fn build_docker_config(
+    args: &RunArgs,
+    matches: &ArgMatches,
+    file: Option<&ConfigFile>,
+) -> Result<DockerComputeConfig> {
+    let mut cfg = if let Some(file) = file {
+        let merged = config_file::driver_table(
+            ComputeDriverKind::Docker,
+            &file.openshell.gateway,
+            file.openshell.drivers.get("docker"),
+        );
+        merged
+            .try_into::<DockerComputeConfig>()
+            .map_err(|e| miette::miette!("invalid [openshell.drivers.docker] table: {e}"))?
+    } else {
+        DockerComputeConfig::default()
+    };
+
+    if args.docker_supervisor_bin.is_some() {
+        cfg.supervisor_bin.clone_from(&args.docker_supervisor_bin);
+    }
+    if args.docker_supervisor_image.is_some() {
+        cfg.supervisor_image
+            .clone_from(&args.docker_supervisor_image);
+    }
+    if args.docker_tls_ca.is_some() {
+        cfg.guest_tls_ca.clone_from(&args.docker_tls_ca);
+    }
+    if args.docker_tls_cert.is_some() {
+        cfg.guest_tls_cert.clone_from(&args.docker_tls_cert);
+    }
+    if args.docker_tls_key.is_some() {
+        cfg.guest_tls_key.clone_from(&args.docker_tls_key);
+    }
+    if !arg_defaulted(matches, "docker_network_name") {
+        cfg.network_name.clone_from(&args.docker_network_name);
+    }
+    Ok(cfg)
 }
 
 #[cfg(test)]
@@ -700,5 +954,220 @@ mod tests {
         let cli = Cli::try_parse_from(["openshell-gateway"]).expect("parses without --db-url");
         assert!(cli.command.is_none());
         assert!(cli.run.db_url.is_none());
+    }
+
+    // ── Config-file merge tests ──────────────────────────────────────────
+    //
+    // `merge_file_into_args` is the bridge between `config_file::ConfigFile`
+    // and `RunArgs`. These cases lock in the precedence rule:
+    //
+    //   CLI flag  >  OPENSHELL_* env var  >  TOML file  >  built-in default
+    //
+    // by exercising each combination on representative gateway fields.
+
+    use super::{ConfigFile, merge_file_into_args};
+    use clap::FromArgMatches;
+
+    fn parse_with_args(argv: &[&str]) -> (super::RunArgs, clap::ArgMatches) {
+        let matches = command().try_get_matches_from(argv).expect("parses");
+        let cli = Cli::from_arg_matches(&matches).expect("from arg matches");
+        (cli.run, matches)
+    }
+
+    fn config_file_from_toml(toml: &str) -> ConfigFile {
+        toml::from_str(toml).expect("valid TOML in test fixture")
+    }
+
+    #[test]
+    fn file_value_applies_when_cli_uses_default() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g1 = EnvVarGuard::remove("OPENSHELL_BIND_ADDRESS");
+        let _g2 = EnvVarGuard::remove("OPENSHELL_SERVER_PORT");
+        let _g3 = EnvVarGuard::remove("OPENSHELL_LOG_LEVEL");
+
+        let (mut args, matches) =
+            parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
+        let file = config_file_from_toml(
+            r#"
+[openshell.gateway]
+bind_address = "0.0.0.0:9090"
+log_level = "debug"
+"#,
+        );
+        merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+
+        assert_eq!(args.bind_address, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        assert_eq!(args.port, 9090);
+        assert_eq!(args.log_level, "debug");
+    }
+
+    #[test]
+    fn cli_flag_overrides_file_value() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g1 = EnvVarGuard::remove("OPENSHELL_BIND_ADDRESS");
+        let _g2 = EnvVarGuard::remove("OPENSHELL_LOG_LEVEL");
+
+        let (mut args, matches) = parse_with_args(&[
+            "openshell-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--log-level",
+            "warn",
+        ]);
+        let file = config_file_from_toml(
+            r#"
+[openshell.gateway]
+log_level = "debug"
+"#,
+        );
+        merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+
+        assert_eq!(args.log_level, "warn", "CLI flag must win over file");
+    }
+
+    #[test]
+    fn env_var_overrides_file_value() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = EnvVarGuard::set("OPENSHELL_LOG_LEVEL", "trace");
+
+        let (mut args, matches) =
+            parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
+        let file = config_file_from_toml(
+            r#"
+[openshell.gateway]
+log_level = "debug"
+"#,
+        );
+        merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+
+        assert_eq!(args.log_level, "trace", "env var must win over file");
+    }
+
+    #[test]
+    fn file_oidc_block_populates_oidc_args() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g1 = EnvVarGuard::remove("OPENSHELL_OIDC_ISSUER");
+        let _g2 = EnvVarGuard::remove("OPENSHELL_OIDC_AUDIENCE");
+
+        let (mut args, matches) =
+            parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
+        let file = config_file_from_toml(
+            r#"
+[openshell.gateway.oidc]
+issuer = "https://idp.example.com"
+audience = "openshell-cli"
+"#,
+        );
+        merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+
+        assert_eq!(args.oidc_issuer.as_deref(), Some("https://idp.example.com"));
+        assert_eq!(args.oidc_audience, "openshell-cli");
+    }
+
+    #[test]
+    fn file_populates_service_routing_fields() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g1 = EnvVarGuard::remove("OPENSHELL_SERVER_SAN");
+        let _g2 = EnvVarGuard::remove("OPENSHELL_ENABLE_LOOPBACK_SERVICE_HTTP");
+
+        let (mut args, matches) =
+            parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
+        let file = config_file_from_toml(
+            r#"
+[openshell.gateway]
+server_sans                  = ["gateway.local", "*.dev.openshell.localhost"]
+enable_loopback_service_http = false
+"#,
+        );
+        merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+
+        assert_eq!(
+            args.server_sans,
+            vec![
+                "gateway.local".to_string(),
+                "*.dev.openshell.localhost".to_string()
+            ]
+        );
+        assert!(!args.enable_loopback_service_http);
+    }
+
+    #[test]
+    fn env_var_overrides_file_loopback_service_http() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = EnvVarGuard::set("OPENSHELL_ENABLE_LOOPBACK_SERVICE_HTTP", "true");
+
+        let (mut args, matches) =
+            parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
+        let file = config_file_from_toml(
+            r"
+[openshell.gateway]
+enable_loopback_service_http = false
+",
+        );
+        merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+
+        assert!(
+            args.enable_loopback_service_http,
+            "env var must win over file"
+        );
+    }
+
+    #[test]
+    fn driver_inherits_shared_image_from_gateway_section() {
+        // [openshell.gateway].default_image inherits into the K8s driver
+        // table when the driver-specific table does not set it.
+        let file = config_file_from_toml(
+            r#"
+[openshell.gateway]
+default_image = "ghcr.io/nvidia/openshell/sandbox:1.0"
+
+[openshell.drivers.kubernetes]
+namespace = "agents"
+"#,
+        );
+        let merged = crate::config_file::driver_table(
+            super::ComputeDriverKind::Kubernetes,
+            &file.openshell.gateway,
+            file.openshell.drivers.get("kubernetes"),
+        );
+        let parsed = merged
+            .try_into::<openshell_driver_kubernetes::KubernetesComputeConfig>()
+            .expect("merged table deserializes");
+        assert_eq!(parsed.default_image, "ghcr.io/nvidia/openshell/sandbox:1.0");
+        assert_eq!(parsed.namespace, "agents");
+    }
+
+    #[test]
+    fn driver_specific_value_overrides_gateway_inheritance() {
+        let file = config_file_from_toml(
+            r#"
+[openshell.gateway]
+default_image = "gateway-default:1.0"
+
+[openshell.drivers.kubernetes]
+default_image = "k8s-specific:1.0"
+"#,
+        );
+        let merged = crate::config_file::driver_table(
+            super::ComputeDriverKind::Kubernetes,
+            &file.openshell.gateway,
+            file.openshell.drivers.get("kubernetes"),
+        );
+        let parsed = merged
+            .try_into::<openshell_driver_kubernetes::KubernetesComputeConfig>()
+            .expect("deserializes");
+        assert_eq!(parsed.default_image, "k8s-specific:1.0");
     }
 }

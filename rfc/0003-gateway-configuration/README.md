@@ -84,8 +84,13 @@ compute_drivers       = ["kubernetes"]
 ssh_session_ttl_secs    = 86400
 ssh_gateway_host        = "127.0.0.1"
 ssh_gateway_port        = 8080
-ssh_connect_path        = "/connect/ssh"
 sandbox_ssh_port        = 2222
+
+# Service routing — wildcard DNS SANs in `server_sans` also enable sandbox
+# service URLs under that domain. `enable_loopback_service_http` toggles
+# plaintext HTTP routing for loopback service URLs.
+server_sans                  = ["openshell", "*.dev.openshell.localhost"]
+enable_loopback_service_http = true
 
 # ──────────────────────────────────────────────────────────────────────────────
 # TLS / mTLS — when omitted, the gateway listens plaintext (sets --disable-tls)
