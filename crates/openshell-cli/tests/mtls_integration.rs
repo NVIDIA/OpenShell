@@ -4,10 +4,10 @@
 use openshell_cli::tls::{TlsOptions, grpc_client};
 use openshell_core::proto::{
     CreateProviderRequest, CreateSshSessionRequest, CreateSshSessionResponse,
-    DeleteProviderRequest, DeleteProviderResponse, ExecSandboxEvent, ExecSandboxRequest,
-    GetProviderRequest, HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
-    ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, ServiceStatus,
-    UpdateProviderRequest,
+    DeleteProviderRequest, DeleteProviderResponse, ExecSandboxEvent, ExecSandboxInput,
+    ExecSandboxRequest, GetProviderRequest, HealthRequest, HealthResponse, ListProvidersRequest,
+    ListProvidersResponse, ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse,
+    ServiceStatus, UpdateProviderRequest,
     open_shell_server::{OpenShell, OpenShellServer},
 };
 use rcgen::{
@@ -314,6 +314,15 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
             rx,
         )))
+    }
+
+    type ExecSandboxInteractiveStream =
+        tokio_stream::wrappers::ReceiverStream<Result<ExecSandboxEvent, Status>>;
+    async fn exec_sandbox_interactive(
+        &self,
+        _request: tonic::Request<tonic::Streaming<ExecSandboxInput>>,
+    ) -> Result<Response<Self::ExecSandboxInteractiveStream>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
     }
 
     async fn update_config(

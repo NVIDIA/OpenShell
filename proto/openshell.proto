@@ -69,6 +69,11 @@ service OpenShell {
   // Forward one CLI-side TCP connection to a loopback TCP target in a sandbox.
   rpc ForwardTcp(stream TcpForwardFrame) returns (stream TcpForwardFrame);
 
+  // Execute an interactive command with bidirectional stdin/stdout streaming.
+  // The first client message MUST carry an ExecSandboxInput with the start
+  // variant. Subsequent messages carry stdin bytes or window resize events.
+  rpc ExecSandboxInteractive(stream ExecSandboxInput) returns (stream ExecSandboxEvent);
+
   // Create a provider.
   rpc CreateProvider(CreateProviderRequest) returns (ProviderResponse);
 
@@ -574,6 +579,12 @@ message ExecSandboxRequest {
 
   // Request a pseudo-terminal for the remote command.
   bool tty = 7;
+
+  // Initial terminal columns (used when tty=true, 0 = use default).
+  uint32 cols = 8;
+
+  // Initial terminal rows (used when tty=true, 0 = use default).
+  uint32 rows = 9;
 }
 
 // One stdout chunk from a sandbox exec.
@@ -623,6 +634,25 @@ message TcpForwardFrame {
     bytes data = 2;
   }
 }
+
+// Client-to-server message for interactive exec.
+message ExecSandboxInput {
+  oneof payload {
+    // First message: exec request metadata.
+    ExecSandboxRequest start = 1;
+    // Subsequent messages: raw stdin bytes.
+    bytes stdin = 2;
+    // Terminal window size change.
+    ExecSandboxWindowResize resize = 3;
+  }
+}
+
+// Terminal window resize event for interactive exec.
+message ExecSandboxWindowResize {
+  uint32 cols = 1;
+  uint32 rows = 2;
+}
+
 
 // SSH session record stored in persistence.
 message SshSession {

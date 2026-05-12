@@ -40,8 +40,8 @@ use hyper_util::{
 use openshell_core::proto::{
     CreateProviderRequest, CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse,
     DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    ExecSandboxEvent, ExecSandboxRequest, GatewayMessage, GetGatewayConfigRequest,
-    GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
+    ExecSandboxEvent, ExecSandboxInput, ExecSandboxRequest, GatewayMessage,
+    GetGatewayConfigRequest, GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
     GetSandboxConfigResponse, GetSandboxProviderEnvironmentRequest,
     GetSandboxProviderEnvironmentResponse, GetSandboxRequest, HealthRequest, HealthResponse,
     ListProvidersRequest, ListProvidersResponse, ListSandboxesRequest, ListSandboxesResponse,
@@ -289,6 +289,14 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<Self::ExecSandboxStream>, Status> {
         let (_tx, rx) = mpsc::channel(1);
         Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    type ExecSandboxInteractiveStream = ReceiverStream<Result<ExecSandboxEvent, Status>>;
+    async fn exec_sandbox_interactive(
+        &self,
+        _request: tonic::Request<tonic::Streaming<ExecSandboxInput>>,
+    ) -> Result<Response<Self::ExecSandboxInteractiveStream>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
     }
 
     async fn update_config(

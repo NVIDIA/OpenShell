@@ -96,6 +96,15 @@ impl OpenShell for RelayGateway {
         Err(Status::unimplemented("unused"))
     }
 
+    type ExecSandboxInteractiveStream =
+        ReceiverStream<Result<openshell_core::proto::ExecSandboxEvent, Status>>;
+    async fn exec_sandbox_interactive(
+        &self,
+        _: tonic::Request<tonic::Streaming<openshell_core::proto::ExecSandboxInput>>,
+    ) -> Result<Response<Self::ExecSandboxInteractiveStream>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
     async fn health(
         &self,
         _: tonic::Request<openshell_core::proto::HealthRequest>,

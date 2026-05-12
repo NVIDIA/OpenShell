@@ -17,12 +17,12 @@ use openshell_core::proto::{
     DeleteProviderProfileResponse, DeleteProviderRequest, DeleteProviderResponse,
     DeleteSandboxRequest, DeleteSandboxResponse, DeleteServiceRequest, DeleteServiceResponse,
     DetachSandboxProviderRequest, DetachSandboxProviderResponse, EditDraftChunkRequest,
-    EditDraftChunkResponse, ExecSandboxEvent, ExecSandboxRequest, ExposeServiceRequest,
-    GatewayMessage, GetDraftHistoryRequest, GetDraftHistoryResponse, GetDraftPolicyRequest,
-    GetDraftPolicyResponse, GetGatewayConfigRequest, GetGatewayConfigResponse,
-    GetProviderProfileRequest, GetProviderRequest, GetSandboxConfigRequest,
-    GetSandboxConfigResponse, GetSandboxLogsRequest, GetSandboxLogsResponse,
-    GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
+    EditDraftChunkResponse, ExecSandboxEvent, ExecSandboxInput, ExecSandboxRequest,
+    ExposeServiceRequest, GatewayMessage, GetDraftHistoryRequest, GetDraftHistoryResponse,
+    GetDraftPolicyRequest, GetDraftPolicyResponse, GetGatewayConfigRequest,
+    GetGatewayConfigResponse, GetProviderProfileRequest, GetProviderRequest,
+    GetSandboxConfigRequest, GetSandboxConfigResponse, GetSandboxLogsRequest,
+    GetSandboxLogsResponse, GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
     GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
     GetServiceRequest, HealthRequest, HealthResponse, ImportProviderProfilesRequest,
     ImportProviderProfilesResponse, LintProviderProfilesRequest, LintProviderProfilesResponse,
@@ -252,6 +252,15 @@ impl OpenShell for OpenShellService {
         request: Request<tonic::Streaming<TcpForwardFrame>>,
     ) -> Result<Response<Self::ForwardTcpStream>, Status> {
         sandbox::handle_forward_tcp(&self.state, request).await
+    }
+
+    type ExecSandboxInteractiveStream = ReceiverStream<Result<ExecSandboxEvent, Status>>;
+
+    async fn exec_sandbox_interactive(
+        &self,
+        request: Request<tonic::Streaming<ExecSandboxInput>>,
+    ) -> Result<Response<Self::ExecSandboxInteractiveStream>, Status> {
+        sandbox::handle_exec_sandbox_interactive(&self.state, request).await
     }
 
     // --- SSH sessions ---

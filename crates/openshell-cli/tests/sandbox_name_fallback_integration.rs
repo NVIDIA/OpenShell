@@ -10,14 +10,14 @@ use openshell_core::proto::{
     CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse, DeleteProviderRequest,
     DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     DetachSandboxProviderRequest, DetachSandboxProviderResponse, ExecSandboxEvent,
-    ExecSandboxRequest, GatewayMessage, GetGatewayConfigRequest, GetGatewayConfigResponse,
-    GetProviderRequest, GetSandboxConfigRequest, GetSandboxConfigResponse,
-    GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
-    HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
-    ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
-    ListSandboxesResponse, ProviderResponse, Sandbox, SandboxPolicy, SandboxResponse,
-    SandboxStreamEvent, ServiceStatus, SupervisorMessage, UpdateProviderRequest,
-    WatchSandboxRequest,
+    ExecSandboxInput, ExecSandboxRequest, GatewayMessage, GetGatewayConfigRequest,
+    GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
+    GetSandboxConfigResponse, GetSandboxProviderEnvironmentRequest,
+    GetSandboxProviderEnvironmentResponse, GetSandboxRequest, HealthRequest, HealthResponse,
+    ListProvidersRequest, ListProvidersResponse, ListSandboxProvidersRequest,
+    ListSandboxProvidersResponse, ListSandboxesRequest, ListSandboxesResponse, ProviderResponse,
+    Sandbox, SandboxPolicy, SandboxResponse, SandboxStreamEvent, ServiceStatus, SupervisorMessage,
+    UpdateProviderRequest, WatchSandboxRequest,
 };
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
@@ -335,6 +335,15 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
             rx,
         )))
+    }
+
+    type ExecSandboxInteractiveStream =
+        tokio_stream::wrappers::ReceiverStream<Result<ExecSandboxEvent, Status>>;
+    async fn exec_sandbox_interactive(
+        &self,
+        _request: tonic::Request<tonic::Streaming<ExecSandboxInput>>,
+    ) -> Result<Response<Self::ExecSandboxInteractiveStream>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
     }
 
     async fn update_config(

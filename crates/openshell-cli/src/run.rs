@@ -2398,6 +2398,11 @@ pub async fn sandbox_exec_grpc(
     let tty = tty_override
         .unwrap_or_else(|| std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
 
+    if tty_override == Some(true) && std::io::stdin().is_terminal() {
+        return sandbox_exec_interactive_grpc(client, &sandbox, command, workdir, timeout_seconds)
+            .await;
+    }
+
     // Make the streaming gRPC call.
     let mut stream = client
         .exec_sandbox(ExecSandboxRequest {
@@ -2408,6 +2413,7 @@ pub async fn sandbox_exec_grpc(
             timeout_seconds,
             stdin: stdin_payload,
             tty,
+            ..Default::default()
         })
         .await
         .into_diagnostic()?
@@ -2725,6 +2731,137 @@ async fn drain_and_shutdown_local_socket(mut socket: tokio::net::TcpStream) {
         Ok(Ok(n)) if n != 0
     ) {}
     let _ = socket.shutdown().await;
+}
+
+struct RawModeGuard;
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+async fn sandbox_exec_interactive_grpc(
+    mut client: crate::tls::GrpcClient,
+    sandbox: &Sandbox,
+    command: &[String],
+    workdir: Option<&str>,
+    timeout_seconds: u32,
+) -> Result<i32> {
+    use futures::SinkExt;
+    use openshell_core::proto::{ExecSandboxInput, ExecSandboxWindowResize, exec_sandbox_input};
+
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+
+    let (mut input_tx, input_rx) = futures::channel::mpsc::channel::<ExecSandboxInput>(4096);
+
+    // Send the start message with exec metadata.
+    input_tx
+        .send(ExecSandboxInput {
+            payload: Some(exec_sandbox_input::Payload::Start(ExecSandboxRequest {
+                sandbox_id: sandbox.object_id().to_string(),
+                command: command.to_vec(),
+                workdir: workdir.unwrap_or_default().to_string(),
+                environment: HashMap::new(),
+                timeout_seconds,
+                stdin: Vec::new(),
+                tty: true,
+                cols: u32::from(cols),
+                rows: u32::from(rows),
+            })),
+        })
+        .await
+        .into_diagnostic()?;
+
+    let mut stream = client
+        .exec_sandbox_interactive(input_rx)
+        .await
+        .into_diagnostic()?
+        .into_inner();
+
+    // Enable raw mode so keystrokes are forwarded immediately.
+    crossterm::terminal::enable_raw_mode().into_diagnostic()?;
+    let raw_guard = RawModeGuard;
+
+    // Stdin reader: read raw bytes one at a time so single keystrokes
+    // (e.g. 'q' in top) are forwarded immediately.
+    let mut stdin_tx = input_tx.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut stdin = std::io::stdin().lock();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = match stdin.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            if stdin_tx
+                .try_send(ExecSandboxInput {
+                    payload: Some(exec_sandbox_input::Payload::Stdin(buf[..n].to_vec())),
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+
+    // SIGWINCH handler: forward terminal resize events.
+    #[cfg(unix)]
+    let mut resize_tx = input_tx.clone();
+    #[cfg(unix)]
+    let resize_task = tokio::spawn(async move {
+        let mut sig = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+            .expect("failed to register SIGWINCH handler");
+        while sig.recv().await.is_some() {
+            if let Ok((c, r)) = crossterm::terminal::size() {
+                let msg = ExecSandboxInput {
+                    payload: Some(exec_sandbox_input::Payload::Resize(
+                        ExecSandboxWindowResize {
+                            cols: u32::from(c),
+                            rows: u32::from(r),
+                        },
+                    )),
+                };
+                if resize_tx.send(msg).await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    let mut exit_code = 0i32;
+    let stdout = std::io::stdout();
+
+    while let Some(event) = stream.next().await {
+        let event = event.into_diagnostic()?;
+        match event.payload {
+            Some(exec_sandbox_event::Payload::Stdout(out)) => {
+                let mut handle = stdout.lock();
+                handle.write_all(&out.data).into_diagnostic()?;
+                handle.flush().into_diagnostic()?;
+            }
+            Some(exec_sandbox_event::Payload::Stderr(err)) => {
+                let mut handle = stdout.lock();
+                handle.write_all(&err.data).into_diagnostic()?;
+                handle.flush().into_diagnostic()?;
+            }
+            Some(exec_sandbox_event::Payload::Exit(exit)) => {
+                exit_code = exit.exit_code;
+                break;
+            }
+            None => {}
+        }
+    }
+
+    #[cfg(unix)]
+    resize_task.abort();
+
+    // Drop the raw mode guard to restore the terminal before exiting.
+    drop(raw_guard);
+
+    // The spawn_blocking stdin reader is stuck on stdin.read() and cannot be
+    // cancelled. Force-exit so the tokio runtime doesn't hang waiting for it.
+    std::process::exit(exit_code)
 }
 
 /// Print a single YAML line with dimmed keys and regular values.

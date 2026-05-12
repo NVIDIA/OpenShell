@@ -17,7 +17,7 @@ use openshell_core::proto::{
     AttachSandboxProviderRequest, AttachSandboxProviderResponse, CreateSandboxRequest,
     CreateSshSessionRequest, CreateSshSessionResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     DetachSandboxProviderRequest, DetachSandboxProviderResponse, ExecSandboxEvent, ExecSandboxExit,
-    ExecSandboxRequest, ExecSandboxStderr, ExecSandboxStdout, GetSandboxRequest,
+    ExecSandboxInput, ExecSandboxRequest, ExecSandboxStderr, ExecSandboxStdout, GetSandboxRequest,
     ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
     ListSandboxesResponse, Provider, RevokeSshSessionRequest, RevokeSshSessionResponse,
     SandboxResponse, SandboxStreamEvent, SshRelayTarget, TcpForwardFrame, TcpForwardInit,
@@ -1039,6 +1039,128 @@ async fn bridge_forward_tcp_stream(
 }
 
 // ---------------------------------------------------------------------------
+// Interactive exec handler (bidirectional stdin streaming)
+// ---------------------------------------------------------------------------
+
+fn validate_interactive_exec_start(
+    msg: Option<ExecSandboxInput>,
+) -> Result<ExecSandboxRequest, Status> {
+    use openshell_core::proto::exec_sandbox_input::Payload;
+
+    let msg =
+        msg.ok_or_else(|| Status::invalid_argument("empty stream: expected start message"))?;
+
+    let Some(Payload::Start(req)) = msg.payload else {
+        return Err(Status::invalid_argument(
+            "first message must be a start payload",
+        ));
+    };
+
+    if req.sandbox_id.is_empty() {
+        return Err(Status::invalid_argument("sandbox_id is required"));
+    }
+    if req.command.is_empty() {
+        return Err(Status::invalid_argument("command is required"));
+    }
+    if req.environment.keys().any(|key| !is_valid_env_key(key)) {
+        return Err(Status::invalid_argument(
+            "environment keys must match ^[A-Za-z_][A-Za-z0-9_]*$",
+        ));
+    }
+    validate_exec_request_fields(&req)?;
+
+    Ok(req)
+}
+
+pub(super) async fn handle_exec_sandbox_interactive(
+    state: &Arc<ServerState>,
+    request: Request<tonic::Streaming<ExecSandboxInput>>,
+) -> Result<Response<ReceiverStream<Result<ExecSandboxEvent, Status>>>, Status> {
+    use openshell_core::ObjectId;
+
+    let mut input_stream = request.into_inner();
+
+    let first_msg = input_stream
+        .message()
+        .await
+        .map_err(|e| Status::internal(format!("failed to read first message: {e}")))?;
+
+    let req = validate_interactive_exec_start(first_msg)?;
+
+    let sandbox = state
+        .store
+        .get_message::<Sandbox>(&req.sandbox_id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+
+    if SandboxPhase::try_from(sandbox.phase).ok() != Some(SandboxPhase::Ready) {
+        return Err(Status::failed_precondition("sandbox is not ready"));
+    }
+
+    let (channel_id, relay_rx) = state
+        .supervisor_sessions
+        .open_relay(sandbox.object_id(), std::time::Duration::from_secs(15))
+        .await
+        .map_err(|e| Status::unavailable(format!("supervisor relay failed: {e}")))?;
+
+    let command_str = build_remote_exec_command(&req)
+        .map_err(|e| Status::invalid_argument(format!("command construction failed: {e}")))?;
+    let timeout_seconds = req.timeout_seconds;
+    let cols = req.cols;
+    let rows = req.rows;
+
+    let sandbox_id = sandbox.object_id().to_string();
+
+    let (tx, rx) = mpsc::channel::<Result<ExecSandboxEvent, Status>>(256);
+    tokio::spawn(async move {
+        let relay_stream = match tokio::time::timeout(std::time::Duration::from_secs(10), relay_rx)
+            .await
+        {
+            Ok(Ok(Ok(stream))) => stream,
+            Ok(Ok(Err(status))) => {
+                warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, error = %status.message(), "ExecSandboxInteractive: relay target open failed");
+                let _ = tx.send(Err(status)).await;
+                return;
+            }
+            Ok(Err(_)) => {
+                warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, "ExecSandboxInteractive: relay channel dropped");
+                let _ = tx
+                    .send(Err(Status::unavailable("relay channel dropped")))
+                    .await;
+                return;
+            }
+            Err(_) => {
+                warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, "ExecSandboxInteractive: relay open timed out");
+                let _ = tx
+                    .send(Err(Status::deadline_exceeded("relay open timed out")))
+                    .await;
+                return;
+            }
+        };
+
+        if let Err(err) = stream_interactive_exec_over_relay(
+            tx.clone(),
+            &sandbox_id,
+            &channel_id,
+            relay_stream,
+            &command_str,
+            input_stream,
+            timeout_seconds,
+            cols,
+            rows,
+        )
+        .await
+        {
+            warn!(sandbox_id = %sandbox_id, error = %err, "ExecSandboxInteractive failed");
+            let _ = tx.send(Err(err)).await;
+        }
+    });
+
+    Ok(Response::new(ReceiverStream::new(rx)))
+}
+
+// ---------------------------------------------------------------------------
 // SSH session handlers
 // ---------------------------------------------------------------------------
 
@@ -1287,6 +1409,205 @@ async fn stream_exec_over_relay(
         .await;
 
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_interactive_exec_over_relay(
+    tx: mpsc::Sender<Result<ExecSandboxEvent, Status>>,
+    sandbox_id: &str,
+    channel_id: &str,
+    relay_stream: tokio::io::DuplexStream,
+    command: &str,
+    input_stream: tonic::Streaming<ExecSandboxInput>,
+    timeout_seconds: u32,
+    cols: u32,
+    rows: u32,
+) -> Result<(), Status> {
+    let command_preview: String = command.chars().take(120).collect();
+    info!(
+        sandbox_id = %sandbox_id,
+        channel_id = %channel_id,
+        command_len = command.len(),
+        command_preview = %command_preview,
+        "ExecSandboxInteractive (relay): command started"
+    );
+
+    let (local_proxy_port, proxy_task) = start_single_use_ssh_proxy_over_relay(relay_stream)
+        .await
+        .map_err(|e| Status::internal(format!("failed to start relay proxy: {e}")))?;
+
+    let exec = run_interactive_exec_with_russh(
+        local_proxy_port,
+        command,
+        input_stream,
+        cols,
+        rows,
+        tx.clone(),
+    );
+
+    let exec_result = if timeout_seconds == 0 {
+        exec.await
+    } else if let Ok(r) = tokio::time::timeout(
+        std::time::Duration::from_secs(u64::from(timeout_seconds)),
+        exec,
+    )
+    .await
+    {
+        r
+    } else {
+        let _ = tx
+            .send(Ok(ExecSandboxEvent {
+                payload: Some(openshell_core::proto::exec_sandbox_event::Payload::Exit(
+                    ExecSandboxExit { exit_code: 124 },
+                )),
+            }))
+            .await;
+        let _ = proxy_task.await;
+        return Ok(());
+    };
+
+    let exit_code = match exec_result {
+        Ok(code) => code,
+        Err(status) => {
+            let _ = proxy_task.await;
+            return Err(status);
+        }
+    };
+
+    let _ = proxy_task.await;
+
+    let _ = tx
+        .send(Ok(ExecSandboxEvent {
+            payload: Some(openshell_core::proto::exec_sandbox_event::Payload::Exit(
+                ExecSandboxExit { exit_code },
+            )),
+        }))
+        .await;
+
+    Ok(())
+}
+
+async fn run_interactive_exec_with_russh(
+    local_proxy_port: u16,
+    command: &str,
+    mut input_stream: tonic::Streaming<ExecSandboxInput>,
+    cols: u32,
+    rows: u32,
+    tx: mpsc::Sender<Result<ExecSandboxEvent, Status>>,
+) -> Result<i32, Status> {
+    use openshell_core::proto::exec_sandbox_input::Payload;
+    use russh::ChannelMsg;
+
+    if command.as_bytes().contains(&0) {
+        return Err(Status::invalid_argument(
+            "command contains null bytes at transport boundary",
+        ));
+    }
+    if command.len() > MAX_COMMAND_STRING_LEN {
+        return Err(Status::invalid_argument(format!(
+            "command exceeds {MAX_COMMAND_STRING_LEN} byte limit at transport boundary"
+        )));
+    }
+
+    let stream = TcpStream::connect(("127.0.0.1", local_proxy_port))
+        .await
+        .map_err(|e| Status::internal(format!("failed to connect to ssh proxy: {e}")))?;
+
+    let config = Arc::new(russh::client::Config::default());
+    let mut client = russh::client::connect_stream(config, stream, SandboxSshClientHandler)
+        .await
+        .map_err(|e| Status::internal(format!("failed to establish ssh transport: {e}")))?;
+
+    match client
+        .authenticate_none("sandbox")
+        .await
+        .map_err(|e| Status::internal(format!("failed to authenticate ssh session: {e}")))?
+    {
+        AuthResult::Success => {}
+        AuthResult::Failure { .. } => {
+            return Err(Status::permission_denied(
+                "ssh authentication rejected by sandbox",
+            ));
+        }
+    }
+
+    let channel = client
+        .channel_open_session()
+        .await
+        .map_err(|e| Status::internal(format!("failed to open ssh channel: {e}")))?;
+
+    channel
+        .request_pty(false, "xterm-256color", cols, rows, 0, 0, &[])
+        .await
+        .map_err(|e| Status::internal(format!("failed to allocate PTY: {e}")))?;
+
+    channel
+        .exec(true, command.as_bytes())
+        .await
+        .map_err(|e| Status::internal(format!("failed to execute command over ssh: {e}")))?;
+
+    let (mut read_half, write_half) = channel.split();
+
+    let stdin_task = tokio::spawn(async move {
+        while let Ok(Some(msg)) = input_stream.message().await {
+            match msg.payload {
+                Some(Payload::Stdin(data)) => {
+                    if write_half.data(std::io::Cursor::new(data)).await.is_err() {
+                        break;
+                    }
+                }
+                Some(Payload::Resize(resize)) => {
+                    let _ = write_half
+                        .window_change(resize.cols, resize.rows, 0, 0)
+                        .await;
+                }
+                Some(Payload::Start(_)) | None => {}
+            }
+        }
+        let _ = write_half.eof().await;
+    });
+
+    let mut exit_code: Option<i32> = None;
+    while let Some(msg) = read_half.wait().await {
+        match msg {
+            ChannelMsg::Data { data } => {
+                let _ = tx
+                    .send(Ok(ExecSandboxEvent {
+                        payload: Some(openshell_core::proto::exec_sandbox_event::Payload::Stdout(
+                            ExecSandboxStdout {
+                                data: data.to_vec(),
+                            },
+                        )),
+                    }))
+                    .await;
+            }
+            ChannelMsg::ExtendedData { data, .. } => {
+                let _ = tx
+                    .send(Ok(ExecSandboxEvent {
+                        payload: Some(openshell_core::proto::exec_sandbox_event::Payload::Stderr(
+                            ExecSandboxStderr {
+                                data: data.to_vec(),
+                            },
+                        )),
+                    }))
+                    .await;
+            }
+            ChannelMsg::ExitStatus { exit_status } => {
+                let converted = i32::try_from(exit_status).unwrap_or(i32::MAX);
+                exit_code = Some(converted);
+            }
+            ChannelMsg::Close => break,
+            _ => {}
+        }
+    }
+
+    stdin_task.abort();
+
+    let _ = client
+        .disconnect(russh::Disconnect::ByApplication, "exec complete", "en")
+        .await;
+
+    Ok(exit_code.unwrap_or(1))
 }
 
 /// Create a localhost SSH proxy that bridges to a relay `DuplexStream`.
@@ -1898,5 +2219,147 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    }
+
+    // ---- validate_interactive_exec_start ----
+
+    #[test]
+    fn interactive_exec_rejects_empty_stream() {
+        let err = validate_interactive_exec_start(None).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("expected start message"));
+    }
+
+    #[test]
+    fn interactive_exec_rejects_stdin_as_first_message() {
+        use openshell_core::proto::exec_sandbox_input;
+        let msg = ExecSandboxInput {
+            payload: Some(exec_sandbox_input::Payload::Stdin(b"hello".to_vec())),
+        };
+        let err = validate_interactive_exec_start(Some(msg)).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("start payload"));
+    }
+
+    #[test]
+    fn interactive_exec_rejects_resize_as_first_message() {
+        use openshell_core::proto::{ExecSandboxWindowResize, exec_sandbox_input};
+        let msg = ExecSandboxInput {
+            payload: Some(exec_sandbox_input::Payload::Resize(
+                ExecSandboxWindowResize { cols: 80, rows: 24 },
+            )),
+        };
+        let err = validate_interactive_exec_start(Some(msg)).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("start payload"));
+    }
+
+    #[test]
+    fn interactive_exec_rejects_none_payload() {
+        let msg = ExecSandboxInput { payload: None };
+        let err = validate_interactive_exec_start(Some(msg)).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn interactive_exec_rejects_missing_sandbox_id() {
+        use openshell_core::proto::exec_sandbox_input;
+        let msg = ExecSandboxInput {
+            payload: Some(exec_sandbox_input::Payload::Start(ExecSandboxRequest {
+                command: vec!["bash".to_string()],
+                ..Default::default()
+            })),
+        };
+        let err = validate_interactive_exec_start(Some(msg)).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("sandbox_id"));
+    }
+
+    #[test]
+    fn interactive_exec_rejects_missing_command() {
+        use openshell_core::proto::exec_sandbox_input;
+        let msg = ExecSandboxInput {
+            payload: Some(exec_sandbox_input::Payload::Start(ExecSandboxRequest {
+                sandbox_id: "test-id".to_string(),
+                ..Default::default()
+            })),
+        };
+        let err = validate_interactive_exec_start(Some(msg)).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("command"));
+    }
+
+    #[test]
+    fn interactive_exec_rejects_invalid_env_key() {
+        use openshell_core::proto::exec_sandbox_input;
+        let msg = ExecSandboxInput {
+            payload: Some(exec_sandbox_input::Payload::Start(ExecSandboxRequest {
+                sandbox_id: "test-id".to_string(),
+                command: vec!["bash".to_string()],
+                environment: std::iter::once(("bad key!".to_string(), "val".to_string())).collect(),
+                ..Default::default()
+            })),
+        };
+        let err = validate_interactive_exec_start(Some(msg)).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("environment"));
+    }
+
+    #[test]
+    fn interactive_exec_accepts_valid_start() {
+        use openshell_core::proto::exec_sandbox_input;
+        let msg = ExecSandboxInput {
+            payload: Some(exec_sandbox_input::Payload::Start(ExecSandboxRequest {
+                sandbox_id: "test-id".to_string(),
+                command: vec!["bash".to_string()],
+                tty: true,
+                cols: 120,
+                rows: 40,
+                ..Default::default()
+            })),
+        };
+        let req = validate_interactive_exec_start(Some(msg)).unwrap();
+        assert_eq!(req.sandbox_id, "test-id");
+        assert_eq!(req.command, vec!["bash"]);
+        assert!(req.tty);
+        assert_eq!(req.cols, 120);
+        assert_eq!(req.rows, 40);
+    }
+
+    #[tokio::test]
+    async fn interactive_exec_rejects_sandbox_not_found() {
+        let state = test_server_state().await;
+
+        let req = ExecSandboxRequest {
+            sandbox_id: "nonexistent".to_string(),
+            command: vec!["bash".to_string()],
+            tty: true,
+            ..Default::default()
+        };
+        let sandbox_result = state
+            .store
+            .get_message::<Sandbox>(&req.sandbox_id)
+            .await
+            .unwrap();
+        assert!(sandbox_result.is_none());
+    }
+
+    #[tokio::test]
+    async fn interactive_exec_rejects_sandbox_not_ready() {
+        let state = test_server_state().await;
+        let mut sandbox = test_sandbox("not-ready", Vec::new());
+        sandbox.phase = SandboxPhase::Provisioning as i32;
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let stored = state
+            .store
+            .get_message::<Sandbox>("sandbox-not-ready")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            SandboxPhase::try_from(stored.phase).ok(),
+            Some(SandboxPhase::Ready)
+        );
     }
 }
