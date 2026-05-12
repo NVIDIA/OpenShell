@@ -314,6 +314,7 @@ import os
 import socket
 import struct
 import time
+import urllib.parse
 
 HOST = {host:?}
 PORT = {port}
@@ -362,13 +363,35 @@ def read_frame(sock):
         payload = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
     return first, payload
 
+def proxy_parts():
+    names = ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")
+    proxy_url = next((os.environ.get(name) for name in names if os.environ.get(name)), None)
+    if not proxy_url:
+        raise RuntimeError("proxy environment is not configured")
+    parsed = urllib.parse.urlparse(proxy_url)
+    if not parsed.hostname:
+        raise RuntimeError(f"invalid proxy URL: {{proxy_url!r}}")
+    return parsed.hostname, parsed.port or 80
+
 def connect_with_retry(host, port, timeout_seconds=20):
+    proxy_host, proxy_port = proxy_parts()
+    target = f"{{host}}:{{port}}"
     deadline = time.monotonic() + timeout_seconds
     last_error = None
     while time.monotonic() < deadline:
+        sock = None
         try:
-            return socket.create_connection((host, port), timeout=5)
-        except OSError as error:
+            sock = socket.create_connection((proxy_host, proxy_port), timeout=5)
+            request = f"CONNECT {{target}} HTTP/1.1\r\nHost: {{target}}\r\n\r\n"
+            sock.sendall(request.encode("ascii"))
+            response = recv_until(sock, b"\r\n\r\n").decode("iso-8859-1", "replace")
+            if response.startswith("HTTP/1.1 200") or response.startswith("HTTP/1.0 200"):
+                return sock
+            first_line = response.splitlines()[0] if response else "<empty response>"
+            raise RuntimeError(f"proxy CONNECT failed: {{first_line}}")
+        except (OSError, RuntimeError) as error:
+            if sock is not None:
+                sock.close()
             last_error = error
             time.sleep(0.25)
     raise last_error
