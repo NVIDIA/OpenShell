@@ -49,21 +49,7 @@ pub fn harden_child_process() -> Result<()> {
         ));
     }
 
-    // Limit process creation to prevent fork bombs. 512 processes per UID is
-    // sufficient for typical agent workloads (shell, compilers, language servers)
-    // while preventing runaway forking. Set as a hard limit so the sandbox user
-    // cannot raise it after privilege drop.
-    let nproc_limit = libc::rlimit {
-        rlim_cur: 512,
-        rlim_max: 512,
-    };
-    let rc = unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &raw const nproc_limit) };
-    if rc != 0 {
-        return Err(miette::miette!(
-            "Failed to set RLIMIT_NPROC: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
+    limit_pids()?;
 
     #[cfg(target_os = "linux")]
     {
@@ -77,6 +63,59 @@ pub fn harden_child_process() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Fork-bomb protection via the most appropriate mechanism.
+///
+/// On Linux with cgroup v2 pids controller, the container runtime already
+/// enforces per-container PIDs limit via `pids.max`. RLIMIT_NPROC is skipped
+/// because it is per-UID kernel-wide and leaks across containers sharing
+/// the same UID.
+///
+/// When no cgroup pids controller is detected, RLIMIT_NPROC is applied as
+/// fallback.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn limit_pids() -> Result<()> {
+    let max_pids = max_pids_limit();
+
+    #[cfg(target_os = "linux")]
+    if cgroup_pids_active() {
+        debug!(
+            max_pids,
+            "cgroup v2 pids controller active, skipping RLIMIT_NPROC"
+        );
+        return Ok(());
+    }
+
+    let nproc_limit = libc::rlimit {
+        rlim_cur: max_pids,
+        rlim_max: max_pids,
+    };
+    let rc = unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &raw const nproc_limit) };
+    if rc != 0 {
+        return Err(miette::miette!(
+            "Failed to set RLIMIT_NPROC: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    debug!(max_pids, "RLIMIT_NPROC set (no cgroup pids controller)");
+    Ok(())
+}
+
+const DEFAULT_MAX_PIDS: u64 = 512;
+
+fn max_pids_limit() -> u64 {
+    std::env::var("OPENSHELL_MAX_PIDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_MAX_PIDS)
+}
+
+/// Check whether the cgroup v2 pids controller is active for this process.
+#[cfg(target_os = "linux")]
+fn cgroup_pids_active() -> bool {
+    std::fs::metadata("/sys/fs/cgroup/pids.max").is_ok()
 }
 
 /// Handle to a running process.
@@ -837,5 +876,36 @@ mod tests {
         let output = cmd.output().await.expect("spawn env");
         let stdout = String::from_utf8(output.stdout).expect("utf8");
         assert!(stdout.contains("ANTHROPIC_API_KEY=openshell:resolve:env:ANTHROPIC_API_KEY"));
+    }
+
+    #[test]
+    fn max_pids_limit_returns_default() {
+        // SAFETY: test is single-threaded for this env var
+        unsafe { std::env::remove_var("OPENSHELL_MAX_PIDS") };
+        assert_eq!(max_pids_limit(), DEFAULT_MAX_PIDS);
+    }
+
+    #[test]
+    fn max_pids_limit_reads_env() {
+        // SAFETY: test is single-threaded for this env var
+        unsafe { std::env::set_var("OPENSHELL_MAX_PIDS", "2048") };
+        let val = max_pids_limit();
+        unsafe { std::env::remove_var("OPENSHELL_MAX_PIDS") };
+        assert_eq!(val, 2048);
+    }
+
+    #[test]
+    fn max_pids_limit_ignores_invalid_env() {
+        // SAFETY: test is single-threaded for this env var
+        unsafe { std::env::set_var("OPENSHELL_MAX_PIDS", "not-a-number") };
+        let val = max_pids_limit();
+        unsafe { std::env::remove_var("OPENSHELL_MAX_PIDS") };
+        assert_eq!(val, DEFAULT_MAX_PIDS);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn cgroup_pids_active_returns_bool() {
+        let _ = cgroup_pids_active();
     }
 }
