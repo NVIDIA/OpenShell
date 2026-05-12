@@ -49,6 +49,8 @@ NAMESPACE="openshell"
 RELEASE_NAME="openshell"
 PORTFORWARD_PID=""
 PORTFORWARD_LOG="${WORKDIR}/portforward.log"
+PORTFORWARD_HEALTH_PID=""
+PORTFORWARD_HEALTH_LOG="${WORKDIR}/portforward-health.log"
 HELM_INSTALLED=0
 
 # Isolate CLI/SDK gateway metadata from the developer's real config.
@@ -71,6 +73,11 @@ cleanup() {
     wait "${PORTFORWARD_PID}" >/dev/null 2>&1 || true
   fi
 
+  if [ -n "${PORTFORWARD_HEALTH_PID}" ]; then
+    kill "${PORTFORWARD_HEALTH_PID}" >/dev/null 2>&1 || true
+    wait "${PORTFORWARD_HEALTH_PID}" >/dev/null 2>&1 || true
+  fi
+
   if [ "${exit_code}" -ne 0 ] && [ -n "${KUBE_CONTEXT}" ] && [ -n "${NAMESPACE}" ]; then
     if command -v kubectl >/dev/null 2>&1 \
        && kctl get namespace "${NAMESPACE}" >/dev/null 2>&1; then
@@ -89,6 +96,11 @@ cleanup() {
       echo "=== port-forward log ==="
       cat "${PORTFORWARD_LOG}" || true
       echo "=== end port-forward log ==="
+    fi
+    if [ -f "${PORTFORWARD_HEALTH_LOG}" ]; then
+      echo "=== health port-forward log ==="
+      cat "${PORTFORWARD_HEALTH_LOG}" || true
+      echo "=== end health port-forward log ==="
     fi
   fi
 
@@ -332,6 +344,40 @@ if [ "${elapsed}" -ge "${timeout}" ]; then
   cat "${PORTFORWARD_LOG}" >&2 || true
   exit 1
 fi
+
+# Dedicated port-forward to the gateway pod's health listener. The chart's
+# Service intentionally exposes only the gRPC and metrics ports — kubelet
+# probes the health endpoint directly on the pod IP — so the /readyz e2e
+# test reaches it through this separate forward. Target the named `health`
+# containerPort declared on the StatefulSet so a future override of
+# `service.healthPort` stays compatible without touching this script.
+HEALTH_LOCAL_PORT="$(e2e_pick_port)"
+echo "Starting kubectl port-forward sts/${RELEASE_NAME} ${HEALTH_LOCAL_PORT}:health..."
+kctl -n "${NAMESPACE}" port-forward "sts/${RELEASE_NAME}" \
+  "${HEALTH_LOCAL_PORT}:health" >"${PORTFORWARD_HEALTH_LOG}" 2>&1 &
+PORTFORWARD_HEALTH_PID=$!
+
+elapsed=0
+timeout=30
+while [ "${elapsed}" -lt "${timeout}" ]; do
+  if ! kill -0 "${PORTFORWARD_HEALTH_PID}" 2>/dev/null; then
+    echo "ERROR: kubectl health port-forward exited before becoming reachable" >&2
+    cat "${PORTFORWARD_HEALTH_LOG}" >&2 || true
+    exit 1
+  fi
+  if curl -s -o /dev/null --connect-timeout 1 "http://127.0.0.1:${HEALTH_LOCAL_PORT}/healthz"; then
+    break
+  fi
+  sleep 1
+  elapsed=$((elapsed + 1))
+done
+if [ "${elapsed}" -ge "${timeout}" ]; then
+  echo "ERROR: health port-forward did not accept TCP within ${timeout}s" >&2
+  cat "${PORTFORWARD_HEALTH_LOG}" >&2 || true
+  exit 1
+fi
+
+export OPENSHELL_E2E_HEALTH_PORT="${HEALTH_LOCAL_PORT}"
 
 GATEWAY_NAME="openshell-e2e-kube-${LOCAL_PORT}"
 GATEWAY_ENDPOINT="http://127.0.0.1:${LOCAL_PORT}"
