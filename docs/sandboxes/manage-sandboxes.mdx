@@ -159,6 +159,8 @@ Pass an optional service name to create a named service URL:
 openshell service expose my-sandbox 8080 web
 ```
 
+Use `openshell svc` as shorthand for `openshell service`.
+
 For loopback gateways, OpenShell prints a URL in the form `http://<sandbox>.<gateway>.openshell.localhost:<port>/` or `http://<sandbox>--<service>.<gateway>.openshell.localhost:<port>/` when a service name is provided. Browser traffic enters the same gateway listener as mTLS-protected gRPC, but plaintext HTTP is accepted only from loopback clients and only for sandbox service hostnames. Gateway APIs, auth routes, health endpoints, and non-service hostnames remain unavailable over plaintext HTTP. Cross-origin and sibling-subdomain browser requests are rejected before reaching the sandbox service. Disable this local browser path with `--enable-loopback-service-http=false` or `OPENSHELL_ENABLE_LOOPBACK_SERVICE_HTTP=false`.
 
 <Note>

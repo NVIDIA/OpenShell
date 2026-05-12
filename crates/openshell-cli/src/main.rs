@@ -273,6 +273,14 @@ const FORWARD_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
   $ openshell forward list
 ";
 
+const SERVICE_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
+  svc
+
+\x1b[1mEXAMPLES\x1b[0m
+  $ openshell service expose my-sandbox 8080
+  $ openshell service expose my-sandbox 8080 web
+";
+
 const LOGS_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
   lg
 
@@ -411,7 +419,7 @@ enum Commands {
     },
 
     /// Expose sandbox services.
-    #[command(help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    #[command(alias = "svc", after_help = SERVICE_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
     Service {
         #[command(subcommand)]
         command: Option<ServiceCommands>,
@@ -3603,6 +3611,28 @@ mod tests {
     fn service_expose_allows_omitted_service_name() {
         let cli = Cli::try_parse_from(["openshell", "service", "expose", "my-sandbox", "8080"])
             .expect("service expose should allow omitting the service name");
+
+        match cli.command {
+            Some(Commands::Service {
+                command:
+                    Some(ServiceCommands::Expose {
+                        sandbox,
+                        target_port,
+                        service,
+                    }),
+            }) => {
+                assert_eq!(sandbox, "my-sandbox");
+                assert_eq!(target_port, 8080);
+                assert_eq!(service, None);
+            }
+            other => panic!("expected service expose command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_alias_parses_service_commands() {
+        let cli = Cli::try_parse_from(["openshell", "svc", "expose", "my-sandbox", "8080"])
+            .expect("svc alias should parse service commands");
 
         match cli.command {
             Some(Commands::Service {
