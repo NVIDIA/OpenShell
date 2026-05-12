@@ -58,8 +58,10 @@ jobs:
       - name: Check Docker GPU prerequisites
         run: |
           docker info --format '{{json .CDISpecDirs}}'
-          GPU_PROBE_IMAGE="$(awk -F= '/^ARG[[:space:]]+GATEWAY_BASE_IMAGE=/ { print $2; exit }' deploy/docker/Dockerfile.gateway)"
-          test -n "${GPU_PROBE_IMAGE}"
+          # NVIDIA-managed Ubuntu base — has the layout CDI injection expects
+          # (ldconfig, populated /usr/bin, etc.). The gateway runtime is now
+          # distroless and lacks those, so it is not a viable probe target.
+          GPU_PROBE_IMAGE="nvcr.io/nvidia/base/ubuntu:noble-20251013"
           docker run --rm --device nvidia.com/gpu=all "${GPU_PROBE_IMAGE}" nvidia-smi -L
 
       - name: Run tests
