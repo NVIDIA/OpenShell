@@ -91,6 +91,17 @@ chmod 755 "$HOME/.local/bin/openshell-gateway"
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
+For the VM compute driver, also place `openshell-driver-vm` under the gateway libexec directory:
+
+```shell
+mkdir -p "$HOME/.local/libexec/openshell"
+curl -LsSf "https://github.com/NVIDIA/OpenShell/releases/latest/download/openshell-driver-vm-${gateway_target}.tar.gz" \
+  | tar -xz -C "$HOME/.local/libexec/openshell" openshell-driver-vm
+chmod 755 "$HOME/.local/libexec/openshell/openshell-driver-vm"
+```
+
+The gateway searches `$HOME/.local/libexec/openshell` by default. To use a different directory, set `OPENSHELL_DRIVER_DIR`.
+
 To configure the gateway process itself, refer to [Configuring the Gateway](/sandboxes/manage-gateways#configuring-the-gateway).
 
 ## Manual CLI Setup
