@@ -120,13 +120,25 @@ spin_clear() {
 # Redact host-side credentials from the agent log tail before printing on
 # failure. Codex shouldn't echo the token, but a misbehaving tool call (e.g.,
 # `curl -v`) could leak it; sanitize before showing the log.
+#
+# Uses python's literal `str.replace` rather than sed because tokens
+# (especially JWTs) can contain characters that break sed's pattern parser
+# — a sed delimiter collision in one of the substitutions blanks the entire
+# log tail, hiding the very failure context we're trying to surface.
 redact_log() {
-    local replacement='[redacted]'
-    sed \
-        -e "s|${DEMO_GITHUB_TOKEN:-__no_github_token__}|${replacement}|g" \
-        -e "s|${CODEX_AUTH_ACCESS_TOKEN:-__no_codex_access__}|${replacement}|g" \
-        -e "s|${CODEX_AUTH_REFRESH_TOKEN:-__no_codex_refresh__}|${replacement}|g" \
-        -e "s|${CODEX_AUTH_ACCOUNT_ID:-__no_codex_account__}|${replacement}|g"
+    python3 - \
+        "${DEMO_GITHUB_TOKEN:-}" \
+        "${CODEX_AUTH_ACCESS_TOKEN:-}" \
+        "${CODEX_AUTH_REFRESH_TOKEN:-}" \
+        "${CODEX_AUTH_ACCOUNT_ID:-}" \
+        <<'PY'
+import sys
+tokens = [t for t in sys.argv[1:] if t]
+for line in sys.stdin:
+    for t in tokens:
+        line = line.replace(t, "[redacted]")
+    sys.stdout.write(line)
+PY
 }
 
 fail() {
