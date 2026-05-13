@@ -35,11 +35,7 @@ impl ProviderCredentialState {
         passthrough_keys: &[String],
     ) -> Self {
         let (child_env, generation_resolver, current_resolver) =
-            SecretResolver::from_provider_env_for_current_revision(
-                env,
-                passthrough_keys,
-                revision,
-            );
+            SecretResolver::from_provider_env_for_current_revision(env, passthrough_keys, revision);
         let snapshot = Arc::new(ProviderCredentialSnapshot {
             revision,
             child_env,
@@ -81,11 +77,7 @@ impl ProviderCredentialState {
         passthrough_keys: &[String],
     ) -> usize {
         let (child_env, generation_resolver, current_resolver) =
-            SecretResolver::from_provider_env_for_current_revision(
-                env,
-                passthrough_keys,
-                revision,
-            );
+            SecretResolver::from_provider_env_for_current_revision(env, passthrough_keys, revision);
         let mut inner = self
             .inner
             .write()
