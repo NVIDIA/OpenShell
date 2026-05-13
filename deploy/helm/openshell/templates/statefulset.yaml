@@ -59,9 +59,18 @@ spec:
             {{- end }}
             - --log-level
             - {{ .Values.server.logLevel }}
+            {{- if not .Values.server.dbUrlSecretRef.name }}
             - --db-url
             - {{ .Values.server.dbUrl | quote }}
+            {{- end }}
           env:
+            {{- if .Values.server.dbUrlSecretRef.name }}
+            - name: OPENSHELL_DB_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.server.dbUrlSecretRef.name | quote }}
+                  key: {{ .Values.server.dbUrlSecretRef.key | quote }}
+            {{- end }}
             - name: OPENSHELL_SANDBOX_NAMESPACE
               value: {{ include "openshell.sandboxNamespace" . | quote }}
             - name: OPENSHELL_SANDBOX_IMAGE

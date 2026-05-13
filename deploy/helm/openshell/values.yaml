@@ -90,6 +90,14 @@ server:
   # namespace (.Release.Namespace) when left empty.
   sandboxNamespace: ""
   dbUrl: "sqlite:/var/openshell/openshell.db"
+  # Source the database URL from a Kubernetes Secret instead of `dbUrl`. When
+  # `name` is set, the gateway reads OPENSHELL_DB_URL from this Secret and the
+  # plaintext `dbUrl` value above is ignored. Use this for Postgres so the
+  # password never lives in values.yaml or Helm release history.
+  # See ci/values-postgres.yaml for a worked example.
+  dbUrlSecretRef:
+    name: ""
+    key: "url"
   sandboxImage: "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
   # Kubernetes imagePullPolicy for sandbox pods.  Empty = Kubernetes default
   # (Always for :latest, IfNotPresent otherwise).  Set to "Always" for dev

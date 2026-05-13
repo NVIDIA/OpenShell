@@ -52,6 +52,7 @@ See [`values.yaml`](values.yaml) for configurable values. Selected overlays:
 - [`ci/values-gateway.yaml`](ci/values-gateway.yaml) — gateway-only configuration
 - [`ci/values-cert-manager.yaml`](ci/values-cert-manager.yaml) — cert-manager integration
 - [`ci/values-keycloak.yaml`](ci/values-keycloak.yaml) — Keycloak OIDC integration
+- [`ci/values-postgres.yaml`](ci/values-postgres.yaml) — Postgres persistence via a Secret-backed DB URL
 
 ## PKI bootstrap
 

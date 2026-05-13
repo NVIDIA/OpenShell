@@ -1,0 +1,31 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Postgres persistence overlay.
+#
+# Sources the gateway's database URL from a Kubernetes Secret so the password
+# never lives in values.yaml or Helm release history.
+#
+# 1. Create the Secret in the release namespace, out-of-band:
+#
+#      kubectl create secret generic openshell-db \
+#        --namespace openshell \
+#        --from-literal=url='postgres://openshell:CHANGEME@postgres.openshell.svc.cluster.local:5432/openshell?sslmode=require'
+#
+#    Both `postgres://` and `postgresql://` schemes are accepted. The gateway
+#    runs the embedded migrations on first connect.
+#
+# 2. Layer this file on top of values.yaml when deploying:
+#
+#      helm upgrade --install openshell . \
+#        -f values.yaml -f ci/values-postgres.yaml
+#
+# When `server.dbUrlSecretRef.name` is set, the chart drops the `--db-url`
+# CLI flag and the gateway reads OPENSHELL_DB_URL from the referenced Secret.
+# The plaintext `server.dbUrl` value is ignored. The chart still provisions
+# the `/var/openshell` PVC, but it is unused when persistence is Postgres.
+
+server:
+  dbUrlSecretRef:
+    name: openshell-db
+    key: url
