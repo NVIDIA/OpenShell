@@ -36,6 +36,27 @@ Ordinary network traffic follows this order:
 Explicit deny and hardening checks win over allow rules. If no rule matches, the
 request is denied.
 
+## Host Wildcards
+
+Network endpoint `host` patterns accept a `*` wildcard inside the first DNS
+label only. The OPA runtime matches with a `.` label boundary, so a wildcard
+never spans dots. The validator enforces the same boundary so that policy load
+fails fast instead of silently mismatching at the proxy.
+
+| Pattern | Accepted | Example match | Notes |
+|---|---|---|---|
+| `*.example.com` | Yes | `api.example.com` | Single first label of any value. |
+| `**.example.com` | Yes | `a.b.example.com` | Recursive wildcard as the entire first label. |
+| `*-aiplatform.googleapis.com` | Yes | `us-central1-aiplatform.googleapis.com` | Intra-label wildcard inside the first DNS label. |
+| `*` or `**` | No | — | Matches every host. |
+| `*.com`, `**.com` | No | — | TLD wildcards (`labels <= 2`). |
+| `foo.*.example.com` | No | — | Wildcard outside the first DNS label. |
+| `foo**.example.com` | No | — | Recursive `**` mixed inside a label; allowed only as the entire first label. |
+
+Validation rejects the disallowed patterns at policy load time with a message
+that names the offending host. Exact hosts and IP addresses do not use this
+path.
+
 ## TLS and L7 Inspection
 
 For HTTP endpoints that need request-level controls, the proxy can terminate TLS

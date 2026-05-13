@@ -3740,6 +3740,69 @@ network_policies:
     }
 
     #[test]
+    fn wildcard_host_intra_label_matches() {
+        // First-label intra-label wildcard: `*` matches the variable prefix
+        // within a single DNS label. Locks validator/runtime alignment for
+        // the pattern accepted by `validate_host_wildcard`.
+        let data = r#"
+network_policies:
+  intra_label:
+    name: intra_label
+    endpoints:
+      - { host: "*-aiplatform.googleapis.com", port: 443 }
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let input = NetworkInput {
+            host: "us-central1-aiplatform.googleapis.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let decision = engine.evaluate_network(&input).unwrap();
+        assert!(
+            decision.allowed,
+            "*-aiplatform.googleapis.com should match us-central1-aiplatform.googleapis.com: {}",
+            decision.reason
+        );
+    }
+
+    #[test]
+    fn wildcard_host_intra_label_does_not_cross_dot() {
+        // `glob.match(..., ["."])` treats `.` as a label boundary that `*`
+        // cannot cross. `*-aiplatform.googleapis.com` must not match a host
+        // whose first label is `us-central1` and where `aiplatform` is a
+        // separate label.
+        let data = r#"
+network_policies:
+  intra_label:
+    name: intra_label
+    endpoints:
+      - { host: "*-aiplatform.googleapis.com", port: 443 }
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let input = NetworkInput {
+            host: "us-central1.aiplatform.googleapis.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let decision = engine.evaluate_network(&input).unwrap();
+        assert!(
+            !decision.allowed,
+            "*-aiplatform.googleapis.com must NOT match us-central1.aiplatform.googleapis.com \
+             (would cross a `.` boundary)"
+        );
+    }
+
+    #[test]
     fn wildcard_host_multi_port() {
         let data = r#"
 network_policies:
