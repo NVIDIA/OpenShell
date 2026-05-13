@@ -1126,6 +1126,24 @@ enum SandboxCommands {
         #[arg(long, overrides_with = "auto_providers")]
         no_auto_providers: bool,
 
+        /// Bind-mount a host directory into the sandbox.
+        ///
+        /// Format: `HOST_PATH[:SANDBOX_PATH][:ro]`
+        ///
+        /// - `HOST_PATH` is the absolute path on the gateway host.
+        /// - `SANDBOX_PATH` is the absolute path inside the sandbox
+        ///   (defaults to the same as `HOST_PATH` when omitted).
+        /// - Append `:ro` to mount read-only.
+        ///
+        /// Only supported by local Docker-backed gateways. Kubernetes and
+        /// VM gateways will reject this flag at sandbox create time.
+        ///
+        /// Examples:
+        ///   `--volume /home/user/project:/workspace`
+        ///   `--volume /data:/data:ro`
+        #[arg(long = "volume", value_name = "HOST_PATH[:SANDBOX_PATH][:ro]")]
+        volumes: Vec<String>,
+
         /// Attach labels to the sandbox (key=value format, repeatable).
         #[arg(long = "label")]
         labels: Vec<String>,
@@ -2372,6 +2390,7 @@ async fn main() -> Result<()> {
                     no_tty,
                     auto_providers,
                     no_auto_providers,
+                    volumes,
                     labels,
                     command,
                 } => {
@@ -2412,6 +2431,12 @@ async fn main() -> Result<()> {
                         (local, remote, !no_git_ignore)
                     });
 
+                    // Parse --volume specs into (host_path, sandbox_path, read_only) tuples.
+                    let mut volume_specs = Vec::new();
+                    for vol in &volumes {
+                        volume_specs.push(parse_volume_spec(vol)?);
+                    }
+
                     let editor = editor.map(Into::into);
                     let forward = forward
                         .map(|s| openshell_core::forward::ForwardSpec::parse(&s))
@@ -2438,6 +2463,7 @@ async fn main() -> Result<()> {
                         &command,
                         tty_override,
                         auto_providers_override,
+                        &volume_specs,
                         &labels_map,
                         &tls,
                     ))
@@ -2827,6 +2853,38 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Parse a volume spec like `HOST_PATH[:SANDBOX_PATH][:ro]` into components.
+///
+/// Returns `(host_path, sandbox_path, read_only)`.  When `SANDBOX_PATH` is
+/// omitted, `sandbox_path` defaults to `host_path`.  The only recognised
+/// option suffix is `ro` (read-only); any other suffix is rejected.
+fn parse_volume_spec(spec: &str) -> Result<(String, String, bool), miette::Report> {
+    // Split into at most three colon-separated parts.
+    let parts: Vec<&str> = spec.splitn(3, ':').collect();
+    let host_path = parts[0];
+    if host_path.is_empty() {
+        return Err(miette::miette!(
+            "invalid volume spec '{spec}': host path must not be empty"
+        ));
+    }
+    let sandbox_path = parts.get(1).copied().unwrap_or(host_path);
+    if sandbox_path.is_empty() {
+        return Err(miette::miette!(
+            "invalid volume spec '{spec}': sandbox path must not be empty when specified"
+        ));
+    }
+    let read_only = match parts.get(2).copied() {
+        Some("ro") => true,
+        Some("rw") | None => false,
+        Some(opt) => {
+            return Err(miette::miette!(
+                "invalid volume option '{opt}' in spec '{spec}': only 'ro' and 'rw' are supported"
+            ));
+        }
+    };
+    Ok((host_path.to_string(), sandbox_path.to_string(), read_only))
 }
 
 /// Parse an upload spec like `<local>[:<remote>]` into (`local_path`, `optional_sandbox_path`).

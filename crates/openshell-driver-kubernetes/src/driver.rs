@@ -194,6 +194,17 @@ impl KubernetesComputeDriver {
     }
 
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), tonic::Status> {
+        let has_mounts = sandbox
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.template.as_ref())
+            .is_some_and(|tmpl| !tmpl.mounts.is_empty());
+        if has_mounts {
+            return Err(tonic::Status::failed_precondition(
+                "--volume bind mounts are not supported by Kubernetes-backed gateways; \
+                 use `openshell sandbox upload` to transfer files into the sandbox instead",
+            ));
+        }
         let gpu_requested = sandbox.spec.as_ref().is_some_and(|spec| spec.gpu);
         if gpu_requested
             && !self.has_gpu_capacity().await.map_err(|err| {

@@ -22,7 +22,7 @@ use openshell_core::config::{DEFAULT_DOCKER_NETWORK_NAME, DEFAULT_STOP_TIMEOUT_S
 use openshell_core::gpu::cdi_gpu_device_ids;
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    DriverCondition, DriverSandbox, DriverSandboxStatus, DriverSandboxTemplate,
+    DriverCondition, DriverSandbox, DriverSandboxMount, DriverSandboxStatus, DriverSandboxTemplate,
     GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest, GetSandboxResponse,
     ListSandboxesRequest, ListSandboxesResponse, StopSandboxRequest, StopSandboxResponse,
     ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent,
@@ -324,6 +324,14 @@ impl DockerComputeDriver {
             return Err(Status::failed_precondition(
                 "docker compute driver does not support template.platform_config",
             ));
+        }
+
+        for (i, mount) in template.mounts.iter().enumerate() {
+            if mount.host_path.is_empty() {
+                return Err(Status::invalid_argument(format!(
+                    "template.mounts[{i}].host_path must not be empty"
+                )));
+            }
         }
 
         let _ = docker_resource_limits(template)?;
@@ -869,7 +877,10 @@ impl ComputeDriver for DockerComputeDriver {
     }
 }
 
-fn build_binds(config: &DockerDriverRuntimeConfig) -> Vec<String> {
+fn build_binds(
+    config: &DockerDriverRuntimeConfig,
+    user_mounts: &[DriverSandboxMount],
+) -> Vec<String> {
     let mut binds = vec![format!(
         "{}:{}:ro,z",
         config.supervisor_bin.display(),
@@ -883,6 +894,15 @@ fn build_binds(config: &DockerDriverRuntimeConfig) -> Vec<String> {
             TLS_CERT_MOUNT_PATH
         ));
         binds.push(format!("{}:{}:ro,z", tls.key.display(), TLS_KEY_MOUNT_PATH));
+    }
+    for mount in user_mounts {
+        let sandbox_path = if mount.sandbox_path.is_empty() {
+            &mount.host_path
+        } else {
+            &mount.sandbox_path
+        };
+        let options = if mount.read_only { ":ro" } else { "" };
+        binds.push(format!("{}:{}{}", mount.host_path, sandbox_path, options));
     }
     binds
 }
@@ -997,7 +1017,7 @@ fn build_container_create_body(
             nano_cpus: resource_limits.nano_cpus,
             memory: resource_limits.memory_bytes,
             device_requests: docker_gpu_device_requests(spec.gpu, &spec.gpu_device),
-            binds: Some(build_binds(config)),
+            binds: Some(build_binds(config, &template.mounts)),
             restart_policy: Some(RestartPolicy {
                 name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
                 maximum_retry_count: None,

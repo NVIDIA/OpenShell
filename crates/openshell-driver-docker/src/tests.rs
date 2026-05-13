@@ -30,6 +30,7 @@ fn test_sandbox() -> DriverSandbox {
                 environment: HashMap::from([("TEMPLATE_ENV".to_string(), "template".to_string())]),
                 resources: None,
                 platform_config: None,
+                mounts: vec![],
             }),
             gpu: false,
             gpu_device: String::new(),
@@ -359,6 +360,7 @@ fn docker_resource_limits_rejects_requests() {
             memory_limit: String::new(),
         }),
         platform_config: None,
+        mounts: vec![],
     };
 
     let err = docker_resource_limits(&template).unwrap_err();
@@ -410,7 +412,7 @@ fn build_environment_keeps_path_driver_controlled() {
 
 #[test]
 fn build_binds_uses_docker_tls_directory() {
-    let binds = build_binds(&runtime_config());
+    let binds = build_binds(&runtime_config(), &[]);
     let targets = binds
         .iter()
         .filter_map(|bind| bind.split(':').nth(1).map(String::from))

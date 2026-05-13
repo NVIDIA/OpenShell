@@ -87,6 +87,45 @@ pub(super) async fn handle_create_sandbox(
         template.image = state.compute.default_image().to_string();
     }
 
+    // Automatically add bind-mount sandbox paths to the filesystem policy so
+    // that Landlock (the kernel-level filesystem allowlist enforced inside the
+    // sandbox) permits access to them.  Without this, the mount is visible in
+    // the container's namespace but every open(2) on it returns EACCES.
+    //
+    // We inject the paths here, at create time, so they are persisted with the
+    // sandbox record and delivered to the supervisor via GetSandboxConfig.
+    //
+    // IMPORTANT: when no user policy was provided we seed from the full
+    // restrictive default (which includes /usr, /lib, /etc, /sandbox, /tmp,
+    // etc.) rather than an empty SandboxPolicy.  The installed supervisor
+    // applies the gateway-delivered policy verbatim for Landlock; a sparse
+    // policy causes it to lock itself out of every system path it needs.
+    if !template.mounts.is_empty() {
+        let policy = spec
+            .policy
+            .get_or_insert_with(openshell_policy::restrictive_default_policy);
+        let fs = policy
+            .filesystem
+            .get_or_insert_with(openshell_core::proto::FilesystemPolicy::default);
+        for mount in &template.mounts {
+            let sandbox_path = if mount.sandbox_path.is_empty() {
+                &mount.host_path
+            } else {
+                &mount.sandbox_path
+            };
+            if sandbox_path.is_empty() {
+                continue;
+            }
+            if mount.read_only {
+                if !fs.read_only.contains(sandbox_path) {
+                    fs.read_only.push(sandbox_path.clone());
+                }
+            } else if !fs.read_write.contains(sandbox_path) {
+                fs.read_write.push(sandbox_path.clone());
+            }
+        }
+    }
+
     // Ensure process identity defaults to "sandbox" when missing or
     // empty, then validate policy safety before persisting.
     if let Some(ref mut policy) = spec.policy {

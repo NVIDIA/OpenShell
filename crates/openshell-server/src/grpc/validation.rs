@@ -31,6 +31,10 @@ pub(super) const MAX_EXEC_COMMAND_ARGS: usize = 1024;
 pub(super) const MAX_EXEC_ARG_LEN: usize = 32 * 1024; // 32 KiB
 /// Maximum length of the workdir field (bytes).
 pub(super) const MAX_EXEC_WORKDIR_LEN: usize = 4096;
+/// Maximum number of bind mounts per sandbox template.
+const MAX_MOUNTS: usize = 32;
+/// Maximum byte length of a mount path (host or sandbox side).
+const MAX_MOUNT_PATH_LEN: usize = 4096;
 
 /// Validate fields of an `ExecSandboxRequest` for control characters and size
 /// limits before constructing a shell command string.
@@ -197,6 +201,33 @@ fn validate_sandbox_template(tmpl: &SandboxTemplate) -> Result<(), Status> {
         if size > MAX_TEMPLATE_STRUCT_SIZE {
             return Err(Status::invalid_argument(format!(
                 "template.volume_claim_templates serialized size exceeds maximum ({size} > {MAX_TEMPLATE_STRUCT_SIZE})"
+            )));
+        }
+    }
+
+    // Validate mounts.
+    if tmpl.mounts.len() > MAX_MOUNTS {
+        return Err(Status::invalid_argument(format!(
+            "template.mounts exceeds maximum count ({} > {MAX_MOUNTS})",
+            tmpl.mounts.len()
+        )));
+    }
+    for (i, mount) in tmpl.mounts.iter().enumerate() {
+        if mount.host_path.is_empty() {
+            return Err(Status::invalid_argument(format!(
+                "template.mounts[{i}].host_path must not be empty"
+            )));
+        }
+        if mount.host_path.len() > MAX_MOUNT_PATH_LEN {
+            return Err(Status::invalid_argument(format!(
+                "template.mounts[{i}].host_path exceeds maximum length ({} > {MAX_MOUNT_PATH_LEN})",
+                mount.host_path.len()
+            )));
+        }
+        if mount.sandbox_path.len() > MAX_MOUNT_PATH_LEN {
+            return Err(Status::invalid_argument(format!(
+                "template.mounts[{i}].sandbox_path exceeds maximum length ({} > {MAX_MOUNT_PATH_LEN})",
+                mount.sandbox_path.len()
             )));
         }
     }

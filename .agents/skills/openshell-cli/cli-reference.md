@@ -140,6 +140,7 @@ Create a sandbox through the active gateway, wait for readiness, then connect or
 | `--name <NAME>` | Sandbox name (auto-generated if omitted) |
 | `--from <SOURCE>` | Sandbox source: community name, Dockerfile path, directory, or image reference (BYOC) |
 | `--upload <PATH>[:<DEST>]` | Upload local files into sandbox (default dest: `/sandbox`) |
+| `--volume <HOST>[:<SANDBOX>][:ro]` | Bind-mount a host directory into the sandbox. Only supported by Docker-backed gateways. Repeatable. |
 | `--no-keep` | Delete sandbox after the initial command or shell exits |
 | `--provider <NAME>` | Provider to attach (repeatable) |
 | `--policy <PATH>` | Path to custom policy YAML |

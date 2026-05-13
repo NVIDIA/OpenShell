@@ -115,6 +115,22 @@ message DriverSandboxTemplate {
   // For the Kubernetes driver this carries fields such as runtimeClassName,
   // annotations, and volumeClaimTemplates.
   google.protobuf.Struct platform_config = 11;
+  // Host directories to bind-mount into the sandbox.
+  //
+  // Only supported by the Docker driver. Other drivers must reject a
+  // non-empty list at ValidateSandboxCreate time.
+  repeated DriverSandboxMount mounts = 12;
+}
+
+// A host directory bind-mounted into a sandbox by the compute driver.
+message DriverSandboxMount {
+  // Absolute path on the gateway host to bind-mount.
+  string host_path = 1;
+  // Absolute path inside the sandbox where the host directory appears.
+  // When empty, the driver uses the same path as host_path.
+  string sandbox_path = 2;
+  // When true, the directory is mounted read-only.
+  bool read_only = 3;
 }
 
 // Typed compute-resource requirements.

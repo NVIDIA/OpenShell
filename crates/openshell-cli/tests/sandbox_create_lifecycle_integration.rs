@@ -677,6 +677,7 @@ async fn sandbox_create_keeps_command_sessions_by_default() {
         &["echo".to_string(), "OK".to_string()],
         Some(false),
         Some(false),
+        &[],
         &HashMap::new(),
         &tls,
     )
@@ -716,6 +717,7 @@ async fn sandbox_create_deletes_command_sessions_with_no_keep() {
         &["echo".to_string(), "OK".to_string()],
         Some(false),
         Some(false),
+        &[],
         &HashMap::new(),
         &tls,
     )
@@ -758,6 +760,7 @@ async fn sandbox_create_deletes_shell_sessions_with_no_keep() {
         &[],
         Some(true),
         Some(false),
+        &[],
         &HashMap::new(),
         &tls,
     )
@@ -800,6 +803,7 @@ async fn sandbox_create_keeps_sandbox_with_hidden_keep_flag() {
         &["echo".to_string(), "OK".to_string()],
         Some(false),
         Some(false),
+        &[],
         &HashMap::new(),
         &tls,
     )
@@ -842,6 +846,7 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
         &["echo".to_string(), "OK".to_string()],
         Some(false),
         Some(false),
+        &[],
         &HashMap::new(),
         &tls,
     )

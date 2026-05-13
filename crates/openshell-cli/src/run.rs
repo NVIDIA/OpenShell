@@ -37,10 +37,11 @@ use openshell_core::proto::{
     ListSandboxPoliciesRequest, ListSandboxProvidersRequest, ListSandboxesRequest,
     ListServicesRequest, PolicySource, PolicyStatus, Provider, ProviderProfile,
     ProviderProfileDiagnostic, ProviderProfileImportItem, RejectDraftChunkRequest,
-    RevokeSshSessionRequest, Sandbox, SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate,
-    ServiceEndpointResponse, SetClusterInferenceRequest, SettingScope, SettingValue,
-    TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest, UpdateProviderRequest,
-    WatchSandboxRequest, exec_sandbox_event, setting_value, tcp_forward_init,
+    RevokeSshSessionRequest, Sandbox, SandboxMount, SandboxPhase, SandboxPolicy, SandboxSpec,
+    SandboxTemplate, ServiceEndpointResponse, SetClusterInferenceRequest, SettingScope,
+    SettingValue, TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest,
+    UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event, setting_value,
+    tcp_forward_init,
 };
 use openshell_core::settings::{self, SettingValueKind};
 use openshell_core::{ObjectId, ObjectName};
@@ -1475,6 +1476,7 @@ pub async fn sandbox_create(
     command: &[String],
     tty_override: Option<bool>,
     auto_providers_override: Option<bool>,
+    volumes: &[(String, String, bool)],
     labels: &HashMap<String, String>,
     tls: &TlsOptions,
 ) -> Result<()> {
@@ -1531,10 +1533,30 @@ pub async fn sandbox_create(
 
     let policy = load_sandbox_policy(policy)?;
 
-    let template = image.map(|img| SandboxTemplate {
-        image: img,
-        ..SandboxTemplate::default()
-    });
+    let sandbox_mounts: Vec<SandboxMount> = volumes
+        .iter()
+        .map(|(host_path, sandbox_path, read_only)| SandboxMount {
+            host_path: host_path.clone(),
+            sandbox_path: sandbox_path.clone(),
+            read_only: *read_only,
+        })
+        .collect();
+
+    // Build the sandbox template. An explicit image (via --from) or any
+    // mounts (via --volume) are both reasons to include a template in the
+    // request. When neither is present the gateway fills in the default.
+    let template = match (image, sandbox_mounts.is_empty()) {
+        (Some(img), _) => Some(SandboxTemplate {
+            image: img,
+            mounts: sandbox_mounts,
+            ..SandboxTemplate::default()
+        }),
+        (None, false) => Some(SandboxTemplate {
+            mounts: sandbox_mounts,
+            ..SandboxTemplate::default()
+        }),
+        (None, true) => None,
+    };
 
     let request = CreateSandboxRequest {
         spec: Some(SandboxSpec {

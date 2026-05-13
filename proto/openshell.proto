@@ -282,6 +282,26 @@ message SandboxTemplate {
   // available (beta through 1.35, GA in 1.36+) and a supporting runtime.
   // When unset, the cluster-wide default is used.
   optional bool user_namespaces = 10;
+  // Host directories to bind-mount into the sandbox.
+  //
+  // Only supported by local Docker-backed gateways. Kubernetes and VM drivers
+  // will reject a non-empty list at sandbox create time.
+  repeated SandboxMount mounts = 11;
+}
+
+// A host directory bind-mounted into a sandbox at create time.
+//
+// Mirrors the Docker `-v HOST:CONTAINER[:ro]` bind-mount semantics.
+// The gateway passes this through to the compute driver unchanged;
+// only the Docker driver currently supports it.
+message SandboxMount {
+  // Absolute path on the gateway host to bind-mount.
+  string host_path = 1;
+  // Absolute path inside the sandbox where the host directory appears.
+  // When empty, the driver uses the same path as host_path.
+  string sandbox_path = 2;
+  // When true, the directory is mounted read-only.
+  bool read_only = 3;
 }
 
 // User-facing sandbox status derived by the gateway from compute-driver observations.

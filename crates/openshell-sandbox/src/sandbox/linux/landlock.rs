@@ -141,10 +141,29 @@ pub fn prepare(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<Option<P
         let access_all = AccessFs::from_all(abi);
         let access_read = AccessFs::from_read(abi);
 
+        // Exclude ReadDir from the restriction mask.
+        //
+        // Docker Desktop on macOS uses a proprietary 'fakeowner' filesystem for
+        // host bind mounts.  Landlock rules for fakeowner directories are added
+        // successfully (PathFd opens without error, rules_applied increments), but
+        // the kernel-side enforcement fails to match the rule at access time —
+        // making every `opendir(2)` / `getdents64(2)` on a fakeowner path return
+        // EACCES even when the path is in the allowlist.
+        //
+        // By removing ReadDir from the restriction mask, directory listing is
+        // unrestricted for all paths (the kernel does not check Landlock for
+        // ReadDir at all).  File-level access (ReadFile, WriteFile, Execute, etc.)
+        // remains fully enforced by the existing per-path rules, so the practical
+        // security boundary is unchanged: the sandbox can see file names inside
+        // directories it can traverse, but cannot read or write their contents
+        // unless an explicit allow rule exists.
+        let read_dir_flag = landlock::BitFlags::from(AccessFs::ReadDir);
+        let restriction_mask = access_all & !read_dir_flag;
+
         let mut ruleset = Ruleset::default();
         ruleset = ruleset
             .set_compatibility(compat_level(compatibility))
-            .handle_access(access_all)
+            .handle_access(restriction_mask)
             .into_diagnostic()?;
 
         let mut ruleset = ruleset.create().into_diagnostic()?;

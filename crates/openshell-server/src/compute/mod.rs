@@ -17,9 +17,9 @@ use crate::tracing_bus::TracingLogBus;
 use futures::{Stream, StreamExt};
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, DeleteSandboxRequest, DriverCondition, DriverPlatformEvent,
-    DriverResourceRequirements, DriverSandbox, DriverSandboxSpec, DriverSandboxStatus,
-    DriverSandboxTemplate, GetCapabilitiesRequest, GetSandboxRequest, ListSandboxesRequest,
-    ValidateSandboxCreateRequest, WatchSandboxesEvent, WatchSandboxesRequest,
+    DriverResourceRequirements, DriverSandbox, DriverSandboxMount, DriverSandboxSpec,
+    DriverSandboxStatus, DriverSandboxTemplate, GetCapabilitiesRequest, GetSandboxRequest,
+    ListSandboxesRequest, ValidateSandboxCreateRequest, WatchSandboxesEvent, WatchSandboxesRequest,
     compute_driver_client::ComputeDriverClient, compute_driver_server::ComputeDriver,
     watch_sandboxes_event,
 };
@@ -441,45 +441,81 @@ impl ComputeRuntime {
             .map_err(|e| Status::internal(format!("persist sandbox failed: {e}")))?;
 
         let driver_sandbox = driver_sandbox_from_public(&sandbox);
-        match self
-            .driver
-            .create_sandbox(Request::new(CreateSandboxRequest {
-                sandbox: Some(driver_sandbox),
-            }))
-            .await
-        {
-            Ok(_) => {
-                self.sandbox_watch_bus.notify(sandbox.object_id());
-                Ok(sandbox)
-            }
-            Err(status) if status.code() == Code::AlreadyExists => {
-                let _ = self
-                    .store
-                    .delete(Sandbox::object_type(), sandbox.object_id())
+        let sandbox_id = sandbox.object_id().to_string();
+        let sandbox_name = sandbox.object_name().to_string();
+
+        // Clone all fields needed by the spawned background task.
+        let driver = self.driver.clone();
+        let store = self.store.clone();
+        let sandbox_index = self.sandbox_index.clone();
+        let sandbox_watch_bus = self.sandbox_watch_bus.clone();
+        let sync_lock = self.sync_lock.clone();
+
+        // Drive the underlying create in a background task. On Docker/Podman
+        // the driver pulls the container image synchronously, which can take
+        // minutes for large images. Blocking the gRPC call for that duration
+        // leaves the client with no feedback or provisioning display. Spawning
+        // here lets `create_sandbox` return the Provisioning-phase sandbox
+        // immediately so the client can render progress while the pull runs.
+        tokio::spawn(async move {
+            match driver
+                .create_sandbox(Request::new(CreateSandboxRequest {
+                    sandbox: Some(driver_sandbox),
+                }))
+                .await
+            {
+                Ok(_) => {
+                    sandbox_watch_bus.notify(&sandbox_id);
+                }
+                Err(err) => {
+                    warn!(
+                        %sandbox_id,
+                        %sandbox_name,
+                        error = %err,
+                        "Driver failed to create sandbox; marking sandbox as error"
+                    );
+                    // Attempt to persist an Error phase so the watch stream
+                    // delivers a terminal failure to the client instead of
+                    // silently closing.
+                    let persist_result = async {
+                        let _guard = sync_lock.lock_owned().await;
+                        let mut sb = store
+                            .get_message::<Sandbox>(&sandbox_id)
+                            .await
+                            .map_err(|e| format!("fetch: {e}"))?
+                            .ok_or_else(|| "sandbox not found".to_string())?;
+                        sb.phase = SandboxPhase::Error as i32;
+                        sb.status = Some(SandboxStatus {
+                            conditions: vec![SandboxCondition {
+                                r#type: "Ready".to_string(),
+                                status: "False".to_string(),
+                                reason: "CreateFailed".to_string(),
+                                message: err.message().to_string(),
+                                ..Default::default()
+                            }],
+                            ..SandboxStatus::default()
+                        });
+                        store
+                            .put_message(&sb)
+                            .await
+                            .map_err(|e| format!("persist: {e}"))
+                    }
                     .await;
-                self.sandbox_index.remove_sandbox(sandbox.object_id());
-                Err(Status::already_exists("sandbox already exists"))
+                    if let Err(e) = persist_result {
+                        warn!(
+                            %sandbox_id,
+                            error = %e,
+                            "Failed to persist sandbox error state; deleting instead"
+                        );
+                        let _ = store.delete(Sandbox::object_type(), &sandbox_id).await;
+                        sandbox_index.remove_sandbox(&sandbox_id);
+                    }
+                    sandbox_watch_bus.notify(&sandbox_id);
+                }
             }
-            Err(status) if status.code() == Code::FailedPrecondition => {
-                let _ = self
-                    .store
-                    .delete(Sandbox::object_type(), sandbox.object_id())
-                    .await;
-                self.sandbox_index.remove_sandbox(sandbox.object_id());
-                Err(Status::failed_precondition(status.message().to_string()))
-            }
-            Err(err) => {
-                let _ = self
-                    .store
-                    .delete(Sandbox::object_type(), sandbox.object_id())
-                    .await;
-                self.sandbox_index.remove_sandbox(sandbox.object_id());
-                Err(Status::internal(format!(
-                    "create sandbox failed: {}",
-                    err.message()
-                )))
-            }
-        }
+        });
+
+        Ok(sandbox)
     }
 
     pub async fn delete_sandbox(&self, name: &str) -> Result<bool, Status> {
@@ -1143,6 +1179,15 @@ fn driver_sandbox_template_from_public(template: &SandboxTemplate) -> DriverSand
         environment: template.environment.clone(),
         resources: extract_typed_resources(&template.resources),
         platform_config: build_platform_config(template),
+        mounts: template
+            .mounts
+            .iter()
+            .map(|m| DriverSandboxMount {
+                host_path: m.host_path.clone(),
+                sandbox_path: m.sandbox_path.clone(),
+                read_only: m.read_only,
+            })
+            .collect(),
     }
 }
 

@@ -1487,6 +1487,12 @@ fn validate_vm_sandbox(sandbox: &Sandbox, gpu_enabled: bool) -> Result<(), Statu
                 "vm sandboxes do not support template.resources",
             ));
         }
+        if !template.mounts.is_empty() {
+            return Err(Status::failed_precondition(
+                "--volume bind mounts are not supported by VM-backed gateways; \
+                 use `openshell sandbox upload` to transfer files into the sandbox instead",
+            ));
+        }
     }
     Ok(())
 }
