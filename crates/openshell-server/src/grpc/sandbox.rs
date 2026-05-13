@@ -32,7 +32,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use russh::ChannelMsg;
 use russh::client::AuthResult;
@@ -1001,7 +1001,7 @@ async fn bridge_forward_tcp_stream(
                 }
                 Ok(None) => break,
                 Err(err) => {
-                    warn!(sandbox_id = %sandbox_id_in, channel_id = %channel_id_in, error = %err, "ForwardTcp: inbound stream failed");
+                    debug!(sandbox_id = %sandbox_id_in, channel_id = %channel_id_in, error = %err, "ForwardTcp: inbound stream ended");
                     break;
                 }
             }
