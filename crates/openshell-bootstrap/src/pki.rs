@@ -86,6 +86,9 @@ pub fn generate_pki(extra_sans: &[String]) -> Result<PkiBundle> {
     client_params
         .distinguished_name
         .push(DnType::CommonName, "openshell-client");
+    client_params
+        .distinguished_name
+        .push(DnType::OrganizationalUnitName, "openshell-user");
 
     let client_cert = client_params
         .signed_by(&client_key, &ca_cert, &ca_key)

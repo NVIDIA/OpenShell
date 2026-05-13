@@ -160,7 +160,6 @@ across package upgrades.
 | `OPENSHELL_LOG_LEVEL` | `info` | Log level: `trace`, `debug`, `info`, `warn`, `error` |
 | `OPENSHELL_DRIVERS` | `podman` | Compute driver (`podman`, `docker`, `kubernetes`) |
 | `OPENSHELL_DB_URL` | `sqlite://$XDG_STATE_HOME/openshell/gateway.db` | SQLite database URL for state persistence |
-| `OPENSHELL_DISABLE_GATEWAY_AUTH` | (unset) | Set to `true` to skip mTLS client certificate checks |
 
 ### TLS settings
 
@@ -168,7 +167,7 @@ across package upgrades.
 |----------|---------|-------------|
 | `OPENSHELL_TLS_CERT` | (auto-generated path) | Server TLS certificate |
 | `OPENSHELL_TLS_KEY` | (auto-generated path) | Server TLS private key |
-| `OPENSHELL_TLS_CLIENT_CA` | (auto-generated path) | CA for client certificate verification |
+| `OPENSHELL_TLS_CLIENT_CA` | (auto-generated path) | CA for client certificate verification; requires mTLS unless OIDC is also configured |
 | `OPENSHELL_DISABLE_TLS` | (unset) | Set to `true` to disable TLS |
 | `OPENSHELL_PODMAN_TLS_CA` | (auto-generated path) | CA cert mounted into sandbox containers |
 | `OPENSHELL_PODMAN_TLS_CERT` | (auto-generated path) | Client cert mounted into sandbox containers |

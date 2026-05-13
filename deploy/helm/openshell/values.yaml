@@ -119,10 +119,6 @@ server:
   # Linux 5.12+. When enabled, container UID 0 maps to an unprivileged host
   # UID and capabilities become namespaced.
   enableUserNamespaces: false
-  # Disable gateway authentication (mTLS client certificate requirement).
-  # Set to true when the gateway sits behind a reverse proxy (e.g.
-  # Cloudflare Tunnel) that terminates TLS.
-  disableGatewayAuth: false
   # Disable TLS entirely — the server listens on plaintext HTTP.
   # Set to true when a reverse proxy / tunnel terminates TLS at the edge.
   disableTls: false
@@ -132,7 +128,8 @@ server:
   tls:
     # K8s secret (type kubernetes.io/tls) with tls.crt and tls.key for the server
     certSecretName: openshell-server-tls
-    # K8s secret with ca.crt for client certificate verification
+    # K8s secret with ca.crt for client certificate verification (mTLS).
+    # Set to "" to disable mTLS and run HTTPS-only (use OIDC for auth instead).
     clientCaSecretName: openshell-server-client-ca
     # K8s secret mounted into sandbox pods for mTLS to the server
     clientTlsSecretName: openshell-client-tls

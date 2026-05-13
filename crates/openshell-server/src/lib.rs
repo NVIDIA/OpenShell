@@ -289,8 +289,8 @@ pub async fn run_server(
         Some(TlsAcceptor::from_files(
             &tls.cert_path,
             &tls.key_path,
-            &tls.client_ca_path,
-            tls.allow_unauthenticated,
+            tls.client_ca_path.as_deref(),
+            tls.require_client_auth,
         )?)
     } else {
         info!("TLS disabled — accepting plaintext connections");
@@ -488,7 +488,11 @@ fn spawn_gateway_connection(
                 Ok(ConnectionProtocol::Tls | ConnectionProtocol::Unknown) => {
                     match acceptor.inner().accept(stream).await {
                         Ok(tls_stream) => {
-                            if let Err(e) = service.serve(tls_stream).await {
+                            let peer_identity = multiplex::extract_peer_identity(&tls_stream);
+                            if let Err(e) = service
+                                .serve_with_peer_identity(tls_stream, peer_identity)
+                                .await
+                            {
                                 if is_benign_connection_close(e.as_ref()) {
                                     debug!(error = %e, client = %addr, "Connection closed");
                                 } else {

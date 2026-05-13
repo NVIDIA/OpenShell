@@ -72,7 +72,11 @@ gRPC and HTTP, secured by mutual TLS (mTLS) by default.
 
 **--tls-client-ca** *PATH*
 :   Path to CA certificate for client certificate verification (mTLS).
-    Required unless **--disable-tls** is set.
+    When set without **--oidc-issuer**, client certificates are required
+    and the TLS handshake rejects unauthenticated connections. When set
+    together with **--oidc-issuer**, client certificates are accepted
+    but not required — callers may authenticate with either a Bearer
+    token or a client certificate.
     Environment: **OPENSHELL_TLS_CLIENT_CA**.
 
 **--disable-tls**
@@ -82,12 +86,6 @@ gRPC and HTTP, secured by mutual TLS (mTLS) by default.
     gateway sits behind a TLS-terminating reverse proxy, or restrict
     **--bind-address** to **127.0.0.1**.
     Environment: **OPENSHELL_DISABLE_TLS**.
-
-**--disable-gateway-auth**
-:   Disable mTLS client certificate requirement. The TLS handshake
-    accepts connections without a client certificate. Ignored when
-    **--disable-tls** is set.
-    Environment: **OPENSHELL_DISABLE_GATEWAY_AUTH**.
 
 **--server-san** *SAN*
 :   Subject Alternative Name configured on the gateway server

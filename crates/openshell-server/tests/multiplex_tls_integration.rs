@@ -586,7 +586,7 @@ async fn serves_grpc_and_http_over_tls_on_same_port() {
     let tls_acceptor = TlsAcceptor::from_files(
         &temp.path().join("server-cert.pem"),
         &temp.path().join("server-key.pem"),
-        &temp.path().join("ca.pem"),
+        Some(temp.path().join("ca.pem").as_path()),
         false,
     )
     .unwrap();
@@ -625,7 +625,7 @@ async fn mtls_valid_client_cert_accepted() {
     let tls_acceptor = TlsAcceptor::from_files(
         &temp.path().join("server-cert.pem"),
         &temp.path().join("server-key.pem"),
-        &temp.path().join("ca.pem"),
+        Some(temp.path().join("ca.pem").as_path()),
         false,
     )
     .unwrap();
@@ -646,21 +646,56 @@ async fn mtls_valid_client_cert_accepted() {
 }
 
 #[tokio::test]
-async fn mtls_no_client_cert_rejected() {
+async fn no_client_cert_accepted_with_ca() {
     install_rustls_provider();
     let (temp, pki) = generate_pki();
 
     let tls_acceptor = TlsAcceptor::from_files(
         &temp.path().join("server-cert.pem"),
         &temp.path().join("server-key.pem"),
-        &temp.path().join("ca.pem"),
+        Some(temp.path().join("ca.pem").as_path()),
         false,
     )
     .unwrap();
 
     let (addr, server) = start_test_server(tls_acceptor).await;
 
-    // Connect with CA trust but no client cert -- should be rejected.
+    // Connect with CA trust but no client cert — should succeed (certs are optional).
+    let ca_cert = tonic::transport::Certificate::from_pem(pki.ca_cert_pem.clone());
+    let tls = ClientTlsConfig::new()
+        .ca_certificate(ca_cert)
+        .domain_name("localhost");
+    let endpoint = Endpoint::from_shared(format!("https://localhost:{}", addr.port()))
+        .expect("invalid endpoint")
+        .tls_config(tls)
+        .expect("failed to set tls");
+
+    let channel = endpoint
+        .connect()
+        .await
+        .expect("should connect without client cert");
+    let mut client = OpenShellClient::new(channel);
+    let response = client.health(HealthRequest {}).await.unwrap();
+    assert_eq!(response.get_ref().status, ServiceStatus::Healthy as i32);
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn no_client_cert_rejected_when_required() {
+    install_rustls_provider();
+    let (temp, pki) = generate_pki();
+
+    let tls_acceptor = TlsAcceptor::from_files(
+        &temp.path().join("server-cert.pem"),
+        &temp.path().join("server-key.pem"),
+        Some(temp.path().join("ca.pem").as_path()),
+        true,
+    )
+    .unwrap();
+
+    let (addr, server) = start_test_server(tls_acceptor).await;
+
     let ca_cert = tonic::transport::Certificate::from_pem(pki.ca_cert_pem.clone());
     let tls = ClientTlsConfig::new()
         .ca_certificate(ca_cert)
@@ -671,14 +706,12 @@ async fn mtls_no_client_cert_rejected() {
         .expect("failed to set tls");
 
     let result = endpoint.connect().await;
-    // Connection should fail at the TLS handshake level or shortly after.
-    // The exact error depends on timing -- it may fail on connect or on first RPC.
     if let Ok(channel) = result {
         let mut client = OpenShellClient::new(channel);
         let rpc_result = client.health(HealthRequest {}).await;
         assert!(
             rpc_result.is_err(),
-            "expected RPC to fail without client cert"
+            "expected RPC to fail without client cert when mTLS is required"
         );
     }
 
@@ -693,7 +726,7 @@ async fn mtls_wrong_ca_client_cert_rejected() {
     let tls_acceptor = TlsAcceptor::from_files(
         &temp.path().join("server-cert.pem"),
         &temp.path().join("server-key.pem"),
-        &temp.path().join("ca.pem"),
+        Some(temp.path().join("ca.pem").as_path()),
         false,
     )
     .unwrap();

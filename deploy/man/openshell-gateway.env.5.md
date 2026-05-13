@@ -66,9 +66,6 @@ exist (the unit has built-in defaults for all required settings).
 **OPENSHELL_DB_URL** (default: sqlite://$XDG_STATE_HOME/openshell/gateway.db)
 :   SQLite database URL for gateway state persistence.
 
-**OPENSHELL_DISABLE_GATEWAY_AUTH** (default: unset)
-:   Set to **true** to disable mTLS client certificate verification.
-
 ## TLS
 
 **OPENSHELL_TLS_CERT** (default: auto-generated path)
@@ -78,7 +75,10 @@ exist (the unit has built-in defaults for all required settings).
 :   Path to server TLS private key.
 
 **OPENSHELL_TLS_CLIENT_CA** (default: auto-generated path)
-:   Path to CA certificate for client certificate verification.
+:   Path to CA certificate for client certificate verification. When
+    set without **OPENSHELL_OIDC_ISSUER**, mTLS is required. When both
+    are set, callers may authenticate via Bearer token or client
+    certificate.
 
 **OPENSHELL_DISABLE_TLS** (default: unset)
 :   Set to **true** to disable TLS entirely and listen on plaintext

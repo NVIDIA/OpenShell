@@ -36,7 +36,6 @@ spec:
       sshGatewayHost: __SSH_GATEWAY_HOST__
       sshGatewayPort: __SSH_GATEWAY_PORT__
       hostGatewayIP: __HOST_GATEWAY_IP__
-      disableGatewayAuth: __DISABLE_GATEWAY_AUTH__
       disableTls: __DISABLE_TLS__
       oidc:
         issuer: "__OIDC_ISSUER__"

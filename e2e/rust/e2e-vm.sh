@@ -29,7 +29,7 @@
 #   3. On macOS, codesigns the VM driver (libkrun needs the
 #      `com.apple.security.hypervisor` entitlement).
 #   4. Starts the gateway with `--drivers vm --disable-tls
-#      --disable-gateway-auth --db-url sqlite::memory:` on a random
+#      --db-url sqlite::memory:` on a random
 #      free port, waits for `Server listening`, then runs the
 #      cluster-agnostic Rust smoke test.
 #   5. Tears the gateway down and (on failure) preserves the gateway
@@ -176,7 +176,6 @@ echo "==> Starting openshell-gateway on 127.0.0.1:${HOST_PORT} (state: ${RUN_STA
 "${GATEWAY_BIN}" \
   --drivers vm \
   --disable-tls \
-  --disable-gateway-auth \
   --db-url 'sqlite::memory:' \
   --port "${HOST_PORT}" \
   --grpc-endpoint "http://host.containers.internal:${HOST_PORT}" \

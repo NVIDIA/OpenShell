@@ -9,7 +9,7 @@ use openshell_core::ComputeDriverKind;
 use openshell_core::config::{DEFAULT_DOCKER_NETWORK_NAME, DEFAULT_SERVER_PORT, DEFAULT_SSH_PORT};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::certgen;
@@ -238,12 +238,6 @@ struct RunArgs {
     #[arg(long, env = "OPENSHELL_DISABLE_TLS")]
     disable_tls: bool,
 
-    /// Disable gateway authentication (mTLS client certificate requirement).
-    /// When set, the TLS handshake accepts connections without a client
-    /// certificate. Ignored when --disable-tls is set.
-    #[arg(long, env = "OPENSHELL_DISABLE_GATEWAY_AUTH")]
-    disable_gateway_auth: bool,
-
     /// OIDC issuer URL for JWT-based authentication.
     /// When set, the server validates `authorization: Bearer` tokens on gRPC
     /// requests against the issuer's JWKS endpoint.
@@ -335,6 +329,15 @@ async fn run_from_args(args: RunArgs) -> Result<()> {
 
     let bind = SocketAddr::new(args.bind_address, args.port);
 
+    let has_client_ca = args.tls_client_ca.is_some();
+    let has_oidc = args.oidc_issuer.is_some();
+
+    if args.disable_tls && has_client_ca {
+        return Err(miette::miette!(
+            "--disable-tls and --tls-client-ca are mutually exclusive.  Client mTLS authentication requires that TLS be enabled."
+        ));
+    }
+
     let tls = if args.disable_tls {
         None
     } else {
@@ -346,16 +349,11 @@ async fn run_from_args(args: RunArgs) -> Result<()> {
         let key_path = args.tls_key.ok_or_else(|| {
             miette::miette!("--tls-key is required when TLS is enabled (use --disable-tls to skip)")
         })?;
-        let client_ca_path = args.tls_client_ca.ok_or_else(|| {
-            miette::miette!(
-                "--tls-client-ca is required when TLS is enabled (use --disable-tls to skip)"
-            )
-        })?;
         Some(openshell_core::TlsConfig {
             cert_path,
             key_path,
-            client_ca_path,
-            allow_unauthenticated: args.disable_gateway_auth,
+            require_client_auth: has_client_ca && !has_oidc,
+            client_ca_path: args.tls_client_ca,
         })
     };
 
@@ -461,9 +459,23 @@ async fn run_from_args(args: RunArgs) -> Result<()> {
     };
 
     if args.disable_tls {
-        info!("TLS disabled — listening on plaintext HTTP");
-    } else if args.disable_gateway_auth {
-        info!("Gateway auth disabled — accepting connections without client certificates");
+        warn!("TLS disabled — listening on plaintext HTTP");
+    } else {
+        info!("TLS enabled — listening on encrypted HTTPS");
+    }
+
+    if has_client_ca {
+        info!("mTLS authentication enabled");
+    }
+    if has_oidc {
+        info!("OIDC authentication enabled");
+    }
+
+    if !has_client_ca && !has_oidc {
+        warn!(
+            "Neither mTLS (--tls-client-ca) nor OIDC (--oidc-issuer) is configured — \
+             the gateway has no authentication mechanism"
+        );
     }
 
     info!(bind = %config.bind_address, "Starting OpenShell server");

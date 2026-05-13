@@ -94,7 +94,6 @@ sandbox_ssh_port        = 2222
 cert_path             = "/etc/openshell/certs/gateway.pem"
 key_path              = "/etc/openshell/certs/gateway-key.pem"
 client_ca_path        = "/etc/openshell/certs/client-ca.pem"
-allow_unauthenticated = false   # mirrors --disable-gateway-auth
 
 # ──────────────────────────────────────────────────────────────────────────────
 # OIDC — when omitted, JWT bearer auth is disabled

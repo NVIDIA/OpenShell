@@ -12,18 +12,17 @@
 //!
 //! Test matrix:
 //!
-//! | `allow_unauthenticated` | client cert | bearer auth header | expected |
-//! |-----------------------|-------------|--------------------|----------|
-//! | false                 | valid       | —                  | OK       |
-//! | false                 | none        | —                  | rejected |
-//! | true                  | valid       | —                  | OK       |
-//! | true                  | none        | present            | OK (*)   |
-//! | true                  | none        | absent             | OK (**)  |
+//! | `client_ca` | client cert  | bearer header | expected                  |
+//! |-------------|-------------|---------------|---------------------------|
+//! | Some        | valid       | —             | OK (cert validated)       |
+//! | Some        | none        | —             | OK (cert optional)        |
+//! | Some        | none        | present       | OK (bearer auth)          |
+//! | Some        | rogue CA    | —             | rejected (bad cert)       |
+//! | None        | none        | —             | OK (HTTPS-only)           |
 //!
-//! (*) Simulates the edge tunnel path: no client cert but a JWT header.
-//! (**) TLS handshake succeeds, but in production the auth middleware (not yet
-//!      implemented) would reject.  This test proves the TLS layer alone does
-//!      not block unauthenticated connections when the flag is set.
+//! Client certificates are always optional when a CA is configured.  They are
+//! validated when present (rogue-CA certs are rejected) but never required.
+//! Authentication is handled at the application layer (OIDC bearer tokens).
 
 use bytes::Bytes;
 use http_body_util::Empty;
@@ -675,17 +674,17 @@ fn https_client_no_cert(
 // Tests
 // ===========================================================================
 
-/// Baseline: with `allow_unauthenticated=false` (default), mTLS connections work.
+/// Valid client cert is accepted when a CA is configured.
 #[tokio::test]
-async fn baseline_mtls_works_with_mandatory_client_certs() {
+async fn mtls_valid_client_cert_accepted() {
     install_rustls_provider();
     let (temp, pki) = generate_pki();
 
     let tls_acceptor = TlsAcceptor::from_files(
         &temp.path().join("server-cert.pem"),
         &temp.path().join("server-key.pem"),
-        &temp.path().join("ca.pem"),
-        false, // mandatory mTLS
+        Some(temp.path().join("ca.pem").as_path()),
+        false,
     )
     .unwrap();
 
@@ -715,102 +714,18 @@ async fn baseline_mtls_works_with_mandatory_client_certs() {
     server.abort();
 }
 
-/// Baseline: with `allow_unauthenticated=false`, no-client-cert connections are
-/// rejected at the TLS layer.
+/// No client cert is accepted when a CA is configured — client certs are
+/// always optional.  Auth is deferred to the application layer.
 #[tokio::test]
-async fn baseline_no_cert_rejected_with_mandatory_mtls() {
+async fn no_client_cert_accepted_with_ca_configured() {
     install_rustls_provider();
     let (temp, pki) = generate_pki();
 
     let tls_acceptor = TlsAcceptor::from_files(
         &temp.path().join("server-cert.pem"),
         &temp.path().join("server-key.pem"),
-        &temp.path().join("ca.pem"),
-        false, // mandatory mTLS
-    )
-    .unwrap();
-
-    let (addr, server) = start_test_server(tls_acceptor).await;
-
-    let ca_cert = tonic::transport::Certificate::from_pem(pki.ca_cert_pem.clone());
-    let tls = ClientTlsConfig::new()
-        .ca_certificate(ca_cert)
-        .domain_name("localhost");
-    let endpoint = Endpoint::from_shared(format!("https://localhost:{}", addr.port()))
-        .expect("invalid endpoint")
-        .tls_config(tls)
-        .expect("failed to set tls");
-
-    let result = endpoint.connect().await;
-    if let Ok(channel) = result {
-        let mut client = OpenShellClient::new(channel);
-        let rpc_result = client.health(HealthRequest {}).await;
-        assert!(
-            rpc_result.is_err(),
-            "expected RPC to fail without client cert when mTLS is mandatory"
-        );
-    }
-    // If connect() itself failed, that's also correct — TLS handshake rejected.
-
-    server.abort();
-}
-
-/// With `allow_unauthenticated=true`, mTLS connections still work (dual-auth).
-#[tokio::test]
-async fn dual_auth_mtls_still_accepted() {
-    install_rustls_provider();
-    let (temp, pki) = generate_pki();
-
-    let tls_acceptor = TlsAcceptor::from_files(
-        &temp.path().join("server-cert.pem"),
-        &temp.path().join("server-key.pem"),
-        &temp.path().join("ca.pem"),
-        true, // allow unauthenticated (tunnel mode)
-    )
-    .unwrap();
-
-    let (addr, server) = start_test_server(tls_acceptor).await;
-
-    // gRPC with mTLS should still work
-    let mut grpc = grpc_client_mtls(
-        addr,
-        pki.ca_cert_pem.clone(),
-        pki.client_cert_pem.clone(),
-        pki.client_key_pem.clone(),
-    )
-    .await;
-    let resp = grpc.health(HealthRequest {}).await.unwrap();
-    assert_eq!(resp.get_ref().status, ServiceStatus::Healthy as i32);
-
-    // HTTP with mTLS should still work
-    let client = https_client_mtls(&pki);
-    let req = Request::builder()
-        .method("GET")
-        .uri(format!("https://localhost:{}/healthz", addr.port()))
-        .body(Empty::<Bytes>::new())
-        .unwrap();
-    let resp = client.request(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    server.abort();
-}
-
-/// With `allow_unauthenticated=true`, no-client-cert connections pass the TLS
-/// handshake. This simulates Cloudflare Tunnel re-originating a connection.
-///
-/// The gRPC health check succeeds because there is no auth middleware yet —
-/// this proves the TLS layer is no longer the gate.  When auth middleware is
-/// added, the test should be updated to expect 401 without a valid JWT.
-#[tokio::test]
-async fn tunnel_mode_no_cert_passes_tls_handshake() {
-    install_rustls_provider();
-    let (temp, pki) = generate_pki();
-
-    let tls_acceptor = TlsAcceptor::from_files(
-        &temp.path().join("server-cert.pem"),
-        &temp.path().join("server-key.pem"),
-        &temp.path().join("ca.pem"),
-        true, // allow unauthenticated (tunnel mode)
+        Some(temp.path().join("ca.pem").as_path()),
+        false,
     )
     .unwrap();
 
@@ -822,7 +737,7 @@ async fn tunnel_mode_no_cert_passes_tls_handshake() {
     assert_eq!(
         resp.get_ref().status,
         ServiceStatus::Healthy as i32,
-        "gRPC health check should succeed without client cert in tunnel mode"
+        "gRPC health check should succeed without client cert"
     );
 
     // HTTP without client cert
@@ -836,28 +751,24 @@ async fn tunnel_mode_no_cert_passes_tls_handshake() {
     assert_eq!(
         resp.status(),
         StatusCode::OK,
-        "HTTP health check should succeed without client cert in tunnel mode"
+        "HTTP health check should succeed without client cert"
     );
 
     server.abort();
 }
 
-/// Simulate the steady-state Cloudflare tunnel flow: no client cert, but the
-/// `cf-authorization` header carries a token.  At the TLS level this must
-/// succeed; the header is passed through to the gRPC handler.
-///
-/// Note: We use a dummy token value here. When real JWT verification middleware
-/// is added, this test should use a properly-signed test JWT.
+/// Bearer auth header passes through to the gRPC handler when no client
+/// cert is presented.
 #[tokio::test]
-async fn tunnel_mode_cf_authorization_header_reaches_server() {
+async fn bearer_header_reaches_server_without_client_cert() {
     install_rustls_provider();
     let (temp, pki) = generate_pki();
 
     let tls_acceptor = TlsAcceptor::from_files(
         &temp.path().join("server-cert.pem"),
         &temp.path().join("server-key.pem"),
-        &temp.path().join("ca.pem"),
-        true,
+        Some(temp.path().join("ca.pem").as_path()),
+        false,
     )
     .unwrap();
 
@@ -871,24 +782,24 @@ async fn tunnel_mode_cf_authorization_header_reaches_server() {
     assert_eq!(
         resp.get_ref().status,
         ServiceStatus::Healthy as i32,
-        "gRPC with cf-authorization header should succeed in tunnel mode"
+        "gRPC with bearer header should succeed without client cert"
     );
 
     server.abort();
 }
 
-/// With `allow_unauthenticated=true`, a client cert from a rogue CA is still
-/// rejected by the TLS layer — the verifier still validates presented certs.
+/// A client cert from a rogue CA is rejected at the TLS layer even though
+/// client certs are optional — presented certs are still validated.
 #[tokio::test]
-async fn tunnel_mode_rogue_cert_still_rejected() {
+async fn rogue_cert_rejected() {
     install_rustls_provider();
     let (temp, pki) = generate_pki();
 
     let tls_acceptor = TlsAcceptor::from_files(
         &temp.path().join("server-cert.pem"),
         &temp.path().join("server-key.pem"),
-        &temp.path().join("ca.pem"),
-        true,
+        Some(temp.path().join("ca.pem").as_path()),
+        false,
     )
     .unwrap();
 
@@ -936,10 +847,53 @@ async fn tunnel_mode_rogue_cert_still_rejected() {
         let rpc_result = client.health(HealthRequest {}).await;
         assert!(
             rpc_result.is_err(),
-            "expected RPC to fail with rogue client cert even in tunnel mode"
+            "expected RPC to fail with rogue client cert"
         );
     }
     // If connect() itself failed, that's also correct.
+
+    server.abort();
+}
+
+/// HTTPS-only mode: no client CA configured, so the server never requests
+/// client certificates.  Clients connect with server-only TLS.
+#[tokio::test]
+async fn https_only_no_client_cert_required() {
+    install_rustls_provider();
+    let (temp, pki) = generate_pki();
+
+    let tls_acceptor = TlsAcceptor::from_files(
+        &temp.path().join("server-cert.pem"),
+        &temp.path().join("server-key.pem"),
+        None,
+        false,
+    )
+    .unwrap();
+
+    let (addr, server) = start_test_server(tls_acceptor).await;
+
+    // gRPC without client cert — should succeed (no client certs requested)
+    let mut grpc = grpc_client_no_cert(addr, pki.ca_cert_pem.clone()).await;
+    let resp = grpc.health(HealthRequest {}).await.unwrap();
+    assert_eq!(
+        resp.get_ref().status,
+        ServiceStatus::Healthy as i32,
+        "gRPC health check should succeed in HTTPS-only mode"
+    );
+
+    // HTTP without client cert
+    let client = https_client_no_cert(&pki.ca_cert_pem);
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("https://localhost:{}/healthz", addr.port()))
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    let resp = client.request(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "HTTP health check should succeed in HTTPS-only mode"
+    );
 
     server.abort();
 }

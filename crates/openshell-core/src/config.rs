@@ -315,10 +315,15 @@ pub struct ServiceRoutingConfig {
 
 /// TLS configuration.
 ///
-/// By default mTLS is enforced — all clients must present a certificate
-/// signed by the given CA.  When `allow_unauthenticated` is `true`, the
-/// TLS handshake also accepts connections without a client certificate
-/// (needed for reverse-proxy deployments like Cloudflare Tunnel).
+/// Two modes are supported:
+/// - **HTTPS with optional mTLS** (`client_ca_path = Some`):
+///   Client certificates are validated against the given CA when presented,
+///   but never required.  Clients may connect with or without a certificate.
+/// - **HTTPS-only** (`client_ca_path = None`):
+///   Server-side TLS only; no client certificates are requested.
+///
+/// In both modes, authentication is handled at the application layer
+/// (e.g. OIDC bearer tokens).  mTLS is an additional mechanism.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TlsConfig {
     /// Path to the TLS certificate file.
@@ -327,16 +332,17 @@ pub struct TlsConfig {
     /// Path to the TLS private key file.
     pub key_path: PathBuf,
 
-    /// Path to the CA certificate file for client certificate verification (mTLS).
-    /// The server requires all clients to present a valid certificate signed by
-    /// this CA.
-    pub client_ca_path: PathBuf,
-
-    /// When `true`, the TLS handshake succeeds even without a client
-    /// certificate.  Application-layer middleware must then enforce auth
-    /// (e.g. via a CF JWT header).
+    /// Path to the CA certificate file for client certificate verification.
+    /// When `Some`, client certs signed by this CA are validated.
+    /// When `None`, the server does not request client certs.
     #[serde(default)]
-    pub allow_unauthenticated: bool,
+    pub client_ca_path: Option<PathBuf>,
+
+    /// When `true` and `client_ca_path` is `Some`, the TLS handshake rejects
+    /// connections that do not present a valid client certificate.
+    /// When `false`, client certificates are accepted but not required.
+    #[serde(default)]
+    pub require_client_auth: bool,
 }
 
 /// OIDC (`OpenID` Connect) configuration for JWT-based authentication.

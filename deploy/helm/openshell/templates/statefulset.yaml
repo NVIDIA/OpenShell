@@ -113,14 +113,12 @@ spec:
               value: /etc/openshell-tls/server/tls.crt
             - name: OPENSHELL_TLS_KEY
               value: /etc/openshell-tls/server/tls.key
+            {{- if or .Values.server.tls.clientCaSecretName .Values.pkiInitJob.enabled (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) }}
             - name: OPENSHELL_TLS_CLIENT_CA
               value: /etc/openshell-tls/client-ca/ca.crt
+            {{- end }}
             - name: OPENSHELL_CLIENT_TLS_SECRET_NAME
               value: {{ .Values.server.tls.clientTlsSecretName | quote }}
-            {{- if .Values.server.disableGatewayAuth }}
-            - name: OPENSHELL_DISABLE_GATEWAY_AUTH
-              value: "true"
-            {{- end }}
             {{- end }}
             {{- if .Values.server.oidc.issuer }}
             {{- if .Values.server.oidc.caConfigMapName }}
@@ -157,6 +155,7 @@ spec:
             - name: tls-cert
               mountPath: /etc/openshell-tls/server
               readOnly: true
+            {{- if or .Values.server.tls.clientCaSecretName .Values.pkiInitJob.enabled (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) }}
             - name: tls-client-ca
               mountPath: /etc/openshell-tls/client-ca
               readOnly: true
@@ -165,6 +164,7 @@ spec:
             - name: oidc-ca
               mountPath: /etc/openshell-tls/oidc-ca
               readOnly: true
+            {{- end }}
             {{- end }}
           ports:
             - name: grpc
@@ -208,6 +208,7 @@ spec:
         - name: tls-cert
           secret:
             secretName: {{ .Values.server.tls.certSecretName }}
+        {{- if or .Values.server.tls.clientCaSecretName .Values.pkiInitJob.enabled (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) }}
         - name: tls-client-ca
           secret:
             {{- if or .Values.pkiInitJob.enabled (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) }}
@@ -223,6 +224,7 @@ spec:
         - name: oidc-ca
           configMap:
             name: {{ .Values.server.oidc.caConfigMapName }}
+        {{- end }}
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

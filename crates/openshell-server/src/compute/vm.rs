@@ -599,8 +599,8 @@ mod tests {
         let config = Config::new(Some(TlsConfig {
             cert_path: server_cert,
             key_path: server_key,
-            client_ca_path: server_ca,
-            allow_unauthenticated: false,
+            client_ca_path: Some(server_ca),
+            require_client_auth: false,
         }))
         .with_grpc_endpoint("https://gateway.internal:8443");
 
@@ -635,8 +635,8 @@ mod tests {
         let config = Config::new(Some(TlsConfig {
             cert_path: server_cert.clone(),
             key_path: server_key.clone(),
-            client_ca_path: server_ca,
-            allow_unauthenticated: false,
+            client_ca_path: Some(server_ca),
+            require_client_auth: false,
         }))
         .with_grpc_endpoint("https://gateway.internal:8443");
         let vm_config = VmComputeConfig {

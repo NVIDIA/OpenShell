@@ -31,8 +31,8 @@ use tower_http::request_id::{MakeRequestId, RequestId};
 use tracing::Span;
 
 use crate::{
-    OpenShellService, ServerState, auth::authz::AuthzPolicy, auth::oidc, http_router,
-    inference::InferenceService, service_http_router,
+    OpenShellService, ServerState, auth::authz::AuthzPolicy, auth::identity::Identity, auth::oidc,
+    http_router, inference::InferenceService, service_http_router,
 };
 
 /// Request-ID generator that produces a UUID v4 for each inbound request.
@@ -132,6 +132,18 @@ impl MultiplexService {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        self.serve_with_peer_identity(stream, None).await
+    }
+
+    /// Serve a TLS connection with an optional mTLS peer identity.
+    pub async fn serve_with_peer_identity<S>(
+        &self,
+        stream: S,
+        peer_identity: Option<Identity>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let openshell = OpenShellServer::new(OpenShellService::new(self.state.clone()))
             .max_decoding_message_size(MAX_GRPC_DECODE_SIZE);
         let inference = InferenceServer::new(InferenceService::new(self.state.clone()))
@@ -141,10 +153,18 @@ impl MultiplexService {
             user_role: oidc.user_role.clone(),
             scopes_enabled: !oidc.scopes_claim.is_empty(),
         });
+        let has_client_ca = self
+            .state
+            .config
+            .tls
+            .as_ref()
+            .is_some_and(|tls| tls.client_ca_path.is_some());
         let grpc_service = AuthGrpcRouter::new(
             GrpcRouter::new(openshell, inference),
             self.state.oidc_cache.clone(),
             authz_policy,
+            has_client_ca,
+            peer_identity,
         );
         let http_service = http_router(self.state.clone());
 
@@ -153,13 +173,6 @@ impl MultiplexService {
 
         let service = MultiplexedService::new(grpc_service, http_service);
 
-        // HTTP/2 adaptive flow control. Default windows (64 KiB / 64 KiB)
-        // throttle the RelayStream data plane to ~500 Mbps on LAN. Instead
-        // of committing to a fixed large window (which worst-case pins
-        // `max_concurrent_streams × stream_window` bytes per connection),
-        // we let hyper/h2 auto-size based on the measured bandwidth-delay
-        // product. Idle streams stay tiny; busy bulk streams grow as
-        // needed. Overrides any fixed initial_*_window_size settings.
         let mut builder = Builder::new(TokioExecutor::new());
         builder.http2().adaptive_window(true);
 
@@ -263,6 +276,10 @@ pub struct AuthGrpcRouter<S> {
     inner: S,
     oidc_cache: Option<Arc<oidc::JwksCache>>,
     authz_policy: Option<AuthzPolicy>,
+    /// Whether a client CA is configured (mTLS is a valid auth mechanism).
+    has_client_ca: bool,
+    /// mTLS peer identity extracted from the TLS handshake.
+    peer_identity: Option<Identity>,
 }
 
 impl<S> AuthGrpcRouter<S> {
@@ -270,11 +287,15 @@ impl<S> AuthGrpcRouter<S> {
         inner: S,
         oidc_cache: Option<Arc<oidc::JwksCache>>,
         authz_policy: Option<AuthzPolicy>,
+        has_client_ca: bool,
+        peer_identity: Option<Identity>,
     ) -> Self {
         Self {
             inner,
             oidc_cache,
             authz_policy,
+            has_client_ca,
+            peer_identity,
         }
     }
 }
@@ -300,17 +321,26 @@ where
     fn call(&mut self, req: Request<B>) -> Self::Future {
         let oidc_cache = self.oidc_cache.clone();
         let authz_policy = self.authz_policy.clone();
+        let has_client_ca = self.has_client_ca;
+        let peer_identity = self.peer_identity.clone();
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
             let mut req = req;
             oidc::clear_internal_auth_markers(req.headers_mut());
 
-            // If OIDC is not configured, pass through directly.
-            let Some(cache) = oidc_cache else {
+            // No auth configured — pass through.
+            if oidc_cache.is_none() && !has_client_ca {
                 return inner.ready().await?.call(req).await;
-            };
+            }
 
+            // mTLS-only (no OIDC) — TLS layer already enforced client certs,
+            // so if we got here the peer is authenticated.
+            if oidc_cache.is_none() && has_client_ca {
+                return inner.ready().await?.call(req).await;
+            }
+
+            let cache = oidc_cache.expect("checked above");
             let path = req.uri().path().to_string();
 
             // Health probes and reflection — truly unauthenticated.
@@ -342,9 +372,22 @@ where
                 .and_then(|v| v.strip_prefix("Bearer "));
 
             let Some(token) = token else {
+                // No bearer token — fall back to mTLS if a client cert was
+                // presented (only possible when both OIDC and client CA are
+                // configured and require_client_auth is false).
+                if let Some(ref identity) = peer_identity {
+                    if let Some(ref policy) = authz_policy
+                        && let Err(status) = policy.check(identity, &path)
+                    {
+                        let response = status.into_http();
+                        let (parts, body) = response.into_parts();
+                        let body = tonic::body::BoxBody::new(body);
+                        return Ok(Response::from_parts(parts, body));
+                    }
+                    return inner.ready().await?.call(req).await;
+                }
                 let status = tonic::Status::unauthenticated("missing authorization header");
                 let response = status.into_http();
-                // Convert the response body type.
                 let (parts, body) = response.into_parts();
                 let body = tonic::body::BoxBody::new(body);
                 return Ok(Response::from_parts(parts, body));
@@ -519,6 +562,43 @@ impl Body for BoxBody {
     fn size_hint(&self) -> http_body::SizeHint {
         self.0.size_hint()
     }
+}
+
+/// Extract an [`Identity`] from the peer certificates presented during a TLS
+/// handshake. Returns `None` if no client certificate was presented.
+pub fn extract_peer_identity<S>(tls_stream: &tokio_rustls::server::TlsStream<S>) -> Option<Identity>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    use crate::auth::identity::IdentityProvider;
+    use x509_parser::prelude::*;
+
+    let (_, server_conn) = tls_stream.get_ref();
+    let certs = server_conn.peer_certificates()?;
+    let first = certs.first()?;
+
+    let (_, cert) = X509Certificate::from_der(first.as_ref()).ok()?;
+    let subject = cert.subject();
+
+    let cn = subject
+        .iter_common_name()
+        .next()
+        .and_then(|attr| attr.as_str().ok())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let roles: Vec<String> = subject
+        .iter_organizational_unit()
+        .filter_map(|attr| attr.as_str().ok().map(String::from))
+        .collect();
+
+    Some(Identity {
+        subject: cn.clone(),
+        display_name: Some(cn),
+        roles,
+        scopes: Vec::new(),
+        provider: IdentityProvider::Mtls,
+    })
 }
 
 #[cfg(test)]
