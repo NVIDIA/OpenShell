@@ -609,7 +609,7 @@ fn split_sandbox_path(path: &str) -> (&str, &str) {
 /// checks on sandbox-side source paths in download flows.
 const SANDBOX_WORKSPACE_ROOT: &str = "/sandbox";
 
-/// Lexically normalise a POSIX-style absolute path by resolving `.` and `..`
+/// Lexically clean a POSIX-style absolute path by resolving `.` and `..`
 /// components, collapsing repeated separators, and stripping any trailing
 /// slash. Returns `None` if the input is empty or relative — the caller is
 /// expected to reject those before reaching this helper.
@@ -619,7 +619,7 @@ const SANDBOX_WORKSPACE_ROOT: &str = "/sandbox";
 /// client-side to refuse obvious path-traversal attempts before issuing the
 /// SSH command. Symlink-based escapes inside the sandbox must be addressed
 /// server-side.
-fn lexical_normalise_absolute_path(path: &str) -> Option<String> {
+fn lexical_clean_absolute_path(path: &str) -> Option<String> {
     if !path.starts_with('/') {
         return None;
     }
@@ -647,26 +647,26 @@ fn lexical_normalise_absolute_path(path: &str) -> Option<String> {
 /// Validate that a sandbox-side source path passed to `sandbox download`
 /// resolves under the sandbox writable root.
 ///
-/// Returns the normalised, traversal-resolved path on success. Refuses any
+/// Returns the cleaned, traversal-resolved path on success. Refuses any
 /// path that lexically escapes `/sandbox` (e.g. `/etc/passwd`,
 /// `/sandbox/../etc/passwd`) with a user-facing error.
 ///
 /// This is a lexical guard only — it does not follow symlinks. Call
-/// `canonicalize_sandbox_source_path` after this on any path that will be
-/// passed to a subsequent SSH I/O operation, so a symlink such as
+/// `resolve_sandbox_source_path` after this on any path that will be passed
+/// to a subsequent SSH I/O operation, so a symlink such as
 /// `/sandbox/etc-link -> /etc` cannot leak files outside the workspace.
 fn validate_sandbox_source_path(path: &str) -> Result<String> {
     if path.is_empty() {
         return Err(miette::miette!("sandbox source path is empty"));
     }
-    let normalised = lexical_normalise_absolute_path(path)
+    let cleaned = lexical_clean_absolute_path(path)
         .ok_or_else(|| miette::miette!("sandbox source path must be absolute (got '{path}')"))?;
-    if !is_under_sandbox_workspace(&normalised) {
+    if !is_under_sandbox_workspace(&cleaned) {
         return Err(miette::miette!(
             "sandbox source path '{path}' is outside the sandbox workspace ({SANDBOX_WORKSPACE_ROOT})"
         ));
     }
-    Ok(normalised)
+    Ok(cleaned)
 }
 
 /// Pure helper: is `path` equal to `/sandbox` or a descendant of it?
@@ -680,28 +680,28 @@ fn is_under_sandbox_workspace(path: &str) -> bool {
 /// The lexical guard in `validate_sandbox_source_path` cannot see symlinks; a
 /// path such as `/sandbox/etc-link/passwd` (where `etc-link -> /etc`) clears
 /// the lexical check but would still leak `/etc/passwd` once `tar -C` follows
-/// the link. Canonicalising on the remote side and re-validating closes that
-/// gap. The returned canonical path is what the caller should hand to probe
-/// and tar invocations.
-async fn canonicalize_sandbox_source_path(
+/// the link. Resolving symlinks on the remote side and re-validating closes
+/// that gap. The returned fully-resolved path is what the caller should hand
+/// to probe and tar invocations.
+async fn resolve_sandbox_source_path(
     session: &SshSessionConfig,
     sandbox_path: &str,
 ) -> Result<String> {
-    let canonical_cmd = format!("realpath -e -- {path}", path = shell_escape(sandbox_path));
-    let canonical = ssh_run_capture_stdout(session, &canonical_cmd)
+    let resolve_cmd = format!("realpath -e -- {path}", path = shell_escape(sandbox_path));
+    let resolved = ssh_run_capture_stdout(session, &resolve_cmd)
         .await
-        .wrap_err_with(|| format!("failed to canonicalise sandbox source path '{sandbox_path}'"))?;
-    if canonical.is_empty() {
+        .wrap_err_with(|| format!("failed to resolve sandbox source path '{sandbox_path}'"))?;
+    if resolved.is_empty() {
         return Err(miette::miette!(
             "sandbox source path '{sandbox_path}' does not exist"
         ));
     }
-    if !is_under_sandbox_workspace(&canonical) {
+    if !is_under_sandbox_workspace(&resolved) {
         return Err(miette::miette!(
-            "sandbox source path '{sandbox_path}' resolves to '{canonical}', outside the sandbox workspace ({SANDBOX_WORKSPACE_ROOT})"
+            "sandbox source path '{sandbox_path}' resolves to '{resolved}', outside the sandbox workspace ({SANDBOX_WORKSPACE_ROOT})"
         ));
     }
-    Ok(canonical)
+    Ok(resolved)
 }
 
 /// Resolve the host-side target path for a downloaded *file*, following
@@ -934,7 +934,7 @@ pub async fn sandbox_sync_down(
 ) -> Result<()> {
     let sandbox_path = validate_sandbox_source_path(sandbox_path)?;
     let session = ssh_session_config(server, name, tls).await?;
-    let sandbox_path = canonicalize_sandbox_source_path(&session, &sandbox_path).await?;
+    let sandbox_path = resolve_sandbox_source_path(&session, &sandbox_path).await?;
     let kind = probe_sandbox_source_kind(&session, &sandbox_path).await?;
 
     match kind {
@@ -1540,31 +1540,31 @@ mod tests {
     }
 
     #[test]
-    fn lexical_normalise_resolves_dot_and_dotdot_segments() {
+    fn lexical_clean_resolves_dot_and_dotdot_segments() {
         assert_eq!(
-            lexical_normalise_absolute_path("/sandbox/./a"),
+            lexical_clean_absolute_path("/sandbox/./a"),
             Some("/sandbox/a".to_string())
         );
         assert_eq!(
-            lexical_normalise_absolute_path("/sandbox/sub/../a"),
+            lexical_clean_absolute_path("/sandbox/sub/../a"),
             Some("/sandbox/a".to_string())
         );
         assert_eq!(
-            lexical_normalise_absolute_path("/sandbox/../etc/passwd"),
+            lexical_clean_absolute_path("/sandbox/../etc/passwd"),
             Some("/etc/passwd".to_string())
         );
         assert_eq!(
-            lexical_normalise_absolute_path("//sandbox///foo//"),
+            lexical_clean_absolute_path("//sandbox///foo//"),
             Some("/sandbox/foo".to_string())
         );
-        assert_eq!(lexical_normalise_absolute_path("/"), Some("/".to_string()));
+        assert_eq!(lexical_clean_absolute_path("/"), Some("/".to_string()));
     }
 
     #[test]
-    fn lexical_normalise_refuses_relative_paths() {
-        assert_eq!(lexical_normalise_absolute_path(""), None);
-        assert_eq!(lexical_normalise_absolute_path("sandbox/a"), None);
-        assert_eq!(lexical_normalise_absolute_path("./a"), None);
+    fn lexical_clean_refuses_relative_paths() {
+        assert_eq!(lexical_clean_absolute_path(""), None);
+        assert_eq!(lexical_clean_absolute_path("sandbox/a"), None);
+        assert_eq!(lexical_clean_absolute_path("./a"), None);
     }
 
     #[test]
