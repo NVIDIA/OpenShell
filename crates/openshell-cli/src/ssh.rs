@@ -648,22 +648,60 @@ fn lexical_normalise_absolute_path(path: &str) -> Option<String> {
 /// resolves under the sandbox writable root.
 ///
 /// Returns the normalised, traversal-resolved path on success. Refuses any
-/// path that escapes `/sandbox` (e.g. `/etc/passwd`, `/sandbox/../etc/passwd`)
-/// with a user-facing error.
+/// path that lexically escapes `/sandbox` (e.g. `/etc/passwd`,
+/// `/sandbox/../etc/passwd`) with a user-facing error.
+///
+/// This is a lexical guard only — it does not follow symlinks. Call
+/// `canonicalize_sandbox_source_path` after this on any path that will be
+/// passed to a subsequent SSH I/O operation, so a symlink such as
+/// `/sandbox/etc-link -> /etc` cannot leak files outside the workspace.
 fn validate_sandbox_source_path(path: &str) -> Result<String> {
     if path.is_empty() {
         return Err(miette::miette!("sandbox source path is empty"));
     }
     let normalised = lexical_normalise_absolute_path(path)
         .ok_or_else(|| miette::miette!("sandbox source path must be absolute (got '{path}')"))?;
-    let inside_workspace = normalised == SANDBOX_WORKSPACE_ROOT
-        || normalised.starts_with(&format!("{SANDBOX_WORKSPACE_ROOT}/"));
-    if !inside_workspace {
+    if !is_under_sandbox_workspace(&normalised) {
         return Err(miette::miette!(
             "sandbox source path '{path}' is outside the sandbox workspace ({SANDBOX_WORKSPACE_ROOT})"
         ));
     }
     Ok(normalised)
+}
+
+/// Pure helper: is `path` equal to `/sandbox` or a descendant of it?
+fn is_under_sandbox_workspace(path: &str) -> bool {
+    path == SANDBOX_WORKSPACE_ROOT || path.starts_with(&format!("{SANDBOX_WORKSPACE_ROOT}/"))
+}
+
+/// Resolve every symlink in `sandbox_path` on the sandbox side and refuse the
+/// result if it lands outside `/sandbox`.
+///
+/// The lexical guard in `validate_sandbox_source_path` cannot see symlinks; a
+/// path such as `/sandbox/etc-link/passwd` (where `etc-link -> /etc`) clears
+/// the lexical check but would still leak `/etc/passwd` once `tar -C` follows
+/// the link. Canonicalising on the remote side and re-validating closes that
+/// gap. The returned canonical path is what the caller should hand to probe
+/// and tar invocations.
+async fn canonicalize_sandbox_source_path(
+    session: &SshSessionConfig,
+    sandbox_path: &str,
+) -> Result<String> {
+    let canonical_cmd = format!("realpath -e -- {path}", path = shell_escape(sandbox_path));
+    let canonical = ssh_run_capture_stdout(session, &canonical_cmd)
+        .await
+        .wrap_err_with(|| format!("failed to canonicalise sandbox source path '{sandbox_path}'"))?;
+    if canonical.is_empty() {
+        return Err(miette::miette!(
+            "sandbox source path '{sandbox_path}' does not exist"
+        ));
+    }
+    if !is_under_sandbox_workspace(&canonical) {
+        return Err(miette::miette!(
+            "sandbox source path '{sandbox_path}' resolves to '{canonical}', outside the sandbox workspace ({SANDBOX_WORKSPACE_ROOT})"
+        ));
+    }
+    Ok(canonical)
 }
 
 /// Resolve the host-side target path for a downloaded *file*, following
@@ -896,6 +934,7 @@ pub async fn sandbox_sync_down(
 ) -> Result<()> {
     let sandbox_path = validate_sandbox_source_path(sandbox_path)?;
     let session = ssh_session_config(server, name, tls).await?;
+    let sandbox_path = canonicalize_sandbox_source_path(&session, &sandbox_path).await?;
     let kind = probe_sandbox_source_kind(&session, &sandbox_path).await?;
 
     match kind {
@@ -955,6 +994,20 @@ async fn stream_sandbox_tar(
     Ok(())
 }
 
+/// Build the `tar cf - -C <parent> -- <basename>` command used to wrap a
+/// single sandbox-side file for download.
+///
+/// The trailing `--` is required: a sandbox-side file whose basename starts
+/// with `-` (e.g. `--checkpoint-action=...`) would otherwise be parsed by GNU
+/// tar as an option rather than a member to archive.
+fn build_single_file_tar_cmd(parent: &str, basename: &str) -> String {
+    format!(
+        "tar cf - -C {parent} -- {name}",
+        parent = shell_escape(parent),
+        name = shell_escape(basename),
+    )
+}
+
 async fn sandbox_sync_down_file(
     session: &SshSessionConfig,
     sandbox_path: &str,
@@ -980,11 +1033,7 @@ async fn sandbox_sync_down_file(
         .into_diagnostic()
         .wrap_err("failed to create download staging directory")?;
 
-    let tar_cmd = format!(
-        "tar cf - -C {parent} {name}",
-        parent = shell_escape(parent),
-        name = shell_escape(basename),
-    );
+    let tar_cmd = build_single_file_tar_cmd(parent, basename);
     stream_sandbox_tar(session, tar_cmd, staging.path()).await?;
 
     place_downloaded_file(staging.path(), basename, &final_path).wrap_err_with(|| {
@@ -1567,6 +1616,51 @@ mod tests {
 
         let relative = validate_sandbox_source_path("sandbox/file").unwrap_err();
         assert!(format!("{relative}").contains("must be absolute"));
+    }
+
+    #[test]
+    fn is_under_sandbox_workspace_accepts_root_and_descendants() {
+        assert!(is_under_sandbox_workspace("/sandbox"));
+        assert!(is_under_sandbox_workspace("/sandbox/file"));
+        assert!(is_under_sandbox_workspace("/sandbox/sub/nested"));
+    }
+
+    #[test]
+    fn is_under_sandbox_workspace_rejects_outside_paths_and_prefix_collisions() {
+        assert!(!is_under_sandbox_workspace("/etc/passwd"));
+        assert!(!is_under_sandbox_workspace("/sandboxed/secrets"));
+        assert!(!is_under_sandbox_workspace("/"));
+        assert!(!is_under_sandbox_workspace(""));
+    }
+
+    #[test]
+    fn build_single_file_tar_cmd_inserts_double_dash_before_basename() {
+        // Without `--`, a basename such as `--checkpoint-action=...` would be
+        // parsed by GNU tar as an option. Guard the wire format against this
+        // regression.
+        let cmd = build_single_file_tar_cmd("/sandbox", "--checkpoint-action=exec=id");
+        assert!(
+            cmd.contains(" -- "),
+            "expected `--` separator in tar command, got: {cmd}"
+        );
+        assert!(
+            cmd.ends_with(&shell_escape("--checkpoint-action=exec=id")),
+            "expected basename at end of tar command, got: {cmd}"
+        );
+    }
+
+    #[test]
+    fn build_single_file_tar_cmd_escapes_parent_and_basename() {
+        let cmd = build_single_file_tar_cmd("/sandbox/with space", "name with space");
+        assert!(cmd.contains(" -- "), "missing `--` separator: {cmd}");
+        assert!(
+            cmd.contains(&shell_escape("/sandbox/with space")),
+            "parent not shell-escaped: {cmd}"
+        );
+        assert!(
+            cmd.contains(&shell_escape("name with space")),
+            "basename not shell-escaped: {cmd}"
+        );
     }
 
     #[test]
