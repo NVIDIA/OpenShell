@@ -14,9 +14,10 @@ openshell-gateway.env - OpenShell gateway environment configuration
 
 The **openshell-gateway.env** file contains environment variables that
 configure the OpenShell gateway server when running as a systemd user
-service. It is generated automatically on first start by
-**init-gateway-env.sh** and is not overwritten on subsequent starts or
-package upgrades.
+service. Package-managed services generate or repair it automatically on
+first start. Newer packages use **openshell-gateway init-env**; RPM
+packages may also use **init-gateway-env.sh**. The file is not
+overwritten on subsequent starts or package upgrades.
 
 The file uses the standard systemd **EnvironmentFile** format: one
 **KEY=VALUE** pair per line. Lines beginning with **#** are comments.
@@ -43,7 +44,8 @@ the SSH handshake secret).
 **OPENSHELL_SSH_HANDSHAKE_SECRET**
 :   Shared HMAC secret for gateway-to-sandbox SSH handshake
     authentication. Auto-generated as a 32-byte hex string on first
-    start. To regenerate: **openssl rand -hex 32**.
+    start. To regenerate: **openssl rand -hex 32**. The value is a
+    symmetric sandbox RPC secret, not an SSH public/private key pair.
 
 ## Gateway
 

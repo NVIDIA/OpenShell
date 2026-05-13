@@ -289,6 +289,14 @@ class Openshell < Formula
         exit 1
       fi
 
+      gateway_env="${{HOME}}/.config/openshell/gateway.env"
+      "#{{opt_bin}}/openshell-gateway" init-env --output "${{gateway_env}}" --driver vm
+      if [ -f "${{gateway_env}}" ]; then
+        set -a
+        . "${{gateway_env}}"
+        set +a
+      fi
+
       docker_tls_dir="${{OPENSHELL_DOCKER_TLS_DIR:-${{HOME}}/.local/state/openshell/homebrew/tls}}"
       mkdir -p "${{docker_tls_dir}}/client"
       chmod 700 "${{docker_tls_dir}}" "${{docker_tls_dir}}/client"

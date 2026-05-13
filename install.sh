@@ -581,6 +581,46 @@ patch_homebrew_formula() {
     mv "$_patched_file" "$_formula_file"
   fi
 
+  if ! grep -q '.config/openshell/gateway.env' "$_formula_file"; then
+    info "patching Homebrew formula to read ~/.config/openshell/gateway.env..."
+    awk '
+      { print }
+      /HOME must be set for Docker TLS bind mounts/ { in_home_block = 1 }
+      in_home_block && /^[[:space:]]*fi$/ {
+        print ""
+        print "      gateway_env=\"${HOME}/.config/openshell/gateway.env\""
+        print "      \"#{opt_bin}/openshell-gateway\" init-env --output \"${gateway_env}\" --driver vm"
+        print "      if [ -f \"${gateway_env}\" ]; then"
+        print "        set -a"
+        print "        . \"${gateway_env}\""
+        print "        set +a"
+        print "      fi"
+        in_home_block = 0
+      }
+    ' "$_formula_file" >"$_patched_file"
+    mv "$_patched_file" "$_formula_file"
+  fi
+
+  if ! grep -q 'init-env --output' "$_formula_file"; then
+    info "patching Homebrew formula to bootstrap gateway.env with openshell-gateway init-env..."
+    awk '
+      BEGIN { inserted = 0; skipping = 0 }
+      /^[[:space:]]*if \[ ! -f "\$\{gateway_env\}" \]; then$/ { skipping = 1; next }
+      skipping && /^[[:space:]]*fi$/ { skipping = 0; next }
+      /^[[:space:]]*if ! grep -q '\''\^OPENSHELL_SSH_HANDSHAKE_SECRET='\'' "\$\{gateway_env\}"; then$/ { skipping = 1; next }
+      skipping { next }
+      /^[[:space:]]*gateway_env="\$\{HOME\}\/\.config\/openshell\/gateway\.env"$/ {
+        print
+        print "      \"#{opt_bin}/openshell-gateway\" init-env --output \"${gateway_env}\" --driver vm"
+        inserted = 1
+        next
+      }
+      { print }
+      END { if (!inserted) exit 1 }
+    ' "$_formula_file" >"$_patched_file"
+    mv "$_patched_file" "$_formula_file"
+  fi
+
 }
 
 start_user_gateway() {

@@ -4,14 +4,17 @@
 //! Shared CLI entrypoint for the gateway binaries.
 
 use clap::{ArgAction, Command, CommandFactory, FromArgMatches, Parser};
-use miette::{IntoDiagnostic, Result};
+use miette::{Context, IntoDiagnostic, Result};
 use openshell_core::ComputeDriverKind;
 use openshell_core::config::{
     DEFAULT_DOCKER_NETWORK_NAME, DEFAULT_SERVER_PORT, DEFAULT_SSH_HANDSHAKE_SKEW_SECS,
     DEFAULT_SSH_PORT,
 };
+use rand::Rng;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -39,6 +42,20 @@ struct Cli {
 enum Commands {
     /// Generate mTLS PKI and write Kubernetes Secrets (Helm pre-install hook).
     GenerateCerts(certgen::CertgenArgs),
+
+    /// Create or repair a gateway environment file with generated local secrets.
+    InitEnv(InitEnvArgs),
+}
+
+#[derive(clap::Args, Debug)]
+struct InitEnvArgs {
+    /// Environment file to create or repair.
+    #[arg(long, value_name = "PATH")]
+    output: PathBuf,
+
+    /// Compute driver to write when `OPENSHELL_DRIVERS` is absent.
+    #[arg(long, value_parser = parse_compute_driver)]
+    driver: Option<ComputeDriverKind>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -333,8 +350,137 @@ pub async fn run_cli() -> Result<()> {
 
     match cli.command {
         Some(Commands::GenerateCerts(args)) => certgen::run(args).await,
+        Some(Commands::InitEnv(args)) => run_init_env(args),
         None => Box::pin(run_from_args(cli.run)).await,
     }
+}
+
+fn run_init_env(args: InitEnvArgs) -> Result<()> {
+    let result = init_gateway_env(&args.output, args.driver)?;
+    info!(
+        path = %args.output.display(),
+        created = result.created,
+        added_secret = result.added_secret,
+        added_driver = result.added_driver,
+        "gateway environment initialized"
+    );
+    Ok(())
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct InitEnvResult {
+    created: bool,
+    added_secret: bool,
+    added_driver: bool,
+}
+
+fn init_gateway_env(path: &Path, driver: Option<ComputeDriverKind>) -> Result<InitEnvResult> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("create parent directory for {}", path.display()))?;
+    }
+
+    let mut result = InitEnvResult::default();
+    let mut contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            result.created = true;
+            gateway_env_header().to_string()
+        }
+        Err(err) => {
+            return Err(err)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("read {}", path.display()));
+        }
+    };
+
+    if !env_file_has_key(&contents, "OPENSHELL_SSH_HANDSHAKE_SECRET") {
+        ensure_trailing_newline(&mut contents);
+        contents.push_str("# Shared secret for gateway-to-sandbox RPC authentication.\n");
+        contents
+            .push_str("# Auto-generated on first bootstrap. To regenerate: openssl rand -hex 32\n");
+        contents.push_str("OPENSHELL_SSH_HANDSHAKE_SECRET=");
+        contents.push_str(&generate_secret_hex());
+        contents.push('\n');
+        result.added_secret = true;
+    }
+
+    if let Some(driver) = driver
+        && !env_file_has_key(&contents, "OPENSHELL_DRIVERS")
+    {
+        ensure_trailing_newline(&mut contents);
+        contents.push_str("# Compute driver selected for this local gateway.\n");
+        contents.push_str("OPENSHELL_DRIVERS=");
+        contents.push_str(driver.as_str());
+        contents.push('\n');
+        result.added_driver = true;
+    }
+
+    if result.created || result.added_secret || result.added_driver {
+        write_gateway_env(path, &contents)?;
+    }
+
+    Ok(result)
+}
+
+fn gateway_env_header() -> &'static str {
+    "# OpenShell Gateway Environment Configuration\n\
+# Generated on first bootstrap. Edit freely; this file is not overwritten.\n\
+# Run 'openshell-gateway --help' for the full list of options.\n\n"
+}
+
+fn env_file_has_key(contents: &str, key: &str) -> bool {
+    let prefix = format!("{key}=");
+    contents
+        .lines()
+        .map(str::trim_start)
+        .any(|line| line.starts_with(&prefix))
+}
+
+fn ensure_trailing_newline(contents: &mut String) {
+    if !contents.is_empty() && !contents.ends_with('\n') {
+        contents.push('\n');
+    }
+}
+
+fn generate_secret_hex() -> String {
+    let mut rng = rand::rng();
+    let secret: [u8; 32] = rng.random();
+    hex::encode(secret)
+}
+
+fn write_gateway_env(path: &Path, contents: &str) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.create(true).write(true).truncate(true);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    let mut file = options
+        .open(path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("open {}", path.display()))?;
+    file.write_all(contents.as_bytes())
+        .into_diagnostic()
+        .wrap_err_with(|| format!("write {}", path.display()))?;
+    file.sync_all()
+        .into_diagnostic()
+        .wrap_err_with(|| format!("sync {}", path.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let permissions = fs::Permissions::from_mode(0o600);
+        fs::set_permissions(path, permissions)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("set permissions on {}", path.display()))?;
+    }
+
+    Ok(())
 }
 
 async fn run_from_args(args: RunArgs) -> Result<()> {
@@ -494,8 +640,9 @@ fn parse_compute_driver(value: &str) -> std::result::Result<ComputeDriverKind, S
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, command};
+    use super::{Cli, ComputeDriverKind, command, init_gateway_env};
     use clap::Parser;
+    use std::fs;
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::{LazyLock, Mutex};
 
@@ -699,6 +846,72 @@ mod tests {
             cli.command,
             Some(super::Commands::GenerateCerts(_))
         ));
+    }
+
+    #[test]
+    fn init_env_subcommand_parses_without_db_url() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = EnvVarGuard::remove("OPENSHELL_DB_URL");
+
+        let cli = Cli::try_parse_from([
+            "openshell-gateway",
+            "init-env",
+            "--output",
+            "/tmp/openshell-gateway.env",
+            "--driver",
+            "vm",
+        ])
+        .expect("init-env should parse without --db-url");
+
+        assert!(matches!(cli.command, Some(super::Commands::InitEnv(_))));
+    }
+
+    #[test]
+    fn init_gateway_env_creates_secret_and_default_driver() {
+        let temp = tempfile::tempdir().unwrap();
+        let env_path = temp.path().join("gateway.env");
+
+        let result = init_gateway_env(&env_path, Some(ComputeDriverKind::Vm)).unwrap();
+        let contents = fs::read_to_string(&env_path).unwrap();
+
+        assert!(result.created);
+        assert!(result.added_secret);
+        assert!(result.added_driver);
+        assert!(contents.contains("OPENSHELL_SSH_HANDSHAKE_SECRET="));
+        assert!(contents.contains("OPENSHELL_DRIVERS=vm"));
+    }
+
+    #[test]
+    fn init_gateway_env_repairs_partial_file_without_overriding_driver() {
+        let temp = tempfile::tempdir().unwrap();
+        let env_path = temp.path().join("gateway.env");
+        fs::write(&env_path, "OPENSHELL_DRIVERS=podman\n").unwrap();
+
+        let result = init_gateway_env(&env_path, Some(ComputeDriverKind::Vm)).unwrap();
+        let contents = fs::read_to_string(&env_path).unwrap();
+
+        assert!(!result.created);
+        assert!(result.added_secret);
+        assert!(!result.added_driver);
+        assert!(contents.contains("OPENSHELL_DRIVERS=podman"));
+        assert!(!contents.contains("OPENSHELL_DRIVERS=vm"));
+        assert!(contents.contains("OPENSHELL_SSH_HANDSHAKE_SECRET="));
+    }
+
+    #[test]
+    fn init_gateway_env_preserves_complete_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let env_path = temp.path().join("gateway.env");
+        let original = "OPENSHELL_DRIVERS=docker\nOPENSHELL_SSH_HANDSHAKE_SECRET=existing\n";
+        fs::write(&env_path, original).unwrap();
+
+        let result = init_gateway_env(&env_path, Some(ComputeDriverKind::Vm)).unwrap();
+        let contents = fs::read_to_string(&env_path).unwrap();
+
+        assert_eq!(result, super::InitEnvResult::default());
+        assert_eq!(contents, original);
     }
 
     #[test]

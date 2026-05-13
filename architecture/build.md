@@ -53,7 +53,12 @@ versions.
 The Homebrew service keeps gateway TLS under the Homebrew state directory but
 mirrors Docker sandbox client TLS into `$HOME/.local/state/openshell/homebrew/tls`
 at service start, because Docker Desktop bind mounts must use paths visible to
-the macOS user's shared home directory.
+the macOS user's shared home directory. The Homebrew wrapper also sources
+`$HOME/.config/openshell/gateway.env` before starting the gateway so local
+driver selection, the generated sandbox RPC secret, and other gateway overrides
+follow the same operator-facing file convention as the Linux packages. The
+wrapper calls `openshell-gateway init-env --output ... --driver vm` first, which
+creates or repairs the env file without replacing an existing driver choice.
 
 Local image work should use `mise` tasks rather than direct Docker commands so
 the same staging and tagging assumptions are used locally and in CI.

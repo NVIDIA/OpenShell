@@ -22,7 +22,8 @@ jobs:
     steps:
       - name: Ensure VM driver
         run: |
-          launchctl setenv OPENSHELL_DRIVERS vm
+          mkdir -p "${HOME}/.config/openshell"
+          printf 'OPENSHELL_DRIVERS=vm\n' > "${HOME}/.config/openshell/gateway.env"
 
       - name: Install and check status
         run: |

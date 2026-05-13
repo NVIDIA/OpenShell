@@ -14,6 +14,10 @@ openshell-gateway - OpenShell gateway server daemon
 
 **openshell-gateway** \[*OPTIONS*\]
 
+**openshell-gateway** **init-env** **--output** *PATH* \[**--driver** *DRIVER*\]
+
+**openshell-gateway** **generate-certs** \[*OPTIONS*\]
+
 # DESCRIPTION
 
 **openshell-gateway** is the control-plane server for OpenShell. It
@@ -124,6 +128,17 @@ gRPC and HTTP, secured by mutual TLS (mTLS) by default.
 :   gRPC endpoint for sandbox callbacks. Should be reachable from
     within sandbox containers.
     Environment: **OPENSHELL_GRPC_ENDPOINT**.
+
+# SUBCOMMANDS
+
+**init-env** **--output** *PATH* \[**--driver** *DRIVER*\]
+:   Create or repair a gateway environment file. The command creates
+    parent directories, adds **OPENSHELL_SSH_HANDSHAKE_SECRET** when
+    missing, and writes **OPENSHELL_DRIVERS** only when **--driver** is
+    provided and the file does not already contain a driver choice.
+
+**generate-certs**
+:   Generate local mTLS materials or Kubernetes TLS Secrets.
 
 # SYSTEMD INTEGRATION
 

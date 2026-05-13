@@ -24,6 +24,21 @@ You can also set the driver with `OPENSHELL_DRIVERS`. Supported values are `dock
 
 When `--drivers` and `OPENSHELL_DRIVERS` are unset, the gateway auto-detects Kubernetes, then Podman, then Docker by CLI availability or a local Unix socket. The VM driver is never auto-detected; configure it explicitly with `--drivers vm`.
 
+For Homebrew-managed gateways on macOS, the service runs `openshell-gateway init-env` before startup. This creates or repairs `~/.config/openshell/gateway.env`, adds the generated sandbox RPC secret when missing, and writes `OPENSHELL_DRIVERS=vm` only when no driver is already configured. To use Docker or Podman, edit the driver entry and restart:
+
+```shell
+env_file="${HOME}/.config/openshell/gateway.env"
+openshell-gateway init-env --output "${env_file}" --driver vm
+if grep -q '^OPENSHELL_DRIVERS=' "${env_file}"; then
+  perl -0pi -e 's/^OPENSHELL_DRIVERS=.*/OPENSHELL_DRIVERS=docker/m' "${env_file}"
+else
+  printf 'OPENSHELL_DRIVERS=docker\n' >> "${env_file}"
+fi
+brew services restart openshell
+```
+
+Use `OPENSHELL_DRIVERS=podman` instead if you run a local Podman service.
+
 Common gateway options:
 
 | Option | Environment variable | Description |

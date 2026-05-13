@@ -38,7 +38,30 @@ For detailed driver behavior, refer to [Sandbox Compute Drivers](/reference/sand
 
 On macOS, the install script uses Homebrew. The Homebrew package installs the `openshell` CLI, the gateway binary, and a Homebrew-managed gateway service.
 
-The Homebrew service listens on `https://127.0.0.1:17670` and generates a local mTLS bundle on install. The CLI reads the client bundle from `~/.config/openshell/gateways/openshell/mtls/`.
+The Homebrew service listens on `https://127.0.0.1:17670` and generates a local mTLS bundle on install. The CLI reads the client bundle from `~/.config/openshell/gateways/openshell/mtls/`. The service also runs `openshell-gateway init-env` before startup to create or repair `~/.config/openshell/gateway.env` with local generated secrets and a default `OPENSHELL_DRIVERS=vm` entry when you have not selected a driver.
+
+To force a different local driver, edit `OPENSHELL_DRIVERS` in `~/.config/openshell/gateway.env` and restart the service:
+
+```shell
+env_file="${HOME}/.config/openshell/gateway.env"
+openshell-gateway init-env --output "${env_file}" --driver vm
+if grep -q '^OPENSHELL_DRIVERS=' "${env_file}"; then
+  perl -0pi -e 's/^OPENSHELL_DRIVERS=.*/OPENSHELL_DRIVERS=docker/m' "${env_file}"
+else
+  printf 'OPENSHELL_DRIVERS=docker\n' >> "${env_file}"
+fi
+brew services restart openshell
+```
+
+Use `OPENSHELL_DRIVERS=podman` instead if you run a local Podman service.
+
+To repair an existing env file without changing your selected driver, run:
+
+```shell
+env_file="${HOME}/.config/openshell/gateway.env"
+openshell-gateway init-env --output "${env_file}" --driver vm
+brew services restart openshell
+```
 
 The installer starts the service for you. Use Homebrew service commands when you need to inspect, restart, or stop the gateway service:
 

@@ -28,7 +28,7 @@ Run the install script:
 curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
 ```
 
-The install script uses Homebrew, RPM, or a Debian package based on your machine. It starts the local gateway server after installation.
+The install script uses Homebrew, RPM, or a Debian package based on your machine. It starts the local gateway server after installation. On macOS, the Homebrew service bootstraps `~/.config/openshell/gateway.env` automatically and defaults to the local MicroVM driver when no driver is configured.
 
 If you prefer [uv](https://docs.astral.sh/uv/):
 
