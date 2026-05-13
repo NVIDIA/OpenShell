@@ -235,6 +235,10 @@ Download files from the sandbox to your host:
 openshell sandbox download my-sandbox /sandbox/output ./local
 ```
 
+When the sandbox-side source is a single file, the destination follows `cp`-style placement: if the destination already exists as a directory or ends with `/`, the file lands inside it as `<dest>/<basename>`; otherwise the file is written at the exact destination path.
+
+The CLI only allows sandbox-side sources that resolve inside the writable workspace (`/sandbox`). Paths that escape lexically (`/etc/passwd`, `/sandbox/../etc/passwd`) and paths that escape through a symlink (`/sandbox/etc-link` pointing at `/etc`) are both refused before any data is transferred.
+
 <Note>
 You can also upload files at creation time with the `--upload` flag on
 `openshell sandbox create`.
