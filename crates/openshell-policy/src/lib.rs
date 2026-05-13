@@ -120,6 +120,15 @@ struct NetworkEndpointDef {
     /// Defaults to false (strict).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     allow_encoded_slash: bool,
+    /// When true, client-to-server WebSocket text messages on this REST
+    /// endpoint rewrite credential placeholders after an allowed 101 upgrade.
+    /// Defaults to false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    websocket_credential_rewrite: bool,
+    /// When true, supported textual REST request bodies rewrite credential
+    /// placeholders before forwarding upstream. Defaults to false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    request_body_credential_rewrite: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     persisted_queries: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -317,6 +326,8 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                                 })
                                 .collect(),
                             allow_encoded_slash: e.allow_encoded_slash,
+                            websocket_credential_rewrite: e.websocket_credential_rewrite,
+                            request_body_credential_rewrite: e.request_body_credential_rewrite,
                             persisted_queries: e.persisted_queries,
                             graphql_persisted_queries: e
                                 .graphql_persisted_queries
@@ -480,6 +491,8 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                                 })
                                 .collect(),
                             allow_encoded_slash: e.allow_encoded_slash,
+                            websocket_credential_rewrite: e.websocket_credential_rewrite,
+                            request_body_credential_rewrite: e.request_body_credential_rewrite,
                             persisted_queries: e.persisted_queries.clone(),
                             graphql_persisted_queries: e
                                 .graphql_persisted_queries
@@ -1654,6 +1667,80 @@ network_policies:
         assert_eq!(ep.rules[1].allow.as_ref().unwrap().operation_name, "Issue*");
         assert_eq!(ep.deny_rules[0].operation_type, "mutation");
         assert_eq!(ep.deny_rules[0].fields, vec!["deleteRepository"]);
+    }
+
+    #[test]
+    fn round_trip_preserves_websocket_credential_rewrite() {
+        let yaml = r"
+version: 1
+network_policies:
+  discord_gateway:
+    name: discord_gateway
+    endpoints:
+      - host: gateway.example.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        access: full
+        websocket_credential_rewrite: true
+    binaries:
+      - path: /usr/bin/node
+";
+        let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
+        let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
+        let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+
+        let ep = &proto2.network_policies["discord_gateway"].endpoints[0];
+        assert_eq!(ep.protocol, "rest");
+        assert!(ep.websocket_credential_rewrite);
+        assert!(yaml_out.contains("websocket_credential_rewrite: true"));
+    }
+
+    #[test]
+    fn round_trip_preserves_request_body_credential_rewrite() {
+        let yaml = r"
+version: 1
+network_policies:
+  slack_api:
+    name: slack_api
+    endpoints:
+      - host: slack.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        access: read-write
+        request_body_credential_rewrite: true
+    binaries:
+      - path: /usr/bin/node
+";
+        let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
+        let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
+        let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+
+        let ep = &proto2.network_policies["slack_api"].endpoints[0];
+        assert_eq!(ep.protocol, "rest");
+        assert!(ep.request_body_credential_rewrite);
+        assert!(yaml_out.contains("request_body_credential_rewrite: true"));
+    }
+
+    #[test]
+    fn websocket_credential_rewrite_defaults_false() {
+        let yaml = r"
+version: 1
+network_policies:
+  gateway:
+    endpoints:
+      - host: gateway.example.com
+        port: 443
+        protocol: rest
+        access: full
+    binaries:
+      - path: /usr/bin/node
+";
+        let proto = parse_sandbox_policy(yaml).expect("parse failed");
+        let ep = &proto.network_policies["gateway"].endpoints[0];
+        assert!(!ep.websocket_credential_rewrite);
+        assert!(!ep.request_body_credential_rewrite);
     }
 
     #[test]

@@ -184,7 +184,7 @@ impl std::fmt::Display for PolicyMergeError {
                 protocol,
             } => write!(
                 f,
-                "endpoint {host}:{port} uses unsupported protocol '{protocol}'; this operation currently supports only protocol 'rest'"
+                "endpoint {host}:{port} uses unsupported protocol '{protocol}'; this operation currently supports only protocol 'rest' or 'websocket'"
             ),
             Self::EndpointHasNoAllowBase { host, port } => write!(
                 f,
@@ -265,7 +265,7 @@ fn apply_operation(
                     port: *port,
                 }
             })?;
-            ensure_rest_endpoint(endpoint, host, *port)?;
+            ensure_method_path_endpoint(endpoint, host, *port)?;
             if endpoint.access.is_empty() && endpoint.rules.is_empty() {
                 return Err(PolicyMergeError::EndpointHasNoAllowBase {
                     host: host.clone(),
@@ -281,7 +281,7 @@ fn apply_operation(
                     port: *port,
                 }
             })?;
-            ensure_rest_endpoint(endpoint, host, *port)?;
+            ensure_method_path_endpoint(endpoint, host, *port)?;
             expand_existing_access(endpoint, host, *port, warnings)?;
             append_unique_l7_rules(&mut endpoint.rules, rules);
         }
@@ -462,6 +462,9 @@ fn merge_endpoint(
 
     append_unique_deny_rules(&mut existing.deny_rules, &incoming.deny_rules);
     append_unique_strings(&mut existing.allowed_ips, &incoming.allowed_ips);
+    existing.allow_encoded_slash |= incoming.allow_encoded_slash;
+    existing.websocket_credential_rewrite |= incoming.websocket_credential_rewrite;
+    existing.request_body_credential_rewrite |= incoming.request_body_credential_rewrite;
     normalize_endpoint(existing);
     Ok(())
 }
@@ -568,7 +571,7 @@ fn endpoint_matches_host_port(endpoint: &NetworkEndpoint, host: &str, port: u32)
     endpoint.host.eq_ignore_ascii_case(host) && canonical_ports(endpoint).contains(&port)
 }
 
-fn ensure_rest_endpoint(
+fn ensure_method_path_endpoint(
     endpoint: &NetworkEndpoint,
     host: &str,
     port: u32,
@@ -579,7 +582,7 @@ fn ensure_rest_endpoint(
             port,
         });
     }
-    if endpoint.protocol != "rest" {
+    if !matches!(endpoint.protocol.as_str(), "rest" | "websocket") {
         return Err(PolicyMergeError::UnsupportedEndpointProtocol {
             host: host.to_string(),
             port,
@@ -600,12 +603,13 @@ fn expand_existing_access(
     }
 
     let access = endpoint.access.clone();
-    let expanded =
-        expand_access_preset(&access).ok_or_else(|| PolicyMergeError::UnsupportedAccessPreset {
+    let expanded = expand_access_preset(&endpoint.protocol, &access).ok_or_else(|| {
+        PolicyMergeError::UnsupportedAccessPreset {
             host: host.to_string(),
             port,
             access: access.clone(),
-        })?;
+        }
+    })?;
     endpoint.access.clear();
     append_unique_l7_rules(&mut endpoint.rules, &expanded);
     warnings.push(PolicyMergeWarning::ExpandedAccessPreset {
@@ -616,11 +620,13 @@ fn expand_existing_access(
     Ok(())
 }
 
-fn expand_access_preset(access: &str) -> Option<Vec<L7Rule>> {
-    let methods = match access {
-        "read-only" => vec!["GET", "HEAD", "OPTIONS"],
-        "read-write" => vec!["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH"],
-        "full" => vec!["*"],
+fn expand_access_preset(protocol: &str, access: &str) -> Option<Vec<L7Rule>> {
+    let methods = match (protocol, access) {
+        (_, "full") => vec!["*"],
+        ("websocket", "read-only") => vec!["GET"],
+        ("websocket", "read-write") => vec!["GET", "WEBSOCKET_TEXT"],
+        (_, "read-only") => vec!["GET", "HEAD", "OPTIONS"],
+        (_, "read-write") => vec!["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH"],
         _ => return None,
     };
 
@@ -871,6 +877,96 @@ mod tests {
     }
 
     #[test]
+    fn add_rule_merges_websocket_credential_rewrite_flag() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "existing".to_string(),
+            NetworkPolicyRule {
+                name: "existing".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "realtime.example.com".to_string(),
+                    port: 443,
+                    ports: vec![443],
+                    protocol: "websocket".to_string(),
+                    access: "read-write".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+
+        let incoming = NetworkPolicyRule {
+            name: "incoming".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "realtime.example.com".to_string(),
+                port: 443,
+                ports: vec![443],
+                protocol: "websocket".to_string(),
+                websocket_credential_rewrite: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let result = merge_policy(
+            policy,
+            &[PolicyMergeOp::AddRule {
+                rule_name: "allow_realtime_example_com_443".to_string(),
+                rule: incoming,
+            }],
+        )
+        .expect("merge should succeed");
+
+        let endpoint = &result.policy.network_policies["existing"].endpoints[0];
+        assert!(endpoint.websocket_credential_rewrite);
+    }
+
+    #[test]
+    fn add_rule_merges_request_body_credential_rewrite_flag() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "existing".to_string(),
+            NetworkPolicyRule {
+                name: "existing".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "slack.com".to_string(),
+                    port: 443,
+                    ports: vec![443],
+                    protocol: "rest".to_string(),
+                    access: "read-write".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+
+        let incoming = NetworkPolicyRule {
+            name: "incoming".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "slack.com".to_string(),
+                port: 443,
+                ports: vec![443],
+                protocol: "rest".to_string(),
+                request_body_credential_rewrite: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let result = merge_policy(
+            policy,
+            &[PolicyMergeOp::AddRule {
+                rule_name: "allow_slack_com_443".to_string(),
+                rule: incoming,
+            }],
+        )
+        .expect("merge should succeed");
+
+        let endpoint = &result.policy.network_policies["existing"].endpoints[0];
+        assert!(endpoint.request_body_credential_rewrite);
+    }
+
+    #[test]
     fn add_allow_expands_access_preset() {
         let mut policy = restrictive_default_policy();
         policy.network_policies.insert(
@@ -909,7 +1005,92 @@ mod tests {
     }
 
     #[test]
-    fn add_deny_requires_rest_protocol() {
+    fn add_allow_expands_websocket_access_preset() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "realtime".to_string(),
+            NetworkPolicyRule {
+                name: "realtime".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "realtime.example.com".to_string(),
+                    port: 443,
+                    ports: vec![443],
+                    protocol: "websocket".to_string(),
+                    access: "read-write".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+
+        let result = merge_policy(
+            policy,
+            &[PolicyMergeOp::AddAllowRules {
+                host: "realtime.example.com".to_string(),
+                port: 443,
+                rules: vec![rest_rule("WEBSOCKET_TEXT", "/rooms/private/**")],
+            }],
+        )
+        .expect("merge should succeed");
+
+        let endpoint = &result.policy.network_policies["realtime"].endpoints[0];
+        assert!(endpoint.access.is_empty());
+        assert_eq!(endpoint.rules.len(), 3);
+        assert!(endpoint.rules.contains(&rest_rule("GET", "**")));
+        assert!(endpoint.rules.contains(&rest_rule("WEBSOCKET_TEXT", "**")));
+        assert!(
+            endpoint
+                .rules
+                .contains(&rest_rule("WEBSOCKET_TEXT", "/rooms/private/**"))
+        );
+        assert!(!endpoint.rules.contains(&rest_rule("POST", "**")));
+        assert!(result.warnings.iter().any(|warning| matches!(
+            warning,
+            PolicyMergeWarning::ExpandedAccessPreset { access, .. } if access == "read-write"
+        )));
+    }
+
+    #[test]
+    fn add_deny_accepts_websocket_protocol() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "realtime".to_string(),
+            NetworkPolicyRule {
+                name: "realtime".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "realtime.example.com".to_string(),
+                    port: 443,
+                    ports: vec![443],
+                    protocol: "websocket".to_string(),
+                    access: "read-write".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+
+        let result = merge_policy(
+            policy,
+            &[PolicyMergeOp::AddDenyRules {
+                host: "realtime.example.com".to_string(),
+                port: 443,
+                deny_rules: vec![L7DenyRule {
+                    method: "WEBSOCKET_TEXT".to_string(),
+                    path: "/admin/**".to_string(),
+                    ..Default::default()
+                }],
+            }],
+        )
+        .expect("merge should succeed");
+
+        let endpoint = &result.policy.network_policies["realtime"].endpoints[0];
+        assert_eq!(endpoint.deny_rules.len(), 1);
+        assert_eq!(endpoint.deny_rules[0].method, "WEBSOCKET_TEXT");
+        assert_eq!(endpoint.deny_rules[0].path, "/admin/**");
+    }
+
+    #[test]
+    fn add_deny_rejects_unsupported_protocol() {
         let mut policy = restrictive_default_policy();
         policy.network_policies.insert(
             "db".to_string(),

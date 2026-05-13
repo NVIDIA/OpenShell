@@ -12,13 +12,13 @@ The OpenShell gateway requires mTLS certificates for sandbox supervisors and cli
 
 | Mode | When to use |
 |---|---|
-| Built-in `pkiInitJob` (default) | Simplest path. A pre-install Kubernetes Job generates a self-signed CA and certificates once at install time. No additional dependencies. |
+| Built-in `pkiInitJob` (default) | The default path. A pre-install Kubernetes Job generates a self-signed CA and certificates during installation. No additional dependencies. |
 | cert-manager | Production deployments that need automatic certificate rotation managed by a running controller. |
 
 The rest of this page covers switching to cert-manager. The built-in mode requires no configuration.
 
 <Note>
-cert-manager and `pkiInitJob` are mutually exclusive. The chart will fail if both are enabled at the same time.
+cert-manager and `pkiInitJob` are mutually exclusive. The chart fails if both are enabled at the same time.
 </Note>
 
 ## Install cert-manager

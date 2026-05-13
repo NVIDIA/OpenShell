@@ -395,6 +395,20 @@ fi
 export HOME=/sandbox
 export USER=sandbox
 
+# Fix /sandbox ownership. The host-side CLI extracts OCI layers as a non-root
+# user (e.g. UID 501 on macOS), so /sandbox may be owned by the host UID.
+if [ -d /sandbox ]; then
+    _sb_uid=$(id -u sandbox 2>/dev/null || true)
+    _sb_gid=$(id -g sandbox 2>/dev/null || true)
+    if [ -n "$_sb_uid" ] && [ -n "$_sb_gid" ]; then
+        _cur_uid=$(stat -c '%u' /sandbox 2>/dev/null || true)
+        if [ -n "$_cur_uid" ] && [ "$_cur_uid" != "$_sb_uid" ]; then
+            ts "fixing /sandbox ownership (was uid=${_cur_uid}, setting to sandbox=${_sb_uid}:${_sb_gid})"
+            chown -R "${_sb_uid}:${_sb_gid}" /sandbox
+        fi
+    fi
+fi
+
 rewrite_openshell_endpoint_if_needed
 
 # Log supervisor connectivity state for debugging stuck-in-Provisioning issues

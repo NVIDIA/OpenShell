@@ -23,7 +23,7 @@ use hyper_util::{
     server::conn::auto::Builder,
 };
 use openshell_core::proto::{
-    GatewayMessage, RelayFrame, RelayInit, SupervisorMessage,
+    GatewayMessage, RelayFrame, RelayInit, SupervisorMessage, TcpForwardFrame,
     open_shell_client::OpenShellClient,
     open_shell_server::{OpenShell, OpenShellServer},
 };
@@ -84,6 +84,15 @@ impl OpenShell for RelayGateway {
         &self,
         _: tonic::Request<openshell_core::proto::ExecSandboxRequest>,
     ) -> Result<Response<Self::ExecSandboxStream>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    type ForwardTcpStream =
+        std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<TcpForwardFrame, Status>> + Send>>;
+    async fn forward_tcp(
+        &self,
+        _: tonic::Request<tonic::Streaming<TcpForwardFrame>>,
+    ) -> Result<Response<Self::ForwardTcpStream>, Status> {
         Err(Status::unimplemented("unused"))
     }
 
@@ -160,6 +169,33 @@ impl OpenShell for RelayGateway {
     ) -> Result<Response<openshell_core::proto::CreateSshSessionResponse>, Status> {
         Err(Status::unimplemented("unused"))
     }
+    async fn expose_service(
+        &self,
+        _: tonic::Request<openshell_core::proto::ExposeServiceRequest>,
+    ) -> Result<Response<openshell_core::proto::ServiceEndpointResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+    async fn get_service(
+        &self,
+        _: tonic::Request<openshell_core::proto::GetServiceRequest>,
+    ) -> Result<Response<openshell_core::proto::ServiceEndpointResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn list_services(
+        &self,
+        _: tonic::Request<openshell_core::proto::ListServicesRequest>,
+    ) -> Result<Response<openshell_core::proto::ListServicesResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn delete_service(
+        &self,
+        _: tonic::Request<openshell_core::proto::DeleteServiceRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteServiceResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
     async fn revoke_ssh_session(
         &self,
         _: tonic::Request<openshell_core::proto::RevokeSshSessionRequest>,
@@ -439,7 +475,7 @@ async fn relay_round_trips_bytes() {
 
     tokio::spawn(run_echo_supervisor(channel, channel_id));
 
-    let relay = relay_rx.await.expect("relay duplex");
+    let relay = relay_rx.await.expect("relay result").expect("relay duplex");
     let (mut read_half, mut write_half) = tokio::io::split(relay);
 
     write_half.write_all(b"hello relay").await.expect("write");
@@ -464,7 +500,7 @@ async fn relay_closes_cleanly_when_gateway_drops() {
 
     let supervisor = tokio::spawn(run_echo_supervisor(channel, channel_id));
 
-    let relay = relay_rx.await.expect("relay duplex");
+    let relay = relay_rx.await.expect("relay result").expect("relay duplex");
     drop(relay);
 
     // The supervisor's inbound stream should terminate shortly after the
@@ -509,7 +545,7 @@ async fn relay_sees_eof_when_supervisor_closes() {
         })
     };
 
-    let relay = relay_rx.await.expect("relay duplex");
+    let relay = relay_rx.await.expect("relay result").expect("relay duplex");
     let (mut read_half, _write_half) = tokio::io::split(relay);
     let mut buf = [0u8; 16];
     let n = tokio::time::timeout(Duration::from_secs(5), read_half.read(&mut buf))
@@ -555,8 +591,8 @@ async fn concurrent_relays_multiplex_independently() {
     tokio::spawn(run_echo_supervisor(channel.clone(), id_a));
     tokio::spawn(run_echo_supervisor(channel, id_b));
 
-    let relay_a = rx_a.await.expect("relay a");
-    let relay_b = rx_b.await.expect("relay b");
+    let relay_a = rx_a.await.expect("relay a result").expect("relay a");
+    let relay_b = rx_b.await.expect("relay b result").expect("relay b");
 
     let (mut ra, mut wa) = tokio::io::split(relay_a);
     let (mut rb, mut wb) = tokio::io::split(relay_b);

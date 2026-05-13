@@ -1,0 +1,126 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Branch Kubernetes E2E
+
+on:
+  push:
+    branches:
+      - "pull-request/[0-9]+"
+  workflow_dispatch: {}
+
+permissions: {}
+
+jobs:
+  pr_metadata:
+    name: Resolve PR metadata
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      should_run: ${{ steps.gate.outputs.should_run }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - id: gate
+        uses: ./.github/actions/pr-gate
+        with:
+          required_label: test:e2e-kubernetes
+
+  build-gateway:
+    needs: [pr_metadata]
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: gateway
+      platform: linux/amd64
+
+  build-supervisor:
+    needs: [pr_metadata]
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: supervisor
+      platform: linux/amd64
+
+  kubernetes-e2e:
+    name: Kubernetes E2E (Rust smoke)
+    needs: [pr_metadata, build-gateway, build-supervisor]
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    # Bare runner: running kind-in-container hits nested-Docker / kubeconfig
+    # complications. The runner has Docker; mise installs helm, kubectl, and
+    # the Rust toolchain.
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: read
+    env:
+      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      KIND_CLUSTER_NAME: kube-e2e-${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install mise
+        run: |
+          curl https://mise.run | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/share/mise/shims" >> "$GITHUB_PATH"
+
+      - name: Install tools
+        run: mise install --locked
+
+      # The openshell-policy crate transitively pulls in z3-sys, whose
+      # build script needs the z3 C/C++ headers and clang/bindgen to
+      # compile. The bare runner doesn't ship them; the CI container
+      # image used by other Rust e2e jobs does, but we can't run this job
+      # there (the runner's container handler injects its own --network
+      # bridge, which conflicts with the --network host we need so kind's
+      # API server is reachable from the test process).
+      - name: Install z3 build deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libz3-dev clang
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: ${{ env.KIND_CLUSTER_NAME }}
+          wait: 120s
+
+      # mise.toml sets KUBECONFIG="{{config_root}}/kubeconfig"; helm/kind-action
+      # writes to ~/.kube/config. Materialize the kind context at the mise path
+      # so `mise run e2e:kubernetes` (and the wrapper's `kubectl --context=…`)
+      # finds the kind cluster.
+      - name: Export kind kubeconfig to mise path
+        run: |
+          set -euo pipefail
+          kind get kubeconfig --name "$KIND_CLUSTER_NAME" > "$GITHUB_WORKSPACE/kubeconfig"
+          chmod 600 "$GITHUB_WORKSPACE/kubeconfig"
+
+      # Pre-pull and side-load: kind nodes don't have ghcr credentials, and
+      # tagging IMAGE_TAG to a SHA means the chart's IfNotPresent pull policy
+      # is satisfied once the image is loaded into the node's containerd.
+      - name: Load gateway and supervisor images into kind
+        run: |
+          set -euo pipefail
+          for component in gateway supervisor; do
+            image="ghcr.io/nvidia/openshell/${component}:${{ github.sha }}"
+            docker pull "$image"
+            kind load docker-image "$image" --name "$KIND_CLUSTER_NAME"
+          done
+
+      - name: Run Kubernetes E2E (Rust smoke)
+        env:
+          OPENSHELL_E2E_KUBE_CONTEXT: kind-${{ env.KIND_CLUSTER_NAME }}
+          IMAGE_TAG: ${{ github.sha }}
+          OPENSHELL_REGISTRY: ghcr.io/nvidia/openshell
+        run: mise run --no-deps --skip-deps e2e:kubernetes

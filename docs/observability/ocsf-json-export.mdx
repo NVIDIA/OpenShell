@@ -145,10 +145,12 @@ The `class_uid` field identifies the event type:
 
 The JSONL file can be shipped to any tool that accepts OCSF-formatted data:
 
-- **Splunk**: Use the [Splunk OCSF Add-on](https://splunkbase.splunk.com/app/6943) to ingest OCSF JSONL files.
-- **Amazon Security Lake**: OCSF is the native schema for Security Lake.
-- **Elastic**: Use Filebeat to ship JSONL files with the OCSF field mappings.
-- **Custom pipelines**: Parse the JSONL file with `jq`, Python, or any JSON-capable tool.
+| Tool | Integration Path |
+|---|---|
+| Splunk | Use the [Splunk OCSF Add-on](https://splunkbase.splunk.com/app/6943) to ingest OCSF JSONL files. |
+| Amazon Security Lake | OCSF is the native schema for Security Lake. |
+| Elastic | Use Filebeat to ship JSONL files with the OCSF field mappings. |
+| Custom pipelines | Parse the JSONL file with `jq`, Python, or any JSON-capable tool. |
 
 Example with `jq` to extract all denied connections:
 
@@ -161,9 +163,9 @@ cat /var/log/openshell-ocsf.2026-04-01.log | \
 
 The shorthand format in `openshell.YYYY-MM-DD.log` and the JSON format in `openshell-ocsf.YYYY-MM-DD.log` are derived from the same OCSF events. The shorthand is a human-readable projection; the JSON is the complete record. Both are generated at the same time from the same event data.
 
-The shorthand log is always active. The JSON export is opt-in via `ocsf_json_enabled`.
+The shorthand log is always active. The JSON export is opt-in through `ocsf_json_enabled`.
 
 ## Next Steps
 
 - Learn how to [read the shorthand format](/observability/logging) for real-time monitoring.
-- See the [OCSF specification](https://schema.ocsf.io/) for the full schema reference.
+- Refer to the [OCSF specification](https://schema.ocsf.io/) for the full schema reference.

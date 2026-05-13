@@ -1,12 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Local dev: builds gateway + supervisor images using Dockerfile.images with
-# BUILD_FROM_SOURCE=1, which compiles Rust binaries inside Docker without
-# requiring pre-staged artifacts.
+# Local dev: builds gateway + supervisor images via tasks/scripts/docker-build-image.sh,
+# which first stages Rust binaries natively on the host (using cargo / cargo-zigbuild
+# when cross-compiling) and then builds the image from the prebuilt binary. This
+# mirrors CI and is faster than compiling inside Docker on every rebuild because
+# the host's cargo target cache and sccache are reused across iterations.
 #
 # Run from repo root:
-#   skaffold dev -f deploy/helm/openshell/skaffold.yaml
+#   mise run helm:skaffold:dev
+#   mise run helm:skaffold:run
 #
 # See https://skaffold.dev/docs/deployers/helm/ (setValueTemplates, IMAGE_* fields).
 apiVersion: skaffold/v4beta14
@@ -23,39 +26,34 @@ build:
       context: ../../..
       custom:
         buildCommand: |
-          docker buildx build \
-            --build-arg BUILD_FROM_SOURCE=1 \
-            --target gateway \
-            --tag "$IMAGE" \
-            --load \
-            --file deploy/docker/Dockerfile.images \
-            .
+          IMAGE_NAME="${IMAGE%:*}" \
+          IMAGE_TAG="${IMAGE##*:}" \
+          tasks/scripts/docker-build-image.sh gateway
         dependencies:
           paths:
             - Cargo.toml
             - Cargo.lock
             - crates/**
             - proto/**
-            - deploy/docker/Dockerfile.images
-            - crates/openshell-server/migrations/**
+            - deploy/docker/Dockerfile.gateway
+            - tasks/scripts/docker-build-image.sh
+            - tasks/scripts/stage-prebuilt-binaries.sh
     - image: openshell/supervisor
       context: ../../..
       custom:
         buildCommand: |
-          docker buildx build \
-            --build-arg BUILD_FROM_SOURCE=1 \
-            --target supervisor \
-            --tag "$IMAGE" \
-            --load \
-            --file deploy/docker/Dockerfile.images \
-            .
+          IMAGE_NAME="${IMAGE%:*}" \
+          IMAGE_TAG="${IMAGE##*:}" \
+          tasks/scripts/docker-build-image.sh supervisor
         dependencies:
           paths:
             - Cargo.toml
             - Cargo.lock
             - crates/**
             - proto/**
-            - deploy/docker/Dockerfile.images
+            - deploy/docker/Dockerfile.supervisor
+            - tasks/scripts/docker-build-image.sh
+            - tasks/scripts/stage-prebuilt-binaries.sh
 deploy:
   helm:
     releases:

@@ -26,18 +26,21 @@ use openshell_bootstrap::{
 use openshell_core::proto::ProviderProfileCategory;
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, AttachSandboxProviderRequest,
-    ClearDraftChunksRequest, CreateProviderRequest, CreateSandboxRequest,
+    ClearDraftChunksRequest, CreateProviderRequest, CreateSandboxRequest, CreateSshSessionRequest,
     DeleteProviderProfileRequest, DeleteProviderRequest, DeleteSandboxRequest,
-    DetachSandboxProviderRequest, ExecSandboxRequest, GetClusterInferenceRequest,
-    GetDraftHistoryRequest, GetDraftPolicyRequest, GetGatewayConfigRequest,
-    GetProviderProfileRequest, GetProviderRequest, GetSandboxConfigRequest, GetSandboxLogsRequest,
-    GetSandboxPolicyStatusRequest, GetSandboxRequest, HealthRequest, ImportProviderProfilesRequest,
+    DeleteServiceRequest, DetachSandboxProviderRequest, ExecSandboxRequest, ExposeServiceRequest,
+    GetClusterInferenceRequest, GetDraftHistoryRequest, GetDraftPolicyRequest,
+    GetGatewayConfigRequest, GetProviderProfileRequest, GetProviderRequest,
+    GetSandboxConfigRequest, GetSandboxLogsRequest, GetSandboxPolicyStatusRequest,
+    GetSandboxRequest, GetServiceRequest, HealthRequest, ImportProviderProfilesRequest,
     LintProviderProfilesRequest, ListProviderProfilesRequest, ListProvidersRequest,
-    ListSandboxPoliciesRequest, ListSandboxProvidersRequest, ListSandboxesRequest, PolicySource,
-    PolicyStatus, Provider, ProviderProfile, ProviderProfileDiagnostic, ProviderProfileImportItem,
-    RejectDraftChunkRequest, Sandbox, SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate,
-    SetClusterInferenceRequest, SettingScope, SettingValue, UpdateConfigRequest,
-    UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event, setting_value,
+    ListSandboxPoliciesRequest, ListSandboxProvidersRequest, ListSandboxesRequest,
+    ListServicesRequest, PolicySource, PolicyStatus, Provider, ProviderProfile,
+    ProviderProfileDiagnostic, ProviderProfileImportItem, RejectDraftChunkRequest,
+    RevokeSshSessionRequest, Sandbox, SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate,
+    ServiceEndpointResponse, SetClusterInferenceRequest, SettingScope, SettingValue,
+    TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest, UpdateProviderRequest,
+    WatchSandboxRequest, exec_sandbox_event, setting_value, tcp_forward_init,
 };
 use openshell_core::settings::{self, SettingValueKind};
 use openshell_core::{ObjectId, ObjectName};
@@ -1554,7 +1557,7 @@ pub async fn sandbox_create(
                 status.message()
             ));
         }
-        Err(status) => return Err(status).into_diagnostic(),
+        Err(status) => return Err(miette::miette!(status.to_string())),
     };
     let sandbox = response
         .into_inner()
@@ -2438,6 +2441,292 @@ pub async fn sandbox_exec_grpc(
     Ok(exit_code)
 }
 
+pub async fn service_forward_tcp(
+    server: &str,
+    name: &str,
+    local: Option<&str>,
+    target_host: &str,
+    target_port: u16,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let (bind_addr, bind_port) = parse_tcp_forward_spec(local, target_port)?;
+    let mut client = grpc_client(server, tls).await?;
+
+    let sandbox = fetch_ready_sandbox_for_forward(&mut client, name).await?;
+
+    let listener = tokio::net::TcpListener::bind((bind_addr.as_str(), bind_port))
+        .await
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to bind local forward on {bind_addr}:{bind_port}"))?;
+    let local_addr = listener
+        .local_addr()
+        .into_diagnostic()
+        .wrap_err("failed to read local forward address")?;
+    eprintln!(
+        "{} Forwarding {} -> {}:{} in sandbox {} via gRPC",
+        "✓".green().bold(),
+        local_addr,
+        target_host,
+        target_port,
+        name,
+    );
+
+    let sandbox_id = sandbox.object_id().to_string();
+    let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::channel::<String>(1);
+    let mut health_check = tokio::time::interval(Duration::from_secs(2));
+    health_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            Some(reason) = fatal_rx.recv() => {
+                return Err(miette::miette!("service forward stopped: {reason}"));
+            }
+
+            _ = health_check.tick() => {
+                fetch_ready_sandbox_for_forward(&mut client, name).await?;
+            }
+
+            accepted = listener.accept() => {
+                let (socket, peer) = accepted
+                    .into_diagnostic()
+                    .wrap_err("failed to accept local forward connection")?;
+                let mut client = client.clone();
+                let sandbox_id = sandbox_id.clone();
+                let target_host = target_host.to_string();
+                let service_id = format!("service-forward:{name}:{target_host}:{target_port}");
+                let fatal_tx = fatal_tx.clone();
+                tokio::spawn(async move {
+                    let token = match create_forward_session_token(&mut client, &sandbox_id).await {
+                        Ok(token) => token,
+                        Err(err) => {
+                            tracing::warn!(peer = %peer, error = %err, "service forward session creation failed");
+                            if err.fatal {
+                                let _ = fatal_tx.send(err.message).await;
+                            }
+                            return;
+                        }
+                    };
+                    if let Err(err) = forward_one_tcp_connection(
+                        &mut client,
+                        socket,
+                        sandbox_id,
+                        target_host,
+                        target_port,
+                        service_id,
+                        token.clone(),
+                    )
+                    .await
+                    {
+                        tracing::warn!(peer = %peer, error = %err, "service forward connection failed");
+                        if err.fatal {
+                            let _ = fatal_tx.send(err.message).await;
+                        }
+                    }
+                    let _ = client
+                        .revoke_ssh_session(RevokeSshSessionRequest { token })
+                        .await;
+                });
+            }
+        }
+    }
+}
+
+async fn create_forward_session_token(
+    client: &mut crate::tls::GrpcClient,
+    sandbox_id: &str,
+) -> std::result::Result<String, ForwardTcpConnectionError> {
+    let response = client
+        .create_ssh_session(CreateSshSessionRequest {
+            sandbox_id: sandbox_id.to_string(),
+        })
+        .await
+        .map_err(ForwardTcpConnectionError::from_status)?;
+    Ok(response.into_inner().token)
+}
+
+async fn fetch_ready_sandbox_for_forward(
+    client: &mut crate::tls::GrpcClient,
+    name: &str,
+) -> Result<Sandbox> {
+    let response = match client
+        .get_sandbox(GetSandboxRequest {
+            name: name.to_string(),
+        })
+        .await
+    {
+        Ok(response) => response,
+        Err(status) if status.code() == Code::NotFound => {
+            return Err(miette::miette!(
+                "sandbox '{name}' no longer exists; stopping service forward"
+            ));
+        }
+        Err(status) => return Err(status).into_diagnostic(),
+    };
+
+    let sandbox = response
+        .into_inner()
+        .sandbox
+        .ok_or_else(|| miette::miette!("sandbox '{name}' not found"))?;
+
+    if SandboxPhase::try_from(sandbox.phase) != Ok(SandboxPhase::Ready) {
+        return Err(miette::miette!(
+            "sandbox '{}' is no longer ready (phase: {}); stopping service forward",
+            name,
+            phase_name(sandbox.phase)
+        ));
+    }
+
+    Ok(sandbox)
+}
+
+#[derive(Debug)]
+struct ForwardTcpConnectionError {
+    message: String,
+    fatal: bool,
+}
+
+impl ForwardTcpConnectionError {
+    fn transient(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            fatal: false,
+        }
+    }
+
+    fn from_status(status: Status) -> Self {
+        let fatal = matches!(status.code(), Code::NotFound | Code::FailedPrecondition);
+        Self {
+            message: status.to_string(),
+            fatal,
+        }
+    }
+}
+
+impl std::fmt::Display for ForwardTcpConnectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ForwardTcpConnectionError {}
+
+fn parse_tcp_forward_spec(local: Option<&str>, default_port: u16) -> Result<(String, u16)> {
+    let Some(spec) = local else {
+        return Ok(("127.0.0.1".to_string(), default_port));
+    };
+
+    if let Some(pos) = spec.rfind(':') {
+        let addr = &spec[..pos];
+        let port_str = &spec[pos + 1..];
+        if let Ok(port) = port_str.parse::<u16>() {
+            if addr.is_empty() {
+                return Err(miette::miette!("bind address is required before ':'"));
+            }
+            return Ok((addr.to_string(), port));
+        }
+    }
+
+    let port: u16 = spec.parse().map_err(|_| {
+        miette::miette!("invalid local forward spec '{spec}': expected [bind_address:]port")
+    })?;
+    Ok(("127.0.0.1".to_string(), port))
+}
+
+async fn forward_one_tcp_connection(
+    client: &mut crate::tls::GrpcClient,
+    socket: tokio::net::TcpStream,
+    sandbox_id: String,
+    target_host: String,
+    target_port: u16,
+    service_id: String,
+    authorization_token: String,
+) -> std::result::Result<(), ForwardTcpConnectionError> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_stream::wrappers::ReceiverStream;
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<TcpForwardFrame>(16);
+    tx.send(TcpForwardFrame {
+        payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Init(
+            TcpForwardInit {
+                sandbox_id,
+                service_id,
+                target: Some(tcp_forward_init::Target::Tcp(TcpRelayTarget {
+                    host: target_host,
+                    port: u32::from(target_port),
+                })),
+                authorization_token,
+            },
+        )),
+    })
+    .await
+    .map_err(|_| ForwardTcpConnectionError::transient("failed to initialize forward stream"))?;
+
+    let mut response = match client.forward_tcp(ReceiverStream::new(rx)).await {
+        Ok(response) => response.into_inner(),
+        Err(status) => {
+            let err = ForwardTcpConnectionError::from_status(status);
+            drain_and_shutdown_local_socket(socket).await;
+            return Err(err);
+        }
+    };
+
+    let (mut local_read, mut local_write) = socket.into_split();
+
+    let to_gateway = tokio::spawn(async move {
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = local_read.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            if tx
+                .send(TcpForwardFrame {
+                    payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Data(
+                        buf[..n].to_vec(),
+                    )),
+                })
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+        Ok::<(), std::io::Error>(())
+    });
+
+    while let Some(frame) = response
+        .message()
+        .await
+        .map_err(ForwardTcpConnectionError::from_status)?
+    {
+        let Some(openshell_core::proto::tcp_forward_frame::Payload::Data(data)) = frame.payload
+        else {
+            continue;
+        };
+        if data.is_empty() {
+            continue;
+        }
+        local_write
+            .write_all(&data)
+            .await
+            .map_err(|err| ForwardTcpConnectionError::transient(err.to_string()))?;
+    }
+
+    let _ = local_write.shutdown().await;
+    to_gateway.abort();
+    Ok(())
+}
+
+async fn drain_and_shutdown_local_socket(mut socket: tokio::net::TcpStream) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut buf = [0u8; 4096];
+    while matches!(
+        tokio::time::timeout(Duration::from_millis(25), socket.read(&mut buf)).await,
+        Ok(Ok(n)) if n != 0
+    ) {}
+    let _ = socket.shutdown().await;
+}
+
 /// Print a single YAML line with dimmed keys and regular values.
 fn print_yaml_line(line: &str) {
     // Find leading whitespace
@@ -3158,6 +3447,236 @@ fn parse_credential_pairs(items: &[String]) -> Result<HashMap<String, String>> {
     }
 
     Ok(map)
+}
+
+pub async fn service_expose(
+    server: &str,
+    sandbox: &str,
+    service: &str,
+    target_port: u16,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .expose_service(ExposeServiceRequest {
+            sandbox: sandbox.to_string(),
+            service: service.to_string(),
+            target_port: u32::from(target_port),
+            domain: true,
+        })
+        .await
+        .map_err(service_expose_status_error)?
+        .into_inner();
+
+    if service.is_empty() {
+        println!(
+            "{} Exposed sandbox {} -> 127.0.0.1:{}",
+            "✓".green().bold(),
+            sandbox.bold(),
+            target_port,
+        );
+    } else {
+        println!(
+            "{} Exposed service {} on sandbox {} -> 127.0.0.1:{}",
+            "✓".green().bold(),
+            service.bold(),
+            sandbox.bold(),
+            target_port,
+        );
+    }
+    if !response.url.is_empty() {
+        let url = service_url_for_gateway(&response.url, server);
+        println!("  URL: {}", url.cyan());
+    }
+    Ok(())
+}
+
+fn service_expose_status_error(status: Status) -> miette::Report {
+    service_status_error("expose service", "sandbox:write", status)
+}
+
+pub async fn service_list(
+    server: &str,
+    sandbox: Option<&str>,
+    limit: u32,
+    offset: u32,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .list_services(ListServicesRequest {
+            sandbox: sandbox.unwrap_or_default().to_string(),
+            limit,
+            offset,
+        })
+        .await
+        .map_err(|status| service_status_error("list services", "sandbox:read", status))?
+        .into_inner();
+
+    if response.services.is_empty() {
+        if let Some(sandbox) = sandbox {
+            println!("No services exposed for sandbox {sandbox}.");
+        } else {
+            println!("No services exposed.");
+        }
+        return Ok(());
+    }
+
+    print_service_endpoint_table(&response.services, server);
+    Ok(())
+}
+
+pub async fn service_get(
+    server: &str,
+    sandbox: &str,
+    service: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .get_service(GetServiceRequest {
+            sandbox: sandbox.to_string(),
+            service: service.to_string(),
+        })
+        .await
+        .map_err(|status| service_status_error("get service", "sandbox:read", status))?
+        .into_inner();
+
+    print_service_endpoint_table(&[response], server);
+    Ok(())
+}
+
+pub async fn service_delete(
+    server: &str,
+    sandbox: &str,
+    service: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .delete_service(DeleteServiceRequest {
+            sandbox: sandbox.to_string(),
+            service: service.to_string(),
+        })
+        .await
+        .map_err(|status| service_status_error("delete service", "sandbox:write", status))?
+        .into_inner();
+
+    if !response.deleted {
+        return Err(miette!("delete service failed: service endpoint not found"));
+    }
+
+    if service.is_empty() {
+        println!(
+            "{} Deleted exposed sandbox {}",
+            "✓".green().bold(),
+            sandbox.bold(),
+        );
+    } else {
+        println!(
+            "{} Deleted service {} on sandbox {}",
+            "✓".green().bold(),
+            service.bold(),
+            sandbox.bold(),
+        );
+    }
+    Ok(())
+}
+
+fn service_status_error(action: &str, required_scope: &str, status: Status) -> miette::Report {
+    let message = status.message();
+    match status.code() {
+        Code::PermissionDenied => {
+            miette!("{action} failed: permission denied (requires {required_scope})")
+        }
+        Code::Unauthenticated => miette!("{action} failed: authentication required"),
+        Code::NotFound if message == "sandbox not found" => {
+            miette!("{action} failed: sandbox not found")
+        }
+        Code::NotFound if message == "service endpoint not found" => {
+            miette!("{action} failed: service endpoint not found")
+        }
+        Code::InvalidArgument if !message.is_empty() => {
+            miette!("{action} failed: invalid request: {message}")
+        }
+        _ => miette!("{action} failed: {status}"),
+    }
+}
+
+fn print_service_endpoint_table(services: &[ServiceEndpointResponse], gateway_endpoint: &str) {
+    let rows = services
+        .iter()
+        .filter_map(|response| {
+            let endpoint = response.endpoint.as_ref()?;
+            let service = service_display_name(&endpoint.service_name).to_string();
+            let target = format!("127.0.0.1:{}", endpoint.target_port);
+            let url = if response.url.is_empty() {
+                String::new()
+            } else {
+                service_url_for_gateway(&response.url, gateway_endpoint)
+            };
+            Some((endpoint.sandbox_name.clone(), service, target, url))
+        })
+        .collect::<Vec<_>>();
+
+    if rows.is_empty() {
+        return;
+    }
+
+    let sandbox_width = rows
+        .iter()
+        .map(|(sandbox, _, _, _)| sandbox.len())
+        .max()
+        .unwrap_or(7)
+        .max(7);
+    let service_width = rows
+        .iter()
+        .map(|(_, service, _, _)| service.len())
+        .max()
+        .unwrap_or(7)
+        .max(7);
+    let target_width = rows
+        .iter()
+        .map(|(_, _, target, _)| target.len())
+        .max()
+        .unwrap_or(6)
+        .max(6);
+
+    println!(
+        "{:<sandbox_width$}  {:<service_width$}  {:<target_width$}  {}",
+        "SANDBOX".bold(),
+        "SERVICE".bold(),
+        "TARGET".bold(),
+        "URL".bold(),
+    );
+
+    for (sandbox, service, target, url) in rows {
+        println!(
+            "{sandbox:<sandbox_width$}  {service:<service_width$}  {target:<target_width$}  {url}"
+        );
+    }
+}
+
+fn service_display_name(service: &str) -> &str {
+    if service.is_empty() { "-" } else { service }
+}
+
+fn service_url_for_gateway(service_url: &str, gateway_endpoint: &str) -> String {
+    let (Ok(mut service_url), Ok(gateway_endpoint)) = (
+        url::Url::parse(service_url),
+        url::Url::parse(gateway_endpoint),
+    ) else {
+        return service_url.to_string();
+    };
+
+    if service_url
+        .set_port(gateway_endpoint.port_or_known_default())
+        .is_err()
+    {
+        return service_url.to_string();
+    }
+
+    service_url.to_string()
 }
 
 #[allow(clippy::too_many_arguments)] // user-facing CLI command
@@ -5581,6 +6100,7 @@ mod tests {
         inferred_provider_type, package_managed_tls_dirs, parse_cli_setting_value,
         parse_credential_pairs, plaintext_gateway_is_remote, provisioning_timeout_message,
         ready_false_condition_message, resolve_from, sandbox_should_persist,
+        service_expose_status_error, service_url_for_gateway,
     };
     use crate::TEST_ENV_LOCK;
     use hyper::StatusCode;
@@ -5591,6 +6111,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::thread;
+    use tonic::Status;
 
     use openshell_bootstrap::GatewayMetadata;
     use openshell_core::proto::{
@@ -5952,6 +6473,62 @@ mod tests {
 
         assert!(dockerfile_sources_supported_for_gateway(Some(&metadata)));
         assert!(dockerfile_sources_supported_for_gateway(None));
+    }
+
+    #[test]
+    fn service_url_for_gateway_uses_external_gateway_port() {
+        assert_eq!(
+            service_url_for_gateway(
+                "https://quiet-flamingo--openclaw.navigator.openshell.localhost:8080/",
+                "https://127.0.0.1:31886"
+            ),
+            "https://quiet-flamingo--openclaw.navigator.openshell.localhost:31886/"
+        );
+    }
+
+    #[test]
+    fn service_url_for_gateway_omits_default_external_port() {
+        assert_eq!(
+            service_url_for_gateway(
+                "https://quiet-flamingo--openclaw.navigator.openshell.localhost:8080/",
+                "https://gateway.example.com"
+            ),
+            "https://quiet-flamingo--openclaw.navigator.openshell.localhost/"
+        );
+    }
+
+    #[test]
+    fn service_url_for_gateway_preserves_service_scheme() {
+        assert_eq!(
+            service_url_for_gateway(
+                "http://quiet-flamingo--openclaw.navigator.openshell.localhost:8080/",
+                "https://127.0.0.1:31886"
+            ),
+            "http://quiet-flamingo--openclaw.navigator.openshell.localhost:31886/"
+        );
+    }
+
+    #[test]
+    fn service_url_for_gateway_uses_gateway_default_port() {
+        assert_eq!(
+            service_url_for_gateway(
+                "http://quiet-flamingo--openclaw.navigator.openshell.localhost:8080/",
+                "https://gateway.example.com"
+            ),
+            "http://quiet-flamingo--openclaw.navigator.openshell.localhost:443/"
+        );
+    }
+
+    #[test]
+    fn service_expose_status_error_mentions_required_scope() {
+        let report = service_expose_status_error(Status::permission_denied(
+            "scope 'sandbox:write' required",
+        ));
+
+        assert_eq!(
+            report.to_string(),
+            "expose service failed: permission denied (requires sandbox:write)"
+        );
     }
 
     #[test]

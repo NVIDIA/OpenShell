@@ -10,7 +10,7 @@ use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard};
 use crate::policy::ProxyPolicy;
 use crate::policy_local::{POLICY_LOCAL_HOST, PolicyLocalContext};
 use crate::provider_credentials::ProviderCredentialState;
-use crate::secrets::{SecretResolver, rewrite_header_line};
+use crate::secrets::{SecretResolver, rewrite_header_line_checked};
 use miette::{IntoDiagnostic, Result};
 use openshell_core::net::{is_always_blocked_ip, is_internal_ip};
 use openshell_ocsf::{
@@ -2277,11 +2277,17 @@ fn rewrite_forward_request(
     used: usize,
     path: &str,
     secret_resolver: Option<&SecretResolver>,
+    request_body_credential_rewrite: bool,
 ) -> Result<Vec<u8>, crate::secrets::UnresolvedPlaceholderError> {
     let header_end = raw[..used]
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .map_or(used, |p| p + 4);
+    let websocket_upgrade = crate::l7::rest::request_is_websocket_upgrade(&raw[..header_end]);
+    let upstream_path = match secret_resolver {
+        Some(resolver) => crate::secrets::rewrite_target_for_eval(path, resolver)?.resolved,
+        None => path.to_string(),
+    };
 
     let header_str = String::from_utf8_lossy(&raw[..header_end]);
     let lines = header_str.split("\r\n").collect::<Vec<_>>();
@@ -2298,7 +2304,7 @@ fn rewrite_forward_request(
             if parts.len() == 3 {
                 output.extend_from_slice(parts[0].as_bytes());
                 output.push(b' ');
-                output.extend_from_slice(path.as_bytes());
+                output.extend_from_slice(upstream_path.as_bytes());
                 output.push(b' ');
                 output.extend_from_slice(parts[2].as_bytes());
             } else {
@@ -2325,14 +2331,19 @@ fn rewrite_forward_request(
         // Replace Connection header
         if lower.starts_with("connection:") {
             has_connection = true;
+            if websocket_upgrade {
+                output.extend_from_slice(line.as_bytes());
+                output.extend_from_slice(b"\r\n");
+                continue;
+            }
             output.extend_from_slice(b"Connection: close\r\n");
             continue;
         }
 
-        let rewritten_line = secret_resolver.map_or_else(
-            || line.to_string(),
-            |resolver| rewrite_header_line(line, resolver),
-        );
+        let rewritten_line = match secret_resolver {
+            Some(resolver) => rewrite_header_line_checked(line, resolver)?,
+            None => line.to_string(),
+        };
 
         output.extend_from_slice(rewritten_line.as_bytes());
         output.extend_from_slice(b"\r\n");
@@ -2343,7 +2354,7 @@ fn rewrite_forward_request(
     }
 
     // Inject missing headers
-    if !has_connection {
+    if !has_connection && !websocket_upgrade {
         output.extend_from_slice(b"Connection: close\r\n");
     }
     if !has_via {
@@ -2352,6 +2363,7 @@ fn rewrite_forward_request(
 
     // End of headers
     output.extend_from_slice(b"\r\n");
+    let rewritten_header_end = output.len();
 
     // Append any overflow body bytes from the original buffer
     if header_end < used {
@@ -2360,13 +2372,27 @@ fn rewrite_forward_request(
 
     // Fail-closed: scan for any remaining unresolved placeholders
     if secret_resolver.is_some() {
-        let output_str = String::from_utf8_lossy(&output);
-        if output_str.contains(crate::secrets::PLACEHOLDER_PREFIX_PUBLIC) {
+        let scan_end = if request_body_credential_rewrite {
+            rewritten_header_end
+        } else {
+            output.len()
+        };
+        let output_str = String::from_utf8_lossy(&output[..scan_end]);
+        if output_str.contains(crate::secrets::PLACEHOLDER_PREFIX_PUBLIC)
+            || output_str.contains(crate::secrets::PROVIDER_ALIAS_MARKER_PUBLIC)
+        {
             return Err(crate::secrets::UnresolvedPlaceholderError { location: "header" });
         }
     }
 
     Ok(output)
+}
+
+struct ForwardRelayOptions<'a> {
+    generation_guard: &'a PolicyGenerationGuard,
+    websocket_extensions: crate::l7::rest::WebSocketExtensionMode,
+    secret_resolver: Option<&'a SecretResolver>,
+    request_body_credential_rewrite: bool,
 }
 
 async fn relay_rewritten_forward_request<C, U>(
@@ -2375,7 +2401,7 @@ async fn relay_rewritten_forward_request<C, U>(
     rewritten: Vec<u8>,
     client: &mut C,
     upstream: &mut U,
-    generation_guard: &PolicyGenerationGuard,
+    options: ForwardRelayOptions<'_>,
 ) -> Result<crate::l7::provider::RelayOutcome>
 where
     C: TokioAsyncRead + TokioAsyncWrite + Unpin,
@@ -2396,12 +2422,16 @@ where
         body_length,
     };
 
-    crate::l7::rest::relay_http_request_with_resolver_guarded(
+    crate::l7::rest::relay_http_request_with_options_guarded(
         &req,
         client,
         upstream,
-        None,
-        Some(generation_guard),
+        crate::l7::rest::RelayRequestOptions {
+            resolver: options.secret_resolver,
+            generation_guard: Some(options.generation_guard),
+            websocket_extensions: options.websocket_extensions,
+            request_body_credential_rewrite: options.request_body_credential_rewrite,
+        },
     )
     .await
 }
@@ -2623,6 +2653,35 @@ async fn handle_forward_proxy(
     };
     let mut forward_request_bytes = buf[..used].to_vec();
     let mut upstream_target = path.clone();
+    let mut websocket_extensions = crate::l7::rest::WebSocketExtensionMode::Preserve;
+    let mut forward_tunnel_engine: Option<crate::opa::TunnelPolicyEngine> = None;
+    let mut forward_upgrade_config: Option<crate::l7::L7EndpointConfig> = None;
+    let mut forward_upgrade_target = String::new();
+    let mut forward_upgrade_query_params = std::collections::HashMap::new();
+    let mut forward_websocket_request =
+        crate::l7::rest::request_is_websocket_upgrade(&forward_request_bytes);
+    let mut request_body_credential_rewrite = false;
+    let l7_ctx = crate::l7::relay::L7EvalContext {
+        host: host_lc.clone(),
+        port,
+        policy_name: matched_policy.clone().unwrap_or_default(),
+        binary_path: decision
+            .binary
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        ancestors: decision
+            .ancestors
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
+        cmdline_paths: decision
+            .cmdline_paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
+        secret_resolver: secret_resolver.clone(),
+    };
 
     // 4b. If the endpoint has L7 config, evaluate the request against
     //     L7 policy.  The forward proxy handles exactly one request per
@@ -2668,28 +2727,6 @@ async fn handle_forward_proxy(
                 .await?;
                 return Ok(());
             }
-        };
-
-        let l7_ctx = crate::l7::relay::L7EvalContext {
-            host: host_lc.clone(),
-            port,
-            policy_name: matched_policy.clone().unwrap_or_default(),
-            binary_path: decision
-                .binary
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            ancestors: decision
-                .ancestors
-                .iter()
-                .map(|p| p.to_string_lossy().into_owned())
-                .collect(),
-            cmdline_paths: decision
-                .cmdline_paths
-                .iter()
-                .map(|p| p.to_string_lossy().into_owned())
-                .collect(),
-            secret_resolver: secret_resolver.clone(),
         };
 
         // Canonicalize the request-target. The canonical form is fed to OPA
@@ -2760,6 +2797,14 @@ async fn handle_forward_proxy(
             .await?;
             return Ok(());
         };
+        forward_websocket_request =
+            crate::l7::rest::request_is_websocket_upgrade(&forward_request_bytes);
+        websocket_extensions = crate::l7::relay::websocket_extension_mode(&l7_config.config);
+        request_body_credential_rewrite = l7_config.config.protocol == crate::l7::L7Protocol::Rest
+            && l7_config.config.request_body_credential_rewrite;
+        forward_upgrade_config = Some(l7_config.config.clone());
+        forward_upgrade_target = path.clone();
+        forward_upgrade_query_params = query_params.clone();
         let graphql = if l7_config.config.protocol == crate::l7::L7Protocol::Graphql {
             let header_end = forward_request_bytes
                 .windows(4)
@@ -2920,6 +2965,7 @@ async fn handle_forward_proxy(
             .await?;
             return Ok(());
         }
+        forward_tunnel_engine = Some(tunnel_engine);
     }
 
     // 5. DNS resolution + SSRF defence (mirrors the CONNECT path logic).
@@ -3180,6 +3226,7 @@ async fn handle_forward_proxy(
         forward_request_bytes.len(),
         &upstream_target,
         secret_resolver.as_deref(),
+        request_body_credential_rewrite,
     ) {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -3222,11 +3269,47 @@ async fn handle_forward_proxy(
         rewritten,
         client,
         &mut upstream,
-        &forward_generation_guard,
+        ForwardRelayOptions {
+            generation_guard: &forward_generation_guard,
+            websocket_extensions,
+            secret_resolver: secret_resolver.as_deref(),
+            request_body_credential_rewrite,
+        },
     )
     .await?;
-    if let crate::l7::provider::RelayOutcome::Upgraded { overflow } = outcome {
-        crate::l7::relay::handle_upgrade(client, &mut upstream, overflow, &host_lc, port).await?;
+    if let crate::l7::provider::RelayOutcome::Upgraded {
+        overflow,
+        websocket_permessage_deflate,
+    } = outcome
+    {
+        let mut upgrade_options = if let (Some(config), Some(engine)) = (
+            forward_upgrade_config.as_ref(),
+            forward_tunnel_engine.as_ref(),
+        ) {
+            crate::l7::relay::upgrade_options(
+                config,
+                &l7_ctx,
+                forward_websocket_request,
+                &forward_upgrade_target,
+                &forward_upgrade_query_params,
+                Some(engine),
+            )
+        } else {
+            crate::l7::relay::UpgradeRelayOptions {
+                websocket_request: forward_websocket_request,
+                ..Default::default()
+            }
+        };
+        upgrade_options.websocket.permessage_deflate = websocket_permessage_deflate;
+        crate::l7::relay::handle_upgrade(
+            client,
+            &mut upstream,
+            overflow,
+            &host_lc,
+            port,
+            upgrade_options,
+        )
+        .await?;
     }
 
     Ok(())
@@ -3298,6 +3381,473 @@ fn is_benign_relay_error(err: &miette::Report) -> bool {
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    use std::sync::Arc;
+
+    fn websocket_l7_config(
+        protocol: crate::l7::L7Protocol,
+        websocket_credential_rewrite: bool,
+    ) -> crate::l7::L7EndpointConfig {
+        crate::l7::L7EndpointConfig {
+            protocol,
+            path: "/**".to_string(),
+            tls: crate::l7::TlsMode::Auto,
+            enforcement: crate::l7::EnforcementMode::Enforce,
+            graphql_max_body_bytes: crate::l7::graphql::DEFAULT_MAX_BODY_BYTES,
+            allow_encoded_slash: false,
+            websocket_credential_rewrite,
+            request_body_credential_rewrite: false,
+            websocket_graphql_policy: false,
+        }
+    }
+
+    fn forward_test_guard() -> PolicyGenerationGuard {
+        let policy = include_str!("../data/sandbox-policy.rego");
+        let policy_data = "network_policies: {}\n";
+        let engine = OpaEngine::from_strings(policy, policy_data).unwrap();
+        engine
+            .generation_guard(engine.current_generation())
+            .unwrap()
+    }
+
+    async fn relay_forward_request_and_capture(
+        method: &str,
+        path: &str,
+        raw: &[u8],
+        resolver: Option<&SecretResolver>,
+        request_body_credential_rewrite: bool,
+    ) -> Result<String> {
+        let guard = forward_test_guard();
+        let rewritten = rewrite_forward_request(
+            raw,
+            raw.len(),
+            path,
+            resolver,
+            request_body_credential_rewrite,
+        )
+        .map_err(|e| miette::miette!("{e}"))?;
+        let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
+        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+
+        let upstream_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            let mut total = 0usize;
+            let mut expected_total = None;
+            loop {
+                let n = upstream_side.read(&mut buf[total..]).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                total += n;
+                if expected_total.is_none()
+                    && let Some(end) = buf[..total].windows(4).position(|w| w == b"\r\n\r\n")
+                {
+                    let header_end = end + 4;
+                    let headers = String::from_utf8_lossy(&buf[..header_end]);
+                    let len = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    expected_total = Some(header_end + len);
+                }
+                if expected_total.is_some_and(|expected| total >= expected) {
+                    break;
+                }
+            }
+            upstream_side
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+            upstream_side.flush().await.unwrap();
+            String::from_utf8_lossy(&buf[..total]).to_string()
+        });
+
+        relay_rewritten_forward_request(
+            method,
+            path,
+            rewritten,
+            &mut proxy_to_client,
+            &mut proxy_to_upstream,
+            ForwardRelayOptions {
+                generation_guard: &guard,
+                websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
+                secret_resolver: resolver,
+                request_body_credential_rewrite,
+            },
+        )
+        .await?;
+
+        upstream_task
+            .await
+            .map_err(|e| miette::miette!("upstream task failed: {e}"))
+    }
+
+    fn forward_websocket_policy_parts(
+        data: &str,
+        host: &str,
+        port: u16,
+        path: &str,
+        policy_name: &str,
+    ) -> (
+        crate::l7::L7EndpointConfig,
+        crate::opa::TunnelPolicyEngine,
+        crate::l7::relay::L7EvalContext,
+    ) {
+        let policy = include_str!("../data/sandbox-policy.rego");
+        let engine = OpaEngine::from_strings(policy, data).unwrap();
+        let decision = ConnectDecision {
+            action: NetworkAction::Allow {
+                matched_policy: Some(policy_name.to_string()),
+            },
+            generation: engine.current_generation(),
+            binary: Some(PathBuf::from("/usr/bin/node")),
+            binary_pid: None,
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let route =
+            query_l7_route_snapshot(&engine, &decision, host, port).expect("L7 route should match");
+        let config = select_l7_config_for_path(&route.configs, path)
+            .expect("path-specific L7 config should match")
+            .config
+            .clone();
+        let tunnel_engine = engine
+            .clone_engine_for_tunnel(route.generation)
+            .expect("tunnel engine");
+        let ctx = crate::l7::relay::L7EvalContext {
+            host: host.to_string(),
+            port,
+            policy_name: policy_name.to_string(),
+            binary_path: "/usr/bin/node".to_string(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: None,
+        };
+        (config, tunnel_engine, ctx)
+    }
+
+    async fn read_http_headers<R: TokioAsyncRead + Unpin>(reader: &mut R) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 256];
+        loop {
+            let n =
+                tokio::time::timeout(std::time::Duration::from_secs(1), reader.read(&mut chunk))
+                    .await
+                    .expect("HTTP headers should arrive")
+                    .expect("header read should succeed");
+            assert!(n > 0, "stream closed before HTTP headers");
+            bytes.extend_from_slice(&chunk[..n]);
+            if bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                return bytes;
+            }
+        }
+    }
+
+    fn masked_text_frame(payload: &[u8]) -> Vec<u8> {
+        let mask = [0x11, 0x22, 0x33, 0x44];
+        assert!(
+            payload.len() <= 125,
+            "test helper only supports small frames"
+        );
+        let payload_len = u8::try_from(payload.len()).expect("small frame length");
+        let mut frame = vec![0x81, 0x80 | payload_len];
+        frame.extend_from_slice(&mask);
+        frame.extend(
+            payload
+                .iter()
+                .enumerate()
+                .map(|(idx, byte)| byte ^ mask[idx % 4]),
+        );
+        frame
+    }
+
+    async fn forward_websocket_denied_after_upgrade(
+        config: crate::l7::L7EndpointConfig,
+        tunnel_engine: crate::opa::TunnelPolicyEngine,
+        ctx: crate::l7::relay::L7EvalContext,
+        path: &str,
+        payload: &str,
+    ) -> (miette::Report, Vec<u8>) {
+        let host = ctx.host.clone();
+        let port = ctx.port;
+        let raw = format!(
+            "GET http://{host}{path} HTTP/1.1\r\n\
+             Host: {host}\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Sec-WebSocket-Version: 13\r\n\r\n"
+        );
+        let rewritten = rewrite_forward_request(raw.as_bytes(), raw.len(), path, None, false)
+            .expect("forward websocket request should rewrite to origin form");
+        let websocket_extensions = crate::l7::relay::websocket_extension_mode(&config);
+        let target = path.to_string();
+        let query_params = std::collections::HashMap::new();
+        let (mut proxy_to_upstream, mut upstream) = tokio::io::duplex(8192);
+        let (mut app, mut proxy_to_client) = tokio::io::duplex(8192);
+
+        let relay = tokio::spawn(async move {
+            let guard = tunnel_engine.generation_guard();
+            let outcome = relay_rewritten_forward_request(
+                "GET",
+                &target,
+                rewritten,
+                &mut proxy_to_client,
+                &mut proxy_to_upstream,
+                ForwardRelayOptions {
+                    generation_guard: guard,
+                    websocket_extensions,
+                    secret_resolver: None,
+                    request_body_credential_rewrite: false,
+                },
+            )
+            .await?;
+            if let crate::l7::provider::RelayOutcome::Upgraded {
+                overflow,
+                websocket_permessage_deflate,
+            } = outcome
+            {
+                let mut options = crate::l7::relay::upgrade_options(
+                    &config,
+                    &ctx,
+                    true,
+                    &target,
+                    &query_params,
+                    Some(&tunnel_engine),
+                );
+                options.websocket.permessage_deflate = websocket_permessage_deflate;
+                crate::l7::relay::handle_upgrade(
+                    &mut proxy_to_client,
+                    &mut proxy_to_upstream,
+                    overflow,
+                    &host,
+                    port,
+                    options,
+                )
+                .await?;
+            }
+            Ok::<(), miette::Report>(())
+        });
+
+        let forwarded_headers = read_http_headers(&mut upstream).await;
+        let forwarded_headers = String::from_utf8_lossy(&forwarded_headers);
+        assert!(forwarded_headers.starts_with(&format!("GET {path} HTTP/1.1\r\n")));
+        assert!(forwarded_headers.contains("Upgrade: websocket\r\n"));
+
+        upstream
+            .write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+            )
+            .await
+            .unwrap();
+
+        let response = read_http_headers(&mut app).await;
+        assert!(String::from_utf8_lossy(&response).contains("101 Switching Protocols"));
+
+        app.write_all(&masked_text_frame(payload.as_bytes()))
+            .await
+            .unwrap();
+
+        let err = tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("websocket relay should fail closed after denied frame")
+            .expect("relay task should not panic")
+            .expect_err("denied websocket frame should fail the forward relay");
+
+        let mut leaked = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upstream.read_to_end(&mut leaked),
+        )
+        .await
+        .expect("upstream side should close")
+        .expect("upstream read should succeed");
+        (err, leaked)
+    }
+
+    #[test]
+    fn forward_websocket_upgrade_options_enable_native_policy_context() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("DISCORD_BOT_TOKEN".to_string(), "discord-real".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let resolver = resolver.map(Arc::new);
+        let policy = include_str!("../data/sandbox-policy.rego");
+        let policy_data = "network_policies: {}\n";
+        let engine = OpaEngine::from_strings(policy, policy_data).unwrap();
+        let tunnel_engine = engine
+            .clone_engine_for_tunnel(engine.current_generation())
+            .unwrap();
+        let ctx = crate::l7::relay::L7EvalContext {
+            host: "gateway.example.test".to_string(),
+            port: 80,
+            policy_name: "ws_api".to_string(),
+            binary_path: "/usr/bin/node".to_string(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: resolver,
+        };
+        let query_params = std::collections::HashMap::new();
+
+        let extensions = crate::l7::relay::websocket_extension_mode(&websocket_l7_config(
+            crate::l7::L7Protocol::Websocket,
+            true,
+        ));
+        let options = crate::l7::relay::upgrade_options(
+            &websocket_l7_config(crate::l7::L7Protocol::Websocket, true),
+            &ctx,
+            true,
+            "/ws",
+            &query_params,
+            Some(&tunnel_engine),
+        );
+
+        assert_eq!(
+            extensions,
+            crate::l7::rest::WebSocketExtensionMode::PermessageDeflate
+        );
+        assert!(options.websocket.credential_rewrite);
+        assert!(options.secret_resolver.is_some());
+        assert!(options.engine.is_some());
+        assert!(options.ctx.is_some());
+        assert!(matches!(
+            options.websocket.message_policy,
+            crate::l7::relay::WebSocketMessagePolicy::Transport
+        ));
+    }
+
+    #[test]
+    fn forward_websocket_upgrade_options_preserve_rest_without_rewrite() {
+        let ctx = crate::l7::relay::L7EvalContext {
+            host: "gateway.example.test".to_string(),
+            port: 80,
+            policy_name: "rest_api".to_string(),
+            binary_path: "/usr/bin/node".to_string(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: None,
+        };
+        let query_params = std::collections::HashMap::new();
+        let config = websocket_l7_config(crate::l7::L7Protocol::Rest, false);
+        let extensions = crate::l7::relay::websocket_extension_mode(&config);
+        let options =
+            crate::l7::relay::upgrade_options(&config, &ctx, true, "/ws", &query_params, None);
+
+        assert_eq!(
+            extensions,
+            crate::l7::rest::WebSocketExtensionMode::Preserve
+        );
+        assert!(!options.websocket.credential_rewrite);
+        assert!(options.secret_resolver.is_none());
+        assert!(options.engine.is_none());
+        assert!(options.ctx.is_none());
+        assert!(matches!(
+            options.websocket.message_policy,
+            crate::l7::relay::WebSocketMessagePolicy::None
+        ));
+    }
+
+    #[tokio::test]
+    async fn forward_websocket_upgrade_blocks_text_frame_by_policy() {
+        let data = r#"
+network_policies:
+  ws_api:
+    name: ws_api
+    endpoints:
+      - host: gateway.example.test
+        port: 80
+        path: "/ws"
+        protocol: websocket
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/ws"
+          - allow:
+              method: WEBSOCKET_TEXT
+              path: "/ws"
+        deny_rules:
+          - method: WEBSOCKET_TEXT
+            path: "/ws"
+    binaries:
+      - { path: /usr/bin/node }
+"#;
+        let (config, tunnel_engine, ctx) =
+            forward_websocket_policy_parts(data, "gateway.example.test", 80, "/ws", "ws_api");
+
+        let (err, leaked) = forward_websocket_denied_after_upgrade(
+            config,
+            tunnel_engine,
+            ctx,
+            "/ws",
+            r#"{"type":"unsafe"}"#,
+        )
+        .await;
+
+        assert!(err.to_string().contains("websocket text message denied"));
+        assert!(
+            leaked.is_empty(),
+            "denied forward-proxy WebSocket text frames must not reach upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_graphql_websocket_upgrade_blocks_unallowed_operation() {
+        let data = r#"
+network_policies:
+  graphql_ws:
+    name: graphql_ws
+    endpoints:
+      - host: gateway.example.test
+        port: 80
+        path: "/graphql"
+        protocol: websocket
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/graphql"
+          - allow:
+              operation_type: query
+              fields: [viewer]
+        deny_rules:
+          - operation_type: query
+            fields: [admin]
+    binaries:
+      - { path: /usr/bin/node }
+"#;
+        let (config, tunnel_engine, ctx) = forward_websocket_policy_parts(
+            data,
+            "gateway.example.test",
+            80,
+            "/graphql",
+            "graphql_ws",
+        );
+        assert!(
+            config.websocket_graphql_policy,
+            "operation rules should enable GraphQL-over-WebSocket inspection"
+        );
+
+        let (err, leaked) = forward_websocket_denied_after_upgrade(
+            config,
+            tunnel_engine,
+            ctx,
+            "/graphql",
+            r#"{"id":"1","type":"subscribe","payload":{"query":"query { admin }"}}"#,
+        )
+        .await;
+
+        assert!(err.to_string().contains("websocket GraphQL message denied"));
+        assert!(
+            leaked.is_empty(),
+            "denied forward-proxy GraphQL WebSocket operations must not reach upstream"
+        );
+    }
 
     #[test]
     fn l7_route_selection_prefers_path_specific_graphql_endpoint() {
@@ -3310,6 +3860,9 @@ mod tests {
                     enforcement: crate::l7::EnforcementMode::Enforce,
                     graphql_max_body_bytes: crate::l7::graphql::DEFAULT_MAX_BODY_BYTES,
                     allow_encoded_slash: false,
+                    websocket_credential_rewrite: false,
+                    request_body_credential_rewrite: false,
+                    websocket_graphql_policy: false,
                 },
             },
             L7ConfigSnapshot {
@@ -3320,6 +3873,9 @@ mod tests {
                     enforcement: crate::l7::EnforcementMode::Enforce,
                     graphql_max_body_bytes: crate::l7::graphql::DEFAULT_MAX_BODY_BYTES,
                     allow_encoded_slash: false,
+                    websocket_credential_rewrite: false,
+                    request_body_credential_rewrite: false,
+                    websocket_graphql_policy: false,
                 },
             },
         ];
@@ -4246,7 +4802,8 @@ mod tests {
     fn test_rewrite_get_request() {
         let raw =
             b"GET http://10.0.0.1:8000/api HTTP/1.1\r\nHost: 10.0.0.1:8000\r\nAccept: */*\r\n\r\n";
-        let result = rewrite_forward_request(raw, raw.len(), "/api", None).expect("should succeed");
+        let result =
+            rewrite_forward_request(raw, raw.len(), "/api", None, false).expect("should succeed");
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.starts_with("GET /api HTTP/1.1\r\n"));
         assert!(result_str.contains("Host: 10.0.0.1:8000"));
@@ -4257,7 +4814,8 @@ mod tests {
     #[test]
     fn test_rewrite_strips_proxy_headers() {
         let raw = b"GET http://host/p HTTP/1.1\r\nHost: host\r\nProxy-Authorization: Basic abc\r\nProxy-Connection: keep-alive\r\nAccept: */*\r\n\r\n";
-        let result = rewrite_forward_request(raw, raw.len(), "/p", None).expect("should succeed");
+        let result =
+            rewrite_forward_request(raw, raw.len(), "/p", None, false).expect("should succeed");
         let result_str = String::from_utf8_lossy(&result);
         assert!(
             !result_str
@@ -4271,7 +4829,8 @@ mod tests {
     #[test]
     fn test_rewrite_replaces_connection_header() {
         let raw = b"GET http://host/p HTTP/1.1\r\nHost: host\r\nConnection: keep-alive\r\n\r\n";
-        let result = rewrite_forward_request(raw, raw.len(), "/p", None).expect("should succeed");
+        let result =
+            rewrite_forward_request(raw, raw.len(), "/p", None, false).expect("should succeed");
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.contains("Connection: close"));
         assert!(!result_str.contains("keep-alive"));
@@ -4280,7 +4839,8 @@ mod tests {
     #[test]
     fn test_rewrite_preserves_body_overflow() {
         let raw = b"POST http://host/api HTTP/1.1\r\nHost: host\r\nContent-Length: 13\r\n\r\n{\"key\":\"val\"}";
-        let result = rewrite_forward_request(raw, raw.len(), "/api", None).expect("should succeed");
+        let result =
+            rewrite_forward_request(raw, raw.len(), "/api", None, false).expect("should succeed");
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.contains("{\"key\":\"val\"}"));
         assert!(result_str.contains("POST /api HTTP/1.1"));
@@ -4289,7 +4849,8 @@ mod tests {
     #[test]
     fn test_rewrite_preserves_existing_via() {
         let raw = b"GET http://host/p HTTP/1.1\r\nHost: host\r\nVia: 1.0 upstream\r\n\r\n";
-        let result = rewrite_forward_request(raw, raw.len(), "/p", None).expect("should succeed");
+        let result =
+            rewrite_forward_request(raw, raw.len(), "/p", None, false).expect("should succeed");
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.contains("Via: 1.0 upstream"));
         // Should not add a second Via header
@@ -4312,7 +4873,7 @@ mod tests {
         .expect("canonicalization should succeed for the attack payload");
         assert_eq!(canon.path, "/secret");
 
-        let rewritten = rewrite_forward_request(raw, raw.len(), &canon.path, None)
+        let rewritten = rewrite_forward_request(raw, raw.len(), &canon.path, None, false)
             .expect("rewrite_forward_request should succeed");
         let rewritten_str = String::from_utf8_lossy(&rewritten);
         assert!(
@@ -4338,7 +4899,7 @@ mod tests {
             _ => canon.path,
         };
 
-        let rewritten = rewrite_forward_request(raw, raw.len(), &upstream_target, None)
+        let rewritten = rewrite_forward_request(raw, raw.len(), &upstream_target, None, false)
             .expect("rewrite_forward_request should succeed");
         let rewritten_str = String::from_utf8_lossy(&rewritten);
         assert!(
@@ -4357,11 +4918,167 @@ mod tests {
                 .collect(),
         );
         let raw = b"GET http://host/p HTTP/1.1\r\nHost: host\r\nAuthorization: Bearer openshell:resolve:env:ANTHROPIC_API_KEY\r\n\r\n";
-        let result = rewrite_forward_request(raw, raw.len(), "/p", resolver.as_ref())
+        let result = rewrite_forward_request(raw, raw.len(), "/p", resolver.as_ref(), false)
             .expect("should succeed");
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.contains("Authorization: Bearer sk-test"));
         assert!(!result_str.contains("openshell:resolve:env:ANTHROPIC_API_KEY"));
+    }
+
+    #[tokio::test]
+    async fn forward_relay_rewrites_urlencoded_body_alias_from_initial_read() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("API_TOKEN".to_string(), "provider-real-token".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let alias = "provider-OPENSHELL-RESOLVE-ENV-API_TOKEN";
+        let body = format!("token={alias}&channel=C123");
+        let raw = format!(
+            "POST http://api.example.com/api/messages HTTP/1.1\r\n\
+             Host: api.example.com\r\n\
+             Authorization: Bearer {alias}\r\n\
+             Content-Type: application/x-www-form-urlencoded\r\n\
+             Content-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+
+        let forwarded = relay_forward_request_and_capture(
+            "POST",
+            "/api/messages",
+            raw.as_bytes(),
+            Some(&resolver),
+            true,
+        )
+        .await
+        .expect("forward relay should rewrite credentials");
+
+        let expected_body = "token=provider-real-token&channel=C123";
+        assert!(forwarded.starts_with("POST /api/messages HTTP/1.1\r\n"));
+        assert!(forwarded.contains("Authorization: Bearer provider-real-token\r\n"));
+        assert!(forwarded.contains(&format!("Content-Length: {}\r\n", expected_body.len())));
+        assert!(forwarded.ends_with(expected_body));
+        assert!(!forwarded.contains("OPENSHELL-RESOLVE-ENV"));
+    }
+
+    #[tokio::test]
+    async fn forward_relay_rewrites_urlencoded_canonical_body_from_initial_read() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("API_TOKEN".to_string(), "provider-real-token".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let alias = "provider-OPENSHELL-RESOLVE-ENV-API_TOKEN";
+        let body = "token=openshell%3Aresolve%3Aenv%3AAPI_TOKEN&channel=C123";
+        let raw = format!(
+            "POST http://api.example.com/api/messages HTTP/1.1\r\n\
+             Host: api.example.com\r\n\
+             Authorization: Bearer {alias}\r\n\
+             Content-Type: application/x-www-form-urlencoded\r\n\
+             Content-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+
+        let forwarded = relay_forward_request_and_capture(
+            "POST",
+            "/api/messages",
+            raw.as_bytes(),
+            Some(&resolver),
+            true,
+        )
+        .await
+        .expect("forward relay should rewrite credentials");
+
+        let expected_body = "token=provider-real-token&channel=C123";
+        assert!(forwarded.contains("Authorization: Bearer provider-real-token\r\n"));
+        assert!(forwarded.contains(&format!("Content-Length: {}\r\n", expected_body.len())));
+        assert!(forwarded.ends_with(expected_body));
+        assert!(!forwarded.contains("openshell%3Aresolve%3Aenv%3AAPI_TOKEN"));
+        assert!(!forwarded.contains("openshell:resolve:env:API_TOKEN"));
+    }
+
+    #[tokio::test]
+    async fn forward_relay_unresolved_body_placeholder_fails_before_upstream_write() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("API_TOKEN".to_string(), "provider-real-token".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let alias = "provider-OPENSHELL-RESOLVE-ENV-API_TOKEN";
+        let body = "token=provider-OPENSHELL-RESOLVE-ENV-MISSING_TOKEN";
+        let raw = format!(
+            "POST http://api.example.com/api/messages HTTP/1.1\r\n\
+             Host: api.example.com\r\n\
+             Authorization: Bearer {alias}\r\n\
+             Content-Type: application/x-www-form-urlencoded\r\n\
+             Content-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let guard = forward_test_guard();
+        let rewritten = rewrite_forward_request(
+            raw.as_bytes(),
+            raw.len(),
+            "/api/messages",
+            Some(&resolver),
+            true,
+        )
+        .expect("header rewrite should defer body overflow to body rewriter");
+        let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
+        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+
+        let err = relay_rewritten_forward_request(
+            "POST",
+            "/api/messages",
+            rewritten,
+            &mut proxy_to_client,
+            &mut proxy_to_upstream,
+            ForwardRelayOptions {
+                generation_guard: &guard,
+                websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
+                secret_resolver: Some(&resolver),
+                request_body_credential_rewrite: true,
+            },
+        )
+        .await
+        .expect_err("unresolved body placeholder should fail closed");
+
+        assert!(!err.to_string().contains("provider-real-token"));
+        assert!(!err.to_string().contains("MISSING_TOKEN"));
+        drop(proxy_to_upstream);
+        let mut forwarded = Vec::new();
+        upstream_side.read_to_end(&mut forwarded).await.unwrap();
+        assert!(
+            forwarded.is_empty(),
+            "failed forward body rewrite must not reach upstream"
+        );
+    }
+
+    #[test]
+    fn test_forward_rewrite_preserves_websocket_upgrade_connection_header() {
+        let raw = "GET http://gateway.example.test/ws HTTP/1.1\r\n\
+                   Host: gateway.example.test\r\n\
+                   Upgrade: websocket\r\n\
+                   Connection: keep-alive, Upgrade\r\n\
+                   Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                   Sec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover\r\n\
+                   Sec-WebSocket-Version: 13\r\n\r\n";
+
+        let result = rewrite_forward_request(raw.as_bytes(), raw.len(), "/ws", None, false)
+            .expect("websocket forward rewrite should succeed");
+        let result_str = String::from_utf8_lossy(&result);
+
+        assert!(result_str.starts_with("GET /ws HTTP/1.1\r\n"));
+        assert!(result_str.contains("Connection: keep-alive, Upgrade\r\n"));
+        assert!(
+            !result_str.contains("Connection: close\r\n"),
+            "websocket forward proxy must not strip the upgrade token"
+        );
     }
 
     #[tokio::test]
@@ -4375,8 +5092,8 @@ mod tests {
         engine.reload(policy, policy_data).unwrap();
 
         let raw = b"GET http://host/api HTTP/1.1\r\nHost: host\r\n\r\n";
-        let rewritten =
-            rewrite_forward_request(raw, raw.len(), "/api", None).expect("rewrite should succeed");
+        let rewritten = rewrite_forward_request(raw, raw.len(), "/api", None, false)
+            .expect("rewrite should succeed");
         let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
         let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
 
@@ -4386,7 +5103,12 @@ mod tests {
             rewritten,
             &mut proxy_to_client,
             &mut proxy_to_upstream,
-            &guard,
+            ForwardRelayOptions {
+                generation_guard: &guard,
+                websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
+                secret_resolver: None,
+                request_body_credential_rewrite: false,
+            },
         )
         .await;
         assert!(
@@ -4413,8 +5135,8 @@ mod tests {
             .unwrap();
 
         let raw = b"POST http://host/api HTTP/1.1\r\nHost: host\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
-        let rewritten =
-            rewrite_forward_request(raw, raw.len(), "/api", None).expect("rewrite should succeed");
+        let rewritten = rewrite_forward_request(raw, raw.len(), "/api", None, false)
+            .expect("rewrite should succeed");
         let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
         let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
 
@@ -4424,7 +5146,12 @@ mod tests {
             rewritten,
             &mut proxy_to_client,
             &mut proxy_to_upstream,
-            &guard,
+            ForwardRelayOptions {
+                generation_guard: &guard,
+                websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
+                secret_resolver: None,
+                request_body_credential_rewrite: false,
+            },
         )
         .await;
         assert!(result.is_err(), "forward relay must reject CL/TE ambiguity");

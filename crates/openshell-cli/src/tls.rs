@@ -342,6 +342,7 @@ pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
         let endpoint = Endpoint::from_shared(server.to_string())
             .into_diagnostic()?
             .connect_timeout(Duration::from_secs(10))
+            .http2_adaptive_window(true)
             .http2_keep_alive_interval(Duration::from_secs(10))
             .keep_alive_while_idle(true);
         return endpoint.connect().await.into_diagnostic();
@@ -362,6 +363,7 @@ pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
         let endpoint = Endpoint::from_shared(local_url)
             .into_diagnostic()?
             .connect_timeout(Duration::from_secs(10))
+            .http2_adaptive_window(true)
             .http2_keep_alive_interval(Duration::from_secs(10))
             .keep_alive_while_idle(true);
         return endpoint.connect().await.into_diagnostic();
@@ -389,6 +391,7 @@ pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
     let mut endpoint = Endpoint::from_shared(server.to_string())
         .into_diagnostic()?
         .connect_timeout(Duration::from_secs(10))
+        .http2_adaptive_window(true)
         .http2_keep_alive_interval(Duration::from_secs(10))
         .keep_alive_while_idle(true);
 
@@ -403,9 +406,12 @@ pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
                     .ca
                     .as_ref()
                     .and_then(|ca_path| std::fs::read(ca_path).ok())
-                    .map_or_else(ClientTlsConfig::new, |ca_pem| {
-                        ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_pem))
-                    })
+                    .map_or_else(
+                        || ClientTlsConfig::new().with_enabled_roots(),
+                        |ca_pem| {
+                            ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_pem))
+                        },
+                    )
             },
             |materials| build_tonic_tls_config(&materials),
         )

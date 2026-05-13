@@ -3,30 +3,30 @@
 
 //! SSH connection and proxy utilities.
 
-use crate::tls::{TlsOptions, build_rustls_config, grpc_client, require_tls_materials};
+use crate::tls::{TlsOptions, grpc_client};
 use miette::{IntoDiagnostic, Result, WrapErr};
 #[cfg(unix)]
 use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
 use openshell_core::ObjectId;
 use openshell_core::forward::{
-    build_proxy_command, find_ssh_forward_pid, resolve_ssh_gateway, shell_escape,
-    validate_ssh_session_response, write_forward_pid,
+    build_proxy_command, find_ssh_forward_pid, format_gateway_url, resolve_ssh_gateway,
+    shell_escape, validate_ssh_session_response, write_forward_pid,
 };
-use openshell_core::proto::{CreateSshSessionRequest, GetSandboxRequest};
+use openshell_core::proto::{
+    CreateSshSessionRequest, GetSandboxRequest, SshRelayTarget, TcpForwardFrame, TcpForwardInit,
+    tcp_forward_init,
+};
 use owo_colors::OwoColorize;
-use rustls::pki_types::ServerName;
 use std::fs;
 use std::io::{IsTerminal, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command as TokioCommand;
-use tokio_rustls::TlsConnector;
+use tokio_stream::wrappers::ReceiverStream;
 
 const FOREGROUND_FORWARD_STARTUP_GRACE_PERIOD: Duration = Duration::from_secs(2);
 
@@ -100,8 +100,7 @@ async fn ssh_session_config(
     // external tunnel endpoint (the cluster URL), not the server's internal
     // scheme/host/port which may be plaintext HTTP on 127.0.0.1.
     let gateway_url = if tls.is_bearer_auth() {
-        let base = server.trim_end_matches('/');
-        format!("{base}{}", session.connect_path)
+        server.trim_end_matches('/').to_string()
     } else {
         // If the server returned a loopback gateway address, override it with the
         // cluster endpoint's host. This handles the case where the server defaults
@@ -110,10 +109,7 @@ async fn ssh_session_config(
         let gateway_port_u16 = session.gateway_port as u16;
         let (gateway_host, gateway_port) =
             resolve_ssh_gateway(&session.gateway_host, gateway_port_u16, server);
-        format!(
-            "{}://{}:{}{}",
-            session.gateway_scheme, gateway_host, gateway_port, session.connect_path
-        )
+        format_gateway_url(&session.gateway_scheme, &gateway_host, gateway_port)
     };
     let gateway_name = tls
         .gateway_name()
@@ -821,18 +817,82 @@ pub async fn sandbox_ssh_proxy(
     token: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
-    // The gateway returns 412 (Precondition Failed) when the sandbox pod
-    // exists but hasn't reached Ready phase yet. This is a transient state
-    // after sandbox allocation — retry with backoff instead of failing
-    // immediately.
-    const MAX_CONNECT_WAIT: Duration = Duration::from_secs(60);
-    const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+    let server = grpc_server_from_ssh_gateway_url(gateway_url)?;
+    let mut client = grpc_client(&server, tls).await?;
 
+    let (tx, rx) = tokio::sync::mpsc::channel::<TcpForwardFrame>(16);
+    tx.send(TcpForwardFrame {
+        payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Init(
+            TcpForwardInit {
+                sandbox_id: sandbox_id.to_string(),
+                service_id: format!("ssh-proxy:{sandbox_id}"),
+                target: Some(tcp_forward_init::Target::Ssh(SshRelayTarget {})),
+                authorization_token: token.to_string(),
+            },
+        )),
+    })
+    .await
+    .map_err(|_| miette::miette!("failed to initialize SSH forward stream"))?;
+
+    let mut response = client
+        .forward_tcp(ReceiverStream::new(rx))
+        .await
+        .into_diagnostic()?
+        .into_inner();
+
+    let stdin = tokio::io::stdin();
+    let stdout = tokio::io::stdout();
+
+    let to_remote = tokio::spawn(async move {
+        let mut stdin = stdin;
+        let mut buf = vec![0u8; 64 * 1024];
+        while let Ok(n) = stdin.read(&mut buf).await {
+            if n == 0 {
+                break;
+            }
+            if tx
+                .send(TcpForwardFrame {
+                    payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Data(
+                        buf[..n].to_vec(),
+                    )),
+                })
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    let from_remote = tokio::spawn(async move {
+        let mut stdout = stdout;
+        loop {
+            let Ok(Some(frame)) = response.message().await else {
+                break;
+            };
+            let Some(openshell_core::proto::tcp_forward_frame::Payload::Data(data)) = frame.payload
+            else {
+                continue;
+            };
+            if data.is_empty() {
+                continue;
+            }
+            if stdout.write_all(&data).await.is_err() {
+                break;
+            }
+            let _ = stdout.flush().await;
+        }
+    });
+    let _ = from_remote.await;
+    to_remote.abort();
+
+    Ok(())
+}
+
+fn grpc_server_from_ssh_gateway_url(gateway_url: &str) -> Result<String> {
     let url: url::Url = gateway_url
         .parse()
         .into_diagnostic()
         .wrap_err("invalid gateway URL")?;
-
     let scheme = url.scheme();
     let gateway_host = url
         .host_str()
@@ -840,69 +900,7 @@ pub async fn sandbox_ssh_proxy(
     let gateway_port = url
         .port_or_known_default()
         .ok_or_else(|| miette::miette!("gateway URL missing port"))?;
-    let connect_path = url.path();
-
-    let request = format!(
-        "CONNECT {connect_path} HTTP/1.1\r\nHost: {gateway_host}\r\nX-Sandbox-Id: {sandbox_id}\r\nX-Sandbox-Token: {token}\r\n\r\n"
-    );
-
-    let start = std::time::Instant::now();
-    let mut backoff = INITIAL_BACKOFF;
-    let mut buf_stream;
-
-    loop {
-        let mut stream: Box<dyn ProxyStream> =
-            connect_gateway(scheme, gateway_host, gateway_port, tls).await?;
-        stream
-            .write_all(request.as_bytes())
-            .await
-            .into_diagnostic()?;
-
-        // Wrap in a BufReader **before** reading the HTTP response.  The gateway
-        // may send the 200 OK response and the first SSH protocol bytes in the
-        // same TCP segment / WebSocket frame.  A plain `read()` would consume
-        // those SSH bytes into our buffer and discard them, causing SSH to see a
-        // truncated protocol banner and exit with code 255.  BufReader ensures
-        // any bytes read past the `\r\n\r\n` header boundary stay buffered and
-        // are returned by subsequent reads during the bidirectional copy phase.
-        buf_stream = BufReader::new(stream);
-        let status = read_connect_status(&mut buf_stream).await?;
-        if status == 200 {
-            break;
-        }
-        if status == 412 && start.elapsed() < MAX_CONNECT_WAIT {
-            tracing::debug!(
-                elapsed = ?start.elapsed(),
-                "sandbox not yet ready (HTTP 412), retrying in {backoff:?}"
-            );
-            tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(Duration::from_secs(8));
-            continue;
-        }
-        return Err(miette::miette!(
-            "gateway CONNECT failed with status {status}"
-        ));
-    }
-
-    let (reader, writer) = tokio::io::split(buf_stream);
-    let stdin = tokio::io::stdin();
-    let stdout = tokio::io::stdout();
-
-    // Spawn both copy directions as independent tasks.  Using separate spawned
-    // tasks (instead of try_join!/select!) ensures that when one direction
-    // completes or errors, the other continues independently until it also
-    // finishes.  This is critical: when the remote side closes the connection,
-    // we must keep the stdin→gateway copy alive so SSH can finish sending its
-    // protocol-close packets, and vice-versa.
-    let to_remote = tokio::spawn(copy_ignoring_errors(stdin, writer));
-    let from_remote = tokio::spawn(copy_ignoring_errors(reader, stdout));
-    let _ = from_remote.await;
-    // Once the remote→stdout direction is done, SSH has received all the data
-    // it needs.  Drop the stdin→gateway task – SSH will close its pipe when
-    // it's done regardless.
-    to_remote.abort();
-
-    Ok(())
+    Ok(format_gateway_url(scheme, gateway_host, gateway_port))
 }
 
 /// Run the SSH proxy in "name mode": create a session on the fly, then proxy.
@@ -1121,93 +1119,6 @@ fn launch_editor_command(binary: &str, label: &str, remote_target: &str) -> Resu
 pub fn print_ssh_config(gateway: &str, name: &str) {
     print!("{}", render_ssh_config(gateway, name));
 }
-
-/// Copy all bytes from `reader` to `writer`, flushing on completion.
-/// Errors are intentionally discarded – connection teardown errors are
-/// expected during normal SSH session shutdown.
-async fn copy_ignoring_errors<R, W>(mut reader: R, mut writer: W)
-where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
-{
-    let _ = tokio::io::copy(&mut reader, &mut writer).await;
-    let _ = AsyncWriteExt::flush(&mut writer).await;
-    let _ = AsyncWriteExt::shutdown(&mut writer).await;
-}
-
-async fn connect_gateway(
-    scheme: &str,
-    host: &str,
-    port: u16,
-    tls: &TlsOptions,
-) -> Result<Box<dyn ProxyStream>> {
-    // When using Cloudflare edge bearer auth, route through the WebSocket
-    // tunnel proxy regardless of the origin scheme. The proxy handles edge
-    // auth headers and TLS termination at the edge; the origin may be
-    // plaintext HTTP behind the tunnel. OIDC tokens bypass the tunnel.
-    if let Some(token) = tls.edge_token.as_deref() {
-        let gateway_url = format!("https://{host}:{port}");
-        let proxy = crate::edge_tunnel::start_tunnel_proxy(&gateway_url, token).await?;
-        let tcp = TcpStream::connect(proxy.local_addr)
-            .await
-            .into_diagnostic()?;
-        tcp.set_nodelay(true).into_diagnostic()?;
-        return Ok(Box::new(tcp));
-    }
-
-    let tcp = TcpStream::connect((host, port)).await.into_diagnostic()?;
-    tcp.set_nodelay(true).into_diagnostic()?;
-    if scheme.eq_ignore_ascii_case("https") {
-        let materials = require_tls_materials(&format!("https://{host}:{port}"), tls)?;
-        let config = build_rustls_config(&materials)?;
-        let connector = TlsConnector::from(Arc::new(config));
-        let server_name = ServerName::try_from(host.to_string())
-            .map_err(|_| miette::miette!("invalid server name: {host}"))?;
-        let tls = connector
-            .connect(server_name, tcp)
-            .await
-            .into_diagnostic()?;
-        Ok(Box::new(tls))
-    } else {
-        Ok(Box::new(tcp))
-    }
-}
-
-/// Read exactly the HTTP response status line and headers up to `\r\n\r\n`.
-///
-/// Uses byte-at-a-time reads so that the caller's `BufReader` retains any
-/// bytes that arrived after the header boundary (e.g. the SSH protocol
-/// banner that the gateway may send in the same TCP segment).
-async fn read_connect_status<R: AsyncRead + Unpin>(stream: &mut R) -> Result<u16> {
-    let mut buf = Vec::new();
-    let mut byte = [0u8; 1];
-    loop {
-        let n = stream.read(&mut byte).await.into_diagnostic()?;
-        if n == 0 {
-            break;
-        }
-        buf.push(byte[0]);
-        if buf.len() >= 4 && &buf[buf.len() - 4..] == b"\r\n\r\n" {
-            break;
-        }
-        if buf.len() > 8192 {
-            break;
-        }
-    }
-    let text = String::from_utf8_lossy(&buf);
-    let line = text.lines().next().unwrap_or("");
-    let status = line
-        .split_whitespace()
-        .nth(1)
-        .unwrap_or("0")
-        .parse::<u16>()
-        .unwrap_or(0);
-    Ok(status)
-}
-
-trait ProxyStream: AsyncRead + AsyncWrite + Unpin + Send {}
-
-impl<T> ProxyStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
 #[cfg(test)]
 mod tests {

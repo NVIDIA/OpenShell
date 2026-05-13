@@ -8,6 +8,7 @@
 //! and either forwards or denies the request.
 
 use crate::l7::provider::{L7Provider, RelayOutcome};
+use crate::l7::rest::WebSocketExtensionMode;
 use crate::l7::{EnforcementMode, L7EndpointConfig, L7Protocol, L7RequestInfo};
 use crate::opa::{PolicyGenerationGuard, TunnelPolicyEngine};
 use crate::secrets::{self, SecretResolver};
@@ -36,6 +37,44 @@ pub struct L7EvalContext {
     pub cmdline_paths: Vec<String>,
     /// Supervisor-only placeholder resolver for outbound headers.
     pub(crate) secret_resolver: Option<Arc<SecretResolver>>,
+}
+
+#[derive(Default)]
+pub(crate) struct UpgradeRelayOptions<'a> {
+    pub(crate) websocket_request: bool,
+    pub(crate) websocket: WebSocketUpgradeBehavior,
+    pub(crate) secret_resolver: Option<Arc<SecretResolver>>,
+    pub(crate) engine: Option<&'a TunnelPolicyEngine>,
+    pub(crate) ctx: Option<&'a L7EvalContext>,
+    pub(crate) enforcement: EnforcementMode,
+    pub(crate) target: String,
+    pub(crate) query_params: std::collections::HashMap<String, Vec<String>>,
+    pub(crate) policy_name: String,
+}
+
+#[derive(Default)]
+pub(crate) struct WebSocketUpgradeBehavior {
+    pub(crate) credential_rewrite: bool,
+    pub(crate) message_policy: WebSocketMessagePolicy,
+    pub(crate) permessage_deflate: bool,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum WebSocketMessagePolicy {
+    #[default]
+    None,
+    Transport,
+    Graphql,
+}
+
+impl WebSocketMessagePolicy {
+    fn inspects_messages(self) -> bool {
+        self != Self::None
+    }
+
+    fn is_graphql(self) -> bool {
+        self == Self::Graphql
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -101,7 +140,9 @@ where
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
     match config.protocol {
-        L7Protocol::Rest => relay_rest(config, &engine, client, upstream, ctx).await,
+        L7Protocol::Rest | L7Protocol::Websocket => {
+            relay_rest(config, &engine, client, upstream, ctx).await
+        }
         L7Protocol::Graphql => relay_graphql(config, &engine, client, upstream, ctx).await,
         L7Protocol::Sql => {
             if close_if_stale(engine.generation_guard(), ctx) {
@@ -242,6 +283,24 @@ where
             query_params: req.query_params.clone(),
             graphql: graphql_info.clone(),
         };
+        let websocket_request = crate::l7::rest::request_is_websocket_upgrade(&req.raw_header);
+        if config.protocol == L7Protocol::Websocket && !websocket_request {
+            crate::l7::rest::RestProvider::default()
+                .deny_with_redacted_target(
+                    &req,
+                    &ctx.policy_name,
+                    "websocket endpoint requires a valid WebSocket upgrade request",
+                    client,
+                    Some(&redacted_target),
+                    Some(crate::l7::rest::DenyResponseContext {
+                        host: Some(&ctx.host),
+                        port: Some(ctx.port),
+                        binary: Some(&ctx.binary_path),
+                    }),
+                )
+                .await?;
+            return Ok(());
+        }
 
         let parse_error_reason = graphql_info
             .as_ref()
@@ -264,10 +323,10 @@ where
             (false, EnforcementMode::Audit) => "audit",
             (false, EnforcementMode::Enforce) => "deny",
         };
-        let engine_type = if config.protocol == L7Protocol::Graphql {
-            "l7-graphql"
-        } else {
-            "l7"
+        let engine_type = match config.protocol {
+            L7Protocol::Graphql => "l7-graphql",
+            L7Protocol::Websocket => "l7-websocket",
+            L7Protocol::Rest | L7Protocol::Sql => "l7",
         };
         emit_l7_request_log(
             ctx,
@@ -282,19 +341,39 @@ where
         let _ = &eval_target;
 
         if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
-            let outcome = crate::l7::rest::relay_http_request_with_resolver_guarded(
+            let outcome = crate::l7::rest::relay_http_request_with_options_guarded(
                 &req,
                 client,
                 upstream,
-                ctx.secret_resolver.as_deref(),
-                Some(engine.generation_guard()),
+                crate::l7::rest::RelayRequestOptions {
+                    resolver: ctx.secret_resolver.as_deref(),
+                    generation_guard: Some(engine.generation_guard()),
+                    websocket_extensions: websocket_extension_mode(config),
+                    request_body_credential_rewrite: config.protocol == L7Protocol::Rest
+                        && config.request_body_credential_rewrite,
+                },
             )
             .await?;
             match outcome {
                 RelayOutcome::Reusable => {}
                 RelayOutcome::Consumed => return Ok(()),
-                RelayOutcome::Upgraded { overflow } => {
-                    return handle_upgrade(client, upstream, overflow, &ctx.host, ctx.port).await;
+                RelayOutcome::Upgraded {
+                    overflow,
+                    websocket_permessage_deflate,
+                } => {
+                    let mut options = upgrade_options(
+                        config,
+                        ctx,
+                        websocket_request,
+                        &redacted_target,
+                        &req.query_params,
+                        Some(&engine),
+                    );
+                    options.websocket.permessage_deflate = websocket_permessage_deflate;
+                    return handle_upgrade(
+                        client, upstream, overflow, &ctx.host, ctx.port, options,
+                    )
+                    .await;
                 }
             }
         } else {
@@ -374,20 +453,29 @@ fn emit_l7_request_log(
 /// Handle an upgraded connection (101 Switching Protocols).
 ///
 /// Forwards any overflow bytes from the upgrade response to the client, then
-/// switches to raw bidirectional TCP copy for the upgraded protocol (WebSocket,
-/// HTTP/2, etc.). L7 policy enforcement does not apply after the upgrade —
-/// the initial HTTP request was already evaluated.
+/// either switches to a parsed WebSocket relay for opted-in message policy /
+/// credential rewriting or to raw bidirectional TCP copy for other upgrades.
 pub(crate) async fn handle_upgrade<C, U>(
     client: &mut C,
     upstream: &mut U,
     overflow: Vec<u8>,
     host: &str,
     port: u16,
+    options: UpgradeRelayOptions<'_>,
 ) -> Result<()>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    let use_websocket_relay = options.websocket_request
+        && (options.websocket.message_policy.inspects_messages()
+            || options.websocket.permessage_deflate
+            || (options.websocket.credential_rewrite && options.secret_resolver.is_some()));
+    let relay_mode = if use_websocket_relay {
+        "websocket parsed relay"
+    } else {
+        "raw bidirectional relay (L7 enforcement no longer active)"
+    };
     ocsf_emit!(
         NetworkActivityBuilder::new(crate::ocsf_ctx())
             .activity(ActivityId::Other)
@@ -395,12 +483,56 @@ where
             .severity(SeverityId::Informational)
             .dst_endpoint(Endpoint::from_domain(host, port))
             .message(format!(
-                "101 Switching Protocols — raw bidirectional relay (L7 enforcement no longer active) \
-                 [host:{host} port:{port} overflow_bytes:{}]",
+                "101 Switching Protocols — {relay_mode} [host:{host} port:{port} overflow_bytes:{}]",
                 overflow.len()
             ))
             .build()
     );
+    if use_websocket_relay {
+        let resolver = if options.websocket.credential_rewrite {
+            options.secret_resolver.as_deref()
+        } else {
+            None
+        };
+        let inspector = if options.websocket.message_policy.inspects_messages() {
+            match (options.engine, options.ctx) {
+                (Some(engine), Some(ctx)) => Some(crate::l7::websocket::InspectionOptions {
+                    engine,
+                    ctx,
+                    enforcement: options.enforcement,
+                    target: options.target.clone(),
+                    query_params: options.query_params.clone(),
+                    graphql_policy: options.websocket.message_policy.is_graphql(),
+                }),
+                _ => {
+                    return Err(miette!(
+                        "websocket message inspection missing policy context"
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        let compression = if options.websocket.permessage_deflate {
+            crate::l7::websocket::WebSocketCompression::PermessageDeflate
+        } else {
+            crate::l7::websocket::WebSocketCompression::None
+        };
+        return crate::l7::websocket::relay_with_options(
+            client,
+            upstream,
+            overflow,
+            host,
+            port,
+            crate::l7::websocket::RelayOptions {
+                policy_name: &options.policy_name,
+                resolver,
+                inspector,
+                compression,
+            },
+        )
+        .await;
+    }
     if !overflow.is_empty() {
         client.write_all(&overflow).await.into_diagnostic()?;
         client.flush().await.into_diagnostic()?;
@@ -409,6 +541,57 @@ where
         .await
         .into_diagnostic()?;
     Ok(())
+}
+
+pub(crate) fn upgrade_options<'a>(
+    config: &L7EndpointConfig,
+    ctx: &'a L7EvalContext,
+    websocket_request: bool,
+    target: &str,
+    query_params: &std::collections::HashMap<String, Vec<String>>,
+    engine: Option<&'a TunnelPolicyEngine>,
+) -> UpgradeRelayOptions<'a> {
+    let websocket_credential_rewrite =
+        matches!(config.protocol, L7Protocol::Rest | L7Protocol::Websocket)
+            && config.websocket_credential_rewrite;
+    let websocket_message_policy = if config.protocol == L7Protocol::Websocket {
+        if config.websocket_graphql_policy {
+            WebSocketMessagePolicy::Graphql
+        } else {
+            WebSocketMessagePolicy::Transport
+        }
+    } else {
+        WebSocketMessagePolicy::None
+    };
+    UpgradeRelayOptions {
+        websocket_request,
+        websocket: WebSocketUpgradeBehavior {
+            credential_rewrite: websocket_credential_rewrite,
+            message_policy: websocket_message_policy,
+            permessage_deflate: false,
+        },
+        secret_resolver: if websocket_credential_rewrite {
+            ctx.secret_resolver.clone()
+        } else {
+            None
+        },
+        engine,
+        ctx: engine.map(|_| ctx),
+        enforcement: config.enforcement,
+        target: target.to_string(),
+        query_params: query_params.clone(),
+        policy_name: ctx.policy_name.clone(),
+    }
+}
+
+pub(crate) fn websocket_extension_mode(config: &L7EndpointConfig) -> WebSocketExtensionMode {
+    if config.protocol == L7Protocol::Websocket
+        || (config.protocol == L7Protocol::Rest && config.websocket_credential_rewrite)
+    {
+        WebSocketExtensionMode::PermessageDeflate
+    } else {
+        WebSocketExtensionMode::Preserve
+    }
 }
 
 /// REST relay loop: parse request -> evaluate -> allow/deny -> relay response -> repeat.
@@ -490,6 +673,24 @@ where
             query_params: req.query_params.clone(),
             graphql: None,
         };
+        let websocket_request = crate::l7::rest::request_is_websocket_upgrade(&req.raw_header);
+        if config.protocol == L7Protocol::Websocket && !websocket_request {
+            provider
+                .deny_with_redacted_target(
+                    &req,
+                    &ctx.policy_name,
+                    "websocket endpoint requires a valid WebSocket upgrade request",
+                    client,
+                    Some(&redacted_target),
+                    Some(crate::l7::rest::DenyResponseContext {
+                        host: Some(&ctx.host),
+                        port: Some(ctx.port),
+                        binary: Some(&ctx.binary_path),
+                    }),
+                )
+                .await?;
+            return Ok(());
+        }
 
         // Evaluate L7 policy via Rego (using redacted target)
         let (allowed, reason) = evaluate_l7_request(engine, ctx, &request_info)?;
@@ -558,12 +759,17 @@ where
 
         if allowed || config.enforcement == EnforcementMode::Audit {
             // Forward request to upstream and relay response
-            let outcome = crate::l7::rest::relay_http_request_with_resolver_guarded(
+            let outcome = crate::l7::rest::relay_http_request_with_options_guarded(
                 &req,
                 client,
                 upstream,
-                ctx.secret_resolver.as_deref(),
-                Some(engine.generation_guard()),
+                crate::l7::rest::RelayRequestOptions {
+                    resolver: ctx.secret_resolver.as_deref(),
+                    generation_guard: Some(engine.generation_guard()),
+                    websocket_extensions: websocket_extension_mode(config),
+                    request_body_credential_rewrite: config.protocol == L7Protocol::Rest
+                        && config.request_body_credential_rewrite,
+                },
             )
             .await?;
             match outcome {
@@ -576,8 +782,23 @@ where
                     );
                     return Ok(());
                 }
-                RelayOutcome::Upgraded { overflow } => {
-                    return handle_upgrade(client, upstream, overflow, &ctx.host, ctx.port).await;
+                RelayOutcome::Upgraded {
+                    overflow,
+                    websocket_permessage_deflate,
+                } => {
+                    let mut options = upgrade_options(
+                        config,
+                        ctx,
+                        websocket_request,
+                        &redacted_target,
+                        &req.query_params,
+                        Some(engine),
+                    );
+                    options.websocket.permessage_deflate = websocket_permessage_deflate;
+                    return handle_upgrade(
+                        client, upstream, overflow, &ctx.host, ctx.port, options,
+                    )
+                    .await;
                 }
             }
         } else {
@@ -787,8 +1008,21 @@ where
                     );
                     return Ok(());
                 }
-                RelayOutcome::Upgraded { overflow } => {
-                    return handle_upgrade(client, upstream, overflow, &ctx.host, ctx.port).await;
+                RelayOutcome::Upgraded {
+                    overflow,
+                    websocket_permessage_deflate,
+                } => {
+                    let options = UpgradeRelayOptions {
+                        websocket: WebSocketUpgradeBehavior {
+                            permessage_deflate: websocket_permessage_deflate,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    };
+                    return handle_upgrade(
+                        client, upstream, overflow, &ctx.host, ctx.port, options,
+                    )
+                    .await;
                 }
             }
         } else {
@@ -1016,20 +1250,31 @@ where
         // Forward request with credential rewriting and relay the response.
         // relay_http_request_with_resolver handles both directions: it sends
         // the request upstream and reads the response back to the client.
-        let outcome = crate::l7::rest::relay_http_request_with_resolver_guarded(
+        let outcome = crate::l7::rest::relay_http_request_with_options_guarded(
             &req,
             client,
             upstream,
-            resolver,
-            Some(generation_guard),
+            crate::l7::rest::RelayRequestOptions {
+                resolver,
+                generation_guard: Some(generation_guard),
+                ..Default::default()
+            },
         )
         .await?;
 
         match outcome {
             RelayOutcome::Reusable => {} // continue loop
             RelayOutcome::Consumed => break,
-            RelayOutcome::Upgraded { overflow } => {
-                return handle_upgrade(client, upstream, overflow, &ctx.host, ctx.port).await;
+            RelayOutcome::Upgraded { overflow, .. } => {
+                return handle_upgrade(
+                    client,
+                    upstream,
+                    overflow,
+                    &ctx.host,
+                    ctx.port,
+                    UpgradeRelayOptions::default(),
+                )
+                .await;
             }
         }
     }
@@ -1049,7 +1294,7 @@ mod tests {
     use super::*;
     use crate::opa::{NetworkInput, OpaEngine};
     use std::path::PathBuf;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
     const TEST_POLICY: &str = include_str!("../../data/sandbox-policy.rego");
 
@@ -1084,6 +1329,436 @@ mod tests {
             parse_rejection_detail(error, ParseRejectionMode::L7Endpoint),
             error
         );
+    }
+
+    #[test]
+    fn websocket_text_policy_requires_explicit_message_rule() {
+        let data = r#"
+network_policies:
+  ws_api:
+    name: ws_api
+    endpoints:
+      - host: gateway.example.test
+        port: 443
+        protocol: websocket
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/ws"
+    binaries:
+      - { path: /usr/bin/node }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let input = NetworkInput {
+            host: "gateway.example.test".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/node"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let generation = engine
+            .evaluate_network_action_with_generation(&input)
+            .unwrap()
+            .1;
+        let tunnel_engine = engine.clone_engine_for_tunnel(generation).unwrap();
+        let ctx = L7EvalContext {
+            host: "gateway.example.test".into(),
+            port: 443,
+            policy_name: "ws_api".into(),
+            binary_path: "/usr/bin/node".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: None,
+        };
+        let request = L7RequestInfo {
+            action: "WEBSOCKET_TEXT".into(),
+            target: "/ws".into(),
+            query_params: std::collections::HashMap::new(),
+            graphql: None,
+        };
+
+        let (allowed, reason) = evaluate_l7_request(&tunnel_engine, &ctx, &request).unwrap();
+
+        assert!(!allowed);
+        assert!(reason.contains("WEBSOCKET_TEXT /ws not permitted"));
+    }
+
+    #[tokio::test]
+    async fn route_selected_websocket_upgrade_rejects_invalid_accept_without_forwarding_101() {
+        let data = r#"
+network_policies:
+  route_api:
+    name: route_api
+    endpoints:
+      - host: gateway.example.test
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/ws"
+    binaries:
+      - { path: /usr/bin/node }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let tunnel_engine = engine
+            .clone_engine_for_tunnel(engine.current_generation())
+            .unwrap();
+        let configs = vec![L7EndpointConfig {
+            protocol: L7Protocol::Rest,
+            path: "/ws".into(),
+            tls: crate::l7::TlsMode::Auto,
+            enforcement: EnforcementMode::Enforce,
+            graphql_max_body_bytes: 0,
+            allow_encoded_slash: false,
+            websocket_credential_rewrite: true,
+            request_body_credential_rewrite: false,
+            websocket_graphql_policy: false,
+        }];
+        let ctx = L7EvalContext {
+            host: "gateway.example.test".into(),
+            port: 443,
+            policy_name: "route_api".into(),
+            binary_path: "/usr/bin/node".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: None,
+        };
+
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_route_selection(
+                &configs,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        app.write_all(
+            b"GET /ws HTTP/1.1\r\nHost: gateway.example.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+        let mut forwarded = [0u8; 1024];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upstream.read(&mut forwarded),
+        )
+        .await
+        .expect("upgrade request should reach upstream")
+        .unwrap();
+        let forwarded = String::from_utf8_lossy(&forwarded[..n]);
+        assert!(forwarded.contains("Upgrade: websocket\r\n"));
+        assert!(forwarded.contains("Connection: Upgrade\r\n"));
+
+        upstream
+            .write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: invalid\r\n\r\n",
+            )
+            .await
+            .unwrap();
+
+        let err = tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should fail closed on invalid accept")
+            .unwrap()
+            .expect_err("invalid accept must fail the route-selected relay");
+        assert!(err.to_string().contains("Sec-WebSocket-Accept"));
+
+        let mut response = [0u8; 1];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(1), app.read(&mut response))
+            .await
+            .expect("client side should close without 101")
+            .unwrap();
+        assert_eq!(n, 0, "invalid response must not forward 101 headers");
+    }
+
+    #[tokio::test]
+    async fn route_selected_websocket_rewrites_text_credentials_after_upgrade() {
+        let data = r#"
+network_policies:
+  route_api:
+    name: route_api
+    endpoints:
+      - host: gateway.example.test
+        port: 443
+        protocol: websocket
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/ws"
+          - allow:
+              method: WEBSOCKET_TEXT
+              path: "/ws"
+        websocket_credential_rewrite: true
+    binaries:
+      - { path: /usr/bin/node }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let tunnel_engine = engine
+            .clone_engine_for_tunnel(engine.current_generation())
+            .unwrap();
+        let configs = vec![L7EndpointConfig {
+            protocol: L7Protocol::Websocket,
+            path: "/ws".into(),
+            tls: crate::l7::TlsMode::Auto,
+            enforcement: EnforcementMode::Enforce,
+            graphql_max_body_bytes: 0,
+            allow_encoded_slash: false,
+            websocket_credential_rewrite: true,
+            request_body_credential_rewrite: false,
+            websocket_graphql_policy: false,
+        }];
+        let (child_env, resolver) = SecretResolver::from_provider_env(
+            std::iter::once(("DISCORD_BOT_TOKEN".to_string(), "real-token".to_string())).collect(),
+        );
+        let placeholder = child_env.get("DISCORD_BOT_TOKEN").expect("placeholder env");
+        let ctx = L7EvalContext {
+            host: "gateway.example.test".into(),
+            port: 443,
+            policy_name: "route_api".into(),
+            binary_path: "/usr/bin/node".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: resolver.map(Arc::new),
+        };
+
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_route_selection(
+                &configs,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        app.write_all(
+            b"GET /ws HTTP/1.1\r\nHost: gateway.example.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+        let mut forwarded = [0u8; 1024];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upstream.read(&mut forwarded),
+        )
+        .await
+        .expect("upgrade request should reach upstream")
+        .unwrap();
+        let forwarded = String::from_utf8_lossy(&forwarded[..n]);
+        assert!(forwarded.contains("Upgrade: websocket\r\n"));
+
+        upstream
+            .write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+            )
+            .await
+            .unwrap();
+
+        let mut response = [0u8; 1024];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(1), app.read(&mut response))
+            .await
+            .expect("client should receive upgrade response")
+            .unwrap();
+        assert!(String::from_utf8_lossy(&response[..n]).contains("101 Switching Protocols"));
+
+        let payload = format!(r#"{{"op":2,"d":{{"token":"{placeholder}"}}}}"#);
+        app.write_all(&masked_text_frame(payload.as_bytes()))
+            .await
+            .unwrap();
+
+        let (masked, rewritten) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            read_text_frame(&mut upstream),
+        )
+        .await
+        .expect("rewritten websocket text should reach upstream")
+        .unwrap();
+        assert!(masked, "client-to-server frame must remain masked");
+        assert_eq!(rewritten, r#"{"op":2,"d":{"token":"real-token"}}"#);
+        assert!(!rewritten.contains(placeholder));
+
+        drop(app);
+        drop(upstream);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), relay).await;
+    }
+
+    #[tokio::test]
+    async fn route_selected_graphql_websocket_rewrites_connection_init_credentials_after_upgrade() {
+        let data = r#"
+network_policies:
+  route_api:
+    name: route_api
+    endpoints:
+      - host: gateway.example.test
+        port: 443
+        path: "/graphql"
+        protocol: websocket
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/graphql"
+          - allow:
+              operation_type: query
+              fields: [viewer]
+        websocket_credential_rewrite: true
+    binaries:
+      - { path: /usr/bin/node }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let tunnel_engine = engine
+            .clone_engine_for_tunnel(engine.current_generation())
+            .unwrap();
+        let configs = vec![L7EndpointConfig {
+            protocol: L7Protocol::Websocket,
+            path: "/graphql".into(),
+            tls: crate::l7::TlsMode::Auto,
+            enforcement: EnforcementMode::Enforce,
+            graphql_max_body_bytes: 0,
+            allow_encoded_slash: false,
+            websocket_credential_rewrite: true,
+            request_body_credential_rewrite: false,
+            websocket_graphql_policy: true,
+        }];
+        let (child_env, resolver) = SecretResolver::from_provider_env(
+            std::iter::once(("T".to_string(), "real-token".to_string())).collect(),
+        );
+        let placeholder = child_env.get("T").expect("placeholder env");
+        let ctx = L7EvalContext {
+            host: "gateway.example.test".into(),
+            port: 443,
+            policy_name: "route_api".into(),
+            binary_path: "/usr/bin/node".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: resolver.map(Arc::new),
+        };
+
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_route_selection(
+                &configs,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        app.write_all(
+            b"GET /graphql HTTP/1.1\r\nHost: gateway.example.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .await
+        .unwrap();
+
+        let mut forwarded = [0u8; 1024];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upstream.read(&mut forwarded),
+        )
+        .await
+        .expect("upgrade request should reach upstream")
+        .unwrap();
+        let forwarded = String::from_utf8_lossy(&forwarded[..n]);
+        assert!(forwarded.contains("GET /graphql HTTP/1.1"));
+        assert!(forwarded.contains("Upgrade: websocket\r\n"));
+
+        upstream
+            .write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+            )
+            .await
+            .unwrap();
+
+        let mut response = [0u8; 1024];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(1), app.read(&mut response))
+            .await
+            .expect("client should receive upgrade response")
+            .unwrap();
+        assert!(String::from_utf8_lossy(&response[..n]).contains("101 Switching Protocols"));
+
+        let payload = format!(
+            r#"{{"type":"connection_init","payload":{{"authorization":"{placeholder}"}}}}"#
+        );
+        app.write_all(&masked_text_frame(payload.as_bytes()))
+            .await
+            .unwrap();
+
+        let (masked, rewritten) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            read_text_frame(&mut upstream),
+        )
+        .await
+        .expect("rewritten GraphQL WebSocket control message should reach upstream")
+        .unwrap();
+        assert!(masked, "client-to-server frame must remain masked");
+        assert_eq!(
+            rewritten,
+            r#"{"type":"connection_init","payload":{"authorization":"real-token"}}"#
+        );
+        assert!(!rewritten.contains(placeholder));
+
+        drop(app);
+        drop(upstream);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), relay).await;
+    }
+
+    fn masked_text_frame(payload: &[u8]) -> Vec<u8> {
+        let mask = [0x11, 0x22, 0x33, 0x44];
+        assert!(
+            payload.len() <= 125,
+            "test helper only supports small frames"
+        );
+        let payload_len = u8::try_from(payload.len()).expect("small frame length");
+        let mut frame = vec![0x81, 0x80 | payload_len];
+        frame.extend_from_slice(&mask);
+        frame.extend(
+            payload
+                .iter()
+                .enumerate()
+                .map(|(idx, byte)| byte ^ mask[idx % 4]),
+        );
+        frame
+    }
+
+    async fn read_text_frame<R: AsyncRead + Unpin>(
+        reader: &mut R,
+    ) -> std::io::Result<(bool, String)> {
+        let mut header = [0u8; 2];
+        reader.read_exact(&mut header).await?;
+        assert_eq!(header[0] & 0x0f, 0x1, "expected text frame");
+        let masked = header[1] & 0x80 != 0;
+        let payload_len = usize::from(header[1] & 0x7f);
+        assert!(payload_len <= 125, "test helper only supports small frames");
+        let mut mask = [0u8; 4];
+        if masked {
+            reader.read_exact(&mut mask).await?;
+        }
+        let mut payload = vec![0u8; payload_len];
+        reader.read_exact(&mut payload).await?;
+        if masked {
+            for (idx, byte) in payload.iter_mut().enumerate() {
+                *byte ^= mask[idx % 4];
+            }
+        }
+        Ok((masked, String::from_utf8(payload).expect("text payload")))
     }
 
     #[tokio::test]

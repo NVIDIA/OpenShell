@@ -11,7 +11,7 @@ keywords: "Generative AI, Cybersecurity, Tutorial, GitHub, Sandbox, Policy, Clau
 This tutorial walks through an iterative sandbox policy workflow. You launch a sandbox, ask Claude Code to push code to GitHub, and observe the default network policy denying the request.
 You then diagnose the denial from your machine and from inside the sandbox, apply a policy update, and verify that the policy update to the sandbox takes effect.
 
-After completing this tutorial, you will have:
+After completing this tutorial, you have:
 
 - A running sandbox with Claude Code that can push to a GitHub repository.
 - A custom network policy that grants GitHub access for a specific repository.
@@ -131,7 +131,7 @@ The sandbox runs a proxy that enforces policies on outbound traffic.
 The `github_rest_api` policy allows GET requests (used to read the file)
 but blocks PUT/write requests to GitHub. This is a sandbox-level restriction,
 not a token issue. No matter what token you provide, pushes through the API
-will be blocked until the policy is updated.
+are blocked until you update the policy.
 </Accordion>
 
 Both perspectives confirm the same thing: the proxy is doing its job. The default policy is designed to be restrictive. To allow GitHub pushes, you need to update the network policy.
@@ -162,7 +162,7 @@ Refer to the following policy example to compare with the generated policy befor
 
 The following YAML shows a complete policy that extends the [default policy](/reference/default-policy) with GitHub access for a single repository. Replace `<org>` with your GitHub organization or username and `<repo>` with your repository name.
 
-The `filesystem_policy`, `landlock`, and `process` sections are static. They are read once at sandbox creation and cannot be changed by a hot-reload. They are included here for completeness so the file is self-contained, but only the `network_policies` section takes effect when you apply this to a running sandbox.
+The `filesystem_policy`, `landlock`, and `process` sections are static. OpenShell reads them at sandbox creation, and a hot reload cannot change them. They are included here for completeness so the file is self-contained, but only the `network_policies` section takes effect when you apply this to a running sandbox.
 
 ```yaml
 version: 1

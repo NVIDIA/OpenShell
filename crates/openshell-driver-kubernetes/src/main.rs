@@ -11,6 +11,7 @@ use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_driver_kubernetes::{
     ComputeDriverService, KubernetesComputeConfig, KubernetesComputeDriver,
+    SupervisorSideloadMethod,
 };
 
 #[derive(Parser, Debug)]
@@ -64,6 +65,13 @@ struct Args {
     #[arg(long, env = "OPENSHELL_SUPERVISOR_IMAGE_PULL_POLICY")]
     supervisor_image_pull_policy: Option<String>,
 
+    #[arg(
+        long,
+        env = "OPENSHELL_SUPERVISOR_SIDELOAD_METHOD",
+        default_value = "image-volume"
+    )]
+    supervisor_sideload_method: SupervisorSideloadMethod,
+
     #[arg(long, env = "OPENSHELL_ENABLE_USER_NAMESPACES")]
     enable_user_namespaces: bool,
 }
@@ -85,6 +93,7 @@ async fn main() -> Result<()> {
             .supervisor_image
             .unwrap_or_else(|| openshell_core::config::DEFAULT_SUPERVISOR_IMAGE.to_string()),
         supervisor_image_pull_policy: args.supervisor_image_pull_policy.unwrap_or_default(),
+        supervisor_sideload_method: args.supervisor_sideload_method,
         grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
         ssh_socket_path: args.sandbox_ssh_socket_path,
         ssh_handshake_secret: args.ssh_handshake_secret,

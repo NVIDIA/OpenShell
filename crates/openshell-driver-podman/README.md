@@ -46,6 +46,7 @@ The container spec in `container.rs` sets these security-critical fields:
 | `no_new_privileges` | `true` | Prevents privilege escalation after exec. |
 | `seccomp_profile_path` | `unconfined` | The supervisor installs its own policy-aware BPF filter. A container-level profile can block Landlock/seccomp syscalls during setup. |
 | `mounts` | Private tmpfs at `/run/netns` | Lets the supervisor create named network namespaces in rootless Podman. |
+| CDI GPU devices | Sandbox `gpu_device` value when set, otherwise all NVIDIA GPUs | Exposes requested GPUs to GPU-enabled sandbox containers. |
 
 The restricted agent child does not retain these supervisor privileges.
 
@@ -85,8 +86,8 @@ sequenceDiagram
     C->>C: entrypoint: /opt/openshell/bin/openshell-sandbox
 ```
 
-The `supervisor` target in `deploy/docker/Dockerfile.images` copies the
-`openshell-sandbox` binary to `/openshell-sandbox` in the supervisor image.
+The supervisor image from `deploy/docker/Dockerfile.supervisor` copies the static
+`openshell-sandbox` binary to `/openshell-sandbox`.
 Mounting that image at `/opt/openshell/bin` makes the binary available as
 `/opt/openshell/bin/openshell-sandbox`.
 
@@ -351,4 +352,4 @@ matter compared to cluster or rootful runtimes:
   netns, proxy, and relay behavior shared by all drivers.
 - Container engine abstraction: `tasks/scripts/container-engine.sh` for
   build/deploy support across Docker and Podman.
-- Supervisor image build: `deploy/docker/Dockerfile.images`.
+- Supervisor image build: `deploy/docker/Dockerfile.supervisor`.

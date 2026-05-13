@@ -260,6 +260,16 @@ request_denied_for_endpoint(request, endpoint) if {
 	not graphql_request_allowed(request, endpoint)
 }
 
+# The same authority applies when a WebSocket endpoint opts into GraphQL
+# operation policy. Once the relay classifies a client text message as a
+# GraphQL-over-WebSocket operation, generic WEBSOCKET_TEXT rules must not bypass
+# operation_type / operation_name / fields policy.
+request_denied_for_endpoint(request, endpoint) if {
+	endpoint.protocol == "websocket"
+	is_object(request.graphql)
+	not graphql_request_allowed(request, endpoint)
+}
+
 # Deny query matching: fail-closed semantics.
 # If no query rules on the deny rule, match unconditionally (any query params).
 # If query rules present, trigger the deny if ANY value for a configured key

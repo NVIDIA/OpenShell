@@ -140,7 +140,7 @@ For gateways behind a reverse proxy that handles authentication (e.g. Cloudflare
 1. The CLI stores gateway metadata with the edge authentication mode.
 2. Opens your browser to the gateway's authentication endpoint.
 3. The reverse proxy handles login (SSO, identity provider, etc.).
-4. After authentication, the browser relays the authorization token back to the CLI via a localhost callback.
+4. After authentication, the browser relays the authorization token back to the CLI through a localhost callback.
 5. The CLI stores the token and sets the gateway as active.
 
 **Connection flow** (subsequent commands):

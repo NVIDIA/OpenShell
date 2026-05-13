@@ -1,0 +1,41 @@
+# syntax=docker/dockerfile:1.4
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Gateway image build.
+#
+# The Rust binary is built natively before this image build runs and staged at:
+#   deploy/docker/.build/prebuilt-binaries/<arch>/openshell-gateway
+#
+# Use tasks/scripts/docker-build-image.sh gateway (or `mise run build:docker:gateway`)
+# to stage the binary and build the image in one step. CI builds the binary
+# per-architecture via the `rust-native-build.yml` workflow and uploads it as
+# an artifact, which is downloaded into the same staging directory before the
+# image build job runs.
+#
+# The runtime is `nvcr.io/nvidia/distroless/cc:4.0.0`, which provides glibc and
+# the dynamic loader needed by the GNU-linked gateway binary while keeping the
+# attack surface small.
+
+ARG GATEWAY_BASE_IMAGE=nvcr.io/nvidia/distroless/cc:v4.0.4
+
+FROM ${GATEWAY_BASE_IMAGE} AS gateway
+
+ARG TARGETARCH
+
+WORKDIR /app
+
+# --chmod=0550 preserves the executable bit through actions/upload-artifact +
+# download-artifact (which strip exec perms during the roundtrip) without
+# granting world-execute. --chown=nvs:nvs matches the image's only defined
+# non-root user (`nvs:1000`, the NVIDIA distroless convention) and aligns
+# with the Helm chart's `securityContext.runAsUser: 1000`, which overrides
+# the Dockerfile's USER at runtime.
+COPY --chown=nvs:nvs --chmod=0550 deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-gateway /usr/local/bin/openshell-gateway
+
+USER nvs:nvs
+EXPOSE 8080
+
+ENTRYPOINT ["/usr/local/bin/openshell-gateway"]
+CMD ["--bind-address", "0.0.0.0", "--port", "8080"]

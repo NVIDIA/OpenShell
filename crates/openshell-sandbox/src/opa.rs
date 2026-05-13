@@ -1061,6 +1061,12 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                     if e.allow_encoded_slash {
                         ep["allow_encoded_slash"] = true.into();
                     }
+                    if e.websocket_credential_rewrite {
+                        ep["websocket_credential_rewrite"] = true.into();
+                    }
+                    if e.request_body_credential_rewrite {
+                        ep["request_body_credential_rewrite"] = true.into();
+                    }
                     if !e.persisted_queries.is_empty() {
                         ep["persisted_queries"] = e.persisted_queries.clone().into();
                     }
@@ -1811,6 +1817,28 @@ network_policies:
         access: read-only
     binaries:
       - { path: /usr/bin/curl }
+  graphql_ws:
+    name: graphql_ws
+    endpoints:
+      - host: realtime.graphql.com
+        ports: [443]
+        path: "/graphql"
+        protocol: websocket
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/graphql"
+          - allow:
+              operation_type: query
+              fields: [viewer]
+          - allow:
+              operation_type: subscription
+              fields: [messageAdded]
+        deny_rules:
+          - operation_type: mutation
+    binaries:
+      - { path: /usr/bin/curl }
   l4_only:
     name: l4_only
     endpoints:
@@ -1892,6 +1920,25 @@ process:
                 "graphql": {
                     "operations": [],
                     "error": error
+                }
+            }
+        })
+    }
+
+    fn l7_websocket_graphql_input(host: &str, operations: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "network": { "host": host, "port": 443 },
+            "exec": {
+                "path": "/usr/bin/curl",
+                "ancestors": [],
+                "cmdline_paths": []
+            },
+            "request": {
+                "method": "WEBSOCKET_TEXT",
+                "path": "/graphql",
+                "query_params": {},
+                "graphql": {
+                    "operations": operations
                 }
             }
         })
@@ -2132,6 +2179,97 @@ process:
             }]),
         );
         assert!(!eval_l7(&engine, &mutation));
+    }
+
+    #[test]
+    fn l7_websocket_graphql_subscription_allowed_by_field_rule() {
+        let engine = l7_engine();
+        let input = l7_websocket_graphql_input(
+            "realtime.graphql.com",
+            serde_json::json!([{
+                "operation_type": "subscription",
+                "operation_name": "NewMessages",
+                "fields": ["messageAdded"],
+                "persisted_query": false
+            }]),
+        );
+        assert!(eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_websocket_graphql_unlisted_field_denied() {
+        let engine = l7_engine();
+        let input = l7_websocket_graphql_input(
+            "realtime.graphql.com",
+            serde_json::json!([{
+                "operation_type": "query",
+                "fields": ["adminAuditLog"],
+                "persisted_query": false
+            }]),
+        );
+        assert!(!eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_websocket_graphql_deny_rule_takes_precedence() {
+        let engine = l7_engine();
+        let input = l7_websocket_graphql_input(
+            "realtime.graphql.com",
+            serde_json::json!([{
+                "operation_type": "mutation",
+                "operation_name": "DeleteRepo",
+                "fields": ["deleteRepository"],
+                "persisted_query": false
+            }]),
+        );
+        assert!(!eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_websocket_graphql_not_bypassed_by_generic_text_rule() {
+        let data = r#"
+network_policies:
+  graphql_ws:
+    name: graphql_ws
+    endpoints:
+      - host: realtime.graphql.com
+        ports: [443]
+        path: "/graphql"
+        protocol: websocket
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/graphql"
+          - allow:
+              method: WEBSOCKET_TEXT
+              path: "/graphql"
+          - allow:
+              operation_type: query
+              fields: [viewer]
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let data_json: serde_json::Value =
+            serde_yml::from_str(data).expect("fixture should parse as YAML");
+        let mut rego = regorus::Engine::new();
+        rego.add_policy("policy.rego".into(), TEST_POLICY.into())
+            .expect("policy should load");
+        rego.add_data_json(&data_json.to_string())
+            .expect("data should load");
+        let engine = OpaEngine {
+            engine: Mutex::new(rego),
+            generation: Arc::new(AtomicU64::new(0)),
+        };
+        let input = l7_websocket_graphql_input(
+            "realtime.graphql.com",
+            serde_json::json!([{
+                "operation_type": "query",
+                "fields": ["adminAuditLog"],
+                "persisted_query": false
+            }]),
+        );
+        assert!(!eval_l7(&engine, &input));
     }
 
     #[test]
@@ -2461,6 +2599,120 @@ network_policies:
             .expect("endpoint config");
         let l7 = crate::l7::parse_l7_config(&config).unwrap();
         assert!(l7.allow_encoded_slash);
+    }
+
+    #[test]
+    fn l7_endpoint_config_preserves_proto_websocket_credential_rewrite() {
+        let mut network_policies = std::collections::HashMap::new();
+        network_policies.insert(
+            "gateway".to_string(),
+            NetworkPolicyRule {
+                name: "gateway".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "gateway.example.com".to_string(),
+                    port: 443,
+                    protocol: "rest".to_string(),
+                    enforcement: "enforce".to_string(),
+                    access: "full".to_string(),
+                    websocket_credential_rewrite: true,
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/node".to_string(),
+                    ..Default::default()
+                }],
+            },
+        );
+        let proto = ProtoSandboxPolicy {
+            version: 1,
+            filesystem: Some(ProtoFs {
+                include_workdir: true,
+                read_only: vec![],
+                read_write: vec![],
+            }),
+            landlock: Some(openshell_core::proto::LandlockPolicy {
+                compatibility: "best_effort".to_string(),
+            }),
+            process: Some(ProtoProc {
+                run_as_user: "sandbox".to_string(),
+                run_as_group: "sandbox".to_string(),
+            }),
+            network_policies,
+        };
+
+        let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
+        let input = NetworkInput {
+            host: "gateway.example.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/node"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        let config = engine
+            .query_endpoint_config(&input)
+            .unwrap()
+            .expect("endpoint config");
+        let l7 = crate::l7::parse_l7_config(&config).unwrap();
+        assert!(l7.websocket_credential_rewrite);
+    }
+
+    #[test]
+    fn l7_endpoint_config_preserves_proto_request_body_credential_rewrite() {
+        let mut network_policies = std::collections::HashMap::new();
+        network_policies.insert(
+            "slack".to_string(),
+            NetworkPolicyRule {
+                name: "slack".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "slack.com".to_string(),
+                    port: 443,
+                    protocol: "rest".to_string(),
+                    enforcement: "enforce".to_string(),
+                    access: "read-write".to_string(),
+                    request_body_credential_rewrite: true,
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/node".to_string(),
+                    ..Default::default()
+                }],
+            },
+        );
+        let proto = ProtoSandboxPolicy {
+            version: 1,
+            filesystem: Some(ProtoFs {
+                include_workdir: true,
+                read_only: vec![],
+                read_write: vec![],
+            }),
+            landlock: Some(openshell_core::proto::LandlockPolicy {
+                compatibility: "best_effort".to_string(),
+            }),
+            process: Some(ProtoProc {
+                run_as_user: "sandbox".to_string(),
+                run_as_group: "sandbox".to_string(),
+            }),
+            network_policies,
+        };
+
+        let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
+        let input = NetworkInput {
+            host: "slack.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/node"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        let config = engine
+            .query_endpoint_config(&input)
+            .unwrap()
+            .expect("endpoint config");
+        let l7 = crate::l7::parse_l7_config(&config).unwrap();
+        assert!(l7.request_body_credential_rewrite);
     }
 
     #[test]

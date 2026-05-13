@@ -10,9 +10,7 @@ position: 1
 
 A sandbox is the OpenShell data plane: a safe, private execution environment where an AI agent runs. Each sandbox combines runtime isolation with OpenShell policy controls that prevent unauthorized data access, credential exposure, and network exfiltration.
 
-<Info>
-You need an active gateway before creating a sandbox.
-</Info>
+<Info>You need an active gateway before creating a sandbox.</Info>
 
 ## Create a Sandbox
 
@@ -114,13 +112,13 @@ openshell sandbox exec -n my-sandbox --tty -- /bin/bash
 
 OpenShell allocates a TTY automatically when both stdin and stdout are terminals. Force the behavior with `--tty` or disable it with `--no-tty`.
 
-| Flag | Purpose |
-|---|---|
-| `-n`, `--name` | Sandbox to target. |
-| `--workdir` | Working directory for the command inside the sandbox. |
-| `--timeout` | Command timeout in seconds. `0` disables the timeout. |
-| `--tty` | Force TTY allocation. |
-| `--no-tty` | Disable TTY allocation even when attached to a terminal. |
+| Flag           | Purpose                                                  |
+| -------------- | -------------------------------------------------------- |
+| `-n`, `--name` | Sandbox to target.                                       |
+| `--workdir`    | Working directory for the command inside the sandbox.    |
+| `--timeout`    | Command timeout in seconds. `0` disables the timeout.    |
+| `--tty`        | Force TTY allocation.                                    |
+| `--no-tty`     | Disable TTY allocation even when attached to a terminal. |
 
 ## Label a Sandbox
 
@@ -136,6 +134,52 @@ List only the sandboxes that match a label selector:
 openshell sandbox list --selector env=dev
 openshell sandbox list --selector env=dev,team=platform
 ```
+
+## Expose Long Running Services
+
+Service forwarding makes a long-running process inside a sandbox reachable through a gateway-managed URL. Use it for development servers, notebooks, dashboards, or other services that keep listening after the sandbox starts. Run the service on loopback inside the sandbox, expose its port, then open the URL printed by OpenShell.
+
+Expose a service that listens on loopback inside the sandbox:
+
+```shell
+openshell service expose my-sandbox 8080
+```
+
+Pass an optional service name to create a named service URL:
+
+```shell
+openshell service expose my-sandbox 8080 web
+```
+
+List exposed endpoints:
+
+```shell
+openshell service list
+```
+
+List endpoints for one sandbox:
+
+```shell
+openshell service list my-sandbox
+```
+
+Show or delete one endpoint:
+
+```shell
+openshell service get my-sandbox web
+openshell service delete my-sandbox web
+```
+
+Omit the service name to manage the unnamed endpoint:
+
+```shell
+openshell service get my-sandbox
+openshell service delete my-sandbox
+```
+
+<Note>
+Loopback gateways return local `openshell.localhost` URLs. Remote gateways return HTTPS URLs that require normal gateway authentication. For gateway service-domain configuration, refer to [Manage Gateways](/sandboxes/manage-gateways#configure-service-forwarding).
+</Note>
 
 ## Monitor and Debug
 
@@ -169,12 +213,12 @@ Stream sandbox logs to monitor agent activity and diagnose policy decisions:
 openshell logs my-sandbox
 ```
 
-| Flag | Purpose | Example |
-|---|---|---|
-| `--tail` | Stream logs in real time | `openshell logs my-sandbox --tail` |
-| `--source` | Filter by log source | `--source sandbox` |
-| `--level` | Filter by severity | `--level warn` |
-| `--since` | Show logs from a time window | `--since 5m` |
+| Flag       | Purpose                      | Example                            |
+| ---------- | ---------------------------- | ---------------------------------- |
+| `--tail`   | Stream logs in real time     | `openshell logs my-sandbox --tail` |
+| `--source` | Filter by log source         | `--source sandbox`                 |
+| `--level`  | Filter by severity           | `--level warn`                     |
+| `--since`  | Show logs from a time window | `--since 5m`                       |
 
 OpenShell Terminal combines sandbox status and live logs in a single real-time dashboard:
 
@@ -253,12 +297,12 @@ openshell sandbox delete my-sandbox
 
 Every sandbox moves through a defined set of phases:
 
-| Phase | Description |
-|---|---|
-| Provisioning | The runtime is setting up the sandbox environment, injecting credentials, and applying your policy. |
-| Ready | The sandbox is running. The agent process is active and all isolation layers are enforced. You can connect, sync files, and view logs. |
-| Error | Something went wrong during provisioning or execution. Check logs with `openshell logs` for details. |
-| Deleting | The sandbox is being torn down. The system releases resources and purges credentials. |
+| Phase        | Description                                                                                                                            |
+| ------------ | -------------------------------------------------------------------------------------------------------------------------------------- |
+| Provisioning | The runtime is setting up the sandbox environment, injecting credentials, and applying your policy.                                    |
+| Ready        | The sandbox is running. The agent process is active and all isolation layers are enforced. You can connect, sync files, and view logs. |
+| Error        | Something went wrong during provisioning or execution. Check logs with `openshell logs` for details.                                   |
+| Deleting     | The sandbox is being torn down. The system releases resources and purges credentials.                                                  |
 
 ## Sandbox Compute Drivers
 

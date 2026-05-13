@@ -94,6 +94,11 @@ OPENSHELL_SSH_HANDSHAKE_SECRET=${SECRET}
 #OPENSHELL_TLS_KEY=\$XDG_STATE_HOME/openshell/tls/server/tls.key
 #OPENSHELL_TLS_CLIENT_CA=\$XDG_STATE_HOME/openshell/tls/ca.crt
 
+# Comma-separated DNS SANs configured on the gateway server certificate.
+# Wildcard DNS SANs also enable sandbox service URLs under that domain.
+# Example: OPENSHELL_SERVER_SAN=*.apps.example.com
+#OPENSHELL_SERVER_SAN=
+
 # Podman driver: client certs bind-mounted into sandbox containers.
 #OPENSHELL_PODMAN_TLS_CA=\$XDG_STATE_HOME/openshell/tls/ca.crt
 #OPENSHELL_PODMAN_TLS_CERT=\$XDG_STATE_HOME/openshell/tls/client/tls.crt

@@ -14,6 +14,7 @@ use hyper::body::Incoming;
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder,
+    service::TowerToHyperService,
 };
 use metrics::{counter, histogram};
 use openshell_core::proto::{
@@ -31,7 +32,7 @@ use tracing::Span;
 
 use crate::{
     OpenShellService, ServerState, auth::authz::AuthzPolicy, auth::oidc, http_router,
-    inference::InferenceService,
+    inference::InferenceService, service_http_router,
 };
 
 /// Request-ID generator that produces a UUID v4 for each inbound request.
@@ -165,6 +166,25 @@ impl MultiplexService {
 
         builder
             .serve_connection_with_upgrades(TokioIo::new(stream), service)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Serve a plaintext HTTP connection for sandbox service endpoints only.
+    pub async fn serve_service_http<S>(
+        &self,
+        stream: S,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let http_service = TowerToHyperService::new(request_id_middleware!(service_http_router(
+            self.state.clone()
+        )));
+
+        Builder::new(TokioExecutor::new())
+            .serve_connection_with_upgrades(TokioIo::new(stream), http_service)
             .await?;
 
         Ok(())
@@ -470,7 +490,6 @@ fn grpc_status_from_response<B>(res: &Response<B>) -> String {
 
 fn normalize_http_path(path: &str) -> &'static str {
     match path {
-        p if p.starts_with("/connect/ssh") => "/connect/ssh",
         p if p.starts_with("/_ws_tunnel") => "/_ws_tunnel",
         p if p.starts_with("/auth/") => "/auth",
         _ => "unknown",
@@ -722,19 +741,6 @@ mod tests {
     #[test]
     fn grpc_method_handles_empty_string() {
         assert_eq!(grpc_method_from_path(""), "");
-    }
-
-    #[test]
-    fn normalize_ssh_path() {
-        assert_eq!(normalize_http_path("/connect/ssh"), "/connect/ssh");
-    }
-
-    #[test]
-    fn normalize_ssh_path_with_trailing_segments() {
-        assert_eq!(
-            normalize_http_path("/connect/ssh?token=abc"),
-            "/connect/ssh"
-        );
     }
 
     #[test]

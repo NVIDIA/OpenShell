@@ -48,11 +48,26 @@ service OpenShell {
   // Create a short-lived SSH session for a sandbox.
   rpc CreateSshSession(CreateSshSessionRequest) returns (CreateSshSessionResponse);
 
+  // Create or update a sandbox HTTP service endpoint for local routing.
+  rpc ExposeService(ExposeServiceRequest) returns (ServiceEndpointResponse);
+
+  // Fetch one sandbox HTTP service endpoint.
+  rpc GetService(GetServiceRequest) returns (ServiceEndpointResponse);
+
+  // List sandbox HTTP service endpoints.
+  rpc ListServices(ListServicesRequest) returns (ListServicesResponse);
+
+  // Delete one sandbox HTTP service endpoint.
+  rpc DeleteService(DeleteServiceRequest) returns (DeleteServiceResponse);
+
   // Revoke a previously issued SSH session.
   rpc RevokeSshSession(RevokeSshSessionRequest) returns (RevokeSshSessionResponse);
 
   // Execute a command in a ready sandbox and stream output.
   rpc ExecSandbox(ExecSandboxRequest) returns (stream ExecSandboxEvent);
+
+  // Forward one CLI-side TCP connection to a loopback TCP target in a sandbox.
+  rpc ForwardTcp(stream TcpForwardFrame) returns (stream TcpForwardFrame);
 
   // Create a provider.
   rpc CreateProvider(CreateProviderRequest) returns (ProviderResponse);
@@ -127,8 +142,9 @@ service OpenShell {
   //
   // The supervisor opens this stream at startup and keeps it alive for the
   // sandbox lifetime. The gateway uses it to coordinate relay channels for
-  // SSH connect and ExecSandbox. Raw SSH bytes flow over RelayStream calls
-  // (separate HTTP/2 streams on the same connection), not over this stream.
+  // SSH connect, ExecSandbox, and targetable sandbox services. Raw service
+  // bytes flow over RelayStream calls (separate HTTP/2 streams on the same
+  // connection), not over this stream.
   rpc ConnectSupervisor(stream SupervisorMessage) returns (stream GatewayMessage);
 
   // Raw byte relay between supervisor and gateway.
@@ -137,8 +153,8 @@ service OpenShell {
   // on its ConnectSupervisor stream. The first RelayFrame carries a
   // RelayInit with the channel_id to associate the new HTTP/2 stream with
   // the pending relay slot on the gateway. Subsequent frames carry raw bytes in either
-  // direction between the gateway-side waiter (ssh_tunnel / exec handler)
-  // and the supervisor-side local SSH daemon bridge.
+  // direction between the gateway-side waiter (ForwardTcp / exec handler)
+  // and the supervisor-side target bridge.
   //
   // This rides the same TCP+TLS+HTTP/2 connection as ConnectSupervisor —
   // no new TLS handshake, no reverse HTTP CONNECT.
@@ -446,16 +462,82 @@ message CreateSshSessionResponse {
   // Gateway scheme. Must be exactly "http" or "https".
   string gateway_scheme = 5;
 
-  // HTTP path for the CONNECT/upgrade endpoint. Must begin with `/`. RFC
-  // 3986 path charset only ([A-Za-z0-9._~!$&'()*+,;=:@/-] plus %HH).
-  // Must not contain `?`, `#`, whitespace, backtick, or backslash.
-  string connect_path = 6;
-
   // Optional host key fingerprint. If non-empty, [A-Za-z0-9:+/=-] only.
   string host_key_fingerprint = 7;
 
   // Expiry timestamp in milliseconds since epoch. 0 means no expiry.
   int64 expires_at_ms = 8;
+}
+
+// Request to expose an HTTP service running inside a sandbox.
+message ExposeServiceRequest {
+  // Sandbox name.
+  string sandbox = 1;
+  // Service name within the sandbox.
+  string service = 2;
+  // Loopback TCP port inside the sandbox.
+  uint32 target_port = 3;
+  // Whether to print/use the browser-facing service URL.
+  bool domain = 4;
+}
+
+// Request to fetch an exposed sandbox service endpoint.
+message GetServiceRequest {
+  // Sandbox name.
+  string sandbox = 1;
+  // Service name within the sandbox. Empty selects the unnamed endpoint.
+  string service = 2;
+}
+
+// Request to list exposed sandbox service endpoints.
+message ListServicesRequest {
+  // Optional sandbox name. Empty lists endpoints for all sandboxes.
+  string sandbox = 1;
+  // Page size. Zero uses the server default.
+  uint32 limit = 2;
+  // Page offset.
+  uint32 offset = 3;
+}
+
+// Response containing exposed sandbox service endpoints.
+message ListServicesResponse {
+  repeated ServiceEndpointResponse services = 1;
+}
+
+// Request to delete an exposed sandbox service endpoint.
+message DeleteServiceRequest {
+  // Sandbox name.
+  string sandbox = 1;
+  // Service name within the sandbox. Empty selects the unnamed endpoint.
+  string service = 2;
+}
+
+// Response for deleting an exposed sandbox service endpoint.
+message DeleteServiceResponse {
+  // True when an endpoint existed and was deleted.
+  bool deleted = 1;
+}
+
+// Persisted sandbox service endpoint.
+message ServiceEndpoint {
+  // Kubernetes-style metadata.
+  openshell.datamodel.v1.ObjectMeta metadata = 1;
+  // Sandbox object ID.
+  string sandbox_id = 2;
+  // Sandbox name.
+  string sandbox_name = 3;
+  // Service name within the sandbox.
+  string service_name = 4;
+  // Loopback TCP port inside the sandbox.
+  uint32 target_port = 5;
+  // Whether browser-facing service routing is enabled for this endpoint.
+  bool domain = 6;
+}
+
+// Response containing a service endpoint and, when available, its local URL.
+message ServiceEndpointResponse {
+  ServiceEndpoint endpoint = 1;
+  string url = 2;
 }
 
 // Revoke SSH session request.
@@ -515,6 +597,30 @@ message ExecSandboxEvent {
     ExecSandboxStdout stdout = 1;
     ExecSandboxStderr stderr = 2;
     ExecSandboxExit exit = 3;
+  }
+}
+
+// Initial frame for one TCP forward stream.
+message TcpForwardInit {
+  // Sandbox id.
+  string sandbox_id = 1;
+  // Optional service identifier for audit/correlation.
+  string service_id = 4;
+  // Target the gateway should request from the supervisor.
+  oneof target {
+    SshRelayTarget ssh = 5;
+    TcpRelayTarget tcp = 6;
+  }
+  // Optional target-specific authorization token. SSH targets use this as the
+  // short-lived SSH session token issued by CreateSshSession.
+  string authorization_token = 7;
+}
+
+// A single frame on the CLI-to-gateway TCP forward stream.
+message TcpForwardFrame {
+  oneof payload {
+    TcpForwardInit init = 1;
+    bytes data = 2;
   }
 }
 
@@ -1035,10 +1141,29 @@ message GatewayHeartbeat {}
 // On receiving this, the supervisor should initiate a RelayStream RPC to
 // the gateway, sending a RelayInit in the first RelayFrame to associate
 // the new HTTP/2 stream with the pending relay slot. The supervisor
-// bridges that stream to the local SSH daemon.
+// bridges that stream to the requested local target.
 message RelayOpen {
   // Gateway-allocated channel identifier (UUID).
   string channel_id = 1;
+  // Target the supervisor should dial inside the sandbox.
+  // If absent, supervisors treat the relay as SSH for compatibility.
+  oneof target {
+    SshRelayTarget ssh = 2;
+    TcpRelayTarget tcp = 3;
+  }
+  // Optional service identifier for audit/correlation.
+  string service_id = 5;
+}
+
+// Built-in SSH relay target.
+message SshRelayTarget {}
+
+// TCP target dialed by the supervisor from inside the sandbox.
+message TcpRelayTarget {
+  // Phase 1 accepts loopback only: 127.0.0.1, ::1, or localhost.
+  string host = 1;
+  // Target port. Must fit in u16 and be non-zero.
+  uint32 port = 2;
 }
 
 // Initial RelayStream frame sent by the supervisor to claim a pending relay.
