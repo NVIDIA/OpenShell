@@ -56,9 +56,13 @@ const SANDBOX_SECRET_METHODS: &[&str] = &[
 /// (policy/settings mutations) and the sandbox supervisor (policy sync on
 /// startup). `OpenShell/GetSandboxConfig` serves CLI settings reads while
 /// remaining compatible with sandbox-secret-authenticated callers.
+/// `GetDraftPolicy` serves CLI reviewer surfaces (`openshell rule get`,
+/// TUI inbox) AND the sandbox-side `policy.local /wait` long-poll that
+/// blocks on the agent's proposal until the developer decides.
 const DUAL_AUTH_METHODS: &[&str] = &[
     "/openshell.v1.OpenShell/UpdateConfig",
     "/openshell.v1.OpenShell/GetSandboxConfig",
+    "/openshell.v1.OpenShell/GetDraftPolicy",
 ];
 
 /// Returns `true` if the method accepts either Bearer or sandbox-secret auth.
@@ -492,6 +496,21 @@ mod tests {
         ));
         assert!(is_dual_auth_method(
             "/openshell.v1.OpenShell/GetSandboxConfig"
+        ));
+    }
+
+    #[test]
+    fn openshell_get_draft_policy_is_dual_auth() {
+        // policy.local calls GetDraftPolicy with x-sandbox-secret (from
+        // inside the sandbox supervisor), and the CLI/TUI reviewer
+        // surfaces call it with an OIDC Bearer. Sandbox-secret-only
+        // would lock CLI out; Bearer-only would 401 the /wait long-poll
+        // in OIDC-enabled deployments.
+        assert!(!is_sandbox_secret_method(
+            "/openshell.v1.OpenShell/GetDraftPolicy"
+        ));
+        assert!(is_dual_auth_method(
+            "/openshell.v1.OpenShell/GetDraftPolicy"
         ));
     }
 
