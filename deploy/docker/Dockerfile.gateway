@@ -26,13 +26,7 @@ ARG TARGETARCH
 
 WORKDIR /app
 
-# --chmod=0550 preserves the executable bit through actions/upload-artifact +
-# download-artifact (which strip exec perms during the roundtrip) without
-# granting world-execute. --chown=nvs:nvs matches the image's only defined
-# non-root user (`nvs:1000`, the NVIDIA distroless convention) and aligns
-# with the Helm chart's `securityContext.runAsUser: 1000`, which overrides
-# the Dockerfile's USER at runtime.
-COPY --chown=nvs:nvs --chmod=0550 deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-gateway /usr/local/bin/openshell-gateway
+COPY deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-gateway /usr/local/bin/openshell-gateway
 
 USER nvs:nvs
 EXPOSE 8080
