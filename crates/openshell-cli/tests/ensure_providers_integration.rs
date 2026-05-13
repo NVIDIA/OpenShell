@@ -67,6 +67,7 @@ impl TestOpenShell {
                 r#type: provider_type.to_string(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
             },
         );
     }
@@ -319,6 +320,19 @@ impl OpenShell for TestOpenShell {
             }
             base
         };
+        let merge_expiry = |mut base: HashMap<String, i64>, incoming: HashMap<String, i64>| {
+            if incoming.is_empty() {
+                return base;
+            }
+            for (k, v) in incoming {
+                if v <= 0 {
+                    base.remove(&k);
+                } else {
+                    base.insert(k, v);
+                }
+            }
+            base
+        };
         let existing_metadata = existing.metadata.clone().unwrap_or_default();
         let provider_metadata = provider.metadata.clone().unwrap_or_default();
         let updated = Provider {
@@ -332,12 +346,43 @@ impl OpenShell for TestOpenShell {
             r#type: existing.r#type,
             credentials: merge(existing.credentials, provider.credentials),
             config: merge(existing.config, provider.config),
+            credential_expires_at_ms: merge_expiry(
+                existing.credential_expires_at_ms,
+                provider.credential_expires_at_ms,
+            ),
         };
         let updated_name = updated.object_name().to_string();
         providers.insert(updated_name, updated.clone());
         Ok(Response::new(ProviderResponse {
             provider: Some(updated),
         }))
+    }
+    async fn get_provider_refresh_status(
+        &self,
+        _: tonic::Request<openshell_core::proto::GetProviderRefreshStatusRequest>,
+    ) -> Result<Response<openshell_core::proto::GetProviderRefreshStatusResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn configure_provider_refresh(
+        &self,
+        _: tonic::Request<openshell_core::proto::ConfigureProviderRefreshRequest>,
+    ) -> Result<Response<openshell_core::proto::ConfigureProviderRefreshResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn rotate_provider_credential(
+        &self,
+        _: tonic::Request<openshell_core::proto::RotateProviderCredentialRequest>,
+    ) -> Result<Response<openshell_core::proto::RotateProviderCredentialResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn delete_provider_refresh(
+        &self,
+        _: tonic::Request<openshell_core::proto::DeleteProviderRefreshRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteProviderRefreshResponse>, Status> {
+        Err(Status::unimplemented("unused"))
     }
 
     async fn delete_provider(

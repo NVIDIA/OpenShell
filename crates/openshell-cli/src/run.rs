@@ -31,21 +31,24 @@ use openshell_core::progress::{
 use openshell_core::proto::ProviderProfileCategory;
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, AttachSandboxProviderRequest,
-    ClearDraftChunksRequest, CreateProviderRequest, CreateSandboxRequest, CreateSshSessionRequest,
-    DeleteProviderProfileRequest, DeleteProviderRequest, DeleteSandboxRequest,
+    ClearDraftChunksRequest, ConfigureProviderRefreshRequest, CreateProviderRequest,
+    CreateSandboxRequest, CreateSshSessionRequest, DeleteProviderProfileRequest,
+    DeleteProviderRefreshRequest, DeleteProviderRequest, DeleteSandboxRequest,
     DeleteServiceRequest, DetachSandboxProviderRequest, ExecSandboxRequest, ExposeServiceRequest,
     GetClusterInferenceRequest, GetDraftHistoryRequest, GetDraftPolicyRequest,
-    GetGatewayConfigRequest, GetProviderProfileRequest, GetProviderRequest,
-    GetSandboxConfigRequest, GetSandboxLogsRequest, GetSandboxPolicyStatusRequest,
-    GetSandboxRequest, GetServiceRequest, HealthRequest, ImportProviderProfilesRequest,
-    LintProviderProfilesRequest, ListProviderProfilesRequest, ListProvidersRequest,
-    ListSandboxPoliciesRequest, ListSandboxProvidersRequest, ListSandboxesRequest,
-    ListServicesRequest, PlatformEvent, PolicySource, PolicyStatus, Provider, ProviderProfile,
+    GetGatewayConfigRequest, GetProviderProfileRequest, GetProviderRefreshStatusRequest,
+    GetProviderRequest, GetSandboxConfigRequest, GetSandboxLogsRequest,
+    GetSandboxPolicyStatusRequest, GetSandboxRequest, GetServiceRequest, HealthRequest,
+    ImportProviderProfilesRequest, LintProviderProfilesRequest, ListProviderProfilesRequest,
+    ListProvidersRequest, ListSandboxPoliciesRequest, ListSandboxProvidersRequest,
+    ListSandboxesRequest, ListServicesRequest, PlatformEvent, PolicySource, PolicyStatus, Provider,
+    ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy, ProviderProfile,
     ProviderProfileDiagnostic, ProviderProfileImportItem, RejectDraftChunkRequest,
-    RevokeSshSessionRequest, Sandbox, SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate,
-    ServiceEndpointResponse, SetClusterInferenceRequest, SettingScope, SettingValue,
-    TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest, UpdateProviderRequest,
-    WatchSandboxRequest, exec_sandbox_event, setting_value, tcp_forward_init,
+    RevokeSshSessionRequest, RotateProviderCredentialRequest, Sandbox, SandboxPhase, SandboxPolicy,
+    SandboxSpec, SandboxTemplate, ServiceEndpointResponse, SetClusterInferenceRequest,
+    SettingScope, SettingValue, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
+    UpdateConfigRequest, UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event,
+    setting_value, tcp_forward_init,
 };
 use openshell_core::settings::{self, SettingValueKind};
 use openshell_core::{ObjectId, ObjectName};
@@ -3616,6 +3619,7 @@ async fn auto_create_provider(
                 r#type: provider_type.to_string(),
                 credentials: discovered.credentials.clone(),
                 config: discovered.config.clone(),
+                credential_expires_at_ms: HashMap::new(),
             }),
         };
 
@@ -3657,6 +3661,7 @@ async fn auto_create_provider(
                     r#type: provider_type.to_string(),
                     credentials: discovered.credentials.clone(),
                     config: discovered.config.clone(),
+                    credential_expires_at_ms: HashMap::new(),
                 }),
             };
 
@@ -3747,6 +3752,37 @@ fn parse_credential_pairs(items: &[String]) -> Result<HashMap<String, String>> {
             ));
         }
 
+        map.insert(key.to_string(), value);
+    }
+
+    Ok(map)
+}
+
+fn parse_credential_expiry_pairs(items: &[String]) -> Result<HashMap<String, i64>> {
+    let mut map = HashMap::new();
+
+    for item in items {
+        let Some((key, value)) = item.split_once('=') else {
+            return Err(miette::miette!(
+                "--credential-expires-at expects KEY=TIMESTAMP_MS, got '{item}'"
+            ));
+        };
+        let key = key.trim();
+        if key.is_empty() {
+            return Err(miette::miette!(
+                "--credential-expires-at key cannot be empty"
+            ));
+        }
+        let value = value.trim().parse::<i64>().map_err(|_| {
+            miette::miette!(
+                "--credential-expires-at value for '{key}' must be a Unix epoch millisecond timestamp"
+            )
+        })?;
+        if value < 0 {
+            return Err(miette::miette!(
+                "--credential-expires-at value for '{key}' must be greater than or equal to 0"
+            ));
+        }
         map.insert(key.to_string(), value);
     }
 
@@ -4051,10 +4087,20 @@ pub async fn provider_create(
     }
 
     if credential_map.is_empty() {
-        return Err(miette::miette!(
-            "no credentials resolved for provider type '{provider_type}'. \
-             Use --credential KEY[=VALUE] or --from-existing with the appropriate env vars set."
-        ));
+        let allows_refresh_bootstrap = client
+            .get_provider_profile(GetProviderProfileRequest {
+                id: provider_type.clone(),
+            })
+            .await
+            .ok()
+            .and_then(|response| response.into_inner().profile)
+            .is_some_and(|profile| provider_profile_allows_refresh_bootstrap(&profile));
+        if !allows_refresh_bootstrap {
+            return Err(miette::miette!(
+                "no credentials resolved for provider type '{provider_type}'. \
+                 Use --credential KEY[=VALUE] or --from-existing with the appropriate env vars set."
+            ));
+        }
     }
 
     let response = client
@@ -4070,6 +4116,7 @@ pub async fn provider_create(
                 r#type: provider_type.clone(),
                 credentials: credential_map,
                 config: config_map,
+                credential_expires_at_ms: HashMap::new(),
             }),
         })
         .await
@@ -4086,6 +4133,18 @@ pub async fn provider_create(
         provider.object_name()
     );
     Ok(())
+}
+
+fn provider_profile_allows_refresh_bootstrap(profile: &ProviderProfile) -> bool {
+    profile.credentials.iter().any(|credential| {
+        credential.refresh.as_ref().is_some_and(|refresh| {
+            matches!(
+                ProviderCredentialRefreshStrategy::try_from(refresh.strategy),
+                Ok(ProviderCredentialRefreshStrategy::Oauth2ClientCredentials
+                    | ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt)
+            )
+        })
+    })
 }
 
 pub async fn provider_get(server: &str, name: &str, tls: &TlsOptions) -> Result<()> {
@@ -4367,6 +4426,189 @@ pub async fn provider_profile_delete(server: &str, id: &str, tls: &TlsOptions) -
     Ok(())
 }
 
+pub async fn provider_refresh_status(
+    server: &str,
+    name: &str,
+    credential_key: Option<&str>,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .get_provider_refresh_status(GetProviderRefreshStatusRequest {
+            provider: name.to_string(),
+            credential_key: credential_key.unwrap_or_default().to_string(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner();
+
+    if response.credentials.is_empty() {
+        println!("No refresh configuration found for provider '{name}'.");
+        return Ok(());
+    }
+
+    println!(
+        "{:<28}  {:<28}  {:<18}  {:<20}  {}",
+        "PROVIDER".bold(),
+        "CREDENTIAL_KEY".bold(),
+        "STRATEGY".bold(),
+        "EXPIRES_AT".bold(),
+        "STATUS".bold(),
+    );
+    for status in response.credentials {
+        print_refresh_status_row(&status);
+    }
+    Ok(())
+}
+
+pub struct ProviderRefreshConfigInput<'a> {
+    pub name: &'a str,
+    pub credential_key: &'a str,
+    pub strategy: &'a str,
+    pub material: &'a [String],
+    pub secret_material_keys: &'a [String],
+    pub credential_expires_at_ms: Option<i64>,
+}
+
+pub async fn provider_refresh_config(
+    server: &str,
+    input: ProviderRefreshConfigInput<'_>,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let strategy = provider_refresh_strategy(input.strategy)?;
+    let material = parse_key_value_pairs(input.material, "--material")?;
+    let mut client = grpc_client(server, tls).await?;
+    let status = client
+        .configure_provider_refresh(ConfigureProviderRefreshRequest {
+            provider: input.name.to_string(),
+            credential_key: input.credential_key.to_string(),
+            strategy: strategy as i32,
+            material,
+            secret_material_keys: input.secret_material_keys.to_vec(),
+            expires_at_ms: input.credential_expires_at_ms,
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner()
+        .status
+        .ok_or_else(|| miette!("provider refresh status missing from response"))?;
+
+    println!(
+        "{} Configured refresh for {} {}",
+        "✓".green().bold(),
+        status.provider_name,
+        status.credential_key
+    );
+    Ok(())
+}
+
+pub async fn provider_rotate(
+    server: &str,
+    name: &str,
+    credential_key: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let status = client
+        .rotate_provider_credential(RotateProviderCredentialRequest {
+            provider: name.to_string(),
+            credential_key: credential_key.to_string(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner()
+        .status
+        .ok_or_else(|| miette!("provider refresh status missing from response"))?;
+
+    if status.last_error.is_empty() {
+        println!(
+            "{} Rotation requested for {} {} ({})",
+            "✓".green().bold(),
+            status.provider_name,
+            status.credential_key,
+            status.status
+        );
+    } else {
+        println!(
+            "Rotation request recorded for {} {} ({}): {}",
+            status.provider_name, status.credential_key, status.status, status.last_error
+        );
+    }
+    Ok(())
+}
+
+pub async fn provider_refresh_delete(
+    server: &str,
+    name: &str,
+    credential_key: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .delete_provider_refresh(DeleteProviderRefreshRequest {
+            provider: name.to_string(),
+            credential_key: credential_key.to_string(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner();
+
+    if response.deleted {
+        println!(
+            "{} Deleted refresh config for {} {}",
+            "✓".green().bold(),
+            name,
+            credential_key
+        );
+    } else {
+        println!("No refresh config found for provider '{name}' credential '{credential_key}'.");
+    }
+    Ok(())
+}
+
+fn provider_refresh_strategy(strategy: &str) -> Result<ProviderCredentialRefreshStrategy> {
+    match strategy {
+        "static" => Ok(ProviderCredentialRefreshStrategy::Static),
+        "external" => Ok(ProviderCredentialRefreshStrategy::External),
+        "oauth2_refresh_token" => Ok(ProviderCredentialRefreshStrategy::Oauth2RefreshToken),
+        "oauth2_client_credentials" => {
+            Ok(ProviderCredentialRefreshStrategy::Oauth2ClientCredentials)
+        }
+        "google_service_account_jwt" => {
+            Ok(ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt)
+        }
+        _ => Err(miette!("unsupported provider refresh strategy: {strategy}")),
+    }
+}
+
+fn print_refresh_status_row(status: &ProviderCredentialRefreshStatus) {
+    let strategy = ProviderCredentialRefreshStrategy::try_from(status.strategy)
+        .unwrap_or(ProviderCredentialRefreshStrategy::Unspecified);
+    println!(
+        "{:<28}  {:<28}  {:<18}  {:<20}  {}",
+        status.provider_name,
+        status.credential_key,
+        provider_refresh_strategy_name(strategy),
+        if status.expires_at_ms > 0 {
+            format_epoch_ms(status.expires_at_ms)
+        } else {
+            "-".to_string()
+        },
+        status.status
+    );
+}
+
+fn provider_refresh_strategy_name(strategy: ProviderCredentialRefreshStrategy) -> &'static str {
+    match strategy {
+        ProviderCredentialRefreshStrategy::Static => "static",
+        ProviderCredentialRefreshStrategy::External => "external",
+        ProviderCredentialRefreshStrategy::Oauth2RefreshToken => "oauth2_refresh_token",
+        ProviderCredentialRefreshStrategy::Oauth2ClientCredentials => "oauth2_client_credentials",
+        ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => "google_service_account_jwt",
+        ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
+    }
+}
+
 fn load_profile_import_items(
     file: Option<&Path>,
     from: Option<&Path>,
@@ -4519,6 +4761,7 @@ pub async fn provider_update(
     from_existing: bool,
     credentials: &[String],
     config: &[String],
+    credential_expires_at: &[String],
     tls: &TlsOptions,
 ) -> Result<()> {
     if from_existing && !credentials.is_empty() {
@@ -4531,6 +4774,7 @@ pub async fn provider_update(
 
     let mut credential_map = parse_credential_pairs(credentials)?;
     let mut config_map = parse_key_value_pairs(config, "--config")?;
+    let credential_expires_at_ms = parse_credential_expiry_pairs(credential_expires_at)?;
 
     if from_existing {
         // Fetch the existing provider to discover its type for credential lookup.
@@ -4576,7 +4820,9 @@ pub async fn provider_update(
                 r#type: String::new(),
                 credentials: credential_map,
                 config: config_map,
+                credential_expires_at_ms: HashMap::new(),
             }),
+            credential_expires_at_ms,
         })
         .await
         .into_diagnostic()?;
@@ -6526,6 +6772,7 @@ mod tests {
                     "https://api.custom.example".to_string(),
                 ))
                 .collect(),
+                credential_expires_at_ms: std::collections::HashMap::new(),
             }],
             false,
         );

@@ -1632,6 +1632,7 @@ fn spawn_create_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
                     r#type: ptype.clone(),
                     credentials: credentials.clone(),
                     config: HashMap::default(),
+                    credential_expires_at_ms: HashMap::default(),
                 }),
             };
 
@@ -1723,7 +1724,9 @@ fn spawn_update_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
                 r#type: ptype,
                 credentials,
                 config: HashMap::default(),
+                credential_expires_at_ms: HashMap::default(),
             }),
+            credential_expires_at_ms: HashMap::default(),
         };
 
         match tokio::time::timeout(Duration::from_secs(5), client.update_provider(req)).await {
