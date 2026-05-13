@@ -426,6 +426,21 @@ async fn sandbox_download_directory_only() {
     guard.cleanup().await;
 }
 
+/// Assert that an error string carries the two markers of a remote-side
+/// canonicalisation refusal: `resolves to` (proving `realpath -e` ran) and
+/// `outside the` + `sandbox workspace` (proving the boundary check fired).
+///
+/// miette renders the long single-line error wrapped across multiple lines
+/// at terminal width and inserts a `│ ` continuation marker, so a single
+/// long substring like `"outside the sandbox workspace"` is fragile —
+/// match the short markers individually instead.
+fn assert_resolves_outside_workspace(err: &str, label: &str) {
+    assert!(
+        err.contains("resolves to") && err.contains("outside the") && err.contains("sandbox workspace"),
+        "expected resolves-outside-workspace error for {label}, got: {err}"
+    );
+}
+
 /// Regression for the Codex high-severity finding: `validate_sandbox_source_path`
 /// is purely lexical, so a sandbox-side symlink that escapes `/sandbox` could
 /// slip through and let `tar -C` follow the link into the host filesystem.
@@ -459,30 +474,21 @@ async fn sandbox_download_rejects_symlinks_pointing_outside_workspace() {
         .download("/sandbox/etc-link", dest_str)
         .await
         .expect_err("download of a directory symlink to /etc must be refused");
-    assert!(
-        err.contains("outside the sandbox workspace"),
-        "expected workspace-boundary error for directory symlink, got: {err}"
-    );
+    assert_resolves_outside_workspace(&err, "directory symlink");
 
     // File-source symlink: /sandbox/passwd-link -> /etc/passwd
     let err = guard
         .download("/sandbox/passwd-link", dest_str)
         .await
         .expect_err("download of a file symlink to /etc/passwd must be refused");
-    assert!(
-        err.contains("outside the sandbox workspace"),
-        "expected workspace-boundary error for file symlink, got: {err}"
-    );
+    assert_resolves_outside_workspace(&err, "file symlink");
 
     // Path with a symlinked component: /sandbox/etc-link/passwd
     let err = guard
         .download("/sandbox/etc-link/passwd", dest_str)
         .await
         .expect_err("download via a symlinked path component must be refused");
-    assert!(
-        err.contains("outside the sandbox workspace"),
-        "expected workspace-boundary error for symlinked component, got: {err}"
-    );
+    assert_resolves_outside_workspace(&err, "symlinked component");
 
     // Sanity check: the host destination should still be empty — no file from
     // /etc should have leaked through on any of the three attempts.
