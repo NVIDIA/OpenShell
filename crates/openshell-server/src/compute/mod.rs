@@ -24,8 +24,8 @@ use openshell_core::proto::compute::v1::{
     watch_sandboxes_event,
 };
 use openshell_core::proto::{
-    PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
-    SandboxTemplate, SshSession,
+    PlatformEvent, ResourceSpec, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec,
+    SandboxStatus, SandboxTemplate, SshSession,
 };
 use openshell_driver_docker::DockerComputeDriver;
 use openshell_driver_kubernetes::{
@@ -1126,23 +1126,76 @@ fn driver_sandbox_spec_from_public(spec: &SandboxSpec) -> DriverSandboxSpec {
     DriverSandboxSpec {
         log_level: spec.log_level.clone(),
         environment: spec.environment.clone(),
-        template: spec
-            .template
-            .as_ref()
-            .map(driver_sandbox_template_from_public),
-        gpu: spec.gpu,
+        template: driver_sandbox_template_from_public(
+            spec.template.as_ref(),
+            spec.resources.as_ref(),
+        ),
+        gpu: spec.gpu || spec.resources.as_ref().is_some_and(|r| r.gpu_count > 0),
         gpu_device: spec.gpu_device.clone(),
     }
 }
 
-fn driver_sandbox_template_from_public(template: &SandboxTemplate) -> DriverSandboxTemplate {
-    DriverSandboxTemplate {
+fn driver_sandbox_template_from_public(
+    template: Option<&SandboxTemplate>,
+    resources: Option<&ResourceSpec>,
+) -> Option<DriverSandboxTemplate> {
+    let driver_resources =
+        driver_resources_from_public(resources, template.and_then(|t| t.resources.as_ref()));
+
+    if template.is_none() && driver_resources.is_none() {
+        return None;
+    }
+
+    let default_template = SandboxTemplate::default();
+    let template = template.unwrap_or(&default_template);
+
+    Some(DriverSandboxTemplate {
         image: template.image.clone(),
         agent_socket_path: template.agent_socket.clone(),
         labels: template.labels.clone(),
         environment: template.environment.clone(),
-        resources: extract_typed_resources(&template.resources),
+        resources: driver_resources,
         platform_config: build_platform_config(template),
+    })
+}
+
+fn driver_resources_from_public(
+    resources: Option<&ResourceSpec>,
+    template_resources: Option<&prost_types::Struct>,
+) -> Option<DriverResourceRequirements> {
+    let mut req = extract_typed_resources(template_resources).unwrap_or_default();
+
+    if let Some(resources) = resources {
+        if !resources.cpu_request.is_empty() {
+            req.cpu_request.clone_from(&resources.cpu_request);
+        }
+        if !resources.cpu_limit.is_empty() {
+            req.cpu_limit.clone_from(&resources.cpu_limit);
+        }
+        if !resources.memory_request.is_empty() {
+            req.memory_request.clone_from(&resources.memory_request);
+        }
+        if !resources.memory_limit.is_empty() {
+            req.memory_limit.clone_from(&resources.memory_limit);
+        }
+        if resources.gpu_count > 0 {
+            req.gpu_count = resources.gpu_count;
+        }
+        if !resources.driver_config.is_empty() {
+            req.driver_config.clone_from(&resources.driver_config);
+        }
+    }
+
+    if req.cpu_request.is_empty()
+        && req.cpu_limit.is_empty()
+        && req.memory_request.is_empty()
+        && req.memory_limit.is_empty()
+        && req.gpu_count == 0
+        && req.driver_config.is_empty()
+    {
+        None
+    } else {
+        Some(req)
     }
 }
 
@@ -1152,7 +1205,7 @@ fn driver_sandbox_template_from_public(template: &SandboxTemplate) -> DriverSand
 /// with the Kubernetes limits/requests shape. We pull out the well-known
 /// keys into the typed `DriverResourceRequirements` message.
 fn extract_typed_resources(
-    resources: &Option<prost_types::Struct>,
+    resources: Option<&prost_types::Struct>,
 ) -> Option<DriverResourceRequirements> {
     fn get_quantity(s: &prost_types::Struct, section: &str, key: &str) -> String {
         s.fields
@@ -1168,13 +1221,14 @@ fn extract_typed_resources(
             .unwrap_or_default()
     }
 
-    let s = resources.as_ref()?;
+    let s = resources?;
 
     let req = DriverResourceRequirements {
         cpu_request: get_quantity(s, "requests", "cpu"),
         cpu_limit: get_quantity(s, "limits", "cpu"),
         memory_request: get_quantity(s, "requests", "memory"),
         memory_limit: get_quantity(s, "limits", "memory"),
+        ..DriverResourceRequirements::default()
     };
 
     // Return None when all fields are empty so drivers can distinguish
@@ -1183,6 +1237,8 @@ fn extract_typed_resources(
         && req.cpu_limit.is_empty()
         && req.memory_request.is_empty()
         && req.memory_limit.is_empty()
+        && req.gpu_count == 0
+        && req.driver_config.is_empty()
     {
         None
     } else {
@@ -2096,6 +2152,43 @@ mod tests {
         );
 
         assert!(resources_raw.fields.contains_key("opaque_cpu"));
+    }
+
+    #[test]
+    fn driver_sandbox_spec_maps_resource_spec_to_driver_resources() {
+        let spec = SandboxSpec {
+            resources: Some(ResourceSpec {
+                cpu_request: "2".to_string(),
+                cpu_limit: "4".to_string(),
+                memory_request: "8Gi".to_string(),
+                memory_limit: "16Gi".to_string(),
+                gpu_count: 4,
+                driver_config: std::iter::once((
+                    "kubernetes.resource-name".to_string(),
+                    "nvidia.com/gpu".to_string(),
+                ))
+                .collect(),
+            }),
+            ..Default::default()
+        };
+
+        let driver_spec = driver_sandbox_spec_from_public(&spec);
+        assert!(driver_spec.gpu);
+
+        let resources = driver_spec
+            .template
+            .as_ref()
+            .and_then(|template| template.resources.as_ref())
+            .expect("resource spec should create driver template resources");
+        assert_eq!(resources.cpu_request, "2");
+        assert_eq!(resources.cpu_limit, "4");
+        assert_eq!(resources.memory_request, "8Gi");
+        assert_eq!(resources.memory_limit, "16Gi");
+        assert_eq!(resources.gpu_count, 4);
+        assert_eq!(
+            resources.driver_config.get("kubernetes.resource-name"),
+            Some(&"nvidia.com/gpu".to_string())
+        );
     }
 
     #[test]

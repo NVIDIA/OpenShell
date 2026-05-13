@@ -256,6 +256,28 @@ message SandboxSpec {
   // (e.g. "0", "1"). When empty with gpu=true, the driver assigns the
   // first available GPU.
   string gpu_device = 10;
+  // Portable resource requirements for the sandbox workload.
+  ResourceSpec resources = 11;
+}
+
+// Portable resource requirements for a sandbox workload.
+//
+// Values use Kubernetes-style quantity strings (e.g. "500m", "2", "4Gi")
+// because they are a well-known, widely-adopted notation. Drivers for
+// non-Kubernetes platforms must parse these strings into their native units.
+message ResourceSpec {
+  // Minimum CPU cores requested (e.g. "500m", "2").
+  string cpu_request = 1;
+  // Maximum CPU cores allowed (e.g. "500m", "4").
+  string cpu_limit = 2;
+  // Minimum memory requested (e.g. "256Mi", "4Gi").
+  string memory_request = 3;
+  // Maximum memory allowed (e.g. "512Mi", "8Gi").
+  string memory_limit = 4;
+  // Number of GPUs requested. A value of 0 means no explicit GPU count.
+  uint32 gpu_count = 5;
+  // Opaque key-value configuration interpreted by the selected driver.
+  map<string, string> driver_config = 100;
 }
 
 // Public sandbox template mapped onto compute-driver template inputs.

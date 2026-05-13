@@ -25,6 +25,7 @@ Make sure the following are in place before you install.
 | Agent Sandbox controller and CRDs | Yes | Install before the OpenShell chart. Refer to [Install Agent Sandbox](#install-agent-sandbox). |
 | cert-manager | No | Refer to [Managing Certificates](/kubernetes/managing-certificates). Use cert-manager only if you prefer it over the built-in PKI job. |
 | Kubernetes Gateway API | No | Refer to [Ingress](/kubernetes/ingress). Use it only for external access without port-forwarding. |
+| NVIDIA device plugin or equivalent | No | Required only for GPU sandboxes. The cluster must expose allocatable `nvidia.com/gpu` resources for `--gpu` and `--gpu-count`. |
 
 ## Install Agent Sandbox
 

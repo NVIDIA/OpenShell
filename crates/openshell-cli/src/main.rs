@@ -1030,6 +1030,7 @@ enum DoctorCommands {
 }
 
 #[derive(Subcommand, Debug)]
+#[allow(clippy::large_enum_variant)]
 enum SandboxCommands {
     /// Create a sandbox.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
@@ -1084,10 +1085,37 @@ enum SandboxCommands {
         #[arg(long)]
         gpu: bool,
 
+        /// Request a specific number of GPUs.
+        ///
+        /// This implies --gpu. Kubernetes-backed gateways schedule pods with
+        /// the corresponding nvidia.com/gpu resource limit.
+        #[arg(long, value_name = "COUNT", value_parser = clap::value_parser!(u32).range(1..), conflicts_with = "gpu_device")]
+        gpu_count: Option<u32>,
+
+        /// Minimum CPU cores requested, e.g. "500m" or "2".
+        #[arg(long, value_name = "QUANTITY")]
+        cpu_request: Option<String>,
+
+        /// Maximum CPU cores allowed, e.g. "2" or "4".
+        #[arg(long, value_name = "QUANTITY")]
+        cpu_limit: Option<String>,
+
+        /// Minimum memory requested, e.g. "512Mi" or "4Gi".
+        #[arg(long, value_name = "QUANTITY")]
+        memory_request: Option<String>,
+
+        /// Maximum memory allowed, e.g. "1Gi" or "8Gi".
+        #[arg(long, value_name = "QUANTITY")]
+        memory_limit: Option<String>,
+
+        /// Driver-specific resource configuration as KEY=VALUE.
+        #[arg(long = "resource-config", value_name = "KEY=VALUE")]
+        resource_config: Vec<String>,
+
         /// Target a driver-specific GPU device. Docker and Podman use CDI device IDs
         /// (for example "nvidia.com/gpu=0"); VM uses a PCI BDF or index.
         /// Only valid with --gpu. When omitted with --gpu, the driver uses its default GPU selection.
-        #[arg(long, requires = "gpu")]
+        #[arg(long, requires = "gpu", conflicts_with = "gpu_count")]
         gpu_device: Option<String>,
 
         /// Provider names to attach to this sandbox.
@@ -2364,6 +2392,12 @@ async fn main() -> Result<()> {
                     no_keep,
                     editor,
                     gpu,
+                    gpu_count,
+                    cpu_request,
+                    cpu_limit,
+                    memory_request,
+                    memory_limit,
+                    resource_config,
                     gpu_device,
                     providers,
                     policy,
@@ -2430,6 +2464,14 @@ async fn main() -> Result<()> {
                         upload_spec.as_ref(),
                         keep,
                         gpu,
+                        run::SandboxResourceArgs {
+                            cpu_request: cpu_request.as_deref(),
+                            cpu_limit: cpu_limit.as_deref(),
+                            memory_request: memory_request.as_deref(),
+                            memory_limit: memory_limit.as_deref(),
+                            gpu_count,
+                            driver_config: &resource_config,
+                        },
                         gpu_device.as_deref(),
                         editor,
                         &providers,
@@ -3820,5 +3862,80 @@ mod tests {
             }
             other => panic!("expected service delete command, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn sandbox_create_gpu_count_rejects_zero() {
+        let result = Cli::try_parse_from(["openshell", "sandbox", "create", "--gpu-count", "0"]);
+        assert!(
+            result.is_err(),
+            "sandbox create --gpu-count 0 should be rejected"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("--gpu-count"));
+    }
+
+    #[test]
+    fn sandbox_create_resource_spec_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--cpu-request",
+            "2",
+            "--cpu-limit",
+            "4",
+            "--memory-request",
+            "8Gi",
+            "--memory-limit",
+            "16Gi",
+            "--resource-config",
+            "kubernetes.resource-name=nvidia.com/gpu",
+        ])
+        .expect("sandbox create resource flags should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Create {
+                        cpu_request,
+                        cpu_limit,
+                        memory_request,
+                        memory_limit,
+                        resource_config,
+                        ..
+                    }),
+                ..
+            }) => {
+                assert_eq!(cpu_request.as_deref(), Some("2"));
+                assert_eq!(cpu_limit.as_deref(), Some("4"));
+                assert_eq!(memory_request.as_deref(), Some("8Gi"));
+                assert_eq!(memory_limit.as_deref(), Some("16Gi"));
+                assert_eq!(
+                    resource_config,
+                    vec!["kubernetes.resource-name=nvidia.com/gpu".to_string()]
+                );
+            }
+            other => panic!("expected sandbox create command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_gpu_count_conflicts_with_gpu_device() {
+        let result = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--gpu",
+            "--gpu-count",
+            "2",
+            "--gpu-device",
+            "nvidia.com/gpu=0",
+        ]);
+
+        assert!(
+            result.is_err(),
+            "sandbox create should reject combining --gpu-count and --gpu-device"
+        );
     }
 }

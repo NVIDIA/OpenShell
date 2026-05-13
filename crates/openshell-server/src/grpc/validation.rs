@@ -9,7 +9,8 @@
 #![allow(clippy::result_large_err)] // Validation returns Result<_, Status>
 
 use openshell_core::proto::{
-    ExecSandboxRequest, Provider, SandboxPolicy as ProtoSandboxPolicy, SandboxTemplate,
+    ExecSandboxRequest, Provider, ResourceSpec, SandboxPolicy as ProtoSandboxPolicy,
+    SandboxTemplate,
 };
 use prost::Message;
 use tonic::Status;
@@ -20,6 +21,8 @@ use super::{
     MAX_PROVIDER_TYPE_LEN, MAX_PROVIDERS, MAX_TEMPLATE_MAP_ENTRIES, MAX_TEMPLATE_STRING_LEN,
     MAX_TEMPLATE_STRUCT_SIZE,
 };
+
+const NVIDIA_GPU_RESOURCE_NAME: &str = "nvidia.com/gpu";
 
 // ---------------------------------------------------------------------------
 // Exec request validation
@@ -130,6 +133,20 @@ pub(super) fn validate_sandbox_spec(
     if let Some(ref tmpl) = spec.template {
         validate_sandbox_template(tmpl)?;
     }
+    if let Some(ref resources) = spec.resources {
+        validate_resource_spec(resources)?;
+        validate_resource_template_conflicts(resources, spec.template.as_ref())?;
+    }
+    if spec
+        .resources
+        .as_ref()
+        .is_some_and(|resources| resources.gpu_count > 0)
+        && !spec.gpu_device.is_empty()
+    {
+        return Err(Status::invalid_argument(
+            "resources.gpu_count cannot be combined with gpu_device",
+        ));
+    }
 
     // --- spec.policy serialized size ---
     if let Some(ref policy) = spec.policy {
@@ -142,6 +159,104 @@ pub(super) fn validate_sandbox_spec(
     }
 
     Ok(())
+}
+
+fn validate_resource_spec(resources: &ResourceSpec) -> Result<(), Status> {
+    for (field, value) in [
+        ("resources.cpu_request", &resources.cpu_request),
+        ("resources.cpu_limit", &resources.cpu_limit),
+        ("resources.memory_request", &resources.memory_request),
+        ("resources.memory_limit", &resources.memory_limit),
+    ] {
+        if value.len() > MAX_MAP_VALUE_LEN {
+            return Err(Status::invalid_argument(format!(
+                "{field} exceeds maximum length ({} > {MAX_MAP_VALUE_LEN})",
+                value.len()
+            )));
+        }
+    }
+
+    validate_string_map(
+        &resources.driver_config,
+        MAX_TEMPLATE_MAP_ENTRIES,
+        MAX_MAP_KEY_LEN,
+        MAX_MAP_VALUE_LEN,
+        "resources.driver_config",
+    )
+}
+
+fn validate_resource_template_conflicts(
+    resources: &ResourceSpec,
+    template: Option<&SandboxTemplate>,
+) -> Result<(), Status> {
+    let Some(template_resources) = template.and_then(|template| template.resources.as_ref()) else {
+        return Ok(());
+    };
+
+    for (field, section, key, expected) in [
+        (
+            "resources.cpu_request",
+            "requests",
+            "cpu",
+            resources.cpu_request.as_str(),
+        ),
+        (
+            "resources.cpu_limit",
+            "limits",
+            "cpu",
+            resources.cpu_limit.as_str(),
+        ),
+        (
+            "resources.memory_request",
+            "requests",
+            "memory",
+            resources.memory_request.as_str(),
+        ),
+        (
+            "resources.memory_limit",
+            "limits",
+            "memory",
+            resources.memory_limit.as_str(),
+        ),
+    ] {
+        if !expected.is_empty()
+            && template_resource_string(template_resources, section, key)
+                .is_some_and(|actual| actual != expected)
+        {
+            return Err(Status::invalid_argument(format!(
+                "{field} conflicts with template.resources.{section}.{key}"
+            )));
+        }
+    }
+
+    if resources.gpu_count > 0
+        && template_resource_string(template_resources, "limits", NVIDIA_GPU_RESOURCE_NAME)
+            .is_some_and(|actual| actual != resources.gpu_count.to_string())
+    {
+        return Err(Status::invalid_argument(
+            "resources.gpu_count conflicts with template.resources.limits.nvidia.com/gpu",
+        ));
+    }
+
+    Ok(())
+}
+
+fn template_resource_string<'a>(
+    resources: &'a prost_types::Struct,
+    section: &str,
+    key: &str,
+) -> Option<&'a str> {
+    resources
+        .fields
+        .get(section)
+        .and_then(|value| match value.kind.as_ref() {
+            Some(prost_types::value::Kind::StructValue(section)) => section.fields.get(key),
+            _ => None,
+        })
+        .and_then(|value| match value.kind.as_ref() {
+            Some(prost_types::value::Kind::StringValue(value)) => Some(value.as_str()),
+            _ => None,
+        })
 }
 
 /// Validate template-level field sizes.
@@ -672,6 +787,81 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_sandbox_spec("gpu-sandbox", &spec).is_ok());
+    }
+
+    #[test]
+    fn validate_sandbox_spec_accepts_resource_spec() {
+        let spec = SandboxSpec {
+            resources: Some(ResourceSpec {
+                cpu_limit: "4".to_string(),
+                memory_limit: "8Gi".to_string(),
+                gpu_count: 2,
+                driver_config: std::iter::once((
+                    "kubernetes.resource-name".to_string(),
+                    "nvidia.com/gpu".to_string(),
+                ))
+                .collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert!(validate_sandbox_spec("resource-sandbox", &spec).is_ok());
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_gpu_count_with_gpu_device() {
+        let spec = SandboxSpec {
+            gpu_device: "nvidia.com/gpu=0".to_string(),
+            resources: Some(ResourceSpec {
+                gpu_count: 2,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = validate_sandbox_spec("resource-sandbox", &spec).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("gpu_count"));
+        assert!(err.message().contains("gpu_device"));
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_conflicting_template_resources() {
+        use prost_types::{Struct, Value, value::Kind};
+
+        let spec = SandboxSpec {
+            resources: Some(ResourceSpec {
+                cpu_limit: "4".to_string(),
+                ..Default::default()
+            }),
+            template: Some(SandboxTemplate {
+                resources: Some(Struct {
+                    fields: std::iter::once((
+                        "limits".to_string(),
+                        Value {
+                            kind: Some(Kind::StructValue(Struct {
+                                fields: std::iter::once((
+                                    "cpu".to_string(),
+                                    Value {
+                                        kind: Some(Kind::StringValue("2".to_string())),
+                                    },
+                                ))
+                                .collect(),
+                            })),
+                        },
+                    ))
+                    .collect(),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = validate_sandbox_spec("resource-sandbox", &spec).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("resources.cpu_limit"));
+        assert!(err.message().contains("template.resources.limits.cpu"));
     }
 
     #[test]

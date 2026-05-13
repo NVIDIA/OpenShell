@@ -1245,10 +1245,13 @@ fn container_resources(template: &SandboxTemplate, gpu: bool) -> Option<serde_js
         apply("requests", "memory", &req.memory_request);
         apply("limits", "cpu", &req.cpu_limit);
         apply("limits", "memory", &req.memory_limit);
+        if req.gpu_count > 0 {
+            set_gpu_limit(&mut resources, &req.gpu_count.to_string(), true);
+        }
     }
 
     if gpu {
-        apply_gpu_limit(&mut resources);
+        set_gpu_limit(&mut resources, GPU_RESOURCE_QUANTITY, false);
     }
     if resources.as_object().is_some_and(serde_json::Map::is_empty) {
         None
@@ -1257,10 +1260,10 @@ fn container_resources(template: &SandboxTemplate, gpu: bool) -> Option<serde_js
     }
 }
 
-fn apply_gpu_limit(resources: &mut serde_json::Value) {
+fn set_gpu_limit(resources: &mut serde_json::Value, quantity: &str, overwrite: bool) {
     let Some(resources_obj) = resources.as_object_mut() else {
         *resources = serde_json::json!({});
-        return apply_gpu_limit(resources);
+        return set_gpu_limit(resources, quantity, overwrite);
     };
 
     let limits = resources_obj
@@ -1268,13 +1271,16 @@ fn apply_gpu_limit(resources: &mut serde_json::Value) {
         .or_insert_with(|| serde_json::json!({}));
     let Some(limits_obj) = limits.as_object_mut() else {
         *limits = serde_json::json!({});
-        return apply_gpu_limit(resources);
+        return set_gpu_limit(resources, quantity, overwrite);
     };
 
-    limits_obj.insert(
-        GPU_RESOURCE_NAME.to_string(),
-        serde_json::json!(GPU_RESOURCE_QUANTITY),
-    );
+    if overwrite {
+        limits_obj.insert(GPU_RESOURCE_NAME.to_string(), serde_json::json!(quantity));
+    } else {
+        limits_obj
+            .entry(GPU_RESOURCE_NAME.to_string())
+            .or_insert_with(|| serde_json::json!(quantity));
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1493,6 +1499,23 @@ fn condition_from_value(value: &serde_json::Value) -> Option<SandboxCondition> {
 mod tests {
     use super::*;
     use prost_types::{Struct, Value, value::Kind};
+
+    fn string_value(value: &str) -> Value {
+        Value {
+            kind: Some(Kind::StringValue(value.to_string())),
+        }
+    }
+
+    fn struct_value(fields: impl IntoIterator<Item = (&'static str, Value)>) -> Value {
+        Value {
+            kind: Some(Kind::StructValue(Struct {
+                fields: fields
+                    .into_iter()
+                    .map(|(key, value)| (key.to_string(), value))
+                    .collect(),
+            })),
+        }
+    }
 
     #[test]
     fn apply_required_env_always_injects_ssh_handshake_secret() {
@@ -1896,6 +1919,75 @@ mod tests {
             limits[GPU_RESOURCE_NAME],
             serde_json::json!(GPU_RESOURCE_QUANTITY)
         );
+    }
+
+    #[test]
+    fn gpu_resource_spec_sets_gpu_resource_limit() {
+        use openshell_core::proto::compute::v1::DriverResourceRequirements;
+
+        let template = SandboxTemplate {
+            resources: Some(DriverResourceRequirements {
+                gpu_count: 4,
+                ..Default::default()
+            }),
+            ..SandboxTemplate::default()
+        };
+
+        let pod_template = {
+            let params = SandboxPodParams::default();
+            sandbox_template_to_k8s(
+                &template,
+                true,
+                &std::collections::HashMap::new(),
+                true,
+                &params,
+            )
+        };
+
+        let limits = &pod_template["spec"]["containers"][0]["resources"]["limits"];
+        assert_eq!(limits[GPU_RESOURCE_NAME], serde_json::json!("4"));
+    }
+
+    #[test]
+    fn gpu_sandbox_preserves_explicit_gpu_resource_limit() {
+        use openshell_core::proto::compute::v1::DriverResourceRequirements;
+
+        let template = SandboxTemplate {
+            resources: Some(DriverResourceRequirements {
+                cpu_limit: "2".to_string(),
+                ..Default::default()
+            }),
+            platform_config: Some(Struct {
+                fields: std::iter::once((
+                    "resources_raw".to_string(),
+                    struct_value([(
+                        "limits",
+                        struct_value([
+                            ("example.com/custom", string_value("7")),
+                            (GPU_RESOURCE_NAME, string_value("2")),
+                        ]),
+                    )]),
+                ))
+                .collect(),
+            }),
+            ..SandboxTemplate::default()
+        };
+
+        let pod_template = {
+            let params = SandboxPodParams::default();
+            sandbox_template_to_k8s(
+                &template,
+                true,
+                &std::collections::HashMap::new(),
+                true,
+                &params,
+            )
+        };
+
+        let limits = &pod_template["spec"]["containers"][0]["resources"]["limits"];
+        assert_eq!(limits["cpu"], serde_json::json!("2"));
+        assert_eq!(limits["example.com/custom"], serde_json::json!("7"));
+        assert_eq!(limits[GPU_RESOURCE_NAME], serde_json::json!("2"));
     }
 
     #[test]

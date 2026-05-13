@@ -131,6 +131,10 @@ message DriverResourceRequirements {
   string memory_request = 3;
   // Maximum memory allowed (e.g. "512Mi", "8Gi").
   string memory_limit = 4;
+  // Number of GPUs requested. A value of 0 means no explicit GPU count.
+  uint32 gpu_count = 5;
+  // Opaque key-value configuration interpreted by the selected driver.
+  map<string, string> driver_config = 100;
 }
 
 // Raw status observed directly from the compute platform.

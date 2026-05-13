@@ -22,7 +22,7 @@ Each runtime receives a sandbox spec from the gateway and is responsible for:
 |---|---|---|---|
 | Docker | Local development with Docker available. | Container plus nested sandbox namespace. | Uses host networking so loopback gateway endpoints work from the supervisor. |
 | Podman | Rootless or single-machine deployments. | Container plus nested sandbox namespace. | Uses the Podman REST API, OCI image volumes, and CDI GPU devices when available. |
-| Kubernetes | Cluster deployment through Helm. | Pod plus nested sandbox namespace. | Uses Kubernetes API objects, service accounts, secrets, PVC-backed workspace storage, and GPU resources. |
+| Kubernetes | Cluster deployment through Helm. | Pod plus nested sandbox namespace. | Uses Kubernetes API objects, service accounts, secrets, PVC-backed workspace storage, and `nvidia.com/gpu` limits for GPU requests. |
 | VM | Experimental microVM isolation. | Per-sandbox libkrun VM. | Gateway spawns `openshell-driver-vm` as a subprocess over a private, state-local Unix socket. |
 
 VM runtime state paths are derived only from driver-validated sandbox IDs
@@ -62,7 +62,9 @@ users.
 Custom sandbox images must include the agent runtime and any system
 dependencies, but they should not need to include the gateway. GPU-capable
 images must include the user-space libraries required by the workload. The
-runtime still owns GPU device injection.
+runtime still owns GPU device injection or resource scheduling. Kubernetes maps
+portable `SandboxSpec.resources` CPU, memory, and GPU count requirements into
+pod resource requests and limits when the cluster exposes those resources.
 
 ## Deployment Shape
 

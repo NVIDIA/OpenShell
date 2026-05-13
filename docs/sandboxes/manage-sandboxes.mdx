@@ -35,6 +35,35 @@ To request GPU resources, add `--gpu`:
 openshell sandbox create --gpu -- claude
 ```
 
+To request multiple GPUs on a Kubernetes-backed gateway, set a GPU count:
+
+```shell
+openshell sandbox create --gpu-count 4 -- claude
+```
+
+GPU counts schedule Kubernetes sandbox pods with an `nvidia.com/gpu` resource
+limit. `--gpu-count` cannot be combined with `--gpu-device` because count-based
+scheduling and driver-specific device selection are different allocation modes.
+
+To set portable CPU and memory resource requests or limits, use the resource
+flags:
+
+```shell
+openshell sandbox create \
+  --cpu-request 2 \
+  --cpu-limit 4 \
+  --memory-request 8Gi \
+  --memory-limit 16Gi \
+  -- claude
+```
+
+Resource values use Kubernetes-style quantity strings. Kubernetes-backed
+gateways map these fields into pod `resources.requests` and
+`resources.limits`.
+
+For driver-specific resource settings, pass opaque key-value entries with
+`--resource-config KEY=VALUE`. The selected driver interprets those entries.
+
 For Docker-backed sandboxes, GPU injection uses Docker CDI. If you enable Docker
 CDI after the gateway starts, restart the gateway so OpenShell can detect the
 updated Docker daemon capability.

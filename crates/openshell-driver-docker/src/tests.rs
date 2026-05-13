@@ -357,6 +357,7 @@ fn docker_resource_limits_rejects_requests() {
             cpu_limit: String::new(),
             memory_request: String::new(),
             memory_limit: String::new(),
+            ..DriverResourceRequirements::default()
         }),
         platform_config: None,
     };
