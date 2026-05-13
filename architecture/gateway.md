@@ -104,6 +104,12 @@ This keeps the gateway data model portable across storage backends and leaves
 room for future stores that can provide the same object, label, version, and
 scope semantics.
 
+The SQLite adapter tightens the on-disk database file to mode `0o600` on every
+connect so that provider API keys, SSH session tokens, and sandbox metadata are
+not readable by other local users on shared hosts. The same restriction is
+reapplied to the `<db>-wal` and `<db>-shm` sidecars (created by SQLite's
+default WAL journal mode), which mirror the same sensitive contents.
+
 Persisted state includes sandboxes, providers, SSH sessions, policy revisions,
 settings, inference configuration, and deployment records.
 

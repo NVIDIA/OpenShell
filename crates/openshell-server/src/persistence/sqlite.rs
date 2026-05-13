@@ -2,15 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{
-    DraftChunkRecord, ObjectRecord, PersistenceResult, PolicyRecord, current_time_ms, map_db_error,
-    map_migrate_error,
+    DraftChunkRecord, ObjectRecord, PersistenceError, PersistenceResult, PolicyRecord,
+    current_time_ms, map_db_error, map_migrate_error,
 };
 use crate::policy_store::{
     draft_chunk_payload_from_record, draft_chunk_record_from_parts, policy_payload_from_record,
     policy_record_from_parts,
 };
+use openshell_core::paths::set_file_owner_only;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 static SQLITE_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/sqlite");
@@ -40,10 +42,19 @@ impl SqliteStore {
             pool_options = pool_options.idle_timeout(None).max_lifetime(None);
         }
 
+        // Capture the on-disk path before `connect_with` consumes the options
+        // so we can restrict the permissions after the database is connected.
+        let db_path = (!is_in_memory).then(|| options.get_filename().to_path_buf());
+
         let pool = pool_options
             .connect_with(options)
             .await
             .map_err(|e| map_db_error(&e))?;
+
+        // Tighten the permissions of the database file to owner-only access (0o600).
+        if let Some(path) = db_path {
+            restrict_db_file_permissions(&path)?;
+        }
 
         Ok(Self { pool })
     }
@@ -614,6 +625,38 @@ WHERE "object_type" = ?1 AND "scope" = ?2
 
 fn draft_chunk_dedup_key(chunk: &DraftChunkRecord) -> String {
     format!("{}|{}|{}", chunk.host, chunk.port, chunk.binary)
+}
+
+/// Restrict the on-disk `SQLite` database file (and its WAL/SHM sidecars,
+/// when present) to owner-only read/write (`0o600`).
+///
+/// In WAL mode, `SQLite` keeps two sidecars next to
+/// the main database file: `<db>-wal` (uncommitted page log)
+/// and `<db>-shm` (shared memory index). They mirror the same sensitive data
+/// as the main file, so they get the same `0o600` treatment whenever they exist on disk.
+///
+/// Delegates to `set_file_owner_only`, which is a no-op on non-Unix platforms.
+pub(super) fn restrict_db_file_permissions(path: &Path) -> PersistenceResult<()> {
+    set_file_owner_only(path).map_err(|err| PersistenceError::Database(err.to_string()))?;
+
+    for sidecar in sqlite_sidecar_paths(path) {
+        if sidecar.exists() {
+            set_file_owner_only(&sidecar)
+                .map_err(|err| PersistenceError::Database(err.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Compute the WAL/SHM sidecar paths `SQLite` derives from a main database file
+/// (e.g. `foo.db` -> [`foo.db-wal`, `foo.db-shm`]).
+pub(super) fn sqlite_sidecar_paths(path: &Path) -> [PathBuf; 2] {
+    let with_suffix = |suffix: &str| -> PathBuf {
+        let mut buf = path.as_os_str().to_os_string();
+        buf.push(suffix);
+        PathBuf::from(buf)
+    };
+    [with_suffix("-wal"), with_suffix("-shm")]
 }
 
 fn row_to_object_record(row: sqlx::sqlite::SqliteRow) -> ObjectRecord {

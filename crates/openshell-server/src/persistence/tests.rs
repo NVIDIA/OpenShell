@@ -34,6 +34,183 @@ async fn sqlite_connect_runs_embedded_migrations() {
     assert!(records.is_empty());
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn sqlite_connect_restricts_db_file_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp.path().join("openshell.db");
+    let url = format!("sqlite:{}?mode=rwc", db_path.display());
+
+    let _store = Store::connect(&url).await.expect("connect to sqlite");
+
+    let mode = std::fs::metadata(&db_path)
+        .expect("db file exists")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "expected 0600, got {mode:04o}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sqlite_connect_tightens_existing_db_file_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp.path().join("openshell.db");
+    let url = format!("sqlite:{}?mode=rwc", db_path.display());
+
+    // First connect creates the file; close the pool by dropping the store.
+    {
+        let _store = Store::connect(&url).await.expect("initial connect");
+    }
+
+    // Simulate a pre-existing database left with permissive permissions
+    // (e.g., from an older gateway version that lacked this hardening).
+    std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o644))
+        .expect("loosen permissions");
+
+    let _store = Store::connect(&url).await.expect("reconnect to sqlite");
+
+    let mode = std::fs::metadata(&db_path)
+        .expect("db file exists")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "expected 0600, got {mode:04o}");
+}
+
+// The next three tests cover `restrict_db_file_permissions` against the
+// WAL/SHM sidecars at increasing levels of fidelity:
+//
+// 1. `_tightens_main_and_wal_and_shm_files`: synthetic empty files, proves
+//    the chmod loop walks all three paths.
+// 2. `_skips_missing_sidecars`: proves the `exists()` guard, which is the
+//    actual production path today (sqlx 0.8 doesn't default to WAL and
+//    doesn't accept `journal_mode` as a URL parameter).
+// 3. `_handles_real_sqlite_wal_files`: opens a real sqlx pool with
+//    `SqliteJournalMode::Wal` via the builder API so SQLite materializes
+//    real `-wal` and `-shm` files, then checks the helper tightens them.
+
+#[cfg(unix)]
+#[test]
+fn restrict_db_file_permissions_tightens_main_and_wal_and_shm_files() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp.path().join("openshell.db");
+    let [wal_path, shm_path] = super::sqlite::sqlite_sidecar_paths(&db_path);
+
+    // Simulate a SQLite database in WAL mode whose three files were left
+    // world-readable (older gateway version, or non-zero umask at creation).
+    for path in [&db_path, &wal_path, &shm_path] {
+        std::fs::write(path, b"").expect("create file");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).expect("set 0o644");
+    }
+
+    super::sqlite::restrict_db_file_permissions(&db_path).expect("restrict permissions");
+
+    for path in [&db_path, &wal_path, &shm_path] {
+        let mode = std::fs::metadata(path)
+            .expect("file exists")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode,
+            0o600,
+            "expected 0600 on {}, got {mode:04o}",
+            path.display()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn restrict_db_file_permissions_skips_missing_sidecars() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp.path().join("openshell.db");
+    let [wal_path, shm_path] = super::sqlite::sqlite_sidecar_paths(&db_path);
+
+    // Only the main DB file exists (non-WAL journal mode, or pre-write WAL).
+    std::fs::write(&db_path, b"").expect("create file");
+    std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o644)).expect("set 0o644");
+
+    super::sqlite::restrict_db_file_permissions(&db_path).expect("restrict permissions");
+
+    assert!(!wal_path.exists(), "WAL sidecar should not be created");
+    assert!(!shm_path.exists(), "SHM sidecar should not be created");
+
+    let mode = std::fs::metadata(&db_path)
+        .expect("db file exists")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "expected 0600, got {mode:04o}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn restrict_db_file_permissions_handles_real_sqlite_wal_files() {
+    use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+    use std::os::unix::fs::PermissionsExt;
+    use std::str::FromStr;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp.path().join("openshell.db");
+    let url = format!("sqlite:{}", db_path.display());
+
+    // sqlx does not parse `journal_mode` from the connection URL — callers
+    // must opt into WAL via the builder API.
+    let options = SqliteConnectOptions::from_str(&url)
+        .expect("parse url")
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal);
+
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .expect("connect with WAL");
+
+    // Force a write so SQLite definitely materializes a non-empty WAL on disk.
+    sqlx::query("CREATE TABLE _hardening_probe (x INTEGER)")
+        .execute(&pool)
+        .await
+        .expect("write");
+
+    let [wal_path, shm_path] = super::sqlite::sqlite_sidecar_paths(&db_path);
+    assert!(wal_path.exists(), "WAL should exist after write");
+    assert!(shm_path.exists(), "SHM should exist after WAL write");
+
+    // Loosen permissions on every file to simulate what an older gateway
+    // version (or a non-zero default umask) would have left behind.
+    for path in [&db_path, &wal_path, &shm_path] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644))
+            .expect("loosen permissions");
+    }
+
+    super::sqlite::restrict_db_file_permissions(&db_path).expect("restrict permissions");
+
+    for path in [&db_path, &wal_path, &shm_path] {
+        let mode = std::fs::metadata(path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode,
+            0o600,
+            "expected 0600 on {}, got {mode:04o}",
+            path.display()
+        );
+    }
+}
+
 #[tokio::test]
 async fn sqlite_updates_timestamp() {
     let store = Store::connect("sqlite::memory:?cache=shared")
