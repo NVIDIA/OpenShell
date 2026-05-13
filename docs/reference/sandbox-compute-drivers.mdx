@@ -87,6 +87,14 @@ For maintainer-level implementation details, refer to the [VM driver README](htt
 
 The gateway starts `openshell-driver-vm` over a private Unix socket and passes its process ID so the driver can reject unexpected local clients. The driver's standalone TCP listener is disabled unless `--allow-unauthenticated-tcp` is set for local development.
 
+### Local image resolution
+
+The VM driver resolves sandbox images from a local container engine before falling back to registry pulls. It tries Docker first, then falls back to the Podman socket (Docker-compatible API). On Linux with Podman, enable the API socket so the driver can find local images:
+
+```shell
+systemctl --user start podman.socket
+```
+
 ## Kubernetes Driver
 
 Kubernetes-backed sandboxes run as pods in the configured sandbox namespace. Use Kubernetes for shared clusters, remote compute, GPU scheduling, and operator-managed environments.
