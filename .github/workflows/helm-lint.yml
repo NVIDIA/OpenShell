@@ -55,3 +55,6 @@ jobs:
 
       - name: Lint Helm chart
         run: mise run helm:lint
+
+      - name: Run Helm chart unit tests
+        run: mise run helm:test

@@ -19,6 +19,16 @@ run = """
   echo "All variants passed."
 """
 
+["helm:test"]
+description = "Run Helm chart unit tests"
+run = """
+  set -e
+  if ! helm plugin list | grep -q unittest; then
+    helm plugin install https://github.com/helm-unittest/helm-unittest
+  fi
+  helm unittest deploy/helm/openshell
+"""
+
 ["helm:skaffold:dev"]
 description = "Run skaffold dev for deploy/helm/openshell (iterative deploy)"
 dir = "deploy/helm/openshell"

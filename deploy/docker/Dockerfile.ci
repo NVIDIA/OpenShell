@@ -83,7 +83,8 @@ RUN --mount=type=secret,id=MISE_GITHUB_TOKEN \
     npm install -g "npm@${NPM_VERSION}" && \
     mise reshim && \
     (/root/.cargo/bin/rustup component remove rust-docs || true) && \
-    rm -rf /root/.rustup/toolchains/*/share/doc /root/.rustup/toolchains/*/share/man
+    rm -rf /root/.rustup/toolchains/*/share/doc /root/.rustup/toolchains/*/share/man && \
+    helm plugin install https://github.com/helm-unittest/helm-unittest
 
 # Set working directory for CI jobs
 WORKDIR /builds
