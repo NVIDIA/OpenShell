@@ -24,7 +24,7 @@ description = "Run Helm chart unit tests"
 run = """
   set -e
   if ! helm plugin list | grep -q unittest; then
-    helm plugin install https://github.com/helm-unittest/helm-unittest
+    helm plugin install https://github.com/helm-unittest/helm-unittest --verify=false
   fi
   helm unittest deploy/helm/openshell
 """

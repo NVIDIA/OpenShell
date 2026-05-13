@@ -636,10 +636,6 @@ WHERE "object_type" = ?1 AND "scope" = ?2
     }
 }
 
-fn draft_chunk_dedup_key(chunk: &DraftChunkRecord) -> String {
-    format!("{}|{}|{}", chunk.host, chunk.port, chunk.binary)
-}
-
 /// Restrict the on-disk `SQLite` database file (and its WAL/SHM sidecars,
 /// when present) to owner-only read/write (`0o600`).
 ///
