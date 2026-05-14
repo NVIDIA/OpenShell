@@ -126,6 +126,12 @@ pub struct GatewayFileSection {
     #[serde(default)]
     pub guest_tls_key: Option<PathBuf>,
 
+    // ── TLS toggle ───────────────────────────────────────────────────────
+    /// When `true`, the gateway listens on plaintext HTTP and ignores any
+    /// `[openshell.gateway.tls]` table. Mirrors `--disable-tls`.
+    #[serde(default)]
+    pub disable_tls: Option<bool>,
+
     // ── Nested tables ────────────────────────────────────────────────────
     #[serde(default)]
     pub tls: Option<TlsConfig>,

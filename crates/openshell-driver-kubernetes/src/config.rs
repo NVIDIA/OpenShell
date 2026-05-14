@@ -1,9 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use openshell_core::config::{
-    DEFAULT_IMAGE_PULL_POLICY, DEFAULT_K8S_NAMESPACE, DEFAULT_SUPERVISOR_IMAGE,
-};
+use openshell_core::config::{DEFAULT_K8S_NAMESPACE, DEFAULT_SUPERVISOR_IMAGE};
 use serde::{Deserialize, Serialize};
 
 /// How the supervisor binary is delivered into sandbox pods.
@@ -70,7 +68,11 @@ impl Default for KubernetesComputeConfig {
         Self {
             namespace: DEFAULT_K8S_NAMESPACE.to_string(),
             default_image: String::new(),
-            image_pull_policy: DEFAULT_IMAGE_PULL_POLICY.to_string(),
+            // Default empty so the gateway omits `imagePullPolicy` from pod
+            // specs and Kubernetes applies its own default (Always for `latest`,
+            // IfNotPresent otherwise). `DEFAULT_IMAGE_PULL_POLICY` ("missing")
+            // is Podman vocabulary and is not a valid Kubernetes value.
+            image_pull_policy: String::new(),
             supervisor_image: DEFAULT_SUPERVISOR_IMAGE.to_string(),
             supervisor_image_pull_policy: String::new(),
             supervisor_sideload_method: SupervisorSideloadMethod::default(),

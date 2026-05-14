@@ -389,32 +389,54 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
         .with_bind_address(bind)
         .with_log_level(&args.log_level);
 
-    if args.health_port != 0 {
-        if args.port == args.health_port {
+    // Listener addresses for the health and metrics endpoints. The file may
+    // pin a different interface than the main listener (e.g. health on
+    // 127.0.0.1 while gRPC binds 0.0.0.0); the full `SocketAddr` from the
+    // file is preserved unless CLI/env supplied an explicit `--health-port` /
+    // `--metrics-port`, in which case the port overrides the file value
+    // while the IP defaults to `args.bind_address`.
+    let file_gateway = file.as_ref().map(|f| &f.openshell.gateway);
+    let health_bind = resolve_aux_listener(
+        args.bind_address,
+        args.health_port,
+        &matches,
+        "health_port",
+        || file_gateway.and_then(|g| g.health_bind_address),
+    );
+    let metrics_bind = resolve_aux_listener(
+        args.bind_address,
+        args.metrics_port,
+        &matches,
+        "metrics_port",
+        || file_gateway.and_then(|g| g.metrics_bind_address),
+    );
+
+    if let Some(addr) = health_bind {
+        if args.port == addr.port() {
             return Err(miette::miette!(
                 "--port and --health-port must be different (both set to {})",
                 args.port
             ));
         }
-        let health_bind = SocketAddr::new(args.bind_address, args.health_port);
-        config = config.with_health_bind_address(health_bind);
+        config = config.with_health_bind_address(addr);
     }
 
-    if args.metrics_port != 0 {
-        if args.port == args.metrics_port {
+    if let Some(addr) = metrics_bind {
+        if args.port == addr.port() {
             return Err(miette::miette!(
                 "--port and --metrics-port must be different (both set to {})",
                 args.port
             ));
         }
-        if args.health_port != 0 && args.health_port == args.metrics_port {
+        if let Some(health) = health_bind
+            && health.port() == addr.port()
+        {
             return Err(miette::miette!(
                 "--health-port and --metrics-port must be different (both set to {})",
-                args.health_port
+                health.port()
             ));
         }
-        let metrics_bind = SocketAddr::new(args.bind_address, args.metrics_port);
-        config = config.with_metrics_bind_address(metrics_bind);
+        config = config.with_metrics_bind_address(addr);
     }
 
     config = config
@@ -426,6 +448,13 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
         .with_sandbox_ssh_port(args.sandbox_ssh_port)
         .with_server_sans(args.server_sans.clone())
         .with_loopback_service_http(args.enable_loopback_service_http);
+
+    if let Some(ttl) = file
+        .as_ref()
+        .and_then(|f| f.openshell.gateway.ssh_session_ttl_secs)
+    {
+        config = config.with_ssh_session_ttl_secs(ttl);
+    }
 
     if let Some(image) = args.sandbox_image.clone() {
         config = config.with_sandbox_image(image);
@@ -511,6 +540,39 @@ fn arg_defaulted(matches: &ArgMatches, id: &str) -> bool {
     )
 }
 
+/// Resolve the bind address for an auxiliary listener (health / metrics).
+///
+/// The precedence is:
+///   1. CLI flag or `OPENSHELL_*` env var explicitly set on the corresponding
+///      port argument → `bind_address:port` (port from CLI, IP from the main
+///      listener interface).
+///   2. Full `SocketAddr` from `[openshell.gateway].{health,metrics}_bind_address`
+///      → used as-is (this is how operators pin a loopback-only health port
+///      on a gateway whose gRPC listener is bound publicly).
+///   3. Otherwise the listener is disabled (returns `None`).
+fn resolve_aux_listener(
+    bind_ip: IpAddr,
+    port_arg: u16,
+    matches: &ArgMatches,
+    port_id: &str,
+    file_addr: impl FnOnce() -> Option<SocketAddr>,
+) -> Option<SocketAddr> {
+    if !arg_defaulted(matches, port_id) {
+        if port_arg == 0 {
+            return None;
+        }
+        return Some(SocketAddr::new(bind_ip, port_arg));
+    }
+    if let Some(addr) = file_addr() {
+        return Some(addr);
+    }
+    if port_arg == 0 {
+        None
+    } else {
+        Some(SocketAddr::new(bind_ip, port_arg))
+    }
+}
+
 /// Apply gateway-wide values from `[openshell.gateway]` onto `RunArgs` for
 /// every argument that is still sourced from clap's built-in default.
 ///
@@ -525,16 +587,11 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
             args.port = addr.port();
         }
     }
-    if let Some(addr) = file.health_bind_address
-        && arg_defaulted(matches, "health_port")
-    {
-        args.health_port = addr.port();
-    }
-    if let Some(addr) = file.metrics_bind_address
-        && arg_defaulted(matches, "metrics_port")
-    {
-        args.metrics_port = addr.port();
-    }
+    // Note: file's full health_bind_address / metrics_bind_address are
+    // consumed in `run_from_args`'s listener-resolution block so the IP
+    // half of the SocketAddr is preserved. Copying only the port here
+    // would silently relocate a loopback-intended listener onto the
+    // public bind address.
     if let Some(level) = &file.log_level
         && arg_defaulted(matches, "log_level")
     {
@@ -598,6 +655,11 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
         && arg_defaulted(matches, "enable_loopback_service_http")
     {
         args.enable_loopback_service_http = enabled;
+    }
+    if let Some(disabled) = file.disable_tls
+        && arg_defaulted(matches, "disable_tls")
+    {
+        args.disable_tls = disabled;
     }
     // TLS gateway listener fields
     if let Some(tls) = &file.tls {
@@ -1073,6 +1135,95 @@ audience = "openshell-cli"
 
         assert_eq!(args.oidc_issuer.as_deref(), Some("https://idp.example.com"));
         assert_eq!(args.oidc_audience, "openshell-cli");
+    }
+
+    #[test]
+    fn aux_listener_preserves_file_ip_against_public_bind() {
+        use std::net::SocketAddr;
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = EnvVarGuard::remove("OPENSHELL_HEALTH_PORT");
+
+        let (_args, matches) =
+            parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
+        let file_addr: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+        let resolved = super::resolve_aux_listener(
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            0,
+            &matches,
+            "health_port",
+            || Some(file_addr),
+        );
+        assert_eq!(
+            resolved,
+            Some(file_addr),
+            "TOML health_bind_address 127.0.0.1:8081 must not be relocated to 0.0.0.0:8081"
+        );
+    }
+
+    #[test]
+    fn aux_listener_cli_port_overrides_file_addr() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = EnvVarGuard::remove("OPENSHELL_HEALTH_PORT");
+
+        let (_args, matches) = parse_with_args(&[
+            "openshell-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--health-port",
+            "9999",
+        ]);
+        let file_addr: std::net::SocketAddr = "127.0.0.1:8081".parse().unwrap();
+        let resolved = super::resolve_aux_listener(
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            9999,
+            &matches,
+            "health_port",
+            || Some(file_addr),
+        );
+        assert_eq!(
+            resolved,
+            Some("0.0.0.0:9999".parse().unwrap()),
+            "CLI flag must win over file value"
+        );
+    }
+
+    #[test]
+    fn file_disable_tls_applies() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = EnvVarGuard::remove("OPENSHELL_DISABLE_TLS");
+
+        let (mut args, matches) =
+            parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
+        let file = config_file_from_toml(
+            r"
+[openshell.gateway]
+disable_tls = true
+",
+        );
+        merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+
+        assert!(args.disable_tls);
+    }
+
+    #[test]
+    fn file_ssh_session_ttl_secs_is_parsed() {
+        // The loader must accept and surface the documented key. The actual
+        // wiring into `Config` happens in `run_from_args` against the parsed
+        // file (not via `merge_file_into_args`, since there is no matching
+        // `RunArgs` field), so this test pins the schema half.
+        let file = config_file_from_toml(
+            r"
+[openshell.gateway]
+ssh_session_ttl_secs = 1234
+",
+        );
+        assert_eq!(file.openshell.gateway.ssh_session_ttl_secs, Some(1234));
     }
 
     #[test]

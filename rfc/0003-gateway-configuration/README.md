@@ -95,6 +95,10 @@ enable_loopback_service_http = true
 # ──────────────────────────────────────────────────────────────────────────────
 # TLS / mTLS — when omitted, the gateway listens plaintext (sets --disable-tls)
 # ──────────────────────────────────────────────────────────────────────────────
+# Mirrors --disable-tls / OPENSHELL_DISABLE_TLS. When true, the gateway
+# ignores the [openshell.gateway.tls] table below.
+disable_tls           = false
+
 [openshell.gateway.tls]
 cert_path             = "/etc/openshell/certs/gateway.pem"
 key_path              = "/etc/openshell/certs/gateway-key.pem"
