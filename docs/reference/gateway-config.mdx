@@ -16,7 +16,7 @@ The OpenShell gateway reads its configuration from a TOML file when `--config` o
 CLI flag  >  OPENSHELL_* env var  >  TOML file  >  built-in default
 ```
 
-`database_url` and `ssh_handshake_secret` are env-only. The loader rejects them when they appear in the file.
+`database_url` is env-only. The loader rejects it when it appears in the file.
 
 ## Layout
 

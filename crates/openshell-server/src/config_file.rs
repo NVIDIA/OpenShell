@@ -5,7 +5,7 @@
 //!
 //! See `rfc/0003-gateway-configuration/README.md` for the file format. This
 //! module parses the file into [`ConfigFile`], rejects fields that must be
-//! supplied via env/CLI (database URL, SSH handshake secret), and provides
+//! supplied via env/CLI (database URL), and provides
 //! [`driver_table`] which overlays shared `[openshell.gateway]` defaults onto
 //! a `[openshell.drivers.<name>]` table so each driver crate's
 //! `Deserialize` impl sees a fully-populated table.
