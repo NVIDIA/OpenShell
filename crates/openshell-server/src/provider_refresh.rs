@@ -185,8 +185,7 @@ pub fn new_refresh_state(
 ) -> Result<StoredProviderCredentialRefreshState, Status> {
     let provider_id = provider.object_id().to_string();
     let provider_name = provider.object_name().to_string();
-    let now_ms =
-        current_time_ms().map_err(|e| Status::internal(format!("timestamp error: {e}")))?;
+    let now_ms = current_time_ms();
     let next_refresh_at_ms = next_refresh_at_ms(
         config.expires_at_ms,
         config.refresh_before_seconds,
@@ -224,12 +223,14 @@ use openshell_core::{ObjectId, ObjectName};
 struct MintedCredential {
     access_token: String,
     expires_at_ms: i64,
+    refresh_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
     access_token: String,
     expires_in: Option<i64>,
+    refresh_token: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -307,9 +308,20 @@ pub async fn refresh_provider_credential(
 
     match mint_credential(&state).await {
         Ok(minted) => {
-            let now_ms =
-                current_time_ms().map_err(|e| Status::internal(format!("timestamp error: {e}")))?;
+            let now_ms = current_time_ms();
             apply_minted_credential(store, &provider, credential_key, &minted).await?;
+            if let Some(refresh_token) = minted.refresh_token {
+                state
+                    .material
+                    .insert("refresh_token".to_string(), refresh_token);
+                if !state
+                    .secret_material_keys
+                    .iter()
+                    .any(|key| key == "refresh_token")
+                {
+                    state.secret_material_keys.push("refresh_token".to_string());
+                }
+            }
             state.expires_at_ms = minted.expires_at_ms;
             state.next_refresh_at_ms = next_refresh_at_ms(
                 minted.expires_at_ms,
@@ -334,8 +346,7 @@ pub async fn refresh_provider_credential(
             Ok(state)
         }
         Err(err) => {
-            let now_ms =
-                current_time_ms().map_err(|e| Status::internal(format!("timestamp error: {e}")))?;
+            let now_ms = current_time_ms();
             state.status = "error".to_string();
             state.last_error = err.message().to_string();
             state.next_refresh_at_ms =
@@ -385,6 +396,9 @@ async fn mint_credential(
     let strategy = ProviderCredentialRefreshStrategy::try_from(state.strategy)
         .unwrap_or(ProviderCredentialRefreshStrategy::Unspecified);
     match strategy {
+        ProviderCredentialRefreshStrategy::Oauth2RefreshToken => {
+            mint_oauth2_refresh_token(state).await
+        }
         ProviderCredentialRefreshStrategy::Oauth2ClientCredentials => {
             mint_oauth2_client_credentials(state).await
         }
@@ -393,11 +407,32 @@ async fn mint_credential(
         }
         ProviderCredentialRefreshStrategy::External
         | ProviderCredentialRefreshStrategy::Static
-        | ProviderCredentialRefreshStrategy::Oauth2RefreshToken
         | ProviderCredentialRefreshStrategy::Unspecified => Err(Status::failed_precondition(
             format!("refresh strategy '{strategy:?}' cannot be minted by the gateway yet"),
         )),
     }
+}
+
+async fn mint_oauth2_refresh_token(
+    state: &StoredProviderCredentialRefreshState,
+) -> Result<MintedCredential, Status> {
+    let token_url = oauth2_token_url(state)?;
+    let client_id = required_material(&state.material, "client_id")?;
+    let refresh_token = required_material(&state.material, "refresh_token")?;
+    let mut form = vec![
+        ("grant_type".to_string(), "refresh_token".to_string()),
+        ("client_id".to_string(), client_id),
+        ("refresh_token".to_string(), refresh_token),
+    ];
+    if let Some(client_secret) = material_value(&state.material, &["client_secret"]) {
+        form.push(("client_secret".to_string(), client_secret));
+    }
+    let scope = refresh_scopes(state).join(" ");
+    if !scope.is_empty() {
+        form.push(("scope".to_string(), scope));
+    }
+
+    request_token(&token_url, &form, state.max_lifetime_seconds).await
 }
 
 async fn mint_oauth2_client_credentials(
@@ -431,8 +466,7 @@ async fn mint_google_service_account_jwt(
             "google_service_account_jwt requires at least one scope",
         ));
     }
-    let now_ms =
-        current_time_ms().map_err(|e| Status::internal(format!("timestamp error: {e}")))?;
+    let now_ms = current_time_ms();
     let now_secs = now_ms / 1000;
     let lifetime_secs = if state.max_lifetime_seconds > 0 {
         state.max_lifetime_seconds.min(DEFAULT_MAX_LIFETIME_SECONDS)
@@ -508,8 +542,7 @@ async fn request_token(
             "token endpoint returned empty access_token",
         ));
     }
-    let now_ms =
-        current_time_ms().map_err(|e| Status::internal(format!("timestamp error: {e}")))?;
+    let now_ms = current_time_ms();
     let lifetime_cap_seconds = if max_lifetime_seconds > 0 {
         max_lifetime_seconds
     } else {
@@ -523,6 +556,9 @@ async fn request_token(
     Ok(MintedCredential {
         access_token: token.access_token,
         expires_at_ms: now_ms.saturating_add(lifetime_seconds.saturating_mul(1000)),
+        refresh_token: token
+            .refresh_token
+            .filter(|refresh_token| !refresh_token.trim().is_empty()),
     })
 }
 
@@ -618,8 +654,7 @@ pub fn spawn_refresh_worker(state: std::sync::Arc<crate::ServerState>, interval:
 }
 
 async fn run_refresh_worker_tick(store: &Store) -> Result<(), Status> {
-    let now_ms =
-        current_time_ms().map_err(|e| Status::internal(format!("timestamp error: {e}")))?;
+    let now_ms = current_time_ms();
     let states = list_all_refresh_states(store).await?;
     let watched_count = states.len();
     let due_count = states
@@ -681,10 +716,11 @@ async fn run_refresh_worker_tick(store: &Store) -> Result<(), Status> {
 #[cfg(test)]
 mod tests {
     use super::{
-        NewRefreshStateConfig, new_refresh_state, put_refresh_state, refresh_provider_credential,
-        refresh_state_name, refresh_strategy_name, seconds_until_ms,
+        NewRefreshStateConfig, get_refresh_state, new_refresh_state, put_refresh_state,
+        refresh_provider_credential, refresh_state_name, refresh_strategy_name, seconds_until_ms,
     };
     use crate::persistence::Store;
+    use openshell_core::ObjectId;
     use openshell_core::proto::datamodel::v1::ObjectMeta;
     use openshell_core::proto::{Provider, ProviderCredentialRefreshStrategy};
     use std::collections::HashMap;
@@ -714,6 +750,10 @@ mod tests {
         assert_eq!(seconds_until_ms(1_000, 61_000), 60);
         assert_eq!(seconds_until_ms(61_000, 1_000), 0);
         assert_eq!(seconds_until_ms(1_000, 0), 0);
+        assert_eq!(
+            refresh_strategy_name(ProviderCredentialRefreshStrategy::Oauth2RefreshToken as i32),
+            "oauth2_refresh_token"
+        );
         assert_eq!(
             refresh_strategy_name(
                 ProviderCredentialRefreshStrategy::Oauth2ClientCredentials as i32
@@ -752,7 +792,7 @@ mod tests {
             .unwrap();
         let provider = provider("my-graph", "outlook");
         store.put_message(&provider).await.unwrap();
-        let before_refresh_ms = crate::persistence::current_time_ms().unwrap();
+        let before_refresh_ms = crate::persistence::current_time_ms();
         let state = new_refresh_state(
             &provider,
             "MS_GRAPH_ACCESS_TOKEN",
@@ -794,6 +834,90 @@ mod tests {
         assert_eq!(
             stored.credential_expires_at_ms.get("MS_GRAPH_ACCESS_TOKEN"),
             Some(&refreshed.expires_at_ms)
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth2_refresh_token_refresh_mints_access_token_and_persists_rotated_refresh_token() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(body_string_contains("grant_type=refresh_token"))
+            .and(body_string_contains("client_id=client-id"))
+            .and(body_string_contains("refresh_token=old-refresh-token"))
+            .and(body_string_contains(
+                "scope=https%3A%2F%2Fgraph.microsoft.com%2F.default",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "delegated-graph-token",
+                "refresh_token": "rotated-refresh-token",
+                "expires_in": 3600,
+                "token_type": "Bearer"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .unwrap();
+        let provider = provider("my-delegated-graph", "outlook");
+        store.put_message(&provider).await.unwrap();
+        let state = new_refresh_state(
+            &provider,
+            "MS_GRAPH_ACCESS_TOKEN",
+            NewRefreshStateConfig {
+                strategy: ProviderCredentialRefreshStrategy::Oauth2RefreshToken,
+                material: HashMap::from([
+                    ("client_id".to_string(), "client-id".to_string()),
+                    ("refresh_token".to_string(), "old-refresh-token".to_string()),
+                ]),
+                secret_material_keys: vec!["refresh_token".to_string()],
+                expires_at_ms: 0,
+                token_url: format!("{}/token", mock_server.uri()),
+                scopes: vec!["https://graph.microsoft.com/.default".to_string()],
+                refresh_before_seconds: 30,
+                max_lifetime_seconds: 60,
+            },
+        )
+        .unwrap();
+        put_refresh_state(&store, &state).await.unwrap();
+
+        let refreshed =
+            refresh_provider_credential(&store, "my-delegated-graph", "MS_GRAPH_ACCESS_TOKEN")
+                .await
+                .unwrap();
+        assert_eq!(refreshed.status, "refreshed");
+        assert!(refreshed.expires_at_ms > 0);
+
+        let stored_provider = store
+            .get_message_by_name::<Provider>("my-delegated-graph")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored_provider.credentials.get("MS_GRAPH_ACCESS_TOKEN"),
+            Some(&"delegated-graph-token".to_string())
+        );
+        assert_eq!(
+            stored_provider
+                .credential_expires_at_ms
+                .get("MS_GRAPH_ACCESS_TOKEN"),
+            Some(&refreshed.expires_at_ms)
+        );
+
+        let stored_state = get_refresh_state(&store, provider.object_id(), "MS_GRAPH_ACCESS_TOKEN")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored_state.material.get("refresh_token"),
+            Some(&"rotated-refresh-token".to_string())
+        );
+        assert!(
+            stored_state
+                .secret_material_keys
+                .iter()
+                .any(|key| key == "refresh_token")
         );
     }
 

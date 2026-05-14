@@ -394,8 +394,7 @@ pub(super) async fn resolve_provider_environment(
 
     let mut env = std::collections::HashMap::new();
     let mut expires = std::collections::HashMap::new();
-    let now_ms = crate::persistence::current_time_ms()
-        .map_err(|e| Status::internal(format!("timestamp error: {e}")))?;
+    let now_ms = crate::persistence::current_time_ms();
 
     for name in provider_names {
         let provider = store
@@ -1882,7 +1881,7 @@ mod tests {
         .await
         .unwrap();
 
-        let expires_at_ms = crate::persistence::current_time_ms().unwrap() + 60_000;
+        let expires_at_ms = crate::persistence::current_time_ms() + 60_000;
         let response = handle_configure_provider_refresh(
             &state,
             Request::new(ConfigureProviderRefreshRequest {
@@ -2657,7 +2656,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_provider_env_skips_expired_credentials_and_returns_expiry_metadata() {
         let store = Store::connect("sqlite::memory:").await.unwrap();
-        let now_ms = crate::persistence::current_time_ms().unwrap();
+        let now_ms = crate::persistence::current_time_ms();
         let provider = Provider {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: String::new(),
