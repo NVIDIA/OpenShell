@@ -51,6 +51,18 @@ pub const DEFAULT_K8S_NAMESPACE: &str = "openshell";
 /// CDI device identifier for requesting all NVIDIA GPUs.
 pub const CDI_GPU_DEVICE_ALL: &str = "nvidia.com/gpu=all";
 
+/// Default install path of the `wxc-exec.exe` helper used by the Windows
+/// AppContainer / Isolation Session compute drivers.
+///
+/// The bootstrap-wxc task is responsible for placing the binary here. The
+/// drivers consult this path when [`WXC_EXEC_ENV_VAR`] is unset.
+#[cfg(target_os = "windows")]
+pub const WXC_EXEC_DEFAULT_PATH_PROGRAMFILES: &str = r"C:\Program Files\OpenShell\wxc-exec.exe";
+
+/// Environment variable that overrides the discovered path to `wxc-exec.exe`.
+#[cfg(target_os = "windows")]
+pub const WXC_EXEC_ENV_VAR: &str = "OPENSHELL_WXC_EXEC";
+
 /// Compute backends the gateway can orchestrate sandboxes through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -59,6 +71,14 @@ pub enum ComputeDriverKind {
     Vm,
     Docker,
     Podman,
+    /// Windows AppContainer-backed sandbox compute driver. Wired by the
+    /// `wxc-exec` helper installed via the bootstrap-wxc task.
+    #[serde(rename = "appcontainer")]
+    AppContainer,
+    /// Windows Isolation Session-backed sandbox compute driver. Wired by the
+    /// `wxc-exec` helper installed via the bootstrap-wxc task.
+    #[serde(rename = "isolation-session")]
+    IsolationSession,
 }
 
 impl ComputeDriverKind {
@@ -69,6 +89,8 @@ impl ComputeDriverKind {
             Self::Vm => "vm",
             Self::Docker => "docker",
             Self::Podman => "podman",
+            Self::AppContainer => "appcontainer",
+            Self::IsolationSession => "isolation-session",
         }
     }
 }
@@ -88,8 +110,10 @@ impl FromStr for ComputeDriverKind {
             "vm" => Ok(Self::Vm),
             "docker" => Ok(Self::Docker),
             "podman" => Ok(Self::Podman),
+            "appcontainer" => Ok(Self::AppContainer),
+            "isolation-session" => Ok(Self::IsolationSession),
             other => Err(format!(
-                "unsupported compute driver '{other}'. expected one of: kubernetes, vm, docker, podman"
+                "unsupported compute driver '{other}'. expected one of: kubernetes, vm, docker, podman, appcontainer, isolation-session"
             )),
         }
     }
@@ -744,12 +768,50 @@ mod tests {
             "docker".parse::<ComputeDriverKind>().unwrap(),
             ComputeDriverKind::Docker
         );
+        assert_eq!(
+            "appcontainer".parse::<ComputeDriverKind>().unwrap(),
+            ComputeDriverKind::AppContainer
+        );
+        assert_eq!(
+            "isolation-session".parse::<ComputeDriverKind>().unwrap(),
+            ComputeDriverKind::IsolationSession
+        );
     }
 
     #[test]
     fn compute_driver_kind_rejects_unknown_values() {
         let err = "firecracker".parse::<ComputeDriverKind>().unwrap_err();
         assert!(err.contains("unsupported compute driver 'firecracker'"));
+    }
+
+    #[test]
+    fn compute_driver_kind_display_round_trips() {
+        for kind in [
+            ComputeDriverKind::Kubernetes,
+            ComputeDriverKind::Vm,
+            ComputeDriverKind::Docker,
+            ComputeDriverKind::Podman,
+            ComputeDriverKind::AppContainer,
+            ComputeDriverKind::IsolationSession,
+        ] {
+            let rendered = kind.to_string();
+            assert_eq!(rendered, kind.as_str());
+            let parsed: ComputeDriverKind = rendered.parse().unwrap();
+            assert_eq!(parsed, kind);
+        }
+    }
+
+    #[test]
+    fn compute_driver_kind_serde_round_trips_new_variants() {
+        let appcontainer = serde_json::to_string(&ComputeDriverKind::AppContainer).unwrap();
+        assert_eq!(appcontainer, "\"appcontainer\"");
+        let parsed: ComputeDriverKind = serde_json::from_str(&appcontainer).unwrap();
+        assert_eq!(parsed, ComputeDriverKind::AppContainer);
+
+        let isolation = serde_json::to_string(&ComputeDriverKind::IsolationSession).unwrap();
+        assert_eq!(isolation, "\"isolation-session\"");
+        let parsed: ComputeDriverKind = serde_json::from_str(&isolation).unwrap();
+        assert_eq!(parsed, ComputeDriverKind::IsolationSession);
     }
 
     #[test]

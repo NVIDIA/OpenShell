@@ -694,6 +694,15 @@ async fn build_compute_runtime(
             .await
             .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
         }
+        // TODO(server-compute): wire AppContainer / IsolationSession Windows
+        // compute drivers. Until then, `configured_compute_driver` accepts
+        // these variants but `build_compute_runtime` rejects them with an
+        // explicit error so misconfigurations surface clearly.
+        ComputeDriverKind::AppContainer | ComputeDriverKind::IsolationSession => {
+            Err(Error::config(format!(
+                "compute driver `{driver}` is not yet wired into the gateway"
+            )))
+        }
     }
 }
 
@@ -709,7 +718,9 @@ fn configured_compute_driver(config: &Config) -> Result<ComputeDriverKind> {
             driver @ (ComputeDriverKind::Kubernetes
             | ComputeDriverKind::Vm
             | ComputeDriverKind::Docker
-            | ComputeDriverKind::Podman),
+            | ComputeDriverKind::Podman
+            | ComputeDriverKind::AppContainer
+            | ComputeDriverKind::IsolationSession),
         ] => Ok(*driver),
         drivers => Err(Error::config(format!(
             "multiple compute drivers are not supported yet; configured drivers: {}",
