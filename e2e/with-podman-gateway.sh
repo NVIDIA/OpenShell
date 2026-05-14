@@ -316,7 +316,6 @@ HEALTH_PORT=$(e2e_pick_port)
 STATE_DIR="${WORKDIR}/state"
 mkdir -p "${STATE_DIR}"
 
-HANDSHAKE_SECRET="e2e-podman-$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
 E2E_NAMESPACE="e2e-podman-$$-${HOST_PORT}"
 PODMAN_NETWORK_NAME="${E2E_NAMESPACE}"
 ensure_e2e_podman_network "${PODMAN_NETWORK_NAME}"
@@ -348,7 +347,6 @@ e2e_export_gateway_restart_metadata \
   "${GATEWAY_LOG}" \
   "${GATEWAY_PID_FILE}"
 
-OPENSHELL_SSH_HANDSHAKE_SECRET="${HANDSHAKE_SECRET}" \
 OPENSHELL_SUPERVISOR_IMAGE="${SUPERVISOR_IMAGE}" \
 OPENSHELL_NETWORK_NAME="${PODMAN_NETWORK_NAME}" \
   "${GATEWAY_BIN}" "${GATEWAY_ARGS[@]}" >"${GATEWAY_LOG}" 2>&1 &

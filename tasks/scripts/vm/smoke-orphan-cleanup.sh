@@ -59,7 +59,6 @@ start_gateway() {
     OPENSHELL_GRPC_ENDPOINT="http://host.containers.internal:$PORT" \
     OPENSHELL_SSH_GATEWAY_HOST=127.0.0.1 \
     OPENSHELL_SSH_GATEWAY_PORT="$PORT" \
-    OPENSHELL_SSH_HANDSHAKE_SECRET=dev-vm-driver-secret \
     OPENSHELL_VM_DRIVER_STATE_DIR="$STATE_DIR" \
     OPENSHELL_VM_RUNTIME_COMPRESSED_DIR="$ROOT/target/vm-runtime-compressed" \
     nohup "$ROOT/target/debug/openshell-gateway" --disable-tls \

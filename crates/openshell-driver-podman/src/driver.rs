@@ -378,8 +378,8 @@ impl PodmanComputeDriver {
             .await;
 
         // Remove container. If NotFound, the container was removed between
-        // inspect and here (TOCTOU race); proceed with volume/secret cleanup
-        // since those resources are idempotent to remove.
+        // inspect and here (TOCTOU race); proceed with volume cleanup
+        // since the workspace volume is idempotent to remove.
         let container_existed = match self.client.remove_container(&name).await {
             Ok(()) => true,
             Err(PodmanApiError::NotFound(_)) => false,

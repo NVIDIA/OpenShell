@@ -17,7 +17,7 @@ The gateway today is configured exclusively through CLI flags and `OPENSHELL_*` 
 - **Too many flags** — the gateway has ~40 configurable parameters today (TLS, OIDC, four compute drivers, three listeners). Long `docker run` commands and `args:` arrays in Kubernetes manifests are hard to read, diff, and audit.
 - **Driver coupling** — Docker, Podman, Kubernetes, and VM drivers all live in the same flat CLI namespace, with no structural separation. Most flags only apply to one driver, but there is no way to express that in CLI form.
 - **Helm friction** — The chart's `statefulset.yaml` already carries a long `env:` block of `OPENSHELL_*` variables that each map to a `values.yaml` key. A config file can be mounted as a single `ConfigMap` and reduces the chart's templating surface significantly.
-- **Secrets management** — Injecting secrets (TLS material paths, handshake secret, database URL, OIDC settings) via environment variables is functional but not idiomatic for Kubernetes. A file-based format opens the door to projected secrets and volume mounts that compose cleanly with the non-secret config.
+- **Secrets management** — Injecting secrets (TLS material paths, database URL, OIDC settings) via environment variables is functional but not idiomatic for Kubernetes. A file-based format opens the door to projected secrets and volume mounts that compose cleanly with the non-secret config.
 
 ## Non-goals
 
@@ -79,10 +79,8 @@ log_level             = "info"
 compute_drivers       = ["kubernetes"]
 
 # SSH proxy (gateway-side; driver-side equivalents live under each driver).
-# Note: ssh_handshake_secret is a secret and must be supplied via
-# OPENSHELL_SSH_HANDSHAKE_SECRET (or --ssh-handshake-secret) — it is NOT
-# permitted in the file. database_url is the same: env / CLI only.
-ssh_handshake_skew_secs = 300
+# Note: database_url is a secret and must be supplied via OPENSHELL_DB_URL
+# (or --db-url) — it is NOT permitted in the file.
 ssh_session_ttl_secs    = 86400
 ssh_gateway_host        = "127.0.0.1"
 ssh_gateway_port        = 8080
@@ -182,16 +180,15 @@ Field-level merge rules:
 
 ### Secrets
 
-Two fields are deliberately excluded from the TOML schema and must be supplied via environment variable or CLI flag:
+One field is deliberately excluded from the TOML schema and must be supplied via environment variable or CLI flag:
 
 | Field | Source |
 |---|---|
 | `database_url` | `OPENSHELL_DB_URL` / `--db-url` |
-| `ssh_handshake_secret` | `OPENSHELL_SSH_HANDSHAKE_SECRET` / `--ssh-handshake-secret` |
 
-These two values are high-value secrets where a leaked plaintext file is materially worse than a leaked env var (database URLs typically embed credentials; the handshake secret authenticates every gateway↔sandbox SSH session). Forcing them out of the file removes the easiest accidental-commit path.
+Database URLs typically embed credentials, and a leaked plaintext file is materially worse than a leaked env var. Forcing the URL out of the file removes the easiest accidental-commit path.
 
-If either field appears under `[openshell.gateway]`, the parser fails with a clear error pointing operators at the env/CLI form.
+If the field appears under `[openshell.gateway]`, the parser fails with a clear error pointing operators at the env/CLI form.
 
 OIDC settings (including `oidc.audience`, `oidc.admin_role`, etc.) **are** allowed in the file. None of them are credentials by themselves. However, operators should still prefer env-var injection for any field they would otherwise store in a Kubernetes `Secret` — TLS material paths, OIDC issuer URLs in restricted environments, and so on. The general guidance: if it would live in a `Secret` resource, source it from an env var; if it would live in a `ConfigMap`, the file is fine.
 
@@ -204,12 +201,11 @@ The following cross-field validations are applied after merging file + env + CLI
 - `bind_address`, `health_bind_address`, and `metrics_bind_address` must all use distinct ports when set.
 - When `[openshell.gateway.tls]` is present, all three of `cert_path`, `key_path`, and `client_ca_path` must be present (either from the file or from CLI/env). Partial TLS configuration is an error.
 - `database_url` must be non-empty after merging env + CLI — every supported driver requires it. The field is not accepted from the file (see Secrets above).
-- `ssh_handshake_secret` is not accepted from the file. Drivers that require it surface a runtime error if env/CLI did not provide it.
 - `compute_drivers` may be empty; in that case the gateway falls back to auto-detection. If the list contains a driver name with no matching `[openshell.drivers.<name>]` table, the driver runs with its built-in defaults.
 
 ### Backwards compatibility
 
-The existing CLI interface is fully preserved. All flags continue to work exactly as before. The `--config` flag is new and additive. `OPENSHELL_DB_URL` and `OPENSHELL_SSH_HANDSHAKE_SECRET` remain required process inputs (they are not accepted from the file).
+The existing CLI interface is fully preserved. All flags continue to work exactly as before. The `--config` flag is new and additive. `OPENSHELL_DB_URL` remains a required process input (it is not accepted from the file).
 
 ### Example: minimal Kubernetes deployment
 
@@ -220,7 +216,7 @@ version = 1
 [openshell.gateway]
 bind_address    = "0.0.0.0:8080"
 compute_drivers = ["kubernetes"]
-# database_url and ssh_handshake_secret come from env (e.g. valueFrom.secretKeyRef).
+# database_url comes from env (e.g. valueFrom.secretKeyRef).
 # No [openshell.gateway.tls] → plaintext listener (gateway runs behind Envoy / ingress).
 
 [openshell.drivers.kubernetes]
@@ -237,7 +233,7 @@ The Helm chart today renders a long `env:` block in `templates/statefulset.yaml`
 1. A new `gateway.config` value tree (TOML-shaped YAML) in `values.yaml`.
 2. A new `ConfigMap` template that renders the values into a TOML document via Helm's `tpl`.
 3. A volume mount of the `ConfigMap` at `/etc/openshell/gateway.toml` and a `--config` flag in the gateway container's `args`.
-4. Continued use of `Secret`-backed `env:` entries for `OPENSHELL_DB_URL` and `OPENSHELL_SSH_HANDSHAKE_SECRET` (these never live in the `ConfigMap`), plus optional projections for TLS material paths. The CLI/env precedence above means any `Secret`-backed env var also wins over a value in the `ConfigMap`.
+4. Continued use of a `Secret`-backed `env:` entry for `OPENSHELL_DB_URL` (which never lives in the `ConfigMap`), plus optional projections for TLS material paths. The CLI/env precedence above means any `Secret`-backed env var also wins over a value in the `ConfigMap`.
 
 ```yaml
 # values.yaml excerpt
@@ -271,7 +267,7 @@ No part of this RFC has shipped yet. The work breaks down as:
 ## Risks
 
 - **Serde `deny_unknown_fields` is strict** — any field name change in `openshell_core::Config` or in a driver's config struct becomes a breaking change for anyone using the file. Mitigate by treating field renames as breaking, keeping the `version` field reserved for schema migrations, and surfacing rename errors clearly.
-- **Secrets in the file** — `database_url` and `ssh_handshake_secret` are excluded from the schema entirely (env / CLI only). OIDC settings remain allowed in the file because none of them are credentials in isolation. Operators should still prefer env-var injection for any field that would live in a `Secret` rather than a `ConfigMap` (TLS material paths, restricted-environment OIDC issuers, etc.). Documentation must call this out prominently.
+- **Secrets in the file** — `database_url` is excluded from the schema entirely (env / CLI only). OIDC settings remain allowed in the file because none of them are credentials in isolation. Operators should still prefer env-var injection for any field that would live in a `Secret` rather than a `ConfigMap` (TLS material paths, restricted-environment OIDC issuers, etc.). Documentation must call this out prominently.
 - **Partial TLS configuration** — the hard error on partial TLS config is the right UX, but the error message must clearly identify which source (file vs. CLI/env) is missing which field, since the file's `[openshell.gateway.tls]` table is all-or-nothing while the CLI flags are independent.
 - **Driver schema drift** — once each driver owns its own TOML table, driver releases can change field names independently of the gateway. The gateway's `version` field does not protect against driver-side breakage; document driver-config stability separately.
 
@@ -295,4 +291,4 @@ No part of this RFC has shipped yet. The work breaks down as:
 2. **Directory-based config (`conf.d` pattern)** — a `--config-dir` flag that globs all `*.toml` files in a directory, sorts them alphabetically, and deep-merges them in order (later files win per key). CLI/env overrides still sit above everything. This maps cleanly to Kubernetes: a base `ConfigMap` as `10-base.toml`, driver config as `20-kubernetes.toml`, and credentials from a projected `Secret` as `90-credentials.toml` — all mounted into the same directory without a monolithic file. This is the approach taken by cri-o and kubelet, inspired by systemd's `conf.d` convention.
 
    Deferred to a follow-on: the single `--config` file is sufficient for v1, and the directory loader can be added without any schema changes. Before implementing, three design decisions must be settled: (a) whether `--config` and `--config-dir` are mutually exclusive or composable (and if so which takes lower precedence); (b) whether a later file's array value (e.g. `compute_drivers`) replaces or appends — replace is simpler and less surprising; (c) `deny_unknown_fields` validation must apply to the final merged result rather than each individual file, since partial drop-in files won't contain all sections.
-3. **OIDC secret hygiene (revisit)** — `database_url` and `ssh_handshake_secret` are excluded from the file schema (resolved). OIDC settings are allowed for v1 since the listed fields are identifiers, not credentials. If we add OIDC fields that *are* credentials in the future (e.g. a client secret for confidential-client flows), they should join the env-only list at that point. Re-evaluate once the OIDC surface stabilises.
+3. **OIDC secret hygiene (revisit)** — `database_url` is excluded from the file schema (resolved). OIDC settings are allowed for v1 since the listed fields are identifiers, not credentials. If we add OIDC fields that *are* credentials in the future (e.g. a client secret for confidential-client flows), they should join the env-only list at that point. Re-evaluate once the OIDC surface stabilises.

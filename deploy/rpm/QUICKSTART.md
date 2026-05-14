@@ -63,7 +63,6 @@ systemctl --user enable --now openshell-gateway
 On first start, the gateway automatically generates:
 
 - A self-signed PKI bundle (CA, server cert, client cert) for mTLS
-- An SSH handshake secret for sandbox authentication
 - A commented configuration file at `~/.config/openshell/gateway.env`
 
 > **Note:** The gateway binds to all interfaces (`0.0.0.0`) by default.

@@ -197,12 +197,13 @@ The standalone `openshell-driver-podman` binary sets the same struct field from
 
 ## Credential Injection
 
-The SSH handshake secret is injected via Podman's `secret_env` API rather than
-a plaintext environment variable.
+Sandboxes authenticate to the gateway via mTLS using client materials bind-
+mounted into the container from a Podman secret. No shared per-request secret
+is injected as an environment variable.
 
 | Credential | Mechanism | Visible in `inspect`? | Visible in `/proc/<pid>/environ`? |
 |---|---|---|---|
-| SSH handshake secret | Podman `secret_env`, created via secrets API and referenced by name | No | Yes, supervisor only, scrubbed from children |
+| mTLS client cert/key | Bind-mounted file paths (`OPENSHELL_TLS_*` env vars point at them) | Yes (paths only) | Yes (paths only) |
 | Sandbox identity | Plaintext env var | Yes | Yes |
 | gRPC endpoint | Plaintext env var, override-protected | Yes | Yes |
 | Supervisor relay socket path | Plaintext env var, override-protected | Yes | Yes |
@@ -250,8 +251,8 @@ sequenceDiagram
 ```
 
 Each step rolls back previously-created resources on failure. The Conflict path
-cleans up the volume and secret because they are keyed by the new sandbox's ID,
-not the conflicting container's ID.
+cleans up the volume because it is keyed by the new sandbox's ID, not the
+conflicting container's ID.
 
 ### Readiness and Health
 
@@ -274,11 +275,9 @@ the socket without the old marker or published-port signal.
 4. Force-remove the container.
 5. Remove workspace volume derived from the request `sandbox_id`, warning on
    failure and continuing.
-6. Remove handshake secret derived from the request `sandbox_id`, warning on
-   failure and continuing.
 
 If the container is already gone during inspect or remove, the driver still
-performs idempotent volume and secret cleanup using the request `sandbox_id` and
+performs idempotent volume cleanup using the request `sandbox_id` and
 returns `Ok(false)` for the container-delete result. This prevents leaked
 Podman resources after out-of-band container removal or label drift.
 

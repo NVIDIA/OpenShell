@@ -137,7 +137,7 @@ The unit runs two **ExecStartPre** scripts on first start:
 
 1. **init-pki.sh** generates a self-signed PKI bundle for mTLS.
 2. **init-gateway-env.sh** generates the environment configuration
-   file with an auto-generated SSH handshake secret.
+   file.
 
 Both scripts are idempotent and skip generation if their output files
 already exist.

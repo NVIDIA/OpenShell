@@ -158,8 +158,6 @@ trap cleanup EXIT
 
 # ── Launch the gateway + VM driver ───────────────────────────────────
 
-SSH_HANDSHAKE_SECRET="$(openssl rand -hex 32)"
-
 echo "==> Starting openshell-gateway on 127.0.0.1:${HOST_PORT} (state: ${RUN_STATE_DIR})"
 
 # Pin --driver-dir to the workspace `target/debug/` so we always pick up
@@ -182,7 +180,6 @@ echo "==> Starting openshell-gateway on 127.0.0.1:${HOST_PORT} (state: ${RUN_STA
   --db-url 'sqlite::memory:' \
   --port "${HOST_PORT}" \
   --grpc-endpoint "http://host.containers.internal:${HOST_PORT}" \
-  --ssh-handshake-secret "${SSH_HANDSHAKE_SECRET}" \
   --driver-dir "${ROOT}/target/debug" \
   --vm-driver-state-dir "${RUN_STATE_DIR}" \
   >"${GATEWAY_LOG}" 2>&1 &
