@@ -42,9 +42,6 @@ pub const DEFAULT_SUPERVISOR_IMAGE: &str = "openshell/supervisor:latest";
 /// Default image pull policy for sandbox images.
 pub const DEFAULT_IMAGE_PULL_POLICY: &str = "missing";
 
-/// Default Kubernetes namespace for sandbox resources.
-pub const DEFAULT_K8S_NAMESPACE: &str = "openshell";
-
 /// CDI device identifier for requesting all NVIDIA GPUs.
 pub const CDI_GPU_DEVICE_ALL: &str = "nvidia.com/gpu=all";
 

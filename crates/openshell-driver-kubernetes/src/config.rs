@@ -1,8 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use openshell_core::config::{DEFAULT_K8S_NAMESPACE, DEFAULT_SUPERVISOR_IMAGE};
+use openshell_core::config::DEFAULT_SUPERVISOR_IMAGE;
 use serde::{Deserialize, Serialize};
+
+/// Default Kubernetes namespace for sandbox resources.
+pub const DEFAULT_K8S_NAMESPACE: &str = "openshell";
 
 /// How the supervisor binary is delivered into sandbox pods.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
