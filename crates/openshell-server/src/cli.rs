@@ -122,8 +122,10 @@ struct RunArgs {
     #[arg(long, env = "OPENSHELL_SANDBOX_IMAGE_PULL_POLICY")]
     sandbox_image_pull_policy: Option<String>,
 
-    /// gRPC endpoint for sandboxes to callback to `OpenShell`.
-    /// This should be reachable from within the Kubernetes cluster.
+    /// gRPC endpoint that sandboxes use to call back into the gateway.
+    /// Must be reachable from wherever the sandbox runs (Kubernetes pod,
+    /// Docker/Podman container, or VM), and is applied to every compute
+    /// driver.
     #[arg(long, env = "OPENSHELL_GRPC_ENDPOINT")]
     grpc_endpoint: Option<String>,
 
