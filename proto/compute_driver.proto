@@ -6,6 +6,7 @@ syntax = "proto3";
 package openshell.compute.v1;
 
 import "google/protobuf/struct.proto";
+import "sandbox.proto";
 
 // Internal compute-driver contract used by the gateway.
 //
@@ -215,6 +216,10 @@ message ListSandboxesResponse {
 message CreateSandboxRequest {
   // Sandbox configuration to provision on the compute platform.
   DriverSandbox sandbox = 1;
+  // Optional AEGIS-issued ticket scoping this sandbox's execution envelope.
+  // When present, the driver verifies the ticket and enforces its envelope
+  // for the upcoming command execution.
+  optional openshell.sandbox.v1.SignedTicket signed_ticket = 2;
 }
 
 message CreateSandboxResponse {}

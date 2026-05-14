@@ -269,3 +269,116 @@ message GetSandboxConfigResponse {
   // Changes when attached provider names or attached provider records change.
   uint64 provider_env_revision = 8;
 }
+
+// AEGIS execution-envelope policy bound to a single tool call.
+//
+// EnvelopePolicy is the constrained subset of `SandboxPolicy` that the AEGIS
+// gateway adapter computes per tool call and embeds inside an `ExecutionTicket`.
+// Drivers consume this envelope to scope filesystem, network, and timeout
+// constraints for the upcoming command execution.
+message EnvelopePolicy {
+  // Filesystem paths the tool call may read and write.
+  repeated string readwrite_paths = 1;
+  // Filesystem paths the tool call may read only.
+  repeated string readonly_paths = 2;
+  // Filesystem paths the tool call must not access.
+  repeated string denied_paths = 3;
+  // True when network egress is permitted for this tool call.
+  bool network_enabled = 4;
+  // True when loopback / private-range network access is permitted.
+  bool allow_local_network = 5;
+  // Maximum wall-clock execution time in milliseconds before the driver
+  // terminates the tool call. Zero means "use driver default".
+  uint32 timeout_ms = 6;
+  // Driver-specific sandbox profile name (e.g. AppContainer profile).
+  string sandbox_profile = 7;
+}
+
+// AEGIS execution ticket: the signed authorization bound to one tool call.
+//
+// The ticket is canonically serialized as JSON, base64-encoded, and embedded
+// in a `SignedTicket` together with an ECDSA P-256 signature. Drivers verify
+// the signature offline against the gateway's published public key before
+// honoring the envelope.
+message ExecutionTicket {
+  // Ticket schema version.
+  uint32 version = 1;
+  // Tool name reported by the agent runtime (e.g. "shell", "edit_file").
+  string tool_name = 2;
+  // Runtime-supplied tool-call identifier used to correlate ticket issuance,
+  // verification, and audit events for the same logical call.
+  string tool_call_id = 3;
+  // Sandbox session identifier the tool call belongs to.
+  string session_id = 4;
+  // Hash of the canonicalized tool arguments at issuance time.
+  string args_hash = 5;
+  // Working directory the tool call will run in.
+  string cwd = 6;
+  // Constrained execution envelope the driver must enforce.
+  EnvelopePolicy envelope = 7;
+  // Hash of the policy revision used to derive this ticket.
+  string policy_hash = 8;
+  // Issuance timestamp (milliseconds since epoch).
+  uint64 issued_at = 9;
+  // Expiration timestamp (milliseconds since epoch).
+  uint64 expires_at = 10;
+  // Single-use nonce that prevents ticket replay.
+  string nonce = 11;
+}
+
+// Wire form of an AEGIS execution ticket carrying its signature.
+message SignedTicket {
+  // Base64 of the canonical JSON encoding of `ExecutionTicket`.
+  string ticket = 1;
+  // Base64 of the ECDSA P-256 signature over the canonical ticket bytes.
+  string signature = 2;
+  // Base64 of the SPKI-encoded public key. Empty means the driver should
+  // resolve the gateway's well-known public key path.
+  string public_key = 3;
+}
+
+// AEGIS policy decision attached to an issuance response.
+message AegisDecisionRecord {
+  // Decision verdict: "allow", "deny", or "ask".
+  string decision = 1;
+  // Human-readable reason for the decision.
+  string reason = 2;
+  // Name of the Rego rule that produced the decision.
+  string rule_name = 3;
+  // Ticket the gateway would issue if the decision is "allow".
+  ExecutionTicket ticket = 4;
+}
+
+// Request to evaluate AEGIS policy and (when allowed) issue a signed ticket.
+message IssueAegisTicketRequest {
+  // Adapter scope the runtime payload follows (e.g. "copilot", "claude").
+  string scope = 1;
+  // Raw runtime hook payload. The gateway adapter normalizes this into an
+  // ActionRequest before policy evaluation.
+  bytes runtime_payload = 2;
+}
+
+// Response carrying the AEGIS decision and, when allowed, a signed ticket.
+message IssueAegisTicketResponse {
+  // Decision record describing the verdict and matched rule.
+  AegisDecisionRecord decision = 1;
+  // Signed ticket. Only populated when `decision.decision` is "allow".
+  SignedTicket signed_ticket = 2;
+}
+
+// Request to verify an existing signed AEGIS ticket.
+message VerifyAegisTicketRequest {
+  // Ticket whose signature, expiry, and nonce state must be validated.
+  SignedTicket signed_ticket = 1;
+}
+
+// Response describing whether a signed AEGIS ticket is valid.
+message VerifyAegisTicketResponse {
+  // True when the ticket signature, expiry, and nonce checks all pass.
+  bool valid = 1;
+  // Human-readable reason when `valid` is false.
+  string reason = 2;
+  // Decoded ticket payload, populated whenever the wire format parsed
+  // successfully (even if `valid` is false).
+  ExecutionTicket ticket = 3;
+}

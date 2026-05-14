@@ -203,6 +203,15 @@ service OpenShell {
 
   // Get decision history for a sandbox's draft policy.
   rpc GetDraftHistory(GetDraftHistoryRequest) returns (GetDraftHistoryResponse);
+
+  // Evaluate AEGIS policy for a tool call and, when allowed, issue a
+  // signed ExecutionTicket the agent runtime can hand to the driver.
+  rpc IssueAegisTicket(openshell.sandbox.v1.IssueAegisTicketRequest)
+      returns (openshell.sandbox.v1.IssueAegisTicketResponse);
+
+  // Verify an existing signed AEGIS ticket without redeeming it.
+  rpc VerifyAegisTicket(openshell.sandbox.v1.VerifyAegisTicketRequest)
+      returns (openshell.sandbox.v1.VerifyAegisTicketResponse);
 }
 
 // Health check request.
