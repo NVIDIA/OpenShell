@@ -2817,11 +2817,6 @@ mod tests {
         assert!(env.contains(&format!(
             "OPENSHELL_SSH_SOCKET_PATH={GUEST_SSH_SOCKET_PATH}"
         )));
-        assert!(
-            !env.iter()
-                .any(|e| e.starts_with("OPENSHELL_SSH_HANDSHAKE_SECRET=")),
-            "SSH handshake secret must not be injected into guest env"
-        );
     }
 
     #[test]

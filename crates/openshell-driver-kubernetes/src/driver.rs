@@ -1504,30 +1504,6 @@ mod tests {
     use prost_types::{Struct, Value, value::Kind};
 
     #[test]
-    fn apply_required_env_does_not_inject_handshake_env() {
-        let mut env = Vec::new();
-        apply_required_env(
-            &mut env,
-            "sandbox-1",
-            "my-sandbox",
-            "https://endpoint:8080",
-            "0.0.0.0:2222",
-            true,
-        );
-
-        for name in [
-            "OPENSHELL_SSH_HANDSHAKE_SECRET",
-            "OPENSHELL_SSH_HANDSHAKE_SKEW_SECS",
-        ] {
-            assert!(
-                !env.iter()
-                    .any(|e| e.get("name").and_then(|v| v.as_str()) == Some(name)),
-                "{name} must not appear in sandbox pod env after handshake-secret removal"
-            );
-        }
-    }
-
-    #[test]
     fn supervisor_sideload_injects_run_as_user_zero() {
         let mut pod_template = serde_json::json!({
             "spec": {

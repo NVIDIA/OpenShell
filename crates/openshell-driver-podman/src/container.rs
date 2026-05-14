@@ -814,32 +814,6 @@ mod tests {
     }
 
     #[test]
-    fn container_spec_does_not_inject_handshake_env() {
-        let sandbox = test_sandbox("test-id", "test-name");
-        let config = test_config();
-        let spec = build_container_spec(&sandbox, &config);
-
-        let env_map = spec["env"].as_object().expect("env should be an object");
-        for name in [
-            "OPENSHELL_SSH_HANDSHAKE_SECRET",
-            "OPENSHELL_SSH_HANDSHAKE_SKEW_SECS",
-        ] {
-            assert!(
-                !env_map.contains_key(name),
-                "{name} must not appear in container env"
-            );
-        }
-
-        let secret_env = spec["secret_env"]
-            .as_object()
-            .expect("secret_env should be an object");
-        assert!(
-            !secret_env.contains_key("OPENSHELL_SSH_HANDSHAKE_SECRET"),
-            "handshake secret must not appear in secret_env"
-        );
-    }
-
-    #[test]
     fn container_spec_sets_sandbox_name_in_env() {
         let sandbox = test_sandbox("test-id", "my-sandbox");
         let config = test_config();

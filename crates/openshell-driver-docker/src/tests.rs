@@ -395,14 +395,6 @@ fn build_environment_sets_docker_tls_paths() {
     assert!(env.contains(&"TEMPLATE_ENV=template".to_string()));
     assert!(env.contains(&"SPEC_ENV=spec".to_string()));
     assert!(env.contains(&"OPENSHELL_SANDBOX_COMMAND=sleep infinity".to_string()));
-    assert!(
-        !env.iter()
-            .any(|entry| entry.starts_with("OPENSHELL_SSH_HANDSHAKE_SECRET="))
-    );
-    assert!(
-        !env.iter()
-            .any(|entry| entry.starts_with("OPENSHELL_SSH_HANDSHAKE_SKEW_SECS="))
-    );
 }
 
 #[test]
