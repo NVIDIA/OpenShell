@@ -65,6 +65,21 @@ before the child process starts.
 Gateway-global policy can override sandbox-scoped policy. Use it sparingly
 because it changes the effective access model for every sandbox on the gateway.
 
+## Per-tool-call envelopes (AEGIS)
+
+The gateway can also evaluate a Rego corpus per tool call and return an
+**EnvelopePolicy** that the compute driver composes with the baseline
+`SandboxPolicy` (most-restrictive-wins). This is a separate decision surface
+from the static baseline: it answers "may this specific call run, with these
+args, in this cwd?" before the tool process spawns. Full design lives in
+[aegis-governance.md](aegis-governance.md).
+
+The Rego corpus is a new privilege-escalation surface. An admin who controls
+the corpus controls every envelope the gateway issues, and therefore the
+effective access for every tool call routed through AEGIS. v1 ships only the
+gateway tier of the planned three-tier composition; treat the corpus with the
+same care as the gateway's TLS material and provider credentials.
+
 ## Policy Advisor
 
 The policy advisor pipeline turns observed denials into draft policy

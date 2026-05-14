@@ -58,6 +58,9 @@ The gateway API is organized around platform objects and operational streams:
 | Inference | Set gateway-level model/provider config and resolve sandbox route bundles. |
 | Observability | Push sandbox logs, stream sandbox status and logs to clients. |
 
+The gateway also issues AEGIS execution tickets — see
+[aegis-governance.md](aegis-governance.md).
+
 Domain objects use shared metadata: stable server-generated IDs, human-readable
 names, creation timestamps, and labels. Crate-level details live in
 `crates/openshell-core/README.md`.

@@ -24,6 +24,8 @@ Each runtime receives a sandbox spec from the gateway and is responsible for:
 | Podman | Rootless or single-machine deployments. | Container plus nested sandbox namespace. | Uses the Podman REST API, OCI image volumes, and CDI GPU devices when available. |
 | Kubernetes | Cluster deployment through Helm. | Pod plus nested sandbox namespace. | Uses Kubernetes API objects, service accounts, secrets, PVC-backed workspace storage, and GPU resources. |
 | VM | Experimental microVM isolation. | Per-sandbox libkrun VM. | Gateway spawns `openshell-driver-vm` as a subprocess over a private, state-local Unix socket. |
+| AppContainer | Windows per-tool-call isolation. | `wxc-exec.exe` AppContainer runner. | Verifies AEGIS signed tickets before spawn — see [aegis-governance.md](aegis-governance.md). |
+| IsolationSession | Windows stronger isolation profile. | `wxc-exec.exe` IsolationSession runner. | Verifies AEGIS signed tickets before spawn — see [aegis-governance.md](aegis-governance.md). |
 
 VM runtime state paths are derived only from driver-validated sandbox IDs
 matching `[A-Za-z0-9._-]{1,128}`. The gateway-owned VM driver socket uses a
