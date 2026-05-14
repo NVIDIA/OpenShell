@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{
-    DraftChunkRecord, ObjectRecord, PersistenceResult, PolicyRecord, current_time_ms, map_db_error,
-    map_migrate_error,
+    DraftChunkRecord, ObjectRecord, PersistenceError, PersistenceResult, PolicyRecord,
+    WriteCondition, WriteResult, current_time_ms, map_db_error, map_migrate_error,
 };
 use crate::policy_store::{
     draft_chunk_payload_from_record, draft_chunk_record_from_parts, policy_payload_from_record,
@@ -52,7 +52,7 @@ impl PostgresStore {
         let labels_jsonb: Option<serde_json::Value> = labels
             .map(serde_json::from_str)
             .transpose()
-            .map_err(|e| super::PersistenceError::Encode(format!("invalid labels JSON: {e}")))?;
+            .map_err(|e| PersistenceError::Encode(format!("invalid labels JSON: {e}")))?;
 
         sqlx::query(
             r"
@@ -76,6 +76,157 @@ ON CONFLICT (object_type, name) WHERE name IS NOT NULL DO UPDATE SET
         Ok(())
     }
 
+    pub async fn put_if(
+        &self,
+        object_type: &str,
+        id: &str,
+        name: &str,
+        payload: &[u8],
+        labels: Option<&str>,
+        condition: WriteCondition,
+    ) -> PersistenceResult<WriteResult> {
+        let now_ms = current_time_ms();
+        let labels_jsonb: Option<serde_json::Value> = labels
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|e| PersistenceError::Encode(format!("invalid labels JSON: {e}")))?;
+
+        match condition {
+            WriteCondition::MustCreate => {
+                // Insert only - fail if object exists
+                let row = sqlx::query(
+                    r"
+INSERT INTO objects (object_type, id, name, payload, created_at_ms, updated_at_ms, labels, resource_version)
+VALUES ($1, $2, $3, $4, $5, $5, COALESCE($6, '{}'::jsonb), 1)
+RETURNING resource_version, created_at_ms, updated_at_ms
+",
+                )
+                .bind(object_type)
+                .bind(id)
+                .bind(name)
+                .bind(payload)
+                .bind(now_ms)
+                .bind(labels_jsonb)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| map_db_error(&e))?;
+
+                let resource_version_i64: i64 = row.try_get("resource_version").unwrap_or(1);
+                Ok(WriteResult {
+                    resource_version: resource_version_i64.max(1).cast_unsigned(),
+                    created_at_ms: row.get("created_at_ms"),
+                    updated_at_ms: row.get("updated_at_ms"),
+                })
+            }
+            WriteCondition::MatchResourceVersion(expected_version) => {
+                // Update with version check using RETURNING
+                let row_result = sqlx::query(
+                    r"
+UPDATE objects
+SET payload = $4, labels = COALESCE($5, '{}'::jsonb), updated_at_ms = $6, resource_version = resource_version + 1
+WHERE object_type = $1 AND id = $2 AND resource_version = $3
+RETURNING resource_version, created_at_ms, updated_at_ms
+",
+                )
+                .bind(object_type)
+                .bind(id)
+                .bind(i64::try_from(expected_version).unwrap_or(i64::MAX))
+                .bind(payload)
+                .bind(labels_jsonb)
+                .bind(now_ms)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| map_db_error(&e))?;
+
+                if let Some(row) = row_result {
+                    let resource_version_i64: i64 = row.try_get("resource_version").unwrap_or(1);
+                    Ok(WriteResult {
+                        resource_version: resource_version_i64.max(1).cast_unsigned(),
+                        created_at_ms: row.get("created_at_ms"),
+                        updated_at_ms: row.get("updated_at_ms"),
+                    })
+                } else {
+                    // Check if object exists to distinguish NotFound from Conflict
+                    let existing = self.get(object_type, id).await?;
+                    if let Some(record) = existing {
+                        Err(PersistenceError::Conflict {
+                            current_resource_version: Some(record.resource_version),
+                        })
+                    } else {
+                        Err(PersistenceError::Database(format!(
+                            "object not found: {object_type}/{id}"
+                        )))
+                    }
+                }
+            }
+            WriteCondition::Unconditional => {
+                // Unconditional upsert by name
+                let row = sqlx::query(
+                    r"
+INSERT INTO objects (object_type, id, name, payload, created_at_ms, updated_at_ms, labels, resource_version)
+VALUES ($1, $2, $3, $4, $5, $5, COALESCE($6, '{}'::jsonb), 1)
+ON CONFLICT (object_type, name) WHERE name IS NOT NULL DO UPDATE SET
+    payload = EXCLUDED.payload,
+    updated_at_ms = EXCLUDED.updated_at_ms,
+    labels = EXCLUDED.labels,
+    resource_version = objects.resource_version + 1
+RETURNING resource_version, created_at_ms, updated_at_ms
+",
+                )
+                .bind(object_type)
+                .bind(id)
+                .bind(name)
+                .bind(payload)
+                .bind(now_ms)
+                .bind(labels_jsonb)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| map_db_error(&e))?;
+
+                let resource_version_i64: i64 = row.try_get("resource_version").unwrap_or(1);
+                Ok(WriteResult {
+                    resource_version: resource_version_i64.max(1).cast_unsigned(),
+                    created_at_ms: row.get("created_at_ms"),
+                    updated_at_ms: row.get("updated_at_ms"),
+                })
+            }
+        }
+    }
+
+    pub async fn delete_if(
+        &self,
+        object_type: &str,
+        id: &str,
+        expected_resource_version: u64,
+    ) -> PersistenceResult<bool> {
+        let result = sqlx::query(
+            r"
+DELETE FROM objects
+WHERE object_type = $1 AND id = $2 AND resource_version = $3
+",
+        )
+        .bind(object_type)
+        .bind(id)
+        .bind(i64::try_from(expected_resource_version).unwrap_or(i64::MAX))
+        .execute(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+
+        if result.rows_affected() > 0 {
+            Ok(true)
+        } else {
+            // Check if object exists to distinguish NotFound from Conflict
+            let existing = self.get(object_type, id).await?;
+            if let Some(record) = existing {
+                Err(PersistenceError::Conflict {
+                    current_resource_version: Some(record.resource_version),
+                })
+            } else {
+                Ok(false)
+            }
+        }
+    }
+
     pub async fn get(
         &self,
         object_type: &str,
@@ -83,7 +234,7 @@ ON CONFLICT (object_type, name) WHERE name IS NOT NULL DO UPDATE SET
     ) -> PersistenceResult<Option<ObjectRecord>> {
         let row = sqlx::query(
             r"
-SELECT object_type, id, name, payload, created_at_ms, updated_at_ms, labels
+SELECT object_type, id, name, payload, created_at_ms, updated_at_ms, labels, resource_version
 FROM objects
 WHERE object_type = $1 AND id = $2
 ",
@@ -104,7 +255,7 @@ WHERE object_type = $1 AND id = $2
     ) -> PersistenceResult<Option<ObjectRecord>> {
         let row = sqlx::query(
             r"
-SELECT object_type, id, name, payload, created_at_ms, updated_at_ms, labels
+SELECT object_type, id, name, payload, created_at_ms, updated_at_ms, labels, resource_version
 FROM objects
 WHERE object_type = $1 AND name = $2
 ",
@@ -146,7 +297,7 @@ WHERE object_type = $1 AND name = $2
     ) -> PersistenceResult<Vec<ObjectRecord>> {
         let rows = sqlx::query(
             r"
-SELECT object_type, id, name, payload, created_at_ms, updated_at_ms, labels
+SELECT object_type, id, name, payload, created_at_ms, updated_at_ms, labels, resource_version
 FROM objects
 WHERE object_type = $1
 ORDER BY created_at_ms ASC, name ASC
@@ -173,13 +324,12 @@ LIMIT $2 OFFSET $3
         use super::parse_label_selector;
 
         let required_labels = parse_label_selector(label_selector)?;
-        let labels_jsonb = serde_json::to_value(&required_labels).map_err(|e| {
-            super::PersistenceError::Encode(format!("failed to serialize labels: {e}"))
-        })?;
+        let labels_jsonb = serde_json::to_value(&required_labels)
+            .map_err(|e| PersistenceError::Encode(format!("failed to serialize labels: {e}")))?;
 
         let rows = sqlx::query(
             r"
-SELECT object_type, id, name, payload, created_at_ms, updated_at_ms, labels
+SELECT object_type, id, name, payload, created_at_ms, updated_at_ms, labels, resource_version
 FROM objects
 WHERE object_type = $1 AND labels @> $2
 ORDER BY created_at_ms ASC, name ASC
@@ -611,6 +761,7 @@ WHERE object_type = $1 AND scope = $2
 
 fn row_to_object_record(row: sqlx::postgres::PgRow) -> ObjectRecord {
     let labels_jsonb: Option<serde_json::Value> = row.get("labels");
+    let resource_version_i64: i64 = row.try_get("resource_version").unwrap_or(1);
     ObjectRecord {
         object_type: row.get("object_type"),
         id: row.get("id"),
@@ -619,6 +770,7 @@ fn row_to_object_record(row: sqlx::postgres::PgRow) -> ObjectRecord {
         created_at_ms: row.get("created_at_ms"),
         updated_at_ms: row.get("updated_at_ms"),
         labels: labels_jsonb.map(|value| value.to_string()),
+        resource_version: resource_version_i64.max(1).cast_unsigned(),
     }
 }
 

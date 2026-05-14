@@ -28,7 +28,7 @@ pub mod time;
 
 pub use config::{ComputeDriverKind, Config, OidcConfig, TlsConfig};
 pub use error::{ComputeDriverError, Error, Result};
-pub use metadata::{ObjectId, ObjectLabels, ObjectName};
+pub use metadata::{GetResourceVersion, ObjectId, ObjectLabels, ObjectName, SetResourceVersion};
 
 /// Build version string derived from git metadata.
 ///

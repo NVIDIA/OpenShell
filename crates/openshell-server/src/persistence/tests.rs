@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{ObjectType, Store, generate_name};
+use super::{ObjectType, PersistenceError, Store, generate_name};
 use crate::policy_store::PolicyStoreExt;
 use openshell_core::proto::{ObjectForTest, SandboxPolicy};
 use prost::Message;
@@ -961,4 +961,461 @@ fn parse_label_selector_handles_whitespace() {
     assert_eq!(result.len(), 2);
     assert_eq!(result.get("env"), Some(&"prod".to_string()));
     assert_eq!(result.get("tier"), Some(&"frontend".to_string()));
+}
+
+// ---------------------------------------------------------------------------
+// CAS (compare-and-swap) tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn cas_put_if_must_create_succeeds() {
+    use super::WriteCondition;
+
+    let store = Store::connect("sqlite::memory:?cache=shared")
+        .await
+        .unwrap();
+
+    let result = store
+        .put_if(
+            "sandbox",
+            "id-1",
+            "new-sandbox",
+            b"payload",
+            None,
+            WriteCondition::MustCreate,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.resource_version, 1);
+
+    let record = store.get("sandbox", "id-1").await.unwrap().unwrap();
+    assert_eq!(record.resource_version, 1);
+    assert_eq!(record.payload, b"payload");
+}
+
+#[tokio::test]
+async fn cas_put_if_must_create_fails_on_duplicate() {
+    use super::{PersistenceError, WriteCondition};
+
+    let store = Store::connect("sqlite::memory:?cache=shared")
+        .await
+        .unwrap();
+
+    // First insert succeeds
+    store
+        .put_if(
+            "sandbox",
+            "id-1",
+            "sandbox-1",
+            b"payload1",
+            None,
+            WriteCondition::MustCreate,
+        )
+        .await
+        .unwrap();
+
+    // Second insert with same ID fails
+    let result = store
+        .put_if(
+            "sandbox",
+            "id-1",
+            "sandbox-2",
+            b"payload2",
+            None,
+            WriteCondition::MustCreate,
+        )
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(PersistenceError::UniqueViolation { .. })
+    ));
+}
+
+#[tokio::test]
+async fn cas_put_if_match_version_succeeds() {
+    use super::WriteCondition;
+
+    let store = Store::connect("sqlite::memory:?cache=shared")
+        .await
+        .unwrap();
+
+    // Create initial object
+    store
+        .put_if(
+            "sandbox",
+            "id-1",
+            "sandbox-1",
+            b"v1",
+            None,
+            WriteCondition::MustCreate,
+        )
+        .await
+        .unwrap();
+
+    // Update with correct version
+    let result = store
+        .put_if(
+            "sandbox",
+            "id-1",
+            "sandbox-1",
+            b"v2",
+            None,
+            WriteCondition::MatchResourceVersion(1),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.resource_version, 2);
+
+    let record = store.get("sandbox", "id-1").await.unwrap().unwrap();
+    assert_eq!(record.resource_version, 2);
+    assert_eq!(record.payload, b"v2");
+}
+
+#[tokio::test]
+async fn cas_put_if_match_version_fails_on_mismatch() {
+    use super::{PersistenceError, WriteCondition};
+
+    let store = Store::connect("sqlite::memory:?cache=shared")
+        .await
+        .unwrap();
+
+    // Create initial object
+    store
+        .put_if(
+            "sandbox",
+            "id-1",
+            "sandbox-1",
+            b"v1",
+            None,
+            WriteCondition::MustCreate,
+        )
+        .await
+        .unwrap();
+
+    // Update with wrong version
+    let result = store
+        .put_if(
+            "sandbox",
+            "id-1",
+            "sandbox-1",
+            b"v2",
+            None,
+            WriteCondition::MatchResourceVersion(99),
+        )
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(PersistenceError::Conflict {
+            current_resource_version: Some(1)
+        })
+    ));
+
+    // Original payload unchanged
+    let record = store.get("sandbox", "id-1").await.unwrap().unwrap();
+    assert_eq!(record.resource_version, 1);
+    assert_eq!(record.payload, b"v1");
+}
+
+#[tokio::test]
+async fn cas_delete_if_succeeds_with_correct_version() {
+    use super::WriteCondition;
+
+    let store = Store::connect("sqlite::memory:?cache=shared")
+        .await
+        .unwrap();
+
+    store
+        .put_if(
+            "sandbox",
+            "id-1",
+            "sandbox-1",
+            b"payload",
+            None,
+            WriteCondition::MustCreate,
+        )
+        .await
+        .unwrap();
+
+    let deleted = store.delete_if("sandbox", "id-1", 1).await.unwrap();
+    assert!(deleted);
+
+    let record = store.get("sandbox", "id-1").await.unwrap();
+    assert!(record.is_none());
+}
+
+#[tokio::test]
+async fn cas_delete_if_fails_with_wrong_version() {
+    use super::{PersistenceError, WriteCondition};
+
+    let store = Store::connect("sqlite::memory:?cache=shared")
+        .await
+        .unwrap();
+
+    store
+        .put_if(
+            "sandbox",
+            "id-1",
+            "sandbox-1",
+            b"payload",
+            None,
+            WriteCondition::MustCreate,
+        )
+        .await
+        .unwrap();
+
+    let result = store.delete_if("sandbox", "id-1", 99).await;
+    assert!(matches!(
+        result,
+        Err(PersistenceError::Conflict {
+            current_resource_version: Some(1)
+        })
+    ));
+
+    // Object still exists
+    let record = store.get("sandbox", "id-1").await.unwrap().unwrap();
+    assert_eq!(record.resource_version, 1);
+}
+
+#[tokio::test]
+async fn cas_resource_version_increments() {
+    use super::WriteCondition;
+
+    let store = Store::connect("sqlite::memory:?cache=shared")
+        .await
+        .unwrap();
+
+    // Create
+    let r1 = store
+        .put_if(
+            "sandbox",
+            "id-1",
+            "sandbox-1",
+            b"v1",
+            None,
+            WriteCondition::MustCreate,
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1.resource_version, 1);
+
+    // Update 1
+    let r2 = store
+        .put_if(
+            "sandbox",
+            "id-1",
+            "sandbox-1",
+            b"v2",
+            None,
+            WriteCondition::MatchResourceVersion(1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r2.resource_version, 2);
+
+    // Update 2
+    let r3 = store
+        .put_if(
+            "sandbox",
+            "id-1",
+            "sandbox-1",
+            b"v3",
+            None,
+            WriteCondition::MatchResourceVersion(2),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r3.resource_version, 3);
+
+    let record = store.get("sandbox", "id-1").await.unwrap().unwrap();
+    assert_eq!(record.resource_version, 3);
+}
+
+#[tokio::test]
+async fn cas_concurrent_updates_one_succeeds() {
+    use super::WriteCondition;
+    use std::sync::Arc;
+
+    let store = Arc::new(
+        Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .unwrap(),
+    );
+
+    // Create initial object
+    store
+        .put_if(
+            "sandbox",
+            "id-1",
+            "sandbox-1",
+            b"initial",
+            None,
+            WriteCondition::MustCreate,
+        )
+        .await
+        .unwrap();
+
+    // Spawn 10 concurrent updates trying to update from version 1
+    let mut handles = vec![];
+    for i in 0..10 {
+        let store = Arc::clone(&store);
+        let handle = tokio::spawn(async move {
+            store
+                .put_if(
+                    "sandbox",
+                    "id-1",
+                    "sandbox-1",
+                    format!("update-{i}").as_bytes(),
+                    None,
+                    WriteCondition::MatchResourceVersion(1),
+                )
+                .await
+        });
+        handles.push(handle);
+    }
+
+    let results: Vec<_> = futures::future::join_all(handles)
+        .await
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect();
+
+    // Exactly one should succeed, rest should conflict
+    let successes = results.iter().filter(|r| r.is_ok()).count();
+    let conflicts = results.iter().filter(|r| r.is_err()).count();
+
+    assert_eq!(successes, 1);
+    assert_eq!(conflicts, 9);
+
+    // Final version should be 2
+    let record = store.get("sandbox", "id-1").await.unwrap().unwrap();
+    assert_eq!(record.resource_version, 2);
+}
+
+#[tokio::test]
+async fn cas_update_message_cas_succeeds() {
+    use openshell_core::proto::Sandbox;
+
+    let store = Store::connect("sqlite::memory:?cache=shared")
+        .await
+        .unwrap();
+
+    // Create a sandbox
+    let sandbox = Sandbox {
+        metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+            id: "test-id".to_string(),
+            name: "test-sandbox".to_string(),
+            created_at_ms: 1000,
+            labels: std::collections::HashMap::new(),
+            resource_version: 0,
+        }),
+        spec: None,
+        status: None,
+        phase: 0,
+        current_policy_version: 0,
+    };
+
+    store.put_message(&sandbox).await.unwrap();
+
+    // Update using CAS with expected_version = 0 (use current version)
+    let updated = store
+        .update_message_cas::<Sandbox, _>("test-id", 0, |s| {
+            s.phase = 2; // Set to Ready
+            s.current_policy_version = 42;
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(updated.phase, 2);
+    assert_eq!(updated.current_policy_version, 42);
+    assert_eq!(
+        updated.metadata.as_ref().map_or(0, |m| m.resource_version),
+        2
+    );
+}
+
+#[tokio::test]
+async fn cas_update_message_cas_conflicts_on_concurrent_updates() {
+    use openshell_core::proto::Sandbox;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let store = Arc::new(
+        Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .unwrap(),
+    );
+
+    // Create a sandbox
+    let sandbox = Sandbox {
+        metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+            id: "test-id".to_string(),
+            name: "test-sandbox".to_string(),
+            created_at_ms: 1000,
+            labels: std::collections::HashMap::new(),
+            resource_version: 0,
+        }),
+        spec: None,
+        status: None,
+        phase: 0,
+        current_policy_version: 0,
+    };
+
+    store.put_message(&sandbox).await.unwrap();
+
+    // Track how many updates succeed
+    let success_count = Arc::new(AtomicU32::new(0));
+
+    // Spawn 5 concurrent CAS updates (using expected_version = 0 to use current)
+    let mut handles = vec![];
+    for i in 0..5 {
+        let store = Arc::clone(&store);
+        let success_count = Arc::clone(&success_count);
+        let handle = tokio::spawn(async move {
+            let result = store
+                .update_message_cas::<Sandbox, _>("test-id", 0, |s| {
+                    s.current_policy_version = i;
+                })
+                .await;
+            if result.is_ok() {
+                success_count.fetch_add(1, Ordering::SeqCst);
+            }
+            result
+        });
+        handles.push(handle);
+    }
+
+    let results: Vec<_> = futures::future::join_all(handles)
+        .await
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect();
+
+    // Only one should succeed; others fail with Conflict due to single-attempt CAS
+    let successes = results.iter().filter(|r| r.is_ok()).count();
+    let conflicts = results
+        .iter()
+        .filter(|r| matches!(r, Err(PersistenceError::Conflict { .. })))
+        .count();
+    assert_eq!(successes, 1, "exactly one concurrent update should succeed");
+    assert_eq!(conflicts, 4, "four updates should fail with Conflict");
+    assert_eq!(success_count.load(Ordering::SeqCst), 1);
+
+    // Final version should be 2 (initial 1 + 1 successful update)
+    let final_sandbox = store
+        .get_message::<Sandbox>("test-id")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        final_sandbox
+            .metadata
+            .as_ref()
+            .map_or(0, |m| m.resource_version),
+        2,
+        "resource_version should be 2 (initial 1 + 1 successful update)"
+    );
 }

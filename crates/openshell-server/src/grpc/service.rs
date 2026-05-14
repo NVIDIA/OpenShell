@@ -15,7 +15,7 @@ use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
 use crate::ServerState;
-use crate::persistence::ObjectType;
+use crate::persistence::{ObjectType, WriteCondition};
 use crate::service_routing;
 
 const MAX_SERVICE_NAME_LEN: usize = 28;
@@ -41,29 +41,52 @@ pub(super) async fn handle_expose_service(
 
     let now = super::current_time_ms();
     let key = service_routing::endpoint_key(&req.sandbox, &req.service);
-    let (id, created_at_ms, created) = match state
+
+    // Fetch existing endpoint to determine create vs. update path
+    let existing = state
         .store
         .get_message_by_name::<ServiceEndpoint>(&key)
         .await
-    {
-        Ok(Some(existing)) => (
+        .map_err(|e| Status::internal(format!("fetch endpoint failed: {e}")))?;
+
+    let (id, created_at_ms, condition, created) = if let Some(existing) = existing {
+        // Update path: preserve id and created_at, use CAS to prevent conflicts
+        let resource_version = existing
+            .metadata
+            .as_ref()
+            .map_or(0, |metadata| metadata.resource_version);
+        (
             existing.object_id().to_string(),
             existing
                 .metadata
                 .as_ref()
                 .map_or(now, |metadata| metadata.created_at_ms),
+            WriteCondition::MatchResourceVersion(resource_version),
             false,
-        ),
-        Ok(None) => (Uuid::new_v4().to_string(), now, true),
-        Err(e) => return Err(Status::internal(format!("fetch endpoint failed: {e}"))),
+        )
+    } else {
+        // Create path: new id and created_at, use MustCreate to prevent races
+        (
+            Uuid::new_v4().to_string(),
+            now,
+            WriteCondition::MustCreate,
+            true,
+        )
     };
+
+    let labels_json = serde_json::to_string(&HashMap::from([(
+        "sandbox".to_string(),
+        req.sandbox.clone(),
+    )]))
+    .map_err(|e| Status::internal(format!("serialize labels failed: {e}")))?;
 
     let endpoint = ServiceEndpoint {
         metadata: Some(ObjectMeta {
-            id,
-            name: key,
+            id: id.clone(),
+            name: key.clone(),
             created_at_ms,
             labels: HashMap::from([("sandbox".to_string(), req.sandbox.clone())]),
+            resource_version: 0,
         }),
         sandbox_id: sandbox.object_id().to_string(),
         sandbox_name: req.sandbox.clone(),
@@ -72,11 +95,24 @@ pub(super) async fn handle_expose_service(
         domain: true,
     };
 
-    state
+    // Single-attempt CAS write: fails with ABORTED on concurrent modification
+    let result = state
         .store
-        .put_message(&endpoint)
+        .put_if(
+            ServiceEndpoint::object_type(),
+            &id,
+            &key,
+            &endpoint.encode_to_vec(),
+            Some(&labels_json),
+            condition,
+        )
         .await
-        .map_err(|e| Status::internal(format!("persist endpoint failed: {e}")))?;
+        .map_err(|e| super::persistence_error_to_status(e, "expose service"))?;
+
+    let mut endpoint = endpoint;
+    if let Some(ref mut meta) = endpoint.metadata {
+        meta.resource_version = result.resource_version;
+    }
 
     let url = service_routing::endpoint_url(&state.config, &req.sandbox, &req.service)
         .unwrap_or_default();
@@ -113,30 +149,20 @@ pub(super) async fn handle_list_services(
     }
 
     let limit = super::clamp_limit(req.limit, 100, super::MAX_PAGE_SIZE);
-    let records = if req.sandbox.is_empty() {
-        state
-            .store
-            .list(ServiceEndpoint::object_type(), limit, req.offset)
-            .await
+    let endpoints: Vec<ServiceEndpoint> = if req.sandbox.is_empty() {
+        state.store.list_messages(limit, req.offset).await
     } else {
         state
             .store
-            .list_with_selector(
-                ServiceEndpoint::object_type(),
-                &format!("sandbox={}", req.sandbox),
-                limit,
-                req.offset,
-            )
+            .list_messages_with_selector(&format!("sandbox={}", req.sandbox), limit, req.offset)
             .await
     }
     .map_err(|e| Status::internal(format!("list endpoints failed: {e}")))?;
 
-    let mut services = Vec::with_capacity(records.len());
-    for record in records {
-        let endpoint = ServiceEndpoint::decode(record.payload.as_slice())
-            .map_err(|e| Status::internal(format!("decode endpoint failed: {e}")))?;
-        services.push(service_endpoint_response(state, endpoint));
-    }
+    let services = endpoints
+        .into_iter()
+        .map(|ep| service_endpoint_response(state, ep))
+        .collect();
 
     Ok(Response::new(ListServicesResponse { services }))
 }
@@ -279,6 +305,7 @@ mod tests {
                     name: name.to_string(),
                     created_at_ms: 1_000,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 spec: Some(openshell_core::proto::SandboxSpec::default()),
                 phase: SandboxPhase::Ready as i32,
@@ -396,5 +423,143 @@ mod tests {
         .unwrap()
         .into_inner();
         assert!(listed.services.is_empty());
+    }
+
+    #[tokio::test]
+    async fn concurrent_expose_service_handles_cas_properly() {
+        let state = test_server_state().await;
+        seed_sandbox(&state, "my-sandbox").await;
+
+        // Spawn two concurrent expose_service calls for the same endpoint
+        let state1 = state.clone();
+        let handle1 = tokio::spawn(async move {
+            handle_expose_service(
+                &state1,
+                Request::new(ExposeServiceRequest {
+                    sandbox: "my-sandbox".to_string(),
+                    service: "web".to_string(),
+                    target_port: 8080,
+                    domain: true,
+                }),
+            )
+            .await
+        });
+
+        let state2 = state.clone();
+        let handle2 = tokio::spawn(async move {
+            handle_expose_service(
+                &state2,
+                Request::new(ExposeServiceRequest {
+                    sandbox: "my-sandbox".to_string(),
+                    service: "web".to_string(),
+                    target_port: 9090,
+                    domain: true,
+                }),
+            )
+            .await
+        });
+
+        let result1 = handle1.await.unwrap();
+        let result2 = handle2.await.unwrap();
+
+        // One should succeed with MustCreate, the other may fail with ABORTED or succeed with update
+        let successes = [&result1, &result2].iter().filter(|r| r.is_ok()).count();
+
+        // At least one should succeed
+        assert!(
+            successes >= 1,
+            "at least one expose should succeed, got: {result1:?}, {result2:?}"
+        );
+
+        // Only one endpoint should exist
+        let listed = handle_list_services(
+            &state,
+            Request::new(ListServicesRequest {
+                sandbox: "my-sandbox".to_string(),
+                limit: 0,
+                offset: 0,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(listed.services.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_expose_service_update_uses_cas() {
+        let state = test_server_state().await;
+        seed_sandbox(&state, "my-sandbox").await;
+
+        // Create an initial endpoint
+        handle_expose_service(
+            &state,
+            Request::new(ExposeServiceRequest {
+                sandbox: "my-sandbox".to_string(),
+                service: "web".to_string(),
+                target_port: 7070,
+                domain: true,
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Spawn two concurrent updates
+        let state1 = state.clone();
+        let handle1 = tokio::spawn(async move {
+            handle_expose_service(
+                &state1,
+                Request::new(ExposeServiceRequest {
+                    sandbox: "my-sandbox".to_string(),
+                    service: "web".to_string(),
+                    target_port: 8080,
+                    domain: true,
+                }),
+            )
+            .await
+        });
+
+        let state2 = state.clone();
+        let handle2 = tokio::spawn(async move {
+            handle_expose_service(
+                &state2,
+                Request::new(ExposeServiceRequest {
+                    sandbox: "my-sandbox".to_string(),
+                    service: "web".to_string(),
+                    target_port: 9090,
+                    domain: true,
+                }),
+            )
+            .await
+        });
+
+        let result1 = handle1.await.unwrap();
+        let result2 = handle2.await.unwrap();
+
+        // One should succeed, one may fail with ABORTED due to CAS conflict
+        let successes = [&result1, &result2].iter().filter(|r| r.is_ok()).count();
+
+        assert!(
+            successes >= 1,
+            "at least one update should succeed, got: {result1:?}, {result2:?}"
+        );
+
+        // The endpoint should have one of the new port values
+        let fetched = handle_get_service(
+            &state,
+            Request::new(GetServiceRequest {
+                sandbox: "my-sandbox".to_string(),
+                service: "web".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let port = fetched.endpoint.as_ref().unwrap().target_port;
+        assert!(
+            port == 8080 || port == 9090,
+            "port should be one of the updated values, got {port}"
+        );
+        assert_ne!(port, 7070, "port should not be the original value");
     }
 }

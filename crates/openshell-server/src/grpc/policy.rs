@@ -1006,32 +1006,29 @@ pub(super) async fn handle_update_config(
         validate_static_fields_unchanged(baseline_policy, &new_policy)?;
         validate_policy_safety(&new_policy)?;
     } else {
+        // Backfill spec.policy using CAS (first-time policy discovery)
         let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
-        let mut sandbox = state
+        let sandbox_id = sandbox.object_id().to_string();
+        let new_policy_clone = new_policy.clone();
+        state
             .store
-            .get_message::<Sandbox>(&sandbox_id)
+            .update_message_cas::<Sandbox, _>(
+                &sandbox_id,
+                req.expected_resource_version,
+                |sandbox| {
+                    if let Some(ref mut spec) = sandbox.spec
+                        && spec.policy.is_none()
+                    {
+                        spec.policy = Some(new_policy_clone.clone());
+                    }
+                },
+            )
             .await
-            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-            .ok_or_else(|| Status::not_found("sandbox not found"))?;
-        let spec = sandbox
-            .spec
-            .as_mut()
-            .ok_or_else(|| Status::internal("sandbox has no spec"))?;
-        if let Some(baseline_policy) = spec.policy.as_ref() {
-            validate_static_fields_unchanged(baseline_policy, &new_policy)?;
-            validate_policy_safety(&new_policy)?;
-        } else {
-            spec.policy = Some(new_policy.clone());
-            state
-                .store
-                .put_message(&sandbox)
-                .await
-                .map_err(|e| Status::internal(format!("backfill spec.policy failed: {e}")))?;
-            info!(
-                sandbox_id = %sandbox_id,
-                "UpdateConfig: backfilled spec.policy from sandbox-discovered policy"
-            );
-        }
+            .map_err(|e| super::persistence_error_to_status(e, "backfill spec.policy"))?;
+        info!(
+            sandbox_id = %sandbox_id,
+            "UpdateConfig: backfilled spec.policy from sandbox-discovered policy"
+        );
     }
 
     let latest = state
@@ -1228,11 +1225,19 @@ pub(super) async fn handle_report_policy_status(
             .store
             .supersede_older_policies(&req.sandbox_id, version)
             .await;
+
+        // Update current_policy_version using CAS
+        // TODO: Accept expected_version from UpdateConfigRequest for proper client-driven CAS
         let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
-        if let Ok(Some(mut sandbox)) = state.store.get_message::<Sandbox>(&req.sandbox_id).await {
-            sandbox.current_policy_version = req.version;
-            let _ = state.store.put_message(&sandbox).await;
-        }
+        let version_to_set = req.version;
+        state
+            .store
+            .update_message_cas::<Sandbox, _>(&req.sandbox_id, 0, |sandbox| {
+                sandbox.current_policy_version = version_to_set;
+            })
+            .await
+            .map_err(|e| super::persistence_error_to_status(e, "update current_policy_version"))?;
+
         state.sandbox_watch_bus.notify(&req.sandbox_id);
     }
 
@@ -2667,8 +2672,11 @@ async fn load_settings_record(
         .await
         .map_err(|e| Status::internal(format!("fetch settings failed: {e}")))?;
     if let Some(record) = record {
-        serde_json::from_slice::<StoredSettings>(&record.payload)
-            .map_err(|e| Status::internal(format!("decode settings payload failed: {e}")))
+        let mut settings = serde_json::from_slice::<StoredSettings>(&record.payload)
+            .map_err(|e| Status::internal(format!("decode settings payload failed: {e}")))?;
+        // Populate resource_version from database record for CAS
+        settings.resource_version = record.resource_version;
+        Ok(settings)
     } else {
         Ok(StoredSettings::default())
     }
@@ -2680,18 +2688,43 @@ async fn save_settings_record(
     name: &str,
     settings: &StoredSettings,
 ) -> Result<(), Status> {
+    use crate::persistence::WriteCondition;
+
     let payload = serde_json::to_vec(settings)
         .map_err(|e| Status::internal(format!("encode settings payload failed: {e}")))?;
-    store
-        .put(
-            object_type,
-            &uuid::Uuid::new_v4().to_string(),
-            name,
-            &payload,
-            None,
+
+    let (id, condition) = if settings.resource_version == 0 {
+        // Create new settings (resource_version 0 means never persisted)
+        (uuid::Uuid::new_v4().to_string(), WriteCondition::MustCreate)
+    } else {
+        // Update existing with CAS on the version from when it was loaded
+        // Fetch the record to get the stable ID
+        let existing = store
+            .get_by_name(object_type, name)
+            .await
+            .map_err(|e| Status::internal(format!("fetch settings for CAS failed: {e}")))?
+            .ok_or_else(|| Status::not_found("settings disappeared since load"))?;
+
+        (
+            existing.id,
+            WriteCondition::MatchResourceVersion(settings.resource_version),
         )
+    };
+
+    // Single-attempt CAS write
+    store
+        .put_if(object_type, &id, name, &payload, None, condition)
         .await
-        .map_err(|e| Status::internal(format!("persist settings failed: {e}")))?;
+        .map_err(|e| match e {
+            crate::persistence::PersistenceError::Conflict { .. } => {
+                Status::aborted("settings were modified concurrently; please retry")
+            }
+            crate::persistence::PersistenceError::UniqueViolation { .. } => {
+                Status::aborted("settings were created concurrently; please retry")
+            }
+            other => super::persistence_error_to_status(other, "persist settings"),
+        })?;
+
     Ok(())
 }
 
@@ -2857,6 +2890,7 @@ mod tests {
                 name: "no-policy-sandbox".to_string(),
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
+                resource_version: 0,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -2882,6 +2916,7 @@ mod tests {
                 name: name.to_string(),
                 created_at_ms: 1_000_000,
                 labels: HashMap::new(),
+                resource_version: 0,
             }),
             r#type: provider_type.to_string(),
             credentials: std::iter::once(("GITHUB_TOKEN".to_string(), "ghp-test".to_string()))
@@ -2923,6 +2958,7 @@ mod tests {
                 name: name.to_string(),
                 created_at_ms: 1_000_000,
                 labels: HashMap::new(),
+                resource_version: 0,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(policy),
@@ -2942,6 +2978,7 @@ mod tests {
                 StoredSettingValue::Bool(true),
             ))
             .collect(),
+            ..Default::default()
         };
         save_global_settings(state.store.as_ref(), &global_settings)
             .await
@@ -2991,6 +3028,7 @@ mod tests {
                     name: "generic".to_string(),
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 profile: Some(openshell_core::proto::ProviderProfile {
                     id: "generic".to_string(),
@@ -3032,6 +3070,7 @@ mod tests {
                     name: "custom-api".to_string(),
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 profile: Some(openshell_core::proto::ProviderProfile {
                     id: "custom-api".to_string(),
@@ -3094,6 +3133,7 @@ mod tests {
                     name: "custom-api".to_string(),
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 profile: Some(openshell_core::proto::ProviderProfile {
                     id: "custom-api".to_string(),
@@ -3520,6 +3560,7 @@ mod tests {
             Request::new(AttachSandboxProviderRequest {
                 sandbox_name: "attach-lifecycle".to_string(),
                 provider_name: "work-github".to_string(),
+                expected_resource_version: 0,
             }),
         )
         .await
@@ -3555,6 +3596,7 @@ mod tests {
             Request::new(DetachSandboxProviderRequest {
                 sandbox_name: "attach-lifecycle".to_string(),
                 provider_name: "work-github".to_string(),
+                expected_resource_version: 0,
             }),
         )
         .await
@@ -3678,6 +3720,7 @@ mod tests {
             Request::new(AttachSandboxProviderRequest {
                 sandbox_name: "custom-attach-lifecycle".to_string(),
                 provider_name: "work-custom".to_string(),
+                expected_resource_version: 0,
             }),
         )
         .await
@@ -3716,6 +3759,7 @@ mod tests {
             Request::new(DetachSandboxProviderRequest {
                 sandbox_name: "custom-attach-lifecycle".to_string(),
                 provider_name: "work-custom".to_string(),
+                expected_resource_version: 0,
             }),
         )
         .await
@@ -3779,6 +3823,7 @@ mod tests {
                 name: "global-profile-sandbox".to_string(),
                 created_at_ms: 1_000_000,
                 labels: HashMap::new(),
+                resource_version: 0,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(sandbox_policy),
@@ -3820,6 +3865,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            ..Default::default()
         };
         save_global_settings(state.store.as_ref(), &global_settings)
             .await
@@ -3866,6 +3912,7 @@ mod tests {
                 name: "backfill-sandbox".to_string(),
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
+                resource_version: 0,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -3946,6 +3993,7 @@ mod tests {
                 name: "draft-flow".to_string(),
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
+                resource_version: 0,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -4156,6 +4204,7 @@ mod tests {
                 name: sandbox_name.clone(),
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
+                resource_version: 0,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -4253,6 +4302,7 @@ mod tests {
                 name: sandbox_name.clone(),
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
+                resource_version: 0,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -4366,6 +4416,7 @@ mod tests {
                 name: sandbox_name.clone(),
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
+                resource_version: 0,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -4465,6 +4516,7 @@ mod tests {
                 name: sandbox_name.clone(),
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
+                resource_version: 0,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -4570,6 +4622,7 @@ mod tests {
                 name: "draft-owner".to_string(),
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
+                resource_version: 0,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -4584,6 +4637,7 @@ mod tests {
                 name: "draft-other".to_string(),
                 created_at_ms: 1_000_001,
                 labels: std::collections::HashMap::new(),
+                resource_version: 0,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -5319,6 +5373,7 @@ mod tests {
             revision: 1,
             settings: std::iter::once(("policy".to_string(), StoredSettingValue::Bytes(encoded)))
                 .collect(),
+            ..Default::default()
         };
 
         let decoded = decode_policy_from_global_settings(&global)
@@ -5401,6 +5456,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            ..Default::default()
         };
         let sandbox = StoredSettings {
             revision: 1,
@@ -5413,6 +5469,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            ..Default::default()
         };
 
         let merged = merge_effective_settings(&global, &sandbox).unwrap();
@@ -5442,6 +5499,7 @@ mod tests {
             )]
             .into_iter()
             .collect(),
+            ..Default::default()
         };
 
         let merged = merge_effective_settings(&global, &sandbox).unwrap();
@@ -5471,6 +5529,7 @@ mod tests {
                 StoredSettingValue::Bytes("deadbeef".to_string()),
             ))
             .collect(),
+            ..Default::default()
         };
         let sandbox = StoredSettings {
             revision: 1,
@@ -5479,6 +5538,7 @@ mod tests {
                 StoredSettingValue::Bytes("cafebabe".to_string()),
             ))
             .collect(),
+            ..Default::default()
         };
 
         let merged = merge_effective_settings(&global, &sandbox).unwrap();
@@ -5771,24 +5831,53 @@ mod tests {
                     .settings
                     .insert(format!("key_{i}"), StoredSettingValue::Int(i as i64));
                 settings.revision = settings.revision.wrapping_add(1);
-                save_global_settings(&store, &settings).await.unwrap();
+                save_global_settings(&store, &settings).await
             }));
         }
 
+        let mut succeeded = 0;
+        let mut cas_conflicts = 0;
         for h in handles {
-            h.await.unwrap();
+            match h.await.unwrap() {
+                Ok(()) => succeeded += 1,
+                Err(e) if e.code() == Code::Aborted => cas_conflicts += 1,
+                Err(e) => panic!("unexpected error: {e}"),
+            }
         }
 
         let final_settings = load_global_settings(&store).await.unwrap();
-        let lost = (n as u64).saturating_sub(final_settings.revision);
-        if lost == 0 {
-            eprintln!(
-                "note: no lost writes detected in unlocked test (sequential scheduling); \
-                 the locked test is the authoritative correctness check"
-            );
-        } else {
-            eprintln!("unlocked test: {lost} lost writes out of {n} (expected behavior)");
-        }
+
+        // With single-attempt CAS (no retry), concurrent modifications are properly detected:
+        // - All tasks read initial state (revision=0, resource_version=0)
+        // - First write succeeds with resource_version=1
+        // - Subsequent writes fail with ABORTED (CAS conflict) because they all have stale resource_version=0
+        // - Only the first write succeeds; all others are rejected
+        //
+        // This demonstrates that single-attempt CAS prevents lost writes by rejecting stale updates.
+        // The caller must retry from a fresh read to incorporate concurrent changes.
+        assert!(
+            cas_conflicts > 0,
+            "most concurrent writes should fail with CAS conflict (succeeded={succeeded}, conflicts={cas_conflicts})"
+        );
+        assert!(
+            succeeded < n,
+            "not all writes should succeed due to conflicts (succeeded={succeeded}, total={n})"
+        );
+        assert_eq!(
+            final_settings.revision as usize, succeeded,
+            "final revision should match number of successful writes"
+        );
+        assert_eq!(
+            final_settings.settings.len(),
+            succeeded,
+            "final settings should contain exactly the keys from successful writes"
+        );
+
+        eprintln!(
+            "unlocked CAS test: {succeeded} succeeded, {cas_conflicts} CAS conflicts, \
+             final revision={} (matches succeeded count, demonstrating proper conflict detection)",
+            final_settings.revision
+        );
     }
 
     // ---- Conflict guard tests ----
@@ -5835,6 +5924,7 @@ mod tests {
             .await
             .unwrap();
 
+        // Create initial global settings
         let mut global = StoredSettings::default();
         global.settings.insert(
             "log_level".to_string(),
@@ -5846,6 +5936,8 @@ mod tests {
         let loaded = load_global_settings(&store).await.unwrap();
         assert!(loaded.settings.contains_key("log_level"));
 
+        // Load fresh to get current resource_version before updating
+        let mut global = load_global_settings(&store).await.unwrap();
         global.settings.remove("log_level");
         global.revision = 2;
         save_global_settings(&store, &global).await.unwrap();
@@ -5888,5 +5980,331 @@ mod tests {
         let err = proto_setting_to_stored("policy", &value).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("unknown setting key"));
+    }
+
+    #[tokio::test]
+    async fn save_settings_detects_concurrent_modification() {
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+
+        // Create initial settings
+        let mut settings = StoredSettings {
+            revision: 1,
+            settings: std::iter::once((
+                "initial_key".to_string(),
+                StoredSettingValue::String("initial_value".to_string()),
+            ))
+            .collect(),
+            ..Default::default()
+        };
+        save_global_settings(&store, &settings).await.unwrap();
+
+        // Load settings (simulating first client read)
+        let loaded = load_global_settings(&store).await.unwrap();
+        assert_eq!(loaded.revision, 1);
+
+        // Simulate concurrent modification: another client updates the settings
+        let mut concurrent_update = loaded.clone();
+        concurrent_update.settings.insert(
+            "concurrent_key".to_string(),
+            StoredSettingValue::String("concurrent_value".to_string()),
+        );
+        concurrent_update.revision = 2;
+        save_global_settings(&store, &concurrent_update)
+            .await
+            .unwrap();
+
+        // Now attempt to save our original modification (which is based on stale revision 1)
+        settings.settings.insert(
+            "our_key".to_string(),
+            StoredSettingValue::String("our_value".to_string()),
+        );
+        settings.revision = 2; // We think we're updating to revision 2
+
+        let result = save_global_settings(&store, &settings).await;
+
+        // Should fail with ABORTED due to concurrent modification
+        assert!(result.is_err(), "save with stale revision should fail");
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::Aborted,
+            "should fail with ABORTED due to version mismatch"
+        );
+        assert!(
+            err.message().contains("concurrently"),
+            "error should mention concurrent modification: {}",
+            err.message()
+        );
+
+        // Verify the database contains the concurrent update, not our stale update
+        let final_settings = load_global_settings(&store).await.unwrap();
+        assert_eq!(final_settings.revision, 2);
+        assert!(
+            final_settings.settings.contains_key("concurrent_key"),
+            "concurrent update should be preserved"
+        );
+        assert!(
+            !final_settings.settings.contains_key("our_key"),
+            "stale update should NOT be in database"
+        );
+    }
+
+    // ---- CAS (Client-driven optimistic concurrency) tests for UpdateConfig ----
+    // These test the policy backfill path where spec.policy is None and UpdateConfig
+    // uses update_message_cas to atomically set it.
+
+    #[tokio::test]
+    async fn update_config_policy_backfill_cas_succeeds_with_correct_version() {
+        use openshell_core::proto::{SandboxPhase, SandboxSpec};
+
+        let state = test_server_state().await;
+
+        // Create a sandbox WITHOUT a policy (spec.policy = None)
+        // This simulates a sandbox before the supervisor has discovered and synced a policy
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-1".to_string(),
+                name: "test-sandbox".to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+                resource_version: 0,
+            }),
+            spec: Some(SandboxSpec {
+                policy: None, // No policy yet - will be backfilled
+                providers: Vec::new(),
+                ..Default::default()
+            }),
+            phase: SandboxPhase::Provisioning as i32,
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+
+        // Fetch the sandbox to get its current resource_version
+        let current = state
+            .store
+            .get_message_by_name::<Sandbox>("test-sandbox")
+            .await
+            .unwrap()
+            .unwrap();
+        let current_version = current.metadata.as_ref().unwrap().resource_version;
+
+        // Backfill the policy with correct expected_resource_version
+        let new_policy = ProtoSandboxPolicy::default();
+
+        let response = handle_update_config(
+            &state,
+            Request::new(UpdateConfigRequest {
+                name: "test-sandbox".to_string(),
+                policy: Some(new_policy),
+                setting_key: String::new(),
+                setting_value: None,
+                delete_setting: false,
+                global: false,
+                merge_operations: vec![],
+                expected_resource_version: current_version,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        // UpdateConfigResponse contains the policy version
+        assert_eq!(response.version, 1);
+
+        // Verify the resource_version incremented and policy was backfilled
+        let updated_sandbox = state
+            .store
+            .get_message_by_name::<Sandbox>("test-sandbox")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            updated_sandbox.metadata.as_ref().unwrap().resource_version,
+            current_version + 1,
+            "resource_version should increment during CAS backfill"
+        );
+        assert!(
+            updated_sandbox.spec.as_ref().unwrap().policy.is_some(),
+            "policy should be backfilled"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_config_policy_backfill_cas_rejects_stale_version() {
+        use openshell_core::proto::{SandboxPhase, SandboxSpec};
+
+        let state = test_server_state().await;
+
+        // Create a sandbox WITHOUT a policy
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-1".to_string(),
+                name: "test-sandbox".to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+                resource_version: 0,
+            }),
+            spec: Some(SandboxSpec {
+                policy: None,
+                providers: Vec::new(),
+                ..Default::default()
+            }),
+            phase: SandboxPhase::Provisioning as i32,
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+
+        // Get current version
+        let current = state
+            .store
+            .get_message_by_name::<Sandbox>("test-sandbox")
+            .await
+            .unwrap()
+            .unwrap();
+        let current_version = current.metadata.as_ref().unwrap().resource_version;
+
+        // Try to backfill with a stale version
+        let new_policy = ProtoSandboxPolicy::default();
+
+        let err = handle_update_config(
+            &state,
+            Request::new(UpdateConfigRequest {
+                name: "test-sandbox".to_string(),
+                policy: Some(new_policy),
+                setting_key: String::new(),
+                setting_value: None,
+                delete_setting: false,
+                global: false,
+                merge_operations: vec![],
+                expected_resource_version: 99, // stale version
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        // Should get ABORTED status for CAS conflict
+        assert_eq!(err.code(), Code::Aborted);
+        assert!(
+            err.message().contains("modified concurrently")
+                || err.message().contains("resource_version"),
+            "error message should mention concurrency conflict: {}",
+            err.message()
+        );
+
+        // Verify the sandbox was not modified (policy still None)
+        let unchanged = state
+            .store
+            .get_message_by_name::<Sandbox>("test-sandbox")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            unchanged.metadata.as_ref().unwrap().resource_version,
+            current_version,
+            "resource_version should not change when CAS fails"
+        );
+        assert!(
+            unchanged.spec.as_ref().unwrap().policy.is_none(),
+            "policy should still be None after failed backfill"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_config_policy_backfill_concurrent_with_stale_versions() {
+        use openshell_core::proto::{SandboxPhase, SandboxSpec};
+        use std::sync::Arc;
+
+        let state = Arc::new(test_server_state().await);
+
+        // Create a sandbox WITHOUT a policy
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-1".to_string(),
+                name: "test-sandbox".to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+                resource_version: 0,
+            }),
+            spec: Some(SandboxSpec {
+                policy: None,
+                providers: Vec::new(),
+                ..Default::default()
+            }),
+            phase: SandboxPhase::Provisioning as i32,
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+
+        // All three clients fetch the sandbox and see the same version
+        let initial = state
+            .store
+            .get_message_by_name::<Sandbox>("test-sandbox")
+            .await
+            .unwrap()
+            .unwrap();
+        let initial_version = initial.metadata.as_ref().unwrap().resource_version;
+
+        // Launch 3 concurrent policy backfill attempts, all using the same initial version
+        let mut handles = vec![];
+        for _i in 0..3 {
+            let state_clone = Arc::clone(&state);
+            let new_policy = ProtoSandboxPolicy::default();
+
+            let handle = tokio::spawn(async move {
+                handle_update_config(
+                    &state_clone,
+                    Request::new(UpdateConfigRequest {
+                        name: "test-sandbox".to_string(),
+                        policy: Some(new_policy),
+                        setting_key: String::new(),
+                        setting_value: None,
+                        delete_setting: false,
+                        global: false,
+                        merge_operations: vec![],
+                        expected_resource_version: initial_version,
+                    }),
+                )
+                .await
+            });
+            handles.push(handle);
+        }
+
+        let results: Vec<_> = futures::future::join_all(handles)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        // Only one should succeed; others should get ABORTED
+        let successes = results.iter().filter(|r| r.is_ok()).count();
+        let aborted_conflicts = results
+            .iter()
+            .filter(|r| r.as_ref().err().is_some_and(|e| e.code() == Code::Aborted))
+            .count();
+
+        assert_eq!(
+            successes, 1,
+            "exactly one backfill should succeed with client-driven CAS"
+        );
+        assert_eq!(
+            aborted_conflicts, 2,
+            "two backfills should fail with ABORTED due to stale version"
+        );
+
+        // Final sandbox should have resource_version = initial_version + 1 and policy backfilled
+        let final_sandbox = state
+            .store
+            .get_message_by_name::<Sandbox>("test-sandbox")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            final_sandbox.metadata.as_ref().unwrap().resource_version,
+            initial_version + 1
+        );
+        assert!(
+            final_sandbox.spec.as_ref().unwrap().policy.is_some(),
+            "policy should be backfilled after one success"
+        );
     }
 }

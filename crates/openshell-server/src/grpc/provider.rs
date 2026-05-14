@@ -5,7 +5,9 @@
 
 #![allow(clippy::result_large_err)] // gRPC handlers return Result<Response<_>, Status>
 
-use crate::persistence::{ObjectName, ObjectType, Store, generate_name};
+use crate::persistence::{
+    ObjectId, ObjectLabels, ObjectName, ObjectType, Store, WriteCondition, generate_name,
+};
 use openshell_core::proto::{Provider, Sandbox};
 use prost::Message;
 use tonic::Status;
@@ -43,6 +45,7 @@ pub(super) async fn create_provider_record(
             name: generate_name(),
             created_at_ms: now_ms,
             labels: std::collections::HashMap::new(),
+            resource_version: 0,
         });
     }
 
@@ -71,19 +74,38 @@ pub(super) async fn create_provider_record(
     // Validate field sizes before any I/O.
     validate_provider_fields(&provider)?;
 
-    let existing = store
-        .get_message_by_name::<Provider>(provider.object_name())
-        .await
-        .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?;
-
-    if existing.is_some() {
-        return Err(Status::already_exists("provider already exists"));
+    // Generate UUID for database row and update metadata.id to match
+    let provider_id = uuid::Uuid::new_v4().to_string();
+    let mut provider = provider;
+    if let Some(metadata) = provider.metadata.as_mut() {
+        metadata.id.clone_from(&provider_id);
     }
 
-    store
-        .put_message(&provider)
+    // Create with MustCreate condition to prevent duplicate creation race
+    let result = store
+        .put_if(
+            Provider::object_type(),
+            &provider_id,
+            provider.object_name(),
+            &provider.encode_to_vec(),
+            None,
+            WriteCondition::MustCreate,
+        )
         .await
-        .map_err(|e| Status::internal(format!("persist provider failed: {e}")))?;
+        .map_err(|e| {
+            if matches!(
+                e,
+                crate::persistence::PersistenceError::UniqueViolation { .. }
+            ) {
+                Status::already_exists("provider already exists")
+            } else {
+                Status::internal(format!("persist provider failed: {e}"))
+            }
+        })?;
+
+    if let Some(metadata) = provider.metadata.as_mut() {
+        metadata.resource_version = result.resource_version;
+    }
 
     Ok(redact_provider_credentials(provider))
 }
@@ -106,31 +128,31 @@ pub(super) async fn list_provider_records(
     limit: u32,
     offset: u32,
 ) -> Result<Vec<Provider>, Status> {
-    let records = store
-        .list(Provider::object_type(), limit, offset)
+    let providers: Vec<Provider> = store
+        .list_messages(limit, offset)
         .await
         .map_err(|e| Status::internal(format!("list providers failed: {e}")))?;
 
-    let mut providers = Vec::with_capacity(records.len());
-    for record in records {
-        let provider = Provider::decode(record.payload.as_slice())
-            .map_err(|e| Status::internal(format!("decode provider failed: {e}")))?;
-        providers.push(redact_provider_credentials(provider));
-    }
-
-    Ok(providers)
+    Ok(providers
+        .into_iter()
+        .map(redact_provider_credentials)
+        .collect())
 }
 
 pub(super) async fn update_provider_record(
     store: &Store,
     provider: Provider,
 ) -> Result<Provider, Status> {
-    use crate::persistence::ObjectName;
+    use crate::persistence::{ObjectId, ObjectName};
 
     if provider.object_name().is_empty() {
         return Err(Status::invalid_argument("provider.name is required"));
     }
 
+    // Extract expected version from provider metadata
+    let expected_resource_version = provider.metadata.as_ref().map_or(0, |m| m.resource_version);
+
+    // Resolve provider ID from name for CAS update
     let existing = store
         .get_message_by_name::<Provider>(provider.object_name())
         .await
@@ -149,24 +171,70 @@ pub(super) async fn update_provider_record(
         ));
     }
 
-    let updated = Provider {
-        metadata: existing.metadata,
-        r#type: existing.r#type,
-        credentials: merge_map(existing.credentials, provider.credentials),
-        config: merge_map(existing.config, provider.config),
+    let current_version = existing.metadata.as_ref().map_or(0, |m| m.resource_version);
+
+    let cas_version = if expected_resource_version == 0 {
+        current_version
+    } else {
+        expected_resource_version
     };
 
-    // Ensure metadata is valid (defense in depth - existing.metadata should always be valid)
-    super::validation::validate_object_metadata(updated.metadata.as_ref(), "provider")?;
+    // Apply merge to create candidate
+    let mut candidate = existing.clone();
+    candidate.credentials = merge_map(candidate.credentials, provider.credentials);
+    candidate.config = merge_map(candidate.config, provider.config);
 
-    validate_provider_fields(&updated)?;
+    // Validate BEFORE writing to prevent persisting invalid state
+    super::validation::validate_object_metadata(candidate.metadata.as_ref(), "provider")?;
+    validate_provider_fields(&candidate)?;
 
-    store
-        .put_message(&updated)
+    // Serialize labels for storage
+    let labels_map = candidate.object_labels();
+    let labels_json = if labels_map
+        .as_ref()
+        .is_none_or(std::collections::HashMap::is_empty)
+    {
+        None
+    } else {
+        Some(
+            serde_json::to_string(&labels_map)
+                .map_err(|e| Status::internal(format!("serialize labels failed: {e}")))?,
+        )
+    };
+
+    // Write validated candidate with CAS condition
+    let result = store
+        .put_if(
+            Provider::object_type(),
+            candidate.object_id(),
+            candidate.object_name(),
+            &candidate.encode_to_vec(),
+            labels_json.as_deref(),
+            WriteCondition::MatchResourceVersion(cas_version),
+        )
         .await
-        .map_err(|e| Status::internal(format!("persist provider failed: {e}")))?;
+        .map_err(|e| {
+            if matches!(e, crate::persistence::PersistenceError::Conflict { .. }) {
+                Status::aborted(format!(
+                    "provider was modified concurrently (current resource_version: {})",
+                    match e {
+                        crate::persistence::PersistenceError::Conflict {
+                            current_resource_version,
+                        } => current_resource_version.unwrap_or(0),
+                        _ => 0,
+                    }
+                ))
+            } else {
+                Status::internal(format!("update provider failed: {e}"))
+            }
+        })?;
 
-    Ok(redact_provider_credentials(updated))
+    // Update resource_version from successful write
+    if let Some(metadata) = candidate.metadata.as_mut() {
+        metadata.resource_version = result.resource_version;
+    }
+
+    Ok(redact_provider_credentials(candidate))
 }
 
 pub(super) async fn delete_provider_record(store: &Store, name: &str) -> Result<bool, Status> {
@@ -434,7 +502,14 @@ pub(super) async fn handle_import_provider_profiles(
         let stored = stored_provider_profile(profile.to_proto());
         state
             .store
-            .put_message(&stored)
+            .put_if(
+                StoredProviderProfile::object_type(),
+                stored.object_id(),
+                stored.object_name(),
+                &stored.encode_to_vec(),
+                None,
+                WriteCondition::MustCreate,
+            )
             .await
             .map_err(|e| Status::internal(format!("persist provider profile failed: {e}")))?;
         imported.push(stored.profile.unwrap_or_default());
@@ -534,17 +609,10 @@ async fn merged_provider_profiles(store: &Store) -> Result<Vec<ProviderTypeProfi
 }
 
 async fn custom_provider_profiles(store: &Store) -> Result<Vec<StoredProviderProfile>, Status> {
-    let records = store
-        .list(StoredProviderProfile::object_type(), 10_000, 0)
+    let profiles: Vec<StoredProviderProfile> = store
+        .list_messages(10_000, 0)
         .await
         .map_err(|e| Status::internal(format!("list provider profiles failed: {e}")))?;
-
-    let mut profiles = Vec::with_capacity(records.len());
-    for record in records {
-        let profile = StoredProviderProfile::decode(record.payload.as_slice())
-            .map_err(|e| Status::internal(format!("decode provider profile failed: {e}")))?;
-        profiles.push(profile);
-    }
     Ok(profiles)
 }
 
@@ -655,6 +723,7 @@ fn stored_provider_profile(profile: ProviderProfile) -> StoredProviderProfile {
             name: profile.id.clone(),
             created_at_ms: now_ms,
             labels: std::collections::HashMap::new(),
+            resource_version: 0,
         }),
         profile: Some(profile),
     }
@@ -795,6 +864,7 @@ mod tests {
                 name: name.to_string(),
                 created_at_ms: 0,
                 labels: HashMap::new(),
+                resource_version: 0,
             }),
             r#type: provider_type.to_string(),
             credentials: [
@@ -1305,6 +1375,7 @@ mod tests {
                     name: "sandbox-using-custom".to_string(),
                     created_at_ms: 0,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 spec: Some(SandboxSpec {
                     providers: vec!["custom-provider".to_string()],
@@ -1397,6 +1468,7 @@ mod tests {
                     name: "gitlab-local".to_string(),
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 r#type: "gitlab".to_string(),
                 credentials: std::iter::once((
@@ -1472,6 +1544,7 @@ mod tests {
                     name: "attached-sandbox".to_string(),
                     created_at_ms: 0,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 spec: Some(SandboxSpec {
                     providers: vec!["gitlab-local".to_string()],
@@ -1494,6 +1567,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_create_and_update_return_correct_resource_version() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .unwrap();
+
+        // Create provider and verify resource_version: 1 in response
+        let created = provider_with_values("test-provider", "openai");
+        let persisted = create_provider_record(&store, created).await.unwrap();
+        assert_eq!(
+            persisted.metadata.as_ref().unwrap().resource_version,
+            1,
+            "create_provider_record should return resource_version: 1 after insert"
+        );
+
+        // Update provider and verify resource_version: 2 in response
+        let updated = update_provider_record(
+            &store,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "test-provider".to_string(),
+                    created_at_ms: 1_000_000,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                r#type: "openai".to_string(),
+                credentials: std::iter::once((
+                    "OPENAI_API_KEY".to_string(),
+                    "updated-key".to_string(),
+                ))
+                .collect(),
+                config: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            updated.metadata.as_ref().unwrap().resource_version,
+            2,
+            "update_provider_record should return resource_version: 2 after first update"
+        );
+
+        // Update again and verify resource_version: 3
+        let updated_again = update_provider_record(
+            &store,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "test-provider".to_string(),
+                    created_at_ms: 1_000_000,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                r#type: "openai".to_string(),
+                credentials: std::iter::once((
+                    "OPENAI_API_KEY".to_string(),
+                    "third-key".to_string(),
+                ))
+                .collect(),
+                config: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            updated_again.metadata.as_ref().unwrap().resource_version,
+            3,
+            "update_provider_record should return resource_version: 3 after second update"
+        );
+    }
+
+    #[tokio::test]
     async fn provider_validation_errors() {
         let store = Store::connect("sqlite::memory:?cache=shared")
             .await
@@ -1507,6 +1652,7 @@ mod tests {
                     name: "bad-provider".to_string(),
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 r#type: String::new(),
                 credentials: HashMap::new(),
@@ -1531,6 +1677,7 @@ mod tests {
                     name: "missing".to_string(),
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 r#type: String::new(),
                 credentials: HashMap::new(),
@@ -1559,6 +1706,7 @@ mod tests {
                     name: "noop-test".to_string(),
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 r#type: String::new(),
                 credentials: HashMap::new(),
@@ -1606,6 +1754,7 @@ mod tests {
                     name: "delete-key-test".to_string(),
                     created_at_ms: 0,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 r#type: String::new(),
                 credentials: std::iter::once(("SECONDARY".to_string(), String::new())).collect(),
@@ -1657,6 +1806,7 @@ mod tests {
                     name: "type-preserve-test".to_string(),
                     created_at_ms: 0,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 r#type: String::new(),
                 credentials: HashMap::new(),
@@ -1686,6 +1836,7 @@ mod tests {
                     name: "type-change-test".to_string(),
                     created_at_ms: 0,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 r#type: "openai".to_string(),
                 credentials: HashMap::new(),
@@ -1717,6 +1868,7 @@ mod tests {
                     name: "validate-merge-test".to_string(),
                     created_at_ms: 0,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 r#type: String::new(),
                 credentials: std::iter::once((oversized_key, "value".to_string())).collect(),
@@ -1745,6 +1897,7 @@ mod tests {
                 name: "claude-local".to_string(),
                 created_at_ms: 0,
                 labels: HashMap::new(),
+                resource_version: 0,
             }),
             r#type: "claude".to_string(),
             credentials: [
@@ -1788,6 +1941,7 @@ mod tests {
                 name: "test-provider".to_string(),
                 created_at_ms: 0,
                 labels: HashMap::new(),
+                resource_version: 0,
             }),
             r#type: "test".to_string(),
             credentials: [
@@ -1820,6 +1974,7 @@ mod tests {
                     name: "claude-local".to_string(),
                     created_at_ms: 0,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 r#type: "claude".to_string(),
                 credentials: std::iter::once((
@@ -1840,6 +1995,7 @@ mod tests {
                     name: "gitlab-local".to_string(),
                     created_at_ms: 0,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 r#type: "gitlab".to_string(),
                 credentials: std::iter::once(("GITLAB_TOKEN".to_string(), "glpat-xyz".to_string()))
@@ -1871,6 +2027,7 @@ mod tests {
                     name: "provider-a".to_string(),
                     created_at_ms: 0,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 r#type: "claude".to_string(),
                 credentials: std::iter::once(("SHARED_KEY".to_string(), "first-value".to_string()))
@@ -1888,6 +2045,7 @@ mod tests {
                     name: "provider-b".to_string(),
                     created_at_ms: 0,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 r#type: "gitlab".to_string(),
                 credentials: std::iter::once((
@@ -1924,6 +2082,7 @@ mod tests {
                     name: "my-claude".to_string(),
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 r#type: "claude".to_string(),
                 credentials: std::iter::once((
@@ -1943,6 +2102,7 @@ mod tests {
                 name: "test-sandbox".to_string(),
                 created_at_ms: 1_000_000,
                 labels: HashMap::new(),
+                resource_version: 0,
             }),
             spec: Some(SandboxSpec {
                 providers: vec!["my-claude".to_string()],
@@ -1979,6 +2139,7 @@ mod tests {
                 name: "empty-sandbox".to_string(),
                 created_at_ms: 1_000_000,
                 labels: HashMap::new(),
+                resource_version: 0,
             }),
             spec: Some(SandboxSpec::default()),
             status: None,
@@ -2007,5 +2168,362 @@ mod tests {
         let store = Store::connect("sqlite::memory:").await.unwrap();
         let result = store.get_message::<Sandbox>("nonexistent").await.unwrap();
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn update_provider_validates_before_write() {
+        let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
+
+        // Create a valid provider
+        let provider = provider_with_values("test-validate-provider", "test-type");
+        let created = create_provider_record(&store, provider.clone())
+            .await
+            .unwrap();
+
+        // Build update request with just the name and new credentials
+        let mut update_req = Provider {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: String::new(),
+                name: "test-validate-provider".to_string(),
+                created_at_ms: 0,
+                labels: HashMap::new(),
+                resource_version: 0,
+            }),
+            r#type: String::new(), // Empty type is ignored in update
+            credentials: HashMap::new(),
+            config: HashMap::new(),
+        };
+
+        // Attempt to update with an oversized credential key (exceeds MAX_MAP_KEY_LEN)
+        update_req.credentials.insert(
+            "k".repeat(MAX_MAP_KEY_LEN + 1),
+            "oversized-key-value".to_string(),
+        );
+
+        let result = update_provider_record(&store, update_req).await;
+
+        // Update should fail with InvalidArgument due to oversized key
+        assert!(result.is_err(), "update with invalid data should fail");
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::InvalidArgument,
+            "should fail validation with InvalidArgument"
+        );
+        assert!(
+            err.message().contains("key"),
+            "error message should mention key: {}",
+            err.message()
+        );
+
+        // Verify database still contains the ORIGINAL valid provider (not the invalid one)
+        let stored = store
+            .get_message_by_name::<Provider>("test-validate-provider")
+            .await
+            .unwrap()
+            .expect("provider should still exist");
+
+        assert_eq!(
+            stored.object_id(),
+            created.object_id(),
+            "stored provider ID should match original"
+        );
+        assert_eq!(
+            stored.credentials.len(),
+            created.credentials.len(),
+            "credentials count should not have changed"
+        );
+        assert!(
+            !stored
+                .credentials
+                .contains_key(&"k".repeat(MAX_MAP_KEY_LEN + 1)),
+            "oversized key should NOT be in database"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_create_provider_rejects_duplicate() {
+        let store = Arc::new(
+            Store::connect("sqlite::memory:?cache=shared")
+                .await
+                .unwrap(),
+        );
+
+        let provider = provider_with_values("test-concurrent-provider", "test-type");
+
+        // Spawn two concurrent creation attempts for the same provider
+        let store1 = store.clone();
+        let provider1 = provider.clone();
+        let handle1 = tokio::spawn(async move { create_provider_record(&store1, provider1).await });
+
+        let store2 = store.clone();
+        let provider2 = provider.clone();
+        let handle2 = tokio::spawn(async move { create_provider_record(&store2, provider2).await });
+
+        // Wait for both to complete
+        let result1 = handle1.await.unwrap();
+        let result2 = handle2.await.unwrap();
+
+        // Exactly one should succeed, one should fail with AlreadyExists
+        let success_count = [&result1, &result2].iter().filter(|r| r.is_ok()).count();
+        let already_exists_count = [&result1, &result2]
+            .iter()
+            .filter(|r| {
+                r.as_ref()
+                    .err()
+                    .is_some_and(|e| e.code() == Code::AlreadyExists)
+            })
+            .count();
+
+        assert_eq!(
+            success_count, 1,
+            "exactly one creation should succeed, got results: {result1:?} {result2:?}"
+        );
+        assert_eq!(
+            already_exists_count, 1,
+            "exactly one creation should fail with AlreadyExists, got results: {result1:?} {result2:?}"
+        );
+
+        // Verify the successful provider can be retrieved by name
+        let created_provider = [result1, result2]
+            .into_iter()
+            .find_map(Result::ok)
+            .expect("should have one successful creation");
+        let retrieved = store
+            .get_message_by_name::<Provider>("test-concurrent-provider")
+            .await
+            .unwrap();
+        assert!(
+            retrieved.is_some(),
+            "created provider should be retrievable by name"
+        );
+        assert_eq!(
+            retrieved.unwrap().object_id(),
+            created_provider.object_id(),
+            "retrieved provider should match created provider"
+        );
+    }
+
+    // ---- CAS (Client-driven optimistic concurrency) tests for UpdateProvider ----
+
+    #[tokio::test]
+    async fn update_provider_client_driven_cas_succeeds_with_correct_version() {
+        let state = test_server_state().await;
+
+        // Create a provider
+        let mut provider = provider_with_values("test-provider", "generic");
+        provider.metadata.as_mut().unwrap().id = String::new();
+        handle_create_provider(
+            &state,
+            Request::new(CreateProviderRequest {
+                provider: Some(provider.clone()),
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Fetch the provider to get its current resource_version
+        let current = state
+            .store
+            .get_message_by_name::<Provider>("test-provider")
+            .await
+            .unwrap()
+            .unwrap();
+        let current_version = current.metadata.as_ref().unwrap().resource_version;
+
+        // Prepare an update with the correct resource_version
+        let mut updated_provider = current.clone();
+        updated_provider
+            .credentials
+            .insert("NEW_KEY".to_string(), "new-value".to_string());
+        updated_provider.metadata.as_mut().unwrap().resource_version = current_version;
+
+        // Update should succeed
+        let response = handle_update_provider(
+            &state,
+            Request::new(UpdateProviderRequest {
+                provider: Some(updated_provider.clone()),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(
+            response.provider.as_ref().unwrap().object_name(),
+            "test-provider"
+        );
+        assert_eq!(
+            response
+                .provider
+                .as_ref()
+                .unwrap()
+                .metadata
+                .as_ref()
+                .unwrap()
+                .resource_version,
+            current_version + 1
+        );
+        assert!(
+            response
+                .provider
+                .unwrap()
+                .credentials
+                .contains_key("NEW_KEY")
+        );
+    }
+
+    #[tokio::test]
+    async fn update_provider_client_driven_cas_rejects_stale_version() {
+        let state = test_server_state().await;
+
+        // Create a provider
+        let mut provider = provider_with_values("test-provider", "generic");
+        provider.metadata.as_mut().unwrap().id = String::new();
+        handle_create_provider(
+            &state,
+            Request::new(CreateProviderRequest {
+                provider: Some(provider.clone()),
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Fetch the current state
+        let current = state
+            .store
+            .get_message_by_name::<Provider>("test-provider")
+            .await
+            .unwrap()
+            .unwrap();
+        let current_version = current.metadata.as_ref().unwrap().resource_version;
+
+        // Prepare an update with a stale resource_version
+        let mut stale_provider = current.clone();
+        stale_provider
+            .credentials
+            .insert("NEW_KEY".to_string(), "new-value".to_string());
+        stale_provider.metadata.as_mut().unwrap().resource_version = 99; // stale version
+
+        // Update should fail with ABORTED
+        let err = handle_update_provider(
+            &state,
+            Request::new(UpdateProviderRequest {
+                provider: Some(stale_provider),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::Aborted);
+        assert!(
+            err.message().contains("modified concurrently")
+                || err.message().contains("resource_version"),
+            "error message should mention concurrency conflict: {}",
+            err.message()
+        );
+
+        // Verify the provider was not modified
+        let unchanged = state
+            .store
+            .get_message_by_name::<Provider>("test-provider")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            unchanged.metadata.as_ref().unwrap().resource_version,
+            current_version
+        );
+        assert!(!unchanged.credentials.contains_key("NEW_KEY"));
+    }
+
+    #[tokio::test]
+    async fn update_provider_concurrent_updates_with_stale_versions() {
+        use std::sync::Arc;
+
+        let state = Arc::new(test_server_state().await);
+
+        // Create a provider
+        let mut provider = provider_with_values("test-provider", "generic");
+        provider.metadata.as_mut().unwrap().id = String::new();
+        handle_create_provider(
+            &state,
+            Request::new(CreateProviderRequest {
+                provider: Some(provider.clone()),
+            }),
+        )
+        .await
+        .unwrap();
+
+        // All three clients fetch the provider and see the same version
+        let initial = state
+            .store
+            .get_message_by_name::<Provider>("test-provider")
+            .await
+            .unwrap()
+            .unwrap();
+        let initial_version = initial.metadata.as_ref().unwrap().resource_version;
+
+        // Launch 3 concurrent updates, all using the same initial version
+        let mut handles = vec![];
+        for i in 0..3 {
+            let state_clone = Arc::clone(&state);
+            let mut updated = initial.clone();
+            updated
+                .credentials
+                .insert(format!("KEY_{i}"), format!("value-{i}"));
+            updated.metadata.as_mut().unwrap().resource_version = initial_version;
+
+            let handle = tokio::spawn(async move {
+                handle_update_provider(
+                    &state_clone,
+                    Request::new(UpdateProviderRequest {
+                        provider: Some(updated),
+                    }),
+                )
+                .await
+            });
+            handles.push(handle);
+        }
+
+        let results: Vec<_> = futures::future::join_all(handles)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        // Only one should succeed; others should get ABORTED
+        let successes = results.iter().filter(|r| r.is_ok()).count();
+        let aborted_conflicts = results
+            .iter()
+            .filter(|r| r.as_ref().err().is_some_and(|e| e.code() == Code::Aborted))
+            .count();
+
+        assert_eq!(
+            successes, 1,
+            "exactly one update should succeed with client-driven CAS"
+        );
+        assert_eq!(
+            aborted_conflicts, 2,
+            "two updates should fail with ABORTED due to stale version"
+        );
+
+        // Final provider should have exactly 1 new credential key and resource_version = initial_version + 1
+        let final_provider = state
+            .store
+            .get_message_by_name::<Provider>("test-provider")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            final_provider.metadata.as_ref().unwrap().resource_version,
+            initial_version + 1
+        );
+
+        // Exactly one of KEY_0, KEY_1, or KEY_2 should be present
+        let new_keys_count = (0..3)
+            .filter(|i| final_provider.credentials.contains_key(&format!("KEY_{i}")))
+            .count();
+        assert_eq!(new_keys_count, 1);
     }
 }

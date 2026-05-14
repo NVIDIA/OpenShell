@@ -384,6 +384,11 @@ message AttachSandboxProviderRequest {
   string sandbox_name = 1;
   // Provider name to attach.
   string provider_name = 2;
+  // Expected resource version for optimistic concurrency control.
+  // If 0, the server uses the current version (backward compatibility).
+  // If non-zero, the server validates that the sandbox's current resource_version
+  // matches this value before applying the mutation, returning ABORTED on mismatch.
+  uint64 expected_resource_version = 3;
 }
 
 // Detach provider from sandbox request.
@@ -392,6 +397,11 @@ message DetachSandboxProviderRequest {
   string sandbox_name = 1;
   // Provider name to detach.
   string provider_name = 2;
+  // Expected resource version for optimistic concurrency control.
+  // If 0, the server uses the current version (backward compatibility).
+  // If non-zero, the server validates that the sandbox's current resource_version
+  // matches this value before applying the mutation, returning ABORTED on mismatch.
+  uint64 expected_resource_version = 3;
 }
 
 // Delete sandbox request.
@@ -935,6 +945,12 @@ message UpdateConfigRequest {
   bool global = 6;
   // Batched incremental policy merge operations. Sandbox-scoped only.
   repeated PolicyMergeOperation merge_operations = 7;
+  // Expected resource version for optimistic concurrency control (sandbox-scoped only).
+  // If 0, the server uses the current version (backward compatibility).
+  // If non-zero, the server validates that the sandbox's current resource_version
+  // matches this value before applying the mutation, returning ABORTED on mismatch.
+  // Ignored for global-scoped updates.
+  uint64 expected_resource_version = 8;
 }
 
 message PolicyMergeOperation {

@@ -3,7 +3,7 @@
 
 use super::{
     DraftChunkRecord, ObjectRecord, PersistenceError, PersistenceResult, PolicyRecord,
-    current_time_ms, map_db_error, map_migrate_error,
+    WriteCondition, WriteResult, current_time_ms, map_db_error, map_migrate_error,
 };
 use crate::policy_store::{
     draft_chunk_payload_from_record, draft_chunk_record_from_parts, policy_payload_from_record,
@@ -98,6 +98,155 @@ ON CONFLICT ("object_type", "name") WHERE "name" IS NOT NULL DO UPDATE SET
         Ok(())
     }
 
+    pub async fn put_if(
+        &self,
+        object_type: &str,
+        id: &str,
+        name: &str,
+        payload: &[u8],
+        labels: Option<&str>,
+        condition: WriteCondition,
+    ) -> PersistenceResult<WriteResult> {
+        let now_ms = current_time_ms();
+
+        match condition {
+            WriteCondition::MustCreate => {
+                // Insert only - fail if object exists
+                sqlx::query(
+                    r#"
+INSERT INTO "objects" ("object_type", "id", "name", "payload", "created_at_ms", "updated_at_ms", "labels", "resource_version")
+VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, 1)
+"#,
+                )
+                .bind(object_type)
+                .bind(id)
+                .bind(name)
+                .bind(payload)
+                .bind(now_ms)
+                .bind(labels.unwrap_or("{}"))
+                .execute(&self.pool)
+                .await
+                .map_err(|e| map_db_error(&e))?;
+
+                Ok(WriteResult {
+                    resource_version: 1,
+                    created_at_ms: now_ms,
+                    updated_at_ms: now_ms,
+                })
+            }
+            WriteCondition::MatchResourceVersion(expected_version) => {
+                // Update with version check
+                let result = sqlx::query(
+                    r#"
+UPDATE "objects"
+SET "payload" = ?4, "labels" = ?5, "updated_at_ms" = ?6, "resource_version" = "resource_version" + 1
+WHERE "object_type" = ?1 AND "id" = ?2 AND "resource_version" = ?3
+"#,
+                )
+                .bind(object_type)
+                .bind(id)
+                .bind(i64::try_from(expected_version).unwrap_or(i64::MAX))
+                .bind(payload)
+                .bind(labels.unwrap_or("{}"))
+                .bind(now_ms)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| map_db_error(&e))?;
+
+                if result.rows_affected() == 0 {
+                    // Check if object exists to distinguish NotFound from Conflict
+                    let existing = self.get(object_type, id).await?;
+                    if let Some(record) = existing {
+                        return Err(PersistenceError::Conflict {
+                            current_resource_version: Some(record.resource_version),
+                        });
+                    }
+                    return Err(PersistenceError::Database(format!(
+                        "object not found: {object_type}/{id}"
+                    )));
+                }
+
+                // Fetch the updated record to get the new resource_version
+                let updated = self.get(object_type, id).await?.ok_or_else(|| {
+                    PersistenceError::Database("object disappeared after update".to_string())
+                })?;
+
+                Ok(WriteResult {
+                    resource_version: updated.resource_version,
+                    created_at_ms: updated.created_at_ms,
+                    updated_at_ms: updated.updated_at_ms,
+                })
+            }
+            WriteCondition::Unconditional => {
+                // Unconditional upsert by name
+                sqlx::query(
+                    r#"
+INSERT INTO "objects" ("object_type", "id", "name", "payload", "created_at_ms", "updated_at_ms", "labels", "resource_version")
+VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, 1)
+ON CONFLICT ("object_type", "name") WHERE "name" IS NOT NULL DO UPDATE SET
+    "payload" = excluded."payload",
+    "updated_at_ms" = excluded."updated_at_ms",
+    "labels" = excluded."labels",
+    "resource_version" = "objects"."resource_version" + 1
+"#,
+                )
+                .bind(object_type)
+                .bind(id)
+                .bind(name)
+                .bind(payload)
+                .bind(now_ms)
+                .bind(labels.unwrap_or("{}"))
+                .execute(&self.pool)
+                .await
+                .map_err(|e| map_db_error(&e))?;
+
+                // Fetch the result to get the resource_version
+                let record = self.get_by_name(object_type, name).await?.ok_or_else(|| {
+                    PersistenceError::Database("object disappeared after upsert".to_string())
+                })?;
+
+                Ok(WriteResult {
+                    resource_version: record.resource_version,
+                    created_at_ms: record.created_at_ms,
+                    updated_at_ms: record.updated_at_ms,
+                })
+            }
+        }
+    }
+
+    pub async fn delete_if(
+        &self,
+        object_type: &str,
+        id: &str,
+        expected_resource_version: u64,
+    ) -> PersistenceResult<bool> {
+        let result = sqlx::query(
+            r#"
+DELETE FROM "objects"
+WHERE "object_type" = ?1 AND "id" = ?2 AND "resource_version" = ?3
+"#,
+        )
+        .bind(object_type)
+        .bind(id)
+        .bind(i64::try_from(expected_resource_version).unwrap_or(i64::MAX))
+        .execute(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+
+        if result.rows_affected() > 0 {
+            Ok(true)
+        } else {
+            // Check if object exists to distinguish NotFound from Conflict
+            let existing = self.get(object_type, id).await?;
+            if let Some(record) = existing {
+                return Err(PersistenceError::Conflict {
+                    current_resource_version: Some(record.resource_version),
+                });
+            }
+            Ok(false)
+        }
+    }
+
     pub async fn get(
         &self,
         object_type: &str,
@@ -105,7 +254,7 @@ ON CONFLICT ("object_type", "name") WHERE "name" IS NOT NULL DO UPDATE SET
     ) -> PersistenceResult<Option<ObjectRecord>> {
         let row = sqlx::query(
             r#"
-SELECT "object_type", "id", "name", "payload", "created_at_ms", "updated_at_ms", "labels"
+SELECT "object_type", "id", "name", "payload", "created_at_ms", "updated_at_ms", "labels", "resource_version"
 FROM "objects"
 WHERE "object_type" = ?1 AND "id" = ?2
 "#,
@@ -126,7 +275,7 @@ WHERE "object_type" = ?1 AND "id" = ?2
     ) -> PersistenceResult<Option<ObjectRecord>> {
         let row = sqlx::query(
             r#"
-SELECT "object_type", "id", "name", "payload", "created_at_ms", "updated_at_ms", "labels"
+SELECT "object_type", "id", "name", "payload", "created_at_ms", "updated_at_ms", "labels", "resource_version"
 FROM "objects"
 WHERE "object_type" = ?1 AND "name" = ?2
 "#,
@@ -178,7 +327,7 @@ WHERE "object_type" = ?1 AND "name" = ?2
     ) -> PersistenceResult<Vec<ObjectRecord>> {
         let rows = sqlx::query(
             r#"
-SELECT "object_type", "id", "name", "payload", "created_at_ms", "updated_at_ms", "labels"
+SELECT "object_type", "id", "name", "payload", "created_at_ms", "updated_at_ms", "labels", "resource_version"
 FROM "objects"
 WHERE "object_type" = ?1
 ORDER BY "created_at_ms" ASC, "name" ASC
@@ -669,6 +818,7 @@ pub(super) fn sqlite_sidecar_paths(path: &Path) -> [PathBuf; 2] {
 }
 
 fn row_to_object_record(row: sqlx::sqlite::SqliteRow) -> ObjectRecord {
+    let resource_version_i64: i64 = row.try_get("resource_version").unwrap_or(1);
     ObjectRecord {
         object_type: row.get("object_type"),
         id: row.get("id"),
@@ -677,6 +827,7 @@ fn row_to_object_record(row: sqlx::sqlite::SqliteRow) -> ObjectRecord {
         created_at_ms: row.get("created_at_ms"),
         updated_at_ms: row.get("updated_at_ms"),
         labels: row.get("labels"),
+        resource_version: resource_version_i64.max(1).cast_unsigned(),
     }
 }
 

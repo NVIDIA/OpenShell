@@ -3,6 +3,7 @@
 
 #![allow(clippy::result_large_err)] // gRPC handlers return Result<Response<_>, Status>
 
+use openshell_core::ObjectId;
 use openshell_core::proto::{
     ClusterInferenceConfig, GetClusterInferenceRequest, GetClusterInferenceResponse,
     GetInferenceBundleRequest, GetInferenceBundleResponse, InferenceRoute, Provider, ResolvedRoute,
@@ -11,13 +12,14 @@ use openshell_core::proto::{
 };
 use openshell_router::config::ResolvedRoute as RouterResolvedRoute;
 use openshell_router::{ValidationFailureKind, verify_backend_endpoint};
+use prost::Message as _;
 use std::sync::Arc;
 use std::time::Duration;
 use tonic::{Request, Response, Status};
 
 use crate::{
     ServerState,
-    persistence::{ObjectName, ObjectType, Store, current_time_ms},
+    persistence::{ObjectName, ObjectType, Store, WriteCondition, current_time_ms},
 };
 
 #[derive(Debug)]
@@ -169,6 +171,7 @@ async fn upsert_cluster_inference_route(
 
     let config = build_cluster_inference_config(&provider, model_id, timeout_secs);
 
+    // Fetch existing route to determine create vs. update path
     let existing = store
         .get_message_by_name::<InferenceRoute>(route_name)
         .await
@@ -176,32 +179,49 @@ async fn upsert_cluster_inference_route(
 
     let now_ms = current_time_ms();
 
-    let route = if let Some(existing) = existing {
-        InferenceRoute {
-            metadata: existing.metadata.clone(),
-            config: Some(config),
-            version: existing.version.saturating_add(1),
-        }
+    let (id, metadata, new_version, condition) = if let Some(existing) = existing {
+        // Update path: preserve metadata, increment version, use CAS
+        let resource_version = existing.metadata.as_ref().map_or(0, |m| m.resource_version);
+        (
+            existing.object_id().to_string(),
+            existing.metadata.clone(),
+            existing.version.saturating_add(1),
+            WriteCondition::MatchResourceVersion(resource_version),
+        )
     } else {
-        InferenceRoute {
-            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
-                id: uuid::Uuid::new_v4().to_string(),
-                name: route_name.to_string(),
-                created_at_ms: now_ms,
-                labels: std::collections::HashMap::new(),
-            }),
-            config: Some(config),
-            version: 1,
-        }
+        // Create path: new metadata, version 1, use MustCreate
+        let new_id = uuid::Uuid::new_v4().to_string();
+        let new_metadata = Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+            id: new_id.clone(),
+            name: route_name.to_string(),
+            created_at_ms: now_ms,
+            labels: std::collections::HashMap::new(),
+            resource_version: 0,
+        });
+        (new_id, new_metadata, 1, WriteCondition::MustCreate)
+    };
+
+    let route = InferenceRoute {
+        metadata,
+        config: Some(config),
+        version: new_version,
     };
 
     // Ensure metadata is valid (defense in depth - should always be true for server-constructed metadata)
     crate::grpc::validate_object_metadata(route.metadata.as_ref(), "inference_route")?;
 
+    // Single-attempt CAS write: fails with ABORTED on concurrent modification
     store
-        .put_message(&route)
+        .put_if(
+            InferenceRoute::object_type(),
+            &id,
+            route_name,
+            &route.encode_to_vec(),
+            None,
+            condition,
+        )
         .await
-        .map_err(|e| Status::internal(format!("persist route failed: {e}")))?;
+        .map_err(|e| crate::grpc::persistence_error_to_status(e, "upsert inference route"))?;
 
     Ok(UpsertedInferenceRoute { route, validation })
 }
@@ -489,6 +509,7 @@ mod tests {
                 name: name.to_string(),
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
+                resource_version: 0,
             }),
             config: Some(ClusterInferenceConfig {
                 provider_name: provider_name.to_string(),
@@ -506,6 +527,7 @@ mod tests {
                 name: name.to_string(),
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
+                resource_version: 0,
             }),
             r#type: provider_type.to_string(),
             credentials: std::iter::once((key_name.to_string(), key_value.to_string())).collect(),
@@ -665,6 +687,7 @@ mod tests {
                 name: "openai-dev".to_string(),
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
+                resource_version: 0,
             }),
             r#type: "openai".to_string(),
             credentials: std::iter::once(("OPENAI_API_KEY".to_string(), "sk-test".to_string()))
@@ -686,6 +709,7 @@ mod tests {
                 name: CLUSTER_INFERENCE_ROUTE_NAME.to_string(),
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
+                resource_version: 0,
             }),
             config: Some(ClusterInferenceConfig {
                 provider_name: "openai-dev".to_string(),
@@ -1045,5 +1069,158 @@ mod tests {
     fn effective_route_name_rejects_unknown_name() {
         let err = effective_route_name("unknown-route").unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn concurrent_upsert_route_create_uses_must_create() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .expect("store");
+
+        let provider = make_provider("openai-dev", "openai", "OPENAI_API_KEY", "sk-test");
+        store.put_message(&provider).await.expect("persist");
+
+        // Spawn two concurrent upsert calls for the same route (create path)
+        let store1 = store.clone();
+        let handle1 = tokio::spawn(async move {
+            upsert_cluster_inference_route(
+                &store1,
+                CLUSTER_INFERENCE_ROUTE_NAME,
+                "openai-dev",
+                "gpt-4o",
+                0,
+                false,
+            )
+            .await
+        });
+
+        let store2 = store.clone();
+        let handle2 = tokio::spawn(async move {
+            upsert_cluster_inference_route(
+                &store2,
+                CLUSTER_INFERENCE_ROUTE_NAME,
+                "openai-dev",
+                "gpt-4.1",
+                0,
+                false,
+            )
+            .await
+        });
+
+        let result1 = handle1.await.unwrap();
+        let result2 = handle2.await.unwrap();
+
+        // One should succeed with MustCreate, the other should fail
+        let successes = [&result1, &result2].iter().filter(|r| r.is_ok()).count();
+        let failures = [&result1, &result2]
+            .iter()
+            .filter(|r| {
+                r.as_ref().is_err_and(|e| {
+                    // Accept either ABORTED (from CAS) or Internal (from DB unique constraint)
+                    e.code() == tonic::Code::Aborted
+                        || (e.code() == tonic::Code::Internal
+                            && e.message().contains("unique violation"))
+                })
+            })
+            .count();
+
+        assert_eq!(
+            successes, 1,
+            "exactly one create should succeed, got: {result1:?}, {result2:?}"
+        );
+        assert_eq!(
+            failures, 1,
+            "exactly one create should fail, got: {result1:?}, {result2:?}"
+        );
+
+        // Only one route should exist
+        let route = store
+            .get_message_by_name::<InferenceRoute>(CLUSTER_INFERENCE_ROUTE_NAME)
+            .await
+            .expect("fetch")
+            .expect("route should exist");
+        assert_eq!(route.version, 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_upsert_route_update_uses_cas() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .expect("store");
+
+        let provider = make_provider("openai-dev", "openai", "OPENAI_API_KEY", "sk-test");
+        store.put_message(&provider).await.expect("persist");
+
+        // Create initial route
+        upsert_cluster_inference_route(
+            &store,
+            CLUSTER_INFERENCE_ROUTE_NAME,
+            "openai-dev",
+            "gpt-3.5",
+            0,
+            false,
+        )
+        .await
+        .expect("initial create should succeed");
+
+        // Spawn two concurrent updates
+        let store1 = store.clone();
+        let handle1 = tokio::spawn(async move {
+            upsert_cluster_inference_route(
+                &store1,
+                CLUSTER_INFERENCE_ROUTE_NAME,
+                "openai-dev",
+                "gpt-4o",
+                0,
+                false,
+            )
+            .await
+        });
+
+        let store2 = store.clone();
+        let handle2 = tokio::spawn(async move {
+            upsert_cluster_inference_route(
+                &store2,
+                CLUSTER_INFERENCE_ROUTE_NAME,
+                "openai-dev",
+                "gpt-4.1",
+                0,
+                false,
+            )
+            .await
+        });
+
+        let result1 = handle1.await.unwrap();
+        let result2 = handle2.await.unwrap();
+
+        // One should succeed, one may fail with ABORTED due to CAS conflict
+        let successes = [&result1, &result2].iter().filter(|r| r.is_ok()).count();
+
+        assert!(
+            successes >= 1,
+            "at least one update should succeed, got: {result1:?}, {result2:?}"
+        );
+
+        // The route should have one of the new model values and version 2
+        let route = store
+            .get_message_by_name::<InferenceRoute>(CLUSTER_INFERENCE_ROUTE_NAME)
+            .await
+            .expect("fetch")
+            .expect("route should exist");
+        let config = route.config.expect("config");
+        assert!(
+            config.model_id == "gpt-4o" || config.model_id == "gpt-4.1",
+            "model should be one of the updated values, got {}",
+            config.model_id
+        );
+        assert_ne!(
+            config.model_id, "gpt-3.5",
+            "model should not be the original value"
+        );
+        assert!(
+            route.version >= 2 && route.version <= 3,
+            "version should be 2 (one update won, one conflicted) or 3 (both succeeded sequentially), got {}",
+            route.version
+        );
     }
 }

@@ -20,7 +20,7 @@ use openshell_core::proto::{
     GetSandboxProviderEnvironmentResponse, GetSandboxRequest, HealthRequest, HealthResponse,
     ListProvidersRequest, ListProvidersResponse, ListSandboxProvidersRequest,
     ListSandboxProvidersResponse, ListSandboxesRequest, ListSandboxesResponse, Provider,
-    ProviderProfile, ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse,
+    ProviderProfile, ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, Sandbox,
     SandboxResponse, SandboxStreamEvent, ServiceStatus, SupervisorMessage, UpdateProviderRequest,
     WatchSandboxRequest,
 };
@@ -83,9 +83,25 @@ impl OpenShell for TestOpenShell {
 
     async fn get_sandbox(
         &self,
-        _request: tonic::Request<GetSandboxRequest>,
+        request: tonic::Request<GetSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
-        Ok(Response::new(SandboxResponse::default()))
+        let name = request.into_inner().name;
+        // Return a minimal sandbox with metadata for CAS operations
+        Ok(Response::new(SandboxResponse {
+            sandbox: Some(Sandbox {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: format!("sb-{name}"),
+                    name,
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 1,
+                }),
+                spec: None,
+                status: None,
+                phase: 0,
+                current_policy_version: 0,
+            }),
+        }))
     }
 
     async fn list_sandboxes(
@@ -155,7 +171,7 @@ impl OpenShell for TestOpenShell {
             providers.push(request.provider_name.clone());
             true
         };
-        let sandbox = openshell_core::proto::Sandbox {
+        let sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 name: request.sandbox_name,
                 ..Default::default()
@@ -192,7 +208,7 @@ impl OpenShell for TestOpenShell {
         let before_len = providers.len();
         providers.retain(|name| name != &request.provider_name);
         let detached = providers.len() != before_len;
-        let sandbox = openshell_core::proto::Sandbox {
+        let sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 name: request.sandbox_name,
                 ..Default::default()
@@ -447,6 +463,7 @@ impl OpenShell for TestOpenShell {
                 name: provider_metadata.name,
                 created_at_ms: existing_metadata.created_at_ms,
                 labels: existing_metadata.labels,
+                resource_version: 0,
             }),
             r#type: existing.r#type,
             credentials: merge(existing.credentials, provider.credentials),

@@ -40,6 +40,10 @@ pub enum PersistenceError {
         detail: Option<String>,
         constraint_msg: String,
     },
+    #[error("resource version conflict: expected version does not match current")]
+    Conflict {
+        current_resource_version: Option<u64>,
+    },
 }
 
 impl PersistenceError {
@@ -77,6 +81,28 @@ pub struct ObjectRecord {
     pub updated_at_ms: i64,
     /// JSON-serialized labels (key-value pairs).
     pub labels: Option<String>,
+    /// Optimistic concurrency control version.
+    /// Incremented on each update for compare-and-swap operations.
+    pub resource_version: u64,
+}
+
+/// Write condition for compare-and-swap operations.
+#[derive(Debug, Clone, Copy)]
+pub enum WriteCondition {
+    /// Object must not exist (insert only).
+    MustCreate,
+    /// Object must exist with the specified resource version (update only).
+    MatchResourceVersion(u64),
+    /// Unconditional write (insert or update).
+    Unconditional,
+}
+
+/// Result of a successful write operation.
+#[derive(Debug, Clone)]
+pub struct WriteResult {
+    pub resource_version: u64,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
 }
 
 /// Persistence store implementations.
@@ -93,7 +119,9 @@ pub trait ObjectType {
 
 // Import object metadata accessor traits from openshell-core
 // (implementations for all proto types are in openshell-core::metadata)
-pub use openshell_core::{ObjectId, ObjectLabels, ObjectName};
+pub use openshell_core::{
+    GetResourceVersion, ObjectId, ObjectLabels, ObjectName, SetResourceVersion,
+};
 
 /// Generate a random 6-character lowercase alphabetic name.
 pub fn generate_name() -> String {
@@ -131,18 +159,71 @@ impl Store {
         }
     }
 
-    /// Insert or update a generic named object.
-    pub async fn put(
+    /// Insert or update a generic object with compare-and-swap support.
+    ///
+    /// # Arguments
+    /// * `object_type` - Type discriminator for the object
+    /// * `id` - Stable object identifier
+    /// * `name` - Human-readable object name
+    /// * `payload` - Serialized object data
+    /// * `labels` - Optional JSON-serialized labels
+    /// * `condition` - Write precondition (`MustCreate`, `MatchResourceVersion`, or `Unconditional`)
+    ///
+    /// # Returns
+    /// * `Ok(WriteResult)` - Write succeeded with new `resource_version` and timestamps
+    /// * `Err(Conflict)` - Resource version mismatch (for `MatchResourceVersion`)
+    /// * `Err(UniqueViolation)` - Object already exists (for `MustCreate`) or name conflict
+    pub async fn put_if(
         &self,
         object_type: &str,
         id: &str,
         name: &str,
         payload: &[u8],
         labels: Option<&str>,
-    ) -> PersistenceResult<()> {
+        condition: WriteCondition,
+    ) -> PersistenceResult<WriteResult> {
         match self {
-            Self::Postgres(store) => store.put(object_type, id, name, payload, labels).await,
-            Self::Sqlite(store) => store.put(object_type, id, name, payload, labels).await,
+            Self::Postgres(store) => {
+                store
+                    .put_if(object_type, id, name, payload, labels, condition)
+                    .await
+            }
+            Self::Sqlite(store) => {
+                store
+                    .put_if(object_type, id, name, payload, labels, condition)
+                    .await
+            }
+        }
+    }
+
+    /// Delete an object by id with compare-and-swap support.
+    ///
+    /// # Arguments
+    /// * `object_type` - Type discriminator for the object
+    /// * `id` - Stable object identifier
+    /// * `expected_resource_version` - Required resource version for the delete to proceed
+    ///
+    /// # Returns
+    /// * `Ok(true)` - Object was deleted
+    /// * `Ok(false)` - Object not found
+    /// * `Err(Conflict)` - Resource version mismatch
+    pub async fn delete_if(
+        &self,
+        object_type: &str,
+        id: &str,
+        expected_resource_version: u64,
+    ) -> PersistenceResult<bool> {
+        match self {
+            Self::Postgres(store) => {
+                store
+                    .delete_if(object_type, id, expected_resource_version)
+                    .await
+            }
+            Self::Sqlite(store) => {
+                store
+                    .delete_if(object_type, id, expected_resource_version)
+                    .await
+            }
         }
     }
 
@@ -226,33 +307,8 @@ impl Store {
     // Generic protobuf message helpers
     // -----------------------------------------------------------------------
 
-    /// Insert or update a protobuf message using its inferred object type, id, and name.
-    pub async fn put_message<T: Message + ObjectType + ObjectId + ObjectName + ObjectLabels>(
-        &self,
-        message: &T,
-    ) -> PersistenceResult<()> {
-        // Serialize labels to JSON
-        let labels_map = message.object_labels();
-        let labels_json = if labels_map.as_ref().is_none_or(HashMap::is_empty) {
-            None
-        } else {
-            Some(serde_json::to_string(&labels_map).map_err(|e| {
-                PersistenceError::Encode(format!("failed to serialize labels: {e}"))
-            })?)
-        };
-
-        self.put(
-            T::object_type(),
-            message.object_id(),
-            message.object_name(),
-            &message.encode_to_vec(),
-            labels_json.as_deref(),
-        )
-        .await
-    }
-
     /// Fetch and decode a protobuf message by id.
-    pub async fn get_message<T: Message + Default + ObjectType>(
+    pub async fn get_message<T: Message + Default + ObjectType + SetResourceVersion>(
         &self,
         id: &str,
     ) -> PersistenceResult<Option<T>> {
@@ -261,13 +317,17 @@ impl Store {
             return Ok(None);
         };
 
-        T::decode(record.payload.as_slice())
-            .map(Some)
-            .map_err(|e| PersistenceError::Decode(format!("protobuf decode error: {e}")))
+        let mut message = T::decode(record.payload.as_slice())
+            .map_err(|e| PersistenceError::Decode(format!("protobuf decode error: {e}")))?;
+
+        // Hydrate resource_version from DB row (authoritative source)
+        message.set_resource_version(record.resource_version);
+
+        Ok(Some(message))
     }
 
     /// Fetch and decode a protobuf message by name.
-    pub async fn get_message_by_name<T: Message + Default + ObjectType>(
+    pub async fn get_message_by_name<T: Message + Default + ObjectType + SetResourceVersion>(
         &self,
         name: &str,
     ) -> PersistenceResult<Option<T>> {
@@ -276,9 +336,142 @@ impl Store {
             return Ok(None);
         };
 
-        T::decode(record.payload.as_slice())
-            .map(Some)
-            .map_err(|e| PersistenceError::Decode(format!("protobuf decode error: {e}")))
+        let mut message = T::decode(record.payload.as_slice())
+            .map_err(|e| PersistenceError::Decode(format!("protobuf decode error: {e}")))?;
+
+        // Hydrate resource_version from DB row (authoritative source)
+        message.set_resource_version(record.resource_version);
+
+        Ok(Some(message))
+    }
+
+    /// List and decode protobuf messages, hydrating `resource_version` from
+    /// the authoritative DB row (mirrors `get_message`).
+    pub async fn list_messages<T: Message + Default + ObjectType + SetResourceVersion>(
+        &self,
+        limit: u32,
+        offset: u32,
+    ) -> PersistenceResult<Vec<T>> {
+        let records = self.list(T::object_type(), limit, offset).await?;
+        let mut messages = Vec::with_capacity(records.len());
+        for record in records {
+            let mut message = T::decode(record.payload.as_slice())
+                .map_err(|e| PersistenceError::Decode(format!("protobuf decode error: {e}")))?;
+            message.set_resource_version(record.resource_version);
+            messages.push(message);
+        }
+        Ok(messages)
+    }
+
+    /// List and decode protobuf messages with label selector filtering,
+    /// hydrating `resource_version` from the authoritative DB row.
+    pub async fn list_messages_with_selector<
+        T: Message + Default + ObjectType + SetResourceVersion,
+    >(
+        &self,
+        label_selector: &str,
+        limit: u32,
+        offset: u32,
+    ) -> PersistenceResult<Vec<T>> {
+        let records = self
+            .list_with_selector(T::object_type(), label_selector, limit, offset)
+            .await?;
+        let mut messages = Vec::with_capacity(records.len());
+        for record in records {
+            let mut message = T::decode(record.payload.as_slice())
+                .map_err(|e| PersistenceError::Decode(format!("protobuf decode error: {e}")))?;
+            message.set_resource_version(record.resource_version);
+            messages.push(message);
+        }
+        Ok(messages)
+    }
+
+    /// Update a protobuf message using CAS (compare-and-swap).
+    ///
+    /// Fetches the current object, validates the expected version, applies the
+    /// mutation function, and attempts a single CAS write. Returns Conflict on
+    /// version mismatch for caller-driven retry.
+    ///
+    /// # Arguments
+    /// * `id` - Object ID to update
+    /// * `expected_version` - Required resource version for the update to proceed.
+    ///   Pass 0 to use the current version (internal operations only).
+    ///   For client-facing operations, pass the client-provided expected version.
+    /// * `mutate` - Function that modifies the object in place
+    ///
+    /// # Returns
+    /// * `Ok(T)` - Successfully updated object with new `resource_version`
+    /// * `Err(Conflict)` - Version mismatch; caller should retry
+    /// * `Err(Database)` - Object not found or other DB error
+    pub async fn update_message_cas<T, F>(
+        &self,
+        id: &str,
+        expected_version: u64,
+        mut mutate: F,
+    ) -> PersistenceResult<T>
+    where
+        T: Message
+            + Default
+            + ObjectType
+            + ObjectId
+            + ObjectName
+            + ObjectLabels
+            + SetResourceVersion
+            + GetResourceVersion
+            + Clone,
+        F: FnMut(&mut T),
+    {
+        // Fetch current object with authoritative resource_version
+        let current = self
+            .get_message::<T>(id)
+            .await?
+            .ok_or_else(|| PersistenceError::Database(format!("object {id} not found")))?;
+
+        let current_version = current.get_resource_version();
+
+        // Determine the version to use for CAS:
+        // - If expected_version is 0, use current version (internal operations)
+        // - Otherwise, validate that expected matches current (client-facing operations)
+        let cas_version = if expected_version == 0 {
+            current_version
+        } else {
+            if expected_version != current_version {
+                return Err(PersistenceError::Conflict {
+                    current_resource_version: Some(current_version),
+                });
+            }
+            expected_version
+        };
+
+        // Apply mutation
+        let mut updated = current.clone();
+        mutate(&mut updated);
+
+        // Serialize labels
+        let labels_map = updated.object_labels();
+        let labels_json = if labels_map.as_ref().is_none_or(HashMap::is_empty) {
+            None
+        } else {
+            Some(serde_json::to_string(&labels_map).map_err(|e| {
+                PersistenceError::Encode(format!("failed to serialize labels: {e}"))
+            })?)
+        };
+
+        // Single-attempt CAS write - fails with Conflict on version mismatch
+        let result = self
+            .put_if(
+                T::object_type(),
+                updated.object_id(),
+                updated.object_name(),
+                &updated.encode_to_vec(),
+                labels_json.as_deref(),
+                WriteCondition::MatchResourceVersion(cas_version),
+            )
+            .await?;
+
+        // Success - hydrate the new resource_version and return
+        updated.set_resource_version(result.resource_version);
+        Ok(updated)
     }
 }
 
@@ -356,6 +549,49 @@ pub fn parse_label_selector(selector: &str) -> PersistenceResult<HashMap<String,
     }
 
     Ok(labels)
+}
+
+/// Unconditional write helpers — test-only.
+///
+/// Production code must use [`Store::put_if`] (with [`WriteCondition`]) or
+/// [`Store::update_message_cas`] to ensure every write is CAS-protected.
+#[cfg(test)]
+impl Store {
+    pub async fn put(
+        &self,
+        object_type: &str,
+        id: &str,
+        name: &str,
+        payload: &[u8],
+        labels: Option<&str>,
+    ) -> PersistenceResult<()> {
+        match self {
+            Self::Postgres(store) => store.put(object_type, id, name, payload, labels).await,
+            Self::Sqlite(store) => store.put(object_type, id, name, payload, labels).await,
+        }
+    }
+
+    pub async fn put_message<T: Message + ObjectType + ObjectId + ObjectName + ObjectLabels>(
+        &self,
+        message: &T,
+    ) -> PersistenceResult<()> {
+        let labels_map = message.object_labels();
+        let labels_json = if labels_map.as_ref().is_none_or(HashMap::is_empty) {
+            None
+        } else {
+            Some(serde_json::to_string(&labels_map).map_err(|e| {
+                PersistenceError::Encode(format!("failed to serialize labels: {e}"))
+            })?)
+        };
+        self.put(
+            T::object_type(),
+            message.object_id(),
+            message.object_name(),
+            &message.encode_to_vec(),
+            labels_json.as_deref(),
+        )
+        .await
+    }
 }
 
 #[cfg(test)]

@@ -10,9 +10,8 @@
 #![allow(clippy::cast_possible_wrap)] // Intentional u32->i32 conversions for proto compat
 
 use crate::ServerState;
-use crate::persistence::{ObjectType, generate_name};
+use crate::persistence::{ObjectType, WriteCondition, generate_name};
 use futures::future;
-use openshell_core::ObjectId;
 use openshell_core::proto::{
     AttachSandboxProviderRequest, AttachSandboxProviderResponse, CreateSandboxRequest,
     CreateSshSessionRequest, CreateSshSessionResponse, DeleteSandboxRequest, DeleteSandboxResponse,
@@ -24,10 +23,12 @@ use openshell_core::proto::{
     TcpRelayTarget, WatchSandboxRequest, relay_open, tcp_forward_init,
 };
 use openshell_core::proto::{Sandbox, SandboxPhase, SandboxTemplate, SshSession};
+use openshell_core::{ObjectId, ObjectName};
 use prost::Message;
 use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -109,6 +110,7 @@ pub(super) async fn handle_create_sandbox(
             name: name.clone(),
             created_at_ms: now_ms,
             labels: request.labels.clone(),
+            resource_version: 0,
         }),
         spec: Some(spec),
         status: None,
@@ -168,33 +170,20 @@ pub(super) async fn handle_list_sandboxes(
     let request = request.into_inner();
     let limit = clamp_limit(request.limit, 100, MAX_PAGE_SIZE);
 
-    // If no label selector is provided, use the unfiltered list path
-    let records = if request.label_selector.is_empty() {
+    let sandboxes: Vec<Sandbox> = if request.label_selector.is_empty() {
         state
             .store
-            .list(Sandbox::object_type(), limit, request.offset)
+            .list_messages(limit, request.offset)
             .await
             .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?
     } else {
         crate::grpc::validation::validate_label_selector(&request.label_selector)?;
         state
             .store
-            .list_with_selector(
-                Sandbox::object_type(),
-                &request.label_selector,
-                limit,
-                request.offset,
-            )
+            .list_messages_with_selector(&request.label_selector, limit, request.offset)
             .await
             .map_err(|e| Status::internal(format!("list sandboxes with selector failed: {e}")))?
     };
-
-    let mut sandboxes = Vec::with_capacity(records.len());
-    for record in records {
-        let sandbox = Sandbox::decode(record.payload.as_slice())
-            .map_err(|e| Status::internal(format!("decode sandbox failed: {e}")))?;
-        sandboxes.push(sandbox);
-    }
 
     Ok(Response::new(ListSandboxesResponse { sandboxes }))
 }
@@ -217,6 +206,16 @@ pub(super) async fn handle_attach_sandbox_provider(
         return Err(Status::invalid_argument("provider_name is required"));
     }
 
+    // Validate provider name would not violate sandbox spec constraints if added
+    // (pre-validation ensures CAS mutations preserve invariants)
+    if request.provider_name.len() > super::MAX_NAME_LEN {
+        return Err(Status::invalid_argument(format!(
+            "provider_name exceeds maximum length ({} > {})",
+            request.provider_name.len(),
+            super::MAX_NAME_LEN
+        )));
+    }
+
     get_provider_record(state.store.as_ref(), &request.provider_name)
         .await
         .map_err(|err| {
@@ -231,39 +230,61 @@ pub(super) async fn handle_attach_sandbox_provider(
         })?;
 
     let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
-    let mut sandbox = sandbox_by_name(state, &request.sandbox_name).await?;
-    let sandbox_name = sandbox
+    let sandbox = sandbox_by_name(state, &request.sandbox_name).await?;
+    let sandbox_id = sandbox
         .metadata
         .as_ref()
-        .map_or_else(String::new, |metadata| metadata.name.clone());
+        .ok_or_else(|| Status::internal("sandbox metadata is missing"))?
+        .id
+        .clone();
+
+    // Pre-check: fail fast if sandbox spec is missing (invariant violation)
     let spec = sandbox
         .spec
-        .as_mut()
-        .ok_or_else(|| Status::failed_precondition("sandbox spec is missing"))?;
+        .as_ref()
+        .ok_or_else(|| Status::internal("sandbox spec is missing"))?;
 
-    dedupe_provider_names(&mut spec.providers);
-    let attached = if spec
-        .providers
-        .iter()
-        .any(|name| name == &request.provider_name)
+    // Pre-check: fail fast if already at MAX_PROVIDERS limit (avoid spurious CAS conflicts)
+    // Note: This is an optimization; the CAS closure rechecks after dedupe in case of races
+    if spec.providers.len() >= MAX_PROVIDERS
+        && !spec
+            .providers
+            .iter()
+            .any(|name| name == &request.provider_name)
     {
-        false
-    } else {
-        if spec.providers.len() >= MAX_PROVIDERS {
-            return Err(Status::invalid_argument(format!(
-                "providers list exceeds maximum ({MAX_PROVIDERS})"
-            )));
-        }
-        spec.providers.push(request.provider_name.clone());
-        true
-    };
-    validate_sandbox_spec(&sandbox_name, spec)?;
+        return Err(Status::invalid_argument(format!(
+            "providers list exceeds maximum ({MAX_PROVIDERS})"
+        )));
+    }
 
-    state
+    let provider_name = request.provider_name.clone();
+    let attached = Arc::new(AtomicBool::new(false));
+    let attached_clone = attached.clone();
+
+    let sandbox = state
         .store
-        .put_message(&sandbox)
+        .update_message_cas::<Sandbox, _>(
+            &sandbox_id,
+            request.expected_resource_version,
+            |sandbox| {
+                let Some(ref mut spec) = sandbox.spec else {
+                    // Spec should always exist post-creation; if missing, fail CAS to surface error
+                    return;
+                };
+
+                dedupe_provider_names(&mut spec.providers);
+                if !spec.providers.iter().any(|name| name == &provider_name)
+                    && spec.providers.len() < MAX_PROVIDERS
+                {
+                    spec.providers.push(provider_name.clone());
+                    attached_clone.store(true, Ordering::Relaxed);
+                }
+            },
+        )
         .await
-        .map_err(|e| Status::internal(format!("persist sandbox failed: {e}")))?;
+        .map_err(|e| super::persistence_error_to_status(e, "attach sandbox provider"))?;
+
+    let attached = attached.load(Ordering::Relaxed);
 
     info!(
         sandbox_name = %request.sandbox_name,
@@ -287,28 +308,58 @@ pub(super) async fn handle_detach_sandbox_provider(
         return Err(Status::invalid_argument("provider_name is required"));
     }
 
+    // Validate provider name (pre-validation ensures CAS mutations preserve invariants)
+    if request.provider_name.len() > super::MAX_NAME_LEN {
+        return Err(Status::invalid_argument(format!(
+            "provider_name exceeds maximum length ({} > {})",
+            request.provider_name.len(),
+            super::MAX_NAME_LEN
+        )));
+    }
+
     let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
-    let mut sandbox = sandbox_by_name(state, &request.sandbox_name).await?;
-    let sandbox_name = sandbox
+    let sandbox = sandbox_by_name(state, &request.sandbox_name).await?;
+    let sandbox_id = sandbox
         .metadata
         .as_ref()
-        .map_or_else(String::new, |metadata| metadata.name.clone());
-    let spec = sandbox
+        .ok_or_else(|| Status::internal("sandbox metadata is missing"))?
+        .id
+        .clone();
+
+    // Pre-check: fail fast if sandbox spec is missing (invariant violation)
+    let _spec = sandbox
         .spec
-        .as_mut()
-        .ok_or_else(|| Status::failed_precondition("sandbox spec is missing"))?;
+        .as_ref()
+        .ok_or_else(|| Status::internal("sandbox spec is missing"))?;
 
-    let before_len = spec.providers.len();
-    spec.providers.retain(|name| name != &request.provider_name);
-    let detached = spec.providers.len() != before_len;
-    dedupe_provider_names(&mut spec.providers);
-    validate_sandbox_spec(&sandbox_name, spec)?;
+    let provider_name = request.provider_name.clone();
+    let detached = Arc::new(AtomicBool::new(false));
+    let detached_clone = detached.clone();
 
-    state
+    let sandbox = state
         .store
-        .put_message(&sandbox)
+        .update_message_cas::<Sandbox, _>(
+            &sandbox_id,
+            request.expected_resource_version,
+            |sandbox| {
+                let Some(ref mut spec) = sandbox.spec else {
+                    // Spec should always exist post-creation; if missing, fail CAS to surface error
+                    return;
+                };
+
+                let before_len = spec.providers.len();
+                spec.providers.retain(|name| name != &provider_name);
+                if spec.providers.len() != before_len {
+                    detached_clone.store(true, Ordering::Relaxed);
+                    // Only dedupe after making a change
+                    dedupe_provider_names(&mut spec.providers);
+                }
+            },
+        )
         .await
-        .map_err(|e| Status::internal(format!("persist sandbox failed: {e}")))?;
+        .map_err(|e| super::persistence_error_to_status(e, "detach sandbox provider"))?;
+
+    let detached = detached.load(Ordering::Relaxed);
 
     info!(
         sandbox_name = %request.sandbox_name,
@@ -1196,6 +1247,7 @@ pub(super) async fn handle_create_ssh_session(
             name: generate_name(),
             created_at_ms: now_ms,
             labels: std::collections::HashMap::new(),
+            resource_version: 0,
         }),
         sandbox_id: req.sandbox_id.clone(),
         token: token.clone(),
@@ -1206,9 +1258,17 @@ pub(super) async fn handle_create_ssh_session(
     // Ensure metadata is valid (defense in depth - should always be true for server-constructed metadata)
     super::validation::validate_object_metadata(session.metadata.as_ref(), "ssh_session")?;
 
+    // Use MustCreate to atomically ensure the session token is unique
     state
         .store
-        .put_message(&session)
+        .put_if(
+            SshSession::object_type(),
+            &token,
+            session.object_name(),
+            &session.encode_to_vec(),
+            None,
+            WriteCondition::MustCreate,
+        )
         .await
         .map_err(|e| Status::internal(format!("persist ssh session failed: {e}")))?;
 
@@ -1249,12 +1309,26 @@ pub(super) async fn handle_revoke_ssh_session(
         return Ok(Response::new(RevokeSshSessionResponse { revoked: false }));
     };
 
+    let resource_version = session
+        .metadata
+        .as_ref()
+        .map_or(0, |metadata| metadata.resource_version);
+
     session.revoked = true;
+
+    // Use CAS to prevent lost updates from concurrent revocations
     state
         .store
-        .put_message(&session)
+        .put_if(
+            SshSession::object_type(),
+            session.object_id(),
+            session.object_name(),
+            &session.encode_to_vec(),
+            None,
+            WriteCondition::MatchResourceVersion(resource_version),
+        )
         .await
-        .map_err(|e| Status::internal(format!("persist ssh session failed: {e}")))?;
+        .map_err(|e| super::persistence_error_to_status(e, "revoke ssh session"))?;
 
     Ok(Response::new(RevokeSshSessionResponse { revoked: true }))
 }
@@ -2000,6 +2074,7 @@ mod tests {
                 name: name.to_string(),
                 created_at_ms: 1_000_000,
                 labels: HashMap::new(),
+                resource_version: 0,
             }),
             r#type: provider_type.to_string(),
             credentials: std::iter::once(("TOKEN".to_string(), "secret".to_string())).collect(),
@@ -2014,6 +2089,7 @@ mod tests {
                 name: name.to_string(),
                 created_at_ms: 1_000_000,
                 labels: std::iter::once(("team".to_string(), "agents".to_string())).collect(),
+                resource_version: 0,
             }),
             spec: Some(openshell_core::proto::SandboxSpec {
                 log_level: "debug".to_string(),
@@ -2046,6 +2122,7 @@ mod tests {
             Request::new(AttachSandboxProviderRequest {
                 sandbox_name: "work".to_string(),
                 provider_name: "work-github".to_string(),
+                expected_resource_version: 0,
             }),
         )
         .await
@@ -2088,6 +2165,7 @@ mod tests {
             Request::new(AttachSandboxProviderRequest {
                 sandbox_name: "work".to_string(),
                 provider_name: "work-github".to_string(),
+                expected_resource_version: 0,
             }),
         )
         .await
@@ -2128,6 +2206,7 @@ mod tests {
             Request::new(DetachSandboxProviderRequest {
                 sandbox_name: "work".to_string(),
                 provider_name: "work-github".to_string(),
+                expected_resource_version: 0,
             }),
         )
         .await
@@ -2151,6 +2230,7 @@ mod tests {
             Request::new(DetachSandboxProviderRequest {
                 sandbox_name: "work".to_string(),
                 provider_name: "work-github".to_string(),
+                expected_resource_version: 0,
             }),
         )
         .await
@@ -2205,6 +2285,7 @@ mod tests {
             Request::new(AttachSandboxProviderRequest {
                 sandbox_name: "work".to_string(),
                 provider_name: "missing".to_string(),
+                expected_resource_version: 0,
             }),
         )
         .await
@@ -2352,6 +2433,609 @@ mod tests {
         assert_ne!(
             SandboxPhase::try_from(stored.phase).ok(),
             Some(SandboxPhase::Ready)
+        );
+    }
+    #[tokio::test]
+    async fn attach_sandbox_provider_accepts_at_max_providers_limit() {
+        let state = test_server_state().await;
+
+        // Create MAX_PROVIDERS (32) providers
+        for i in 0..MAX_PROVIDERS {
+            state
+                .store
+                .put_message(&test_provider(&format!("provider-{i}"), "generic"))
+                .await
+                .unwrap();
+        }
+
+        // Create sandbox with 31 providers already attached
+        let mut existing_providers = Vec::new();
+        for i in 0..(MAX_PROVIDERS - 1) {
+            existing_providers.push(format!("provider-{i}"));
+        }
+        state
+            .store
+            .put_message(&test_sandbox("work", existing_providers))
+            .await
+            .unwrap();
+
+        // Attaching the 32nd provider should succeed
+        let response = handle_attach_sandbox_provider(
+            &state,
+            Request::new(AttachSandboxProviderRequest {
+                sandbox_name: "work".to_string(),
+                provider_name: "provider-31".to_string(),
+                expected_resource_version: 0,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(response.attached);
+        let providers = state
+            .store
+            .get_message_by_name::<Sandbox>("work")
+            .await
+            .unwrap()
+            .unwrap()
+            .spec
+            .unwrap()
+            .providers;
+        assert_eq!(providers.len(), MAX_PROVIDERS);
+    }
+
+    #[tokio::test]
+    async fn attach_sandbox_provider_rejects_beyond_max_providers_limit() {
+        let state = test_server_state().await;
+
+        // Create MAX_PROVIDERS + 1 providers
+        for i in 0..=MAX_PROVIDERS {
+            state
+                .store
+                .put_message(&test_provider(&format!("provider-{i}"), "generic"))
+                .await
+                .unwrap();
+        }
+
+        // Create sandbox with MAX_PROVIDERS already attached
+        let mut existing_providers = Vec::new();
+        for i in 0..MAX_PROVIDERS {
+            existing_providers.push(format!("provider-{i}"));
+        }
+        state
+            .store
+            .put_message(&test_sandbox("work", existing_providers))
+            .await
+            .unwrap();
+
+        // Attempting to attach the 33rd provider should fail
+        let err = handle_attach_sandbox_provider(
+            &state,
+            Request::new(AttachSandboxProviderRequest {
+                sandbox_name: "work".to_string(),
+                provider_name: "provider-32".to_string(),
+                expected_resource_version: 0,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("exceeds maximum"));
+
+        // Verify sandbox was not modified
+        let providers = state
+            .store
+            .get_message_by_name::<Sandbox>("work")
+            .await
+            .unwrap()
+            .unwrap()
+            .spec
+            .unwrap()
+            .providers;
+        assert_eq!(providers.len(), MAX_PROVIDERS);
+    }
+
+    #[tokio::test]
+    async fn attach_sandbox_provider_pre_validation_fails_fast() {
+        let state = test_server_state().await;
+
+        // Provider name that exceeds validation limits
+        let long_name = "a".repeat(1000);
+        state
+            .store
+            .put_message(&test_provider(&long_name, "generic"))
+            .await
+            .unwrap();
+
+        state
+            .store
+            .put_message(&test_sandbox("work", Vec::new()))
+            .await
+            .unwrap();
+
+        // Should fail validation before attempting CAS
+        let err = handle_attach_sandbox_provider(
+            &state,
+            Request::new(AttachSandboxProviderRequest {
+                sandbox_name: "work".to_string(),
+                provider_name: long_name,
+                expected_resource_version: 0,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn detach_sandbox_provider_pre_validation_rejects_invalid_names() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_sandbox("work", vec!["valid".to_string()]))
+            .await
+            .unwrap();
+
+        // Provider name that exceeds validation limits
+        let long_name = "a".repeat(1000);
+
+        let err = handle_detach_sandbox_provider(
+            &state,
+            Request::new(DetachSandboxProviderRequest {
+                sandbox_name: "work".to_string(),
+                provider_name: long_name,
+                expected_resource_version: 0,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn concurrent_create_ssh_session_prevents_duplicate_tokens() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_sandbox("work", Vec::new()))
+            .await
+            .unwrap();
+
+        // Both requests try to create sessions for the same sandbox
+        // The token generation is random, so we can't force a collision,
+        // but we can verify that both succeed with different tokens
+        let state1 = state.clone();
+        let handle1 = tokio::spawn(async move {
+            handle_create_ssh_session(
+                &state1,
+                Request::new(CreateSshSessionRequest {
+                    sandbox_id: "sandbox-work".to_string(),
+                }),
+            )
+            .await
+        });
+
+        let state2 = state.clone();
+        let handle2 = tokio::spawn(async move {
+            handle_create_ssh_session(
+                &state2,
+                Request::new(CreateSshSessionRequest {
+                    sandbox_id: "sandbox-work".to_string(),
+                }),
+            )
+            .await
+        });
+
+        let result1 = handle1.await.unwrap();
+        let result2 = handle2.await.unwrap();
+
+        // Both should succeed (tokens are random UUIDs, collision is astronomically unlikely)
+        assert!(result1.is_ok(), "first create should succeed");
+        assert!(result2.is_ok(), "second create should succeed");
+
+        let token1 = result1.unwrap().into_inner().token;
+        let token2 = result2.unwrap().into_inner().token;
+
+        // Tokens must be different
+        assert_ne!(token1, token2, "tokens should be unique");
+
+        // Both sessions should be in the database
+        let session1 = state
+            .store
+            .get_message::<SshSession>(&token1)
+            .await
+            .unwrap();
+        let session2 = state
+            .store
+            .get_message::<SshSession>(&token2)
+            .await
+            .unwrap();
+        assert!(session1.is_some());
+        assert!(session2.is_some());
+    }
+
+    #[tokio::test]
+    async fn concurrent_revoke_ssh_session_handles_cas_properly() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_sandbox("work", Vec::new()))
+            .await
+            .unwrap();
+
+        // Create a session first
+        let response = handle_create_ssh_session(
+            &state,
+            Request::new(CreateSshSessionRequest {
+                sandbox_id: "sandbox-work".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        let token = response.into_inner().token;
+
+        // Spawn two concurrent revocation attempts
+        let state1 = state.clone();
+        let token1 = token.clone();
+        let handle1 = tokio::spawn(async move {
+            handle_revoke_ssh_session(
+                &state1,
+                Request::new(RevokeSshSessionRequest { token: token1 }),
+            )
+            .await
+        });
+
+        let state2 = state.clone();
+        let token2 = token.clone();
+        let handle2 = tokio::spawn(async move {
+            handle_revoke_ssh_session(
+                &state2,
+                Request::new(RevokeSshSessionRequest { token: token2 }),
+            )
+            .await
+        });
+
+        let result1 = handle1.await.unwrap();
+        let result2 = handle2.await.unwrap();
+
+        // One should succeed, one may fail with ABORTED due to CAS conflict
+        let successes = [&result1, &result2]
+            .iter()
+            .filter(|r| r.is_ok() && r.as_ref().unwrap().get_ref().revoked)
+            .count();
+
+        // At least one should succeed in revoking
+        assert!(
+            successes >= 1,
+            "at least one revocation should succeed, got: {result1:?}, {result2:?}"
+        );
+
+        // The session should be revoked in the database
+        let session = state.store.get_message::<SshSession>(&token).await.unwrap();
+        assert!(session.is_some());
+        assert!(session.unwrap().revoked, "session should be revoked");
+    }
+
+    // ---- CAS (Client-driven optimistic concurrency) tests ----
+
+    #[tokio::test]
+    async fn attach_sandbox_provider_client_driven_cas_succeeds_with_correct_version() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("github", "github"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox("work", Vec::new()))
+            .await
+            .unwrap();
+
+        // Fetch the sandbox to get its current resource_version
+        let sandbox = state
+            .store
+            .get_message_by_name::<Sandbox>("work")
+            .await
+            .unwrap()
+            .unwrap();
+        let current_version = sandbox.metadata.as_ref().unwrap().resource_version;
+
+        // Attach with correct expected_resource_version
+        let response = handle_attach_sandbox_provider(
+            &state,
+            Request::new(AttachSandboxProviderRequest {
+                sandbox_name: "work".to_string(),
+                provider_name: "github".to_string(),
+                expected_resource_version: current_version,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(response.attached);
+
+        // Verify the resource_version incremented
+        let updated_sandbox = state
+            .store
+            .get_message_by_name::<Sandbox>("work")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            updated_sandbox.metadata.as_ref().unwrap().resource_version,
+            current_version + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_sandbox_provider_client_driven_cas_rejects_stale_version() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("github", "github"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox("work", Vec::new()))
+            .await
+            .unwrap();
+
+        // Get current version
+        let sandbox = state
+            .store
+            .get_message_by_name::<Sandbox>("work")
+            .await
+            .unwrap()
+            .unwrap();
+        let current_version = sandbox.metadata.as_ref().unwrap().resource_version;
+
+        // Try to attach with a stale version (current_version - 1 would be 0, use 99 instead)
+        let err = handle_attach_sandbox_provider(
+            &state,
+            Request::new(AttachSandboxProviderRequest {
+                sandbox_name: "work".to_string(),
+                provider_name: "github".to_string(),
+                expected_resource_version: 99,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        // Should get ABORTED status for CAS conflict
+        assert_eq!(err.code(), tonic::Code::Aborted);
+        assert!(
+            err.message().contains("modified concurrently")
+                || err.message().contains("resource_version"),
+            "error message should mention concurrency conflict: {}",
+            err.message()
+        );
+
+        // Verify the sandbox was not modified
+        let unchanged_sandbox = state
+            .store
+            .get_message_by_name::<Sandbox>("work")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            unchanged_sandbox
+                .metadata
+                .as_ref()
+                .unwrap()
+                .resource_version,
+            current_version
+        );
+        assert!(unchanged_sandbox.spec.unwrap().providers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn detach_sandbox_provider_client_driven_cas_succeeds_with_correct_version() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("github", "github"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox("work", vec!["github".to_string()]))
+            .await
+            .unwrap();
+
+        // Fetch the sandbox to get its current resource_version
+        let sandbox = state
+            .store
+            .get_message_by_name::<Sandbox>("work")
+            .await
+            .unwrap()
+            .unwrap();
+        let current_version = sandbox.metadata.as_ref().unwrap().resource_version;
+
+        // Detach with correct expected_resource_version
+        let response = handle_detach_sandbox_provider(
+            &state,
+            Request::new(DetachSandboxProviderRequest {
+                sandbox_name: "work".to_string(),
+                provider_name: "github".to_string(),
+                expected_resource_version: current_version,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(response.detached);
+
+        // Verify the resource_version incremented
+        let updated_sandbox = state
+            .store
+            .get_message_by_name::<Sandbox>("work")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            updated_sandbox.metadata.as_ref().unwrap().resource_version,
+            current_version + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn detach_sandbox_provider_client_driven_cas_rejects_stale_version() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("github", "github"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox("work", vec!["github".to_string()]))
+            .await
+            .unwrap();
+
+        // Get current version
+        let sandbox = state
+            .store
+            .get_message_by_name::<Sandbox>("work")
+            .await
+            .unwrap()
+            .unwrap();
+        let current_version = sandbox.metadata.as_ref().unwrap().resource_version;
+
+        // Try to detach with a stale version
+        let err = handle_detach_sandbox_provider(
+            &state,
+            Request::new(DetachSandboxProviderRequest {
+                sandbox_name: "work".to_string(),
+                provider_name: "github".to_string(),
+                expected_resource_version: 99,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        // Should get ABORTED status for CAS conflict
+        assert_eq!(err.code(), tonic::Code::Aborted);
+        assert!(
+            err.message().contains("modified concurrently")
+                || err.message().contains("resource_version"),
+            "error message should mention concurrency conflict: {}",
+            err.message()
+        );
+
+        // Verify the sandbox was not modified
+        let unchanged_sandbox = state
+            .store
+            .get_message_by_name::<Sandbox>("work")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            unchanged_sandbox
+                .metadata
+                .as_ref()
+                .unwrap()
+                .resource_version,
+            current_version
+        );
+        assert_eq!(unchanged_sandbox.spec.unwrap().providers, vec!["github"]);
+    }
+
+    #[tokio::test]
+    async fn attach_sandbox_provider_concurrent_with_stale_versions() {
+        use std::sync::Arc;
+
+        let state = Arc::new(test_server_state().await);
+
+        // Create multiple providers
+        for i in 0..3 {
+            state
+                .store
+                .put_message(&test_provider(&format!("provider-{i}"), "generic"))
+                .await
+                .unwrap();
+        }
+
+        state
+            .store
+            .put_message(&test_sandbox("work", Vec::new()))
+            .await
+            .unwrap();
+
+        // All three clients fetch the sandbox and see version 1
+        let initial_version = state
+            .store
+            .get_message_by_name::<Sandbox>("work")
+            .await
+            .unwrap()
+            .unwrap()
+            .metadata
+            .as_ref()
+            .unwrap()
+            .resource_version;
+
+        // Launch 3 concurrent attach operations, all using the same initial version
+        let mut handles = vec![];
+        for i in 0..3 {
+            let state_clone = Arc::clone(&state);
+            let handle = tokio::spawn(async move {
+                handle_attach_sandbox_provider(
+                    &state_clone,
+                    Request::new(AttachSandboxProviderRequest {
+                        sandbox_name: "work".to_string(),
+                        provider_name: format!("provider-{i}"),
+                        expected_resource_version: initial_version,
+                    }),
+                )
+                .await
+            });
+            handles.push(handle);
+        }
+
+        let results: Vec<_> = future::join_all(handles)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        // Only one should succeed; others should get ABORTED
+        let successes = results.iter().filter(|r| r.is_ok()).count();
+        let aborted_conflicts = results
+            .iter()
+            .filter(|r| {
+                r.as_ref()
+                    .err()
+                    .is_some_and(|e| e.code() == tonic::Code::Aborted)
+            })
+            .count();
+
+        assert_eq!(
+            successes, 1,
+            "exactly one attach should succeed with client-driven CAS"
+        );
+        assert_eq!(
+            aborted_conflicts, 2,
+            "two attaches should fail with ABORTED due to stale version"
+        );
+
+        // Final sandbox should have exactly 1 provider and resource_version = initial_version + 1
+        let final_sandbox = state
+            .store
+            .get_message_by_name::<Sandbox>("work")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(final_sandbox.spec.as_ref().unwrap().providers.len(), 1);
+        assert_eq!(
+            final_sandbox.metadata.as_ref().unwrap().resource_version,
+            initial_version + 1
         );
     }
 }

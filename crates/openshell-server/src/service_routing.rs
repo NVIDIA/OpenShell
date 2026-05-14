@@ -803,6 +803,7 @@ mod tests {
                 name: "my-sandbox--web".to_string(),
                 created_at_ms: 1_700_000_000_000,
                 labels: std::collections::HashMap::default(),
+                resource_version: 0,
             }),
             sandbox_id: "sandbox-id".to_string(),
             sandbox_name: "my-sandbox".to_string(),

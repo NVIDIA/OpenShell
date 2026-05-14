@@ -1627,6 +1627,7 @@ fn spawn_create_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
                         name: provider_name.clone(),
                         created_at_ms: 0,
                         labels: HashMap::new(),
+                        resource_version: 0,
                     }),
                     r#type: ptype.clone(),
                     credentials: credentials.clone(),
@@ -1717,6 +1718,7 @@ fn spawn_update_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
                     name: name.clone(),
                     created_at_ms: 0,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 r#type: ptype,
                 credentials,
@@ -2060,6 +2062,7 @@ fn spawn_set_global_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
             delete_setting: false,
             global: true,
             merge_operations: vec![],
+            expected_resource_version: 0,
         };
 
         let result = tokio::time::timeout(Duration::from_secs(5), client.update_config(req)).await;
@@ -2095,6 +2098,7 @@ fn spawn_delete_global_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
             delete_setting: true,
             global: true,
             merge_operations: vec![],
+            expected_resource_version: 0,
         };
 
         let result = tokio::time::timeout(Duration::from_secs(5), client.update_config(req)).await;
@@ -2164,6 +2168,7 @@ fn spawn_set_sandbox_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
             delete_setting: false,
             global: false,
             merge_operations: vec![],
+            expected_resource_version: 0,
         };
 
         let result = tokio::time::timeout(Duration::from_secs(5), client.update_config(req)).await;
@@ -2203,6 +2208,7 @@ fn spawn_delete_sandbox_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
             delete_setting: true,
             global: false,
             merge_operations: vec![],
+            expected_resource_version: 0,
         };
 
         let result = tokio::time::timeout(Duration::from_secs(5), client.update_config(req)).await;

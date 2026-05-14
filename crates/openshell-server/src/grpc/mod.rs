@@ -65,6 +65,29 @@ pub fn clamp_limit(raw: u32, default: u32, max: u32) -> u32 {
     if raw == 0 { default } else { raw.min(max) }
 }
 
+/// Map a `PersistenceError` to an appropriate gRPC `Status`.
+///
+/// CAS conflicts (optimistic concurrency failures) are mapped to `ABORTED`
+/// to signal that the client should retry with fresh data. Other persistence
+/// errors are mapped to `INTERNAL`.
+pub fn persistence_error_to_status(
+    err: crate::persistence::PersistenceError,
+    operation: &str,
+) -> Status {
+    use crate::persistence::PersistenceError;
+
+    match err {
+        PersistenceError::Conflict {
+            current_resource_version,
+        } => Status::aborted(format!(
+            "{} failed due to concurrent modification (current resource_version: {})",
+            operation,
+            current_resource_version.map_or_else(|| "unknown".to_string(), |v| v.to_string())
+        )),
+        other => Status::internal(format!("{operation} failed: {other}")),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Field-level size limits (shared across submodules)
 // ---------------------------------------------------------------------------
@@ -104,6 +127,10 @@ const MAX_PROVIDER_CONFIG_ENTRIES: usize = 64;
 struct StoredSettings {
     revision: u64,
     settings: BTreeMap<String, StoredSettingValue>,
+    /// Database `resource_version` for CAS. Not persisted in the JSON payload;
+    /// loaded from `ObjectRecord` and used for optimistic concurrency control.
+    #[serde(skip)]
+    resource_version: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

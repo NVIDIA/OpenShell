@@ -83,6 +83,7 @@ The storage schema is intentionally narrow:
 | `version` | Optional monotonically increasing version for scoped records. |
 | `status` | Optional workflow state for records such as policy revisions or draft policy chunks. |
 | `dedup_key` and `hit_count` | Optional policy-advisor fields for coalescing repeated observations. |
+| `resource_version` | Monotonically increasing counter for optimistic concurrency control. Incremented atomically on each update. |
 | `payload` | Prost-encoded protobuf payload for the full domain object. |
 | `created_at_ms` and `updated_at_ms` | Gateway timestamps used for ordering and list output. |
 | `labels` | JSON object carrying Kubernetes-style object labels for filtering and organization. |
@@ -112,6 +113,92 @@ default WAL journal mode), which mirror the same sensitive contents.
 
 Persisted state includes sandboxes, providers, SSH sessions, policy revisions,
 settings, inference configuration, and deployment records.
+
+### Optimistic Concurrency (CAS)
+
+Every object row carries a `resource_version` that the database increments
+atomically on each write. Concurrent mutations use compare-and-swap (CAS): the
+writer reads the current version, applies changes, and writes back with a
+`WHERE resource_version = <expected>` guard. If another writer updated the row
+in between, the guard fails and the caller receives a `Conflict` error.
+
+This matters for HA deployments where multiple gateway replicas share the same
+Postgres database, and for single-node deployments where concurrent gRPC
+handlers or the reconciler mutate the same sandbox.
+
+**Compile-time enforcement.** The unconditional write methods `put` and
+`put_message` are gated behind `#[cfg(test)]`. Production code must use
+`put_if` with an explicit `WriteCondition` or `update_message_cas`. The
+compiler rejects any other write path, making non-CAS writes structurally
+impossible outside of tests.
+
+Every write goes through one of three conditions:
+
+- `MustCreate` -- insert-only. The database rejects the write with a
+  `UniqueViolation` error if a row with that ID already exists. Handlers match
+  on the structured `PersistenceError::UniqueViolation { .. }` variant to
+  distinguish creation conflicts from other failures.
+- `MatchResourceVersion(v)` -- update-only. The database rejects the write
+  with a `Conflict` error if the current version differs from `v`.
+- `Unconditional` -- test-only; not reachable in production builds.
+
+**Creates.** All create paths use `MustCreate` and hydrate the response
+directly from the `WriteResult` returned by `put_if`, which carries the
+assigned `resource_version`, `created_at_ms`, and `updated_at_ms`. This
+eliminates a read-after-write round trip and the race window that would come
+with it.
+
+**Updates.** The `update_message_cas` helper makes a single CAS attempt: it
+fetches the current object, applies a mutation closure, and writes with a
+`MatchResourceVersion` condition. On conflict the persistence layer returns a
+`Conflict` error, which gRPC handlers map to `ABORTED` status so the client
+(or the next watch/reconcile event) can retry with fresh state. There is no
+automatic retry loop.
+
+The helper accepts an `expected_version` parameter that selects between two
+modes:
+
+- **Server-driven** (`expected_version = 0`): the helper uses the version it
+  just read from the database. Internal operations (reconciler, policy status
+  reports, compute phase transitions) use this mode because the caller does
+  not track versions.
+- **Client-driven** (`expected_version != 0`): the helper validates that the
+  caller's version matches the current database version before applying the
+  mutation. If they diverge it returns `Conflict` without attempting the
+  write. Client-facing operations that carry an `expected_resource_version`
+  field use this mode: `AttachSandboxProvider`, `DetachSandboxProvider`,
+  `UpdateProvider`, and `UpdateConfig` (policy backfill path).
+
+**Lists.** The `list_messages` and `list_messages_with_selector` helpers decode
+protobuf payloads from list results and hydrate `resource_version` from the
+authoritative database column into each decoded message, mirroring the
+`get_message` pattern. This ensures list responses carry correct versions
+without requiring callers to manually hydrate each record.
+
+**Deletes.** Delete operations are not yet CAS-protected -- the delete request
+protos do not carry `expected_resource_version`. A `delete_if` primitive exists
+in the persistence layer but is not wired into gRPC handlers.
+
+**Coverage.** All `ObjectMeta`-bearing message types have write-condition
+coverage:
+
+| Type | Create | Update | List |
+|---|---|---|---|
+| Sandbox | `MustCreate` | `update_message_cas` | `list_messages` |
+| Provider | `MustCreate` | `update_message_cas` | `list_messages` |
+| ProviderProfile | `MustCreate` | (immutable) | `list_messages` |
+| InferenceRoute | `MustCreate` | `update_message_cas` | `list_messages` |
+| SandboxPolicy | scoped versioning | scoped versioning | scoped query |
+| Settings | `Mutex`-guarded | `Mutex`-guarded | single-row |
+
+Global settings updates use a Tokio `Mutex` to serialize multi-step
+validation within a single gateway process, with CAS on the underlying
+persistence write as defense in depth. In an HA deployment with multiple
+gateways, the Mutex alone would be insufficient. Sandbox-scoped settings
+rely entirely on CAS without a Mutex.
+
+The `resource_version` is surfaced to clients through `ObjectMeta` in proto
+responses. Database migrations backfill existing rows with version 1.
 
 Policy and runtime settings are delivered together through the effective sandbox
 config path. A gateway-global policy can override sandbox-scoped policy. The

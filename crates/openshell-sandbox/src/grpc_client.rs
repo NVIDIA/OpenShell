@@ -155,6 +155,7 @@ async fn sync_policy_with_client(
             delete_setting: false,
             global: false,
             merge_operations: vec![],
+            expected_resource_version: 0,
         })
         .await
         .into_diagnostic()

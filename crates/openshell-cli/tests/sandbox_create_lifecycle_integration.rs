@@ -85,6 +85,7 @@ impl OpenShell for TestOpenShell {
                     name: sandbox_name,
                     created_at_ms: 0,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 phase: SandboxPhase::Provisioning as i32,
                 ..Sandbox::default()
@@ -104,6 +105,7 @@ impl OpenShell for TestOpenShell {
                     name,
                     created_at_ms: 0,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 phase: SandboxPhase::Ready as i32,
                 ..Sandbox::default()
@@ -324,6 +326,7 @@ impl OpenShell for TestOpenShell {
                     name: sandbox_id.trim_start_matches("id-").to_string(),
                     created_at_ms: 0,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 phase: SandboxPhase::Provisioning as i32,
                 ..Sandbox::default()

@@ -2389,6 +2389,11 @@ pub async fn sandbox_get(
     println!("  {} {}", "Id:".dimmed(), id);
     println!("  {} {}", "Name:".dimmed(), name);
     println!("  {} {}", "Phase:".dimmed(), phase_name(sandbox.phase));
+    println!(
+        "  {} {}",
+        "Resource version:".dimmed(),
+        sandbox.metadata.as_ref().map_or(0, |m| m.resource_version)
+    );
 
     // Display labels if present
     if let Some(metadata) = &sandbox.metadata
@@ -3154,6 +3159,7 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
         "id": sandbox.object_id(),
         "name": sandbox.object_name(),
         "labels": labels,
+        "resource_version": meta.map_or(0, |m| m.resource_version),
         "created_at": format_epoch_ms(meta.map_or(0, |m| m.created_at_ms)),
         "phase": phase_name(sandbox.phase),
         "current_policy_version": sandbox.current_policy_version,
@@ -3186,14 +3192,38 @@ pub async fn sandbox_provider_attach(
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
-    let response = client
-        .attach_sandbox_provider(AttachSandboxProviderRequest {
-            sandbox_name: name.to_string(),
-            provider_name: provider.to_string(),
+
+    // Fetch current sandbox to get resource_version for CAS
+    let sandbox = client
+        .get_sandbox(GetSandboxRequest {
+            name: name.to_string(),
         })
         .await
         .into_diagnostic()?
-        .into_inner();
+        .into_inner()
+        .sandbox
+        .ok_or_else(|| miette::miette!("sandbox not found"))?;
+
+    let resource_version = sandbox.metadata.as_ref().map_or(0, |m| m.resource_version);
+
+    let response = match client
+        .attach_sandbox_provider(AttachSandboxProviderRequest {
+            sandbox_name: name.to_string(),
+            provider_name: provider.to_string(),
+            expected_resource_version: resource_version,
+        })
+        .await
+    {
+        Ok(response) => response.into_inner(),
+        Err(status) if status.code() == Code::Aborted => {
+            return Err(miette::miette!(
+                "Failed to attach provider: sandbox was modified by another operation.\n\
+                 Please retry the command."
+            )
+            .with_source_code(status.message().to_string()));
+        }
+        Err(e) => return Err(e).into_diagnostic(),
+    };
 
     if response.attached {
         println!(
@@ -3215,14 +3245,38 @@ pub async fn sandbox_provider_detach(
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
-    let response = client
-        .detach_sandbox_provider(DetachSandboxProviderRequest {
-            sandbox_name: name.to_string(),
-            provider_name: provider.to_string(),
+
+    // Fetch current sandbox to get resource_version for CAS
+    let sandbox = client
+        .get_sandbox(GetSandboxRequest {
+            name: name.to_string(),
         })
         .await
         .into_diagnostic()?
-        .into_inner();
+        .into_inner()
+        .sandbox
+        .ok_or_else(|| miette::miette!("sandbox not found"))?;
+
+    let resource_version = sandbox.metadata.as_ref().map_or(0, |m| m.resource_version);
+
+    let response = match client
+        .detach_sandbox_provider(DetachSandboxProviderRequest {
+            sandbox_name: name.to_string(),
+            provider_name: provider.to_string(),
+            expected_resource_version: resource_version,
+        })
+        .await
+    {
+        Ok(response) => response.into_inner(),
+        Err(status) if status.code() == Code::Aborted => {
+            return Err(miette::miette!(
+                "Failed to detach provider: sandbox was modified by another operation.\n\
+                 Please retry the command."
+            )
+            .with_source_code(status.message().to_string()));
+        }
+        Err(e) => return Err(e).into_diagnostic(),
+    };
 
     if response.detached {
         println!(
@@ -3557,6 +3611,7 @@ async fn auto_create_provider(
                     name: exact_name.to_string(),
                     created_at_ms: 0,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 r#type: provider_type.to_string(),
                 credentials: discovered.credentials.clone(),
@@ -3597,6 +3652,7 @@ async fn auto_create_provider(
                         name: name.clone(),
                         created_at_ms: 0,
                         labels: HashMap::new(),
+                        resource_version: 0,
                     }),
                     r#type: provider_type.to_string(),
                     credentials: discovered.credentials.clone(),
@@ -4009,6 +4065,7 @@ pub async fn provider_create(
                     name: name.to_string(),
                     created_at_ms: 0,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 r#type: provider_type.clone(),
                 credentials: credential_map,
@@ -4053,6 +4110,11 @@ pub async fn provider_get(server: &str, name: &str, tls: &TlsOptions) -> Result<
     println!("  {} {}", "Id:".dimmed(), provider.object_id());
     println!("  {} {}", "Name:".dimmed(), provider.object_name());
     println!("  {} {}", "Type:".dimmed(), provider.r#type);
+    println!(
+        "  {} {}",
+        "Resource version:".dimmed(),
+        provider.metadata.as_ref().map_or(0, |m| m.resource_version)
+    );
     println!(
         "  {} {}",
         "Credential keys:".dimmed(),
@@ -4509,6 +4571,7 @@ pub async fn provider_update(
                     name: name.to_string(),
                     created_at_ms: 0,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 r#type: String::new(),
                 credentials: credential_map,
@@ -5063,6 +5126,7 @@ pub async fn sandbox_policy_set_global(
             delete_setting: false,
             global: true,
             merge_operations: vec![],
+            expected_resource_version: 0,
         })
         .await
         .into_diagnostic()?
@@ -5261,6 +5325,7 @@ pub async fn gateway_setting_set(
             delete_setting: false,
             global: true,
             merge_operations: vec![],
+            expected_resource_version: 0,
         })
         .await
         .into_diagnostic()?
@@ -5295,6 +5360,7 @@ pub async fn sandbox_setting_set(
             delete_setting: false,
             global: false,
             merge_operations: vec![],
+            expected_resource_version: 0,
         })
         .await
         .into_diagnostic()?
@@ -5329,6 +5395,7 @@ pub async fn gateway_setting_delete(
             delete_setting: true,
             global: true,
             merge_operations: vec![],
+            expected_resource_version: 0,
         })
         .await
         .into_diagnostic()?
@@ -5363,6 +5430,7 @@ pub async fn sandbox_setting_delete(
             delete_setting: true,
             global: false,
             merge_operations: vec![],
+            expected_resource_version: 0,
         })
         .await
         .into_diagnostic()?
@@ -5421,6 +5489,7 @@ pub async fn sandbox_policy_set(
             delete_setting: false,
             global: false,
             merge_operations: vec![],
+            expected_resource_version: 0,
         })
         .await
         .into_diagnostic()?;
@@ -5595,6 +5664,7 @@ pub async fn sandbox_policy_update(
             delete_setting: false,
             global: false,
             merge_operations: plan.merge_operations,
+            expected_resource_version: 0,
         })
         .await
         .into_diagnostic()?

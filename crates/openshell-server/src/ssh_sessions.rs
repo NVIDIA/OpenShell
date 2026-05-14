@@ -90,6 +90,7 @@ mod tests {
                 name: format!("session-{id}"),
                 created_at_ms: 1000,
                 labels: HashMap::new(),
+                resource_version: 0,
             }),
             sandbox_id: sandbox_id.to_string(),
             token: id.to_string(),
