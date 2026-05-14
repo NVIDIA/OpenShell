@@ -738,7 +738,8 @@ async fn provider_type_allows_empty_credentials_for_refresh(
         credential.refresh.as_ref().is_some_and(|refresh| {
             matches!(
                 refresh.strategy,
-                ProviderCredentialRefreshStrategy::Oauth2ClientCredentials
+                ProviderCredentialRefreshStrategy::Oauth2RefreshToken
+                    | ProviderCredentialRefreshStrategy::Oauth2ClientCredentials
                     | ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt
             )
         })
@@ -1289,8 +1290,8 @@ mod tests {
     use openshell_core::proto::{
         DeleteProviderProfileRequest, GetProviderProfileRequest, ImportProviderProfilesRequest,
         L7Allow, L7Rule, LintProviderProfilesRequest, ListProviderProfilesRequest, NetworkBinary,
-        NetworkEndpoint, ProviderProfile, ProviderProfileCategory, ProviderProfileImportItem,
-        Sandbox, SandboxSpec,
+        NetworkEndpoint, ProviderCredentialRefresh, ProviderCredentialRefreshMaterial,
+        ProviderProfile, ProviderProfileCategory, ProviderProfileImportItem, Sandbox, SandboxSpec,
     };
     use openshell_core::{ObjectId, ObjectName};
     use std::collections::HashMap;
@@ -2325,12 +2326,11 @@ mod tests {
 
     #[tokio::test]
     async fn provider_validation_errors() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let state = test_server_state().await;
+        let store = state.store.as_ref();
 
         let create_missing_type = create_provider_record(
-            &store,
+            store,
             Provider {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
@@ -2350,7 +2350,7 @@ mod tests {
         assert_eq!(create_missing_type.code(), Code::InvalidArgument);
 
         let create_missing_credentials = create_provider_record(
-            &store,
+            store,
             Provider {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
@@ -2369,7 +2369,7 @@ mod tests {
         assert_eq!(create_missing_credentials.code(), Code::InvalidArgument);
 
         let refresh_bootstrap_provider = create_provider_record(
-            &store,
+            store,
             Provider {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
@@ -2387,14 +2387,83 @@ mod tests {
         .unwrap();
         assert!(refresh_bootstrap_provider.credentials.is_empty());
 
-        let get_err = get_provider_record(&store, "").await.unwrap_err();
+        handle_import_provider_profiles(
+            &state,
+            Request::new(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(ProviderProfile {
+                        id: "delegated-refresh-api".to_string(),
+                        display_name: "Delegated Refresh API".to_string(),
+                        description: String::new(),
+                        category: ProviderProfileCategory::Messaging as i32,
+                        credentials: vec![openshell_core::proto::ProviderProfileCredential {
+                            name: "access_token".to_string(),
+                            description: String::new(),
+                            env_vars: vec!["DELEGATED_ACCESS_TOKEN".to_string()],
+                            required: true,
+                            auth_style: "bearer".to_string(),
+                            header_name: "authorization".to_string(),
+                            query_param: String::new(),
+                            refresh: Some(ProviderCredentialRefresh {
+                                strategy: ProviderCredentialRefreshStrategy::Oauth2RefreshToken
+                                    as i32,
+                                token_url: "https://login.example/token".to_string(),
+                                scopes: vec!["https://example.test/.default".to_string()],
+                                refresh_before_seconds: 300,
+                                max_lifetime_seconds: 3600,
+                                material: vec![
+                                    ProviderCredentialRefreshMaterial {
+                                        name: "client_id".to_string(),
+                                        description: String::new(),
+                                        required: true,
+                                        secret: false,
+                                    },
+                                    ProviderCredentialRefreshMaterial {
+                                        name: "refresh_token".to_string(),
+                                        description: String::new(),
+                                        required: true,
+                                        secret: true,
+                                    },
+                                ],
+                            }),
+                        }],
+                        endpoints: vec![],
+                        binaries: vec![],
+                        inference_capable: false,
+                    }),
+                    source: "delegated-refresh-api.yaml".to_string(),
+                }],
+            }),
+        )
+        .await
+        .unwrap();
+        let delegated_refresh_bootstrap_provider = create_provider_record(
+            store,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "delegated-refresh-no-token-yet".to_string(),
+                    created_at_ms: 1_000_000,
+                    labels: HashMap::new(),
+                }),
+                r#type: "delegated-refresh-api".to_string(),
+                credentials: HashMap::new(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(delegated_refresh_bootstrap_provider.credentials.is_empty());
+
+        let get_err = get_provider_record(store, "").await.unwrap_err();
         assert_eq!(get_err.code(), Code::InvalidArgument);
 
-        let delete_err = delete_provider_record(&store, "").await.unwrap_err();
+        let delete_err = delete_provider_record(store, "").await.unwrap_err();
         assert_eq!(delete_err.code(), Code::InvalidArgument);
 
         let update_missing_err = update_provider_record(
-            &store,
+            store,
             Provider {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
