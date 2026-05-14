@@ -11,6 +11,10 @@ use kube::core::gvk::GroupVersionKind;
 use kube::core::{DynamicObject, ObjectMeta};
 use kube::runtime::watcher::{self, Event};
 use kube::{Client, Error as KubeError};
+use openshell_core::progress::{
+    PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX, PROGRESS_STEP_STARTING_SANDBOX,
+    mark_progress_active, mark_progress_complete, mark_progress_detail,
+};
 use openshell_core::proto::compute::v1::{
     DriverCondition as SandboxCondition, DriverPlatformEvent as PlatformEvent,
     DriverSandbox as Sandbox, DriverSandboxSpec as SandboxSpec,
@@ -646,6 +650,11 @@ fn map_kube_event_to_platform(
     if let Some(count) = obj.count {
         metadata.insert("count".to_string(), count.to_string());
     }
+    attach_kube_progress_metadata(
+        &mut metadata,
+        obj.reason.as_deref().unwrap_or_default(),
+        obj.message.as_deref().unwrap_or_default(),
+    );
 
     Some((
         sandbox_id,
@@ -658,6 +667,76 @@ fn map_kube_event_to_platform(
             metadata,
         },
     ))
+}
+
+fn attach_kube_progress_metadata(
+    metadata: &mut std::collections::HashMap<String, String>,
+    reason: &str,
+    message: &str,
+) {
+    match reason {
+        "Scheduled" => {
+            mark_progress_complete(
+                metadata,
+                PROGRESS_STEP_REQUESTING_SANDBOX,
+                "Sandbox allocated",
+            );
+            mark_progress_active(metadata, PROGRESS_STEP_PULLING_IMAGE);
+        }
+        "Pulling" => {
+            mark_progress_active(metadata, PROGRESS_STEP_PULLING_IMAGE);
+            if let Some(image) = pulling_image_from_kube_message(message) {
+                mark_progress_detail(metadata, image);
+            }
+        }
+        "Pulled" => {
+            let label = pulled_image_label(message);
+            mark_progress_complete(metadata, PROGRESS_STEP_PULLING_IMAGE, label);
+            mark_progress_active(metadata, PROGRESS_STEP_STARTING_SANDBOX);
+        }
+        _ => {}
+    }
+}
+
+fn pulling_image_from_kube_message(message: &str) -> Option<String> {
+    let image = message
+        .strip_prefix("Pulling image ")
+        .map(str::trim)
+        .map(|value| value.trim_matches('"'))?;
+    (!image.is_empty()).then(|| image.to_string())
+}
+
+fn pulled_image_label(message: &str) -> String {
+    extract_image_size(message).map_or_else(
+        || "Image pulled".to_string(),
+        |bytes| format!("Image pulled ({})", format_bytes(bytes)),
+    )
+}
+
+fn extract_image_size(message: &str) -> Option<u64> {
+    let size_prefix = "Image size: ";
+    let start = message.find(size_prefix)? + size_prefix.len();
+    let rest = &message[start..];
+    let end = rest.find(' ')?;
+    rest[..end].parse().ok()
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+
+    if bytes >= GB {
+        #[allow(clippy::cast_precision_loss)]
+        let gb = bytes as f64 / GB as f64;
+        format!("{gb:.1} GB")
+    } else if bytes >= MB {
+        format!("{} MB", bytes / MB)
+    } else if bytes >= KB {
+        format!("{} KB", bytes / KB)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 /// Path where the supervisor binary is mounted inside the agent container.
@@ -1501,7 +1580,83 @@ fn condition_from_value(value: &serde_json::Value) -> Option<SandboxCondition> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openshell_core::progress::{
+        PROGRESS_ACTIVE_DETAIL_KEY, PROGRESS_ACTIVE_STEP_KEY, PROGRESS_COMPLETE_LABEL_KEY,
+        PROGRESS_COMPLETE_STEP_KEY,
+    };
     use prost_types::{Struct, Value, value::Kind};
+
+    #[test]
+    fn kube_pulling_event_adds_image_progress_metadata() {
+        let mut metadata = std::collections::HashMap::new();
+
+        attach_kube_progress_metadata(
+            &mut metadata,
+            "Pulling",
+            "Pulling image \"ghcr.io/acme/sandbox:latest\"",
+        );
+
+        assert_eq!(
+            metadata.get(PROGRESS_ACTIVE_STEP_KEY).map(String::as_str),
+            Some(PROGRESS_STEP_PULLING_IMAGE)
+        );
+        assert_eq!(
+            metadata.get(PROGRESS_ACTIVE_DETAIL_KEY).map(String::as_str),
+            Some("ghcr.io/acme/sandbox:latest")
+        );
+    }
+
+    #[test]
+    fn kube_pulled_event_adds_completed_image_progress_metadata() {
+        let mut metadata = std::collections::HashMap::new();
+
+        attach_kube_progress_metadata(
+            &mut metadata,
+            "Pulled",
+            "Successfully pulled image \"ghcr.io/acme/sandbox:latest\". Image size: 44040192 bytes.",
+        );
+
+        assert_eq!(
+            metadata.get(PROGRESS_COMPLETE_STEP_KEY).map(String::as_str),
+            Some(PROGRESS_STEP_PULLING_IMAGE)
+        );
+        assert_eq!(
+            metadata
+                .get(PROGRESS_COMPLETE_LABEL_KEY)
+                .map(String::as_str),
+            Some("Image pulled (42 MB)")
+        );
+        assert_eq!(
+            metadata.get(PROGRESS_ACTIVE_STEP_KEY).map(String::as_str),
+            Some(PROGRESS_STEP_STARTING_SANDBOX)
+        );
+    }
+
+    #[test]
+    fn apply_required_env_always_injects_ssh_handshake_secret() {
+        let mut env = Vec::new();
+        apply_required_env(
+            &mut env,
+            "sandbox-1",
+            "my-sandbox",
+            "https://endpoint:8080",
+            "0.0.0.0:2222",
+            "my-secret-value",
+            300,
+            true,
+        );
+
+        let secret_entry = env
+            .iter()
+            .find(|e| {
+                e.get("name").and_then(|v| v.as_str()) == Some("OPENSHELL_SSH_HANDSHAKE_SECRET")
+            })
+            .expect("OPENSHELL_SSH_HANDSHAKE_SECRET must be present in env");
+        assert_eq!(
+            secret_entry.get("value").and_then(|v| v.as_str()),
+            Some("my-secret-value")
+        );
+    }
 
     #[test]
     fn supervisor_sideload_injects_run_as_user_zero() {

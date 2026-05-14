@@ -161,10 +161,18 @@ The gateway is auto-registered by `mise run gateway:vm`. In another terminal:
 
 First sandbox takes 10–30 seconds to boot (image fetch/prepare/cache + libkrun + guest init). If `--from` is omitted, the VM driver uses the gateway's configured default sandbox image. Without either `--from` or `--sandbox-image`, VM sandbox creation fails. Subsequent creates reuse the prepared image cache and create only a sparse per-sandbox `overlay.ext4` before boot.
 
+`CreateSandbox` accepts the sandbox quickly and continues VM provisioning in the
+background. The driver publishes platform events for image resolution, cache
+hits/misses, layer pulls, rootfs preparation, overlay creation, and VM launcher
+startup so the CLI can show progress through the existing sandbox watch stream.
+
 During rootfs preparation the VM driver exports or pulls the selected OCI image,
 applies the OpenShell guest mutations, formats a sparse `rootfs.ext4`, and
-caches it under `<state-dir>/images/<cache-id>/rootfs.ext4`. Each sandbox boots
-that cached base disk read-only and gets its own sparse writable
+caches it under `<state-dir>/images/<cache-id>/rootfs.ext4`. Registry layers are
+downloaded, verified, and extracted concurrently, then applied in image order. Set
+`OPENSHELL_VM_IMAGE_PULL_CONCURRENCY` to tune registry layer download
+parallelism (default `4`, maximum `16`). Each sandbox boots that cached base
+disk read-only and gets its own sparse writable
 `<state-dir>/sandboxes/<id>/overlay.ext4`. Guest init mounts overlayfs as `/`,
 so writes to `/sandbox` and other mutable paths land in the overlay while the
 cached root image remains unchanged.

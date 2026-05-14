@@ -21,14 +21,20 @@ use openshell_core::proto::{
     GetSandboxProviderEnvironmentResponse, GetSandboxRequest, HealthRequest, HealthResponse,
     ListProvidersRequest, ListProvidersResponse, ListSandboxProvidersRequest,
     ListSandboxProvidersResponse, ListSandboxesRequest, ListSandboxesResponse, PlatformEvent,
-    ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, Sandbox, SandboxPhase,
-    SandboxResponse, SandboxStreamEvent, ServiceStatus, SupervisorMessage, UpdateProviderRequest,
-    WatchSandboxRequest, sandbox_stream_event,
+    ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, Sandbox,
+    SandboxCondition, SandboxPhase, SandboxResponse, SandboxStatus, SandboxStreamEvent,
+    ServiceStatus, SupervisorMessage, UpdateProviderRequest, WatchSandboxRequest,
+    sandbox_stream_event,
+};
+use rcgen::{
+    BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
 };
 use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, mpsc};
@@ -40,6 +46,8 @@ use tonic::{Response, Status};
 struct SandboxState {
     deleted_names: Arc<Mutex<Vec<Vec<String>>>>,
     create_requests: Arc<Mutex<Vec<CreateSandboxRequest>>>,
+    vm_error_after_started: Arc<AtomicBool>,
+    vm_slow_progress_before_ready: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Default)]
@@ -304,6 +312,11 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<Self::WatchSandboxStream>, Status> {
         let sandbox_id = request.into_inner().id;
         let (tx, rx) = mpsc::channel(4);
+        let vm_error_after_started = self.state.vm_error_after_started.load(Ordering::SeqCst);
+        let vm_slow_progress_before_ready = self
+            .state
+            .vm_slow_progress_before_ready
+            .load(Ordering::SeqCst);
 
         tokio::spawn(async move {
             let provisioning = Sandbox {
@@ -316,6 +329,23 @@ impl OpenShell for TestOpenShell {
                 phase: SandboxPhase::Provisioning as i32,
                 ..Sandbox::default()
             };
+            let error = Sandbox {
+                phase: SandboxPhase::Error as i32,
+                status: Some(SandboxStatus {
+                    sandbox_name: sandbox_id.trim_start_matches("id-").to_string(),
+                    agent_pod: String::new(),
+                    agent_fd: String::new(),
+                    sandbox_fd: String::new(),
+                    conditions: vec![SandboxCondition {
+                        r#type: "Ready".to_string(),
+                        status: "False".to_string(),
+                        reason: "ProcessExited".to_string(),
+                        message: "VM process exited with status 0".to_string(),
+                        last_transition_time: String::new(),
+                    }],
+                }),
+                ..provisioning.clone()
+            };
             let ready = Sandbox {
                 phase: SandboxPhase::Ready as i32,
                 ..provisioning.clone()
@@ -326,6 +356,56 @@ impl OpenShell for TestOpenShell {
                     payload: Some(sandbox_stream_event::Payload::Sandbox(provisioning)),
                 }))
                 .await;
+            if vm_error_after_started {
+                let _ = tx
+                    .send(Ok(SandboxStreamEvent {
+                        payload: Some(sandbox_stream_event::Payload::Event(PlatformEvent {
+                            source: "vm".to_string(),
+                            reason: "Started".to_string(),
+                            message: "Started VM launcher".to_string(),
+                            ..PlatformEvent::default()
+                        })),
+                    }))
+                    .await;
+                let _ = tx
+                    .send(Ok(SandboxStreamEvent {
+                        payload: Some(sandbox_stream_event::Payload::Sandbox(error)),
+                    }))
+                    .await;
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                return;
+            }
+            if vm_slow_progress_before_ready {
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                let _ = tx
+                    .send(Ok(SandboxStreamEvent {
+                        payload: Some(sandbox_stream_event::Payload::Event(PlatformEvent {
+                            source: "vm".to_string(),
+                            reason: "PreparingRootfs".to_string(),
+                            message: "Preparing rootfs".to_string(),
+                            ..PlatformEvent::default()
+                        })),
+                    }))
+                    .await;
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                let _ = tx
+                    .send(Ok(SandboxStreamEvent {
+                        payload: Some(sandbox_stream_event::Payload::Event(PlatformEvent {
+                            source: "vm".to_string(),
+                            reason: "CreatingRootDisk".to_string(),
+                            message: "Formatting root disk".to_string(),
+                            ..PlatformEvent::default()
+                        })),
+                    }))
+                    .await;
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                let _ = tx
+                    .send(Ok(SandboxStreamEvent {
+                        payload: Some(sandbox_stream_event::Payload::Sandbox(ready)),
+                    }))
+                    .await;
+                return;
+            }
             let _ = tx
                 .send(Ok(SandboxStreamEvent {
                     payload: Some(sandbox_stream_event::Payload::Event(PlatformEvent {
@@ -567,6 +647,14 @@ fn install_fake_ssh(dir: &TempDir) -> std::path::PathBuf {
 }
 
 fn test_env(fake_ssh_dir: &TempDir, xdg_dir: &TempDir) -> EnvVarGuard {
+    test_env_with(fake_ssh_dir, xdg_dir, &[])
+}
+
+fn test_env_with(
+    fake_ssh_dir: &TempDir,
+    xdg_dir: &TempDir,
+    extra: &[(&'static str, String)],
+) -> EnvVarGuard {
     let path = format!(
         "{}:{}",
         fake_ssh_dir.path().display(),
@@ -574,7 +662,18 @@ fn test_env(fake_ssh_dir: &TempDir, xdg_dir: &TempDir) -> EnvVarGuard {
     );
     let xdg = xdg_dir.path().to_str().unwrap().to_string();
 
-    EnvVarGuard::set(&[("PATH", &path), ("XDG_CONFIG_HOME", &xdg), ("HOME", &xdg)])
+    let mut owned_pairs = vec![
+        ("PATH", path),
+        ("XDG_CONFIG_HOME", xdg.clone()),
+        ("HOME", xdg),
+    ];
+    owned_pairs.extend(extra.iter().cloned());
+    let pairs = owned_pairs
+        .iter()
+        .map(|(key, value)| (*key, value.as_str()))
+        .collect::<Vec<_>>();
+
+    EnvVarGuard::set(&pairs)
 }
 
 async fn deleted_names(server: &TestServer) -> Vec<Vec<String>> {
@@ -606,6 +705,7 @@ async fn sandbox_create_keeps_command_sessions_by_default() {
         None,
         true,
         false,
+        None,
         None,
         None,
         None,
@@ -703,6 +803,102 @@ async fn sandbox_create_sends_cpu_and_memory_limits_only() {
         Some("2Gi")
     );
     assert!(!resources.fields.contains_key("requests"));
+}
+
+#[tokio::test]
+async fn sandbox_create_returns_vm_error_without_waiting_for_timeout() {
+    let server = run_server().await;
+    server
+        .openshell
+        .state
+        .vm_error_after_started
+        .store(true, Ordering::SeqCst);
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env_with(
+        &fake_ssh_dir,
+        &xdg_dir,
+        &[("OPENSHELL_PROVISION_TIMEOUT", "1".to_string())],
+    );
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+
+    let started_at = Instant::now();
+    let err = run::sandbox_create(
+        &server.endpoint,
+        Some("vm-error"),
+        None,
+        "openshell",
+        None,
+        true,
+        false,
+        None,
+        None,
+        None,
+        None,
+        &[],
+        None,
+        None,
+        &["echo".to_string(), "OK".to_string()],
+        Some(false),
+        Some(false),
+        &HashMap::new(),
+        &tls,
+    )
+    .await
+    .expect_err("sandbox create should fail on terminal VM error");
+
+    assert!(
+        started_at.elapsed() < Duration::from_secs(2),
+        "terminal VM errors should not wait for the provisioning timeout"
+    );
+    let rendered = err.to_string();
+    assert!(rendered.contains("sandbox entered error phase while provisioning"));
+    assert!(rendered.contains("ProcessExited: VM process exited with status 0"));
+    assert!(!rendered.contains("timed out"));
+}
+
+#[tokio::test]
+async fn sandbox_create_keeps_waiting_while_vm_progress_arrives() {
+    let server = run_server().await;
+    server
+        .openshell
+        .state
+        .vm_slow_progress_before_ready
+        .store(true, Ordering::SeqCst);
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env_with(
+        &fake_ssh_dir,
+        &xdg_dir,
+        &[("OPENSHELL_PROVISION_TIMEOUT", "1".to_string())],
+    );
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+
+    run::sandbox_create(
+        &server.endpoint,
+        Some("vm-slow-progress"),
+        None,
+        "openshell",
+        None,
+        true,
+        false,
+        None,
+        None,
+        None,
+        None,
+        &[],
+        None,
+        None,
+        &["echo".to_string(), "OK".to_string()],
+        Some(false),
+        Some(false),
+        &HashMap::new(),
+        &tls,
+    )
+    .await
+    .expect("sandbox create should not time out while VM progress is active");
 }
 
 #[tokio::test]

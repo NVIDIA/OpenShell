@@ -23,6 +23,11 @@ use openshell_bootstrap::{
     remove_gateway_metadata, resolve_ssh_hostname, save_active_gateway, save_last_sandbox,
     store_gateway_metadata,
 };
+use openshell_core::progress::{
+    PROGRESS_ACTIVE_DETAIL_KEY, PROGRESS_ACTIVE_STEP_KEY, PROGRESS_COMPLETE_LABEL_KEY,
+    PROGRESS_COMPLETE_STEP_KEY, PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX,
+    PROGRESS_STEP_STARTING_SANDBOX,
+};
 use openshell_core::proto::ProviderProfileCategory;
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, AttachSandboxProviderRequest,
@@ -35,7 +40,7 @@ use openshell_core::proto::{
     GetSandboxRequest, GetServiceRequest, HealthRequest, ImportProviderProfilesRequest,
     LintProviderProfilesRequest, ListProviderProfilesRequest, ListProvidersRequest,
     ListSandboxPoliciesRequest, ListSandboxProvidersRequest, ListSandboxesRequest,
-    ListServicesRequest, PolicySource, PolicyStatus, Provider, ProviderProfile,
+    ListServicesRequest, PlatformEvent, PolicySource, PolicyStatus, Provider, ProviderProfile,
     ProviderProfileDiagnostic, ProviderProfileImportItem, RejectDraftChunkRequest,
     RevokeSshSessionRequest, Sandbox, SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate,
     ServiceEndpointResponse, SetClusterInferenceRequest, SettingScope, SettingValue,
@@ -196,26 +201,6 @@ impl ProvisioningStep {
     }
 }
 
-/// Kubernetes event reason codes we care about.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum KubeEventReason {
-    Scheduled,
-    Pulling,
-    Pulled,
-    Started,
-}
-
-/// Map a Kubernetes event reason string to an enum.
-fn parse_kube_event_reason(reason: &str) -> Option<KubeEventReason> {
-    match reason {
-        "Scheduled" => Some(KubeEventReason::Scheduled),
-        "Pulling" => Some(KubeEventReason::Pulling),
-        "Pulled" => Some(KubeEventReason::Pulled),
-        "Started" => Some(KubeEventReason::Started),
-        _ => None,
-    }
-}
-
 /// Live-updating display showing a provisioning step checklist with spinner.
 ///
 /// Completed steps are printed as static `✓ Step` lines.  The current
@@ -270,14 +255,6 @@ impl ProvisioningDisplay {
             active_detail: String::new(),
             step_start: now,
         }
-    }
-
-    /// Record a completed provisioning step.
-    ///
-    /// The step is printed as a static `✓` line and the spinner advances
-    /// to the next expected state.
-    fn complete_step(&mut self, step: ProvisioningStep) {
-        self.complete_step_with_label(step, step.completed_label());
     }
 
     /// Record a completed provisioning step with a custom label.
@@ -382,34 +359,80 @@ fn format_timestamp(d: Duration) -> String {
     format!("[{secs:.1}s]")
 }
 
-/// Extract image size in bytes from a Kubernetes Pulled event message.
-/// Example: "Successfully pulled image ... Image size: 620405524 bytes."
-fn extract_image_size(message: &str) -> Option<u64> {
-    let size_prefix = "Image size: ";
-    let start = message.find(size_prefix)? + size_prefix.len();
-    let rest = &message[start..];
-    let end = rest.find(' ')?;
-    rest[..end].parse().ok()
+fn progress_step_from_metadata(value: &str) -> Option<ProvisioningStep> {
+    match value {
+        PROGRESS_STEP_REQUESTING_SANDBOX => Some(ProvisioningStep::RequestingSandbox),
+        PROGRESS_STEP_PULLING_IMAGE => Some(ProvisioningStep::PullingSandboxImage),
+        PROGRESS_STEP_STARTING_SANDBOX => Some(ProvisioningStep::StartingSandbox),
+        _ => None,
+    }
 }
 
-/// Format bytes as a human-readable string (e.g., "620 MB").
-fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = 1024 * KB;
-    const GB: u64 = 1024 * MB;
+fn noninteractive_active_label(step: ProvisioningStep) -> String {
+    step.active_label().trim_end_matches('.').to_string()
+}
 
-    if bytes >= GB {
-        // GB-scale precision loss is acceptable for a human-readable label.
-        #[allow(clippy::cast_precision_loss)]
-        let gb = bytes as f64 / GB as f64;
-        format!("{gb:.1} GB")
-    } else if bytes >= MB {
-        format!("{} MB", bytes / MB)
-    } else if bytes >= KB {
-        format!("{} KB", bytes / KB)
-    } else {
-        format!("{bytes} B")
+fn handle_platform_progress_event(
+    event: &PlatformEvent,
+    display: &mut Option<ProvisioningDisplay>,
+    provision_start: Instant,
+) -> bool {
+    let completed_step = event
+        .metadata
+        .get(PROGRESS_COMPLETE_STEP_KEY)
+        .and_then(|step| progress_step_from_metadata(step));
+    let active_step = event
+        .metadata
+        .get(PROGRESS_ACTIVE_STEP_KEY)
+        .and_then(|step| progress_step_from_metadata(step));
+    let active_detail = event
+        .metadata
+        .get(PROGRESS_ACTIVE_DETAIL_KEY)
+        .filter(|detail| !detail.is_empty());
+
+    let handled = completed_step.is_some() || active_step.is_some() || active_detail.is_some();
+    if !handled {
+        return false;
     }
+
+    if let Some(step) = completed_step {
+        let label = event
+            .metadata
+            .get(PROGRESS_COMPLETE_LABEL_KEY)
+            .map_or_else(|| step.completed_label(), String::as_str);
+        if let Some(d) = display.as_mut() {
+            d.complete_step_with_label(step, label);
+        } else {
+            let ts = format_timestamp(provision_start.elapsed());
+            println!("{} {}", ts.dimmed(), label);
+        }
+    }
+
+    if let Some(step) = active_step
+        && let Some(d) = display.as_mut()
+    {
+        d.set_active_step(step);
+    }
+
+    if let Some(detail) = active_detail {
+        if let Some(d) = display.as_mut() {
+            d.set_active_detail(detail);
+        } else {
+            let ts = format_timestamp(provision_start.elapsed());
+            if let Some(step) = active_step {
+                println!(
+                    "{} {} {}",
+                    ts.dimmed(),
+                    noninteractive_active_label(step),
+                    detail
+                );
+            } else {
+                println!("{} {}", ts.dimmed(), detail);
+            }
+        }
+    }
+
+    true
 }
 
 fn print_sandbox_header(sandbox: &Sandbox, display: Option<&ProvisioningDisplay>) {
@@ -1720,7 +1743,7 @@ pub async fn sandbox_create(
             follow_logs: true,
             follow_events: true,
             log_tail_lines: 200,
-            event_tail: 0,
+            event_tail: 50,
             stop_on_terminal: false,
             log_since_ms: 0,
             log_sources: vec!["gateway".to_string()],
@@ -1735,7 +1758,6 @@ pub async fn sandbox_create(
     let mut last_condition_message = ready_false_condition_message(sandbox.status.as_ref());
     // Track whether we have seen a non-Ready phase during the watch.
     let mut saw_non_ready = SandboxPhase::try_from(sandbox.phase) != Ok(SandboxPhase::Ready);
-    let start_time = Instant::now();
     let provision_timeout = Duration::from_secs(
         std::env::var("OPENSHELL_PROVISION_TIMEOUT")
             .ok()
@@ -1746,10 +1768,10 @@ pub async fn sandbox_create(
     let mut saw_gateway_ready = false;
 
     loop {
-        // Compute remaining time so the timeout fires even when the stream
-        // produces no events (e.g. server-side producer died).
-        let remaining = provision_timeout.saturating_sub(start_time.elapsed());
-        let maybe_item = tokio::time::timeout(remaining, stream.next()).await;
+        // Timeout only when provisioning goes idle. VM first-create can spend
+        // longer than the default timeout pulling and preparing large images,
+        // but progress events should keep the CLI alive.
+        let maybe_item = tokio::time::timeout(provision_timeout, stream.next()).await;
 
         let item = match maybe_item {
             Ok(Some(item)) => item,
@@ -1795,6 +1817,7 @@ pub async fn sandbox_create(
                                 format!("{}: {}", condition.reason, condition.message);
                         }
                     }
+                    break;
                 }
 
                 // Only accept Ready as terminal after we've observed a
@@ -1813,76 +1836,11 @@ pub async fn sandbox_create(
                 }
             }
             Some(openshell_core::proto::sandbox_stream_event::Payload::Event(ev)) => {
-                // Map Kubernetes events to provisioning steps.
-                // We simplify the display to: Sandbox allocated -> Pulling image -> Ready
-                if let Some(reason) = parse_kube_event_reason(&ev.reason) {
-                    match reason {
-                        KubeEventReason::Scheduled => {
-                            if let Some(d) = display.as_mut() {
-                                d.complete_step_with_label(
-                                    ProvisioningStep::RequestingSandbox,
-                                    "Sandbox allocated",
-                                );
-                                d.set_active_step(ProvisioningStep::PullingSandboxImage);
-                            } else {
-                                let ts = format_timestamp(provision_start.elapsed());
-                                println!("{} Sandbox allocated", ts.dimmed());
-                            }
-                        }
-                        KubeEventReason::Pulling => {
-                            // Extract image name from the event message.
-                            let image_name = ev
-                                .message
-                                .strip_prefix("Pulling image ")
-                                .map_or("", |s| s.trim_matches('"'));
-                            if let Some(d) = display.as_mut() {
-                                d.set_active("Pulling image...");
-                                if !image_name.is_empty() {
-                                    d.set_active_detail(image_name);
-                                }
-                            } else {
-                                let ts = format_timestamp(provision_start.elapsed());
-                                if image_name.is_empty() {
-                                    println!("{} Pulling image...", ts.dimmed());
-                                } else {
-                                    println!("{} Pulling image {image_name}", ts.dimmed());
-                                }
-                            }
-                        }
-                        KubeEventReason::Pulled => {
-                            // Extract image size from message like:
-                            // "Successfully pulled image ... Image size: 620405524 bytes."
-                            let size_label = extract_image_size(&ev.message)
-                                .map(format_bytes)
-                                .unwrap_or_default();
-                            let label = if size_label.is_empty() {
-                                "Image pulled".to_string()
-                            } else {
-                                format!("Image pulled ({size_label})")
-                            };
-                            if let Some(d) = display.as_mut() {
-                                d.complete_step_with_label(
-                                    ProvisioningStep::PullingSandboxImage,
-                                    &label,
-                                );
-                                d.set_active_step(ProvisioningStep::StartingSandbox);
-                            } else {
-                                let ts = format_timestamp(provision_start.elapsed());
-                                println!("{} {}", ts.dimmed(), label);
-                            }
-                        }
-                        KubeEventReason::Started => {
-                            // Only complete StartingSandbox if we've already completed
-                            // PullingSandboxImage (meaning the container is starting).
-                            if let Some(d) = display.as_mut()
-                                && d.completed_steps
-                                    .contains(&ProvisioningStep::PullingSandboxImage)
-                            {
-                                d.complete_step(ProvisioningStep::StartingSandbox);
-                            }
-                        }
-                    }
-                } else if let Some(d) = display.as_mut() {
+                if handle_platform_progress_event(&ev, &mut display, provision_start) {
+                    continue;
+                }
+
+                if let Some(d) = display.as_mut() {
                     // Unknown events: show as detail on the current spinner.
                     if !ev.message.is_empty() {
                         d.set_active_detail(&ev.message);
@@ -6264,15 +6222,15 @@ fn format_timestamp_ms(ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        TlsOptions, build_sandbox_resource_limits, dockerfile_sources_supported_for_gateway,
-        format_endpoint, format_gateway_select_header, format_gateway_select_items,
-        format_provider_attachment_table, gateway_add, gateway_auth_label,
-        gateway_env_override_warning, gateway_select_with, gateway_type_label, git_sync_files,
-        http_health_check, image_requests_gpu, import_local_package_mtls_bundle,
+        ProvisioningStep, TlsOptions, build_sandbox_resource_limits,
+        dockerfile_sources_supported_for_gateway, format_endpoint, format_gateway_select_header,
+        format_gateway_select_items, format_provider_attachment_table, gateway_add,
+        gateway_auth_label, gateway_env_override_warning, gateway_select_with, gateway_type_label,
+        git_sync_files, http_health_check, image_requests_gpu, import_local_package_mtls_bundle,
         inferred_provider_type, package_managed_tls_dirs, parse_cli_setting_value,
-        parse_credential_pairs, plaintext_gateway_is_remote, provisioning_timeout_message,
-        ready_false_condition_message, resolve_from, sandbox_should_persist,
-        service_expose_status_error, service_url_for_gateway,
+        parse_credential_pairs, plaintext_gateway_is_remote, progress_step_from_metadata,
+        provisioning_timeout_message, ready_false_condition_message, resolve_from,
+        sandbox_should_persist, service_expose_status_error, service_url_for_gateway,
     };
     use crate::TEST_ENV_LOCK;
     use hyper::StatusCode;
@@ -6286,6 +6244,10 @@ mod tests {
     use tonic::Status;
 
     use openshell_bootstrap::GatewayMetadata;
+    use openshell_core::progress::{
+        PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX,
+        PROGRESS_STEP_STARTING_SANDBOX,
+    };
     use openshell_core::proto::{
         Provider, SandboxCondition, SandboxStatus, datamodel::v1::ObjectMeta,
     };
@@ -6423,6 +6385,23 @@ mod tests {
         assert!(output.contains("custom-api"));
         assert!(output.contains('2'));
         assert!(output.contains('1'));
+    }
+
+    #[test]
+    fn progress_step_metadata_values_map_to_cli_steps() {
+        assert_eq!(
+            progress_step_from_metadata(PROGRESS_STEP_REQUESTING_SANDBOX),
+            Some(ProvisioningStep::RequestingSandbox)
+        );
+        assert_eq!(
+            progress_step_from_metadata(PROGRESS_STEP_PULLING_IMAGE),
+            Some(ProvisioningStep::PullingSandboxImage)
+        );
+        assert_eq!(
+            progress_step_from_metadata(PROGRESS_STEP_STARTING_SANDBOX),
+            Some(ProvisioningStep::StartingSandbox)
+        );
+        assert_eq!(progress_step_from_metadata("driver-private-step"), None);
     }
 
     #[cfg(feature = "dev-settings")]

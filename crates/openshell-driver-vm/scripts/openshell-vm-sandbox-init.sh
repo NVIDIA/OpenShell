@@ -344,6 +344,20 @@ setup_sandbox_workdir() {
     ts "prepared /sandbox ownership"
 }
 
+configure_hostname() {
+    local sandbox_hostname="${OPENSHELL_SANDBOX:-openshell-sandbox-vm}"
+    sandbox_hostname="$(printf '%s' "$sandbox_hostname" | tr -c 'A-Za-z0-9.-' '-')"
+    sandbox_hostname="$(printf '%s' "$sandbox_hostname" | sed 's/^[.-][.-]*//; s/[.-][.-]*$//')"
+    sandbox_hostname="$(printf '%.63s' "$sandbox_hostname")"
+    if [ -z "$sandbox_hostname" ]; then
+        sandbox_hostname="openshell-sandbox-vm"
+    fi
+
+    hostname "$sandbox_hostname" 2>/dev/null || true
+    printf '%s\n' "$sandbox_hostname" >/etc/hostname 2>/dev/null || true
+    ts "hostname=${sandbox_hostname}"
+}
+
 mount -t proc proc /proc 2>/dev/null &
 mount -t sysfs sysfs /sys 2>/dev/null &
 mount -t tmpfs tmpfs /tmp 2>/dev/null &
@@ -359,7 +373,7 @@ wait
 
 setup_sandbox_workdir
 
-hostname openshell-sandbox-vm 2>/dev/null || true
+configure_hostname
 ip link set lo up 2>/dev/null || true
 
 # GPU initialization (before networking so nvidia-smi output is visible early)

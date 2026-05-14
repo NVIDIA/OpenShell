@@ -16,6 +16,12 @@ Each runtime receives a sandbox spec from the gateway and is responsible for:
 - Reporting lifecycle and platform events back to the gateway.
 - Cleaning up runtime-owned resources.
 
+Drivers own runtime-specific platform event interpretation. When an event should
+drive client provisioning UI, the driver attaches the shared
+`openshell.progress.*` metadata defined in `openshell-core` instead of requiring
+clients to parse Kubernetes reasons, VM cache states, or other driver-local
+reason strings.
+
 ## Runtime Summary
 
 | Runtime | Best fit | Sandbox boundary | Notes |

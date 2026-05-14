@@ -3884,6 +3884,34 @@ network_policies:
     }
 
     #[test]
+    fn wildcard_host_matches_intra_label_suffix() {
+        let data = r#"
+network_policies:
+  wildcard:
+    name: wildcard
+    endpoints:
+      - { host: "*-aiplatform.googleapis.com", port: 443 }
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let input = NetworkInput {
+            host: "us-central1-aiplatform.googleapis.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let decision = engine.evaluate_network(&input).unwrap();
+        assert!(
+            decision.allowed,
+            "*-aiplatform.googleapis.com should match us-central1-aiplatform.googleapis.com: {}",
+            decision.reason
+        );
+    }
+
+    #[test]
     fn wildcard_host_rejects_deep_subdomain() {
         // * should match single DNS label only (does not cross .)
         let data = r#"

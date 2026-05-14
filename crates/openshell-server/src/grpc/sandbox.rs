@@ -414,6 +414,7 @@ pub(super) async fn handle_watch_sandbox(
     let log_since_ms = req.log_since_ms;
     let log_sources = req.log_sources;
     let log_min_level = req.log_min_level;
+    let event_tail = req.event_tail;
 
     let (tx, rx) = mpsc::channel::<Result<SandboxStreamEvent, Status>>(256);
     let state = state.clone();
@@ -518,7 +519,7 @@ pub(super) async fn handle_watch_sandbox(
             for evt in state
                 .tracing_log_bus
                 .platform_event_bus
-                .tail(&sandbox_id, 50)
+                .tail(&sandbox_id, event_tail as usize)
             {
                 if tx.send(Ok(evt)).await.is_err() {
                     return;

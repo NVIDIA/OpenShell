@@ -20,6 +20,7 @@ pub mod inference;
 pub mod metadata;
 pub mod net;
 pub mod paths;
+pub mod progress;
 pub mod proto;
 pub mod sandbox_env;
 pub mod settings;
