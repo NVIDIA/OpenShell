@@ -3,7 +3,12 @@
 
 [workspace]
 resolver = "2"
-members = ["crates/*"]
+members = [
+    "crates/*",
+    "crates/openshell-driver-appcontainer",
+    "crates/openshell-driver-isolation-session",
+    "crates/openshell-mxc-bridge",
+]
 
 [workspace.package]
 version = "0.0.0"
@@ -113,6 +118,11 @@ uuid = { version = "1.10", features = ["v4"] }
 
 # SMT solver (uses system libz3; enable z3/bundled via the prover's bundled-z3 feature for local dev without system z3)
 z3 = "0.19"
+
+# Windows interop (declared at workspace level for AEGIS/MXC crates; consumed only by Windows-targeted crates)
+windows = { version = "0.58", features = ["Win32_Foundation"] }
+windows-sys = { version = "0.59" }
+widestring = "1.1"
 
 [workspace.lints.rust]
 unsafe_code = "warn"

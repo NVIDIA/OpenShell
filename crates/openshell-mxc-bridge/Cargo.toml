@@ -1,0 +1,8 @@
+[package]
+name = "openshell-mxc-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
