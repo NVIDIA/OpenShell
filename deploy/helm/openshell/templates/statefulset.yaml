@@ -128,6 +128,10 @@ spec:
             {{- end }}
             {{- end }}
             {{- if .Values.server.oidc.issuer }}
+            {{- if .Values.server.oidc.caConfigMapName }}
+            - name: SSL_CERT_FILE
+              value: /etc/openshell-tls/oidc-ca/ca.crt
+            {{- end }}
             - name: OPENSHELL_OIDC_ISSUER
               value: {{ .Values.server.oidc.issuer | quote }}
             - name: OPENSHELL_OIDC_AUDIENCE
@@ -160,6 +164,11 @@ spec:
               readOnly: true
             - name: tls-client-ca
               mountPath: /etc/openshell-tls/client-ca
+              readOnly: true
+            {{- end }}
+            {{- if and .Values.server.oidc.issuer .Values.server.oidc.caConfigMapName }}
+            - name: oidc-ca
+              mountPath: /etc/openshell-tls/oidc-ca
               readOnly: true
             {{- end }}
           ports:
@@ -214,6 +223,11 @@ spec:
             {{- else }}
             secretName: {{ .Values.server.tls.clientCaSecretName }}
             {{- end }}
+        {{- end }}
+        {{- if and .Values.server.oidc.issuer .Values.server.oidc.caConfigMapName }}
+        - name: oidc-ca
+          configMap:
+            name: {{ .Values.server.oidc.caConfigMapName }}
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
