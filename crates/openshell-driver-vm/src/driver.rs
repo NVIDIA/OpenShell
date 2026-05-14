@@ -762,12 +762,14 @@ impl VmDriver {
         sandbox_id: &str,
         image_ref: &str,
     ) -> Result<String, Status> {
-        if let Some((docker, image_identity)) = self.resolve_local_docker_image(image_ref).await? {
+        if let Some((engine, image_identity)) =
+            self.resolve_local_container_image(image_ref).await?
+        {
             return self
                 .ensure_cached_local_image_rootfs_archive(
                     sandbox_id,
                     image_ref,
-                    &docker,
+                    &engine,
                     &image_identity,
                 )
                 .await;
@@ -860,13 +862,13 @@ impl VmDriver {
         Ok(image_identity)
     }
 
-    async fn resolve_local_docker_image(
+    async fn resolve_local_container_image(
         &self,
         image_ref: &str,
     ) -> Result<Option<(Docker, String)>, Status> {
         let required_local_image = is_openshell_local_build_image_ref(image_ref);
-        let docker = match connect_local_container_engine().await {
-            Some(docker) => docker,
+        let engine = match connect_local_container_engine().await {
+            Some(engine) => engine,
             None if required_local_image => {
                 return Err(Status::failed_precondition(format!(
                     "no container engine (Docker/Podman) available for locally built sandbox image '{image_ref}'"
@@ -881,9 +883,9 @@ impl VmDriver {
             }
         };
 
-        match docker.inspect_image(image_ref).await {
+        match engine.inspect_image(image_ref).await {
             Ok(inspect) => {
-                if let Some(message) = local_docker_image_platform_mismatch(
+                if let Some(message) = local_image_platform_mismatch(
                     image_ref,
                     inspect.os.as_deref(),
                     inspect.architecture.as_deref(),
@@ -911,7 +913,7 @@ impl VmDriver {
                     image_identity = %image_identity,
                     "vm driver: resolved image from local container engine"
                 );
-                Ok(Some((docker, image_identity)))
+                Ok(Some((engine, image_identity)))
             }
             Err(err) if is_docker_not_found_error(&err) && required_local_image => {
                 Err(Status::failed_precondition(format!(
@@ -1576,7 +1578,7 @@ fn is_openshell_local_build_image_ref(image_ref: &str) -> bool {
     image_ref.starts_with("openshell/sandbox-from:")
 }
 
-fn local_docker_image_platform_mismatch(
+fn local_image_platform_mismatch(
     image_ref: &str,
     actual_os: Option<&str>,
     actual_arch: Option<&str>,
@@ -2969,9 +2971,9 @@ mod tests {
     }
 
     #[test]
-    fn local_docker_image_platform_mismatch_checks_guest_platform() {
+    fn local_image_platform_mismatch_checks_guest_platform() {
         assert!(
-            local_docker_image_platform_mismatch(
+            local_image_platform_mismatch(
                 "openshell/sandbox-from:123",
                 Some("linux"),
                 Some(linux_oci_arch()),
@@ -2979,7 +2981,7 @@ mod tests {
             .is_none()
         );
 
-        let err = local_docker_image_platform_mismatch(
+        let err = local_image_platform_mismatch(
             "openshell/sandbox-from:123",
             Some("linux"),
             Some("wrong-arch"),
@@ -2988,7 +2990,7 @@ mod tests {
         assert!(err.contains("wrong-arch"));
         assert!(err.contains(linux_oci_arch()));
 
-        let err = local_docker_image_platform_mismatch("openshell/sandbox-from:123", None, None)
+        let err = local_image_platform_mismatch("openshell/sandbox-from:123", None, None)
             .expect("unknown platform should be reported");
         assert!(err.contains("unknown/unknown"));
     }
