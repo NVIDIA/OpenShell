@@ -2,10 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use openshell_core::config::{
-    DEFAULT_NETWORK_NAME, DEFAULT_SSH_PORT, DEFAULT_STOP_TIMEOUT_SECS, DEFAULT_SUPERVISOR_IMAGE,
+    DEFAULT_SSH_PORT, DEFAULT_STOP_TIMEOUT_SECS, DEFAULT_SUPERVISOR_IMAGE,
 };
 use std::path::PathBuf;
 use std::str::FromStr;
+
+/// Default Podman bridge network name.
+pub const DEFAULT_NETWORK_NAME: &str = "openshell";
 
 /// Image pull policy for sandbox and supervisor images.
 ///

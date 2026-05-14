@@ -9,9 +9,9 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use openshell_core::VERSION;
-use openshell_core::config::{DEFAULT_NETWORK_NAME, DEFAULT_SSH_PORT, DEFAULT_STOP_TIMEOUT_SECS};
+use openshell_core::config::{DEFAULT_SSH_PORT, DEFAULT_STOP_TIMEOUT_SECS};
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
-use openshell_driver_podman::config::ImagePullPolicy;
+use openshell_driver_podman::config::{DEFAULT_NETWORK_NAME, ImagePullPolicy};
 use openshell_driver_podman::{ComputeDriverService, PodmanComputeConfig, PodmanComputeDriver};
 
 #[derive(Parser)]
