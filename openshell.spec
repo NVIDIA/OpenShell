@@ -154,9 +154,9 @@ Type=exec
 ExecStartPre=%{_libexecdir}/openshell/init-pki.sh %%S/openshell/tls
 
 # Auto-generate gateway.env (SSH handshake secret + commented config
-# reference) on first start if not present.
+# reference) on first start if not present. ExecStart exports the generated
+# secret so the first gateway process receives it.
 # %%E expands to $XDG_CONFIG_HOME (~/.config) in user units.
-ExecStartPre=%{_libexecdir}/openshell/init-gateway-env.sh %%E/openshell/gateway.env
 EnvironmentFile=-%%E/openshell/gateway.env
 Environment=OPENSHELL_BIND_ADDRESS=0.0.0.0
 Environment=OPENSHELL_DRIVERS=podman
@@ -171,7 +171,7 @@ Environment=OPENSHELL_TLS_CLIENT_CA=%%S/openshell/tls/ca.crt
 Environment=OPENSHELL_PODMAN_TLS_CA=%%S/openshell/tls/ca.crt
 Environment=OPENSHELL_PODMAN_TLS_CERT=%%S/openshell/tls/client/tls.crt
 Environment=OPENSHELL_PODMAN_TLS_KEY=%%S/openshell/tls/client/tls.key
-ExecStart=/usr/bin/openshell-gateway
+ExecStart=/bin/bash %{_libexecdir}/openshell/openshell-gateway-start.sh %{_libexecdir}/openshell/init-gateway-env.sh %%E/openshell/gateway.env %{_bindir}/openshell-gateway
 StateDirectory=openshell
 Restart=on-failure
 RestartSec=5
@@ -190,6 +190,7 @@ EOF
 install -d %{buildroot}%{_libexecdir}/%{name}
 install -pm 0755 deploy/rpm/init-pki.sh %{buildroot}%{_libexecdir}/%{name}/init-pki.sh
 install -pm 0755 deploy/rpm/init-gateway-env.sh %{buildroot}%{_libexecdir}/%{name}/init-gateway-env.sh
+install -pm 0755 deploy/systemd/openshell-gateway-start.sh %{buildroot}%{_libexecdir}/%{name}/openshell-gateway-start.sh
 # Patch commented image defaults to match the build type (dev or latest).
 # The source file uses :latest as a generic reference; the installed copy
 # reflects what this RPM actually expects from the registry.
@@ -277,6 +278,7 @@ PYTHONPATH=%{buildroot}%{python3_sitelib} %{python3} -c "from importlib.metadata
 %{_userunitdir}/%{name}-gateway.service
 %{_libexecdir}/%{name}/init-pki.sh
 %{_libexecdir}/%{name}/init-gateway-env.sh
+%{_libexecdir}/%{name}/openshell-gateway-start.sh
 %{_mandir}/man8/openshell-gateway.8*
 %{_mandir}/man5/openshell-gateway.env.5*
 

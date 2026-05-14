@@ -4,8 +4,8 @@
 
 # Generate the gateway environment configuration file on first start.
 #
-# Called from the systemd ExecStartPre directive to bootstrap the
-# gateway configuration. Idempotent: exits immediately if the file
+# Called from systemd startup helpers to bootstrap the gateway
+# configuration. Idempotent: exits immediately if the file
 # already exists.
 #
 # Usage:

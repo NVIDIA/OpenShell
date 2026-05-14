@@ -589,7 +589,7 @@ start_user_gateway() {
   if ! as_target_user systemctl --user daemon-reload; then
     info "could not reach the user systemd manager for ${TARGET_USER}"
     info "restart the gateway later with: systemctl --user enable openshell-gateway && systemctl --user restart openshell-gateway"
-    info "then register it with: openshell gateway add https://127.0.0.1:17670 --local --name openshell"
+    info "then register it with: openshell gateway add https://127.0.0.1:${LOCAL_GATEWAY_PORT} --local --name openshell"
     return 0
   fi
 
@@ -744,6 +744,7 @@ install_linux_deb() {
   info "installing ${_deb_file}..."
   install_deb_package "$_deb_path"
   info "installed ${APP_NAME} package from ${RELEASE_TAG}"
+  LOCAL_GATEWAY_PORT="8080"
   start_user_gateway
 }
 
@@ -791,6 +792,7 @@ install_linux_rpm() {
   info "installing ${_rpm_file} and ${_gateway_rpm_file}..."
   install_rpm_packages "${_tmpdir}/${_rpm_file}" "${_tmpdir}/${_gateway_rpm_file}"
   info "installed ${APP_NAME} RPM packages from ${RELEASE_TAG}"
+  LOCAL_GATEWAY_PORT="8080"
   start_user_gateway
 }
 

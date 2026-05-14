@@ -116,6 +116,13 @@ stage_binary "$OPENSHELL_DRIVER_VM_BINARY" "$pkgroot/usr/libexec/openshell/opens
 install -D -m 0644 "$src_dir/openshell-gateway.service" \
 	"$pkgroot/usr/lib/systemd/user/openshell-gateway.service"
 
+# First-start user configuration bootstrap. The service uses the gateway
+# binary for PKI generation and these helpers for the SSH handshake secret.
+install -D -m 0755 "${repo_root}/deploy/rpm/init-gateway-env.sh" \
+	"$pkgroot/usr/libexec/openshell/init-gateway-env.sh"
+install -D -m 0755 "${repo_root}/deploy/systemd/openshell-gateway-start.sh" \
+	"$pkgroot/usr/libexec/openshell/openshell-gateway-start.sh"
+
 # ---------------------------------------------------------------------------
 # DEBIAN/ control directory
 # ---------------------------------------------------------------------------
@@ -177,6 +184,8 @@ dpkg-deb -x "$package_file" "$extract_dir"
 "$extract_dir/usr/bin/openshell" --version
 "$extract_dir/usr/bin/openshell-gateway" --version
 "$extract_dir/usr/libexec/openshell/openshell-driver-vm" --version
+test -x "$extract_dir/usr/libexec/openshell/init-gateway-env.sh"
+test -x "$extract_dir/usr/libexec/openshell/openshell-gateway-start.sh"
 
 if command -v systemd-analyze >/dev/null 2>&1; then
 	# verify --user catches user-scope-specific issues like StateDirectory=

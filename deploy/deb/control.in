@@ -5,6 +5,7 @@ Maintainer: NVIDIA OpenShell Maintainers <openshell@nvidia.com>
 Section: utils
 Priority: optional
 Pre-Depends: init-system-helpers (>= 1.54~)
+Recommends: podman
 Homepage: https://github.com/NVIDIA/OpenShell
 Description: Safe, sandboxed runtimes for autonomous AI agents
  OpenShell provides host-side command-line and gateway components for

@@ -123,6 +123,14 @@ port_is_in_use() {
   (echo >/dev/tcp/127.0.0.1/"${port}") >/dev/null 2>&1
 }
 
+generate_secret() {
+  if command_available openssl; then
+    openssl rand -hex 32
+  else
+    od -An -tx1 -N32 /dev/urandom | tr -dc '0-9a-f'
+  fi
+}
+
 register_gateway_metadata() {
   local name=$1
   local endpoint=$2
@@ -250,9 +258,17 @@ STATE_DIR="${OPENSHELL_GATEWAY_STATE_DIR:-${ROOT}/.cache/gateway-${DRIVER}}"
 SANDBOX_NAMESPACE="${OPENSHELL_SANDBOX_NAMESPACE:-${DRIVER}-dev}"
 SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-ghcr.io/nvidia/openshell-community/sandboxes/base:latest}"
 SANDBOX_IMAGE_PULL_POLICY="${OPENSHELL_SANDBOX_IMAGE_PULL_POLICY:-IfNotPresent}"
+if [[ "${DRIVER}" == "podman" ]]; then
+  SANDBOX_IMAGE_PULL_POLICY="${OPENSHELL_SANDBOX_IMAGE_PULL_POLICY:-missing}"
+fi
 LOG_LEVEL="${OPENSHELL_LOG_LEVEL:-info}"
+BIND_ADDRESS="${OPENSHELL_BIND_ADDRESS:-127.0.0.1}"
+SSH_HANDSHAKE_SECRET="${OPENSHELL_SSH_HANDSHAKE_SECRET:-$(generate_secret)}"
 
 if [[ "${DRIVER}" == "podman" ]]; then
+  # Podman sandboxes call back through host.containers.internal, so the
+  # development plaintext gateway must listen beyond loopback.
+  BIND_ADDRESS="${OPENSHELL_BIND_ADDRESS:-0.0.0.0}"
   require_podman_service
   SUPERVISOR_IMAGE="${OPENSHELL_SUPERVISOR_IMAGE:-openshell/supervisor:dev}"
   ensure_podman_supervisor_image "${SUPERVISOR_IMAGE}"
@@ -287,6 +303,7 @@ echo "  gateway:   ${GATEWAY_NAME}"
 echo "  endpoint:  ${GATEWAY_ENDPOINT}"
 echo "  namespace: ${SANDBOX_NAMESPACE}"
 echo "  state dir: ${STATE_DIR}"
+echo "  bind:      ${BIND_ADDRESS}"
 if [[ "${DRIVER}" == "podman" ]]; then
   echo "  supervisor image: ${OPENSHELL_SUPERVISOR_IMAGE}"
 fi
@@ -295,6 +312,7 @@ echo "Active gateway set to '${GATEWAY_NAME}'. The CLI now targets this gateway 
 echo
 
 exec "${GATEWAY_BIN}" \
+  --bind-address "${BIND_ADDRESS}" \
   --port "${PORT}" \
   --log-level "${LOG_LEVEL}" \
   --drivers "${DRIVER}" \
@@ -302,4 +320,5 @@ exec "${GATEWAY_BIN}" \
   --db-url "sqlite:${STATE_DIR}/gateway.db?mode=rwc" \
   --sandbox-namespace "${SANDBOX_NAMESPACE}" \
   --sandbox-image "${SANDBOX_IMAGE}" \
-  --sandbox-image-pull-policy "${SANDBOX_IMAGE_PULL_POLICY}"
+  --sandbox-image-pull-policy "${SANDBOX_IMAGE_PULL_POLICY}" \
+  --ssh-handshake-secret "${SSH_HANDSHAKE_SECRET}"

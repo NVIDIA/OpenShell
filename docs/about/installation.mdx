@@ -51,9 +51,9 @@ brew services restart openshell
 
 On Fedora and RHEL, the install script uses RPM packages. The RPM installs the `openshell` CLI, the `openshell-gateway` daemon, and a systemd user service.
 
-On Debian and Ubuntu, the install script uses a Debian package. The Debian package installs the `openshell` CLI, the `openshell-gateway` daemon, VM sandbox support, and a systemd user service.
+On Debian and Ubuntu, the install script uses a Debian package. The Debian package installs the `openshell` CLI, the `openshell-gateway` daemon, a Podman-backed systemd user service, and the VM driver helper.
 
-The Debian user service listens on `https://127.0.0.1:17670` and generates a local mTLS bundle before the gateway starts. The CLI reads the client bundle from `~/.config/openshell/gateways/openshell/mtls/`.
+The Linux user service listens on `https://127.0.0.1:8080` and generates a local mTLS bundle before the gateway starts. The CLI reads the client bundle from `~/.config/openshell/gateways/openshell/mtls/`.
 
 The installer starts the service for you. Use systemd user commands when you need to inspect, restart, or stop the gateway service:
 
