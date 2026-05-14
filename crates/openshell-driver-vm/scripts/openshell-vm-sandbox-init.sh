@@ -397,6 +397,11 @@ export USER=sandbox
 
 # Fix /sandbox ownership. The host-side CLI extracts OCI layers as a non-root
 # user (e.g. UID 501 on macOS), so /sandbox may be owned by the host UID.
+#
+# On macOS (Hypervisor.framework), guest root has real root privileges and
+# chown succeeds. On Linux non-root hosts with virtiofs, guest root maps to
+# the host user, so chown is denied — this is non-fatal because the
+# supervisor's own filesystem preparation handles the paths that matter.
 if [ -d /sandbox ]; then
     _sb_uid=$(id -u sandbox 2>/dev/null || true)
     _sb_gid=$(id -g sandbox 2>/dev/null || true)
@@ -404,7 +409,8 @@ if [ -d /sandbox ]; then
         _cur_uid=$(stat -c '%u' /sandbox 2>/dev/null || true)
         if [ -n "$_cur_uid" ] && [ "$_cur_uid" != "$_sb_uid" ]; then
             ts "fixing /sandbox ownership (was uid=${_cur_uid}, setting to sandbox=${_sb_uid}:${_sb_gid})"
-            chown -R "${_sb_uid}:${_sb_gid}" /sandbox
+            chown -R "${_sb_uid}:${_sb_gid}" /sandbox 2>/dev/null || \
+                ts "chown /sandbox denied (virtiofs rootless host), continuing"
         fi
     fi
 fi
