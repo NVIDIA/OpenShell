@@ -14,7 +14,9 @@ use futures::StreamExt;
 use http_body_util::Full;
 use hyper::{Request, StatusCode};
 use hyper_rustls::HttpsConnectorBuilder;
-use hyper_util::{client::legacy::Client, rt::TokioExecutor};
+use hyper_util::{
+    client::legacy::Client, client::legacy::connect::HttpConnector, rt::TokioExecutor,
+};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use miette::{IntoDiagnostic, Result, WrapErr, miette};
 use openshell_bootstrap::{
@@ -1271,6 +1273,14 @@ async fn http_health_check(server: &str, tls: &TlsOptions) -> Result<Option<Stat
     let uri: hyper::Uri = format!("{base}/healthz").parse().into_diagnostic()?;
 
     let scheme = uri.scheme_str().unwrap_or("https");
+    if scheme.eq_ignore_ascii_case("http") {
+        let client: Client<HttpConnector, Full<Bytes>> =
+            Client::builder(TokioExecutor::new()).build_http();
+        let req = health_check_request(uri, tls)?;
+        let resp = client.request(req).await.into_diagnostic()?;
+        return Ok(Some(resp.status()));
+    }
+
     let https = if tls.gateway_insecure && scheme.eq_ignore_ascii_case("https") {
         let insecure_config = build_insecure_rustls_config()?;
         HttpsConnectorBuilder::new()
@@ -1278,7 +1288,7 @@ async fn http_health_check(server: &str, tls: &TlsOptions) -> Result<Option<Stat
             .https_or_http()
             .enable_http1()
             .build()
-    } else if scheme.eq_ignore_ascii_case("http") || tls.is_bearer_auth() {
+    } else if tls.is_bearer_auth() {
         HttpsConnectorBuilder::new()
             .with_native_roots()
             .into_diagnostic()?
@@ -1295,6 +1305,12 @@ async fn http_health_check(server: &str, tls: &TlsOptions) -> Result<Option<Stat
             .build()
     };
     let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(https);
+    let req = health_check_request(uri, tls)?;
+    let resp = client.request(req).await.into_diagnostic()?;
+    Ok(Some(resp.status()))
+}
+
+fn health_check_request(uri: hyper::Uri, tls: &TlsOptions) -> Result<Request<Full<Bytes>>> {
     let mut req_builder = Request::builder().method("GET").uri(uri);
     // Inject edge authentication headers when an edge token is configured.
     if let Some(ref token) = tls.edge_token {
@@ -1302,11 +1318,7 @@ async fn http_health_check(server: &str, tls: &TlsOptions) -> Result<Option<Stat
             .header("Cf-Access-Jwt-Assertion", token.as_str())
             .header("Cookie", format!("CF_Authorization={token}"));
     }
-    let req = req_builder
-        .body(Full::new(Bytes::new()))
-        .into_diagnostic()?;
-    let resp = client.request(req).await.into_diagnostic()?;
-    Ok(Some(resp.status()))
+    req_builder.body(Full::new(Bytes::new())).into_diagnostic()
 }
 
 async fn gateway_reachable(server: &str, tls: &TlsOptions) -> bool {

@@ -19,6 +19,7 @@ tokio = { version = "1.43", features = ["full"] }
 # gRPC/Protobuf
 tonic = "0.12"
 tonic-build = "0.12"
+prost-build = "0.13"
 prost = "0.13"
 prost-types = "0.13"
 
@@ -97,7 +98,6 @@ futures = "0.3"
 bytes = "1"
 pin-project-lite = "0.2"
 tokio-stream = "0.1"
-protobuf-src = "1.1.0"
 url = "2"
 
 # Database
@@ -149,3 +149,9 @@ strip = true
 [profile.dev]
 # Faster compile times for dev builds
 debug = 1
+
+# Compile build scripts and proc-macros with optimizations so they run faster.
+# This speeds up tonic-build, clap derive, serde derive, etc. at the cost of a
+# one-time slower compilation of those crates.
+[profile.dev.build-override]
+opt-level = 2

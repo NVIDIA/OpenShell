@@ -115,7 +115,11 @@ if [[ "$needs_build" == "1" ]]; then
       build_args+=(--features bundled-z3)
     fi
   fi
-  cargo build "${build_args[@]}"
+  if [[ "${OPENSHELL_CLI_USE_SCCACHE:-}" == "1" ]]; then
+    cargo build "${build_args[@]}"
+  else
+    env -u RUSTC_WRAPPER cargo build "${build_args[@]}"
+  fi
   # Persist state after successful build
   mkdir -p "$(dirname "$STATE_FILE")"
   cd "$PROJECT_ROOT"

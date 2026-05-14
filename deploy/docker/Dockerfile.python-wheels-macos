@@ -31,6 +31,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libclang-dev \
     libssl-dev \
     pkg-config \
+    protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
 # aws-lc-sys probes with --target=arm64-apple-macosx and clang then looks for
