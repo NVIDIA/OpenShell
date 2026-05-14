@@ -608,7 +608,13 @@ async fn build_compute_runtime(
                 k8s.image_pull_policy
                     .clone_from(&config.sandbox_image_pull_policy);
             }
-            k8s.grpc_endpoint.clone_from(&config.grpc_endpoint);
+            // Same rationale as `image_pull_policy`: only let the gateway-wide
+            // CLI/env value win when it was actually set, otherwise the empty
+            // CLI default would clobber `grpc_endpoint` from
+            // `[openshell.drivers.kubernetes]`.
+            if !config.grpc_endpoint.is_empty() {
+                k8s.grpc_endpoint.clone_from(&config.grpc_endpoint);
+            }
             k8s.ssh_socket_path
                 .clone_from(&config.sandbox_ssh_socket_path);
             k8s.client_tls_secret_name
@@ -702,7 +708,9 @@ async fn build_compute_runtime(
             {
                 podman.image_pull_policy = policy;
             }
-            podman.grpc_endpoint.clone_from(&config.grpc_endpoint);
+            if !config.grpc_endpoint.is_empty() {
+                podman.grpc_endpoint.clone_from(&config.grpc_endpoint);
+            }
             podman.gateway_port = config.bind_address.port();
             podman
                 .sandbox_ssh_socket_path

@@ -33,7 +33,6 @@ data:
     sandbox_namespace     = {{ include "openshell.sandboxNamespace" . | quote }}
     default_image         = {{ .Values.server.sandboxImage | quote }}
     supervisor_image      = {{ include "openshell.supervisorImage" . | quote }}
-    grpc_endpoint         = {{ include "openshell.grpcEndpoint" . | quote }}
     {{- if .Values.server.sshGatewayHost }}
     ssh_gateway_host      = {{ .Values.server.sshGatewayHost | quote }}
     {{- end }}
@@ -46,7 +45,9 @@ data:
     {{- if .Values.server.enableUserNamespaces }}
     enable_user_namespaces = true
     {{- end }}
-    {{- if not .Values.server.disableTls }}
+    {{- if .Values.server.disableTls }}
+    disable_tls            = true
+    {{- else }}
     client_tls_secret_name = {{ .Values.server.tls.clientTlsSecretName | quote }}
     {{- end }}
     enable_loopback_service_http = {{ .Values.server.enableLoopbackServiceHttp }}
@@ -92,7 +93,8 @@ data:
     {{- end }}
 
     [openshell.drivers.kubernetes]
-    supervisor_sideload_method = {{ include "openshell.supervisorSideloadMethod" . | quote }}
+    grpc_endpoint                = {{ include "openshell.grpcEndpoint" . | quote }}
+    supervisor_sideload_method   = {{ include "openshell.supervisorSideloadMethod" . | quote }}
     {{- if .Values.server.sandboxImagePullPolicy }}
     image_pull_policy            = {{ .Values.server.sandboxImagePullPolicy | quote }}
     {{- end }}
