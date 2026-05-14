@@ -49,6 +49,7 @@ const SANDBOX_SECRET_METHODS: &[&str] = &[
     "/openshell.v1.OpenShell/SubmitPolicyAnalysis",
     "/openshell.sandbox.v1.SandboxService/GetSandboxConfig",
     "/openshell.inference.v1.Inference/GetInferenceBundle",
+    "/openshell.v1.OpenShell/VerifyAegisTicket",
 ];
 
 /// Methods that accept either OIDC Bearer token (CLI users) or sandbox
@@ -526,6 +527,23 @@ mod tests {
     fn sandbox_secret_missing_header() {
         let headers = http::HeaderMap::new();
         assert!(validate_sandbox_secret(&headers, "test-secret").is_err());
+    }
+
+    #[test]
+    fn aegis_verify_uses_sandbox_secret() {
+        assert!(is_sandbox_secret_method(
+            "/openshell.v1.OpenShell/VerifyAegisTicket"
+        ));
+        assert!(!is_unauthenticated_method(
+            "/openshell.v1.OpenShell/VerifyAegisTicket"
+        ));
+    }
+
+    #[test]
+    fn aegis_issue_requires_oidc_default() {
+        let path = "/openshell.v1.OpenShell/IssueAegisTicket";
+        assert!(!is_sandbox_secret_method(path));
+        assert!(!is_unauthenticated_method(path));
     }
 
     #[test]
