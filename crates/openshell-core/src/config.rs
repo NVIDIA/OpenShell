@@ -27,9 +27,6 @@ pub const DEFAULT_SERVER_PORT: u16 = 8080;
 /// Default container stop timeout in seconds (SIGTERM → SIGKILL).
 pub const DEFAULT_STOP_TIMEOUT_SECS: u32 = 10;
 
-/// Default Podman bridge network name.
-pub const DEFAULT_NETWORK_NAME: &str = "openshell";
-
 /// Default Docker bridge network name for local sandboxes.
 pub const DEFAULT_DOCKER_NETWORK_NAME: &str = "openshell-docker";
 
@@ -38,9 +35,6 @@ pub const DEFAULT_SERVICE_ROUTING_DOMAIN: &str = "openshell.localhost";
 
 /// Default OCI image for the openshell-sandbox supervisor binary.
 pub const DEFAULT_SUPERVISOR_IMAGE: &str = "openshell/supervisor:latest";
-
-/// Default image pull policy for sandbox images.
-pub const DEFAULT_IMAGE_PULL_POLICY: &str = "missing";
 
 /// CDI device identifier for requesting all NVIDIA GPUs.
 pub const CDI_GPU_DEVICE_ALL: &str = "nvidia.com/gpu=all";
