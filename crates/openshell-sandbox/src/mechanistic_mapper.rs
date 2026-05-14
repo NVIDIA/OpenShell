@@ -277,7 +277,7 @@ fn generate_security_notes(host: &str, port: u16, is_ssrf: bool) -> String {
     if is_ssrf {
         notes.push(
             "This connection was blocked by SSRF protection. \
-             Allowing it bypasses internal-IP safety checks."
+             Private IP access requires an explicit `allowed_ips` policy entry."
                 .to_string(),
         );
     }

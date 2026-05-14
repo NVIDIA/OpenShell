@@ -72,6 +72,11 @@ recommendations:
 4. A human or admin workflow approves or rejects drafts.
 5. Approved drafts merge into the target sandbox policy.
 
+Proposals intentionally omit `allowed_ips`. If a proposed rule targets a host
+that resolves to a private IP, the proxy's runtime SSRF classification blocks
+the connection. The operator must then add an explicit `allowed_ips` entry to
+permit it — a two-step flow that keeps SSRF protection on by default.
+
 The advisor should propose narrow additions and preserve explicit-deny behavior.
 It is a workflow aid, not an automatic permission grant.
 
