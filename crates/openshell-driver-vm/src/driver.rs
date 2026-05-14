@@ -899,15 +899,13 @@ impl VmDriver {
                     return Ok(None);
                 }
 
-                let image_identity =
-                    inspect
-                        .id
-                        .filter(|id| !id.trim().is_empty())
-                        .ok_or_else(|| {
-                            Status::failed_precondition(format!(
-                                "local container image '{image_ref}' inspect response has no image ID"
-                            ))
-                        })?;
+                let image_identity = inspect.id.filter(|id| !id.trim().is_empty()).ok_or_else(
+                    || {
+                        Status::failed_precondition(format!(
+                            "local container image '{image_ref}' inspect response has no image ID"
+                        ))
+                    },
+                )?;
                 info!(
                     image_ref = %image_ref,
                     image_identity = %image_identity,
@@ -1539,11 +1537,9 @@ async fn connect_local_container_engine() -> Option<Docker> {
 
     let podman_socket = podman_socket_path();
     if podman_socket.exists() {
-        if let Ok(docker) = Docker::connect_with_unix(
-            podman_socket.to_str()?,
-            120,
-            bollard::API_DEFAULT_VERSION,
-        ) {
+        if let Ok(docker) =
+            Docker::connect_with_unix(podman_socket.to_str()?, 120, bollard::API_DEFAULT_VERSION)
+        {
             if docker.ping().await.is_ok() {
                 info!(
                     socket = %podman_socket.display(),
