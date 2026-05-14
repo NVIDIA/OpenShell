@@ -699,12 +699,16 @@ async fn build_compute_runtime(
 
 fn configured_compute_driver(config: &Config) -> Result<ComputeDriverKind> {
     match config.compute_drivers.as_slice() {
-        [] => openshell_core::config::detect_driver().ok_or_else(|| {
-            Error::config(
+        [] => match openshell_core::config::detect_driver() {
+            Some(ComputeDriverKind::Vm) => Err(Error::config(
+                "vm compute driver is opt-in only; set --drivers vm or OPENSHELL_DRIVERS=vm",
+            )),
+            Some(driver) => Ok(driver),
+            None => Err(Error::config(
                 "no compute driver configured and auto-detection found no suitable driver; \
                 set --drivers or OPENSHELL_DRIVERS to kubernetes, podman, docker, or vm",
-            )
-        }),
+            )),
+        },
         [
             driver @ (ComputeDriverKind::Kubernetes
             | ComputeDriverKind::Vm
@@ -789,7 +793,7 @@ mod tests {
         // depending on the environment. This test verifies the auto-detection path
         // is taken rather than immediately returning an error.
         let result = configured_compute_driver(&config);
-        // Either we get a detected driver or an error about none being detected
+        // Either we get a detected driver or an error about none being detected.
         match result {
             Ok(driver) => {
                 assert!(
@@ -805,7 +809,7 @@ mod tests {
             Err(e) => {
                 assert!(
                     e.to_string()
-                        .contains("no compute driver configured and none detected"),
+                        .contains("auto-detection found no suitable driver"),
                     "unexpected error: {e}"
                 );
             }

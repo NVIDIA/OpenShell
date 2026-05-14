@@ -300,6 +300,13 @@ class Openshell < Formula
       export OPENSHELL_DOCKER_TLS_CERT="${{docker_tls_dir}}/client/tls.crt"
       export OPENSHELL_DOCKER_TLS_KEY="${{docker_tls_dir}}/client/tls.key"
 
+      gateway_env="#{{var}}/openshell/gateway.env"
+      if [ -f "${{gateway_env}}" ]; then
+        set -a
+        . "${{gateway_env}}"
+        set +a
+      fi
+
       exec "#{{opt_bin}}/openshell-gateway"
     SH
     chmod 0755, libexec/"openshell-gateway-homebrew-service"
@@ -310,6 +317,25 @@ class Openshell < Formula
     (var/"openshell/vm-driver").mkpath
     (var/"log/openshell").mkpath
     system bin/"openshell-gateway", "generate-certs", "--output-dir", var/"openshell/tls", "--server-san", "host.openshell.internal"
+
+    gateway_env = var/"openshell/gateway.env"
+    unless gateway_env.exist?
+      gateway_env.atomic_write <<~ENV
+        # OpenShell Gateway Environment Configuration
+        # Edit freely; this file is not overwritten.
+        #
+        # Uncomment to force the VM compute driver. Leaving this unset keeps
+        # normal Podman/Docker/Kubernetes auto-detection.
+        #OPENSHELL_DRIVERS=vm
+
+        # VM driver paths configured by the Homebrew service.
+        #OPENSHELL_VM_DRIVER_STATE_DIR=#{{var}}/openshell/vm-driver
+        #OPENSHELL_VM_TLS_CA=#{{var}}/openshell/tls/ca.crt
+        #OPENSHELL_VM_TLS_CERT=#{{var}}/openshell/tls/client/tls.crt
+        #OPENSHELL_VM_TLS_KEY=#{{var}}/openshell/tls/client/tls.key
+      ENV
+      chmod 0600, gateway_env
+    end
 
     entitlements = var/"openshell/openshell-driver-vm.entitlements.plist"
     entitlements.atomic_write <<~XML
