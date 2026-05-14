@@ -149,10 +149,12 @@ pub fn translate(
     opts: &TranslateOptions,
 ) -> Result<ContainerConfig, TranslateError> {
     match opts.schema {
-        Schema::AlphaProcess => translate_alpha(policy, envelope, opts)
-            .map(|cfg| ContainerConfig::Alpha(Box::new(cfg))),
-        Schema::DevIsolationSession => translate_dev(policy, envelope, opts)
-            .map(|cfg| ContainerConfig::Dev(Box::new(cfg))),
+        Schema::AlphaProcess => {
+            translate_alpha(policy, envelope, opts).map(|cfg| ContainerConfig::Alpha(Box::new(cfg)))
+        }
+        Schema::DevIsolationSession => {
+            translate_dev(policy, envelope, opts).map(|cfg| ContainerConfig::Dev(Box::new(cfg)))
+        }
     }
 }
 
@@ -369,14 +371,15 @@ fn build_network(
 }
 
 fn build_ui(opts: &TranslateOptions) -> schema_alpha::UiConfig {
-    opts.ui.as_ref().map_or_else(
-        schema_alpha::UiConfig::default,
-        |u| schema_alpha::UiConfig {
-            disable: !u.allow_windows,
-            clipboard: u.clipboard,
-            injection: u.allow_input_injection,
-        },
-    )
+    opts.ui
+        .as_ref()
+        .map_or_else(schema_alpha::UiConfig::default, |u| {
+            schema_alpha::UiConfig {
+                disable: !u.allow_windows,
+                clipboard: u.clipboard,
+                injection: u.allow_input_injection,
+            }
+        })
 }
 
 fn build_app_container(

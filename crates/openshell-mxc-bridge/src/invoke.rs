@@ -164,10 +164,16 @@ mod tests {
     #[test]
     fn config_is_base64_encoded() {
         let path = PathBuf::from("/opt/mxc/wxc-exec");
-        let inv = build_invocation(&path, Schema::AlphaProcess, r#"{"version":"0.5.0-alpha"}"#, false);
+        let inv = build_invocation(
+            &path,
+            Schema::AlphaProcess,
+            r#"{"version":"0.5.0-alpha"}"#,
+            false,
+        );
         let b64 = inv.args[1].to_string_lossy().into_owned();
-        let decoded =
-            base64::engine::general_purpose::STANDARD.decode(b64.as_bytes()).expect("decodes");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(b64.as_bytes())
+            .expect("decodes");
         assert_eq!(decoded, br#"{"version":"0.5.0-alpha"}"#);
     }
 

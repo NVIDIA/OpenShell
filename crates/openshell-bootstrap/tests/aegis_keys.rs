@@ -60,12 +60,12 @@ fn sign_and_verify_round_trip() {
     let dir = TempDir::new().unwrap();
     let material = load_or_generate(dir.path()).expect("generate");
 
-    let signing_secret = p256::SecretKey::from_pkcs8_pem(&material.private_key_pem)
-        .expect("parse private key");
+    let signing_secret =
+        p256::SecretKey::from_pkcs8_pem(&material.private_key_pem).expect("parse private key");
     let signing_key = SigningKey::from(signing_secret);
 
-    let verifying_public = p256::PublicKey::from_public_key_pem(&material.public_key_pem)
-        .expect("parse public key");
+    let verifying_public =
+        p256::PublicKey::from_public_key_pem(&material.public_key_pem).expect("parse public key");
     let verifying_key = VerifyingKey::from(verifying_public);
 
     let message = b"aegis ticket round-trip canary";

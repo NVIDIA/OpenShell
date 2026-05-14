@@ -10,9 +10,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use openshell_core::proto::{
-    FilesystemPolicy, NetworkEndpoint, NetworkPolicyRule, SandboxPolicy,
-};
+use openshell_core::proto::{FilesystemPolicy, NetworkEndpoint, NetworkPolicyRule, SandboxPolicy};
 use openshell_mxc_bridge::schema_alpha::{
     ClipboardPolicy, DefaultNetworkPolicy, EnforcementMode, Proxy, UiConfig,
 };
@@ -141,13 +139,20 @@ fn baseline_network_with_envelope_outbound_allowed() {
 
     let cfg = translate_alpha(&baseline, Some(&envelope), &opts).expect("translates");
     let net = cfg.network.expect("network block");
-    assert!(matches!(net.default_policy, Some(DefaultNetworkPolicy::Allow)));
+    assert!(matches!(
+        net.default_policy,
+        Some(DefaultNetworkPolicy::Allow)
+    ));
     assert!(matches!(net.enforcement_mode, Some(EnforcementMode::Both)));
     assert_eq!(net.allowed_hosts, vec!["api.example.com".to_owned()]);
 
     let app = cfg.app_container.expect("appContainer");
     assert!(app.capabilities.iter().any(|c| c == "internetClient"));
-    assert!(!app.capabilities.iter().any(|c| c == "privateNetworkClientServer"));
+    assert!(
+        !app.capabilities
+            .iter()
+            .any(|c| c == "privateNetworkClientServer")
+    );
 }
 
 #[test]
@@ -166,7 +171,11 @@ fn allow_local_network_adds_private_network_capability() {
     let cfg = translate_alpha(&baseline, Some(&envelope), &opts).expect("translates");
     let app = cfg.app_container.expect("appContainer");
     assert!(app.capabilities.iter().any(|c| c == "internetClient"));
-    assert!(app.capabilities.iter().any(|c| c == "privateNetworkClientServer"));
+    assert!(
+        app.capabilities
+            .iter()
+            .any(|c| c == "privateNetworkClientServer")
+    );
 }
 
 #[test]
@@ -195,7 +204,10 @@ fn proxy_on_windows_target_passes_through() {
 
     let cfg = translate_alpha(&baseline, None, &opts).expect("translates");
     let net = cfg.network.expect("network block (proxy forces it)");
-    assert!(matches!(net.proxy, Some(Proxy::Localhost { localhost: 9090 })));
+    assert!(matches!(
+        net.proxy,
+        Some(Proxy::Localhost { localhost: 9090 })
+    ));
 }
 
 #[test]
@@ -208,7 +220,10 @@ fn clear_policy_on_exit_explicit_false_preserves_policy() {
     };
 
     let cfg = translate_alpha(&baseline, None, &opts).expect("translates");
-    assert_eq!(cfg.lifecycle.expect("lifecycle").preserve_policy, Some(true));
+    assert_eq!(
+        cfg.lifecycle.expect("lifecycle").preserve_policy,
+        Some(true)
+    );
 }
 
 #[test]
@@ -221,7 +236,10 @@ fn clear_policy_on_exit_default_true_clears_policy() {
     };
 
     let cfg = translate_alpha(&baseline, None, &opts).expect("translates");
-    assert_eq!(cfg.lifecycle.expect("lifecycle").preserve_policy, Some(false));
+    assert_eq!(
+        cfg.lifecycle.expect("lifecycle").preserve_policy,
+        Some(false)
+    );
 }
 
 #[test]
@@ -272,7 +290,10 @@ fn dev_schema_sets_isolation_session_containment() {
 
     let cfg = translate_dev(&baseline, None, &opts).expect("translates");
     assert_eq!(cfg.version, "0.6.0-dev");
-    assert!(matches!(cfg.containment, schema_dev::Containment::IsolationSession));
+    assert!(matches!(
+        cfg.containment,
+        schema_dev::Containment::IsolationSession
+    ));
     let iso = cfg
         .experimental
         .isolation_session

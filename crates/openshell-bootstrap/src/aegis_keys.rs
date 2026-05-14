@@ -145,11 +145,10 @@ pub fn load_or_generate(storage_dir: &Path) -> Result<AegisKeyMaterial, AegisKey
             path: private_path.clone(),
             source: e,
         })?;
-        let secret =
-            SecretKey::from_pkcs8_pem(&pem).map_err(|e| AegisKeyError::KeyParse {
-                path: private_path.clone(),
-                source: e,
-            })?;
+        let secret = SecretKey::from_pkcs8_pem(&pem).map_err(|e| AegisKeyError::KeyParse {
+            path: private_path.clone(),
+            source: e,
+        })?;
         let material = AegisKeyMaterial::from_secret(&secret)?;
         // Re-write the public key in case it was deleted out-of-band.
         write_public_key(storage_dir, &material)?;
@@ -236,10 +235,7 @@ fn generate_and_persist(storage_dir: &Path) -> Result<AegisKeyMaterial, AegisKey
     Ok(material)
 }
 
-fn write_public_key(
-    storage_dir: &Path,
-    material: &AegisKeyMaterial,
-) -> Result<(), AegisKeyError> {
+fn write_public_key(storage_dir: &Path, material: &AegisKeyMaterial) -> Result<(), AegisKeyError> {
     let public_path = storage_dir.join(PUBLIC_KEY_FILENAME);
     fs::write(&public_path, material.public_key_pem.as_bytes()).map_err(|e| AegisKeyError::Io {
         path: public_path,

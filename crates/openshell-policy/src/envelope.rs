@@ -107,7 +107,11 @@ pub fn compose(baseline: &SandboxPolicy, envelope: &EnvelopePolicy) -> Effective
     let baseline_denied: BTreeSet<&str> = BTreeSet::new();
 
     // Intersect envelope read-write against baseline read-write.
-    let env_rw: BTreeSet<&str> = envelope.readwrite_paths.iter().map(String::as_str).collect();
+    let env_rw: BTreeSet<&str> = envelope
+        .readwrite_paths
+        .iter()
+        .map(String::as_str)
+        .collect();
     let readwrite_paths = sorted_intersection(&env_rw, &baseline_rw);
 
     // Read-only effective set: union envelope ro + envelope rw, intersect
@@ -120,8 +124,7 @@ pub fn compose(baseline: &SandboxPolicy, envelope: &EnvelopePolicy) -> Effective
     let readonly_paths = sorted_intersection(&env_ro_union, &baseline_ro);
 
     // Denied paths are a union — anything either side denies stays denied.
-    let mut denied_set: BTreeSet<&str> =
-        envelope.denied_paths.iter().map(String::as_str).collect();
+    let mut denied_set: BTreeSet<&str> = envelope.denied_paths.iter().map(String::as_str).collect();
     denied_set.extend(baseline_denied.iter().copied());
     let denied_paths: Vec<String> = denied_set.into_iter().map(str::to_owned).collect();
 
@@ -234,10 +237,7 @@ mod tests {
 
     #[test]
     fn empty_envelope_against_permissive_baseline_is_fully_restrictive() {
-        let baseline = baseline_with_fs(
-            vec!["/usr", "/etc", "/var/log"],
-            vec!["/tmp", "/sandbox"],
-        );
+        let baseline = baseline_with_fs(vec!["/usr", "/etc", "/var/log"], vec!["/tmp", "/sandbox"]);
         let envelope = EnvelopePolicy::default();
 
         let effective = compose(&baseline, &envelope);
@@ -350,10 +350,7 @@ mod tests {
 
     #[test]
     fn outputs_are_sorted_and_deduplicated() {
-        let baseline = baseline_with_fs(
-            vec!["/a", "/b", "/c"],
-            vec!["/x", "/y", "/z"],
-        );
+        let baseline = baseline_with_fs(vec!["/a", "/b", "/c"], vec!["/x", "/y", "/z"]);
         let envelope = EnvelopePolicy {
             readwrite_paths: vec!["/z".to_owned(), "/x".to_owned(), "/x".to_owned()],
             readonly_paths: vec!["/c".to_owned(), "/a".to_owned()],
@@ -362,10 +359,16 @@ mod tests {
 
         let effective = compose(&baseline, &envelope);
 
-        assert_eq!(effective.readwrite_paths, vec!["/x".to_owned(), "/z".to_owned()]);
+        assert_eq!(
+            effective.readwrite_paths,
+            vec!["/x".to_owned(), "/z".to_owned()]
+        );
         // readonly = (envelope.readonly ∪ envelope.readwrite) ∩ baseline.read_only
         // baseline.read_only is {/a,/b,/c}, so the intersection is {/a,/c}.
-        assert_eq!(effective.readonly_paths, vec!["/a".to_owned(), "/c".to_owned()]);
+        assert_eq!(
+            effective.readonly_paths,
+            vec!["/a".to_owned(), "/c".to_owned()]
+        );
     }
 
     #[test]
