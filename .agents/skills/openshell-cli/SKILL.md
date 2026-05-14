@@ -141,6 +141,7 @@ openshell sandbox create \
 Key flags:
 - `--provider`: Attach one or more providers (repeatable)
 - `--policy`: Custom policy YAML (otherwise uses built-in default or `OPENSHELL_SANDBOX_POLICY` env var)
+- `--cpu`, `--memory`: Set per-sandbox compute sizing. Docker/Podman apply limits; Kubernetes applies matching requests and limits.
 - `--upload <PATH>[:<DEST>]`: Upload local files into the sandbox (default dest: `/sandbox`)
 - `--no-keep`: Delete the sandbox after the initial command or shell exits
 - `--forward <PORT>`: Forward a local port and keep the sandbox alive

@@ -27,6 +27,22 @@ openshell gateway add http://127.0.0.1:18080 --local --name local
 openshell gateway select local
 ```
 
+### CPU and Memory
+
+Set per-sandbox CPU and memory amounts with `--cpu` and `--memory`:
+
+```shell
+openshell sandbox create --cpu 2 --memory 4Gi -- claude
+```
+
+CPU values use Kubernetes-style quantities such as `500m`, `1`, or `2.5`.
+Memory values use byte quantities such as `512Mi`, `4Gi`, or `8G`.
+
+Docker and Podman apply these values as runtime limits. Kubernetes applies each
+value as both the request and the limit so the scheduler reserves the same
+amount the sandbox can use. The VM driver currently accepts these flags but
+does not change VM allocation.
+
 ### GPU Resources
 
 To request GPU resources, add `--gpu`:

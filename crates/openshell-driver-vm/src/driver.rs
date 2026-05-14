@@ -1482,11 +1482,6 @@ fn validate_vm_sandbox(sandbox: &Sandbox, gpu_enabled: bool) -> Result<(), Statu
                 "vm sandboxes do not support template.platform_config",
             ));
         }
-        if template.resources.is_some() {
-            return Err(Status::failed_precondition(
-                "vm sandboxes do not support template.resources",
-            ));
-        }
     }
     Ok(())
 }
@@ -2615,6 +2610,29 @@ mod tests {
             ..Default::default()
         };
         validate_vm_sandbox(&sandbox, false).expect("template.image should be accepted");
+    }
+
+    #[test]
+    fn validate_vm_sandbox_accepts_template_resources_as_noop() {
+        use openshell_core::proto::compute::v1::DriverResourceRequirements;
+
+        let sandbox = Sandbox {
+            id: "sandbox-123".to_string(),
+            spec: Some(SandboxSpec {
+                template: Some(SandboxTemplate {
+                    resources: Some(DriverResourceRequirements {
+                        cpu_limit: "2".to_string(),
+                        memory_limit: "4Gi".to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        validate_vm_sandbox(&sandbox, false)
+            .expect("template.resources should be accepted and ignored");
     }
 
     #[test]

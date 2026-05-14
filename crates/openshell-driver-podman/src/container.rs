@@ -606,13 +606,18 @@ fn parse_cpu_to_microseconds(quantity: &str) -> Option<u64> {
 /// (decimal), as well as plain byte values.
 fn parse_memory_to_bytes(quantity: &str) -> Option<u64> {
     let suffixes: &[(&str, u64)] = &[
+        ("Ei", 1024 * 1024 * 1024 * 1024 * 1024 * 1024),
+        ("Pi", 1024 * 1024 * 1024 * 1024 * 1024),
         ("Ti", 1024 * 1024 * 1024 * 1024),
         ("Gi", 1024 * 1024 * 1024),
         ("Mi", 1024 * 1024),
         ("Ki", 1024),
+        ("E", 1_000_000_000_000_000_000),
+        ("P", 1_000_000_000_000_000),
         ("T", 1_000_000_000_000),
         ("G", 1_000_000_000),
         ("M", 1_000_000),
+        ("K", 1_000),
         ("k", 1_000),
     ];
 
@@ -656,11 +661,43 @@ mod tests {
     fn parse_memory_decimal_suffixes() {
         assert_eq!(parse_memory_to_bytes("1G"), Some(1_000_000_000));
         assert_eq!(parse_memory_to_bytes("500M"), Some(500_000_000));
+        assert_eq!(parse_memory_to_bytes("1K"), Some(1_000));
     }
 
     #[test]
     fn parse_memory_plain_bytes() {
         assert_eq!(parse_memory_to_bytes("1048576"), Some(1_048_576));
+    }
+
+    #[test]
+    fn container_spec_applies_cpu_and_memory_limits() {
+        use openshell_core::proto::compute::v1::{
+            DriverResourceRequirements, DriverSandboxSpec, DriverSandboxTemplate,
+        };
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                resources: Some(DriverResourceRequirements {
+                    cpu_limit: "500m".to_string(),
+                    memory_limit: "2Gi".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let config = test_config();
+        let spec = build_container_spec(&sandbox, &config);
+
+        assert_eq!(
+            spec["resource_limits"]["cpu"]["quota"].as_u64(),
+            Some(50_000)
+        );
+        assert_eq!(
+            spec["resource_limits"]["memory"]["limit"].as_u64(),
+            Some(2 * 1024 * 1024 * 1024)
+        );
     }
 
     #[test]

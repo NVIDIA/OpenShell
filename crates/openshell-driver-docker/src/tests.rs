@@ -367,6 +367,26 @@ fn docker_resource_limits_rejects_requests() {
 }
 
 #[test]
+fn docker_resource_limits_applies_cpu_and_memory_limits() {
+    let template = DriverSandboxTemplate {
+        image: "img".to_string(),
+        agent_socket_path: String::new(),
+        labels: HashMap::new(),
+        environment: HashMap::new(),
+        resources: Some(DriverResourceRequirements {
+            cpu_limit: "500m".to_string(),
+            memory_limit: "2Gi".to_string(),
+            ..Default::default()
+        }),
+        platform_config: None,
+    };
+
+    let limits = docker_resource_limits(&template).unwrap();
+    assert_eq!(limits.nano_cpus, Some(500_000_000));
+    assert_eq!(limits.memory_bytes, Some(2_147_483_648));
+}
+
+#[test]
 fn build_environment_sets_docker_tls_paths() {
     let env = build_environment(&test_sandbox(), &runtime_config());
     assert!(env.contains(&format!("OPENSHELL_TLS_CA={TLS_CA_MOUNT_PATH}")));

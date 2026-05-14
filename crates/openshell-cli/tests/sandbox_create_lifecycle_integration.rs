@@ -84,6 +84,7 @@ impl Drop for EnvVarGuard {
 #[derive(Clone, Default)]
 struct SandboxState {
     deleted_names: Arc<Mutex<Vec<Vec<String>>>>,
+    create_requests: Arc<Mutex<Vec<CreateSandboxRequest>>>,
 }
 
 #[derive(Clone, Default)]
@@ -107,7 +108,9 @@ impl OpenShell for TestOpenShell {
         &self,
         request: tonic::Request<CreateSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
-        let name = request.into_inner().name;
+        let request = request.into_inner();
+        let name = request.name.clone();
+        self.state.create_requests.lock().await.push(request);
         let sandbox_name = if name.is_empty() {
             "test-sandbox".to_string()
         } else {
@@ -648,6 +651,10 @@ async fn deleted_names(server: &TestServer) -> Vec<Vec<String>> {
     server.openshell.state.deleted_names.lock().await.clone()
 }
 
+async fn create_requests(server: &TestServer) -> Vec<CreateSandboxRequest> {
+    server.openshell.state.create_requests.lock().await.clone()
+}
+
 fn test_tls(server: &TestServer) -> TlsOptions {
     server.tls.with_gateway_name("openshell")
 }
@@ -671,6 +678,8 @@ async fn sandbox_create_keeps_command_sessions_by_default() {
         false,
         None,
         None,
+        None,
+        None,
         &[],
         None,
         None,
@@ -692,6 +701,81 @@ async fn sandbox_create_keeps_command_sessions_by_default() {
 }
 
 #[tokio::test]
+async fn sandbox_create_sends_cpu_and_memory_limits_only() {
+    let server = run_server().await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+
+    run::sandbox_create(
+        &server.endpoint,
+        Some("resources"),
+        None,
+        "openshell",
+        None,
+        true,
+        false,
+        None,
+        Some("500m"),
+        Some("2Gi"),
+        None,
+        &[],
+        None,
+        None,
+        &["echo".to_string(), "OK".to_string()],
+        Some(false),
+        Some(false),
+        &HashMap::new(),
+        &tls,
+    )
+    .await
+    .expect("sandbox create should succeed");
+
+    let requests = create_requests(&server).await;
+    let resources = requests[0]
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.template.as_ref())
+        .and_then(|template| template.resources.as_ref())
+        .expect("resource limits should be sent");
+    let limits = resources
+        .fields
+        .get("limits")
+        .and_then(|value| value.kind.as_ref())
+        .and_then(|kind| match kind {
+            prost_types::value::Kind::StructValue(inner) => Some(inner),
+            _ => None,
+        })
+        .expect("limits should be a struct");
+
+    assert_eq!(
+        limits
+            .fields
+            .get("cpu")
+            .and_then(|value| value.kind.as_ref())
+            .and_then(|kind| match kind {
+                prost_types::value::Kind::StringValue(value) => Some(value.as_str()),
+                _ => None,
+            }),
+        Some("500m")
+    );
+    assert_eq!(
+        limits
+            .fields
+            .get("memory")
+            .and_then(|value| value.kind.as_ref())
+            .and_then(|kind| match kind {
+                prost_types::value::Kind::StringValue(value) => Some(value.as_str()),
+                _ => None,
+            }),
+        Some("2Gi")
+    );
+    assert!(!resources.fields.contains_key("requests"));
+}
+
+#[tokio::test]
 async fn sandbox_create_deletes_command_sessions_with_no_keep() {
     let server = run_server().await;
     let fake_ssh_dir = tempfile::tempdir().unwrap();
@@ -708,6 +792,8 @@ async fn sandbox_create_deletes_command_sessions_with_no_keep() {
         None,
         false,
         false,
+        None,
+        None,
         None,
         None,
         &[],
@@ -752,6 +838,8 @@ async fn sandbox_create_deletes_shell_sessions_with_no_keep() {
         false,
         None,
         None,
+        None,
+        None,
         &[],
         None,
         None,
@@ -794,6 +882,8 @@ async fn sandbox_create_keeps_sandbox_with_hidden_keep_flag() {
         false,
         None,
         None,
+        None,
+        None,
         &[],
         None,
         None,
@@ -834,6 +924,8 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
         None,
         false,
         false,
+        None,
+        None,
         None,
         None,
         &[],

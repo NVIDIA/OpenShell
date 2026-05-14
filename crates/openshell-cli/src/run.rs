@@ -1434,6 +1434,101 @@ fn sandbox_should_persist(
     keep || forward.is_some()
 }
 
+fn build_sandbox_resource_limits(
+    cpu: Option<&str>,
+    memory: Option<&str>,
+) -> Result<Option<prost_types::Struct>> {
+    use prost_types::{Struct, Value, value::Kind};
+
+    fn string_value(value: String) -> Value {
+        Value {
+            kind: Some(Kind::StringValue(value)),
+        }
+    }
+
+    let mut limits = std::collections::BTreeMap::new();
+    if let Some(cpu) = cpu {
+        limits.insert("cpu".to_string(), string_value(validate_cpu_quantity(cpu)?));
+    }
+    if let Some(memory) = memory {
+        limits.insert(
+            "memory".to_string(),
+            string_value(validate_memory_quantity(memory)?),
+        );
+    }
+
+    if limits.is_empty() {
+        return Ok(None);
+    }
+
+    let mut fields = std::collections::BTreeMap::new();
+    fields.insert(
+        "limits".to_string(),
+        Value {
+            kind: Some(Kind::StructValue(Struct { fields: limits })),
+        },
+    );
+    Ok(Some(Struct { fields }))
+}
+
+fn validate_cpu_quantity(value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(miette!("--cpu must not be empty"));
+    }
+
+    if let Some(millicores) = value.strip_suffix('m') {
+        if millicores.is_empty() || !millicores.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(miette!(
+                "invalid --cpu value '{value}': expected positive cores or millicores, for example 2, 0.5, or 500m"
+            ));
+        }
+        let millicores = millicores.parse::<u64>().into_diagnostic()?;
+        if millicores == 0 {
+            return Err(miette!("--cpu must be greater than zero"));
+        }
+        return Ok(value.to_string());
+    }
+
+    let cores = value.parse::<f64>().map_err(|_| {
+        miette!(
+            "invalid --cpu value '{value}': expected positive cores or millicores, for example 2, 0.5, or 500m"
+        )
+    })?;
+    if !cores.is_finite() || cores <= 0.0 {
+        return Err(miette!("--cpu must be greater than zero"));
+    }
+    Ok(value.to_string())
+}
+
+fn validate_memory_quantity(value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(miette!("--memory must not be empty"));
+    }
+
+    let number_end = value
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (number, suffix) = value.split_at(number_end);
+    if number.is_empty()
+        || !matches!(
+            suffix,
+            "" | "Ki" | "Mi" | "Gi" | "Ti" | "Pi" | "Ei" | "K" | "M" | "G" | "T" | "P" | "E"
+        )
+    {
+        return Err(miette!(
+            "invalid --memory value '{value}': expected positive bytes or a quantity such as 512Mi, 4Gi, or 8G"
+        ));
+    }
+
+    let amount = number.parse::<u128>().into_diagnostic()?;
+    if amount == 0 {
+        return Err(miette!("--memory must be greater than zero"));
+    }
+    Ok(value.to_string())
+}
+
 async fn finalize_sandbox_create_session(
     server: &str,
     sandbox_name: &str,
@@ -1468,6 +1563,8 @@ pub async fn sandbox_create(
     keep: bool,
     gpu: bool,
     gpu_device: Option<&str>,
+    cpu: Option<&str>,
+    memory: Option<&str>,
     editor: Option<Editor>,
     providers: &[String],
     policy: Option<&str>,
@@ -1530,11 +1627,17 @@ pub async fn sandbox_create(
     .await?;
 
     let policy = load_sandbox_policy(policy)?;
+    let resource_limits = build_sandbox_resource_limits(cpu, memory)?;
 
-    let template = image.map(|img| SandboxTemplate {
-        image: img,
-        ..SandboxTemplate::default()
-    });
+    let template = if image.is_some() || resource_limits.is_some() {
+        Some(SandboxTemplate {
+            image: image.unwrap_or_default(),
+            resources: resource_limits,
+            ..SandboxTemplate::default()
+        })
+    } else {
+        None
+    };
 
     let request = CreateSandboxRequest {
         spec: Some(SandboxSpec {
@@ -6011,8 +6114,8 @@ fn format_timestamp_ms(ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        TlsOptions, dockerfile_sources_supported_for_gateway, format_endpoint,
-        format_gateway_select_header, format_gateway_select_items,
+        TlsOptions, build_sandbox_resource_limits, dockerfile_sources_supported_for_gateway,
+        format_endpoint, format_gateway_select_header, format_gateway_select_items,
         format_provider_attachment_table, gateway_add, gateway_auth_label,
         gateway_env_override_warning, gateway_select_with, gateway_type_label, git_sync_files,
         http_health_check, image_requests_gpu, import_local_package_mtls_bundle,
@@ -6213,6 +6316,55 @@ mod tests {
         let err =
             parse_cli_setting_value("unknown_key", "value").expect_err("unknown key should fail");
         assert!(err.to_string().contains("unknown setting key"));
+    }
+
+    #[test]
+    fn build_sandbox_resource_limits_sets_limits_only() {
+        let resources = build_sandbox_resource_limits(Some("500m"), Some("2Gi"))
+            .expect("resource limits should parse")
+            .expect("resource limits should be present");
+
+        let limits = resources
+            .fields
+            .get("limits")
+            .and_then(|value| value.kind.as_ref())
+            .and_then(|kind| match kind {
+                prost_types::value::Kind::StructValue(inner) => Some(inner),
+                _ => None,
+            })
+            .expect("limits should be a struct");
+
+        assert_eq!(
+            limits
+                .fields
+                .get("cpu")
+                .and_then(|value| value.kind.as_ref())
+                .and_then(|kind| match kind {
+                    prost_types::value::Kind::StringValue(value) => Some(value.as_str()),
+                    _ => None,
+                }),
+            Some("500m")
+        );
+        assert_eq!(
+            limits
+                .fields
+                .get("memory")
+                .and_then(|value| value.kind.as_ref())
+                .and_then(|kind| match kind {
+                    prost_types::value::Kind::StringValue(value) => Some(value.as_str()),
+                    _ => None,
+                }),
+            Some("2Gi")
+        );
+        assert!(!resources.fields.contains_key("requests"));
+    }
+
+    #[test]
+    fn build_sandbox_resource_limits_rejects_invalid_quantities() {
+        assert!(build_sandbox_resource_limits(Some("0"), None).is_err());
+        assert!(build_sandbox_resource_limits(Some("half"), None).is_err());
+        assert!(build_sandbox_resource_limits(None, Some("0Gi")).is_err());
+        assert!(build_sandbox_resource_limits(None, Some("1.5Gi")).is_err());
     }
 
     #[test]

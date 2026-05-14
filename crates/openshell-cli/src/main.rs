@@ -1090,6 +1090,14 @@ enum SandboxCommands {
         #[arg(long, requires = "gpu")]
         gpu_device: Option<String>,
 
+        /// CPU limit for the sandbox (for example: 500m, 1, 2.5).
+        #[arg(long)]
+        cpu: Option<String>,
+
+        /// Memory limit for the sandbox (for example: 512Mi, 4Gi, 8G).
+        #[arg(long)]
+        memory: Option<String>,
+
         /// Provider names to attach to this sandbox.
         #[arg(long = "provider")]
         providers: Vec<String>,
@@ -2365,6 +2373,8 @@ async fn main() -> Result<()> {
                     editor,
                     gpu,
                     gpu_device,
+                    cpu,
+                    memory,
                     providers,
                     policy,
                     forward,
@@ -2431,6 +2441,8 @@ async fn main() -> Result<()> {
                         keep,
                         gpu,
                         gpu_device.as_deref(),
+                        cpu.as_deref(),
+                        memory.as_deref(),
                         editor,
                         &providers,
                         policy.as_deref(),
@@ -3638,6 +3650,40 @@ mod tests {
             } else {
                 panic!("expected SandboxCommands::Create");
             }
+        }
+    }
+
+    #[test]
+    fn sandbox_create_resource_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--cpu",
+            "500m",
+            "--memory",
+            "2Gi",
+            "--",
+            "claude",
+        ])
+        .expect("sandbox create resource flags should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Create {
+                        cpu,
+                        memory,
+                        command,
+                        ..
+                    }),
+                ..
+            }) => {
+                assert_eq!(cpu.as_deref(), Some("500m"));
+                assert_eq!(memory.as_deref(), Some("2Gi"));
+                assert_eq!(command, vec!["claude".to_string()]);
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
         }
     }
 

@@ -1241,10 +1241,21 @@ fn container_resources(template: &SandboxTemplate, gpu: bool) -> Option<serde_js
                 sec[key] = serde_json::json!(value);
             }
         };
-        apply("requests", "cpu", &req.cpu_request);
-        apply("requests", "memory", &req.memory_request);
         apply("limits", "cpu", &req.cpu_limit);
         apply("limits", "memory", &req.memory_limit);
+
+        let cpu_request = if req.cpu_request.is_empty() {
+            &req.cpu_limit
+        } else {
+            &req.cpu_request
+        };
+        let memory_request = if req.memory_request.is_empty() {
+            &req.memory_limit
+        } else {
+            &req.memory_request
+        };
+        apply("requests", "cpu", cpu_request);
+        apply("requests", "memory", memory_request);
     }
 
     if gpu {
@@ -1896,6 +1907,36 @@ mod tests {
             limits[GPU_RESOURCE_NAME],
             serde_json::json!(GPU_RESOURCE_QUANTITY)
         );
+    }
+
+    #[test]
+    fn cpu_and_memory_limits_are_mirrored_to_requests() {
+        use openshell_core::proto::compute::v1::DriverResourceRequirements;
+        let template = SandboxTemplate {
+            resources: Some(DriverResourceRequirements {
+                cpu_limit: "500m".to_string(),
+                memory_limit: "2Gi".to_string(),
+                ..Default::default()
+            }),
+            ..SandboxTemplate::default()
+        };
+
+        let pod_template = {
+            let params = SandboxPodParams::default();
+            sandbox_template_to_k8s(
+                &template,
+                false,
+                &std::collections::HashMap::new(),
+                true,
+                &params,
+            )
+        };
+
+        let resources = &pod_template["spec"]["containers"][0]["resources"];
+        assert_eq!(resources["limits"]["cpu"], serde_json::json!("500m"));
+        assert_eq!(resources["limits"]["memory"], serde_json::json!("2Gi"));
+        assert_eq!(resources["requests"]["cpu"], serde_json::json!("500m"));
+        assert_eq!(resources["requests"]["memory"], serde_json::json!("2Gi"));
     }
 
     #[test]

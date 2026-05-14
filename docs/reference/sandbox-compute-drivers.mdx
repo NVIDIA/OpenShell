@@ -32,6 +32,11 @@ Common gateway options:
 | `--sandbox-image <image>` | `OPENSHELL_SANDBOX_IMAGE` | Set the default sandbox image used when a sandbox create request does not specify one. |
 | `--grpc-endpoint <url>` | `OPENSHELL_GRPC_ENDPOINT` | Set the gateway callback endpoint that sandbox workloads use to connect back to OpenShell. |
 
+Sandbox create supports `--cpu` and `--memory` for per-sandbox compute sizing.
+Docker and Podman apply them as runtime limits. Kubernetes applies them as both
+container requests and limits. The VM driver accepts the fields but currently
+ignores them.
+
 ## Docker Driver
 
 [Docker](https://www.docker.com/get-started/)-backed sandboxes run as containers on the gateway host. Use Docker for local development, single-machine gateways, and hosts that already use Docker Desktop or Docker Engine.
