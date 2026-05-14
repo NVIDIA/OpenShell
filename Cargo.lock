@@ -3330,11 +3330,14 @@ dependencies = [
  "futures",
  "miette",
  "openshell-core",
+ "p256",
  "rcgen",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tar",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
 ]
@@ -3407,6 +3410,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-driver-appcontainer"
+version = "0.0.0"
+
+[[package]]
 name = "openshell-driver-docker"
 version = "0.0.0"
 dependencies = [
@@ -3422,6 +3429,10 @@ dependencies = [
  "tracing",
  "url",
 ]
+
+[[package]]
+name = "openshell-driver-isolation-session"
+version = "0.0.0"
 
 [[package]]
 name = "openshell-driver-kubernetes"
@@ -3496,6 +3507,18 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "zstd",
+]
+
+[[package]]
+name = "openshell-mxc-bridge"
+version = "0.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "openshell-core",
+ "openshell-policy",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -4511,6 +4534,7 @@ dependencies = [
  "num-bigint",
  "num-traits",
  "rand 0.9.4",
+ "regex",
  "serde",
  "serde_json",
  "serde_yaml",
