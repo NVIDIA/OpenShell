@@ -526,11 +526,17 @@ graphql_field_matches_any(field, patterns) if {
 }
 
 # Wildcard "*" matches any method; otherwise case-insensitive exact match.
+# RFC 9110 §9.3.2: HEAD is semantically identical to GET except no response body.
 method_matches(_, "*") if true
 
 method_matches(actual, expected) if {
 	expected != "*"
 	upper(actual) == upper(expected)
+}
+
+method_matches(actual, expected) if {
+	upper(actual) == "HEAD"
+	upper(expected) == "GET"
 }
 
 # Path matching: "**" matches everything; otherwise glob.match with "/" delimiter.

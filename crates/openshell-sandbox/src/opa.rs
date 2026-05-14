@@ -4805,4 +4805,29 @@ network_policies:
             decision.reason
         );
     }
+
+    #[test]
+    fn l7_head_allowed_where_get_is_allowed() {
+        let engine = l7_engine();
+        let input = l7_input("api.example.com", 8080, "HEAD", "/repos/myorg/foo");
+        assert!(eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_head_denied_when_only_post_allowed() {
+        let engine = OpaEngine::from_strings(
+            TEST_POLICY,
+            "network_policies:\n  p:\n    name: p\n    endpoints:\n      - host: h.test\n        port: 80\n        protocol: rest\n        enforcement: enforce\n        rules:\n          - allow: {method: POST, path: \"/\"}\n    binaries:\n      - {path: /bin/sh}\n",
+        )
+        .unwrap();
+        let input = l7_input("h.test", 80, "HEAD", "/");
+        assert!(!eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_options_not_implicitly_allowed_by_get() {
+        let engine = l7_engine();
+        let input = l7_input("api.example.com", 8080, "OPTIONS", "/repos/myorg/foo");
+        assert!(!eval_l7(&engine, &input));
+    }
 }
