@@ -75,6 +75,18 @@ The gateway uses the VM compute driver to create VM-backed sandboxes. MicroVM re
 
 For maintainer-level implementation details, refer to the [VM driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-vm/README.md).
 
+### Enable the VM Driver
+
+The VM driver is opt-in. Release packages can install `openshell-driver-vm`, but the gateway does not select it unless you configure the driver explicitly.
+
+For a one-off gateway process, pass `--drivers vm`:
+
+```shell
+openshell-gateway --drivers vm
+```
+
+For a service, set `OPENSHELL_DRIVERS=vm` in the service environment file and restart the service. Homebrew creates `$(brew --prefix)/var/openshell/gateway.env` with a commented `OPENSHELL_DRIVERS=vm` entry. Debian and RPM user services read `~/.config/openshell/gateway.env`.
+
 | Option | Environment variable | Description |
 |---|---|---|
 | `--drivers vm` | `OPENSHELL_DRIVERS=vm` | Select the VM compute driver. VM is never auto-detected. |
