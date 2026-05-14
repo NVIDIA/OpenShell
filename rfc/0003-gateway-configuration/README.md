@@ -269,7 +269,7 @@ No part of this RFC has shipped yet. The work breaks down as:
 3. **Per-driver deserialization** — give each driver crate (`openshell-driver-{kubernetes,docker,podman,vm}`) a `from_toml` (or `serde::Deserialize`) entry point so the gateway can hand each driver its own table.
 4. **Test coverage** — file parsing, env-overrides-file, CLI-overrides-env, partial TLS error, port-collision error, unknown-field rejection, missing driver table fallback.
 5. **Helm chart migration** — add `gateway.config` value tree, render the `ConfigMap`, mount it, switch the gateway container to `--config`. Keep the `OPENSHELL_*` env names available as opt-in overrides for secrets.
-6. **Example file** — ship `examples/gateway/gateway.example.toml` and link it from the docs reference.
+6. **Example file** — ship the per-driver examples on the published docs reference at `docs/reference/gateway-config.mdx`.
 7. **Architecture doc update** — reflect the new config sources and precedence in `architecture/gateway.md`.
 
 ## Risks

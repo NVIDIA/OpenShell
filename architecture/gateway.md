@@ -204,8 +204,8 @@ CLI flag  >  OPENSHELL_* env var  >  TOML file  >  built-in default
 
 The TOML file is opt-in via `--config <PATH>` / `OPENSHELL_GATEWAY_CONFIG`.
 When unset, the gateway behaves exactly as before — CLI flags and env vars
-drive every setting. See `examples/gateway/gateway.example.toml` for a
-worked example and RFC 0003 for the full schema.
+drive every setting. See `docs/reference/gateway-config.mdx` for worked
+per-driver examples and RFC 0003 for the full schema.
 
 `database_url` is env-only and rejected when present in the file
 (`OPENSHELL_DB_URL` / `--db-url`).
