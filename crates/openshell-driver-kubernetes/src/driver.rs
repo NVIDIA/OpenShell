@@ -47,6 +47,16 @@ impl KubernetesDriverError {
     }
 }
 
+impl From<KubernetesDriverError> for openshell_core::ComputeDriverError {
+    fn from(err: KubernetesDriverError) -> Self {
+        match err {
+            KubernetesDriverError::AlreadyExists => Self::AlreadyExists,
+            KubernetesDriverError::Precondition(m) => Self::Precondition(m),
+            KubernetesDriverError::Message(m) => Self::Message(m),
+        }
+    }
+}
+
 /// Timeout for individual Kubernetes API calls (create, delete, get).
 /// This prevents gRPC handlers from blocking indefinitely when the k8s
 /// API server is unreachable or slow.
@@ -984,7 +994,10 @@ struct SandboxPodParams<'a> {
 fn spec_pod_env(spec: Option<&SandboxSpec>) -> std::collections::HashMap<String, String> {
     let mut env = spec.map_or_else(Default::default, |s| s.environment.clone());
     if let Some(s) = spec.filter(|s| !s.log_level.is_empty()) {
-        env.insert("OPENSHELL_LOG_LEVEL".to_string(), s.log_level.clone());
+        env.insert(
+            openshell_core::sandbox_env::LOG_LEVEL.to_string(),
+            s.log_level.clone(),
+        );
     }
     env
 }
@@ -1339,31 +1352,47 @@ fn apply_required_env(
     ssh_handshake_skew_secs: u64,
     tls_enabled: bool,
 ) {
-    upsert_env(env, "OPENSHELL_SANDBOX_ID", sandbox_id);
-    upsert_env(env, "OPENSHELL_SANDBOX", sandbox_name);
-    upsert_env(env, "OPENSHELL_ENDPOINT", grpc_endpoint);
-    upsert_env(env, "OPENSHELL_SANDBOX_COMMAND", "sleep infinity");
-    if !ssh_socket_path.is_empty() {
-        upsert_env(env, "OPENSHELL_SSH_SOCKET_PATH", ssh_socket_path);
-    }
-    upsert_env(env, "OPENSHELL_SSH_HANDSHAKE_SECRET", ssh_handshake_secret);
+    upsert_env(env, openshell_core::sandbox_env::SANDBOX_ID, sandbox_id);
+    upsert_env(env, openshell_core::sandbox_env::SANDBOX, sandbox_name);
+    upsert_env(env, openshell_core::sandbox_env::ENDPOINT, grpc_endpoint);
     upsert_env(
         env,
-        "OPENSHELL_SSH_HANDSHAKE_SKEW_SECS",
+        openshell_core::sandbox_env::SANDBOX_COMMAND,
+        "sleep infinity",
+    );
+    if !ssh_socket_path.is_empty() {
+        upsert_env(
+            env,
+            openshell_core::sandbox_env::SSH_SOCKET_PATH,
+            ssh_socket_path,
+        );
+    }
+    upsert_env(
+        env,
+        openshell_core::sandbox_env::SSH_HANDSHAKE_SECRET,
+        ssh_handshake_secret,
+    );
+    upsert_env(
+        env,
+        openshell_core::sandbox_env::SSH_HANDSHAKE_SKEW_SECS,
         &ssh_handshake_skew_secs.to_string(),
     );
     // TLS cert paths for sandbox-to-server mTLS. Only set when TLS is enabled
     // and the client TLS secret is mounted into the sandbox pod.
     if tls_enabled {
-        upsert_env(env, "OPENSHELL_TLS_CA", "/etc/openshell-tls/client/ca.crt");
         upsert_env(
             env,
-            "OPENSHELL_TLS_CERT",
+            openshell_core::sandbox_env::TLS_CA,
+            "/etc/openshell-tls/client/ca.crt",
+        );
+        upsert_env(
+            env,
+            openshell_core::sandbox_env::TLS_CERT,
             "/etc/openshell-tls/client/tls.crt",
         );
         upsert_env(
             env,
-            "OPENSHELL_TLS_KEY",
+            openshell_core::sandbox_env::TLS_KEY,
             "/etc/openshell-tls/client/tls.key",
         );
     }

@@ -680,7 +680,7 @@ fn apply_child_env(
     let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into());
 
     cmd.env_clear()
-        .env("OPENSHELL_SANDBOX", "1")
+        .env(openshell_core::sandbox_env::SANDBOX, "1")
         .env("HOME", session_home)
         .env("USER", session_user)
         .env("SHELL", "/bin/bash")

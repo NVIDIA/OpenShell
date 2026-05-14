@@ -101,8 +101,7 @@ pub(super) async fn handle_create_sandbox(
         request.name.clone()
     };
 
-    let now_ms = current_time_ms()
-        .map_err(|e| Status::internal(format!("failed to get current time: {e}")))?;
+    let now_ms = current_time_ms();
 
     let sandbox = Sandbox {
         metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
@@ -862,8 +861,7 @@ async fn validate_ssh_forward_token(
     }
 
     if session.expires_at_ms > 0 {
-        let now_ms = current_time_ms()
-            .map_err(|e| Status::internal(format!("timestamp generation failed: {e}")))?;
+        let now_ms = current_time_ms();
         if now_ms > session.expires_at_ms {
             return Err(Status::unauthenticated("SSH session token expired"));
         }
@@ -1063,8 +1061,7 @@ pub(super) async fn handle_create_ssh_session(
     }
 
     let token = uuid::Uuid::new_v4().to_string();
-    let now_ms = current_time_ms()
-        .map_err(|e| Status::internal(format!("timestamp generation failed: {e}")))?;
+    let now_ms = current_time_ms();
     let expires_at_ms = if state.config.ssh_session_ttl_secs > 0 {
         now_ms + (state.config.ssh_session_ttl_secs as i64 * 1000)
     } else {

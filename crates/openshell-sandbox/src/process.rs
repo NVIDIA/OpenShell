@@ -159,7 +159,7 @@ impl ProcessHandle {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .kill_on_drop(true)
-            .env("OPENSHELL_SANDBOX", "1");
+            .env(openshell_core::sandbox_env::SANDBOX, "1");
 
         scrub_sensitive_env(&mut cmd);
         inject_provider_env(&mut cmd, provider_env);
@@ -286,7 +286,7 @@ impl ProcessHandle {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .kill_on_drop(true)
-            .env("OPENSHELL_SANDBOX", "1");
+            .env(openshell_core::sandbox_env::SANDBOX, "1");
 
         scrub_sensitive_env(&mut cmd);
         inject_provider_env(&mut cmd, provider_env);

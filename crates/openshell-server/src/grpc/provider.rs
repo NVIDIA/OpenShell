@@ -37,8 +37,7 @@ pub(super) async fn create_provider_record(
 
     // Initialize metadata if not present
     if provider.metadata.is_none() {
-        let now_ms = current_time_ms()
-            .map_err(|e| Status::internal(format!("failed to get current time: {e}")))?;
+        let now_ms = current_time_ms();
         provider.metadata = Some(openshell_core::proto::datamodel::v1::ObjectMeta {
             id: uuid::Uuid::new_v4().to_string(),
             name: generate_name(),
@@ -649,7 +648,7 @@ async fn profile_conflict_diagnostics(
 
 fn stored_provider_profile(profile: ProviderProfile) -> StoredProviderProfile {
     use crate::persistence::current_time_ms;
-    let now_ms = current_time_ms().unwrap_or_default();
+    let now_ms = current_time_ms();
     StoredProviderProfile {
         metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
             id: uuid::Uuid::new_v4().to_string(),

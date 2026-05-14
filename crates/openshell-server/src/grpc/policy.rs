@@ -1196,7 +1196,7 @@ pub(super) async fn handle_report_policy_status(
     };
 
     let loaded_at_ms = if status_str == "loaded" {
-        Some(current_time_ms().map_err(|e| Status::internal(format!("timestamp error: {e}")))?)
+        Some(current_time_ms())
     } else {
         None
     };
@@ -1372,8 +1372,7 @@ pub(super) async fn handle_submit_policy_analysis(
             continue;
         }
 
-        let now_ms =
-            current_time_ms().map_err(|e| Status::internal(format!("timestamp error: {e}")))?;
+        let now_ms = current_time_ms();
         let proposed_rule_bytes = chunk
             .proposed_rule
             .as_ref()
@@ -1569,8 +1568,7 @@ pub(super) async fn handle_approve_draft_chunk(
         merge_chunk_into_policy(state.store.as_ref(), &sandbox_id, &chunk).await?;
     let chunk_summary = summarize_draft_chunk_rule(&chunk)?;
 
-    let now_ms =
-        current_time_ms().map_err(|e| Status::internal(format!("timestamp error: {e}")))?;
+    let now_ms = current_time_ms();
     state
         .store
         .update_draft_chunk_status(&req.chunk_id, "approved", Some(now_ms), None)
@@ -1669,8 +1667,7 @@ pub(super) async fn handle_reject_draft_chunk(
         );
     }
 
-    let now_ms =
-        current_time_ms().map_err(|e| Status::internal(format!("timestamp error: {e}")))?;
+    let now_ms = current_time_ms();
     // Persist the reviewer's free-form `reason` into the chunk's
     // `rejection_reason` field so the in-sandbox agent can read it back via
     // GetDraftPolicy / policy.local and revise the proposal.
@@ -1759,8 +1756,7 @@ pub(super) async fn handle_approve_all_draft_chunks(
         last_hash = hash;
         let chunk_summary = summarize_draft_chunk_rule(chunk)?;
 
-        let now_ms =
-            current_time_ms().map_err(|e| Status::internal(format!("timestamp error: {e}")))?;
+        let now_ms = current_time_ms();
         state
             .store
             .update_draft_chunk_status(&chunk.id, "approved", Some(now_ms), None)

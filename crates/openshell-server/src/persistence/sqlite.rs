@@ -74,7 +74,7 @@ impl SqliteStore {
         payload: &[u8],
         labels: Option<&str>,
     ) -> PersistenceResult<()> {
-        let now_ms = current_time_ms()?;
+        let now_ms = current_time_ms();
 
         sqlx::query(
             r#"
@@ -231,7 +231,7 @@ LIMIT ?2 OFFSET ?3
         payload: &[u8],
         hash: &str,
     ) -> PersistenceResult<()> {
-        let now_ms = current_time_ms()?;
+        let now_ms = current_time_ms();
         let record = PolicyRecord {
             id: id.to_string(),
             sandbox_id: sandbox_id.to_string(),
@@ -374,7 +374,7 @@ LIMIT ?3 OFFSET ?4
         record.load_error = load_error.map(ToOwned::to_owned);
         record.loaded_at_ms = loaded_at_ms;
         let payload = policy_payload_from_record(&record)?;
-        let now_ms = current_time_ms()?;
+        let now_ms = current_time_ms();
 
         let result = sqlx::query(
             r#"
@@ -400,7 +400,7 @@ WHERE "object_type" = ?1 AND "scope" = ?2 AND "version" = ?3
         sandbox_id: &str,
         before_version: i64,
     ) -> PersistenceResult<u64> {
-        let now_ms = current_time_ms()?;
+        let now_ms = current_time_ms();
         let result = sqlx::query(
             r#"
 UPDATE "objects"
@@ -526,7 +526,7 @@ ORDER BY "created_at_ms" DESC
 
         record.status = status.to_string();
         record.decided_at_ms = decided_at_ms;
-        record.last_seen_ms = current_time_ms()?;
+        record.last_seen_ms = current_time_ms();
         if let Some(reason) = rejection_reason {
             record.rejection_reason = reason.to_string();
         }
@@ -564,7 +564,7 @@ WHERE "object_type" = ?1 AND "id" = ?2
         }
 
         record.proposed_rule = proposed_rule.to_vec();
-        record.last_seen_ms = current_time_ms()?;
+        record.last_seen_ms = current_time_ms();
         let payload = draft_chunk_payload_from_record(&record)?;
 
         let result = sqlx::query(

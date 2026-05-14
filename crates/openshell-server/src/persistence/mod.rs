@@ -14,7 +14,6 @@ use openshell_core::{Error as CoreError, Result as CoreResult};
 use prost::Message;
 use rand::Rng;
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 pub use postgres::PostgresStore;
@@ -283,12 +282,8 @@ impl Store {
     }
 }
 
-pub fn current_time_ms() -> PersistenceResult<i64> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| PersistenceError::Database(format!("time error: {e}")))?;
-    i64::try_from(now.as_millis())
-        .map_err(|e| PersistenceError::Database(format!("time conversion error: {e}")))
+pub fn current_time_ms() -> i64 {
+    openshell_core::time::now_ms()
 }
 
 fn map_db_error(error: &sqlx::Error) -> PersistenceError {

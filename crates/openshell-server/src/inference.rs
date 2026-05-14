@@ -174,8 +174,7 @@ async fn upsert_cluster_inference_route(
         .await
         .map_err(|e| Status::internal(format!("fetch route failed: {e}")))?;
 
-    let now_ms =
-        current_time_ms().map_err(|e| Status::internal(format!("get current time: {e}")))?;
+    let now_ms = current_time_ms();
 
     let route = if let Some(existing) = existing {
         InferenceRoute {

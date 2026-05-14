@@ -2201,38 +2201,47 @@ fn build_guest_environment(
             "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
         ),
         ("TERM".to_string(), "xterm".to_string()),
-        ("OPENSHELL_ENDPOINT".to_string(), openshell_endpoint),
-        ("OPENSHELL_SANDBOX_ID".to_string(), sandbox.id.clone()),
-        ("OPENSHELL_SANDBOX".to_string(), sandbox.name.clone()),
         (
-            "OPENSHELL_SSH_SOCKET_PATH".to_string(),
+            openshell_core::sandbox_env::ENDPOINT.to_string(),
+            openshell_endpoint,
+        ),
+        (
+            openshell_core::sandbox_env::SANDBOX_ID.to_string(),
+            sandbox.id.clone(),
+        ),
+        (
+            openshell_core::sandbox_env::SANDBOX.to_string(),
+            sandbox.name.clone(),
+        ),
+        (
+            openshell_core::sandbox_env::SSH_SOCKET_PATH.to_string(),
             GUEST_SSH_SOCKET_PATH.to_string(),
         ),
         (
-            "OPENSHELL_SANDBOX_COMMAND".to_string(),
+            openshell_core::sandbox_env::SANDBOX_COMMAND.to_string(),
             "tail -f /dev/null".to_string(),
         ),
         (
-            "OPENSHELL_LOG_LEVEL".to_string(),
-            sandbox_log_level(sandbox, &config.log_level),
+            openshell_core::sandbox_env::LOG_LEVEL.to_string(),
+            openshell_core::driver_utils::sandbox_log_level(sandbox, &config.log_level),
         ),
         (
-            "OPENSHELL_SSH_HANDSHAKE_SECRET".to_string(),
+            openshell_core::sandbox_env::SSH_HANDSHAKE_SECRET.to_string(),
             config.ssh_handshake_secret.clone(),
         ),
     ]);
     if config.requires_tls_materials() {
         environment.extend(HashMap::from([
             (
-                "OPENSHELL_TLS_CA".to_string(),
+                openshell_core::sandbox_env::TLS_CA.to_string(),
                 GUEST_TLS_CA_PATH.to_string(),
             ),
             (
-                "OPENSHELL_TLS_CERT".to_string(),
+                openshell_core::sandbox_env::TLS_CERT.to_string(),
                 GUEST_TLS_CERT_PATH.to_string(),
             ),
             (
-                "OPENSHELL_TLS_KEY".to_string(),
+                openshell_core::sandbox_env::TLS_KEY.to_string(),
                 GUEST_TLS_KEY_PATH.to_string(),
             ),
         ]));
@@ -2245,16 +2254,6 @@ fn build_guest_environment(
         .into_iter()
         .map(|(key, value)| format!("{key}={value}"))
         .collect()
-}
-
-fn sandbox_log_level(sandbox: &Sandbox, default_level: &str) -> String {
-    sandbox
-        .spec
-        .as_ref()
-        .map(|spec| spec.log_level.as_str())
-        .filter(|level| !level.is_empty())
-        .unwrap_or(default_level)
-        .to_string()
 }
 
 fn sandboxes_root_dir(root: &Path) -> PathBuf {
@@ -2363,7 +2362,7 @@ fn sanitize_image_identity(image_identity: &str) -> String {
 
 fn unique_image_cache_suffix() -> String {
     let counter = IMAGE_CACHE_BUILD_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{}-{counter}", current_time_ms())
+    format!("{}-{counter}", openshell_core::time::now_ms())
 }
 
 async fn write_sandbox_image_metadata(
@@ -2492,21 +2491,13 @@ fn error_condition(reason: &str, message: &str) -> SandboxCondition {
 
 fn platform_event(source: &str, event_type: &str, reason: &str, message: String) -> PlatformEvent {
     PlatformEvent {
-        timestamp_ms: current_time_ms(),
+        timestamp_ms: openshell_core::time::now_ms(),
         source: source.to_string(),
         r#type: event_type.to_string(),
         reason: reason.to_string(),
         message,
         metadata: HashMap::new(),
     }
-}
-
-fn current_time_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| {
-            i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
-        })
 }
 
 #[cfg(test)]

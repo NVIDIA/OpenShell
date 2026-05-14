@@ -10,6 +10,7 @@
 //! - Build version metadata
 
 pub mod config;
+pub mod driver_utils;
 pub mod error;
 pub mod forward;
 pub mod gpu;
@@ -19,7 +20,9 @@ pub mod metadata;
 pub mod net;
 pub mod paths;
 pub mod proto;
+pub mod sandbox_env;
 pub mod settings;
+pub mod time;
 
 pub use config::{ComputeDriverKind, Config, OidcConfig, TlsConfig};
 pub use error::{ComputeDriverError, Error, Result};

@@ -1,6 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+mod helpers;
+
+use helpers::{
+    EnvVarGuard, build_ca, build_client_cert, build_server_cert, install_rustls_provider,
+};
 use openshell_cli::run;
 use openshell_cli::tls::TlsOptions;
 use openshell_core::proto::open_shell_server::{OpenShell, OpenShellServer};
@@ -19,9 +24,6 @@ use openshell_core::proto::{
     SupervisorMessage, UpdateProviderRequest, WatchSandboxRequest,
 };
 use openshell_core::{ObjectId, ObjectName};
-use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
-};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -30,37 +32,6 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Certificate as TlsCertificate, Identity, Server, ServerTlsConfig};
 use tonic::{Response, Status};
-
-struct EnvVarGuard {
-    key: &'static str,
-    original: Option<String>,
-}
-
-#[allow(unsafe_code)]
-impl EnvVarGuard {
-    fn set(key: &'static str, value: &str) -> Self {
-        let original = std::env::var(key).ok();
-        unsafe {
-            std::env::set_var(key, value);
-        }
-        Self { key, original }
-    }
-}
-
-#[allow(unsafe_code)]
-impl Drop for EnvVarGuard {
-    fn drop(&mut self) {
-        if let Some(value) = &self.original {
-            unsafe {
-                std::env::set_var(self.key, value);
-            }
-        } else {
-            unsafe {
-                std::env::remove_var(self.key);
-            }
-        }
-    }
-}
 
 #[derive(Clone, Default)]
 struct ProviderState {
@@ -668,34 +639,6 @@ impl OpenShell for TestOpenShell {
     }
 }
 
-fn install_rustls_provider() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-}
-
-fn build_ca() -> (Certificate, KeyPair) {
-    let key_pair = KeyPair::generate().unwrap();
-    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
-    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    let cert = params.self_signed(&key_pair).unwrap();
-    (cert, key_pair)
-}
-
-fn build_server_cert(ca: &Certificate, ca_key: &KeyPair) -> (String, String) {
-    let key_pair = KeyPair::generate().unwrap();
-    let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
-    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-    let cert = params.signed_by(&key_pair, ca, ca_key).unwrap();
-    (cert.pem(), key_pair.serialize_pem())
-}
-
-fn build_client_cert(ca: &Certificate, ca_key: &KeyPair) -> (String, String) {
-    let key_pair = KeyPair::generate().unwrap();
-    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
-    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
-    let cert = params.signed_by(&key_pair, ca, ca_key).unwrap();
-    (cert.pem(), key_pair.serialize_pem())
-}
-
 /// Test fixture: TLS-enabled server with matching client certs.
 struct TestServer {
     endpoint: String,
@@ -1146,7 +1089,7 @@ async fn provider_create_rejects_key_only_credentials_without_local_env_value() 
 #[tokio::test]
 async fn provider_create_supports_generic_type_and_env_lookup_credentials() {
     let ts = run_server().await;
-    let _guard = EnvVarGuard::set("NAV_GENERIC_TEST_KEY", "generic-value");
+    let _guard = EnvVarGuard::set(&[("NAV_GENERIC_TEST_KEY", "generic-value")]);
 
     run::provider_create(
         &ts.endpoint,
@@ -1204,7 +1147,7 @@ async fn provider_create_rejects_combined_from_existing_and_credentials() {
 #[tokio::test]
 async fn provider_create_rejects_empty_env_var_for_key_only_credential() {
     let ts = run_server().await;
-    let _guard = EnvVarGuard::set("NAV_EMPTY_ENV_KEY", "");
+    let _guard = EnvVarGuard::set(&[("NAV_EMPTY_ENV_KEY", "")]);
 
     let err = run::provider_create(
         &ts.endpoint,
@@ -1228,7 +1171,7 @@ async fn provider_create_rejects_empty_env_var_for_key_only_credential() {
 #[tokio::test]
 async fn provider_create_supports_nvidia_type_with_nvidia_api_key() {
     let ts = run_server().await;
-    let _guard = EnvVarGuard::set("NVIDIA_API_KEY", "nvapi-live-test");
+    let _guard = EnvVarGuard::set(&[("NVIDIA_API_KEY", "nvapi-live-test")]);
 
     run::provider_create(
         &ts.endpoint,

@@ -15,7 +15,6 @@ use std::pin::Pin;
 use tonic::{Request, Response, Status};
 
 use crate::PodmanComputeDriver;
-use openshell_core::ComputeDriverError;
 
 #[derive(Debug, Clone)]
 pub struct ComputeDriverService {
@@ -38,7 +37,7 @@ impl ComputeDriver for ComputeDriverService {
         self.driver
             .capabilities()
             .map(Response::new)
-            .map_err(status_from_driver_error)
+            .map_err(Status::from)
     }
 
     async fn validate_sandbox_create(
@@ -51,7 +50,7 @@ impl ComputeDriver for ComputeDriverService {
             .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
         self.driver
             .validate_sandbox_create(&sandbox)
-            .map_err(status_from_driver_error)?;
+            .map_err(Status::from)?;
         Ok(Response::new(ValidateSandboxCreateResponse {}))
     }
 
@@ -68,7 +67,7 @@ impl ComputeDriver for ComputeDriverService {
             .driver
             .get_sandbox(&request.sandbox_name)
             .await
-            .map_err(status_from_driver_error)?
+            .map_err(Status::from)?
             .ok_or_else(|| Status::not_found("sandbox not found"))?;
 
         if !request.sandbox_id.is_empty() && request.sandbox_id != sandbox.id {
@@ -86,11 +85,7 @@ impl ComputeDriver for ComputeDriverService {
         &self,
         _request: Request<ListSandboxesRequest>,
     ) -> Result<Response<ListSandboxesResponse>, Status> {
-        let sandboxes = self
-            .driver
-            .list_sandboxes()
-            .await
-            .map_err(status_from_driver_error)?;
+        let sandboxes = self.driver.list_sandboxes().await.map_err(Status::from)?;
         Ok(Response::new(ListSandboxesResponse { sandboxes }))
     }
 
@@ -105,7 +100,7 @@ impl ComputeDriver for ComputeDriverService {
         self.driver
             .create_sandbox(&sandbox)
             .await
-            .map_err(status_from_driver_error)?;
+            .map_err(Status::from)?;
         Ok(Response::new(CreateSandboxResponse {}))
     }
 
@@ -120,7 +115,7 @@ impl ComputeDriver for ComputeDriverService {
         self.driver
             .stop_sandbox(&request.sandbox_name)
             .await
-            .map_err(status_from_driver_error)?;
+            .map_err(Status::from)?;
         Ok(Response::new(StopSandboxResponse {}))
     }
 
@@ -139,7 +134,7 @@ impl ComputeDriver for ComputeDriverService {
             .driver
             .delete_sandbox(&request.sandbox_id, &request.sandbox_name)
             .await
-            .map_err(status_from_driver_error)?;
+            .map_err(Status::from)?;
         Ok(Response::new(DeleteSandboxResponse { deleted }))
     }
 
@@ -150,21 +145,9 @@ impl ComputeDriver for ComputeDriverService {
         &self,
         _request: Request<WatchSandboxesRequest>,
     ) -> Result<Response<Self::WatchSandboxesStream>, Status> {
-        let stream = self
-            .driver
-            .watch_sandboxes()
-            .await
-            .map_err(status_from_driver_error)?;
+        let stream = self.driver.watch_sandboxes().await.map_err(Status::from)?;
         let stream = stream.map(|item| item.map_err(|err| Status::internal(err.to_string())));
         Ok(Response::new(Box::pin(stream)))
-    }
-}
-
-fn status_from_driver_error(err: ComputeDriverError) -> Status {
-    match err {
-        ComputeDriverError::AlreadyExists => Status::already_exists("sandbox already exists"),
-        ComputeDriverError::Precondition(message) => Status::failed_precondition(message),
-        ComputeDriverError::Message(message) => Status::internal(message),
     }
 }
 
@@ -179,6 +162,7 @@ mod tests {
     use hyper::service::service_fn;
     use hyper::{Response as HyperResponse, StatusCode};
     use hyper_util::rt::TokioIo;
+    use openshell_core::ComputeDriverError;
     use std::collections::VecDeque;
     use std::convert::Infallible;
     use std::path::PathBuf;
@@ -187,9 +171,8 @@ mod tests {
 
     #[test]
     fn precondition_driver_errors_map_to_failed_precondition_status() {
-        let status = status_from_driver_error(ComputeDriverError::Precondition(
-            "sandbox container is not running".to_string(),
-        ));
+        let status: Status =
+            ComputeDriverError::Precondition("sandbox container is not running".to_string()).into();
 
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
         assert_eq!(status.message(), "sandbox container is not running");
@@ -197,7 +180,7 @@ mod tests {
 
     #[test]
     fn already_exists_driver_errors_map_to_already_exists_status() {
-        let status = status_from_driver_error(ComputeDriverError::AlreadyExists);
+        let status: Status = ComputeDriverError::AlreadyExists.into();
         assert_eq!(status.code(), tonic::Code::AlreadyExists);
     }
 

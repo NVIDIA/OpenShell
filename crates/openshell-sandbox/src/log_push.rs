@@ -9,7 +9,6 @@
 
 use crate::grpc_client::CachedOpenShellClient;
 use openshell_core::proto::{PushSandboxLogsRequest, SandboxLogLine};
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tracing::{Event, Subscriber};
 use tracing_subscriber::Layer;
@@ -67,7 +66,7 @@ impl<S: Subscriber> Layer<S> for LogPushLayer {
             visitor.into_parts(meta.name())
         };
 
-        let ts = current_time_ms().unwrap_or(0);
+        let ts = openshell_core::time::now_ms();
 
         let is_ocsf = meta.target() == openshell_ocsf::OCSF_TARGET;
 
@@ -297,9 +296,4 @@ impl tracing::field::Visit for LogVisitor {
                 .push((field.name().to_string(), format!("{value:?}")));
         }
     }
-}
-
-fn current_time_ms() -> Option<i64> {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
-    i64::try_from(now.as_millis()).ok()
 }

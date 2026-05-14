@@ -252,7 +252,10 @@ fn build_env(
     // 1. User-supplied environment (lowest priority).
     if let Some(s) = spec {
         if !s.log_level.is_empty() {
-            env.insert("OPENSHELL_LOG_LEVEL".into(), s.log_level.clone());
+            env.insert(
+                openshell_core::sandbox_env::LOG_LEVEL.into(),
+                s.log_level.clone(),
+            );
         }
         for (k, v) in &s.environment {
             env.insert(k.clone(), v.clone());
@@ -265,30 +268,51 @@ fn build_env(
     }
 
     // 2. Required driver vars (highest priority -- always overwrite).
-    env.insert("OPENSHELL_SANDBOX".into(), sandbox.name.clone());
-    env.insert("OPENSHELL_SANDBOX_ID".into(), sandbox.id.clone());
-    env.insert("OPENSHELL_ENDPOINT".into(), config.grpc_endpoint.clone());
     env.insert(
-        "OPENSHELL_SSH_SOCKET_PATH".into(),
+        openshell_core::sandbox_env::SANDBOX.into(),
+        sandbox.name.clone(),
+    );
+    env.insert(
+        openshell_core::sandbox_env::SANDBOX_ID.into(),
+        sandbox.id.clone(),
+    );
+    env.insert(
+        openshell_core::sandbox_env::ENDPOINT.into(),
+        config.grpc_endpoint.clone(),
+    );
+    env.insert(
+        openshell_core::sandbox_env::SSH_SOCKET_PATH.into(),
         config.sandbox_ssh_socket_path.clone(),
     );
     // NOTE: The SSH handshake secret is injected via a Podman secret
     // (see the "secrets" field below) rather than a plaintext env var.
     // This prevents exposure through `podman inspect`.
     env.insert(
-        "OPENSHELL_SSH_HANDSHAKE_SKEW_SECS".into(),
+        openshell_core::sandbox_env::SSH_HANDSHAKE_SKEW_SECS.into(),
         config.ssh_handshake_skew_secs.to_string(),
     );
     env.insert("OPENSHELL_CONTAINER_IMAGE".into(), image.to_string());
-    env.insert("OPENSHELL_SANDBOX_COMMAND".into(), "sleep infinity".into());
+    env.insert(
+        openshell_core::sandbox_env::SANDBOX_COMMAND.into(),
+        "sleep infinity".into(),
+    );
 
     // 3. TLS client cert paths (when mTLS is enabled). These point to
     //    the container-side mount paths where the cert files are
     //    bind-mounted from the host.
     if config.tls_enabled() {
-        env.insert("OPENSHELL_TLS_CA".into(), TLS_CA_MOUNT_PATH.into());
-        env.insert("OPENSHELL_TLS_CERT".into(), TLS_CERT_MOUNT_PATH.into());
-        env.insert("OPENSHELL_TLS_KEY".into(), TLS_KEY_MOUNT_PATH.into());
+        env.insert(
+            openshell_core::sandbox_env::TLS_CA.into(),
+            TLS_CA_MOUNT_PATH.into(),
+        );
+        env.insert(
+            openshell_core::sandbox_env::TLS_CERT.into(),
+            TLS_CERT_MOUNT_PATH.into(),
+        );
+        env.insert(
+            openshell_core::sandbox_env::TLS_KEY.into(),
+            TLS_KEY_MOUNT_PATH.into(),
+        );
     }
 
     env
@@ -498,7 +522,7 @@ pub fn build_container_spec(sandbox: &DriverSandbox, config: &PodmanComputeConfi
         // The secret is created by the driver before the container
         // (see `PodmanComputeDriver::create_sandbox`).
         secret_env: BTreeMap::from([(
-            "OPENSHELL_SSH_HANDSHAKE_SECRET".into(),
+            openshell_core::sandbox_env::SSH_HANDSHAKE_SECRET.into(),
             secret_name(&sandbox.id),
         )]),
         stop_timeout: config.stop_timeout_secs,
@@ -855,7 +879,9 @@ mod tests {
 
         let env_map = spec["env"].as_object().expect("env should be an object");
         assert_eq!(
-            env_map.get("OPENSHELL_SANDBOX").and_then(|v| v.as_str()),
+            env_map
+                .get(openshell_core::sandbox_env::SANDBOX)
+                .and_then(|v| v.as_str()),
             Some("my-sandbox"),
         );
     }

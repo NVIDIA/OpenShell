@@ -44,13 +44,13 @@ async fn connect_channel(endpoint: &str) -> Result<Channel> {
     let tls_enabled = endpoint.starts_with("https://");
 
     if tls_enabled {
-        let ca_path = std::env::var("OPENSHELL_TLS_CA")
+        let ca_path = std::env::var(openshell_core::sandbox_env::TLS_CA)
             .into_diagnostic()
             .wrap_err("OPENSHELL_TLS_CA is required")?;
-        let cert_path = std::env::var("OPENSHELL_TLS_CERT")
+        let cert_path = std::env::var(openshell_core::sandbox_env::TLS_CERT)
             .into_diagnostic()
             .wrap_err("OPENSHELL_TLS_CERT is required")?;
-        let key_path = std::env::var("OPENSHELL_TLS_KEY")
+        let key_path = std::env::var(openshell_core::sandbox_env::TLS_KEY)
             .into_diagnostic()
             .wrap_err("OPENSHELL_TLS_KEY is required")?;
 
@@ -111,7 +111,7 @@ type AuthenticatedInferenceClient =
     InferenceClient<InterceptedService<Channel, SandboxSecretInterceptor>>;
 
 fn sandbox_secret_interceptor() -> SandboxSecretInterceptor {
-    let secret = std::env::var("OPENSHELL_SSH_HANDSHAKE_SECRET")
+    let secret = std::env::var(openshell_core::sandbox_env::SSH_HANDSHAKE_SECRET)
         .ok()
         .and_then(|s| s.parse().ok());
     SandboxSecretInterceptor { secret }

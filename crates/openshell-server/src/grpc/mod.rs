@@ -120,9 +120,8 @@ enum StoredSettingValue {
 // Utility
 // ---------------------------------------------------------------------------
 
-fn current_time_ms() -> Result<i64, std::time::SystemTimeError> {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
-    Ok(i64::try_from(now.as_millis()).unwrap_or(i64::MAX))
+fn current_time_ms() -> i64 {
+    openshell_core::time::now_ms()
 }
 
 /// Validate that object metadata is present and contains required fields.

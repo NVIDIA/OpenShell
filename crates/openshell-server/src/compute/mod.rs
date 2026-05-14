@@ -717,7 +717,7 @@ impl ComputeRuntime {
     }
 
     async fn reconcile_store_with_backend(&self, grace_period: Duration) -> Result<(), String> {
-        let sweep_started_at_ms = current_time_ms();
+        let sweep_started_at_ms = openshell_core::time::now_ms();
         let backend_sandboxes = self
             .driver
             .list_sandboxes(Request::new(ListSandboxesRequest {}))
@@ -822,8 +822,7 @@ impl ComputeRuntime {
         let session_connected = self.supervisor_sessions.has_session(&incoming.id);
         let mut phase = derive_phase(incoming.status.as_ref());
         let mut sandbox = existing.unwrap_or_else(|| {
-            use crate::persistence::current_time_ms;
-            let now_ms = current_time_ms().unwrap_or(0);
+            let now_ms = openshell_core::time::now_ms();
             Sandbox {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: incoming.id.clone(),
@@ -1066,7 +1065,7 @@ impl ComputeRuntime {
         }
 
         let sandbox = decode_sandbox_record(&current_record)?;
-        let age_ms = current_time_ms().saturating_sub(current_record.created_at_ms);
+        let age_ms = openshell_core::time::now_ms().saturating_sub(current_record.created_at_ms);
         if age_ms < grace_ms {
             return Ok(());
         }
@@ -1361,15 +1360,6 @@ fn compute_error_from_status(status: Status) -> ComputeError {
         Code::FailedPrecondition => ComputeError::Precondition(status.message().to_string()),
         _ => ComputeError::Message(status.message().to_string()),
     }
-}
-
-fn current_time_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(i64::MAX)
 }
 
 fn decode_sandbox_record(record: &ObjectRecord) -> Result<Sandbox, String> {

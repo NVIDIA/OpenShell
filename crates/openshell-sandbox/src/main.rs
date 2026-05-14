@@ -50,17 +50,17 @@ struct Args {
 
     /// Sandbox ID for fetching policy via gRPC from `OpenShell` server.
     /// Requires --openshell-endpoint to be set.
-    #[arg(long, env = "OPENSHELL_SANDBOX_ID")]
+    #[arg(long, env = openshell_core::sandbox_env::SANDBOX_ID)]
     sandbox_id: Option<String>,
 
     /// Sandbox (used for policy sync when the sandbox discovers policy
     /// from disk or falls back to the restrictive default).
-    #[arg(long, env = "OPENSHELL_SANDBOX")]
+    #[arg(long, env = openshell_core::sandbox_env::SANDBOX)]
     sandbox: Option<String>,
 
     /// `OpenShell` server gRPC endpoint for fetching policy.
     /// Required when using --sandbox-id.
-    #[arg(long, env = "OPENSHELL_ENDPOINT")]
+    #[arg(long, env = openshell_core::sandbox_env::ENDPOINT)]
     openshell_endpoint: Option<String>,
 
     /// Path to Rego policy file for OPA-based network access control.
@@ -74,21 +74,21 @@ struct Args {
     policy_data: Option<String>,
 
     /// Log level (trace, debug, info, warn, error).
-    #[arg(long, default_value = "warn", env = "OPENSHELL_LOG_LEVEL")]
+    #[arg(long, default_value = "warn", env = openshell_core::sandbox_env::LOG_LEVEL)]
     log_level: String,
 
     /// Filesystem path to the Unix socket the embedded SSH daemon binds.
     /// The supervisor bridges `RelayStream` traffic from the gateway onto
     /// this socket; nothing else should connect to it.
-    #[arg(long, env = "OPENSHELL_SSH_SOCKET_PATH")]
+    #[arg(long, env = openshell_core::sandbox_env::SSH_SOCKET_PATH)]
     ssh_socket_path: Option<String>,
 
     /// Shared secret for gateway-to-sandbox SSH handshake.
-    #[arg(long, env = "OPENSHELL_SSH_HANDSHAKE_SECRET")]
+    #[arg(long, env = openshell_core::sandbox_env::SSH_HANDSHAKE_SECRET)]
     ssh_handshake_secret: Option<String>,
 
     /// Allowed clock skew for SSH handshake validation.
-    #[arg(long, env = "OPENSHELL_SSH_HANDSHAKE_SKEW_SECS", default_value = "300")]
+    #[arg(long, env = openshell_core::sandbox_env::SSH_HANDSHAKE_SKEW_SECS, default_value = "300")]
     ssh_handshake_skew_secs: u64,
 
     /// Path to YAML inference routes for standalone routing.
@@ -265,7 +265,7 @@ fn main() -> Result<()> {
         // Get command - either from CLI args, environment variable, or default to /bin/bash
         let command = if !args.command.is_empty() {
             args.command
-        } else if let Ok(c) = std::env::var("OPENSHELL_SANDBOX_COMMAND") {
+        } else if let Ok(c) = std::env::var(openshell_core::sandbox_env::SANDBOX_COMMAND) {
             // Simple shell-like splitting on whitespace
             c.split_whitespace().map(String::from).collect()
         } else {

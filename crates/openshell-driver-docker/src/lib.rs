@@ -894,7 +894,7 @@ fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig
         ("TERM".to_string(), "xterm".to_string()),
         (
             "OPENSHELL_LOG_LEVEL".to_string(),
-            sandbox_log_level(sandbox, &config.log_level),
+            openshell_core::driver_utils::sandbox_log_level(sandbox, &config.log_level),
         ),
     ]);
 
@@ -906,17 +906,23 @@ fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig
     }
 
     environment.insert(
-        "OPENSHELL_ENDPOINT".to_string(),
+        openshell_core::sandbox_env::ENDPOINT.to_string(),
         config.grpc_endpoint.clone(),
     );
-    environment.insert("OPENSHELL_SANDBOX_ID".to_string(), sandbox.id.clone());
-    environment.insert("OPENSHELL_SANDBOX".to_string(), sandbox.name.clone());
     environment.insert(
-        "OPENSHELL_SSH_SOCKET_PATH".to_string(),
+        openshell_core::sandbox_env::SANDBOX_ID.to_string(),
+        sandbox.id.clone(),
+    );
+    environment.insert(
+        openshell_core::sandbox_env::SANDBOX.to_string(),
+        sandbox.name.clone(),
+    );
+    environment.insert(
+        openshell_core::sandbox_env::SSH_SOCKET_PATH.to_string(),
         config.ssh_socket_path.clone(),
     );
     environment.insert(
-        "OPENSHELL_SANDBOX_COMMAND".to_string(),
+        openshell_core::sandbox_env::SANDBOX_COMMAND.to_string(),
         SANDBOX_COMMAND.to_string(),
     );
     // The root supervisor executes namespace helpers during bootstrap; keep
@@ -924,15 +930,15 @@ fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig
     environment.insert("PATH".to_string(), SUPERVISOR_PATH.to_string());
     if config.guest_tls.is_some() {
         environment.insert(
-            "OPENSHELL_TLS_CA".to_string(),
+            openshell_core::sandbox_env::TLS_CA.to_string(),
             TLS_CA_MOUNT_PATH.to_string(),
         );
         environment.insert(
-            "OPENSHELL_TLS_CERT".to_string(),
+            openshell_core::sandbox_env::TLS_CERT.to_string(),
             TLS_CERT_MOUNT_PATH.to_string(),
         );
         environment.insert(
-            "OPENSHELL_TLS_KEY".to_string(),
+            openshell_core::sandbox_env::TLS_KEY.to_string(),
             TLS_KEY_MOUNT_PATH.to_string(),
         );
     }
@@ -1045,16 +1051,6 @@ fn require_sandbox_identifier(sandbox_id: &str, sandbox_name: &str) -> Result<()
         ));
     }
     Ok(())
-}
-
-fn sandbox_log_level(sandbox: &DriverSandbox, default_level: &str) -> String {
-    sandbox
-        .spec
-        .as_ref()
-        .map(|spec| spec.log_level.as_str())
-        .filter(|level| !level.is_empty())
-        .unwrap_or(default_level)
-        .to_string()
 }
 
 fn docker_container_openshell_endpoint(endpoint: &str, host: &str, port: u16) -> String {

@@ -5,6 +5,11 @@
 //! `--provider` names are auto-created when they match a known provider type,
 //! pass through when they already exist, and error for unrecognised names.
 
+mod helpers;
+
+use helpers::{
+    EnvVarGuard, build_ca, build_client_cert, build_server_cert, install_rustls_provider,
+};
 use openshell_cli::run;
 use openshell_cli::tls::TlsOptions;
 use openshell_core::proto::open_shell_server::{OpenShell, OpenShellServer};
@@ -23,9 +28,6 @@ use openshell_core::proto::{
     SupervisorMessage, UpdateProviderRequest, WatchSandboxRequest,
 };
 use openshell_core::{ObjectId, ObjectName};
-use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
-};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -34,60 +36,6 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Certificate as TlsCertificate, Identity, Server, ServerTlsConfig};
 use tonic::{Response, Status};
-
-// ── EnvVarGuard ──────────────────────────────────────────────────────
-
-// Serialise tests that mutate environment variables so concurrent
-// threads don't clobber each other.
-static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-struct SavedVar {
-    key: &'static str,
-    original: Option<String>,
-}
-
-/// Holds the global env lock and restores all modified variables on drop.
-struct EnvVarGuard {
-    vars: Vec<SavedVar>,
-    _lock: std::sync::MutexGuard<'static, ()>,
-}
-
-#[allow(unsafe_code)]
-impl EnvVarGuard {
-    /// Acquire the lock and set one or more environment variables.
-    fn set(pairs: &[(&'static str, &str)]) -> Self {
-        let lock = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut vars = Vec::with_capacity(pairs.len());
-        for &(key, value) in pairs {
-            let original = std::env::var(key).ok();
-            unsafe {
-                std::env::set_var(key, value);
-            }
-            vars.push(SavedVar { key, original });
-        }
-        Self { vars, _lock: lock }
-    }
-}
-
-#[allow(unsafe_code)]
-impl Drop for EnvVarGuard {
-    fn drop(&mut self) {
-        for var in &self.vars {
-            if let Some(value) = &var.original {
-                unsafe {
-                    std::env::set_var(var.key, value);
-                }
-            } else {
-                unsafe {
-                    std::env::remove_var(var.key);
-                }
-            }
-        }
-        // _lock drops here, releasing the mutex
-    }
-}
 
 // ── mock OpenShell server ─────────────────────────────────────────────
 
@@ -557,36 +505,6 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<Self::ForwardTcpStream>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
-}
-
-// ── TLS helpers ──────────────────────────────────────────────────────
-
-fn install_rustls_provider() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-}
-
-fn build_ca() -> (Certificate, KeyPair) {
-    let key_pair = KeyPair::generate().unwrap();
-    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
-    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    let cert = params.self_signed(&key_pair).unwrap();
-    (cert, key_pair)
-}
-
-fn build_server_cert(ca: &Certificate, ca_key: &KeyPair) -> (String, String) {
-    let key_pair = KeyPair::generate().unwrap();
-    let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
-    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-    let cert = params.signed_by(&key_pair, ca, ca_key).unwrap();
-    (cert.pem(), key_pair.serialize_pem())
-}
-
-fn build_client_cert(ca: &Certificate, ca_key: &KeyPair) -> (String, String) {
-    let key_pair = KeyPair::generate().unwrap();
-    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
-    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
-    let cert = params.signed_by(&key_pair, ca, ca_key).unwrap();
-    (cert.pem(), key_pair.serialize_pem())
 }
 
 // ── test server fixture ──────────────────────────────────────────────

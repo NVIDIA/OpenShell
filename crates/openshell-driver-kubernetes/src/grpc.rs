@@ -14,7 +14,7 @@ use openshell_core::proto::compute::v1::{
 use std::pin::Pin;
 use tonic::{Request, Response, Status};
 
-use crate::{KubernetesComputeDriver, KubernetesDriverError};
+use crate::KubernetesComputeDriver;
 
 #[derive(Debug, Clone)]
 pub struct ComputeDriverService {
@@ -103,7 +103,7 @@ impl ComputeDriver for ComputeDriverService {
         self.driver
             .create_sandbox(&sandbox)
             .await
-            .map_err(status_from_driver_error)?;
+            .map_err(|e| Status::from(openshell_core::ComputeDriverError::from(e)))?;
         Ok(Response::new(CreateSandboxResponse {}))
     }
 
@@ -146,23 +146,18 @@ impl ComputeDriver for ComputeDriverService {
     }
 }
 
-fn status_from_driver_error(err: KubernetesDriverError) -> Status {
-    match err {
-        KubernetesDriverError::AlreadyExists => Status::already_exists("sandbox already exists"),
-        KubernetesDriverError::Precondition(message) => Status::failed_precondition(message),
-        KubernetesDriverError::Message(message) => Status::internal(message),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::KubernetesDriverError;
+    use openshell_core::ComputeDriverError;
+    use tonic::Status;
 
     #[test]
     fn precondition_driver_errors_map_to_failed_precondition_status() {
-        let status = status_from_driver_error(KubernetesDriverError::Precondition(
+        let status: Status = ComputeDriverError::from(KubernetesDriverError::Precondition(
             "sandbox agent pod IP is not available".to_string(),
-        ));
+        ))
+        .into();
 
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
         assert_eq!(status.message(), "sandbox agent pod IP is not available");
@@ -170,7 +165,7 @@ mod tests {
 
     #[test]
     fn already_exists_driver_errors_map_to_already_exists_status() {
-        let status = status_from_driver_error(KubernetesDriverError::AlreadyExists);
+        let status: Status = ComputeDriverError::from(KubernetesDriverError::AlreadyExists).into();
 
         assert_eq!(status.code(), tonic::Code::AlreadyExists);
         assert_eq!(status.message(), "sandbox already exists");

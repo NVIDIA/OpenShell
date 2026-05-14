@@ -1,6 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+mod helpers;
+
+use helpers::{
+    EnvVarGuard, build_ca, build_client_cert, build_server_cert, install_rustls_provider,
+};
 use openshell_cli::tls::{TlsOptions, grpc_client};
 use openshell_core::proto::{
     CreateProviderRequest, CreateSshSessionRequest, CreateSshSessionResponse,
@@ -10,9 +15,6 @@ use openshell_core::proto::{
     UpdateProviderRequest,
     open_shell_server::{OpenShell, OpenShellServer},
 };
-use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
-};
 use tempfile::tempdir;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -21,41 +23,6 @@ use tonic::{
     Response, Status,
     transport::{Certificate as TlsCertificate, Identity, Server, ServerTlsConfig},
 };
-
-struct EnvVarGuard {
-    key: &'static str,
-    original: Option<String>,
-}
-
-#[allow(unsafe_code)]
-impl EnvVarGuard {
-    fn set(key: &'static str, value: &str) -> Self {
-        let original = std::env::var(key).ok();
-        unsafe {
-            std::env::set_var(key, value);
-        }
-        Self { key, original }
-    }
-}
-
-#[allow(unsafe_code)]
-impl Drop for EnvVarGuard {
-    fn drop(&mut self) {
-        if let Some(value) = &self.original {
-            unsafe {
-                std::env::set_var(self.key, value);
-            }
-        } else {
-            unsafe {
-                std::env::remove_var(self.key);
-            }
-        }
-    }
-}
-
-fn install_rustls_provider() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-}
 
 #[derive(Clone, Default)]
 struct TestOpenShell;
@@ -450,34 +417,6 @@ impl OpenShell for TestOpenShell {
     }
 }
 
-fn build_ca() -> (Certificate, KeyPair) {
-    let key_pair = KeyPair::generate().unwrap();
-    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
-    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    let cert = params.self_signed(&key_pair).unwrap();
-    (cert, key_pair)
-}
-
-fn build_server_cert(ca: &Certificate, ca_key: &KeyPair) -> (String, String) {
-    let key_pair = KeyPair::generate().unwrap();
-    let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
-    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-    let cert = params.signed_by(&key_pair, ca, ca_key).unwrap();
-    let cert_pem = cert.pem();
-    let key_pem = key_pair.serialize_pem();
-    (cert_pem, key_pem)
-}
-
-fn build_client_cert(ca: &Certificate, ca_key: &KeyPair) -> (String, String) {
-    let key_pair = KeyPair::generate().unwrap();
-    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
-    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
-    let cert = params.signed_by(&key_pair, ca, ca_key).unwrap();
-    let cert_pem = cert.pem();
-    let key_pem = key_pair.serialize_pem();
-    (cert_pem, key_pem)
-}
-
 async fn run_server(
     server_cert: String,
     server_key: String,
@@ -544,7 +483,8 @@ async fn cli_requires_client_cert_for_https() {
     let dir = tempdir().unwrap();
     // Point XDG_CONFIG_HOME at the isolated temp dir so that default_tls_dir
     // cannot discover real client certs from the developer's machine.
-    let _xdg_env = EnvVarGuard::set("XDG_CONFIG_HOME", &dir.path().to_string_lossy());
+    let xdg_path = dir.path().to_string_lossy();
+    let _xdg_env = EnvVarGuard::set(&[("XDG_CONFIG_HOME", &xdg_path)]);
     let ca_path = dir.path().join("ca.crt");
     std::fs::write(&ca_path, ca_cert).unwrap();
 
