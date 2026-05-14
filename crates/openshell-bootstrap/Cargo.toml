@@ -15,15 +15,19 @@ bollard = "0.20"
 bytes = { workspace = true }
 futures = { workspace = true }
 miette = { workspace = true }
+p256 = { workspace = true }
 rcgen = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 tar = "0.4"
 tempfile = "3"
+thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true
