@@ -29,6 +29,7 @@ e2e-docker-gpu = ["e2e-docker", "e2e-gpu"]
 e2e-kubernetes = ["e2e"]
 e2e-podman = ["e2e", "e2e-host-gateway"]
 e2e-podman-gpu = ["e2e-podman", "e2e-gpu"]
+e2e-vm = ["e2e"]
 
 [[test]]
 name = "custom_image"
@@ -43,7 +44,12 @@ required-features = ["e2e-docker"]
 [[test]]
 name = "gateway_resume"
 path = "tests/gateway_resume.rs"
-required-features = ["e2e"]
+required-features = ["e2e-docker"]
+
+[[test]]
+name = "vm_gateway_resume"
+path = "tests/vm_gateway_resume.rs"
+required-features = ["e2e-vm"]
 
 [[test]]
 name = "websocket_conformance"

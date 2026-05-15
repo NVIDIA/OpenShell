@@ -48,6 +48,7 @@ COMPRESSED_DIR="${ROOT}/target/vm-runtime-compressed"
 GATEWAY_BIN="${ROOT}/target/debug/openshell-gateway"
 DRIVER_BIN="${ROOT}/target/debug/openshell-driver-vm"
 E2E_TEST="${OPENSHELL_E2E_VM_TEST:-smoke}"
+E2E_FEATURES="${OPENSHELL_E2E_VM_FEATURES:-e2e-vm}"
 
 # The VM driver places `compute-driver.sock` under --vm-driver-state-dir.
 # AF_UNIX SUN_LEN is 104 bytes on macOS (108 on Linux), so paths anchored
@@ -246,10 +247,10 @@ e2e_export_gateway_restart_metadata \
 # preparation; allow 180s for slower CI runners.
 export OPENSHELL_PROVISION_TIMEOUT="${SANDBOX_PROVISION_TIMEOUT}"
 
-echo "==> Running e2e ${E2E_TEST} test (endpoint: ${OPENSHELL_GATEWAY_ENDPOINT})"
+echo "==> Running e2e ${E2E_TEST} test (features: ${E2E_FEATURES}, endpoint: ${OPENSHELL_GATEWAY_ENDPOINT})"
 cargo test \
   --manifest-path "${ROOT}/e2e/rust/Cargo.toml" \
-  --features e2e \
+  --features "${E2E_FEATURES}" \
   --test "${E2E_TEST}" \
   -- --nocapture
 

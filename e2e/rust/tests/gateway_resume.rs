@@ -3,11 +3,11 @@
 
 #![cfg(feature = "e2e")]
 
-//! E2E coverage for resuming sandboxes after a standalone gateway restart.
+//! E2E coverage for resuming Docker sandboxes after a standalone gateway restart.
 //!
-//! This intentionally targets managed local gateways started by e2e wrapper
-//! scripts. Existing-endpoint E2E runs do not own the gateway process, so they
-//! skip this restart-only coverage.
+//! This intentionally targets the Docker-driver gateway started by
+//! `e2e/with-docker-gateway.sh`. Existing-endpoint E2E runs do not own the
+//! gateway process, so they skip this restart-only coverage.
 
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -210,25 +210,18 @@ async fn wait_for_container_running(
 }
 
 #[tokio::test]
-async fn gateway_restart_resumes_running_sandbox() {
+async fn docker_gateway_restart_resumes_running_sandbox() {
     let Some(gateway) = ManagedGateway::from_env().expect("load managed e2e gateway metadata")
     else {
         eprintln!("Skipping gateway resume test: e2e gateway is not managed by this test run");
         return;
     };
-
-    let is_vm = std::env::var("OPENSHELL_E2E_DRIVER").as_deref() == Ok("vm");
-    let docker_namespace = if is_vm {
-        None
-    } else {
-        let namespace = std::env::var("OPENSHELL_E2E_DOCKER_NETWORK_NAME")
-            .ok()
-            .filter(|value| !value.trim().is_empty());
-        if namespace.is_none() {
-            eprintln!("Skipping gateway resume test: Docker e2e namespace is unavailable");
-            return;
-        }
-        namespace
+    let Some(namespace) = std::env::var("OPENSHELL_E2E_DOCKER_NETWORK_NAME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        eprintln!("Skipping gateway resume test: Docker e2e namespace is unavailable");
+        return;
     };
 
     wait_for_healthy(Duration::from_secs(30))
@@ -254,28 +247,22 @@ async fn gateway_restart_resumes_running_sandbox() {
         "sandbox state was not written before restart:\n{before_restart}"
     );
 
-    if let Some(namespace) = docker_namespace.as_deref() {
-        wait_for_container_running(namespace, &sandbox.name, true, Duration::from_secs(60))
-            .await
-            .expect("sandbox container should be running before gateway restart");
-    }
+    wait_for_container_running(&namespace, &sandbox.name, true, Duration::from_secs(60))
+        .await
+        .expect("sandbox container should be running before gateway restart");
 
     gateway.stop().expect("stop e2e gateway");
-    if let Some(namespace) = docker_namespace.as_deref() {
-        wait_for_container_running(namespace, &sandbox.name, false, Duration::from_secs(120))
-            .await
-            .expect("gateway shutdown should stop managed Docker sandboxes");
-    }
+    wait_for_container_running(&namespace, &sandbox.name, false, Duration::from_secs(120))
+        .await
+        .expect("gateway shutdown should stop managed Docker sandboxes");
 
     gateway.start().expect("restart e2e gateway");
     wait_for_healthy(Duration::from_secs(120))
         .await
         .expect("gateway should become healthy after restart");
-    if let Some(namespace) = docker_namespace.as_deref() {
-        wait_for_container_running(namespace, &sandbox.name, true, Duration::from_secs(120))
-            .await
-            .expect("gateway startup should resume the Docker sandbox container");
-    }
+    wait_for_container_running(&namespace, &sandbox.name, true, Duration::from_secs(120))
+        .await
+        .expect("gateway startup should resume the Docker sandbox container");
 
     let names = sandbox_names().await.expect("list sandboxes after restart");
     assert!(
