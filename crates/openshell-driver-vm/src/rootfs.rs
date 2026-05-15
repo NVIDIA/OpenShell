@@ -159,10 +159,21 @@ pub fn write_rootfs_image_file(
 
     let tmp_path = temporary_injection_path(image_path);
     fs::write(&tmp_path, contents).map_err(|e| format!("write {}: {e}", tmp_path.display()))?;
-    let _ = run_debugfs(image_path, &format!("rm {guest_path}"));
+    let Some(quoted_guest_path) = debugfs_quote_absolute_path(guest_path) else {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!("invalid debugfs guest path '{guest_path}'"));
+    };
+    let Some(quoted_tmp_path) = debugfs_quote_argument(&tmp_path.to_string_lossy()) else {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!(
+            "invalid debugfs injection path '{}'",
+            tmp_path.display()
+        ));
+    };
+    let _ = run_debugfs(image_path, &format!("rm {quoted_guest_path}"));
     let result = run_debugfs(
         image_path,
-        &format!("write {} {}", tmp_path.display(), guest_path),
+        &format!("write {quoted_tmp_path} {quoted_guest_path}"),
     );
     let _ = fs::remove_file(&tmp_path);
     result
@@ -174,9 +185,12 @@ pub fn set_rootfs_image_file_mode(
     mode: u32,
 ) -> Result<(), String> {
     let regular_file_mode = 0o100_000 | (mode & 0o7777);
+    let Some(quoted_guest_path) = debugfs_quote_absolute_path(guest_path) else {
+        return Err(format!("invalid debugfs guest path '{guest_path}'"));
+    };
     run_debugfs(
         image_path,
-        &format!("set_inode_field {guest_path} mode 0{regular_file_mode:o}"),
+        &format!("set_inode_field {quoted_guest_path} mode 0{regular_file_mode:o}"),
     )
 }
 
@@ -539,7 +553,7 @@ fn collect_sandbox_owner_commands(
         return Ok(true);
     }
 
-    let Some(quoted_guest_path) = debugfs_quote_path(guest_path) else {
+    let Some(quoted_guest_path) = debugfs_quote_absolute_path(guest_path) else {
         return Ok(false);
     };
     commands.push(format!("set_inode_field {quoted_guest_path} uid {uid}"));
@@ -579,14 +593,22 @@ fn collect_sandbox_owner_commands(
     Ok(true)
 }
 
-fn debugfs_quote_path(path: &str) -> Option<String> {
+fn debugfs_quote_absolute_path(path: &str) -> Option<String> {
     if path.is_empty() || !path.starts_with('/') {
         return None;
     }
 
-    let mut quoted = String::with_capacity(path.len() + 2);
+    debugfs_quote_argument(path)
+}
+
+fn debugfs_quote_argument(argument: &str) -> Option<String> {
+    if argument.is_empty() {
+        return None;
+    }
+
+    let mut quoted = String::with_capacity(argument.len() + 2);
     quoted.push('"');
-    for ch in path.chars() {
+    for ch in argument.chars() {
         match ch {
             '\0' | '\n' | '\r' => return None,
             '\\' => quoted.push_str("\\\\"),
@@ -1082,6 +1104,19 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn debugfs_quote_argument_quotes_source_paths_with_spaces() {
+        assert_eq!(
+            debugfs_quote_argument("/tmp/openshell state/.openshell-rootfs-inject-123-0"),
+            Some("\"/tmp/openshell state/.openshell-rootfs-inject-123-0\"".to_string())
+        );
+        assert_eq!(
+            debugfs_quote_argument("/tmp/path/with\\backslash/and\"quote"),
+            Some("\"/tmp/path/with\\\\backslash/and\\\"quote\"".to_string())
+        );
+        assert_eq!(debugfs_quote_argument("/tmp/bad\npath"), None);
     }
 
     fn unique_temp_dir() -> PathBuf {

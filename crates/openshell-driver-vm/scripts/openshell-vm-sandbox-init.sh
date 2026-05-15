@@ -234,7 +234,7 @@ setup_overlay_root() {
         exit 1
     fi
 
-    mkdir -p /overlay /lower /newroot
+    mkdir -p /overlay /lower /newroot /image-cache
     mount -o remount,ro / 2>/dev/null || true
     mount -t ext4 -o rw /dev/vdb /overlay
     mkdir -p /overlay/upper /overlay/work
@@ -252,7 +252,6 @@ setup_overlay_root() {
 
     local lower_root="/lower"
     if [ -b /dev/vdc ]; then
-        mkdir -p /image-cache
         mount -t ext4 -o ro /dev/vdc /image-cache
         if [ -d /image-cache/image-rootfs ]; then
             lower_root="/image-cache/image-rootfs"

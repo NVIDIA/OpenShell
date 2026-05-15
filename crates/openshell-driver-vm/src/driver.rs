@@ -580,40 +580,10 @@ impl VmDriver {
         let is_gpu = spec.is_some_and(|s| s.gpu);
         let gpu_device = spec.map_or("", |s| s.gpu_device.as_str());
         let gpu_bdf = if is_gpu {
-            let inventory = self
-                .gpu_inventory
-                .as_ref()
-                .ok_or_else(|| Status::internal("GPU inventory not initialized"))?;
-            match inventory
-                .lock()
-                .map_err(|e| Status::internal(format!("GPU inventory lock poisoned: {e}")))
-                .and_then(|mut inv| {
-                    inv.assign(&sandbox.id, gpu_device)
-                        .map_err(Status::failed_precondition)
-                }) {
-                Ok(assignment) => {
-                    tracing::info!(
-                        sandbox_id = %sandbox.id,
-                        bdf = %assignment.bdf,
-                        gpu_name = %assignment.name,
-                        iommu_group = assignment.iommu_group,
-                        "assigned GPU to sandbox"
-                    );
-                    Some(assignment.bdf)
-                }
-                Err(err) => {
-                    return Err(err);
-                }
-            }
+            Some(self.assign_gpu_to_record(&sandbox.id, gpu_device).await?)
         } else {
             None
         };
-        if let Some(bdf) = gpu_bdf.as_ref()
-            && !self.record_gpu_assignment(&sandbox.id, bdf.clone()).await
-        {
-            self.release_gpu_and_subnet(&sandbox.id);
-            return Err(Status::cancelled("sandbox provisioning cancelled"));
-        }
 
         let console_output = state_dir.join("rootfs-console.log");
         let mut command = Command::new(&self.launcher_bin);
@@ -905,15 +875,39 @@ impl VmDriver {
         }
     }
 
-    async fn record_gpu_assignment(&self, sandbox_id: &str, bdf: String) -> bool {
+    async fn assign_gpu_to_record(
+        &self,
+        sandbox_id: &str,
+        gpu_device: &str,
+    ) -> Result<String, Status> {
         let mut registry = self.registry.lock().await;
         match registry.get_mut(sandbox_id) {
-            Some(record) if !record.deleting => {
-                record.gpu_bdf = Some(bdf);
-                true
-            }
-            _ => false,
+            Some(record) if !record.deleting => {}
+            _ => return Err(Status::cancelled("sandbox provisioning cancelled")),
         }
+
+        let inventory = self
+            .gpu_inventory
+            .as_ref()
+            .ok_or_else(|| Status::internal("GPU inventory not initialized"))?;
+        let assignment = inventory
+            .lock()
+            .map_err(|e| Status::internal(format!("GPU inventory lock poisoned: {e}")))?
+            .assign(sandbox_id, gpu_device)
+            .map_err(Status::failed_precondition)?;
+
+        let record = registry
+            .get_mut(sandbox_id)
+            .expect("sandbox record exists while registry lock is held");
+        record.gpu_bdf = Some(assignment.bdf.clone());
+        tracing::info!(
+            sandbox_id = %sandbox_id,
+            bdf = %assignment.bdf,
+            gpu_name = %assignment.name,
+            iommu_group = assignment.iommu_group,
+            "assigned GPU to sandbox"
+        );
+        Ok(assignment.bdf)
     }
 
     async fn fail_provisioning(
