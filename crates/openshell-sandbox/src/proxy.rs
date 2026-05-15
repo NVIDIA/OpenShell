@@ -1915,8 +1915,17 @@ fn is_host_gateway_alias(host: &str) -> bool {
 
 /// Returns `true` if `ip` is a known cloud instance metadata endpoint that
 /// must never be exempted from SSRF blocking.
+///
+/// IPv4-mapped IPv6 addresses (e.g. `::ffff:169.254.169.254`) are normalized
+/// to their embedded IPv4 representation before comparison, so the invariant
+/// holds regardless of how the address is represented.
 fn is_cloud_metadata_ip(ip: IpAddr) -> bool {
-    CLOUD_METADATA_IPS.contains(&ip)
+    match ip {
+        IpAddr::V4(_) => CLOUD_METADATA_IPS.contains(&ip),
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .is_some_and(|v4| CLOUD_METADATA_IPS.contains(&IpAddr::V4(v4))),
+    }
 }
 
 /// Read the proxy's own `/etc/hosts` at startup and return the IP mapped to
@@ -1958,13 +1967,15 @@ fn detect_trusted_host_gateway() -> Option<IpAddr> {
         return None;
     }
     // The exemption exists solely for link-local IPs used by rootless Podman
-    // with pasta. Loopback (127.x), unspecified (0.0.0.0), and other
-    // always-blocked non-link-local addresses are never legitimate host
-    // gateway IPs and must not receive the exemption.
-    if is_always_blocked_ip(ip) && !is_link_local_ip(ip) {
+    // with pasta. Private RFC 1918 addresses (e.g. Docker bridge 172.17.0.1,
+    // Kubernetes node 192.168.x.x), loopback, unspecified, and all other
+    // non-link-local addresses are never legitimate candidates for the
+    // link-local SSRF exemption — they must fall through to the normal
+    // allowed_ips / resolve_and_reject_internal() enforcement path.
+    if !is_link_local_ip(ip) {
         warn!(
             %ip,
-            "host.openshell.internal maps to an always-blocked non-link-local IP; \
+            "host.openshell.internal maps to a non-link-local IP; \
              trusted-gateway SSRF exemption disabled"
         );
         return None;
@@ -2022,13 +2033,12 @@ async fn resolve_and_check_trusted_gateway(
             ));
         }
         // Defense-in-depth: even if the resolved IP matches trusted_gw, reject
-        // always-blocked non-link-local addresses (loopback, unspecified). This
-        // catches the case where detect_trusted_host_gateway somehow admitted a
-        // bad IP, or where trusted_gw was set to a loopback/unspecified address
-        // through a code path we haven't anticipated.
-        if is_always_blocked_ip(addr.ip()) && !is_link_local_ip(addr.ip()) {
+        // any non-link-local address. detect_trusted_host_gateway() already
+        // enforces this at startup, but we re-check here to guard against any
+        // unanticipated code path that might admit a private or loopback IP.
+        if !is_link_local_ip(addr.ip()) {
             return Err(format!(
-                "{host} resolves to always-blocked non-link-local address {}, \
+                "{host} resolves to non-link-local address {}, \
                  connection rejected",
                 addr.ip()
             ));
@@ -3910,6 +3920,29 @@ mod tests {
         assert!(!is_cloud_metadata_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
     }
 
+    #[test]
+    fn test_is_cloud_metadata_ip_blocks_ipv4_mapped_metadata() {
+        // ::ffff:169.254.169.254 is the IPv4-mapped IPv6 representation of the
+        // AWS/GCP/Azure IMDS endpoint. is_link_local_ip() recognizes it as
+        // link-local, so is_cloud_metadata_ip() must also catch it — otherwise
+        // the trusted-gateway exemption would be granted to the metadata service.
+        let mapped = Ipv4Addr::new(169, 254, 169, 254).to_ipv6_mapped();
+        assert!(
+            is_cloud_metadata_ip(IpAddr::V6(mapped)),
+            "::ffff:169.254.169.254 must be recognized as cloud metadata"
+        );
+    }
+
+    #[test]
+    fn test_is_cloud_metadata_ip_allows_other_ipv4_mapped_link_local() {
+        // Other IPv4-mapped link-local addresses are NOT metadata.
+        let mapped = Ipv4Addr::new(169, 254, 1, 2).to_ipv6_mapped();
+        assert!(
+            !is_cloud_metadata_ip(IpAddr::V6(mapped)),
+            "::ffff:169.254.1.2 should not be flagged as cloud metadata"
+        );
+    }
+
     // -- detect_trusted_host_gateway --
 
     #[test]
@@ -3941,44 +3974,59 @@ mod tests {
 
     #[test]
     fn test_detect_trusted_host_gateway_rejects_loopback() {
-        // Loopback is always-blocked and not link-local — must not be trusted.
+        // Loopback is not link-local — must not receive the SSRF exemption.
         let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
         assert!(!is_cloud_metadata_ip(ip));
-        assert!(is_always_blocked_ip(ip));
         assert!(!is_link_local_ip(ip));
-        // The guard: always-blocked && !link-local → reject.
-        assert!(is_always_blocked_ip(ip) && !is_link_local_ip(ip));
+        // The guard: !link-local → reject.
+        assert!(!is_link_local_ip(ip));
     }
 
     #[test]
     fn test_detect_trusted_host_gateway_rejects_unspecified() {
-        // Unspecified (0.0.0.0) must not be trusted.
+        // Unspecified (0.0.0.0) is not link-local — must not be trusted.
         let ip = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
         assert!(!is_cloud_metadata_ip(ip));
-        assert!(is_always_blocked_ip(ip));
         assert!(!is_link_local_ip(ip));
-        assert!(is_always_blocked_ip(ip) && !is_link_local_ip(ip));
+        assert!(!is_link_local_ip(ip));
     }
 
     #[test]
     fn test_detect_trusted_host_gateway_rejects_loopback_v6() {
         let ip = IpAddr::V6(Ipv6Addr::LOCALHOST);
         assert!(!is_cloud_metadata_ip(ip));
-        assert!(is_always_blocked_ip(ip));
         assert!(!is_link_local_ip(ip));
-        assert!(is_always_blocked_ip(ip) && !is_link_local_ip(ip));
+    }
+
+    #[test]
+    fn test_detect_trusted_host_gateway_rejects_private_ip() {
+        // Docker bridge (172.17.0.1) and K8s host gateway (192.168.x.x) are
+        // RFC 1918 private addresses — not link-local. Before this fix they
+        // slipped through the old always-blocked guard and received the SSRF
+        // exemption. The new guard (!is_link_local_ip) rejects them, so
+        // connections to these hosts fall through to resolve_and_reject_internal().
+        for ip in [
+            IpAddr::V4(Ipv4Addr::new(172, 17, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        ] {
+            assert!(!is_cloud_metadata_ip(ip), "{ip} should not be metadata");
+            assert!(!is_link_local_ip(ip), "{ip} should not be link-local");
+            // Guard fires — exemption disabled.
+            assert!(!is_link_local_ip(ip), "{ip}: guard must reject");
+        }
     }
 
     #[test]
     fn test_detect_trusted_host_gateway_allows_link_local_non_metadata() {
-        // 169.254.1.2 is always-blocked (link-local) but IS link-local,
-        // so the guard should pass and allow the exemption.
+        // 169.254.1.2 (rootless Podman pasta gateway) IS link-local and is
+        // not a cloud metadata IP — it is the only address class the exemption
+        // is designed for.
         let ip = IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2));
         assert!(!is_cloud_metadata_ip(ip));
-        assert!(is_always_blocked_ip(ip));
         assert!(is_link_local_ip(ip));
-        // The guard does NOT fire — this IP is eligible for the exemption.
-        assert!(!(is_always_blocked_ip(ip) && !is_link_local_ip(ip)));
+        // Guard does NOT fire — this IP is eligible for the exemption.
+        assert!(is_link_local_ip(ip));
     }
 
     // -- parse_hosts_file_for_host: multi-entry / duplicate scenarios --
@@ -4189,8 +4237,8 @@ mod tests {
         assert!(result.is_err(), "loopback must be rejected");
         let err = result.unwrap_err();
         assert!(
-            err.contains("always-blocked non-link-local"),
-            "expected always-blocked rejection, got: {err}"
+            err.contains("non-link-local"),
+            "expected non-link-local rejection, got: {err}"
         );
     }
 
@@ -4203,8 +4251,8 @@ mod tests {
         assert!(result.is_err(), "unspecified must be rejected");
         let err = result.unwrap_err();
         assert!(
-            err.contains("always-blocked non-link-local"),
-            "expected always-blocked rejection, got: {err}"
+            err.contains("non-link-local"),
+            "expected non-link-local rejection, got: {err}"
         );
     }
 
@@ -4235,6 +4283,22 @@ mod tests {
         assert!(
             err.contains("cloud metadata"),
             "expected cloud-metadata rejection, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trusted_gateway_rejects_private_ip_as_trusted_gw() {
+        // Defense-in-depth: a private RFC 1918 IP (e.g. Docker bridge 172.17.0.1)
+        // must be rejected even if it somehow matched trusted_gw.
+        // detect_trusted_host_gateway() already blocks these via !is_link_local_ip(),
+        // but resolve_and_check_trusted_gateway() must enforce the same invariant.
+        let docker_bridge = IpAddr::V4(Ipv4Addr::new(172, 17, 0, 1));
+        let result = resolve_and_check_trusted_gateway("172.17.0.1", 8080, docker_bridge, 0).await;
+        assert!(result.is_err(), "private RFC 1918 IP must be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("non-link-local"),
+            "expected non-link-local rejection for private IP, got: {err}"
         );
     }
 
