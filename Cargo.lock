@@ -3587,6 +3587,7 @@ dependencies = [
  "miette",
  "openshell-core",
  "serde",
+ "serde_json",
  "serde_yml",
 ]
 

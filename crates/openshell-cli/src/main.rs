@@ -681,6 +681,21 @@ impl OutputFormat {
 }
 
 #[derive(Clone, Debug, ValueEnum)]
+enum PolicyGetOutput {
+    Table,
+    Json,
+}
+
+impl PolicyGetOutput {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Table => "table",
+            Self::Json => "json",
+        }
+    }
+}
+
+#[derive(Clone, Debug, ValueEnum)]
 enum CliEditor {
     Vscode,
     Cursor,
@@ -1595,6 +1610,10 @@ enum PolicyCommands {
         #[arg(long)]
         full: bool,
 
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = PolicyGetOutput::Table)]
+        output: PolicyGetOutput,
+
         /// Show the global policy revision.
         #[arg(long)]
         global: bool,
@@ -2271,13 +2290,29 @@ async fn main() -> Result<()> {
                     name,
                     rev,
                     full,
+                    output,
                     global,
                 } => {
                     if global {
-                        run::sandbox_policy_get_global(&ctx.endpoint, rev, full, &tls).await?;
+                        run::sandbox_policy_get_global(
+                            &ctx.endpoint,
+                            rev,
+                            full,
+                            output.as_str(),
+                            &tls,
+                        )
+                        .await?;
                     } else {
                         let name = resolve_sandbox_name(name, &ctx.name)?;
-                        run::sandbox_policy_get(&ctx.endpoint, &name, rev, full, &tls).await?;
+                        run::sandbox_policy_get(
+                            &ctx.endpoint,
+                            &name,
+                            rev,
+                            full,
+                            output.as_str(),
+                            &tls,
+                        )
+                        .await?;
                     }
                 }
                 PolicyCommands::List {
@@ -3965,6 +4000,34 @@ mod tests {
                 assert!(name.is_none());
             }
             other => panic!("expected settings get command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn policy_get_json_output_parses() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "policy",
+            "get",
+            "my-sandbox",
+            "--full",
+            "-o",
+            "json",
+        ])
+        .expect("policy get -o json should parse");
+
+        match cli.command {
+            Some(Commands::Policy {
+                command:
+                    Some(PolicyCommands::Get {
+                        name, full, output, ..
+                    }),
+            }) => {
+                assert_eq!(name.as_deref(), Some("my-sandbox"));
+                assert!(full);
+                assert!(matches!(output, PolicyGetOutput::Json));
+            }
+            other => panic!("expected policy get command, got: {other:?}"),
         }
     }
 

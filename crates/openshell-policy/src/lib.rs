@@ -558,6 +558,25 @@ pub fn serialize_sandbox_policy(policy: &SandboxPolicy) -> Result<String> {
         .wrap_err("failed to serialize policy to YAML")
 }
 
+/// Convert a proto sandbox policy into the canonical policy JSON representation.
+///
+/// The shape mirrors the YAML schema used by [`serialize_sandbox_policy`], so
+/// automation can use the same documented field names in either format.
+pub fn sandbox_policy_to_json_value(policy: &SandboxPolicy) -> Result<serde_json::Value> {
+    let json_repr = from_proto(policy);
+    serde_json::to_value(&json_repr)
+        .into_diagnostic()
+        .wrap_err("failed to serialize policy to JSON")
+}
+
+/// Serialize a proto sandbox policy to a pretty-printed JSON string.
+pub fn serialize_sandbox_policy_json(policy: &SandboxPolicy) -> Result<String> {
+    let json_repr = sandbox_policy_to_json_value(policy)?;
+    serde_json::to_string_pretty(&json_repr)
+        .into_diagnostic()
+        .wrap_err("failed to serialize policy to JSON")
+}
+
 /// Load a sandbox policy from an explicit source.
 ///
 /// Resolution order:
@@ -879,6 +898,30 @@ mod tests {
             !yaml.contains("\nfilesystem:"),
             "unexpected bare `filesystem:` key in YAML output"
         );
+    }
+
+    /// Verify that JSON serialization uses the same canonical schema keys as YAML.
+    #[test]
+    fn serialized_json_uses_policy_schema_keys() {
+        let proto = parse_sandbox_policy(
+            r"
+version: 1
+network_policies:
+  github:
+    endpoints:
+      - host: api.github.com
+        port: 443
+        protocol: https
+    binaries:
+      - path: /usr/bin/curl
+",
+        )
+        .expect("parse failed");
+        let json = sandbox_policy_to_json_value(&proto).expect("serialize failed");
+
+        assert_eq!(json["version"], serde_json::json!(1));
+        assert!(json.get("filesystem").is_none());
+        assert!(json.get("network_policies").is_some());
     }
 
     /// Verify that `allowed_ips` survives the round-trip.

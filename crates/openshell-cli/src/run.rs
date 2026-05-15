@@ -6125,6 +6125,7 @@ pub async fn sandbox_policy_get(
     name: &str,
     version: u32,
     full: bool,
+    output: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
@@ -6141,6 +6142,23 @@ pub async fn sandbox_policy_get(
     let inner = status_resp.into_inner();
     if let Some(rev) = inner.revision {
         let status = PolicyStatus::try_from(rev.status).unwrap_or(PolicyStatus::Unspecified);
+        match output {
+            "json" => {
+                let obj = policy_revision_to_json(
+                    "sandbox",
+                    Some(name),
+                    Some(inner.active_version),
+                    &rev,
+                    status,
+                    full,
+                )?;
+                println!("{}", serde_json::to_string_pretty(&obj).into_diagnostic()?);
+                return Ok(());
+            }
+            "table" => {}
+            _ => return Err(miette!("unsupported output format: {output}")),
+        }
+
         println!("Version:      {}", rev.version);
         println!("Hash:         {}", rev.policy_hash);
         println!("Status:       {status:?}");
@@ -6176,6 +6194,7 @@ pub async fn sandbox_policy_get_global(
     server: &str,
     version: u32,
     full: bool,
+    output: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
@@ -6192,6 +6211,16 @@ pub async fn sandbox_policy_get_global(
     let inner = status_resp.into_inner();
     if let Some(rev) = inner.revision {
         let status = PolicyStatus::try_from(rev.status).unwrap_or(PolicyStatus::Unspecified);
+        match output {
+            "json" => {
+                let obj = policy_revision_to_json("global", None, None, &rev, status, full)?;
+                println!("{}", serde_json::to_string_pretty(&obj).into_diagnostic()?);
+                return Ok(());
+            }
+            "table" => {}
+            _ => return Err(miette!("unsupported output format: {output}")),
+        }
+
         println!("Scope:        global");
         println!("Version:      {}", rev.version);
         println!("Hash:         {}", rev.policy_hash);
@@ -6218,6 +6247,66 @@ pub async fn sandbox_policy_get_global(
     }
 
     Ok(())
+}
+
+fn policy_status_json_name(status: PolicyStatus) -> &'static str {
+    match status {
+        PolicyStatus::Unspecified => "unspecified",
+        PolicyStatus::Pending => "pending",
+        PolicyStatus::Loaded => "loaded",
+        PolicyStatus::Failed => "failed",
+        PolicyStatus::Superseded => "superseded",
+    }
+}
+
+fn policy_revision_to_json(
+    scope: &str,
+    sandbox: Option<&str>,
+    active_version: Option<u32>,
+    rev: &openshell_core::proto::SandboxPolicyRevision,
+    status: PolicyStatus,
+    full: bool,
+) -> Result<serde_json::Value> {
+    let mut obj = serde_json::Map::new();
+    obj.insert("scope".to_string(), serde_json::json!(scope));
+    if let Some(sandbox) = sandbox {
+        obj.insert("sandbox".to_string(), serde_json::json!(sandbox));
+    }
+    obj.insert("version".to_string(), serde_json::json!(rev.version));
+    obj.insert("hash".to_string(), serde_json::json!(rev.policy_hash));
+    obj.insert(
+        "status".to_string(),
+        serde_json::json!(policy_status_json_name(status)),
+    );
+    if let Some(active_version) = active_version {
+        obj.insert(
+            "active_version".to_string(),
+            serde_json::json!(active_version),
+        );
+    }
+    if rev.created_at_ms > 0 {
+        obj.insert(
+            "created_at_ms".to_string(),
+            serde_json::json!(rev.created_at_ms),
+        );
+    }
+    if rev.loaded_at_ms > 0 {
+        obj.insert(
+            "loaded_at_ms".to_string(),
+            serde_json::json!(rev.loaded_at_ms),
+        );
+    }
+    if !rev.load_error.is_empty() {
+        obj.insert("load_error".to_string(), serde_json::json!(rev.load_error));
+    }
+    if full {
+        let policy = match rev.policy.as_ref() {
+            Some(policy) => openshell_policy::sandbox_policy_to_json_value(policy)?,
+            None => serde_json::Value::Null,
+        };
+        obj.insert("policy".to_string(), policy);
+    }
+    Ok(serde_json::Value::Object(obj))
 }
 
 pub async fn sandbox_policy_list(
