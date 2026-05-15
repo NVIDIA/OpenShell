@@ -144,7 +144,12 @@ ensure_e2e_podman_network() {
 default_podman_socket_path() {
   case "$(uname -s)" in
     Darwin)
-      printf '%s\n' "${HOME}/.local/share/containers/podman/machine/podman.sock"
+      # On macOS the podman client talks to a VM; the API socket path is
+      # per-launch (under $TMPDIR) and reported by `podman machine inspect`.
+      # The legacy ~/.local/share/containers/podman/machine/podman.sock path
+      # is not created by podman >= 5.x with the applehv/libkrun providers.
+      podman_cmd machine inspect --format '{{.ConnectionInfo.PodmanSocket.Path}}' 2>/dev/null \
+        | awk 'NF { print; exit }'
       ;;
     Linux)
       if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
@@ -165,11 +170,24 @@ ensure_podman_api_socket() {
   fi
 
   local default_socket
-  if default_socket="$(default_podman_socket_path)" \
+  default_socket="$(default_podman_socket_path || true)"
+  if [ -n "${default_socket}" ] \
      && [ -S "${default_socket}" ] \
      && podman_cmd --url "unix://${default_socket}" info >/dev/null 2>&1; then
     export OPENSHELL_PODMAN_SOCKET="${default_socket}"
     return 0
+  fi
+
+  # `podman system service` is a Linux-only subcommand — the macOS client
+  # delegates the API service to the VM, so we can't spin one up locally.
+  # If we got here on Darwin, the user's `podman machine` is either not
+  # running or its socket isn't reachable; surface that directly.
+  if [ "$(uname -s)" = "Darwin" ]; then
+    echo "ERROR: could not reach the Podman API socket on macOS." >&2
+    echo "       Expected socket from 'podman machine inspect': ${default_socket:-<none>}" >&2
+    echo "       Ensure 'podman machine start' has been run, or set" >&2
+    echo "       OPENSHELL_PODMAN_SOCKET to a reachable unix socket path." >&2
+    exit 2
   fi
 
   PODMAN_SOCKET="${WORKDIR}/podman/podman.sock"
@@ -348,6 +366,14 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
   printf 'default_image = %s\n'  "$(toml_string "${SANDBOX_IMAGE}")"
   printf 'image_pull_policy = "missing"\n'
   printf 'supervisor_image = %s\n' "$(toml_string "${SUPERVISOR_IMAGE}")"
+  # The in-process Podman driver reads `socket_path` from TOML only — the
+  # OPENSHELL_PODMAN_SOCKET env var is honoured by the standalone driver
+  # binary, not the in-process driver used here. Pin the socket to the one
+  # the harness discovered (e.g. via `podman machine inspect` on macOS) so
+  # we don't fall back to the driver's stale macOS default.
+  if [ -n "${OPENSHELL_PODMAN_SOCKET:-}" ]; then
+    printf 'socket_path = %s\n' "$(toml_string "${OPENSHELL_PODMAN_SOCKET}")"
+  fi
 } > "${GATEWAY_CONFIG}"
 
 GATEWAY_ARGS=(
