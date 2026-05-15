@@ -16,6 +16,7 @@ const ROOTFS_VARIANT_MARKER: &str = ".openshell-rootfs-variant";
 const SANDBOX_GUEST_INIT_PATH: &str = "/srv/openshell-vm-sandbox-init.sh";
 const SANDBOX_SUPERVISOR_PATH: &str = "/opt/openshell/bin/openshell-sandbox";
 const SANDBOX_UMOCI_PATH: &str = "/opt/openshell/bin/umoci";
+const SANDBOX_OWNER_NORMALIZED_MARKER: &str = "/opt/openshell/.sandbox-owner-normalized";
 const ROOTFS_IMAGE_MIN_SIZE_BYTES: u64 = 512 * 1024 * 1024;
 const ROOTFS_IMAGE_MIN_HEADROOM_BYTES: u64 = 256 * 1024 * 1024;
 const EXT4_IMAGE_MIN_HEADROOM_BYTES: u64 = 16 * 1024 * 1024;
@@ -78,7 +79,12 @@ pub fn create_rootfs_archive_from_dir(source: &Path, archive_path: &Path) -> Res
 
 pub fn create_rootfs_image_from_dir(source: &Path, image_path: &Path) -> Result<(), String> {
     let image_size = rootfs_image_size_bytes(source)?;
-    create_ext4_image_from_dir_with_size(source, image_path, image_size)
+    create_ext4_image_from_dir_with_size(source, image_path, image_size)?;
+    if let Err(err) = normalize_sandbox_owner_in_rootfs_image(source, image_path) {
+        let _ = fs::remove_file(image_path);
+        return Err(err);
+    }
+    Ok(())
 }
 
 pub fn create_ext4_image_from_dir_with_size(
@@ -494,6 +500,182 @@ fn ensure_rootfs_image_parent_dirs(image_path: &Path, guest_path: &str) {
     }
 }
 
+fn normalize_sandbox_owner_in_rootfs_image(source: &Path, image_path: &Path) -> Result<(), String> {
+    let sandbox_dir = source.join("sandbox");
+    if !sandbox_dir.exists() {
+        return Ok(());
+    }
+
+    let Some((uid, gid)) = sandbox_guest_user_ids(source)? else {
+        return Ok(());
+    };
+
+    let mut commands = Vec::new();
+    if !collect_sandbox_owner_commands(&sandbox_dir, "/sandbox", uid, gid, &mut commands)? {
+        return Ok(());
+    }
+    if commands.is_empty() {
+        return Ok(());
+    }
+
+    run_debugfs_batch(image_path, &commands)?;
+    write_rootfs_image_file(image_path, SANDBOX_OWNER_NORMALIZED_MARKER, b"1\n")
+}
+
+fn collect_sandbox_owner_commands(
+    source_path: &Path,
+    guest_path: &str,
+    uid: u32,
+    gid: u32,
+    commands: &mut Vec<String>,
+) -> Result<bool, String> {
+    let metadata = fs::symlink_metadata(source_path).map_err(|e| {
+        format!(
+            "stat {} for rootfs ownership normalization: {e}",
+            source_path.display()
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Ok(true);
+    }
+
+    let Some(quoted_guest_path) = debugfs_quote_path(guest_path) else {
+        return Ok(false);
+    };
+    commands.push(format!("set_inode_field {quoted_guest_path} uid {uid}"));
+    commands.push(format!("set_inode_field {quoted_guest_path} gid {gid}"));
+
+    if !metadata.is_dir() {
+        return Ok(true);
+    }
+
+    let mut entries = fs::read_dir(source_path)
+        .map_err(|e| {
+            format!(
+                "read {} for rootfs ownership normalization: {e}",
+                source_path.display()
+            )
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| {
+            format!(
+                "read {} entry for rootfs ownership normalization: {e}",
+                source_path.display()
+            )
+        })?;
+    entries.sort_by_key(fs::DirEntry::file_name);
+
+    for entry in entries {
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            return Ok(false);
+        };
+        let child_guest_path = format!("{guest_path}/{file_name}");
+        if !collect_sandbox_owner_commands(&entry.path(), &child_guest_path, uid, gid, commands)? {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}
+
+fn debugfs_quote_path(path: &str) -> Option<String> {
+    if path.is_empty() || !path.starts_with('/') {
+        return None;
+    }
+
+    let mut quoted = String::with_capacity(path.len() + 2);
+    quoted.push('"');
+    for ch in path.chars() {
+        match ch {
+            '\0' | '\n' | '\r' => return None,
+            '\\' => quoted.push_str("\\\\"),
+            '"' => quoted.push_str("\\\""),
+            _ => quoted.push(ch),
+        }
+    }
+    quoted.push('"');
+    Some(quoted)
+}
+
+fn sandbox_guest_user_ids(rootfs: &Path) -> Result<Option<(u32, u32)>, String> {
+    let passwd_path = rootfs.join("etc/passwd");
+    if !passwd_path.exists() {
+        return Ok(None);
+    }
+
+    let passwd = fs::read_to_string(&passwd_path)
+        .map_err(|e| format!("read {}: {e}", passwd_path.display()))?;
+    for line in passwd.lines() {
+        let mut parts = line.split(':');
+        if parts.next() != Some("sandbox") {
+            continue;
+        }
+        let _password = parts.next();
+        let uid = parts
+            .next()
+            .ok_or_else(|| format!("sandbox entry in {} is missing uid", passwd_path.display()))?
+            .parse::<u32>()
+            .map_err(|e| format!("sandbox uid in {} is invalid: {e}", passwd_path.display()))?;
+        let gid = parts
+            .next()
+            .ok_or_else(|| format!("sandbox entry in {} is missing gid", passwd_path.display()))?
+            .parse::<u32>()
+            .map_err(|e| format!("sandbox gid in {} is invalid: {e}", passwd_path.display()))?;
+        return Ok(Some((uid, gid)));
+    }
+
+    Ok(None)
+}
+
+fn run_debugfs_batch(image_path: &Path, commands: &[String]) -> Result<(), String> {
+    let command_path = temporary_injection_path(image_path);
+    let mut contents = commands.join("\n");
+    contents.push('\n');
+    fs::write(&command_path, contents)
+        .map_err(|e| format!("write {}: {e}", command_path.display()))?;
+
+    let result = run_debugfs_batch_file(image_path, &command_path);
+    let _ = fs::remove_file(&command_path);
+    result
+}
+
+fn run_debugfs_batch_file(image_path: &Path, command_path: &Path) -> Result<(), String> {
+    let mut last_error = None;
+    for candidate in e2fs_tool_candidates("debugfs") {
+        let label = candidate.display().to_string();
+        let output = Command::new(&candidate)
+            .arg("-w")
+            .arg("-f")
+            .arg(command_path)
+            .arg(image_path)
+            .output();
+        match output {
+            Ok(output) if output.status.success() => return Ok(()),
+            Ok(output) => {
+                last_error = Some(format!(
+                    "{label} failed with status {}\nstdout: {}\nstderr: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                last_error = Some(format!("{label} not found"));
+            }
+            Err(err) => {
+                last_error = Some(format!("run {label}: {err}"));
+            }
+        }
+    }
+    Err(format!(
+        "debugfs batch {} failed for {}: {}. Install e2fsprogs (debugfs) and retry",
+        command_path.display(),
+        image_path.display(),
+        last_error.unwrap_or_else(|| "debugfs not found".to_string())
+    ))
+}
+
 fn run_debugfs(image_path: &Path, command: &str) -> Result<(), String> {
     let mut last_error = None;
     for candidate in e2fs_tool_candidates("debugfs") {
@@ -850,6 +1032,54 @@ mod tests {
         let mut tail = [0_u8; 4];
         dest_file.read_exact(&mut tail).expect("read tail");
         assert_eq!(&tail, b"tail");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sandbox_guest_user_ids_reads_existing_sandbox_user() {
+        let dir = unique_temp_dir();
+        let rootfs = dir.join("rootfs");
+        fs::create_dir_all(rootfs.join("etc")).expect("create etc");
+        fs::write(
+            rootfs.join("etc/passwd"),
+            "root:x:0:0:root:/root:/bin/bash\nsandbox:x:998:997:Sandbox:/sandbox:/bin/sh\n",
+        )
+        .expect("write passwd");
+
+        assert_eq!(
+            sandbox_guest_user_ids(&rootfs).expect("read sandbox user"),
+            Some((998, 997))
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn collect_sandbox_owner_commands_quotes_guest_paths() {
+        let dir = unique_temp_dir();
+        let sandbox_dir = dir.join("sandbox");
+        fs::create_dir_all(sandbox_dir.join("dir with space")).expect("create sandbox tree");
+        fs::write(sandbox_dir.join("dir with space/file.txt"), "hello\n").expect("write file");
+
+        let mut commands = Vec::new();
+        assert!(
+            collect_sandbox_owner_commands(&sandbox_dir, "/sandbox", 998, 997, &mut commands)
+                .expect("collect commands")
+        );
+
+        assert!(commands.contains(&"set_inode_field \"/sandbox\" uid 998".to_string()));
+        assert!(commands.contains(&"set_inode_field \"/sandbox\" gid 997".to_string()));
+        assert!(
+            commands.contains(
+                &"set_inode_field \"/sandbox/dir with space/file.txt\" uid 998".to_string()
+            )
+        );
+        assert!(
+            commands.contains(
+                &"set_inode_field \"/sandbox/dir with space/file.txt\" gid 997".to_string()
+            )
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

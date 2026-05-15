@@ -106,8 +106,8 @@ const GUEST_IMAGE_CONFIG_DIR: &str = "openshell-image";
 const GUEST_IMAGE_OCI_LAYOUT_DIR: &str = "oci";
 const GUEST_IMAGE_OCI_REF: &str = "openshell";
 const IMAGE_EXPORT_ROOTFS_ARCHIVE: &str = "source-rootfs.tar";
-const BOOTSTRAP_IMAGE_CACHE_LAYOUT_VERSION: &str = "sandbox-bootstrap-rootfs-ext4-v1";
-const PREPARED_IMAGE_CACHE_LAYOUT_VERSION: &str = "sandbox-prepared-rootfs-ext4-umoci-v1";
+const BOOTSTRAP_IMAGE_CACHE_LAYOUT_VERSION: &str = "sandbox-bootstrap-rootfs-ext4-v2";
+const PREPARED_IMAGE_CACHE_LAYOUT_VERSION: &str = "sandbox-prepared-rootfs-ext4-umoci-v2";
 const IMAGE_IDENTITY_FILE: &str = "image-identity";
 const IMAGE_REFERENCE_FILE: &str = "image-reference";
 const IMAGE_PREP_INIT_MODE: &str = "image-prep";
@@ -4978,7 +4978,7 @@ mod tests {
     fn prepared_image_cache_identity_includes_rootfs_layout_version() {
         assert_eq!(
             prepared_image_cache_identity("sha256:local-image"),
-            "sandbox-prepared-rootfs-ext4-umoci-v1:sha256:local-image"
+            "sandbox-prepared-rootfs-ext4-umoci-v2:sha256:local-image"
         );
     }
 
@@ -4986,7 +4986,7 @@ mod tests {
     fn bootstrap_image_cache_identity_includes_rootfs_layout_version() {
         assert_eq!(
             bootstrap_image_cache_identity("sha256:bootstrap-image"),
-            "sandbox-bootstrap-rootfs-ext4-v1:sha256:bootstrap-image"
+            "sandbox-bootstrap-rootfs-ext4-v2:sha256:bootstrap-image"
         );
     }
 

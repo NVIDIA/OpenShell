@@ -25,6 +25,7 @@ BOOT_START=$(date +%s%3N 2>/dev/null || date +%s)
 GVPROXY_GATEWAY_IP="192.168.127.1"
 GVPROXY_HOST_LOOPBACK_IP="192.168.127.254"
 GATEWAY_IP="$GVPROXY_GATEWAY_IP"
+SANDBOX_OWNER_NORMALIZED_MARKER="/opt/openshell/.sandbox-owner-normalized"
 
 GPU_ENABLED="${GPU_ENABLED:-false}"
 VM_NET_IP="${VM_NET_IP:-}"
@@ -62,8 +63,17 @@ root_path() {
 }
 
 sandbox_owner() {
+    sandbox_owner_from_passwd "$(root_path /etc/passwd)"
+}
+
+sandbox_owner_for_root() {
+    local root="$1"
+    sandbox_owner_from_passwd "$root/etc/passwd"
+}
+
+sandbox_owner_from_passwd() {
     local passwd_path name uid gid rest
-    passwd_path="$(root_path /etc/passwd)"
+    passwd_path="$1"
     if [ -f "$passwd_path" ]; then
         while IFS=: read -r name _ uid gid rest; do
             _="${rest:-}"
@@ -117,8 +127,19 @@ ensure_target_runtime() {
     if ! grep -q '^sandbox:' "$image_root/etc/shadow" 2>/dev/null; then
         printf 'sandbox:!:20123:0:99999:7:::\n' >> "$image_root/etc/shadow"
     fi
-    chown 10001:10001 "$image_root/sandbox" 2>/dev/null || true
+    local owner
+    local owner_normalized=0
+    owner="$(sandbox_owner_for_root "$image_root")"
+    if chown -R "$owner" "$image_root/sandbox" 2>/dev/null; then
+        owner_normalized=1
+    elif chown -R 10001:10001 "$image_root/sandbox" 2>/dev/null; then
+        owner_normalized=1
+    fi
     chmod 0755 "$image_root/sandbox"
+    if [ "$owner_normalized" -eq 1 ]; then
+        mkdir -p "$image_root/opt/openshell"
+        printf '1\n' > "$image_root${SANDBOX_OWNER_NORMALIZED_MARKER}"
+    fi
 }
 
 prepare_guest_image_rootfs() {
@@ -502,11 +523,16 @@ setup_gpu() {
 setup_sandbox_workdir() {
     local sandbox_dir
     local owner
+    local current_owner
     sandbox_dir="$(root_path /sandbox)"
     owner="$(sandbox_owner)"
     mkdir -p "$sandbox_dir"
-    if ! chown -R "$owner" "$sandbox_dir" 2>/dev/null; then
-        chown -R 10001:10001 "$sandbox_dir"
+    current_owner="$(stat -c '%u:%g' "$sandbox_dir" 2>/dev/null || true)"
+    if [ "$current_owner" != "$owner" ] \
+        || [ ! -f "$(root_path "$SANDBOX_OWNER_NORMALIZED_MARKER")" ]; then
+        if ! chown -R "$owner" "$sandbox_dir" 2>/dev/null; then
+            chown -R 10001:10001 "$sandbox_dir"
+        fi
     fi
     chmod 0755 "$sandbox_dir"
     ts "prepared /sandbox ownership (${owner})"
