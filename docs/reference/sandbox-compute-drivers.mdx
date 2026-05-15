@@ -14,21 +14,22 @@ Every compute driver runs the OpenShell supervisor inside the sandbox workload. 
 
 ## Configure a Compute Driver
 
-Configure the compute driver on the gateway. Current releases accept one driver per gateway:
+Configure the compute driver on the gateway. Current releases accept one driver per gateway. Set `compute_drivers` in the gateway TOML file:
 
-```shell
-openshell-gateway --drivers docker
+```toml
+[openshell.gateway]
+compute_drivers = ["docker"]
 ```
 
-You can also set the driver with `OPENSHELL_DRIVERS`. Supported values are `docker`, `podman`, `kubernetes`, and `vm`.
+Supported values are `docker`, `podman`, `kubernetes`, and `vm`.
 
-When `--drivers` and `OPENSHELL_DRIVERS` are unset, the gateway auto-detects Kubernetes, then Podman, then Docker by CLI availability or a local Unix socket. The VM driver is never auto-detected; configure it explicitly with `--drivers vm`.
+When `compute_drivers` is unset, the gateway auto-detects Kubernetes, then Podman, then Docker by CLI availability or a local Unix socket. The VM driver is never auto-detected; configure it explicitly with `compute_drivers = ["vm"]` or set `OPENSHELL_DRIVERS=vm` in the launch environment.
 
 Common gateway options:
 
-| Option | Environment variable | Description |
-|---|---|---|
-| `--drivers <driver>` | `OPENSHELL_DRIVERS` | Select the compute driver. Supported values are `docker`, `podman`, `kubernetes`, and `vm`. |
+| Gateway TOML option | Description |
+|---|---|
+| `compute_drivers = ["<driver>"]` | Select the compute driver. Supported values are `docker`, `podman`, `kubernetes`, and `vm`. |
 
 Set driver-specific values such as sandbox images, callback endpoints, network names, TLS material, and VM sizing in the gateway TOML file. See the [Gateway Configuration File](./gateway-config) reference for the full `[openshell.drivers.<name>]` schema.
 
@@ -45,7 +46,7 @@ The gateway talks to the Docker daemon to create sandbox containers. Docker is a
 
 For maintainer-level implementation details, refer to the [Docker driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-docker/README.md).
 
-Select Docker with `--drivers docker` or `OPENSHELL_DRIVERS=docker`. Configure Docker driver values such as `grpc_endpoint`, `network_name`, `supervisor_bin`, `supervisor_image`, `image_pull_policy`, and `guest_tls_*` in `[openshell.drivers.docker]`.
+Select Docker with `compute_drivers = ["docker"]` in `[openshell.gateway]`. Configure Docker driver values such as `grpc_endpoint`, `network_name`, `supervisor_bin`, `supervisor_image`, `image_pull_policy`, and `guest_tls_*` in `[openshell.drivers.docker]`.
 
 For GPU-backed Docker sandboxes, configure Docker CDI before starting the gateway so OpenShell can detect the daemon capability.
 
@@ -57,7 +58,7 @@ The gateway talks to the Podman API socket. The Podman driver requires Podman 5.
 
 For maintainer-level implementation details, refer to the [Podman driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-podman/README.md) and [Podman networking notes](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-podman/NETWORKING.md).
 
-Select Podman with `--drivers podman` or `OPENSHELL_DRIVERS=podman`. Configure Podman driver values such as `socket_path`, `network_name`, `supervisor_image`, `stop_timeout_secs`, `image_pull_policy`, `grpc_endpoint`, and `guest_tls_*` in `[openshell.drivers.podman]`.
+Select Podman with `compute_drivers = ["podman"]` in `[openshell.gateway]`. Configure Podman driver values such as `socket_path`, `network_name`, `supervisor_image`, `stop_timeout_secs`, `image_pull_policy`, `grpc_endpoint`, and `guest_tls_*` in `[openshell.drivers.podman]`.
 
 ## MicroVM Driver
 
@@ -77,15 +78,16 @@ For maintainer-level implementation details, refer to the [VM driver README](htt
 
 The VM driver is opt-in. Release packages can install `openshell-driver-vm`, but the gateway does not select it unless you configure the driver explicitly.
 
-For a one-off gateway process, pass `--drivers vm`:
+Enable VM by setting `compute_drivers = ["vm"]` in the gateway TOML file:
 
-```shell
-openshell-gateway --drivers vm
+```toml
+[openshell.gateway]
+compute_drivers = ["vm"]
 ```
 
-For a service, set `OPENSHELL_DRIVERS=vm` in the service environment file and restart the service. Homebrew creates `$(brew --prefix)/var/openshell/gateway.env` with a commented `OPENSHELL_DRIVERS=vm` entry. Debian and RPM user services read `~/.config/openshell/gateway.env`.
+For a launch-time override, set `OPENSHELL_DRIVERS=vm` in the gateway environment and restart the service.
 
-Select VM with `--drivers vm` or `OPENSHELL_DRIVERS=vm`. Configure VM driver values such as `grpc_endpoint`, `driver_dir`, `state_dir`, `default_image`, `bootstrap_image`, `vcpus`, `mem_mib`, `overlay_disk_mib`, `krun_log_level`, and `guest_tls_*` in `[openshell.drivers.vm]`. The VM `state_dir` stores overlay disks, console logs, runtime state, image-rootfs cache, and the private `run/compute-driver.sock` socket.
+Configure VM driver values such as `grpc_endpoint`, `driver_dir`, `state_dir`, `default_image`, `bootstrap_image`, `vcpus`, `mem_mib`, `overlay_disk_mib`, `krun_log_level`, and `guest_tls_*` in `[openshell.drivers.vm]`. The VM `state_dir` stores overlay disks, console logs, runtime state, image-rootfs cache, and the private `run/compute-driver.sock` socket.
 
 The gateway starts `openshell-driver-vm` over a private Unix socket and passes its process ID so the driver can reject unexpected local clients. The driver's standalone TCP listener is disabled unless `--allow-unauthenticated-tcp` is set for local development.
 
@@ -107,7 +109,7 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 
 | Gateway configuration | Helm value | Description |
 |---|---|---|
-| `compute_drivers = ["kubernetes"]` or `--drivers kubernetes` | Not applicable | Select the Kubernetes compute driver. |
+| `compute_drivers = ["kubernetes"]` | Not applicable | Select the Kubernetes compute driver. |
 | `[openshell.drivers.kubernetes].namespace` | `server.sandboxNamespace` | Set the namespace for sandbox resources. The Helm chart defaults to the release namespace when left empty. |
 | `default_image` | `server.sandboxImage` | Set the default sandbox image. |
 | `image_pull_policy` | `server.sandboxImagePullPolicy` | Set the Kubernetes image pull policy for sandbox pods. |

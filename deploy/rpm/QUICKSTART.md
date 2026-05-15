@@ -52,7 +52,8 @@ creation. Ensure the host can reach ghcr.io over HTTPS (port 443).
 
 For air-gapped environments, pre-load images with `podman pull` and
 set `image_pull_policy = "never"` in
-`~/.config/openshell/gateway.toml`. See CONFIGURATION.md for details.
+`~/.config/openshell/gateway.toml`. See CONFIGURATION.md for
+details.
 
 ## Start the gateway
 
@@ -63,14 +64,12 @@ systemctl --user enable --now openshell-gateway
 On first start, the gateway automatically generates:
 
 - A self-signed PKI bundle (CA, server cert, client cert) for mTLS
-- A commented configuration file at `~/.config/openshell/gateway.env`
 - A gateway TOML file at `~/.config/openshell/gateway.toml`
 
-> **Note:** The gateway binds to all interfaces (`0.0.0.0`) by default.
-> Mutual TLS (mTLS) is enabled automatically on first start, requiring a
-> valid client certificate for every connection. Do not disable TLS
-> without restricting the bind address to `127.0.0.1`. See
-> CONFIGURATION.md for details.
+> **Note:** The gateway binds to `127.0.0.1:17670` by default. Mutual
+> TLS (mTLS) is enabled automatically on first start, requiring a valid
+> client certificate for every connection. See CONFIGURATION.md for
+> details.
 
 Verify the service is running:
 
@@ -83,7 +82,7 @@ systemctl --user status openshell-gateway
 The CLI needs to know where the gateway is. Register it:
 
 ```shell
-openshell gateway add --local https://127.0.0.1:8080
+openshell gateway add --local https://127.0.0.1:17670
 ```
 
 This discovers the pre-provisioned mTLS certificates at

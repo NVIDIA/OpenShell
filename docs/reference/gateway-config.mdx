@@ -18,6 +18,17 @@ Gateway CLI flag  >  gateway OPENSHELL_* env var  >  TOML file  >  built-in defa
 
 `database_url` is env-only. The loader rejects it when it appears in the file.
 
+## Package-Managed Locations
+
+Package-managed gateways create a TOML file on first start and launch the gateway with `--config`. Set `OPENSHELL_GATEWAY_CONFIG` in the launch environment to use a different file.
+
+| Package | Gateway TOML location |
+|---|---|
+| Homebrew | `$XDG_CONFIG_HOME/openshell/gateway.toml` when it exists, otherwise the Homebrew-managed `var/openshell/gateway.toml` under the Homebrew prefix, such as `/opt/homebrew/var/openshell/gateway.toml`. |
+| Debian/Ubuntu | `%E/openshell/gateway.toml`, usually `~/.config/openshell/gateway.toml` for the systemd user service. |
+| Fedora/RHEL RPM | `%E/openshell/gateway.toml`, usually `~/.config/openshell/gateway.toml` for the systemd user service. |
+| Snap | `$SNAP_COMMON/gateway.toml`, usually `/var/snap/openshell/common/gateway.toml`. |
+
 ## Layout
 
 The file is rooted at `[openshell]`. Gateway-wide settings live under `[openshell.gateway]`. Each compute driver owns its own `[openshell.drivers.<name>]` table. Shared keys set at gateway scope are inherited into driver tables when not overridden.

@@ -4,24 +4,13 @@
 
 set -eu
 
-CONFIG_FILE="${OPENSHELL_GATEWAY_CONFIG:-${SNAP_COMMON}/gateway.toml}"
+CANONICAL_CONFIG_FILE="${SNAP_COMMON}/gateway.toml"
+CONFIG_FILE="${OPENSHELL_GATEWAY_CONFIG:-$CANONICAL_CONFIG_FILE}"
+DB_URL="${OPENSHELL_DB_URL:-sqlite:${SNAP_COMMON}/gateway.db?mode=rwc}"
 
-if [ ! -f "$CONFIG_FILE" ]; then
-    mkdir -p "$(dirname "$CONFIG_FILE")"
-    cat > "$CONFIG_FILE" << EOF
-[openshell]
-version = 1
-
-[openshell.drivers.docker]
-default_image = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
-image_pull_policy = "IfNotPresent"
-sandbox_namespace = "docker-snap"
-grpc_endpoint = "http://host.openshell.internal:17670"
-supervisor_bin = "${SNAP}/bin/openshell-sandbox"
-network_name = "openshell-snap"
-EOF
-    chmod 600 "$CONFIG_FILE"
+if [ ! -f "$CANONICAL_CONFIG_FILE" ]; then
+    "${SNAP}/bin/init-gateway-config.sh" snap "$CANONICAL_CONFIG_FILE" "${SNAP}/bin/openshell-sandbox"
 fi
 
 export OPENSHELL_GATEWAY_CONFIG="$CONFIG_FILE"
-exec "${SNAP}/bin/openshell-gateway" "$@"
+exec "${SNAP}/bin/openshell-gateway" --config "$CONFIG_FILE" --db-url "$DB_URL" "$@"

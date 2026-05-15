@@ -88,7 +88,7 @@ The snap exposes the CLI:
 
 - `openshell`
 
-It also defines a system service running the gateway with the Docker driver.
+It also defines a system service with packaged Docker driver settings.
 
 - `openshell.gateway`
 
@@ -98,9 +98,10 @@ to move the gateway to the refreshed snap revision.
 
 `openshell-sandbox` is staged next to `openshell-gateway` as the Docker
 supervisor binary. The gateway app starts through a small wrapper that writes
-`$SNAP_COMMON/gateway.toml` on first start and points the in-process Docker
-driver at `$SNAP/bin/openshell-sandbox`. The service stores its gateway
-database under `$SNAP_COMMON`.
+`$SNAP_COMMON/gateway.toml` on first start. The generated TOML leaves
+`compute_drivers` unset for auto-detection and includes Docker driver settings,
+including `$SNAP/bin/openshell-sandbox` as the supervisor binary. The service
+stores its gateway database under `$SNAP_COMMON`.
 
 ## Interfaces
 
@@ -140,21 +141,19 @@ override is required. The OpenShell snap still requires the Docker snap because
 it relies on the `docker:docker-daemon` slot; it does not work with Docker
 installed from a Debian package or Docker's upstream packages.
 
-The service runs the gateway with the Docker driver enabled:
+The service runs the gateway with an explicit config file and database URL:
 
 ```shell
 openshell.gateway \
-  --drivers docker \
-  --disable-tls \
-  --port 17670 \
-  --db-url "sqlite:$SNAP_COMMON/gateway.db?mode=rwc" \
-  --config "$SNAP_COMMON/gateway.toml"
+  --config "$SNAP_COMMON/gateway.toml" \
+  --db-url "sqlite:$SNAP_COMMON/gateway.db?mode=rwc"
 ```
 
 This stores the gateway SQLite database at
-`/var/snap/openshell/common/gateway.db`. The generated TOML stores Docker
-driver settings such as the supervisor binary path, network name, sandbox
-namespace, sandbox image, pull policy, and callback endpoint.
+`/var/snap/openshell/common/gateway.db`. The generated TOML stores gateway
+settings such as the bind address and plaintext TLS mode, plus Docker driver
+settings such as the supervisor binary path, network name, sandbox namespace,
+sandbox image, pull policy, and callback endpoint.
 
 ## Connect with the OpenShell CLI
 

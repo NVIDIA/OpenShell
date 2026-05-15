@@ -41,12 +41,6 @@ apps:
     daemon: simple
     refresh-mode: endure
     environment:
-      OPENSHELL_BIND_ADDRESS: 127.0.0.1
-      OPENSHELL_SERVER_PORT: 17670
-      OPENSHELL_DB_URL: "sqlite:$SNAP_COMMON/gateway.db?mode=rwc"
-      OPENSHELL_DISABLE_TLS: "true"
-      OPENSHELL_DRIVERS: docker
-      OPENSHELL_GATEWAY_CONFIG: "$SNAP_COMMON/gateway.toml"
       XDG_DATA_HOME: "$SNAP_COMMON"
       XDG_RUNTIME_DIR: "$SNAP_COMMON"
     plugs:
@@ -91,6 +85,8 @@ parts:
         "$CRAFT_PART_INSTALL/bin/openshell-sandbox"
       install -D -m 0755 "$CRAFT_PROJECT_DIR/deploy/snap/bin/openshell-gateway-wrapper" \
         "$CRAFT_PART_INSTALL/bin/openshell-gateway-wrapper"
+      install -D -m 0755 "$CRAFT_PROJECT_DIR/deploy/common/init-gateway-config.sh" \
+        "$CRAFT_PART_INSTALL/bin/init-gateway-config.sh"
       install -D -m 0644 "$CRAFT_PROJECT_DIR/LICENSE" \
         "$CRAFT_PART_INSTALL/usr/share/doc/openshell/LICENSE"
       install -D -m 0644 "$CRAFT_PROJECT_DIR/README.md" \

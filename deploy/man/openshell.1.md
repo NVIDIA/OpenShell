@@ -208,7 +208,7 @@ Check gateway health:
 
 # SEE ALSO
 
-**openshell-gateway**(8), **openshell-gateway.env**(5)
+**openshell-gateway**(8)
 
 Full documentation: *https://docs.nvidia.com/openshell/*
 

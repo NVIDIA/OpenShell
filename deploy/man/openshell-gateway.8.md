@@ -22,12 +22,13 @@ network and filesystem policies to sandboxes, routes inference
 requests, and provides the SSH tunnel endpoint for CLI-to-sandbox
 connections.
 
-When installed via RPM, the gateway runs as a systemd user service
-with the Podman compute driver. Sandboxes are rootless Podman
-containers on the host.
+When installed via a Linux package, the gateway runs as a systemd user
+service. The packaged service creates a gateway TOML file on first
+start and launches the gateway with **--config**.
 
-The gateway exposes a single port (default 8080) with multiplexed
-gRPC and HTTP, secured by mutual TLS (mTLS) by default.
+The gateway exposes a single port with multiplexed gRPC and HTTP,
+secured by mutual TLS (mTLS) by default unless the TOML config disables
+TLS.
 
 # OPTIONS
 
@@ -100,7 +101,7 @@ configured in the TOML file passed with **--config**.
 
 # SYSTEMD INTEGRATION
 
-The RPM installs a systemd user unit at
+The package installs a systemd user unit at
 */usr/lib/systemd/user/openshell-gateway.service*. Manage the gateway
 with standard systemd commands:
 
@@ -118,8 +119,7 @@ The unit runs two **ExecStartPre** steps on first start:
 
 1. **openshell-gateway generate-certs --output-dir** generates a
    self-signed PKI bundle for mTLS.
-2. **init-gateway-env.sh** generates the environment configuration
-   file.
+2. **init-gateway-config.sh** generates the gateway TOML file.
 
 Both steps are idempotent and skip generation if their output files
 already exist.
@@ -130,11 +130,16 @@ To persist the service across logouts:
 
 # CONFIGURATION
 
-The systemd user unit reads configuration from
-*~/.config/openshell/gateway.env*. See **openshell-gateway.env**(5)
-for the full variable reference.
+The systemd user unit launches the gateway with:
 
-To override individual settings without modifying gateway.env:
+    openshell-gateway --config ~/.config/openshell/gateway.toml \
+      --db-url sqlite:~/.local/state/openshell/gateway/openshell.db
+
+Gateway listener, TLS, and compute driver settings live in
+*~/.config/openshell/gateway.toml*. The database URL stays
+on **--db-url** because the gateway rejects `database_url` in TOML.
+
+To override individual settings without modifying the generated TOML:
 
     systemctl --user edit openshell-gateway
 
@@ -148,16 +153,16 @@ This creates a drop-in override that persists across package upgrades.
 */usr/lib/systemd/user/openshell-gateway.service*
 :   Systemd user unit file.
 
-*/usr/libexec/openshell/init-gateway-env.sh*
-:   Gateway environment file generator.
+*/usr/libexec/openshell/init-gateway-config.sh*
+:   Gateway TOML file generator.
 
-*~/.config/openshell/gateway.env*
-:   Gateway environment configuration (generated on first start).
+*~/.config/openshell/gateway.toml*
+:   Gateway TOML configuration (generated on first start).
 
 *~/.local/state/openshell/tls/*
 :   Auto-generated TLS certificates.
 
-*~/.local/state/openshell/gateway.db*
+*~/.local/state/openshell/gateway/openshell.db*
 :   SQLite database for gateway state.
 
 *~/.config/openshell/gateways/openshell/mtls/*
@@ -171,18 +176,17 @@ Start the gateway as a systemd user service:
 
 Check gateway health from the CLI:
 
-    openshell gateway add --local https://127.0.0.1:8080
+    openshell gateway add --local https://127.0.0.1:17670
     openshell status
 
-Override the API port via a systemd drop-in:
+Override the API port in the generated TOML:
 
-    systemctl --user edit openshell-gateway
-    # Add: [Service]
-    # Add: Environment=OPENSHELL_SERVER_PORT=9090
+    $EDITOR ~/.config/openshell/gateway.toml
+    systemctl --user restart openshell-gateway
 
 # SEE ALSO
 
-**openshell**(1), **openshell-gateway.env**(5), **systemctl**(1),
-**journalctl**(1), **loginctl**(1), **podman**(1)
+**openshell**(1), **systemctl**(1), **journalctl**(1), **loginctl**(1),
+**podman**(1)
 
 Full documentation: *https://docs.nvidia.com/openshell/*
