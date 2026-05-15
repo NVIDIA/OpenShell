@@ -351,14 +351,19 @@ ensure_host_gateway_aliases() {
     # gateway IP only listens on gvproxy's own service ports (DNS:53, DHCP,
     # HTTP API:80). Pinning host.containers.internal to the gateway IP
     # silently breaks guest→host port reachability for arbitrary ports.
-    local hosts_tmp
-    local hosts_path
     local host_aliases="host.openshell.internal host.containers.internal host.docker.internal"
     local gateway_aliases="gateway.containers.internal"
     local filter='(^|[[:space:]])(host\.openshell\.internal|host\.containers\.internal|host\.docker\.internal|gateway\.containers\.internal)([[:space:]]|$)'
-    hosts_path="$(root_path /etc/hosts)"
-    hosts_tmp="$(root_path "/tmp/openshell-hosts.$$.tmp")"
 
+    write_host_gateway_aliases "$(root_path /etc/hosts)" "$(root_path "/tmp/openshell-hosts.$$.tmp")" || true
+    if [ -n "${ROOT_PREFIX:-}" ]; then
+        write_host_gateway_aliases "/etc/hosts" "/tmp/openshell-hosts.$$.tmp" || true
+    fi
+}
+
+write_host_gateway_aliases() {
+    local hosts_path="$1"
+    local hosts_tmp="$2"
     mkdir -p "$(dirname "$hosts_path")" 2>/dev/null || true
     mkdir -p "$(dirname "$hosts_tmp")" 2>/dev/null || true
     if [ -f "$hosts_path" ]; then
@@ -379,7 +384,11 @@ ensure_host_gateway_aliases() {
         # TAP networking: gateway and host are both reachable at GATEWAY_IP.
         printf '%s %s %s\n' "$GATEWAY_IP" "$host_aliases" "$gateway_aliases" >> "$hosts_tmp"
     fi
-    cat "$hosts_tmp" > "$hosts_path"
+    if ! cat "$hosts_tmp" > "$hosts_path" 2>/dev/null; then
+        rm -f "$hosts_tmp"
+        ts "WARNING: could not update ${hosts_path}"
+        return 1
+    fi
     rm -f "$hosts_tmp"
 }
 

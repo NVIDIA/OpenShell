@@ -413,20 +413,10 @@ impl VmDriver {
             "vm driver: resolved image ref, preparing disks"
         );
 
-        tokio::fs::create_dir_all(&state_dir)
-            .await
-            .map_err(|err| Status::internal(format!("create state dir failed: {err}")))?;
-
-        let tls_paths = self
-            .config
-            .tls_paths()
-            .map_err(Status::failed_precondition)?;
-
         let snapshot = sandbox_snapshot(sandbox, provisioning_condition(), false);
         {
             let mut registry = self.registry.lock().await;
             if registry.contains_key(&sandbox.id) {
-                let _ = tokio::fs::remove_dir_all(&state_dir).await;
                 return Err(Status::already_exists("sandbox already exists"));
             }
             registry.insert(
@@ -440,6 +430,21 @@ impl VmDriver {
                     deleting: false,
                 },
             );
+        }
+
+        let tls_paths = match self.config.tls_paths() {
+            Ok(paths) => paths,
+            Err(err) => {
+                let mut registry = self.registry.lock().await;
+                registry.remove(&sandbox.id);
+                return Err(Status::failed_precondition(err));
+            }
+        };
+
+        if let Err(err) = tokio::fs::create_dir_all(&state_dir).await {
+            let mut registry = self.registry.lock().await;
+            registry.remove(&sandbox.id);
+            return Err(Status::internal(format!("create state dir failed: {err}")));
         }
 
         self.publish_platform_event(
@@ -612,6 +617,7 @@ impl VmDriver {
 
         let console_output = state_dir.join("rootfs-console.log");
         let mut command = Command::new(&self.launcher_bin);
+        command.kill_on_drop(true);
         command.stdin(Stdio::null());
         command.stdout(Stdio::inherit());
         command.stderr(Stdio::inherit());
@@ -1717,6 +1723,7 @@ impl VmDriver {
     ) -> Result<(), Status> {
         let console_output = run_dir.join("image-prep-console.log");
         let mut command = Command::new(&self.launcher_bin);
+        command.kill_on_drop(true);
         command.stdin(Stdio::null());
         command.stdout(Stdio::inherit());
         command.stderr(Stdio::inherit());
@@ -1737,10 +1744,13 @@ impl VmDriver {
             .arg("--vm-env")
             .arg(format!("OPENSHELL_VM_INIT_MODE={IMAGE_PREP_INIT_MODE}"));
 
-        let status = command
-            .status()
-            .await
+        let mut child = command
+            .spawn()
             .map_err(|err| Status::internal(format!("failed to run image-prep vm: {err}")))?;
+        let status = child
+            .wait()
+            .await
+            .map_err(|err| Status::internal(format!("failed to wait for image-prep vm: {err}")))?;
         if status.success() {
             return Ok(());
         }
@@ -4907,6 +4917,67 @@ mod tests {
         assert!(response.deleted);
         assert!(!driver.registry.lock().await.contains_key("sandbox-123"));
         assert!(!state_dir.exists());
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn duplicate_create_keeps_existing_state_dir() {
+        let base = unique_temp_dir();
+        let driver_state = base.join("driver-state");
+        let (events, _) = broadcast::channel(WATCH_BUFFER);
+        let driver = VmDriver {
+            config: VmDriverConfig {
+                state_dir: driver_state.clone(),
+                default_image: "ghcr.io/example/sandbox:latest".to_string(),
+                ..Default::default()
+            },
+            launcher_bin: PathBuf::from("openshell-driver-vm"),
+            registry: Arc::new(Mutex::new(HashMap::new())),
+            image_cache_lock: Arc::new(Mutex::new(())),
+            events,
+            gpu_inventory: None,
+            subnet_allocator: Arc::new(std::sync::Mutex::new(SubnetAllocator::new(
+                Ipv4Addr::new(10, 0, 128, 0),
+                17,
+            ))),
+        };
+
+        let state_dir = sandbox_state_dir(&driver_state, "sandbox-123").unwrap();
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(state_dir.join("overlay.ext4"), b"live overlay").unwrap();
+        {
+            let mut registry = driver.registry.lock().await;
+            registry.insert(
+                "sandbox-123".to_string(),
+                SandboxRecord {
+                    snapshot: Sandbox {
+                        id: "sandbox-123".to_string(),
+                        name: "sandbox-123".to_string(),
+                        ..Default::default()
+                    },
+                    state_dir: state_dir.clone(),
+                    process: None,
+                    provisioning_task: None,
+                    gpu_bdf: None,
+                    deleting: false,
+                },
+            );
+        }
+
+        let err = driver
+            .create_sandbox(&Sandbox {
+                id: "sandbox-123".to_string(),
+                name: "sandbox-123".to_string(),
+                spec: Some(SandboxSpec::default()),
+                ..Default::default()
+            })
+            .await
+            .expect_err("duplicate create should fail");
+
+        assert_eq!(err.code(), Code::AlreadyExists);
+        assert!(state_dir.join("overlay.ext4").exists());
+        assert!(driver.registry.lock().await.contains_key("sandbox-123"));
 
         let _ = std::fs::remove_dir_all(base);
     }

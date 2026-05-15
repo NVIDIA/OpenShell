@@ -21,8 +21,8 @@ use openshell_core::proto::{
     GetSandboxProviderEnvironmentResponse, GetSandboxRequest, HealthRequest, HealthResponse,
     ListProvidersRequest, ListProvidersResponse, ListSandboxProvidersRequest,
     ListSandboxProvidersResponse, ListSandboxesRequest, ListSandboxesResponse, PlatformEvent,
-    ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, Sandbox,
-    SandboxCondition, SandboxPhase, SandboxResponse, SandboxStatus, SandboxStreamEvent,
+    ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, Sandbox, SandboxCondition,
+    SandboxLogLine, SandboxPhase, SandboxResponse, SandboxStatus, SandboxStreamEvent,
     ServiceStatus, SupervisorMessage, UpdateProviderRequest, WatchSandboxRequest,
     sandbox_stream_event,
 };
@@ -45,6 +45,7 @@ struct SandboxState {
     create_requests: Arc<Mutex<Vec<CreateSandboxRequest>>>,
     vm_error_after_started: Arc<AtomicBool>,
     vm_slow_progress_before_ready: Arc<AtomicBool>,
+    vm_log_churn_before_ready: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Default)]
@@ -314,6 +315,7 @@ impl OpenShell for TestOpenShell {
             .state
             .vm_slow_progress_before_ready
             .load(Ordering::SeqCst);
+        let vm_log_churn_before_ready = self.state.vm_log_churn_before_ready.load(Ordering::SeqCst);
 
         tokio::spawn(async move {
             let provisioning = Sandbox {
@@ -370,6 +372,30 @@ impl OpenShell for TestOpenShell {
                     }))
                     .await;
                 tokio::time::sleep(Duration::from_secs(5)).await;
+                return;
+            }
+            if vm_log_churn_before_ready {
+                for message in ["still booting", "still booting again"] {
+                    tokio::time::sleep(Duration::from_millis(600)).await;
+                    let _ = tx
+                        .send(Ok(SandboxStreamEvent {
+                            payload: Some(sandbox_stream_event::Payload::Log(SandboxLogLine {
+                                sandbox_id: sandbox_id.clone(),
+                                timestamp_ms: 0,
+                                level: "INFO".to_string(),
+                                target: "test".to_string(),
+                                message: message.to_string(),
+                                source: "gateway".to_string(),
+                                fields: HashMap::new(),
+                            })),
+                        }))
+                        .await;
+                }
+                let _ = tx
+                    .send(Ok(SandboxStreamEvent {
+                        payload: Some(sandbox_stream_event::Payload::Sandbox(ready)),
+                    }))
+                    .await;
                 return;
             }
             if vm_slow_progress_before_ready {
@@ -895,6 +921,56 @@ async fn sandbox_create_keeps_waiting_while_vm_progress_arrives() {
     )
     .await
     .expect("sandbox create should not time out while VM progress is active");
+}
+
+#[tokio::test]
+async fn sandbox_create_times_out_when_only_logs_arrive() {
+    let server = run_server().await;
+    server
+        .openshell
+        .state
+        .vm_log_churn_before_ready
+        .store(true, Ordering::SeqCst);
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env_with(
+        &fake_ssh_dir,
+        &xdg_dir,
+        &[("OPENSHELL_PROVISION_TIMEOUT", "1".to_string())],
+    );
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+
+    let started_at = Instant::now();
+    let err = run::sandbox_create(
+        &server.endpoint,
+        Some("vm-log-churn"),
+        None,
+        "openshell",
+        None,
+        true,
+        false,
+        None,
+        None,
+        None,
+        None,
+        &[],
+        None,
+        None,
+        &["echo".to_string(), "OK".to_string()],
+        Some(false),
+        Some(false),
+        &HashMap::new(),
+        &tls,
+    )
+    .await
+    .expect_err("sandbox create should time out when only logs arrive");
+
+    assert!(
+        started_at.elapsed() < Duration::from_secs(2),
+        "logs should not extend the provisioning timeout"
+    );
+    assert!(err.to_string().contains("sandbox provisioning timed out"));
 }
 
 #[tokio::test]

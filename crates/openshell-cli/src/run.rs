@@ -435,6 +435,32 @@ fn handle_platform_progress_event(
     true
 }
 
+fn is_provisioning_progress_event(event: &PlatformEvent) -> bool {
+    if event.metadata.contains_key(PROGRESS_COMPLETE_STEP_KEY)
+        || event.metadata.contains_key(PROGRESS_ACTIVE_STEP_KEY)
+        || event.metadata.contains_key(PROGRESS_ACTIVE_DETAIL_KEY)
+    {
+        return true;
+    }
+
+    event.source == "vm"
+        && matches!(
+            event.reason.as_str(),
+            "PullingLayer"
+                | "ResolvingImage"
+                | "AuthenticatingRegistry"
+                | "FetchingManifest"
+                | "CacheHit"
+                | "CacheMiss"
+                | "WaitingForImageCacheLock"
+                | "ExportingRootfs"
+                | "PreparingRootfs"
+                | "CreatingRootDisk"
+                | "PreparingOverlay"
+                | "Started"
+        )
+}
+
 fn print_sandbox_header(sandbox: &Sandbox, display: Option<&ProvisioningDisplay>) {
     let lines = [
         String::new(),
@@ -1764,14 +1790,30 @@ pub async fn sandbox_create(
             .and_then(|v| v.parse().ok())
             .unwrap_or(300),
     );
+    let mut provisioning_idle_deadline = Instant::now() + provision_timeout;
     // Track whether we saw the gateway become ready (from log messages).
     let mut saw_gateway_ready = false;
 
     loop {
         // Timeout only when provisioning goes idle. VM first-create can spend
         // longer than the default timeout pulling and preparing large images,
-        // but progress events should keep the CLI alive.
-        let maybe_item = tokio::time::timeout(provision_timeout, stream.next()).await;
+        // but only recognized progress events extend the idle deadline. Logs
+        // and generic status churn must not keep a stuck sandbox alive forever.
+        let remaining = provisioning_idle_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            let timeout_message = provisioning_timeout_message(
+                provision_timeout.as_secs(),
+                requested_gpu,
+                last_condition_message.as_deref(),
+            );
+            if let Some(d) = display.as_mut() {
+                d.finish_error(&timeout_message);
+            }
+            println!();
+            return Err(miette::miette!(timeout_message));
+        }
+
+        let maybe_item = tokio::time::timeout(remaining, stream.next()).await;
 
         let item = match maybe_item {
             Ok(Some(item)) => item,
@@ -1836,8 +1878,15 @@ pub async fn sandbox_create(
                 }
             }
             Some(openshell_core::proto::sandbox_stream_event::Payload::Event(ev)) => {
+                let extends_timeout = is_provisioning_progress_event(&ev);
                 if handle_platform_progress_event(&ev, &mut display, provision_start) {
+                    if extends_timeout {
+                        provisioning_idle_deadline = Instant::now() + provision_timeout;
+                    }
                     continue;
+                }
+                if extends_timeout {
+                    provisioning_idle_deadline = Instant::now() + provision_timeout;
                 }
 
                 if let Some(d) = display.as_mut() {
