@@ -32,7 +32,7 @@ use tracing::Span;
 
 use crate::{
     OpenShellService, ServerState,
-    auth::authenticator::AuthenticatorChain,
+    auth::authenticator::{AuthenticatorChain, PermissiveUserAuthenticator},
     auth::authz::AuthzPolicy,
     auth::identity::Identity,
     auth::oidc::{self, OidcAuthenticator},
@@ -267,7 +267,12 @@ where
 /// 2. `SandboxJwtAuthenticator` — validates gateway-minted JWTs. Recognized
 ///    via a distinctive `kid` so non-matching Bearer tokens fall through.
 /// 3. `OidcAuthenticator` — validates user Bearer tokens against the
-///    configured OIDC issuer.
+///    configured OIDC issuer. Returns `Unauthenticated` for missing
+///    Bearer headers so non-OIDC clients can't sneak through.
+/// 4. `PermissiveUserAuthenticator` — installed only when no OIDC is
+///    configured (singleplayer / helm-dev). Catches anything the
+///    sandbox authenticators didn't claim and produces a synthetic
+///    user principal, preserving the pre-PR-1 "no OIDC = open" posture.
 ///
 /// When neither OIDC nor gateway-minted JWTs are configured (a barebones
 /// dev gateway), the chain is left as `None` so the router short-circuits
@@ -282,6 +287,12 @@ fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> 
     }
     if let Some(cache) = state.oidc_cache.clone() {
         authenticators.push(Arc::new(OidcAuthenticator::new(cache)));
+    } else if !authenticators.is_empty() {
+        // No OIDC, but sandbox-side authentication IS configured —
+        // user CLI calls must still pass through, so install a
+        // permissive final fallback. Production deployments configure
+        // OIDC and this branch is unused.
+        authenticators.push(Arc::new(PermissiveUserAuthenticator::new("dev-anonymous")));
     }
     if authenticators.is_empty() {
         return None;

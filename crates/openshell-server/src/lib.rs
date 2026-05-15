@@ -305,21 +305,24 @@ pub async fn run_server(
     // and without the issuer there's nothing to exchange the SA token
     // for.
     if state.sandbox_jwt_issuer.is_some() && std::env::var_os("KUBERNETES_SERVICE_HOST").is_some() {
+        // Pod lookups must target the sandbox namespace (where the K8s
+        // driver places sandbox pods), not the gateway's own pod
+        // namespace. Sourced from the merged
+        // `[openshell.drivers.kubernetes].namespace` config, falling
+        // back to "default" only if the driver config can't be parsed.
+        let sandbox_namespace = kubernetes_config_from_file(config_file.as_ref())
+            .map_or_else(|_| "default".to_string(), |cfg| cfg.namespace);
         match kube::Client::try_default().await {
             Ok(client) => {
-                let namespace = std::env::var("POD_NAMESPACE")
-                    .ok()
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| "default".to_string());
                 let resolver = Arc::new(auth::k8s_sa::LiveK8sResolver::new(
                     client,
-                    &namespace,
+                    &sandbox_namespace,
                     "openshell-gateway".to_string(),
                 ));
                 let authenticator = auth::k8s_sa::K8sServiceAccountAuthenticator::new(resolver);
                 state.k8s_sa_authenticator = Some(Arc::new(authenticator));
                 info!(
-                    namespace = %namespace,
+                    namespace = %sandbox_namespace,
                     "K8s ServiceAccount bootstrap authenticator enabled"
                 );
             }

@@ -159,23 +159,26 @@ async fn build_plain_channel(endpoint: &str) -> Result<Channel> {
 
 /// Build a Bearer-authenticated channel to the gateway.
 ///
-/// Resolves the sandbox JWT via the three-step lookup described at the
-/// module level (env → file → K8s SA bootstrap exchange), installs the
-/// token into the process-wide [`TOKEN_SLOT`], wraps the channel in an
-/// [`AuthInterceptor`] that reads from that slot, and spawns the refresh
-/// loop the first time the channel is built.
+/// First call per process resolves the sandbox JWT via the three-step
+/// lookup (env → file → K8s SA bootstrap exchange) and installs it into
+/// the process-wide [`TOKEN_SLOT`]. Subsequent calls reuse the cached
+/// slot — the refresh loop keeps the value fresh, so re-running the
+/// bootstrap is both unnecessary and (on the K8s SA path) expensive
+/// (one apiserver round-trip per call). The refresh loop itself is
+/// spawned once per process via [`REFRESH_SPAWNED`].
 async fn connect_channel(endpoint: &str) -> Result<AuthedChannel> {
     let channel = build_plain_channel(endpoint).await?;
-    let token = acquire_sandbox_token(endpoint, &channel).await?;
-    let slot = install_token_slot(&token)?;
+    let slot = if let Some(existing) = TOKEN_SLOT.get() {
+        existing.clone()
+    } else {
+        let token = acquire_sandbox_token(endpoint, &channel).await?;
+        install_token_slot(&token)?
+    };
     let intercepted = InterceptedService::new(channel, AuthInterceptor::new(slot.clone()));
-    // Spawn the refresh loop once per process. It uses the same authed
-    // channel, so its outbound calls always carry the current token.
     if REFRESH_SPAWNED.set(()).is_ok() {
         let refresh_channel = intercepted.clone();
-        let refresh_slot = slot;
         tokio::spawn(async move {
-            refresh_token_loop(refresh_channel, refresh_slot).await;
+            refresh_token_loop(refresh_channel, slot).await;
         });
     }
     Ok(intercepted)
