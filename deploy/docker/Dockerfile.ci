@@ -84,7 +84,7 @@ RUN --mount=type=secret,id=MISE_GITHUB_TOKEN \
     mise reshim && \
     (/root/.cargo/bin/rustup component remove rust-docs || true) && \
     rm -rf /root/.rustup/toolchains/*/share/doc /root/.rustup/toolchains/*/share/man && \
-    helm plugin install https://github.com/helm-unittest/helm-unittest
+    helm plugin install https://github.com/helm-unittest/helm-unittest --verify=false
 
 # Set working directory for CI jobs
 WORKDIR /builds
