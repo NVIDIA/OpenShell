@@ -314,6 +314,7 @@ fn truncate_for_log(input: &str, max_chars: usize) -> String {
     }
 }
 
+#[cfg(test)]
 fn is_sandbox_caller<T>(request: &Request<T>) -> bool {
     matches!(
         request
@@ -357,7 +358,9 @@ pub(super) async fn handle_get_sandbox_config(
     state: &Arc<ServerState>,
     request: Request<GetSandboxConfigRequest>,
 ) -> Result<Response<GetSandboxConfigResponse>, Status> {
-    let sandbox_id = request.into_inner().sandbox_id;
+    let sandbox_id = request.get_ref().sandbox_id.clone();
+    crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id)?;
+    drop(request);
 
     let sandbox = state
         .store
@@ -620,7 +623,9 @@ pub(super) async fn handle_get_sandbox_provider_environment(
     state: &Arc<ServerState>,
     request: Request<GetSandboxProviderEnvironmentRequest>,
 ) -> Result<Response<GetSandboxProviderEnvironmentResponse>, Status> {
-    let sandbox_id = request.into_inner().sandbox_id;
+    let sandbox_id = request.get_ref().sandbox_id.clone();
+    crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id)?;
+    drop(request);
 
     let sandbox = state
         .store
@@ -663,10 +668,32 @@ pub(super) async fn handle_update_config(
     state: &Arc<ServerState>,
     request: Request<UpdateConfigRequest>,
 ) -> Result<Response<UpdateConfigResponse>, Status> {
-    let sandbox_caller = is_sandbox_caller(&request);
+    let principal = request
+        .extensions()
+        .get::<crate::auth::principal::Principal>()
+        .cloned();
+    let sandbox_caller = matches!(
+        principal,
+        Some(crate::auth::principal::Principal::Sandbox(_))
+    );
     let req = request.into_inner();
     if sandbox_caller {
         validate_sandbox_caller_update(&req)?;
+        // Resolve req.name to a sandbox UUID and verify the calling
+        // sandbox principal owns it. User callers (CLI / TUI) bypass
+        // this check because RBAC was their gate.
+        let sandbox = state
+            .store
+            .get_message_by_name::<Sandbox>(&req.name)
+            .await
+            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        crate::auth::guard::ensure_sandbox_scope(
+            principal
+                .as_ref()
+                .expect("sandbox_caller implies principal"),
+            sandbox.object_id(),
+        )?;
     }
     let key = req.setting_key.trim();
     let has_policy = req.policy.is_some();
@@ -1189,6 +1216,8 @@ pub(super) async fn handle_report_policy_status(
     state: &Arc<ServerState>,
     request: Request<ReportPolicyStatusRequest>,
 ) -> Result<Response<ReportPolicyStatusResponse>, Status> {
+    let sandbox_id = request.get_ref().sandbox_id.clone();
+    crate::auth::guard::enforce_sandbox_scope(&request, &sandbox_id)?;
     let req = request.into_inner();
     if req.sandbox_id.is_empty() {
         return Err(Status::invalid_argument("sandbox_id is required"));
@@ -1311,6 +1340,11 @@ pub(super) async fn handle_push_sandbox_logs(
     state: &Arc<ServerState>,
     request: Request<tonic::Streaming<PushSandboxLogsRequest>>,
 ) -> Result<Response<PushSandboxLogsResponse>, Status> {
+    let principal = request
+        .extensions()
+        .get::<crate::auth::principal::Principal>()
+        .cloned()
+        .ok_or_else(|| Status::unauthenticated("missing principal"))?;
     let mut stream = request.into_inner();
     let mut validated = false;
 
@@ -1324,6 +1358,10 @@ pub(super) async fn handle_push_sandbox_logs(
         }
 
         if !validated {
+            // The streaming RPC carries the sandbox_id in every frame, but
+            // the equality check only needs to run once on the first frame
+            // — the principal is stable across the stream.
+            crate::auth::guard::ensure_sandbox_scope(&principal, &batch.sandbox_id)?;
             state
                 .store
                 .get_message::<Sandbox>(&batch.sandbox_id)
@@ -1352,6 +1390,11 @@ pub(super) async fn handle_submit_policy_analysis(
     state: &Arc<ServerState>,
     request: Request<SubmitPolicyAnalysisRequest>,
 ) -> Result<Response<SubmitPolicyAnalysisResponse>, Status> {
+    let principal = request
+        .extensions()
+        .get::<crate::auth::principal::Principal>()
+        .cloned()
+        .ok_or_else(|| Status::unauthenticated("missing principal"))?;
     let req = request.into_inner();
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
@@ -1364,6 +1407,9 @@ pub(super) async fn handle_submit_policy_analysis(
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
     let sandbox_id = sandbox.object_id().to_string();
+    // Name → id resolved; now enforce that a sandbox principal only acts
+    // on its own sandbox. User principals are unaffected.
+    crate::auth::guard::ensure_sandbox_scope(&principal, &sandbox_id)?;
 
     let current_version = state
         .store
@@ -1480,6 +1526,11 @@ pub(super) async fn handle_get_draft_policy(
     state: &Arc<ServerState>,
     request: Request<GetDraftPolicyRequest>,
 ) -> Result<Response<GetDraftPolicyResponse>, Status> {
+    let principal = request
+        .extensions()
+        .get::<crate::auth::principal::Principal>()
+        .cloned()
+        .ok_or_else(|| Status::unauthenticated("missing principal"))?;
     let req = request.into_inner();
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
@@ -1492,6 +1543,7 @@ pub(super) async fn handle_get_draft_policy(
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
     let sandbox_id = sandbox.object_id().to_string();
+    crate::auth::guard::ensure_sandbox_scope(&principal, &sandbox_id)?;
 
     let status_filter = if req.status_filter.is_empty() {
         None
@@ -2833,6 +2885,10 @@ fn materialize_global_settings(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::identity::{Identity, IdentityProvider};
+    use crate::auth::principal::{
+        Principal, SandboxIdentitySource, SandboxPrincipal, UserPrincipal,
+    };
     use crate::grpc::test_support::test_server_state;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -2842,6 +2898,41 @@ mod tests {
         Store::connect("sqlite::memory:?cache=shared")
             .await
             .expect("in-memory SQLite store should connect")
+    }
+
+    /// Wrap a request with a user `Principal` so handlers' scope guards
+    /// treat the test caller as a CLI user, equivalent to the earlier test
+    /// behavior where requests were not scoped to sandbox callers.
+    fn with_user<T>(mut request: Request<T>) -> Request<T> {
+        request
+            .extensions_mut()
+            .insert(Principal::User(UserPrincipal {
+                identity: Identity {
+                    subject: "test-user".to_string(),
+                    display_name: None,
+                    roles: vec![],
+                    scopes: vec![],
+                    provider: IdentityProvider::Oidc,
+                },
+            }));
+        request
+    }
+
+    /// Wrap a request with a sandbox `Principal` bound to `sandbox_id`.
+    /// Use for tests that exercise sandbox-caller code paths.
+    #[allow(dead_code)]
+    fn with_sandbox<T>(mut request: Request<T>, sandbox_id: &str) -> Request<T> {
+        request
+            .extensions_mut()
+            .insert(Principal::Sandbox(SandboxPrincipal {
+                sandbox_id: sandbox_id.to_string(),
+                source: SandboxIdentitySource::BootstrapJwt {
+                    issuer: "openshell-gateway:test".to_string(),
+                    jti: "j-test".to_string(),
+                },
+                trust_domain: Some("openshell".to_string()),
+            }));
+        request
     }
 
     #[test]
@@ -2908,6 +2999,169 @@ mod tests {
             },
         }));
         assert!(!is_sandbox_caller(&req));
+    }
+
+    // ---- PR-4 IDOR guard (issue #1354) ----
+
+    #[tokio::test]
+    async fn cross_sandbox_get_sandbox_config_denied() {
+        use openshell_core::proto::{SandboxPhase, SandboxSpec};
+        let state = test_server_state().await;
+        // Two sandboxes; the caller is principal of A, the request body
+        // references B.
+        for (id, name) in [("sb-a", "sandbox-a"), ("sb-b", "sandbox-b")] {
+            let sandbox = Sandbox {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    created_at_ms: 1_000_000,
+                    labels: HashMap::new(),
+                }),
+                spec: Some(SandboxSpec {
+                    policy: None,
+                    ..Default::default()
+                }),
+                phase: SandboxPhase::Provisioning as i32,
+                ..Default::default()
+            };
+            state.store.put_message(&sandbox).await.unwrap();
+        }
+        let req = with_sandbox(
+            Request::new(GetSandboxConfigRequest {
+                sandbox_id: "sb-b".to_string(),
+            }),
+            "sb-a",
+        );
+        let err = handle_get_sandbox_config(&state, req)
+            .await
+            .expect_err("cross-sandbox call must be denied");
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn same_sandbox_get_sandbox_config_allowed() {
+        use openshell_core::proto::{SandboxPhase, SandboxSpec};
+        let state = test_server_state().await;
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-self".to_string(),
+                name: "self".to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+            }),
+            spec: Some(SandboxSpec {
+                policy: None,
+                ..Default::default()
+            }),
+            phase: SandboxPhase::Provisioning as i32,
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+        let req = with_sandbox(
+            Request::new(GetSandboxConfigRequest {
+                sandbox_id: "sb-self".to_string(),
+            }),
+            "sb-self",
+        );
+        handle_get_sandbox_config(&state, req)
+            .await
+            .expect("matching principal must be allowed");
+    }
+
+    #[tokio::test]
+    async fn cross_sandbox_submit_policy_analysis_denied() {
+        use openshell_core::proto::{SandboxPhase, SandboxSpec};
+        let state = test_server_state().await;
+        for (id, name) in [("sb-a", "sandbox-a"), ("sb-b", "sandbox-b")] {
+            let sandbox = Sandbox {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    created_at_ms: 1_000_000,
+                    labels: HashMap::new(),
+                }),
+                spec: Some(SandboxSpec {
+                    policy: None,
+                    ..Default::default()
+                }),
+                phase: SandboxPhase::Provisioning as i32,
+                ..Default::default()
+            };
+            state.store.put_message(&sandbox).await.unwrap();
+        }
+        let req = with_sandbox(
+            Request::new(SubmitPolicyAnalysisRequest {
+                name: "sandbox-b".to_string(),
+                ..Default::default()
+            }),
+            "sb-a",
+        );
+        let err = handle_submit_policy_analysis(&state, req)
+            .await
+            .expect_err("cross-sandbox submit must be denied");
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn cross_sandbox_get_draft_policy_denied() {
+        use openshell_core::proto::{SandboxPhase, SandboxSpec};
+        let state = test_server_state().await;
+        for (id, name) in [("sb-a", "sandbox-a"), ("sb-b", "sandbox-b")] {
+            let sandbox = Sandbox {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    created_at_ms: 1_000_000,
+                    labels: HashMap::new(),
+                }),
+                spec: Some(SandboxSpec {
+                    policy: None,
+                    ..Default::default()
+                }),
+                phase: SandboxPhase::Provisioning as i32,
+                ..Default::default()
+            };
+            state.store.put_message(&sandbox).await.unwrap();
+        }
+        let req = with_sandbox(
+            Request::new(GetDraftPolicyRequest {
+                name: "sandbox-b".to_string(),
+                status_filter: String::new(),
+            }),
+            "sb-a",
+        );
+        let err = handle_get_draft_policy(&state, req)
+            .await
+            .expect_err("cross-sandbox draft read must be denied");
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn user_principal_can_read_any_sandbox_config() {
+        // RBAC was the user gate; the IDOR guard must NOT trip for users.
+        use openshell_core::proto::{SandboxPhase, SandboxSpec};
+        let state = test_server_state().await;
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-x".to_string(),
+                name: "x".to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+            }),
+            spec: Some(SandboxSpec {
+                policy: None,
+                ..Default::default()
+            }),
+            phase: SandboxPhase::Provisioning as i32,
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+        let req = with_user(Request::new(GetSandboxConfigRequest {
+            sandbox_id: "sb-x".to_string(),
+        }));
+        handle_get_sandbox_config(&state, req)
+            .await
+            .expect("user principal must succeed");
     }
 
     // ---- Sandbox without policy ----
@@ -3023,9 +3277,9 @@ mod tests {
     async fn get_sandbox_policy(state: &Arc<ServerState>, sandbox_id: &str) -> ProtoSandboxPolicy {
         handle_get_sandbox_config(
             state,
-            Request::new(GetSandboxConfigRequest {
+            with_user(Request::new(GetSandboxConfigRequest {
                 sandbox_id: sandbox_id.to_string(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -3466,9 +3720,9 @@ mod tests {
 
         let legacy_env = handle_get_sandbox_provider_environment(
             &state,
-            Request::new(GetSandboxProviderEnvironmentRequest {
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-provider-env".to_string(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -3478,9 +3732,9 @@ mod tests {
         enable_providers_v2(&state).await;
         let v2_env = handle_get_sandbox_provider_environment(
             &state,
-            Request::new(GetSandboxProviderEnvironmentRequest {
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-provider-env".to_string(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -3512,9 +3766,9 @@ mod tests {
 
         let first = handle_get_sandbox_provider_environment(
             &state,
-            Request::new(GetSandboxProviderEnvironmentRequest {
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-provider-revision".to_string(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -3528,9 +3782,9 @@ mod tests {
 
         let second = handle_get_sandbox_provider_environment(
             &state,
-            Request::new(GetSandboxProviderEnvironmentRequest {
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-provider-revision".to_string(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -3582,9 +3836,9 @@ mod tests {
         );
         let baseline_env = handle_get_sandbox_provider_environment(
             &state,
-            Request::new(GetSandboxProviderEnvironmentRequest {
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-attach-lifecycle".to_string(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -3592,11 +3846,11 @@ mod tests {
 
         handle_attach_sandbox_provider(
             &state,
-            Request::new(AttachSandboxProviderRequest {
+            with_user(Request::new(AttachSandboxProviderRequest {
                 sandbox_name: "attach-lifecycle".to_string(),
                 provider_name: "work-github".to_string(),
                 expected_resource_version: 0,
-            }),
+            })),
         )
         .await
         .unwrap();
@@ -3610,9 +3864,9 @@ mod tests {
 
         let attached_env = handle_get_sandbox_provider_environment(
             &state,
-            Request::new(GetSandboxProviderEnvironmentRequest {
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-attach-lifecycle".to_string(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -3646,9 +3900,9 @@ mod tests {
 
         let detached_env = handle_get_sandbox_provider_environment(
             &state,
-            Request::new(GetSandboxProviderEnvironmentRequest {
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-attach-lifecycle".to_string(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -3742,9 +3996,9 @@ mod tests {
         );
         let baseline_env = handle_get_sandbox_provider_environment(
             &state,
-            Request::new(GetSandboxProviderEnvironmentRequest {
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-custom-attach-lifecycle".to_string(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -3752,11 +4006,11 @@ mod tests {
 
         handle_attach_sandbox_provider(
             &state,
-            Request::new(AttachSandboxProviderRequest {
+            with_user(Request::new(AttachSandboxProviderRequest {
                 sandbox_name: "custom-attach-lifecycle".to_string(),
                 provider_name: "work-custom".to_string(),
                 expected_resource_version: 0,
-            }),
+            })),
         )
         .await
         .unwrap();
@@ -3773,9 +4027,9 @@ mod tests {
 
         let attached_env = handle_get_sandbox_provider_environment(
             &state,
-            Request::new(GetSandboxProviderEnvironmentRequest {
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-custom-attach-lifecycle".to_string(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -3808,9 +4062,9 @@ mod tests {
         );
         let detached_env = handle_get_sandbox_provider_environment(
             &state,
-            Request::new(GetSandboxProviderEnvironmentRequest {
+            with_user(Request::new(GetSandboxProviderEnvironmentRequest {
                 sandbox_id: "sb-custom-attach-lifecycle".to_string(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -3908,9 +4162,9 @@ mod tests {
 
         let response = handle_get_sandbox_config(
             &state,
-            Request::new(GetSandboxConfigRequest {
+            with_user(Request::new(GetSandboxConfigRequest {
                 sandbox_id: "sb-global-profile".to_string(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -4036,7 +4290,7 @@ mod tests {
 
         let submit = handle_submit_policy_analysis(
             &state,
-            Request::new(SubmitPolicyAnalysisRequest {
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
                 name: sandbox_name.clone(),
                 proposed_chunks: vec![PolicyChunk {
                     rule_name: "allow_example".to_string(),
@@ -4050,7 +4304,7 @@ mod tests {
                     ..Default::default()
                 }],
                 ..Default::default()
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -4062,10 +4316,10 @@ mod tests {
 
         let draft_policy = handle_get_draft_policy(
             &state,
-            Request::new(GetDraftPolicyRequest {
+            with_user(Request::new(GetDraftPolicyRequest {
                 name: sandbox_name.clone(),
                 status_filter: String::new(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -4132,10 +4386,10 @@ mod tests {
 
         let draft_policy_after_undo = handle_get_draft_policy(
             &state,
-            Request::new(GetDraftPolicyRequest {
+            with_user(Request::new(GetDraftPolicyRequest {
                 name: sandbox_name.clone(),
                 status_filter: String::new(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -4184,10 +4438,10 @@ mod tests {
 
         let draft_policy_after_clear = handle_get_draft_policy(
             &state,
-            Request::new(GetDraftPolicyRequest {
+            with_user(Request::new(GetDraftPolicyRequest {
                 name: sandbox_name.clone(),
                 status_filter: String::new(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -4246,7 +4500,7 @@ mod tests {
 
         let submit = handle_submit_policy_analysis(
             &state,
-            Request::new(SubmitPolicyAnalysisRequest {
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
                 name: sandbox_name.clone(),
                 proposed_chunks: vec![PolicyChunk {
                     rule_name: "allow_example".to_string(),
@@ -4255,7 +4509,7 @@ mod tests {
                     ..Default::default()
                 }],
                 ..Default::default()
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -4276,10 +4530,10 @@ mod tests {
 
         let draft = handle_get_draft_policy(
             &state,
-            Request::new(GetDraftPolicyRequest {
+            with_user(Request::new(GetDraftPolicyRequest {
                 name: sandbox_name,
                 status_filter: String::new(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -4355,7 +4609,7 @@ mod tests {
             async move {
                 handle_submit_policy_analysis(
                     &state,
-                    Request::new(SubmitPolicyAnalysisRequest {
+                    with_user(Request::new(SubmitPolicyAnalysisRequest {
                         name: sandbox_name,
                         analysis_mode: "agent_authored".to_string(),
                         proposed_chunks: vec![PolicyChunk {
@@ -4364,7 +4618,7 @@ mod tests {
                             ..Default::default()
                         }],
                         ..Default::default()
-                    }),
+                    })),
                 )
                 .await
                 .unwrap()
@@ -4384,10 +4638,10 @@ mod tests {
 
         let draft = handle_get_draft_policy(
             &state,
-            Request::new(GetDraftPolicyRequest {
+            with_user(Request::new(GetDraftPolicyRequest {
                 name: sandbox_name.clone(),
                 status_filter: String::new(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -4462,7 +4716,7 @@ mod tests {
             async move {
                 handle_submit_policy_analysis(
                     &state,
-                    Request::new(SubmitPolicyAnalysisRequest {
+                    with_user(Request::new(SubmitPolicyAnalysisRequest {
                         name: sandbox_name,
                         analysis_mode: "mechanistic".to_string(),
                         proposed_chunks: vec![PolicyChunk {
@@ -4471,7 +4725,7 @@ mod tests {
                             ..Default::default()
                         }],
                         ..Default::default()
-                    }),
+                    })),
                 )
                 .await
                 .unwrap()
@@ -4485,10 +4739,10 @@ mod tests {
 
         let draft = handle_get_draft_policy(
             &state,
-            Request::new(GetDraftPolicyRequest {
+            with_user(Request::new(GetDraftPolicyRequest {
                 name: sandbox_name,
                 status_filter: String::new(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -4558,7 +4812,7 @@ mod tests {
 
         let submit = handle_submit_policy_analysis(
             &state,
-            Request::new(SubmitPolicyAnalysisRequest {
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
                 name: sandbox_name.clone(),
                 proposed_chunks: vec![PolicyChunk {
                     rule_name: "allow_example".to_string(),
@@ -4566,7 +4820,7 @@ mod tests {
                     ..Default::default()
                 }],
                 ..Default::default()
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -4606,10 +4860,10 @@ mod tests {
 
         let draft = handle_get_draft_policy(
             &state,
-            Request::new(GetDraftPolicyRequest {
+            with_user(Request::new(GetDraftPolicyRequest {
                 name: sandbox_name,
                 status_filter: String::new(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -4680,7 +4934,7 @@ mod tests {
 
         handle_submit_policy_analysis(
             &state,
-            Request::new(SubmitPolicyAnalysisRequest {
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
                 name: sandbox_a.object_name().to_string(),
                 proposed_chunks: vec![PolicyChunk {
                     rule_name: "allow_example".to_string(),
@@ -4694,17 +4948,17 @@ mod tests {
                     ..Default::default()
                 }],
                 ..Default::default()
-            }),
+            })),
         )
         .await
         .unwrap();
 
         let draft_policy = handle_get_draft_policy(
             &state,
-            Request::new(GetDraftPolicyRequest {
+            with_user(Request::new(GetDraftPolicyRequest {
                 name: sandbox_a.object_name().to_string(),
                 status_filter: String::new(),
-            }),
+            })),
         )
         .await
         .unwrap()

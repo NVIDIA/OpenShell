@@ -59,8 +59,25 @@ impl ObjectType for InferenceRoute {
 impl Inference for InferenceService {
     async fn get_inference_bundle(
         &self,
-        _request: Request<GetInferenceBundleRequest>,
+        request: Request<GetInferenceBundleRequest>,
     ) -> Result<Response<GetInferenceBundleResponse>, Status> {
+        // GetInferenceBundle is gateway-wide (no per-sandbox routes yet),
+        // so it has no `sandbox_id` to compare against. Just reject
+        // anonymous callers; both user and sandbox principals are allowed.
+        match request
+            .extensions()
+            .get::<crate::auth::principal::Principal>()
+        {
+            Some(
+                crate::auth::principal::Principal::User(_)
+                | crate::auth::principal::Principal::Sandbox(_),
+            ) => {}
+            Some(crate::auth::principal::Principal::Anonymous) | None => {
+                return Err(Status::unauthenticated(
+                    "GetInferenceBundle requires an authenticated caller",
+                ));
+            }
+        }
         resolve_inference_bundle(self.state.store.as_ref())
             .await
             .map(Response::new)
