@@ -14,8 +14,7 @@ use sqlx::{PgPool, Row};
 
 static POSTGRES_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/postgres");
 
-const POLICY_OBJECT_TYPE: &str = "sandbox_policy";
-const DRAFT_CHUNK_OBJECT_TYPE: &str = "draft_policy_chunk";
+use super::{DRAFT_CHUNK_OBJECT_TYPE, POLICY_OBJECT_TYPE};
 
 #[derive(Debug, Clone)]
 pub struct PostgresStore {

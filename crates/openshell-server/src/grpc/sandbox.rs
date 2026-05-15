@@ -1848,13 +1848,7 @@ async fn run_exec_with_russh(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::compute::new_test_runtime;
-    use crate::persistence::Store;
-    use crate::sandbox_index::SandboxIndex;
-    use crate::sandbox_watch::SandboxWatchBus;
-    use crate::supervisor_session::SupervisorSessionRegistry;
-    use crate::tracing_bus::TracingLogBus;
-    use openshell_core::Config;
+    use crate::grpc::test_support::test_server_state;
     use openshell_core::proto::datamodel::v1::ObjectMeta;
     use std::collections::HashMap;
 
@@ -2065,21 +2059,6 @@ mod tests {
                 "fallback name should be all lowercase: {name}"
             );
         }
-    }
-
-    async fn test_server_state() -> Arc<ServerState> {
-        let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
-        let compute = new_test_runtime(store.clone()).await;
-        Arc::new(ServerState::new(
-            Config::new(None).with_database_url("sqlite::memory:"),
-            store,
-            compute,
-            SandboxIndex::new(),
-            SandboxWatchBus::new(),
-            TracingLogBus::new(),
-            Arc::new(SupervisorSessionRegistry::new()),
-            None,
-        ))
     }
 
     fn test_provider(name: &str, provider_type: &str) -> Provider {

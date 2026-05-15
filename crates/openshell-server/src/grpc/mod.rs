@@ -592,6 +592,45 @@ impl OpenShell for OpenShellService {
 }
 
 // ---------------------------------------------------------------------------
+// Shared test support
+// ---------------------------------------------------------------------------
+
+/// Shared test helpers for grpc submodule unit tests.
+#[cfg(test)]
+pub mod test_support {
+    use std::sync::Arc;
+
+    use crate::ServerState;
+    use crate::compute::new_test_runtime;
+    use crate::persistence::Store;
+    use crate::sandbox_index::SandboxIndex;
+    use crate::sandbox_watch::SandboxWatchBus;
+    use crate::supervisor_session::SupervisorSessionRegistry;
+    use crate::tracing_bus::TracingLogBus;
+    use openshell_core::Config;
+
+    /// Build an in-memory `ServerState` for unit tests.
+    pub async fn test_server_state() -> Arc<ServerState> {
+        let store = Arc::new(
+            Store::connect("sqlite::memory:?cache=shared")
+                .await
+                .unwrap(),
+        );
+        let compute = new_test_runtime(store.clone()).await;
+        Arc::new(ServerState::new(
+            Config::new(None).with_database_url("sqlite::memory:?cache=shared"),
+            store,
+            compute,
+            SandboxIndex::new(),
+            SandboxWatchBus::new(),
+            TracingLogBus::new(),
+            Arc::new(SupervisorSessionRegistry::new()),
+            None,
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests for mod-level utilities
 // ---------------------------------------------------------------------------
 

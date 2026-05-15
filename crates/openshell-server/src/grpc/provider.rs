@@ -1454,14 +1454,8 @@ pub(super) async fn handle_delete_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ServerState;
-    use crate::compute::new_test_runtime;
     use crate::grpc::MAX_MAP_KEY_LEN;
-    use crate::sandbox_index::SandboxIndex;
-    use crate::sandbox_watch::SandboxWatchBus;
-    use crate::supervisor_session::SupervisorSessionRegistry;
-    use crate::tracing_bus::TracingLogBus;
-    use openshell_core::Config;
+    use crate::grpc::test_support::test_server_state;
     use openshell_core::proto::{
         DeleteProviderProfileRequest, GetProviderProfileRequest, ImportProviderProfilesRequest,
         L7Allow, L7Rule, LintProviderProfilesRequest, ListProviderProfilesRequest, NetworkBinary,
@@ -1471,7 +1465,6 @@ mod tests {
     };
     use openshell_core::{ObjectId, ObjectName};
     use std::collections::HashMap;
-    use std::sync::Arc;
     use tonic::{Code, Request};
 
     #[test]
@@ -1607,25 +1600,6 @@ mod tests {
             query_param: String::new(),
             refresh: None,
         }
-    }
-
-    async fn test_server_state() -> Arc<ServerState> {
-        let store = Arc::new(
-            Store::connect("sqlite::memory:?cache=shared")
-                .await
-                .unwrap(),
-        );
-        let compute = new_test_runtime(store.clone()).await;
-        Arc::new(ServerState::new(
-            Config::new(None).with_database_url("sqlite::memory:?cache=shared"),
-            store,
-            compute,
-            SandboxIndex::new(),
-            SandboxWatchBus::new(),
-            TracingLogBus::new(),
-            Arc::new(SupervisorSessionRegistry::new()),
-            None,
-        ))
     }
 
     #[tokio::test]

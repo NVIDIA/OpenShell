@@ -2828,14 +2828,7 @@ fn materialize_global_settings(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ServerState;
-    use crate::compute::new_test_runtime;
-    use crate::persistence::Store;
-    use crate::sandbox_index::SandboxIndex;
-    use crate::sandbox_watch::SandboxWatchBus;
-    use crate::supervisor_session::SupervisorSessionRegistry;
-    use crate::tracing_bus::TracingLogBus;
-    use openshell_core::Config;
+    use crate::grpc::test_support::test_server_state;
     use std::collections::HashMap;
     use std::sync::Arc;
     use tonic::Code;
@@ -3967,25 +3960,6 @@ mod tests {
         assert_eq!(policy.version, 1);
         assert!(policy.filesystem.is_some());
         assert_eq!(policy.process.unwrap().run_as_user, "sandbox");
-    }
-
-    async fn test_server_state() -> Arc<ServerState> {
-        let store = Arc::new(
-            Store::connect("sqlite::memory:?cache=shared")
-                .await
-                .unwrap(),
-        );
-        let compute = new_test_runtime(store.clone()).await;
-        Arc::new(ServerState::new(
-            Config::new(None).with_database_url("sqlite::memory:?cache=shared"),
-            store,
-            compute,
-            SandboxIndex::new(),
-            SandboxWatchBus::new(),
-            TracingLogBus::new(),
-            Arc::new(SupervisorSessionRegistry::new()),
-            None,
-        ))
     }
 
     #[tokio::test]

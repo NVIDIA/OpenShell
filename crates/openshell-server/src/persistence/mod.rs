@@ -19,6 +19,11 @@ use thiserror::Error;
 pub use postgres::PostgresStore;
 pub use sqlite::SqliteStore;
 
+/// Object type string for sandbox policy records.
+pub const POLICY_OBJECT_TYPE: &str = "sandbox_policy";
+/// Object type string for draft policy chunk records.
+pub const DRAFT_CHUNK_OBJECT_TYPE: &str = "draft_policy_chunk";
+
 pub type PersistenceResult<T> = Result<T, PersistenceError>;
 
 /// Persistence-layer error type.
