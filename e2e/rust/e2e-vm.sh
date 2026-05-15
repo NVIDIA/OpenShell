@@ -29,9 +29,9 @@
 #   3. On macOS, codesigns the VM driver (libkrun needs the
 #      `com.apple.security.hypervisor` entitlement).
 #   4. Starts the gateway with `--drivers vm --disable-tls
-#      --db-url sqlite::memory:` on a random
-#      free port, waits for `Server listening`, then runs the
-#      cluster-agnostic Rust smoke test.
+#      --disable-gateway-auth --db-url sqlite:<run-state>/gateway.db` on a random
+#      free port, waits for `Server listening`, then runs the selected
+#      Rust e2e test (`smoke` by default).
 #   5. Tears the gateway down and (on failure) preserves the gateway
 #      log and every VM serial console log for post-mortem.
 #
@@ -42,9 +42,12 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+source "${ROOT}/e2e/support/gateway-common.sh"
+
 COMPRESSED_DIR="${ROOT}/target/vm-runtime-compressed"
 GATEWAY_BIN="${ROOT}/target/debug/openshell-gateway"
 DRIVER_BIN="${ROOT}/target/debug/openshell-driver-vm"
+E2E_TEST="${OPENSHELL_E2E_VM_TEST:-smoke}"
 
 # The VM driver places `compute-driver.sock` under --vm-driver-state-dir.
 # AF_UNIX SUN_LEN is 104 bytes on macOS (108 on Linux), so paths anchored
@@ -110,23 +113,31 @@ RUN_STATE_DIR="${STATE_DIR_ROOT}/os-vm-e2e-${HOST_PORT}-$$"
 mkdir -p "${RUN_STATE_DIR}"
 
 GATEWAY_LOG="$(mktemp /tmp/openshell-gateway-e2e.XXXXXX)"
+GATEWAY_PID_FILE="${RUN_STATE_DIR}/gateway.pid"
+GATEWAY_ARGS_FILE="${RUN_STATE_DIR}/gateway.args"
+GATEWAY_DB="${RUN_STATE_DIR}/gateway.db"
 
 # ── Cleanup (trap) ───────────────────────────────────────────────────
 
 cleanup() {
   local exit_code=$?
 
-  if [ -n "${GATEWAY_PID:-}" ] && kill -0 "${GATEWAY_PID}" 2>/dev/null; then
-    echo "Stopping openshell-gateway (pid ${GATEWAY_PID})..."
+  local gateway_pid="${GATEWAY_PID:-}"
+  if [ -f "${GATEWAY_PID_FILE:-}" ]; then
+    gateway_pid="$(cat "${GATEWAY_PID_FILE}" 2>/dev/null || true)"
+  fi
+
+  if [ -n "${gateway_pid}" ] && kill -0 "${gateway_pid}" 2>/dev/null; then
+    echo "Stopping openshell-gateway (pid ${gateway_pid})..."
     # SIGTERM first; gateway drops ManagedDriverProcess which SIGKILLs
     # the driver and removes the UDS. Wait briefly, then force-kill.
-    kill -TERM "${GATEWAY_PID}" 2>/dev/null || true
+    kill -TERM "${gateway_pid}" 2>/dev/null || true
     for _ in 1 2 3 4 5 6 7 8 9 10; do
-      kill -0 "${GATEWAY_PID}" 2>/dev/null || break
+      kill -0 "${gateway_pid}" 2>/dev/null || break
       sleep 0.5
     done
-    kill -KILL "${GATEWAY_PID}" 2>/dev/null || true
-    wait "${GATEWAY_PID}" 2>/dev/null || true
+    kill -KILL "${gateway_pid}" 2>/dev/null || true
+    wait "${gateway_pid}" 2>/dev/null || true
   fi
 
   # On failure, keep the VM console log for debugging. We deliberately
@@ -173,16 +184,22 @@ echo "==> Starting openshell-gateway on 127.0.0.1:${HOST_PORT} (state: ${RUN_STA
 # (192.168.127.1) does NOT forward arbitrary host ports. The driver also
 # rewrites loopback URLs to this hostname as a safety net, so this matches
 # what the guest will actually see and aligns with `tasks/scripts/gateway-vm.sh`.
-"${GATEWAY_BIN}" \
-  --drivers vm \
-  --disable-tls \
-  --db-url 'sqlite::memory:' \
-  --port "${HOST_PORT}" \
-  --grpc-endpoint "http://host.containers.internal:${HOST_PORT}" \
-  --driver-dir "${ROOT}/target/debug" \
-  --vm-driver-state-dir "${RUN_STATE_DIR}" \
+GATEWAY_ARGS=(
+  --drivers vm
+  --disable-tls
+  --disable-gateway-auth
+  --db-url "sqlite:${GATEWAY_DB}?mode=rwc"
+  --port "${HOST_PORT}"
+  --grpc-endpoint "http://host.containers.internal:${HOST_PORT}"
+  --driver-dir "${ROOT}/target/debug"
+  --vm-driver-state-dir "${RUN_STATE_DIR}"
+)
+e2e_write_gateway_args_file "${GATEWAY_ARGS_FILE}" "${GATEWAY_ARGS[@]}"
+
+"${GATEWAY_BIN}" "${GATEWAY_ARGS[@]}" \
   >"${GATEWAY_LOG}" 2>&1 &
 GATEWAY_PID=$!
+printf '%s\n' "${GATEWAY_PID}" >"${GATEWAY_PID_FILE}"
 
 # ── Wait for gateway readiness ───────────────────────────────────────
 #
@@ -216,6 +233,12 @@ echo "==> Gateway ready after ${elapsed}s"
 
 export OPENSHELL_GATEWAY_ENDPOINT="http://127.0.0.1:${HOST_PORT}"
 export OPENSHELL_E2E_EXPECT_VM_OVERLAY=1
+export OPENSHELL_E2E_DRIVER="vm"
+e2e_export_gateway_restart_metadata \
+  "${GATEWAY_BIN}" \
+  "${GATEWAY_ARGS_FILE}" \
+  "${GATEWAY_LOG}" \
+  "${GATEWAY_PID_FILE}"
 
 # The VM driver creates each sandbox VM from a cached read-only ext4 root disk
 # plus a writable overlay disk. The guest's sandbox supervisor then initializes
@@ -223,11 +246,11 @@ export OPENSHELL_E2E_EXPECT_VM_OVERLAY=1
 # preparation; allow 180s for slower CI runners.
 export OPENSHELL_PROVISION_TIMEOUT="${SANDBOX_PROVISION_TIMEOUT}"
 
-echo "==> Running e2e smoke test (endpoint: ${OPENSHELL_GATEWAY_ENDPOINT})"
+echo "==> Running e2e ${E2E_TEST} test (endpoint: ${OPENSHELL_GATEWAY_ENDPOINT})"
 cargo test \
   --manifest-path "${ROOT}/e2e/rust/Cargo.toml" \
   --features e2e \
-  --test smoke \
+  --test "${E2E_TEST}" \
   -- --nocapture
 
-echo "==> Smoke test passed."
+echo "==> ${E2E_TEST} test passed."

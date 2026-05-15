@@ -189,6 +189,13 @@ the overlay while cached image disks remain unchanged. The overlay disk must be
 large enough to hold the compressed payload, unpacked rootfs, and sandbox writes
 during the first prepare.
 
+The driver also writes the accepted `DriverSandbox` launch request to
+`<state-dir>/sandboxes/<id>/sandbox.pb`. If the gateway restarts, it starts a
+new VM driver process; that process scans the sandbox state directories,
+restarts each persisted VM launcher, and preserves any existing `overlay.ext4`
+instead of cloning a fresh overlay template. If a restart happened before the
+overlay was created, the driver creates it during the resume attempt.
+
 ## Logs and debugging
 
 Raise log verbosity for both processes:

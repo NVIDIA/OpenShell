@@ -69,6 +69,8 @@ The VM driver boots a cached immutable bootstrap ext4 root disk. When the reques
 
 VM sandbox creation follows the same progress model as Kubernetes-backed sandboxes. The gateway accepts the sandbox, then the VM driver publishes watch events while it resolves the image, prepares or reuses the bootstrap and prepared image caches, creates the writable overlay, and starts the VM launcher.
 
+On gateway restart, the gateway starts a fresh VM driver process. The driver scans its state directory for accepted sandbox launch records, restarts those VMs, and reuses each sandbox's existing `overlay.ext4` so files written inside the sandbox remain available after the supervisor reconnects.
+
 For maintainer-level implementation details, refer to the [VM driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-vm/README.md).
 
 ### Enable the VM Driver

@@ -39,11 +39,14 @@ use openshell_core::proto::compute::v1::{
     compute_driver_server::ComputeDriver, watch_sandboxes_event,
 };
 use openshell_vfio::SysfsRoot;
+use prost::Message;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::net::Ipv4Addr;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
@@ -102,6 +105,7 @@ const IMAGE_CACHE_ROOTFS_IMAGE: &str = "rootfs.ext4";
 const OVERLAY_TEMPLATE_CACHE_DIR: &str = "overlay-templates";
 const OVERLAY_TEMPLATE_CACHE_LAYOUT_VERSION: &str = "sandbox-overlay-ext4-v1";
 const SANDBOX_OVERLAY_IMAGE: &str = "overlay.ext4";
+const SANDBOX_REQUEST_FILE: &str = "sandbox.pb";
 const GUEST_IMAGE_CONFIG_DIR: &str = "openshell-image";
 const GUEST_IMAGE_OCI_LAYOUT_DIR: &str = "oci";
 const GUEST_IMAGE_OCI_REF: &str = "openshell";
@@ -278,6 +282,12 @@ struct SandboxRecord {
     deleting: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverlayPreparation {
+    Fresh,
+    PreserveExisting,
+}
+
 #[derive(Clone)]
 pub struct VmDriver {
     config: VmDriverConfig,
@@ -306,14 +316,12 @@ impl VmDriver {
         }
 
         let state_root = sandboxes_root_dir(&config.state_dir);
-        tokio::fs::create_dir_all(&state_root)
-            .await
-            .map_err(|err| {
-                format!(
-                    "failed to create state dir '{}': {err}",
-                    state_root.display()
-                )
-            })?;
+        create_private_dir_all(&state_root).await.map_err(|err| {
+            format!(
+                "failed to create state dir '{}': {err}",
+                state_root.display()
+            )
+        })?;
         let image_cache_root = image_cache_root_dir(&config.state_dir);
         tokio::fs::create_dir_all(&image_cache_root)
             .await
@@ -349,7 +357,7 @@ impl VmDriver {
         )));
 
         let (events, _) = broadcast::channel(WATCH_BUFFER);
-        Ok(Self {
+        let driver = Self {
             config,
             launcher_bin,
             registry: Arc::new(Mutex::new(HashMap::new())),
@@ -357,7 +365,9 @@ impl VmDriver {
             events,
             gpu_inventory,
             subnet_allocator,
-        })
+        };
+        driver.restore_persisted_sandboxes().await;
+        Ok(driver)
     }
 
     #[must_use]
@@ -441,10 +451,19 @@ impl VmDriver {
             }
         };
 
-        if let Err(err) = tokio::fs::create_dir_all(&state_dir).await {
+        if let Err(err) = create_private_dir_all(&state_dir).await {
             let mut registry = self.registry.lock().await;
             registry.remove(&sandbox.id);
             return Err(Status::internal(format!("create state dir failed: {err}")));
+        }
+
+        if let Err(err) = write_sandbox_request(&state_dir, sandbox).await {
+            let mut registry = self.registry.lock().await;
+            registry.remove(&sandbox.id);
+            let _ = tokio::fs::remove_dir_all(&state_dir).await;
+            return Err(Status::internal(format!(
+                "write sandbox resume metadata failed: {err}"
+            )));
         }
 
         self.publish_platform_event(
@@ -470,6 +489,7 @@ impl VmDriver {
                     image_ref_for_task,
                     state_dir_for_task,
                     tls_paths,
+                    OverlayPreparation::Fresh,
                 )
                 .await;
         });
@@ -494,14 +514,23 @@ impl VmDriver {
         image_ref: String,
         state_dir: PathBuf,
         tls_paths: Option<VmDriverTlsPaths>,
+        overlay_preparation: OverlayPreparation,
     ) {
         let sandbox_id = sandbox.id.clone();
         if let Err(err) = self
-            .provision_sandbox_inner(sandbox, image_ref, state_dir.clone(), tls_paths)
+            .provision_sandbox_inner(
+                sandbox,
+                image_ref,
+                state_dir.clone(),
+                tls_paths,
+                overlay_preparation,
+            )
             .await
         {
             if err.code() == tonic::Code::Cancelled {
-                let _ = tokio::fs::remove_dir_all(&state_dir).await;
+                if overlay_preparation == OverlayPreparation::Fresh {
+                    let _ = tokio::fs::remove_dir_all(&state_dir).await;
+                }
                 return;
             }
 
@@ -510,8 +539,14 @@ impl VmDriver {
                 error = %err.message(),
                 "vm driver: sandbox provisioning failed"
             );
-            self.fail_provisioning(&sandbox_id, &state_dir, "ProvisioningFailed", err.message())
-                .await;
+            self.fail_provisioning(
+                &sandbox_id,
+                &state_dir,
+                "ProvisioningFailed",
+                err.message(),
+                overlay_preparation == OverlayPreparation::Fresh,
+            )
+            .await;
         }
     }
 
@@ -522,6 +557,7 @@ impl VmDriver {
         image_ref: String,
         state_dir: PathBuf,
         tls_paths: Option<VmDriverTlsPaths>,
+        overlay_preparation: OverlayPreparation,
     ) -> Result<(), Status> {
         self.ensure_provisioning_active(&sandbox.id).await?;
         self.publish_platform_event(
@@ -559,7 +595,7 @@ impl VmDriver {
             ),
         );
         if let Err(err) = self
-            .prepare_runtime_overlay(&overlay_disk, tls_paths.as_ref())
+            .prepare_runtime_overlay(&overlay_disk, tls_paths.as_ref(), overlay_preparation)
             .await
         {
             return Err(Status::internal(format!(
@@ -856,6 +892,158 @@ impl VmDriver {
         snapshots
     }
 
+    async fn restore_persisted_sandboxes(&self) {
+        let state_root = sandboxes_root_dir(&self.config.state_dir);
+        let mut entries = match tokio::fs::read_dir(&state_root).await {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+            Err(err) => {
+                warn!(
+                    state_root = %state_root.display(),
+                    error = %err,
+                    "vm driver: failed to scan persisted sandboxes"
+                );
+                return;
+            }
+        };
+
+        loop {
+            let entry = match entries.next_entry().await {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(err) => {
+                    warn!(
+                        state_root = %state_root.display(),
+                        error = %err,
+                        "vm driver: failed to continue scanning persisted sandboxes"
+                    );
+                    break;
+                }
+            };
+            let state_dir = entry.path();
+            let is_dir = match entry.file_type().await {
+                Ok(file_type) => file_type.is_dir(),
+                Err(err) => {
+                    warn!(
+                        state_dir = %state_dir.display(),
+                        error = %err,
+                        "vm driver: failed to inspect persisted sandbox state dir"
+                    );
+                    continue;
+                }
+            };
+            if !is_dir {
+                continue;
+            }
+
+            let request_path = state_dir.join(SANDBOX_REQUEST_FILE);
+            let sandbox = match read_sandbox_request(&request_path).await {
+                Ok(sandbox) => sandbox,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => {
+                    warn!(
+                        state_dir = %state_dir.display(),
+                        error = %err,
+                        "vm driver: failed to read persisted sandbox request"
+                    );
+                    continue;
+                }
+            };
+
+            if let Err(status) =
+                validate_restored_sandbox_state(&self.config.state_dir, &state_dir, &sandbox)
+            {
+                warn!(
+                    sandbox_id = %sandbox.id,
+                    state_dir = %state_dir.display(),
+                    error = %status.message(),
+                    "vm driver: ignoring invalid persisted sandbox state"
+                );
+                continue;
+            }
+
+            self.restore_persisted_sandbox(sandbox, state_dir).await;
+        }
+    }
+
+    async fn restore_persisted_sandbox(&self, sandbox: Sandbox, state_dir: PathBuf) {
+        let Some(image_ref) = self.resolved_sandbox_image(&sandbox) else {
+            warn!(
+                sandbox_id = %sandbox.id,
+                sandbox_name = %sandbox.name,
+                "vm driver: cannot restore persisted sandbox without image"
+            );
+            return;
+        };
+        let tls_paths = match self.config.tls_paths() {
+            Ok(paths) => paths,
+            Err(err) => {
+                warn!(
+                    sandbox_id = %sandbox.id,
+                    sandbox_name = %sandbox.name,
+                    error = %err,
+                    "vm driver: cannot restore persisted sandbox TLS configuration"
+                );
+                return;
+            }
+        };
+
+        let snapshot = sandbox_snapshot(&sandbox, provisioning_condition(), false);
+        {
+            let mut registry = self.registry.lock().await;
+            if registry.contains_key(&sandbox.id) {
+                return;
+            }
+            registry.insert(
+                sandbox.id.clone(),
+                SandboxRecord {
+                    snapshot: snapshot.clone(),
+                    state_dir: state_dir.clone(),
+                    process: None,
+                    provisioning_task: None,
+                    gpu_bdf: None,
+                    deleting: false,
+                },
+            );
+        }
+
+        self.publish_platform_event(
+            sandbox.id.clone(),
+            platform_event(
+                "vm",
+                "Normal",
+                "Restoring",
+                "Restoring persisted VM sandbox after driver restart".to_string(),
+            ),
+        );
+        self.publish_snapshot(snapshot);
+
+        let driver = self.clone();
+        let sandbox_id = sandbox.id.clone();
+        let task = tokio::spawn(async move {
+            driver
+                .provision_sandbox(
+                    sandbox,
+                    image_ref,
+                    state_dir,
+                    tls_paths,
+                    OverlayPreparation::PreserveExisting,
+                )
+                .await;
+        });
+
+        let mut registry = self.registry.lock().await;
+        if let Some(record) = registry.get_mut(&sandbox_id) {
+            if record.deleting {
+                task.abort();
+            } else {
+                record.provisioning_task = Some(task);
+            }
+        } else {
+            task.abort();
+        }
+    }
+
     fn release_gpu_and_subnet(&self, sandbox_id: &str) {
         if let Some(inventory) = self.gpu_inventory.as_ref()
             && let Ok(mut inv) = inventory.lock()
@@ -916,6 +1104,7 @@ impl VmDriver {
         state_dir: &Path,
         reason: &str,
         message: &str,
+        remove_state: bool,
     ) {
         self.release_gpu_and_subnet(sandbox_id);
         let snapshot = {
@@ -937,7 +1126,9 @@ impl VmDriver {
             Some(record.snapshot.clone())
         };
 
-        let _ = tokio::fs::remove_dir_all(state_dir).await;
+        if remove_state {
+            let _ = tokio::fs::remove_dir_all(state_dir).await;
+        }
         self.publish_platform_event(
             sandbox_id.to_string(),
             platform_event(
@@ -999,6 +1190,7 @@ impl VmDriver {
         &self,
         overlay_disk: &Path,
         tls_paths: Option<&VmDriverTlsPaths>,
+        preparation: OverlayPreparation,
     ) -> Result<(), String> {
         let tls_materials = match tls_paths {
             Some(paths) => Some(read_guest_tls_materials(paths).await?),
@@ -1028,10 +1220,12 @@ impl VmDriver {
         }
 
         tokio::task::spawn_blocking(move || {
-            create_sandbox_overlay_image_from_template(
+            prepare_sandbox_overlay_image(
                 &template_path,
                 &overlay_disk,
                 tls_materials.as_ref(),
+                preparation,
+                overlay_size_bytes,
             )
         })
         .await
@@ -3313,6 +3507,21 @@ fn sandboxes_root_dir(root: &Path) -> PathBuf {
     root.join("sandboxes")
 }
 
+async fn create_private_dir_all(path: &Path) -> Result<(), std::io::Error> {
+    tokio::fs::create_dir_all(path).await?;
+    restrict_owner_only_dir(path).await
+}
+
+#[cfg(unix)]
+async fn restrict_owner_only_dir(path: &Path) -> Result<(), std::io::Error> {
+    tokio::fs::set_permissions(path, fs::Permissions::from_mode(0o700)).await
+}
+
+#[cfg(not(unix))]
+async fn restrict_owner_only_dir(_path: &Path) -> Result<(), std::io::Error> {
+    Ok(())
+}
+
 #[allow(clippy::result_large_err)]
 fn sandbox_state_dir(root: &Path, sandbox_id: &str) -> Result<PathBuf, Status> {
     validate_sandbox_id(sandbox_id)?;
@@ -3550,6 +3759,63 @@ async fn write_sandbox_image_metadata(
     Ok(())
 }
 
+async fn write_sandbox_request(state_dir: &Path, sandbox: &Sandbox) -> Result<(), std::io::Error> {
+    restrict_owner_only_dir(state_dir).await?;
+    write_private_file(
+        &state_dir.join(SANDBOX_REQUEST_FILE),
+        sandbox.encode_to_vec(),
+    )
+    .await
+}
+
+async fn read_sandbox_request(path: &Path) -> Result<Sandbox, std::io::Error> {
+    let bytes = tokio::fs::read(path).await?;
+    Sandbox::decode(bytes.as_slice()).map_err(|err| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("decode persisted sandbox request: {err}"),
+        )
+    })
+}
+
+async fn write_private_file(path: &Path, bytes: Vec<u8>) -> Result<(), std::io::Error> {
+    tokio::fs::write(path, bytes).await?;
+    restrict_owner_read_write(path).await
+}
+
+#[cfg(unix)]
+async fn restrict_owner_read_write(path: &Path) -> Result<(), std::io::Error> {
+    tokio::fs::set_permissions(path, fs::Permissions::from_mode(0o600)).await
+}
+
+#[cfg(not(unix))]
+async fn restrict_owner_read_write(_path: &Path) -> Result<(), std::io::Error> {
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_restored_sandbox_state(
+    root: &Path,
+    state_dir: &Path,
+    sandbox: &Sandbox,
+) -> Result<(), Status> {
+    validate_sandbox_id(&sandbox.id)?;
+    validate_sandbox_state_dir(root, state_dir)?;
+    let Some(dir_name) = state_dir.file_name().and_then(|name| name.to_str()) else {
+        return Err(Status::internal(format!(
+            "sandbox state path has no valid directory name: {}",
+            state_dir.display()
+        )));
+    };
+    if dir_name != sandbox.id {
+        return Err(Status::internal(format!(
+            "sandbox state dir '{}' does not match persisted sandbox id '{}'",
+            dir_name, sandbox.id
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 struct GuestTlsMaterials {
     ca: Vec<u8>,
@@ -3661,6 +3927,48 @@ fn create_sandbox_overlay_image_from_template(
         inject_guest_tls_materials(overlay_disk, tls)?;
     }
     Ok(())
+}
+
+fn prepare_sandbox_overlay_image(
+    template_path: &Path,
+    overlay_disk: &Path,
+    tls_materials: Option<&GuestTlsMaterials>,
+    preparation: OverlayPreparation,
+    expected_size_bytes: u64,
+) -> Result<(), String> {
+    if preparation == OverlayPreparation::PreserveExisting {
+        match fs::metadata(overlay_disk) {
+            Ok(metadata) if metadata.is_file() && metadata.len() == expected_size_bytes => {
+                if let Some(tls) = tls_materials {
+                    inject_guest_tls_materials(overlay_disk, tls)?;
+                }
+                return Ok(());
+            }
+            Ok(metadata) if metadata.is_file() => {
+                return Err(format!(
+                    "existing overlay disk '{}' has size {}, expected {}",
+                    overlay_disk.display(),
+                    metadata.len(),
+                    expected_size_bytes
+                ));
+            }
+            Ok(_) => {
+                return Err(format!(
+                    "existing overlay path '{}' is not a file",
+                    overlay_disk.display()
+                ));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(format!(
+                    "stat overlay disk {}: {err}",
+                    overlay_disk.display()
+                ));
+            }
+        }
+    }
+
+    create_sandbox_overlay_image_from_template(template_path, overlay_disk, tls_materials)
 }
 
 fn inject_guest_tls_materials(
@@ -4326,6 +4634,98 @@ mod tests {
                 .join(OVERLAY_TEMPLATE_CACHE_LAYOUT_VERSION)
                 .join("4194304.ext4")
         );
+    }
+
+    #[tokio::test]
+    async fn sandbox_request_metadata_round_trips_for_resume() {
+        let base = unique_temp_dir();
+        let state_dir = base.join("sandboxes").join("sandbox-123");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let sandbox = Sandbox {
+            id: "sandbox-123".to_string(),
+            name: "resume-sandbox".to_string(),
+            namespace: "vm-dev".to_string(),
+            spec: Some(SandboxSpec {
+                environment: HashMap::from([("KEY".to_string(), "value".to_string())]),
+                template: Some(SandboxTemplate {
+                    image: "ghcr.io/example/sandbox:latest".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        write_sandbox_request(&state_dir, &sandbox)
+            .await
+            .expect("write sandbox request");
+        let restored = read_sandbox_request(&state_dir.join(SANDBOX_REQUEST_FILE))
+            .await
+            .expect("read sandbox request");
+
+        assert_eq!(restored, sandbox);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            let dir_mode = std::fs::metadata(&state_dir).unwrap().permissions().mode() & 0o777;
+            let file_mode = std::fs::metadata(state_dir.join(SANDBOX_REQUEST_FILE))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(dir_mode, 0o700);
+            assert_eq!(file_mode, 0o600);
+        }
+        validate_restored_sandbox_state(&base, &state_dir, &restored)
+            .expect("restored state should validate");
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn prepare_sandbox_overlay_preserves_existing_overlay_on_resume() {
+        let base = unique_temp_dir();
+        std::fs::create_dir_all(&base).unwrap();
+        let template = base.join("template.ext4");
+        let overlay = base.join("overlay.ext4");
+        std::fs::write(&template, b"fresh-overlay").unwrap();
+        std::fs::write(&overlay, b"saved-overlay").unwrap();
+
+        prepare_sandbox_overlay_image(
+            &template,
+            &overlay,
+            None,
+            OverlayPreparation::PreserveExisting,
+            "saved-overlay".len() as u64,
+        )
+        .expect("preserve existing overlay");
+
+        assert_eq!(std::fs::read(&overlay).unwrap(), b"saved-overlay");
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn prepare_sandbox_overlay_creates_missing_overlay_on_resume() {
+        let base = unique_temp_dir();
+        std::fs::create_dir_all(&base).unwrap();
+        let template = base.join("template.ext4");
+        let overlay = base.join("overlay.ext4");
+        std::fs::write(&template, b"fresh-overlay").unwrap();
+
+        prepare_sandbox_overlay_image(
+            &template,
+            &overlay,
+            None,
+            OverlayPreparation::PreserveExisting,
+            "fresh-overlay".len() as u64,
+        )
+        .expect("create missing overlay");
+
+        assert_eq!(std::fs::read(&overlay).unwrap(), b"fresh-overlay");
+
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]

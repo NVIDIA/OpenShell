@@ -43,7 +43,7 @@ required-features = ["e2e-docker"]
 [[test]]
 name = "gateway_resume"
 path = "tests/gateway_resume.rs"
-required-features = ["e2e-docker"]
+required-features = ["e2e"]
 
 [[test]]
 name = "websocket_conformance"
