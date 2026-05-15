@@ -1107,8 +1107,8 @@ pub(super) async fn handle_exec_sandbox_interactive(
     let command_str = build_remote_exec_command(&req)
         .map_err(|e| Status::invalid_argument(format!("command construction failed: {e}")))?;
     let timeout_seconds = req.timeout_seconds;
-    let cols = req.cols;
-    let rows = req.rows;
+    let cols = if req.cols == 0 { 80 } else { req.cols };
+    let rows = if req.rows == 0 { 24 } else { req.rows };
 
     let sandbox_id = sandbox.object_id().to_string();
 
@@ -1565,32 +1565,35 @@ async fn run_interactive_exec_with_russh(
             }
         }
         let _ = write_half.eof().await;
+        let _ = write_half.close().await;
     });
 
     let mut exit_code: Option<i32> = None;
     while let Some(msg) = read_half.wait().await {
         match msg {
             ChannelMsg::Data { data } => {
-                let _ = tx
-                    .send(Ok(ExecSandboxEvent {
-                        payload: Some(openshell_core::proto::exec_sandbox_event::Payload::Stdout(
-                            ExecSandboxStdout {
-                                data: data.to_vec(),
-                            },
-                        )),
-                    }))
-                    .await;
+                let event = Ok(ExecSandboxEvent {
+                    payload: Some(openshell_core::proto::exec_sandbox_event::Payload::Stdout(
+                        ExecSandboxStdout {
+                            data: data.to_vec(),
+                        },
+                    )),
+                });
+                if tx.send(event).await.is_err() {
+                    break;
+                }
             }
             ChannelMsg::ExtendedData { data, .. } => {
-                let _ = tx
-                    .send(Ok(ExecSandboxEvent {
-                        payload: Some(openshell_core::proto::exec_sandbox_event::Payload::Stderr(
-                            ExecSandboxStderr {
-                                data: data.to_vec(),
-                            },
-                        )),
-                    }))
-                    .await;
+                let event = Ok(ExecSandboxEvent {
+                    payload: Some(openshell_core::proto::exec_sandbox_event::Payload::Stderr(
+                        ExecSandboxStderr {
+                            data: data.to_vec(),
+                        },
+                    )),
+                });
+                if tx.send(event).await.is_err() {
+                    break;
+                }
             }
             ChannelMsg::ExitStatus { exit_status } => {
                 let converted = i32::try_from(exit_status).unwrap_or(i32::MAX);

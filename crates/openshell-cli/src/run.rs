@@ -2741,6 +2741,14 @@ impl Drop for RawModeGuard {
     }
 }
 
+struct TaskGuard(tokio::task::JoinHandle<()>);
+
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 async fn sandbox_exec_interactive_grpc(
     mut client: crate::tls::GrpcClient,
     sandbox: &Sandbox,
@@ -2748,12 +2756,12 @@ async fn sandbox_exec_interactive_grpc(
     workdir: Option<&str>,
     timeout_seconds: u32,
 ) -> Result<i32> {
-    use futures::SinkExt;
     use openshell_core::proto::{ExecSandboxInput, ExecSandboxWindowResize, exec_sandbox_input};
+    use tokio_stream::wrappers::ReceiverStream;
 
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
 
-    let (mut input_tx, input_rx) = futures::channel::mpsc::channel::<ExecSandboxInput>(4096);
+    let (input_tx, input_rx) = tokio::sync::mpsc::channel::<ExecSandboxInput>(4096);
 
     // Send the start message with exec metadata.
     input_tx
@@ -2774,7 +2782,7 @@ async fn sandbox_exec_interactive_grpc(
         .into_diagnostic()?;
 
     let mut stream = client
-        .exec_sandbox_interactive(input_rx)
+        .exec_sandbox_interactive(ReceiverStream::new(input_rx))
         .await
         .into_diagnostic()?
         .into_inner();
@@ -2783,51 +2791,63 @@ async fn sandbox_exec_interactive_grpc(
     crossterm::terminal::enable_raw_mode().into_diagnostic()?;
     let raw_guard = RawModeGuard;
 
-    // Stdin reader: read raw bytes one at a time so single keystrokes
-    // (e.g. 'q' in top) are forwarded immediately.
-    let mut stdin_tx = input_tx.clone();
-    tokio::task::spawn_blocking(move || {
-        let mut stdin = std::io::stdin().lock();
-        let mut buf = [0u8; 4096];
-        loop {
-            let n = match stdin.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => n,
-            };
-            if stdin_tx
-                .try_send(ExecSandboxInput {
-                    payload: Some(exec_sandbox_input::Payload::Stdin(buf[..n].to_vec())),
-                })
-                .is_err()
-            {
-                break;
+    // Stdin reader on a detached OS thread. Using std::thread (not
+    // spawn_blocking) so the tokio runtime shutdown doesn't wait for a
+    // thread blocked on stdin.read(). The thread exits when the channel
+    // closes (blocking_send returns Err) or stdin hits EOF.
+    #[cfg(unix)]
+    {
+        let stdin_tx = input_tx.clone();
+        std::thread::spawn(move || {
+            let mut stdin = std::io::stdin().lock();
+            let mut buf = [0u8; 4096];
+            loop {
+                match stdin.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if stdin_tx
+                            .blocking_send(ExecSandboxInput {
+                                payload: Some(exec_sandbox_input::Payload::Stdin(
+                                    buf[..n].to_vec(),
+                                )),
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
             }
-        }
-    });
+        });
+    }
 
     // SIGWINCH handler: forward terminal resize events.
     #[cfg(unix)]
-    let mut resize_tx = input_tx.clone();
-    #[cfg(unix)]
-    let resize_task = tokio::spawn(async move {
-        let mut sig = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
-            .expect("failed to register SIGWINCH handler");
-        while sig.recv().await.is_some() {
-            if let Ok((c, r)) = crossterm::terminal::size() {
-                let msg = ExecSandboxInput {
-                    payload: Some(exec_sandbox_input::Payload::Resize(
-                        ExecSandboxWindowResize {
-                            cols: u32::from(c),
-                            rows: u32::from(r),
-                        },
-                    )),
-                };
-                if resize_tx.send(msg).await.is_err() {
-                    break;
+    let resize_task = {
+        let resize_tx = input_tx.clone();
+        tokio::spawn(async move {
+            let mut sig =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+                    .expect("failed to register SIGWINCH handler");
+            while sig.recv().await.is_some() {
+                if let Ok((c, r)) = crossterm::terminal::size() {
+                    let msg = ExecSandboxInput {
+                        payload: Some(exec_sandbox_input::Payload::Resize(
+                            ExecSandboxWindowResize {
+                                cols: u32::from(c),
+                                rows: u32::from(r),
+                            },
+                        )),
+                    };
+                    if resize_tx.send(msg).await.is_err() {
+                        break;
+                    }
                 }
             }
-        }
-    });
+        })
+    };
+    #[cfg(unix)]
+    let _resize_guard = TaskGuard(resize_task);
 
     let mut exit_code = 0i32;
     let stdout = std::io::stdout();
@@ -2853,15 +2873,12 @@ async fn sandbox_exec_interactive_grpc(
         }
     }
 
-    #[cfg(unix)]
-    resize_task.abort();
+    drop(input_tx);
 
-    // Drop the raw mode guard to restore the terminal before exiting.
+    // Drop the raw mode guard to restore the terminal before returning.
     drop(raw_guard);
 
-    // The spawn_blocking stdin reader is stuck on stdin.read() and cannot be
-    // cancelled. Force-exit so the tokio runtime doesn't hang waiting for it.
-    std::process::exit(exit_code)
+    Ok(exit_code)
 }
 
 /// Print a single YAML line with dimmed keys and regular values.
