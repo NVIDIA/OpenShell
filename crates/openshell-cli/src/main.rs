@@ -2700,7 +2700,11 @@ async fn main() -> Result<()> {
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_auth(&mut tls, &ctx.name);
             let channel = openshell_cli::tls::build_channel(&ctx.endpoint, &tls).await?;
-            openshell_tui::run(channel, &ctx.name, &ctx.endpoint, theme).await?;
+            let interceptor = openshell_core::auth::EdgeAuthInterceptor::new(
+                tls.oidc_token.as_deref(),
+                tls.edge_token.as_deref(),
+            )?;
+            openshell_tui::run(channel, interceptor, &ctx.name, &ctx.endpoint, theme).await?;
         }
         Some(Commands::Completions { shell }) => {
             let exe = std::env::current_exe()
