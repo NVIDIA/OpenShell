@@ -159,12 +159,11 @@ impl KubernetesComputeDriver {
         })
     }
 
-    pub async fn capabilities(&self) -> Result<GetCapabilitiesResponse, String> {
+    pub fn capabilities(&self) -> Result<GetCapabilitiesResponse, String> {
         Ok(openshell_core::driver_utils::build_capabilities_response(
             "kubernetes",
             openshell_core::VERSION,
             &self.config.default_image,
-            self.has_gpu_capacity().await.unwrap_or(false),
         ))
     }
 

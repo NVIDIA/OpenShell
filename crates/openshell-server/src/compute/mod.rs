@@ -1650,8 +1650,6 @@ impl ComputeDriver for NoopTestDriver {
                 driver_name: "noop-test-driver".to_string(),
                 driver_version: "test".to_string(),
                 default_image: "openshell/sandbox:test".to_string(),
-                supports_gpu: false,
-                gpu_count: 0,
             },
         ))
     }
@@ -1799,8 +1797,6 @@ mod tests {
                 driver_name: "test-driver".to_string(),
                 driver_version: "test".to_string(),
                 default_image: "openshell/sandbox:test".to_string(),
-                supports_gpu: true,
-                gpu_count: 0,
             }))
         }
 

@@ -36,7 +36,6 @@ impl ComputeDriver for ComputeDriverService {
     ) -> Result<Response<GetCapabilitiesResponse>, Status> {
         self.driver
             .capabilities()
-            .await
             .map(Response::new)
             .map_err(Status::internal)
     }

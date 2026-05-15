@@ -63,20 +63,16 @@ pub fn sandbox_token_path(
 /// Build a [`GetCapabilitiesResponse`] from the common driver capability fields.
 ///
 /// Every compute driver constructs this response with the same fields. Shared
-/// here to avoid repeating the struct literal (and the always-zero `gpu_count`
-/// default) in each driver crate.
+/// here to avoid repeating the struct literal in each driver crate.
 pub fn build_capabilities_response(
     driver_name: &str,
     driver_version: impl Into<String>,
     default_image: impl Into<String>,
-    supports_gpu: bool,
 ) -> GetCapabilitiesResponse {
     GetCapabilitiesResponse {
         driver_name: driver_name.to_string(),
         driver_version: driver_version.into(),
         default_image: default_image.into(),
-        supports_gpu,
-        gpu_count: 0,
     }
 }
 
