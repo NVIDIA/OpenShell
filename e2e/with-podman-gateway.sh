@@ -100,7 +100,6 @@ cleanup() {
       podman_cmd rm -f "${id}" >/dev/null 2>&1 || true
       if [ -n "${sandbox_id}" ] && [ "${sandbox_id}" != "<no value>" ]; then
         podman_cmd volume rm -f "openshell-sandbox-${sandbox_id}-workspace" >/dev/null 2>&1 || true
-        podman_cmd secret rm "openshell-handshake-${sandbox_id}" >/dev/null 2>&1 || true
       fi
     done
   fi

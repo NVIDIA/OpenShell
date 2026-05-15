@@ -153,8 +153,8 @@ Type=exec
 # %%S expands to $XDG_STATE_HOME (~/.local/state) in user units.
 ExecStartPre=%{_libexecdir}/openshell/init-pki.sh %%S/openshell/tls
 
-# Auto-generate gateway.env (SSH handshake secret + commented config
-# reference) on first start if not present.
+# Auto-generate gateway.env (commented config reference) on first
+# start if not present.
 # %%E expands to $XDG_CONFIG_HOME (~/.config) in user units.
 ExecStartPre=%{_libexecdir}/openshell/init-gateway-env.sh %%E/openshell/gateway.env
 EnvironmentFile=-%%E/openshell/gateway.env
