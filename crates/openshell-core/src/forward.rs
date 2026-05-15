@@ -462,7 +462,13 @@ pub fn resolve_ssh_gateway(
             // Remote cluster: use the remote host but keep the cluster URL port.
             return (host.to_string(), cluster_port);
         }
-        // Local cluster: both loopback — use cluster URL's port (Docker-mapped).
+        // Both endpoints loopback. The unspecified addresses (0.0.0.0 / ::)
+        // are bind-only — they aren't valid connect targets and aren't in TLS
+        // cert SANs, so fall back to the cluster URL's host (which the CLI
+        // is already using to reach the gateway).
+        if gateway_host == "0.0.0.0" || gateway_host == "::" {
+            return (host.to_string(), cluster_port);
+        }
         return (gateway_host.to_string(), cluster_port);
     }
 
@@ -691,6 +697,16 @@ mod tests {
         let (host, port) = resolve_ssh_gateway("127.0.0.1", 8080, "https://127.0.0.1:443");
         assert_eq!(host, "127.0.0.1");
         assert_eq!(port, 8080);
+    }
+
+    #[test]
+    fn resolve_ssh_gateway_swaps_zeros_for_loopback_cluster_host() {
+        // The gateway binds 0.0.0.0 but advertises that bind address via the
+        // SSH session response. 0.0.0.0 is not a valid connect target and is
+        // not in any TLS cert SAN; fall through to the cluster URL's host.
+        let (host, port) = resolve_ssh_gateway("0.0.0.0", 8080, "https://127.0.0.1:9000");
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, 9000);
     }
 
     #[test]
