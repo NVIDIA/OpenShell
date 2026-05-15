@@ -5,7 +5,7 @@ use std::fs;
 use std::fs::File;
 #[cfg(test)]
 use std::io::BufWriter;
-use std::io::Cursor;
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -119,6 +119,31 @@ pub fn create_ext4_image_from_dir_with_size(
     Ok(())
 }
 
+pub fn clone_or_copy_sparse_file(source: &Path, dest: &Path) -> Result<(), String> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
+    if dest.exists() {
+        fs::remove_file(dest).map_err(|e| format!("remove old file {}: {e}", dest.display()))?;
+    }
+
+    let clone_error = match try_clone_file(source, dest) {
+        Ok(()) => return Ok(()),
+        Err(err) => {
+            let _ = fs::remove_file(dest);
+            err
+        }
+    };
+
+    copy_sparse_file(source, dest).map_err(|copy_error| {
+        format!(
+            "clone {} to {} failed ({clone_error}); sparse copy failed: {copy_error}",
+            source.display(),
+            dest.display()
+        )
+    })
+}
+
 pub fn write_rootfs_image_file(
     image_path: &Path,
     guest_path: &str,
@@ -135,6 +160,99 @@ pub fn write_rootfs_image_file(
     );
     let _ = fs::remove_file(&tmp_path);
     result
+}
+
+pub fn set_rootfs_image_file_mode(
+    image_path: &Path,
+    guest_path: &str,
+    mode: u32,
+) -> Result<(), String> {
+    let regular_file_mode = 0o100_000 | (mode & 0o7777);
+    run_debugfs(
+        image_path,
+        &format!("set_inode_field {guest_path} mode 0{regular_file_mode:o}"),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn try_clone_file(source: &Path, dest: &Path) -> Result<(), String> {
+    let output = Command::new("cp")
+        .arg("-c")
+        .arg(source)
+        .arg(dest)
+        .output()
+        .map_err(|e| format!("run cp -c: {e}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "cp -c failed with status {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn try_clone_file(source: &Path, dest: &Path) -> Result<(), String> {
+    let output = Command::new("cp")
+        .arg("--reflink=auto")
+        .arg("--sparse=always")
+        .arg(source)
+        .arg(dest)
+        .output()
+        .map_err(|e| format!("run cp --reflink=auto: {e}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "cp --reflink=auto --sparse=always failed with status {}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    ))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn try_clone_file(_source: &Path, _dest: &Path) -> Result<(), String> {
+    Err("no platform clone command available".to_string())
+}
+
+fn copy_sparse_file(source: &Path, dest: &Path) -> Result<(), String> {
+    const BUFFER_SIZE: usize = 1024 * 1024;
+
+    let mut source_file =
+        File::open(source).map_err(|e| format!("open {}: {e}", source.display()))?;
+    let mut dest_file =
+        File::create(dest).map_err(|e| format!("create {}: {e}", dest.display()))?;
+    let mut buffer = vec![0_u8; BUFFER_SIZE];
+    let mut size = 0_u64;
+
+    loop {
+        let read = source_file
+            .read(&mut buffer)
+            .map_err(|e| format!("read {}: {e}", source.display()))?;
+        if read == 0 {
+            break;
+        }
+
+        if buffer[..read].iter().all(|byte| *byte == 0) {
+            let skip =
+                i64::try_from(read).map_err(|_| format!("sparse copy chunk too large: {read}"))?;
+            dest_file
+                .seek(SeekFrom::Current(skip))
+                .map_err(|e| format!("seek {}: {e}", dest.display()))?;
+        } else {
+            dest_file
+                .write_all(&buffer[..read])
+                .map_err(|e| format!("write {}: {e}", dest.display()))?;
+        }
+        size += read as u64;
+    }
+
+    dest_file
+        .set_len(size)
+        .map_err(|e| format!("size {}: {e}", dest.display()))
 }
 
 #[cfg(test)]
@@ -694,6 +812,44 @@ mod tests {
             fs::read_link(&extracted_link).expect("read extracted symlink"),
             PathBuf::from("/proc/self/mounts")
         );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clone_or_copy_sparse_file_preserves_size_and_contents() {
+        let dir = unique_temp_dir();
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let source = dir.join("source.bin");
+        let dest = dir.join("dest.bin");
+
+        let mut source_file = File::create(&source).expect("create source");
+        source_file.write_all(b"head").expect("write head");
+        source_file
+            .seek(SeekFrom::Start(1024 * 1024 + 7))
+            .expect("seek source");
+        source_file.write_all(b"tail").expect("write tail");
+        source_file
+            .set_len(2 * 1024 * 1024 + 3)
+            .expect("size source");
+        drop(source_file);
+
+        clone_or_copy_sparse_file(&source, &dest).expect("copy sparse file");
+
+        assert_eq!(
+            fs::metadata(&dest).expect("stat dest").len(),
+            2 * 1024 * 1024 + 3
+        );
+        let mut dest_file = File::open(&dest).expect("open dest");
+        let mut head = [0_u8; 4];
+        dest_file.read_exact(&mut head).expect("read head");
+        assert_eq!(&head, b"head");
+        dest_file
+            .seek(SeekFrom::Start(1024 * 1024 + 7))
+            .expect("seek dest");
+        let mut tail = [0_u8; 4];
+        dest_file.read_exact(&mut tail).expect("read tail");
+        assert_eq!(&tail, b"tail");
 
         let _ = fs::remove_dir_all(&dir);
     }

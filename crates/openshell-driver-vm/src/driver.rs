@@ -5,8 +5,9 @@ use crate::gpu::{
     GpuInventory, SubnetAllocator, allocate_vsock_cid, mac_from_sandbox_id, tap_device_name,
 };
 use crate::rootfs::{
-    create_ext4_image_from_dir_with_size, create_rootfs_image_from_dir, extract_rootfs_archive_to,
-    prepare_sandbox_rootfs_from_image_root, sandbox_guest_init_path,
+    clone_or_copy_sparse_file, create_ext4_image_from_dir_with_size, create_rootfs_image_from_dir,
+    extract_rootfs_archive_to, prepare_sandbox_rootfs_from_image_root, sandbox_guest_init_path,
+    set_rootfs_image_file_mode, write_rootfs_image_file,
 };
 use bollard::Docker;
 use bollard::errors::Error as BollardError;
@@ -98,6 +99,8 @@ const GUEST_TLS_CERT_PATH: &str = "/opt/openshell/tls/tls.crt";
 const GUEST_TLS_KEY_PATH: &str = "/opt/openshell/tls/tls.key";
 const IMAGE_CACHE_ROOT_DIR: &str = "images";
 const IMAGE_CACHE_ROOTFS_IMAGE: &str = "rootfs.ext4";
+const OVERLAY_TEMPLATE_CACHE_DIR: &str = "overlay-templates";
+const OVERLAY_TEMPLATE_CACHE_LAYOUT_VERSION: &str = "sandbox-overlay-ext4-v1";
 const SANDBOX_OVERLAY_IMAGE: &str = "overlay.ext4";
 const GUEST_IMAGE_CONFIG_DIR: &str = "openshell-image";
 const GUEST_IMAGE_OCI_LAYOUT_DIR: &str = "oci";
@@ -1013,8 +1016,23 @@ impl VmDriver {
                 )
             })?;
 
+        let template_path = overlay_template_image(&self.config.state_dir, overlay_size_bytes);
+        if !overlay_template_image_ready(&template_path, overlay_size_bytes).await? {
+            let _cache_guard = self.image_cache_lock.lock().await;
+            let template_path = template_path.clone();
+            tokio::task::spawn_blocking(move || {
+                ensure_sandbox_overlay_template_image(&template_path, overlay_size_bytes)
+            })
+            .await
+            .map_err(|err| format!("overlay template preparation panicked: {err}"))??;
+        }
+
         tokio::task::spawn_blocking(move || {
-            create_sandbox_overlay_image(&overlay_disk, overlay_size_bytes, tls_materials.as_ref())
+            create_sandbox_overlay_image_from_template(
+                &template_path,
+                &overlay_disk,
+                tls_materials.as_ref(),
+            )
         })
         .await
         .map_err(|err| format!("overlay image preparation panicked: {err}"))?
@@ -3301,6 +3319,13 @@ fn sandbox_overlay_image(state_dir: &Path) -> PathBuf {
     state_dir.join(SANDBOX_OVERLAY_IMAGE)
 }
 
+fn overlay_template_image(root: &Path, size_bytes: u64) -> PathBuf {
+    image_cache_root_dir(root)
+        .join(OVERLAY_TEMPLATE_CACHE_DIR)
+        .join(OVERLAY_TEMPLATE_CACHE_LAYOUT_VERSION)
+        .join(format!("{size_bytes}.ext4"))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SandboxRuntimeDiskPaths {
     overlay_disk: PathBuf,
@@ -3541,11 +3566,66 @@ async fn read_guest_tls_materials(paths: &VmDriverTlsPaths) -> Result<GuestTlsMa
     Ok(GuestTlsMaterials { ca, cert, key })
 }
 
-fn create_sandbox_overlay_image(
-    overlay_disk: &Path,
+async fn overlay_template_image_ready(path: &Path, size_bytes: u64) -> Result<bool, String> {
+    match tokio::fs::metadata(path).await {
+        Ok(metadata) => Ok(metadata.is_file() && metadata.len() == size_bytes),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(format!("stat overlay template {}: {err}", path.display())),
+    }
+}
+
+fn ensure_sandbox_overlay_template_image(
+    template_path: &Path,
     size_bytes: u64,
-    tls_materials: Option<&GuestTlsMaterials>,
 ) -> Result<(), String> {
+    if let Ok(metadata) = fs::metadata(template_path)
+        && metadata.is_file()
+        && metadata.len() == size_bytes
+    {
+        return Ok(());
+    }
+
+    let parent = template_path.parent().ok_or_else(|| {
+        format!(
+            "overlay template path has no parent: {}",
+            template_path.display()
+        )
+    })?;
+    fs::create_dir_all(parent).map_err(|err| {
+        format!(
+            "create overlay template cache dir {}: {err}",
+            parent.display()
+        )
+    })?;
+
+    let staging_image = parent.join(format!(
+        ".{}.staging-{}-{}",
+        template_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("overlay-template.ext4"),
+        std::process::id(),
+        openshell_core::time::now_ms()
+    ));
+
+    let result = (|| {
+        create_empty_sandbox_overlay_image(&staging_image, size_bytes)?;
+        fs::rename(&staging_image, template_path).map_err(|err| {
+            format!(
+                "move overlay template {} to {}: {err}",
+                staging_image.display(),
+                template_path.display()
+            )
+        })
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&staging_image);
+    }
+    result
+}
+
+fn create_empty_sandbox_overlay_image(overlay_disk: &Path, size_bytes: u64) -> Result<(), String> {
     let staging_dir = overlay_staging_dir(overlay_disk);
     if staging_dir.exists() {
         fs::remove_dir_all(&staging_dir)
@@ -3560,15 +3640,46 @@ fn create_sandbox_overlay_image(
         fs::create_dir_all(staging_dir.join("config"))
             .map_err(|err| format!("create overlay config dir: {err}"))?;
 
-        if let Some(tls) = tls_materials {
-            stage_guest_tls_materials(&staging_dir, tls)?;
-        }
-
         create_ext4_image_from_dir_with_size(&staging_dir, overlay_disk, size_bytes)
     })();
 
     let _ = fs::remove_dir_all(&staging_dir);
     result
+}
+
+fn create_sandbox_overlay_image_from_template(
+    template_path: &Path,
+    overlay_disk: &Path,
+    tls_materials: Option<&GuestTlsMaterials>,
+) -> Result<(), String> {
+    clone_or_copy_sparse_file(template_path, overlay_disk)?;
+    if let Some(tls) = tls_materials {
+        inject_guest_tls_materials(overlay_disk, tls)?;
+    }
+    Ok(())
+}
+
+fn inject_guest_tls_materials(
+    overlay_disk: &Path,
+    materials: &GuestTlsMaterials,
+) -> Result<(), String> {
+    write_rootfs_image_file(
+        overlay_disk,
+        &overlay_upper_path(GUEST_TLS_CA_PATH),
+        &materials.ca,
+    )?;
+    write_rootfs_image_file(
+        overlay_disk,
+        &overlay_upper_path(GUEST_TLS_CERT_PATH),
+        &materials.cert,
+    )?;
+    let key_path = overlay_upper_path(GUEST_TLS_KEY_PATH);
+    write_rootfs_image_file(overlay_disk, &key_path, &materials.key)?;
+    set_rootfs_image_file_mode(overlay_disk, &key_path, 0o600)
+}
+
+fn overlay_upper_path(guest_path: &str) -> String {
+    format!("/upper/{}", guest_path.trim_start_matches('/'))
 }
 
 fn create_image_prep_disk(
@@ -3704,6 +3815,7 @@ fn dir_size_bytes(path: &Path) -> Result<u64, String> {
     Ok(total)
 }
 
+#[cfg(test)]
 fn stage_guest_tls_materials(
     staging_dir: &Path,
     materials: &GuestTlsMaterials,
@@ -3896,7 +4008,7 @@ fn attach_vm_progress_metadata(event: &mut PlatformEvent) {
         "PreparingRootfs" => mark_progress_detail(&mut event.metadata, "Preparing rootfs"),
         "CreatingRootDisk" => mark_progress_detail(&mut event.metadata, "Formatting root disk"),
         "PreparingOverlay" => mark_progress_detail(&mut event.metadata, "Preparing overlay disk"),
-        "Started" => mark_progress_detail(&mut event.metadata, "VM launcher started"),
+        "Started" => mark_progress_detail(&mut event.metadata, "Waiting for VM supervisor"),
         _ => {}
     }
 }
@@ -4196,6 +4308,28 @@ mod tests {
         let disks = sandbox_runtime_disk_paths(&state_dir);
 
         assert_eq!(disks.overlay_disk, state_dir.join(SANDBOX_OVERLAY_IMAGE));
+    }
+
+    #[test]
+    fn overlay_template_image_is_keyed_by_size_and_layout() {
+        let path = overlay_template_image(Path::new("/tmp/openshell-vm"), 4 * 1024 * 1024);
+
+        assert_eq!(
+            path,
+            Path::new("/tmp/openshell-vm")
+                .join(IMAGE_CACHE_ROOT_DIR)
+                .join(OVERLAY_TEMPLATE_CACHE_DIR)
+                .join(OVERLAY_TEMPLATE_CACHE_LAYOUT_VERSION)
+                .join("4194304.ext4")
+        );
+    }
+
+    #[test]
+    fn overlay_upper_path_targets_overlay_upperdir() {
+        assert_eq!(
+            overlay_upper_path(GUEST_TLS_KEY_PATH),
+            "/upper/opt/openshell/tls/tls.key"
+        );
     }
 
     #[test]
