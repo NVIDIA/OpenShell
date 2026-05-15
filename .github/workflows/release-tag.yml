@@ -797,13 +797,14 @@ jobs:
             --output release/openshell.rb
           cat release/openshell.rb
 
-      - name: Attest VM driver artifacts
+      - name: Attest release artifacts
         uses: actions/attest@v4
         with:
           subject-path: |
-            release/openshell-driver-vm-x86_64-unknown-linux-gnu.tar.gz
-            release/openshell-driver-vm-aarch64-unknown-linux-gnu.tar.gz
-            release/openshell-driver-vm-aarch64-apple-darwin.tar.gz
+            release/*.tar.gz
+            release/*.deb
+            release/*.rpm
+            release/*.whl
 
       - name: Prune removed VM checksum asset
         uses: actions/github-script@v9
