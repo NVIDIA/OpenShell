@@ -280,11 +280,15 @@ fn prepare_vm_state_dir(state_dir: &Path, expected_uid: u32) -> Result<()> {
     })?;
     let metadata = checked_directory_metadata(state_dir, expected_uid, "vm driver state dir")?;
     let mode = metadata.permissions().mode() & 0o777;
-    if mode & 0o022 != 0 {
-        return Err(Error::execution(format!(
-            "vm driver state dir '{}' must not be group/world-writable (mode {mode:03o})",
-            state_dir.display()
-        )));
+    if mode != 0o700 {
+        std::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700)).map_err(
+            |err| {
+                Error::execution(format!(
+                    "failed to restrict vm driver state dir '{}': {err}",
+                    state_dir.display()
+                ))
+            },
+        )?;
     }
     Ok(())
 }
@@ -720,7 +724,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_compute_driver_socket_path_rejects_writable_state_dir() {
+    fn prepare_compute_driver_socket_path_restricts_existing_state_dir() {
         let dir = tempdir().unwrap();
         let vm_config = VmComputeConfig {
             state_dir: dir.path().join("state"),
@@ -731,10 +735,14 @@ mod tests {
             .unwrap();
         let socket_path = compute_driver_socket_path(&vm_config);
 
-        let err = prepare_compute_driver_socket_path(&vm_config, &socket_path)
-            .expect_err("world-writable state dir should be rejected")
-            .to_string();
-        assert!(err.contains("must not be group/world-writable"));
+        prepare_compute_driver_socket_path(&vm_config, &socket_path).unwrap();
+
+        let mode = std::fs::metadata(vm_config.state_dir)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
     }
 
     #[test]

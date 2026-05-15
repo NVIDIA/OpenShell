@@ -307,6 +307,7 @@ fi
 
 mkdir -p "${STATE_DIR}"
 mkdir -p "${VM_DRIVER_STATE_DIR}"
+chmod 700 "${VM_DRIVER_STATE_DIR}"
 CONFIG_PATH="${STATE_DIR}/gateway.toml"
 cat >"${CONFIG_PATH}" <<EOF
 [openshell]

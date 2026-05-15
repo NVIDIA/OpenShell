@@ -30,6 +30,50 @@ detect_platform() {
     esac
 }
 
+# ── Runtime dependency downloads ────────────────────────────────────────
+
+# Download a Linux guest umoci binary for the requested architecture.
+# Usage: download_umoci_binary <output> <version> <guest_arch>
+download_umoci_binary() {
+    local output="$1"
+    local version="$2"
+    local guest_arch="$3"
+    local suffix
+
+    case "$guest_arch" in
+        arm64|aarch64) suffix="arm64" ;;
+        amd64|x86_64)  suffix="amd64" ;;
+        *)
+            echo "Error: Unsupported guest architecture for umoci: ${guest_arch}" >&2
+            return 1
+            ;;
+    esac
+
+    local base_url="https://github.com/opencontainers/umoci/releases/download/${version}"
+    local candidates=("umoci.linux.${suffix}" "umoci.${suffix}")
+    local error_log last_error asset
+    error_log="$(mktemp)"
+    last_error=""
+
+    echo "    Downloading umoci ${version} for linux/${suffix}..."
+    for asset in "${candidates[@]}"; do
+        if curl -fsSL -o "$output" "${base_url}/${asset}" 2>"$error_log"; then
+            chmod +x "$output"
+            rm -f "$error_log"
+            return 0
+        fi
+        last_error="$(cat "$error_log")"
+        rm -f "$output"
+    done
+
+    rm -f "$error_log"
+    echo "Error: failed to download umoci ${version} for linux/${suffix}" >&2
+    if [ -n "$last_error" ]; then
+        echo "$last_error" >&2
+    fi
+    return 1
+}
+
 # ── Compression helpers ─────────────────────────────────────────────────
 
 # Compress a single file with zstd level 19, reporting sizes.

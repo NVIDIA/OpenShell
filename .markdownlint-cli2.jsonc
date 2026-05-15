@@ -1,14 +1,24 @@
 {
   "globs": [
-    "**/*.md",
-    "**/*.mdx"
+    "*.md",
+    "architecture/**/*.md",
+    "crates/**/*.md",
+    "deploy/**/*.md",
+    "docs/**/*.md",
+    "docs/**/*.mdx",
+    "e2e/**/*.md",
+    "examples/**/*.md",
+    "rfc/**/*.md"
   ],
-  "gitignore": true,
+  "gitignore": false,
   "ignores": [
     ".agents/**",
     ".claude/**",
     ".opencode/**",
     ".github/**",
+    "**/node_modules/**",
+    "target/**",
+    ".pytest_cache/**",
     "THIRD-PARTY-NOTICES/**",
     "CLAUDE.md",
     // Man page sources use pandoc markdown with multiple H1 sections

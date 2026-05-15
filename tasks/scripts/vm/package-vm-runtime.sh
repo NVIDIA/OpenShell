@@ -122,14 +122,13 @@ chmod +x "${PACKAGE_DIR}/gvproxy"
 # ── Download umoci for the Linux guest ───────────────────────────────────
 
 echo "==> Downloading umoci ${UMOCI_VERSION} for ${PLATFORM} guest..."
+UMOCI_GUEST_ARCH=""
 case "$PLATFORM" in
-    linux-aarch64|darwin-aarch64) UMOCI_SUFFIX="arm64" ;;
-    linux-x86_64)                 UMOCI_SUFFIX="amd64" ;;
+    linux-aarch64|darwin-aarch64) UMOCI_GUEST_ARCH="arm64" ;;
+    linux-x86_64)                 UMOCI_GUEST_ARCH="amd64" ;;
 esac
 
-curl -fsSL -o "${PACKAGE_DIR}/umoci" \
-    "https://github.com/opencontainers/umoci/releases/download/${UMOCI_VERSION}/umoci.${UMOCI_SUFFIX}"
-chmod +x "${PACKAGE_DIR}/umoci"
+download_umoci_binary "${PACKAGE_DIR}/umoci" "${UMOCI_VERSION}" "${UMOCI_GUEST_ARCH}"
 
 # ── Write provenance metadata ───────────────────────────────────────────
 

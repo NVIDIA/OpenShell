@@ -61,21 +61,7 @@ mkdir -p "$OUTPUT_DIR"
 download_umoci_for_guest() {
     local output="$1"
     local guest_arch="$2"
-    local suffix
-
-    case "$guest_arch" in
-        arm64|aarch64) suffix="arm64" ;;
-        amd64|x86_64)  suffix="amd64" ;;
-        *)
-            echo "Error: Unsupported guest architecture for umoci: ${guest_arch}" >&2
-            exit 1
-            ;;
-    esac
-
-    echo "    Downloading umoci ${UMOCI_VERSION} for ${suffix}..."
-    curl -fsSL -o "$output" \
-        "https://github.com/opencontainers/umoci/releases/download/${UMOCI_VERSION}/umoci.${suffix}"
-    chmod +x "$output"
+    download_umoci_binary "$output" "${UMOCI_VERSION}" "$guest_arch"
 }
 
 # ── Fast path: compressed artifacts already present (e.g. from vm:setup) ──
