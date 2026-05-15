@@ -391,6 +391,7 @@ e2e_generate_pki "${GATEWAY_BIN}" "${PKI_DIR}"
 HOST_PORT=$(e2e_pick_port)
 STATE_DIR="${WORKDIR}/state"
 mkdir -p "${STATE_DIR}"
+JWT_DIR="${STATE_DIR}/jwt"
 
 GATEWAY_ENDPOINT="https://host.openshell.internal:${HOST_PORT}"
 E2E_NAMESPACE="e2e-docker-$$-${HOST_PORT}"
@@ -410,6 +411,7 @@ else
 fi
 
 echo "Starting openshell-gateway on port ${HOST_PORT} (namespace: ${E2E_NAMESPACE})..."
+e2e_generate_gateway_jwt "${JWT_DIR}"
 
 # Driver-specific options moved from CLI flags into a TOML config table
 # (commit 560550d2). Synthesize a minimal config here and pass --config.
@@ -428,6 +430,7 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
 {
   printf '[openshell]\nversion = 1\n\n'
   printf '[openshell.gateway]\nlog_level = "info"\n\n'
+  e2e_write_gateway_jwt_config "${JWT_DIR}" "openshell-e2e-docker-${HOST_PORT}"
   printf '[openshell.drivers.docker]\n'
   printf 'sandbox_namespace = %s\n'    "$(toml_string "${E2E_NAMESPACE}")"
   printf 'network_name = %s\n'         "$(toml_string "${DOCKER_NETWORK_NAME}")"

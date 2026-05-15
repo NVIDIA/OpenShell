@@ -335,6 +335,7 @@ HOST_PORT=$(e2e_pick_port)
 HEALTH_PORT=$(e2e_pick_port)
 STATE_DIR="${WORKDIR}/state"
 mkdir -p "${STATE_DIR}"
+JWT_DIR="${STATE_DIR}/jwt"
 
 E2E_NAMESPACE="e2e-podman-$$-${HOST_PORT}"
 PODMAN_NETWORK_NAME="${E2E_NAMESPACE}"
@@ -346,6 +347,7 @@ export OPENSHELL_E2E_NETWORK_NAME="${PODMAN_NETWORK_NAME}"
 export OPENSHELL_E2E_SANDBOX_NAMESPACE="${E2E_NAMESPACE}"
 
 echo "Starting openshell-gateway on port ${HOST_PORT} (namespace: ${E2E_NAMESPACE})..."
+e2e_generate_gateway_jwt "${JWT_DIR}"
 
 # Driver-specific options moved from CLI flags into a TOML config table
 # (commit 560550d2). Synthesize a minimal config here and pass --config.
@@ -370,6 +372,7 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
 # (CLI > TOML in the merge precedence) so the test can use an ephemeral port.
 cp "${ROOT}/deploy/rpm/gateway.toml.default" "${GATEWAY_CONFIG}"
 {
+  e2e_write_gateway_jwt_config "${JWT_DIR}" "openshell-e2e-podman-${HOST_PORT}"
   printf '\n[openshell.drivers.podman]\n'
   # The Podman driver scopes isolation by network rather than namespace.
   printf 'network_name = %s\n'   "$(toml_string "${PODMAN_NETWORK_NAME}")"

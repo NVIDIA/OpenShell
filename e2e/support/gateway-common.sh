@@ -93,6 +93,37 @@ EOF
   printf '%s' "${name}" >"${config_home}/openshell/active_gateway"
 }
 
+e2e_toml_string() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf '"%s"' "${value}"
+}
+
+e2e_generate_gateway_jwt() {
+  local jwt_dir=$1
+
+  mkdir -p "${jwt_dir}"
+  (
+    umask 077
+    openssl genpkey -algorithm Ed25519 -out "${jwt_dir}/signing.pem" >/dev/null 2>&1
+  )
+  openssl pkey -in "${jwt_dir}/signing.pem" -pubout -out "${jwt_dir}/public.pem" >/dev/null 2>&1
+  openssl rand -hex 16 >"${jwt_dir}/kid"
+}
+
+e2e_write_gateway_jwt_config() {
+  local jwt_dir=$1
+  local gateway_id=$2
+
+  printf '[openshell.gateway.gateway_jwt]\n'
+  printf 'signing_key_path = %s\n' "$(e2e_toml_string "${jwt_dir}/signing.pem")"
+  printf 'public_key_path = %s\n'  "$(e2e_toml_string "${jwt_dir}/public.pem")"
+  printf 'kid_path = %s\n'         "$(e2e_toml_string "${jwt_dir}/kid")"
+  printf 'gateway_id = %s\n'       "$(e2e_toml_string "${gateway_id}")"
+  printf 'ttl_secs = 86400\n\n'
+}
+
 e2e_build_gateway_binaries() {
   local root=$1
   local target_var=$2
@@ -176,4 +207,3 @@ e2e_print_gateway_log_on_failure() {
     echo "=== end gateway log ==="
   fi
 }
-
