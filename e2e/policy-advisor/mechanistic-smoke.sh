@@ -43,10 +43,6 @@ step() { printf "\n${BOLD}${CYAN}==> %s${RESET}\n\n" "$1"; }
 ok()   { printf "  ${GREEN}✓${RESET} %s\n" "$*"; }
 fail() { printf "\n${RED}FAIL:${RESET} %s\n" "$*" >&2; exit 1; }
 
-TMP_DIR=""
-SSH_CONFIG=""
-SSH_HOST=""
-
 cleanup() {
     if [[ "$KEEP_SANDBOX" != "1" ]]; then
         "$OPENSHELL_BIN" sandbox delete "$SANDBOX" >/dev/null 2>&1 || true
@@ -104,18 +100,13 @@ trigger_l4_deny() {
 }
 
 assert_pending_chunk() {
-    step "Waiting ${FLUSH_WAIT}s for denial aggregator to flush"
+    step "Waiting ${FLUSH_WAIT}s then checking for pending chunk"
     sleep "$FLUSH_WAIT"
-
-    step "Checking for pending mechanistic chunk"
     local output
     output="$("$OPENSHELL_BIN" rule get "$SANDBOX" --status pending 2>&1)"
-
     printf '%s\n' "$output" | sed 's/^/  /'
-
     printf '%s\n' "$output" | grep -qi "blocked.invalid" \
-        || fail "no pending chunk for blocked.invalid found in: ${output}"
-
+        || fail "no pending chunk for blocked.invalid"
     ok "pending mechanistic chunk present for blocked.invalid"
 }
 
