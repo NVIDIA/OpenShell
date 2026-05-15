@@ -52,6 +52,12 @@ pub struct CertgenArgs {
     #[arg(long, required_unless_present = "output_dir")]
     client_secret_name: Option<String>,
 
+    /// Name of the sandbox-JWT signing-key Secret (`Opaque`) to create.
+    /// Holds `signing.pem`, `public.pem`, and `kid` keys. Mounted on the
+    /// gateway pod (only) so it can mint and validate per-sandbox JWTs.
+    #[arg(long, required_unless_present = "output_dir")]
+    jwt_secret_name: Option<String>,
+
     /// Extra Subject Alternative Name for the server certificate. Repeatable.
     /// Auto-detected as an IP address or DNS name.
     #[arg(long = "server-san", value_name = "SAN")]
@@ -93,10 +99,10 @@ enum K8sAction {
     Create,
 }
 
-fn decide_k8s(server_exists: bool, client_exists: bool) -> K8sAction {
-    match (server_exists, client_exists) {
-        (true, true) => K8sAction::SkipExists,
-        (false, false) => K8sAction::Create,
+fn decide_k8s(server_exists: bool, client_exists: bool, jwt_exists: bool) -> K8sAction {
+    match (server_exists, client_exists, jwt_exists) {
+        (true, true, true) => K8sAction::SkipExists,
+        (false, false, false) => K8sAction::Create,
         _ => K8sAction::PartialState,
     }
 }
@@ -114,6 +120,10 @@ async fn run_kubernetes(args: &CertgenArgs, bundle: &PkiBundle) -> Result<()> {
         .client_secret_name
         .as_deref()
         .ok_or_else(|| miette::miette!("--client-secret-name is required"))?;
+    let jwt_name = args
+        .jwt_secret_name
+        .as_deref()
+        .ok_or_else(|| miette::miette!("--jwt-secret-name is required"))?;
 
     let client = Client::try_default()
         .await
@@ -133,22 +143,29 @@ async fn run_kubernetes(args: &CertgenArgs, bundle: &PkiBundle) -> Result<()> {
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to read secret {client_name}"))?
         .is_some();
+    let jwt_exists = api
+        .get_opt(jwt_name)
+        .await
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read secret {jwt_name}"))?
+        .is_some();
 
-    match decide_k8s(server_exists, client_exists) {
+    match decide_k8s(server_exists, client_exists, jwt_exists) {
         K8sAction::SkipExists => {
             info!(
                 namespace = %namespace,
                 server = %server_name,
                 client = %client_name,
+                jwt = %jwt_name,
                 "PKI secrets already exist, skipping."
             );
             return Ok(());
         }
         K8sAction::PartialState => {
             return Err(miette::miette!(
-                "partial PKI state in namespace {namespace}: exactly one of \
-                 {server_name} / {client_name} exists. Recover with: \
-                 kubectl delete secret -n {namespace} {server_name} {client_name}",
+                "partial PKI state in namespace {namespace}: only some of \
+                 {server_name} / {client_name} / {jwt_name} exist. Recover with: \
+                 kubectl delete secret -n {namespace} {server_name} {client_name} {jwt_name}",
             ));
         }
         K8sAction::Create => {}
@@ -166,6 +183,12 @@ async fn run_kubernetes(args: &CertgenArgs, bundle: &PkiBundle) -> Result<()> {
         &bundle.client_key_pem,
         &bundle.ca_cert_pem,
     );
+    let jwt_secret = jwt_signing_secret(
+        jwt_name,
+        &bundle.jwt_signing_key_pem,
+        &bundle.jwt_public_key_pem,
+        &bundle.jwt_key_id,
+    );
 
     api.create(&PostParams::default(), &server_secret)
         .await
@@ -175,11 +198,16 @@ async fn run_kubernetes(args: &CertgenArgs, bundle: &PkiBundle) -> Result<()> {
         .await
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to create secret {client_name}"))?;
+    api.create(&PostParams::default(), &jwt_secret)
+        .await
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to create secret {jwt_name}"))?;
 
     info!(
         namespace = %namespace,
         server = %server_name,
         client = %client_name,
+        jwt = %jwt_name,
         "PKI secrets created."
     );
     Ok(())
@@ -202,6 +230,31 @@ fn tls_secret(name: &str, crt_pem: &str, key_pem: &str, ca_pem: &str) -> Secret 
             ..Default::default()
         },
         type_: Some("kubernetes.io/tls".to_string()),
+        data: Some(data),
+        ..Default::default()
+    }
+}
+
+/// Build an `Opaque` Secret carrying the gateway-minted sandbox JWT
+/// signing material. Mounted only on the gateway pod — sandbox pods
+/// receive a per-pod gateway-signed token, never the signing key itself.
+fn jwt_signing_secret(name: &str, signing_pem: &str, public_pem: &str, kid: &str) -> Secret {
+    let mut data = BTreeMap::new();
+    data.insert(
+        "signing.pem".to_string(),
+        ByteString(signing_pem.as_bytes().to_vec()),
+    );
+    data.insert(
+        "public.pem".to_string(),
+        ByteString(public_pem.as_bytes().to_vec()),
+    );
+    data.insert("kid".to_string(), ByteString(kid.as_bytes().to_vec()));
+    Secret {
+        metadata: ObjectMeta {
+            name: Some(name.to_string()),
+            ..Default::default()
+        },
+        type_: Some("Opaque".to_string()),
         data: Some(data),
         ..Default::default()
     }
@@ -235,12 +288,17 @@ struct LocalPaths {
     client_dir: PathBuf,
     client_crt: PathBuf,
     client_key: PathBuf,
+    jwt_dir: PathBuf,
+    jwt_signing: PathBuf,
+    jwt_public: PathBuf,
+    jwt_kid: PathBuf,
 }
 
 impl LocalPaths {
     fn resolve(dir: &Path) -> Self {
         let server_dir = dir.join("server");
         let client_dir = dir.join("client");
+        let jwt_dir = dir.join("jwt");
         Self {
             ca_crt: dir.join("ca.crt"),
             ca_key: dir.join("ca.key"),
@@ -250,10 +308,14 @@ impl LocalPaths {
             client_crt: client_dir.join("tls.crt"),
             client_key: client_dir.join("tls.key"),
             client_dir,
+            jwt_signing: jwt_dir.join("signing.pem"),
+            jwt_public: jwt_dir.join("public.pem"),
+            jwt_kid: jwt_dir.join("kid"),
+            jwt_dir,
         }
     }
 
-    fn all_files(&self) -> [&Path; 6] {
+    fn all_files(&self) -> [&Path; 9] {
         [
             &self.ca_crt,
             &self.ca_key,
@@ -261,6 +323,9 @@ impl LocalPaths {
             &self.server_key,
             &self.client_crt,
             &self.client_key,
+            &self.jwt_signing,
+            &self.jwt_public,
+            &self.jwt_kid,
         ]
     }
 
@@ -271,7 +336,7 @@ impl LocalPaths {
 
 fn decide_local(present: usize) -> LocalAction {
     match present {
-        6 => LocalAction::Skip,
+        9 => LocalAction::Skip,
         0 => LocalAction::Create,
         _ => LocalAction::PartialState,
     }
@@ -318,6 +383,9 @@ fn read_local_bundle(paths: &LocalPaths) -> Result<PkiBundle> {
         server_key_pem: read_pem(&paths.server_key)?,
         client_cert_pem: read_pem(&paths.client_crt)?,
         client_key_pem: read_pem(&paths.client_key)?,
+        jwt_signing_key_pem: read_pem(&paths.jwt_signing)?,
+        jwt_public_key_pem: read_pem(&paths.jwt_public)?,
+        jwt_key_id: read_pem(&paths.jwt_kid)?.trim().to_string(),
     })
 }
 
@@ -339,9 +407,11 @@ fn write_local_bundle(dir: &Path, bundle: &PkiBundle, paths: &LocalPaths) -> Res
 
     let temp_server = temp.join("server");
     let temp_client = temp.join("client");
+    let temp_jwt = temp.join("jwt");
     create_dir_restricted(&temp)?;
     create_dir_restricted(&temp_server)?;
     create_dir_restricted(&temp_client)?;
+    create_dir_restricted(&temp_jwt)?;
 
     write_pem(&temp.join("ca.crt"), &bundle.ca_cert_pem, false)?;
     write_pem(&temp.join("ca.key"), &bundle.ca_key_pem, true)?;
@@ -349,19 +419,34 @@ fn write_local_bundle(dir: &Path, bundle: &PkiBundle, paths: &LocalPaths) -> Res
     write_pem(&temp_server.join("tls.key"), &bundle.server_key_pem, true)?;
     write_pem(&temp_client.join("tls.crt"), &bundle.client_cert_pem, false)?;
     write_pem(&temp_client.join("tls.key"), &bundle.client_key_pem, true)?;
+    write_pem(
+        &temp_jwt.join("signing.pem"),
+        &bundle.jwt_signing_key_pem,
+        true,
+    )?;
+    write_pem(
+        &temp_jwt.join("public.pem"),
+        &bundle.jwt_public_key_pem,
+        false,
+    )?;
+    write_pem(&temp_jwt.join("kid"), &bundle.jwt_key_id, false)?;
 
     // Final destination (might not exist yet on first run).
     create_dir_restricted(dir)?;
     create_dir_restricted(&paths.server_dir)?;
     create_dir_restricted(&paths.client_dir)?;
+    create_dir_restricted(&paths.jwt_dir)?;
 
-    let renames: [(PathBuf, &Path); 6] = [
+    let renames: [(PathBuf, &Path); 9] = [
         (temp.join("ca.crt"), paths.ca_crt.as_path()),
         (temp.join("ca.key"), paths.ca_key.as_path()),
         (temp_server.join("tls.crt"), paths.server_crt.as_path()),
         (temp_server.join("tls.key"), paths.server_key.as_path()),
         (temp_client.join("tls.crt"), paths.client_crt.as_path()),
         (temp_client.join("tls.key"), paths.client_key.as_path()),
+        (temp_jwt.join("signing.pem"), paths.jwt_signing.as_path()),
+        (temp_jwt.join("public.pem"), paths.jwt_public.as_path()),
+        (temp_jwt.join("kid"), paths.jwt_kid.as_path()),
     ];
     for (from, to) in &renames {
         std::fs::rename(from, to)
@@ -406,8 +491,8 @@ fn print_bundle(bundle: &PkiBundle) {
 #[cfg(test)]
 mod tests {
     use super::{
-        K8sAction, LocalAction, LocalPaths, decide_k8s, decide_local, read_local_bundle,
-        sibling_temp_dir, tls_secret, write_local_bundle,
+        K8sAction, LocalAction, LocalPaths, decide_k8s, decide_local, jwt_signing_secret,
+        read_local_bundle, sibling_temp_dir, tls_secret, write_local_bundle,
     };
     use openshell_bootstrap::pki::generate_pki;
     use std::path::Path;
@@ -415,23 +500,32 @@ mod tests {
     // ── Kubernetes-mode decision ──
 
     #[test]
-    fn decide_k8s_skip_when_both_exist() {
-        assert_eq!(decide_k8s(true, true), K8sAction::SkipExists);
+    fn decide_k8s_skip_when_all_three_exist() {
+        assert_eq!(decide_k8s(true, true, true), K8sAction::SkipExists);
     }
 
     #[test]
-    fn decide_k8s_create_when_neither_exists() {
-        assert_eq!(decide_k8s(false, false), K8sAction::Create);
+    fn decide_k8s_create_when_none_exist() {
+        assert_eq!(decide_k8s(false, false, false), K8sAction::Create);
     }
 
     #[test]
-    fn decide_k8s_partial_when_only_server_exists() {
-        assert_eq!(decide_k8s(true, false), K8sAction::PartialState);
-    }
-
-    #[test]
-    fn decide_k8s_partial_when_only_client_exists() {
-        assert_eq!(decide_k8s(false, true), K8sAction::PartialState);
+    fn decide_k8s_partial_for_any_mixed_state() {
+        let mixes = [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+            (true, true, false),
+            (true, false, true),
+            (false, true, true),
+        ];
+        for (s, c, j) in mixes {
+            assert_eq!(
+                decide_k8s(s, c, j),
+                K8sAction::PartialState,
+                "({s},{c},{j})"
+            );
+        }
     }
 
     #[test]
@@ -446,11 +540,23 @@ mod tests {
         assert_eq!(data["ca.crt"].0, b"CA-PEM");
     }
 
+    #[test]
+    fn jwt_signing_secret_has_opaque_type_and_three_keys() {
+        let s = jwt_signing_secret("jwt", "SIGN", "PUB", "kid-1");
+        assert_eq!(s.metadata.name.as_deref(), Some("jwt"));
+        assert_eq!(s.type_.as_deref(), Some("Opaque"));
+        let data = s.data.expect("data set");
+        assert_eq!(data.len(), 3);
+        assert_eq!(data["signing.pem"].0, b"SIGN");
+        assert_eq!(data["public.pem"].0, b"PUB");
+        assert_eq!(data["kid"].0, b"kid-1");
+    }
+
     // ── Local-mode decision ──
 
     #[test]
-    fn decide_local_skip_when_all_six_present() {
-        assert_eq!(decide_local(6), LocalAction::Skip);
+    fn decide_local_skip_when_all_nine_present() {
+        assert_eq!(decide_local(9), LocalAction::Skip);
     }
 
     #[test]
@@ -460,7 +566,7 @@ mod tests {
 
     #[test]
     fn decide_local_partial_for_any_count_in_between() {
-        for n in 1..=5 {
+        for n in 1..=8 {
             assert_eq!(decide_local(n), LocalAction::PartialState, "n = {n}");
         }
     }

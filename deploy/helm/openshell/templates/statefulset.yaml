@@ -84,6 +84,9 @@ spec:
               mountPath: /etc/openshell-tls/client-ca
               readOnly: true
             {{- end }}
+            - name: sandbox-jwt
+              mountPath: /etc/openshell-jwt
+              readOnly: true
             {{- if and .Values.server.oidc.issuer .Values.server.oidc.caConfigMapName }}
             - name: oidc-ca
               mountPath: /etc/openshell-tls/oidc-ca
@@ -147,6 +150,10 @@ spec:
             secretName: {{ .Values.server.tls.clientCaSecretName }}
             {{- end }}
         {{- end }}
+        - name: sandbox-jwt
+          secret:
+            secretName: {{ .Values.server.sandboxJwt.signingSecretName | default (printf "%s-jwt-keys" (include "openshell.fullname" .)) }}
+            defaultMode: 0400
         {{- if and .Values.server.oidc.issuer .Values.server.oidc.caConfigMapName }}
         - name: oidc-ca
           configMap:

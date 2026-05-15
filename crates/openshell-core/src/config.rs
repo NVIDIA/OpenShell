@@ -205,6 +205,13 @@ pub struct Config {
     #[serde(default)]
     pub oidc: Option<OidcConfig>,
 
+    /// Gateway-minted sandbox JWT configuration. When `Some`, the gateway
+    /// loads the signing key from disk and accepts gateway-issued sandbox
+    /// JWTs as `Principal::Sandbox`. Required for the per-sandbox identity
+    /// flow (issue #1354).
+    #[serde(default)]
+    pub gateway_jwt: Option<GatewayJwtConfig>,
+
     /// Database URL for persistence.
     pub database_url: String,
 
@@ -317,6 +324,37 @@ const fn default_jwks_ttl_secs() -> u64 {
     3600
 }
 
+/// Gateway-minted sandbox JWT configuration.
+///
+/// Points the gateway at the Ed25519 signing key (produced by `certgen`)
+/// and identifies the issuer string embedded in every minted token. The
+/// signing key never leaves the gateway process; the public key is loaded
+/// by the same gateway so it can validate its own tokens.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatewayJwtConfig {
+    /// Path to the Ed25519 signing key (PKCS#8 PEM).
+    pub signing_key_path: PathBuf,
+    /// Path to the matching public key (SPKI PEM).
+    pub public_key_path: PathBuf,
+    /// Path to the `kid` value (plain text, one line).
+    pub kid_path: PathBuf,
+    /// Stable gateway identity embedded in `iss`/`aud`. Defaults to the
+    /// hostname-or-`openshell` placeholder if unset.
+    #[serde(default = "default_gateway_id")]
+    pub gateway_id: String,
+    /// Token lifetime in seconds. Defaults to 24 hours.
+    #[serde(default = "default_sandbox_token_ttl_secs")]
+    pub ttl_secs: u64,
+}
+
+fn default_gateway_id() -> String {
+    "openshell".to_string()
+}
+
+const fn default_sandbox_token_ttl_secs() -> u64 {
+    86_400
+}
+
 fn default_roles_claim() -> String {
     "realm_access.roles".to_string()
 }
@@ -340,6 +378,7 @@ impl Config {
             log_level: default_log_level(),
             tls,
             oidc: None,
+            gateway_jwt: None,
             database_url: String::new(),
             compute_drivers: vec![],
             ssh_session_ttl_secs: default_ssh_session_ttl_secs(),

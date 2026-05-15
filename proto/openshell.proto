@@ -224,6 +224,28 @@ service OpenShell {
 
   // Get decision history for a sandbox's draft policy.
   rpc GetDraftHistory(GetDraftHistoryRequest) returns (GetDraftHistoryResponse);
+
+  // Exchange a sandbox-bootstrap credential (e.g. a Kubernetes projected
+  // ServiceAccount token) for a gateway-minted JWT bound to the calling
+  // sandbox's UUID. Used by the Kubernetes driver path; singleplayer
+  // drivers receive the gateway JWT directly from the create-sandbox flow
+  // and never call this RPC.
+  rpc IssueSandboxToken(IssueSandboxTokenRequest) returns (IssueSandboxTokenResponse);
+}
+
+// IssueSandboxToken request. Empty body; identity is established by the
+// authentication credentials carried in the request headers (a projected
+// Kubernetes ServiceAccount JWT in the K8s driver path).
+message IssueSandboxTokenRequest {}
+
+// IssueSandboxToken response. The supervisor caches the returned token in
+// memory and presents it as `Authorization: Bearer` on every subsequent
+// gateway RPC.
+message IssueSandboxTokenResponse {
+  // Gateway-minted JWT bound to the calling sandbox's UUID.
+  string token = 1;
+  // Absolute expiry of the issued token, milliseconds since the epoch.
+  int64 expires_at_ms = 2;
 }
 
 // Health check request.

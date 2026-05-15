@@ -20,10 +20,11 @@ use openshell_core::proto::{
     GetGatewayConfigRequest, GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
     GetSandboxConfigResponse, GetSandboxProviderEnvironmentRequest,
     GetSandboxProviderEnvironmentResponse, GetSandboxRequest, HealthRequest, HealthResponse,
-    ListProvidersRequest, ListProvidersResponse, ListSandboxesRequest, ListSandboxesResponse,
-    ProviderResponse, RelayFrame, RevokeSshSessionRequest, RevokeSshSessionResponse,
-    SandboxResponse, SandboxStreamEvent, ServiceStatus, SupervisorMessage, TcpForwardFrame,
-    UpdateProviderRequest, WatchSandboxRequest,
+    IssueSandboxTokenRequest, IssueSandboxTokenResponse, ListProvidersRequest,
+    ListProvidersResponse, ListSandboxesRequest, ListSandboxesResponse, ProviderResponse,
+    RelayFrame, RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResponse,
+    SandboxStreamEvent, ServiceStatus, SupervisorMessage, TcpForwardFrame, UpdateProviderRequest,
+    WatchSandboxRequest,
     open_shell_server::{OpenShell, OpenShellServer},
 };
 use openshell_server::{MultiplexedService, TlsAcceptor, health_router};
@@ -417,6 +418,13 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<openshell_core::proto::GetDraftHistoryRequest>,
     ) -> Result<Response<openshell_core::proto::GetDraftHistoryResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn issue_sandbox_token(
+        &self,
+        _request: tonic::Request<IssueSandboxTokenRequest>,
+    ) -> Result<Response<IssueSandboxTokenResponse>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
 

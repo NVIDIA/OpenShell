@@ -99,6 +99,12 @@ pub(super) async fn handle_create_sandbox(
     }
 
     let id = uuid::Uuid::new_v4().to_string();
+    // PR 3 wires `state.sandbox_jwt_issuer.mint(&id)` here for singleplayer
+    // drivers (Docker / Podman / VM), passing the minted token through the
+    // driver call so it lands in the sandbox bundle. K8s sandboxes skip
+    // this mint and exchange a projected ServiceAccount token via
+    // `IssueSandboxToken` at supervisor startup.
+
     let name = if request.name.is_empty() {
         petname::petname(2, "-").unwrap_or_else(generate_name)
     } else {

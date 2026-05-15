@@ -160,7 +160,7 @@ impl MultiplexService {
             user_role: oidc.user_role.clone(),
             scopes_enabled: !oidc.scopes_claim.is_empty(),
         });
-        let authenticator_chain = build_authenticator_chain(self.state.oidc_cache.clone());
+        let authenticator_chain = build_authenticator_chain(&self.state);
         let grpc_service = AuthGrpcRouter::with_peer_identity(
             GrpcRouter::new(openshell, inference),
             authenticator_chain,
@@ -259,29 +259,39 @@ where
 
 /// Assemble the authenticator chain for the gateway.
 ///
-/// PR-1 composition:
-/// 1. [`LegacySandboxMarkerAuthenticator`] — preserves the path-based
-///    sandbox/dual-auth-no-Bearer behavior so handlers that still read the
-///    metadata marker keep working. Removed in PR 3.
-/// 2. [`OidcAuthenticator`] — validates Bearer tokens against the configured
-///    OIDC issuer. Only added when OIDC is configured.
+/// Chain order (first-match-wins):
+/// 1. [`K8sServiceAccountAuthenticator`] (path-scoped to `IssueSandboxToken`)
+///    — exchanges a projected SA token for a `Principal::Sandbox` so the
+///    `IssueSandboxToken` handler can mint a gateway JWT. No-op on every
+///    other path; only present when the gateway runs in-cluster.
+/// 2. [`SandboxJwtAuthenticator`] — validates gateway-minted JWTs. Recognized
+///    via a distinctive `kid` so non-matching Bearer tokens fall through.
+/// 3. [`LegacySandboxMarkerAuthenticator`] — PR-1 holdover that produces a
+///    `Principal::Sandbox` for sandbox/dual-auth paths without a Bearer.
+///    Removed in PR 3.
+/// 4. [`OidcAuthenticator`] — validates user Bearer tokens against the
+///    configured OIDC issuer. Only added when OIDC is configured.
 ///
-/// When OIDC is not configured (singleplayer dev mode, fronting-proxy
-/// deployments before PR 3), the chain still has the legacy marker so
-/// sandbox-class methods produce a `Principal::Sandbox` and non-sandbox
-/// methods produce `None` — preserving today's "OIDC None == pass through"
-/// behavior via the router's `chain_empty_means_passthrough` short-circuit.
-fn build_authenticator_chain(
-    oidc_cache: Option<Arc<oidc::JwksCache>>,
-) -> Option<AuthenticatorChain> {
+/// When OIDC is *and* sandbox-JWT signing are both unconfigured (a barebones
+/// dev gateway), the chain is left as `None` so the router short-circuits to
+/// pass-through. The legacy marker can satisfy sandbox-class routes only
+/// when paired with an OIDC authenticator that gates user routes, so we
+/// require at least one of OIDC or sandbox JWT to build a chain.
+fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> {
     let mut authenticators: Vec<Arc<dyn crate::auth::authenticator::Authenticator>> = Vec::new();
+    if let Some(k8s) = state.k8s_sa_authenticator.clone() {
+        authenticators.push(k8s);
+    }
+    if let Some(jwt) = state.sandbox_jwt_authenticator.clone() {
+        authenticators.push(jwt);
+    }
     authenticators.push(Arc::new(LegacySandboxMarkerAuthenticator));
-    if let Some(cache) = oidc_cache {
+    if let Some(cache) = state.oidc_cache.clone() {
         authenticators.push(Arc::new(OidcAuthenticator::new(cache)));
-    } else {
-        // No OIDC configured — the router treats a missing OIDC cache as
-        // "pass-through for non-sandbox methods" by skipping the chain
-        // entirely. See AuthGrpcRouter::call.
+    } else if state.sandbox_jwt_authenticator.is_none() {
+        // Neither OIDC nor gateway-minted JWTs are configured — preserve
+        // the pre-PR-1 "open by default" dev behavior by returning no chain
+        // so the router short-circuits to pass-through.
         return None;
     }
     Some(AuthenticatorChain::new(authenticators))
@@ -977,10 +987,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(
-                matches!(
-                    seen.lock().unwrap().clone(),
-                    Some(Principal::Sandbox(_))
-                ),
+                matches!(seen.lock().unwrap().clone(), Some(Principal::Sandbox(_))),
                 "principal must reach extensions"
             );
             assert!(

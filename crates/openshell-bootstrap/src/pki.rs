@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::jwt::{JwtKeyMaterial, generate_jwt_key};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use rcgen::{BasicConstraints, CertificateParams, DnType, Ia5String, IsCa, KeyPair, SanType};
 use std::net::IpAddr;
@@ -15,6 +16,12 @@ pub struct PkiBundle {
     pub server_key_pem: String,
     pub client_cert_pem: String,
     pub client_key_pem: String,
+    /// PKCS#8 PEM Ed25519 private key for minting per-sandbox JWTs.
+    pub jwt_signing_key_pem: String,
+    /// SPKI PEM Ed25519 public key, paired with `jwt_signing_key_pem`.
+    pub jwt_public_key_pem: String,
+    /// Stable identifier embedded in the `kid` header of every minted JWT.
+    pub jwt_key_id: String,
 }
 
 /// Default SANs always included on the server certificate. Covers the host
@@ -99,6 +106,13 @@ pub fn generate_pki(extra_sans: &[String]) -> Result<PkiBundle> {
         .into_diagnostic()
         .wrap_err("failed to sign client certificate")?;
 
+    // --- JWT signing key (Ed25519, used to mint per-sandbox identity tokens) ---
+    let JwtKeyMaterial {
+        signing_key_pem: jwt_signing_key_pem,
+        public_key_pem: jwt_public_key_pem,
+        kid: jwt_key_id,
+    } = generate_jwt_key().wrap_err("failed to generate JWT signing key")?;
+
     Ok(PkiBundle {
         ca_cert_pem: ca_cert.pem(),
         ca_key_pem: ca_key.serialize_pem(),
@@ -106,6 +120,9 @@ pub fn generate_pki(extra_sans: &[String]) -> Result<PkiBundle> {
         server_key_pem: server_key.serialize_pem(),
         client_cert_pem: client_cert.pem(),
         client_key_pem: client_key.serialize_pem(),
+        jwt_signing_key_pem,
+        jwt_public_key_pem,
+        jwt_key_id,
     })
 }
 
@@ -148,6 +165,9 @@ mod tests {
         assert!(bundle.server_key_pem.contains("BEGIN PRIVATE KEY"));
         assert!(bundle.client_cert_pem.contains("BEGIN CERTIFICATE"));
         assert!(bundle.client_key_pem.contains("BEGIN PRIVATE KEY"));
+        assert!(bundle.jwt_signing_key_pem.contains("BEGIN PRIVATE KEY"));
+        assert!(bundle.jwt_public_key_pem.contains("BEGIN PUBLIC KEY"));
+        assert_eq!(bundle.jwt_key_id.len(), 32, "kid is 16 bytes hex-encoded");
     }
 
     #[test]

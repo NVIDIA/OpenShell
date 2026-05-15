@@ -100,6 +100,7 @@ spec:
             - generate-certs
             - --server-secret-name={{ .Values.server.tls.certSecretName }}
             - --client-secret-name={{ .Values.server.tls.clientTlsSecretName }}
+            - --jwt-secret-name={{ .Values.server.sandboxJwt.signingSecretName | default (printf "%s-jwt-keys" (include "openshell.fullname" .)) }}
             {{- range .Values.pkiInitJob.serverDnsNames }}
             - --server-san={{ . }}
             {{- end }}

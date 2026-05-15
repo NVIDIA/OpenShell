@@ -12,7 +12,10 @@ pub mod authenticator;
 pub mod authz;
 mod http;
 pub mod identity;
+pub mod k8s_sa;
 pub mod oidc;
 pub mod principal;
+pub mod revocation;
+pub mod sandbox_jwt;
 
 pub use http::router;

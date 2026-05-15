@@ -336,6 +336,18 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
         });
     }
 
+    // PR-2 wires gateway_jwt via the config file only — there's no CLI
+    // flag yet because the standard deployments (helm chart + RPM init
+    // script) drop the keypair to a known path and pass that path through
+    // the TOML. A CLI shortcut can be added if a singleplayer operator
+    // needs to override.
+    if let Some(jwt) = file
+        .as_ref()
+        .and_then(|f| f.openshell.gateway.gateway_jwt.clone())
+    {
+        config.gateway_jwt = Some(jwt);
+    }
+
     let vm_config = build_vm_config(
         file.as_ref(),
         local_tls.as_ref(),
@@ -832,6 +844,8 @@ mod tests {
             "openshell-server-tls",
             "--client-secret-name",
             "openshell-client-tls",
+            "--jwt-secret-name",
+            "openshell-jwt-keys",
             "--server-san",
             "openshell.example.com",
             "--server-san",

@@ -25,7 +25,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use openshell_core::config::ComputeDriverKind;
-use openshell_core::{OidcConfig, TlsConfig};
+use openshell_core::{GatewayJwtConfig, OidcConfig, TlsConfig};
 use serde::{Deserialize, Serialize};
 
 /// Latest schema version this build understands.
@@ -133,6 +133,8 @@ pub struct GatewayFileSection {
     pub tls: Option<TlsConfig>,
     #[serde(default)]
     pub oidc: Option<OidcConfig>,
+    #[serde(default)]
+    pub gateway_jwt: Option<GatewayJwtConfig>,
 
     // ── Disallowed-in-file fields ────────────────────────────────────────
     //

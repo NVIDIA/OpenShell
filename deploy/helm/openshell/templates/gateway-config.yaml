@@ -64,6 +64,13 @@ data:
     {{- end }}
     {{- end }}
 
+    [openshell.gateway.gateway_jwt]
+    signing_key_path = "/etc/openshell-jwt/signing.pem"
+    public_key_path  = "/etc/openshell-jwt/public.pem"
+    kid_path         = "/etc/openshell-jwt/kid"
+    gateway_id       = {{ .Values.server.sandboxJwt.gatewayId | default (include "openshell.fullname" .) | quote }}
+    ttl_secs         = {{ .Values.server.sandboxJwt.ttlSecs | default 86400 }}
+
     {{- if .Values.server.oidc.issuer }}
 
     [openshell.gateway.oidc]

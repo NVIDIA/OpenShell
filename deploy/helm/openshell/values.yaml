@@ -175,6 +175,18 @@ server:
     clientCaSecretName: openshell-server-client-ca
     # -- K8s secret mounted into sandbox pods for mTLS to the server.
     clientTlsSecretName: openshell-client-tls
+  # Gateway-minted sandbox JWT signing keys. The pre-install certgen hook
+  # generates an Ed25519 keypair and writes it to a secret containing
+  # signing.pem (PKCS#8), public.pem (SPKI), and kid (plain text).
+  sandboxJwt:
+    # Name of the Opaque Secret holding the signing key material. Empty
+    # falls back to "<release>-jwt-keys".
+    signingSecretName: ""
+    # Stable gateway identity embedded in iss/aud of every minted token.
+    # Defaults to the release name so HA replicas share identity.
+    gatewayId: ""
+    # Token TTL in seconds. Defaults to 86400 (24h).
+    ttlSecs: 86400
   # OIDC (OpenID Connect) configuration for JWT-based authentication.
   # When issuer is set, the server validates Bearer tokens on gRPC requests.
   oidc:

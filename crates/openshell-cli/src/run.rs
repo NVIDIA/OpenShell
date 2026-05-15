@@ -743,6 +743,11 @@ fn import_local_package_mtls_bundle(name: &str) -> Result<Option<PathBuf>> {
             client_key_pem: std::fs::read_to_string(&key)
                 .into_diagnostic()
                 .wrap_err_with(|| format!("failed to read {}", key.display()))?,
+            // CLI never holds the gateway's JWT signing material — only the
+            // gateway needs it. Fill the JWT fields with placeholders.
+            jwt_signing_key_pem: String::new(),
+            jwt_public_key_pem: String::new(),
+            jwt_key_id: String::new(),
         };
         openshell_bootstrap::mtls::store_pki_bundle(name, &bundle)
             .wrap_err_with(|| format!("failed to store mTLS bundle for gateway '{name}'"))?;
