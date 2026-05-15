@@ -1522,25 +1522,23 @@ fn parse_registry_reference(image_ref: &str) -> Result<Reference, Status> {
 /// `DOCKER_HOST`). If Docker is unavailable, falls back to the Podman
 /// socket, which exposes a Docker-compatible API.
 async fn connect_local_container_engine() -> Option<Docker> {
-    if let Ok(docker) = Docker::connect_with_local_defaults() {
-        if docker.ping().await.is_ok() {
-            return Some(docker);
-        }
+    if let Ok(docker) = Docker::connect_with_local_defaults()
+        && docker.ping().await.is_ok()
+    {
+        return Some(docker);
     }
 
     let podman_socket = podman_socket_path();
-    if podman_socket.exists() {
-        if let Ok(docker) =
+    if podman_socket.exists()
+        && let Ok(docker) =
             Docker::connect_with_unix(podman_socket.to_str()?, 120, bollard::API_DEFAULT_VERSION)
-        {
-            if docker.ping().await.is_ok() {
-                info!(
-                    socket = %podman_socket.display(),
-                    "vm driver: connected to Podman (Docker-compatible API)"
-                );
-                return Some(docker);
-            }
-        }
+        && docker.ping().await.is_ok()
+    {
+        info!(
+            socket = %podman_socket.display(),
+            "vm driver: connected to Podman (Docker-compatible API)"
+        );
+        return Some(docker);
     }
 
     None
