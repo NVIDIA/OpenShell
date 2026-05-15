@@ -187,6 +187,12 @@ server:
     gatewayId: ""
     # Token TTL in seconds. Defaults to 86400 (24h).
     ttlSecs: 86400
+    # Lifetime (seconds) of the projected ServiceAccount token kubelet
+    # writes into each sandbox pod for the IssueSandboxToken bootstrap
+    # exchange. Kubelet enforces a minimum of 600s; the driver clamps
+    # values outside [600, 86400]. Default 3600 — generous, since the
+    # supervisor consumes the token within seconds of pod start.
+    k8sSaTokenTtlSecs: 3600
   # OIDC (OpenID Connect) configuration for JWT-based authentication.
   # When issuer is set, the server validates Bearer tokens on gRPC requests.
   oidc:

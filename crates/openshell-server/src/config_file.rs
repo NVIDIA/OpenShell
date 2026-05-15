@@ -115,6 +115,11 @@ pub struct GatewayFileSection {
     pub host_gateway_ip: Option<String>,
     #[serde(default)]
     pub enable_user_namespaces: Option<bool>,
+    /// Lifetime (seconds) of the projected `ServiceAccount` token kubelet
+    /// writes for the `IssueSandboxToken` bootstrap exchange. Driver
+    /// clamps to `[600, 86400]`.
+    #[serde(default)]
+    pub sa_token_ttl_secs: Option<i64>,
     #[serde(default)]
     pub guest_tls_ca: Option<PathBuf>,
     #[serde(default)]
@@ -249,6 +254,7 @@ fn inheritable_keys(driver: ComputeDriverKind) -> &'static [&'static str] {
             "client_tls_secret_name",
             "host_gateway_ip",
             "enable_user_namespaces",
+            "sa_token_ttl_secs",
         ],
         ComputeDriverKind::Docker => &[
             "sandbox_namespace",
@@ -283,6 +289,7 @@ fn gateway_inherited_value(g: &GatewayFileSection, key: &str) -> Option<toml::Va
         "client_tls_secret_name" => g.client_tls_secret_name.as_deref().map(string_value),
         "host_gateway_ip" => g.host_gateway_ip.as_deref().map(string_value),
         "enable_user_namespaces" => g.enable_user_namespaces.map(toml::Value::Boolean),
+        "sa_token_ttl_secs" => g.sa_token_ttl_secs.map(toml::Value::Integer),
         "guest_tls_ca" => g.guest_tls_ca.as_deref().map(path_value),
         "guest_tls_cert" => g.guest_tls_cert.as_deref().map(path_value),
         "guest_tls_key" => g.guest_tls_key.as_deref().map(path_value),

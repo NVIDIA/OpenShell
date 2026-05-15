@@ -68,6 +68,13 @@ struct Args {
 
     #[arg(long, env = "OPENSHELL_ENABLE_USER_NAMESPACES")]
     enable_user_namespaces: bool,
+
+    /// Lifetime (seconds) of the projected `ServiceAccount` token
+    /// kubelet writes into each sandbox pod for the `IssueSandboxToken`
+    /// bootstrap exchange. Kubelet enforces a minimum of 600s; the
+    /// gateway clamps values outside `[600, 86400]`. Default 3600.
+    #[arg(long, env = "OPENSHELL_K8S_SA_TOKEN_TTL_SECS", default_value_t = 3600)]
+    sa_token_ttl_secs: i64,
 }
 
 #[tokio::main]
@@ -99,6 +106,7 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| {
             openshell_driver_kubernetes::DEFAULT_WORKSPACE_STORAGE_SIZE.to_string()
         }),
+        sa_token_ttl_secs: args.sa_token_ttl_secs,
     })
     .await
     .into_diagnostic()?;

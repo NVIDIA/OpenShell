@@ -94,6 +94,7 @@ data:
     [openshell.drivers.kubernetes]
     grpc_endpoint                = {{ include "openshell.grpcEndpoint" . | quote }}
     supervisor_sideload_method   = {{ include "openshell.supervisorSideloadMethod" . | quote }}
+    sa_token_ttl_secs            = {{ .Values.server.sandboxJwt.k8sSaTokenTtlSecs | default 3600 }}
     {{- if .Values.server.sandboxImagePullPolicy }}
     image_pull_policy            = {{ .Values.server.sandboxImagePullPolicy | quote }}
     {{- end }}

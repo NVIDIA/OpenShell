@@ -328,6 +328,7 @@ impl KubernetesComputeDriver {
             host_gateway_ip: &self.config.host_gateway_ip,
             enable_user_namespaces: self.config.enable_user_namespaces,
             workspace_default_storage_size: &self.config.workspace_default_storage_size,
+            sa_token_ttl_secs: self.config.effective_sa_token_ttl_secs(),
         };
         obj.data = sandbox_to_k8s_spec(sandbox.spec.as_ref(), &params);
         let api = self.api();
@@ -1041,7 +1042,6 @@ fn default_workspace_volume_claim_templates(storage_size: &str) -> serde_json::V
 }
 
 /// Parameters shared by `sandbox_to_k8s_spec` and `sandbox_template_to_k8s`.
-#[derive(Default)]
 struct SandboxPodParams<'a> {
     default_image: &'a str,
     image_pull_policy: &'a str,
@@ -1056,6 +1056,30 @@ struct SandboxPodParams<'a> {
     host_gateway_ip: &'a str,
     enable_user_namespaces: bool,
     workspace_default_storage_size: &'a str,
+    /// Lifetime (seconds) of the projected `ServiceAccount` token used
+    /// for the bootstrap `IssueSandboxToken` exchange.
+    sa_token_ttl_secs: i64,
+}
+
+impl Default for SandboxPodParams<'_> {
+    fn default() -> Self {
+        Self {
+            default_image: "",
+            image_pull_policy: "",
+            supervisor_image: "",
+            supervisor_image_pull_policy: "",
+            supervisor_sideload_method: SupervisorSideloadMethod::default(),
+            sandbox_id: "",
+            sandbox_name: "",
+            grpc_endpoint: "",
+            ssh_socket_path: "",
+            client_tls_secret_name: "",
+            host_gateway_ip: "",
+            enable_user_namespaces: false,
+            workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE,
+            sa_token_ttl_secs: 3600,
+        }
+    }
 }
 
 fn spec_pod_env(spec: Option<&SandboxSpec>) -> std::collections::HashMap<String, String> {
@@ -1303,7 +1327,7 @@ fn sandbox_template_to_k8s(
             "sources": [{
                 "serviceAccountToken": {
                     "audience": "openshell-gateway",
-                    "expirationSeconds": 3600_i64,
+                    "expirationSeconds": params.sa_token_ttl_secs,
                     "path": "token"
                 }
             }],
