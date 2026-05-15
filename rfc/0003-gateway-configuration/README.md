@@ -78,13 +78,9 @@ log_level             = "info"
 # (kubernetes → podman → docker). VM is never auto-detected.
 compute_drivers       = ["kubernetes"]
 
-# SSH proxy (gateway-side; driver-side equivalents live under each driver).
 # Note: database_url is a secret and must be supplied via OPENSHELL_DB_URL
 # (or --db-url) — it is NOT permitted in the file.
 ssh_session_ttl_secs    = 86400
-ssh_gateway_host        = "127.0.0.1"
-ssh_gateway_port        = 8080
-sandbox_ssh_port        = 2222
 
 # Service routing — wildcard DNS SANs in `server_sans` also enable sandbox
 # service URLs under that domain. `enable_loopback_service_http` toggles
@@ -133,6 +129,10 @@ host_gateway_ip              = "10.0.0.1"
 ssh_socket_path              = "/run/openshell/ssh.sock"
 
 [openshell.drivers.docker]
+default_image     = "ghcr.io/nvidia/openshell/sandbox:latest"
+image_pull_policy = "IfNotPresent"
+sandbox_namespace = "docker-dev"
+grpc_endpoint     = "https://host.openshell.internal:8080"
 network_name      = "openshell"
 supervisor_bin    = "/usr/local/libexec/openshell/openshell-sandbox"  # optional override
 supervisor_image  = "ghcr.io/nvidia/openshell/supervisor:latest"      # used to extract bin
@@ -154,6 +154,7 @@ guest_tls_key     = "/etc/openshell/certs/client-key.pem"
 [openshell.drivers.vm]
 state_dir       = "/var/lib/openshell/vm"
 driver_dir      = "/usr/local/libexec/openshell"
+grpc_endpoint   = "https://host.containers.internal:8080"
 vcpus           = 2
 mem_mib         = 2048
 krun_log_level  = 1

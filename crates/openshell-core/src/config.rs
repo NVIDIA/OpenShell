@@ -21,7 +21,7 @@ use std::str::FromStr;
 /// Default SSH port inside sandbox containers.
 pub const DEFAULT_SSH_PORT: u16 = 2222;
 
-/// Default server / SSH gateway port.
+/// Default gateway server port.
 pub const DEFAULT_SERVER_PORT: u16 = 8080;
 
 /// Default container stop timeout in seconds (SIGTERM → SIGKILL).
@@ -216,74 +216,9 @@ pub struct Config {
     #[serde(default)]
     pub compute_drivers: Vec<ComputeDriverKind>,
 
-    /// Kubernetes namespace for sandboxes.
-    #[serde(default = "default_sandbox_namespace")]
-    pub sandbox_namespace: String,
-
-    /// Default container image for sandboxes.
-    #[serde(default = "default_sandbox_image")]
-    pub sandbox_image: String,
-
-    /// Kubernetes `imagePullPolicy` for sandbox pods (e.g. `Always`,
-    /// `IfNotPresent`, `Never`).  Defaults to empty, which lets Kubernetes
-    /// apply its own default (`:latest` → `Always`, anything else →
-    /// `IfNotPresent`).
-    #[serde(default)]
-    pub sandbox_image_pull_policy: String,
-
-    /// gRPC endpoint for sandboxes to connect back to `OpenShell`.
-    /// Used by sandbox pods to fetch their policy at startup.
-    #[serde(default)]
-    pub grpc_endpoint: String,
-
-    /// Public gateway host for SSH proxy connections.
-    #[serde(default = "default_ssh_gateway_host")]
-    pub ssh_gateway_host: String,
-
-    /// Public gateway port for SSH proxy connections.
-    #[serde(default = "default_ssh_gateway_port")]
-    pub ssh_gateway_port: u16,
-
-    /// SSH listen port inside sandbox containers that expose a TCP endpoint.
-    #[serde(default = "default_sandbox_ssh_port")]
-    pub sandbox_ssh_port: u16,
-
-    /// Filesystem path where the sandbox supervisor binds its SSH Unix
-    /// socket. The supervisor is passed this path via
-    /// `OPENSHELL_SSH_SOCKET_PATH` / `--ssh-socket-path` and connects its
-    /// relay bridge to the same path.
-    ///
-    /// When the gateway orchestrates sandboxes that each live in their own
-    /// filesystem (K8s pod, libkrun VM, etc.), the default is safe. For
-    /// local dev where multiple supervisors share `/run`, override this to
-    /// something unique per sandbox.
-    #[serde(default = "default_sandbox_ssh_socket_path")]
-    pub sandbox_ssh_socket_path: String,
-
     /// TTL for SSH session tokens, in seconds. 0 disables expiry.
     #[serde(default = "default_ssh_session_ttl_secs")]
     pub ssh_session_ttl_secs: u64,
-
-    /// Kubernetes secret name containing client TLS materials for sandbox pods.
-    /// When set, sandbox pods get this secret mounted so they can connect to
-    /// the server over mTLS.
-    #[serde(default)]
-    pub client_tls_secret_name: String,
-
-    /// Host gateway IP for sandbox pod hostAliases.
-    /// When set, sandbox pods get hostAliases entries mapping
-    /// `host.docker.internal` and `host.openshell.internal` to this IP,
-    /// allowing them to reach services running on the Docker host.
-    #[serde(default)]
-    pub host_gateway_ip: String,
-
-    /// Enable Kubernetes user namespace isolation (`hostUsers: false`) for
-    /// sandbox pods.  When enabled, container UID 0 maps to an unprivileged
-    /// host UID and capabilities become namespaced. Requires Kubernetes 1.33+
-    /// with user namespace support available (beta through 1.35, GA in 1.36+),
-    /// plus a supporting container runtime and Linux 5.12+.
-    #[serde(default)]
-    pub enable_user_namespaces: bool,
 
     /// Browser-facing sandbox service routing configuration.
     #[serde(default)]
@@ -407,18 +342,7 @@ impl Config {
             oidc: None,
             database_url: String::new(),
             compute_drivers: vec![],
-            sandbox_namespace: default_sandbox_namespace(),
-            sandbox_image: default_sandbox_image(),
-            sandbox_image_pull_policy: String::new(),
-            grpc_endpoint: String::new(),
-            ssh_gateway_host: default_ssh_gateway_host(),
-            ssh_gateway_port: default_ssh_gateway_port(),
-            sandbox_ssh_port: default_sandbox_ssh_port(),
-            sandbox_ssh_socket_path: default_sandbox_ssh_socket_path(),
             ssh_session_ttl_secs: default_ssh_session_ttl_secs(),
-            client_tls_secret_name: String::new(),
-            host_gateway_ip: String::new(),
-            enable_user_namespaces: false,
             service_routing: ServiceRoutingConfig::default(),
         }
     }
@@ -479,73 +403,10 @@ impl Config {
         self
     }
 
-    /// Create a new configuration with a sandbox namespace.
-    #[must_use]
-    pub fn with_sandbox_namespace(mut self, namespace: impl Into<String>) -> Self {
-        self.sandbox_namespace = namespace.into();
-        self
-    }
-
-    /// Create a new configuration with a default sandbox image.
-    #[must_use]
-    pub fn with_sandbox_image(mut self, image: impl Into<String>) -> Self {
-        self.sandbox_image = image.into();
-        self
-    }
-
-    /// Create a new configuration with a sandbox image pull policy.
-    #[must_use]
-    pub fn with_sandbox_image_pull_policy(mut self, policy: impl Into<String>) -> Self {
-        self.sandbox_image_pull_policy = policy.into();
-        self
-    }
-
-    /// Create a new configuration with a gRPC endpoint for sandbox callback.
-    #[must_use]
-    pub fn with_grpc_endpoint(mut self, endpoint: impl Into<String>) -> Self {
-        self.grpc_endpoint = endpoint.into();
-        self
-    }
-
-    /// Create a new configuration with the SSH gateway host.
-    #[must_use]
-    pub fn with_ssh_gateway_host(mut self, host: impl Into<String>) -> Self {
-        self.ssh_gateway_host = host.into();
-        self
-    }
-
-    /// Create a new configuration with the SSH gateway port.
-    #[must_use]
-    pub const fn with_ssh_gateway_port(mut self, port: u16) -> Self {
-        self.ssh_gateway_port = port;
-        self
-    }
-
-    /// Create a new configuration with the sandbox SSH port.
-    #[must_use]
-    pub const fn with_sandbox_ssh_port(mut self, port: u16) -> Self {
-        self.sandbox_ssh_port = port;
-        self
-    }
-
     /// Create a new configuration with the SSH session TTL.
     #[must_use]
     pub const fn with_ssh_session_ttl_secs(mut self, secs: u64) -> Self {
         self.ssh_session_ttl_secs = secs;
-        self
-    }
-
-    /// Set the Kubernetes secret name for sandbox client TLS materials.
-    #[must_use]
-    pub fn with_client_tls_secret_name(mut self, name: impl Into<String>) -> Self {
-        self.client_tls_secret_name = name.into();
-        self
-    }
-
-    /// Set the host gateway IP for sandbox pod hostAliases.
-    #[must_use]
-    pub fn with_host_gateway_ip(mut self, ip: impl Into<String>) -> Self {
-        self.host_gateway_ip = ip.into();
         self
     }
 
@@ -651,30 +512,6 @@ fn is_dns_label(label: &str) -> bool {
 
 fn default_log_level() -> String {
     "info".to_string()
-}
-
-fn default_sandbox_namespace() -> String {
-    "default".to_string()
-}
-
-fn default_sandbox_image() -> String {
-    format!("{}/base:latest", crate::image::DEFAULT_COMMUNITY_REGISTRY)
-}
-
-fn default_ssh_gateway_host() -> String {
-    "127.0.0.1".to_string()
-}
-
-const fn default_ssh_gateway_port() -> u16 {
-    DEFAULT_SERVER_PORT
-}
-
-fn default_sandbox_ssh_socket_path() -> String {
-    "/run/openshell/ssh.sock".to_string()
-}
-
-const fn default_sandbox_ssh_port() -> u16 {
-    DEFAULT_SSH_PORT
 }
 
 const fn default_ssh_session_ttl_secs() -> u64 {

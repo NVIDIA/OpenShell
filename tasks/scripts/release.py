@@ -289,17 +289,6 @@ class Openshell < Formula
         exit 1
       fi
 
-      docker_tls_dir="${{OPENSHELL_DOCKER_TLS_DIR:-${{HOME}}/.local/state/openshell/homebrew/tls}}"
-      mkdir -p "${{docker_tls_dir}}/client"
-      chmod 700 "${{docker_tls_dir}}" "${{docker_tls_dir}}/client"
-      /usr/bin/install -m 0644 "#{{var}}/openshell/tls/ca.crt" "${{docker_tls_dir}}/ca.crt"
-      /usr/bin/install -m 0644 "#{{var}}/openshell/tls/client/tls.crt" "${{docker_tls_dir}}/client/tls.crt"
-      /usr/bin/install -m 0600 "#{{var}}/openshell/tls/client/tls.key" "${{docker_tls_dir}}/client/tls.key"
-
-      export OPENSHELL_DOCKER_TLS_CA="${{docker_tls_dir}}/ca.crt"
-      export OPENSHELL_DOCKER_TLS_CERT="${{docker_tls_dir}}/client/tls.crt"
-      export OPENSHELL_DOCKER_TLS_KEY="${{docker_tls_dir}}/client/tls.key"
-
       gateway_env="#{{var}}/openshell/gateway.env"
       if [ -f "${{gateway_env}}" ]; then
         set -a
@@ -307,6 +296,43 @@ class Openshell < Formula
         set +a
       fi
 
+      docker_tls_dir="${{OPENSHELL_DOCKER_TLS_DIR:-${{HOME}}/.local/state/openshell/homebrew/tls}}"
+      mkdir -p "${{docker_tls_dir}}/client"
+      chmod 700 "${{docker_tls_dir}}" "${{docker_tls_dir}}/client"
+      /usr/bin/install -m 0644 "#{{var}}/openshell/tls/ca.crt" "${{docker_tls_dir}}/ca.crt"
+      /usr/bin/install -m 0644 "#{{var}}/openshell/tls/client/tls.crt" "${{docker_tls_dir}}/client/tls.crt"
+      /usr/bin/install -m 0600 "#{{var}}/openshell/tls/client/tls.key" "${{docker_tls_dir}}/client/tls.key"
+
+      gateway_config="${{OPENSHELL_GATEWAY_CONFIG:-#{{var}}/openshell/gateway.toml}}"
+      if [ ! -f "${{gateway_config}}" ]; then
+        mkdir -p "$(dirname "${{gateway_config}}")" "#{{var}}/openshell/vm-driver"
+        cat > "${{gateway_config}}" <<EOF
+[openshell]
+version = 1
+
+[openshell.gateway]
+default_image = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+supervisor_image = "ghcr.io/nvidia/openshell/supervisor:latest"
+guest_tls_ca = "#{{var}}/openshell/tls/ca.crt"
+guest_tls_cert = "#{{var}}/openshell/tls/client/tls.crt"
+guest_tls_key = "#{{var}}/openshell/tls/client/tls.key"
+
+[openshell.drivers.vm]
+state_dir = "#{{var}}/openshell/vm-driver"
+driver_dir = "#{{opt_libexec}}"
+grpc_endpoint = "https://127.0.0.1:{LOCAL_GATEWAY_PORT}"
+
+[openshell.drivers.docker]
+grpc_endpoint = "https://127.0.0.1:{LOCAL_GATEWAY_PORT}"
+supervisor_image = "{docker_supervisor_image}"
+guest_tls_ca = "${{docker_tls_dir}}/ca.crt"
+guest_tls_cert = "${{docker_tls_dir}}/client/tls.crt"
+guest_tls_key = "${{docker_tls_dir}}/client/tls.key"
+EOF
+        chmod 0600 "${{gateway_config}}"
+      fi
+
+      export OPENSHELL_GATEWAY_CONFIG="${{gateway_config}}"
       exec "#{{opt_bin}}/openshell-gateway"
     SH
     chmod 0755, libexec/"openshell-gateway-homebrew-service"
@@ -328,11 +354,8 @@ class Openshell < Formula
         # normal Podman/Docker/Kubernetes auto-detection.
         #OPENSHELL_DRIVERS=vm
 
-        # VM driver paths configured by the Homebrew service.
-        #OPENSHELL_VM_DRIVER_STATE_DIR=#{{var}}/openshell/vm-driver
-        #OPENSHELL_VM_TLS_CA=#{{var}}/openshell/tls/ca.crt
-        #OPENSHELL_VM_TLS_CERT=#{{var}}/openshell/tls/client/tls.crt
-        #OPENSHELL_VM_TLS_KEY=#{{var}}/openshell/tls/client/tls.key
+        # Driver implementation settings live in gateway.toml.
+        #OPENSHELL_GATEWAY_CONFIG=#{{var}}/openshell/gateway.toml
       ENV
       chmod 0600, gateway_env
     end
@@ -361,18 +384,7 @@ class Openshell < Formula
       OPENSHELL_TLS_KEY: "#{{var}}/openshell/tls/server/tls.key",
       OPENSHELL_TLS_CLIENT_CA: "#{{var}}/openshell/tls/ca.crt",
       OPENSHELL_DB_URL: "sqlite:#{{var}}/openshell/gateway/openshell.db",
-      OPENSHELL_GRPC_ENDPOINT: "https://127.0.0.1:{LOCAL_GATEWAY_PORT}",
-      OPENSHELL_SSH_GATEWAY_HOST: "127.0.0.1",
-      OPENSHELL_SSH_GATEWAY_PORT: "{LOCAL_GATEWAY_PORT}",
-      OPENSHELL_VM_DRIVER_STATE_DIR: "#{{var}}/openshell/vm-driver",
-      OPENSHELL_VM_TLS_CA: "#{{var}}/openshell/tls/ca.crt",
-      OPENSHELL_VM_TLS_CERT: "#{{var}}/openshell/tls/client/tls.crt",
-      OPENSHELL_VM_TLS_KEY: "#{{var}}/openshell/tls/client/tls.key",
-      OPENSHELL_DOCKER_SUPERVISOR_IMAGE: "{docker_supervisor_image}",
-      OPENSHELL_PODMAN_TLS_CA: "#{{var}}/openshell/tls/ca.crt",
-      OPENSHELL_PODMAN_TLS_CERT: "#{{var}}/openshell/tls/client/tls.crt",
-      OPENSHELL_PODMAN_TLS_KEY: "#{{var}}/openshell/tls/client/tls.key",
-      OPENSHELL_DRIVER_DIR: "#{{opt_libexec}}",
+      OPENSHELL_GATEWAY_CONFIG: "#{{var}}/openshell/gateway.toml",
     )
     keep_alive successful_exit: false
     log_path var/"log/openshell/openshell-gateway.out.log"

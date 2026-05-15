@@ -65,7 +65,7 @@ const DOCKER_NETWORK_DRIVER: &str = "bridge";
 
 /// Default image holding the Linux `openshell-sandbox` binary. The gateway
 /// pulls this image and extracts the binary to a host-side cache when no
-/// explicit `--docker-supervisor-bin` override or local build is available.
+/// explicit `supervisor_bin` override or local build is available.
 const DEFAULT_DOCKER_SUPERVISOR_IMAGE_REPO: &str = "ghcr.io/nvidia/openshell/supervisor";
 
 /// Path to the supervisor binary inside the `openshell/supervisor` image
@@ -130,6 +130,18 @@ pub trait SupervisorReadiness: Send + Sync + 'static {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DockerComputeConfig {
+    /// Default OCI image for sandboxes.
+    pub default_image: String,
+
+    /// Image pull policy for sandbox images.
+    pub image_pull_policy: String,
+
+    /// Namespace label applied to Docker sandboxes.
+    pub sandbox_namespace: String,
+
+    /// Gateway gRPC endpoint the sandbox connects back to.
+    pub grpc_endpoint: String,
+
     /// Optional override for the Linux `openshell-sandbox` binary mounted into containers.
     pub supervisor_bin: Option<PathBuf>,
 
@@ -150,19 +162,38 @@ pub struct DockerComputeConfig {
 
     /// Docker bridge network that sandbox containers join.
     pub network_name: String,
+
+    /// Host gateway IP used for sandbox host aliases.
+    pub host_gateway_ip: String,
+
+    /// Unix socket path the in-container supervisor bridges relay traffic to.
+    pub ssh_socket_path: String,
 }
 
 impl Default for DockerComputeConfig {
     fn default() -> Self {
         Self {
+            default_image: default_sandbox_image(),
+            image_pull_policy: String::new(),
+            sandbox_namespace: "default".to_string(),
+            grpc_endpoint: String::new(),
             supervisor_bin: None,
             supervisor_image: None,
             guest_tls_ca: None,
             guest_tls_cert: None,
             guest_tls_key: None,
             network_name: DEFAULT_DOCKER_NETWORK_NAME.to_string(),
+            host_gateway_ip: String::new(),
+            ssh_socket_path: "/run/openshell/ssh.sock".to_string(),
         }
     }
+}
+
+fn default_sandbox_image() -> String {
+    format!(
+        "{}/base:latest",
+        openshell_core::image::DEFAULT_COMMUNITY_REGISTRY
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,7 +252,7 @@ impl DockerComputeDriver {
         docker_config: &DockerComputeConfig,
         supervisor_readiness: Arc<dyn SupervisorReadiness>,
     ) -> CoreResult<Self> {
-        if config.grpc_endpoint.trim().is_empty() {
+        if docker_config.grpc_endpoint.trim().is_empty() {
             return Err(Error::config(
                 "grpc_endpoint is required when using the docker compute driver",
             ));
@@ -247,28 +278,28 @@ impl DockerComputeDriver {
         }
         let network_name = docker_network_name(docker_config);
         let bridge_gateway_ip = ensure_bridge_network(&docker, &network_name).await?;
-        let host_gateway_ip = parse_optional_host_gateway_ip(&config.host_gateway_ip)?;
+        let host_gateway_ip = parse_optional_host_gateway_ip(&docker_config.host_gateway_ip)?;
         let gateway_route =
             docker_gateway_route(&info, bridge_gateway_ip, gateway_port, host_gateway_ip);
         let grpc_endpoint = docker_container_openshell_endpoint(
-            &config.grpc_endpoint,
+            &docker_config.grpc_endpoint,
             HOST_OPENSHELL_INTERNAL,
             gateway_port,
         );
         let daemon_arch = normalize_docker_arch(version.arch.as_deref().unwrap_or_default());
         let supervisor_bin = resolve_supervisor_bin(&docker, docker_config, &daemon_arch).await?;
-        let guest_tls = docker_guest_tls_paths(config, docker_config)?;
+        let guest_tls = docker_guest_tls_paths(docker_config)?;
 
         let driver = Self {
             docker: Arc::new(docker),
             config: DockerDriverRuntimeConfig {
-                default_image: config.sandbox_image.clone(),
-                image_pull_policy: config.sandbox_image_pull_policy.clone(),
-                sandbox_namespace: config.sandbox_namespace.clone(),
+                default_image: docker_config.default_image.clone(),
+                image_pull_policy: docker_config.image_pull_policy.clone(),
+                sandbox_namespace: docker_config.sandbox_namespace.clone(),
                 grpc_endpoint,
                 network_name,
                 gateway_route,
-                ssh_socket_path: config.sandbox_ssh_socket_path.clone(),
+                ssh_socket_path: docker_config.ssh_socket_path.clone(),
                 stop_timeout_secs: DEFAULT_STOP_TIMEOUT_SECS,
                 log_level: config.log_level.clone(),
                 supervisor_bin,
@@ -708,12 +739,12 @@ impl DockerComputeDriver {
             "never" => match self.docker.inspect_image(image).await {
                 Ok(_) => Ok(()),
                 Err(err) if is_not_found_error(&err) => Err(Status::failed_precondition(format!(
-                    "docker image '{image}' is not present locally and sandbox_image_pull_policy=Never"
+                    "docker image '{image}' is not present locally and image_pull_policy=Never"
                 ))),
                 Err(err) => Err(internal_status("inspect Docker image", err)),
             },
             other => Err(Status::failed_precondition(format!(
-                "unsupported docker sandbox_image_pull_policy '{other}'; expected Always, IfNotPresent, or Never",
+                "unsupported docker image_pull_policy '{other}'; expected Always, IfNotPresent, or Never",
             ))),
         }
     }
@@ -1093,11 +1124,10 @@ fn parse_optional_host_gateway_ip(value: &str) -> CoreResult<Option<IpAddr>> {
         return Ok(None);
     }
 
-    trimmed.parse().map(Some).map_err(|err| {
-        Error::config(format!(
-            "invalid OPENSHELL_HOST_GATEWAY_IP value '{trimmed}': {err}"
-        ))
-    })
+    trimmed
+        .parse()
+        .map(Some)
+        .map_err(|err| Error::config(format!("invalid host_gateway_ip value '{trimmed}': {err}")))
 }
 
 fn docker_gateway_route(
@@ -1636,7 +1666,7 @@ pub(crate) async fn resolve_supervisor_bin(
     docker_config: &DockerComputeConfig,
     daemon_arch: &str,
 ) -> CoreResult<PathBuf> {
-    // Tier 1: explicit --docker-supervisor-bin / OPENSHELL_DOCKER_SUPERVISOR_BIN.
+    // Tier 1: explicit supervisor_bin in [openshell.drivers.docker].
     if let Some(path) = docker_config.supervisor_bin.clone() {
         let path = canonicalize_existing_file(&path, "docker supervisor binary")?;
         validate_linux_elf_binary(&path)?;
@@ -1980,18 +2010,17 @@ pub(crate) fn validate_linux_elf_binary(path: &Path) -> CoreResult<()> {
 }
 
 pub(crate) fn docker_guest_tls_paths(
-    config: &Config,
     docker_config: &DockerComputeConfig,
 ) -> CoreResult<Option<DockerGuestTlsPaths>> {
     let tls_flags_provided = docker_config.guest_tls_ca.is_some()
         || docker_config.guest_tls_cert.is_some()
         || docker_config.guest_tls_key.is_some();
 
-    if !config.grpc_endpoint.starts_with("https://") {
+    if !docker_config.grpc_endpoint.starts_with("https://") {
         if tls_flags_provided {
             return Err(Error::config(format!(
-                "--docker-tls-ca/--docker-tls-cert/--docker-tls-key were provided but OPENSHELL_GRPC_ENDPOINT is '{}'; TLS materials require an https:// endpoint",
-                config.grpc_endpoint,
+                "guest_tls_ca/guest_tls_cert/guest_tls_key were provided but grpc_endpoint is '{}'; TLS materials require an https:// endpoint",
+                docker_config.grpc_endpoint,
             )));
         }
         return Ok(None);
@@ -2004,23 +2033,23 @@ pub(crate) fn docker_guest_tls_paths(
     ];
     if provided.iter().all(Option::is_none) {
         return Err(Error::config(
-            "docker compute driver requires --docker-tls-ca, --docker-tls-cert, and --docker-tls-key when OPENSHELL_GRPC_ENDPOINT uses https://",
+            "docker compute driver requires guest_tls_ca, guest_tls_cert, and guest_tls_key when grpc_endpoint uses https://",
         ));
     }
 
     let Some(ca) = docker_config.guest_tls_ca.clone() else {
         return Err(Error::config(
-            "--docker-tls-ca is required when Docker sandbox TLS materials are configured",
+            "guest_tls_ca is required when Docker sandbox TLS materials are configured",
         ));
     };
     let Some(cert) = docker_config.guest_tls_cert.clone() else {
         return Err(Error::config(
-            "--docker-tls-cert is required when Docker sandbox TLS materials are configured",
+            "guest_tls_cert is required when Docker sandbox TLS materials are configured",
         ));
     };
     let Some(key) = docker_config.guest_tls_key.clone() else {
         return Err(Error::config(
-            "--docker-tls-key is required when Docker sandbox TLS materials are configured",
+            "guest_tls_key is required when Docker sandbox TLS materials are configured",
         ));
     };
 

@@ -39,10 +39,10 @@ The agent child process does not retain these supervisor privileges.
 The Docker driver bind-mounts a host-side Linux `openshell-sandbox` binary into
 each sandbox container. Resolution order is:
 
-1. `--docker-supervisor-bin` / `OPENSHELL_DOCKER_SUPERVISOR_BIN`.
+1. `supervisor_bin` in `[openshell.drivers.docker]`.
 2. A sibling `openshell-sandbox` next to the running `openshell-gateway` binary.
 3. A local Linux cargo target build for the Docker daemon architecture.
-4. `--docker-supervisor-image` / `OPENSHELL_DOCKER_SUPERVISOR_IMAGE`, or the
+4. `supervisor_image` in `[openshell.drivers.docker]`, or the
    release-matched default supervisor image, extracting `/openshell-sandbox`.
 
 Release and Docker-image gateway builds bake the matching supervisor image tag

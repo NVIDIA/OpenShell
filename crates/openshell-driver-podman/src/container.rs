@@ -490,7 +490,8 @@ pub fn build_container_spec(sandbox: &DriverSandbox, config: &PodmanComputeConfi
                 "CMD-SHELL".into(),
                 format!(
                     "test -e /var/run/openshell-ssh-ready || test -S {} || ss -tlnp | grep -q :{}",
-                    config.sandbox_ssh_socket_path, config.ssh_port
+                    config.sandbox_ssh_socket_path,
+                    openshell_core::config::DEFAULT_SSH_PORT
                 ),
             ],
             interval: 3_000_000_000,
@@ -569,7 +570,7 @@ pub fn build_container_spec(sandbox: &DriverSandbox, config: &PodmanComputeConfi
         // the host, so we must use the published host port on 127.0.0.1 instead.
         portmappings: vec![PortMapping {
             host_port: 0,
-            container_port: config.ssh_port,
+            container_port: openshell_core::config::DEFAULT_SSH_PORT,
             protocol: "tcp".into(),
         }],
     };

@@ -256,7 +256,7 @@ impl PodmanComputeDriver {
         let image = container::resolve_image(sandbox, &self.config);
         if image.is_empty() {
             return Err(ComputeDriverError::Precondition(
-                "no sandbox image configured: set --sandbox-image on the server \
+                "no sandbox image configured: set default_image in [openshell.drivers.podman] \
                  or provide an image in the sandbox template"
                     .to_string(),
             ));

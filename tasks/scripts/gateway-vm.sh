@@ -305,6 +305,21 @@ fi
 
 mkdir -p "${STATE_DIR}"
 mkdir -p "${VM_DRIVER_STATE_DIR}"
+CONFIG_PATH="${STATE_DIR}/gateway.toml"
+cat >"${CONFIG_PATH}" <<EOF
+[openshell]
+version = 1
+
+[openshell.gateway]
+compute_drivers = ["vm"]
+disable_tls = ${DISABLE_TLS}
+
+[openshell.drivers.vm]
+default_image = "${SANDBOX_IMAGE}"
+grpc_endpoint = "${GRPC_ENDPOINT}"
+driver_dir = "${DRIVER_DIR}"
+state_dir = "${VM_DRIVER_STATE_DIR}"
+EOF
 
 GATEWAY_ENDPOINT="http://127.0.0.1:${PORT}"
 register_gateway_metadata "${GATEWAY_NAME}" "${GATEWAY_ENDPOINT}" "${PORT}" "${VM_DRIVER_STATE_DIR}"
@@ -326,16 +341,11 @@ echo "or by setting OPENSHELL_GATEWAY (e.g. in .env)."
 echo
 
 GATEWAY_ARGS=(
+  --config "${CONFIG_PATH}"
   --port "${PORT}"
   --log-level "${LOG_LEVEL}"
   --drivers vm
   --db-url "sqlite:${STATE_DIR}/gateway.db?mode=rwc"
-  --sandbox-namespace "${SANDBOX_NAMESPACE}"
-  --sandbox-image "${SANDBOX_IMAGE}"
-  --sandbox-image-pull-policy "${SANDBOX_IMAGE_PULL_POLICY}"
-  --grpc-endpoint "${GRPC_ENDPOINT}"
-  --driver-dir "${DRIVER_DIR}"
-  --vm-driver-state-dir "${VM_DRIVER_STATE_DIR}"
 )
 
 if [ "${DISABLE_TLS}" = "true" ]; then

@@ -49,17 +49,27 @@ build_binaries() {
 
 start_gateway() {
     local health_port=$((PORT + 1))
+    local config="$STATE_DIR/gateway.toml"
     echo "==> Starting gateway on port $PORT (state=$STATE_DIR, health=$health_port)"
     mkdir -p "$STATE_DIR"
+    cat >"$config" <<EOF
+[openshell]
+version = 1
+
+[openshell.gateway]
+compute_drivers = ["vm"]
+disable_tls = true
+
+[openshell.drivers.vm]
+grpc_endpoint = "http://host.containers.internal:$PORT"
+driver_dir = "$ROOT/target/debug"
+state_dir = "$STATE_DIR"
+EOF
     OPENSHELL_SERVER_PORT="$PORT" \
     OPENSHELL_HEALTH_PORT="$health_port" \
     OPENSHELL_DB_URL="sqlite:$STATE_DIR/openshell.db" \
     OPENSHELL_DRIVERS=vm \
-    OPENSHELL_DRIVER_DIR="$ROOT/target/debug" \
-    OPENSHELL_GRPC_ENDPOINT="http://host.containers.internal:$PORT" \
-    OPENSHELL_SSH_GATEWAY_HOST=127.0.0.1 \
-    OPENSHELL_SSH_GATEWAY_PORT="$PORT" \
-    OPENSHELL_VM_DRIVER_STATE_DIR="$STATE_DIR" \
+    OPENSHELL_GATEWAY_CONFIG="$config" \
     OPENSHELL_VM_RUNTIME_COMPRESSED_DIR="$ROOT/target/vm-runtime-compressed" \
     nohup "$ROOT/target/debug/openshell-gateway" --disable-tls \
         > "$LOG" 2>&1 &

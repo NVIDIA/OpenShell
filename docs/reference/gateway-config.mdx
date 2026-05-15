@@ -8,12 +8,12 @@ keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Gateway, Configu
 position: 5
 ---
 
-The OpenShell gateway reads its configuration from a TOML file when `--config` or `OPENSHELL_GATEWAY_CONFIG` is set. CLI flags and `OPENSHELL_*` environment variables always override the file. See [RFC 0003](https://github.com/NVIDIA/OpenShell/blob/main/rfc/0003-gateway-configuration/README.md) for the full schema.
+The OpenShell gateway reads its configuration from a TOML file when `--config` or `OPENSHELL_GATEWAY_CONFIG` is set. Gateway process flags and gateway `OPENSHELL_*` environment variables override the file. Compute driver settings live in the driver TOML tables. See [RFC 0003](https://github.com/NVIDIA/OpenShell/blob/main/rfc/0003-gateway-configuration/README.md) for the full schema.
 
 ## Source Precedence
 
 ```text
-CLI flag  >  OPENSHELL_* env var  >  TOML file  >  built-in default
+Gateway CLI flag  >  gateway OPENSHELL_* env var  >  TOML file  >  built-in default
 ```
 
 `database_url` is env-only. The loader rejects it when it appears in the file.
@@ -62,9 +62,6 @@ log_level             = "info"
 compute_drivers       = ["kubernetes"]
 
 sandbox_namespace     = "openshell"
-sandbox_ssh_port      = 2222
-ssh_gateway_host      = "127.0.0.1"
-ssh_gateway_port      = 8080
 
 # Subject Alternative Names baked into the gateway server certificate.
 # Wildcard DNS SANs (e.g. "*.dev.openshell.localhost") also enable sandbox
@@ -151,9 +148,13 @@ guest_tls_cert   = "/etc/openshell/certs/client.pem"
 guest_tls_key    = "/etc/openshell/certs/client-key.pem"
 
 [openshell.drivers.docker]
-network_name   = "openshell-docker"
+default_image    = "ghcr.io/nvidia/openshell/sandbox:latest"
+image_pull_policy = "IfNotPresent"
+sandbox_namespace = "docker-dev"
+grpc_endpoint    = "https://host.openshell.internal:8080"
+network_name     = "openshell-docker"
 # Skip the image-pull-and-extract step by pointing at a locally built binary.
-supervisor_bin = "/usr/local/libexec/openshell/openshell-sandbox"
+supervisor_bin   = "/usr/local/libexec/openshell/openshell-sandbox"
 ```
 
 ### Podman
@@ -203,6 +204,7 @@ guest_tls_cert = "/var/lib/openshell/guest-tls/client.pem"
 guest_tls_key  = "/var/lib/openshell/guest-tls/client-key.pem"
 
 [openshell.drivers.vm]
+grpc_endpoint = "https://host.containers.internal:8080"
 state_dir      = "/var/lib/openshell/vm"
 # Where the gateway looks for the openshell-driver-vm subprocess binary.
 driver_dir     = "/usr/local/libexec/openshell"

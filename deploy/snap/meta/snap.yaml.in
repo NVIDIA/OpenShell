@@ -31,23 +31,16 @@ apps:
       - ssh-keys
       - system-observe
   gateway:
-    command: bin/openshell-gateway
+    command: bin/openshell-gateway-wrapper
     daemon: simple
     refresh-mode: endure
     environment:
       OPENSHELL_BIND_ADDRESS: 127.0.0.1
       OPENSHELL_SERVER_PORT: 17670
       OPENSHELL_DB_URL: "sqlite:$SNAP_COMMON/gateway.db?mode=rwc"
-      OPENSHELL_GRPC_ENDPOINT: http://host.openshell.internal:17670
       OPENSHELL_DISABLE_TLS: true
       OPENSHELL_DRIVERS: docker
-      OPENSHELL_DOCKER_SUPERVISOR_BIN: "$SNAP/bin/openshell-sandbox"
-      OPENSHELL_DOCKER_NETWORK_NAME: openshell-snap
-      OPENSHELL_SANDBOX_IMAGE: ghcr.io/nvidia/openshell-community/sandboxes/base:latest
-      OPENSHELL_SANDBOX_IMAGE_PULL_POLICY: IfNotPresent
-      OPENSHELL_SANDBOX_SSH_PORT: 2222
-      OPENSHELL_SSH_GATEWAY_HOST: 127.0.0.1
-      OPENSHELL_SSH_GATEWAY_PORT: 8080
+      OPENSHELL_GATEWAY_CONFIG: "$SNAP_COMMON/gateway.toml"
       XDG_DATA_HOME: "$SNAP_COMMON"
       # Used for creating and locating certain sockets.
       XDG_RUNTIME_DIR: "$SNAP_COMMON"

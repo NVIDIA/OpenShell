@@ -1263,17 +1263,10 @@ pub(super) async fn handle_revoke_ssh_session(
 // ---------------------------------------------------------------------------
 
 fn resolve_gateway(config: &openshell_core::Config) -> (String, u16) {
-    let host = if config.ssh_gateway_host.is_empty() {
-        config.bind_address.ip().to_string()
-    } else {
-        config.ssh_gateway_host.clone()
-    };
-    let port = if config.ssh_gateway_port == 0 {
-        config.bind_address.port()
-    } else {
-        config.ssh_gateway_port
-    };
-    (host, port)
+    (
+        config.bind_address.ip().to_string(),
+        config.bind_address.port(),
+    )
 }
 
 /// Shell-escape a value for embedding in a POSIX shell command.

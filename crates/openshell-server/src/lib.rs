@@ -582,49 +582,7 @@ async fn build_compute_runtime(
 
     match driver {
         ComputeDriverKind::Kubernetes => {
-            let mut k8s = kubernetes_config_from_file(file)?;
-            // Env overrides file for fields not represented in Config.
-            if let Ok(v) = std::env::var("OPENSHELL_SUPERVISOR_IMAGE")
-                && !v.is_empty()
-            {
-                k8s.supervisor_image = v;
-            }
-            if let Ok(v) = std::env::var("OPENSHELL_SUPERVISOR_IMAGE_PULL_POLICY")
-                && !v.is_empty()
-            {
-                k8s.supervisor_image_pull_policy = v;
-            }
-            if let Ok(v) = std::env::var("OPENSHELL_SUPERVISOR_SIDELOAD_METHOD")
-                && !v.is_empty()
-                && let Ok(parsed) = v.parse()
-            {
-                k8s.supervisor_sideload_method = parsed;
-            }
-            // Shared fields are sourced from Config, which already merged
-            // file + CLI/env at startup.
-            k8s.namespace.clone_from(&config.sandbox_namespace);
-            k8s.default_image.clone_from(&config.sandbox_image);
-            // Only let the gateway-wide CLI/env value overwrite the per-driver
-            // file value when it was actually set — otherwise the empty CLI
-            // default would silently clobber `image_pull_policy` configured
-            // under `[openshell.drivers.kubernetes]`.
-            if !config.sandbox_image_pull_policy.is_empty() {
-                k8s.image_pull_policy
-                    .clone_from(&config.sandbox_image_pull_policy);
-            }
-            // Same rationale as `image_pull_policy`: only let the gateway-wide
-            // CLI/env value win when it was actually set, otherwise the empty
-            // CLI default would clobber `grpc_endpoint` from
-            // `[openshell.drivers.kubernetes]`.
-            if !config.grpc_endpoint.is_empty() {
-                k8s.grpc_endpoint.clone_from(&config.grpc_endpoint);
-            }
-            k8s.ssh_socket_path
-                .clone_from(&config.sandbox_ssh_socket_path);
-            k8s.client_tls_secret_name
-                .clone_from(&config.client_tls_secret_name);
-            k8s.host_gateway_ip.clone_from(&config.host_gateway_ip);
-            k8s.enable_user_namespaces = config.enable_user_namespaces;
+            let k8s = kubernetes_config_from_file(file)?;
             ComputeRuntime::new_kubernetes(
                 k8s,
                 store,
@@ -663,63 +621,7 @@ async fn build_compute_runtime(
         }
         ComputeDriverKind::Podman => {
             let mut podman = podman_config_from_file(file)?;
-            // Env overrides file for fields not represented in Config.
-            if let Ok(v) = std::env::var("OPENSHELL_PODMAN_SOCKET")
-                && !v.is_empty()
-            {
-                podman.socket_path = std::path::PathBuf::from(v);
-            }
-            if let Ok(v) = std::env::var("OPENSHELL_NETWORK_NAME")
-                && !v.is_empty()
-            {
-                podman.network_name = v;
-            }
-            if let Ok(v) = std::env::var("OPENSHELL_STOP_TIMEOUT")
-                && let Ok(parsed) = v.parse()
-            {
-                podman.stop_timeout_secs = parsed;
-            }
-            if let Ok(v) = std::env::var("OPENSHELL_SUPERVISOR_IMAGE")
-                && !v.is_empty()
-            {
-                podman.supervisor_image = v;
-            }
-            if let Ok(v) = std::env::var("OPENSHELL_PODMAN_TLS_CA")
-                && !v.is_empty()
-            {
-                podman.guest_tls_ca = Some(std::path::PathBuf::from(v));
-            }
-            if let Ok(v) = std::env::var("OPENSHELL_PODMAN_TLS_CERT")
-                && !v.is_empty()
-            {
-                podman.guest_tls_cert = Some(std::path::PathBuf::from(v));
-            }
-            if let Ok(v) = std::env::var("OPENSHELL_PODMAN_TLS_KEY")
-                && !v.is_empty()
-            {
-                podman.guest_tls_key = Some(std::path::PathBuf::from(v));
-            }
-            // Shared fields are sourced from Config (which already merged
-            // file + CLI/env at startup).
-            podman.default_image.clone_from(&config.sandbox_image);
-            // The CLI/env `image_pull_policy` is K8s-shaped
-            // (e.g. `IfNotPresent`) and won't parse into Podman's lowercase
-            // enum. Only apply it when the operator set a Podman-shaped value
-            // explicitly; otherwise keep whatever `[openshell.drivers.podman]`
-            // (or the struct default) provided.
-            if !config.sandbox_image_pull_policy.is_empty()
-                && let Ok(policy) = config.sandbox_image_pull_policy.parse()
-            {
-                podman.image_pull_policy = policy;
-            }
-            if !config.grpc_endpoint.is_empty() {
-                podman.grpc_endpoint.clone_from(&config.grpc_endpoint);
-            }
             podman.gateway_port = config.bind_address.port();
-            podman
-                .sandbox_ssh_socket_path
-                .clone_from(&config.sandbox_ssh_socket_path);
-            podman.ssh_port = config.sandbox_ssh_port;
 
             ComputeRuntime::new_podman(
                 podman,

@@ -73,6 +73,9 @@ pub struct VmComputeConfig {
     /// Default sandbox image the driver should use when a request omits one.
     pub default_image: String,
 
+    /// Gateway gRPC endpoint the sandbox guest connects back to.
+    pub grpc_endpoint: String,
+
     /// libkrun log level used by the VM driver helper.
     pub krun_log_level: u32,
 
@@ -135,7 +138,8 @@ impl Default for VmComputeConfig {
         Self {
             state_dir: Self::default_state_dir(),
             driver_dir: None,
-            default_image: String::new(),
+            default_image: default_sandbox_image(),
+            grpc_endpoint: String::new(),
             krun_log_level: Self::default_krun_log_level(),
             vcpus: Self::default_vcpus(),
             mem_mib: Self::default_mem_mib(),
@@ -144,6 +148,13 @@ impl Default for VmComputeConfig {
             guest_tls_key: None,
         }
     }
+}
+
+fn default_sandbox_image() -> String {
+    format!(
+        "{}/base:latest",
+        openshell_core::image::DEFAULT_COMMUNITY_REGISTRY
+    )
 }
 
 #[cfg(unix)]
@@ -158,7 +169,7 @@ pub struct VmGuestTlsPaths {
 ///
 /// Resolution order:
 /// 1. `{driver_dir}/openshell-driver-vm`, where `driver_dir` comes from
-///    `--driver-dir` / `OPENSHELL_DRIVER_DIR`.
+///    `[openshell.drivers.vm].driver_dir`.
 /// 2. Conventional install directories:
 ///    `~/.local/libexec/openshell`, `/usr/libexec/openshell`,
 ///    `/usr/local/libexec/openshell`, `/usr/local/libexec`.
@@ -198,7 +209,7 @@ pub fn resolve_compute_driver_bin(vm_config: &VmComputeConfig) -> Result<PathBuf
         .collect::<Vec<_>>()
         .join(", ");
     Err(Error::config(format!(
-        "vm compute driver binary not found (searched {searched_display}); install it under --driver-dir / OPENSHELL_DRIVER_DIR, a conventional libexec path such as ~/.local/libexec/openshell, /usr/libexec/openshell, or /usr/local/libexec{{,/openshell}}, or place it next to the gateway binary"
+        "vm compute driver binary not found (searched {searched_display}); install it under [openshell.drivers.vm].driver_dir, a conventional libexec path such as ~/.local/libexec/openshell, /usr/libexec/openshell, or /usr/local/libexec{{,/openshell}}, or place it next to the gateway binary"
     )))
 }
 
@@ -360,10 +371,9 @@ fn remove_stale_socket(socket_path: &Path, expected_uid: u32) -> Result<()> {
 
 #[cfg(unix)]
 pub fn compute_driver_guest_tls_paths(
-    config: &Config,
     vm_config: &VmComputeConfig,
 ) -> Result<Option<VmGuestTlsPaths>> {
-    if !config.grpc_endpoint.starts_with("https://") {
+    if !vm_config.grpc_endpoint.starts_with("https://") {
         return Ok(None);
     }
 
@@ -374,23 +384,23 @@ pub fn compute_driver_guest_tls_paths(
     ];
     if provided.iter().all(Option::is_none) {
         return Err(Error::config(
-            "vm compute driver requires --vm-tls-ca, --vm-tls-cert, and --vm-tls-key when OPENSHELL_GRPC_ENDPOINT uses https://",
+            "vm compute driver requires guest_tls_ca, guest_tls_cert, and guest_tls_key when grpc_endpoint uses https://",
         ));
     }
 
     let Some(ca) = vm_config.guest_tls_ca.clone() else {
         return Err(Error::config(
-            "--vm-tls-ca is required when VM guest TLS materials are configured",
+            "guest_tls_ca is required when VM guest TLS materials are configured",
         ));
     };
     let Some(cert) = vm_config.guest_tls_cert.clone() else {
         return Err(Error::config(
-            "--vm-tls-cert is required when VM guest TLS materials are configured",
+            "guest_tls_cert is required when VM guest TLS materials are configured",
         ));
     };
     let Some(key) = vm_config.guest_tls_key.clone() else {
         return Err(Error::config(
-            "--vm-tls-key is required when VM guest TLS materials are configured",
+            "guest_tls_key is required when VM guest TLS materials are configured",
         ));
     };
 
@@ -414,7 +424,7 @@ pub async fn spawn(
     config: &Config,
     vm_config: &VmComputeConfig,
 ) -> Result<(Channel, Arc<ManagedDriverProcess>)> {
-    if config.grpc_endpoint.trim().is_empty() {
+    if vm_config.grpc_endpoint.trim().is_empty() {
         return Err(Error::config(
             "grpc_endpoint is required when using the vm compute driver",
         ));
@@ -422,7 +432,7 @@ pub async fn spawn(
 
     let driver_bin = resolve_compute_driver_bin(vm_config)?;
     let socket_path = compute_driver_socket_path(vm_config);
-    let guest_tls_paths = compute_driver_guest_tls_paths(config, vm_config)?;
+    let guest_tls_paths = compute_driver_guest_tls_paths(vm_config)?;
     prepare_compute_driver_socket_path(vm_config, &socket_path)?;
 
     let mut command = Command::new(&driver_bin);
@@ -437,7 +447,7 @@ pub async fn spawn(
     command.arg("--log-level").arg(&config.log_level);
     command
         .arg("--openshell-endpoint")
-        .arg(&config.grpc_endpoint);
+        .arg(&vm_config.grpc_endpoint);
     command.arg("--state-dir").arg(&vm_config.state_dir);
     if !vm_config.default_image.trim().is_empty() {
         command.arg("--default-image").arg(&vm_config.default_image);
@@ -539,7 +549,6 @@ mod tests {
         prepare_compute_driver_socket_path, prepare_vm_state_dir, resolve_compute_driver_bin,
         resolve_driver_search_dirs,
     };
-    use openshell_core::{Config, TlsConfig};
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener as StdUnixListener;
     use std::path::PathBuf;
@@ -570,8 +579,7 @@ mod tests {
         let err = resolve_compute_driver_bin(&vm_config)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("--driver-dir"));
-        assert!(err.contains("OPENSHELL_DRIVER_DIR"));
+        assert!(err.contains("[openshell.drivers.vm].driver_dir"));
         assert!(err.contains("openshell-driver-vm"));
     }
 
@@ -589,27 +597,16 @@ mod tests {
 
     #[test]
     fn vm_compute_driver_tls_requires_explicit_guest_bundle() {
-        let dir = tempdir().unwrap();
-        let server_cert = dir.path().join("server.crt");
-        let server_key = dir.path().join("server.key");
-        let server_ca = dir.path().join("client-ca.crt");
-        std::fs::write(&server_cert, "server-cert").unwrap();
-        std::fs::write(&server_key, "server-key").unwrap();
-        std::fs::write(&server_ca, "client-ca").unwrap();
+        let vm_config = VmComputeConfig {
+            grpc_endpoint: "https://gateway.internal:8443".to_string(),
+            ..Default::default()
+        };
 
-        let config = Config::new(Some(TlsConfig {
-            cert_path: server_cert,
-            key_path: server_key,
-            client_ca_path: Some(server_ca),
-            require_client_auth: false,
-        }))
-        .with_grpc_endpoint("https://gateway.internal:8443");
-
-        let err = compute_driver_guest_tls_paths(&config, &VmComputeConfig::default())
+        let err = compute_driver_guest_tls_paths(&vm_config)
             .expect_err("https vm endpoints should require an explicit guest client bundle");
         assert!(
             err.to_string()
-                .contains("--vm-tls-ca, --vm-tls-cert, and --vm-tls-key")
+                .contains("guest_tls_ca, guest_tls_cert, and guest_tls_key")
         );
     }
 
@@ -618,14 +615,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let server_cert = dir.path().join("server.crt");
         let server_key = dir.path().join("server.key");
-        let server_ca = dir.path().join("client-ca.crt");
         let guest_ca = dir.path().join("guest-ca.crt");
         let guest_cert = dir.path().join("guest.crt");
         let guest_key = dir.path().join("guest.key");
         for path in [
             &server_cert,
             &server_key,
-            &server_ca,
             &guest_ca,
             &guest_cert,
             &guest_key,
@@ -633,21 +628,15 @@ mod tests {
             std::fs::write(path, path.display().to_string()).unwrap();
         }
 
-        let config = Config::new(Some(TlsConfig {
-            cert_path: server_cert.clone(),
-            key_path: server_key.clone(),
-            client_ca_path: Some(server_ca),
-            require_client_auth: false,
-        }))
-        .with_grpc_endpoint("https://gateway.internal:8443");
         let vm_config = VmComputeConfig {
+            grpc_endpoint: "https://gateway.internal:8443".to_string(),
             guest_tls_ca: Some(guest_ca.clone()),
             guest_tls_cert: Some(guest_cert.clone()),
             guest_tls_key: Some(guest_key.clone()),
             ..Default::default()
         };
 
-        let guest_paths = compute_driver_guest_tls_paths(&config, &vm_config)
+        let guest_paths = compute_driver_guest_tls_paths(&vm_config)
             .unwrap()
             .expect("https vm endpoints should pass an explicit guest client bundle");
         assert_eq!(guest_paths.ca, guest_ca);
