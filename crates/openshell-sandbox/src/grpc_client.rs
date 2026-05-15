@@ -20,13 +20,14 @@
 //! injected on every outbound call by [`AuthInterceptor`].
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::sync::{Arc, OnceLock, RwLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::proto::{
     DenialSummary, GetDraftPolicyRequest, GetInferenceBundleRequest, GetInferenceBundleResponse,
     GetSandboxConfigRequest, GetSandboxProviderEnvironmentRequest, IssueSandboxTokenRequest,
-    PolicyChunk, PolicySource, PolicyStatus, ReportPolicyStatusRequest,
+    PolicyChunk, PolicySource, PolicyStatus, RefreshSandboxTokenRequest, ReportPolicyStatusRequest,
     SandboxPolicy as ProtoSandboxPolicy, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse,
     UpdateConfigRequest, inference_client::InferenceClient, open_shell_client::OpenShellClient,
 };
@@ -35,25 +36,48 @@ use tonic::Status;
 use tonic::metadata::AsciiMetadataValue;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Channel type after the [`AuthInterceptor`] is applied. Aliased so the
 /// generated client type signatures stay readable.
 pub type AuthedChannel = InterceptedService<Channel, AuthInterceptor>;
 
+/// Shared, refreshable Bearer header. All [`AuthInterceptor`] clones read
+/// the same slot, so the PR-5 refresh task can rotate the token in place
+/// without rebuilding the channel.
+type TokenSlot = Arc<RwLock<AsciiMetadataValue>>;
+
+/// Process-wide token slot. Initialized by the first [`connect_channel`]
+/// call and shared with every subsequent client + the refresh loop.
+static TOKEN_SLOT: OnceLock<TokenSlot> = OnceLock::new();
+
+/// One-shot guard so the refresh loop spawns at most once per process.
+static REFRESH_SPAWNED: OnceLock<()> = OnceLock::new();
+
+fn install_token_slot(token: &str) -> Result<TokenSlot> {
+    let bearer = AsciiMetadataValue::try_from(format!("Bearer {token}"))
+        .into_diagnostic()
+        .wrap_err("sandbox JWT contained characters not valid for a header value")?;
+    if let Some(existing) = TOKEN_SLOT.get() {
+        *existing.write().expect("token slot poisoned") = bearer;
+        return Ok(existing.clone());
+    }
+    let slot: TokenSlot = Arc::new(RwLock::new(bearer));
+    let _ = TOKEN_SLOT.set(slot.clone());
+    Ok(TOKEN_SLOT.get().cloned().unwrap_or(slot))
+}
+
 /// gRPC interceptor that injects `authorization: Bearer <token>` on every
-/// outbound request.
+/// outbound request. The token lives in a shared [`TokenSlot`] so the
+/// PR-5 refresh task can replace it without rebuilding clients.
 #[derive(Clone)]
 pub struct AuthInterceptor {
-    bearer: AsciiMetadataValue,
+    bearer: TokenSlot,
 }
 
 impl AuthInterceptor {
-    fn new(token: &str) -> Result<Self> {
-        let bearer = AsciiMetadataValue::try_from(format!("Bearer {token}"))
-            .into_diagnostic()
-            .wrap_err("sandbox JWT contained characters not valid for a header value")?;
-        Ok(Self { bearer })
+    fn new(bearer: TokenSlot) -> Self {
+        Self { bearer }
     }
 }
 
@@ -62,8 +86,12 @@ impl tonic::service::Interceptor for AuthInterceptor {
         &mut self,
         mut req: tonic::Request<()>,
     ) -> std::result::Result<tonic::Request<()>, Status> {
-        req.metadata_mut()
-            .insert("authorization", self.bearer.clone());
+        let bearer = self
+            .bearer
+            .read()
+            .expect("auth interceptor token slot poisoned")
+            .clone();
+        req.metadata_mut().insert("authorization", bearer);
         Ok(req)
     }
 }
@@ -132,13 +160,25 @@ async fn build_plain_channel(endpoint: &str) -> Result<Channel> {
 /// Build a Bearer-authenticated channel to the gateway.
 ///
 /// Resolves the sandbox JWT via the three-step lookup described at the
-/// module level (env → file → K8s SA bootstrap exchange) and wraps the
-/// resulting channel in [`AuthInterceptor`].
+/// module level (env → file → K8s SA bootstrap exchange), installs the
+/// token into the process-wide [`TOKEN_SLOT`], wraps the channel in an
+/// [`AuthInterceptor`] that reads from that slot, and spawns the refresh
+/// loop the first time the channel is built.
 async fn connect_channel(endpoint: &str) -> Result<AuthedChannel> {
     let channel = build_plain_channel(endpoint).await?;
     let token = acquire_sandbox_token(endpoint, &channel).await?;
-    let interceptor = AuthInterceptor::new(&token)?;
-    Ok(InterceptedService::new(channel, interceptor))
+    let slot = install_token_slot(&token)?;
+    let intercepted = InterceptedService::new(channel, AuthInterceptor::new(slot.clone()));
+    // Spawn the refresh loop once per process. It uses the same authed
+    // channel, so its outbound calls always carry the current token.
+    if REFRESH_SPAWNED.set(()).is_ok() {
+        let refresh_channel = intercepted.clone();
+        let refresh_slot = slot;
+        tokio::spawn(async move {
+            refresh_token_loop(refresh_channel, refresh_slot).await;
+        });
+    }
+    Ok(intercepted)
 }
 
 /// Resolve the sandbox JWT used to authenticate every outbound RPC.
@@ -174,7 +214,15 @@ async fn acquire_sandbox_token(endpoint: &str, plain_channel: &Channel) -> Resul
             .trim()
             .to_string();
         info!(endpoint = %endpoint, "exchanging K8s ServiceAccount token for sandbox JWT");
-        let interceptor = AuthInterceptor::new(&sa_token)?;
+        // The bootstrap exchange uses a one-off interceptor pinned to the
+        // SA token; the resulting gateway JWT becomes the value in the
+        // shared `TOKEN_SLOT` once `connect_channel` returns.
+        let bootstrap_slot: TokenSlot = Arc::new(RwLock::new(
+            AsciiMetadataValue::try_from(format!("Bearer {sa_token}"))
+                .into_diagnostic()
+                .wrap_err("SA token contained characters not valid for a header value")?,
+        ));
+        let interceptor = AuthInterceptor::new(bootstrap_slot);
         let bootstrap = InterceptedService::new(plain_channel.clone(), interceptor);
         let mut client = OpenShellClient::new(bootstrap);
         let resp = client
@@ -197,6 +245,145 @@ async fn acquire_sandbox_token(endpoint: &str, plain_channel: &Channel) -> Resul
 /// long-lived `supervisor_session` control stream).
 pub async fn connect_channel_pub(endpoint: &str) -> Result<AuthedChannel> {
     connect_channel(endpoint).await
+}
+
+/// Background task that rotates the sandbox JWT at ~80% of its remaining
+/// lifetime. The new token replaces the value in [`TOKEN_SLOT`], so all
+/// in-flight and future clients pick it up on their next request. The
+/// loop never panics: every failure is logged and re-attempted after a
+/// bounded backoff.
+async fn refresh_token_loop(channel: AuthedChannel, slot: TokenSlot) {
+    let mut client = OpenShellClient::new(channel);
+    loop {
+        let sleep = compute_refresh_delay(&slot);
+        tokio::time::sleep(sleep).await;
+        match client
+            .refresh_sandbox_token(RefreshSandboxTokenRequest {})
+            .await
+        {
+            Ok(resp) => {
+                let new_token = resp.into_inner().token;
+                match AsciiMetadataValue::try_from(format!("Bearer {new_token}")) {
+                    Ok(value) => {
+                        if let Ok(mut guard) = slot.write() {
+                            *guard = value;
+                            info!("rotated gateway sandbox JWT in-place");
+                        }
+                    }
+                    Err(e) => warn!(error = %e, "refreshed JWT contained invalid header bytes"),
+                }
+            }
+            Err(status) => {
+                warn!(error = %status, "RefreshSandboxToken failed; will retry");
+                // Backoff so we don't spin against a sustained failure.
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        }
+    }
+}
+
+/// Compute the next refresh delay: 80 % of the time remaining until the
+/// current token's `exp`, plus up to 10 % jitter, floored at 60 s and
+/// capped at 12 h. If the token can't be parsed (legacy/non-JWT bearer)
+/// default to 6 h.
+fn compute_refresh_delay(slot: &TokenSlot) -> Duration {
+    let token = slot
+        .read()
+        .ok()
+        .and_then(|v| v.to_str().ok().map(str::to_string))
+        .unwrap_or_default();
+    let bearer = token.strip_prefix("Bearer ").unwrap_or(&token);
+    let now_ms = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis()),
+    )
+    .unwrap_or(i64::MAX);
+    let remaining_ms = parse_jwt_exp_ms(bearer).map_or(21_600_000, |exp| exp - now_ms); // 6 h fallback
+    let mut delay_ms = (remaining_ms.max(0) * 8 / 10).clamp(60_000, 43_200_000);
+    // Up to 10 % jitter, derived deterministically from token bytes so
+    // unit tests are reproducible without injecting an RNG.
+    let jitter_pct = (token.len() % 10) as u64;
+    let jitter_ms = (u64::try_from(delay_ms).unwrap_or(0) * jitter_pct) / 100;
+    delay_ms = delay_ms.saturating_add(i64::try_from(jitter_ms).unwrap_or(0));
+    Duration::from_millis(u64::try_from(delay_ms).unwrap_or(0))
+}
+
+/// Decode the `exp` claim from a JWT without verifying its signature.
+/// Returns the expiry in milliseconds since the Unix epoch, or `None` if
+/// the token is not a parseable JWT.
+fn parse_jwt_exp_ms(jwt: &str) -> Option<i64> {
+    use base64::Engine;
+    let mut parts = jwt.splitn(3, '.');
+    let _header = parts.next()?;
+    let payload_b64 = parts.next()?;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload_b64)
+        .ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    let exp_secs = value.get("exp")?.as_i64()?;
+    exp_secs.checked_mul(1000)
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+
+    #[test]
+    fn parse_jwt_exp_reads_unsigned_payload() {
+        use base64::Engine as _;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(br#"{"exp":1234567890,"sandbox_id":"sb-1"}"#);
+        let token = format!("h.{payload}.sig");
+        assert_eq!(parse_jwt_exp_ms(&token), Some(1_234_567_890_000));
+    }
+
+    #[test]
+    fn parse_jwt_exp_returns_none_for_malformed_token() {
+        assert!(parse_jwt_exp_ms("not-a-jwt").is_none());
+        assert!(parse_jwt_exp_ms("only.two").is_none());
+        assert!(parse_jwt_exp_ms("a.!!!.c").is_none());
+    }
+
+    #[test]
+    fn compute_refresh_delay_uses_80_percent_when_token_present() {
+        // Build a JWT whose exp is 1000 seconds in the future. With 0-jitter
+        // the delay should be roughly 800 seconds.
+        use base64::Engine as _;
+        let now_s = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let exp = now_s + 1000;
+        let payload_json = format!(r#"{{"exp":{exp}}}"#);
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload_json);
+        let token = format!("h.{payload}.s");
+        let bearer = AsciiMetadataValue::try_from(format!("Bearer {token}")).unwrap();
+        let slot: TokenSlot = Arc::new(RwLock::new(bearer));
+        let delay = compute_refresh_delay(&slot);
+        // 800 s baseline + up to 10 % jitter → 800..=880 s, with some slack
+        // for the 1-second resolution of the exp claim.
+        let secs = delay.as_secs();
+        assert!(
+            (700..=900).contains(&secs),
+            "expected 80%-of-1000s delay, got {secs}s"
+        );
+    }
+
+    #[test]
+    fn compute_refresh_delay_floors_at_60_seconds() {
+        // Already-expired token still produces a 60 s floor so the loop
+        // doesn't busy-spin.
+        use base64::Engine as _;
+        let exp = 1; // past
+        let payload =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!(r#"{{"exp":{exp}}}"#));
+        let token = format!("h.{payload}.s");
+        let bearer = AsciiMetadataValue::try_from(format!("Bearer {token}")).unwrap();
+        let slot: TokenSlot = Arc::new(RwLock::new(bearer));
+        let delay = compute_refresh_delay(&slot);
+        assert!(delay.as_secs() >= 60);
+    }
 }
 
 /// Connect to the `OpenShell` server.

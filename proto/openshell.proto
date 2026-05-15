@@ -231,6 +231,15 @@ service OpenShell {
   // drivers receive the gateway JWT directly from the create-sandbox flow
   // and never call this RPC.
   rpc IssueSandboxToken(IssueSandboxTokenRequest) returns (IssueSandboxTokenResponse);
+
+  // Rotate the calling sandbox's gateway JWT. The previously-issued
+  // token is revoked (its jti added to the gateway's deny list) and a
+  // fresh token bound to the same sandbox UUID is returned. The
+  // supervisor calls this from a background task at ~80% of the token's
+  // lifetime; the new token is cached in memory only — the on-disk
+  // bootstrap file is intentionally not rewritten.
+  rpc RefreshSandboxToken(RefreshSandboxTokenRequest)
+      returns (RefreshSandboxTokenResponse);
 }
 
 // IssueSandboxToken request. Empty body; identity is established by the
@@ -245,6 +254,20 @@ message IssueSandboxTokenResponse {
   // Gateway-minted JWT bound to the calling sandbox's UUID.
   string token = 1;
   // Absolute expiry of the issued token, milliseconds since the epoch.
+  int64 expires_at_ms = 2;
+}
+
+// RefreshSandboxToken request. Empty body; the calling principal must
+// already be a sandbox principal (i.e. the request carries a still-valid
+// gateway-minted JWT in its Authorization header).
+message RefreshSandboxTokenRequest {}
+
+// RefreshSandboxToken response. The previous token is revoked server-side
+// before this response is sent.
+message RefreshSandboxTokenResponse {
+  // Fresh gateway-minted JWT bound to the same sandbox UUID.
+  string token = 1;
+  // Absolute expiry of the new token, milliseconds since the epoch.
   int64 expires_at_ms = 2;
 }
 
