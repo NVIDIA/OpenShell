@@ -31,8 +31,15 @@ use tower_http::request_id::{MakeRequestId, RequestId};
 use tracing::Span;
 
 use crate::{
-    OpenShellService, ServerState, auth::authz::AuthzPolicy, auth::identity::Identity, auth::oidc,
-    http_router, inference::InferenceService, service_http_router,
+    OpenShellService, ServerState,
+    auth::authenticator::{AuthenticatorChain, LegacySandboxMarkerAuthenticator},
+    auth::authz::AuthzPolicy,
+    auth::identity::Identity,
+    auth::oidc::{self, OidcAuthenticator},
+    auth::principal::{Principal, UserPrincipal},
+    http_router,
+    inference::InferenceService,
+    service_http_router,
 };
 
 /// Request-ID generator that produces a UUID v4 for each inbound request.
@@ -153,17 +160,11 @@ impl MultiplexService {
             user_role: oidc.user_role.clone(),
             scopes_enabled: !oidc.scopes_claim.is_empty(),
         });
-        let has_client_ca = self
-            .state
-            .config
-            .tls
-            .as_ref()
-            .is_some_and(|tls| tls.client_ca_path.is_some());
-        let grpc_service = AuthGrpcRouter::new(
+        let authenticator_chain = build_authenticator_chain(self.state.oidc_cache.clone());
+        let grpc_service = AuthGrpcRouter::with_peer_identity(
             GrpcRouter::new(openshell, inference),
-            self.state.oidc_cache.clone(),
+            authenticator_chain,
             authz_policy,
-            has_client_ca,
             peer_identity,
         );
         let http_service = http_router(self.state.clone());
@@ -256,28 +257,54 @@ where
     }
 }
 
-/// gRPC router wrapper that authenticates and authorizes requests.
+/// Assemble the authenticator chain for the gateway.
 ///
-/// When `oidc_cache` is `Some`, extracts the `authorization: Bearer <token>`
-/// header, validates the JWT (authentication), then checks RBAC roles
-/// (authorization) before forwarding to the inner gRPC router.
+/// PR-1 composition:
+/// 1. [`LegacySandboxMarkerAuthenticator`] — preserves the path-based
+///    sandbox/dual-auth-no-Bearer behavior so handlers that still read the
+///    metadata marker keep working. Removed in PR 3.
+/// 2. [`OidcAuthenticator`] — validates Bearer tokens against the configured
+///    OIDC issuer. Only added when OIDC is configured.
 ///
-/// Authentication is provider-specific (currently OIDC via `oidc.rs`).
-/// Authorization is provider-agnostic (via `authz.rs`). This separation
-/// aligns with RFC 0001's control-plane identity design.
+/// When OIDC is not configured (singleplayer dev mode, fronting-proxy
+/// deployments before PR 3), the chain still has the legacy marker so
+/// sandbox-class methods produce a `Principal::Sandbox` and non-sandbox
+/// methods produce `None` — preserving today's "OIDC None == pass through"
+/// behavior via the router's `chain_empty_means_passthrough` short-circuit.
+fn build_authenticator_chain(
+    oidc_cache: Option<Arc<oidc::JwksCache>>,
+) -> Option<AuthenticatorChain> {
+    let mut authenticators: Vec<Arc<dyn crate::auth::authenticator::Authenticator>> = Vec::new();
+    authenticators.push(Arc::new(LegacySandboxMarkerAuthenticator));
+    if let Some(cache) = oidc_cache {
+        authenticators.push(Arc::new(OidcAuthenticator::new(cache)));
+    } else {
+        // No OIDC configured — the router treats a missing OIDC cache as
+        // "pass-through for non-sandbox methods" by skipping the chain
+        // entirely. See AuthGrpcRouter::call.
+        return None;
+    }
+    Some(AuthenticatorChain::new(authenticators))
+}
+
+/// gRPC router wrapper that runs the [`AuthenticatorChain`] and inserts the
+/// resulting [`Principal`] into the request's extensions.
 ///
-/// Sandbox-class methods (`oidc::is_sandbox_method`) accept callers without
-/// a Bearer token: the gRPC channel's mTLS handshake is the trust
-/// boundary. The router marks such requests with the
-/// `INTERNAL_AUTH_SOURCE_HEADER` so handlers (`policy.rs`) can apply
-/// sandbox-restricted scope.
+/// Behavior:
+/// - Strip any external `x-openshell-auth-source` marker first (so callers
+///   cannot spoof a sandbox identity).
+/// - Health probes / reflection bypass the chain entirely.
+/// - When no chain is configured (OIDC not configured), forward without
+///   authentication — preserves today's pass-through behavior.
+/// - Otherwise, run the chain. The first match produces a `Principal`.
+///   `Principal::User` is gated by the RBAC `AuthzPolicy`. The legacy
+///   sandbox marker also inserts the metadata marker for backwards-compat
+///   with handlers that still consume it (PR-1 only; removed in PR 3).
 #[derive(Clone)]
 pub struct AuthGrpcRouter<S> {
     inner: S,
-    oidc_cache: Option<Arc<oidc::JwksCache>>,
+    authenticator_chain: Option<AuthenticatorChain>,
     authz_policy: Option<AuthzPolicy>,
-    /// Whether a client CA is configured (mTLS is a valid auth mechanism).
-    has_client_ca: bool,
     /// mTLS peer identity extracted from the TLS handshake.
     peer_identity: Option<Identity>,
 }
@@ -285,19 +312,32 @@ pub struct AuthGrpcRouter<S> {
 impl<S> AuthGrpcRouter<S> {
     fn new(
         inner: S,
-        oidc_cache: Option<Arc<oidc::JwksCache>>,
+        authenticator_chain: Option<AuthenticatorChain>,
         authz_policy: Option<AuthzPolicy>,
-        has_client_ca: bool,
+    ) -> Self {
+        Self::with_peer_identity(inner, authenticator_chain, authz_policy, None)
+    }
+
+    fn with_peer_identity(
+        inner: S,
+        authenticator_chain: Option<AuthenticatorChain>,
+        authz_policy: Option<AuthzPolicy>,
         peer_identity: Option<Identity>,
     ) -> Self {
         Self {
             inner,
-            oidc_cache,
+            authenticator_chain,
             authz_policy,
-            has_client_ca,
             peer_identity,
         }
     }
+}
+
+fn status_response(status: tonic::Status) -> Response<tonic::body::BoxBody> {
+    let response = status.into_http();
+    let (parts, body) = response.into_parts();
+    let body = tonic::body::BoxBody::new(body);
+    Response::from_parts(parts, body)
 }
 
 impl<S, B> tower::Service<Request<B>> for AuthGrpcRouter<S>
@@ -319,9 +359,8 @@ where
     }
 
     fn call(&mut self, req: Request<B>) -> Self::Future {
-        let oidc_cache = self.oidc_cache.clone();
+        let chain = self.authenticator_chain.clone();
         let authz_policy = self.authz_policy.clone();
-        let has_client_ca = self.has_client_ca;
         let peer_identity = self.peer_identity.clone();
         let mut inner = self.inner.clone();
 
@@ -329,18 +368,12 @@ where
             let mut req = req;
             oidc::clear_internal_auth_markers(req.headers_mut());
 
-            // No auth configured — pass through.
-            if oidc_cache.is_none() && !has_client_ca {
+            // No chain configured — pass through. Preserves today's
+            // "OIDC None means open" behavior for dev/fronting-proxy modes.
+            let Some(chain) = chain else {
                 return inner.ready().await?.call(req).await;
-            }
+            };
 
-            // mTLS-only (no OIDC) — TLS layer already enforced client certs,
-            // so if we got here the peer is authenticated.
-            if oidc_cache.is_none() && has_client_ca {
-                return inner.ready().await?.call(req).await;
-            }
-
-            let cache = oidc_cache.expect("checked above");
             let path = req.uri().path().to_string();
 
             // Health probes and reflection — truly unauthenticated.
@@ -348,72 +381,38 @@ where
                 return inner.ready().await?.call(req).await;
             }
 
-            // Sandbox-class RPCs — no Bearer expected. The gRPC channel's
-            // mTLS handshake (or the operator's fronting proxy when
-            // `--disable-gateway-auth` is set) is the trust boundary.
-            if oidc::is_sandbox_method(&path) {
-                oidc::mark_sandbox_caller(req.headers_mut());
-                return inner.ready().await?.call(req).await;
-            }
-
-            // Dual-auth methods (e.g. UpdateConfig) — Bearer present grants
-            // full scope (CLI users); Bearer absent marks the caller as
-            // sandbox-class for restricted scope downstream.
-            if oidc::is_dual_auth_method(&path) && !has_bearer_token(req.headers()) {
-                oidc::mark_sandbox_caller(req.headers_mut());
-                return inner.ready().await?.call(req).await;
-            }
-
-            // Extract Bearer token from the authorization header.
-            let token = req
-                .headers()
-                .get("authorization")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.strip_prefix("Bearer "));
-
-            let Some(token) = token else {
-                // No bearer token — fall back to mTLS if a client cert was
-                // presented (only possible when both OIDC and client CA are
-                // configured and require_client_auth is false).
-                if let Some(ref identity) = peer_identity {
-                    if let Some(ref policy) = authz_policy
-                        && let Err(status) = policy.check(identity, &path)
-                    {
-                        let response = status.into_http();
-                        let (parts, body) = response.into_parts();
-                        let body = tonic::body::BoxBody::new(body);
-                        return Ok(Response::from_parts(parts, body));
+            let principal = match chain.authenticate(req.headers(), &path).await {
+                Ok(Some(p)) => p,
+                Ok(None) => {
+                    if let Some(identity) = peer_identity {
+                        Principal::User(UserPrincipal { identity })
+                    } else {
+                        return Ok(status_response(tonic::Status::unauthenticated(
+                            "missing authorization header",
+                        )));
                     }
-                    return inner.ready().await?.call(req).await;
                 }
-                let status = tonic::Status::unauthenticated("missing authorization header");
-                let response = status.into_http();
-                let (parts, body) = response.into_parts();
-                let body = tonic::body::BoxBody::new(body);
-                return Ok(Response::from_parts(parts, body));
+                Err(status) => return Ok(status_response(status)),
             };
 
-            // Authenticate: validate the JWT and produce an Identity.
-            let identity = match cache.validate_token(token).await {
-                Ok(id) => id,
-                Err(status) => {
-                    let response = status.into_http();
-                    let (parts, body) = response.into_parts();
-                    let body = tonic::body::BoxBody::new(body);
-                    return Ok(Response::from_parts(parts, body));
-                }
-            };
-
-            // Authorize: check RBAC roles against the method.
-            if let Some(ref policy) = authz_policy
-                && let Err(status) = policy.check(&identity, &path)
+            // Authorize user principals via RBAC. Sandbox principals get
+            // their PR-4 equality check at the handler level; legacy markers
+            // (PR-1) bypass RBAC, matching pre-refactor behavior.
+            if let Principal::User(ref user) = principal
+                && let Some(ref policy) = authz_policy
+                && let Err(status) = policy.check(&user.identity, &path)
             {
-                let response = status.into_http();
-                let (parts, body) = response.into_parts();
-                let body = tonic::body::BoxBody::new(body);
-                return Ok(Response::from_parts(parts, body));
+                return Ok(status_response(status));
             }
 
+            // PR-1 backwards-compat: handlers still consume the metadata
+            // marker today. Insert it for sandbox principals so existing
+            // policy-handler logic continues to work. PR 3 removes this.
+            if matches!(principal, Principal::Sandbox(_)) {
+                oidc::mark_sandbox_caller(req.headers_mut());
+            }
+
+            req.extensions_mut().insert(principal);
             inner.ready().await?.call(req).await
         })
     }
@@ -511,13 +510,6 @@ where
             })
         }
     }
-}
-
-fn has_bearer_token(headers: &http::HeaderMap) -> bool {
-    headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.starts_with("Bearer "))
 }
 
 fn grpc_method_from_path(path: &str) -> String {
@@ -859,5 +851,221 @@ mod tests {
     #[test]
     fn normalize_root_path() {
         assert_eq!(normalize_http_path("/"), "unknown");
+    }
+
+    mod auth_router {
+        use super::*;
+        use crate::auth::authenticator::test_support::MockAuthenticator;
+        use crate::auth::identity::{Identity, IdentityProvider};
+        use crate::auth::principal::{
+            Principal, SandboxIdentitySource, SandboxPrincipal, UserPrincipal,
+        };
+        use http_body_util::Full;
+        use std::sync::Arc;
+        use std::sync::Mutex;
+        use tower::Service;
+
+        type RecordedPrincipal = Arc<Mutex<Option<Principal>>>;
+
+        /// Service that snapshots the `Principal` from request extensions
+        /// and the `x-openshell-auth-source` header, then returns 200 OK.
+        #[derive(Clone)]
+        struct PrincipalRecorder {
+            recorded: RecordedPrincipal,
+            sandbox_marker: Arc<Mutex<bool>>,
+        }
+
+        impl PrincipalRecorder {
+            fn new() -> (Self, RecordedPrincipal, Arc<Mutex<bool>>) {
+                let recorded = Arc::new(Mutex::new(None));
+                let marker = Arc::new(Mutex::new(false));
+                (
+                    Self {
+                        recorded: recorded.clone(),
+                        sandbox_marker: marker.clone(),
+                    },
+                    recorded,
+                    marker,
+                )
+            }
+        }
+
+        impl<B: Send + 'static> Service<Request<B>> for PrincipalRecorder {
+            type Response = Response<tonic::body::BoxBody>;
+            type Error = std::convert::Infallible;
+            type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+
+            fn call(&mut self, req: Request<B>) -> Self::Future {
+                let principal = req.extensions().get::<Principal>().cloned();
+                let has_marker = req
+                    .headers()
+                    .get(oidc::INTERNAL_AUTH_SOURCE_HEADER)
+                    .is_some_and(|v| v.as_bytes() == oidc::AUTH_SOURCE_SANDBOX.as_bytes());
+                *self.recorded.lock().unwrap() = principal;
+                *self.sandbox_marker.lock().unwrap() = has_marker;
+                Box::pin(async move {
+                    let body = tonic::body::BoxBody::new(
+                        Full::new(Bytes::new())
+                            .map_err(|never| match never {})
+                            .boxed_unsync(),
+                    );
+                    Ok(Response::new(body))
+                })
+            }
+        }
+
+        fn empty_request(path: &str) -> Request<Full<Bytes>> {
+            Request::builder()
+                .uri(path)
+                .body(Full::new(Bytes::new()))
+                .unwrap()
+        }
+
+        fn user_principal(subject: &str) -> Principal {
+            Principal::User(UserPrincipal {
+                identity: Identity {
+                    subject: subject.to_string(),
+                    display_name: None,
+                    roles: vec![],
+                    scopes: vec![],
+                    provider: IdentityProvider::Oidc,
+                },
+            })
+        }
+
+        fn sandbox_principal() -> Principal {
+            Principal::Sandbox(SandboxPrincipal {
+                sandbox_id: String::new(),
+                source: SandboxIdentitySource::LegacyMarker,
+                trust_domain: None,
+            })
+        }
+
+        #[tokio::test]
+        async fn user_principal_lands_in_request_extensions() {
+            let mock = Arc::new(MockAuthenticator::returning(Ok(Some(user_principal(
+                "alice",
+            )))));
+            let chain = AuthenticatorChain::new(vec![mock]);
+            let (recorder, seen, _) = PrincipalRecorder::new();
+            let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
+            let _ = router
+                .call(empty_request("/openshell.v1.OpenShell/ListSandboxes"))
+                .await
+                .unwrap();
+            let principal = seen.lock().unwrap().clone().expect("principal");
+            match principal {
+                Principal::User(u) => assert_eq!(u.identity.subject, "alice"),
+                _ => panic!("expected user principal"),
+            }
+        }
+
+        #[tokio::test]
+        async fn sandbox_principal_inserts_metadata_marker_for_backcompat() {
+            // PR-1 keeps the metadata marker so handlers that still read it
+            // (until PR 3/4 swap them over to extensions) keep working.
+            let mock = Arc::new(MockAuthenticator::returning(Ok(Some(sandbox_principal()))));
+            let chain = AuthenticatorChain::new(vec![mock]);
+            let (recorder, seen, marker_seen) = PrincipalRecorder::new();
+            let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
+            let _ = router
+                .call(empty_request("/openshell.v1.OpenShell/ReportPolicyStatus"))
+                .await
+                .unwrap();
+            assert!(
+                matches!(
+                    seen.lock().unwrap().clone(),
+                    Some(Principal::Sandbox(_))
+                ),
+                "principal must reach extensions"
+            );
+            assert!(
+                *marker_seen.lock().unwrap(),
+                "sandbox principals must also set the legacy metadata marker"
+            );
+        }
+
+        #[tokio::test]
+        async fn missing_principal_returns_unauthenticated() {
+            let mock = Arc::new(MockAuthenticator::returning(Ok(None)));
+            let chain = AuthenticatorChain::new(vec![mock]);
+            let (recorder, seen, _) = PrincipalRecorder::new();
+            let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
+            let res = router
+                .call(empty_request("/openshell.v1.OpenShell/ListSandboxes"))
+                .await
+                .unwrap();
+            assert!(seen.lock().unwrap().is_none());
+            // tonic sets grpc-status=16 (UNAUTHENTICATED) in trailers.
+            let grpc_status = res
+                .headers()
+                .get("grpc-status")
+                .map(|v| v.to_str().unwrap().to_string());
+            assert_eq!(grpc_status.as_deref(), Some("16"));
+        }
+
+        #[tokio::test]
+        async fn authenticator_error_short_circuits() {
+            let mock = Arc::new(MockAuthenticator::returning(Err(
+                tonic::Status::unauthenticated("forged"),
+            )));
+            let chain = AuthenticatorChain::new(vec![mock]);
+            let (recorder, seen, _) = PrincipalRecorder::new();
+            let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
+            let res = router
+                .call(empty_request("/openshell.v1.OpenShell/ListSandboxes"))
+                .await
+                .unwrap();
+            assert!(seen.lock().unwrap().is_none());
+            assert_eq!(
+                res.headers()
+                    .get("grpc-status")
+                    .map(|v| v.to_str().unwrap().to_string())
+                    .as_deref(),
+                Some("16")
+            );
+        }
+
+        #[tokio::test]
+        async fn health_methods_bypass_chain() {
+            // Authenticator is wired to fail-closed; the request still gets
+            // through because the path is exempt.
+            let mock = Arc::new(MockAuthenticator::returning(Err(
+                tonic::Status::unauthenticated("would reject"),
+            )));
+            let chain = AuthenticatorChain::new(vec![mock.clone()]);
+            let (recorder, _, _) = PrincipalRecorder::new();
+            let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
+            let res = router
+                .call(empty_request("/openshell.v1.OpenShell/Health"))
+                .await
+                .unwrap();
+            assert_eq!(res.status(), 200);
+            assert_eq!(mock.call_count(), 0, "health must not consult the chain");
+        }
+
+        #[tokio::test]
+        async fn external_auth_source_marker_is_stripped() {
+            let mock = Arc::new(MockAuthenticator::returning(Ok(Some(user_principal(
+                "alice",
+            )))));
+            let chain = AuthenticatorChain::new(vec![mock]);
+            let (recorder, _, marker_seen) = PrincipalRecorder::new();
+            let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
+            let mut req = empty_request("/openshell.v1.OpenShell/ListSandboxes");
+            req.headers_mut().insert(
+                oidc::INTERNAL_AUTH_SOURCE_HEADER,
+                HeaderValue::from_static(oidc::AUTH_SOURCE_SANDBOX),
+            );
+            let _ = router.call(req).await.unwrap();
+            assert!(
+                !*marker_seen.lock().unwrap(),
+                "external sandbox marker must be stripped before auth"
+            );
+        }
     }
 }

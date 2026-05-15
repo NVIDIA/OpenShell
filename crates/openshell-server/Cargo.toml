@@ -82,6 +82,7 @@ uuid = { workspace = true }
 hmac = "0.12"
 sha2 = { workspace = true }
 jsonwebtoken = { workspace = true }
+async-trait = "0.1"
 hex = "0.4"
 russh = "0.57"
 rand = { workspace = true }

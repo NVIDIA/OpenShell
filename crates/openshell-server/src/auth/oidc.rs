@@ -10,7 +10,10 @@
 //! This module owns authentication (verifying who the caller is).
 //! Authorization (deciding what the caller can do) is in `authz.rs`.
 
+use super::authenticator::Authenticator;
 use super::identity::{Identity, IdentityProvider};
+use super::principal::{Principal, UserPrincipal};
+use async_trait::async_trait;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use openshell_core::OidcConfig;
 use reqwest::Client;
@@ -418,6 +421,42 @@ impl JwksCache {
             scopes,
             provider: IdentityProvider::Oidc,
         })
+    }
+}
+
+/// Authenticator that validates `Authorization: Bearer <jwt>` headers against
+/// the configured OIDC issuer.
+///
+/// Returns `Ok(None)` when no Bearer header is present, so the chain can fall
+/// through to other authenticators (e.g. the gateway-minted sandbox JWT
+/// authenticator added in PR 2).
+pub struct OidcAuthenticator {
+    cache: Arc<JwksCache>,
+}
+
+impl OidcAuthenticator {
+    pub fn new(cache: Arc<JwksCache>) -> Self {
+        Self { cache }
+    }
+}
+
+#[async_trait]
+impl Authenticator for OidcAuthenticator {
+    async fn authenticate(
+        &self,
+        headers: &http::HeaderMap,
+        _path: &str,
+    ) -> Result<Option<Principal>, Status> {
+        let Some(token) = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+        else {
+            return Ok(None);
+        };
+
+        let identity = self.cache.validate_token(token).await?;
+        Ok(Some(Principal::User(UserPrincipal { identity })))
     }
 }
 

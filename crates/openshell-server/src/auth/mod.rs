@@ -8,9 +8,11 @@
 //! - `identity`: Provider-agnostic identity representation
 //! - `http`: HTTP endpoints for auth discovery and token exchange
 
+pub mod authenticator;
 pub mod authz;
 mod http;
 pub mod identity;
 pub mod oidc;
+pub mod principal;
 
 pub use http::router;
