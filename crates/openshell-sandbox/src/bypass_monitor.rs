@@ -5,15 +5,15 @@
 //! detect and report direct connection attempts that bypass the HTTP CONNECT
 //! proxy.
 //!
-//! When the sandbox network namespace has iptables LOG rules installed (see
+//! When the sandbox network namespace has nftables log rules installed (see
 //! `NetworkNamespace::install_bypass_rules`), the kernel writes a log line for
-//! each dropped packet. This module reads those messages, parses the iptables
+//! each dropped packet. This module reads those messages, parses the nftables
 //! LOG format, and emits structured tracing events + denial aggregator entries.
 //!
 //! ## Graceful degradation
 //!
 //! If `/dev/kmsg` cannot be opened (e.g., restricted container environment),
-//! the monitor logs a one-time warning and returns. The iptables REJECT rules
+//! the monitor logs a one-time warning and returns. The nftables reject rules
 //! still provide fast-fail UX — the monitor only adds diagnostic visibility.
 
 use crate::denial_aggregator::DenialEvent;
@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::sync::mpsc;
 use tracing::debug;
 
-/// A parsed iptables LOG entry from `/dev/kmsg`.
+/// A parsed nftables log entry from `/dev/kmsg`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BypassEvent {
     /// Destination IP address.
@@ -41,7 +41,7 @@ pub struct BypassEvent {
     pub uid: Option<u32>,
 }
 
-/// Parse an iptables LOG line from `/dev/kmsg`.
+/// Parse a nftables log line from `/dev/kmsg`.
 ///
 /// Expected format (from the kernel LOG target):
 /// ```text
@@ -74,7 +74,7 @@ pub fn parse_kmsg_line(line: &str, namespace_prefix: &str) -> Option<BypassEvent
     })
 }
 
-/// Extract a single space-delimited field value from an iptables LOG line.
+/// Extract a single space-delimited field value from a nftables log line.
 ///
 /// Given `"DST="` and a string like `"...DST=93.184.216.34 LEN=60..."`,
 /// returns `Some("93.184.216.34")`.
@@ -103,7 +103,7 @@ fn hint_for_event(event: &BypassEvent) -> &'static str {
 
 /// Spawn the bypass monitor as a background tokio task.
 ///
-/// Uses `dmesg --follow` to tail the kernel ring buffer for iptables LOG
+/// Uses `dmesg --follow` to tail the kernel ring buffer for nftables log
 /// entries matching the given namespace. Falls back gracefully if `dmesg`
 /// is not available.
 ///
@@ -221,7 +221,7 @@ pub fn spawn(
                     .severity(SeverityId::Medium)
                     .dst_endpoint(dst_ep.clone())
                     .actor_process(Process::from_bypass(&binary, &binary_pid, &ancestors))
-                    .firewall_rule("bypass-detect", "iptables")
+                    .firewall_rule("bypass-detect", "nftables")
                     .observation_point(3)
                     .message(format!(
                         "BYPASS_DETECT {}:{} proto={} binary={binary} action=reject reason={reason}",

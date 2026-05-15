@@ -178,7 +178,7 @@ Namespace 2: Rootless Podman network namespace, managed by pasta
 Namespace 3: Inner sandbox netns, created by supervisor
   |
   veth pair, such as 10.200.0.1 <-> 10.200.0.2
-  iptables forces ordinary traffic through proxy
+  nftables forces ordinary traffic through proxy
   user workload runs here
 ```
 
@@ -270,7 +270,7 @@ Container on the Podman bridge
        |
        user code runs here
        |
-       iptables rules:
+       nftables rules:
          ACCEPT -> proxy TCP
          ACCEPT -> loopback
          ACCEPT -> established/related
@@ -337,7 +337,7 @@ User code in inner netns
      HTTP_PROXY points at the local sandbox proxy
   |
   2. TCP connect to proxy
-     allowed by iptables as the only ordinary egress destination
+     allowed by nftables as the only ordinary egress destination
   |
   3. HTTP CONNECT api.example.com:443
   |
@@ -398,7 +398,7 @@ bind-mounted into sandbox containers by the Podman driver.
 | Port publishing | Not needed for relay | Ephemeral host port remains in the container spec for compatibility and debug paths. |
 | TLS | mTLS via Kubernetes secrets | mTLS via mounted client files, RPM defaults, or explicit configuration. |
 | DNS | Kubernetes CoreDNS | Podman bridge DNS through aardvark-dns when DNS is enabled. |
-| Network policy | Kubernetes network policy for pod ingress plus supervisor policy | iptables inside inner sandbox netns plus supervisor policy. |
+| Network policy | Kubernetes network policy for pod ingress plus supervisor policy | nftables inside inner sandbox netns plus supervisor policy. |
 | Supervisor delivery | Kubernetes driver managed pod image or template | OCI image volume mount. |
 | Secrets | Kubernetes Secret volume and env vars | Mounted TLS client materials from a Podman secret. |
 

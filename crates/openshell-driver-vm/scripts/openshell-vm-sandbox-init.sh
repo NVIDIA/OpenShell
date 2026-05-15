@@ -585,6 +585,13 @@ run_post_overlay_setup() {
     mount -t cgroup2 cgroup2 "$(root_path /sys/fs/cgroup)" 2>/dev/null &
     wait
 
+    # Allow nftables LOG rules to work in non-init network namespaces.
+    # Without this, the kernel's nf_log_syslog silently suppresses output
+    # from the sandbox's network namespace.
+    if [ -f /proc/sys/net/netfilter/nf_log_all_netns ]; then
+        echo 1 > /proc/sys/net/netfilter/nf_log_all_netns 2>/dev/null || true
+    fi
+
     setup_sandbox_workdir
 
     configure_hostname

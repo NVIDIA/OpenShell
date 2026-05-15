@@ -10,7 +10,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::{embedded_runtime, ffi, procguard, rootfs};
+use crate::{embedded_runtime, ffi, nft_ruleset, procguard, rootfs};
 
 pub const VM_RUNTIME_DIR_ENV: &str = "OPENSHELL_VM_RUNTIME_DIR";
 
@@ -413,6 +413,12 @@ fn setup_tap_networking(tap_device: &str, host_ip: &str, gateway_port: u16) -> R
     enable_ip_forwarding()?;
 
     let subnet = tap_subnet_from_host_ip(host_ip);
+    let table_name = nft_ruleset::teardown_table_name(tap_device);
+
+    // Delete any stale nftables table from a previous driver run.
+    let _ = run_cmd("nft", &["delete", "table", "ip", &table_name]);
+
+    // Clean up legacy iptables rules from older driver versions.
     let _ = run_cmd(
         "iptables",
         &[
@@ -426,27 +432,10 @@ fn setup_tap_networking(tap_device: &str, host_ip: &str, gateway_port: u16) -> R
             "MASQUERADE",
         ],
     );
-    run_cmd(
-        "iptables",
-        &[
-            "-t",
-            "nat",
-            "-A",
-            "POSTROUTING",
-            "-s",
-            &subnet,
-            "-j",
-            "MASQUERADE",
-        ],
-    )?;
     let _ = run_cmd(
         "iptables",
         &["-D", "FORWARD", "-i", tap_device, "-j", "ACCEPT"],
     );
-    run_cmd(
-        "iptables",
-        &["-A", "FORWARD", "-i", tap_device, "-j", "ACCEPT"],
-    )?;
     let _ = run_cmd(
         "iptables",
         &[
@@ -462,25 +451,6 @@ fn setup_tap_networking(tap_device: &str, host_ip: &str, gateway_port: u16) -> R
             "ACCEPT",
         ],
     );
-    run_cmd(
-        "iptables",
-        &[
-            "-A",
-            "FORWARD",
-            "-o",
-            tap_device,
-            "-m",
-            "state",
-            "--state",
-            "RELATED,ESTABLISHED",
-            "-j",
-            "ACCEPT",
-        ],
-    )?;
-    // Allow guest → host traffic only to the gateway gRPC port.
-    // Previous versions accepted ALL inbound traffic from the TAP
-    // interface; scope to the specific port so the guest cannot reach
-    // other host services.
     let port_str = gateway_port.to_string();
     let _ = run_cmd(
         "iptables",
@@ -488,17 +458,24 @@ fn setup_tap_networking(tap_device: &str, host_ip: &str, gateway_port: u16) -> R
             "-D", "INPUT", "-i", tap_device, "-p", "tcp", "--dport", &port_str, "-j", "ACCEPT",
         ],
     );
-    run_cmd(
+    let _ = run_cmd(
         "iptables",
-        &[
-            "-A", "INPUT", "-i", tap_device, "-p", "tcp", "--dport", &port_str, "-j", "ACCEPT",
-        ],
-    )?;
+        &["-D", "INPUT", "-i", tap_device, "-j", "ACCEPT"],
+    );
+
+    // Load nftables ruleset atomically.
+    let ruleset = nft_ruleset::generate_tap_ruleset(tap_device, &subnet, gateway_port);
+    run_nft_stdin(&ruleset)?;
 
     Ok(())
 }
 
 fn teardown_tap_networking(tap_device: &str, host_ip: &str, gateway_port: u16) {
+    // Delete the entire nftables table — single atomic operation.
+    let table_name = nft_ruleset::teardown_table_name(tap_device);
+    let _ = run_cmd("nft", &["delete", "table", "ip", &table_name]);
+
+    // Clean up legacy iptables rules from older driver versions.
     let subnet = tap_subnet_from_host_ip(host_ip);
     let _ = run_cmd(
         "iptables",
@@ -519,8 +496,6 @@ fn teardown_tap_networking(tap_device: &str, host_ip: &str, gateway_port: u16) {
         "iptables",
         &["-D", "FORWARD", "-i", tap_device, "-j", "ACCEPT"],
     );
-    // Remove the port-scoped INPUT rule. Also try the legacy blanket
-    // rule so stale rules from older driver versions are cleaned up.
     if gateway_port > 0 {
         let port_str = gateway_port.to_string();
         let _ = run_cmd(
@@ -547,6 +522,7 @@ fn teardown_tap_networking(tap_device: &str, host_ip: &str, gateway_port: u16) {
             "MASQUERADE",
         ],
     );
+
     let _ = run_cmd("ip", &["link", "set", tap_device, "down"]);
     let _ = run_cmd("ip", &["tuntap", "del", "dev", tap_device, "mode", "tap"]);
 }
@@ -580,6 +556,35 @@ fn run_cmd(cmd: &str, args: &[&str]) -> Result<(), String> {
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         Err(format!("{cmd} {} failed: {stderr}", args.join(" ")))
+    }
+}
+
+fn run_nft_stdin(ruleset: &str) -> Result<(), String> {
+    use std::io::Write;
+
+    let mut child = StdCommand::new("nft")
+        .args(["-f", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to run nft: {e}"))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(ruleset.as_bytes())
+            .map_err(|e| format!("failed to write nft ruleset: {e}"))?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("failed to wait for nft: {e}"))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!("nft -f - failed: {stderr}"))
     }
 }
 
@@ -715,7 +720,7 @@ fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
     //     on its own service ports (DNS:53, DHCP, HTTP API:80).
     //
     // That network plane is also what the sandbox supervisor's
-    // per-sandbox netns (veth pair + iptables, see
+    // per-sandbox netns (veth pair + nftables, see
     // `openshell-sandbox/src/sandbox/linux/netns.rs`) branches off of;
     // libkrun's built-in TSI socket impersonation would not satisfy
     // those kernel-level primitives.
@@ -1480,5 +1485,18 @@ mod tests {
                 .expect("second socket base");
 
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn tap_subnet_from_host_ip_calculates_slash30_base() {
+        assert_eq!(tap_subnet_from_host_ip("10.0.128.1"), "10.0.128.0/30");
+        assert_eq!(tap_subnet_from_host_ip("10.0.128.2"), "10.0.128.0/30");
+        assert_eq!(tap_subnet_from_host_ip("10.0.128.5"), "10.0.128.4/30");
+    }
+
+    #[test]
+    fn tap_subnet_from_host_ip_handles_invalid_ip() {
+        let result = tap_subnet_from_host_ip("not-an-ip");
+        assert_eq!(result, "not-an-ip/30");
     }
 }

@@ -55,7 +55,7 @@ The restricted agent child does not retain these supervisor privileges.
 | Capability | Purpose |
 |---|---|
 | `SYS_ADMIN` | seccomp filter installation, namespace creation, and Landlock setup. |
-| `NET_ADMIN` | Network namespace veth setup, IP address assignment, routes, and iptables. |
+| `NET_ADMIN` | Network namespace veth setup, IP address assignment, routes, and nftables. |
 | `SYS_PTRACE` | Reading `/proc/<pid>/exe` and walking process ancestry for binary identity. |
 | `SYSLOG` | Reading `/dev/kmsg` for bypass-detection diagnostics. |
 | `DAC_READ_SEARCH` | Reading `/proc/<pid>/fd/` across UIDs so the proxy can resolve the binary responsible for a connection. |

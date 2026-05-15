@@ -456,7 +456,7 @@ mod tests {
             actor: Some(Actor {
                 process: Process::new("node", 1234),
             }),
-            firewall_rule: Some(FirewallRule::new("bypass-detect", "iptables")),
+            firewall_rule: Some(FirewallRule::new("bypass-detect", "nftables")),
             connection_info: Some(ConnectionInfo::new("tcp")),
             action: Some(ActionId::Denied),
             disposition: Some(DispositionId::Blocked),
@@ -467,7 +467,7 @@ mod tests {
         let shorthand = event.format_shorthand();
         assert_eq!(
             shorthand,
-            "NET:REFUSE [MED] DENIED node(1234) -> 93.184.216.34:443/tcp [policy:bypass-detect engine:iptables]"
+            "NET:REFUSE [MED] DENIED node(1234) -> 93.184.216.34:443/tcp [policy:bypass-detect engine:nftables]"
         );
     }
 

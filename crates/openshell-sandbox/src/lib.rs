@@ -509,7 +509,7 @@ pub async fn run_sandbox(
     let netns = if matches!(policy.network.mode, NetworkMode::Proxy) {
         match NetworkNamespace::create() {
             Ok(ns) => {
-                // Install bypass detection rules (iptables LOG + REJECT).
+                // Install bypass detection rules (nftables log + reject).
                 // This provides fast-fail UX and diagnostic logging for direct
                 // connection attempts that bypass the HTTP CONNECT proxy.
                 let proxy_port = policy
@@ -550,7 +550,7 @@ pub async fn run_sandbox(
     let _netns: Option<()> = None;
 
     // Install the supervisor seccomp prelude after privileged startup helpers
-    // (network namespace setup, iptables probes) complete, but before the SSH
+    // (network namespace setup, nftables probes) complete, but before the SSH
     // listener and workload process are exposed.
     apply_supervisor_startup_hardening()?;
 
@@ -620,7 +620,7 @@ pub async fn run_sandbox(
     };
 
     // Spawn bypass detection monitor (Linux only, proxy mode only).
-    // Reads /dev/kmsg for iptables LOG entries and emits structured
+    // Reads /dev/kmsg for nftables log entries and emits structured
     // tracing events for direct connection attempts that bypass the proxy.
     #[cfg(target_os = "linux")]
     let _bypass_monitor = netns.as_ref().and_then(|ns| {

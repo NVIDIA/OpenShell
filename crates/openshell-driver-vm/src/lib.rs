@@ -5,6 +5,7 @@ pub mod driver;
 mod embedded_runtime;
 mod ffi;
 pub mod gpu;
+mod nft_ruleset;
 pub mod procguard;
 mod rootfs;
 mod runtime;

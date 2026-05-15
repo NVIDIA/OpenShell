@@ -95,6 +95,12 @@ The VM driver resolves sandbox images from a local container engine before falli
 systemctl --user start podman.socket
 ```
 
+### Host Firewall
+
+The VM driver creates nftables rules on the host for each sandbox VM's TAP network interface. These rules provide NAT for VM connectivity and defense-in-depth isolation: unsolicited inbound connections to the VM are dropped, and the VM can only reach the gateway port on the host. Primary security enforcement (proxy-only egress and bypass detection) is handled by the sandbox supervisor inside the VM guest.
+
+On hosts with restrictive firewalls (e.g. firewalld), the host firewall may additionally block VM traffic that the driver's rules accept. If VM sandboxes cannot reach the network, verify that the host firewall allows forwarding and input for `vmtap-*` interfaces. See the [VM driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-vm/README.md#host-side-nftables-rules) for details.
+
 ## Kubernetes Driver
 
 Kubernetes-backed sandboxes run as pods in the configured sandbox namespace. Use Kubernetes for shared clusters, remote compute, GPU scheduling, and operator-managed environments.

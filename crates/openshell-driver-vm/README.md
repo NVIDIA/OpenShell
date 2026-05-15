@@ -200,6 +200,25 @@ RUST_LOG=openshell_server=debug,openshell_driver_vm=debug \
 
 The VM guest's serial console is appended to `<state-dir>/<sandbox-id>/console.log`. Sandbox IDs must match `[A-Za-z0-9._-]{1,128}` before the driver uses them in host paths. The gateway-owned compute-driver socket lives at `<state-dir>/run/compute-driver.sock`; OpenShell creates `run/` with owner-only permissions, removes same-owner stale sockets, and the gateway removes the socket on clean shutdown via `ManagedDriverProcess::drop`. UDS clients must match the driver UID and provide the expected gateway process PID by default. Standalone same-UID UDS mode requires the explicit `--allow-same-uid-peer` development flag. TCP mode is disabled by default because it is unauthenticated; use `--allow-unauthenticated-tcp --bind-address 127.0.0.1:50061` only for local development.
 
+## Host-side nftables rules
+
+The VM driver creates a per-VM nftables table on the host (`openshell_vm_vmtap_<id>`) with three chains. These rules serve two purposes: NAT infrastructure (required for VM connectivity) and defense-in-depth host isolation. Primary security enforcement — proxy-only egress and bypass detection — is handled by the sandbox supervisor's own nftables rules inside the VM guest.
+
+**`postrouting` (NAT):** Masquerades outbound VM traffic so it can be routed from the VM's private subnet to the external network. This chain handles forwarded traffic (VM → internet), not traffic destined for the host.
+
+**`forward` (defense-in-depth):** Accepts all outbound traffic from the VM (security enforcement happens guest-side) and accepts established/related response traffic back to the VM. Drops unsolicited inbound connections to the VM from the broader network. This chain handles forwarded traffic only — packets transiting the host between the TAP interface and other interfaces.
+
+**`input` (defense-in-depth):** Accepts traffic from the VM to the gateway port on the host. Drops all other traffic from the VM destined for the host itself. This limits what a compromised guest can reach on the host to the gateway service only.
+
+The `input` and `postrouting` chains handle different traffic paths: `input` covers packets addressed to the host (VM → host), while `postrouting` covers packets the host is forwarding on behalf of the VM (VM → internet). A packet from the VM goes through one path or the other, never both.
+
+All chains use `policy accept`, so non-TAP traffic is unaffected. Because nftables evaluates multiple base chains on the same hook independently, host firewalls interact with these rules as follows:
+
+- **Open host (no other firewall):** Our chains are the only filter. The defense-in-depth drop rules block unsolicited inbound and non-gateway host access. Non-TAP traffic passes through.
+- **Restrictive host firewall (e.g. firewalld):** The host firewall's chains may additionally drop TAP traffic that our chains accept. A `drop` verdict from any chain is final — our `accept` cannot override it. If VM connectivity fails, verify that the host firewall allows forwarding and input for `vmtap-*` interfaces.
+
+Each table is created atomically via `nft -f` on VM start and torn down atomically via `nft delete table` when the VM is destroyed.
+
 ## Prerequisites
 
 - macOS on Apple Silicon, or Linux on aarch64/x86_64 with KVM
