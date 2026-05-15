@@ -70,7 +70,7 @@ impl Default for KubernetesComputeConfig {
     fn default() -> Self {
         Self {
             namespace: DEFAULT_K8S_NAMESPACE.to_string(),
-            default_image: String::new(),
+            default_image: default_sandbox_image(),
             // Default empty so the gateway omits `imagePullPolicy` from pod
             // specs and Kubernetes applies its own default (Always for `latest`,
             // IfNotPresent otherwise). `DEFAULT_IMAGE_PULL_POLICY` ("missing")
@@ -86,4 +86,11 @@ impl Default for KubernetesComputeConfig {
             enable_user_namespaces: false,
         }
     }
+}
+
+fn default_sandbox_image() -> String {
+    format!(
+        "{}/base:latest",
+        openshell_core::image::DEFAULT_COMMUNITY_REGISTRY
+    )
 }

@@ -13,21 +13,10 @@ Environment=OPENSHELL_TLS_CERT=%S/openshell/tls/server/tls.crt
 Environment=OPENSHELL_TLS_KEY=%S/openshell/tls/server/tls.key
 Environment=OPENSHELL_TLS_CLIENT_CA=%S/openshell/tls/ca.crt
 Environment=OPENSHELL_DB_URL=sqlite:%S/openshell/gateway/openshell.db
-Environment=OPENSHELL_GRPC_ENDPOINT=https://127.0.0.1:17670
-Environment=OPENSHELL_SSH_GATEWAY_HOST=127.0.0.1
-Environment=OPENSHELL_SSH_GATEWAY_PORT=17670
-Environment=OPENSHELL_VM_DRIVER_STATE_DIR=%S/openshell/vm-driver
-Environment=OPENSHELL_VM_TLS_CA=%S/openshell/tls/ca.crt
-Environment=OPENSHELL_VM_TLS_CERT=%S/openshell/tls/client/tls.crt
-Environment=OPENSHELL_VM_TLS_KEY=%S/openshell/tls/client/tls.key
-Environment=OPENSHELL_DOCKER_TLS_CA=%S/openshell/tls/ca.crt
-Environment=OPENSHELL_DOCKER_TLS_CERT=%S/openshell/tls/client/tls.crt
-Environment=OPENSHELL_DOCKER_TLS_KEY=%S/openshell/tls/client/tls.key
-Environment=OPENSHELL_PODMAN_TLS_CA=%S/openshell/tls/ca.crt
-Environment=OPENSHELL_PODMAN_TLS_CERT=%S/openshell/tls/client/tls.crt
-Environment=OPENSHELL_PODMAN_TLS_KEY=%S/openshell/tls/client/tls.key
+Environment=OPENSHELL_GATEWAY_CONFIG=%S/openshell/gateway/config.toml
 EnvironmentFile=-%h/.config/openshell/gateway.env
 ExecStartPre=/usr/bin/openshell-gateway generate-certs --output-dir %S/openshell/tls --server-san host.openshell.internal
+ExecStartPre=/usr/libexec/openshell/init-gateway-config.sh %S/openshell/gateway/config.toml %S/openshell/tls /usr/libexec/openshell %S/openshell/vm-driver
 ExecStart=/usr/bin/openshell-gateway
 Restart=on-failure
 RestartSec=5s

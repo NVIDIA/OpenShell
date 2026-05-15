@@ -51,8 +51,8 @@ The gateway pulls container images from ghcr.io on first sandbox
 creation. Ensure the host can reach ghcr.io over HTTPS (port 443).
 
 For air-gapped environments, pre-load images with `podman pull` and
-set `OPENSHELL_SANDBOX_IMAGE_PULL_POLICY=never` in
-`~/.config/openshell/gateway.env`. See CONFIGURATION.md for details.
+set `image_pull_policy = "never"` in
+`~/.config/openshell/gateway.toml`. See CONFIGURATION.md for details.
 
 ## Start the gateway
 
@@ -64,6 +64,7 @@ On first start, the gateway automatically generates:
 
 - A self-signed PKI bundle (CA, server cert, client cert) for mTLS
 - A commented configuration file at `~/.config/openshell/gateway.env`
+- A gateway TOML file at `~/.config/openshell/gateway.toml`
 
 > **Note:** The gateway binds to all interfaces (`0.0.0.0`) by default.
 > Mutual TLS (mTLS) is enabled automatically on first start, requiring a

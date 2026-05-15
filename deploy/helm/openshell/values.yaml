@@ -101,11 +101,6 @@ server:
   # Override only when sandboxes must reach the gateway via a different
   # hostname (e.g. an external ingress or a host alias).
   grpcEndpoint: ""
-  # Public host/port returned to CLI clients for SSH proxy CONNECT requests.
-  # For local clusters the default 127.0.0.1:8080 is correct; for remote
-  # clusters these should be set to the externally reachable host and port.
-  sshGatewayHost: ""
-  sshGatewayPort: 0
   # TLS configuration for the server. The server always terminates mTLS
   # directly and requires client certificates.
   # Host gateway IP for sandbox pod hostAliases. When set, sandbox pods get

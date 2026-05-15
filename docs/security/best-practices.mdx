@@ -71,8 +71,8 @@ This provides defense-in-depth: even if a container escape vulnerability exists,
 
 | Aspect | Detail |
 |---|---|
-| Default | Disabled. Set `server.enableUserNamespaces: true` in the Helm values or `OPENSHELL_ENABLE_USER_NAMESPACES=true` as an environment variable to enable cluster-wide. |
-| What you can change | Enable cluster-wide through Helm or environment variable. Override per-sandbox through the `user_namespaces` field on `SandboxTemplate` in the API. |
+| Default | Disabled. Set `server.enableUserNamespaces: true` in Helm values or `enable_user_namespaces = true` in the gateway config to enable cluster-wide. |
+| What you can change | Enable cluster-wide through Helm or gateway config. Override per-sandbox through the `user_namespaces` field on `SandboxTemplate` in the API. |
 | Prerequisites | Kubernetes 1.33+ with user namespace support available (beta through 1.35, GA in 1.36+), a container runtime that supports user namespaces (containerd 2.0+, CRI-O 1.25+), and Linux 5.12+ for ID-mapped mounts. |
 | Risk if enabled with GPU | NVIDIA device plugin compatibility with user namespaces is unverified. OpenShell logs a warning when both GPU and user namespaces are active on the same sandbox. |
 | Recommendation | Enable on non-GPU clusters running Kubernetes with user namespace support available (1.33+ beta, 1.36+ GA) for stronger host isolation. Test GPU workloads separately before enabling on GPU clusters. |

@@ -7,7 +7,7 @@ use clap::parser::ValueSource;
 use clap::{ArgAction, ArgMatches, Command, CommandFactory, FromArgMatches, Parser};
 use miette::{IntoDiagnostic, Result};
 use openshell_core::ComputeDriverKind;
-use openshell_core::config::{DEFAULT_DOCKER_NETWORK_NAME, DEFAULT_SERVER_PORT, DEFAULT_SSH_PORT};
+use openshell_core::config::DEFAULT_SERVER_PORT;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use tracing::info;
@@ -46,8 +46,8 @@ struct RunArgs {
     /// Path to a TOML configuration file (see RFC 0003).
     ///
     /// When set, gateway-wide settings and per-driver tables are read from
-    /// the file. Command-line flags and `OPENSHELL_*` environment variables
-    /// continue to take precedence over file values.
+    /// the file. Gateway command-line flags and `OPENSHELL_*` environment
+    /// variables continue to take precedence over gateway file values.
     #[arg(long, env = "OPENSHELL_GATEWAY_CONFIG")]
     config: Option<PathBuf>,
 
@@ -109,140 +109,6 @@ struct RunArgs {
         value_parser = parse_compute_driver
     )]
     drivers: Vec<ComputeDriverKind>,
-
-    /// Kubernetes namespace for sandboxes.
-    #[arg(long, env = "OPENSHELL_SANDBOX_NAMESPACE", default_value = "default")]
-    sandbox_namespace: String,
-
-    /// Default container image for sandboxes.
-    #[arg(long, env = "OPENSHELL_SANDBOX_IMAGE")]
-    sandbox_image: Option<String>,
-
-    /// Kubernetes `imagePullPolicy` for sandbox pods (Always, `IfNotPresent`, Never).
-    #[arg(long, env = "OPENSHELL_SANDBOX_IMAGE_PULL_POLICY")]
-    sandbox_image_pull_policy: Option<String>,
-
-    /// gRPC endpoint that sandboxes use to call back into the gateway.
-    /// Must be reachable from wherever the sandbox runs (Kubernetes pod,
-    /// Docker/Podman container, or VM), and is applied to every compute
-    /// driver.
-    #[arg(long, env = "OPENSHELL_GRPC_ENDPOINT")]
-    grpc_endpoint: Option<String>,
-
-    /// Public host for the SSH gateway.
-    #[arg(long, env = "OPENSHELL_SSH_GATEWAY_HOST", default_value = "127.0.0.1")]
-    ssh_gateway_host: String,
-
-    /// Public port for the SSH gateway.
-    #[arg(long, env = "OPENSHELL_SSH_GATEWAY_PORT", default_value_t = DEFAULT_SERVER_PORT)]
-    ssh_gateway_port: u16,
-
-    /// SSH port inside sandbox pods.
-    #[arg(long, env = "OPENSHELL_SANDBOX_SSH_PORT", default_value_t = DEFAULT_SSH_PORT)]
-    sandbox_ssh_port: u16,
-
-    /// Kubernetes secret name containing client TLS materials for sandbox pods.
-    #[arg(long, env = "OPENSHELL_CLIENT_TLS_SECRET_NAME")]
-    client_tls_secret_name: Option<String>,
-
-    /// Host gateway IP for sandbox pod hostAliases.
-    /// When set, sandbox pods get hostAliases entries mapping
-    /// host.docker.internal and host.openshell.internal to this IP.
-    #[arg(long, env = "OPENSHELL_HOST_GATEWAY_IP")]
-    host_gateway_ip: Option<String>,
-
-    /// Working directory for VM driver sandbox state.
-    #[arg(
-        long,
-        env = "OPENSHELL_VM_DRIVER_STATE_DIR",
-        default_value_os_t = VmComputeConfig::default_state_dir()
-    )]
-    vm_driver_state_dir: PathBuf,
-
-    /// Directory searched for compute-driver binaries (e.g.
-    /// `openshell-driver-vm`) when an explicit binary override isn't
-    /// configured. When unset, the gateway searches
-    /// `$HOME/.local/libexec/openshell`, `/usr/libexec/openshell`,
-    /// `/usr/local/libexec/openshell`, `/usr/local/libexec`, then a sibling
-    /// of the gateway binary.
-    #[arg(long, env = "OPENSHELL_DRIVER_DIR")]
-    driver_dir: Option<PathBuf>,
-
-    /// libkrun log level used by the VM helper.
-    #[arg(
-        long,
-        env = "OPENSHELL_VM_KRUN_LOG_LEVEL",
-        default_value_t = VmComputeConfig::default_krun_log_level()
-    )]
-    vm_krun_log_level: u32,
-
-    /// Default vCPU count for VM sandboxes.
-    #[arg(
-        long,
-        env = "OPENSHELL_VM_DRIVER_VCPUS",
-        default_value_t = VmComputeConfig::default_vcpus()
-    )]
-    vm_vcpus: u8,
-
-    /// Default memory allocation for VM sandboxes, in MiB.
-    #[arg(
-        long,
-        env = "OPENSHELL_VM_DRIVER_MEM_MIB",
-        default_value_t = VmComputeConfig::default_mem_mib()
-    )]
-    vm_mem_mib: u32,
-
-    /// CA certificate installed into VM sandboxes for gateway mTLS.
-    #[arg(long, env = "OPENSHELL_VM_TLS_CA")]
-    vm_tls_ca: Option<PathBuf>,
-
-    /// Client certificate installed into VM sandboxes for gateway mTLS.
-    #[arg(long, env = "OPENSHELL_VM_TLS_CERT")]
-    vm_tls_cert: Option<PathBuf>,
-
-    /// Client private key installed into VM sandboxes for gateway mTLS.
-    #[arg(long, env = "OPENSHELL_VM_TLS_KEY")]
-    vm_tls_key: Option<PathBuf>,
-
-    /// Linux `openshell-sandbox` binary bind-mounted into Docker sandboxes.
-    ///
-    /// When unset the gateway falls back to (in order) a sibling
-    /// `openshell-sandbox` next to the gateway binary, a local cargo build,
-    /// or extracting the binary from `--docker-supervisor-image`.
-    #[arg(long, env = "OPENSHELL_DOCKER_SUPERVISOR_BIN")]
-    docker_supervisor_bin: Option<PathBuf>,
-
-    /// Image the Docker driver pulls to extract the Linux
-    /// `openshell-sandbox` binary when no explicit `--docker-supervisor-bin`
-    /// override or local build is available. Defaults to
-    /// `ghcr.io/nvidia/openshell/supervisor:<gateway-image-tag>`.
-    #[arg(long, env = "OPENSHELL_DOCKER_SUPERVISOR_IMAGE")]
-    docker_supervisor_image: Option<String>,
-
-    /// CA certificate bind-mounted into Docker sandboxes for gateway mTLS.
-    #[arg(long, env = "OPENSHELL_DOCKER_TLS_CA")]
-    docker_tls_ca: Option<PathBuf>,
-
-    /// Client certificate bind-mounted into Docker sandboxes for gateway mTLS.
-    #[arg(long, env = "OPENSHELL_DOCKER_TLS_CERT")]
-    docker_tls_cert: Option<PathBuf>,
-
-    /// Client private key bind-mounted into Docker sandboxes for gateway mTLS.
-    #[arg(long, env = "OPENSHELL_DOCKER_TLS_KEY")]
-    docker_tls_key: Option<PathBuf>,
-
-    /// Docker bridge network used for sandbox containers.
-    #[arg(
-        long,
-        env = "OPENSHELL_DOCKER_NETWORK_NAME",
-        default_value = DEFAULT_DOCKER_NETWORK_NAME
-    )]
-    docker_network_name: String,
-
-    /// Enable Kubernetes user namespace isolation (hostUsers: false) for
-    /// sandbox pods.
-    #[arg(long, env = "OPENSHELL_ENABLE_USER_NAMESPACES")]
-    enable_user_namespaces: bool,
 
     /// Disable TLS entirely — listen on plaintext HTTP.
     /// Use this when the gateway sits behind a reverse proxy or tunnel
@@ -446,10 +312,6 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
     config = config
         .with_database_url(db_url)
         .with_compute_drivers(args.drivers.clone())
-        .with_sandbox_namespace(args.sandbox_namespace.clone())
-        .with_ssh_gateway_host(args.ssh_gateway_host.clone())
-        .with_ssh_gateway_port(args.ssh_gateway_port)
-        .with_sandbox_ssh_port(args.sandbox_ssh_port)
         .with_server_sans(args.server_sans.clone())
         .with_loopback_service_http(args.enable_loopback_service_http);
 
@@ -458,26 +320,6 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
         .and_then(|f| f.openshell.gateway.ssh_session_ttl_secs)
     {
         config = config.with_ssh_session_ttl_secs(ttl);
-    }
-
-    if let Some(image) = args.sandbox_image.clone() {
-        config = config.with_sandbox_image(image);
-    }
-
-    if let Some(policy) = args.sandbox_image_pull_policy.clone() {
-        config = config.with_sandbox_image_pull_policy(policy);
-    }
-
-    if let Some(endpoint) = args.grpc_endpoint.clone() {
-        config = config.with_grpc_endpoint(endpoint);
-    }
-
-    if let Some(name) = args.client_tls_secret_name.clone() {
-        config = config.with_client_tls_secret_name(name);
-    }
-
-    if let Some(ip) = args.host_gateway_ip.clone() {
-        config = config.with_host_gateway_ip(ip);
     }
 
     if let Some(issuer) = args.oidc_issuer.clone() {
@@ -492,10 +334,8 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
         });
     }
 
-    config.enable_user_namespaces = args.enable_user_namespaces;
-
-    let vm_config = build_vm_config(&args, &matches, &config, file.as_ref())?;
-    let docker_config = build_docker_config(&args, &matches, file.as_ref())?;
+    let vm_config = build_vm_config(file.as_ref())?;
+    let docker_config = build_docker_config(file.as_ref())?;
 
     if args.disable_tls {
         info!("TLS disabled — listening on plaintext HTTP");
@@ -592,49 +432,6 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
     {
         args.drivers.clone_from(drivers);
     }
-    if let Some(ns) = &file.sandbox_namespace
-        && arg_defaulted(matches, "sandbox_namespace")
-    {
-        args.sandbox_namespace.clone_from(ns);
-    }
-    if let Some(port) = file.sandbox_ssh_port
-        && arg_defaulted(matches, "sandbox_ssh_port")
-    {
-        args.sandbox_ssh_port = port;
-    }
-    if let Some(host) = &file.ssh_gateway_host
-        && arg_defaulted(matches, "ssh_gateway_host")
-    {
-        args.ssh_gateway_host.clone_from(host);
-    }
-    if let Some(port) = file.ssh_gateway_port
-        && arg_defaulted(matches, "ssh_gateway_port")
-    {
-        args.ssh_gateway_port = port;
-    }
-    if let Some(image) = &file.default_image
-        && args.sandbox_image.is_none()
-        && arg_defaulted(matches, "sandbox_image")
-    {
-        args.sandbox_image = Some(image.clone());
-    }
-    if let Some(secret) = &file.client_tls_secret_name
-        && args.client_tls_secret_name.is_none()
-        && arg_defaulted(matches, "client_tls_secret_name")
-    {
-        args.client_tls_secret_name = Some(secret.clone());
-    }
-    if let Some(ip) = &file.host_gateway_ip
-        && args.host_gateway_ip.is_none()
-        && arg_defaulted(matches, "host_gateway_ip")
-    {
-        args.host_gateway_ip = Some(ip.clone());
-    }
-    if let Some(enabled) = file.enable_user_namespaces
-        && arg_defaulted(matches, "enable_user_namespaces")
-    {
-        args.enable_user_namespaces = enabled;
-    }
     if let Some(sans) = &file.server_sans
         && args.server_sans.is_empty()
         && arg_defaulted(matches, "server_sans")
@@ -692,14 +489,9 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
     }
 }
 
-/// Build [`VmComputeConfig`] by overlaying CLI args on top of the
-/// `[openshell.drivers.vm]` table inherited from `[openshell.gateway]`.
-fn build_vm_config(
-    args: &RunArgs,
-    matches: &ArgMatches,
-    config: &openshell_core::Config,
-    file: Option<&ConfigFile>,
-) -> Result<VmComputeConfig> {
+/// Build [`VmComputeConfig`] from the `[openshell.drivers.vm]` table
+/// inherited from `[openshell.gateway]`.
+fn build_vm_config(file: Option<&ConfigFile>) -> Result<VmComputeConfig> {
     let mut cfg = if let Some(file) = file {
         let merged = config_file::driver_table(
             ComputeDriverKind::Vm,
@@ -713,80 +505,26 @@ fn build_vm_config(
         VmComputeConfig::default()
     };
 
-    // CLI/env overrides — and `state_dir` is also pulled from RunArgs when the
-    // file did not set it, so the gateway always has a working directory.
-    if !arg_defaulted(matches, "vm_driver_state_dir") || cfg.state_dir.as_os_str().is_empty() {
-        cfg.state_dir.clone_from(&args.vm_driver_state_dir);
-    }
-    if !arg_defaulted(matches, "driver_dir") || cfg.driver_dir.is_none() {
-        cfg.driver_dir.clone_from(&args.driver_dir);
-    }
-    if !arg_defaulted(matches, "vm_krun_log_level") {
-        cfg.krun_log_level = args.vm_krun_log_level;
-    }
-    if !arg_defaulted(matches, "vm_vcpus") {
-        cfg.vcpus = args.vm_vcpus;
-    }
-    if !arg_defaulted(matches, "vm_mem_mib") {
-        cfg.mem_mib = args.vm_mem_mib;
-    }
-    if let Some(p) = args.vm_tls_ca.clone() {
-        cfg.guest_tls_ca = Some(p);
-    }
-    if let Some(p) = args.vm_tls_cert.clone() {
-        cfg.guest_tls_cert = Some(p);
-    }
-    if let Some(p) = args.vm_tls_key.clone() {
-        cfg.guest_tls_key = Some(p);
-    }
-    // Fall through: image inherited from gateway-wide `sandbox_image` when
-    // the merged table did not supply `default_image`.
-    if cfg.default_image.is_empty() {
-        cfg.default_image.clone_from(&config.sandbox_image);
+    if cfg.state_dir.as_os_str().is_empty() {
+        cfg.state_dir = VmComputeConfig::default_state_dir();
     }
     Ok(cfg)
 }
 
 /// Build [`DockerComputeConfig`] using the same inheritance pattern as
 /// [`build_vm_config`].
-fn build_docker_config(
-    args: &RunArgs,
-    matches: &ArgMatches,
-    file: Option<&ConfigFile>,
-) -> Result<DockerComputeConfig> {
-    let mut cfg = if let Some(file) = file {
+fn build_docker_config(file: Option<&ConfigFile>) -> Result<DockerComputeConfig> {
+    if let Some(file) = file {
         let merged = config_file::driver_table(
             ComputeDriverKind::Docker,
             &file.openshell.gateway,
             file.openshell.drivers.get("docker"),
         );
-        merged
+        return merged
             .try_into::<DockerComputeConfig>()
-            .map_err(|e| miette::miette!("invalid [openshell.drivers.docker] table: {e}"))?
-    } else {
-        DockerComputeConfig::default()
-    };
-
-    if args.docker_supervisor_bin.is_some() {
-        cfg.supervisor_bin.clone_from(&args.docker_supervisor_bin);
+            .map_err(|e| miette::miette!("invalid [openshell.drivers.docker] table: {e}"));
     }
-    if args.docker_supervisor_image.is_some() {
-        cfg.supervisor_image
-            .clone_from(&args.docker_supervisor_image);
-    }
-    if args.docker_tls_ca.is_some() {
-        cfg.guest_tls_ca.clone_from(&args.docker_tls_ca);
-    }
-    if args.docker_tls_cert.is_some() {
-        cfg.guest_tls_cert.clone_from(&args.docker_tls_cert);
-    }
-    if args.docker_tls_key.is_some() {
-        cfg.guest_tls_key.clone_from(&args.docker_tls_key);
-    }
-    if !arg_defaulted(matches, "docker_network_name") {
-        cfg.network_name.clone_from(&args.docker_network_name);
-    }
-    Ok(cfg)
+    Ok(DockerComputeConfig::default())
 }
 
 #[cfg(test)]
@@ -944,6 +682,42 @@ mod tests {
             Cli::try_parse_from(["openshell-gateway", "--db-url", "sqlite::memory:"]).unwrap();
 
         assert_eq!(cli.run.server_sans, vec!["*.apps.example.com".to_string()]);
+    }
+
+    #[test]
+    fn command_rejects_removed_driver_flags() {
+        let err = command()
+            .try_get_matches_from([
+                "openshell-gateway",
+                "--db-url",
+                "sqlite::memory:",
+                "--sandbox-image",
+                "example/sandbox:latest",
+            ])
+            .expect_err("driver implementation flags should not be accepted");
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn command_rejects_removed_ssh_endpoint_flags() {
+        for flag in [
+            "--ssh-gateway-host",
+            "--ssh-gateway-port",
+            "--sandbox-ssh-port",
+        ] {
+            let err = command()
+                .try_get_matches_from([
+                    "openshell-gateway",
+                    "--db-url",
+                    "sqlite::memory:",
+                    flag,
+                    "x",
+                ])
+                .expect_err("SSH endpoint flags should not be accepted");
+
+            assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+        }
     }
 
     #[test]

@@ -115,6 +115,8 @@ stage_binary "$OPENSHELL_DRIVER_VM_BINARY" "$pkgroot/usr/libexec/openshell/opens
 # Per-user systemd unit. Each user enables it via `systemctl --user`.
 install -D -m 0644 "$src_dir/openshell-gateway.service" \
 	"$pkgroot/usr/lib/systemd/user/openshell-gateway.service"
+install -D -m 0755 "$src_dir/init-gateway-config.sh" \
+	"$pkgroot/usr/libexec/openshell/init-gateway-config.sh"
 
 # ---------------------------------------------------------------------------
 # DEBIAN/ control directory

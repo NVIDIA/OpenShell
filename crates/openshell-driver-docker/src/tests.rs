@@ -327,7 +327,7 @@ fn parse_optional_host_gateway_ip_rejects_invalid_values() {
         parse_optional_host_gateway_ip("not-an-ip")
             .unwrap_err()
             .to_string()
-            .contains("OPENSHELL_HOST_GATEWAY_IP")
+            .contains("host_gateway_ip")
     );
 }
 
@@ -708,20 +708,17 @@ fn validate_linux_elf_binary_rejects_non_elf_files() {
 
 #[test]
 fn docker_guest_tls_paths_require_all_files_for_https() {
-    let config = Config::new(None).with_grpc_endpoint("https://localhost:8443");
     let tempdir = TempDir::new().unwrap();
     let ca = tempdir.path().join("ca.crt");
     fs::write(&ca, b"ca").unwrap();
 
-    let err = docker_guest_tls_paths(
-        &config,
-        &DockerComputeConfig {
-            guest_tls_ca: Some(ca),
-            ..Default::default()
-        },
-    )
+    let err = docker_guest_tls_paths(&DockerComputeConfig {
+        grpc_endpoint: "https://localhost:8443".to_string(),
+        guest_tls_ca: Some(ca),
+        ..Default::default()
+    })
     .unwrap_err();
-    assert!(err.to_string().contains("--docker-tls-cert"));
+    assert!(err.to_string().contains("guest_tls_cert"));
 }
 
 #[test]
@@ -798,26 +795,26 @@ fn trim_container_name_tail_strips_separators() {
 
 #[test]
 fn docker_guest_tls_paths_rejects_tls_flags_without_https() {
-    let config = Config::new(None).with_grpc_endpoint("http://localhost:8080");
     let tempdir = TempDir::new().unwrap();
     let ca = tempdir.path().join("ca.crt");
     fs::write(&ca, b"ca").unwrap();
 
-    let err = docker_guest_tls_paths(
-        &config,
-        &DockerComputeConfig {
-            guest_tls_ca: Some(ca),
-            ..Default::default()
-        },
-    )
+    let err = docker_guest_tls_paths(&DockerComputeConfig {
+        grpc_endpoint: "http://localhost:8080".to_string(),
+        guest_tls_ca: Some(ca),
+        ..Default::default()
+    })
     .unwrap_err();
     assert!(err.to_string().contains("https://"));
 }
 
 #[test]
 fn docker_guest_tls_paths_allows_plain_http_without_tls_flags() {
-    let config = Config::new(None).with_grpc_endpoint("http://localhost:8080");
-    let result = docker_guest_tls_paths(&config, &DockerComputeConfig::default()).unwrap();
+    let result = docker_guest_tls_paths(&DockerComputeConfig {
+        grpc_endpoint: "http://localhost:8080".to_string(),
+        ..Default::default()
+    })
+    .unwrap();
     assert!(result.is_none());
 }
 

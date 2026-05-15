@@ -1,0 +1,27 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+set -eu
+
+CONFIG_FILE="${OPENSHELL_GATEWAY_CONFIG:-${SNAP_COMMON}/gateway.toml}"
+
+if [ ! -f "$CONFIG_FILE" ]; then
+    mkdir -p "$(dirname "$CONFIG_FILE")"
+    cat > "$CONFIG_FILE" << EOF
+[openshell]
+version = 1
+
+[openshell.drivers.docker]
+default_image = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+image_pull_policy = "IfNotPresent"
+sandbox_namespace = "docker-snap"
+grpc_endpoint = "http://host.openshell.internal:17670"
+supervisor_bin = "${SNAP}/bin/openshell-sandbox"
+network_name = "openshell-snap"
+EOF
+    chmod 600 "$CONFIG_FILE"
+fi
+
+export OPENSHELL_GATEWAY_CONFIG="$CONFIG_FILE"
+exec "${SNAP}/bin/openshell-gateway" "$@"

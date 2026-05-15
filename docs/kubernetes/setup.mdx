@@ -134,7 +134,6 @@ The most commonly changed values are:
 | `server.sandboxNamespace` | Namespace where sandbox pods are created. Defaults to the Helm release namespace when left empty. |
 | `server.sandboxImage` | Default sandbox image used when a sandbox does not specify one. |
 | `server.grpcEndpoint` | Endpoint that sandbox supervisors use to call back to the gateway. Must be reachable from inside the cluster. |
-| `server.sshGatewayHost` / `server.sshGatewayPort` | Public host and port returned to CLI clients for SSH proxy connections. Required when the gateway is exposed externally. |
 | `server.disableTls` | Run the gateway over plaintext HTTP. Use only behind a trusted transport. |
 | `server.enableLoopbackServiceHttp` | Enable local plaintext HTTP for loopback sandbox service URLs. Defaults to `true`. |
 | `pkiInitJob.serverDnsNames` / `certManager.serverDnsNames` | Additional gateway server DNS SANs. Wildcard SANs also enable sandbox service URLs under that domain. |

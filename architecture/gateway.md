@@ -199,20 +199,21 @@ The gateway reads its configuration from three sources, merged in this
 precedence (highest first):
 
 ```
-CLI flag  >  OPENSHELL_* env var  >  TOML file  >  built-in default
+Gateway CLI flag  >  gateway OPENSHELL_* env var  >  TOML file  >  built-in default
 ```
 
 The TOML file is opt-in via `--config <PATH>` / `OPENSHELL_GATEWAY_CONFIG`.
-When unset, the gateway behaves exactly as before — CLI flags and env vars
-drive every setting. See `docs/reference/gateway-config.mdx` for worked
-per-driver examples and RFC 0003 for the full schema.
+Driver implementation settings live in the TOML driver tables. See
+`docs/reference/gateway-config.mdx` for worked per-driver examples and RFC
+0003 for the full schema.
 
 `database_url` is env-only and rejected when present in the file
 (`OPENSHELL_DB_URL` / `--db-url`).
 
 ### Driver inheritance
 
-`[openshell.gateway]` carries a small set of values (`default_image`,
+`[openshell.gateway]` carries a small set of values (`sandbox_namespace`,
+`default_image`,
 `supervisor_image`, `guest_tls_ca/cert/key`, `client_tls_secret_name`,
 `host_gateway_ip`, `enable_user_namespaces`) that are inherited into each
 driver's `[openshell.drivers.<name>]` table when the driver-specific table
@@ -227,8 +228,8 @@ value means the same thing in both, so the key lives only under each
 driver's own table.
 
 Driver-specific values that are not part of the inheritance allowlist
-(e.g. K8s `namespace`, Podman `socket_path`, VM `vcpus`) only come from
-the driver's own table.
+(e.g. Podman `socket_path`, VM `vcpus`) only come from the driver's own
+table.
 
 ## Operational Constraints
 

@@ -1,9 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use openshell_core::config::{
-    DEFAULT_SSH_PORT, DEFAULT_STOP_TIMEOUT_SECS, DEFAULT_SUPERVISOR_IMAGE,
-};
+use openshell_core::config::{DEFAULT_STOP_TIMEOUT_SECS, DEFAULT_SUPERVISOR_IMAGE};
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -91,8 +89,6 @@ pub struct PodmanComputeConfig {
     /// Name of the Podman bridge network.
     /// Created automatically if it does not exist.
     pub network_name: String,
-    /// SSH port inside the container.
-    pub ssh_port: u16,
     /// Container stop timeout in seconds (SIGTERM → SIGKILL).
     pub stop_timeout_secs: u32,
     /// OCI image containing the openshell-sandbox supervisor binary.
@@ -184,13 +180,12 @@ impl Default for PodmanComputeConfig {
     fn default() -> Self {
         Self {
             socket_path: Self::default_socket_path(),
-            default_image: String::new(),
+            default_image: default_sandbox_image(),
             image_pull_policy: ImagePullPolicy::default(),
             grpc_endpoint: String::new(),
             gateway_port: openshell_core::config::DEFAULT_SERVER_PORT,
             sandbox_ssh_socket_path: "/run/openshell/ssh.sock".to_string(),
             network_name: DEFAULT_NETWORK_NAME.to_string(),
-            ssh_port: DEFAULT_SSH_PORT,
             stop_timeout_secs: DEFAULT_STOP_TIMEOUT_SECS,
             supervisor_image: DEFAULT_SUPERVISOR_IMAGE.to_string(),
             guest_tls_ca: None,
@@ -198,6 +193,13 @@ impl Default for PodmanComputeConfig {
             guest_tls_key: None,
         }
     }
+}
+
+fn default_sandbox_image() -> String {
+    format!(
+        "{}/base:latest",
+        openshell_core::image::DEFAULT_COMMUNITY_REGISTRY
+    )
 }
 
 impl std::fmt::Debug for PodmanComputeConfig {
@@ -210,7 +212,6 @@ impl std::fmt::Debug for PodmanComputeConfig {
             .field("gateway_port", &self.gateway_port)
             .field("sandbox_ssh_socket_path", &self.sandbox_ssh_socket_path)
             .field("network_name", &self.network_name)
-            .field("ssh_port", &self.ssh_port)
             .field("stop_timeout_secs", &self.stop_timeout_secs)
             .field("supervisor_image", &self.supervisor_image)
             .field("guest_tls_ca", &self.guest_tls_ca)

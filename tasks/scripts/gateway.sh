@@ -185,6 +185,19 @@ ensure_podman_supervisor_image() {
   fi
 }
 
+podman_pull_policy() {
+  case "$1" in
+    Always|always) echo "always" ;;
+    IfNotPresent|ifnotpresent|missing|"") echo "missing" ;;
+    Never|never) echo "never" ;;
+    Newer|newer) echo "newer" ;;
+    *)
+      echo "ERROR: unsupported Podman image pull policy '$1'" >&2
+      exit 2
+      ;;
+  esac
+}
+
 explicit_driver=""
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
@@ -250,6 +263,7 @@ STATE_DIR="${OPENSHELL_GATEWAY_STATE_DIR:-${ROOT}/.cache/gateway-${DRIVER}}"
 SANDBOX_NAMESPACE="${OPENSHELL_SANDBOX_NAMESPACE:-${DRIVER}-dev}"
 SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-ghcr.io/nvidia/openshell-community/sandboxes/base:latest}"
 SANDBOX_IMAGE_PULL_POLICY="${OPENSHELL_SANDBOX_IMAGE_PULL_POLICY:-IfNotPresent}"
+GRPC_ENDPOINT="${OPENSHELL_GRPC_ENDPOINT:-}"
 LOG_LEVEL="${OPENSHELL_LOG_LEVEL:-info}"
 
 if [[ "${DRIVER}" == "podman" ]]; then
@@ -278,6 +292,42 @@ if [[ ! -x "${GATEWAY_BIN}" ]]; then
 fi
 
 mkdir -p "${STATE_DIR}"
+CONFIG_PATH="${STATE_DIR}/gateway.toml"
+cat >"${CONFIG_PATH}" <<EOF
+[openshell]
+version = 1
+
+[openshell.gateway]
+compute_drivers = ["${DRIVER}"]
+default_image = "${SANDBOX_IMAGE}"
+disable_tls = true
+EOF
+
+case "${DRIVER}" in
+  kubernetes)
+    cat >>"${CONFIG_PATH}" <<EOF
+sandbox_namespace = "${SANDBOX_NAMESPACE}"
+
+[openshell.drivers.kubernetes]
+namespace = "${SANDBOX_NAMESPACE}"
+image_pull_policy = "${SANDBOX_IMAGE_PULL_POLICY}"
+EOF
+    if [[ -n "${GRPC_ENDPOINT}" ]]; then
+      printf 'grpc_endpoint = "%s"\n' "${GRPC_ENDPOINT}" >>"${CONFIG_PATH}"
+    fi
+    ;;
+  podman)
+    cat >>"${CONFIG_PATH}" <<EOF
+supervisor_image = "${OPENSHELL_SUPERVISOR_IMAGE}"
+
+[openshell.drivers.podman]
+image_pull_policy = "$(podman_pull_policy "${SANDBOX_IMAGE_PULL_POLICY}")"
+EOF
+    if [[ -n "${GRPC_ENDPOINT}" ]]; then
+      printf 'grpc_endpoint = "%s"\n' "${GRPC_ENDPOINT}" >>"${CONFIG_PATH}"
+    fi
+    ;;
+esac
 
 GATEWAY_ENDPOINT="http://127.0.0.1:${PORT}"
 register_gateway_metadata "${GATEWAY_NAME}" "${GATEWAY_ENDPOINT}" "${PORT}"
@@ -295,11 +345,9 @@ echo "Active gateway set to '${GATEWAY_NAME}'. The CLI now targets this gateway 
 echo
 
 exec "${GATEWAY_BIN}" \
+  --config "${CONFIG_PATH}" \
   --port "${PORT}" \
   --log-level "${LOG_LEVEL}" \
   --drivers "${DRIVER}" \
   --disable-tls \
-  --db-url "sqlite:${STATE_DIR}/gateway.db?mode=rwc" \
-  --sandbox-namespace "${SANDBOX_NAMESPACE}" \
-  --sandbox-image "${SANDBOX_IMAGE}" \
-  --sandbox-image-pull-policy "${SANDBOX_IMAGE_PULL_POLICY}"
+  --db-url "sqlite:${STATE_DIR}/gateway.db?mode=rwc"

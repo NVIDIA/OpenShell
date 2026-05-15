@@ -43,7 +43,7 @@ By default `mise run gateway:vm`:
 - Registers the CLI gateway `vm-dev` by writing `~/.config/openshell/gateways/vm-dev/metadata.json`. It does not modify the workspace `.env`.
 - Persists the gateway SQLite DB under `.cache/gateway-vm/gateway.db`.
 - Places the VM driver state (per-sandbox rootfs plus `run/compute-driver.sock`) under `/tmp/openshell-vm-driver-$USER-vm-dev/` so the AF_UNIX socket path stays under macOS `SUN_LEN`.
-- Passes `--driver-dir $PWD/target/debug` so the freshly built `openshell-driver-vm` is used instead of an older installed copy from `~/.local/libexec/openshell`, `/usr/libexec/openshell`, or `/usr/local/libexec`.
+- Writes `.cache/gateway-vm/gateway.toml` with `[openshell.drivers.vm].driver_dir = "$PWD/target/debug"` so the freshly built `openshell-driver-vm` is used instead of an older installed copy from `~/.local/libexec/openshell`, `/usr/libexec/openshell`, or `/usr/local/libexec`.
 
 For GPU passthrough (VFIO), pass `-- --gpu` and run with root privileges:
 
@@ -104,36 +104,36 @@ codesign \
 
 # 4. Start the gateway with the VM driver
 mkdir -p /tmp/openshell-vm-driver-$USER-vm-dev .cache/gateway-vm
+cat > .cache/gateway-vm/gateway.toml <<EOF
+[openshell]
+version = 1
+
+[openshell.gateway]
+compute_drivers = ["vm"]
+disable_tls = true
+
+[openshell.drivers.vm]
+default_image = "<compatible-image>"
+grpc_endpoint = "http://host.containers.internal:18081"
+driver_dir = "$PWD/target/debug"
+state_dir = "/tmp/openshell-vm-driver-$USER-vm-dev"
+EOF
+
 target/debug/openshell-gateway \
+  --config .cache/gateway-vm/gateway.toml \
   --drivers vm \
   --disable-tls \
   --db-url "sqlite:.cache/gateway-vm/gateway.db?mode=rwc" \
-  --driver-dir $PWD/target/debug \
-  --sandbox-namespace vm-dev \
-  --sandbox-image <compatible-image> \
-  --grpc-endpoint http://host.containers.internal:18081 \
-  --port 18081 \
-  --vm-driver-state-dir /tmp/openshell-vm-driver-$USER-vm-dev
+  --port 18081
 ```
 
-The gateway resolves `openshell-driver-vm` in this order: `--driver-dir`, conventional install locations (`~/.local/libexec/openshell`, `/usr/libexec/openshell`, `/usr/local/libexec/openshell`, `/usr/local/libexec`), then a sibling of the gateway binary.
+The gateway resolves `openshell-driver-vm` in this order: `[openshell.drivers.vm].driver_dir`, conventional install locations (`~/.local/libexec/openshell`, `/usr/libexec/openshell`, `/usr/local/libexec/openshell`, `/usr/local/libexec`), then a sibling of the gateway binary.
 
-## Flags
+## Gateway And Driver Configuration
 
-| Flag | Env var | Default | Purpose |
-|---|---|---|---|
-| `--drivers vm` | `OPENSHELL_DRIVERS` | `kubernetes` | Select the VM compute driver. |
-| `--grpc-endpoint URL` | `OPENSHELL_GRPC_ENDPOINT` | — | Required. URL the sandbox guest dials to reach the gateway. Use `http://host.containers.internal:<port>` (or `host.docker.internal` / `host.openshell.internal`) so traffic flows through gvproxy's host-loopback NAT (HostIP `192.168.127.254` → host `127.0.0.1`). Loopback URLs like `http://127.0.0.1:<port>` are rewritten automatically by the driver. The bare gateway IP (`192.168.127.1`) only carries gvproxy's own services and will not reach host-bound ports. |
-| `--vm-driver-state-dir DIR` | `OPENSHELL_VM_DRIVER_STATE_DIR` | `target/openshell-vm-driver` | Per-sandbox rootfs, console logs, image cache, and private `run/compute-driver.sock` UDS. |
-| `--driver-dir DIR` | `OPENSHELL_DRIVER_DIR` | unset | Override the directory searched for `openshell-driver-vm`. |
-| `--vm-driver-vcpus N` | `OPENSHELL_VM_DRIVER_VCPUS` | `2` | vCPUs per sandbox. |
-| `--vm-driver-mem-mib N` | `OPENSHELL_VM_DRIVER_MEM_MIB` | `2048` | Memory per sandbox, in MiB. |
-| `--vm-krun-log-level N` | `OPENSHELL_VM_KRUN_LOG_LEVEL` | `1` | libkrun verbosity (0–5). |
-| `--vm-tls-ca PATH` | `OPENSHELL_VM_TLS_CA` | — | CA cert for the guest's mTLS client bundle. Required when `--grpc-endpoint` uses `https://`. |
-| `--vm-tls-cert PATH` | `OPENSHELL_VM_TLS_CERT` | — | Guest client certificate. |
-| `--vm-tls-key PATH` | `OPENSHELL_VM_TLS_KEY` | — | Guest client private key. |
+Select the VM driver with `--drivers vm` or `OPENSHELL_DRIVERS=vm`. Configure VM-specific settings in `[openshell.drivers.vm]`: `grpc_endpoint`, `state_dir`, `driver_dir`, `vcpus`, `mem_mib`, `krun_log_level`, and `guest_tls_*`.
 
-See [`openshell-gateway --help`](../openshell-server/src/cli.rs) for the full flag surface shared with the Kubernetes driver.
+See [`openshell-gateway --help`](../openshell-server/src/cli.rs) for the gateway process flag surface.
 
 ## Verifying the gateway
 

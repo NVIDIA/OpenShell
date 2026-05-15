@@ -97,9 +97,10 @@ it while sandboxes are active. Restart the service manually when you are ready
 to move the gateway to the refreshed snap revision.
 
 `openshell-sandbox` is staged next to `openshell-gateway` as the Docker
-supervisor binary. The gateway app passes it to the in-process Docker driver
-through `OPENSHELL_DOCKER_SUPERVISOR_BIN=$SNAP/bin/openshell-sandbox`. The
-service stores its gateway database under `$SNAP_COMMON`.
+supervisor binary. The gateway app starts through a small wrapper that writes
+`$SNAP_COMMON/gateway.toml` on first start and points the in-process Docker
+driver at `$SNAP/bin/openshell-sandbox`. The service stores its gateway
+database under `$SNAP_COMMON`.
 
 ## Interfaces
 
@@ -147,16 +148,13 @@ openshell.gateway \
   --disable-tls \
   --port 17670 \
   --db-url "sqlite:$SNAP_COMMON/gateway.db?mode=rwc" \
-  --docker-supervisor-bin "$SNAP/bin/openshell-sandbox" \
-  --docker-network-name openshell-snap \
-  --sandbox-namespace docker-snap \
-  --sandbox-image ghcr.io/nvidia/openshell-community/sandboxes/base:latest \
-  --sandbox-image-pull-policy IfNotPresent \
-  --grpc-endpoint http://host.openshell.internal:17670
+  --config "$SNAP_COMMON/gateway.toml"
 ```
 
 This stores the gateway SQLite database at
-`/var/snap/openshell/common/gateway.db`.
+`/var/snap/openshell/common/gateway.db`. The generated TOML stores Docker
+driver settings such as the supervisor binary path, network name, sandbox
+namespace, sandbox image, pull policy, and callback endpoint.
 
 ## Connect with the OpenShell CLI
 

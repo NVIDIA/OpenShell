@@ -31,12 +31,6 @@ data:
     sandbox_namespace     = {{ include "openshell.sandboxNamespace" . | quote }}
     default_image         = {{ .Values.server.sandboxImage | quote }}
     supervisor_image      = {{ include "openshell.supervisorImage" . | quote }}
-    {{- if .Values.server.sshGatewayHost }}
-    ssh_gateway_host      = {{ .Values.server.sshGatewayHost | quote }}
-    {{- end }}
-    {{- if .Values.server.sshGatewayPort }}
-    ssh_gateway_port      = {{ .Values.server.sshGatewayPort }}
-    {{- end }}
     {{- if .Values.server.hostGatewayIP }}
     host_gateway_ip       = {{ .Values.server.hostGatewayIP | quote }}
     {{- end }}

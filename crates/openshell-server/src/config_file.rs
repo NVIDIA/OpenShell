@@ -10,13 +10,15 @@
 //! a `[openshell.drivers.<name>]` table so each driver crate's
 //! `Deserialize` impl sees a fully-populated table.
 //!
-//! The merge precedence at the gateway level is:
+//! The merge precedence for gateway process settings is:
 //! ```text
 //! CLI flag  >  OPENSHELL_* env var  >  TOML file  >  built-in default
 //! ```
-//! Per-field application of file values happens in [`crate::cli`], which uses
-//! clap's `ArgMatches::value_source` to detect arguments that fell back to
-//! their default and are therefore eligible for replacement by file values.
+//! Driver implementation settings are configured in the TOML driver tables.
+//! Per-field application of gateway file values happens in [`crate::cli`],
+//! which uses clap's `ArgMatches::value_source` to detect arguments that fell
+//! back to their default and are therefore eligible for replacement by file
+//! values.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -90,12 +92,6 @@ pub struct GatewayFileSection {
     // ── Sandbox / SSH ────────────────────────────────────────────────────
     #[serde(default)]
     pub sandbox_namespace: Option<String>,
-    #[serde(default)]
-    pub sandbox_ssh_port: Option<u16>,
-    #[serde(default)]
-    pub ssh_gateway_host: Option<String>,
-    #[serde(default)]
-    pub ssh_gateway_port: Option<u16>,
     #[serde(default)]
     pub ssh_session_ttl_secs: Option<u64>,
 
@@ -245,6 +241,7 @@ pub fn driver_table(
 fn inheritable_keys(driver: ComputeDriverKind) -> &'static [&'static str] {
     match driver {
         ComputeDriverKind::Kubernetes => &[
+            "namespace",
             "default_image",
             "supervisor_image",
             "client_tls_secret_name",
@@ -252,7 +249,10 @@ fn inheritable_keys(driver: ComputeDriverKind) -> &'static [&'static str] {
             "enable_user_namespaces",
         ],
         ComputeDriverKind::Docker => &[
+            "sandbox_namespace",
+            "default_image",
             "supervisor_image",
+            "host_gateway_ip",
             "guest_tls_ca",
             "guest_tls_cert",
             "guest_tls_key",
@@ -275,6 +275,7 @@ fn inheritable_keys(driver: ComputeDriverKind) -> &'static [&'static str] {
 
 fn gateway_inherited_value(g: &GatewayFileSection, key: &str) -> Option<toml::Value> {
     match key {
+        "namespace" | "sandbox_namespace" => g.sandbox_namespace.as_deref().map(string_value),
         "default_image" => g.default_image.as_deref().map(string_value),
         "supervisor_image" => g.supervisor_image.as_deref().map(string_value),
         "client_tls_secret_name" => g.client_tls_secret_name.as_deref().map(string_value),
@@ -389,6 +390,17 @@ nonsense = true
     }
 
     #[test]
+    fn rejects_removed_ssh_endpoint_fields() {
+        let toml = r"
+[openshell.gateway]
+ssh_gateway_port = 8080
+";
+        let tmp = write_tmp(toml);
+        let err = load(tmp.path()).expect_err("removed SSH endpoint keys must be rejected");
+        assert!(matches!(err, ConfigFileError::Parse { .. }));
+    }
+
+    #[test]
     fn rejects_unsupported_version() {
         let toml = r"
 [openshell]
@@ -429,6 +441,30 @@ version = 2
         assert_eq!(
             table.get("supervisor_image").and_then(|v| v.as_str()),
             Some("ghcr.io/nvidia/openshell/supervisor:0.9")
+        );
+    }
+
+    #[test]
+    fn docker_driver_table_inherits_gateway_defaults() {
+        let gateway = GatewayFileSection {
+            sandbox_namespace: Some("agents".to_string()),
+            default_image: Some("ghcr.io/nvidia/openshell/sandbox:0.9".to_string()),
+            host_gateway_ip: Some("10.0.0.1".to_string()),
+            ..Default::default()
+        };
+        let merged = driver_table(ComputeDriverKind::Docker, &gateway, None);
+        let table = merged.as_table().expect("table");
+        assert_eq!(
+            table.get("sandbox_namespace").and_then(|v| v.as_str()),
+            Some("agents")
+        );
+        assert_eq!(
+            table.get("default_image").and_then(|v| v.as_str()),
+            Some("ghcr.io/nvidia/openshell/sandbox:0.9")
+        );
+        assert_eq!(
+            table.get("host_gateway_ip").and_then(|v| v.as_str()),
+            Some("10.0.0.1")
         );
     }
 

@@ -186,8 +186,8 @@ podman pull ghcr.io/nvidia/openshell-community/sandboxes/base:latest
 podman pull ghcr.io/nvidia/openshell/supervisor:latest
 ```
 
-Or set `OPENSHELL_SANDBOX_IMAGE_PULL_POLICY=always` in
-`~/.config/openshell/gateway.env` and restart the gateway.
+Or set `image_pull_policy = "always"` in
+`~/.config/openshell/gateway.toml` and restart the gateway.
 
 ### Gateway stops on logout
 
@@ -216,11 +216,10 @@ systemctl --user restart openshell-gateway
 The SQLite database schema is auto-migrated on startup. Running
 sandboxes are stopped during the restart.
 
-The `gateway.env` file is not overwritten during upgrades. The
-`init-gateway-env.sh` script is idempotent and only generates the file
-on first start. New configuration options from newer versions can be
-added manually by referencing CONFIGURATION.md or running
-`openshell-gateway --help`.
+The `gateway.env` and `gateway.toml` files are not overwritten during
+upgrades. The `init-gateway-env.sh` script is idempotent and only generates
+missing files on first start. New gateway process options can be added
+manually by referencing CONFIGURATION.md or running `openshell-gateway --help`.
 
 To pick up new container images after an upgrade:
 
