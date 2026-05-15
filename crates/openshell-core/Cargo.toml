@@ -29,7 +29,7 @@ dev-settings = []
 
 [build-dependencies]
 tonic-build = { workspace = true }
-prost-build = { workspace = true }
+protobuf-src = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

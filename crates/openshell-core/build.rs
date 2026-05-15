@@ -12,12 +12,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // builds where .git is absent, this silently does nothing and the binary
     // falls back to CARGO_PKG_VERSION (which is already sed-patched by the
     // build pipeline).
-    //
-    // We intentionally do NOT set `rerun-if-changed` for .git/HEAD or
-    // .git/refs/tags. Watching those paths re-triggers protobuf codegen and
-    // cascades a rebuild of every downstream crate on every commit. The git
-    // version is refreshed whenever proto files change or the cargo cache is
-    // cleared, which is sufficient for development.
+    println!("cargo:rerun-if-changed=../../.git/HEAD");
+    println!("cargo:rerun-if-changed=../../.git/refs/tags");
+
     if let Some(version) = git_version() {
         println!("cargo:rustc-env=OPENSHELL_GIT_VERSION={version}");
     }
@@ -25,6 +22,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Protobuf compilation ---
     // Re-run when anything under proto/ changes (including newly added .proto files).
     println!("cargo:rerun-if-changed={PROTO_REL}");
+    // Use bundled protoc from protobuf-src.  The system protoc (from apt-get)
+    // does not bundle the well-known type includes (google/protobuf/struct.proto
+    // etc.), so we must use protobuf-src which ships both the binary and the
+    // include tree.
+    // SAFETY: This is run at build time in a single-threaded build script context.
+    // No other threads are reading environment variables concurrently.
+    #[allow(unsafe_code)]
+    unsafe {
+        env::set_var("PROTOC", protobuf_src::protoc());
+    }
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
     let proto_root = manifest_dir.join(PROTO_REL);
@@ -33,45 +40,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     collect_proto_files(&proto_root, &mut proto_files)?;
     proto_files.sort();
 
-    // Requires `protoc`. Local and CI builds get it from mise; Docker build
-    // images install protobuf-compiler. Those protoc distributions also
-    // provide the well-known type includes used by imports such as
-    // google/protobuf/struct.proto.
-    let mut prost_config = prost_build::Config::new();
-    if let Some(protoc) = resolve_protoc_from_mise() {
-        prost_config.protoc_executable(protoc);
-    }
+    // Configure tonic-build
     tonic_build::configure()
         .build_server(true)
         .build_client(true)
-        .compile_protos_with_config(prost_config, &proto_files, &[proto_root.as_path()])?;
+        .compile_protos(&proto_files, &[proto_root.as_path()])?;
 
     Ok(())
-}
-
-fn resolve_protoc_from_mise() -> Option<PathBuf> {
-    if env::var_os("PROTOC").is_some() || command_exists("protoc") {
-        return None;
-    }
-
-    let output = std::process::Command::new("mise")
-        .args(["where", "protoc"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let root = String::from_utf8(output.stdout).ok()?;
-    let protoc = PathBuf::from(root.trim()).join("bin").join("protoc");
-    protoc.is_file().then_some(protoc)
-}
-
-fn command_exists(command: &str) -> bool {
-    std::process::Command::new(command)
-        .arg("--version")
-        .output()
-        .is_ok_and(|output| output.status.success())
 }
 
 fn collect_proto_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
