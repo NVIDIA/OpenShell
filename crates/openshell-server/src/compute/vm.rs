@@ -76,6 +76,9 @@ pub struct VmComputeConfig {
     /// Gateway gRPC endpoint the sandbox guest connects back to.
     pub grpc_endpoint: String,
 
+    /// Bootstrap image used to boot and prepare VM sandbox target images.
+    pub bootstrap_image: String,
+
     /// libkrun log level used by the VM driver helper.
     pub krun_log_level: u32,
 
@@ -149,6 +152,7 @@ impl Default for VmComputeConfig {
             driver_dir: None,
             default_image: default_sandbox_image(),
             grpc_endpoint: String::new(),
+            bootstrap_image: String::new(),
             krun_log_level: Self::default_krun_log_level(),
             vcpus: Self::default_vcpus(),
             mem_mib: Self::default_mem_mib(),
@@ -461,6 +465,11 @@ pub async fn spawn(
     command.arg("--state-dir").arg(&vm_config.state_dir);
     if !vm_config.default_image.trim().is_empty() {
         command.arg("--default-image").arg(&vm_config.default_image);
+    }
+    if !vm_config.bootstrap_image.trim().is_empty() {
+        command
+            .arg("--bootstrap-image")
+            .arg(&vm_config.bootstrap_image);
     }
     command
         .arg("--krun-log-level")

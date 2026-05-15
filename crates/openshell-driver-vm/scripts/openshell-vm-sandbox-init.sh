@@ -41,27 +41,166 @@ ts() {
 mount_initial_fs() {
     mount -t proc proc /proc 2>/dev/null || true
     mount -t sysfs sysfs /sys 2>/dev/null || true
+    mount -t tmpfs tmpfs /tmp 2>/dev/null || true
     mount -t tmpfs tmpfs /run 2>/dev/null || true
     mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
 }
 
-move_mount_if_possible() {
+bind_mount_into_newroot() {
     local source="$1"
     local target="/newroot${source}"
 
     mkdir -p "$target" 2>/dev/null || true
-    mount --move "$source" "$target" 2>/dev/null || true
+    mount --rbind "$source" "$target" 2>/dev/null \
+        || mount --bind "$source" "$target" 2>/dev/null \
+        || true
 }
 
-exec_chroot_overlay_root() {
+root_path() {
+    local path="$1"
+    printf '%s%s\n' "${ROOT_PREFIX:-}" "$path"
+}
+
+sandbox_owner() {
+    local passwd_path name uid gid rest
+    passwd_path="$(root_path /etc/passwd)"
+    if [ -f "$passwd_path" ]; then
+        while IFS=: read -r name _ uid gid rest; do
+            _="${rest:-}"
+            if [ "$name" = "sandbox" ] \
+                && [[ "$uid" =~ ^[0-9]+$ ]] \
+                && [[ "$gid" =~ ^[0-9]+$ ]]; then
+                printf '%s:%s\n' "$uid" "$gid"
+                return
+            fi
+        done < "$passwd_path"
+    fi
+
+    printf '10001:10001\n'
+}
+
+source_overlay_env_if_present() {
+    local env_file="/overlay/upper/srv/openshell-env.sh"
+    if [ -f "$env_file" ]; then
+        # shellcheck source=/dev/null
+        source "$env_file"
+    fi
+}
+
+ensure_target_runtime() {
+    local image_root="$1"
+
+    mkdir -p \
+        "$image_root/srv" \
+        "$image_root/opt/openshell/bin" \
+        "$image_root/sandbox" \
+        "$image_root/etc"
+
+    cp /srv/openshell-vm-sandbox-init.sh "$image_root/srv/openshell-vm-sandbox-init.sh"
+    chmod 0755 "$image_root/srv/openshell-vm-sandbox-init.sh"
+
+    if [ -x /opt/openshell/bin/openshell-sandbox ]; then
+        cp /opt/openshell/bin/openshell-sandbox "$image_root/opt/openshell/bin/openshell-sandbox"
+        chmod 0755 "$image_root/opt/openshell/bin/openshell-sandbox"
+    fi
+
+    touch "$image_root/etc/passwd" "$image_root/etc/group" "$image_root/etc/shadow" "$image_root/etc/gshadow"
+    if ! grep -q '^sandbox:' "$image_root/etc/group" 2>/dev/null; then
+        printf 'sandbox:x:10001:\n' >> "$image_root/etc/group"
+    fi
+    if ! grep -q '^sandbox:' "$image_root/etc/gshadow" 2>/dev/null; then
+        printf 'sandbox:!::\n' >> "$image_root/etc/gshadow"
+    fi
+    if ! grep -q '^sandbox:' "$image_root/etc/passwd" 2>/dev/null; then
+        printf 'sandbox:x:10001:10001:OpenShell Sandbox:/sandbox:/bin/sh\n' >> "$image_root/etc/passwd"
+    fi
+    if ! grep -q '^sandbox:' "$image_root/etc/shadow" 2>/dev/null; then
+        printf 'sandbox:!:20123:0:99999:7:::\n' >> "$image_root/etc/shadow"
+    fi
+    chown 10001:10001 "$image_root/sandbox" 2>/dev/null || true
+    chmod 0755 "$image_root/sandbox"
+}
+
+prepare_guest_image_rootfs() {
+    local payload_dir="/overlay/config/openshell-image"
+    local image_root="/overlay/image-rootfs"
+    local partial_root="/overlay/image-rootfs.partial"
+    local source
+
+    [ -d "$payload_dir" ] || return 0
+
+    source="$(cat "$payload_dir/source" 2>/dev/null || true)"
+    ts "preparing sandbox image rootfs in guest (${source:-unknown})"
+
+    rm -rf "$image_root" "$partial_root"
+
+    case "$source" in
+        local-docker)
+            mkdir -p "$image_root"
+            tar -xpf "$payload_dir/source-rootfs.tar" -C "$image_root"
+            ;;
+        oci-layout)
+            if [ ! -x /opt/openshell/bin/umoci ]; then
+                ts "FATAL: umoci not found in VM bootstrap image"
+                exit 1
+            fi
+            /opt/openshell/bin/umoci raw unpack \
+                --image "$payload_dir/oci:openshell" \
+                "$partial_root"
+            if [ ! -d "$partial_root/rootfs" ]; then
+                ts "FATAL: umoci unpack did not produce rootfs directory"
+                exit 1
+            fi
+            mv "$partial_root/rootfs" "$image_root"
+            rm -rf "$partial_root"
+            ;;
+        *)
+            ts "FATAL: unknown guest image payload source: ${source:-missing}"
+            exit 1
+            ;;
+    esac
+
+    ensure_target_runtime "$image_root"
+    if [ -f "$payload_dir/identity" ]; then
+        cp "$payload_dir/identity" "$image_root/.openshell-rootfs-variant"
+    fi
+    rm -rf "$payload_dir"
+}
+
+exec_supervisor_in_newroot() {
     local chroot_bin
+    local bootstrap="/.openshell-bootstrap"
+    local supervisor="${bootstrap}/opt/openshell/bin/openshell-sandbox"
+    local loader
+    local lib_path
+
     for chroot_bin in /usr/sbin/chroot /usr/bin/chroot /sbin/chroot /bin/chroot; do
-        if [ -x "$chroot_bin" ]; then
-            exec "$chroot_bin" /newroot /srv/openshell-vm-sandbox-init.sh --post-overlay
+        [ -x "$chroot_bin" ] || continue
+
+        if [ -x "/newroot${supervisor}" ]; then
+            for loader in \
+                "${bootstrap}/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2" \
+                "${bootstrap}/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2" \
+                "${bootstrap}/lib64/ld-linux-x86-64.so.2" \
+                "${bootstrap}/lib/ld-linux-x86-64.so.2" \
+                "${bootstrap}/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1" \
+                "${bootstrap}/usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1" \
+                "${bootstrap}/lib/ld-linux-aarch64.so.1" \
+                "${bootstrap}/lib64/ld-linux-aarch64.so.1"; do
+                if [ -x "/newroot${loader}" ]; then
+                    lib_path="${bootstrap}/lib:${bootstrap}/lib64:${bootstrap}/usr/lib:${bootstrap}/usr/lib64:${bootstrap}/lib/aarch64-linux-gnu:${bootstrap}/lib/x86_64-linux-gnu:${bootstrap}/usr/lib/aarch64-linux-gnu:${bootstrap}/usr/lib/x86_64-linux-gnu"
+                    exec "$chroot_bin" /newroot "$loader" --library-path "$lib_path" "$supervisor" --workdir /sandbox
+                fi
+            done
+            exec "$chroot_bin" /newroot "$supervisor" --workdir /sandbox
+        fi
+
+        if [ -x /newroot/opt/openshell/bin/openshell-sandbox ]; then
+            exec "$chroot_bin" /newroot /opt/openshell/bin/openshell-sandbox --workdir /sandbox
         fi
     done
 
-    ts "FATAL: chroot not found in guest rootfs"
+    ts "FATAL: unable to exec openshell-sandbox in guest rootfs"
     exit 1
 }
 
@@ -74,36 +213,56 @@ setup_overlay_root() {
         exit 1
     fi
 
+    mkdir -p /overlay /lower /newroot
     mount -o remount,ro / 2>/dev/null || true
+    mount -t ext4 -o rw /dev/vdb /overlay
+    mkdir -p /overlay/upper /overlay/work
+    source_overlay_env_if_present
+
+    if [ "${OPENSHELL_VM_INIT_MODE:-sandbox}" = "image-prep" ]; then
+        prepare_guest_image_rootfs
+        sync
+        ts "image-prep complete"
+        exit 0
+    fi
+
     mount --bind / /lower
     mount -o remount,bind,ro /lower 2>/dev/null || true
 
-    mount -t ext4 -o rw /dev/vdb /overlay
-    mkdir -p /overlay/upper /overlay/work
+    local lower_root="/lower"
+    if [ -b /dev/vdc ]; then
+        mkdir -p /image-cache
+        mount -t ext4 -o ro /dev/vdc /image-cache
+        if [ -d /image-cache/image-rootfs ]; then
+            lower_root="/image-cache/image-rootfs"
+            ts "using prepared image rootfs lowerdir"
+        else
+            ts "FATAL: prepared image disk missing /image-rootfs"
+            exit 1
+        fi
+    fi
+
     mount -t overlay overlay \
-        -o lowerdir=/lower,upperdir=/overlay/upper,workdir=/overlay/work \
+        -o lowerdir="$lower_root",upperdir=/overlay/upper,workdir=/overlay/work \
         /newroot
+    mkdir -p /newroot/.openshell-bootstrap
+    mount --bind /lower /newroot/.openshell-bootstrap
 
-    move_mount_if_possible /proc
-    move_mount_if_possible /sys
-    move_mount_if_possible /dev
-    move_mount_if_possible /run
+    # GPU setup runs against the bootstrap runtime and its mounted /dev, /proc,
+    # and /run before those filesystems are mirrored into the target root.
+    if [ "${GPU_ENABLED}" = "true" ]; then
+        setup_gpu || ts "WARNING: GPU init failed; continuing without GPU"
+    fi
 
-    exec_chroot_overlay_root
+    bind_mount_into_newroot /proc
+    bind_mount_into_newroot /sys
+    bind_mount_into_newroot /tmp
+    bind_mount_into_newroot /dev
+    bind_mount_into_newroot /run
+
+    ROOT_PREFIX="/newroot"
+    run_post_overlay_setup
 }
-
-if [ "${1:-}" != "--post-overlay" ]; then
-    setup_overlay_root
-fi
-
-shift || true
-
-# Source QEMU-injected environment variables if present. The file lives in the
-# overlay upperdir so the cached base rootfs remains immutable.
-if [ -f /srv/openshell-env.sh ]; then
-    # shellcheck source=/dev/null
-    source /srv/openshell-env.sh
-fi
 
 parse_endpoint() {
     local endpoint="$1"
@@ -171,13 +330,18 @@ ensure_host_gateway_aliases() {
     # gateway IP only listens on gvproxy's own service ports (DNS:53, DHCP,
     # HTTP API:80). Pinning host.containers.internal to the gateway IP
     # silently breaks guest→host port reachability for arbitrary ports.
-    local hosts_tmp="/tmp/openshell-hosts.$$"
+    local hosts_tmp
+    local hosts_path
     local host_aliases="host.openshell.internal host.containers.internal host.docker.internal"
     local gateway_aliases="gateway.containers.internal"
     local filter='(^|[[:space:]])(host\.openshell\.internal|host\.containers\.internal|host\.docker\.internal|gateway\.containers\.internal)([[:space:]]|$)'
+    hosts_path="$(root_path /etc/hosts)"
+    hosts_tmp="$(root_path "/tmp/openshell-hosts.$$.tmp")"
 
-    if [ -f /etc/hosts ]; then
-        grep -vE "$filter" /etc/hosts > "$hosts_tmp" || true
+    mkdir -p "$(dirname "$hosts_path")" 2>/dev/null || true
+    mkdir -p "$(dirname "$hosts_tmp")" 2>/dev/null || true
+    if [ -f "$hosts_path" ]; then
+        grep -vE "$filter" "$hosts_path" > "$hosts_tmp" || true
     else
         : > "$hosts_tmp"
     fi
@@ -194,7 +358,7 @@ ensure_host_gateway_aliases() {
         # TAP networking: gateway and host are both reachable at GATEWAY_IP.
         printf '%s %s %s\n' "$GATEWAY_IP" "$host_aliases" "$gateway_aliases" >> "$hosts_tmp"
     fi
-    cat "$hosts_tmp" > /etc/hosts
+    cat "$hosts_tmp" > "$hosts_path"
     rm -f "$hosts_tmp"
 }
 
@@ -336,12 +500,16 @@ setup_gpu() {
 }
 
 setup_sandbox_workdir() {
-    mkdir -p /sandbox
-    if ! chown -R sandbox:sandbox /sandbox 2>/dev/null; then
-        chown -R 10001:10001 /sandbox
+    local sandbox_dir
+    local owner
+    sandbox_dir="$(root_path /sandbox)"
+    owner="$(sandbox_owner)"
+    mkdir -p "$sandbox_dir"
+    if ! chown -R "$owner" "$sandbox_dir" 2>/dev/null; then
+        chown -R 10001:10001 "$sandbox_dir"
     fi
-    chmod 0755 /sandbox
-    ts "prepared /sandbox ownership"
+    chmod 0755 "$sandbox_dir"
+    ts "prepared /sandbox ownership (${owner})"
 }
 
 configure_hostname() {
@@ -354,32 +522,39 @@ configure_hostname() {
     fi
 
     hostname "$sandbox_hostname" 2>/dev/null || true
-    printf '%s\n' "$sandbox_hostname" >/etc/hostname 2>/dev/null || true
+    printf '%s\n' "$sandbox_hostname" >"$(root_path /etc/hostname)" 2>/dev/null || true
     ts "hostname=${sandbox_hostname}"
 }
 
-mount -t proc proc /proc 2>/dev/null &
-mount -t sysfs sysfs /sys 2>/dev/null &
-mount -t tmpfs tmpfs /tmp 2>/dev/null &
-mount -t tmpfs tmpfs /run 2>/dev/null &
-mount -t devtmpfs devtmpfs /dev 2>/dev/null &
-wait
+run_post_overlay_setup() {
+    # Source QEMU-injected environment variables if present. The file lives in
+    # the overlay upperdir so the cached bootstrap rootfs remains immutable.
+    local env_file
+    env_file="$(root_path /srv/openshell-env.sh)"
+    if [ -f "$env_file" ]; then
+        # shellcheck source=/dev/null
+        source "$env_file"
+    fi
 
-mkdir -p /dev/pts /dev/shm /sys/fs/cgroup
-mount -t devpts devpts /dev/pts 2>/dev/null &
-mount -t tmpfs tmpfs /dev/shm 2>/dev/null &
-mount -t cgroup2 cgroup2 /sys/fs/cgroup 2>/dev/null &
-wait
+    if [ -z "${ROOT_PREFIX:-}" ]; then
+        mount -t proc proc /proc 2>/dev/null &
+        mount -t sysfs sysfs /sys 2>/dev/null &
+        mount -t tmpfs tmpfs /tmp 2>/dev/null &
+        mount -t tmpfs tmpfs /run 2>/dev/null &
+        mount -t devtmpfs devtmpfs /dev 2>/dev/null &
+        wait
+    fi
 
-setup_sandbox_workdir
+    mkdir -p "$(root_path /dev/pts)" "$(root_path /dev/shm)" "$(root_path /sys/fs/cgroup)"
+    mount -t devpts devpts "$(root_path /dev/pts)" 2>/dev/null &
+    mount -t tmpfs tmpfs "$(root_path /dev/shm)" 2>/dev/null &
+    mount -t cgroup2 cgroup2 "$(root_path /sys/fs/cgroup)" 2>/dev/null &
+    wait
 
-configure_hostname
-ip link set lo up 2>/dev/null || true
+    setup_sandbox_workdir
 
-# GPU initialization (before networking so nvidia-smi output is visible early)
-if [ "${GPU_ENABLED}" = "true" ]; then
-    setup_gpu || ts "WARNING: GPU init failed; continuing without GPU"
-fi
+    configure_hostname
+    ip link set lo up 2>/dev/null || true
 
 # Networking: use TAP static config if VM_NET_IP is set (QEMU path),
 # otherwise fall back to gvproxy DHCP on eth0 (libkrun path).
@@ -422,10 +597,10 @@ if [ -n "${VM_NET_IP}" ] && [ -n "${VM_NET_GW}" ]; then
     fi
 
     if [ -n "${VM_NET_DNS}" ]; then
-        echo "nameserver ${VM_NET_DNS}" > /etc/resolv.conf
-    elif [ ! -s /etc/resolv.conf ]; then
-        echo "nameserver 8.8.8.8" > /etc/resolv.conf
-        echo "nameserver 8.8.4.4" >> /etc/resolv.conf
+        echo "nameserver ${VM_NET_DNS}" > "$(root_path /etc/resolv.conf)"
+    elif [ ! -s "$(root_path /etc/resolv.conf)" ]; then
+        echo "nameserver 8.8.8.8" > "$(root_path /etc/resolv.conf)"
+        echo "nameserver 8.8.4.4" >> "$(root_path /etc/resolv.conf)"
     fi
 
     ensure_host_gateway_aliases
@@ -434,10 +609,9 @@ elif ip link show eth0 >/dev/null 2>&1; then
     ip link set eth0 up 2>/dev/null || true
 
     if command -v udhcpc >/dev/null 2>&1; then
-        UDHCPC_SCRIPT="/usr/share/udhcpc/default.script"
-        if [ ! -f "$UDHCPC_SCRIPT" ]; then
-            UDHCPC_SCRIPT="/run/openshell-udhcpc.script"
-            cat > "$UDHCPC_SCRIPT" <<'DHCP_SCRIPT'
+        UDHCPC_SCRIPT="$(root_path /run/openshell-udhcpc.script)"
+        mkdir -p "$(dirname "$UDHCPC_SCRIPT")"
+        cat > "$UDHCPC_SCRIPT" <<'DHCP_SCRIPT'
 #!/bin/sh
 case "$1" in
     bound|renew)
@@ -447,18 +621,20 @@ case "$1" in
             ip route add default via "$router" dev "$interface"
         fi
         if [ -n "$dns" ]; then
-            : > /etc/resolv.conf
+            resolv_conf="${OPENSHELL_RESOLV_CONF:-/etc/resolv.conf}"
+            mkdir -p "$(dirname "$resolv_conf")" 2>/dev/null || true
+            : > "$resolv_conf" 2>/dev/null || true
             for d in $dns; do
-                echo "nameserver $d" >> /etc/resolv.conf
+                echo "nameserver $d" >> "$resolv_conf" 2>/dev/null || true
             done
         fi
         ;;
 esac
 DHCP_SCRIPT
-            chmod +x "$UDHCPC_SCRIPT"
-        fi
+        chmod +x "$UDHCPC_SCRIPT"
 
-        if ! udhcpc -i eth0 -f -q -n -T 1 -t 3 -A 1 -s "$UDHCPC_SCRIPT" 2>&1; then
+        if ! OPENSHELL_RESOLV_CONF="$(root_path /etc/resolv.conf)" \
+            udhcpc -i eth0 -f -q -n -T 1 -t 3 -A 1 -s "$UDHCPC_SCRIPT" 2>&1; then
             ts "WARNING: DHCP failed, falling back to static config"
             ip addr add 192.168.127.2/24 dev eth0 2>/dev/null || true
             ip route add default via "$GVPROXY_GATEWAY_IP" 2>/dev/null || true
@@ -469,9 +645,9 @@ DHCP_SCRIPT
         ip route add default via "$GVPROXY_GATEWAY_IP" 2>/dev/null || true
     fi
 
-    if [ ! -s /etc/resolv.conf ]; then
-        echo "nameserver 8.8.8.8" > /etc/resolv.conf
-        echo "nameserver 8.8.4.4" >> /etc/resolv.conf
+    if [ ! -s "$(root_path /etc/resolv.conf)" ]; then
+        echo "nameserver 8.8.8.8" > "$(root_path /etc/resolv.conf)"
+        echo "nameserver 8.8.4.4" >> "$(root_path /etc/resolv.conf)"
     fi
 
     ensure_host_gateway_aliases
@@ -523,4 +699,15 @@ if [ -n "${OPENSHELL_SANDBOX_ID:-}" ]; then
 fi
 
 ts "starting openshell-sandbox supervisor"
+if [ "${ROOT_PREFIX:-}" = "/newroot" ]; then
+    exec_supervisor_in_newroot
+fi
 exec /opt/openshell/bin/openshell-sandbox --workdir /sandbox
+}
+
+if [ "${1:-}" != "--post-overlay" ]; then
+    setup_overlay_root
+fi
+
+shift || true
+run_post_overlay_setup

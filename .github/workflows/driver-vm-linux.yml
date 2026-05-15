@@ -162,7 +162,7 @@ jobs:
       - name: Verify embedded driver inputs
         run: |
           set -euo pipefail
-          for file in libkrun.so.zst libkrunfw.so.5.zst gvproxy.zst openshell-sandbox.zst; do
+          for file in libkrun.so.zst libkrunfw.so.5.zst gvproxy.zst umoci.zst openshell-sandbox.zst; do
             test -s "target/vm-runtime-compressed/${file}"
           done
 

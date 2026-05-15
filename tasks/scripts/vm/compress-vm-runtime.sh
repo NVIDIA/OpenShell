@@ -4,9 +4,9 @@
 
 # Gather VM runtime artifacts from local sources and compress for embedding.
 #
-# This script collects libkrun, libkrunfw, and gvproxy from local sources
-# (Homebrew on macOS, built from source on Linux) and compresses them with
-# zstd for embedding into the openshell-driver-vm binary.
+# This script collects libkrun, libkrunfw, gvproxy, and the guest OCI unpacker
+# from local sources or pinned releases and compresses them with zstd for
+# embedding into the openshell-driver-vm binary.
 #
 # Usage:
 #   ./compress-vm-runtime.sh
@@ -26,9 +26,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/_lib.sh"
 ROOT="$(vm_lib_root)"
 
-# Source pins for gvproxy version.
+# Source pins for runtime tool versions.
 source "${ROOT}/crates/openshell-driver-vm/runtime/pins.env" 2>/dev/null || true
 GVPROXY_VERSION="${GVPROXY_VERSION:-v0.8.8}"
+UMOCI_VERSION="${UMOCI_VERSION:-v0.6.0}"
 
 # ── macOS dylib portability helpers ─────────────────────────────────────
 
@@ -57,6 +58,26 @@ OUTPUT_DIR="${OPENSHELL_VM_RUNTIME_COMPRESSED_DIR:-${ROOT}/target/vm-runtime-com
 
 mkdir -p "$OUTPUT_DIR"
 
+download_umoci_for_guest() {
+    local output="$1"
+    local guest_arch="$2"
+    local suffix
+
+    case "$guest_arch" in
+        arm64|aarch64) suffix="arm64" ;;
+        amd64|x86_64)  suffix="amd64" ;;
+        *)
+            echo "Error: Unsupported guest architecture for umoci: ${guest_arch}" >&2
+            exit 1
+            ;;
+    esac
+
+    echo "    Downloading umoci ${UMOCI_VERSION} for ${suffix}..."
+    curl -fsSL -o "$output" \
+        "https://github.com/opencontainers/umoci/releases/download/${UMOCI_VERSION}/umoci.${suffix}"
+    chmod +x "$output"
+}
+
 # ── Fast path: compressed artifacts already present (e.g. from vm:setup) ──
 
 _check_compressed_artifacts() {
@@ -65,12 +86,12 @@ _check_compressed_artifacts() {
     platform="$(uname -s)-$(uname -m)"
     case "$platform" in
         Darwin-arm64)
-            for f in libkrun.dylib.zst libkrunfw.5.dylib.zst gvproxy.zst; do
+            for f in libkrun.dylib.zst libkrunfw.5.dylib.zst gvproxy.zst umoci.zst; do
                 [ -f "${dir}/${f}" ] || return 1
             done
             ;;
         Linux-*)
-            for f in libkrun.so.zst libkrunfw.so.5.zst gvproxy.zst; do
+            for f in libkrun.so.zst libkrunfw.so.5.zst gvproxy.zst umoci.zst; do
                 [ -f "${dir}/${f}" ] || return 1
             done
             ;;
@@ -211,6 +232,7 @@ case "$(uname -s)-$(uname -m)" in
       echo "Error: gvproxy not found. Install Podman Desktop or run: brew install gvproxy" >&2
       exit 1
     fi
+    download_umoci_for_guest "$WORK_DIR/umoci" "arm64"
     ;;
     
   Linux-*)
@@ -256,6 +278,7 @@ case "$(uname -s)-$(uname -m)" in
         "https://github.com/containers/gvisor-tap-vsock/releases/download/${GVPROXY_VERSION}/gvproxy-linux-${GVPROXY_ARCH}"
       chmod +x "$WORK_DIR/gvproxy"
     fi
+    download_umoci_for_guest "$WORK_DIR/umoci" "$ARCH"
     ;;
     
   *)

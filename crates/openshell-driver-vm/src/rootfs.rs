@@ -11,9 +11,11 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const SUPERVISOR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/openshell-sandbox.zst"));
+const UMOCI: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/umoci.zst"));
 const ROOTFS_VARIANT_MARKER: &str = ".openshell-rootfs-variant";
 const SANDBOX_GUEST_INIT_PATH: &str = "/srv/openshell-vm-sandbox-init.sh";
 const SANDBOX_SUPERVISOR_PATH: &str = "/opt/openshell/bin/openshell-sandbox";
+const SANDBOX_UMOCI_PATH: &str = "/opt/openshell/bin/umoci";
 const ROOTFS_IMAGE_MIN_SIZE_BYTES: u64 = 512 * 1024 * 1024;
 const ROOTFS_IMAGE_MIN_HEADROOM_BYTES: u64 = 256 * 1024 * 1024;
 const EXT4_IMAGE_MIN_HEADROOM_BYTES: u64 = 16 * 1024 * 1024;
@@ -231,6 +233,7 @@ fn prepare_sandbox_rootfs(rootfs: &Path) -> Result<(), String> {
     }
 
     ensure_supervisor_binary(rootfs)?;
+    ensure_umoci_binary(rootfs)?;
 
     let opt_dir = rootfs.join("opt/openshell");
     fs::create_dir_all(&opt_dir).map_err(|e| format!("create {}: {e}", opt_dir.display()))?;
@@ -247,7 +250,8 @@ fn prepare_sandbox_rootfs(rootfs: &Path) -> Result<(), String> {
 
 pub fn validate_sandbox_rootfs(rootfs: &Path) -> Result<(), String> {
     require_rootfs_path(rootfs, SANDBOX_GUEST_INIT_PATH)?;
-    require_rootfs_path(rootfs, "/opt/openshell/bin/openshell-sandbox")?;
+    require_rootfs_path(rootfs, SANDBOX_SUPERVISOR_PATH)?;
+    require_rootfs_path(rootfs, SANDBOX_UMOCI_PATH)?;
     require_any_rootfs_path(rootfs, &["/bin/bash"])?;
     require_any_rootfs_path(rootfs, &["/bin/mount", "/usr/bin/mount"])?;
     require_any_rootfs_path(
@@ -508,6 +512,36 @@ fn ensure_supervisor_binary(rootfs: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn ensure_umoci_binary(rootfs: &Path) -> Result<(), String> {
+    let path = rootfs.join(SANDBOX_UMOCI_PATH.trim_start_matches('/'));
+    if UMOCI.is_empty() {
+        if !path.exists() {
+            return Err(
+                "umoci not embedded. Build openshell-driver-vm with OPENSHELL_VM_RUNTIME_COMPRESSED_DIR set and run `mise run vm:setup` first"
+                    .to_string(),
+            );
+        }
+    } else {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+        }
+
+        let umoci =
+            zstd::decode_all(Cursor::new(UMOCI)).map_err(|e| format!("decompress umoci: {e}"))?;
+        fs::write(&path, umoci).map_err(|e| format!("write {}: {e}", path.display()))?;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("chmod {}: {e}", path.display()))?;
+    }
+
+    Ok(())
+}
+
 fn require_rootfs_path(rootfs: &Path, relative: &str) -> Result<(), String> {
     let candidate = rootfs.join(relative.trim_start_matches('/'));
     if candidate.exists() {
@@ -563,11 +597,7 @@ mod tests {
         fs::create_dir_all(rootfs.join("etc")).expect("create etc");
         fs::create_dir_all(rootfs.join("opt/openshell/bin")).expect("create openshell bin");
         fs::write(rootfs.join("opt/openshell/.initialized"), b"yes").expect("write initialized");
-        fs::write(
-            rootfs.join("opt/openshell/bin/openshell-sandbox"),
-            b"sandbox",
-        )
-        .expect("write openshell-sandbox");
+        write_fake_runtime_binaries(&rootfs);
         fs::write(
             rootfs.join("etc/passwd"),
             "root:x:0:0:root:/root:/bin/bash\n",
@@ -587,6 +617,7 @@ mod tests {
         validate_sandbox_rootfs(&rootfs).expect("validate sandbox rootfs");
 
         assert!(rootfs.join("srv/openshell-vm-sandbox-init.sh").is_file());
+        assert!(rootfs.join("opt/openshell/bin/umoci").is_file());
         assert!(rootfs.join("sandbox").is_dir());
         assert!(rootfs.join("lower").is_dir());
         assert!(rootfs.join("overlay").is_dir());
@@ -621,11 +652,7 @@ mod tests {
         let rootfs = dir.join("rootfs");
 
         fs::create_dir_all(rootfs.join("opt/openshell/bin")).expect("create openshell bin");
-        fs::write(
-            rootfs.join("opt/openshell/bin/openshell-sandbox"),
-            b"sandbox",
-        )
-        .expect("write openshell-sandbox");
+        write_fake_runtime_binaries(&rootfs);
         fs::create_dir_all(rootfs.join("sandbox")).expect("create sandbox workdir");
         fs::write(rootfs.join("sandbox/app.py"), "print('hello')\n").expect("write app");
 
@@ -682,5 +709,14 @@ mod tests {
             "openshell-driver-vm-rootfs-test-{}-{nanos}-{suffix}",
             std::process::id()
         ))
+    }
+
+    fn write_fake_runtime_binaries(rootfs: &Path) {
+        fs::write(
+            rootfs.join("opt/openshell/bin/openshell-sandbox"),
+            b"sandbox",
+        )
+        .expect("write openshell-sandbox");
+        fs::write(rootfs.join("opt/openshell/bin/umoci"), b"umoci").expect("write umoci");
     }
 }

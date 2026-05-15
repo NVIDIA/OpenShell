@@ -38,6 +38,7 @@ GATEWAY_NAME="${OPENSHELL_VM_GATEWAY_NAME:-vm-dev}"
 STATE_DIR="${OPENSHELL_VM_GATEWAY_STATE_DIR:-${ROOT}/.cache/gateway-vm}"
 SANDBOX_NAMESPACE="${OPENSHELL_SANDBOX_NAMESPACE:-vm-dev}"
 SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-${COMMUNITY_SANDBOX_IMAGE:-ghcr.io/nvidia/openshell-community/sandboxes/base:latest}}"
+VM_BOOTSTRAP_IMAGE="${OPENSHELL_VM_BOOTSTRAP_IMAGE:-}"
 SANDBOX_IMAGE_PULL_POLICY="${OPENSHELL_SANDBOX_IMAGE_PULL_POLICY:-IfNotPresent}"
 LOG_LEVEL="${OPENSHELL_LOG_LEVEL:-info}"
 GATEWAY_BIN="${ROOT}/target/debug/openshell-gateway"
@@ -272,7 +273,8 @@ DISABLE_TLS="$(normalize_bool "${OPENSHELL_DISABLE_TLS:-true}")"
 # Build prerequisites: VM runtime artifacts + bundled supervisor.
 if [ ! -d "${COMPRESSED_DIR}" ] \
     || ! find "${COMPRESSED_DIR}" -maxdepth 1 -name 'libkrun*.zst' | grep -q . \
-    || [ ! -f "${COMPRESSED_DIR}/gvproxy.zst" ]; then
+    || [ ! -f "${COMPRESSED_DIR}/gvproxy.zst" ] \
+    || [ ! -f "${COMPRESSED_DIR}/umoci.zst" ]; then
   echo "==> Preparing embedded VM runtime (mise run vm:setup)"
   mise run vm:setup
 fi
@@ -316,6 +318,7 @@ disable_tls = ${DISABLE_TLS}
 
 [openshell.drivers.vm]
 default_image = "${SANDBOX_IMAGE}"
+bootstrap_image = "${VM_BOOTSTRAP_IMAGE}"
 grpc_endpoint = "${GRPC_ENDPOINT}"
 driver_dir = "${DRIVER_DIR}"
 state_dir = "${VM_DRIVER_STATE_DIR}"

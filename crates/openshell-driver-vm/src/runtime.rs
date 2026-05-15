@@ -47,6 +47,7 @@ const COMPAT_NET_FEATURES: u32 = NET_FEATURE_CSUM
 pub struct VmLaunchConfig {
     pub root_disk: PathBuf,
     pub overlay_disk: PathBuf,
+    pub image_disk: Option<PathBuf>,
     pub vcpus: u8,
     pub mem_mib: u32,
     pub exec_path: String,
@@ -108,6 +109,11 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
             "overlay disk image not found: {}",
             config.overlay_disk.display()
         ));
+    }
+    if let Some(image_disk) = &config.image_disk
+        && !image_disk.is_file()
+    {
+        return Err(format!("image disk not found: {}", image_disk.display()));
     }
 
     if let Err(err) = procguard::die_with_parent_cleanup(procguard_kill_children) {
@@ -211,7 +217,7 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
 }
 
 fn qemu_disk_args(config: &VmLaunchConfig) -> Vec<String> {
-    vec![
+    let mut args = vec![
         "-drive".to_string(),
         format!(
             "file={},if=none,format=raw,id=rootfs,readonly=on",
@@ -226,7 +232,19 @@ fn qemu_disk_args(config: &VmLaunchConfig) -> Vec<String> {
         ),
         "-device".to_string(),
         "virtio-blk-pci,drive=overlay".to_string(),
-    ]
+    ];
+    if let Some(image_disk) = &config.image_disk {
+        args.extend([
+            "-drive".to_string(),
+            format!(
+                "file={},if=none,format=raw,id=image,readonly=on",
+                image_disk.display()
+            ),
+            "-device".to_string(),
+            "virtio-blk-pci,drive=image".to_string(),
+        ]);
+    }
+    args
 }
 
 /// Write environment variables into the overlay disk so the guest init script
@@ -637,6 +655,11 @@ fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
             config.overlay_disk.display()
         ));
     }
+    if let Some(image_disk) = &config.image_disk
+        && !image_disk.is_file()
+    {
+        return Err(format!("image disk not found: {}", image_disk.display()));
+    }
 
     // Arm procguard first, BEFORE we spawn gvproxy or fork libkrun, so
     // that the launcher can't be orphaned during setup. The cleanup
@@ -659,7 +682,11 @@ fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
 
     let vm = VmContext::create(&runtime_dir, config.log_level)?;
     vm.set_vm_config(config.vcpus, config.mem_mib)?;
-    vm.set_disks(&config.root_disk, &config.overlay_disk)?;
+    vm.set_disks(
+        &config.root_disk,
+        &config.overlay_disk,
+        config.image_disk.as_deref(),
+    )?;
     vm.set_workdir(&config.workdir)?;
 
     // Run gvproxy strictly as the guest's virtual NIC / DHCP / router.
@@ -706,12 +733,12 @@ fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
             ));
         }
 
-        let sock_base = gvproxy_socket_base(&config.root_disk)?;
+        let sock_base = gvproxy_socket_base(&config.overlay_disk)?;
         let net_sock = sock_base.with_extension("v");
         let _ = std::fs::remove_file(&net_sock);
         let _ = std::fs::remove_file(sock_base.with_extension("v-krun.sock"));
 
-        let run_dir = config.root_disk.parent().unwrap_or(&config.root_disk);
+        let run_dir = config.overlay_disk.parent().unwrap_or(&config.overlay_disk);
         let gvproxy_log = run_dir.join("gvproxy.log");
         let gvproxy_log_file = std::fs::File::create(&gvproxy_log)
             .map_err(|e| format!("create gvproxy log {}: {e}", gvproxy_log.display()))?;
@@ -970,7 +997,12 @@ impl VmContext {
         )
     }
 
-    fn set_disks(&self, root_disk: &Path, overlay_disk: &Path) -> Result<(), String> {
+    fn set_disks(
+        &self,
+        root_disk: &Path,
+        overlay_disk: &Path,
+        image_disk: Option<&Path>,
+    ) -> Result<(), String> {
         let root_disk_c = path_to_cstring(root_disk)?;
         let block_id_c = CString::new("root").map_err(|e| format!("invalid block id: {e}"))?;
         check(
@@ -999,6 +1031,23 @@ impl VmContext {
             },
             "krun_add_disk",
         )?;
+
+        if let Some(image_disk) = image_disk {
+            let image_disk_c = path_to_cstring(image_disk)?;
+            let image_block_id_c =
+                CString::new("image").map_err(|e| format!("invalid image block id: {e}"))?;
+            check(
+                unsafe {
+                    (self.krun.krun_add_disk)(
+                        self.ctx_id,
+                        image_block_id_c.as_ptr(),
+                        image_disk_c.as_ptr(),
+                        true,
+                    )
+                },
+                "krun_add_disk",
+            )?;
+        }
 
         let device_c =
             CString::new("/dev/vda").map_err(|e| format!("invalid root disk device: {e}"))?;
@@ -1232,8 +1281,8 @@ fn secure_socket_base(subdir: &str) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-fn gvproxy_socket_base(root_disk: &Path) -> Result<PathBuf, String> {
-    Ok(secure_socket_base("osd-gv")?.join(hash_path_id(root_disk)))
+fn gvproxy_socket_base(overlay_disk: &Path) -> Result<PathBuf, String> {
+    Ok(secure_socket_base("osd-gv")?.join(hash_path_id(overlay_disk)))
 }
 
 fn install_signal_forwarding(pid: i32) {
@@ -1342,6 +1391,7 @@ mod tests {
         VmLaunchConfig {
             root_disk: PathBuf::from("/rootfs.ext4"),
             overlay_disk: PathBuf::from("/overlay.ext4"),
+            image_disk: None,
             vcpus: 2,
             mem_mib: 2048,
             exec_path: "/srv/openshell-vm-sandbox-init.sh".to_string(),
@@ -1405,5 +1455,30 @@ mod tests {
                 .any(|arg| arg.contains("id=overlay,readonly=on"))
         );
         assert!(args.contains(&"virtio-blk-pci,drive=overlay".to_string()));
+    }
+
+    #[test]
+    fn qemu_disk_args_attach_prepared_image_readonly_when_present() {
+        let mut config = qemu_config();
+        config.image_disk = Some(PathBuf::from("/image-rootfs.ext4"));
+
+        let args = qemu_disk_args(&config);
+
+        assert!(args.contains(
+            &"file=/image-rootfs.ext4,if=none,format=raw,id=image,readonly=on".to_string()
+        ));
+        assert!(args.contains(&"virtio-blk-pci,drive=image".to_string()));
+    }
+
+    #[test]
+    fn gvproxy_socket_base_is_per_sandbox_overlay_path() {
+        let first =
+            gvproxy_socket_base(Path::new("/tmp/openshell-vm/sandboxes/first/overlay.ext4"))
+                .expect("first socket base");
+        let second =
+            gvproxy_socket_base(Path::new("/tmp/openshell-vm/sandboxes/second/overlay.ext4"))
+                .expect("second socket base");
+
+        assert_ne!(first, second);
     }
 }

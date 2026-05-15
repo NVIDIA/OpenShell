@@ -237,9 +237,9 @@ jobs:
 
             ### Kernel Runtime Artifacts
 
-            Pre-built kernel runtime (libkrunfw + libkrun + gvproxy) for embedding into
-            the `openshell-driver-vm` binary. These are rebuilt on demand when the kernel
-            config or pinned dependency versions change.
+            Pre-built kernel runtime (libkrunfw + libkrun + gvproxy + umoci) for embedding
+            into the `openshell-driver-vm` binary. These are rebuilt on demand when the
+            kernel config or pinned dependency versions change.
 
             | Platform | Artifact |
             |----------|----------|

@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Download pre-built VM kernel runtime artifacts from the vm-runtime GitHub Release
-# and stage them for the openshell-driver-vm cargo build.
+# Download pre-built VM kernel runtime artifacts from the vm-runtime GitHub
+# Release and stage them for the openshell-driver-vm cargo build.
 #
 # This script is used by driver release CI and can also be used locally
 # to avoid building libkrun/libkrunfw from source.
@@ -23,10 +23,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/_lib.sh"
 ROOT="$(vm_lib_root)"
+source "${ROOT}/crates/openshell-driver-vm/runtime/pins.env" 2>/dev/null || true
 
 RELEASE_TAG="${VM_RUNTIME_RELEASE_TAG:-vm-runtime}"
 REPO="${GITHUB_REPOSITORY:-NVIDIA/OpenShell}"
 OUTPUT_DIR="${OPENSHELL_VM_RUNTIME_COMPRESSED_DIR:-${ROOT}/target/vm-runtime-compressed}"
+UMOCI_VERSION="${UMOCI_VERSION:-v0.6.0}"
 
 # ── Auto-detect platform (detect_platform from _lib.sh) ─────────────────
 
@@ -108,6 +110,21 @@ rm -rf "$EXTRACT_DIR"
 mkdir -p "$EXTRACT_DIR"
 
 zstd -d "${DOWNLOAD_DIR}/${TARBALL_NAME}" --stdout | tar -xf - -C "$EXTRACT_DIR"
+
+if [ ! -f "${EXTRACT_DIR}/umoci" ]; then
+    case "$PLATFORM" in
+        linux-aarch64|darwin-aarch64) UMOCI_SUFFIX="arm64" ;;
+        linux-x86_64)                 UMOCI_SUFFIX="amd64" ;;
+        *)
+            echo "Error: Unsupported platform for umoci guest binary: ${PLATFORM}" >&2
+            exit 1
+            ;;
+    esac
+    echo "    Runtime tarball has no umoci; downloading ${UMOCI_VERSION} for ${UMOCI_SUFFIX}"
+    curl -fsSL -o "${EXTRACT_DIR}/umoci" \
+        "https://github.com/opencontainers/umoci/releases/download/${UMOCI_VERSION}/umoci.${UMOCI_SUFFIX}"
+    chmod +x "${EXTRACT_DIR}/umoci"
+fi
 
 echo "    Extracted files:"
 ls -lah "$EXTRACT_DIR"

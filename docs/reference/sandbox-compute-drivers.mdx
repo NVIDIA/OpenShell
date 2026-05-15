@@ -65,9 +65,9 @@ MicroVM-backed sandboxes run inside VM-backed isolation instead of a container b
 
 The gateway uses the VM compute driver to create VM-backed sandboxes. MicroVM requires host virtualization support. It uses [libkrun](https://github.com/containers/libkrun) with Apple's [Hypervisor framework](https://developer.apple.com/documentation/hypervisor) on macOS, KVM on Linux, and [QEMU](https://www.qemu.org/) for GPU-backed sandboxes on Linux.
 
-The VM driver prepares an immutable ext4 root disk image from the selected sandbox image and caches it by image identity. Each sandbox boots that cached base disk read-only and receives its own writable `overlay.ext4` disk for `/`, including `/sandbox` writes and runtime TLS material. The overlay persists for the sandbox lifetime and is deleted with the sandbox state directory.
+The VM driver boots a cached immutable bootstrap ext4 root disk. When the requested sandbox image differs from the bootstrap image, the driver stages the registry image as an OCI layout, unpacks it inside a bootstrap VM with `umoci`, and caches the prepared image disk by image identity. Each sandbox receives that prepared disk read-only plus its own writable `overlay.ext4` disk for `/`, including `/sandbox` writes and runtime TLS material. The overlay persists for the sandbox lifetime and is deleted with the sandbox state directory.
 
-VM sandbox creation follows the same progress model as Kubernetes-backed sandboxes. The gateway accepts the sandbox, then the VM driver publishes watch events while it resolves the image, prepares or reuses the root disk cache, creates the writable overlay, and starts the VM launcher.
+VM sandbox creation follows the same progress model as Kubernetes-backed sandboxes. The gateway accepts the sandbox, then the VM driver publishes watch events while it resolves the image, prepares or reuses the bootstrap and prepared image caches, creates the writable overlay, and starts the VM launcher.
 
 For maintainer-level implementation details, refer to the [VM driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-vm/README.md).
 
@@ -83,7 +83,7 @@ openshell-gateway --drivers vm
 
 For a service, set `OPENSHELL_DRIVERS=vm` in the service environment file and restart the service. Homebrew creates `$(brew --prefix)/var/openshell/gateway.env` with a commented `OPENSHELL_DRIVERS=vm` entry. Debian and RPM user services read `~/.config/openshell/gateway.env`.
 
-Select VM with `--drivers vm` or `OPENSHELL_DRIVERS=vm`. Configure VM driver values such as `grpc_endpoint`, `driver_dir`, `state_dir`, `vcpus`, `mem_mib`, `overlay_disk_mib`, `krun_log_level`, and `guest_tls_*` in `[openshell.drivers.vm]`. The VM `state_dir` stores overlay disks, console logs, runtime state, image-rootfs cache, and the private `run/compute-driver.sock` socket.
+Select VM with `--drivers vm` or `OPENSHELL_DRIVERS=vm`. Configure VM driver values such as `grpc_endpoint`, `driver_dir`, `state_dir`, `default_image`, `bootstrap_image`, `vcpus`, `mem_mib`, `overlay_disk_mib`, `krun_log_level`, and `guest_tls_*` in `[openshell.drivers.vm]`. The VM `state_dir` stores overlay disks, console logs, runtime state, image-rootfs cache, and the private `run/compute-driver.sock` socket.
 
 The gateway starts `openshell-driver-vm` over a private Unix socket and passes its process ID so the driver can reject unexpected local clients. The driver's standalone TCP listener is disabled unless `--allow-unauthenticated-tcp` is set for local development.
 

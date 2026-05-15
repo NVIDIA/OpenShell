@@ -11,8 +11,8 @@ runtime/
     openshell.kconfig
 ```
 
-`openshell-driver-vm` embeds libkrun, libkrunfw, gvproxy, and the bundled
-`openshell-sandbox` supervisor.
+`openshell-driver-vm` embeds libkrun, libkrunfw, gvproxy, umoci for guest-side
+OCI image unpacking, and the bundled `openshell-sandbox` supervisor.
 
 ## Why
 
@@ -27,7 +27,7 @@ VM sandboxes can run the same supervisor enforcement path as other backends.
 |---|---|---|
 | `tasks/scripts/vm/build-libkrun.sh` | Linux | Builds libkrunfw and libkrun from source with the custom kernel config |
 | `tasks/scripts/vm/build-libkrun-macos.sh` | macOS | Builds portable libkrunfw and libkrun from a prebuilt `kernel.c` |
-| `tasks/scripts/vm/package-vm-runtime.sh` | Any | Packages `vm-runtime-<platform>.tar.zst` with libraries, gvproxy, and provenance |
+| `tasks/scripts/vm/package-vm-runtime.sh` | Any | Packages `vm-runtime-<platform>.tar.zst` with libraries, gvproxy, umoci, and provenance |
 | `tasks/scripts/vm/download-kernel-runtime.sh` | Any | Downloads runtime tarballs from the `vm-runtime` release and stages compressed files |
 
 ## Local Flow
@@ -62,8 +62,9 @@ publish the driver binary next to `openshell-gateway`.
 ## Provenance
 
 `package-vm-runtime.sh` writes `provenance.json` into each runtime tarball with
-the platform, libkrunfw commit, kernel version, GitHub SHA, and build time. The
-driver logs this metadata when it extracts and loads a runtime bundle.
+the platform, libkrunfw commit, kernel version, gvproxy and umoci versions,
+GitHub SHA, and build time. The driver logs this metadata when it extracts and
+loads a runtime bundle.
 
 The release workflow also publishes GitHub artifact attestations for each
 runtime tarball. Verify a downloaded runtime with:

@@ -33,6 +33,9 @@ struct Args {
     #[arg(long = "vm-overlay-disk", hide = true)]
     vm_overlay_disk: Option<PathBuf>,
 
+    #[arg(long = "vm-image-disk", hide = true)]
+    vm_image_disk: Option<PathBuf>,
+
     #[arg(long, hide = true)]
     vm_exec: Option<String>,
 
@@ -85,6 +88,9 @@ struct Args {
 
     #[arg(long, env = "OPENSHELL_SANDBOX_IMAGE", default_value = "")]
     default_image: String,
+
+    #[arg(long, env = "OPENSHELL_VM_BOOTSTRAP_IMAGE", default_value = "")]
+    bootstrap_image: String,
 
     #[arg(
         long,
@@ -193,6 +199,7 @@ async fn main() -> Result<()> {
         state_dir: args.state_dir.clone(),
         launcher_bin: None,
         default_image: args.default_image.clone(),
+        bootstrap_image: args.bootstrap_image.clone(),
         log_level: args.log_level.clone(),
         krun_log_level: args.krun_log_level,
         vcpus: args.vcpus,
@@ -455,6 +462,7 @@ fn build_vm_launch_config(args: &Args) -> std::result::Result<VmLaunchConfig, St
         .vm_overlay_disk
         .clone()
         .ok_or_else(|| "--vm-overlay-disk is required in internal VM mode".to_string())?;
+    let image_disk = args.vm_image_disk.clone();
     let exec_path = args
         .vm_exec
         .clone()
@@ -473,6 +481,7 @@ fn build_vm_launch_config(args: &Args) -> std::result::Result<VmLaunchConfig, St
     Ok(VmLaunchConfig {
         root_disk,
         overlay_disk,
+        image_disk,
         vcpus: args.vm_vcpus,
         mem_mib: args.vm_mem_mib,
         exec_path,

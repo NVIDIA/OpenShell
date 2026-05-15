@@ -199,7 +199,7 @@ jobs:
       - name: Verify embedded driver inputs
         run: |
           set -euo pipefail
-          for file in libkrun.dylib.zst libkrunfw.5.dylib.zst gvproxy.zst openshell-sandbox.zst; do
+          for file in libkrun.dylib.zst libkrunfw.5.dylib.zst gvproxy.zst umoci.zst openshell-sandbox.zst; do
             test -s "target/vm-runtime-compressed-macos/${file}"
           done
 

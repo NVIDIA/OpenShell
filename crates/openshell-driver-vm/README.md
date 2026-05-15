@@ -2,7 +2,7 @@
 
 > Status: Experimental. The VM compute driver is under active development and the interface still has VM-specific plumbing that will be generalized.
 
-Standalone libkrun-backed [`ComputeDriver`](../../proto/compute_driver.proto) for OpenShell. The gateway spawns this binary as a subprocess, talks to it over a Unix domain socket with the `openshell.compute.v1.ComputeDriver` gRPC surface, and lets it manage per-sandbox microVMs. The runtime (libkrun + libkrunfw + gvproxy) and the sandbox supervisor are embedded directly in the binary; each sandbox boots from a cached immutable ext4 root disk derived from the configured container image plus a per-sandbox writable overlay disk.
+Standalone libkrun-backed [`ComputeDriver`](../../proto/compute_driver.proto) for OpenShell. The gateway spawns this binary as a subprocess, talks to it over a Unix domain socket with the `openshell.compute.v1.ComputeDriver` gRPC surface, and lets it manage per-sandbox microVMs. The runtime (libkrun + libkrunfw + gvproxy), guest OCI unpacker, and sandbox supervisor are embedded directly in the binary; each sandbox boots from a cached immutable bootstrap ext4 root disk plus a per-sandbox writable overlay disk. When the requested sandbox image differs from the bootstrap image, the driver prepares a read-only image ext4 disk inside a bootstrap VM and mounts that unpacked rootfs as the sandbox lowerdir.
 
 ## How it fits together
 
@@ -35,7 +35,7 @@ Sandbox guests execute `/opt/openshell/bin/openshell-sandbox` as PID 1 inside th
 mise run gateway:vm
 ```
 
-First run takes a few minutes while `mise run vm:setup` stages libkrun/libkrunfw/gvproxy and `mise run vm:supervisor` builds the bundled guest supervisor. Subsequent runs are cached.
+First run takes a few minutes while `mise run vm:setup` stages libkrun/libkrunfw/gvproxy/umoci and `mise run vm:supervisor` builds the bundled guest supervisor. Subsequent runs are cached.
 
 By default `mise run gateway:vm`:
 
@@ -75,6 +75,9 @@ mise run gateway:vm
 
 # custom sandbox image
 OPENSHELL_SANDBOX_IMAGE=ghcr.io/example/sandbox:latest mise run gateway:vm
+
+# custom bootstrap image for the VM runtime used to prepare/boot target images
+OPENSHELL_VM_BOOTSTRAP_IMAGE=ghcr.io/example/bootstrap:latest mise run gateway:vm
 ```
 
 Teardown:
@@ -139,6 +142,7 @@ Select the VM driver with `--drivers vm`, `OPENSHELL_DRIVERS=vm`, or `compute_dr
 | `state_dir` | `target/openshell-vm-driver` | Per-sandbox overlay disks, console logs, image cache, and private `run/compute-driver.sock` UDS. |
 | `driver_dir` | unset | Override the directory searched for `openshell-driver-vm`. |
 | `default_image` | OpenShell base image | Sandbox image used when a create request omits one. |
+| `bootstrap_image` | unset | VM runtime image used as the immutable bootstrap root disk. Defaults to the sandbox image when unset. |
 | `vcpus` | `2` | vCPUs per sandbox. |
 | `mem_mib` | `2048` | Memory per sandbox, in MiB. |
 | `overlay_disk_mib` | `4096` | Sparse writable overlay disk size per sandbox, in MiB. |
@@ -166,16 +170,24 @@ background. The driver publishes platform events for image resolution, cache
 hits/misses, layer pulls, rootfs preparation, overlay creation, and VM launcher
 startup so the CLI can show progress through the existing sandbox watch stream.
 
-During rootfs preparation the VM driver exports or pulls the selected OCI image,
-applies the OpenShell guest mutations, formats a sparse `rootfs.ext4`, and
-caches it under `<state-dir>/images/<cache-id>/rootfs.ext4`. Registry layers are
-downloaded, verified, and extracted concurrently, then applied in image order. Set
-`OPENSHELL_VM_IMAGE_PULL_CONCURRENCY` to tune registry layer download
-parallelism (default `4`, maximum `16`). Each sandbox boots that cached base
-disk read-only and gets its own sparse writable
-`<state-dir>/sandboxes/<id>/overlay.ext4`. Guest init mounts overlayfs as `/`,
-so writes to `/sandbox` and other mutable paths land in the overlay while the
-cached root image remains unchanged.
+The VM driver keeps two image caches. The bootstrap cache is a controlled
+`rootfs.ext4` used to boot the guest init and OpenShell supervisor. The prepared
+image cache is used when the requested sandbox image differs from the bootstrap
+image: the host downloads registry layers into a valid OCI layout, attaches that
+payload to a temporary bootstrap VM, and guest init runs `umoci raw unpack` onto
+Linux-owned ext4 storage. The resulting disk is cached under
+`<state-dir>/images/<cache-id>/rootfs.ext4` and attached read-only to later
+sandboxes. Local Docker images are still exported as rootfs tar archives and
+prepared inside the bootstrap VM. Set `OPENSHELL_VM_IMAGE_PULL_CONCURRENCY` to
+tune registry layer download parallelism (default `4`, maximum `16`).
+
+Each sandbox gets its own sparse writable
+`<state-dir>/sandboxes/<id>/overlay.ext4`. Guest init mounts overlayfs as `/`
+with the prepared image rootfs as lowerdir when present, otherwise the bootstrap
+rootfs is used directly. Writes to `/sandbox` and other mutable paths land in
+the overlay while cached image disks remain unchanged. The overlay disk must be
+large enough to hold the compressed payload, unpacked rootfs, and sandbox writes
+during the first prepare.
 
 ## Logs and debugging
 

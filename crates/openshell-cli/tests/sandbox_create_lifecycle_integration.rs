@@ -26,9 +26,6 @@ use openshell_core::proto::{
     ServiceStatus, SupervisorMessage, UpdateProviderRequest, WatchSandboxRequest,
     sandbox_stream_event,
 };
-use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
-};
 use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -705,7 +702,6 @@ async fn sandbox_create_keeps_command_sessions_by_default() {
         None,
         true,
         false,
-        None,
         None,
         None,
         None,
