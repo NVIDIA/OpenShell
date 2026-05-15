@@ -12,11 +12,13 @@
 //! apply but rejects the caller returns `Err(Status)`, which terminates
 //! the chain — fail-closed.
 //!
-//! This module is the abstraction PR (PR 1). Subsequent PRs slot in:
-//! - PR 2: `SandboxJwtAuthenticator` + `K8sServiceAccountAuthenticator`
-//! - PR 3: removal of the PR-1 legacy marker authenticator
+//! Live authenticators slotting into the chain:
+//! - [`super::sandbox_jwt::SandboxJwtAuthenticator`] — gateway-minted JWTs
+//! - [`super::k8s_sa::K8sServiceAccountAuthenticator`] — K8s projected SA
+//!   tokens (path-scoped to `IssueSandboxToken`)
+//! - [`super::oidc::OidcAuthenticator`] — user OIDC Bearer tokens
 
-use super::principal::{Principal, SandboxIdentitySource, SandboxPrincipal};
+use super::principal::Principal;
 use async_trait::async_trait;
 use std::sync::Arc;
 use tonic::Status;
@@ -87,45 +89,6 @@ impl std::fmt::Debug for AuthenticatorChain {
             .field("len", &self.authenticators.len())
             .finish()
     }
-}
-
-/// Authenticator that preserves the pre-refactor behavior for sandbox-class
-/// and dual-auth-no-Bearer paths.
-///
-/// Returns `Some(Principal::Sandbox)` with [`SandboxIdentitySource::LegacyMarker`]
-/// — the `sandbox_id` is left empty because no credential was verified. This
-/// matches the pre-PR-1 router which trusted the path list, not the caller.
-///
-/// PR 3 deletes this type once every sandbox call carries a gateway-minted
-/// JWT and the path-based branches are gone.
-pub struct LegacySandboxMarkerAuthenticator;
-
-#[async_trait]
-impl Authenticator for LegacySandboxMarkerAuthenticator {
-    async fn authenticate(
-        &self,
-        headers: &http::HeaderMap,
-        path: &str,
-    ) -> Result<Option<Principal>, Status> {
-        let is_sandbox_path = super::oidc::is_sandbox_method(path);
-        let is_dual_no_bearer =
-            super::oidc::is_dual_auth_method(path) && !has_bearer_token(headers);
-        if is_sandbox_path || is_dual_no_bearer {
-            return Ok(Some(Principal::Sandbox(SandboxPrincipal {
-                sandbox_id: String::new(),
-                source: SandboxIdentitySource::LegacyMarker,
-                trust_domain: None,
-            })));
-        }
-        Ok(None)
-    }
-}
-
-fn has_bearer_token(headers: &http::HeaderMap) -> bool {
-    headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.starts_with("Bearer "))
 }
 
 #[cfg(test)]
@@ -260,73 +223,6 @@ mod tests {
         let chain = AuthenticatorChain::new(vec![]);
         let result = chain
             .authenticate(&http::HeaderMap::new(), "/some/path")
-            .await
-            .unwrap();
-        assert!(result.is_none());
-    }
-
-    #[tokio::test]
-    async fn legacy_marker_recognizes_sandbox_method() {
-        let auth = LegacySandboxMarkerAuthenticator;
-        let result = auth
-            .authenticate(
-                &http::HeaderMap::new(),
-                "/openshell.v1.OpenShell/ReportPolicyStatus",
-            )
-            .await
-            .unwrap()
-            .expect("sandbox path must produce a principal");
-        match result {
-            Principal::Sandbox(p) => {
-                assert!(p.sandbox_id.is_empty(), "legacy marker has no verified id");
-                assert!(matches!(p.source, SandboxIdentitySource::LegacyMarker));
-            }
-            _ => panic!("expected sandbox principal"),
-        }
-    }
-
-    #[tokio::test]
-    async fn legacy_marker_recognizes_dual_auth_without_bearer() {
-        let auth = LegacySandboxMarkerAuthenticator;
-        let result = auth
-            .authenticate(
-                &http::HeaderMap::new(),
-                "/openshell.v1.OpenShell/UpdateConfig",
-            )
-            .await
-            .unwrap();
-        assert!(
-            result.is_some(),
-            "dual-auth without Bearer must mark sandbox"
-        );
-    }
-
-    #[tokio::test]
-    async fn legacy_marker_yields_to_dual_auth_with_bearer() {
-        let auth = LegacySandboxMarkerAuthenticator;
-        let mut headers = http::HeaderMap::new();
-        headers.insert(
-            "authorization",
-            http::HeaderValue::from_static("Bearer xyz"),
-        );
-        let result = auth
-            .authenticate(&headers, "/openshell.v1.OpenShell/UpdateConfig")
-            .await
-            .unwrap();
-        assert!(
-            result.is_none(),
-            "dual-auth WITH Bearer must fall through to the OIDC authenticator"
-        );
-    }
-
-    #[tokio::test]
-    async fn legacy_marker_skips_unrelated_paths() {
-        let auth = LegacySandboxMarkerAuthenticator;
-        let result = auth
-            .authenticate(
-                &http::HeaderMap::new(),
-                "/openshell.v1.OpenShell/ListSandboxes",
-            )
             .await
             .unwrap();
         assert!(result.is_none());

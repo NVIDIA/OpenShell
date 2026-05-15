@@ -299,6 +299,17 @@ fn build_env(
         );
     }
 
+    // 4. Gateway-minted sandbox JWT (PR 3 of the per-sandbox identity
+    //    series). Passed via env var; the supervisor reads it directly.
+    if let Some(s) = spec
+        && !s.sandbox_token.is_empty()
+    {
+        env.insert(
+            openshell_core::sandbox_env::SANDBOX_TOKEN.into(),
+            s.sandbox_token.clone(),
+        );
+    }
+
     env
 }
 

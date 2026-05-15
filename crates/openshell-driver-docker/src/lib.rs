@@ -979,6 +979,19 @@ fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig
         );
     }
 
+    // Gateway-minted sandbox JWT (PR 3 of the per-sandbox identity series).
+    // Passed via env var since Docker has no native secret mount that is
+    // simpler than the existing bind-mount pattern; the trust boundary
+    // (`docker inspect` access) is already equivalent to the TLS key mount.
+    if let Some(spec) = sandbox.spec.as_ref()
+        && !spec.sandbox_token.is_empty()
+    {
+        environment.insert(
+            openshell_core::sandbox_env::SANDBOX_TOKEN.to_string(),
+            spec.sandbox_token.clone(),
+        );
+    }
+
     let mut pairs = environment.into_iter().collect::<Vec<_>>();
     pairs.sort_by(|left, right| left.0.cmp(&right.0));
     pairs

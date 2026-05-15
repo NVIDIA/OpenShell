@@ -90,6 +90,13 @@ message DriverSandboxSpec {
   // (e.g. "0", "1"). When empty with gpu=true, the driver assigns the
   // first available GPU.
   string gpu_device = 10;
+  // Gateway-minted JWT identifying this sandbox to the gateway. Set by
+  // the gateway on create; the driver materialises it via its native
+  // secret mechanism (Docker/Podman/VM bind-mount a per-sandbox file;
+  // the Kubernetes driver ignores this field and relies on its projected
+  // ServiceAccount token bootstrap instead). Never echoed to the public
+  // Sandbox proto.
+  string sandbox_token = 11;
 }
 
 // Driver-owned runtime template consumed by the compute platform.

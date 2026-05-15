@@ -1147,8 +1147,28 @@ fn sandbox_template_to_k8s(
     if !template.labels.is_empty() {
         metadata.insert("labels".to_string(), serde_json::json!(template.labels));
     }
-    if let Some(annotations) = platform_config_struct(template, "annotations") {
-        metadata.insert("annotations".to_string(), annotations);
+    // Carry the sandbox UUID as a pod annotation so the gateway can resolve
+    // a projected SA token claim (pod name + uid) back to a sandbox identity
+    // when the supervisor calls `IssueSandboxToken` at startup. The gateway's
+    // K8s Role does NOT grant `patch pods`, so this annotation is
+    // effectively immutable post-create (see plan §11.8).
+    let mut pod_annotations = platform_config_struct(template, "annotations")
+        .and_then(|v| match v {
+            serde_json::Value::Object(map) => Some(map),
+            _ => None,
+        })
+        .unwrap_or_default();
+    if !params.sandbox_id.is_empty() {
+        pod_annotations.insert(
+            "openshell.io/sandbox-id".to_string(),
+            serde_json::Value::String(params.sandbox_id.to_string()),
+        );
+    }
+    if !pod_annotations.is_empty() {
+        metadata.insert(
+            "annotations".to_string(),
+            serde_json::Value::Object(pod_annotations),
+        );
     }
 
     let mut spec = serde_json::Map::new();
@@ -1235,17 +1255,26 @@ fn sandbox_template_to_k8s(
         }),
     );
 
-    // Mount client TLS secret for mTLS to the server.
+    // Mount client TLS secret for mTLS to the server, plus the projected
+    // ServiceAccount token used to bootstrap the sandbox's gateway JWT
+    // via `IssueSandboxToken`.
+    let mut volume_mounts: Vec<serde_json::Value> = Vec::new();
     if !params.client_tls_secret_name.is_empty() {
-        container.insert(
-            "volumeMounts".to_string(),
-            serde_json::json!([{
-                "name": "openshell-client-tls",
-                "mountPath": "/etc/openshell-tls/client",
-                "readOnly": true
-            }]),
-        );
+        volume_mounts.push(serde_json::json!({
+            "name": "openshell-client-tls",
+            "mountPath": "/etc/openshell-tls/client",
+            "readOnly": true
+        }));
     }
+    volume_mounts.push(serde_json::json!({
+        "name": "openshell-sa-token",
+        "mountPath": "/var/run/secrets/openshell",
+        "readOnly": true,
+    }));
+    container.insert(
+        "volumeMounts".to_string(),
+        serde_json::Value::Array(volume_mounts),
+    );
 
     if let Some(resources) = container_resources(template, gpu) {
         container.insert("resources".to_string(), resources);
@@ -1257,15 +1286,31 @@ fn sandbox_template_to_k8s(
 
     // Add TLS secret volume.  Mode 0400 (owner-read) prevents the
     // unprivileged sandbox user from reading the mTLS private key.
+    let mut volumes: Vec<serde_json::Value> = Vec::new();
     if !params.client_tls_secret_name.is_empty() {
-        spec.insert(
-            "volumes".to_string(),
-            serde_json::json!([{
-                "name": "openshell-client-tls",
-                "secret": { "secretName": params.client_tls_secret_name, "defaultMode": 256 }
-            }]),
-        );
+        volumes.push(serde_json::json!({
+            "name": "openshell-client-tls",
+            "secret": { "secretName": params.client_tls_secret_name, "defaultMode": 256 }
+        }));
     }
+    // Projected ServiceAccountToken volume — kubelet writes a short-lived
+    // audience-bound JWT into /var/run/secrets/openshell/token and rotates
+    // it automatically. The supervisor exchanges this for a gateway-minted
+    // JWT via `IssueSandboxToken` once at startup.
+    volumes.push(serde_json::json!({
+        "name": "openshell-sa-token",
+        "projected": {
+            "sources": [{
+                "serviceAccountToken": {
+                    "audience": "openshell-gateway",
+                    "expirationSeconds": 3600_i64,
+                    "path": "token"
+                }
+            }],
+            "defaultMode": 256
+        }
+    }));
+    spec.insert("volumes".to_string(), serde_json::Value::Array(volumes));
 
     // Add hostAliases so sandbox pods can reach the Docker host.
     if !params.host_gateway_ip.is_empty() {
@@ -1444,6 +1489,14 @@ fn apply_required_env(
             "/etc/openshell-tls/client/tls.key",
         );
     }
+    // Projected ServiceAccount token written by kubelet (see the volume
+    // definition in `sandbox_template_to_k8s`). The supervisor reads this
+    // and exchanges it for a gateway-minted JWT via `IssueSandboxToken`.
+    upsert_env(
+        env,
+        openshell_core::sandbox_env::K8S_SA_TOKEN_FILE,
+        "/var/run/secrets/openshell/token",
+    );
 }
 
 fn upsert_env(env: &mut Vec<serde_json::Value>, name: &str, value: &str) {

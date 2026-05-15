@@ -421,7 +421,11 @@ impl ComputeRuntime {
             .map(|_| ())
     }
 
-    pub async fn create_sandbox(&self, sandbox: Sandbox) -> Result<Sandbox, Status> {
+    pub async fn create_sandbox(
+        &self,
+        sandbox: Sandbox,
+        sandbox_token: Option<String>,
+    ) -> Result<Sandbox, Status> {
         let sandbox_id = sandbox.object_id().to_string();
 
         // Create with MustCreate condition to prevent duplicate creation race
@@ -452,7 +456,12 @@ impl ComputeRuntime {
                 }
             })?;
 
-        let driver_sandbox = driver_sandbox_from_public(&sandbox);
+        let mut driver_sandbox = driver_sandbox_from_public(&sandbox);
+        if let Some(token) = sandbox_token
+            && let Some(spec) = driver_sandbox.spec.as_mut()
+        {
+            spec.sandbox_token = token;
+        }
         match self
             .driver
             .create_sandbox(Request::new(CreateSandboxRequest {
@@ -1229,6 +1238,7 @@ fn driver_sandbox_spec_from_public(spec: &SandboxSpec) -> DriverSandboxSpec {
             .map(driver_sandbox_template_from_public),
         gpu: spec.gpu,
         gpu_device: spec.gpu_device.clone(),
+        sandbox_token: String::new(),
     }
 }
 

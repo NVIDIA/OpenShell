@@ -117,11 +117,18 @@ impl Authenticator for K8sServiceAccountAuthenticator {
     }
 }
 
-/// Live resolver backed by a `kube::Client`. PR 2 ships this with a
-/// `not_implemented` stub so the authenticator type and trait are in place
-/// for PR 3's K8s driver wiring. The `TokenReview` + pod-`GET`
-/// implementation lands when the K8s driver actually creates the
-/// projected SA volume (PR 3).
+/// Live resolver backed by a `kube::Client`.
+///
+/// Validates the projected `ServiceAccount` token locally against the
+/// apiserver's JWKS endpoint — no `TokenReview` API call required (so the
+/// gateway needs no `system:auth-delegator` cluster binding). The
+/// namespace-scoped `Role` granted in the Helm chart provides the only
+/// permission this resolver needs: `pods: get`, used to read the
+/// `openshell.io/sandbox-id` annotation.
+///
+/// The JWKS fetch + signature verification implementation lands in the
+/// follow-up that brings the K8s helm-dev demo end-to-end; PR 3 ships
+/// the wire break with Docker/Podman as the only exercised drivers.
 #[allow(dead_code)]
 pub struct LiveK8sResolver {
     client: kube::Client,
@@ -143,11 +150,12 @@ impl LiveK8sResolver {
 #[async_trait]
 impl K8sIdentityResolver for LiveK8sResolver {
     async fn resolve(&self, _token: &str) -> Result<Option<ResolvedK8sIdentity>, Status> {
-        // Implementation lands in PR 3 with the K8s driver wiring.
-        // Until then `IssueSandboxToken` is wired but only exercised via
-        // the test harness (see fake resolver below).
+        // Full JWKS verification + pod annotation lookup lands in the
+        // K8s-demo follow-up. Returning `Unimplemented` keeps the
+        // K8s-side `IssueSandboxToken` call from silently succeeding
+        // before the validator is in place.
         Err(Status::unimplemented(
-            "K8s ServiceAccount bootstrap not yet enabled",
+            "K8s ServiceAccount bootstrap pending JWKS implementation",
         ))
     }
 }

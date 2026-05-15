@@ -61,25 +61,22 @@ pub struct SandboxPrincipal {
 }
 
 /// How a [`SandboxPrincipal`] was authenticated.
+///
+/// Variant fields are populated by the producing authenticator and consumed
+/// by audit logging + the PR-4 IDOR guard. Until PR 4 lands those readers
+/// they look unused to the dead-code lint.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum SandboxIdentitySource {
-    /// PR-1 placeholder: the request matched a sandbox-class path or a
-    /// dual-auth path without a Bearer token. No credential was verified.
-    /// Removed in PR 3 once every sandbox call carries a gateway-minted JWT.
-    LegacyMarker,
     /// Gateway-minted JWT validated against the gateway's signing key.
-    /// Populated by PR 2's `SandboxJwtAuthenticator`.
-    #[allow(dead_code)]
+    /// Produced by [`super::sandbox_jwt::SandboxJwtAuthenticator`].
     BootstrapJwt { issuer: String, jti: String },
     /// Per-sandbox client certificate. Reserved for the v2 channel-bound
     /// identity follow-up.
-    #[allow(dead_code)]
     BootstrapCert { fingerprint: String },
     /// SPIRE-issued SVID. Reserved for the SPIFFE/SPIRE follow-up.
-    #[allow(dead_code)]
     SpiffeSvid { spiffe_id: String },
     /// K8s `ServiceAccount` token used to bootstrap a gateway-minted JWT
     /// via `IssueSandboxToken`. Populated only on that one RPC path.
-    #[allow(dead_code)]
     K8sServiceAccount { pod_name: String, pod_uid: String },
 }

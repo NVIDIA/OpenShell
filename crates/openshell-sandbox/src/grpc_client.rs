@@ -3,6 +3,21 @@
 
 //! gRPC client for fetching sandbox policy, provider environment, and inference
 //! route bundles from `OpenShell` server.
+//!
+//! Every request carries a gateway-minted JWT in the `Authorization` header
+//! (PR 3 of the per-sandbox identity series; see issue #1354). The token is
+//! resolved at startup from one of three sources:
+//!
+//! 1. `OPENSHELL_SANDBOX_TOKEN` — raw JWT in the env (test harness path).
+//! 2. `OPENSHELL_SANDBOX_TOKEN_FILE` — file containing the JWT (Docker /
+//!    Podman / VM drivers write this to a bundle file at sandbox-create
+//!    time).
+//! 3. `OPENSHELL_K8S_SA_TOKEN_FILE` — projected `ServiceAccount` JWT; the
+//!    supervisor exchanges it for a gateway JWT via `IssueSandboxToken`
+//!    once at startup.
+//!
+//! The resolved gateway JWT is held in process memory thereafter and
+//! injected on every outbound call by [`AuthInterceptor`].
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -10,15 +25,50 @@ use std::time::Duration;
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::proto::{
     DenialSummary, GetDraftPolicyRequest, GetInferenceBundleRequest, GetInferenceBundleResponse,
-    GetSandboxConfigRequest, GetSandboxProviderEnvironmentRequest, PolicyChunk, PolicySource,
-    PolicyStatus, ReportPolicyStatusRequest, SandboxPolicy as ProtoSandboxPolicy,
-    SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, UpdateConfigRequest,
-    inference_client::InferenceClient, open_shell_client::OpenShellClient,
+    GetSandboxConfigRequest, GetSandboxProviderEnvironmentRequest, IssueSandboxTokenRequest,
+    PolicyChunk, PolicySource, PolicyStatus, ReportPolicyStatusRequest,
+    SandboxPolicy as ProtoSandboxPolicy, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse,
+    UpdateConfigRequest, inference_client::InferenceClient, open_shell_client::OpenShellClient,
 };
+use openshell_core::sandbox_env;
+use tonic::Status;
+use tonic::metadata::AsciiMetadataValue;
+use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
-use tracing::debug;
+use tracing::{debug, info};
 
-/// Create a channel to the `OpenShell` server.
+/// Channel type after the [`AuthInterceptor`] is applied. Aliased so the
+/// generated client type signatures stay readable.
+pub type AuthedChannel = InterceptedService<Channel, AuthInterceptor>;
+
+/// gRPC interceptor that injects `authorization: Bearer <token>` on every
+/// outbound request.
+#[derive(Clone)]
+pub struct AuthInterceptor {
+    bearer: AsciiMetadataValue,
+}
+
+impl AuthInterceptor {
+    fn new(token: &str) -> Result<Self> {
+        let bearer = AsciiMetadataValue::try_from(format!("Bearer {token}"))
+            .into_diagnostic()
+            .wrap_err("sandbox JWT contained characters not valid for a header value")?;
+        Ok(Self { bearer })
+    }
+}
+
+impl tonic::service::Interceptor for AuthInterceptor {
+    fn call(
+        &mut self,
+        mut req: tonic::Request<()>,
+    ) -> std::result::Result<tonic::Request<()>, Status> {
+        req.metadata_mut()
+            .insert("authorization", self.bearer.clone());
+        Ok(req)
+    }
+}
+
+/// Build the plain (un-intercepted) gRPC channel.
 ///
 /// When the endpoint uses `https://`, mTLS is configured using these env vars:
 /// - `OPENSHELL_TLS_CA` -- path to the CA certificate
@@ -27,7 +77,7 @@ use tracing::debug;
 ///
 /// When the endpoint uses `http://`, a plaintext connection is used (for
 /// deployments where TLS is disabled, e.g. behind a Cloudflare Tunnel).
-async fn connect_channel(endpoint: &str) -> Result<Channel> {
+async fn build_plain_channel(endpoint: &str) -> Result<Channel> {
     let mut ep = Endpoint::from_shared(endpoint.to_string())
         .into_diagnostic()
         .wrap_err("invalid gRPC endpoint")?
@@ -43,13 +93,13 @@ async fn connect_channel(endpoint: &str) -> Result<Channel> {
     let tls_enabled = endpoint.starts_with("https://");
 
     if tls_enabled {
-        let ca_path = std::env::var(openshell_core::sandbox_env::TLS_CA)
+        let ca_path = std::env::var(sandbox_env::TLS_CA)
             .into_diagnostic()
             .wrap_err("OPENSHELL_TLS_CA is required")?;
-        let cert_path = std::env::var(openshell_core::sandbox_env::TLS_CERT)
+        let cert_path = std::env::var(sandbox_env::TLS_CERT)
             .into_diagnostic()
             .wrap_err("OPENSHELL_TLS_CERT is required")?;
-        let key_path = std::env::var(openshell_core::sandbox_env::TLS_KEY)
+        let key_path = std::env::var(sandbox_env::TLS_KEY)
             .into_diagnostic()
             .wrap_err("OPENSHELL_TLS_KEY is required")?;
 
@@ -79,24 +129,84 @@ async fn connect_channel(endpoint: &str) -> Result<Channel> {
         .wrap_err("failed to connect to OpenShell server")
 }
 
-/// Create a channel to the `OpenShell` server (public for use by `supervisor_session`).
-pub async fn connect_channel_pub(endpoint: &str) -> Result<Channel> {
+/// Build a Bearer-authenticated channel to the gateway.
+///
+/// Resolves the sandbox JWT via the three-step lookup described at the
+/// module level (env → file → K8s SA bootstrap exchange) and wraps the
+/// resulting channel in [`AuthInterceptor`].
+async fn connect_channel(endpoint: &str) -> Result<AuthedChannel> {
+    let channel = build_plain_channel(endpoint).await?;
+    let token = acquire_sandbox_token(endpoint, &channel).await?;
+    let interceptor = AuthInterceptor::new(&token)?;
+    Ok(InterceptedService::new(channel, interceptor))
+}
+
+/// Resolve the sandbox JWT used to authenticate every outbound RPC.
+///
+/// `endpoint` is logged on errors but never used for transport here; the
+/// actual network call lives inside this function only on the K8s
+/// bootstrap path, which uses `plain_channel` to call `IssueSandboxToken`
+/// once before the steady-state Bearer-authenticated channel is built.
+async fn acquire_sandbox_token(endpoint: &str, plain_channel: &Channel) -> Result<String> {
+    if let Ok(t) = std::env::var(sandbox_env::SANDBOX_TOKEN)
+        && !t.is_empty()
+    {
+        debug!(source = "env", "loaded sandbox token");
+        return Ok(t);
+    }
+
+    if let Ok(path) = std::env::var(sandbox_env::SANDBOX_TOKEN_FILE)
+        && !path.is_empty()
+    {
+        let contents = std::fs::read_to_string(&path)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to read sandbox token from {path}"))?;
+        debug!(source = "file", path = %path, "loaded sandbox token");
+        return Ok(contents.trim().to_string());
+    }
+
+    if let Ok(sa_path) = std::env::var(sandbox_env::K8S_SA_TOKEN_FILE)
+        && !sa_path.is_empty()
+    {
+        let sa_token = std::fs::read_to_string(&sa_path)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to read K8s SA token from {sa_path}"))?
+            .trim()
+            .to_string();
+        info!(endpoint = %endpoint, "exchanging K8s ServiceAccount token for sandbox JWT");
+        let interceptor = AuthInterceptor::new(&sa_token)?;
+        let bootstrap = InterceptedService::new(plain_channel.clone(), interceptor);
+        let mut client = OpenShellClient::new(bootstrap);
+        let resp = client
+            .issue_sandbox_token(IssueSandboxTokenRequest {})
+            .await
+            .into_diagnostic()
+            .wrap_err("IssueSandboxToken bootstrap exchange failed")?;
+        return Ok(resp.into_inner().token);
+    }
+
+    Err(miette::miette!(
+        "no sandbox token source available — set one of {}, {}, or {}",
+        sandbox_env::SANDBOX_TOKEN,
+        sandbox_env::SANDBOX_TOKEN_FILE,
+        sandbox_env::K8S_SA_TOKEN_FILE,
+    ))
+}
+
+/// Build an authenticated channel for direct external use (e.g. the
+/// long-lived `supervisor_session` control stream).
+pub async fn connect_channel_pub(endpoint: &str) -> Result<AuthedChannel> {
     connect_channel(endpoint).await
 }
 
 /// Connect to the `OpenShell` server.
-///
-/// Sandboxes authenticate to the gateway via the mTLS client certificate
-/// configured by `connect_channel`. They do not present an OIDC Bearer
-/// token; the gateway recognises sandbox-class callers by absence of a
-/// Bearer header on the request.
-async fn connect(endpoint: &str) -> Result<OpenShellClient<Channel>> {
+async fn connect(endpoint: &str) -> Result<OpenShellClient<AuthedChannel>> {
     let channel = connect_channel(endpoint).await?;
     Ok(OpenShellClient::new(channel))
 }
 
 /// Connect to the inference service.
-async fn connect_inference(endpoint: &str) -> Result<InferenceClient<Channel>> {
+async fn connect_inference(endpoint: &str) -> Result<InferenceClient<AuthedChannel>> {
     let channel = connect_channel(endpoint).await?;
     Ok(InferenceClient::new(channel))
 }
@@ -118,7 +228,7 @@ pub async fn fetch_policy(endpoint: &str, sandbox_id: &str) -> Result<Option<Pro
 
 /// Fetch sandbox policy using an existing client connection.
 async fn fetch_policy_with_client(
-    client: &mut OpenShellClient<Channel>,
+    client: &mut OpenShellClient<AuthedChannel>,
     sandbox_id: &str,
 ) -> Result<Option<ProtoSandboxPolicy>> {
     let response = client
@@ -142,7 +252,7 @@ async fn fetch_policy_with_client(
 
 /// Sync a locally-discovered policy using an existing client connection.
 async fn sync_policy_with_client(
-    client: &mut OpenShellClient<Channel>,
+    client: &mut OpenShellClient<AuthedChannel>,
     sandbox: &str,
     policy: &ProtoSandboxPolicy,
 ) -> Result<()> {
@@ -238,7 +348,7 @@ pub async fn fetch_provider_environment(
 /// and status reporting, avoiding per-request TLS handshake overhead.
 #[derive(Clone)]
 pub struct CachedOpenShellClient {
-    client: OpenShellClient<Channel>,
+    client: OpenShellClient<AuthedChannel>,
 }
 
 /// Settings poll result returned by [`CachedOpenShellClient::poll_settings`].
@@ -269,7 +379,7 @@ impl CachedOpenShellClient {
     }
 
     /// Get a clone of the underlying tonic client for direct RPC calls.
-    pub fn raw_client(&self) -> OpenShellClient<Channel> {
+    pub fn raw_client(&self) -> OpenShellClient<AuthedChannel> {
         self.client.clone()
     }
 

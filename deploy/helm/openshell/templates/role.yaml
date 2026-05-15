@@ -29,3 +29,14 @@ rules:
       - get
       - list
       - watch
+  # Per-sandbox identity (issue #1354): the gateway resolves a sandbox
+  # pod's projected SA token to its `openshell.io/sandbox-id` annotation
+  # via a pod GET when the supervisor calls IssueSandboxToken. patch is
+  # intentionally NOT granted — the annotation is set once at pod create
+  # and must remain immutable for the lifetime of the sandbox.
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - get

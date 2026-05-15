@@ -10,9 +10,9 @@
 #![allow(clippy::cast_precision_loss)] // f64->f32 for confidence scores
 #![allow(clippy::items_after_statements)] // DB_PORTS const inside function
 
+use crate::ServerState;
 use crate::persistence::{DraftChunkRecord, ObjectId, ObjectName, ObjectType, PolicyRecord, Store};
 use crate::policy_store::PolicyStoreExt;
-use crate::{ServerState, auth::oidc};
 use openshell_core::proto::policy_merge_operation;
 use openshell_core::proto::setting_value;
 use openshell_core::proto::{
@@ -315,7 +315,12 @@ fn truncate_for_log(input: &str, max_chars: usize) -> String {
 }
 
 fn is_sandbox_caller<T>(request: &Request<T>) -> bool {
-    oidc::is_sandbox_caller(request.metadata())
+    matches!(
+        request
+            .extensions()
+            .get::<crate::auth::principal::Principal>(),
+        Some(crate::auth::principal::Principal::Sandbox(_))
+    )
 }
 
 /// Sandbox-class callers may only perform sandbox-scoped policy sync. They
@@ -2873,13 +2878,36 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_caller_marker_detected_from_metadata() {
+    fn sandbox_caller_detected_from_principal_extension() {
+        use crate::auth::principal::{Principal, SandboxIdentitySource, SandboxPrincipal};
         let mut req = Request::new(());
-        req.metadata_mut().insert(
-            oidc::INTERNAL_AUTH_SOURCE_HEADER,
-            oidc::AUTH_SOURCE_SANDBOX.parse().unwrap(),
-        );
+        req.extensions_mut()
+            .insert(Principal::Sandbox(SandboxPrincipal {
+                sandbox_id: "test-sandbox".to_string(),
+                source: SandboxIdentitySource::BootstrapJwt {
+                    issuer: "openshell-gateway:test".to_string(),
+                    jti: "j-1".to_string(),
+                },
+                trust_domain: None,
+            }));
         assert!(is_sandbox_caller(&req));
+    }
+
+    #[test]
+    fn user_principal_not_treated_as_sandbox_caller() {
+        use crate::auth::identity::{Identity, IdentityProvider};
+        use crate::auth::principal::{Principal, UserPrincipal};
+        let mut req = Request::new(());
+        req.extensions_mut().insert(Principal::User(UserPrincipal {
+            identity: Identity {
+                subject: "alice".to_string(),
+                display_name: None,
+                roles: vec![],
+                scopes: vec![],
+                provider: IdentityProvider::Oidc,
+            },
+        }));
+        assert!(!is_sandbox_caller(&req));
     }
 
     // ---- Sandbox without policy ----

@@ -99,12 +99,6 @@ pub(super) async fn handle_create_sandbox(
     }
 
     let id = uuid::Uuid::new_v4().to_string();
-    // PR 3 wires `state.sandbox_jwt_issuer.mint(&id)` here for singleplayer
-    // drivers (Docker / Podman / VM), passing the minted token through the
-    // driver call so it lands in the sandbox bundle. K8s sandboxes skip
-    // this mint and exchange a projected ServiceAccount token via
-    // `IssueSandboxToken` at supervisor startup.
-
     let name = if request.name.is_empty() {
         petname::petname(2, "-").unwrap_or_else(generate_name)
     } else {
@@ -139,7 +133,28 @@ pub(super) async fn handle_create_sandbox(
             status
         })?;
 
-    let sandbox = state.compute.create_sandbox(sandbox).await?;
+    // Mint the gateway JWT for singleplayer drivers. K8s sandboxes skip
+    // this mint and bootstrap via `IssueSandboxToken` at supervisor
+    // startup; identifying "is this K8s?" lives in the compute layer, so
+    // we mint unconditionally here when the issuer is configured and let
+    // the K8s driver simply ignore the field.
+    let sandbox_token = state.sandbox_jwt_issuer.as_ref().map(|issuer| {
+        issuer.mint(&id).map(|minted| {
+            tracing::info!(
+                sandbox_id = %id,
+                jti = %minted.jti,
+                "minted sandbox JWT"
+            );
+            minted.token
+        })
+    });
+    let sandbox_token = match sandbox_token {
+        Some(Ok(token)) => Some(token),
+        Some(Err(status)) => return Err(status),
+        None => None,
+    };
+
+    let sandbox = state.compute.create_sandbox(sandbox, sandbox_token).await?;
 
     info!(
         sandbox_id = %id,

@@ -37,6 +37,7 @@ fn test_sandbox() -> DriverSandbox {
             }),
             gpu: false,
             gpu_device: String::new(),
+            sandbox_token: String::new(),
         }),
         status: None,
     }

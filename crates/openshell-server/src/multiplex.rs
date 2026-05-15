@@ -32,7 +32,7 @@ use tracing::Span;
 
 use crate::{
     OpenShellService, ServerState,
-    auth::authenticator::{AuthenticatorChain, LegacySandboxMarkerAuthenticator},
+    auth::authenticator::AuthenticatorChain,
     auth::authz::AuthzPolicy,
     auth::identity::Identity,
     auth::oidc::{self, OidcAuthenticator},
@@ -260,23 +260,18 @@ where
 /// Assemble the authenticator chain for the gateway.
 ///
 /// Chain order (first-match-wins):
-/// 1. [`K8sServiceAccountAuthenticator`] (path-scoped to `IssueSandboxToken`)
+/// 1. `K8sServiceAccountAuthenticator` (path-scoped to `IssueSandboxToken`)
 ///    — exchanges a projected SA token for a `Principal::Sandbox` so the
 ///    `IssueSandboxToken` handler can mint a gateway JWT. No-op on every
 ///    other path; only present when the gateway runs in-cluster.
-/// 2. [`SandboxJwtAuthenticator`] — validates gateway-minted JWTs. Recognized
+/// 2. `SandboxJwtAuthenticator` — validates gateway-minted JWTs. Recognized
 ///    via a distinctive `kid` so non-matching Bearer tokens fall through.
-/// 3. [`LegacySandboxMarkerAuthenticator`] — PR-1 holdover that produces a
-///    `Principal::Sandbox` for sandbox/dual-auth paths without a Bearer.
-///    Removed in PR 3.
-/// 4. [`OidcAuthenticator`] — validates user Bearer tokens against the
-///    configured OIDC issuer. Only added when OIDC is configured.
+/// 3. `OidcAuthenticator` — validates user Bearer tokens against the
+///    configured OIDC issuer.
 ///
-/// When OIDC is *and* sandbox-JWT signing are both unconfigured (a barebones
-/// dev gateway), the chain is left as `None` so the router short-circuits to
-/// pass-through. The legacy marker can satisfy sandbox-class routes only
-/// when paired with an OIDC authenticator that gates user routes, so we
-/// require at least one of OIDC or sandbox JWT to build a chain.
+/// When neither OIDC nor gateway-minted JWTs are configured (a barebones
+/// dev gateway), the chain is left as `None` so the router short-circuits
+/// to pass-through.
 fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> {
     let mut authenticators: Vec<Arc<dyn crate::auth::authenticator::Authenticator>> = Vec::new();
     if let Some(k8s) = state.k8s_sa_authenticator.clone() {
@@ -285,13 +280,10 @@ fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> 
     if let Some(jwt) = state.sandbox_jwt_authenticator.clone() {
         authenticators.push(jwt);
     }
-    authenticators.push(Arc::new(LegacySandboxMarkerAuthenticator));
     if let Some(cache) = state.oidc_cache.clone() {
         authenticators.push(Arc::new(OidcAuthenticator::new(cache)));
-    } else if state.sandbox_jwt_authenticator.is_none() {
-        // Neither OIDC nor gateway-minted JWTs are configured — preserve
-        // the pre-PR-1 "open by default" dev behavior by returning no chain
-        // so the router short-circuits to pass-through.
+    }
+    if authenticators.is_empty() {
         return None;
     }
     Some(AuthenticatorChain::new(authenticators))
@@ -376,10 +368,10 @@ where
 
         Box::pin(async move {
             let mut req = req;
-            oidc::clear_internal_auth_markers(req.headers_mut());
 
             // No chain configured — pass through. Preserves today's
-            // "OIDC None means open" behavior for dev/fronting-proxy modes.
+            // "auth not configured means open" behavior for dev /
+            // fronting-proxy deployments.
             let Some(chain) = chain else {
                 return inner.ready().await?.call(req).await;
             };
@@ -406,20 +398,14 @@ where
             };
 
             // Authorize user principals via RBAC. Sandbox principals get
-            // their PR-4 equality check at the handler level; legacy markers
-            // (PR-1) bypass RBAC, matching pre-refactor behavior.
+            // a per-handler `sandbox_id` equality check in PR 4; right now
+            // they bypass RBAC because the public sandbox-class methods
+            // they call were path-bypassed before this refactor too.
             if let Principal::User(ref user) = principal
                 && let Some(ref policy) = authz_policy
                 && let Err(status) = policy.check(&user.identity, &path)
             {
                 return Ok(status_response(status));
-            }
-
-            // PR-1 backwards-compat: handlers still consume the metadata
-            // marker today. Insert it for sandbox principals so existing
-            // policy-handler logic continues to work. PR 3 removes this.
-            if matches!(principal, Principal::Sandbox(_)) {
-                oidc::mark_sandbox_caller(req.headers_mut());
             }
 
             req.extensions_mut().insert(principal);
@@ -878,24 +864,21 @@ mod tests {
         type RecordedPrincipal = Arc<Mutex<Option<Principal>>>;
 
         /// Service that snapshots the `Principal` from request extensions
-        /// and the `x-openshell-auth-source` header, then returns 200 OK.
+        /// and returns 200 OK. Used by router-level tests to assert the
+        /// chain's effect on the downstream service.
         #[derive(Clone)]
         struct PrincipalRecorder {
             recorded: RecordedPrincipal,
-            sandbox_marker: Arc<Mutex<bool>>,
         }
 
         impl PrincipalRecorder {
-            fn new() -> (Self, RecordedPrincipal, Arc<Mutex<bool>>) {
+            fn new() -> (Self, RecordedPrincipal) {
                 let recorded = Arc::new(Mutex::new(None));
-                let marker = Arc::new(Mutex::new(false));
                 (
                     Self {
                         recorded: recorded.clone(),
-                        sandbox_marker: marker.clone(),
                     },
                     recorded,
-                    marker,
                 )
             }
         }
@@ -911,12 +894,7 @@ mod tests {
 
             fn call(&mut self, req: Request<B>) -> Self::Future {
                 let principal = req.extensions().get::<Principal>().cloned();
-                let has_marker = req
-                    .headers()
-                    .get(oidc::INTERNAL_AUTH_SOURCE_HEADER)
-                    .is_some_and(|v| v.as_bytes() == oidc::AUTH_SOURCE_SANDBOX.as_bytes());
                 *self.recorded.lock().unwrap() = principal;
-                *self.sandbox_marker.lock().unwrap() = has_marker;
                 Box::pin(async move {
                     let body = tonic::body::BoxBody::new(
                         Full::new(Bytes::new())
@@ -949,9 +927,12 @@ mod tests {
 
         fn sandbox_principal() -> Principal {
             Principal::Sandbox(SandboxPrincipal {
-                sandbox_id: String::new(),
-                source: SandboxIdentitySource::LegacyMarker,
-                trust_domain: None,
+                sandbox_id: "sandbox-a".to_string(),
+                source: SandboxIdentitySource::BootstrapJwt {
+                    issuer: "openshell-gateway:test".to_string(),
+                    jti: "j-1".to_string(),
+                },
+                trust_domain: Some("openshell".to_string()),
             })
         }
 
@@ -961,7 +942,7 @@ mod tests {
                 "alice",
             )))));
             let chain = AuthenticatorChain::new(vec![mock]);
-            let (recorder, seen, _) = PrincipalRecorder::new();
+            let (recorder, seen) = PrincipalRecorder::new();
             let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
             let _ = router
                 .call(empty_request("/openshell.v1.OpenShell/ListSandboxes"))
@@ -975,32 +956,27 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn sandbox_principal_inserts_metadata_marker_for_backcompat() {
-            // PR-1 keeps the metadata marker so handlers that still read it
-            // (until PR 3/4 swap them over to extensions) keep working.
+        async fn sandbox_principal_lands_in_request_extensions() {
             let mock = Arc::new(MockAuthenticator::returning(Ok(Some(sandbox_principal()))));
             let chain = AuthenticatorChain::new(vec![mock]);
-            let (recorder, seen, marker_seen) = PrincipalRecorder::new();
+            let (recorder, seen) = PrincipalRecorder::new();
             let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
             let _ = router
                 .call(empty_request("/openshell.v1.OpenShell/ReportPolicyStatus"))
                 .await
                 .unwrap();
-            assert!(
-                matches!(seen.lock().unwrap().clone(), Some(Principal::Sandbox(_))),
-                "principal must reach extensions"
-            );
-            assert!(
-                *marker_seen.lock().unwrap(),
-                "sandbox principals must also set the legacy metadata marker"
-            );
+            let captured = seen.lock().unwrap().clone();
+            match captured {
+                Some(Principal::Sandbox(p)) => assert_eq!(p.sandbox_id, "sandbox-a"),
+                other => panic!("expected sandbox principal, got {other:?}"),
+            }
         }
 
         #[tokio::test]
         async fn missing_principal_returns_unauthenticated() {
             let mock = Arc::new(MockAuthenticator::returning(Ok(None)));
             let chain = AuthenticatorChain::new(vec![mock]);
-            let (recorder, seen, _) = PrincipalRecorder::new();
+            let (recorder, seen) = PrincipalRecorder::new();
             let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
             let res = router
                 .call(empty_request("/openshell.v1.OpenShell/ListSandboxes"))
@@ -1021,7 +997,7 @@ mod tests {
                 tonic::Status::unauthenticated("forged"),
             )));
             let chain = AuthenticatorChain::new(vec![mock]);
-            let (recorder, seen, _) = PrincipalRecorder::new();
+            let (recorder, seen) = PrincipalRecorder::new();
             let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
             let res = router
                 .call(empty_request("/openshell.v1.OpenShell/ListSandboxes"))
@@ -1045,7 +1021,7 @@ mod tests {
                 tonic::Status::unauthenticated("would reject"),
             )));
             let chain = AuthenticatorChain::new(vec![mock.clone()]);
-            let (recorder, _, _) = PrincipalRecorder::new();
+            let (recorder, _) = PrincipalRecorder::new();
             let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
             let res = router
                 .call(empty_request("/openshell.v1.OpenShell/Health"))
@@ -1053,26 +1029,6 @@ mod tests {
                 .unwrap();
             assert_eq!(res.status(), 200);
             assert_eq!(mock.call_count(), 0, "health must not consult the chain");
-        }
-
-        #[tokio::test]
-        async fn external_auth_source_marker_is_stripped() {
-            let mock = Arc::new(MockAuthenticator::returning(Ok(Some(user_principal(
-                "alice",
-            )))));
-            let chain = AuthenticatorChain::new(vec![mock]);
-            let (recorder, _, marker_seen) = PrincipalRecorder::new();
-            let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
-            let mut req = empty_request("/openshell.v1.OpenShell/ListSandboxes");
-            req.headers_mut().insert(
-                oidc::INTERNAL_AUTH_SOURCE_HEADER,
-                HeaderValue::from_static(oidc::AUTH_SOURCE_SANDBOX),
-            );
-            let _ = router.call(req).await.unwrap();
-            assert!(
-                !*marker_seen.lock().unwrap(),
-                "external sandbox marker must be stripped before auth"
-            );
         }
     }
 }
