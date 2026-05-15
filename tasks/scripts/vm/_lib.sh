@@ -74,6 +74,38 @@ download_umoci_binary() {
     return 1
 }
 
+# Map a VM runtime platform to the Linux guest umoci architecture.
+# Usage: umoci_guest_arch_for_platform <platform>
+umoci_guest_arch_for_platform() {
+    local platform="$1"
+
+    case "$platform" in
+        linux-aarch64|darwin-aarch64) echo "arm64" ;;
+        linux-x86_64)                 echo "amd64" ;;
+        *)
+            echo "Error: Unsupported platform for umoci guest binary: ${platform}" >&2
+            return 1
+            ;;
+    esac
+}
+
+# Ensure an extracted runtime directory contains the guest umoci binary.
+# Usage: ensure_umoci_for_platform <runtime_dir> <platform> <version>
+ensure_umoci_for_platform() {
+    local runtime_dir="$1"
+    local platform="$2"
+    local version="$3"
+
+    if [ -f "${runtime_dir}/umoci" ]; then
+        return 0
+    fi
+
+    local guest_arch
+    guest_arch="$(umoci_guest_arch_for_platform "$platform")"
+    echo "    Runtime tarball has no umoci"
+    download_umoci_binary "${runtime_dir}/umoci" "$version" "$guest_arch"
+}
+
 # ── Compression helpers ─────────────────────────────────────────────────
 
 # Compress a single file with zstd level 19, reporting sizes.

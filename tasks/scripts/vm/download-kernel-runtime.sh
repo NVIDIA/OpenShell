@@ -111,19 +111,7 @@ mkdir -p "$EXTRACT_DIR"
 
 zstd -d "${DOWNLOAD_DIR}/${TARBALL_NAME}" --stdout | tar -xf - -C "$EXTRACT_DIR"
 
-if [ ! -f "${EXTRACT_DIR}/umoci" ]; then
-    UMOCI_GUEST_ARCH=""
-    case "$PLATFORM" in
-        linux-aarch64|darwin-aarch64) UMOCI_GUEST_ARCH="arm64" ;;
-        linux-x86_64)                 UMOCI_GUEST_ARCH="amd64" ;;
-        *)
-            echo "Error: Unsupported platform for umoci guest binary: ${PLATFORM}" >&2
-            exit 1
-            ;;
-    esac
-    echo "    Runtime tarball has no umoci"
-    download_umoci_binary "${EXTRACT_DIR}/umoci" "${UMOCI_VERSION}" "${UMOCI_GUEST_ARCH}"
-fi
+ensure_umoci_for_platform "$EXTRACT_DIR" "$PLATFORM" "$UMOCI_VERSION"
 
 echo "    Extracted files:"
 ls -lah "$EXTRACT_DIR"

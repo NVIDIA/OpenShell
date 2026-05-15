@@ -134,24 +134,10 @@ jobs:
         run: |
           set -euo pipefail
           COMPRESSED_DIR="${PWD}/target/vm-runtime-compressed"
-          mkdir -p "$COMPRESSED_DIR"
-
-          EXTRACT_DIR=$(mktemp -d)
-          zstd -d "runtime-download/vm-runtime-${{ matrix.platform }}.tar.zst" --stdout \
-            | tar -xf - -C "$EXTRACT_DIR"
-
-          echo "Extracted runtime files:"
-          ls -lah "$EXTRACT_DIR"
-
-          for file in "$EXTRACT_DIR"/*; do
-            [ -f "$file" ] || continue
-            name=$(basename "$file")
-            [ "$name" = "provenance.json" ] && continue
-            zstd -19 -f -q -T0 -o "${COMPRESSED_DIR}/${name}.zst" "$file"
-          done
-
-          echo "Staged compressed runtime artifacts:"
-          ls -lah "$COMPRESSED_DIR"
+          VM_RUNTIME_TARBALL="${PWD}/runtime-download/vm-runtime-${{ matrix.platform }}.tar.zst" \
+          VM_RUNTIME_PLATFORM="${{ matrix.platform }}" \
+          OPENSHELL_VM_RUNTIME_COMPRESSED_DIR="$COMPRESSED_DIR" \
+            tasks/scripts/vm/compress-vm-runtime.sh
 
       - name: Build bundled supervisor
         run: |

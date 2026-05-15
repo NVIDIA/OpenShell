@@ -127,6 +127,23 @@ if [ -n "${VM_RUNTIME_TARBALL:-}" ]; then
     # Extract tarball contents
     zstd -d "${VM_RUNTIME_TARBALL}" --stdout | tar -xf - -C "$WORK_DIR"
 
+    VM_RUNTIME_PLATFORM="${VM_RUNTIME_PLATFORM:-}"
+    if [ -z "$VM_RUNTIME_PLATFORM" ]; then
+        case "$(basename "$VM_RUNTIME_TARBALL")" in
+            vm-runtime-darwin-aarch64.tar.zst) VM_RUNTIME_PLATFORM="darwin-aarch64" ;;
+            vm-runtime-linux-aarch64.tar.zst)  VM_RUNTIME_PLATFORM="linux-aarch64" ;;
+            vm-runtime-linux-x86_64.tar.zst)   VM_RUNTIME_PLATFORM="linux-x86_64" ;;
+        esac
+    fi
+    if [ ! -f "${WORK_DIR}/umoci" ]; then
+        if [ -z "$VM_RUNTIME_PLATFORM" ]; then
+            echo "Error: VM_RUNTIME_TARBALL has no umoci and platform could not be inferred." >&2
+            echo "       Set VM_RUNTIME_PLATFORM to linux-aarch64, linux-x86_64, or darwin-aarch64." >&2
+            exit 1
+        fi
+        ensure_umoci_for_platform "$WORK_DIR" "$VM_RUNTIME_PLATFORM" "$UMOCI_VERSION"
+    fi
+
     echo "    Extracted files:"
     ls -lah "$WORK_DIR"
 
