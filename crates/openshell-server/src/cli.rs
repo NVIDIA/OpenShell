@@ -469,7 +469,7 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
             args.tls_key = Some(tls.key_path.clone());
         }
         if args.tls_client_ca.is_none() && arg_defaulted(matches, "tls_client_ca") {
-            args.tls_client_ca = tls.client_ca_path.clone();
+            args.tls_client_ca.clone_from(&tls.client_ca_path);
         }
     }
     // OIDC fields
