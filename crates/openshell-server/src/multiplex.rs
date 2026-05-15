@@ -323,6 +323,7 @@ pub struct AuthGrpcRouter<S> {
 }
 
 impl<S> AuthGrpcRouter<S> {
+    #[cfg(test)]
     fn new(
         inner: S,
         authenticator_chain: Option<AuthenticatorChain>,

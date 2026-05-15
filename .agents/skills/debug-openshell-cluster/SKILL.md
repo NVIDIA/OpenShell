@@ -144,8 +144,15 @@ Check required Helm deployment secrets:
 kubectl -n openshell get secret \
   openshell-server-tls \
   openshell-server-client-ca \
-  openshell-client-tls
+  openshell-client-tls \
+  openshell-jwt-keys
 ```
+
+If the gateway exits with `failed to read sandbox JWT signing key from
+/etc/openshell-jwt/signing.pem`, verify that `openshell-jwt-keys` contains
+`signing.pem`, `public.pem`, and `kid`, and that the StatefulSet mounts the
+`sandbox-jwt` secret at `/etc/openshell-jwt`. The sandbox JWT mount is required
+even when local Helm values disable TLS.
 
 Check the image references currently used by the gateway deployment:
 
