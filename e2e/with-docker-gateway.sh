@@ -448,27 +448,61 @@ else
 fi
 
 echo "Starting openshell-gateway on port ${HOST_PORT} (namespace: ${E2E_NAMESPACE})..."
+
+# Driver-specific options moved from CLI flags into a TOML config table
+# (commit 560550d2). Synthesize a minimal config here and pass --config.
+# Quote a value as a TOML basic string: wrap in double quotes and escape
+# any embedded backslashes / double quotes. Adequate for paths, image
+# refs, and namespace identifiers — none of which contain TOML special
+# characters in practice.
+toml_string() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf '"%s"' "${value}"
+}
+
+GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
+{
+  printf '[openshell]\nversion = 1\n\n'
+  printf '[openshell.gateway]\nlog_level = "info"\n\n'
+  printf '[openshell.drivers.docker]\n'
+  printf 'sandbox_namespace = %s\n'    "$(toml_string "${E2E_NAMESPACE}")"
+  printf 'network_name = %s\n'         "$(toml_string "${DOCKER_NETWORK_NAME}")"
+  printf 'grpc_endpoint = %s\n'        "$(toml_string "${GATEWAY_ENDPOINT}")"
+  printf 'default_image = %s\n'        "$(toml_string "${SANDBOX_IMAGE}")"
+  printf 'image_pull_policy = "IfNotPresent"\n'
+  printf 'guest_tls_ca = %s\n'         "$(toml_string "${PKI_DIR}/ca.crt")"
+  printf 'guest_tls_cert = %s\n'       "$(toml_string "${PKI_DIR}/client.crt")"
+  printf 'guest_tls_key = %s\n'        "$(toml_string "${PKI_DIR}/client.key")"
+  # DOCKER_SUPERVISOR_ARGS holds either ("--docker-supervisor-bin" "<path>")
+  # or ("--docker-supervisor-image" "<image>"); both map to TOML keys on
+  # the docker driver config.
+  for ((i=0; i<${#DOCKER_SUPERVISOR_ARGS[@]}; i+=2)); do
+    case "${DOCKER_SUPERVISOR_ARGS[$i]}" in
+      --docker-supervisor-bin)
+        printf 'supervisor_bin = %s\n'   "$(toml_string "${DOCKER_SUPERVISOR_ARGS[$((i+1))]}")"
+        ;;
+      --docker-supervisor-image)
+        printf 'supervisor_image = %s\n' "$(toml_string "${DOCKER_SUPERVISOR_ARGS[$((i+1))]}")"
+        ;;
+    esac
+  done
+  if [ -n "${GATEWAY_HOST_ALIAS_IP}" ]; then
+    printf 'host_gateway_ip = %s\n'    "$(toml_string "${GATEWAY_HOST_ALIAS_IP}")"
+  fi
+} > "${GATEWAY_CONFIG}"
+
 GATEWAY_ARGS=(
-  --bind-address 0.0.0.0 \
-  --port "${HOST_PORT}" \
-  --drivers docker \
-  --sandbox-namespace "${E2E_NAMESPACE}" \
-  --docker-network-name "${DOCKER_NETWORK_NAME}" \
-  --tls-cert "${PKI_DIR}/server.crt" \
-  --tls-key "${PKI_DIR}/server.key" \
-  --tls-client-ca "${PKI_DIR}/ca.crt" \
-  --db-url "sqlite:${STATE_DIR}/gateway.db?mode=rwc" \
-  --grpc-endpoint "${GATEWAY_ENDPOINT}" \
-  "${DOCKER_SUPERVISOR_ARGS[@]}" \
-  --docker-tls-ca "${PKI_DIR}/ca.crt" \
-  --docker-tls-cert "${PKI_DIR}/client.crt" \
-  --docker-tls-key "${PKI_DIR}/client.key" \
-  --sandbox-image "${SANDBOX_IMAGE}" \
-  --sandbox-image-pull-policy IfNotPresent
+  --config "${GATEWAY_CONFIG}"
+  --bind-address 0.0.0.0
+  --port "${HOST_PORT}"
+  --drivers docker
+  --tls-cert "${PKI_DIR}/server.crt"
+  --tls-key "${PKI_DIR}/server.key"
+  --tls-client-ca "${PKI_DIR}/ca.crt"
+  --db-url "sqlite:${STATE_DIR}/gateway.db?mode=rwc"
 )
-if [ -n "${GATEWAY_HOST_ALIAS_IP}" ]; then
-  GATEWAY_ARGS+=(--host-gateway-ip "${GATEWAY_HOST_ALIAS_IP}")
-fi
 
 e2e_write_gateway_args_file "${GATEWAY_ARGS_FILE}" "${GATEWAY_ARGS[@]}"
 e2e_export_gateway_restart_metadata \

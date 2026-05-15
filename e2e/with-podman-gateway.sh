@@ -325,17 +325,39 @@ export OPENSHELL_E2E_NETWORK_NAME="${PODMAN_NETWORK_NAME}"
 export OPENSHELL_E2E_SANDBOX_NAMESPACE="${E2E_NAMESPACE}"
 
 echo "Starting openshell-gateway on port ${HOST_PORT} (namespace: ${E2E_NAMESPACE})..."
+
+# Driver-specific options moved from CLI flags into a TOML config table
+# (commit 560550d2). Synthesize a minimal config here and pass --config.
+# Quote a value as a TOML basic string: see with-docker-gateway.sh for
+# the same helper (kept duplicated to avoid sourcing across e2e scripts).
+toml_string() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf '"%s"' "${value}"
+}
+
+GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
+{
+  printf '[openshell]\nversion = 1\n\n'
+  printf '[openshell.gateway]\nlog_level = "info"\n\n'
+  printf '[openshell.drivers.podman]\n'
+  # The Podman driver scopes isolation by network rather than namespace.
+  printf 'network_name = %s\n'   "$(toml_string "${PODMAN_NETWORK_NAME}")"
+  printf 'gateway_port = %s\n'   "${HOST_PORT}"
+  printf 'default_image = %s\n'  "$(toml_string "${SANDBOX_IMAGE}")"
+  printf 'image_pull_policy = "missing"\n'
+  printf 'supervisor_image = %s\n' "$(toml_string "${SUPERVISOR_IMAGE}")"
+} > "${GATEWAY_CONFIG}"
+
 GATEWAY_ARGS=(
+  --config "${GATEWAY_CONFIG}"
   --bind-address 0.0.0.0
   --port "${HOST_PORT}"
   --health-port "${HEALTH_PORT}"
-  --ssh-gateway-port "${HOST_PORT}"
   --drivers podman
   --disable-tls
   --db-url "sqlite:${STATE_DIR}/gateway.db?mode=rwc"
-  --sandbox-namespace "${E2E_NAMESPACE}"
-  --sandbox-image "${SANDBOX_IMAGE}"
-  --sandbox-image-pull-policy missing
   --log-level info
 )
 
