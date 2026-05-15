@@ -3745,6 +3745,7 @@ dependencies = [
  "tower-http 0.6.8",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
  "wiremock",
  "x509-parser",

@@ -298,6 +298,39 @@ pub async fn run_server(
         state.sandbox_jwt_authenticator = Some(Arc::new(authenticator));
     }
 
+    // K8s ServiceAccount bootstrap authenticator. Only constructed when
+    // the gateway is running in-cluster (kubelet provides the API host
+    // env var) and has a sandbox JWT issuer to mint replacements against;
+    // outside the cluster we can't talk to the apiserver's JWKS endpoint,
+    // and without the issuer there's nothing to exchange the SA token
+    // for.
+    if state.sandbox_jwt_issuer.is_some() && std::env::var_os("KUBERNETES_SERVICE_HOST").is_some() {
+        match kube::Client::try_default().await {
+            Ok(client) => {
+                let namespace = std::env::var("POD_NAMESPACE")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "default".to_string());
+                let resolver = Arc::new(auth::k8s_sa::LiveK8sResolver::new(
+                    client,
+                    &namespace,
+                    "openshell-gateway".to_string(),
+                ));
+                let authenticator = auth::k8s_sa::K8sServiceAccountAuthenticator::new(resolver);
+                state.k8s_sa_authenticator = Some(Arc::new(authenticator));
+                info!(
+                    namespace = %namespace,
+                    "K8s ServiceAccount bootstrap authenticator enabled"
+                );
+            }
+            Err(e) => warn!(
+                error = %e,
+                "in-cluster K8s client construction failed; \
+                 K8s ServiceAccount bootstrap is disabled"
+            ),
+        }
+    }
+
     let state = Arc::new(state);
 
     // Resume sandboxes that were stopped during the previous gateway
