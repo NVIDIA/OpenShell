@@ -146,6 +146,15 @@ impl ProcessHandle {
             .kill_on_drop(true)
             .env(openshell_core::sandbox_env::SANDBOX, "1");
 
+        // Strip supervisor-only credentials from the entrypoint's inherited
+        // environment. The entrypoint drops to the sandbox user before
+        // `exec`; without this strip, anything running as the sandbox user
+        // (e.g. an SSH-spawned shell) could read /proc/<entrypoint_pid>/environ
+        // and recover the gateway-minted JWT. Issue #1354.
+        cmd.env_remove(openshell_core::sandbox_env::SANDBOX_TOKEN)
+            .env_remove(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE)
+            .env_remove(openshell_core::sandbox_env::K8S_SA_TOKEN_FILE);
+
         inject_provider_env(&mut cmd, provider_env);
 
         if let Some(dir) = workdir {
@@ -271,6 +280,15 @@ impl ProcessHandle {
             .stderr(Stdio::inherit())
             .kill_on_drop(true)
             .env(openshell_core::sandbox_env::SANDBOX, "1");
+
+        // Strip supervisor-only credentials from the entrypoint's inherited
+        // environment. The entrypoint drops to the sandbox user before
+        // `exec`; without this strip, anything running as the sandbox user
+        // (e.g. an SSH-spawned shell) could read /proc/<entrypoint_pid>/environ
+        // and recover the gateway-minted JWT. Issue #1354.
+        cmd.env_remove(openshell_core::sandbox_env::SANDBOX_TOKEN)
+            .env_remove(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE)
+            .env_remove(openshell_core::sandbox_env::K8S_SA_TOKEN_FILE);
 
         inject_provider_env(&mut cmd, provider_env);
 
