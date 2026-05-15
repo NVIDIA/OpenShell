@@ -152,7 +152,7 @@ Each endpoint defines a reachable destination and optional inspection rules.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `host` | string | Yes | Hostname or IP address. Supports DNS-label wildcards such as `*.example.com` and scoped label globs such as `*-aiplatform.googleapis.com`. Bare wildcards and TLD wildcards such as `*.com` are rejected. |
+| `host` | string | Yes | Hostname or IP address. Supports wildcards: `*.example.com` matches any subdomain. |
 | `port` | integer | Yes | TCP port number. |
 | `path` | string | No | Optional HTTP path glob used to select between L7 endpoints that share the same host and port. Empty means all paths. Use this when REST and GraphQL live under the same host, such as `/repos/**` and `/graphql`. |
 | `protocol` | string | No | Set to `rest` for HTTP method/path inspection, `websocket` for RFC 6455 upgrade and client text-message inspection, or `graphql` for GraphQL-over-HTTP operation inspection. WebSocket endpoints can also use GraphQL operation rules for GraphQL-over-WebSocket traffic. Omit for TCP passthrough. |

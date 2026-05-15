@@ -1633,32 +1633,6 @@ mod tests {
     }
 
     #[test]
-    fn apply_required_env_always_injects_ssh_handshake_secret() {
-        let mut env = Vec::new();
-        apply_required_env(
-            &mut env,
-            "sandbox-1",
-            "my-sandbox",
-            "https://endpoint:8080",
-            "0.0.0.0:2222",
-            "my-secret-value",
-            300,
-            true,
-        );
-
-        let secret_entry = env
-            .iter()
-            .find(|e| {
-                e.get("name").and_then(|v| v.as_str()) == Some("OPENSHELL_SSH_HANDSHAKE_SECRET")
-            })
-            .expect("OPENSHELL_SSH_HANDSHAKE_SECRET must be present in env");
-        assert_eq!(
-            secret_entry.get("value").and_then(|v| v.as_str()),
-            Some("my-secret-value")
-        );
-    }
-
-    #[test]
     fn supervisor_sideload_injects_run_as_user_zero() {
         let mut pod_template = serde_json::json!({
             "spec": {

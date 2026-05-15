@@ -535,6 +535,10 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                     errors.push(format!(
                         "{loc}: host wildcard '{host}' matches all hosts; use specific patterns like '*.example.com'"
                     ));
+                } else if !host.starts_with("*.") && !host.starts_with("**.") {
+                    errors.push(format!(
+                        "{loc}: host wildcard must start with '*.' or '**.' (e.g., '*.example.com'), got '{host}'"
+                    ));
                 } else {
                     // Reject TLD wildcards like *.com (2 labels) — they are
                     // accepted by the policy engine but silently fail at the
@@ -1789,26 +1793,22 @@ mod tests {
     }
 
     #[test]
-    fn validate_intra_label_wildcard_host_valid_no_error() {
+    fn validate_wildcard_host_no_star_dot_error() {
         let data = serde_json::json!({
             "network_policies": {
                 "test": {
                     "endpoints": [{
-                        "host": "*-aiplatform.googleapis.com",
+                        "host": "*com",
                         "port": 443
                     }],
                     "binaries": []
                 }
             }
         });
-        let (errors, warnings) = validate_l7_policies(&data);
+        let (errors, _warnings) = validate_l7_policies(&data);
         assert!(
-            errors.is_empty(),
-            "Scoped intra-label host wildcard should be valid, got errors: {errors:?}"
-        );
-        assert!(
-            warnings.is_empty(),
-            "Scoped intra-label host wildcard should not warn, got warnings: {warnings:?}"
+            errors.iter().any(|e| e.contains("must start with")),
+            "Malformed wildcard should be rejected, got errors: {errors:?}"
         );
     }
 
@@ -1829,26 +1829,6 @@ mod tests {
         assert!(
             errors.iter().any(|e| e.contains("TLD wildcard")),
             "*.com should be rejected as TLD wildcard, got errors: {errors:?}"
-        );
-    }
-
-    #[test]
-    fn validate_intra_label_tld_wildcard_rejected() {
-        let data = serde_json::json!({
-            "network_policies": {
-                "test": {
-                    "endpoints": [{
-                        "host": "example.*",
-                        "port": 443
-                    }],
-                    "binaries": []
-                }
-            }
-        });
-        let (errors, _warnings) = validate_l7_policies(&data);
-        assert!(
-            errors.iter().any(|e| e.contains("TLD wildcard")),
-            "example.* should be rejected as TLD wildcard, got errors: {errors:?}"
         );
     }
 
