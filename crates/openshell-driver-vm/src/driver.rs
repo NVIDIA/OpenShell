@@ -91,11 +91,11 @@ const OPENSHELL_HOST_GATEWAY_ALIAS: &str = "host.openshell.internal";
 ///     resolves even when gvproxy's DNS is not in resolv.conf;
 ///   * keeping a recognisable hostname makes log messages clearer than a bare
 ///     192.168.127.254 reference;
-///   * `host.docker.internal` works the same way for Docker-flavoured tooling.
+///   * package-managed gateway certificates include this SAN for guest mTLS.
 ///
 /// Both names ultimately route through the gvproxy NAT path on
 /// `GVPROXY_HOST_LOOPBACK_IP` — they do **not** go through the gateway IP.
-const GVPROXY_HOST_LOOPBACK_ALIAS: &str = "host.containers.internal";
+const GVPROXY_HOST_LOOPBACK_ALIAS: &str = OPENSHELL_HOST_GATEWAY_ALIAS;
 const GUEST_SSH_SOCKET_PATH: &str = "/run/openshell/ssh.sock";
 const GUEST_TLS_CA_PATH: &str = "/opt/openshell/tls/ca.crt";
 const GUEST_TLS_CERT_PATH: &str = "/opt/openshell/tls/tls.crt";
@@ -3392,7 +3392,7 @@ fn merged_environment(sandbox: &Sandbox) -> HashMap<String, String> {
 /// not the host's. Inside the guest we need a name that gvproxy will translate
 /// into the host's loopback address.
 ///
-/// We rewrite to `host.containers.internal`, which gvproxy's embedded DNS resolves
+/// We rewrite to `host.openshell.internal`, which gvproxy's embedded DNS resolves
 /// to the host-loopback IP `192.168.127.254`. gvproxy installs a default NAT entry
 /// rewriting that destination to the host's `127.0.0.1` and dialing out from the
 /// host process, so any port the host is listening on becomes reachable. The

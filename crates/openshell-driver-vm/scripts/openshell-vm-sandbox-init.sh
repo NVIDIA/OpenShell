@@ -17,11 +17,11 @@ BOOT_START=$(date +%s%3N 2>/dev/null || date +%s)
 #                     gvproxy's TCP/UDP/ICMP forwarder. Use this address
 #                     (or any of the host.* hostnames below) to reach a
 #                     service the host is listening on.
-# The host.containers.internal / host.docker.internal DNS records served
-# by gvproxy's embedded resolver point at 192.168.127.254. We mirror that
-# in /etc/hosts so the supervisor can reach the gateway even when
-# gvproxy's DNS is not in resolv.conf (e.g. DHCP failed and we fell
-# back to 8.8.8.8).
+# The host.openshell.internal / host.containers.internal /
+# host.docker.internal DNS records served by gvproxy's embedded resolver
+# point at 192.168.127.254. We mirror that in /etc/hosts so the supervisor
+# can reach the gateway even when gvproxy's DNS is not in resolv.conf
+# (e.g. DHCP failed and we fell back to 8.8.8.8).
 GVPROXY_GATEWAY_IP="192.168.127.1"
 GVPROXY_HOST_LOOPBACK_IP="192.168.127.254"
 GATEWAY_IP="$GVPROXY_GATEWAY_IP"
@@ -419,7 +419,12 @@ rewrite_openshell_endpoint_if_needed() {
     if [ "${GATEWAY_IP}" != "${GVPROXY_GATEWAY_IP}" ]; then
         fallback_ip="$GATEWAY_IP"
     fi
-    for candidate in host.openshell.internal host.containers.internal host.docker.internal "$fallback_ip"; do
+    local candidates="host.openshell.internal host.containers.internal host.docker.internal"
+    if [ "$scheme" != "https" ]; then
+        candidates="${candidates} ${fallback_ip}"
+    fi
+
+    for candidate in $candidates; do
         if [ "$candidate" = "$host" ]; then
             continue
         fi
@@ -434,6 +439,11 @@ rewrite_openshell_endpoint_if_needed() {
             return 0
         fi
     done
+
+    if [ "$scheme" = "https" ]; then
+        ts "WARNING: could not preflight HTTPS OpenShell endpoint ${host}:${port}; preserving hostname for TLS verification"
+        return 0
+    fi
 
     ts "WARNING: could not reach OpenShell endpoint ${host}:${port}"
 }

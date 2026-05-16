@@ -379,6 +379,7 @@ fn prepare_sandbox_rootfs(rootfs: &Path) -> Result<(), String> {
         .map_err(|e| format!("write sandbox rootfs marker: {e}"))?;
     ensure_sandbox_guest_user(rootfs)?;
     create_sandbox_mountpoint(&rootfs.join("sandbox"))?;
+    create_sandbox_mountpoint(&rootfs.join("image-cache"))?;
     create_sandbox_mountpoint(&rootfs.join("lower"))?;
     create_sandbox_mountpoint(&rootfs.join("overlay"))?;
     create_sandbox_mountpoint(&rootfs.join("newroot"))?;
@@ -941,6 +942,7 @@ mod tests {
         assert!(rootfs.join("srv/openshell-vm-sandbox-init.sh").is_file());
         assert!(rootfs.join("opt/openshell/bin/umoci").is_file());
         assert!(rootfs.join("sandbox").is_dir());
+        assert!(rootfs.join("image-cache").is_dir());
         assert!(rootfs.join("lower").is_dir());
         assert!(rootfs.join("overlay").is_dir());
         assert!(rootfs.join("newroot").is_dir());
