@@ -256,6 +256,18 @@ pub(super) async fn handle_attach_sandbox_provider(
             "providers list exceeds maximum ({MAX_PROVIDERS})"
         )));
     }
+    let mut candidate_spec = spec.clone();
+    dedupe_provider_names(&mut candidate_spec.providers);
+    if !candidate_spec
+        .providers
+        .iter()
+        .any(|name| name == &request.provider_name)
+    {
+        candidate_spec.providers.push(request.provider_name.clone());
+    }
+    validate_sandbox_spec(&request.sandbox_name, &candidate_spec)?;
+    validate_provider_environment_keys_unique(state.store.as_ref(), &candidate_spec.providers)
+        .await?;
 
     let provider_name = request.provider_name.clone();
     let attached = Arc::new(AtomicBool::new(false));
@@ -2436,6 +2448,77 @@ mod tests {
             Some(SandboxPhase::Ready)
         );
     }
+
+    #[tokio::test]
+    async fn create_sandbox_rejects_provider_credential_key_collisions() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("provider-a", "outlook"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_provider("provider-b", "google-drive"))
+            .await
+            .unwrap();
+
+        let err = handle_create_sandbox(
+            &state,
+            Request::new(CreateSandboxRequest {
+                name: "collision".to_string(),
+                spec: Some(openshell_core::proto::SandboxSpec {
+                    providers: vec!["provider-a".to_string(), "provider-b".to_string()],
+                    ..Default::default()
+                }),
+                labels: HashMap::new(),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("TOKEN"));
+        assert!(err.message().contains("provider-a"));
+        assert!(err.message().contains("provider-b"));
+    }
+
+    #[tokio::test]
+    async fn attach_sandbox_provider_rejects_credential_key_collisions() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("provider-a", "outlook"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_provider("provider-b", "google-drive"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox("work", vec!["provider-a".to_string()]))
+            .await
+            .unwrap();
+
+        let err = handle_attach_sandbox_provider(
+            &state,
+            Request::new(AttachSandboxProviderRequest {
+                sandbox_name: "work".to_string(),
+                provider_name: "provider-b".to_string(),
+                expected_resource_version: 0,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("TOKEN"));
+        assert!(err.message().contains("provider-a"));
+        assert!(err.message().contains("provider-b"));
+    }
+
     #[tokio::test]
     async fn attach_sandbox_provider_accepts_at_max_providers_limit() {
         let state = test_server_state().await;

@@ -218,6 +218,7 @@ pub(super) async fn update_provider_record(
     // Validate BEFORE writing to prevent persisting invalid state
     super::validation::validate_object_metadata(candidate.metadata.as_ref(), "provider")?;
     validate_provider_fields(&candidate)?;
+    validate_provider_update_against_attached_sandboxes(store, &candidate).await?;
 
     // Serialize labels for storage
     let labels_map = candidate.object_labels();
@@ -335,6 +336,41 @@ async fn sandboxes_using_provider(
     Ok(blocking)
 }
 
+async fn sandboxes_using_provider_records(
+    store: &Store,
+    provider_name: &str,
+) -> Result<Vec<Sandbox>, Status> {
+    let mut sandboxes = Vec::new();
+    let mut offset = 0;
+    loop {
+        let records = store
+            .list(Sandbox::object_type(), 1000, offset)
+            .await
+            .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?;
+        if records.is_empty() {
+            break;
+        }
+        offset = offset
+            .checked_add(
+                u32::try_from(records.len())
+                    .map_err(|_| Status::internal("sandbox page size exceeded u32"))?,
+            )
+            .ok_or_else(|| Status::internal("sandbox pagination offset overflow"))?;
+
+        for record in records {
+            let sandbox = Sandbox::decode(record.payload.as_slice())
+                .map_err(|e| Status::internal(format!("decode sandbox failed: {e}")))?;
+            let Some(spec) = sandbox.spec.as_ref() else {
+                continue;
+            };
+            if spec.providers.iter().any(|name| name == provider_name) {
+                sandboxes.push(sandbox);
+            }
+        }
+    }
+    Ok(sandboxes)
+}
+
 /// Merge an incoming map into an existing map.
 ///
 /// - If `incoming` is empty, return `existing` unchanged (no-op).
@@ -382,8 +418,8 @@ fn merge_i64_map(
 ///
 /// For each provider name in the list, fetches the provider from the store and
 /// collects credential key-value pairs. Returns a map of environment variables
-/// to inject into the sandbox. When duplicate keys appear across providers, the
-/// first provider's value wins.
+/// to inject into the sandbox. Credential keys must be unique across attached
+/// providers so one provider cannot silently overwrite another provider's token.
 pub(super) async fn resolve_provider_environment(
     store: &Store,
     provider_names: &[String],
@@ -395,6 +431,7 @@ pub(super) async fn resolve_provider_environment(
     let mut env = std::collections::HashMap::new();
     let mut expires = std::collections::HashMap::new();
     let now_ms = crate::persistence::current_time_ms();
+    validate_provider_environment_keys_unique_at(store, provider_names, None, now_ms).await?;
 
     for name in provider_names {
         let provider = store
@@ -437,6 +474,109 @@ pub(super) async fn resolve_provider_environment(
         environment: env,
         credential_expires_at_ms: expires,
     })
+}
+
+pub async fn validate_provider_environment_keys_unique(
+    store: &Store,
+    provider_names: &[String],
+) -> Result<(), Status> {
+    validate_provider_environment_keys_unique_at(
+        store,
+        provider_names,
+        None,
+        crate::persistence::current_time_ms(),
+    )
+    .await
+}
+
+pub async fn validate_provider_credential_key_available_for_attached_sandboxes(
+    store: &Store,
+    provider: &Provider,
+    credential_key: &str,
+) -> Result<(), Status> {
+    let mut candidate = provider.clone();
+    candidate
+        .credentials
+        .entry(credential_key.to_string())
+        .or_insert_with(|| "pending".to_string());
+    candidate.credential_expires_at_ms.remove(credential_key);
+    validate_provider_update_against_attached_sandboxes(store, &candidate).await
+}
+
+pub async fn validate_provider_update_against_attached_sandboxes(
+    store: &Store,
+    provider: &Provider,
+) -> Result<(), Status> {
+    let provider_name = provider.object_name().to_string();
+    for sandbox in sandboxes_using_provider_records(store, &provider_name).await? {
+        let sandbox_name = sandbox.object_name().to_string();
+        let Some(spec) = sandbox.spec.as_ref() else {
+            continue;
+        };
+        validate_provider_environment_keys_unique_at(
+            store,
+            &spec.providers,
+            Some(provider),
+            crate::persistence::current_time_ms(),
+        )
+        .await
+        .map_err(|err| {
+            Status::failed_precondition(format!(
+                "provider update would create credential env key conflict on sandbox '{sandbox_name}': {}",
+                err.message()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+async fn validate_provider_environment_keys_unique_at(
+    store: &Store,
+    provider_names: &[String],
+    candidate_provider: Option<&Provider>,
+    now_ms: i64,
+) -> Result<(), Status> {
+    let mut seen = std::collections::HashMap::<String, String>::new();
+    for name in provider_names {
+        let provider = match candidate_provider {
+            Some(candidate) if candidate.object_name() == name.as_str() => candidate.clone(),
+            _ => store
+                .get_message_by_name::<Provider>(name)
+                .await
+                .map_err(|e| Status::internal(format!("failed to fetch provider '{name}': {e}")))?
+                .ok_or_else(|| {
+                    Status::failed_precondition(format!("provider '{name}' not found"))
+                })?,
+        };
+        let provider_name = provider.object_name().to_string();
+        for key in active_provider_credential_keys(&provider, now_ms) {
+            if let Some(first_provider) = seen.get(&key) {
+                if first_provider != &provider_name {
+                    return Err(Status::failed_precondition(format!(
+                        "credential env key '{key}' is provided by both provider '{first_provider}' and provider '{provider_name}'; use provider-specific env names"
+                    )));
+                }
+            } else {
+                seen.insert(key, provider_name.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn active_provider_credential_keys(provider: &Provider, now_ms: i64) -> Vec<String> {
+    provider
+        .credentials
+        .keys()
+        .filter(|key| is_valid_env_key(key))
+        .filter(|key| {
+            provider
+                .credential_expires_at_ms
+                .get(*key)
+                .is_none_or(|expires_at_ms| *expires_at_ms <= 0 || *expires_at_ms > now_ms)
+        })
+        .cloned()
+        .collect()
 }
 
 pub(super) fn is_valid_env_key(key: &str) -> bool {
@@ -1020,6 +1160,12 @@ pub(super) async fn handle_configure_provider_refresh(
     if strategy == ProviderCredentialRefreshStrategy::Unspecified {
         return Err(Status::invalid_argument("refresh strategy is required"));
     }
+    if !crate::provider_refresh::is_gateway_mintable_strategy(strategy) {
+        return Err(Status::invalid_argument(format!(
+            "refresh strategy '{}' is not gateway-mintable; update current credentials with provider update instead",
+            crate::provider_refresh::refresh_strategy_name(strategy as i32)
+        )));
+    }
     if request.material.len() > MAX_PROVIDER_CONFIG_ENTRIES {
         return Err(Status::invalid_argument(format!(
             "material exceeds maximum entries ({} > {MAX_PROVIDER_CONFIG_ENTRIES})",
@@ -1082,6 +1228,12 @@ pub(super) async fn handle_configure_provider_refresh(
         .await
         .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
         .ok_or_else(|| Status::not_found("provider not found"))?;
+    validate_provider_credential_key_available_for_attached_sandboxes(
+        state.store.as_ref(),
+        &provider,
+        credential_key,
+    )
+    .await?;
     let refresh_defaults =
         provider_refresh_defaults(state.store.as_ref(), &provider, credential_key).await?;
     validate_refresh_material(&request.material, refresh_defaults.as_ref())?;
@@ -1969,6 +2121,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configure_provider_refresh_rejects_credential_key_collision_for_attached_sandbox() {
+        let state = test_server_state().await;
+        create_provider_record(
+            state.store.as_ref(),
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "existing-graph".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                }),
+                r#type: "outlook".to_string(),
+                credentials: std::iter::once((
+                    "MS_GRAPH_ACCESS_TOKEN".to_string(),
+                    "existing-token".to_string(),
+                ))
+                .collect(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+        create_provider_record(
+            state.store.as_ref(),
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "refreshing-graph".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                }),
+                r#type: "outlook".to_string(),
+                credentials: std::iter::once(("OTHER_TOKEN".to_string(), "other".to_string()))
+                    .collect(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+        state
+            .store
+            .put_message(&Sandbox {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "sandbox-collision".to_string(),
+                    name: "collision".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                }),
+                spec: Some(SandboxSpec {
+                    providers: vec!["existing-graph".to_string(), "refreshing-graph".to_string()],
+                    ..SandboxSpec::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let err = handle_configure_provider_refresh(
+            &state,
+            Request::new(ConfigureProviderRefreshRequest {
+                provider: "refreshing-graph".to_string(),
+                credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
+                strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials as i32,
+                material: HashMap::from([
+                    ("tenant_id".to_string(), "tenant".to_string()),
+                    ("client_id".to_string(), "client-id".to_string()),
+                    ("client_secret".to_string(), "client-secret".to_string()),
+                ]),
+                secret_material_keys: vec!["client_secret".to_string()],
+                expires_at_ms: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("collision"));
+        assert!(err.message().contains("MS_GRAPH_ACCESS_TOKEN"));
+        let states = crate::provider_refresh::list_all_refresh_states(state.store.as_ref())
+            .await
+            .unwrap();
+        assert!(states.is_empty());
+    }
+
+    #[tokio::test]
     async fn configure_provider_refresh_rejects_profile_endpoint_override_and_missing_material() {
         let state = test_server_state().await;
         create_provider_record(
@@ -2032,6 +2271,62 @@ mod tests {
         .unwrap_err();
         assert_eq!(missing_material.code(), Code::InvalidArgument);
         assert!(missing_material.message().contains("client_id material"));
+    }
+
+    #[tokio::test]
+    async fn configure_provider_refresh_rejects_non_gateway_mintable_strategies() {
+        let state = test_server_state().await;
+        create_provider_record(
+            state.store.as_ref(),
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "msgraph".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                }),
+                r#type: "outlook".to_string(),
+                credentials: std::iter::once((
+                    "MS_GRAPH_ACCESS_TOKEN".to_string(),
+                    "token".to_string(),
+                ))
+                .collect(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        for strategy in [
+            ProviderCredentialRefreshStrategy::Static,
+            ProviderCredentialRefreshStrategy::External,
+        ] {
+            let err = handle_configure_provider_refresh(
+                &state,
+                Request::new(ConfigureProviderRefreshRequest {
+                    provider: "msgraph".to_string(),
+                    credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
+                    strategy: strategy as i32,
+                    material: HashMap::new(),
+                    secret_material_keys: Vec::new(),
+                    expires_at_ms: None,
+                }),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.code(), Code::InvalidArgument);
+            assert!(
+                err.message().contains("not gateway-mintable"),
+                "unexpected error: {}",
+                err.message()
+            );
+        }
+
+        let refresh_states = crate::provider_refresh::list_all_refresh_states(state.store.as_ref())
+            .await
+            .unwrap();
+        assert!(refresh_states.is_empty());
     }
 
     #[tokio::test]
@@ -2859,7 +3154,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_provider_env_first_credential_wins_on_duplicate_key() {
+    async fn resolve_provider_env_rejects_duplicate_credential_keys() {
         let store = Store::connect("sqlite::memory:").await.unwrap();
         create_provider_record(
             &store,
@@ -2903,13 +3198,103 @@ mod tests {
         .await
         .unwrap();
 
-        let result = resolve_provider_environment(
+        let err = resolve_provider_environment(
             &store,
             &["provider-a".to_string(), "provider-b".to_string()],
         )
         .await
+        .unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("SHARED_KEY"));
+        assert!(err.message().contains("provider-a"));
+        assert!(err.message().contains("provider-b"));
+    }
+
+    #[tokio::test]
+    async fn update_provider_rejects_credential_key_collision_for_attached_sandbox() {
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        create_provider_record(
+            &store,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "provider-a".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                }),
+                r#type: "outlook".to_string(),
+                credentials: std::iter::once((
+                    "MS_GRAPH_ACCESS_TOKEN".to_string(),
+                    "graph-token".to_string(),
+                ))
+                .collect(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+            },
+        )
+        .await
         .unwrap();
-        assert_eq!(result.get("SHARED_KEY"), Some(&"first-value".to_string()));
+        create_provider_record(
+            &store,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "provider-b".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                }),
+                r#type: "google-drive".to_string(),
+                credentials: std::iter::once((
+                    "GOOGLE_ACCESS_TOKEN".to_string(),
+                    "google-token".to_string(),
+                ))
+                .collect(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sandbox-collision".to_string(),
+                name: "collision".to_string(),
+                created_at_ms: 0,
+                labels: HashMap::new(),
+            }),
+            spec: Some(SandboxSpec {
+                providers: vec!["provider-a".to_string(), "provider-b".to_string()],
+                ..SandboxSpec::default()
+            }),
+            ..Default::default()
+        };
+        store.put_message(&sandbox).await.unwrap();
+
+        let err = update_provider_record(
+            &store,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "provider-b".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                }),
+                r#type: String::new(),
+                credentials: std::iter::once((
+                    "MS_GRAPH_ACCESS_TOKEN".to_string(),
+                    "wrong-token".to_string(),
+                ))
+                .collect(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("collision"));
+        assert!(err.message().contains("MS_GRAPH_ACCESS_TOKEN"));
     }
 
     #[tokio::test]

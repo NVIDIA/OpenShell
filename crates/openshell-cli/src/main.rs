@@ -655,8 +655,6 @@ enum OutputFormat {
 
 #[derive(Clone, Debug, ValueEnum)]
 enum CliProviderRefreshStrategy {
-    Static,
-    External,
     Oauth2RefreshToken,
     Oauth2ClientCredentials,
     GoogleServiceAccountJwt,
@@ -665,8 +663,6 @@ enum CliProviderRefreshStrategy {
 impl CliProviderRefreshStrategy {
     fn as_str(&self) -> &'static str {
         match self {
-            Self::Static => "static",
-            Self::External => "external",
             Self::Oauth2RefreshToken => "oauth2_refresh_token",
             Self::Oauth2ClientCredentials => "oauth2_client_credentials",
             Self::GoogleServiceAccountJwt => "google_service_account_jwt",

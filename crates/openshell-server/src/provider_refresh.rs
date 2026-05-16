@@ -178,6 +178,7 @@ pub struct NewRefreshStateConfig {
     pub max_lifetime_seconds: i64,
 }
 
+#[allow(clippy::unnecessary_wraps)]
 pub fn new_refresh_state(
     provider: &Provider,
     credential_key: &str,
@@ -268,7 +269,7 @@ fn seconds_until_ms(now_ms: i64, target_ms: i64) -> i64 {
     target_ms.saturating_sub(now_ms).max(0) / 1000
 }
 
-fn refresh_strategy_name(strategy: i32) -> &'static str {
+pub fn refresh_strategy_name(strategy: i32) -> &'static str {
     match ProviderCredentialRefreshStrategy::try_from(strategy)
         .unwrap_or(ProviderCredentialRefreshStrategy::Unspecified)
     {
@@ -279,6 +280,15 @@ fn refresh_strategy_name(strategy: i32) -> &'static str {
         ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => "google_service_account_jwt",
         ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
     }
+}
+
+pub fn is_gateway_mintable_strategy(strategy: ProviderCredentialRefreshStrategy) -> bool {
+    matches!(
+        strategy,
+        ProviderCredentialRefreshStrategy::Oauth2RefreshToken
+            | ProviderCredentialRefreshStrategy::Oauth2ClientCredentials
+            | ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt
+    )
 }
 
 pub async fn refresh_provider_credential(
@@ -309,7 +319,26 @@ pub async fn refresh_provider_credential(
     match mint_credential(&state).await {
         Ok(minted) => {
             let now_ms = current_time_ms();
-            apply_minted_credential(store, &provider, credential_key, &minted).await?;
+            if let Err(err) =
+                apply_minted_credential(store, &provider, credential_key, &minted).await
+            {
+                state.status = "error".to_string();
+                state.last_error = err.message().to_string();
+                state.next_refresh_at_ms =
+                    now_ms.saturating_add(REFRESH_ERROR_RETRY_SECONDS.saturating_mul(1000));
+                put_refresh_state(store, &state).await?;
+                warn!(
+                    provider = %state.provider_name,
+                    credential_key = %state.credential_key,
+                    strategy = %refresh_strategy_name(state.strategy),
+                    status = %state.status,
+                    next_refresh_at_ms = state.next_refresh_at_ms,
+                    seconds_until_refresh = seconds_until_ms(now_ms, state.next_refresh_at_ms),
+                    error = %err,
+                    "provider credential refresh errored"
+                );
+                return Err(err);
+            }
             if let Some(refresh_token) = minted.refresh_token {
                 state
                     .material
@@ -384,6 +413,8 @@ async fn apply_minted_credential(
     } else {
         updated.credential_expires_at_ms.remove(credential_key);
     }
+    crate::grpc::provider::validate_provider_update_against_attached_sandboxes(store, &updated)
+        .await?;
     store
         .put_message(&updated)
         .await
@@ -408,7 +439,7 @@ async fn mint_credential(
         ProviderCredentialRefreshStrategy::External
         | ProviderCredentialRefreshStrategy::Static
         | ProviderCredentialRefreshStrategy::Unspecified => Err(Status::failed_precondition(
-            format!("refresh strategy '{strategy:?}' cannot be minted by the gateway yet"),
+            format!("refresh strategy '{strategy:?}' cannot be minted by the gateway"),
         )),
     }
 }
@@ -670,6 +701,8 @@ async fn run_refresh_worker_tick(store: &Store) -> Result<(), Status> {
         due_count, rotation_requested_count, "provider credential refresh worker sweep"
     );
     for state in states {
+        let strategy = ProviderCredentialRefreshStrategy::try_from(state.strategy)
+            .unwrap_or(ProviderCredentialRefreshStrategy::Unspecified);
         let due = state.next_refresh_at_ms <= 0 || state.next_refresh_at_ms <= now_ms;
         let rotation_requested = state.status == "rotation_requested";
         info!(
@@ -687,6 +720,16 @@ async fn run_refresh_worker_tick(store: &Store) -> Result<(), Status> {
             "provider credential refresh watch"
         );
         if !due && !rotation_requested {
+            continue;
+        }
+        if !is_gateway_mintable_strategy(strategy) {
+            warn!(
+                provider = %state.provider_name,
+                credential_key = %state.credential_key,
+                strategy = %refresh_strategy_name(state.strategy),
+                status = %state.status,
+                "skipping non-gateway-mintable provider credential refresh state"
+            );
             continue;
         }
         info!(
@@ -717,12 +760,15 @@ async fn run_refresh_worker_tick(store: &Store) -> Result<(), Status> {
 mod tests {
     use super::{
         NewRefreshStateConfig, get_refresh_state, new_refresh_state, put_refresh_state,
-        refresh_provider_credential, refresh_state_name, refresh_strategy_name, seconds_until_ms,
+        refresh_provider_credential, refresh_state_name, refresh_strategy_name,
+        run_refresh_worker_tick, seconds_until_ms,
     };
     use crate::persistence::Store;
     use openshell_core::ObjectId;
     use openshell_core::proto::datamodel::v1::ObjectMeta;
-    use openshell_core::proto::{Provider, ProviderCredentialRefreshStrategy};
+    use openshell_core::proto::{
+        Provider, ProviderCredentialRefreshStrategy, Sandbox, SandboxSpec,
+    };
     use std::collections::HashMap;
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -834,6 +880,91 @@ mod tests {
         assert_eq!(
             stored.credential_expires_at_ms.get("MS_GRAPH_ACCESS_TOKEN"),
             Some(&refreshed.expires_at_ms)
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_rejects_minted_credential_key_collision_for_attached_sandbox() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "minted-graph-token",
+                "expires_in": 3600,
+                "token_type": "Bearer"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .unwrap();
+        let mut provider_a = provider("existing-graph", "outlook");
+        provider_a.credentials.insert(
+            "MS_GRAPH_ACCESS_TOKEN".to_string(),
+            "existing-token".to_string(),
+        );
+        store.put_message(&provider_a).await.unwrap();
+        let provider_b = provider("refreshing-graph", "outlook");
+        store.put_message(&provider_b).await.unwrap();
+        store
+            .put_message(&Sandbox {
+                metadata: Some(ObjectMeta {
+                    id: "sandbox-collision".to_string(),
+                    name: "collision".to_string(),
+                    created_at_ms: 1,
+                    labels: HashMap::new(),
+                }),
+                spec: Some(SandboxSpec {
+                    providers: vec!["existing-graph".to_string(), "refreshing-graph".to_string()],
+                    ..SandboxSpec::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let state = new_refresh_state(
+            &provider_b,
+            "MS_GRAPH_ACCESS_TOKEN",
+            NewRefreshStateConfig {
+                strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials,
+                material: HashMap::from([
+                    ("client_id".to_string(), "client-id".to_string()),
+                    ("client_secret".to_string(), "client-secret".to_string()),
+                ]),
+                secret_material_keys: vec!["client_secret".to_string()],
+                expires_at_ms: 0,
+                token_url: format!("{}/token", mock_server.uri()),
+                scopes: Vec::new(),
+                refresh_before_seconds: 30,
+                max_lifetime_seconds: 60,
+            },
+        )
+        .unwrap();
+        put_refresh_state(&store, &state).await.unwrap();
+
+        let err = refresh_provider_credential(&store, "refreshing-graph", "MS_GRAPH_ACCESS_TOKEN")
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("MS_GRAPH_ACCESS_TOKEN"));
+        let stored_state =
+            get_refresh_state(&store, provider_b.object_id(), "MS_GRAPH_ACCESS_TOKEN")
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(stored_state.status, "error");
+        assert!(stored_state.last_error.contains("MS_GRAPH_ACCESS_TOKEN"));
+        let stored_provider = store
+            .get_message_by_name::<Provider>("refreshing-graph")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !stored_provider
+                .credentials
+                .contains_key("MS_GRAPH_ACCESS_TOKEN")
         );
     }
 
@@ -981,6 +1112,51 @@ mod tests {
         assert_eq!(
             stored.credentials.get("GOOGLE_DRIVE_ACCESS_TOKEN"),
             Some(&"minted-drive-token".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_worker_skips_non_gateway_mintable_strategies() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .unwrap();
+        let provider = provider("my-external", "outlook");
+        store.put_message(&provider).await.unwrap();
+        let state = new_refresh_state(
+            &provider,
+            "MS_GRAPH_ACCESS_TOKEN",
+            NewRefreshStateConfig {
+                strategy: ProviderCredentialRefreshStrategy::External,
+                material: HashMap::new(),
+                secret_material_keys: Vec::new(),
+                expires_at_ms: 0,
+                token_url: String::new(),
+                scopes: Vec::new(),
+                refresh_before_seconds: 0,
+                max_lifetime_seconds: 0,
+            },
+        )
+        .unwrap();
+        put_refresh_state(&store, &state).await.unwrap();
+
+        run_refresh_worker_tick(&store).await.unwrap();
+
+        let stored_state = get_refresh_state(&store, provider.object_id(), "MS_GRAPH_ACCESS_TOKEN")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(stored_state.status, "error");
+        assert!(stored_state.last_error.is_empty());
+
+        let stored_provider = store
+            .get_message_by_name::<Provider>("my-external")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !stored_provider
+                .credentials
+                .contains_key("MS_GRAPH_ACCESS_TOKEN")
         );
     }
 

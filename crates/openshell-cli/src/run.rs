@@ -4568,8 +4568,6 @@ pub async fn provider_refresh_delete(
 
 fn provider_refresh_strategy(strategy: &str) -> Result<ProviderCredentialRefreshStrategy> {
     match strategy {
-        "static" => Ok(ProviderCredentialRefreshStrategy::Static),
-        "external" => Ok(ProviderCredentialRefreshStrategy::External),
         "oauth2_refresh_token" => Ok(ProviderCredentialRefreshStrategy::Oauth2RefreshToken),
         "oauth2_client_credentials" => {
             Ok(ProviderCredentialRefreshStrategy::Oauth2ClientCredentials)

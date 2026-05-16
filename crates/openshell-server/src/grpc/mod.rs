@@ -4,7 +4,7 @@
 //! gRPC service implementation.
 
 pub mod policy;
-mod provider;
+pub mod provider;
 mod sandbox;
 mod service;
 mod validation;
