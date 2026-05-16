@@ -34,6 +34,7 @@ jobs:
     with:
       component: gateway
       platform: linux/arm64
+      publish-manifest: false
 
   build-supervisor:
     needs: [pr_metadata]
@@ -45,6 +46,7 @@ jobs:
     with:
       component: supervisor
       platform: linux/arm64
+      publish-manifest: false
 
   e2e:
     needs: [pr_metadata, build-gateway, build-supervisor]
@@ -54,5 +56,5 @@ jobs:
       packages: read
     uses: ./.github/workflows/e2e-test.yml
     with:
-      image-tag: ${{ github.sha }}
+      image-tag: ${{ github.sha }}-arm64
       runner: linux-arm64-cpu8

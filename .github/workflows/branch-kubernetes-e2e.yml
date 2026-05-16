@@ -38,6 +38,7 @@ jobs:
     with:
       component: gateway
       platform: linux/amd64
+      publish-manifest: false
 
   build-supervisor:
     needs: [pr_metadata]
@@ -49,6 +50,7 @@ jobs:
     with:
       component: supervisor
       platform: linux/amd64
+      publish-manifest: false
 
   kubernetes-e2e:
     name: Kubernetes E2E (Rust smoke)
@@ -106,16 +108,15 @@ jobs:
           kind get kubeconfig --name "$KIND_CLUSTER_NAME" > "$GITHUB_WORKSPACE/kubeconfig"
           chmod 600 "$GITHUB_WORKSPACE/kubeconfig"
 
-      # Pre-pull and side-load: kind nodes don't have ghcr credentials, and
-      # tagging IMAGE_TAG to a SHA means the chart's IfNotPresent pull policy
-      # is satisfied once the image is loaded into the node's containerd.
       - name: Load gateway and supervisor images into kind
         run: |
           set -euo pipefail
           for component in gateway supervisor; do
-            image="ghcr.io/nvidia/openshell/${component}:${{ github.sha }}"
-            docker pull "$image"
-            kind load docker-image "$image" --name "$KIND_CLUSTER_NAME"
+            src="ghcr.io/nvidia/openshell/${component}:${{ github.sha }}-amd64"
+            bare="ghcr.io/nvidia/openshell/${component}:${{ github.sha }}"
+            docker pull "$src"
+            docker tag "$src" "$bare"
+            kind load docker-image "$bare" --name "$KIND_CLUSTER_NAME"
           done
 
       - name: Run Kubernetes E2E (Rust smoke)
