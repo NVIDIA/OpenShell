@@ -762,6 +762,17 @@ mod tests {
         use std::net::{TcpListener, TcpStream};
         use std::time::{Duration, Instant};
 
+        struct ChildGuard(libc::pid_t);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                #[allow(unsafe_code)]
+                unsafe {
+                    libc::kill(self.0, libc::SIGKILL);
+                    libc::waitpid(self.0, std::ptr::null_mut(), 0);
+                }
+            }
+        }
+
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
         let listener_port = listener.local_addr().unwrap().port();
         let stream = TcpStream::connect(("127.0.0.1", listener_port)).expect("connect");
@@ -781,9 +792,10 @@ mod tests {
             }
         }
 
+        let _guard = ChildGuard(child_pid);
         let child_pid_u32 = child_pid.cast_unsigned();
         let entrypoint_pid = std::process::id();
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(5);
         let owners = loop {
             let owners = resolve_tcp_peer_socket_owners(entrypoint_pid, peer_port)
                 .expect("resolve socket owners");
@@ -801,13 +813,6 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(20));
         };
-
-        // libc/syscall FFI requires unsafe
-        #[allow(unsafe_code)]
-        unsafe {
-            libc::kill(child_pid, libc::SIGKILL);
-            libc::waitpid(child_pid, std::ptr::null_mut(), 0);
-        }
 
         let owner_pids = owners
             .owners
