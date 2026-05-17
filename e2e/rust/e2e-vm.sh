@@ -68,6 +68,11 @@ SANDBOX_PROVISION_TIMEOUT=180
 
 # ── Build prerequisites ──────────────────────────────────────────────
 
+if [ -n "${RUSTC_WRAPPER:-}" ] && [ "${OPENSHELL_E2E_VM_ALLOW_RUSTC_WRAPPER:-0}" != "1" ]; then
+  echo "==> Building without RUSTC_WRAPPER=${RUSTC_WRAPPER} (set OPENSHELL_E2E_VM_ALLOW_RUSTC_WRAPPER=1 to keep it)"
+  unset RUSTC_WRAPPER
+fi
+
 mkdir -p "${COMPRESSED_DIR}"
 
 if ! find "${COMPRESSED_DIR}" -maxdepth 1 -name 'libkrun*.zst' | grep -q .; then
