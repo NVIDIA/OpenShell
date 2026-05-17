@@ -168,16 +168,46 @@ ce_build() {
 }
 
 # ---------------------------------------------------------------------------
+# ce_normalize_arch — normalize common architecture names.
+#
+# Keeps container-engine helpers from silently drifting between Docker,
+# Podman, and kernel naming conventions.
+# ---------------------------------------------------------------------------
+ce_normalize_arch() {
+  case "$1" in
+    x86_64|amd64) echo "amd64" ;;
+    aarch64|arm64) echo "arm64" ;;
+    *) echo "$1" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# ce_host_arch — kernel architecture normalized for Docker platform names.
+# ---------------------------------------------------------------------------
+ce_host_arch() {
+  ce_normalize_arch "$(uname -m)"
+}
+
+# ---------------------------------------------------------------------------
 # ce_info_arch — host architecture reported by the container engine.
 #
 # Docker: docker info --format '{{.Architecture}}'
 # Podman: podman info --format '{{.Host.Arch}}'
+# Falls back to the kernel architecture when the daemon query is unavailable so
+# local builds do not accidentally target amd64 on arm64 hosts.
 # ---------------------------------------------------------------------------
 ce_info_arch() {
+  local arch=""
   if ce_is_docker; then
-    "${_CE_BIN}" info --format '{{.Architecture}}' 2>/dev/null || echo "amd64"
+    arch=$("${_CE_BIN}" info --format '{{.Architecture}}' 2>/dev/null || true)
   else
-    "${_CE_BIN}" info --format '{{.Host.Arch}}' 2>/dev/null || echo "amd64"
+    arch=$("${_CE_BIN}" info --format '{{.Host.Arch}}' 2>/dev/null || true)
+  fi
+
+  if [[ -n "${arch}" ]]; then
+    ce_normalize_arch "${arch}"
+  else
+    ce_host_arch
   fi
 }
 
