@@ -229,6 +229,8 @@ Each table is created atomically via `nft -f` on VM start and torn down atomical
 ## Prerequisites
 
 - macOS on Apple Silicon, or Linux on aarch64/x86_64 with KVM
+- On Linux, `devenv shell` provides the native build prerequisites without
+  installing distro packages with `apt` or `dnf`
 - Rust toolchain
 - e2fsprogs (`mke2fs` or `mkfs.ext4`, plus `debugfs`) for root and overlay disk image creation and QEMU environment injection
 - Guest-supervisor cross-compile toolchain (needed on macOS, and on Linux when host arch ≠ guest arch):

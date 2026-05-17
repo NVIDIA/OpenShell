@@ -60,6 +60,11 @@ the macOS user's shared home directory.
 Local image work should use `mise` tasks rather than direct Docker commands so
 the same staging and tagging assumptions are used locally and in CI.
 
+Local development can run inside the optional Nix/devenv shell. `devenv.nix`
+provides host-native prerequisites such as Z3, `pkg-config`, libclang, e2fsprogs,
+and container client CLIs; `mise` remains the task runner and installs the
+version-pinned language/toolchain entries from `mise.toml`.
+
 ## CI and E2E
 
 Required checks run on GitHub Actions. E2E and GPU workflows use NVIDIA

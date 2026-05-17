@@ -96,7 +96,23 @@ New issues opened by users without `write`, `maintain`, or `admin` repository pe
 
 ## Prerequisites
 
-Install [mise](https://mise.jdx.dev/). This is used to set up the development environment.
+If you use Nix, enter the checked-in devenv shell first. It provides `mise`,
+Z3, `pkg-config`, VM build tools, the Docker CLI, and local workflow CLIs
+without using `apt` or `dnf`:
+
+```bash
+devenv shell
+mise trust
+mise install --locked
+```
+
+The Docker daemon/machine still has to be configured on the host. Podman is not
+installed by the devenv shell; if you use the Podman driver, install it on the
+host and configure rootless UID/GID mapping (`newuidmap`, `newgidmap`,
+`/etc/subuid`, and `/etc/subgid`).
+
+Without Nix/devenv, install [mise](https://mise.jdx.dev/). This is used to set
+up the development environment.
 
 ```bash
 # Install mise (macOS/Linux)
@@ -127,7 +143,11 @@ Project requirements:
 
 ### Z3 installation
 
-The `openshell-prover` crate links against the system Z3 library via pkg-config.
+The Nix/devenv shell provides Z3 and `pkg-config` for local builds. If you are
+not using Nix/devenv, install Z3 through your platform package manager.
+
+The `openshell-prover` crate links against the system Z3 library via
+`pkg-config`.
 
 ```bash
 # macOS

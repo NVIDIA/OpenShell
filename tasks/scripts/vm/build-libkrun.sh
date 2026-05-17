@@ -20,7 +20,8 @@
 # Usage:
 #   ./build-libkrun.sh
 #
-# The script will install missing dependencies on Debian/Ubuntu and Fedora.
+# The script will install missing dependencies on Debian/Ubuntu and Fedora unless
+# OPENSHELL_SKIP_SYSTEM_DEPS=1 or the script runs inside a Nix/devenv shell.
 
 set -euo pipefail
 
@@ -61,8 +62,37 @@ if [ "$(id -u)" -ne 0 ]; then
   SUDO="sudo"
 fi
 
+deps_provided_by_active_shell() {
+  [ "${OPENSHELL_SKIP_SYSTEM_DEPS:-}" = "1" ] || [ -n "${DEVENV_ROOT:-}" ] || [ -n "${IN_NIX_SHELL:-}" ]
+}
+
+check_shell_deps() {
+  local missing=()
+  local cmd
+
+  for cmd in make git gcc flex bison bc curl cpio zstd jq pkg-config python3; do
+    if ! command -v "$cmd" &>/dev/null; then
+      missing+=("$cmd")
+    fi
+  done
+
+  if [ "${#missing[@]}" -gt 0 ]; then
+    echo "ERROR: missing build tools from the active shell: ${missing[*]}" >&2
+    echo "       Nix/devenv users: run 'devenv shell' from the repository root." >&2
+    echo "       Non-Nix users: unset OPENSHELL_SKIP_SYSTEM_DEPS to allow apt/dnf setup." >&2
+    exit 1
+  fi
+
+  echo "    Build tools found in active shell; skipping apt/dnf setup"
+}
+
 install_deps() {
   echo "==> Checking/installing build dependencies..."
+
+  if deps_provided_by_active_shell; then
+    check_shell_deps
+    return 0
+  fi
   
   if command -v apt-get &>/dev/null; then
     # Debian/Ubuntu
@@ -101,7 +131,16 @@ install_deps
 # project venv, or other early PATH entry often shadows /usr/bin/python3 and does
 # not ship pyelftools even when python3-pyelftools is installed for the distro.
 ensure_python3_with_pyelftools_for_libkrunfw() {
+  local configured_python="${OPENSHELL_LIBKRUNFW_PYTHON:-}"
   echo "    Checking Python 3 + pyelftools (libkrunfw bin2cbundle.py)..."
+  if [ -n "$configured_python" ]; then
+    if [ -x "$configured_python" ] && "$configured_python" -c 'from elftools.elf.elffile import ELFFile' 2>/dev/null; then
+      export PATH="$(dirname "$configured_python"):${PATH}"
+      echo "       OK (${configured_python} from OPENSHELL_LIBKRUNFW_PYTHON)"
+      return 0
+    fi
+    echo "       Warning: OPENSHELL_LIBKRUNFW_PYTHON='${configured_python}' does not provide pyelftools" >&2
+  fi
   if python3 -c 'from elftools.elf.elffile import ELFFile' 2>/dev/null; then
     echo "       OK ($(command -v python3))"
     return 0
@@ -115,6 +154,8 @@ ensure_python3_with_pyelftools_for_libkrunfw() {
   echo "       Install:  Debian/Ubuntu: sudo apt-get install -y python3-pyelftools" >&2
   echo "                Fedora/RHEL:   sudo dnf install -y python3-pyelftools" >&2
   echo "                pip:         python3 -m pip install --user pyelftools" >&2
+  echo "                Nix/devenv:   run 'devenv shell' from the repository root" >&2
+  echo "       Or set OPENSHELL_LIBKRUNFW_PYTHON to a python3 binary with pyelftools." >&2
   echo "       If the package is installed but this still fails, PATH may point at another python3 (mise, venv)." >&2
   echo "       Try:  PATH=/usr/bin:\$PATH mise run vm:setup" >&2
   exit 1
