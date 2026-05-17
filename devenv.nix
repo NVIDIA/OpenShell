@@ -32,6 +32,26 @@ let
   pythonWithPyelftools = pkgs.python3.withPackages (ps: [
     ps.pyelftools
   ]);
+
+  zigMuslWrapper = name: tool: target:
+    pkgs.writeShellScriptBin name ''
+      set -euo pipefail
+
+      args=()
+      for arg in "$@"; do
+        case "$arg" in
+          --target=*) ;;
+          *) args+=("$arg") ;;
+        esac
+      done
+
+      exec zig ${tool} --target=${target} "''${args[@]}"
+    '';
+
+  aarch64MuslCc = zigMuslWrapper "openshell-zig-aarch64-linux-musl-cc" "cc" "aarch64-linux-musl";
+  aarch64MuslCxx = zigMuslWrapper "openshell-zig-aarch64-linux-musl-cxx" "c++" "aarch64-linux-musl";
+  x86_64MuslCc = zigMuslWrapper "openshell-zig-x86_64-linux-musl-cc" "cc" "x86_64-linux-musl";
+  x86_64MuslCxx = zigMuslWrapper "openshell-zig-x86_64-linux-musl-cxx" "c++" "x86_64-linux-musl";
 in
 {
   packages = with pkgs; [
@@ -97,6 +117,18 @@ in
   env.Z3_SYS_Z3_HEADER = "${z3Dev}/include/z3.h";
   env.Z3_LIBRARY_PATH_OVERRIDE = "${z3Lib}/lib";
 
+  # Match CI's Zig-backed musl toolchain so native Nix shells do not leak
+  # glibc-built C objects into static supervisor/CLI links.
+  env.CC_aarch64_unknown_linux_musl = "${aarch64MuslCc}/bin/openshell-zig-aarch64-linux-musl-cc";
+  env.CXX_aarch64_unknown_linux_musl = "${aarch64MuslCxx}/bin/openshell-zig-aarch64-linux-musl-cxx";
+  env.CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER = "${aarch64MuslCc}/bin/openshell-zig-aarch64-linux-musl-cc";
+  env.CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS = "-Clink-self-contained=no";
+
+  env.CC_x86_64_unknown_linux_musl = "${x86_64MuslCc}/bin/openshell-zig-x86_64-linux-musl-cc";
+  env.CXX_x86_64_unknown_linux_musl = "${x86_64MuslCxx}/bin/openshell-zig-x86_64-linux-musl-cxx";
+  env.CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER = "${x86_64MuslCc}/bin/openshell-zig-x86_64-linux-musl-cc";
+  env.CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS = "-Clink-self-contained=no";
+
   enterShell = ''
     echo "OpenShell devenv ready. Run 'mise trust' once, then 'mise install --locked'."
   '';
@@ -110,5 +142,9 @@ in
     test -x "$(command -v mise)"
     test -x "$(command -v mke2fs)"
     test -x "$(command -v docker)"
+    test -x "$CC_aarch64_unknown_linux_musl"
+    test -x "$CXX_aarch64_unknown_linux_musl"
+    test -x "$CC_x86_64_unknown_linux_musl"
+    test -x "$CXX_x86_64_unknown_linux_musl"
   '';
 }
