@@ -28,10 +28,10 @@
 #      `openshell` CLI with the embedded runtime.
 #   3. On macOS, codesigns the VM driver (libkrun needs the
 #      `com.apple.security.hypervisor` entitlement).
-#   4. Starts the gateway with `--drivers vm --disable-tls
-#      --disable-gateway-auth --db-url sqlite:<run-state>/gateway.db` on a random
-#      free port, waits for `Server listening`, then runs the selected
-#      Rust e2e test (`smoke` by default).
+#   4. Writes a per-run gateway config with `[openshell.drivers.vm]`
+#      settings, starts the gateway with `--config <run-state>/gateway.toml`
+#      on a random free port, waits for `Server listening`, then runs the
+#      selected Rust e2e test (`smoke` by default).
 #   5. Tears the gateway down and (on failure) preserves the gateway
 #      log and every VM serial console log for post-mortem.
 #
@@ -50,7 +50,7 @@ DRIVER_BIN="${ROOT}/target/debug/openshell-driver-vm"
 E2E_TEST="${OPENSHELL_E2E_VM_TEST:-smoke}"
 E2E_FEATURES="${OPENSHELL_E2E_VM_FEATURES:-e2e-vm}"
 
-# The VM driver places `compute-driver.sock` under --vm-driver-state-dir.
+# The VM driver places `compute-driver.sock` under `[openshell.drivers.vm].state_dir`.
 # AF_UNIX SUN_LEN is 104 bytes on macOS (108 on Linux), so paths anchored
 # in the workspace's `target/` blow the limit on typical developer
 # machines — e.g. a ~100-char `~/.superset/worktrees/.../target/...`
@@ -116,6 +116,7 @@ mkdir -p "${RUN_STATE_DIR}"
 GATEWAY_LOG="$(mktemp /tmp/openshell-gateway-e2e.XXXXXX)"
 GATEWAY_PID_FILE="${RUN_STATE_DIR}/gateway.pid"
 GATEWAY_ARGS_FILE="${RUN_STATE_DIR}/gateway.args"
+GATEWAY_CONFIG="${RUN_STATE_DIR}/gateway.toml"
 GATEWAY_DB="${RUN_STATE_DIR}/gateway.db"
 
 # ── Cleanup (trap) ───────────────────────────────────────────────────
@@ -172,28 +173,35 @@ trap cleanup EXIT
 
 echo "==> Starting openshell-gateway on 127.0.0.1:${HOST_PORT} (state: ${RUN_STATE_DIR})"
 
-# Pin --driver-dir to the workspace `target/debug/` so we always pick up
+# Pin `driver_dir` to the workspace `target/debug/` so we always pick up
 # the driver we just cargo-built. Without this, the gateway's
 # `resolve_compute_driver_bin` fallback prefers
 # `~/.local/libexec/openshell/openshell-driver-vm` when present,
 # which silently shadows development builds — a subtle source of
 # stale-binary bugs in e2e runs.
-# --grpc-endpoint is the URL the VM driver passes into each guest as
+# `grpc_endpoint` is the URL the VM driver passes into each guest as
 # OPENSHELL_ENDPOINT. The supervisor inside the VM dials this address.
 # Use `host.containers.internal` rather than `127.0.0.1` so gvproxy's
 # host-loopback proxy carries the connection — gvproxy's bare gateway IP
 # (192.168.127.1) does NOT forward arbitrary host ports. The driver also
 # rewrites loopback URLs to this hostname as a safety net, so this matches
 # what the guest will actually see and aligns with `tasks/scripts/gateway-vm.sh`.
+cat >"${GATEWAY_CONFIG}" <<EOF
+[openshell]
+version = 1
+
+[openshell.drivers.vm]
+grpc_endpoint = "http://host.containers.internal:${HOST_PORT}"
+driver_dir = "${ROOT}/target/debug"
+state_dir = "${RUN_STATE_DIR}"
+EOF
+
 GATEWAY_ARGS=(
+  --config "${GATEWAY_CONFIG}"
   --drivers vm
   --disable-tls
-  --disable-gateway-auth
   --db-url "sqlite:${GATEWAY_DB}?mode=rwc"
   --port "${HOST_PORT}"
-  --grpc-endpoint "http://host.containers.internal:${HOST_PORT}"
-  --driver-dir "${ROOT}/target/debug"
-  --vm-driver-state-dir "${RUN_STATE_DIR}"
 )
 e2e_write_gateway_args_file "${GATEWAY_ARGS_FILE}" "${GATEWAY_ARGS[@]}"
 
