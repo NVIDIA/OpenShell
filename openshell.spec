@@ -140,24 +140,19 @@ Wants=podman.socket
 
 [Service]
 Type=exec
-# Self-contained package defaults live in gateway TOML.
-#
-# PKI and gateway TOML are auto-generated on first start. Client certs
-# are placed in ~/.config/openshell/gateways/openshell/mtls/ so the
-# CLI discovers them automatically.
+# PKI is auto-generated on first start. Client certs are placed in
+# ~/.config/openshell/gateways/openshell/mtls/ so the CLI discovers them
+# automatically. Gateway runtime defaults are used unless a TOML config
+# exists in the default user config location or OPENSHELL_GATEWAY_CONFIG is set.
 # See /usr/share/doc/openshell-gateway/ for details.
 
-# Auto-generate PKI on first start. Idempotent: skips when all six PEMs are
-# already in place. %%S expands to $XDG_STATE_HOME (~/.local/state) in user
-# units.
-ExecStartPre=/usr/bin/openshell-gateway generate-certs --output-dir %%S/openshell/tls
-
-# Auto-generate gateway TOML on first start if not present.
-ExecStartPre=%{_libexecdir}/openshell/init-gateway-config.sh rpm %%E/openshell/gateway.toml %%S/openshell/tls ghcr.io/nvidia/openshell/supervisor:%{image_tag}
+# Auto-generate PKI on first start if not present.
+# %%S expands to $XDG_STATE_HOME (~/.local/state) in user units.
+ExecStartPre=/usr/bin/openshell-gateway generate-certs --output-dir %%S/openshell/tls --server-san host.openshell.internal
 
 # Optional OPENSHELL_* overrides.
 EnvironmentFile=-%%E/openshell/gateway.env
-ExecStart=/bin/sh -c 'exec /usr/bin/openshell-gateway --config "$${OPENSHELL_GATEWAY_CONFIG:-%%E/openshell/gateway.toml}" --db-url "$${OPENSHELL_DB_URL:-sqlite://%%S/openshell/gateway.db}"'
+ExecStart=/usr/bin/openshell-gateway
 StateDirectory=openshell
 Restart=on-failure
 RestartSec=5
@@ -171,10 +166,6 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 [Install]
 WantedBy=default.target
 EOF
-
-# --- Gateway config generator ---
-install -d %{buildroot}%{_libexecdir}/%{name}
-install -pm 0755 deploy/common/init-gateway-config.sh %{buildroot}%{_libexecdir}/%{name}/init-gateway-config.sh
 
 # --- Gateway documentation ---
 install -d %{buildroot}%{_docdir}/%{name}-gateway
@@ -255,7 +246,6 @@ PYTHONPATH=%{buildroot}%{python3_sitelib} %{python3} -c "from importlib.metadata
 %doc %{_docdir}/%{name}-gateway/TROUBLESHOOTING.md
 %{_bindir}/%{name}-gateway
 %{_userunitdir}/%{name}-gateway.service
-%{_libexecdir}/%{name}/init-gateway-config.sh
 %{_mandir}/man8/openshell-gateway.8*
 
 %files -n python3-%{name}

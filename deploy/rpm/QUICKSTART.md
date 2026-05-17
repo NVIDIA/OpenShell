@@ -64,7 +64,6 @@ systemctl --user enable --now openshell-gateway
 On first start, the gateway automatically generates:
 
 - A self-signed PKI bundle (CA, server cert, client cert) for mTLS
-- A gateway TOML file at `~/.config/openshell/gateway.toml`
 
 > **Note:** The gateway binds to `127.0.0.1:17670` by default. Mutual
 > TLS (mTLS) is enabled automatically on first start, requiring a valid

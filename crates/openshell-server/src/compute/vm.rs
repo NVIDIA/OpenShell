@@ -105,7 +105,10 @@ impl VmComputeConfig {
     /// Default working directory for VM driver state.
     #[must_use]
     pub fn default_state_dir() -> PathBuf {
-        PathBuf::from("target/openshell-vm-driver")
+        openshell_core::paths::openshell_state_dir().map_or_else(
+            |_| PathBuf::from("target/openshell-vm-driver"),
+            |dir| dir.join("vm-driver"),
+        )
     }
 
     /// Default libkrun log level.
@@ -229,7 +232,21 @@ pub fn resolve_compute_driver_bin(vm_config: &VmComputeConfig) -> Result<PathBuf
 
 fn resolve_driver_search_dirs(vm_config: &VmComputeConfig) -> Vec<PathBuf> {
     vm_config.driver_dir.clone().map_or_else(
-        || VmComputeConfig::default_driver_search_dirs(std::env::var_os("HOME").map(PathBuf::from)),
+        || {
+            let mut dirs = Vec::new();
+            if let Ok(current_exe) = std::env::current_exe()
+                && let Some(prefix) = current_exe.parent().and_then(Path::parent)
+            {
+                push_unique_path(&mut dirs, prefix.join("libexec"));
+                push_unique_path(&mut dirs, prefix.join("libexec").join("openshell"));
+            }
+            for dir in VmComputeConfig::default_driver_search_dirs(
+                std::env::var_os("HOME").map(PathBuf::from),
+            ) {
+                push_unique_path(&mut dirs, dir);
+            }
+            dirs
+        },
         |dir| vec![dir],
     )
 }

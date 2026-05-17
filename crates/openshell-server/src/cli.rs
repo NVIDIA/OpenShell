@@ -16,6 +16,7 @@ use tracing_subscriber::EnvFilter;
 use crate::certgen;
 use crate::compute::{DockerComputeConfig, VmComputeConfig};
 use crate::config_file::{self, ConfigFile, GatewayFileSection};
+use crate::defaults::{self, LocalTlsPaths};
 use crate::{run_server, tracing_bus::TracingLogBus};
 
 /// `OpenShell` gateway process - gRPC and HTTP server with protocol multiplexing.
@@ -87,9 +88,9 @@ struct RunArgs {
 
     /// Database URL for persistence.
     ///
-    /// Required when running the gateway. Validated at the call site rather
-    /// than as a clap-level requirement so the `generate-certs` subcommand
-    /// (which does not need a database) can run without it.
+    /// When unset, the gateway stores state under the `XDG` state
+    /// directory. Kept as an Option at the clap layer so the `generate-certs`
+    /// subcommand can run without gateway runtime defaults.
     #[arg(long, env = "OPENSHELL_DB_URL")]
     db_url: Option<String>,
 
@@ -201,10 +202,11 @@ pub async fn run_cli() -> Result<()> {
 }
 
 async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
-    // Load TOML file when --config / OPENSHELL_GATEWAY_CONFIG is set.
-    // File values are applied below for any argument that is still at its
-    // built-in default — CLI flags and OPENSHELL_* env vars always win.
-    let file: Option<ConfigFile> = if let Some(path) = args.config.clone() {
+    // Load TOML when explicitly requested, or from the default XDG location
+    // when that file exists. Missing default config is not an error: runtime
+    // defaults and OPENSHELL_* env vars are enough for package-managed starts.
+    let config_path = resolve_config_path(&args)?;
+    let file: Option<ConfigFile> = if let Some(path) = config_path {
         Some(config_file::load(&path).map_err(|e| miette::miette!("{e}"))?)
     } else {
         None
@@ -212,6 +214,8 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
     if let Some(file) = file.as_ref() {
         merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
     }
+
+    let local_tls = apply_runtime_defaults(&mut args)?;
 
     let tracing_log_bus = TracingLogBus::new();
     tracing_log_bus.install_subscriber(
@@ -251,7 +255,7 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
     let db_url = args
         .db_url
         .clone()
-        .ok_or_else(|| miette::miette!("--db-url is required (or set OPENSHELL_DB_URL)"))?;
+        .expect("runtime defaults populate db_url");
 
     let mut config = openshell_core::Config::new(tls)
         .with_bind_address(bind)
@@ -332,8 +336,13 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
         });
     }
 
-    let vm_config = build_vm_config(file.as_ref())?;
-    let docker_config = build_docker_config(file.as_ref())?;
+    let vm_config = build_vm_config(
+        file.as_ref(),
+        local_tls.as_ref(),
+        args.disable_tls,
+        args.port,
+    )?;
+    let docker_config = build_docker_config(file.as_ref(), local_tls.as_ref())?;
 
     if args.disable_tls {
         warn!("TLS disabled — listening on plaintext HTTP");
@@ -370,6 +379,40 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
 
 fn parse_compute_driver(value: &str) -> std::result::Result<ComputeDriverKind, String> {
     value.parse()
+}
+
+fn resolve_config_path(args: &RunArgs) -> Result<Option<PathBuf>> {
+    if let Some(path) = args.config.clone() {
+        return Ok(Some(path));
+    }
+
+    let default_path = defaults::default_gateway_config_path()?;
+    Ok(default_path.is_file().then_some(default_path))
+}
+
+fn apply_runtime_defaults(args: &mut RunArgs) -> Result<Option<LocalTlsPaths>> {
+    let local_tls = if args.disable_tls {
+        None
+    } else {
+        defaults::complete_local_tls_paths()?
+    };
+
+    if args.db_url.is_none() {
+        args.db_url = Some(defaults::default_database_url()?);
+    }
+
+    if !args.disable_tls
+        && args.tls_cert.is_none()
+        && args.tls_key.is_none()
+        && args.tls_client_ca.is_none()
+        && let Some(paths) = &local_tls
+    {
+        args.tls_cert = Some(paths.server_cert.clone());
+        args.tls_key = Some(paths.server_key.clone());
+        args.tls_client_ca = Some(paths.ca.clone());
+    }
+
+    Ok(local_tls)
 }
 
 /// Returns `true` when an argument's value came from clap's built-in default
@@ -500,7 +543,12 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
 
 /// Build [`VmComputeConfig`] from the `[openshell.drivers.vm]` table
 /// inherited from `[openshell.gateway]`.
-fn build_vm_config(file: Option<&ConfigFile>) -> Result<VmComputeConfig> {
+fn build_vm_config(
+    file: Option<&ConfigFile>,
+    local_tls: Option<&LocalTlsPaths>,
+    disable_tls: bool,
+    gateway_port: u16,
+) -> Result<VmComputeConfig> {
     let mut cfg = if let Some(file) = file {
         let merged = config_file::driver_table(
             ComputeDriverKind::Vm,
@@ -517,23 +565,61 @@ fn build_vm_config(file: Option<&ConfigFile>) -> Result<VmComputeConfig> {
     if cfg.state_dir.as_os_str().is_empty() {
         cfg.state_dir = VmComputeConfig::default_state_dir();
     }
+    if cfg.grpc_endpoint.trim().is_empty() && (disable_tls || local_tls.is_some()) {
+        let scheme = if disable_tls { "http" } else { "https" };
+        cfg.grpc_endpoint = format!("{scheme}://127.0.0.1:{gateway_port}");
+    }
+    apply_guest_tls_defaults(
+        &mut cfg.guest_tls_ca,
+        &mut cfg.guest_tls_cert,
+        &mut cfg.guest_tls_key,
+        local_tls,
+    );
     Ok(cfg)
 }
 
 /// Build [`DockerComputeConfig`] using the same inheritance pattern as
 /// [`build_vm_config`].
-fn build_docker_config(file: Option<&ConfigFile>) -> Result<DockerComputeConfig> {
-    if let Some(file) = file {
+fn build_docker_config(
+    file: Option<&ConfigFile>,
+    local_tls: Option<&LocalTlsPaths>,
+) -> Result<DockerComputeConfig> {
+    let mut cfg = if let Some(file) = file {
         let merged = config_file::driver_table(
             ComputeDriverKind::Docker,
             &file.openshell.gateway,
             file.openshell.drivers.get("docker"),
         );
-        return merged
+        merged
             .try_into::<DockerComputeConfig>()
-            .map_err(|e| miette::miette!("invalid [openshell.drivers.docker] table: {e}"));
+            .map_err(|e| miette::miette!("invalid [openshell.drivers.docker] table: {e}"))?
+    } else {
+        DockerComputeConfig::default()
+    };
+    apply_guest_tls_defaults(
+        &mut cfg.guest_tls_ca,
+        &mut cfg.guest_tls_cert,
+        &mut cfg.guest_tls_key,
+        local_tls,
+    );
+    Ok(cfg)
+}
+
+fn apply_guest_tls_defaults(
+    ca: &mut Option<PathBuf>,
+    cert: &mut Option<PathBuf>,
+    key: &mut Option<PathBuf>,
+    local_tls: Option<&LocalTlsPaths>,
+) {
+    if ca.is_none()
+        && cert.is_none()
+        && key.is_none()
+        && let Some(paths) = local_tls
+    {
+        *ca = Some(paths.ca.clone());
+        *cert = Some(paths.client_cert.clone());
+        *key = Some(paths.client_key.clone());
     }
-    Ok(DockerComputeConfig::default())
 }
 
 #[cfg(test)]
@@ -782,11 +868,10 @@ mod tests {
     }
 
     #[test]
-    fn bare_invocation_with_no_db_url_errors_at_runtime_not_parse_time() {
+    fn bare_invocation_with_no_db_url_parses_for_runtime_defaults() {
         // db_url is Option<String> at the clap level so subcommand parsing
-        // does not require it. The Run path validates it inside
-        // run_from_args. This test asserts the parse step succeeds with no
-        // --db-url, mirroring what the runtime check sees.
+        // does not require it. The Run path fills a default URL from XDG
+        // state when neither CLI nor env supplied one.
         let _lock = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -817,6 +902,99 @@ mod tests {
 
     fn config_file_from_toml(toml: &str) -> ConfigFile {
         toml::from_str(toml).expect("valid TOML in test fixture")
+    }
+
+    #[test]
+    fn default_config_path_is_loaded_only_when_present() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile::tempdir().unwrap();
+        let _g1 = EnvVarGuard::remove("OPENSHELL_GATEWAY_CONFIG");
+        let _g2 = EnvVarGuard::set("XDG_CONFIG_HOME", tmp.path().to_str().unwrap());
+
+        let (args, _) = parse_with_args(&["openshell-gateway"]);
+        assert_eq!(super::resolve_config_path(&args).unwrap(), None);
+
+        let config = tmp.path().join("openshell").join("gateway.toml");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(&config, "[openshell]\nversion = 1\n").unwrap();
+
+        assert_eq!(super::resolve_config_path(&args).unwrap(), Some(config));
+    }
+
+    #[test]
+    fn explicit_config_path_is_returned_even_when_missing() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = EnvVarGuard::remove("OPENSHELL_GATEWAY_CONFIG");
+
+        let (args, _) = parse_with_args(&["openshell-gateway", "--config", "/tmp/missing.toml"]);
+
+        assert_eq!(
+            super::resolve_config_path(&args).unwrap(),
+            Some(std::path::PathBuf::from("/tmp/missing.toml"))
+        );
+    }
+
+    #[test]
+    fn runtime_defaults_populate_database_url_from_xdg_state() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile::tempdir().unwrap();
+        let _g1 = EnvVarGuard::remove("OPENSHELL_DB_URL");
+        let _g2 = EnvVarGuard::set("XDG_STATE_HOME", tmp.path().to_str().unwrap());
+
+        let (mut args, _) = parse_with_args(&["openshell-gateway", "--disable-tls"]);
+        let local_tls = super::apply_runtime_defaults(&mut args).unwrap();
+
+        let expected = format!(
+            "sqlite:{}",
+            tmp.path().join("openshell/gateway/openshell.db").display()
+        );
+        assert!(local_tls.is_none());
+        assert_eq!(args.db_url.as_deref(), Some(expected.as_str()));
+        assert!(tmp.path().join("openshell/gateway").is_dir());
+    }
+
+    #[test]
+    fn runtime_defaults_use_complete_local_tls_bundle() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = tempfile::tempdir().unwrap();
+        let tls = tempfile::tempdir().unwrap();
+        let _g1 = EnvVarGuard::remove("OPENSHELL_DB_URL");
+        let _g2 = EnvVarGuard::remove("OPENSHELL_TLS_CERT");
+        let _g3 = EnvVarGuard::remove("OPENSHELL_TLS_KEY");
+        let _g4 = EnvVarGuard::remove("OPENSHELL_TLS_CLIENT_CA");
+        let _g5 = EnvVarGuard::remove("OPENSHELL_DISABLE_TLS");
+        let _g6 = EnvVarGuard::set("XDG_STATE_HOME", state.path().to_str().unwrap());
+        let _g7 = EnvVarGuard::set("OPENSHELL_LOCAL_TLS_DIR", tls.path().to_str().unwrap());
+
+        std::fs::create_dir_all(tls.path().join("server")).unwrap();
+        std::fs::create_dir_all(tls.path().join("client")).unwrap();
+        for rel in [
+            "ca.crt",
+            "server/tls.crt",
+            "server/tls.key",
+            "client/tls.crt",
+            "client/tls.key",
+        ] {
+            std::fs::write(tls.path().join(rel), "pem").unwrap();
+        }
+
+        let (mut args, _) = parse_with_args(&["openshell-gateway"]);
+        let local_tls = super::apply_runtime_defaults(&mut args)
+            .unwrap()
+            .expect("complete bundle should be returned");
+
+        assert_eq!(args.tls_cert, Some(tls.path().join("server/tls.crt")));
+        assert_eq!(args.tls_key, Some(tls.path().join("server/tls.key")));
+        assert_eq!(args.tls_client_ca, Some(tls.path().join("ca.crt")));
+        assert_eq!(local_tls.client_cert, tls.path().join("client/tls.crt"));
     }
 
     #[test]

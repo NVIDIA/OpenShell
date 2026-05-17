@@ -74,7 +74,7 @@ fn container_visible_endpoint_rewrites_loopback_hosts() {
             HOST_OPENSHELL_INTERNAL,
             DEFAULT_SERVER_PORT,
         ),
-        "https://host.openshell.internal:8080/"
+        "https://host.openshell.internal:17670/"
     );
     assert_eq!(
         docker_container_openshell_endpoint(
@@ -82,7 +82,7 @@ fn container_visible_endpoint_rewrites_loopback_hosts() {
             HOST_OPENSHELL_INTERNAL,
             DEFAULT_SERVER_PORT,
         ),
-        "http://host.openshell.internal:8080/"
+        "http://host.openshell.internal:17670/"
     );
     assert_eq!(
         docker_container_openshell_endpoint(
@@ -90,7 +90,7 @@ fn container_visible_endpoint_rewrites_loopback_hosts() {
             HOST_OPENSHELL_INTERNAL,
             DEFAULT_SERVER_PORT,
         ),
-        "https://host.openshell.internal:8080/"
+        "https://host.openshell.internal:17670/"
     );
 }
 
@@ -273,7 +273,7 @@ fn docker_gateway_route_uses_bridge_gateway_for_linux_docker() {
     assert_eq!(
         route,
         DockerGatewayRoute::Bridge {
-            bind_address: "172.18.0.1:8080".parse().unwrap(),
+            bind_address: "172.18.0.1:17670".parse().unwrap(),
             host_alias_ip: IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
         }
     );
@@ -303,7 +303,7 @@ fn docker_gateway_route_prefers_configured_host_gateway_ip() {
     assert_eq!(
         route,
         DockerGatewayRoute::Bridge {
-            bind_address: "172.20.0.4:8080".parse().unwrap(),
+            bind_address: "172.20.0.4:17670".parse().unwrap(),
             host_alias_ip: IpAddr::V4(Ipv4Addr::new(172, 20, 0, 4)),
         }
     );

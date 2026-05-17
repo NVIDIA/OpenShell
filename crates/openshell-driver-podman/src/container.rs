@@ -1036,7 +1036,7 @@ mod tests {
         let vol = &image_volumes[0];
         assert_eq!(
             vol["source"].as_str(),
-            Some("openshell/supervisor:latest"),
+            Some("ghcr.io/nvidia/openshell/supervisor:latest"),
             "image volume source should be the supervisor image"
         );
         assert_eq!(

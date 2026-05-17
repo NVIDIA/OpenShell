@@ -675,8 +675,8 @@ fn is_loopback_gateway_endpoint(endpoint: &str) -> bool {
 /// would serve this endpoint.
 ///
 /// Loopback endpoints (`localhost`, `127.0.0.1`, `::1`) resolve to the
-/// `"openshell"` gateway name, matching the convention used by
-/// `init-pki.sh` and the TLS cert resolver in `tls.rs`.
+/// `"openshell"` gateway name, matching the convention used by local
+/// `openshell-gateway generate-certs` and the TLS cert resolver in `tls.rs`.
 fn mtls_certs_exist_for_endpoint(name: &str, endpoint: &str) -> bool {
     let cert_name = if is_loopback_gateway_endpoint(endpoint) {
         "openshell"
@@ -901,7 +901,7 @@ pub async fn gateway_add(
 
     // Derive a gateway name from the hostname when none is provided.
     // Loopback endpoints use the canonical "openshell" name, matching the
-    // convention in init-pki.sh and default_tls_dir.
+    // convention in local cert generation and default_tls_dir.
     let derived_name;
     let name = if let Some(n) = name {
         n
@@ -7170,7 +7170,7 @@ mod tests {
             });
 
             // Loopback endpoints derive the canonical "openshell" gateway
-            // name, matching init-pki.sh and default_tls_dir conventions.
+            // name, matching local cert generation and default_tls_dir conventions.
             let metadata = load_gateway_metadata("openshell").expect("load stored gateway");
             assert_eq!(metadata.auth_mode.as_deref(), Some("plaintext"));
             assert!(!metadata.is_remote);

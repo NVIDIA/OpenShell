@@ -5,12 +5,11 @@
 set -eu
 
 CANONICAL_CONFIG_FILE="${SNAP_COMMON}/gateway.toml"
-CONFIG_FILE="${OPENSHELL_GATEWAY_CONFIG:-$CANONICAL_CONFIG_FILE}"
-DB_URL="${OPENSHELL_DB_URL:-sqlite:${SNAP_COMMON}/gateway.db?mode=rwc}"
+export OPENSHELL_DB_URL="${OPENSHELL_DB_URL:-sqlite:${SNAP_COMMON}/gateway.db?mode=rwc}"
+export OPENSHELL_DISABLE_TLS="${OPENSHELL_DISABLE_TLS:-true}"
 
-if [ ! -f "$CANONICAL_CONFIG_FILE" ]; then
-    "${SNAP}/bin/init-gateway-config.sh" snap "$CANONICAL_CONFIG_FILE" "${SNAP}/bin/openshell-sandbox"
+if [ -z "${OPENSHELL_GATEWAY_CONFIG:-}" ] && [ -f "$CANONICAL_CONFIG_FILE" ]; then
+    exec "${SNAP}/bin/openshell-gateway" --config "$CANONICAL_CONFIG_FILE" "$@"
 fi
 
-export OPENSHELL_GATEWAY_CONFIG="$CONFIG_FILE"
-exec "${SNAP}/bin/openshell-gateway" --config "$CONFIG_FILE" --db-url "$DB_URL" "$@"
+exec "${SNAP}/bin/openshell-gateway" "$@"

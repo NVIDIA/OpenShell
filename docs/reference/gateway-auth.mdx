@@ -162,7 +162,7 @@ When a gateway is deployed with `server.disableTls=true`, TLS is disabled entire
 Register a plaintext gateway with an explicit `http://` endpoint:
 
 ```shell
-openshell gateway add http://127.0.0.1:8080 --local
+openshell gateway add http://127.0.0.1:17670 --local
 ```
 
 This stores the gateway with `auth_mode = plaintext`, skips mTLS client certificate lookup, and does not open the browser login flow.

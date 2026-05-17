@@ -14,10 +14,10 @@ client certificate for all API connections and listens on
 
 ### Auto-generated certificates
 
-On first start, the gateway's `ExecStartPre` runs
-`openshell-gateway generate-certs --output-dir <state-dir>/openshell/tls`,
-which generates the certificates with `rcgen` (the same routine the CLI
-uses for local mTLS bundles):
+On first start, the systemd user service runs
+`openshell-gateway generate-certs --output-dir ~/.local/state/openshell/tls --server-san host.openshell.internal`
+to generate certificates with `rcgen` (the same routine the CLI uses for
+local mTLS bundles):
 
 | File | Purpose | Location |
 |------|---------|----------|
@@ -51,6 +51,7 @@ Names:
 - `openshell.openshell.svc.cluster.local`
 - `host.containers.internal`
 - `host.docker.internal`
+- `host.openshell.internal`
 - `127.0.0.1`
 
 To connect from a remote machine, you need externally-managed
@@ -140,10 +141,9 @@ configuration is required.
 
 ## Configuration reference
 
-Gateway and driver settings live in
-`~/.config/openshell/gateway.toml`, which is generated on first
-start. The systemd unit launches the gateway with that file unless
-`OPENSHELL_GATEWAY_CONFIG` is set.
+Gateway and driver settings have local runtime defaults. The gateway reads
+`~/.config/openshell/gateway.toml` when that file exists. Set
+`OPENSHELL_GATEWAY_CONFIG` in the launch environment to use a different file.
 
 Use `systemctl --user edit openshell-gateway` for service environment
 overrides that persist across package upgrades.
@@ -155,19 +155,18 @@ overrides that persist across package upgrades.
 | `bind_address` | `127.0.0.1:17670` | Address for the gRPC/HTTP API. |
 | `compute_drivers` | unset | When unset, the gateway auto-detects Kubernetes, then Podman, then Docker. Set `compute_drivers = ["podman"]` to force Podman. |
 | `default_image` | `ghcr.io/nvidia/openshell-community/sandboxes/base:latest` | Default sandbox image. |
-| `supervisor_image` | RPM build image tag | Supervisor image mounted into Podman sandboxes. |
+| `supervisor_image` | `ghcr.io/nvidia/openshell/supervisor:latest` | Supervisor image mounted into Podman sandboxes. |
 | `guest_tls_ca`, `guest_tls_cert`, `guest_tls_key` | auto-generated paths | Client TLS material bind-mounted into sandbox containers. |
 | `[openshell.gateway.tls]` paths | auto-generated paths | Server TLS certificate, key, and client CA. |
 | `disable_tls` | unset | Set to `true` to disable TLS. |
 
-The database URL is not accepted in TOML. The unit passes
-`--db-url sqlite://$XDG_STATE_HOME/openshell/gateway.db` unless
-`OPENSHELL_DB_URL` is set.
+The database URL is not accepted in TOML. When `OPENSHELL_DB_URL` is unset,
+the gateway uses `sqlite:$XDG_STATE_HOME/openshell/gateway/openshell.db`.
 
 ### Driver TOML settings
 
-The generated `gateway.toml` contains the RPM's Podman settings but does not
-select a driver:
+Create `~/.config/openshell/gateway.toml` when you need to customize driver
+settings:
 
 ```toml
 [openshell]
@@ -178,15 +177,6 @@ bind_address = "127.0.0.1:17670"
 # Leave unset to auto-detect the compute driver.
 # compute_drivers = ["podman"]
 default_image = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
-supervisor_image = "ghcr.io/nvidia/openshell/supervisor:latest"
-guest_tls_ca = "/home/user/.local/state/openshell/tls/ca.crt"
-guest_tls_cert = "/home/user/.local/state/openshell/tls/client/tls.crt"
-guest_tls_key = "/home/user/.local/state/openshell/tls/client/tls.key"
-
-[openshell.gateway.tls]
-cert_path = "/home/user/.local/state/openshell/tls/server/tls.crt"
-key_path = "/home/user/.local/state/openshell/tls/server/tls.key"
-client_ca_path = "/home/user/.local/state/openshell/tls/ca.crt"
 
 [openshell.drivers.podman]
 image_pull_policy = "missing"
@@ -249,9 +239,7 @@ For air-gapped environments:
 | Gateway binary | `/usr/bin/openshell-gateway` |
 | CLI binary | `/usr/bin/openshell` |
 | Systemd user unit | `/usr/lib/systemd/user/openshell-gateway.service` |
-| PKI bootstrap | `openshell-gateway generate-certs` (run from `ExecStartPre`) |
-| Config generator script | `/usr/libexec/openshell/init-gateway-config.sh` |
 | TLS certificates | `~/.local/state/openshell/tls/` |
 | CLI client certs | `~/.config/openshell/gateways/openshell/mtls/` |
-| Gateway database | `~/.local/state/openshell/gateway.db` |
-| Gateway TOML configuration | `~/.config/openshell/gateway.toml` |
+| Gateway database | `~/.local/state/openshell/gateway/openshell.db` |
+| Optional gateway TOML configuration | `~/.config/openshell/gateway.toml` |

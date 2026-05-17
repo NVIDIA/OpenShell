@@ -224,19 +224,6 @@ def _asset_url(release_tag: str, filename: str) -> str:
     return f"{GITHUB_RELEASE_DOWNLOADS}/{release_tag}/{filename}"
 
 
-def _homebrew_supervisor_image(release_tag: str) -> str:
-    image_tag = "dev" if release_tag == "dev" else release_tag.removeprefix("v")
-    return f"ghcr.io/nvidia/openshell/supervisor:{image_tag}"
-
-
-def _homebrew_gateway_config_helper() -> str:
-    return (
-        (_repo_root() / "deploy/common/init-gateway-config.sh")
-        .read_text(encoding="utf-8")
-        .rstrip()
-    )
-
-
 def render_homebrew_formula(
     *,
     release_tag: str,
@@ -248,8 +235,6 @@ def render_homebrew_formula(
         raise ValueError(f"release tag contains unsupported characters: {release_tag}")
 
     version = release_tag.removeprefix("v")
-    docker_supervisor_image = _homebrew_supervisor_image(release_tag)
-    gateway_config_helper = _homebrew_gateway_config_helper()
     return f"""# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -289,11 +274,6 @@ class Openshell < Formula
       libexec.install "openshell-driver-vm"
     end
 
-    (libexec/"init-gateway-config.sh").write <<~'SH'
-{gateway_config_helper}
-    SH
-    chmod 0755, libexec/"init-gateway-config.sh"
-
     (libexec/"openshell-gateway-homebrew-service").write <<~SH
       #!/bin/sh
       set -eu
@@ -317,29 +297,24 @@ class Openshell < Formula
       fi
 
       docker_tls_dir="${{HOME}}/.local/state/openshell/homebrew/tls"
+      mkdir -p "${{docker_tls_dir}}/server"
       mkdir -p "${{docker_tls_dir}}/client"
-      chmod 700 "${{docker_tls_dir}}" "${{docker_tls_dir}}/client"
+      chmod 700 "${{docker_tls_dir}}" "${{docker_tls_dir}}/server" "${{docker_tls_dir}}/client"
       /usr/bin/install -m 0644 "#{{var}}/openshell/tls/ca.crt" "${{docker_tls_dir}}/ca.crt"
+      /usr/bin/install -m 0644 "#{{var}}/openshell/tls/server/tls.crt" "${{docker_tls_dir}}/server/tls.crt"
+      /usr/bin/install -m 0600 "#{{var}}/openshell/tls/server/tls.key" "${{docker_tls_dir}}/server/tls.key"
       /usr/bin/install -m 0644 "#{{var}}/openshell/tls/client/tls.crt" "${{docker_tls_dir}}/client/tls.crt"
       /usr/bin/install -m 0600 "#{{var}}/openshell/tls/client/tls.key" "${{docker_tls_dir}}/client/tls.key"
+      export OPENSHELL_LOCAL_TLS_DIR="${{OPENSHELL_LOCAL_TLS_DIR:-${{docker_tls_dir}}}}"
 
       xdg_gateway_config="${{xdg_config_home}}/openshell/gateway.toml"
       prefix_gateway_config="#{{var}}/openshell/gateway.toml"
-      if [ -n "${{OPENSHELL_GATEWAY_CONFIG:-}}" ]; then
-        gateway_config="${{OPENSHELL_GATEWAY_CONFIG}}"
-      elif [ -f "${{xdg_gateway_config}}" ]; then
-        gateway_config="${{xdg_gateway_config}}"
-      else
-        if [ ! -f "${{prefix_gateway_config}}" ]; then
-          "#{{opt_libexec}}/init-gateway-config.sh" homebrew "${{prefix_gateway_config}}" "#{{var}}/openshell/tls" "#{{opt_libexec}}" "#{{var}}/openshell/vm-driver" "{docker_supervisor_image}" "${{docker_tls_dir}}"
-        fi
-        gateway_config="${{prefix_gateway_config}}"
+
+      if [ -z "${{OPENSHELL_GATEWAY_CONFIG:-}}" ] && [ ! -f "${{xdg_gateway_config}}" ] && [ -f "${{prefix_gateway_config}}" ]; then
+        exec "#{{opt_bin}}/openshell-gateway" --config "${{prefix_gateway_config}}"
       fi
 
-      gateway_db_url="${{OPENSHELL_DB_URL:-sqlite:#{{var}}/openshell/gateway/openshell.db}}"
-
-      export OPENSHELL_GATEWAY_CONFIG="${{gateway_config}}"
-      exec "#{{opt_bin}}/openshell-gateway" --config "${{gateway_config}}" --db-url "${{gateway_db_url}}"
+      exec "#{{opt_bin}}/openshell-gateway"
     SH
     chmod 0755, libexec/"openshell-gateway-homebrew-service"
   end

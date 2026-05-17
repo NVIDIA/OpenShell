@@ -6,12 +6,9 @@ After=default.target
 [Service]
 Type=simple
 StateDirectory=openshell/gateway
-# Gateway TOML lives under the user config root. %E resolves to
-# $XDG_CONFIG_HOME for user services.
 EnvironmentFile=-%E/openshell/gateway.env
 ExecStartPre=/usr/bin/openshell-gateway generate-certs --output-dir %S/openshell/tls --server-san host.openshell.internal
-ExecStartPre=/usr/libexec/openshell/init-gateway-config.sh deb %E/openshell/gateway.toml %S/openshell/tls /usr/libexec/openshell %S/openshell/vm-driver
-ExecStart=/bin/sh -c 'exec /usr/bin/openshell-gateway --config "$${OPENSHELL_GATEWAY_CONFIG:-%E/openshell/gateway.toml}" --db-url "$${OPENSHELL_DB_URL:-sqlite:%S/openshell/gateway/openshell.db}"'
+ExecStart=/usr/bin/openshell-gateway
 Restart=on-failure
 RestartSec=5s
 PrivateTmp=true

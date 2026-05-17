@@ -97,11 +97,9 @@ it while sandboxes are active. Restart the service manually when you are ready
 to move the gateway to the refreshed snap revision.
 
 `openshell-sandbox` is staged next to `openshell-gateway` as the Docker
-supervisor binary. The gateway app starts through a small wrapper that writes
-`$SNAP_COMMON/gateway.toml` on first start. The generated TOML leaves
-`compute_drivers` unset for auto-detection and includes Docker driver settings,
-including `$SNAP/bin/openshell-sandbox` as the supervisor binary. The service
-stores its gateway database under `$SNAP_COMMON`.
+supervisor binary. The gateway app starts through a small wrapper that sets
+Snap-specific defaults and reads `$SNAP_COMMON/gateway.toml` when that file
+exists. The service stores its gateway database under `$SNAP_COMMON`.
 
 ## Interfaces
 
@@ -141,19 +139,18 @@ override is required. The OpenShell snap still requires the Docker snap because
 it relies on the `docker:docker-daemon` slot; it does not work with Docker
 installed from a Debian package or Docker's upstream packages.
 
-The service runs the gateway with an explicit config file and database URL:
+The service runs the gateway with Snap-specific environment defaults:
 
 ```shell
-openshell.gateway \
-  --config "$SNAP_COMMON/gateway.toml" \
-  --db-url "sqlite:$SNAP_COMMON/gateway.db?mode=rwc"
+OPENSHELL_DISABLE_TLS=true \
+OPENSHELL_DB_URL="sqlite:$SNAP_COMMON/gateway.db?mode=rwc" \
+openshell.gateway
 ```
 
 This stores the gateway SQLite database at
-`/var/snap/openshell/common/gateway.db`. The generated TOML stores gateway
-settings such as the bind address and plaintext TLS mode, plus Docker driver
-settings such as the supervisor binary path, network name, sandbox namespace,
-sandbox image, pull policy, and callback endpoint.
+`/var/snap/openshell/common/gateway.db`. Create
+`/var/snap/openshell/common/gateway.toml` when you need to override gateway or
+Docker driver settings.
 
 ## Connect with the OpenShell CLI
 

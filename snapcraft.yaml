@@ -85,8 +85,6 @@ parts:
         "$CRAFT_PART_INSTALL/bin/openshell-sandbox"
       install -D -m 0755 "$CRAFT_PROJECT_DIR/deploy/snap/bin/openshell-gateway-wrapper" \
         "$CRAFT_PART_INSTALL/bin/openshell-gateway-wrapper"
-      install -D -m 0755 "$CRAFT_PROJECT_DIR/deploy/common/init-gateway-config.sh" \
-        "$CRAFT_PART_INSTALL/bin/init-gateway-config.sh"
       install -D -m 0644 "$CRAFT_PROJECT_DIR/LICENSE" \
         "$CRAFT_PART_INSTALL/usr/share/doc/openshell/LICENSE"
       install -D -m 0644 "$CRAFT_PROJECT_DIR/README.md" \

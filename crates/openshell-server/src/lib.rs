@@ -24,6 +24,7 @@ pub mod certgen;
 pub mod cli;
 mod compute;
 pub mod config_file;
+mod defaults;
 mod grpc;
 mod http;
 mod inference;
@@ -622,6 +623,7 @@ async fn build_compute_runtime(
         ComputeDriverKind::Podman => {
             let mut podman = podman_config_from_file(file)?;
             podman.gateway_port = config.bind_address.port();
+            apply_podman_local_tls_defaults(config, &mut podman)?;
 
             ComputeRuntime::new_podman(
                 podman,
@@ -672,6 +674,29 @@ fn podman_config_from_file(
     merged
         .try_into()
         .map_err(|e| Error::config(format!("invalid [openshell.drivers.podman] table: {e}")))
+}
+
+fn apply_podman_local_tls_defaults(
+    config: &Config,
+    podman: &mut openshell_driver_podman::PodmanComputeConfig,
+) -> Result<()> {
+    if config.tls.is_none()
+        || podman.guest_tls_ca.is_some()
+        || podman.guest_tls_cert.is_some()
+        || podman.guest_tls_key.is_some()
+    {
+        return Ok(());
+    }
+
+    let Some(paths) = defaults::complete_local_tls_paths()
+        .map_err(|e| Error::config(format!("failed to resolve local TLS defaults: {e}")))?
+    else {
+        return Ok(());
+    };
+    podman.guest_tls_ca = Some(paths.ca);
+    podman.guest_tls_cert = Some(paths.client_cert);
+    podman.guest_tls_key = Some(paths.client_key);
+    Ok(())
 }
 
 fn configured_compute_driver(config: &Config) -> Result<ComputeDriverKind> {

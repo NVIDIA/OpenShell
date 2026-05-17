@@ -24,7 +24,7 @@ Use `openshell status` to confirm the CLI can reach the gateway.
 
 ## Supported Compute Drivers
 
-OpenShell supports several local compute drivers. Package-managed gateway configs leave the driver unset by default so the gateway can auto-detect an available driver. Set `compute_drivers` in the gateway TOML when you need to pin a specific driver.
+OpenShell supports several local compute drivers. Package-managed gateways leave the driver unset by default so the gateway can auto-detect an available driver. Set `compute_drivers` in the gateway TOML when you need to pin a specific driver.
 
 | Compute Driver | How It Is Configured | System Requirements |
 |---|---|---|
@@ -38,7 +38,7 @@ For detailed driver behavior, refer to [Sandbox Compute Drivers](/reference/sand
 
 On macOS, the install script uses Homebrew. The Homebrew package installs the `openshell` CLI, the gateway binary, and a Homebrew-managed gateway service.
 
-The Homebrew service listens on `https://127.0.0.1:17670` and generates a local mTLS bundle on install. The service reads `~/.config/openshell/gateway.toml` when that file exists and otherwise uses the Homebrew-managed config under the Homebrew prefix, such as `/opt/homebrew/var/openshell/gateway.toml`.
+The Homebrew service listens on `https://127.0.0.1:17670` and generates a local mTLS bundle on install. The gateway starts from built-in defaults and reads `~/.config/openshell/gateway.toml` when that file exists. If that file is absent, the Homebrew service also falls back to a Homebrew prefix config when present, such as `/opt/homebrew/var/openshell/gateway.toml`.
 
 The CLI reads the client bundle from `~/.config/openshell/gateways/openshell/mtls/`.
 
@@ -55,7 +55,7 @@ On Fedora and RHEL, the install script uses RPM packages. The RPM installs the `
 
 On Debian and Ubuntu, the install script uses a Debian package. The Debian package installs the `openshell` CLI, the `openshell-gateway` daemon, VM sandbox support, and a systemd user service.
 
-The Linux user service listens on `https://127.0.0.1:17670`, writes gateway settings to `~/.config/openshell/gateway.toml`, and generates a local mTLS bundle before the gateway starts.
+The Linux user service listens on `https://127.0.0.1:17670`, starts from built-in defaults, and generates a local mTLS bundle before the gateway starts. Create `~/.config/openshell/gateway.toml` only when you need to override those defaults.
 
 The CLI reads the client bundle from `~/.config/openshell/gateways/openshell/mtls/`.
 

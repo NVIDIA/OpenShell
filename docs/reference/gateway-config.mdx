@@ -8,7 +8,7 @@ keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Gateway, Configu
 position: 5
 ---
 
-The OpenShell gateway reads its configuration from a TOML file when `--config` or `OPENSHELL_GATEWAY_CONFIG` is set. Gateway process flags and gateway `OPENSHELL_*` environment variables override the file. Compute driver settings live in the driver TOML tables. See [RFC 0003](https://github.com/NVIDIA/OpenShell/blob/main/rfc/0003-gateway-configuration/README.md) for the full schema.
+The OpenShell gateway reads its configuration from a TOML file when `--config` or `OPENSHELL_GATEWAY_CONFIG` is set. When neither is set, the gateway reads `$XDG_CONFIG_HOME/openshell/gateway.toml` if that file exists. If no config file exists, the gateway starts from built-in defaults. Gateway process flags and gateway `OPENSHELL_*` environment variables override the file. Compute driver settings live in the driver TOML tables. See [RFC 0003](https://github.com/NVIDIA/OpenShell/blob/main/rfc/0003-gateway-configuration/README.md) for the full schema.
 
 ## Source Precedence
 
@@ -16,17 +16,17 @@ The OpenShell gateway reads its configuration from a TOML file when `--config` o
 Gateway CLI flag  >  gateway OPENSHELL_* env var  >  TOML file  >  built-in default
 ```
 
-`database_url` is env-only. The loader rejects it when it appears in the file.
+`database_url` is env-only. The loader rejects it when it appears in the file. When `OPENSHELL_DB_URL` is unset, the gateway stores its SQLite database under `$XDG_STATE_HOME/openshell/gateway/openshell.db`.
 
 ## Package-Managed Locations
 
-Package-managed gateways create a TOML file on first start and launch the gateway with `--config`. Set `OPENSHELL_GATEWAY_CONFIG` in the launch environment to use a different file.
+Package-managed gateways do not require a TOML file. Create one at the package's optional config location when you need to override built-in defaults. Set `OPENSHELL_GATEWAY_CONFIG` in the launch environment to use a different file.
 
-| Package | Gateway TOML location |
+| Package | Optional Gateway TOML location |
 |---|---|
-| Homebrew | `$XDG_CONFIG_HOME/openshell/gateway.toml` when it exists, otherwise the Homebrew-managed `var/openshell/gateway.toml` under the Homebrew prefix, such as `/opt/homebrew/var/openshell/gateway.toml`. |
-| Debian/Ubuntu | `%E/openshell/gateway.toml`, usually `~/.config/openshell/gateway.toml` for the systemd user service. |
-| Fedora/RHEL RPM | `%E/openshell/gateway.toml`, usually `~/.config/openshell/gateway.toml` for the systemd user service. |
+| Homebrew | `$XDG_CONFIG_HOME/openshell/gateway.toml` when it exists, otherwise an existing Homebrew prefix config such as `/opt/homebrew/var/openshell/gateway.toml`. |
+| Debian/Ubuntu | `$XDG_CONFIG_HOME/openshell/gateway.toml`, usually `~/.config/openshell/gateway.toml` for the systemd user service. |
+| Fedora/RHEL RPM | `$XDG_CONFIG_HOME/openshell/gateway.toml`, usually `~/.config/openshell/gateway.toml` for the systemd user service. |
 | Snap | `$SNAP_COMMON/gateway.toml`, usually `/var/snap/openshell/common/gateway.toml`. |
 
 ## Layout
@@ -149,7 +149,7 @@ Sandboxes run as containers on a local bridge network. The supervisor binary is 
 version = 1
 
 [openshell.gateway]
-bind_address    = "127.0.0.1:8080"
+bind_address    = "127.0.0.1:17670"
 log_level       = "info"
 compute_drivers = ["docker"]
 
@@ -162,7 +162,7 @@ guest_tls_key    = "/etc/openshell/certs/client-key.pem"
 default_image    = "ghcr.io/nvidia/openshell/sandbox:latest"
 image_pull_policy = "IfNotPresent"
 sandbox_namespace = "docker-dev"
-grpc_endpoint    = "https://host.openshell.internal:8080"
+grpc_endpoint    = "https://host.openshell.internal:17670"
 network_name     = "openshell-docker"
 # Skip the image-pull-and-extract step by pointing at a locally built binary.
 supervisor_bin   = "/usr/local/libexec/openshell/openshell-sandbox"
@@ -177,7 +177,7 @@ Sandboxes run as Podman containers on a user-mode bridge network. The supervisor
 version = 1
 
 [openshell.gateway]
-bind_address    = "127.0.0.1:8080"
+bind_address    = "127.0.0.1:17670"
 log_level       = "info"
 compute_drivers = ["podman"]
 
@@ -204,7 +204,7 @@ Each sandbox runs inside its own libkrun microVM managed by the standalone `open
 version = 1
 
 [openshell.gateway]
-bind_address    = "127.0.0.1:8080"
+bind_address    = "127.0.0.1:17670"
 log_level       = "info"
 # VM is never auto-detected; an explicit entry here is required.
 compute_drivers = ["vm"]
@@ -215,7 +215,7 @@ guest_tls_cert = "/var/lib/openshell/guest-tls/client.pem"
 guest_tls_key  = "/var/lib/openshell/guest-tls/client-key.pem"
 
 [openshell.drivers.vm]
-grpc_endpoint = "https://host.containers.internal:8080"
+grpc_endpoint = "https://host.containers.internal:17670"
 state_dir      = "/var/lib/openshell/vm"
 # Where the gateway looks for the openshell-driver-vm subprocess binary.
 driver_dir     = "/usr/local/libexec/openshell"

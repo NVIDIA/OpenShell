@@ -8,9 +8,9 @@
 //! - **Kubernetes mode** (default): create two `kubernetes.io/tls` Secrets
 //!   in the supplied namespace. Used by the Helm pre-install hook. Requires
 //!   `--namespace`, `--server-secret-name`, `--client-secret-name`.
-//! - **Local mode** (`--output-dir <DIR>`): write PEMs to a filesystem layout
-//!   used by the RPM systemd unit's `ExecStartPre`. Also copies client
-//!   materials to
+//! - **Local mode** (`--output-dir <DIR>`): write PEMs to the local package
+//!   filesystem layout. Used by systemd units' `ExecStartPre`. Also copies
+//!   client materials to
 //!   `$XDG_CONFIG_HOME/openshell/gateways/openshell/mtls/` so the local CLI
 //!   picks them up automatically.
 //!

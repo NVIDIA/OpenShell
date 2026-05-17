@@ -23,8 +23,8 @@ requests, and provides the SSH tunnel endpoint for CLI-to-sandbox
 connections.
 
 When installed via a Linux package, the gateway runs as a systemd user
-service. The packaged service creates a gateway TOML file on first
-start and launches the gateway with **--config**.
+service. The packaged service starts from built-in defaults and reads
+the default gateway TOML path only when that file exists.
 
 The gateway exposes a single port with multiplexed gRPC and HTTP,
 secured by mutual TLS (mTLS) by default unless the TOML config disables
@@ -37,7 +37,7 @@ TLS.
     Environment: **OPENSHELL_BIND_ADDRESS**.
 
 **--port** *PORT*
-:   Port for the gRPC/HTTP API. Default: **8080**.
+:   Port for the gRPC/HTTP API. Default: **17670**.
     Environment: **OPENSHELL_SERVER_PORT**.
 
 **--health-port** *PORT*
@@ -54,22 +54,26 @@ TLS.
     Environment: **OPENSHELL_LOG_LEVEL**.
 
 **--db-url** *URL*
-:   SQLite database URL for state persistence. Required.
+:   SQLite database URL for state persistence. When unset, the gateway
+    stores SQLite state under *~/.local/state/openshell/gateway/*.
     Environment: **OPENSHELL_DB_URL**.
 
 **--drivers** *DRIVER*\[,*DRIVER*\]
 :   Compute driver. Accepts a comma-delimited list. The gateway
     currently requires exactly one driver. Options: **podman**,
-    **docker**, **kubernetes**. Default: **kubernetes**.
+    **docker**, **kubernetes**, **vm**. When unset, the gateway
+    auto-detects Kubernetes, then Podman, then Docker. VM is opt-in.
     Environment: **OPENSHELL_DRIVERS**.
 
 **--tls-cert** *PATH*
-:   Path to server TLS certificate file. Required unless
-    **--disable-tls** is set. Environment: **OPENSHELL_TLS_CERT**.
+:   Path to server TLS certificate file. Defaults to the local generated
+    TLS bundle when present. Required unless **--disable-tls** is set.
+    Environment: **OPENSHELL_TLS_CERT**.
 
 **--tls-key** *PATH*
-:   Path to server TLS private key file. Required unless
-    **--disable-tls** is set. Environment: **OPENSHELL_TLS_KEY**.
+:   Path to server TLS private key file. Defaults to the local generated
+    TLS bundle when present. Required unless **--disable-tls** is set.
+    Environment: **OPENSHELL_TLS_KEY**.
 
 **--tls-client-ca** *PATH*
 :   Path to CA certificate for client certificate verification (mTLS).
@@ -115,14 +119,12 @@ View logs:
     journalctl --user -u openshell-gateway
     journalctl --user -u openshell-gateway -f
 
-The unit runs two **ExecStartPre** steps on first start:
+The unit runs **openshell-gateway generate-certs** as an **ExecStartPre**
+step on first start. This generates a self-signed PKI bundle for mTLS
+and skips generation when the bundle already exists.
 
-1. **openshell-gateway generate-certs --output-dir** generates a
-   self-signed PKI bundle for mTLS.
-2. **init-gateway-config.sh** generates the gateway TOML file.
-
-Both steps are idempotent and skip generation if their output files
-already exist.
+The gateway then starts from built-in defaults and reads
+*~/.config/openshell/gateway.toml* when that file exists.
 
 To persist the service across logouts:
 
@@ -132,14 +134,14 @@ To persist the service across logouts:
 
 The systemd user unit launches the gateway with:
 
-    openshell-gateway --config ~/.config/openshell/gateway.toml \
-      --db-url sqlite:~/.local/state/openshell/gateway/openshell.db
+    openshell-gateway
 
-Gateway listener, TLS, and compute driver settings live in
-*~/.config/openshell/gateway.toml*. The database URL stays
-on **--db-url** because the gateway rejects `database_url` in TOML.
+Gateway listener, TLS, database, and compute driver settings have local
+defaults. Create *~/.config/openshell/gateway.toml* when you need to
+override them. The gateway rejects `database_url` in TOML; set
+**OPENSHELL_DB_URL** when you need a different database.
 
-To override individual settings without modifying the generated TOML:
+To override individual settings without creating TOML:
 
     systemctl --user edit openshell-gateway
 
@@ -153,11 +155,8 @@ This creates a drop-in override that persists across package upgrades.
 */usr/lib/systemd/user/openshell-gateway.service*
 :   Systemd user unit file.
 
-*/usr/libexec/openshell/init-gateway-config.sh*
-:   Gateway TOML file generator.
-
 *~/.config/openshell/gateway.toml*
-:   Gateway TOML configuration (generated on first start).
+:   Optional gateway TOML configuration.
 
 *~/.local/state/openshell/tls/*
 :   Auto-generated TLS certificates.
@@ -179,7 +178,7 @@ Check gateway health from the CLI:
     openshell gateway add --local https://127.0.0.1:17670
     openshell status
 
-Override the API port in the generated TOML:
+Override the API port in TOML:
 
     $EDITOR ~/.config/openshell/gateway.toml
     systemctl --user restart openshell-gateway

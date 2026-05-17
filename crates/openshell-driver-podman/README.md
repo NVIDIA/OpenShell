@@ -120,10 +120,10 @@ connection back to the gateway. On SELinux systems, the bind mounts include
 Podman's shared relabel option so the container process can read the files.
 
 The RPM packaging auto-generates a self-signed PKI on first start via
-`init-pki.sh`. Client certs are placed in the CLI auto-discovery directory
-(`~/.config/openshell/gateways/openshell/mtls/`) so the CLI connects with mTLS
-without manual configuration. See `deploy/rpm/CONFIGURATION.md` for the full
-RPM configuration reference.
+`openshell-gateway generate-certs`. Client certs are placed in the CLI
+auto-discovery directory (`~/.config/openshell/gateways/openshell/mtls/`) so
+the CLI connects with mTLS without manual configuration. See
+`deploy/rpm/CONFIGURATION.md` for the full RPM configuration reference.
 
 ## Network Model
 
@@ -134,7 +134,7 @@ the supervisor for sandbox process isolation.
 ```mermaid
 graph TB
     subgraph Host
-        GW["Gateway Server<br/>127.0.0.1:8080"]
+        GW["Gateway Server<br/>127.0.0.1:17670"]
         PS["Podman Socket"]
     end
 
@@ -289,11 +289,11 @@ Podman resources after out-of-band container removal or label drift.
 | `OPENSHELL_SANDBOX_IMAGE` | `--sandbox-image` | From gateway config | Default OCI image for sandboxes. |
 | `OPENSHELL_SANDBOX_IMAGE_PULL_POLICY` | `--sandbox-image-pull-policy` | `missing` | Pull policy: `always`, `missing`, `never`, or `newer`. |
 | `OPENSHELL_GRPC_ENDPOINT` | `--grpc-endpoint` | Auto-detected via `host.containers.internal` | Gateway gRPC endpoint for sandbox callbacks. |
-| `OPENSHELL_GATEWAY_PORT` | `--gateway-port` | `8080` | Gateway port used for endpoint auto-detection by the standalone binary. |
+| `OPENSHELL_GATEWAY_PORT` | `--gateway-port` | `17670` | Gateway port used for endpoint auto-detection by the standalone binary. |
 | `OPENSHELL_NETWORK_NAME` | `--network-name` | `openshell` | Podman bridge network name. |
 | `OPENSHELL_SANDBOX_SSH_SOCKET_PATH` | `--sandbox-ssh-socket-path` | `/run/openshell/ssh.sock` | Supervisor Unix socket path in `PodmanComputeConfig`. |
 | `OPENSHELL_STOP_TIMEOUT` | `--stop-timeout` | `10` | Container stop timeout in seconds. |
-| `OPENSHELL_SUPERVISOR_IMAGE` | `--supervisor-image` | `openshell/supervisor:latest` through the gateway, required standalone | OCI image containing the supervisor binary. |
+| `OPENSHELL_SUPERVISOR_IMAGE` | `--supervisor-image` | `ghcr.io/nvidia/openshell/supervisor:latest` through the gateway, required standalone | OCI image containing the supervisor binary. |
 | `OPENSHELL_PODMAN_TLS_CA` | `--podman-tls-ca` | unset | Host path to the CA certificate mounted for sandbox mTLS. |
 | `OPENSHELL_PODMAN_TLS_CERT` | `--podman-tls-cert` | unset | Host path to the client certificate mounted for sandbox mTLS. |
 | `OPENSHELL_PODMAN_TLS_KEY` | `--podman-tls-key` | unset | Host path to the client private key mounted for sandbox mTLS. |

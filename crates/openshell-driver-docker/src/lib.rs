@@ -252,12 +252,6 @@ impl DockerComputeDriver {
         docker_config: &DockerComputeConfig,
         supervisor_readiness: Arc<dyn SupervisorReadiness>,
     ) -> CoreResult<Self> {
-        if docker_config.grpc_endpoint.trim().is_empty() {
-            return Err(Error::config(
-                "grpc_endpoint is required when using the docker compute driver",
-            ));
-        }
-
         let docker = Docker::connect_with_local_defaults()
             .map_err(|err| Error::execution(format!("failed to create Docker client: {err}")))?;
         let version = docker.version().await.map_err(|err| {
@@ -281,14 +275,24 @@ impl DockerComputeDriver {
         let host_gateway_ip = parse_optional_host_gateway_ip(&docker_config.host_gateway_ip)?;
         let gateway_route =
             docker_gateway_route(&info, bridge_gateway_ip, gateway_port, host_gateway_ip);
+        let mut docker_config = docker_config.clone();
+        if docker_config.grpc_endpoint.trim().is_empty() {
+            let scheme = if docker_guest_tls_configured(&docker_config) {
+                "https"
+            } else {
+                "http"
+            };
+            docker_config.grpc_endpoint =
+                format!("{scheme}://{HOST_OPENSHELL_INTERNAL}:{gateway_port}");
+        }
         let grpc_endpoint = docker_container_openshell_endpoint(
             &docker_config.grpc_endpoint,
             HOST_OPENSHELL_INTERNAL,
             gateway_port,
         );
         let daemon_arch = normalize_docker_arch(version.arch.as_deref().unwrap_or_default());
-        let supervisor_bin = resolve_supervisor_bin(&docker, docker_config, &daemon_arch).await?;
-        let guest_tls = docker_guest_tls_paths(docker_config)?;
+        let supervisor_bin = resolve_supervisor_bin(&docker, &docker_config, &daemon_arch).await?;
+        let guest_tls = docker_guest_tls_paths(&docker_config)?;
 
         let driver = Self {
             docker: Arc::new(docker),
@@ -2007,6 +2011,12 @@ pub(crate) fn validate_linux_elf_binary(path: &Path) -> CoreResult<()> {
         )));
     }
     Ok(())
+}
+
+fn docker_guest_tls_configured(docker_config: &DockerComputeConfig) -> bool {
+    docker_config.guest_tls_ca.is_some()
+        && docker_config.guest_tls_cert.is_some()
+        && docker_config.guest_tls_key.is_some()
 }
 
 pub(crate) fn docker_guest_tls_paths(

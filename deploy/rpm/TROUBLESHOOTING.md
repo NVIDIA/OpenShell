@@ -220,10 +220,9 @@ systemctl --user restart openshell-gateway
 The SQLite database schema is auto-migrated on startup. Running
 sandboxes are stopped during the restart.
 
-The generated `gateway.toml` is not overwritten during upgrades. The
-`init-gateway-config.sh` script is idempotent and only generates the TOML file
-when it is missing. New gateway process options can be added manually by
-referencing CONFIGURATION.md or running `openshell-gateway --help`.
+Package upgrades do not overwrite `~/.config/openshell/gateway.toml` when you
+create one. New gateway process options can be added manually by referencing
+CONFIGURATION.md or running `openshell-gateway --help`.
 
 To pick up new container images after an upgrade:
 

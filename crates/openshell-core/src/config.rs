@@ -22,7 +22,7 @@ use std::str::FromStr;
 pub const DEFAULT_SSH_PORT: u16 = 2222;
 
 /// Default gateway server port.
-pub const DEFAULT_SERVER_PORT: u16 = 8080;
+pub const DEFAULT_SERVER_PORT: u16 = 17670;
 
 /// Default container stop timeout in seconds (SIGTERM → SIGKILL).
 pub const DEFAULT_STOP_TIMEOUT_SECS: u32 = 10;
@@ -34,7 +34,7 @@ pub const DEFAULT_DOCKER_NETWORK_NAME: &str = "openshell-docker";
 pub const DEFAULT_SERVICE_ROUTING_DOMAIN: &str = "openshell.localhost";
 
 /// Default OCI image for the openshell-sandbox supervisor binary.
-pub const DEFAULT_SUPERVISOR_IMAGE: &str = "openshell/supervisor:latest";
+pub const DEFAULT_SUPERVISOR_IMAGE: &str = "ghcr.io/nvidia/openshell/supervisor:latest";
 
 /// CDI device identifier for requesting all NVIDIA GPUs.
 pub const CDI_GPU_DEVICE_ALL: &str = "nvidia.com/gpu=all";
@@ -451,7 +451,7 @@ impl Default for ServiceRoutingConfig {
 }
 
 fn default_bind_address() -> SocketAddr {
-    "127.0.0.1:8080".parse().expect("valid default address")
+    "127.0.0.1:17670".parse().expect("valid default address")
 }
 
 fn default_service_routing_domains() -> Vec<String> {
@@ -557,7 +557,7 @@ mod tests {
 
     #[test]
     fn config_defaults_to_loopback_bind_address() {
-        let expected: SocketAddr = "127.0.0.1:8080".parse().expect("valid address");
+        let expected: SocketAddr = "127.0.0.1:17670".parse().expect("valid address");
         assert_eq!(Config::new(None).bind_address, expected);
     }
 

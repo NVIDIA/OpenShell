@@ -184,8 +184,6 @@ stage_binary "$OPENSHELL_GATEWAY_BINARY"   "$snap_root/bin/openshell-gateway"
 stage_binary "$OPENSHELL_DOCKER_SUPERVISOR_BINARY" "$snap_root/bin/openshell-sandbox"
 install -D -m 0755 "${repo_root}/deploy/snap/bin/openshell-gateway-wrapper" \
 	"$snap_root/bin/openshell-gateway-wrapper"
-install -D -m 0755 "${repo_root}/deploy/common/init-gateway-config.sh" \
-	"$snap_root/bin/init-gateway-config.sh"
 
 install -D -m 0644 "${repo_root}/LICENSE" "$snap_root/usr/share/doc/openshell/LICENSE"
 install -D -m 0644 "${repo_root}/README.md" "$snap_root/usr/share/doc/openshell/README.md"
