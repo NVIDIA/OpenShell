@@ -194,6 +194,11 @@ cat >"${GATEWAY_CONFIG}" <<EOF
 [openshell]
 version = 1
 
+[openshell.gateway]
+bind_address = "127.0.0.1:${HOST_PORT}"
+compute_drivers = ["vm"]
+disable_tls = true
+
 [openshell.drivers.vm]
 grpc_endpoint = "http://host.openshell.internal:${HOST_PORT}"
 driver_dir = "${ROOT}/target/debug"
@@ -202,10 +207,7 @@ EOF
 
 GATEWAY_ARGS=(
   --config "${GATEWAY_CONFIG}"
-  --drivers vm
-  --disable-tls
   --db-url "sqlite:${GATEWAY_DB}?mode=rwc"
-  --port "${HOST_PORT}"
 )
 e2e_write_gateway_args_file "${GATEWAY_ARGS_FILE}" "${GATEWAY_ARGS[@]}"
 
