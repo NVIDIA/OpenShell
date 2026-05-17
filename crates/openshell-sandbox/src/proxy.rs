@@ -52,14 +52,22 @@ const CLOUD_METADATA_IPS: &[IpAddr] = &[
 ];
 
 /// Maximum total bytes for a streaming inference response body (32 MiB).
+#[cfg(not(test))]
 const MAX_STREAMING_BODY: usize = 32 * 1024 * 1024;
+// Keep unit tests deterministic without pushing tens of MiB through loopback.
+#[cfg(test)]
+const MAX_STREAMING_BODY: usize = 1024;
 
 /// Idle timeout per chunk when relaying streaming inference responses.
 ///
 /// Reasoning models (e.g. nemotron-3-super, o1, o3) can pause for 60+ seconds
 /// between "thinking" and output phases. 120s provides headroom while still
 /// catching genuinely stuck streams.
+#[cfg(not(test))]
 const CHUNK_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+// Exercise idle-timeout truncation without slowing the full package test suite.
+#[cfg(test)]
+const CHUNK_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Result of a proxy CONNECT policy decision.
 struct ConnectDecision {
@@ -3671,8 +3679,11 @@ fn is_benign_relay_error(err: &miette::Report) -> bool {
 )]
 mod tests {
     use super::*;
+    use std::future::Future;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::sync::Arc;
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
 
     fn websocket_l7_config(
         protocol: crate::l7::L7Protocol,
@@ -4998,6 +5009,184 @@ network_policies:
         assert!(forwarded_lc.contains("authorization: bearer test-api-key"));
         assert!(!forwarded_lc.contains("authorization: bearer client-key"));
         assert!(!forwarded_lc.contains("cookie:"));
+    }
+
+    fn streaming_inference_route(endpoint: String) -> openshell_router::config::ResolvedRoute {
+        openshell_router::config::ResolvedRoute {
+            name: "inference.local".to_string(),
+            endpoint,
+            model: "meta/llama-3.1-8b-instruct".to_string(),
+            api_key: "test-api-key".to_string(),
+            protocols: vec!["openai_chat_completions".to_string()],
+            auth: openshell_router::config::AuthHeader::Bearer,
+            default_headers: vec![],
+            passthrough_headers: vec![],
+            timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
+        }
+    }
+
+    async fn read_forwarded_inference_request<S: AsyncRead + Unpin>(stream: &mut S) {
+        use crate::l7::inference::{ParseResult, try_parse_http_request};
+
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "upstream request closed before completion");
+            buf.extend_from_slice(&chunk[..n]);
+
+            match try_parse_http_request(&buf) {
+                ParseResult::Complete(_, _) => return,
+                ParseResult::Incomplete => continue,
+                ParseResult::Invalid(reason) => {
+                    panic!("forwarded request should parse cleanly: {reason}");
+                }
+            }
+        }
+    }
+
+    async fn run_live_streaming_inference<F, Fut>(serve_upstream: F) -> String
+    where
+        F: FnOnce(TcpStream) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut upstream, _) = listener.accept().await.unwrap();
+            read_forwarded_inference_request(&mut upstream).await;
+            serve_upstream(upstream).await;
+        });
+
+        let router = openshell_router::Router::new().unwrap();
+        let patterns = crate::l7::inference::default_patterns();
+        let ctx = InferenceContext::new(
+            patterns,
+            router,
+            vec![streaming_inference_route(format!("http://{upstream_addr}"))],
+            vec![],
+        );
+
+        let body = r#"{"model":"ignored","messages":[{"role":"user","content":"hi"}]}"#;
+        let request = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\n\
+             Host: inference.local\r\n\
+             Content-Type: application/json\r\n\
+             Accept: text/event-stream\r\n\
+             Content-Length: {}\r\n\r\n{}",
+            body.len(),
+            body,
+        );
+
+        let (client, mut server) = tokio::io::duplex(65536);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        let server_task =
+            tokio::spawn(async move { process_inference_keepalive(&mut server, &ctx, 443).await });
+
+        client_write.write_all(request.as_bytes()).await.unwrap();
+        client_write.shutdown().await.unwrap();
+
+        let mut response = Vec::new();
+        client_read.read_to_end(&mut response).await.unwrap();
+
+        let outcome = server_task.await.unwrap().unwrap();
+        assert!(
+            matches!(outcome, InferenceOutcome::Routed),
+            "expected Routed outcome, got: {outcome:?}"
+        );
+        upstream_task.await.unwrap();
+
+        String::from_utf8(response).unwrap()
+    }
+
+    fn assert_streaming_sse_error(response: &str, message: &str) {
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK\r\n"),
+            "expected successful streaming response, got: {response}"
+        );
+        assert!(
+            response
+                .to_ascii_lowercase()
+                .contains("transfer-encoding: chunked"),
+            "expected chunked streaming response, got: {response}"
+        );
+        assert!(
+            response.contains("\"type\":\"proxy_stream_error\""),
+            "expected proxy_stream_error SSE event, got: {response}"
+        );
+        assert!(
+            response.contains(&format!("\"message\":\"{message}\"")),
+            "expected SSE message {message:?}, got: {response}"
+        );
+        assert!(
+            response.ends_with("0\r\n\r\n"),
+            "streaming response must end with chunked terminator, got: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn inference_stream_byte_limit_injects_sse_error() {
+        let response = run_live_streaming_inference(|mut upstream| async move {
+            use crate::l7::inference::{format_chunk, format_chunk_terminator};
+
+            upstream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      Content-Type: text/event-stream\r\n\
+                      Transfer-Encoding: chunked\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let body = vec![b'a'; MAX_STREAMING_BODY + 1];
+            let _ = upstream.write_all(&format_chunk(&body)).await;
+            let _ = upstream.write_all(format_chunk_terminator()).await;
+        })
+        .await;
+
+        assert_streaming_sse_error(
+            &response,
+            "response truncated: exceeded maximum streaming body size",
+        );
+    }
+
+    #[tokio::test]
+    async fn inference_stream_upstream_read_error_injects_sse_error() {
+        let response = run_live_streaming_inference(|mut upstream| async move {
+            upstream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      Content-Type: text/event-stream\r\n\
+                      Content-Length: 64\r\n\r\n\
+                      partial",
+                )
+                .await
+                .unwrap();
+        })
+        .await;
+
+        assert!(
+            response.contains("partial"),
+            "expected initial upstream bytes before truncation, got: {response}"
+        );
+        assert_streaming_sse_error(&response, "response truncated: upstream read error");
+    }
+
+    #[tokio::test]
+    async fn inference_stream_idle_timeout_injects_sse_error() {
+        let response = run_live_streaming_inference(|mut upstream| async move {
+            upstream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      Content-Type: text/event-stream\r\n\
+                      Transfer-Encoding: chunked\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(CHUNK_IDLE_TIMEOUT + std::time::Duration::from_millis(50)).await;
+        })
+        .await;
+
+        assert_streaming_sse_error(&response, "response truncated: chunk idle timeout exceeded");
     }
 
     // -- router_error_to_http --
