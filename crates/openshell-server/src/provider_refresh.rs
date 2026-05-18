@@ -199,6 +199,7 @@ pub fn new_refresh_state(
             name: refresh_state_name(&provider_id, credential_key),
             created_at_ms: now_ms,
             labels: HashMap::new(),
+            resource_version: 0,
         }),
         provider_id,
         provider_name,
@@ -416,8 +417,20 @@ async fn apply_minted_credential(
     crate::grpc::provider::validate_provider_update_against_attached_sandboxes(store, &updated)
         .await?;
     store
-        .put_message(&updated)
+        .update_message_cas::<Provider, _>(provider.object_id(), 0, |current| {
+            current
+                .credentials
+                .insert(credential_key.to_string(), minted.access_token.clone());
+            if minted.expires_at_ms > 0 {
+                current
+                    .credential_expires_at_ms
+                    .insert(credential_key.to_string(), minted.expires_at_ms);
+            } else {
+                current.credential_expires_at_ms.remove(credential_key);
+            }
+        })
         .await
+        .map(|_| ())
         .map_err(|e| Status::internal(format!("persist refreshed provider credential failed: {e}")))
 }
 
@@ -914,6 +927,7 @@ mod tests {
                     name: "collision".to_string(),
                     created_at_ms: 1,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 spec: Some(SandboxSpec {
                     providers: vec!["existing-graph".to_string(), "refreshing-graph".to_string()],
@@ -1167,6 +1181,7 @@ mod tests {
                 name: name.to_string(),
                 created_at_ms: 1,
                 labels: HashMap::new(),
+                resource_version: 0,
             }),
             r#type: provider_type.to_string(),
             credentials: HashMap::new(),

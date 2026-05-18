@@ -38,7 +38,9 @@ use tracing::{debug, info, warn};
 use russh::ChannelMsg;
 use russh::client::AuthResult;
 
-use super::provider::{get_provider_record, is_valid_env_key};
+use super::provider::{
+    get_provider_record, is_valid_env_key, validate_provider_environment_keys_unique,
+};
 use super::validation::{
     level_matches, source_matches, validate_exec_request_fields, validate_policy_safety,
     validate_sandbox_spec,
@@ -80,6 +82,7 @@ pub(super) async fn handle_create_sandbox(
             .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
             .ok_or_else(|| Status::failed_precondition(format!("provider '{name}' not found")))?;
     }
+    validate_provider_environment_keys_unique(state.store.as_ref(), &spec.providers).await?;
 
     // Ensure the template always carries the resolved image.
     let mut spec = spec;

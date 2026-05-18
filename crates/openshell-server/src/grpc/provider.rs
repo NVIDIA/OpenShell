@@ -1324,6 +1324,7 @@ pub(super) async fn handle_configure_provider_refresh(
                 name: provider_name.to_string(),
                 created_at_ms: 0,
                 labels: std::collections::HashMap::new(),
+                resource_version: 0,
             }),
             r#type: String::new(),
             credentials: std::collections::HashMap::new(),
@@ -1418,6 +1419,7 @@ pub(super) async fn handle_delete_provider_refresh(
                 name: provider_name.to_string(),
                 created_at_ms: 0,
                 labels: std::collections::HashMap::new(),
+                resource_version: 0,
             }),
             r#type: String::new(),
             credentials: std::collections::HashMap::new(),
@@ -2110,6 +2112,7 @@ mod tests {
                     name: "msgraph".to_string(),
                     created_at_ms: 0,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 r#type: TEST_GRAPH_PROVIDER_TYPE.to_string(),
                 credentials: std::iter::once((
@@ -2222,6 +2225,7 @@ mod tests {
                     name: "msgraph".to_string(),
                     created_at_ms: 0,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 r#type: TEST_GRAPH_PROVIDER_TYPE.to_string(),
                 credentials: std::iter::once((
@@ -2264,6 +2268,7 @@ mod tests {
                     name: "msgraph".to_string(),
                     created_at_ms: 0,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 r#type: String::new(),
                 credentials: HashMap::new(),
@@ -2315,6 +2320,7 @@ mod tests {
                     name: "existing-graph".to_string(),
                     created_at_ms: 0,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 r#type: TEST_GRAPH_PROVIDER_TYPE.to_string(),
                 credentials: std::iter::once((
@@ -2336,6 +2342,7 @@ mod tests {
                     name: "refreshing-graph".to_string(),
                     created_at_ms: 0,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 r#type: TEST_GRAPH_PROVIDER_TYPE.to_string(),
                 credentials: std::iter::once(("OTHER_TOKEN".to_string(), "other".to_string()))
@@ -2354,6 +2361,7 @@ mod tests {
                     name: "collision".to_string(),
                     created_at_ms: 0,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 spec: Some(SandboxSpec {
                     providers: vec!["existing-graph".to_string(), "refreshing-graph".to_string()],
@@ -2404,6 +2412,7 @@ mod tests {
                         name: name.to_string(),
                         created_at_ms: 0,
                         labels: HashMap::new(),
+                        resource_version: 0,
                     }),
                     r#type: TEST_GRAPH_PROVIDER_TYPE.to_string(),
                     credentials: HashMap::new(),
@@ -2422,6 +2431,7 @@ mod tests {
                     name: "refresh-collision".to_string(),
                     created_at_ms: 0,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 spec: Some(SandboxSpec {
                     providers: vec!["first-graph".to_string(), "second-graph".to_string()],
@@ -2487,6 +2497,7 @@ mod tests {
                     name: "msgraph".to_string(),
                     created_at_ms: 0,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 r#type: TEST_GRAPH_PROVIDER_TYPE.to_string(),
                 credentials: std::iter::once((
@@ -2553,6 +2564,7 @@ mod tests {
                     name: "msgraph".to_string(),
                     created_at_ms: 0,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 r#type: "outlook".to_string(),
                 credentials: std::iter::once((
@@ -2849,6 +2861,7 @@ mod tests {
                 ))
                 .collect(),
                 config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
             },
         )
         .await
@@ -2877,6 +2890,7 @@ mod tests {
                 ))
                 .collect(),
                 config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
             },
         )
         .await
@@ -2921,6 +2935,7 @@ mod tests {
                     name: "gitlab-no-creds".to_string(),
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 r#type: "gitlab".to_string(),
                 credentials: HashMap::new(),
@@ -2990,6 +3005,7 @@ mod tests {
                     name: "delegated-refresh-no-token-yet".to_string(),
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 r#type: "delegated-refresh-api".to_string(),
                 credentials: HashMap::new(),
@@ -3025,6 +3041,7 @@ mod tests {
                     name: "mixed-required-no-token-yet".to_string(),
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 r#type: "mixed-required-api".to_string(),
                 credentials: HashMap::new(),
@@ -3060,6 +3077,7 @@ mod tests {
                     name: "optional-static-no-token-yet".to_string(),
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 r#type: "optional-static-api".to_string(),
                 credentials: HashMap::new(),
@@ -3347,6 +3365,7 @@ mod tests {
                 name: "expiring-provider".to_string(),
                 created_at_ms: 0,
                 labels: HashMap::new(),
+                resource_version: 0,
             }),
             r#type: "test".to_string(),
             credentials: [
@@ -3541,6 +3560,7 @@ mod tests {
                     name: "provider-a".to_string(),
                     created_at_ms: 0,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 r#type: "outlook".to_string(),
                 credentials: std::iter::once((
@@ -3562,6 +3582,7 @@ mod tests {
                     name: "provider-b".to_string(),
                     created_at_ms: 0,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 r#type: "google-drive".to_string(),
                 credentials: std::iter::once((
@@ -3581,6 +3602,7 @@ mod tests {
                 name: "collision".to_string(),
                 created_at_ms: 0,
                 labels: HashMap::new(),
+                resource_version: 0,
             }),
             spec: Some(SandboxSpec {
                 providers: vec!["provider-a".to_string(), "provider-b".to_string()],
@@ -3598,6 +3620,7 @@ mod tests {
                     name: "provider-b".to_string(),
                     created_at_ms: 0,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 r#type: String::new(),
                 credentials: std::iter::once((
@@ -3742,6 +3765,7 @@ mod tests {
             r#type: String::new(), // Empty type is ignored in update
             credentials: HashMap::new(),
             config: HashMap::new(),
+            credential_expires_at_ms: HashMap::new(),
         };
 
         // Attempt to update with an oversized credential key (exceeds MAX_MAP_KEY_LEN)
@@ -3893,6 +3917,7 @@ mod tests {
             &state,
             Request::new(UpdateProviderRequest {
                 provider: Some(updated_provider.clone()),
+                credential_expires_at_ms: HashMap::new(),
             }),
         )
         .await
@@ -3960,6 +3985,7 @@ mod tests {
             &state,
             Request::new(UpdateProviderRequest {
                 provider: Some(stale_provider),
+                credential_expires_at_ms: HashMap::new(),
             }),
         )
         .await
@@ -4029,6 +4055,7 @@ mod tests {
                     &state_clone,
                     Request::new(UpdateProviderRequest {
                         provider: Some(updated),
+                        credential_expires_at_ms: HashMap::new(),
                     }),
                 )
                 .await
