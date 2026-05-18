@@ -78,6 +78,8 @@ toml = { workspace = true }
 tokio-stream = { workspace = true }
 sqlx = { workspace = true }
 reqwest = { workspace = true }
+base64 = { workspace = true }
+url = { workspace = true }
 uuid = { workspace = true }
 hmac = "0.12"
 sha2 = { workspace = true }

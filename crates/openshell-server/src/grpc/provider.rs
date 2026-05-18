@@ -274,20 +274,57 @@ pub(super) async fn resolve_provider_environment(
             .map_err(|e| Status::internal(format!("failed to fetch provider '{name}': {e}")))?
             .ok_or_else(|| Status::failed_precondition(format!("provider '{name}' not found")))?;
 
-        for (key, value) in &provider.credentials {
-            if is_valid_env_key(key) {
-                env.entry(key.clone()).or_insert_with(|| value.clone());
-            } else {
-                warn!(
-                    provider_name = %name,
-                    key = %key,
-                    "skipping credential with invalid env var key"
-                );
+        if provider.r#type.trim() == "microsoft-agent-s2s" {
+            insert_supervisor_env(
+                &mut env,
+                name,
+                "OPENSHELL_MICROSOFT_AGENT_S2S_PROVIDER_NAME",
+                name,
+            );
+            for key in [
+                "AZURE_TENANT_ID",
+                "A365_BLUEPRINT_CLIENT_ID",
+                "A365_BLUEPRINT_CLIENT_SECRET",
+                "A365_RUNTIME_AGENT_ID",
+                "A365_ALLOWED_AUDIENCES",
+                "A365_OBSERVABILITY_RESOURCE",
+                "A365_REQUIRED_ROLES",
+            ] {
+                if let Some(value) = provider
+                    .credentials
+                    .get(key)
+                    .or_else(|| provider.config.get(key))
+                {
+                    insert_supervisor_env(&mut env, name, key, value);
+                }
             }
+            continue;
+        }
+
+        for (key, value) in &provider.credentials {
+            insert_supervisor_env(&mut env, name, key, value);
         }
     }
 
     Ok(env)
+}
+
+fn insert_supervisor_env(
+    env: &mut std::collections::HashMap<String, String>,
+    provider_name: &str,
+    key: &str,
+    value: &str,
+) {
+    if is_valid_env_key(key) {
+        env.entry(key.to_string())
+            .or_insert_with(|| value.to_string());
+    } else {
+        warn!(
+            provider_name = %provider_name,
+            key = %key,
+            "skipping credential with invalid env var key"
+        );
+    }
 }
 
 pub(super) fn is_valid_env_key(key: &str) -> bool {

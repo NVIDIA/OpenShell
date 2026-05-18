@@ -91,6 +91,7 @@ impl ProviderRegistry {
         registry.register(providers::nvidia::NvidiaProvider);
         registry.register(providers::gitlab::GitlabProvider);
         registry.register(providers::github::GithubProvider);
+        registry.register(providers::microsoft_agent_s2s::MicrosoftAgentS2sProvider);
         registry.register(providers::outlook::OutlookProvider);
         registry
     }
@@ -153,6 +154,7 @@ pub fn normalize_provider_type(input: &str) -> Option<&'static str> {
         "nvidia" => Some("nvidia"),
         "gitlab" | "glab" => Some("gitlab"),
         "github" | "gh" => Some("github"),
+        "microsoft-agent-s2s" => Some("microsoft-agent-s2s"),
         "outlook" => Some("outlook"),
         _ => None,
     }
@@ -183,6 +185,10 @@ mod tests {
         assert_eq!(normalize_provider_type("anthropic"), Some("anthropic"));
         assert_eq!(normalize_provider_type("nvidia"), Some("nvidia"));
         assert_eq!(normalize_provider_type("copilot"), Some("copilot"));
+        assert_eq!(
+            normalize_provider_type("microsoft-agent-s2s"),
+            Some("microsoft-agent-s2s")
+        );
         assert_eq!(normalize_provider_type("unknown"), None);
     }
 

@@ -172,6 +172,12 @@ impl OpenShell for RelayGateway {
     {
         Err(Status::unimplemented("unused"))
     }
+    async fn mint_sandbox_provider_token(
+        &self,
+        _: tonic::Request<openshell_core::proto::MintSandboxProviderTokenRequest>,
+    ) -> Result<Response<openshell_core::proto::MintSandboxProviderTokenResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
     async fn create_ssh_session(
         &self,
         _: tonic::Request<openshell_core::proto::CreateSshSessionRequest>,

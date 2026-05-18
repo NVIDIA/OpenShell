@@ -25,12 +25,13 @@ use openshell_core::proto::{
     GetSandboxConfigResponse, GetSandboxLogsRequest, GetSandboxLogsResponse,
     GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
     GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse,
-    ListSandboxPoliciesRequest, ListSandboxPoliciesResponse, PolicyChunk, PolicyMergeOperation,
-    PolicySource, PolicyStatus, PushSandboxLogsRequest, PushSandboxLogsResponse,
-    RejectDraftChunkRequest, RejectDraftChunkResponse, ReportPolicyStatusRequest,
-    ReportPolicyStatusResponse, SandboxLogLine, SandboxPolicyRevision, SettingScope, SettingValue,
-    SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, UndoDraftChunkRequest,
-    UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
+    ListSandboxPoliciesRequest, ListSandboxPoliciesResponse, MintSandboxProviderTokenRequest,
+    MintSandboxProviderTokenResponse, PolicyChunk, PolicyMergeOperation, PolicySource,
+    PolicyStatus, PushSandboxLogsRequest, PushSandboxLogsResponse, RejectDraftChunkRequest,
+    RejectDraftChunkResponse, ReportPolicyStatusRequest, ReportPolicyStatusResponse,
+    SandboxLogLine, SandboxPolicyRevision, SettingScope, SettingValue, SubmitPolicyAnalysisRequest,
+    SubmitPolicyAnalysisResponse, UndoDraftChunkRequest, UndoDraftChunkResponse,
+    UpdateConfigRequest, UpdateConfigResponse,
 };
 use openshell_core::proto::{
     L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, Provider, Sandbox,
@@ -640,6 +641,87 @@ pub(super) async fn handle_get_sandbox_provider_environment(
     Ok(Response::new(GetSandboxProviderEnvironmentResponse {
         environment,
         provider_env_revision,
+    }))
+}
+
+pub(super) async fn handle_mint_sandbox_provider_token(
+    state: &Arc<ServerState>,
+    request: Request<MintSandboxProviderTokenRequest>,
+) -> Result<Response<MintSandboxProviderTokenResponse>, Status> {
+    let request = request.into_inner();
+    let sandbox_id = request.sandbox_id.trim();
+    let provider_name = request.provider_name.trim();
+
+    if sandbox_id.is_empty() {
+        return Err(Status::invalid_argument("sandbox_id is required"));
+    }
+    if provider_name.is_empty() {
+        return Err(Status::invalid_argument("provider_name is required"));
+    }
+
+    let sandbox = state
+        .store
+        .get_message::<Sandbox>(sandbox_id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+
+    let spec = sandbox
+        .spec
+        .ok_or_else(|| Status::internal("sandbox has no spec"))?;
+    if !spec.providers.iter().any(|name| name == provider_name) {
+        return Err(Status::failed_precondition(format!(
+            "provider '{provider_name}' is not attached to sandbox"
+        )));
+    }
+
+    let provider = state
+        .store
+        .get_message_by_name::<Provider>(provider_name)
+        .await
+        .map_err(|e| Status::internal(format!("fetch provider '{provider_name}' failed: {e}")))?
+        .ok_or_else(|| {
+            Status::failed_precondition(format!("provider '{provider_name}' not found"))
+        })?;
+
+    if provider.r#type.trim() != "microsoft-agent-s2s" {
+        return Err(Status::failed_precondition(format!(
+            "provider '{provider_name}' is not a microsoft-agent-s2s provider"
+        )));
+    }
+
+    let broker = state
+        .microsoft_s2s_brokers
+        .broker_for_provider(provider_name, &provider)
+        .await
+        .map_err(|e| Status::failed_precondition(e.to_string()))?;
+
+    let audience = if request.audience.trim().is_empty() {
+        broker
+            .default_audience()
+            .ok_or_else(|| Status::invalid_argument("audience is required"))?
+    } else {
+        request.audience.trim().to_string()
+    };
+
+    let token = broker
+        .access_token(&audience)
+        .await
+        .map_err(|e| Status::failed_precondition(e.to_string()))?;
+
+    info!(
+        sandbox_id,
+        provider_name,
+        audience = %audience,
+        cache_hit = token.cache_hit,
+        "MintSandboxProviderToken request completed successfully"
+    );
+
+    Ok(Response::new(MintSandboxProviderTokenResponse {
+        access_token: token.access_token,
+        token_type: "Bearer".to_string(),
+        expires_at_unix: token.expires_at_unix.unwrap_or_default(),
+        cache_hit: token.cache_hit,
     }))
 }
 
@@ -2890,6 +2972,38 @@ mod tests {
         }
     }
 
+    fn test_microsoft_provider(name: &str) -> Provider {
+        Provider {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: format!("provider-{name}"),
+                name: name.to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+            }),
+            r#type: "microsoft-agent-s2s".to_string(),
+            credentials: std::iter::once((
+                "A365_BLUEPRINT_CLIENT_SECRET".to_string(),
+                "secret".to_string(),
+            ))
+            .collect(),
+            config: HashMap::from([
+                ("AZURE_TENANT_ID".to_string(), "tenant-id".to_string()),
+                (
+                    "A365_BLUEPRINT_CLIENT_ID".to_string(),
+                    "blueprint-client-id".to_string(),
+                ),
+                (
+                    "A365_RUNTIME_AGENT_ID".to_string(),
+                    "runtime-agent-id".to_string(),
+                ),
+                (
+                    "A365_ALLOWED_AUDIENCES".to_string(),
+                    "api://allowed".to_string(),
+                ),
+            ]),
+        }
+    }
+
     fn test_policy_with_rule(rule_name: &str, host: &str) -> ProtoSandboxPolicy {
         ProtoSandboxPolicy {
             network_policies: std::iter::once((
@@ -3414,6 +3528,108 @@ mod tests {
 
         assert_eq!(legacy_env, v2_env);
         assert_eq!(v2_env.get("GITHUB_TOKEN"), Some(&"ghp-test".to_string()));
+    }
+
+    #[tokio::test]
+    async fn mint_sandbox_provider_token_rejects_unattached_provider() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_microsoft_provider("work-microsoft"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-microsoft",
+                "microsoft",
+                test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+                Vec::new(),
+            ))
+            .await
+            .unwrap();
+
+        let err = handle_mint_sandbox_provider_token(
+            &state,
+            Request::new(MintSandboxProviderTokenRequest {
+                sandbox_id: "sb-microsoft".to_string(),
+                provider_name: "work-microsoft".to_string(),
+                audience: "api://allowed".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("not attached"));
+    }
+
+    #[tokio::test]
+    async fn mint_sandbox_provider_token_rejects_non_microsoft_provider_type() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("work-github", "github"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-provider-token",
+                "provider-token",
+                test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+                vec!["work-github".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        let err = handle_mint_sandbox_provider_token(
+            &state,
+            Request::new(MintSandboxProviderTokenRequest {
+                sandbox_id: "sb-provider-token".to_string(),
+                provider_name: "work-github".to_string(),
+                audience: "api://allowed".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("microsoft-agent-s2s"));
+    }
+
+    #[tokio::test]
+    async fn mint_sandbox_provider_token_rejects_unallowed_audience() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_microsoft_provider("work-microsoft"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-microsoft",
+                "microsoft",
+                test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+                vec!["work-microsoft".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        let err = handle_mint_sandbox_provider_token(
+            &state,
+            Request::new(MintSandboxProviderTokenRequest {
+                sandbox_id: "sb-microsoft".to_string(),
+                provider_name: "work-microsoft".to_string(),
+                audience: "api://not-allowed".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("not allowed"));
     }
 
     #[tokio::test]

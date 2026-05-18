@@ -155,6 +155,15 @@ impl OpenShell for TestOpenShell {
         ))
     }
 
+    async fn mint_sandbox_provider_token(
+        &self,
+        _request: tonic::Request<openshell_core::proto::MintSandboxProviderTokenRequest>,
+    ) -> Result<Response<openshell_core::proto::MintSandboxProviderTokenResponse>, Status> {
+        Ok(Response::new(
+            openshell_core::proto::MintSandboxProviderTokenResponse::default(),
+        ))
+    }
+
     async fn create_ssh_session(
         &self,
         _request: tonic::Request<CreateSshSessionRequest>,

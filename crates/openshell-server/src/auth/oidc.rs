@@ -48,6 +48,7 @@ const SANDBOX_METHODS: &[&str] = &[
     "/openshell.v1.OpenShell/ReportPolicyStatus",
     "/openshell.v1.OpenShell/PushSandboxLogs",
     "/openshell.v1.OpenShell/GetSandboxProviderEnvironment",
+    "/openshell.v1.OpenShell/MintSandboxProviderToken",
     "/openshell.v1.OpenShell/SubmitPolicyAnalysis",
     "/openshell.sandbox.v1.SandboxService/GetSandboxConfig",
     "/openshell.inference.v1.Inference/GetInferenceBundle",
