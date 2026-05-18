@@ -18,14 +18,14 @@
 %global image_tag dev
 
 Name:           openshell
-Version:        0.0.37
+Version:        0.0.43
 Release:        1.20260518180028805757.podman.toml.gateway.listener.11.g8c0cb7c8%{?dist}
 Summary:        Safe, sandboxed runtimes for autonomous AI agents
 
 License:        Apache-2.0
 URL:            https://github.com/NVIDIA/OpenShell
-Source0: openshell-0.0.37.tar.gz
-Source1: openshell-0.0.37-vendor.tar.xz
+Source0: openshell-0.0.43.tar.gz
+Source1: openshell-0.0.43-vendor.tar.xz
 
 ExclusiveArch:  x86_64 aarch64
 
