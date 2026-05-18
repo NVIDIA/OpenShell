@@ -4,7 +4,8 @@
 //! Sandbox-local provider token resolvers.
 
 use crate::grpc_client;
-use miette::{IntoDiagnostic, Result};
+use miette::{IntoDiagnostic, Result, WrapErr};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -13,9 +14,11 @@ use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 const MAX_REQUEST_HEADER_BYTES: usize = 8192;
+const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024;
 const MICROSOFT_AGENT_S2S_TOKEN_PATH: &str = "/v1/microsoft-agent-s2s/token";
 const MICROSOFT_AGENT_S2S_RESOLVER_PORT: u16 = 3130;
 const TOKEN_URL_ENV: &str = "OPENSHELL_MICROSOFT_AGENT_S2S_TOKEN_URL";
+const TOKEN_PROVIDER_URL_ENV: &str = "OPENSHELL_MICROSOFT_AGENT_S2S_TOKEN_PROVIDER_URL";
 const DEFAULT_AUDIENCE_ENV: &str = "OPENSHELL_MICROSOFT_AGENT_S2S_DEFAULT_AUDIENCE";
 const A365_TOKEN_PROVIDER_URL_ENV: &str = "A365_TOKEN_PROVIDER_URL";
 const PROVIDER_NAME_ENV: &str = "OPENSHELL_MICROSOFT_AGENT_S2S_PROVIDER_NAME";
@@ -155,6 +158,7 @@ fn resolver_environment(
 ) -> HashMap<String, String> {
     let mut environment = HashMap::from([
         (TOKEN_URL_ENV.to_string(), resolver_url.clone()),
+        (TOKEN_PROVIDER_URL_ENV.to_string(), resolver_url.clone()),
         (A365_TOKEN_PROVIDER_URL_ENV.to_string(), resolver_url),
     ]);
     if let Some(audience) = default_audience {
@@ -270,7 +274,51 @@ async fn read_http_request(stream: &mut TcpStream) -> Result<String> {
             return Err(miette::miette!("token resolver request headers too large"));
         }
     }
+
+    let header_end = buffer
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| index + 4)
+        .ok_or_else(|| miette::miette!("incomplete HTTP request"))?;
+
+    let content_length = content_length(&buffer[..header_end])?;
+    if content_length > MAX_REQUEST_BODY_BYTES {
+        return Err(miette::miette!("token resolver request body too large"));
+    }
+
+    while buffer.len().saturating_sub(header_end) < content_length {
+        let read = stream.read(&mut chunk).await.into_diagnostic()?;
+        if read == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if buffer.len().saturating_sub(header_end) > MAX_REQUEST_BODY_BYTES {
+            return Err(miette::miette!("token resolver request body too large"));
+        }
+    }
+
+    if buffer.len().saturating_sub(header_end) < content_length {
+        return Err(miette::miette!("incomplete HTTP request body"));
+    }
+
     String::from_utf8(buffer).into_diagnostic()
+}
+
+fn content_length(headers: &[u8]) -> Result<usize> {
+    let headers = std::str::from_utf8(headers).into_diagnostic()?;
+    for line in headers.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("content-length") {
+            return value
+                .trim()
+                .parse::<usize>()
+                .into_diagnostic()
+                .wrap_err("invalid content-length header");
+        }
+    }
+    Ok(0)
 }
 
 fn parse_token_request(
@@ -278,15 +326,11 @@ fn parse_token_request(
     default_audience: Option<&str>,
     expected_path: &str,
 ) -> std::result::Result<String, HttpError> {
-    let request_line = request
-        .lines()
-        .next()
-        .ok_or_else(|| HttpError::new(400, "Bad Request", "missing HTTP request line"))?;
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or_default();
-    let target = parts.next().unwrap_or_default();
+    let parsed = ParsedHttpRequest::parse(request)?;
+    let method = parsed.method.as_str();
+    let target = parsed.target.as_str();
 
-    if method != "GET" {
+    if method != "GET" && method != "POST" {
         return Err(HttpError::new(
             405,
             "Method Not Allowed",
@@ -301,16 +345,13 @@ fn parse_token_request(
         return Err(HttpError::new(404, "Not Found", "token endpoint not found"));
     }
 
-    let audience = query
-        .split('&')
-        .find_map(|entry| {
-            let (key, value) = entry.split_once('=')?;
-            (key == "audience").then(|| value.to_string())
-        })
-        .or_else(|| default_audience.map(ToOwned::to_owned))
-        .ok_or_else(|| {
-            HttpError::new(400, "Bad Request", "audience query parameter is required")
-        })?;
+    let audience = if method == "GET" {
+        audience_from_query(query)
+    } else {
+        audience_from_json_body(parsed.body)?
+    }
+    .or_else(|| default_audience.map(ToOwned::to_owned))
+    .ok_or_else(|| HttpError::new(400, "Bad Request", "audience is required"))?;
 
     if audience.trim().is_empty() {
         return Err(HttpError::new(
@@ -322,6 +363,58 @@ fn parse_token_request(
 
     debug!(audience = %audience, "microsoft-agent-s2s token resolver request accepted");
     Ok(audience)
+}
+
+fn audience_from_query(query: &str) -> Option<String> {
+    query.split('&').find_map(|entry| {
+        let (key, value) = entry.split_once('=')?;
+        (key == "audience").then(|| value.to_string())
+    })
+}
+
+fn audience_from_json_body(body: &str) -> std::result::Result<Option<String>, HttpError> {
+    if body.trim().is_empty() {
+        return Ok(None);
+    }
+
+    #[derive(Deserialize)]
+    struct TokenRequestBody {
+        audience: Option<String>,
+    }
+
+    serde_json::from_str::<TokenRequestBody>(body)
+        .map(|payload| payload.audience)
+        .map_err(|_| HttpError::new(400, "Bad Request", "invalid JSON request body"))
+}
+
+struct ParsedHttpRequest<'a> {
+    method: String,
+    target: String,
+    body: &'a str,
+}
+
+impl<'a> ParsedHttpRequest<'a> {
+    fn parse(request: &'a str) -> std::result::Result<Self, HttpError> {
+        let Some((head, body)) = request.split_once("\r\n\r\n") else {
+            return Err(HttpError::new(
+                400,
+                "Bad Request",
+                "missing HTTP request separator",
+            ));
+        };
+        let request_line = head
+            .lines()
+            .next()
+            .ok_or_else(|| HttpError::new(400, "Bad Request", "missing HTTP request line"))?;
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().unwrap_or_default().to_string();
+        let target = parts.next().unwrap_or_default().to_string();
+        Ok(Self {
+            method,
+            target,
+            body,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -392,6 +485,10 @@ mod tests {
             Some(&"http://127.0.0.1:3130/v1/microsoft-agent-s2s/token/capability".to_string())
         );
         assert_eq!(
+            environment.get(TOKEN_PROVIDER_URL_ENV),
+            environment.get(TOKEN_URL_ENV)
+        );
+        assert_eq!(
             environment.get(A365_TOKEN_PROVIDER_URL_ENV),
             environment.get(TOKEN_URL_ENV)
         );
@@ -401,5 +498,42 @@ mod tests {
         );
         assert!(!environment.contains_key("A365_BLUEPRINT_CLIENT_SECRET"));
         assert!(!environment.contains_key("A365_BLUEPRINT_CLIENT_ID"));
+    }
+
+    #[test]
+    fn parse_token_request_accepts_post_json_body() {
+        let audience = parse_token_request(
+            "POST /v1/microsoft-agent-s2s/token/test HTTP/1.1\r\nContent-Length: 31\r\n\r\n{\"audience\":\"api://resource\"}",
+            None,
+            "/v1/microsoft-agent-s2s/token/test",
+        )
+        .expect("audience");
+
+        assert_eq!(audience, "api://resource");
+    }
+
+    #[test]
+    fn parse_token_request_uses_default_audience_for_empty_post_body() {
+        let audience = parse_token_request(
+            "POST /v1/microsoft-agent-s2s/token/test HTTP/1.1\r\nContent-Length: 0\r\n\r\n",
+            Some("api://default"),
+            "/v1/microsoft-agent-s2s/token/test",
+        )
+        .expect("audience");
+
+        assert_eq!(audience, "api://default");
+    }
+
+    #[test]
+    fn parse_token_request_rejects_invalid_json_body() {
+        let err = parse_token_request(
+            "POST /v1/microsoft-agent-s2s/token/test HTTP/1.1\r\nContent-Length: 9\r\n\r\nnot-json!",
+            None,
+            "/v1/microsoft-agent-s2s/token/test",
+        )
+        .expect_err("invalid request should fail");
+
+        assert_eq!(err.status, 400);
+        assert_eq!(err.message, "invalid JSON request body");
     }
 }
