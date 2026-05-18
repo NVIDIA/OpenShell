@@ -3599,6 +3599,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mint_sandbox_provider_token_rejects_unallowed_audience() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_microsoft_provider("work-microsoft"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox(
+                "sb-microsoft",
+                "microsoft",
+                test_policy_with_rule("sandbox_only", "sandbox.example.com"),
+                vec!["work-microsoft".to_string()],
+            ))
+            .await
+            .unwrap();
+
+        let err = handle_mint_sandbox_provider_token(
+            &state,
+            Request::new(MintSandboxProviderTokenRequest {
+                sandbox_id: "sb-microsoft".to_string(),
+                provider_name: "work-microsoft".to_string(),
+                audience: "api://not-allowed".to_string(),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("not allowed"));
+    }
+
+    #[tokio::test]
     async fn provider_env_revision_changes_when_attached_provider_record_changes() {
         use openshell_core::proto::GetSandboxProviderEnvironmentRequest;
         use std::time::Duration;

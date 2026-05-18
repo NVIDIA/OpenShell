@@ -547,4 +547,30 @@ mod tests {
         assert_eq!(err.status, 400);
         assert_eq!(err.message, "invalid JSON request body");
     }
+
+    #[test]
+    fn parse_token_request_rejects_unknown_path() {
+        let err = parse_token_request(
+            "GET /v1/microsoft-agent-s2s/debug HTTP/1.1\r\n\r\n",
+            Some("api://default"),
+            "/v1/microsoft-agent-s2s/token/test",
+        )
+        .expect_err("unknown path should fail");
+
+        assert_eq!(err.status, 404);
+        assert_eq!(err.message, "token endpoint not found");
+    }
+
+    #[test]
+    fn parse_token_request_rejects_unsupported_method() {
+        let err = parse_token_request(
+            "DELETE /v1/microsoft-agent-s2s/token/test HTTP/1.1\r\n\r\n",
+            Some("api://default"),
+            "/v1/microsoft-agent-s2s/token/test",
+        )
+        .expect_err("unsupported method should fail");
+
+        assert_eq!(err.status, 405);
+        assert_eq!(err.message, "method not allowed");
+    }
 }
