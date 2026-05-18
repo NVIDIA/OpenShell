@@ -3045,6 +3045,7 @@ fn print_sandbox_policy(policy: &SandboxPolicy) {
 }
 
 /// List sandboxes.
+#[allow(clippy::too_many_arguments)]
 pub async fn sandbox_list(
     server: &str,
     limit: u32,
@@ -3052,6 +3053,7 @@ pub async fn sandbox_list(
     ids_only: bool,
     names_only: bool,
     label_selector: Option<&str>,
+    output: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
@@ -3066,6 +3068,25 @@ pub async fn sandbox_list(
         .into_diagnostic()?;
 
     let sandboxes = response.into_inner().sandboxes;
+
+    match output {
+        "json" => {
+            let items: Vec<serde_json::Value> = sandboxes.iter().map(sandbox_to_json).collect();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&items).into_diagnostic()?
+            );
+            return Ok(());
+        }
+        "yaml" => {
+            let items: Vec<serde_json::Value> = sandboxes.iter().map(sandbox_to_json).collect();
+            print!("{}", serde_yml::to_string(&items).into_diagnostic()?);
+            return Ok(());
+        }
+        "table" => {}
+        _ => return Err(miette!("unsupported output format: {output}")),
+    }
+
     if sandboxes.is_empty() {
         if !ids_only && !names_only {
             println!("No sandboxes found.");
@@ -3124,6 +3145,19 @@ pub async fn sandbox_list(
     }
 
     Ok(())
+}
+
+fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
+    let meta = sandbox.metadata.as_ref();
+    let labels = meta.map_or_else(|| serde_json::json!({}), |m| serde_json::json!(m.labels));
+    serde_json::json!({
+        "id": sandbox.object_id(),
+        "name": sandbox.object_name(),
+        "labels": labels,
+        "created_at": format_epoch_ms(meta.map_or(0, |m| m.created_at_ms)),
+        "phase": phase_name(sandbox.phase),
+        "current_policy_version": sandbox.current_policy_version,
+    })
 }
 
 pub async fn sandbox_provider_list(server: &str, name: &str, tls: &TlsOptions) -> Result<()> {

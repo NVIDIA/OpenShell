@@ -647,13 +647,13 @@ fn normalize_completion_script(output: Vec<u8>, executable: &std::path::Path) ->
 }
 
 #[derive(Clone, Debug, ValueEnum)]
-enum ProviderProfileOutput {
+enum OutputFormat {
     Table,
     Yaml,
     Json,
 }
 
-impl ProviderProfileOutput {
+impl OutputFormat {
     fn as_str(&self) -> &'static str {
         match self {
             Self::Table => "table",
@@ -736,8 +736,8 @@ enum ProviderCommands {
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     ListProfiles {
         /// Output format.
-        #[arg(short = 'o', long = "output", value_enum, default_value_t = ProviderProfileOutput::Table)]
-        output: ProviderProfileOutput,
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
     },
 
     /// Manage provider profiles.
@@ -786,8 +786,8 @@ enum ProviderProfileCommands {
         id: String,
 
         /// Output format.
-        #[arg(short = 'o', long = "output", value_enum, default_value_t = ProviderProfileOutput::Yaml)]
-        output: ProviderProfileOutput,
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Yaml)]
+        output: OutputFormat,
     },
 
     /// Import provider profiles from a file or directory.
@@ -1167,16 +1167,20 @@ enum SandboxCommands {
         offset: u32,
 
         /// Print only sandbox ids (one per line).
-        #[arg(long, conflicts_with = "names")]
+        #[arg(long, conflicts_with_all = ["names", "output"])]
         ids: bool,
 
         /// Print only sandbox names (one per line).
-        #[arg(long, conflicts_with = "ids")]
+        #[arg(long, conflicts_with_all = ["ids", "output"])]
         names: bool,
 
         /// Filter sandboxes by label selector (key1=value1,key2=value2).
         #[arg(long)]
         selector: Option<String>,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table, conflicts_with_all = ["ids", "names"])]
+        output: OutputFormat,
     },
 
     /// Delete a sandbox by name.
@@ -2527,6 +2531,7 @@ async fn main() -> Result<()> {
                             ids,
                             names,
                             selector,
+                            output,
                         } => {
                             run::sandbox_list(
                                 endpoint,
@@ -2535,6 +2540,7 @@ async fn main() -> Result<()> {
                                 ids,
                                 names,
                                 selector.as_deref(),
+                                output.as_str(),
                                 &tls,
                             )
                             .await?;
@@ -3398,7 +3404,7 @@ mod tests {
             cli.command,
             Some(Commands::Provider {
                 command: Some(ProviderCommands::ListProfiles {
-                    output: ProviderProfileOutput::Table
+                    output: OutputFormat::Table
                 })
             })
         ));
@@ -3413,7 +3419,7 @@ mod tests {
             cli.command,
             Some(Commands::Provider {
                 command: Some(ProviderCommands::ListProfiles {
-                    output: ProviderProfileOutput::Json
+                    output: OutputFormat::Json
                 })
             })
         ));
@@ -3436,7 +3442,7 @@ mod tests {
             Some(Commands::Provider {
                 command: Some(ProviderCommands::Profile(ProviderProfileCommands::Export {
                     id,
-                    output: ProviderProfileOutput::Yaml
+                    output: OutputFormat::Yaml
                 }))
             }) if id == "custom-api"
         ));
@@ -3471,6 +3477,66 @@ mod tests {
                 }))
             }) if id == "custom-api"
         ));
+    }
+
+    #[test]
+    fn sandbox_list_default_output_is_table() {
+        let cli = Cli::try_parse_from(["openshell", "sandbox", "list"])
+            .expect("sandbox list should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::List {
+                    output: OutputFormat::Table,
+                    ..
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn sandbox_list_accepts_output_json() {
+        let cli = Cli::try_parse_from(["openshell", "sandbox", "list", "-o", "json"])
+            .expect("sandbox list -o json should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::List {
+                    output: OutputFormat::Json,
+                    ..
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn sandbox_list_accepts_output_yaml() {
+        let cli = Cli::try_parse_from(["openshell", "sandbox", "list", "-o", "yaml"])
+            .expect("sandbox list -o yaml should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::List {
+                    output: OutputFormat::Yaml,
+                    ..
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn sandbox_list_json_conflicts_with_ids() {
+        let result = Cli::try_parse_from(["openshell", "sandbox", "list", "-o", "json", "--ids"]);
+        assert!(result.is_err(), "--ids and -o json should conflict");
+    }
+
+    #[test]
+    fn sandbox_list_json_conflicts_with_names() {
+        let result = Cli::try_parse_from(["openshell", "sandbox", "list", "-o", "json", "--names"]);
+        assert!(result.is_err(), "--names and -o json should conflict");
     }
 
     #[test]

@@ -3435,6 +3435,7 @@ dependencies = [
  "rustls-pemfile",
  "serde",
  "serde_json",
+ "serde_yml",
  "tar",
  "temp-env",
  "tempfile",

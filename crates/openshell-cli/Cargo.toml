@@ -23,6 +23,7 @@ openshell-prover = { path = "../openshell-prover" }
 openshell-tui = { path = "../openshell-tui" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yml = { workspace = true }
 prost-types = { workspace = true }
 
 # Async runtime

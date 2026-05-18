@@ -211,6 +211,13 @@ Filter the list by labels when you want a narrower view:
 openshell sandbox list --selector team=platform
 ```
 
+Use `-o json` or `-o yaml` for machine-readable output:
+
+```shell
+openshell sandbox list -o json
+openshell sandbox list -o yaml
+```
+
 Get detailed information about a specific sandbox. The output lists **Policy source** (`sandbox` or `global`), **Revision** (the active policy’s row version for that source), and the formatted active policy YAML:
 
 ```shell
