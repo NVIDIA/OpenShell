@@ -71,3 +71,95 @@ jobs:
         run: |
           curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | sh
           openshell status
+
+  kubernetes:
+    name: Kubernetes Helm (kind)
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      KIND_CLUSTER_NAME: release-canary-${{ github.run_id }}
+      RELEASE_NAME: openshell
+      RELEASE_NAMESPACE: openshell
+      KIND_GATEWAY_NAME: kind
+    steps:
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: ${{ env.KIND_CLUSTER_NAME }}
+          wait: 120s
+
+      - name: Install OpenShell Helm chart from GHCR OCI
+        run: |
+          set -euo pipefail
+          helm install "$RELEASE_NAME" oci://ghcr.io/nvidia/openshell/helm-chart \
+            --version 0.0.0-dev \
+            --namespace "$RELEASE_NAMESPACE" --create-namespace \
+            --set server.disableTls=true \
+            --set pkiInitJob.enabled=false \
+            --wait --timeout 5m
+
+      - name: Verify gateway pod is Ready
+        run: |
+          set -euo pipefail
+          kubectl wait --namespace "$RELEASE_NAMESPACE" \
+            --for=condition=Ready pod \
+            --selector="app.kubernetes.io/name=openshell,app.kubernetes.io/instance=${RELEASE_NAME}" \
+            --timeout=300s
+
+      - name: Port-forward gateway service
+        run: |
+          set -euo pipefail
+          nohup kubectl port-forward --namespace "$RELEASE_NAMESPACE" \
+            "svc/${RELEASE_NAME}" 8080:8080 \
+            > port-forward.log 2>&1 &
+          echo $! > port-forward.pid
+          for _ in $(seq 1 30); do
+            if (echo > /dev/tcp/127.0.0.1/8080) >/dev/null 2>&1; then
+              echo "port-forward is reachable"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "port-forward did not become reachable" >&2
+          cat port-forward.log >&2
+          exit 1
+
+      - name: Install OpenShell CLI
+        run: |
+          set -euo pipefail
+          mkdir -p "${HOME}/.config/openshell"
+          printf 'OPENSHELL_DRIVERS=docker\n' > "${HOME}/.config/openshell/gateway.env"
+          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | sh
+
+      - name: Register kind gateway and check status
+        run: |
+          set -euo pipefail
+          openshell gateway add http://127.0.0.1:8080 --local --name "$KIND_GATEWAY_NAME"
+          openshell status
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          set +e
+          echo "--- helm status ---"
+          helm status "$RELEASE_NAME" --namespace "$RELEASE_NAMESPACE"
+          echo "--- helm get manifest ---"
+          helm get manifest "$RELEASE_NAME" --namespace "$RELEASE_NAMESPACE"
+          echo "--- get all ---"
+          kubectl get all --namespace "$RELEASE_NAMESPACE"
+          echo "--- describe pods ---"
+          kubectl describe pods --namespace "$RELEASE_NAMESPACE"
+          echo "--- pod logs ---"
+          kubectl logs --namespace "$RELEASE_NAMESPACE" \
+            --selector="app.kubernetes.io/name=openshell,app.kubernetes.io/instance=${RELEASE_NAME}" \
+            --tail=200 --all-containers --prefix
+          echo "--- port-forward log ---"
+          cat port-forward.log 2>/dev/null
+          echo "--- openshell gateway list ---"
+          openshell gateway list 2>/dev/null
+          echo "--- openshell version ---"
+          openshell --version 2>/dev/null
