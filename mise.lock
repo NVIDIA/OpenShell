@@ -27,43 +27,24 @@ url = "https://github.com/EmbarkStudios/cargo-about/releases/download/0.8.4/carg
 url_api = "https://api.github.com/repos/EmbarkStudios/cargo-about/releases/assets/324268695"
 
 [[tools."github:anchore/syft"]]
-version = "1.43.0"
+version = "1.44.0"
 backend = "github:anchore/syft"
 
 [tools."github:anchore/syft"."platforms.linux-arm64"]
-checksum = "sha256:afe92510c467f952a009b994f2d998ff8f9dd266dc26eca55d14a0dd46fec7f2"
-url = "https://github.com/anchore/syft/releases/download/v1.43.0/syft_1.43.0_linux_arm64.tar.gz"
-url_api = "https://api.github.com/repos/anchore/syft/releases/assets/402658323"
-
-[tools."github:anchore/syft"."platforms.linux-arm64-musl"]
-checksum = "sha256:afe92510c467f952a009b994f2d998ff8f9dd266dc26eca55d14a0dd46fec7f2"
-url = "https://github.com/anchore/syft/releases/download/v1.43.0/syft_1.43.0_linux_arm64.tar.gz"
-url_api = "https://api.github.com/repos/anchore/syft/releases/assets/402658323"
+checksum = "sha256:6f6cdcdc695721d91ce756e3b5bc3e3416599c464101f5e32e9c3f33054ee6d9"
+url = "https://github.com/anchore/syft/releases/download/v1.44.0/syft_1.44.0_linux_arm64.tar.gz"
+url_api = "https://api.github.com/repos/anchore/syft/releases/assets/410001182"
 
 [tools."github:anchore/syft"."platforms.linux-x64"]
-checksum = "sha256:7b98251d2d08926bb5d4639b56b1f0996a58ef6667c5830e3fe3cd3ad5f4214a"
-url = "https://github.com/anchore/syft/releases/download/v1.43.0/syft_1.43.0_linux_amd64.tar.gz"
-url_api = "https://api.github.com/repos/anchore/syft/releases/assets/402658325"
-
-[tools."github:anchore/syft"."platforms.linux-x64-musl"]
-checksum = "sha256:7b98251d2d08926bb5d4639b56b1f0996a58ef6667c5830e3fe3cd3ad5f4214a"
-url = "https://github.com/anchore/syft/releases/download/v1.43.0/syft_1.43.0_linux_amd64.tar.gz"
-url_api = "https://api.github.com/repos/anchore/syft/releases/assets/402658325"
+checksum = "sha256:0e91737aee2b5baf1d255b959630194a302335d848ff97bb07921eb6205b5f5a"
+url = "https://github.com/anchore/syft/releases/download/v1.44.0/syft_1.44.0_linux_amd64.tar.gz"
+url_api = "https://api.github.com/repos/anchore/syft/releases/assets/410001183"
 
 [tools."github:anchore/syft"."platforms.macos-arm64"]
-checksum = "sha256:3640e2181c8be7a56377f3c96e520d5380c924dbafd115ee3c8d45fcbc89cac2"
-url = "https://github.com/anchore/syft/releases/download/v1.43.0/syft_1.43.0_darwin_arm64.tar.gz"
-url_api = "https://api.github.com/repos/anchore/syft/releases/assets/402658324"
-
-[tools."github:anchore/syft"."platforms.macos-x64"]
-checksum = "sha256:08fd18f55037f999f50b2c2256a9285f0146978a0b16cdc58662ecdc85d0e3c0"
-url = "https://github.com/anchore/syft/releases/download/v1.43.0/syft_1.43.0_darwin_amd64.tar.gz"
-url_api = "https://api.github.com/repos/anchore/syft/releases/assets/402658329"
-
-[tools."github:anchore/syft"."platforms.windows-x64"]
-checksum = "sha256:c51695d171c61460369dabdd5c71b8f350ef8618466818356a30808d7105c710"
-url = "https://github.com/anchore/syft/releases/download/v1.43.0/syft_1.43.0_windows_amd64.zip"
-url_api = "https://api.github.com/repos/anchore/syft/releases/assets/402658321"
+checksum = "sha256:24e4d34078ae81da7c82539616f0ccac3e226cf4f74a38ce6fb3463619e50a55"
+url = "https://github.com/anchore/syft/releases/download/v1.44.0/syft_1.44.0_darwin_arm64.tar.gz"
+url_api = "https://api.github.com/repos/anchore/syft/releases/assets/410001187"
+provenance = "github-attestations"
 
 [[tools."github:mozilla/sccache"]]
 version = "0.14.0"
@@ -105,20 +86,20 @@ url = "https://github.com/mozilla/sccache/releases/download/v0.14.0/sccache-v0.1
 url_api = "https://api.github.com/repos/mozilla/sccache/releases/assets/353136140"
 
 [[tools.helm]]
-version = "4.1.4"
+version = "4.2.0"
 backend = "aqua:helm/helm"
 
 [tools.helm."platforms.linux-arm64"]
-checksum = "sha256:13d03672be289045d2ff00e4e345d61de1c6f21c1257a45955a30e8ae036d8f1"
-url = "https://get.helm.sh/helm-v4.1.4-linux-arm64.tar.gz"
+checksum = "sha256:1f8de130dfbd04de64978e7b852a7a547be1404956a366608276d2520b678670"
+url = "https://get.helm.sh/helm-v4.2.0-linux-arm64.tar.gz"
 
 [tools.helm."platforms.linux-x64"]
-checksum = "sha256:70b2c30a19da4db264dfd68c8a3664e05093a361cefd89572ffb36f8abfa3d09"
-url = "https://get.helm.sh/helm-v4.1.4-linux-amd64.tar.gz"
+checksum = "sha256:97dbeb971be4ac4b27e3839976d9564c0fb35c6f3b1da89dd1e292d236af4096"
+url = "https://get.helm.sh/helm-v4.2.0-linux-amd64.tar.gz"
 
 [tools.helm."platforms.macos-arm64"]
-checksum = "sha256:7c2eca678e8001fa863cdf8cbf6ac1b3799f9404a89eb55c08260ef5732e658d"
-url = "https://get.helm.sh/helm-v4.1.4-darwin-arm64.tar.gz"
+checksum = "sha256:f13f959015447b6bc309f9fd506509926543988a39035c088b52522ec95e2acb"
+url = "https://get.helm.sh/helm-v4.2.0-darwin-arm64.tar.gz"
 
 [[tools.k3d]]
 version = "5.8.3"
@@ -153,36 +134,20 @@ checksum = "sha256:655d2aadcb1f0a0dd196c5cbc564687ba945a9547c8e82c9fc532051fb260
 url = "https://github.com/k3d-io/k3d/releases/download/v5.8.3/k3d-windows-amd64.exe"
 
 [[tools.kubectl]]
-version = "1.35.4"
+version = "1.36.1"
 backend = "aqua:kubernetes/kubernetes/kubectl"
 
 [tools.kubectl."platforms.linux-arm64"]
-checksum = "sha256:6a5a4cc4e396d7626a7a693a3044b51c75520f81db30fe6816c2554e53be336f"
-url = "https://dl.k8s.io/v1.35.4/bin/linux/arm64/kubectl"
-
-[tools.kubectl."platforms.linux-arm64-musl"]
-checksum = "sha256:6a5a4cc4e396d7626a7a693a3044b51c75520f81db30fe6816c2554e53be336f"
-url = "https://dl.k8s.io/v1.35.4/bin/linux/arm64/kubectl"
+checksum = "sha256:59f7ee8e477fae658447607dc3c8790ac17a1b016c01c622c12070e969e2d4e7"
+url = "https://dl.k8s.io/v1.36.1/bin/linux/arm64/kubectl"
 
 [tools.kubectl."platforms.linux-x64"]
-checksum = "sha256:b529430df69a688fd61b64ad2299edb5fd71cb58be2a4779dba624c7d3510efd"
-url = "https://dl.k8s.io/v1.35.4/bin/linux/amd64/kubectl"
-
-[tools.kubectl."platforms.linux-x64-musl"]
-checksum = "sha256:b529430df69a688fd61b64ad2299edb5fd71cb58be2a4779dba624c7d3510efd"
-url = "https://dl.k8s.io/v1.35.4/bin/linux/amd64/kubectl"
+checksum = "sha256:629d3f410e09bf49b64ae7079f7f0bda1191efed311f7d37fdbab0ad5b0ec2b7"
+url = "https://dl.k8s.io/v1.36.1/bin/linux/amd64/kubectl"
 
 [tools.kubectl."platforms.macos-arm64"]
-checksum = "sha256:ec644a2473b64b486987f695dfb1867963ce6d42d267b86e944585a546f92b5d"
-url = "https://dl.k8s.io/v1.35.4/bin/darwin/arm64/kubectl"
-
-[tools.kubectl."platforms.macos-x64"]
-checksum = "sha256:dddb01bddb96f78e48e33105ccfa2feedff585a8b2e3b812f5d0f64c7403710a"
-url = "https://dl.k8s.io/v1.35.4/bin/darwin/amd64/kubectl"
-
-[tools.kubectl."platforms.windows-x64"]
-checksum = "sha256:d77d03309bd80de56dafe8ca59ff6f2076e2ed4ee61c6a94657a4b6e945210e6"
-url = "https://dl.k8s.io/v1.35.4/bin/windows/amd64/kubectl.exe"
+checksum = "sha256:9092778abaef3079449da4cd70ded0e4be112480c93efcdeace3155968d1d133"
+url = "https://dl.k8s.io/v1.36.1/bin/darwin/arm64/kubectl"
 
 [[tools.node]]
 version = "24.15.0"
@@ -237,45 +202,25 @@ checksum = "sha256:b9576b5fa1a1ef3fe13a8c91d9d8204b46545759bea5ae155cd6ba2ea4cda
 url = "https://github.com/protocolbuffers/protobuf/releases/download/v29.6/protoc-29.6-osx-aarch_64.zip"
 
 [[tools.python]]
-version = "3.13.13"
+version = "3.14.5"
 backend = "core:python"
 
 [tools.python.options]
 precompiled_flavor = "install_only_stripped"
 
 [tools.python."platforms.linux-arm64"]
-checksum = "sha256:67c837838c56a7d16187d1be9fad326a617e0b1ee2687e1a0dda0c85053dac33"
-url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260510/cpython-3.13.13+20260510-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz"
-provenance = "github-attestations"
-
-[tools.python."platforms.linux-arm64-musl"]
-checksum = "sha256:0556f1260a9a1fc83210dcecf9d4cbacf17eb4a684541c84798ffc8b4d618c35"
-url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260414/cpython-3.13.13+20260414-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz"
+checksum = "sha256:bea1aa66159eaf97ade1225e40b7060d709154da961aa37792bb8066d8f6af49"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260510/cpython-3.14.5+20260510-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz"
 provenance = "github-attestations"
 
 [tools.python."platforms.linux-x64"]
-checksum = "sha256:bbe27549e475fe5f22d42a8e0d553dc79d80d8a00e05712599637857d287360e"
-url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260510/cpython-3.13.13+20260510-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
-provenance = "github-attestations"
-
-[tools.python."platforms.linux-x64-musl"]
-checksum = "sha256:13d3b6d15f4c3c1dd1955a3c81e06bdc5aef4cb5cb65076878374948be3b0412"
-url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260414/cpython-3.13.13+20260414-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
+checksum = "sha256:dc10977b0db3bef1ee2275107fde6fe9c148135b556fa352e83c6baa67d17ed6"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260510/cpython-3.14.5+20260510-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
 provenance = "github-attestations"
 
 [tools.python."platforms.macos-arm64"]
-checksum = "sha256:16d2332d950178968534e65fe09f01f876d13af1147176fd0c77a74c9e4d1a4b"
-url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260510/cpython-3.13.13+20260510-aarch64-apple-darwin-install_only_stripped.tar.gz"
-provenance = "github-attestations"
-
-[tools.python."platforms.macos-x64"]
-checksum = "sha256:d34198cd856fa80ebf3aa821fe329a25fab66eeda44f72ac9576591282e31bb7"
-url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260414/cpython-3.13.13+20260414-x86_64-apple-darwin-install_only_stripped.tar.gz"
-provenance = "github-attestations"
-
-[tools.python."platforms.windows-x64"]
-checksum = "sha256:b84dce293464cfd366ee792a3d5b42abe5174fc9cce733ba895b3ef467cb3161"
-url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260414/cpython-3.13.13+20260414-x86_64-pc-windows-msvc-install_only_stripped.tar.gz"
+checksum = "sha256:1bb0b3d45448dfe7e916dc62144cfd7d7a611dc6ccf05b8bb71662cc5c2a1ad2"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260510/cpython-3.14.5+20260510-aarch64-apple-darwin-install_only_stripped.tar.gz"
 provenance = "github-attestations"
 
 [[tools.rust]]
@@ -283,29 +228,18 @@ version = "1.95.0"
 backend = "core:rust"
 
 [[tools.skaffold]]
-version = "2.19.0"
+version = "2.20.0"
 backend = "aqua:GoogleContainerTools/skaffold"
 
 [tools.skaffold."platforms.linux-arm64"]
-url = "https://storage.googleapis.com/skaffold/releases/v2.19.0/skaffold-linux-arm64"
-
-[tools.skaffold."platforms.linux-arm64-musl"]
-url = "https://storage.googleapis.com/skaffold/releases/v2.19.0/skaffold-linux-arm64"
+url = "https://storage.googleapis.com/skaffold/releases/v2.20.0/skaffold-linux-arm64"
 
 [tools.skaffold."platforms.linux-x64"]
-url = "https://storage.googleapis.com/skaffold/releases/v2.19.0/skaffold-linux-amd64"
-
-[tools.skaffold."platforms.linux-x64-musl"]
-url = "https://storage.googleapis.com/skaffold/releases/v2.19.0/skaffold-linux-amd64"
+url = "https://storage.googleapis.com/skaffold/releases/v2.20.0/skaffold-linux-amd64"
 
 [tools.skaffold."platforms.macos-arm64"]
-url = "https://storage.googleapis.com/skaffold/releases/v2.19.0/skaffold-darwin-arm64"
-
-[tools.skaffold."platforms.macos-x64"]
-url = "https://storage.googleapis.com/skaffold/releases/v2.19.0/skaffold-darwin-amd64"
-
-[tools.skaffold."platforms.windows-x64"]
-url = "https://storage.googleapis.com/skaffold/releases/v2.19.0/skaffold-windows-amd64.exe"
+checksum = "blake3:cb665940f9b861c1160ddc9dd6601c047587396cb3ca029e2aa1f397ad9e6849"
+url = "https://storage.googleapis.com/skaffold/releases/v2.20.0/skaffold-darwin-arm64"
 
 [[tools.uv]]
 version = "0.10.12"

@@ -129,7 +129,14 @@ if [ -n "${OPENSHELL_E2E_KUBE_CONTEXT:-}" ]; then
     exit 2
   fi
 else
-  require_cmd k3d
+  if ! command -v k3d >/dev/null 2>&1; then
+    if [ "$(uname -s)" = "Linux" ]; then
+      echo "ERROR: k3d is not installed by mise on Linux in this repo." >&2
+      echo "Set OPENSHELL_E2E_KUBE_CONTEXT to a kind/existing cluster, or install k3d explicitly." >&2
+      exit 2
+    fi
+    require_cmd k3d
+  fi
   CLUSTER_NAME="oshe2e-$$-$(date +%s | tail -c 8)"
   echo "Creating ephemeral k3d cluster ${CLUSTER_NAME}..."
   HELM_K3S_CLUSTER_NAME="${CLUSTER_NAME}" \

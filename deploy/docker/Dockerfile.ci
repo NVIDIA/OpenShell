@@ -8,8 +8,8 @@
 
 FROM nvcr.io/nvidia/base/ubuntu:noble-20251013
 
-ARG DOCKER_VERSION=29.4.1
-ARG BUILDX_VERSION=v0.33.0
+ARG DOCKER_VERSION=29.5.1
+ARG BUILDX_VERSION=v0.34.0
 ARG NPM_VERSION=11.13.0
 ARG TARGETARCH
 
@@ -57,7 +57,7 @@ RUN case "$TARGETARCH" in \
     && chmod +x /usr/local/lib/docker/cli-plugins/docker-buildx
 
 # Install GitHub CLI used by install.sh and CI jobs
-ARG GH_VERSION=2.91.0
+ARG GH_VERSION=2.92.0
 RUN case "$TARGETARCH" in \
       amd64) gh_arch=amd64 ;; \
       arm64) gh_arch=arm64 ;; \

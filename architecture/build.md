@@ -38,8 +38,8 @@ staging directory before running Buildx.
 
 Runtime layout:
 
-- **Gateway**: `nvcr.io/nvidia/distroless/cc` base, GNU-linked binary at
-  `/usr/local/bin/openshell-gateway`, runs as UID/GID `65532:65532`.
+- **Gateway**: `gcr.io/distroless/cc-debian13:nonroot` base, GNU-linked binary at
+  `/usr/local/bin/openshell-gateway`, runs as UID/GID `1000:1000`.
 - **Supervisor**: `scratch` base, static musl binary at `/openshell-sandbox`.
   Static linkage is required because the image is mounted/extracted into
   sandbox environments (Docker extraction, Podman image volumes, Kubernetes

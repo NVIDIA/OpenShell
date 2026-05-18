@@ -50,10 +50,11 @@ dir = "deploy/helm/openshell"
 run = "skaffold diagnose"
 hide = true
 
-# Local k3s via k3d (Docker required). On macOS this is the supported path for a lightweight cluster to pair with helm:skaffold:* .
+# Local k3s via k3d (Docker required). macOS gets k3d from mise; Linux users
+# should install k3d explicitly or point workflows at an existing/kind cluster.
 
 ["helm:k3s:create"]
-description = "Create a local k3s cluster with k3d and merge kubeconfig (macOS/Linux + Docker; use with helm:skaffold:dev)"
+description = "Create a local k3s cluster with k3d and merge kubeconfig (macOS via mise; Linux requires explicit k3d install; use with helm:skaffold:dev)"
 run = "tasks/scripts/helm-k3s-local.sh create"
 
 ["helm:k3s:delete"]
