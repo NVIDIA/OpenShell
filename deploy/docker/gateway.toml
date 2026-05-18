@@ -1,0 +1,51 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# OpenShell gateway TOML configuration — Docker compute driver.
+#
+# This file is the primary configuration source for docker-compose.yml in this
+# directory.  It is mounted read-only at /etc/openshell/gateway.toml inside the
+# gateway container and loaded via OPENSHELL_GATEWAY_CONFIG.
+#
+# Why docker-compose.yml sets command: []:
+#   The gateway image's default CMD passes --bind-address 0.0.0.0 --port 8080
+#   as explicit CLI flags.  CLI flags beat the TOML file in the merge order, so
+#   bind_address = "127.0.0.1:8080" below would be silently ignored without
+#   clearing the CMD first.
+#
+# grpc_endpoint note:
+#   host.docker.internal is automatically resolvable from containers on
+#   Docker Desktop (Windows / macOS).  On Linux, add extra_hosts to the
+#   gateway service:
+#     extra_hosts:
+#       - "host.docker.internal:host-gateway"
+#       - "host.openshell.internal:host-gateway"
+
+[openshell]
+version = 1
+
+[openshell.gateway]
+# Bind to loopback only.  The Docker driver adds an extra listener on the
+# bridge interface automatically so sandbox containers can reach the gateway.
+bind_address        = "127.0.0.1:8080"
+health_bind_address = "127.0.0.1:8081"
+log_level           = "info"
+compute_drivers     = ["docker"]
+disable_tls         = true
+
+[openshell.drivers.docker]
+# Default image pulled for `openshell sandbox create` without --from.
+default_image     = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+# Supervisor image from which the openshell-sandbox binary is extracted on
+# first start.  The binary is cached to XDG_DATA_HOME and reused on restart.
+supervisor_image  = "ghcr.io/nvidia/openshell/supervisor:latest"
+# Only pull images that are not already cached locally.
+image_pull_policy = "IfNotPresent"
+# Prefix applied to sandbox container names.
+sandbox_namespace = "openshell"
+# Address sandbox containers use to call back to the gateway.
+# The Docker driver replaces the host with host.openshell.internal and the
+# port with the gateway's own bind port (8080).  Only the scheme survives.
+# The gateway must be published on port 8080 on the Docker host so that
+# host.openshell.internal:8080 resolves to the gateway container.
+grpc_endpoint     = "http://host.openshell.internal:8080"
