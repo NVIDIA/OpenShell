@@ -583,7 +583,10 @@ async fn build_compute_runtime(
 
     match driver {
         ComputeDriverKind::Kubernetes => {
-            let k8s = kubernetes_config_from_file(file)?;
+            let mut k8s = kubernetes_config_from_file(file)?;
+            if let Ok(size) = std::env::var("OPENSHELL_K8S_WORKSPACE_DEFAULT_STORAGE_SIZE") {
+                k8s.workspace_default_storage_size = size;
+            }
             ComputeRuntime::new_kubernetes(
                 k8s,
                 store,

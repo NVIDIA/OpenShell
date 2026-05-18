@@ -3,7 +3,9 @@
 
 //! Kubernetes compute driver.
 
-use crate::config::{KubernetesComputeConfig, SupervisorSideloadMethod};
+use crate::config::{
+    DEFAULT_WORKSPACE_STORAGE_SIZE, KubernetesComputeConfig, SupervisorSideloadMethod,
+};
 use futures::{Stream, StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::{Event as KubeEventObj, Node};
 use kube::api::{Api, ApiResource, DeleteParams, ListParams, PostParams};
@@ -105,9 +107,6 @@ const WORKSPACE_INIT_MOUNT_PATH: &str = "/workspace-pvc";
 
 /// Name of the init container that seeds the workspace PVC.
 const WORKSPACE_INIT_CONTAINER_NAME: &str = "workspace-init";
-
-/// Default storage request for the workspace PVC.
-const WORKSPACE_DEFAULT_STORAGE: &str = "2Gi";
 
 /// Sentinel file written by the init container after copying the image's
 /// `/sandbox` contents.  Subsequent pod starts skip the copy.
@@ -327,6 +326,7 @@ impl KubernetesComputeDriver {
             client_tls_secret_name: &self.config.client_tls_secret_name,
             host_gateway_ip: &self.config.host_gateway_ip,
             enable_user_namespaces: self.config.enable_user_namespaces,
+            workspace_default_storage_size: &self.config.workspace_default_storage_size,
         };
         obj.data = sandbox_to_k8s_spec(sandbox.spec.as_ref(), &params);
         let api = self.api();
@@ -1025,7 +1025,12 @@ fn apply_workspace_persistence(
 ///
 /// Provides a single PVC named "workspace" that backs the `/sandbox`
 /// directory.  The init container seeds it from the image on first use.
-fn default_workspace_volume_claim_templates() -> serde_json::Value {
+fn default_workspace_volume_claim_templates(storage_size: &str) -> serde_json::Value {
+    let size = if storage_size.is_empty() {
+        DEFAULT_WORKSPACE_STORAGE_SIZE
+    } else {
+        storage_size
+    };
     serde_json::json!([{
         "metadata": {
             "name": WORKSPACE_VOLUME_NAME
@@ -1034,7 +1039,7 @@ fn default_workspace_volume_claim_templates() -> serde_json::Value {
             "accessModes": ["ReadWriteOnce"],
             "resources": {
                 "requests": {
-                    "storage": WORKSPACE_DEFAULT_STORAGE
+                    "storage": size
                 }
             }
         }
@@ -1056,6 +1061,7 @@ struct SandboxPodParams<'a> {
     client_tls_secret_name: &'a str,
     host_gateway_ip: &'a str,
     enable_user_namespaces: bool,
+    workspace_default_storage_size: &'a str,
 }
 
 fn spec_pod_env(spec: Option<&SandboxSpec>) -> std::collections::HashMap<String, String> {
@@ -1112,7 +1118,7 @@ fn sandbox_to_k8s_spec(
     if inject_workspace {
         root.insert(
             "volumeClaimTemplates".to_string(),
-            default_workspace_volume_claim_templates(),
+            default_workspace_volume_claim_templates(params.workspace_default_storage_size),
         );
     }
 
@@ -2571,5 +2577,19 @@ mod tests {
         assert_eq!(tolerations[0]["key"], "nvidia.com/gpu");
         assert_eq!(tolerations[0]["operator"], "Exists");
         assert_eq!(tolerations[0]["effect"], "NoSchedule");
+    }
+
+    #[test]
+    fn default_workspace_vct_uses_provided_storage_size() {
+        let vct = default_workspace_volume_claim_templates("5Gi");
+        let storage = &vct[0]["spec"]["resources"]["requests"]["storage"];
+        assert_eq!(storage, "5Gi");
+    }
+
+    #[test]
+    fn default_workspace_vct_falls_back_to_const_when_empty() {
+        let vct = default_workspace_volume_claim_templates("");
+        let storage = &vct[0]["spec"]["resources"]["requests"]["storage"];
+        assert_eq!(storage, DEFAULT_WORKSPACE_STORAGE_SIZE);
     }
 }

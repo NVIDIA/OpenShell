@@ -138,6 +138,10 @@ server:
   # (Always for :latest, IfNotPresent otherwise). Set to "Always" for dev
   # clusters so new images are picked up without manual eviction.
   sandboxImagePullPolicy: ""
+  # -- Default storage size for the workspace PVC in sandbox pods.
+  # Uses Kubernetes quantity syntax (e.g. "2Gi", "10Gi", "500Mi").
+  # Empty = built-in default (2Gi).
+  workspaceDefaultStorageSize: ""
   # -- gRPC endpoint sandboxes call back into the gateway. Leave empty to derive
   # it from the chart fullname, release namespace, service port, and
   # disableTls flag, for example https://openshell.openshell.svc.cluster.local:8080.

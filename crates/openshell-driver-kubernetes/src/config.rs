@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 /// Default Kubernetes namespace for sandbox resources.
 pub const DEFAULT_K8S_NAMESPACE: &str = "openshell";
 
+/// Default storage size for the workspace PVC.
+pub const DEFAULT_WORKSPACE_STORAGE_SIZE: &str = "2Gi";
+
 /// How the supervisor binary is delivered into sandbox pods.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -64,6 +67,7 @@ pub struct KubernetesComputeConfig {
     pub client_tls_secret_name: String,
     pub host_gateway_ip: String,
     pub enable_user_namespaces: bool,
+    pub workspace_default_storage_size: String,
 }
 
 impl Default for KubernetesComputeConfig {
@@ -84,6 +88,7 @@ impl Default for KubernetesComputeConfig {
             client_tls_secret_name: String::new(),
             host_gateway_ip: String::new(),
             enable_user_namespaces: false,
+            workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE.to_string(),
         }
     }
 }
@@ -93,4 +98,27 @@ fn default_sandbox_image() -> String {
         "{}/base:latest",
         openshell_core::image::DEFAULT_COMMUNITY_REGISTRY
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_workspace_storage_size_is_2gi() {
+        let cfg = KubernetesComputeConfig::default();
+        assert_eq!(
+            cfg.workspace_default_storage_size,
+            DEFAULT_WORKSPACE_STORAGE_SIZE
+        );
+    }
+
+    #[test]
+    fn serde_override_workspace_storage_size() {
+        let json = serde_json::json!({
+            "workspace_default_storage_size": "10Gi"
+        });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.workspace_default_storage_size, "10Gi");
+    }
 }
