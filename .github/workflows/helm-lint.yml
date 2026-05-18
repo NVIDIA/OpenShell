@@ -9,6 +9,10 @@ on:
       - "pull-request/[0-9]+"
     paths:
       - "deploy/helm/**"
+      - "mise.toml"
+      - "mise.lock"
+      - "tasks/helm.toml"
+      - ".github/workflows/helm-lint.yml"
   workflow_dispatch:
 
 env:
@@ -55,6 +59,9 @@ jobs:
 
       - name: Lint Helm chart
         run: mise run helm:lint
+
+      - name: Check Helm chart README
+        run: mise run helm:docs:check
 
       - name: Run Helm chart unit tests
         run: mise run helm:test

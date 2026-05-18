@@ -3,6 +3,25 @@
 
 # Helm chart tasks
 
+["helm:docs"]
+description = "Generate the openshell Helm chart README from Chart.yaml, values.yaml, and README.md.gotmpl"
+run = "helm-docs --chart-search-root deploy/helm/openshell"
+
+["helm:docs:check"]
+description = "Verify the openshell Helm chart README is generated and up to date"
+run = """
+  set -e
+  tmp="$(mktemp)"
+  trap 'rm -f "$tmp"' EXIT
+
+  helm-docs --chart-search-root deploy/helm/openshell --dry-run > "$tmp"
+  if ! diff -u deploy/helm/openshell/README.md "$tmp"; then
+    echo "Helm chart README is out of sync. Run: mise run helm:docs" >&2
+    exit 1
+  fi
+"""
+hide = true
+
 ["helm:lint"]
 description = "Lint the openshell Helm chart (defaults + all CI configuration variants)"
 run = """

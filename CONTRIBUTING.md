@@ -174,15 +174,16 @@ openshell sandbox create -- codex
 
 These are the primary `mise` tasks for day-to-day development:
 
-| Task               | Purpose                                                 |
-| ------------------ | ------------------------------------------------------- |
-| `mise run gateway` | Run a standalone gateway for local development          |
-| `mise run sandbox` | Create or reconnect to the dev sandbox                  |
-| `mise run test`    | Default test suite                                      |
-| `mise run e2e`     | Default end-to-end test lane                            |
-| `mise run ci`      | Full local CI checks (lint, compile/type checks, tests) |
-| `mise run docs`    | Validate Fern docs locally                              |
-| `mise run clean`   | Clean build artifacts                                   |
+| Task                 | Purpose                                                 |
+| -------------------- | ------------------------------------------------------- |
+| `mise run gateway`   | Run a standalone gateway for local development          |
+| `mise run sandbox`   | Create or reconnect to the dev sandbox                  |
+| `mise run test`      | Default test suite                                      |
+| `mise run e2e`       | Default end-to-end test lane                            |
+| `mise run ci`        | Full local CI checks (lint, compile/type checks, tests) |
+| `mise run docs`      | Validate Fern docs locally                              |
+| `mise run helm:docs` | Regenerate the Helm chart README                        |
+| `mise run clean`     | Clean build artifacts                                   |
 
 ## Project Structure
 

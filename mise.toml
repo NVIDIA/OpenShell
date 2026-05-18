@@ -26,6 +26,7 @@ kubectl = "1.36.1"
 uv = "0.10.12"
 protoc = "29.6"
 helm = "4.2.0"
+helm-docs = "1.14.2"
 skaffold = "2.20.0"
 # Keep k3d out of Linux CI images until upstream ships a release rebuilt with
 # patched Go/container dependencies. Linux Kubernetes E2E uses kind or an

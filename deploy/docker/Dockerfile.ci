@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # CI runner image with all development tools pre-installed
-# Rebuild triggered automatically when mise.toml or this file changes
+# Rebuild triggered automatically when mise.toml, mise.lock, tasks, or this file changes
 
 FROM nvcr.io/nvidia/base/ubuntu:noble-20251013
 

@@ -101,6 +101,22 @@ url = "https://get.helm.sh/helm-v4.2.0-linux-amd64.tar.gz"
 checksum = "sha256:f13f959015447b6bc309f9fd506509926543988a39035c088b52522ec95e2acb"
 url = "https://get.helm.sh/helm-v4.2.0-darwin-arm64.tar.gz"
 
+[[tools.helm-docs]]
+version = "1.14.2"
+backend = "aqua:norwoodj/helm-docs"
+
+[tools.helm-docs."platforms.linux-arm64"]
+checksum = "sha256:c3787212332386dcd122debef7848feb165aa701467ae3e3442df7638f3ac4e4"
+url = "https://github.com/norwoodj/helm-docs/releases/download/v1.14.2/helm-docs_1.14.2_Linux_arm64.tar.gz"
+
+[tools.helm-docs."platforms.linux-x64"]
+checksum = "sha256:a8cf72ada34fad93285ba2a452b38bdc5bd52cc9a571236244ec31022928d6cc"
+url = "https://github.com/norwoodj/helm-docs/releases/download/v1.14.2/helm-docs_1.14.2_Linux_x86_64.tar.gz"
+
+[tools.helm-docs."platforms.macos-arm64"]
+checksum = "sha256:2d8399db5b33d240d5f8985241bcf5483563150b968e3229823822979f3e4b8b"
+url = "https://github.com/norwoodj/helm-docs/releases/download/v1.14.2/helm-docs_1.14.2_Darwin_arm64.tar.gz"
+
 [[tools.k3d]]
 version = "5.8.3"
 backend = "aqua:k3d-io/k3d"
