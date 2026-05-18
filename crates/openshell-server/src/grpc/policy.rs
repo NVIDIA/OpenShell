@@ -3014,6 +3014,7 @@ mod tests {
                     name: name.to_string(),
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 spec: Some(SandboxSpec {
                     policy: None,
@@ -3046,6 +3047,7 @@ mod tests {
                 name: "self".to_string(),
                 created_at_ms: 1_000_000,
                 labels: HashMap::new(),
+                resource_version: 0,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -3077,6 +3079,7 @@ mod tests {
                     name: name.to_string(),
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 spec: Some(SandboxSpec {
                     policy: None,
@@ -3111,6 +3114,7 @@ mod tests {
                     name: name.to_string(),
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 spec: Some(SandboxSpec {
                     policy: None,
@@ -3145,6 +3149,7 @@ mod tests {
                 name: "x".to_string(),
                 created_at_ms: 1_000_000,
                 labels: HashMap::new(),
+                resource_version: 0,
             }),
             spec: Some(SandboxSpec {
                 policy: None,

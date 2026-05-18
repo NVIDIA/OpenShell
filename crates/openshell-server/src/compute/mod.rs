@@ -2872,7 +2872,7 @@ mod tests {
             resource_version: 0,
         });
 
-        let created = runtime.create_sandbox(sandbox).await.unwrap();
+        let created = runtime.create_sandbox(sandbox, None).await.unwrap();
 
         assert_eq!(
             created.metadata.as_ref().unwrap().resource_version,
@@ -2908,11 +2908,11 @@ mod tests {
         // Spawn two concurrent creation attempts for the same sandbox
         let runtime1 = runtime.clone();
         let sandbox1 = sandbox.clone();
-        let handle1 = tokio::spawn(async move { runtime1.create_sandbox(sandbox1).await });
+        let handle1 = tokio::spawn(async move { runtime1.create_sandbox(sandbox1, None).await });
 
         let runtime2 = runtime.clone();
         let sandbox2 = sandbox.clone();
-        let handle2 = tokio::spawn(async move { runtime2.create_sandbox(sandbox2).await });
+        let handle2 = tokio::spawn(async move { runtime2.create_sandbox(sandbox2, None).await });
 
         // Wait for both to complete
         let result1 = handle1.await.unwrap();
