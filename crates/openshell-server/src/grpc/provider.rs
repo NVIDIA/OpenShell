@@ -549,7 +549,7 @@ async fn validate_provider_environment_keys_unique_at(
                 })?,
         };
         let provider_name = provider.object_name().to_string();
-        for key in active_provider_credential_keys(&provider, now_ms) {
+        for key in active_provider_environment_keys(store, &provider, now_ms).await? {
             if let Some(first_provider) = seen.get(&key) {
                 if first_provider != &provider_name {
                     return Err(Status::failed_precondition(format!(
@@ -562,6 +562,26 @@ async fn validate_provider_environment_keys_unique_at(
         }
     }
     Ok(())
+}
+
+async fn active_provider_environment_keys(
+    store: &Store,
+    provider: &Provider,
+    now_ms: i64,
+) -> Result<Vec<String>, Status> {
+    let mut keys = active_provider_credential_keys(provider, now_ms);
+    if !provider.object_id().is_empty() {
+        keys.extend(
+            crate::provider_refresh::list_refresh_states_for_provider(store, provider.object_id())
+                .await?
+                .into_iter()
+                .map(|state| state.credential_key)
+                .filter(|key| is_valid_env_key(key)),
+        );
+    }
+    keys.sort();
+    keys.dedup();
+    Ok(keys)
 }
 
 fn active_provider_credential_keys(provider: &Provider, now_ms: i64) -> Vec<String> {
@@ -2357,6 +2377,89 @@ mod tests {
             .await
             .unwrap();
         assert!(states.is_empty());
+    }
+
+    #[tokio::test]
+    async fn configure_provider_refresh_treats_existing_refresh_state_keys_as_reserved() {
+        let state = test_server_state().await;
+        for name in ["first-graph", "second-graph"] {
+            create_provider_record(
+                state.store.as_ref(),
+                Provider {
+                    metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                        id: String::new(),
+                        name: name.to_string(),
+                        created_at_ms: 0,
+                        labels: HashMap::new(),
+                    }),
+                    r#type: "outlook".to_string(),
+                    credentials: HashMap::new(),
+                    config: HashMap::new(),
+                    credential_expires_at_ms: HashMap::new(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+        state
+            .store
+            .put_message(&Sandbox {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "sandbox-refresh-collision".to_string(),
+                    name: "refresh-collision".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                }),
+                spec: Some(SandboxSpec {
+                    providers: vec!["first-graph".to_string(), "second-graph".to_string()],
+                    ..SandboxSpec::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        handle_configure_provider_refresh(
+            &state,
+            Request::new(ConfigureProviderRefreshRequest {
+                provider: "first-graph".to_string(),
+                credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
+                strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials as i32,
+                material: HashMap::from([
+                    ("tenant_id".to_string(), "tenant".to_string()),
+                    ("client_id".to_string(), "client-id".to_string()),
+                    ("client_secret".to_string(), "client-secret".to_string()),
+                ]),
+                secret_material_keys: vec!["client_secret".to_string()],
+                expires_at_ms: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        let err = handle_configure_provider_refresh(
+            &state,
+            Request::new(ConfigureProviderRefreshRequest {
+                provider: "second-graph".to_string(),
+                credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
+                strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials as i32,
+                material: HashMap::from([
+                    ("tenant_id".to_string(), "tenant".to_string()),
+                    ("client_id".to_string(), "client-id".to_string()),
+                    ("client_secret".to_string(), "client-secret".to_string()),
+                ]),
+                secret_material_keys: vec!["client_secret".to_string()],
+                expires_at_ms: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("collision"));
+        assert!(err.message().contains("MS_GRAPH_ACCESS_TOKEN"));
+        assert!(err.message().contains("first-graph"));
+        assert!(err.message().contains("second-graph"));
     }
 
     #[tokio::test]

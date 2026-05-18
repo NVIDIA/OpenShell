@@ -4136,15 +4136,27 @@ pub async fn provider_create(
 }
 
 fn provider_profile_allows_refresh_bootstrap(profile: &ProviderProfile) -> bool {
-    profile.credentials.iter().any(|credential| {
-        credential.refresh.as_ref().is_some_and(|refresh| {
-            matches!(
-                ProviderCredentialRefreshStrategy::try_from(refresh.strategy),
-                Ok(ProviderCredentialRefreshStrategy::Oauth2ClientCredentials
-                    | ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt)
-            )
+    let required_credentials = profile
+        .credentials
+        .iter()
+        .filter(|credential| credential.required)
+        .collect::<Vec<_>>();
+    !required_credentials.is_empty()
+        && required_credentials.iter().all(|credential| {
+            credential
+                .refresh
+                .as_ref()
+                .is_some_and(|refresh| is_gateway_mintable_refresh_strategy(refresh.strategy))
         })
-    })
+}
+
+fn is_gateway_mintable_refresh_strategy(strategy: i32) -> bool {
+    matches!(
+        ProviderCredentialRefreshStrategy::try_from(strategy),
+        Ok(ProviderCredentialRefreshStrategy::Oauth2RefreshToken
+            | ProviderCredentialRefreshStrategy::Oauth2ClientCredentials
+            | ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt)
+    )
 }
 
 pub async fn provider_get(server: &str, name: &str, tls: &TlsOptions) -> Result<()> {
@@ -6663,9 +6675,9 @@ mod tests {
         git_sync_files, http_health_check, image_requests_gpu, import_local_package_mtls_bundle,
         inferred_provider_type, package_managed_tls_dirs, parse_cli_setting_value,
         parse_credential_pairs, plaintext_gateway_is_remote, progress_step_from_metadata,
-        provisioning_timeout_message, ready_false_condition_message, refresh_status_header,
-        refresh_status_row, resolve_from, sandbox_should_persist, service_expose_status_error,
-        service_url_for_gateway,
+        provider_profile_allows_refresh_bootstrap, provisioning_timeout_message,
+        ready_false_condition_message, refresh_status_header, refresh_status_row, resolve_from,
+        sandbox_should_persist, service_expose_status_error, service_url_for_gateway,
     };
     use crate::TEST_ENV_LOCK;
     use hyper::StatusCode;
@@ -6684,7 +6696,8 @@ mod tests {
         PROGRESS_STEP_STARTING_SANDBOX,
     };
     use openshell_core::proto::{
-        Provider, ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
+        Provider, ProviderCredentialRefresh, ProviderCredentialRefreshStatus,
+        ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileCredential,
         SandboxCondition, SandboxStatus, datamodel::v1::ObjectMeta,
     };
 
@@ -6867,6 +6880,65 @@ mod tests {
         assert!(row.contains("error"));
         assert!(row.contains("2026-01-01 00:00:00"));
         assert!(row.contains("..."));
+    }
+
+    #[test]
+    fn refresh_bootstrap_requires_all_required_credentials_to_be_gateway_mintable() {
+        let refresh_token_profile = ProviderProfile {
+            credentials: vec![ProviderProfileCredential {
+                name: "MS_GRAPH_ACCESS_TOKEN".to_string(),
+                required: true,
+                refresh: Some(ProviderCredentialRefresh {
+                    strategy: ProviderCredentialRefreshStrategy::Oauth2RefreshToken as i32,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(provider_profile_allows_refresh_bootstrap(
+            &refresh_token_profile
+        ));
+
+        let mixed_static_profile = ProviderProfile {
+            credentials: vec![
+                ProviderProfileCredential {
+                    name: "ACCESS_TOKEN".to_string(),
+                    required: true,
+                    refresh: Some(ProviderCredentialRefresh {
+                        strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials as i32,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                ProviderProfileCredential {
+                    name: "STATIC_API_KEY".to_string(),
+                    required: true,
+                    refresh: None,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(!provider_profile_allows_refresh_bootstrap(
+            &mixed_static_profile
+        ));
+
+        let optional_refresh_profile = ProviderProfile {
+            credentials: vec![ProviderProfileCredential {
+                name: "OPTIONAL_TOKEN".to_string(),
+                required: false,
+                refresh: Some(ProviderCredentialRefresh {
+                    strategy: ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt as i32,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(!provider_profile_allows_refresh_bootstrap(
+            &optional_refresh_profile
+        ));
     }
 
     #[cfg(feature = "dev-settings")]
