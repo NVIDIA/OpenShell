@@ -3,8 +3,8 @@
 
 #![cfg(feature = "e2e")]
 
-//! E2E regression: WebSocket credential placeholders are resolved on the real
-//! Docker-backed sandbox path after an RFC 6455 upgrade.
+//! E2E regression: WebSocket credential placeholders are resolved on the
+//! sandbox path after an RFC 6455 upgrade.
 //!
 //! The sandbox process sends its provider-managed placeholder in a masked text
 //! frame. The local upstream only reports whether it saw the real secret and
@@ -425,7 +425,7 @@ with connect_with_retry(HOST, PORT) as sock:
 }
 
 #[tokio::test]
-async fn websocket_text_placeholder_is_rewritten_in_docker_sandbox() {
+async fn websocket_text_placeholder_is_rewritten_in_sandbox() {
     let _provider_lock = PROVIDER_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);

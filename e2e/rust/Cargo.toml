@@ -47,6 +47,11 @@ path = "tests/gateway_resume.rs"
 required-features = ["e2e-docker"]
 
 [[test]]
+name = "podman_gateway_resume"
+path = "tests/podman_gateway_resume.rs"
+required-features = ["e2e-podman"]
+
+[[test]]
 name = "vm_gateway_resume"
 path = "tests/vm_gateway_resume.rs"
 required-features = ["e2e-vm"]
@@ -54,7 +59,7 @@ required-features = ["e2e-vm"]
 [[test]]
 name = "websocket_conformance"
 path = "tests/websocket_conformance.rs"
-required-features = ["e2e-docker"]
+required-features = ["e2e-host-gateway"]
 
 [[test]]
 name = "user_namespaces"
