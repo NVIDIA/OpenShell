@@ -6,11 +6,65 @@ the RPM package on Fedora and RHEL systems.
 For first-time setup, see QUICKSTART.md. For troubleshooting, see
 TROUBLESHOOTING.md.
 
+## Default configuration
+
+The RPM ships a default TOML configuration template at
+`/usr/share/openshell-gateway/gateway.toml.default`. On first start of
+`openshell-gateway.service`, the systemd unit copies this template to
+`~/.config/openshell/gateway.toml` if no config file exists there yet.
+
+The defaults are tuned for rootless Podman use:
+
+```toml
+[openshell]
+version = 1
+
+[openshell.gateway]
+bind_address = "0.0.0.0:17670"
+compute_drivers = ["podman"]
+```
+
+`bind_address = "0.0.0.0:17670"` is required because Podman sandbox
+containers reach the gateway over the host network bridge and cannot
+connect to `127.0.0.1` inside the gateway's network namespace. mTLS is
+enabled by default and protects all connections.
+
+`compute_drivers = ["podman"]` pins the compute driver to Podman. Without
+this, the gateway auto-detects in order: Kubernetes, Podman, Docker. Pinning
+prevents unexpected driver selection if Docker is also installed on the host.
+
+### Customizing the configuration
+
+Edit `~/.config/openshell/gateway.toml` directly. The template at
+`/usr/share/openshell-gateway/gateway.toml.default` is not read at runtime
+and is not overwritten by RPM upgrades.
+
+To apply environment variable overrides that persist across upgrades without
+editing the TOML file, add them to `~/.config/openshell/gateway.env`:
+
+```shell
+# Example: restrict to loopback only
+OPENSHELL_BIND_ADDRESS=127.0.0.1
+```
+
+To override the path to the TOML config file entirely:
+
+```shell
+# In ~/.config/openshell/gateway.env
+OPENSHELL_GATEWAY_CONFIG=/path/to/custom/gateway.toml
+```
+
+For one-off service overrides that persist across package upgrades:
+
+```shell
+systemctl --user edit openshell-gateway
+```
+
 ## TLS (mTLS)
 
 The RPM enables mutual TLS by default. The gateway requires a valid
 client certificate for all API connections and listens on
-`127.0.0.1:17670` by default.
+`0.0.0.0:17670` by default (see "Default configuration" above).
 
 ### Auto-generated certificates
 
@@ -152,8 +206,8 @@ overrides that persist across package upgrades.
 
 | TOML option | Default | Description |
 |-------------|---------|-------------|
-| `bind_address` | `127.0.0.1:17670` | Address for the gRPC/HTTP API. |
-| `compute_drivers` | unset | When unset, the gateway auto-detects Kubernetes, then Podman, then Docker. Set `compute_drivers = ["podman"]` to force Podman. |
+| `bind_address` | `0.0.0.0:17670` (RPM default) | Address for the gRPC/HTTP API. |
+| `compute_drivers` | `["podman"]` (RPM default) | When unset, the gateway auto-detects Kubernetes, then Podman, then Docker. The RPM default pins to Podman. |
 | `default_image` | `ghcr.io/nvidia/openshell-community/sandboxes/base:latest` | Default sandbox image. |
 | `supervisor_image` | `ghcr.io/nvidia/openshell/supervisor:latest` | Supervisor image mounted into Podman sandboxes. |
 | `guest_tls_ca`, `guest_tls_cert`, `guest_tls_key` | auto-generated paths | Client TLS material bind-mounted into sandbox containers. |
@@ -173,9 +227,8 @@ settings:
 version = 1
 
 [openshell.gateway]
-bind_address = "127.0.0.1:17670"
-# Leave unset to auto-detect the compute driver.
-# compute_drivers = ["podman"]
+bind_address = "0.0.0.0:17670"
+compute_drivers = ["podman"]
 default_image = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 
 [openshell.drivers.podman]
@@ -239,7 +292,9 @@ For air-gapped environments:
 | Gateway binary | `/usr/bin/openshell-gateway` |
 | CLI binary | `/usr/bin/openshell` |
 | Systemd user unit | `/usr/lib/systemd/user/openshell-gateway.service` |
+| Default TOML config template (read-only) | `/usr/share/openshell-gateway/gateway.toml.default` |
+| Active gateway TOML configuration | `~/.config/openshell/gateway.toml` |
+| Optional environment variable overrides | `~/.config/openshell/gateway.env` |
 | TLS certificates | `~/.local/state/openshell/tls/` |
 | CLI client certs | `~/.config/openshell/gateways/openshell/mtls/` |
 | Gateway database | `~/.local/state/openshell/gateway/openshell.db` |
-| Optional gateway TOML configuration | `~/.config/openshell/gateway.toml` |

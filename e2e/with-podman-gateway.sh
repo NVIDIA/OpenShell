@@ -359,10 +359,18 @@ toml_string() {
 }
 
 GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
+
+# Start from the RPM default template so this e2e test exercises the same
+# TOML config path that RPM users get on first start. The template sets
+# bind_address = "0.0.0.0:17670" and compute_drivers = ["podman"]; those
+# values must be correct for Podman e2e to pass, which means a regression
+# to the template (wrong bind address, wrong driver) will surface here.
+#
+# We append the driver-specific table and override the port via CLI flag
+# (CLI > TOML in the merge precedence) so the test can use an ephemeral port.
+cp "${ROOT}/deploy/rpm/gateway.toml.default" "${GATEWAY_CONFIG}"
 {
-  printf '[openshell]\nversion = 1\n\n'
-  printf '[openshell.gateway]\nlog_level = "info"\n\n'
-  printf '[openshell.drivers.podman]\n'
+  printf '\n[openshell.drivers.podman]\n'
   # The Podman driver scopes isolation by network rather than namespace.
   printf 'network_name = %s\n'   "$(toml_string "${PODMAN_NETWORK_NAME}")"
   printf 'gateway_port = %s\n'   "${HOST_PORT}"
@@ -380,14 +388,14 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
   if [ -n "${OPENSHELL_PODMAN_SOCKET:-}" ]; then
     printf 'socket_path = %s\n' "$(toml_string "${OPENSHELL_PODMAN_SOCKET}")"
   fi
-} > "${GATEWAY_CONFIG}"
+} >> "${GATEWAY_CONFIG}"
 
 GATEWAY_ARGS=(
   --config "${GATEWAY_CONFIG}"
-  --bind-address 0.0.0.0
+  # bind_address and compute_drivers come from the RPM template; no CLI flags
+  # needed. Port is overridden via CLI (CLI > TOML) for ephemeral port selection.
   --port "${HOST_PORT}"
   --health-port "${HEALTH_PORT}"
-  --drivers podman
   --tls-cert "${PKI_DIR}/server/tls.crt"
   --tls-key "${PKI_DIR}/server/tls.key"
   --tls-client-ca "${PKI_DIR}/ca.crt"

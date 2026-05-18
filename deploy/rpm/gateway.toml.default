@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Default gateway configuration for RPM installs.
+#
+# This file is seeded to ~/.config/openshell/gateway.toml on first start
+# of the openshell-gateway.service systemd user unit. Edit that copy to
+# customize. This file is not read directly at runtime.
+#
+# Configuration precedence (highest to lowest):
+#   CLI flag  >  OPENSHELL_* env var  >  TOML file  >  built-in default
+#
+# To override settings without editing this file, set OPENSHELL_* variables
+# in ~/.config/openshell/gateway.env or run:
+#   systemctl --user edit openshell-gateway
+
+[openshell]
+version = 1
+
+[openshell.gateway]
+# Podman sandbox containers reach the gateway over the host network bridge,
+# which requires binding to all interfaces. Override to 127.0.0.1:17670 if
+# you don't use Podman or want loopback-only access (e.g. behind a reverse
+# proxy). mTLS is enabled by default and protects all connections.
+bind_address = "0.0.0.0:17670"
+
+# Pin to the Podman compute driver. Without this, the gateway auto-detects
+# in order: Kubernetes, Podman, Docker. Pinning prevents unexpected driver
+# selection if Docker is also installed on the host.
+compute_drivers = ["podman"]
