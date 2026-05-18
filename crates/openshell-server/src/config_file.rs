@@ -95,6 +95,18 @@ pub struct GatewayFileSection {
     #[serde(default)]
     pub ssh_session_ttl_secs: Option<u64>,
 
+    // ── Sandbox resource defaults ───────────────────────────────
+    //
+    // Applied at `CreateSandbox` time as an overlay onto
+    // `template.resources.limits.{cpu,memory}`. User-supplied values are
+    // preserved; absent fields are filled from these defaults. The value `"0"`
+    // disables the corresponding default — consistent with the Linux/cgroup
+    // convention where 0 means "no bound".
+    #[serde(default)]
+    pub default_sandbox_cpu_limit: Option<String>,
+    #[serde(default)]
+    pub default_sandbox_memory_limit: Option<String>,
+
     // ── Service routing ──────────────────────────────────────────────────
     /// Subject Alternative Names configured on the gateway server certificate.
     /// Wildcard DNS SANs also enable sandbox service URLs under that domain.
@@ -182,6 +194,24 @@ pub enum ConfigFileError {
         env: &'static str,
         cli: &'static str,
     },
+    #[error("invalid gateway config file '{}': {source}", path.display())]
+    InvalidSandboxDefault {
+        path: PathBuf,
+        #[source]
+        source: SandboxDefaultError,
+    },
+}
+
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+pub enum SandboxDefaultError {
+    #[error(
+        "`{field}` has invalid negative value `{value}`; use {disable_value} to disable the default"
+    )]
+    Negative {
+        field: &'static str,
+        value: String,
+        disable_value: &'static str,
+    },
 }
 
 /// Load and validate a TOML config file.
@@ -214,8 +244,34 @@ pub fn load(path: &Path) -> Result<ConfigFile, ConfigFileError> {
             cli: "--db-url",
         });
     }
+    validate_sandbox_defaults(path, &file.openshell.gateway)?;
 
     Ok(file)
+}
+
+fn validate_sandbox_defaults(
+    path: &Path,
+    gateway: &GatewayFileSection,
+) -> Result<(), ConfigFileError> {
+    resolve_sandbox_quantity_default(
+        "default_sandbox_cpu_limit",
+        gateway.default_sandbox_cpu_limit.as_deref(),
+        openshell_core::config::DEFAULT_SANDBOX_CPU_LIMIT,
+    )
+    .map_err(|source| ConfigFileError::InvalidSandboxDefault {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    resolve_sandbox_quantity_default(
+        "default_sandbox_memory_limit",
+        gateway.default_sandbox_memory_limit.as_deref(),
+        openshell_core::config::DEFAULT_SANDBOX_MEMORY_LIMIT,
+    )
+    .map_err(|source| ConfigFileError::InvalidSandboxDefault {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(())
 }
 
 /// Build the merged TOML table for `driver` by overlaying inheritable
@@ -311,6 +367,44 @@ fn string_value(s: &str) -> toml::Value {
 
 fn path_value(p: &Path) -> toml::Value {
     toml::Value::String(p.display().to_string())
+}
+
+/// Resolve a TOML-supplied CPU or memory default into the effective runtime
+/// value used by `apply_sandbox_template_defaults`.
+///
+/// | TOML input | Result | Meaning |
+/// |---|---|---|
+/// | key absent (`None`) | `Some(core_default)` | Use the built-in constant. |
+/// | `"0"` (after trim) | `None` | Operator opt-out; no default applied. |
+/// | empty / whitespace-only | `None` | Operator opt-out; no default applied. |
+/// | leading `-` (e.g. `"-1"`, `"-500m"`) | `Err` | Invalid Kubernetes quantity rejected. |
+/// | any other string | `Some(value)` | Passed through verbatim; the driver validates as a Kubernetes quantity at sandbox creation. |
+///
+/// Rejecting negative quantities matches the Kubernetes resource model (which
+/// only accepts non-negative quantities) and prevents a typo like `"-1"` from
+/// silently disabling the cgroup default.
+pub fn resolve_sandbox_quantity_default(
+    field: &'static str,
+    toml_value: Option<&str>,
+    core_default: &'static str,
+) -> Result<Option<String>, SandboxDefaultError> {
+    toml_value.map_or_else(
+        || Ok(Some(core_default.to_string())),
+        |v| {
+            let trimmed = v.trim();
+            if trimmed.starts_with('-') {
+                Err(SandboxDefaultError::Negative {
+                    field,
+                    value: trimmed.to_string(),
+                    disable_value: r#"`"0"` or `""`"#,
+                })
+            } else if trimmed.is_empty() || trimmed == "0" {
+                Ok(None)
+            } else {
+                Ok(Some(trimmed.to_string()))
+            }
+        },
+    )
 }
 
 #[cfg(test)]
@@ -586,6 +680,183 @@ version = 2
             &[ComputeDriverKind::Podman],
             "RPM default must pin compute_drivers to [podman] to prevent unexpected \
              driver selection when Docker is also installed"
+        );
+    }
+
+    // ---- resolve_sandbox_quantity_default ----
+
+    #[test]
+    fn resolve_sandbox_quantity_default_uses_core_when_absent() {
+        assert_eq!(
+            resolve_sandbox_quantity_default("default_sandbox_cpu_limit", None, "2").unwrap(),
+            Some("2".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_sandbox_quantity_default_zero_string_disables() {
+        assert_eq!(
+            resolve_sandbox_quantity_default("default_sandbox_cpu_limit", Some("0"), "2").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_sandbox_quantity_default_empty_string_disables() {
+        assert_eq!(
+            resolve_sandbox_quantity_default("default_sandbox_memory_limit", Some(""), "4Gi")
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            resolve_sandbox_quantity_default("default_sandbox_memory_limit", Some("  "), "4Gi")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_sandbox_quantity_default_uses_supplied_value() {
+        assert_eq!(
+            resolve_sandbox_quantity_default("default_sandbox_memory_limit", Some("8Gi"), "4Gi")
+                .unwrap(),
+            Some("8Gi".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_sandbox_quantity_default_negative_rejects() {
+        let err = resolve_sandbox_quantity_default("default_sandbox_cpu_limit", Some("-1"), "2")
+            .unwrap_err();
+        assert!(matches!(err, SandboxDefaultError::Negative { .. }));
+        assert!(
+            resolve_sandbox_quantity_default("default_sandbox_cpu_limit", Some("-500m"), "2")
+                .is_err()
+        );
+        assert!(
+            resolve_sandbox_quantity_default("default_sandbox_memory_limit", Some("-2Gi"), "4Gi")
+                .is_err()
+        );
+        assert!(
+            resolve_sandbox_quantity_default("default_sandbox_cpu_limit", Some(" -1 "), "2")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn resolve_sandbox_quantity_default_trims_whitespace() {
+        assert_eq!(
+            resolve_sandbox_quantity_default("default_sandbox_memory_limit", Some(" 8Gi "), "4Gi")
+                .unwrap(),
+            Some("8Gi".to_string())
+        );
+    }
+
+    /// End-to-end: a TOML file that opts out of both sandbox defaults
+    /// (cpu/memory = `"0"`) must resolve to `None` for each field. Guards
+    /// against a refactor that silently drops the sentinel handling between the
+    /// parser and the runtime `Config`.
+    #[test]
+    fn zero_sentinels_in_toml_disable_sandbox_defaults_end_to_end() {
+        let toml = r#"
+[openshell]
+version = 1
+
+[openshell.gateway]
+default_sandbox_cpu_limit    = "0"
+default_sandbox_memory_limit = "0"
+"#;
+        let tmp = write_tmp(toml);
+        let file = load(tmp.path()).expect("valid file parses");
+        let gw = &file.openshell.gateway;
+
+        // Parser preserves the raw TOML values.
+        assert_eq!(gw.default_sandbox_cpu_limit.as_deref(), Some("0"));
+        assert_eq!(gw.default_sandbox_memory_limit.as_deref(), Some("0"));
+
+        // Resolution collapses the sentinels into `None` so the gateway
+        // skips injection in `apply_sandbox_template_defaults`.
+        assert_eq!(
+            resolve_sandbox_quantity_default(
+                "default_sandbox_cpu_limit",
+                gw.default_sandbox_cpu_limit.as_deref(),
+                "2"
+            )
+            .unwrap(),
+            None,
+            r#"`default_sandbox_cpu_limit = "0"` must disable the CPU default"#
+        );
+        assert_eq!(
+            resolve_sandbox_quantity_default(
+                "default_sandbox_memory_limit",
+                gw.default_sandbox_memory_limit.as_deref(),
+                "4Gi"
+            )
+            .unwrap(),
+            None,
+            r#"`default_sandbox_memory_limit = "0"` must disable the memory default"#
+        );
+    }
+
+    /// End-to-end: a TOML file with negative sandbox-default values must be
+    /// rejected. Guards against malformed config silently bypassing the cgroup
+    /// defaults via a downstream parser that maps `-1` to "unlimited".
+    #[test]
+    fn negative_sentinels_in_toml_reject_sandbox_defaults_end_to_end() {
+        let toml = r#"
+[openshell]
+version = 1
+
+[openshell.gateway]
+default_sandbox_cpu_limit    = "-1"
+default_sandbox_memory_limit = "-500m"
+"#;
+        let tmp = write_tmp(toml);
+        let err = load(tmp.path()).expect_err("negative sandbox defaults must be rejected");
+        assert!(matches!(
+            err,
+            ConfigFileError::InvalidSandboxDefault {
+                source: SandboxDefaultError::Negative { .. },
+                ..
+            }
+        ));
+    }
+
+    /// End-to-end: a TOML file with no sandbox-default keys must fall back
+    /// to the canonical constants in `openshell-core`.
+    #[test]
+    fn absent_keys_in_toml_use_core_constants_end_to_end() {
+        let toml = r#"
+[openshell]
+version = 1
+
+[openshell.gateway]
+log_level = "info"
+"#;
+        let tmp = write_tmp(toml);
+        let file = load(tmp.path()).expect("valid file parses");
+        let gw = &file.openshell.gateway;
+
+        assert!(gw.default_sandbox_cpu_limit.is_none());
+        assert!(gw.default_sandbox_memory_limit.is_none());
+
+        assert_eq!(
+            resolve_sandbox_quantity_default(
+                "default_sandbox_cpu_limit",
+                gw.default_sandbox_cpu_limit.as_deref(),
+                "2"
+            )
+            .unwrap(),
+            Some("2".to_string())
+        );
+        assert_eq!(
+            resolve_sandbox_quantity_default(
+                "default_sandbox_memory_limit",
+                gw.default_sandbox_memory_limit.as_deref(),
+                "4Gi"
+            )
+            .unwrap(),
+            Some("4Gi".to_string())
         );
     }
 }

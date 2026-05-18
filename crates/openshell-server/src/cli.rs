@@ -363,6 +363,26 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
         config = config.with_ssh_session_ttl_secs(ttl);
     }
 
+    // Sandbox resource defaults. The gateway always applies these unless the
+    // operator explicitly opts out by setting `"0"` in `[openshell.gateway]`.
+    {
+        let cpu = config_file::resolve_sandbox_quantity_default(
+            "default_sandbox_cpu_limit",
+            file_gateway.and_then(|g| g.default_sandbox_cpu_limit.as_deref()),
+            openshell_core::config::DEFAULT_SANDBOX_CPU_LIMIT,
+        )
+        .map_err(|e| miette::miette!("{e}"))?;
+        let memory = config_file::resolve_sandbox_quantity_default(
+            "default_sandbox_memory_limit",
+            file_gateway.and_then(|g| g.default_sandbox_memory_limit.as_deref()),
+            openshell_core::config::DEFAULT_SANDBOX_MEMORY_LIMIT,
+        )
+        .map_err(|e| miette::miette!("{e}"))?;
+        config = config
+            .with_default_sandbox_cpu_limit(cpu)
+            .with_default_sandbox_memory_limit(memory);
+    }
+
     if let Some(issuer) = args.oidc_issuer.clone() {
         config = config.with_oidc(openshell_core::OidcConfig {
             issuer,

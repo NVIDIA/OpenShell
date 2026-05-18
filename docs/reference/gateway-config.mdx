@@ -87,6 +87,20 @@ default_image          = "ghcr.io/nvidia/openshell/sandbox:latest"
 supervisor_image       = "ghcr.io/nvidia/openshell/supervisor:latest"
 client_tls_secret_name = "openshell-client-tls"
 
+# Per-sandbox CPU/memory cgroup defaults. Overlaid on
+# `template.resources.limits` at CreateSandbox time when the request omits the
+# field. Use Kubernetes-style quantity strings.
+#
+# Opt-out values:
+#   * `"0"`, `""`, or whitespace-only.
+# An opt-out value means the gateway applies no default on that dimension;
+# the sandbox runs without a gateway-imposed bound. Omitting a key entirely
+# uses the built-in default ("2", "4Gi").
+#
+# Negative values are rejected at config load time.
+default_sandbox_cpu_limit    = "2"
+default_sandbox_memory_limit = "4Gi"
+
 # Gateway listener TLS (distinct from the per-driver guest_tls_*).
 [openshell.gateway.tls]
 cert_path             = "/etc/openshell/certs/gateway.pem"
