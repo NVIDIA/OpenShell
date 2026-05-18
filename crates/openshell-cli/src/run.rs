@@ -3426,7 +3426,7 @@ fn inferred_provider_type(command: &[String]) -> Option<String> {
 /// passed through directly; the server validates they exist at sandbox creation.
 ///
 /// `inferred_types` are provider **types** inferred from the trailing command
-/// (e.g. `claude` → type `"claude"`). These are resolved to provider names via
+/// (e.g. `claude` -> type `"claude-code"`). These are resolved to provider names via
 /// a type→name lookup, and missing types may be auto-created interactively.
 ///
 /// Returns a deduplicated list of provider **names** suitable for
@@ -7036,7 +7036,7 @@ mod tests {
     #[test]
     fn inferred_provider_type_returns_type_for_known_command() {
         let result = inferred_provider_type(&["claude".to_string(), "--help".to_string()]);
-        assert_eq!(result, Some("claude".to_string()));
+        assert_eq!(result, Some("claude-code".to_string()));
     }
 
     #[test]
@@ -7065,7 +7065,7 @@ mod tests {
     #[test]
     fn inferred_provider_type_handles_full_path() {
         let result = inferred_provider_type(&["/usr/local/bin/claude".to_string()]);
-        assert_eq!(result, Some("claude".to_string()));
+        assert_eq!(result, Some("claude-code".to_string()));
     }
 
     #[test]

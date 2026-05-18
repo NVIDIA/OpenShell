@@ -640,7 +640,7 @@ use openshell_core::proto::{
 };
 use openshell_providers::{
     CredentialRefreshProfile, ProfileValidationDiagnostic, ProviderTypeProfile, default_profiles,
-    get_default_profile, normalize_profile_id, normalize_provider_type, validate_profile_set,
+    get_default_profile, normalize_profile_id, validate_profile_set,
 };
 use std::sync::Arc;
 use tonic::{Request, Response};
@@ -991,18 +991,6 @@ async fn profile_conflict_diagnostics(
                 profile_id: id.clone(),
                 field: "id".to_string(),
                 message: format!("provider profile '{id}' is built-in and cannot be overwritten"),
-                severity: "error".to_string(),
-            });
-            continue;
-        }
-        if let Some(provider_type) = normalize_provider_type(&id) {
-            diagnostics.push(ProfileValidationDiagnostic {
-                source: source.clone(),
-                profile_id: id.clone(),
-                field: "id".to_string(),
-                message: format!(
-                    "provider profile id '{id}' is reserved for legacy provider type '{provider_type}'"
-                ),
                 severity: "error".to_string(),
             });
             continue;
@@ -1583,6 +1571,29 @@ mod tests {
         }
     }
 
+    async fn import_test_refresh_profile(state: &Arc<ServerState>, id: &str, credential_key: &str) {
+        let mut profile = custom_profile(id);
+        profile.category = ProviderProfileCategory::Messaging as i32;
+        profile.credentials = vec![refreshable_credential("access_token", credential_key)];
+        handle_import_provider_profiles(
+            state,
+            Request::new(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(profile),
+                    source: format!("{id}.yaml"),
+                }],
+            }),
+        )
+        .await
+        .unwrap();
+    }
+
+    const TEST_GRAPH_PROVIDER_TYPE: &str = "test-msgraph";
+
+    async fn import_test_graph_refresh_profile(state: &Arc<ServerState>) {
+        import_test_refresh_profile(state, TEST_GRAPH_PROVIDER_TYPE, "MS_GRAPH_ACCESS_TOKEN").await;
+    }
+
     fn static_credential(name: &str, env_var: &str, required: bool) -> ProviderProfileCredential {
         ProviderProfileCredential {
             name: name.to_string(),
@@ -1629,6 +1640,13 @@ mod tests {
         .unwrap()
         .into_inner();
 
+        let ids = response
+            .profiles
+            .iter()
+            .map(|profile| profile.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["claude-code", "github", "nvidia"]);
+
         let github = response
             .profiles
             .iter()
@@ -1637,13 +1655,6 @@ mod tests {
         assert_eq!(
             github.category,
             ProviderProfileCategory::SourceControl as i32
-        );
-        assert!(
-            response
-                .profiles
-                .iter()
-                .all(|profile| profile.id != "generic"),
-            "generic remains a legacy provider type without a v2 profile"
         );
     }
 
@@ -1754,14 +1765,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn import_provider_profile_rejects_legacy_provider_type_ids() {
+    async fn import_provider_profile_allows_legacy_provider_type_ids_without_built_in_profiles() {
         let state = test_server_state().await;
         let response = handle_import_provider_profiles(
             &state,
             Request::new(ImportProviderProfilesRequest {
                 profiles: vec![ProviderProfileImportItem {
-                    profile: Some(custom_profile("generic")),
-                    source: "generic.yaml".to_string(),
+                    profile: Some(custom_profile("codex")),
+                    source: "codex.yaml".to_string(),
                 }],
             }),
         )
@@ -1769,23 +1780,21 @@ mod tests {
         .unwrap()
         .into_inner();
 
-        assert!(!response.imported);
-        assert!(
-            response
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.message.contains("reserved"))
-        );
+        assert!(response.imported);
+        assert!(response.diagnostics.is_empty());
 
-        let missing = handle_get_provider_profile(
+        let imported = handle_get_provider_profile(
             &state,
             Request::new(GetProviderProfileRequest {
-                id: "generic".to_string(),
+                id: "codex".to_string(),
             }),
         )
         .await
-        .unwrap_err();
-        assert_eq!(missing.code(), Code::NotFound);
+        .unwrap()
+        .into_inner()
+        .profile
+        .expect("codex profile should be returned");
+        assert_eq!(imported.id, "codex");
     }
 
     #[tokio::test]
@@ -2092,6 +2101,7 @@ mod tests {
     #[tokio::test]
     async fn configure_provider_refresh_stores_scoped_status_and_provider_expiry() {
         let state = test_server_state().await;
+        import_test_graph_refresh_profile(&state).await;
         create_provider_record(
             state.store.as_ref(),
             Provider {
@@ -2101,7 +2111,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                 }),
-                r#type: "outlook".to_string(),
+                r#type: TEST_GRAPH_PROVIDER_TYPE.to_string(),
                 credentials: std::iter::once((
                     "MS_GRAPH_ACCESS_TOKEN".to_string(),
                     "token".to_string(),
@@ -2203,6 +2213,7 @@ mod tests {
     #[tokio::test]
     async fn delete_provider_refresh_preserves_manually_updated_expiry() {
         let state = test_server_state().await;
+        import_test_graph_refresh_profile(&state).await;
         create_provider_record(
             state.store.as_ref(),
             Provider {
@@ -2212,7 +2223,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                 }),
-                r#type: "outlook".to_string(),
+                r#type: TEST_GRAPH_PROVIDER_TYPE.to_string(),
                 credentials: std::iter::once((
                     "MS_GRAPH_ACCESS_TOKEN".to_string(),
                     "token".to_string(),
@@ -2295,6 +2306,7 @@ mod tests {
     #[tokio::test]
     async fn configure_provider_refresh_rejects_credential_key_collision_for_attached_sandbox() {
         let state = test_server_state().await;
+        import_test_graph_refresh_profile(&state).await;
         create_provider_record(
             state.store.as_ref(),
             Provider {
@@ -2304,7 +2316,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                 }),
-                r#type: "outlook".to_string(),
+                r#type: TEST_GRAPH_PROVIDER_TYPE.to_string(),
                 credentials: std::iter::once((
                     "MS_GRAPH_ACCESS_TOKEN".to_string(),
                     "existing-token".to_string(),
@@ -2325,7 +2337,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                 }),
-                r#type: "outlook".to_string(),
+                r#type: TEST_GRAPH_PROVIDER_TYPE.to_string(),
                 credentials: std::iter::once(("OTHER_TOKEN".to_string(), "other".to_string()))
                     .collect(),
                 config: HashMap::new(),
@@ -2382,6 +2394,7 @@ mod tests {
     #[tokio::test]
     async fn configure_provider_refresh_treats_existing_refresh_state_keys_as_reserved() {
         let state = test_server_state().await;
+        import_test_graph_refresh_profile(&state).await;
         for name in ["first-graph", "second-graph"] {
             create_provider_record(
                 state.store.as_ref(),
@@ -2392,7 +2405,7 @@ mod tests {
                         created_at_ms: 0,
                         labels: HashMap::new(),
                     }),
-                    r#type: "outlook".to_string(),
+                    r#type: TEST_GRAPH_PROVIDER_TYPE.to_string(),
                     credentials: HashMap::new(),
                     config: HashMap::new(),
                     credential_expires_at_ms: HashMap::new(),
@@ -2465,6 +2478,7 @@ mod tests {
     #[tokio::test]
     async fn configure_provider_refresh_rejects_profile_endpoint_override_and_missing_material() {
         let state = test_server_state().await;
+        import_test_graph_refresh_profile(&state).await;
         create_provider_record(
             state.store.as_ref(),
             Provider {
@@ -2474,7 +2488,7 @@ mod tests {
                     created_at_ms: 0,
                     labels: HashMap::new(),
                 }),
-                r#type: "outlook".to_string(),
+                r#type: TEST_GRAPH_PROVIDER_TYPE.to_string(),
                 credentials: std::iter::once((
                     "MS_GRAPH_ACCESS_TOKEN".to_string(),
                     "token".to_string(),
@@ -2917,25 +2931,6 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(create_missing_credentials.code(), Code::InvalidArgument);
-
-        let refresh_bootstrap_provider = create_provider_record(
-            store,
-            Provider {
-                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
-                    id: String::new(),
-                    name: "outlook-no-token-yet".to_string(),
-                    created_at_ms: 1_000_000,
-                    labels: HashMap::new(),
-                }),
-                r#type: "outlook".to_string(),
-                credentials: HashMap::new(),
-                config: HashMap::new(),
-                credential_expires_at_ms: HashMap::new(),
-            },
-        )
-        .await
-        .unwrap();
-        assert!(refresh_bootstrap_provider.credentials.is_empty());
 
         handle_import_provider_profiles(
             &state,

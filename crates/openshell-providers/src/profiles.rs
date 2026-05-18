@@ -17,17 +17,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 const BUILT_IN_PROFILE_YAMLS: &[&str] = &[
-    include_str!("../../../providers/anthropic.yaml"),
-    include_str!("../../../providers/claude.yaml"),
-    include_str!("../../../providers/codex.yaml"),
-    include_str!("../../../providers/copilot.yaml"),
-    include_str!("../../../providers/google-drive.yaml"),
+    include_str!("../../../providers/claude-code.yaml"),
     include_str!("../../../providers/github.yaml"),
-    include_str!("../../../providers/gitlab.yaml"),
     include_str!("../../../providers/nvidia.yaml"),
-    include_str!("../../../providers/openai.yaml"),
-    include_str!("../../../providers/opencode.yaml"),
-    include_str!("../../../providers/outlook.yaml"),
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -1075,10 +1067,10 @@ mod tests {
 
     #[test]
     fn credential_env_vars_are_deduplicated_in_profile_order() {
-        let profile = get_default_profile("copilot").expect("copilot profile");
+        let profile = get_default_profile("claude-code").expect("claude-code profile");
         assert_eq!(
             profile.credential_env_vars(),
-            vec!["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"]
+            vec!["ANTHROPIC_API_KEY", "CLAUDE_API_KEY"]
         );
     }
 
