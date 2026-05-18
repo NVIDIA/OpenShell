@@ -234,10 +234,6 @@ if ! docker info >/dev/null 2>&1; then
   echo "ERROR: docker daemon is not reachable (docker info failed)" >&2
   exit 2
 fi
-if ! command -v openssl >/dev/null 2>&1; then
-  echo "ERROR: openssl is required to generate ephemeral PKI" >&2
-  exit 2
-fi
 if [ "${GPU_MODE}" = "1" ]; then
   DOCKER_CDI_SPEC_DIRS="$(docker info --format '{{json .CDISpecDirs}}' 2>/dev/null || true)"
   if [ -z "${DOCKER_CDI_SPEC_DIRS}" ] \
@@ -390,7 +386,7 @@ if ! docker image inspect "${SANDBOX_IMAGE}" >/dev/null 2>&1; then
 fi
 
 PKI_DIR="${WORKDIR}/pki"
-e2e_generate_pki "${PKI_DIR}" "host.docker.internal"
+e2e_generate_pki "${GATEWAY_BIN}" "${PKI_DIR}"
 
 HOST_PORT=$(e2e_pick_port)
 STATE_DIR="${WORKDIR}/state"
@@ -439,8 +435,8 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
   printf 'default_image = %s\n'        "$(toml_string "${SANDBOX_IMAGE}")"
   printf 'image_pull_policy = "IfNotPresent"\n'
   printf 'guest_tls_ca = %s\n'         "$(toml_string "${PKI_DIR}/ca.crt")"
-  printf 'guest_tls_cert = %s\n'       "$(toml_string "${PKI_DIR}/client.crt")"
-  printf 'guest_tls_key = %s\n'        "$(toml_string "${PKI_DIR}/client.key")"
+  printf 'guest_tls_cert = %s\n'       "$(toml_string "${PKI_DIR}/client/tls.crt")"
+  printf 'guest_tls_key = %s\n'        "$(toml_string "${PKI_DIR}/client/tls.key")"
   # DOCKER_SUPERVISOR_ARGS holds either ("--docker-supervisor-bin" "<path>")
   # or ("--docker-supervisor-image" "<image>"); both map to TOML keys on
   # the docker driver config.
@@ -464,8 +460,8 @@ GATEWAY_ARGS=(
   --bind-address 0.0.0.0
   --port "${HOST_PORT}"
   --drivers docker
-  --tls-cert "${PKI_DIR}/server.crt"
-  --tls-key "${PKI_DIR}/server.key"
+  --tls-cert "${PKI_DIR}/server/tls.crt"
+  --tls-key "${PKI_DIR}/server/tls.key"
   --tls-client-ca "${PKI_DIR}/ca.crt"
   --db-url "sqlite:${STATE_DIR}/gateway.db?mode=rwc"
 )

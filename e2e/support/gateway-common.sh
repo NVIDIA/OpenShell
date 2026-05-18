@@ -35,48 +35,19 @@ e2e_pick_port() {
 }
 
 e2e_generate_pki() {
-  local pki_dir=$1
-  local host_alias=$2  # e.g. host.docker.internal or host.containers.internal
+  local gateway_bin=$1
+  local pki_dir=$2
+  shift 2
+  # Remaining args are extra --server-san values (e.g. host.containers.internal).
+  # host.docker.internal and localhost are already in the default SAN list.
 
-  mkdir -p "${pki_dir}"
+  local san_args=()
+  san_args+=(--server-san host.openshell.internal)
+  for san in "$@"; do
+    san_args+=(--server-san "${san}")
+  done
 
-  cat > "${pki_dir}/openssl.cnf" <<EOF
-[req]
-distinguished_name = dn
-prompt = no
-[dn]
-CN = openshell-server
-[san_server]
-subjectAltName = @alt_server
-[alt_server]
-DNS.1 = localhost
-DNS.2 = host.openshell.internal
-DNS.3 = ${host_alias}
-IP.1 = 127.0.0.1
-IP.2 = ::1
-[san_client]
-subjectAltName = DNS:openshell-client
-EOF
-
-  openssl req -x509 -newkey rsa:2048 -nodes -days 30 \
-    -keyout "${pki_dir}/ca.key" -out "${pki_dir}/ca.crt" \
-    -subj "/CN=openshell-e2e-ca" >/dev/null 2>&1
-
-  openssl req -newkey rsa:2048 -nodes \
-    -keyout "${pki_dir}/server.key" -out "${pki_dir}/server.csr" \
-    -config "${pki_dir}/openssl.cnf" >/dev/null 2>&1
-  openssl x509 -req -in "${pki_dir}/server.csr" \
-    -CA "${pki_dir}/ca.crt" -CAkey "${pki_dir}/ca.key" -CAcreateserial \
-    -out "${pki_dir}/server.crt" -days 30 \
-    -extfile "${pki_dir}/openssl.cnf" -extensions san_server >/dev/null 2>&1
-
-  openssl req -newkey rsa:2048 -nodes \
-    -keyout "${pki_dir}/client.key" -out "${pki_dir}/client.csr" \
-    -subj "/CN=openshell-client" >/dev/null 2>&1
-  openssl x509 -req -in "${pki_dir}/client.csr" \
-    -CA "${pki_dir}/ca.crt" -CAkey "${pki_dir}/ca.key" -CAcreateserial \
-    -out "${pki_dir}/client.crt" -days 30 \
-    -extfile "${pki_dir}/openssl.cnf" -extensions san_client >/dev/null 2>&1
+  "${gateway_bin}" generate-certs --output-dir "${pki_dir}" "${san_args[@]}"
 }
 
 e2e_register_plaintext_gateway() {
@@ -108,9 +79,9 @@ e2e_register_mtls_gateway() {
   local gateway_config_dir="${config_home}/openshell/gateways/${name}"
 
   mkdir -p "${gateway_config_dir}/mtls"
-  cp "${pki_dir}/ca.crt"     "${gateway_config_dir}/mtls/ca.crt"
-  cp "${pki_dir}/client.crt" "${gateway_config_dir}/mtls/tls.crt"
-  cp "${pki_dir}/client.key" "${gateway_config_dir}/mtls/tls.key"
+  cp "${pki_dir}/ca.crt"         "${gateway_config_dir}/mtls/ca.crt"
+  cp "${pki_dir}/client/tls.crt" "${gateway_config_dir}/mtls/tls.crt"
+  cp "${pki_dir}/client/tls.key" "${gateway_config_dir}/mtls/tls.key"
   cat >"${gateway_config_dir}/metadata.json" <<EOF
 {
   "name": "${name}",

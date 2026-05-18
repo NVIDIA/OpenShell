@@ -313,10 +313,6 @@ if ! podman_cmd info >/dev/null 2>&1; then
   echo "       Start it with 'podman machine start' on macOS, or the user service on Linux." >&2
   exit 2
 fi
-if ! command -v openssl >/dev/null 2>&1; then
-  echo "ERROR: openssl is required to generate ephemeral PKI" >&2
-  exit 2
-fi
 ensure_podman_api_socket
 
 e2e_build_gateway_binaries "${ROOT}" TARGET_DIR GATEWAY_BIN CLI_BIN
@@ -333,7 +329,7 @@ if ! podman_cmd image exists "${SANDBOX_IMAGE}" 2>/dev/null; then
 fi
 
 PKI_DIR="${WORKDIR}/pki"
-e2e_generate_pki "${PKI_DIR}" "host.containers.internal"
+e2e_generate_pki "${GATEWAY_BIN}" "${PKI_DIR}" "host.containers.internal"
 
 HOST_PORT=$(e2e_pick_port)
 HEALTH_PORT=$(e2e_pick_port)
@@ -374,8 +370,8 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
   printf 'image_pull_policy = "missing"\n'
   printf 'supervisor_image = %s\n' "$(toml_string "${SUPERVISOR_IMAGE}")"
   printf 'guest_tls_ca = %s\n'     "$(toml_string "${PKI_DIR}/ca.crt")"
-  printf 'guest_tls_cert = %s\n'   "$(toml_string "${PKI_DIR}/client.crt")"
-  printf 'guest_tls_key = %s\n'    "$(toml_string "${PKI_DIR}/client.key")"
+  printf 'guest_tls_cert = %s\n'   "$(toml_string "${PKI_DIR}/client/tls.crt")"
+  printf 'guest_tls_key = %s\n'    "$(toml_string "${PKI_DIR}/client/tls.key")"
   # The in-process Podman driver reads `socket_path` from TOML only — the
   # OPENSHELL_PODMAN_SOCKET env var is honoured by the standalone driver
   # binary, not the in-process driver used here. Pin the socket to the one
@@ -392,8 +388,8 @@ GATEWAY_ARGS=(
   --port "${HOST_PORT}"
   --health-port "${HEALTH_PORT}"
   --drivers podman
-  --tls-cert "${PKI_DIR}/server.crt"
-  --tls-key "${PKI_DIR}/server.key"
+  --tls-cert "${PKI_DIR}/server/tls.crt"
+  --tls-key "${PKI_DIR}/server/tls.key"
   --tls-client-ca "${PKI_DIR}/ca.crt"
   --db-url "sqlite:${STATE_DIR}/gateway.db?mode=rwc"
   --log-level info
