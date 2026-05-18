@@ -7,7 +7,7 @@
 //! flow (issue #1354). A `docker exec` (or `kubectl exec`) into a
 //! running sandbox can issue raw sandbox-class gRPC calls without
 //! standing up a custom binary inside the sandbox image — useful for
-//! confirming the cross-sandbox IDOR guard and refresh semantics.
+//! confirming the cross-sandbox IDOR guard and renewal semantics.
 //!
 //! Subcommands:
 //! - `get-sandbox-config --sandbox-id <id>` — call `GetSandboxConfig`
@@ -53,7 +53,7 @@ usage: openshell-sandbox debug-rpc <command> [options]
 
 commands:
   get-sandbox-config --sandbox-id <UUID>  call GetSandboxConfig
-  refresh                                 call RefreshSandboxToken
+  refresh                                 renew the gateway JWT
   show-token                              print raw gateway JWT
   show-principal                          print decoded JWT claims
 

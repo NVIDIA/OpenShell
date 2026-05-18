@@ -70,7 +70,7 @@ pub struct SandboxPrincipal {
 pub enum SandboxIdentitySource {
     /// Gateway-minted JWT validated against the gateway's signing key.
     /// Produced by [`super::sandbox_jwt::SandboxJwtAuthenticator`].
-    BootstrapJwt { issuer: String, jti: String },
+    BootstrapJwt { issuer: String },
     /// Per-sandbox client certificate. Reserved for the v2 channel-bound
     /// identity follow-up.
     BootstrapCert { fingerprint: String },

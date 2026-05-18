@@ -13,12 +13,16 @@
 #       Create a local k3d cluster via tasks/scripts/helm-k3s-local.sh, install
 #       the chart, port-forward, and tear the cluster down on exit.
 #
-# Helm e2e currently uses plaintext gateway traffic (ci/values-tls-disabled.yaml).
+# Helm e2e currently uses plaintext gateway traffic (ci/values-skaffold.yaml).
+# The certgen hook still runs so the gateway has sandbox JWT signing keys.
 #
-# Image source: helm install pulls from ${OPENSHELL_REGISTRY}/{gateway,supervisor}:${IMAGE_TAG}
-# (defaults: ghcr.io/nvidia/openshell, latest). CI sets IMAGE_TAG to the commit SHA;
-# local devs should set it to a tag pulled from a registry the cluster can reach,
-# or build and import images via a separate bootstrap step before running this script.
+# Image source:
+#   - Ephemeral k3d mode builds local `openshell/{gateway,supervisor}:${IMAGE_TAG}`
+#     images by default, imports them into k3d, then installs the chart. This
+#     mirrors the Skaffold local-dev path.
+#   - Existing-context mode pulls from ${OPENSHELL_REGISTRY}/{gateway,supervisor}:${IMAGE_TAG}
+#     (defaults: ghcr.io/nvidia/openshell, latest). CI sets IMAGE_TAG to the
+#     commit SHA and preloads or publishes the images before running this script.
 
 set -euo pipefail
 
@@ -30,6 +34,8 @@ fi
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=e2e/support/gateway-common.sh
 source "${ROOT}/e2e/support/gateway-common.sh"
+
+e2e_preserve_mise_dirs
 
 WORKDIR_PARENT="${TMPDIR:-/tmp}"
 WORKDIR_PARENT="${WORKDIR_PARENT%/}"
@@ -147,8 +153,21 @@ else
   KUBE_CONTEXT="k3d-${CLUSTER_NAME}"
 fi
 
-IMAGE_TAG_VALUE="${IMAGE_TAG:-latest}"
-REGISTRY_VALUE="${OPENSHELL_REGISTRY:-ghcr.io/nvidia/openshell}"
+if [ -z "${OPENSHELL_E2E_KUBE_BUILD_IMAGES+x}" ]; then
+  if [ "${CLUSTER_CREATED_BY_US}" = "1" ]; then
+    OPENSHELL_E2E_KUBE_BUILD_IMAGES=1
+  else
+    OPENSHELL_E2E_KUBE_BUILD_IMAGES=0
+  fi
+fi
+
+if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" = "1" ]; then
+  REGISTRY_VALUE="${OPENSHELL_REGISTRY:-openshell}"
+  IMAGE_TAG_VALUE="${IMAGE_TAG:-e2e-${CLUSTER_NAME:-local}}"
+else
+  REGISTRY_VALUE="${OPENSHELL_REGISTRY:-ghcr.io/nvidia/openshell}"
+  IMAGE_TAG_VALUE="${IMAGE_TAG:-latest}"
+fi
 REGISTRY_VALUE="${REGISTRY_VALUE%/}"
 
 # Resolve a host-gateway IP that sandbox pods can dial to reach test fixtures
@@ -160,7 +179,9 @@ REGISTRY_VALUE="${REGISTRY_VALUE%/}"
 # Preference order:
 #   1. OPENSHELL_E2E_HOST_GATEWAY_IP — operator override (remote clusters where
 #      auto-detection has no signal).
-#   2. Gateway of the cluster's Docker network (k3d-<cluster> for ephemeral
+#   2. k3d's CoreDNS host.k3d.internal entry. On Docker Desktop this is a
+#      host-routable address; the Docker network gateway is not.
+#   3. Gateway of the cluster's Docker network (k3d-<cluster> for ephemeral
 #      clusters, `kind` for kind clusters used in CI). Pods SNAT through their
 #      node to this IP, which lands on the host's bridge interface and reaches
 #      any 0.0.0.0-bound listener / published container port.
@@ -171,18 +192,29 @@ HOST_GATEWAY_IP="${OPENSHELL_E2E_HOST_GATEWAY_IP:-}"
 # the docker bridge gateway on Linux). That mapping handles Docker Desktop
 # correctly; the docker network gateway alone does not.
 if [ -z "${HOST_GATEWAY_IP}" ] && command -v kubectl >/dev/null 2>&1; then
-  detected="$(kctl -n kube-system get configmap coredns -o jsonpath='{.data.NodeHosts}' 2>/dev/null \
-    | awk '$2 == "host.k3d.internal" { print $1; exit }')"
-  if [ -n "${detected}" ]; then
-    HOST_GATEWAY_IP="${detected}"
-    echo "Detected host gateway IP ${HOST_GATEWAY_IP} from CoreDNS host.k3d.internal entry."
-  fi
+  for _ in {1..15}; do
+    detected="$(kctl -n kube-system get configmap coredns -o jsonpath='{.data.NodeHosts}' 2>/dev/null \
+      | awk '$2 == "host.k3d.internal" { print $1; exit }' || true)"
+    if [ -n "${detected}" ]; then
+      HOST_GATEWAY_IP="${detected}"
+      echo "Detected host gateway IP ${HOST_GATEWAY_IP} from CoreDNS host.k3d.internal entry."
+      break
+    fi
+    sleep 1
+  done
 fi
 
 # Fallback for non-k3d clusters (kind in CI, etc.): use the docker network
 # gateway IP. Works on Linux where the bridge is reachable from pods; on macOS
 # Docker Desktop without k3d, this will likely not route to the host.
-if [ -z "${HOST_GATEWAY_IP}" ] && command -v docker >/dev/null 2>&1; then
+use_docker_network_gateway=1
+if [ "$(uname -s)" = "Darwin" ] \
+   && { [ "${CLUSTER_CREATED_BY_US}" = "1" ] || [[ "${KUBE_CONTEXT}" == k3d-* ]]; }; then
+  use_docker_network_gateway=0
+fi
+if [ -z "${HOST_GATEWAY_IP}" ] \
+   && [ "${use_docker_network_gateway}" = "1" ] \
+   && command -v docker >/dev/null 2>&1; then
   candidate_networks=()
   if [ "${CLUSTER_CREATED_BY_US}" = "1" ]; then
     candidate_networks+=("k3d-${CLUSTER_NAME}")
@@ -227,6 +259,15 @@ elif [[ "${KUBE_CONTEXT}" == k3d-* ]] && command -v k3d >/dev/null 2>&1; then
     import_cluster_name="${candidate}"
   fi
 fi
+if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" = "1" ]; then
+  require_cmd docker
+  echo "Building local Kubernetes e2e images (${REGISTRY_VALUE}/{gateway,supervisor}:${IMAGE_TAG_VALUE})..."
+  CONTAINER_ENGINE=docker IMAGE_REGISTRY="${REGISTRY_VALUE}" IMAGE_TAG="${IMAGE_TAG_VALUE}" \
+    bash "${ROOT}/tasks/scripts/docker-build-image.sh" gateway
+  CONTAINER_ENGINE=docker IMAGE_REGISTRY="${REGISTRY_VALUE}" IMAGE_TAG="${IMAGE_TAG_VALUE}" \
+    bash "${ROOT}/tasks/scripts/docker-build-image.sh" supervisor
+fi
+
 if [ -n "${import_cluster_name}" ]; then
   for image in \
     "${REGISTRY_VALUE}/gateway:${IMAGE_TAG_VALUE}" \
@@ -255,7 +296,7 @@ fi
 echo "Installing Helm chart (release=${RELEASE_NAME}, namespace=${NAMESPACE}, tag=${IMAGE_TAG_VALUE})..."
 helmctl install "${RELEASE_NAME}" "${ROOT}/deploy/helm/openshell" \
   --namespace "${NAMESPACE}" --create-namespace \
-  --values "${ROOT}/deploy/helm/openshell/ci/values-tls-disabled.yaml" \
+  --values "${ROOT}/deploy/helm/openshell/ci/values-skaffold.yaml" \
   --set "fullnameOverride=openshell" \
   --set "image.repository=${REGISTRY_VALUE}/gateway" \
   --set "image.tag=${IMAGE_TAG_VALUE}" \

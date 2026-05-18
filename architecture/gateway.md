@@ -46,6 +46,13 @@ Sandbox supervisor RPCs authenticate with either mTLS material or a sandbox
 secret depending on the runtime and deployment mode. User-facing mutations are
 authorized by role policy when OIDC or edge identity is enabled.
 
+Sandbox secrets are gateway-signed JWTs bound to a single sandbox ID. Docker,
+Podman, and VM drivers deliver the initial token through supervisor-only
+runtime material; Kubernetes supervisors exchange a projected ServiceAccount
+token through `IssueSandboxToken`. Supervisors renew gateway JWTs in memory
+before expiry. Older tokens are not server-revoked; deployments bound replay
+exposure with short `gateway_jwt.ttl_secs` lifetimes.
+
 ## API Surface
 
 The gateway API is organized around platform objects and operational streams:

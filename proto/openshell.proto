@@ -232,12 +232,12 @@ service OpenShell {
   // and never call this RPC.
   rpc IssueSandboxToken(IssueSandboxTokenRequest) returns (IssueSandboxTokenResponse);
 
-  // Rotate the calling sandbox's gateway JWT. The previously-issued
-  // token is revoked (its jti added to the gateway's deny list) and a
-  // fresh token bound to the same sandbox UUID is returned. The
-  // supervisor calls this from a background task at ~80% of the token's
-  // lifetime; the new token is cached in memory only — the on-disk
-  // bootstrap file is intentionally not rewritten.
+  // Renew the calling sandbox's gateway JWT. Older tokens remain valid
+  // until their own expiry; deployments should keep token TTLs short to
+  // bound replay exposure. The supervisor calls this from a background
+  // task at ~80% of the token's lifetime; the new token is cached in
+  // memory only — the on-disk bootstrap file is intentionally not
+  // rewritten.
   rpc RefreshSandboxToken(RefreshSandboxTokenRequest)
       returns (RefreshSandboxTokenResponse);
 }
@@ -262,8 +262,8 @@ message IssueSandboxTokenResponse {
 // gateway-minted JWT in its Authorization header).
 message RefreshSandboxTokenRequest {}
 
-// RefreshSandboxToken response. The previous token is revoked server-side
-// before this response is sent.
+// RefreshSandboxToken response. The new token replaces the supervisor's
+// in-memory bearer credential.
 message RefreshSandboxTokenResponse {
   // Fresh gateway-minted JWT bound to the same sandbox UUID.
   string token = 1;

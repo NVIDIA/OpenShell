@@ -17,17 +17,14 @@
 
 use super::authenticator::Authenticator;
 use super::principal::{Principal, SandboxIdentitySource, SandboxPrincipal};
-use super::revocation::RevocationSet;
 use async_trait::async_trait;
 use jsonwebtoken::{
     Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, decode_header, encode,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tonic::Status;
 use tracing::{debug, warn};
-use uuid::Uuid;
 
 /// SPIFFE-shaped subject prefix. Embedded in the `sub` claim of every
 /// minted token so a future migration to per-sandbox certs or SPIRE can
@@ -48,7 +45,6 @@ pub struct SandboxJwtClaims {
     pub aud: String,
     pub iat: i64,
     pub exp: i64,
-    pub jti: String,
     /// Canonical sandbox UUID, denormalized from `sub` for cheap parsing
     /// without a SPIFFE library.
     pub sandbox_id: String,
@@ -74,12 +70,10 @@ impl std::fmt::Debug for SandboxJwtIssuer {
     }
 }
 
-/// Outcome of a successful mint — caller persists the `jti` so the same
-/// token can be revoked on `DeleteSandbox` / refresh.
+/// Outcome of a successful mint.
 #[derive(Debug, Clone)]
 pub struct MintedToken {
     pub token: String,
-    pub jti: String,
     pub expires_at_ms: i64,
 }
 
@@ -102,21 +96,17 @@ impl SandboxJwtIssuer {
         })
     }
 
-    /// Mint a fresh token for `sandbox_id`. The caller MUST track the
-    /// returned `jti` (in the `RevocationSet`'s mint-time index if we ever
-    /// need to revoke the most-recent token for a given sandbox).
+    /// Mint a fresh token for `sandbox_id`.
     #[allow(clippy::result_large_err)] // `tonic::Status` is the natural error here
     pub fn mint(&self, sandbox_id: &str) -> Result<MintedToken, Status> {
         let now = now_secs();
-        let exp = now + i64::try_from(self.ttl.as_secs()).unwrap_or(86_400);
-        let jti = Uuid::new_v4().to_string();
+        let exp = now + i64::try_from(self.ttl.as_secs()).unwrap_or(3_600);
         let claims = SandboxJwtClaims {
             sub: format!("{SPIFFE_SUBJECT_PREFIX}{sandbox_id}"),
             iss: self.issuer.clone(),
             aud: self.audience.clone(),
             iat: now,
             exp,
-            jti: jti.clone(),
             sandbox_id: sandbox_id.to_string(),
         };
         let mut header = Header::new(Algorithm::EdDSA);
@@ -127,7 +117,6 @@ impl SandboxJwtIssuer {
         })?;
         Ok(MintedToken {
             token,
-            jti,
             expires_at_ms: exp.saturating_mul(1000),
         })
     }
@@ -143,7 +132,6 @@ pub struct SandboxJwtAuthenticator {
     kid: String,
     issuer: String,
     audience: String,
-    revocation: Arc<RevocationSet>,
 }
 
 impl std::fmt::Debug for SandboxJwtAuthenticator {
@@ -157,12 +145,7 @@ impl std::fmt::Debug for SandboxJwtAuthenticator {
 }
 
 impl SandboxJwtAuthenticator {
-    pub fn from_pem(
-        public_key_pem: &[u8],
-        kid: String,
-        gateway_id: &str,
-        revocation: Arc<RevocationSet>,
-    ) -> Result<Self, String> {
+    pub fn from_pem(public_key_pem: &[u8], kid: String, gateway_id: &str) -> Result<Self, String> {
         let decoding_key = DecodingKey::from_ed_pem(public_key_pem)
             .map_err(|e| format!("failed to parse Ed25519 public key PEM: {e}"))?;
         let identity = format!("openshell-gateway:{gateway_id}");
@@ -171,7 +154,6 @@ impl SandboxJwtAuthenticator {
             kid,
             issuer: identity.clone(),
             audience: identity,
-            revocation,
         })
     }
 
@@ -204,17 +186,9 @@ impl SandboxJwtAuthenticator {
             })?;
 
         let claims = data.claims;
-        if self.revocation.is_revoked(&claims.jti) {
-            debug!(jti = %claims.jti, "sandbox JWT rejected: jti revoked");
-            return Err(Status::unauthenticated("revoked token"));
-        }
-
         Ok(Some(Principal::Sandbox(SandboxPrincipal {
             sandbox_id: claims.sandbox_id,
-            source: SandboxIdentitySource::BootstrapJwt {
-                issuer: claims.iss,
-                jti: claims.jti,
-            },
+            source: SandboxIdentitySource::BootstrapJwt { issuer: claims.iss },
             trust_domain: Some("openshell".to_string()),
         })))
     }
@@ -261,13 +235,8 @@ mod tests {
         h
     }
 
-    fn pair() -> (
-        SandboxJwtIssuer,
-        SandboxJwtAuthenticator,
-        Arc<RevocationSet>,
-    ) {
+    fn pair() -> (SandboxJwtIssuer, SandboxJwtAuthenticator) {
         let mat = generate_jwt_key().expect("jwt key");
-        let revocation = Arc::new(RevocationSet::new());
         let issuer = SandboxJwtIssuer::from_pem(
             mat.signing_key_pem.as_bytes(),
             mat.kid.clone(),
@@ -279,15 +248,14 @@ mod tests {
             mat.public_key_pem.as_bytes(),
             mat.kid,
             "test-gateway",
-            revocation.clone(),
         )
         .unwrap();
-        (issuer, auth, revocation)
+        (issuer, auth)
     }
 
     #[tokio::test]
     async fn mint_and_validate_round_trip() {
-        let (issuer, auth, _) = pair();
+        let (issuer, auth) = pair();
         let minted = issuer.mint("sandbox-a").unwrap();
         let principal = auth
             .authenticate(&header_map_with_bearer(&minted.token), "/anything")
@@ -298,9 +266,8 @@ mod tests {
             Principal::Sandbox(p) => {
                 assert_eq!(p.sandbox_id, "sandbox-a");
                 match p.source {
-                    SandboxIdentitySource::BootstrapJwt { issuer: iss, jti } => {
+                    SandboxIdentitySource::BootstrapJwt { issuer: iss } => {
                         assert_eq!(iss, "openshell-gateway:test-gateway");
-                        assert_eq!(jti, minted.jti);
                     }
                     other => panic!("unexpected source: {other:?}"),
                 }
@@ -310,21 +277,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn revoked_jti_is_rejected() {
-        let (issuer, auth, revocation) = pair();
-        let minted = issuer.mint("sandbox-a").unwrap();
-        revocation.revoke(&minted.jti, minted.expires_at_ms);
-        let err = auth
-            .authenticate(&header_map_with_bearer(&minted.token), "/anything")
-            .await
-            .expect_err("revoked must reject");
-        assert_eq!(err.code(), tonic::Code::Unauthenticated);
-    }
-
-    #[tokio::test]
     async fn token_signed_by_other_key_is_rejected() {
-        let (_, auth_a, _) = pair();
-        let (issuer_b, _, _) = pair(); // different keypair
+        let (_, auth_a) = pair();
+        let (issuer_b, _) = pair(); // different keypair
         let minted = issuer_b.mint("sandbox-b").unwrap();
         // The token has a different `kid` than auth_a expects, so the
         // authenticator yields None (lets the chain fall through). That is
@@ -338,7 +293,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_bearer_yields_none() {
-        let (_, auth, _) = pair();
+        let (_, auth) = pair();
         let result = auth
             .authenticate(&http::HeaderMap::new(), "/anything")
             .await
@@ -348,7 +303,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_token_is_rejected() {
-        let (_, auth, _) = pair();
+        let (_, auth) = pair();
         let err = auth
             .authenticate(&header_map_with_bearer("not.a.jwt"), "/anything")
             .await
@@ -369,20 +324,15 @@ mod tests {
             Duration::from_secs(3600),
         )
         .unwrap();
-        let auth = SandboxJwtAuthenticator::from_pem(
-            mat.public_key_pem.as_bytes(),
-            mat.kid.clone(),
-            "g",
-            Arc::new(RevocationSet::new()),
-        )
-        .unwrap();
+        let auth =
+            SandboxJwtAuthenticator::from_pem(mat.public_key_pem.as_bytes(), mat.kid.clone(), "g")
+                .unwrap();
         let claims = SandboxJwtClaims {
             sub: format!("{SPIFFE_SUBJECT_PREFIX}sandbox-c"),
             iss: "openshell-gateway:g".to_string(),
             aud: "openshell-gateway:g".to_string(),
             iat: now_secs() - 7200,
             exp: now_secs() - 3600,
-            jti: Uuid::new_v4().to_string(),
             sandbox_id: "sandbox-c".to_string(),
         };
         let mut header = Header::new(Algorithm::EdDSA);

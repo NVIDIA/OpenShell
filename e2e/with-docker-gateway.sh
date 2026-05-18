@@ -25,6 +25,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=e2e/support/gateway-common.sh
 source "${ROOT}/e2e/support/gateway-common.sh"
 
+e2e_preserve_mise_dirs
+
 github_actions_host_docker_tmpdir() {
   if [ "${GITHUB_ACTIONS:-}" != "true" ] \
      || [ ! -S /var/run/docker.sock ] \

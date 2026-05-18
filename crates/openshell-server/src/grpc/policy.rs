@@ -2928,7 +2928,6 @@ mod tests {
                 sandbox_id: sandbox_id.to_string(),
                 source: SandboxIdentitySource::BootstrapJwt {
                     issuer: "openshell-gateway:test".to_string(),
-                    jti: "j-test".to_string(),
                 },
                 trust_domain: Some("openshell".to_string()),
             }));
@@ -2977,7 +2976,6 @@ mod tests {
                 sandbox_id: "test-sandbox".to_string(),
                 source: SandboxIdentitySource::BootstrapJwt {
                     issuer: "openshell-gateway:test".to_string(),
-                    jti: "j-1".to_string(),
                 },
                 trust_domain: None,
             }));

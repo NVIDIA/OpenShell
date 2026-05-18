@@ -122,10 +122,6 @@ pub struct ServerState {
     /// `IssueSandboxToken` bootstrap path. Only present when the gateway
     /// runs in-cluster.
     pub k8s_sa_authenticator: Option<Arc<auth::k8s_sa::K8sServiceAccountAuthenticator>>,
-
-    /// In-memory revocation set for gateway-minted sandbox JWTs.
-    /// Populated by `DeleteSandbox` and (in PR 5) `RefreshSandboxToken`.
-    pub sandbox_jwt_revocation: Arc<auth::revocation::RevocationSet>,
 }
 
 fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
@@ -173,7 +169,6 @@ impl ServerState {
             sandbox_jwt_issuer: None,
             sandbox_jwt_authenticator: None,
             k8s_sa_authenticator: None,
-            sandbox_jwt_revocation: Arc::new(auth::revocation::RevocationSet::new()),
         }
     }
 }
@@ -282,13 +277,9 @@ pub async fn run_server(
             Duration::from_secs(jwt.ttl_secs),
         )
         .map_err(Error::config)?;
-        let authenticator = auth::sandbox_jwt::SandboxJwtAuthenticator::from_pem(
-            &public_pem,
-            kid,
-            &jwt.gateway_id,
-            state.sandbox_jwt_revocation.clone(),
-        )
-        .map_err(Error::config)?;
+        let authenticator =
+            auth::sandbox_jwt::SandboxJwtAuthenticator::from_pem(&public_pem, kid, &jwt.gateway_id)
+                .map_err(Error::config)?;
         info!(
             gateway_id = %jwt.gateway_id,
             ttl_secs = jwt.ttl_secs,

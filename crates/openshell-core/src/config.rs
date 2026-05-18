@@ -342,7 +342,7 @@ pub struct GatewayJwtConfig {
     /// hostname-or-`openshell` placeholder if unset.
     #[serde(default = "default_gateway_id")]
     pub gateway_id: String,
-    /// Token lifetime in seconds. Defaults to 24 hours.
+    /// Token lifetime in seconds. Defaults to 1 hour.
     #[serde(default = "default_sandbox_token_ttl_secs")]
     pub ttl_secs: u64,
 }
@@ -352,7 +352,7 @@ fn default_gateway_id() -> String {
 }
 
 const fn default_sandbox_token_ttl_secs() -> u64 {
-    86_400
+    3_600
 }
 
 fn default_roles_claim() -> String {

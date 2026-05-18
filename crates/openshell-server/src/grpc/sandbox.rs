@@ -142,7 +142,6 @@ pub(super) async fn handle_create_sandbox(
         issuer.mint(&id).map(|minted| {
             tracing::info!(
                 sandbox_id = %id,
-                jti = %minted.jti,
                 "minted sandbox JWT"
             );
             minted.token

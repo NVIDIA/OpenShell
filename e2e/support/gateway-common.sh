@@ -50,6 +50,23 @@ e2e_generate_pki() {
   "${gateway_bin}" generate-certs --output-dir "${pki_dir}" "${san_args[@]}"
 }
 
+e2e_preserve_mise_dirs() {
+  if ! command -v mise >/dev/null 2>&1; then
+    return 0
+  fi
+
+  if [ -z "${MISE_DATA_DIR:-}" ]; then
+    export MISE_DATA_DIR="${XDG_DATA_HOME:-${HOME}/.local/share}/mise"
+  fi
+
+  if [ -z "${MISE_CACHE_DIR:-}" ]; then
+    case "$(uname -s)" in
+      Darwin) export MISE_CACHE_DIR="${HOME}/Library/Caches/mise" ;;
+      *) export MISE_CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/mise" ;;
+    esac
+  fi
+}
+
 e2e_register_plaintext_gateway() {
   local config_home=$1
   local name=$2
@@ -121,7 +138,7 @@ e2e_write_gateway_jwt_config() {
   printf 'public_key_path = %s\n'  "$(e2e_toml_string "${jwt_dir}/public.pem")"
   printf 'kid_path = %s\n'         "$(e2e_toml_string "${jwt_dir}/kid")"
   printf 'gateway_id = %s\n'       "$(e2e_toml_string "${gateway_id}")"
-  printf 'ttl_secs = 86400\n\n'
+  printf 'ttl_secs = 3600\n\n'
 }
 
 e2e_build_gateway_binaries() {

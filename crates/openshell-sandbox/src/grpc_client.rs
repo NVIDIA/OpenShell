@@ -43,15 +43,15 @@ use tracing::{debug, info, warn};
 pub type AuthedChannel = InterceptedService<Channel, AuthInterceptor>;
 
 /// Shared, refreshable Bearer header. All [`AuthInterceptor`] clones read
-/// the same slot, so the PR-5 refresh task can rotate the token in place
-/// without rebuilding the channel.
+/// the same slot, so the renewal task can replace the token in place without
+/// rebuilding the channel.
 type TokenSlot = Arc<RwLock<AsciiMetadataValue>>;
 
 /// Process-wide token slot. Initialized by the first [`connect_channel`]
-/// call and shared with every subsequent client + the refresh loop.
+/// call and shared with every subsequent client and the renewal loop.
 static TOKEN_SLOT: OnceLock<TokenSlot> = OnceLock::new();
 
-/// One-shot guard so the refresh loop spawns at most once per process.
+/// One-shot guard so the renewal loop spawns at most once per process.
 static REFRESH_SPAWNED: OnceLock<()> = OnceLock::new();
 
 fn install_token_slot(token: &str) -> Result<TokenSlot> {
@@ -68,8 +68,8 @@ fn install_token_slot(token: &str) -> Result<TokenSlot> {
 }
 
 /// gRPC interceptor that injects `authorization: Bearer <token>` on every
-/// outbound request. The token lives in a shared [`TokenSlot`] so the
-/// PR-5 refresh task can replace it without rebuilding clients.
+/// outbound request. The token lives in a shared [`TokenSlot`] so the renewal
+/// task can replace it without rebuilding clients.
 #[derive(Clone)]
 pub struct AuthInterceptor {
     bearer: TokenSlot,
@@ -162,9 +162,9 @@ async fn build_plain_channel(endpoint: &str) -> Result<Channel> {
 /// First call per process resolves the sandbox JWT via the three-step
 /// lookup (env → file → K8s SA bootstrap exchange) and installs it into
 /// the process-wide [`TOKEN_SLOT`]. Subsequent calls reuse the cached
-/// slot — the refresh loop keeps the value fresh, so re-running the
+/// slot — the renewal loop keeps the value fresh, so re-running the
 /// bootstrap is both unnecessary and (on the K8s SA path) expensive
-/// (one apiserver round-trip per call). The refresh loop itself is
+/// (one apiserver round-trip per call). The renewal loop itself is
 /// spawned once per process via [`REFRESH_SPAWNED`].
 async fn connect_channel(endpoint: &str) -> Result<AuthedChannel> {
     let channel = build_plain_channel(endpoint).await?;
@@ -250,7 +250,7 @@ pub async fn connect_channel_pub(endpoint: &str) -> Result<AuthedChannel> {
     connect_channel(endpoint).await
 }
 
-/// Background task that rotates the sandbox JWT at ~80% of its remaining
+/// Background task that renews the sandbox JWT at ~80% of its remaining
 /// lifetime. The new token replaces the value in [`TOKEN_SLOT`], so all
 /// in-flight and future clients pick it up on their next request. The
 /// loop never panics: every failure is logged and re-attempted after a
@@ -270,7 +270,7 @@ async fn refresh_token_loop(channel: AuthedChannel, slot: TokenSlot) {
                     Ok(value) => {
                         if let Ok(mut guard) = slot.write() {
                             *guard = value;
-                            info!("rotated gateway sandbox JWT in-place");
+                            info!("renewed gateway sandbox JWT in-place");
                         }
                     }
                     Err(e) => warn!(error = %e, "refreshed JWT contained invalid header bytes"),

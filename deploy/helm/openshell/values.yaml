@@ -185,8 +185,8 @@ server:
     # Stable gateway identity embedded in iss/aud of every minted token.
     # Defaults to the release name so HA replicas share identity.
     gatewayId: ""
-    # Token TTL in seconds. Defaults to 86400 (24h).
-    ttlSecs: 86400
+    # Token TTL in seconds. Defaults to 3600 (1h).
+    ttlSecs: 3600
     # Lifetime (seconds) of the projected ServiceAccount token kubelet
     # writes into each sandbox pod for the IssueSandboxToken bootstrap
     # exchange. Kubelet enforces a minimum of 600s; the driver clamps

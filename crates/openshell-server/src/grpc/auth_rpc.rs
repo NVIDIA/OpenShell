@@ -5,12 +5,11 @@
 //!
 //! Hosts the two sandbox-identity RPCs:
 //! - `IssueSandboxToken` — bootstrap exchange (K8s SA token → gateway JWT)
-//! - `RefreshSandboxToken` — rotate a still-valid gateway JWT
+//! - `RefreshSandboxToken` — renew a still-valid gateway JWT
 //!
 //! Both end in a fresh gateway-signed JWT minted by
-//! [`crate::auth::sandbox_jwt::SandboxJwtIssuer`]. `RefreshSandboxToken`
-//! additionally revokes the previous JWT's `jti` so the old token
-//! becomes unusable as soon as the new one is handed back.
+//! [`crate::auth::sandbox_jwt::SandboxJwtIssuer`]. Older tokens remain valid
+//! until their own `exp` and are bounded by the configured short TTL.
 
 use crate::ServerState;
 use crate::auth::principal::{Principal, SandboxIdentitySource};
@@ -19,7 +18,6 @@ use openshell_core::proto::{
     RefreshSandboxTokenResponse,
 };
 use std::sync::Arc;
-use std::time::SystemTime;
 use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
 
@@ -40,9 +38,9 @@ pub async fn handle_issue_sandbox_token(
         ));
     };
 
-    // Only the bootstrap K8s ServiceAccount path can mint a fresh
-    // gateway JWT via this RPC. Sandboxes already holding a gateway JWT
-    // use `RefreshSandboxToken` instead, which also revokes the old jti.
+    // Only the bootstrap K8s ServiceAccount path can mint a fresh gateway JWT
+    // via this RPC. Sandboxes already holding a gateway JWT use
+    // `RefreshSandboxToken` instead.
     if !matches!(
         sandbox.source,
         SandboxIdentitySource::K8sServiceAccount { .. }
@@ -67,7 +65,6 @@ pub async fn handle_issue_sandbox_token(
     let minted = issuer.mint(&sandbox.sandbox_id)?;
     info!(
         sandbox_id = %sandbox.sandbox_id,
-        jti = %minted.jti,
         "issued gateway sandbox JWT"
     );
     Ok(Response::new(IssueSandboxTokenResponse {
@@ -95,7 +92,7 @@ pub async fn handle_refresh_sandbox_token(
 
     // Only callers already holding a gateway-minted JWT may refresh; the
     // K8s bootstrap path must use `IssueSandboxToken`.
-    let SandboxIdentitySource::BootstrapJwt { jti: old_jti, .. } = &sandbox.source else {
+    let SandboxIdentitySource::BootstrapJwt { .. } = &sandbox.source else {
         debug!(
             sandbox_id = %sandbox.sandbox_id,
             "RefreshSandboxToken rejected: non-gateway-JWT principal source"
@@ -113,23 +110,10 @@ pub async fn handle_refresh_sandbox_token(
         Status::unavailable("sandbox JWT minting is not configured on this gateway")
     })?;
 
-    // Mint the new token first; only revoke the old jti after we have a
-    // replacement so a failure here doesn't leave the sandbox stranded.
     let minted = issuer.mint(&sandbox.sandbox_id)?;
-
-    // Best-effort revocation of the old token. The plan calls for the
-    // jti deny-list to live in memory in PR 2; PR 5 only needs to drop
-    // the old jti into it. We use the new token's expiry as a safe upper
-    // bound for the revocation entry — the old jti can't outlive its own
-    // `exp`, and on TTL pruning the entry drops out cleanly.
-    state
-        .sandbox_jwt_revocation
-        .revoke(old_jti, minted.expires_at_ms.max(now_ms()));
     info!(
         sandbox_id = %sandbox.sandbox_id,
-        revoked_jti = %old_jti,
-        new_jti = %minted.jti,
-        "refreshed gateway sandbox JWT"
+        "renewed gateway sandbox JWT"
     );
 
     Ok(Response::new(RefreshSandboxTokenResponse {
@@ -138,21 +122,11 @@ pub async fn handle_refresh_sandbox_token(
     }))
 }
 
-fn now_ms() -> i64 {
-    i64::try_from(
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map_or(0, |d| d.as_millis()),
-    )
-    .unwrap_or(i64::MAX)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ServerState;
     use crate::auth::principal::{Principal, SandboxPrincipal, UserPrincipal};
-    use crate::auth::revocation::RevocationSet;
     use crate::auth::sandbox_jwt::SandboxJwtIssuer;
     use crate::compute::new_test_runtime;
     use crate::persistence::Store;
@@ -164,16 +138,8 @@ mod tests {
     use openshell_core::Config;
     use std::time::Duration;
 
-    async fn state_with_issuer() -> (Arc<ServerState>, SandboxJwtIssuer, Arc<RevocationSet>) {
+    async fn state_with_issuer() -> Arc<ServerState> {
         let mat = generate_jwt_key().expect("jwt key");
-        let revocation = Arc::new(RevocationSet::new());
-        let issuer = SandboxJwtIssuer::from_pem(
-            mat.signing_key_pem.as_bytes(),
-            mat.kid,
-            "test-gateway",
-            Duration::from_secs(3600),
-        )
-        .expect("issuer");
         let store = Arc::new(
             Store::connect("sqlite::memory:?cache=shared")
                 .await
@@ -190,53 +156,46 @@ mod tests {
             Arc::new(SupervisorSessionRegistry::new()),
             None,
         );
-        state.sandbox_jwt_revocation = revocation.clone();
         // We don't need the authenticator for these tests; only the issuer.
-        // The handler tests only exercise the mint+revoke path; they
-        // don't need the issuer to be the same instance that produced
-        // `issuer` above. A fresh keypair is fine.
-        let issuer_clone = SandboxJwtIssuer::from_pem(
-            generate_jwt_key().unwrap().signing_key_pem.as_bytes(),
-            "kid".to_string(),
+        let issuer = SandboxJwtIssuer::from_pem(
+            mat.signing_key_pem.as_bytes(),
+            mat.kid,
             "test-gateway",
             Duration::from_secs(3600),
         )
         .unwrap();
-        state.sandbox_jwt_issuer = Some(Arc::new(issuer_clone));
-        (Arc::new(state), issuer, revocation)
+        state.sandbox_jwt_issuer = Some(Arc::new(issuer));
+        Arc::new(state)
     }
 
-    fn sandbox_principal(sandbox_id: &str, jti: &str) -> Principal {
+    fn sandbox_principal(sandbox_id: &str) -> Principal {
         use crate::auth::principal::SandboxIdentitySource;
         Principal::Sandbox(SandboxPrincipal {
             sandbox_id: sandbox_id.to_string(),
             source: SandboxIdentitySource::BootstrapJwt {
                 issuer: "openshell-gateway:test-gateway".to_string(),
-                jti: jti.to_string(),
             },
             trust_domain: Some("openshell".to_string()),
         })
     }
 
     #[tokio::test]
-    async fn refresh_revokes_old_jti_and_returns_new_token() {
-        let (state, _issuer, revocation) = state_with_issuer().await;
-        let old_jti = "j-original";
+    async fn refresh_returns_new_token() {
+        let state = state_with_issuer().await;
         let mut req = Request::new(RefreshSandboxTokenRequest {});
-        req.extensions_mut()
-            .insert(sandbox_principal("sandbox-a", old_jti));
+        req.extensions_mut().insert(sandbox_principal("sandbox-a"));
         let resp = handle_refresh_sandbox_token(&state, req)
             .await
             .expect("refresh OK")
             .into_inner();
         assert!(!resp.token.is_empty());
-        assert!(revocation.is_revoked(old_jti), "old jti must be revoked");
+        assert!(resp.expires_at_ms > 0);
     }
 
     #[tokio::test]
     async fn refresh_rejects_user_principal() {
         use crate::auth::identity::{Identity, IdentityProvider};
-        let (state, _, _) = state_with_issuer().await;
+        let state = state_with_issuer().await;
         let mut req = Request::new(RefreshSandboxTokenRequest {});
         req.extensions_mut().insert(Principal::User(UserPrincipal {
             identity: Identity {
@@ -259,7 +218,7 @@ mod tests {
         // RefreshSandboxToken — the refresh path assumes a still-valid
         // gateway-minted JWT exists.
         use crate::auth::principal::SandboxIdentitySource;
-        let (state, _, _) = state_with_issuer().await;
+        let state = state_with_issuer().await;
         let mut req = Request::new(RefreshSandboxTokenRequest {});
         req.extensions_mut()
             .insert(Principal::Sandbox(SandboxPrincipal {
@@ -297,8 +256,7 @@ mod tests {
             None,
         ));
         let mut req = Request::new(RefreshSandboxTokenRequest {});
-        req.extensions_mut()
-            .insert(sandbox_principal("sandbox-a", "j-1"));
+        req.extensions_mut().insert(sandbox_principal("sandbox-a"));
         let err = handle_refresh_sandbox_token(&state, req)
             .await
             .expect_err("missing issuer must yield unavailable");
