@@ -2,10 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 %global crate openshell
-%global openshell_cargo_version %{version}
+%global openshell_version 0.0.37
+%global openshell_cargo_version %{openshell_version}
 # Python dist-info metadata intentionally follows the RPM Version. Dev build
 # identity is represented by Release for RPM packages.
-%global openshell_python_version %{version}
+%global openshell_python_version %{openshell_version}
 
 # Cargo/Rust builds with vendored deps do not produce debugsource listings
 # in the format redhat-rpm-config expects (especially on EPEL).
@@ -18,14 +19,14 @@
 %global image_tag dev
 
 Name:           openshell
-Version:        0.0.43
+Version:        %{openshell_version}
 Release:        1.20260518180028805757.podman.toml.gateway.listener.11.g8c0cb7c8%{?dist}
 Summary:        Safe, sandboxed runtimes for autonomous AI agents
 
 License:        Apache-2.0
 URL:            https://github.com/NVIDIA/OpenShell
-Source0: openshell-0.0.43.tar.gz
-Source1: openshell-0.0.43-vendor.tar.xz
+Source0: openshell-%{openshell_version}.tar.gz
+Source1: openshell-%{openshell_version}-vendor.tar.xz
 
 ExclusiveArch:  x86_64 aarch64
 
