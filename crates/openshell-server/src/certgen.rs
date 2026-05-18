@@ -9,8 +9,8 @@
 //!   in the supplied namespace. Used by the Helm pre-install hook. Requires
 //!   `--namespace`, `--server-secret-name`, `--client-secret-name`.
 //! - **Local mode** (`--output-dir <DIR>`): write PEMs to a filesystem layout
-//!   matching `deploy/rpm/init-pki.sh`. Used by the RPM systemd unit's
-//!   `ExecStartPre`. Also copies client materials to
+//!   used by the RPM systemd unit's `ExecStartPre`. Also copies client
+//!   materials to
 //!   `$XDG_CONFIG_HOME/openshell/gateways/openshell/mtls/` so the local CLI
 //!   picks them up automatically.
 //!
@@ -216,7 +216,7 @@ enum LocalAction {
     Create,
 }
 
-/// Layout under `<dir>` matches `deploy/rpm/init-pki.sh`:
+/// Layout under `<dir>`:
 ///
 /// ```text
 /// <dir>/ca.crt
