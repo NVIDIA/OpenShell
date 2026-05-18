@@ -111,3 +111,13 @@ The bot's full administrator documentation is internal to NVIDIA. The only comma
 | `.github/workflows/e2e-gate.yml` | Posts the required `E2E Gate` check on the PR. Re-evaluates after the gated workflow completes. |
 | `.github/workflows/e2e-gate-check.yml` | Reusable gate logic shared by E2E and GPU E2E. |
 | `.github/workflows/e2e-label-help.yml` | When a `test:e2e*` label is applied, posts a PR comment telling the maintainer the next manual step (re-run an existing workflow run, or `/ok to test <SHA>` to refresh the mirror). |
+
+## Release workflows
+
+These workflows run after merge to publish dev/tagged artifacts and verify them. They are not PR-gated.
+
+| File | Role |
+|---|---|
+| `.github/workflows/release-dev.yml` | Publishes the rolling `dev` build on every push to `main`. Builds gateway/supervisor images and binaries, packages, wheels, and pushes the Helm chart as `oci://ghcr.io/nvidia/openshell/helm-chart:0.0.0-dev` (plus an immutable `0.0.0-dev.<sha>` pin). Also dispatchable manually. |
+| `.github/workflows/release-tag.yml` | Publishes a tagged public release. |
+| `.github/workflows/release-canary.yml` | Smoke-tests published artifacts on `macos`, `ubuntu`, `fedora`, and `kubernetes` (kind + Helm) runners. Triggers automatically when `Release Dev` succeeds, and via `workflow_dispatch` on any branch (`gh workflow run release-canary.yml --ref <branch>`). The `kubernetes` job pins to `0.0.0-dev` artifacts; the other jobs install the latest tagged release via `install.sh`. See the `test-release-canary` skill for the manual-dispatch playbook and local kind reproduction. |
