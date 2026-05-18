@@ -4,7 +4,7 @@
 
 # Run the Rust e2e suite against a standalone gateway running the bundled Podman
 # compute driver. Set OPENSHELL_GATEWAY_ENDPOINT=http://host:port to reuse an
-# existing plaintext gateway instead of starting an ephemeral one.
+# existing gateway instead of starting an ephemeral one.
 
 set -euo pipefail
 
