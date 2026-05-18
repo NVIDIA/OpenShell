@@ -34,6 +34,51 @@ e2e_pick_port() {
   python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()'
 }
 
+e2e_generate_pki() {
+  local pki_dir=$1
+  local host_alias=$2  # e.g. host.docker.internal or host.containers.internal
+
+  mkdir -p "${pki_dir}"
+
+  cat > "${pki_dir}/openssl.cnf" <<EOF
+[req]
+distinguished_name = dn
+prompt = no
+[dn]
+CN = openshell-server
+[san_server]
+subjectAltName = @alt_server
+[alt_server]
+DNS.1 = localhost
+DNS.2 = host.openshell.internal
+DNS.3 = ${host_alias}
+IP.1 = 127.0.0.1
+IP.2 = ::1
+[san_client]
+subjectAltName = DNS:openshell-client
+EOF
+
+  openssl req -x509 -newkey rsa:2048 -nodes -days 30 \
+    -keyout "${pki_dir}/ca.key" -out "${pki_dir}/ca.crt" \
+    -subj "/CN=openshell-e2e-ca" >/dev/null 2>&1
+
+  openssl req -newkey rsa:2048 -nodes \
+    -keyout "${pki_dir}/server.key" -out "${pki_dir}/server.csr" \
+    -config "${pki_dir}/openssl.cnf" >/dev/null 2>&1
+  openssl x509 -req -in "${pki_dir}/server.csr" \
+    -CA "${pki_dir}/ca.crt" -CAkey "${pki_dir}/ca.key" -CAcreateserial \
+    -out "${pki_dir}/server.crt" -days 30 \
+    -extfile "${pki_dir}/openssl.cnf" -extensions san_server >/dev/null 2>&1
+
+  openssl req -newkey rsa:2048 -nodes \
+    -keyout "${pki_dir}/client.key" -out "${pki_dir}/client.csr" \
+    -subj "/CN=openshell-client" >/dev/null 2>&1
+  openssl x509 -req -in "${pki_dir}/client.csr" \
+    -CA "${pki_dir}/ca.crt" -CAkey "${pki_dir}/ca.key" -CAcreateserial \
+    -out "${pki_dir}/client.crt" -days 30 \
+    -extfile "${pki_dir}/openssl.cnf" -extensions san_client >/dev/null 2>&1
+}
+
 e2e_register_plaintext_gateway() {
   local config_home=$1
   local name=$2

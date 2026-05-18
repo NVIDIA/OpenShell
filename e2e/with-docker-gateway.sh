@@ -390,41 +390,7 @@ if ! docker image inspect "${SANDBOX_IMAGE}" >/dev/null 2>&1; then
 fi
 
 PKI_DIR="${WORKDIR}/pki"
-mkdir -p "${PKI_DIR}"
-cd "${PKI_DIR}"
-
-cat > openssl.cnf <<'EOF'
-[req]
-distinguished_name = dn
-prompt = no
-[dn]
-CN = openshell-server
-[san_server]
-subjectAltName = @alt_server
-[alt_server]
-DNS.1 = localhost
-DNS.2 = host.openshell.internal
-DNS.3 = host.docker.internal
-IP.1 = 127.0.0.1
-IP.2 = ::1
-[san_client]
-subjectAltName = DNS:openshell-client
-EOF
-
-openssl req -x509 -newkey rsa:2048 -nodes -days 30 \
-  -keyout ca.key -out ca.crt -subj "/CN=openshell-e2e-ca" >/dev/null 2>&1
-
-openssl req -newkey rsa:2048 -nodes -keyout server.key -out server.csr \
-  -config openssl.cnf >/dev/null 2>&1
-openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
-  -out server.crt -days 30 -extfile openssl.cnf -extensions san_server >/dev/null 2>&1
-
-openssl req -newkey rsa:2048 -nodes -keyout client.key -out client.csr \
-  -subj "/CN=openshell-client" >/dev/null 2>&1
-openssl x509 -req -in client.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
-  -out client.crt -days 30 -extfile openssl.cnf -extensions san_client >/dev/null 2>&1
-
-cd "${ROOT}"
+e2e_generate_pki "${PKI_DIR}" "host.docker.internal"
 
 HOST_PORT=$(e2e_pick_port)
 STATE_DIR="${WORKDIR}/state"
