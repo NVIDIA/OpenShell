@@ -665,13 +665,13 @@ impl openshell_core::proto::open_shell_server::OpenShell for TestOpenShell {
     }
 
     type ExecSandboxInteractiveStream = tokio_stream::wrappers::ReceiverStream<
-        Result<openshell_core::proto::ExecSandboxEvent, tonic::Status>,
+        Result<openshell_core::proto::ExecSandboxEvent, Status>,
     >;
     async fn exec_sandbox_interactive(
         &self,
         _: tonic::Request<tonic::Streaming<openshell_core::proto::ExecSandboxInput>>,
-    ) -> Result<tonic::Response<Self::ExecSandboxInteractiveStream>, tonic::Status> {
-        Err(tonic::Status::unimplemented("test"))
+    ) -> Result<Response<Self::ExecSandboxInteractiveStream>, Status> {
+        Err(Status::unimplemented("test"))
     }
 
     async fn update_config(
