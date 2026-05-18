@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-const LOCAL_NO_PROXY: &str = "127.0.0.1,localhost,::1,10.200.0.1";
+const LOCAL_NO_PROXY: &str = "127.0.0.1,localhost,::1";
 
 pub fn proxy_env_vars(proxy_url: &str) -> [(&'static str, String); 9] {
     [

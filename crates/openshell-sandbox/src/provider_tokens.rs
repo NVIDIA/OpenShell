@@ -22,6 +22,7 @@ const TOKEN_PROVIDER_URL_ENV: &str = "OPENSHELL_MICROSOFT_AGENT_S2S_TOKEN_PROVID
 const DEFAULT_AUDIENCE_ENV: &str = "OPENSHELL_MICROSOFT_AGENT_S2S_DEFAULT_AUDIENCE";
 const A365_TOKEN_PROVIDER_URL_ENV: &str = "A365_TOKEN_PROVIDER_URL";
 const PROVIDER_NAME_ENV: &str = "OPENSHELL_MICROSOFT_AGENT_S2S_PROVIDER_NAME";
+const SANDBOX_HOST_BYPASS_IP: &str = "10.200.0.1";
 
 const MICROSOFT_AGENT_S2S_KEYS: &[&str] = &[
     "AZURE_TENANT_ID",
@@ -160,6 +161,8 @@ fn resolver_environment(
         (TOKEN_URL_ENV.to_string(), resolver_url.clone()),
         (TOKEN_PROVIDER_URL_ENV.to_string(), resolver_url.clone()),
         (A365_TOKEN_PROVIDER_URL_ENV.to_string(), resolver_url),
+        ("NO_PROXY".to_string(), SANDBOX_HOST_BYPASS_IP.to_string()),
+        ("no_proxy".to_string(), SANDBOX_HOST_BYPASS_IP.to_string()),
     ]);
     if let Some(audience) = default_audience {
         environment.insert(DEFAULT_AUDIENCE_ENV.to_string(), audience);
@@ -491,6 +494,14 @@ mod tests {
         assert_eq!(
             environment.get(A365_TOKEN_PROVIDER_URL_ENV),
             environment.get(TOKEN_URL_ENV)
+        );
+        assert_eq!(
+            environment.get("NO_PROXY"),
+            Some(&SANDBOX_HOST_BYPASS_IP.to_string())
+        );
+        assert_eq!(
+            environment.get("no_proxy"),
+            Some(&SANDBOX_HOST_BYPASS_IP.to_string())
         );
         assert_eq!(
             environment.get(DEFAULT_AUDIENCE_ENV),
