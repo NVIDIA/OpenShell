@@ -145,6 +145,10 @@ cert-manager alternative.
 | server.oidc.userRole | string | `""` | Role name for standard user access. |
 | server.sandboxImage | string | `"ghcr.io/nvidia/openshell-community/sandboxes/base:latest"` | Default sandbox image used when requests do not specify one. |
 | server.sandboxImagePullPolicy | string | `""` | Kubernetes imagePullPolicy for sandbox pods. Empty = Kubernetes default (Always for :latest, IfNotPresent otherwise). Set to "Always" for dev clusters so new images are picked up without manual eviction. |
+| server.sandboxJwt.gatewayId | string | `""` |  |
+| server.sandboxJwt.k8sSaTokenTtlSecs | int | `3600` |  |
+| server.sandboxJwt.signingSecretName | string | `""` |  |
+| server.sandboxJwt.ttlSecs | int | `3600` |  |
 | server.sandboxNamespace | string | `""` | Namespace where sandbox pods are created. Defaults to the Helm release namespace (.Release.Namespace) when left empty. |
 | server.tls.certSecretName | string | `"openshell-server-tls"` | K8s secret (type kubernetes.io/tls) with tls.crt and tls.key for the server. |
 | server.tls.clientCaSecretName | string | `"openshell-server-client-ca"` | K8s secret with ca.crt for client certificate verification (mTLS). Set to "" to disable mTLS and run HTTPS-only (use OIDC for auth instead). |
