@@ -19,7 +19,7 @@
 
 Name:           openshell
 Version:        0.0.43
-Release:        1.20260518145413666753.use.toml.in.install.5.gd053a317%{?dist}
+Release:        1.20260518180028805757.podman.toml.gateway.listener.11.g8c0cb7c8%{?dist}
 Summary:        Safe, sandboxed runtimes for autonomous AI agents
 
 License:        Apache-2.0
@@ -202,7 +202,7 @@ install -d %{buildroot}%{python3_sitelib}/%{name}-%{openshell_python_version}.di
 cat > %{buildroot}%{python3_sitelib}/%{name}-%{openshell_python_version}.dist-info/METADATA << EOF
 Metadata-Version: 2.1
 Name: %{name}
-Version: 0.0.43
+Version: %{openshell_python_version}
 Summary: OpenShell Python SDK for agent execution and management
 License: Apache-2.0
 Requires-Python: >=3.12
