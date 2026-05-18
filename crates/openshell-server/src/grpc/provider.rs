@@ -874,16 +874,17 @@ async fn provider_type_allows_empty_credentials_for_refresh(
     let Some(profile) = get_provider_type_profile(store, provider_type).await? else {
         return Ok(false);
     };
-    Ok(profile.credentials.iter().any(|credential| {
-        credential.refresh.as_ref().is_some_and(|refresh| {
-            matches!(
-                refresh.strategy,
-                ProviderCredentialRefreshStrategy::Oauth2RefreshToken
-                    | ProviderCredentialRefreshStrategy::Oauth2ClientCredentials
-                    | ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt
-            )
-        })
-    }))
+    let required_credentials = profile
+        .credentials
+        .iter()
+        .filter(|credential| credential.required)
+        .collect::<Vec<_>>();
+    Ok(!required_credentials.is_empty()
+        && required_credentials.iter().all(|credential| {
+            credential.refresh.as_ref().is_some_and(|refresh| {
+                crate::provider_refresh::is_gateway_mintable_strategy(refresh.strategy)
+            })
+        }))
 }
 
 async fn merged_provider_profiles(store: &Store) -> Result<Vec<ProviderTypeProfile>, Status> {
@@ -1380,6 +1381,12 @@ pub(super) async fn handle_delete_provider_refresh(
         .await
         .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
         .ok_or_else(|| Status::not_found("provider not found"))?;
+    let existing_refresh_state = crate::provider_refresh::get_refresh_state(
+        state.store.as_ref(),
+        provider.object_id(),
+        credential_key,
+    )
+    .await?;
     let deleted_refresh_state = crate::provider_refresh::delete_refresh_state(
         state.store.as_ref(),
         provider.object_id(),
@@ -1387,10 +1394,16 @@ pub(super) async fn handle_delete_provider_refresh(
     )
     .await?;
 
-    let expiry_was_configured = provider
-        .credential_expires_at_ms
-        .contains_key(credential_key);
-    if expiry_was_configured {
+    let refresh_owned_expiry = existing_refresh_state
+        .as_ref()
+        .is_some_and(|refresh_state| {
+            refresh_state.expires_at_ms > 0
+                && provider
+                    .credential_expires_at_ms
+                    .get(credential_key)
+                    .is_some_and(|expires_at_ms| *expires_at_ms == refresh_state.expires_at_ms)
+        });
+    if refresh_owned_expiry {
         let updated = Provider {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: String::new(),
@@ -1410,7 +1423,7 @@ pub(super) async fn handle_delete_provider_refresh(
     }
 
     Ok(Response::new(DeleteProviderRefreshResponse {
-        deleted: deleted_refresh_state || expiry_was_configured,
+        deleted: deleted_refresh_state,
     }))
 }
 
@@ -1443,7 +1456,8 @@ mod tests {
         DeleteProviderProfileRequest, GetProviderProfileRequest, ImportProviderProfilesRequest,
         L7Allow, L7Rule, LintProviderProfilesRequest, ListProviderProfilesRequest, NetworkBinary,
         NetworkEndpoint, ProviderCredentialRefresh, ProviderCredentialRefreshMaterial,
-        ProviderProfile, ProviderProfileCategory, ProviderProfileImportItem, Sandbox, SandboxSpec,
+        ProviderProfile, ProviderProfileCategory, ProviderProfileCredential,
+        ProviderProfileImportItem, Sandbox, SandboxSpec,
     };
     use openshell_core::{ObjectId, ObjectName};
     use std::collections::HashMap;
@@ -1514,6 +1528,52 @@ mod tests {
             ..Default::default()
         });
         profile
+    }
+
+    fn refreshable_credential(name: &str, env_var: &str) -> ProviderProfileCredential {
+        ProviderProfileCredential {
+            name: name.to_string(),
+            description: String::new(),
+            env_vars: vec![env_var.to_string()],
+            required: true,
+            auth_style: "bearer".to_string(),
+            header_name: "authorization".to_string(),
+            query_param: String::new(),
+            refresh: Some(ProviderCredentialRefresh {
+                strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials as i32,
+                token_url: "https://auth.example.com/token".to_string(),
+                scopes: Vec::new(),
+                refresh_before_seconds: 300,
+                max_lifetime_seconds: 3600,
+                material: vec![
+                    ProviderCredentialRefreshMaterial {
+                        name: "client_id".to_string(),
+                        description: String::new(),
+                        required: true,
+                        secret: false,
+                    },
+                    ProviderCredentialRefreshMaterial {
+                        name: "client_secret".to_string(),
+                        description: String::new(),
+                        required: true,
+                        secret: true,
+                    },
+                ],
+            }),
+        }
+    }
+
+    fn static_credential(name: &str, env_var: &str, required: bool) -> ProviderProfileCredential {
+        ProviderProfileCredential {
+            name: name.to_string(),
+            description: String::new(),
+            env_vars: vec![env_var.to_string()],
+            required,
+            auth_style: "bearer".to_string(),
+            header_name: "authorization".to_string(),
+            query_param: String::new(),
+            refresh: None,
+        }
     }
 
     async fn test_server_state() -> Arc<ServerState> {
@@ -2121,6 +2181,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_provider_refresh_preserves_manually_updated_expiry() {
+        let state = test_server_state().await;
+        create_provider_record(
+            state.store.as_ref(),
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "msgraph".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                }),
+                r#type: "outlook".to_string(),
+                credentials: std::iter::once((
+                    "MS_GRAPH_ACCESS_TOKEN".to_string(),
+                    "token".to_string(),
+                ))
+                .collect(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let refresh_expires_at_ms = crate::persistence::current_time_ms() + 60_000;
+        handle_configure_provider_refresh(
+            &state,
+            Request::new(ConfigureProviderRefreshRequest {
+                provider: "msgraph".to_string(),
+                credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
+                strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials as i32,
+                material: HashMap::from([
+                    ("tenant_id".to_string(), "tenant".to_string()),
+                    ("client_id".to_string(), "client-id".to_string()),
+                    ("client_secret".to_string(), "client-secret".to_string()),
+                ]),
+                secret_material_keys: vec!["client_secret".to_string()],
+                expires_at_ms: Some(refresh_expires_at_ms),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let manual_expires_at_ms = refresh_expires_at_ms + 60_000;
+        update_provider_record(
+            state.store.as_ref(),
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "msgraph".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                }),
+                r#type: String::new(),
+                credentials: HashMap::new(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::from([(
+                    "MS_GRAPH_ACCESS_TOKEN".to_string(),
+                    manual_expires_at_ms,
+                )]),
+            },
+        )
+        .await
+        .unwrap();
+
+        let deleted = handle_delete_provider_refresh(
+            &state,
+            Request::new(DeleteProviderRefreshRequest {
+                provider: "msgraph".to_string(),
+                credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(deleted.deleted);
+
+        let provider_after_delete = state
+            .store
+            .get_message_by_name::<Provider>("msgraph")
+            .await
+            .unwrap()
+            .expect("provider");
+        assert_eq!(
+            provider_after_delete
+                .credential_expires_at_ms
+                .get("MS_GRAPH_ACCESS_TOKEN"),
+            Some(&manual_expires_at_ms)
+        );
+    }
+
+    #[tokio::test]
     async fn configure_provider_refresh_rejects_credential_key_collision_for_attached_sandbox() {
         let state = test_server_state().await;
         create_provider_record(
@@ -2691,7 +2843,7 @@ mod tests {
                         display_name: "Delegated Refresh API".to_string(),
                         description: String::new(),
                         category: ProviderProfileCategory::Messaging as i32,
-                        credentials: vec![openshell_core::proto::ProviderProfileCredential {
+                        credentials: vec![ProviderProfileCredential {
                             name: "access_token".to_string(),
                             description: String::new(),
                             env_vars: vec!["DELEGATED_ACCESS_TOKEN".to_string()],
@@ -2750,6 +2902,76 @@ mod tests {
         .await
         .unwrap();
         assert!(delegated_refresh_bootstrap_provider.credentials.is_empty());
+
+        let mut mixed_required_profile = custom_profile("mixed-required-api");
+        mixed_required_profile.credentials = vec![
+            refreshable_credential("access_token", "MIXED_ACCESS_TOKEN"),
+            static_credential("static_token", "MIXED_STATIC_TOKEN", true),
+        ];
+        handle_import_provider_profiles(
+            &state,
+            Request::new(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(mixed_required_profile),
+                    source: "mixed-required-api.yaml".to_string(),
+                }],
+            }),
+        )
+        .await
+        .unwrap();
+        let mixed_required_empty = create_provider_record(
+            store,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "mixed-required-no-token-yet".to_string(),
+                    created_at_ms: 1_000_000,
+                    labels: HashMap::new(),
+                }),
+                r#type: "mixed-required-api".to_string(),
+                credentials: HashMap::new(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(mixed_required_empty.code(), Code::InvalidArgument);
+
+        let mut optional_static_profile = custom_profile("optional-static-api");
+        optional_static_profile.credentials = vec![
+            refreshable_credential("access_token", "OPTIONAL_ACCESS_TOKEN"),
+            static_credential("static_token", "OPTIONAL_STATIC_TOKEN", false),
+        ];
+        handle_import_provider_profiles(
+            &state,
+            Request::new(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(optional_static_profile),
+                    source: "optional-static-api.yaml".to_string(),
+                }],
+            }),
+        )
+        .await
+        .unwrap();
+        let optional_static_empty = create_provider_record(
+            store,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "optional-static-no-token-yet".to_string(),
+                    created_at_ms: 1_000_000,
+                    labels: HashMap::new(),
+                }),
+                r#type: "optional-static-api".to_string(),
+                credentials: HashMap::new(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(optional_static_empty.credentials.is_empty());
 
         let get_err = get_provider_record(store, "").await.unwrap_err();
         assert_eq!(get_err.code(), Code::InvalidArgument);

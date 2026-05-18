@@ -4443,22 +4443,35 @@ pub async fn provider_refresh_status(
         .into_inner();
 
     if response.credentials.is_empty() {
-        println!("No refresh configuration found for provider '{name}'.");
+        if let Some(credential_key) = credential_key {
+            println!(
+                "No refresh configuration found for provider '{name}' credential '{credential_key}'."
+            );
+        } else {
+            println!("No refresh configurations found for provider '{name}'.");
+        }
         return Ok(());
     }
 
-    println!(
-        "{:<28}  {:<28}  {:<18}  {:<20}  {}",
-        "PROVIDER".bold(),
-        "CREDENTIAL_KEY".bold(),
-        "STRATEGY".bold(),
-        "EXPIRES_AT".bold(),
-        "STATUS".bold(),
-    );
+    println!("{}", refresh_status_header());
     for status in response.credentials {
         print_refresh_status_row(&status);
     }
     Ok(())
+}
+
+fn refresh_status_header() -> String {
+    format!(
+        "{:<24}  {:<28}  {:<28}  {:<18}  {:<20}  {:<20}  {:<20}  {}",
+        "PROVIDER".bold(),
+        "CREDENTIAL_KEY".bold(),
+        "STRATEGY".bold(),
+        "STATUS".bold(),
+        "EXPIRES_AT".bold(),
+        "NEXT_REFRESH".bold(),
+        "LAST_REFRESH".bold(),
+        "LAST_ERROR".bold(),
+    )
 }
 
 pub struct ProviderRefreshConfigInput<'a> {
@@ -4580,20 +4593,44 @@ fn provider_refresh_strategy(strategy: &str) -> Result<ProviderCredentialRefresh
 }
 
 fn print_refresh_status_row(status: &ProviderCredentialRefreshStatus) {
+    println!("{}", refresh_status_row(status));
+}
+
+fn refresh_status_row(status: &ProviderCredentialRefreshStatus) -> String {
     let strategy = ProviderCredentialRefreshStrategy::try_from(status.strategy)
         .unwrap_or(ProviderCredentialRefreshStrategy::Unspecified);
-    println!(
-        "{:<28}  {:<28}  {:<18}  {:<20}  {}",
+    format!(
+        "{:<24}  {:<28}  {:<28}  {:<18}  {:<20}  {:<20}  {:<20}  {}",
         status.provider_name,
         status.credential_key,
         provider_refresh_strategy_name(strategy),
-        if status.expires_at_ms > 0 {
-            format_epoch_ms(status.expires_at_ms)
-        } else {
-            "-".to_string()
-        },
-        status.status
-    );
+        status.status,
+        format_optional_epoch_ms(status.expires_at_ms),
+        format_optional_epoch_ms(status.next_refresh_at_ms),
+        format_optional_epoch_ms(status.last_refresh_at_ms),
+        truncate_status_field(&status.last_error, 72),
+    )
+}
+
+fn format_optional_epoch_ms(ms: i64) -> String {
+    if ms > 0 {
+        format_epoch_ms(ms)
+    } else {
+        "-".to_string()
+    }
+}
+
+fn truncate_status_field(value: &str, max_chars: usize) -> String {
+    if value.is_empty() {
+        return "-".to_string();
+    }
+    let mut chars = value.chars();
+    let truncated = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
 }
 
 fn provider_refresh_strategy_name(strategy: ProviderCredentialRefreshStrategy) -> &'static str {
@@ -6626,8 +6663,9 @@ mod tests {
         git_sync_files, http_health_check, image_requests_gpu, import_local_package_mtls_bundle,
         inferred_provider_type, package_managed_tls_dirs, parse_cli_setting_value,
         parse_credential_pairs, plaintext_gateway_is_remote, progress_step_from_metadata,
-        provisioning_timeout_message, ready_false_condition_message, resolve_from,
-        sandbox_should_persist, service_expose_status_error, service_url_for_gateway,
+        provisioning_timeout_message, ready_false_condition_message, refresh_status_header,
+        refresh_status_row, resolve_from, sandbox_should_persist, service_expose_status_error,
+        service_url_for_gateway,
     };
     use crate::TEST_ENV_LOCK;
     use hyper::StatusCode;
@@ -6646,7 +6684,8 @@ mod tests {
         PROGRESS_STEP_STARTING_SANDBOX,
     };
     use openshell_core::proto::{
-        Provider, SandboxCondition, SandboxStatus, datamodel::v1::ObjectMeta,
+        Provider, ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
+        SandboxCondition, SandboxStatus, datamodel::v1::ObjectMeta,
     };
 
     struct EnvVarGuard {
@@ -6800,6 +6839,34 @@ mod tests {
             Some(ProvisioningStep::StartingSandbox)
         );
         assert_eq!(progress_step_from_metadata("driver-private-step"), None);
+    }
+
+    #[test]
+    fn refresh_status_table_includes_operational_fields() {
+        let header = refresh_status_header();
+        assert!(header.contains("NEXT_REFRESH"));
+        assert!(header.contains("LAST_REFRESH"));
+        assert!(header.contains("LAST_ERROR"));
+
+        let row = refresh_status_row(&ProviderCredentialRefreshStatus {
+            provider_name: "my-graph".to_string(),
+            provider_id: "provider-id".to_string(),
+            credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
+            strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials as i32,
+            status: "error".to_string(),
+            expires_at_ms: 1_767_225_600_000,
+            next_refresh_at_ms: 1_767_225_660_000,
+            last_refresh_at_ms: 1_767_225_000_000,
+            last_error: "token endpoint returned a very long error message that should be truncated for table readability"
+                .to_string(),
+        });
+
+        assert!(row.contains("my-graph"));
+        assert!(row.contains("MS_GRAPH_ACCESS_TOKEN"));
+        assert!(row.contains("oauth2_client_credentials"));
+        assert!(row.contains("error"));
+        assert!(row.contains("2026-01-01 00:00:00"));
+        assert!(row.contains("..."));
     }
 
     #[cfg(feature = "dev-settings")]
