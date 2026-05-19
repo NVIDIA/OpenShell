@@ -46,6 +46,11 @@ use openshell_ocsf::{
 };
 use openshell_policy::{
     PolicyMergeOp, ProviderPolicyLayer, compose_effective_policy, merge_policy,
+    serialize_sandbox_policy,
+};
+use openshell_prover::{
+    credentials::CredentialSet, model::build_model, policy::parse_policy_str,
+    queries::run_all_queries, registry::load_embedded_binary_registry,
 };
 use openshell_providers::{get_default_profile, normalize_provider_type};
 use prost::Message;
@@ -303,6 +308,173 @@ fn summarize_draft_chunk_rule(chunk: &DraftChunkRecord) -> Result<String, Status
     let rule = NetworkPolicyRule::decode(chunk.proposed_rule.as_slice())
         .map_err(|e| Status::internal(format!("decode proposed_rule failed: {e}")))?;
     Ok(summarize_add_rule(&chunk.rule_name, &rule))
+}
+
+fn validation_result_for_agent_proposal(
+    current_policy: ProtoSandboxPolicy,
+    rule_name: &str,
+    proposed_rule: &NetworkPolicyRule,
+) -> String {
+    let scope_verdict = scope_verdict_for_rule(proposed_rule);
+
+    let merge_op = PolicyMergeOp::AddRule {
+        rule_name: rule_name.to_string(),
+        rule: proposed_rule.clone(),
+    };
+    let merged = match merge_policy(current_policy, &[merge_op]) {
+        Ok(result) => result.policy,
+        Err(error) => {
+            return format!("failed: policy merge rejected ({error}); {scope_verdict}");
+        }
+    };
+
+    if let Err(error) = validate_policy_safety(&merged) {
+        return format!("failed: policy safety check rejected ({error}); {scope_verdict}");
+    }
+
+    if policy_uses_prover_unsupported_features(&merged) {
+        return format!(
+            "validation unavailable: prover does not model deny_rules yet; {scope_verdict}"
+        );
+    }
+
+    let yaml = match serialize_sandbox_policy(&merged) {
+        Ok(yaml) => yaml,
+        Err(error) => {
+            return format!("validation unavailable: serialize policy failed ({error})");
+        }
+    };
+    let prover_policy = match parse_policy_str(&yaml) {
+        Ok(policy) => policy,
+        Err(error) => {
+            return format!("validation unavailable: parse policy failed ({error})");
+        }
+    };
+    let registry = match load_embedded_binary_registry() {
+        Ok(registry) => registry,
+        Err(error) => {
+            return format!("validation unavailable: load prover registry failed ({error})");
+        }
+    };
+
+    let model = build_model(prover_policy, CredentialSet::default(), registry);
+    let findings = run_all_queries(&model);
+    if findings.is_empty() {
+        return format!("prover passed supported checks; {scope_verdict}");
+    }
+
+    let finding_summary = findings
+        .iter()
+        .map(|finding| format!("{} {}", finding.risk, finding.query))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "failed: prover found {} finding(s): {}; {}",
+        findings.len(),
+        finding_summary,
+        scope_verdict
+    )
+}
+
+fn policy_uses_prover_unsupported_features(policy: &ProtoSandboxPolicy) -> bool {
+    policy
+        .network_policies
+        .values()
+        .flat_map(|rule| &rule.endpoints)
+        .any(|endpoint| !endpoint.deny_rules.is_empty())
+}
+
+fn scope_verdict_for_rule(rule: &NetworkPolicyRule) -> String {
+    let mut needs_human = Vec::new();
+    let mut saw_exact_l7_rule = false;
+
+    for endpoint in &rule.endpoints {
+        if endpoint.protocol.trim().is_empty() {
+            needs_human.push("L4/no method-path scope");
+        }
+        if endpoint.host.contains('*') {
+            needs_human.push("wildcard host");
+        }
+        if !endpoint.protocol.trim().is_empty() && endpoint.rules.is_empty() {
+            needs_human.push("L7 preset/no exact method-path");
+        }
+
+        for rule in &endpoint.rules {
+            let Some(allow) = rule.allow.as_ref() else {
+                needs_human.push("unsupported L7 rule shape");
+                continue;
+            };
+            let method = allow.method.trim();
+            let path = allow.path.trim();
+            if method.is_empty() || method == "*" {
+                needs_human.push("wildcard method");
+            }
+            if path.is_empty() || path.contains('*') {
+                needs_human.push("wildcard path");
+            }
+            if !method.is_empty() && method != "*" && !path.is_empty() && !path.contains('*') {
+                saw_exact_l7_rule = true;
+            }
+        }
+    }
+
+    needs_human.sort_unstable();
+    needs_human.dedup();
+    if needs_human.is_empty() && saw_exact_l7_rule {
+        "narrow L7 method/path scope".to_string()
+    } else if needs_human.is_empty() {
+        "needs human: no exact L7 method/path evidence".to_string()
+    } else {
+        format!("needs human: {}", needs_human.join(", "))
+    }
+}
+
+async fn current_effective_policy_for_sandbox(
+    state: &ServerState,
+    sandbox: &Sandbox,
+    sandbox_id: &str,
+) -> Result<ProtoSandboxPolicy, Status> {
+    let mut policy = if let Some(record) = state
+        .store
+        .get_latest_policy(sandbox_id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch latest policy failed: {e}")))?
+    {
+        ProtoSandboxPolicy::decode(record.policy_payload.as_slice())
+            .map_err(|e| Status::internal(format!("decode current policy failed: {e}")))?
+    } else {
+        sandbox
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.policy.clone())
+            .unwrap_or_default()
+    };
+
+    let global_settings = load_global_settings(state.store.as_ref()).await?;
+    let policy_source = decode_policy_from_global_settings(&global_settings)?.map_or(
+        PolicySource::Sandbox,
+        |global_policy| {
+            policy = global_policy;
+            PolicySource::Global
+        },
+    );
+
+    let providers_v2_enabled =
+        bool_setting_enabled(&global_settings, settings::PROVIDERS_V2_ENABLED_KEY)?;
+    if providers_v2_enabled && !matches!(policy_source, PolicySource::Global) {
+        let provider_names = sandbox
+            .spec
+            .as_ref()
+            .map(|spec| spec.providers.clone())
+            .unwrap_or_default();
+        let provider_layers =
+            profile_provider_policy_layers(state.store.as_ref(), &provider_names).await?;
+        if !provider_layers.is_empty() {
+            policy = compose_effective_policy(&policy, &provider_layers);
+        }
+    }
+
+    Ok(policy)
 }
 
 fn truncate_for_log(input: &str, max_chars: usize) -> String {
@@ -1444,6 +1616,7 @@ pub(super) async fn handle_submit_policy_analysis(
     let sandbox =
         resolve_sandbox_by_name_for_principal(state.store.as_ref(), &principal, &req.name).await?;
     let sandbox_id = sandbox.object_id().to_string();
+    let current_policy = current_effective_policy_for_sandbox(state, &sandbox, &sandbox_id).await?;
 
     let current_version = state
         .store
@@ -1486,6 +1659,16 @@ pub(super) async fn handle_submit_policy_analysis(
             .map(|b| b.path.clone())
             .unwrap_or_default();
 
+        let validation_result = if req.analysis_mode == "agent_authored" {
+            validation_result_for_agent_proposal(
+                current_policy.clone(),
+                &chunk.rule_name,
+                chunk.proposed_rule.as_ref().expect("checked above"),
+            )
+        } else {
+            String::new()
+        };
+
         let record = DraftChunkRecord {
             // The handler proposes an id; the store may swap it for an
             // existing row's id on dedup. Always trust `effective_id` for
@@ -1518,7 +1701,7 @@ pub(super) async fn handle_submit_policy_analysis(
             } else {
                 now_ms
             },
-            validation_result: String::new(),
+            validation_result,
             rejection_reason: String::new(),
         };
         // Mechanistic mode dedups N denials targeting the same endpoint
@@ -4688,8 +4871,434 @@ mod tests {
             rejected.rejection_reason, guidance,
             "reviewer's free-form reason must round-trip into the chunk for agent readback"
         );
-        // validation_result is unpopulated until the prover runs (#1097).
+        // Non-agent-authored submissions keep validation_result empty; the
+        // gateway prover path is reserved for analysis_mode=agent_authored.
         assert!(rejected.validation_result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn agent_authored_exact_l7_proposal_gets_prover_pass_verdict() {
+        use openshell_core::proto::{
+            FilesystemPolicy, L7Allow, L7Rule, NetworkBinary, NetworkEndpoint, SandboxPhase,
+            SandboxPolicy, SandboxSpec,
+        };
+
+        let state = test_server_state().await;
+        let sandbox_name = "agent-l7-verdict".to_string();
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-agent-l7-verdict".to_string(),
+                name: sandbox_name.clone(),
+                created_at_ms: 1_000_000,
+                labels: std::collections::HashMap::new(),
+            }),
+            spec: Some(SandboxSpec {
+                policy: Some(SandboxPolicy {
+                    version: 1,
+                    filesystem: Some(FilesystemPolicy {
+                        read_write: vec!["/sandbox".to_string()],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            phase: SandboxPhase::Ready as i32,
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let proposed_rule = NetworkPolicyRule {
+            name: "github_contents_write".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "api.github.com".to_string(),
+                port: 443,
+                protocol: "rest".to_string(),
+                enforcement: "enforce".to_string(),
+                rules: vec![L7Rule {
+                    allow: Some(L7Allow {
+                        method: "PUT".to_string(),
+                        path: "/repos/org/repo/contents/demo/file.md".to_string(),
+                        ..Default::default()
+                    }),
+                }],
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        handle_submit_policy_analysis(
+            &state,
+            Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.clone(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "github_contents_write".to_string(),
+                    proposed_rule: Some(proposed_rule),
+                    rationale: "write one demo file".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let draft = handle_get_draft_policy(
+            &state,
+            Request::new(GetDraftPolicyRequest {
+                name: sandbox_name,
+                status_filter: String::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let verdict = &draft.chunks[0].validation_result;
+        assert!(
+            verdict.contains("prover passed"),
+            "expected prover pass verdict, got: {verdict}"
+        );
+        assert!(
+            verdict.contains("narrow L7 method/path scope"),
+            "expected narrow L7 scope verdict, got: {verdict}"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_authored_l4_proposal_gets_broad_scope_verdict() {
+        use openshell_core::proto::{
+            FilesystemPolicy, NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxPolicy,
+            SandboxSpec,
+        };
+
+        let state = test_server_state().await;
+        let sandbox_name = "agent-l4-verdict".to_string();
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-agent-l4-verdict".to_string(),
+                name: sandbox_name.clone(),
+                created_at_ms: 1_000_000,
+                labels: std::collections::HashMap::new(),
+            }),
+            spec: Some(SandboxSpec {
+                policy: Some(SandboxPolicy {
+                    version: 1,
+                    filesystem: Some(FilesystemPolicy {
+                        read_write: vec!["/sandbox".to_string()],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            phase: SandboxPhase::Ready as i32,
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let proposed_rule = NetworkPolicyRule {
+            name: "github_l4".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "api.github.com".to_string(),
+                port: 443,
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        handle_submit_policy_analysis(
+            &state,
+            Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.clone(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "github_l4".to_string(),
+                    proposed_rule: Some(proposed_rule),
+                    rationale: "broad fallback".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let draft = handle_get_draft_policy(
+            &state,
+            Request::new(GetDraftPolicyRequest {
+                name: sandbox_name,
+                status_filter: String::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let verdict = &draft.chunks[0].validation_result;
+        assert!(
+            verdict.contains("L4/no method-path scope"),
+            "expected L4 scope warning, got: {verdict}"
+        );
+        assert!(
+            verdict.contains("failed: prover found"),
+            "expected prover finding for broad L4 curl access, got: {verdict}"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_authored_policy_with_deny_rules_marks_validation_unavailable() {
+        use openshell_core::proto::{
+            FilesystemPolicy, L7Allow, L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint,
+            SandboxPhase, SandboxPolicy, SandboxSpec,
+        };
+
+        let state = test_server_state().await;
+        let sandbox_name = "agent-deny-unsupported".to_string();
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-agent-deny-unsupported".to_string(),
+                name: sandbox_name.clone(),
+                created_at_ms: 1_000_000,
+                labels: std::collections::HashMap::new(),
+            }),
+            spec: Some(SandboxSpec {
+                policy: Some(SandboxPolicy {
+                    version: 1,
+                    filesystem: Some(FilesystemPolicy {
+                        read_write: vec!["/sandbox".to_string()],
+                        ..Default::default()
+                    }),
+                    network_policies: std::iter::once((
+                        "existing_deny_rule".to_string(),
+                        NetworkPolicyRule {
+                            name: "existing_deny_rule".to_string(),
+                            endpoints: vec![NetworkEndpoint {
+                                host: "api.github.com".to_string(),
+                                port: 443,
+                                protocol: "rest".to_string(),
+                                deny_rules: vec![L7DenyRule {
+                                    method: "DELETE".to_string(),
+                                    path: "/repos/*".to_string(),
+                                    ..Default::default()
+                                }],
+                                ..Default::default()
+                            }],
+                            binaries: vec![NetworkBinary {
+                                path: "/usr/bin/curl".to_string(),
+                                ..Default::default()
+                            }],
+                        },
+                    ))
+                    .collect(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            phase: SandboxPhase::Ready as i32,
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let proposed_rule = NetworkPolicyRule {
+            name: "github_contents_write".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "api.github.com".to_string(),
+                port: 443,
+                protocol: "rest".to_string(),
+                enforcement: "enforce".to_string(),
+                rules: vec![L7Rule {
+                    allow: Some(L7Allow {
+                        method: "PUT".to_string(),
+                        path: "/repos/org/repo/contents/demo/file.md".to_string(),
+                        ..Default::default()
+                    }),
+                }],
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        handle_submit_policy_analysis(
+            &state,
+            Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.clone(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "github_contents_write".to_string(),
+                    proposed_rule: Some(proposed_rule),
+                    rationale: "write one demo file".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let draft = handle_get_draft_policy(
+            &state,
+            Request::new(GetDraftPolicyRequest {
+                name: sandbox_name,
+                status_filter: String::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let verdict = &draft.chunks[0].validation_result;
+        assert!(
+            verdict.contains("validation unavailable"),
+            "expected unsupported-feature verdict, got: {verdict}"
+        );
+        assert!(
+            verdict.contains("deny_rules"),
+            "expected deny_rules limitation in verdict, got: {verdict}"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_authored_validation_uses_providers_v2_effective_policy() {
+        use openshell_core::proto::{
+            FilesystemPolicy, L7Allow, L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint,
+            ProviderProfile, ProviderProfileCategory, SandboxPhase, SandboxPolicy, SandboxSpec,
+            StoredProviderProfile,
+        };
+
+        let state = test_server_state().await;
+        enable_providers_v2(&state).await;
+        state
+            .store
+            .put_message(&test_provider("work-custom", "custom-api"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&StoredProviderProfile {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "profile-custom-api".to_string(),
+                    name: "custom-api".to_string(),
+                    created_at_ms: 1_000_000,
+                    labels: HashMap::new(),
+                }),
+                profile: Some(ProviderProfile {
+                    id: "custom-api".to_string(),
+                    display_name: "Custom API".to_string(),
+                    description: String::new(),
+                    category: ProviderProfileCategory::Other as i32,
+                    credentials: Vec::new(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: "api.github.com".to_string(),
+                        port: 443,
+                        protocol: "rest".to_string(),
+                        deny_rules: vec![L7DenyRule {
+                            method: "DELETE".to_string(),
+                            path: "/repos/*".to_string(),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                    binaries: vec![NetworkBinary {
+                        path: "/usr/bin/curl".to_string(),
+                        ..Default::default()
+                    }],
+                    inference_capable: false,
+                }),
+            })
+            .await
+            .unwrap();
+
+        let sandbox_name = "agent-provider-effective-policy".to_string();
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-agent-provider-effective-policy".to_string(),
+                name: sandbox_name.clone(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+            }),
+            spec: Some(SandboxSpec {
+                policy: Some(SandboxPolicy {
+                    version: 1,
+                    filesystem: Some(FilesystemPolicy {
+                        read_write: vec!["/sandbox".to_string()],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                providers: vec!["work-custom".to_string()],
+                ..Default::default()
+            }),
+            phase: SandboxPhase::Ready as i32,
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let proposed_rule = NetworkPolicyRule {
+            name: "github_contents_write".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "api.github.com".to_string(),
+                port: 443,
+                protocol: "rest".to_string(),
+                enforcement: "enforce".to_string(),
+                rules: vec![L7Rule {
+                    allow: Some(L7Allow {
+                        method: "PUT".to_string(),
+                        path: "/repos/org/repo/contents/demo/file.md".to_string(),
+                        ..Default::default()
+                    }),
+                }],
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        handle_submit_policy_analysis(
+            &state,
+            Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.clone(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "github_contents_write".to_string(),
+                    proposed_rule: Some(proposed_rule),
+                    rationale: "write one demo file".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let draft = handle_get_draft_policy(
+            &state,
+            Request::new(GetDraftPolicyRequest {
+                name: sandbox_name,
+                status_filter: String::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let verdict = &draft.chunks[0].validation_result;
+        assert!(
+            verdict.contains("validation unavailable"),
+            "expected provider-composed unsupported feature to affect validation, got: {verdict}"
+        );
+        assert!(
+            verdict.contains("deny_rules"),
+            "expected provider-composed deny_rules limitation in verdict, got: {verdict}"
+        );
     }
 
     /// Two agent-authored proposals targeting the same host/port/binary must

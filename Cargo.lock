@@ -3717,6 +3717,7 @@ dependencies = [
  "openshell-driver-podman",
  "openshell-ocsf",
  "openshell-policy",
+ "openshell-prover",
  "openshell-providers",
  "openshell-router",
  "openshell-server-macros",

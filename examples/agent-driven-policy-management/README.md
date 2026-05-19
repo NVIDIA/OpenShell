@@ -12,12 +12,16 @@ Run the full agent-driven policy loop end-to-end:
 3. The agent reads `/etc/openshell/skills/policy_advisor.md`, drafts the
    narrowest rule needed, and submits it to `http://policy.local/v1/proposals`.
    It saves the returned `chunk_id`.
-4. The agent calls `GET /v1/proposals/{chunk_id}/wait?timeout=300` — a single
+4. The gateway merges the proposed rule with the current sandbox policy, runs
+   the policy prover, and stores a concise `validation_result` on the pending
+   chunk. This is deterministic control-plane evidence, not agent prose.
+5. The agent calls `GET /v1/proposals/{chunk_id}/wait?timeout=300` — a single
    HTTP request that the supervisor holds open until the developer decides.
    This is the load-bearing UX point: the agent burns zero LLM tokens while
    it waits; it's literally sleeping on a socket.
-5. You approve the proposal from the host with one keystroke.
-6. The agent's `/wait` returns within ~1 second of the approval. The sandbox
+6. You approve the proposal from the host with one keystroke after seeing the
+   exact rule and the prover verdict in `openshell rule get`.
+7. The agent's `/wait` returns within ~1 second of the approval. The sandbox
    has hot-reloaded the merged policy; the agent retries the original PUT
    once and exits.
 
@@ -99,12 +103,16 @@ with three parts, each with a different trust level:
 | `validation_result` (prover output) | gateway-side prover | trust signal — but this surface is in progress (see [RFC 0001](../../rfc/0001-agent-driven-policy-management.md)) |
 
 The MVP today shows the structured rule plus the agent's rationale in
-`openshell rule get` and the TUI inbox panel. The demo's `openshell rule
-approve-all` auto-approves to keep the loop short — in a real session a
-developer reviews the structured grant before pressing `a`. Prover-backed
-validation badges, computed reachability deltas, and a richer "this is what
-the rule actually permits" summary are the next phase. For now, **always
-approve based on the structured rule, not the agent's rationale.**
+`openshell rule get` and the TUI inbox panel. With prover validation wired into
+the gateway, `openshell rule get` also shows `Validation:` for agent-authored
+chunks, for example `prover passed supported checks; narrow L7 method/path
+scope`, a prover finding plus `needs human: L4/no method-path scope`, or
+`validation unavailable` when the proposed effective policy uses features the
+prover does not model yet. The demo's `openshell rule approve-all`
+auto-approves to keep the loop short — in a real session a developer reviews
+the structured grant and the validation result before pressing `a`. For now,
+**always approve based on the structured rule and control-plane validation, not
+the agent's rationale.**
 
 ## Going further
 
