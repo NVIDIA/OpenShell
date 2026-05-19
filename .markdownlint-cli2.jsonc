@@ -16,6 +16,7 @@
     ".claude/**",
     ".opencode/**",
     ".github/**",
+    "architecture/plans/**",
     "**/node_modules/**",
     "target/**",
     ".pytest_cache/**",
