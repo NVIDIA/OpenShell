@@ -9,6 +9,7 @@ use crate::tls::{
     grpc_inference_client, require_tls_materials,
 };
 use bytes::Bytes;
+use chrono::DateTime;
 use dialoguer::{Confirm, Select, theme::ColorfulTheme};
 use futures::StreamExt;
 use http_body_util::Full;
@@ -3758,13 +3759,57 @@ fn parse_credential_pairs(items: &[String]) -> Result<HashMap<String, String>> {
     Ok(map)
 }
 
+pub fn parse_credential_expiry_cli_value(value: &str) -> std::result::Result<i64, String> {
+    parse_credential_expiry_value(value, None).map_err(|err| err.to_string())
+}
+
+fn credential_expiry_value_error(key: Option<&str>, detail: &str) -> miette::Report {
+    key.map_or_else(
+        || miette::miette!("--credential-expires-at value {detail}"),
+        |key| miette::miette!("--credential-expires-at value for '{key}' {detail}"),
+    )
+}
+
+fn parse_credential_expiry_value(value: &str, key: Option<&str>) -> Result<i64> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(credential_expiry_value_error(key, "cannot be empty"));
+    }
+
+    if let Ok(value_ms) = value.parse::<i64>() {
+        if value_ms < 0 {
+            return Err(credential_expiry_value_error(
+                key,
+                "must be greater than or equal to 0",
+            ));
+        }
+        return Ok(value_ms);
+    }
+
+    let parsed = DateTime::parse_from_rfc3339(value).map_err(|_| {
+        credential_expiry_value_error(
+            key,
+            "must be a Unix epoch millisecond timestamp or RFC3339 timestamp",
+        )
+    })?;
+    let value_ms = parsed.timestamp_millis();
+    if value_ms < 0 {
+        return Err(credential_expiry_value_error(
+            key,
+            "must be greater than or equal to 0",
+        ));
+    }
+
+    Ok(value_ms)
+}
+
 fn parse_credential_expiry_pairs(items: &[String]) -> Result<HashMap<String, i64>> {
     let mut map = HashMap::new();
 
     for item in items {
         let Some((key, value)) = item.split_once('=') else {
             return Err(miette::miette!(
-                "--credential-expires-at expects KEY=TIMESTAMP_MS, got '{item}'"
+                "--credential-expires-at expects KEY=TIMESTAMP, got '{item}'"
             ));
         };
         let key = key.trim();
@@ -3773,16 +3818,7 @@ fn parse_credential_expiry_pairs(items: &[String]) -> Result<HashMap<String, i64
                 "--credential-expires-at key cannot be empty"
             ));
         }
-        let value = value.trim().parse::<i64>().map_err(|_| {
-            miette::miette!(
-                "--credential-expires-at value for '{key}' must be a Unix epoch millisecond timestamp"
-            )
-        })?;
-        if value < 0 {
-            return Err(miette::miette!(
-                "--credential-expires-at value for '{key}' must be greater than or equal to 0"
-            ));
-        }
+        let value = parse_credential_expiry_value(value, Some(key))?;
         map.insert(key.to_string(), value);
     }
 
@@ -6674,7 +6710,8 @@ mod tests {
         gateway_auth_label, gateway_env_override_warning, gateway_select_with, gateway_type_label,
         git_sync_files, http_health_check, image_requests_gpu, import_local_package_mtls_bundle,
         inferred_provider_type, package_managed_tls_dirs, parse_cli_setting_value,
-        parse_credential_pairs, plaintext_gateway_is_remote, progress_step_from_metadata,
+        parse_credential_expiry_cli_value, parse_credential_expiry_pairs, parse_credential_pairs,
+        plaintext_gateway_is_remote, progress_step_from_metadata,
         provider_profile_allows_refresh_bootstrap, provisioning_timeout_message,
         ready_false_condition_message, refresh_status_header, refresh_status_row, resolve_from,
         sandbox_should_persist, service_expose_status_error, service_url_for_gateway,
@@ -6800,6 +6837,48 @@ mod tests {
         assert!(err.to_string().contains(
             "requires local env var 'NAV_PARSE_CREDENTIAL_EMPTY' to be set to a non-empty value"
         ));
+    }
+
+    #[test]
+    fn parse_credential_expiry_pairs_accepts_epoch_millis_and_rfc3339() {
+        let parsed = parse_credential_expiry_pairs(&[
+            "API_TOKEN=1767225600000".to_string(),
+            "MS_GRAPH_ACCESS_TOKEN=2026-01-01T00:00:00Z".to_string(),
+        ])
+        .expect("parse");
+
+        assert_eq!(parsed.get("API_TOKEN"), Some(&1_767_225_600_000));
+        assert_eq!(
+            parsed.get("MS_GRAPH_ACCESS_TOKEN"),
+            Some(&1_767_225_600_000)
+        );
+    }
+
+    #[test]
+    fn parse_credential_expiry_pairs_accepts_zero_to_clear_expiry() {
+        let parsed =
+            parse_credential_expiry_pairs(&["API_TOKEN=0".to_string()]).expect("parse zero");
+
+        assert_eq!(parsed.get("API_TOKEN"), Some(&0));
+    }
+
+    #[test]
+    fn parse_credential_expiry_rejects_invalid_timestamp() {
+        let err = parse_credential_expiry_pairs(&["API_TOKEN=next-week".to_string()])
+            .expect_err("invalid timestamp should error");
+
+        assert!(
+            err.to_string()
+                .contains("must be a Unix epoch millisecond timestamp or RFC3339 timestamp")
+        );
+    }
+
+    #[test]
+    fn parse_credential_expiry_cli_value_accepts_rfc3339_offsets() {
+        let parsed = parse_credential_expiry_cli_value("2026-01-01T01:00:00+01:00")
+            .expect("parse RFC3339 with offset");
+
+        assert_eq!(parsed, 1_767_225_600_000);
     }
 
     #[test]

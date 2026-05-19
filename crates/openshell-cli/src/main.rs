@@ -788,8 +788,8 @@ enum ProviderCommands {
         #[arg(long = "config", value_name = "KEY=VALUE")]
         config: Vec<String>,
 
-        /// Credential expiry (`KEY=TIMESTAMP_MS`). A zero timestamp clears expiry.
-        #[arg(long = "credential-expires-at", value_name = "KEY=TIMESTAMP_MS")]
+        /// Credential expiry (`KEY=TIMESTAMP`). Accepts epoch milliseconds or RFC3339. A zero timestamp clears expiry.
+        #[arg(long = "credential-expires-at", value_name = "KEY=TIMESTAMP")]
         credential_expires_at: Vec<String>,
     },
 
@@ -839,8 +839,12 @@ enum ProviderRefreshCommands {
         #[arg(long = "secret-material-key", value_name = "KEY")]
         secret_material_keys: Vec<String>,
 
-        /// Expiry for the current credential (`TIMESTAMP_MS`).
-        #[arg(long = "credential-expires-at", value_name = "TIMESTAMP_MS")]
+        /// Expiry for the current credential. Accepts epoch milliseconds or RFC3339.
+        #[arg(
+            long = "credential-expires-at",
+            value_name = "TIMESTAMP",
+            value_parser = run::parse_credential_expiry_cli_value
+        )]
         credential_expires_at: Option<i64>,
     },
 
@@ -3831,6 +3835,36 @@ mod tests {
                     ..
                 })
             }) if credential_expires_at == vec!["MS_GRAPH_ACCESS_TOKEN=1767225600000"]
+        ));
+    }
+
+    #[test]
+    fn provider_refresh_config_accepts_rfc3339_credential_expiry() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "refresh",
+            "configure",
+            "my-graph",
+            "--credential-key",
+            "MS_GRAPH_ACCESS_TOKEN",
+            "--strategy",
+            "oauth2-client-credentials",
+            "--credential-expires-at",
+            "2026-01-01T00:00:00Z",
+        ])
+        .expect("provider refresh configure should parse RFC3339 credential expiry");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::Refresh(
+                    ProviderRefreshCommands::Configure {
+                        credential_expires_at: Some(1_767_225_600_000),
+                        ..
+                    }
+                ))
+            })
         ));
     }
 
