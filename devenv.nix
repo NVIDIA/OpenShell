@@ -167,9 +167,14 @@ in
 
     mise_trust_status="$(mise trust --show 2>/dev/null || true)"
     if printf '%s\n' "$mise_trust_status" | grep -q ': untrusted$'; then
-      echo "OpenShell devenv ready. Run 'mise trust' once, then 'mise install --locked'."
+      echo "OpenShell devenv ready. Run 'mise trust' once."
     else
-      echo "OpenShell devenv ready. Run 'mise install --locked'."
+      mise_missing_tools="$(mise ls --current --missing --no-header 2>/dev/null || true)"
+      if [ -n "$mise_missing_tools" ]; then
+        echo "OpenShell devenv ready. Run 'mise install --locked'."
+      else
+        echo "OpenShell devenv ready."
+      fi
     fi
   '';
 
