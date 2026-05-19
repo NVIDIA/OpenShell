@@ -106,8 +106,9 @@ mise trust
 mise install --locked
 ```
 
-On macOS, install Xcode Command Line Tools separately; the devenv shell uses the
-host Apple compiler so C++ builds can see the Apple SDK and libc++ headers.
+On macOS, keep Xcode Command Line Tools installed for host developer tools. The
+devenv shell configures Nix's Darwin clang wrapper and Apple SDK paths so C++
+builds can see SDK and libc++ headers.
 
 The Docker daemon/machine still has to be configured on the host. Podman is not
 installed by the devenv shell; if you use the Podman driver, install it on the

@@ -110,8 +110,8 @@ in
     llvmPackages.libclang
   ] ++ lib.optionals isDarwin [
     # macOS VM runtime build dependencies that are otherwise documented as
-    # Homebrew prerequisites. Darwin uses the host Xcode/CLT compiler so C++
-    # probes can see the Apple SDK and libc++ headers.
+    # Homebrew prerequisites. Darwin builds use Nix's clang wrapper and Apple
+    # SDK paths so C++ probes can see SDK and libc++ headers.
     dtc
     llvmPackages.lld
   ] ++ [

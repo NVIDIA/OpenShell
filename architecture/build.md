@@ -68,8 +68,8 @@ provides host-native prerequisites such as Z3, `pkg-config`, libclang,
 e2fsprogs, container client CLIs, and platform-specific VM build dependencies
 (`elfutils`/`libcap-ng` on Linux, `lld`/`dtc` on macOS); `mise` remains the task
 runner and installs the version-pinned language/toolchain entries from
-`mise.toml`. On macOS the shell uses the host Xcode/Command Line Tools compiler
-so C++ probes build against the Apple SDK and libc++ headers. The shell also
+`mise.toml`. On macOS the shell configures Nix's Darwin clang wrapper and Apple
+SDK paths so C++ probes build against SDK and libc++ headers. The shell also
 raises the soft open-file limit when possible so parallel Cargo and `sccache`
 workloads do not inherit macOS's low interactive default.
 

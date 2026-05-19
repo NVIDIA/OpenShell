@@ -231,8 +231,8 @@ Each table is created atomically via `nft -f` on VM start and torn down atomical
 - macOS on Apple Silicon, or Linux on aarch64/x86_64 with KVM
 - On macOS and Linux, `devenv shell` provides the native build prerequisites
   without installing them through Homebrew, `apt`, or `dnf`
-- Xcode Command Line Tools on macOS; the devenv shell uses the host Apple
-  compiler for SDK and libc++ support
+- Xcode Command Line Tools on macOS for host developer tools; the devenv shell
+  configures Nix's Darwin clang wrapper and Apple SDK paths for C++ builds
 - Rust toolchain
 - e2fsprogs (`mke2fs` or `mkfs.ext4`, plus `debugfs`) for root and overlay disk
   image creation and QEMU environment injection
