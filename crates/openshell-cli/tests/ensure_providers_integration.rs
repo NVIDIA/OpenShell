@@ -67,6 +67,7 @@ impl TestOpenShell {
                 r#type: provider_type.to_string(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
             },
         );
     }
@@ -319,6 +320,19 @@ impl OpenShell for TestOpenShell {
             }
             base
         };
+        let merge_expiry = |mut base: HashMap<String, i64>, incoming: HashMap<String, i64>| {
+            if incoming.is_empty() {
+                return base;
+            }
+            for (k, v) in incoming {
+                if v <= 0 {
+                    base.remove(&k);
+                } else {
+                    base.insert(k, v);
+                }
+            }
+            base
+        };
         let existing_metadata = existing.metadata.clone().unwrap_or_default();
         let provider_metadata = provider.metadata.clone().unwrap_or_default();
         let updated = Provider {
@@ -332,12 +346,43 @@ impl OpenShell for TestOpenShell {
             r#type: existing.r#type,
             credentials: merge(existing.credentials, provider.credentials),
             config: merge(existing.config, provider.config),
+            credential_expires_at_ms: merge_expiry(
+                existing.credential_expires_at_ms,
+                provider.credential_expires_at_ms,
+            ),
         };
         let updated_name = updated.object_name().to_string();
         providers.insert(updated_name, updated.clone());
         Ok(Response::new(ProviderResponse {
             provider: Some(updated),
         }))
+    }
+    async fn get_provider_refresh_status(
+        &self,
+        _: tonic::Request<openshell_core::proto::GetProviderRefreshStatusRequest>,
+    ) -> Result<Response<openshell_core::proto::GetProviderRefreshStatusResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn configure_provider_refresh(
+        &self,
+        _: tonic::Request<openshell_core::proto::ConfigureProviderRefreshRequest>,
+    ) -> Result<Response<openshell_core::proto::ConfigureProviderRefreshResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn rotate_provider_credential(
+        &self,
+        _: tonic::Request<openshell_core::proto::RotateProviderCredentialRequest>,
+    ) -> Result<Response<openshell_core::proto::RotateProviderCredentialResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn delete_provider_refresh(
+        &self,
+        _: tonic::Request<openshell_core::proto::DeleteProviderRefreshRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteProviderRefreshResponse>, Status> {
+        Err(Status::unimplemented("unused"))
     }
 
     async fn delete_provider(
@@ -687,19 +732,19 @@ async fn inferred_type_auto_creates_provider() {
     let result = run::ensure_required_providers(
         &mut client,
         &[],
-        &["claude".to_string()],
+        &["claude-code".to_string()],
         Some(true), // --auto-providers
     )
     .await
     .expect("should auto-create the inferred provider");
 
-    assert_eq!(result, vec!["claude".to_string()]);
+    assert_eq!(result, vec!["claude-code".to_string()]);
 
     let providers = ts.openshell.state.providers.lock().await;
     let provider = providers
-        .get("claude")
-        .expect("claude provider should exist");
-    assert_eq!(provider.r#type, "claude");
+        .get("claude-code")
+        .expect("claude-code provider should exist");
+    assert_eq!(provider.r#type, "claude-code");
 }
 
 /// When `--no-auto-providers` is set, missing explicit providers that would
@@ -751,7 +796,7 @@ async fn explicit_and_inferred_providers_combined() {
     let result = run::ensure_required_providers(
         &mut client,
         &["nvidia".to_string()],
-        &["claude".to_string()],
+        &["claude-code".to_string()],
         Some(true),
     )
     .await
@@ -759,12 +804,12 @@ async fn explicit_and_inferred_providers_combined() {
 
     assert_eq!(result.len(), 2);
     assert!(result.contains(&"nvidia".to_string()));
-    assert!(result.contains(&"claude".to_string()));
+    assert!(result.contains(&"claude-code".to_string()));
 
     let providers = ts.openshell.state.providers.lock().await;
     assert_eq!(providers.len(), 2);
     assert!(providers.contains_key("nvidia"));
-    assert!(providers.contains_key("claude"));
+    assert!(providers.contains_key("claude-code"));
 }
 
 /// When an explicit provider name matches an inferred type, the provider

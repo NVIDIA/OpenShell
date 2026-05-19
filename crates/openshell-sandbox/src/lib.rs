@@ -351,7 +351,7 @@ pub async fn run_sandbox(
     // Fetch provider environment variables from the server.
     // This is done after loading the policy so the sandbox can still start
     // even if provider env fetch fails (graceful degradation).
-    let (provider_env_revision, provider_env) =
+    let (provider_env_revision, provider_env, provider_credential_expires_at_ms) =
         if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
             match grpc_client::fetch_provider_environment(endpoint, id).await {
                 Ok(result) => {
@@ -366,7 +366,11 @@ pub async fn run_sandbox(
                             ))
                             .build()
                     );
-                    (result.provider_env_revision, result.environment)
+                    (
+                        result.provider_env_revision,
+                        result.environment,
+                        result.credential_expires_at_ms,
+                    )
                 }
                 Err(e) => {
                     ocsf_emit!(
@@ -379,16 +383,25 @@ pub async fn run_sandbox(
                             ))
                             .build()
                     );
-                    (0, std::collections::HashMap::new())
+                    (
+                        0,
+                        std::collections::HashMap::new(),
+                        std::collections::HashMap::new(),
+                    )
                 }
             }
         } else {
-            (0, std::collections::HashMap::new())
+            (
+                0,
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+            )
         };
 
     let provider_credentials = provider_credentials::ProviderCredentialState::from_environment(
         provider_env_revision,
         provider_env,
+        provider_credential_expires_at_ms,
     );
     let provider_env = provider_credentials.snapshot().child_env.clone();
 
@@ -2359,6 +2372,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
                     let env_count = ctx.provider_credentials.install_environment(
                         env_result.provider_env_revision,
                         env_result.environment,
+                        env_result.credential_expires_at_ms,
                     );
                     current_provider_env_revision = env_result.provider_env_revision;
                     ocsf_emit!(

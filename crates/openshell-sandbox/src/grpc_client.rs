@@ -228,6 +228,7 @@ pub async fn fetch_provider_environment(
     Ok(ProviderEnvironmentResult {
         environment: inner.environment,
         provider_env_revision: inner.provider_env_revision,
+        credential_expires_at_ms: inner.credential_expires_at_ms,
     })
 }
 
@@ -257,6 +258,7 @@ pub struct SettingsPollResult {
 pub struct ProviderEnvironmentResult {
     pub environment: HashMap<String, String>,
     pub provider_env_revision: u64,
+    pub credential_expires_at_ms: HashMap<String, i64>,
 }
 
 impl CachedOpenShellClient {

@@ -25,6 +25,7 @@ use hyper_util::rt::TokioIo;
 use serde::Deserialize;
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
+use tonic::{Response, Status};
 
 // ---------------------------------------------------------------------------
 // Test auth handler (mirrors auth.rs but no ServerState)
@@ -390,20 +391,18 @@ impl openshell_core::proto::open_shell_server::OpenShell for TestOpenShell {
     async fn health(
         &self,
         _request: tonic::Request<openshell_core::proto::HealthRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::HealthResponse>, tonic::Status> {
-        Ok(tonic::Response::new(
-            openshell_core::proto::HealthResponse {
-                status: openshell_core::proto::ServiceStatus::Healthy.into(),
-                version: "test".to_string(),
-            },
-        ))
+    ) -> Result<Response<openshell_core::proto::HealthResponse>, Status> {
+        Ok(Response::new(openshell_core::proto::HealthResponse {
+            status: openshell_core::proto::ServiceStatus::Healthy.into(),
+            version: "test".to_string(),
+        }))
     }
 
     async fn create_sandbox(
         &self,
         _: tonic::Request<openshell_core::proto::CreateSandboxRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::SandboxResponse>, tonic::Status> {
-        Ok(tonic::Response::new(
+    ) -> Result<Response<openshell_core::proto::SandboxResponse>, Status> {
+        Ok(Response::new(
             openshell_core::proto::SandboxResponse::default(),
         ))
     }
@@ -411,8 +410,8 @@ impl openshell_core::proto::open_shell_server::OpenShell for TestOpenShell {
     async fn get_sandbox(
         &self,
         _: tonic::Request<openshell_core::proto::GetSandboxRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::SandboxResponse>, tonic::Status> {
-        Ok(tonic::Response::new(
+    ) -> Result<Response<openshell_core::proto::SandboxResponse>, Status> {
+        Ok(Response::new(
             openshell_core::proto::SandboxResponse::default(),
         ))
     }
@@ -420,8 +419,8 @@ impl openshell_core::proto::open_shell_server::OpenShell for TestOpenShell {
     async fn list_sandboxes(
         &self,
         _: tonic::Request<openshell_core::proto::ListSandboxesRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::ListSandboxesResponse>, tonic::Status> {
-        Ok(tonic::Response::new(
+    ) -> Result<Response<openshell_core::proto::ListSandboxesResponse>, Status> {
+        Ok(Response::new(
             openshell_core::proto::ListSandboxesResponse::default(),
         ))
     }
@@ -429,9 +428,8 @@ impl openshell_core::proto::open_shell_server::OpenShell for TestOpenShell {
     async fn list_sandbox_providers(
         &self,
         _: tonic::Request<openshell_core::proto::ListSandboxProvidersRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::ListSandboxProvidersResponse>, tonic::Status>
-    {
-        Ok(tonic::Response::new(
+    ) -> Result<Response<openshell_core::proto::ListSandboxProvidersResponse>, Status> {
+        Ok(Response::new(
             openshell_core::proto::ListSandboxProvidersResponse::default(),
         ))
     }
@@ -439,9 +437,8 @@ impl openshell_core::proto::open_shell_server::OpenShell for TestOpenShell {
     async fn attach_sandbox_provider(
         &self,
         _: tonic::Request<openshell_core::proto::AttachSandboxProviderRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::AttachSandboxProviderResponse>, tonic::Status>
-    {
-        Ok(tonic::Response::new(
+    ) -> Result<Response<openshell_core::proto::AttachSandboxProviderResponse>, Status> {
+        Ok(Response::new(
             openshell_core::proto::AttachSandboxProviderResponse::default(),
         ))
     }
@@ -449,9 +446,8 @@ impl openshell_core::proto::open_shell_server::OpenShell for TestOpenShell {
     async fn detach_sandbox_provider(
         &self,
         _: tonic::Request<openshell_core::proto::DetachSandboxProviderRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::DetachSandboxProviderResponse>, tonic::Status>
-    {
-        Ok(tonic::Response::new(
+    ) -> Result<Response<openshell_core::proto::DetachSandboxProviderResponse>, Status> {
+        Ok(Response::new(
             openshell_core::proto::DetachSandboxProviderResponse::default(),
         ))
     }
@@ -459,8 +455,8 @@ impl openshell_core::proto::open_shell_server::OpenShell for TestOpenShell {
     async fn delete_sandbox(
         &self,
         _: tonic::Request<openshell_core::proto::DeleteSandboxRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::DeleteSandboxResponse>, tonic::Status> {
-        Ok(tonic::Response::new(
+    ) -> Result<Response<openshell_core::proto::DeleteSandboxResponse>, Status> {
+        Ok(Response::new(
             openshell_core::proto::DeleteSandboxResponse { deleted: true },
         ))
     }
@@ -468,9 +464,8 @@ impl openshell_core::proto::open_shell_server::OpenShell for TestOpenShell {
     async fn get_sandbox_config(
         &self,
         _: tonic::Request<openshell_core::proto::GetSandboxConfigRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::GetSandboxConfigResponse>, tonic::Status>
-    {
-        Ok(tonic::Response::new(
+    ) -> Result<Response<openshell_core::proto::GetSandboxConfigResponse>, Status> {
+        Ok(Response::new(
             openshell_core::proto::GetSandboxConfigResponse::default(),
         ))
     }
@@ -478,9 +473,8 @@ impl openshell_core::proto::open_shell_server::OpenShell for TestOpenShell {
     async fn get_gateway_config(
         &self,
         _: tonic::Request<openshell_core::proto::GetGatewayConfigRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::GetGatewayConfigResponse>, tonic::Status>
-    {
-        Ok(tonic::Response::new(
+    ) -> Result<Response<openshell_core::proto::GetGatewayConfigResponse>, Status> {
+        Ok(Response::new(
             openshell_core::proto::GetGatewayConfigResponse::default(),
         ))
     }
@@ -488,11 +482,9 @@ impl openshell_core::proto::open_shell_server::OpenShell for TestOpenShell {
     async fn get_sandbox_provider_environment(
         &self,
         _: tonic::Request<openshell_core::proto::GetSandboxProviderEnvironmentRequest>,
-    ) -> Result<
-        tonic::Response<openshell_core::proto::GetSandboxProviderEnvironmentResponse>,
-        tonic::Status,
-    > {
-        Ok(tonic::Response::new(
+    ) -> Result<Response<openshell_core::proto::GetSandboxProviderEnvironmentResponse>, Status>
+    {
+        Ok(Response::new(
             openshell_core::proto::GetSandboxProviderEnvironmentResponse::default(),
         ))
     }
@@ -500,9 +492,8 @@ impl openshell_core::proto::open_shell_server::OpenShell for TestOpenShell {
     async fn create_ssh_session(
         &self,
         _: tonic::Request<openshell_core::proto::CreateSshSessionRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::CreateSshSessionResponse>, tonic::Status>
-    {
-        Ok(tonic::Response::new(
+    ) -> Result<Response<openshell_core::proto::CreateSshSessionResponse>, Status> {
+        Ok(Response::new(
             openshell_core::proto::CreateSshSessionResponse::default(),
         ))
     }
@@ -510,9 +501,8 @@ impl openshell_core::proto::open_shell_server::OpenShell for TestOpenShell {
     async fn expose_service(
         &self,
         _: tonic::Request<openshell_core::proto::ExposeServiceRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::ServiceEndpointResponse>, tonic::Status>
-    {
-        Ok(tonic::Response::new(
+    ) -> Result<Response<openshell_core::proto::ServiceEndpointResponse>, Status> {
+        Ok(Response::new(
             openshell_core::proto::ServiceEndpointResponse::default(),
         ))
     }
@@ -520,31 +510,29 @@ impl openshell_core::proto::open_shell_server::OpenShell for TestOpenShell {
     async fn get_service(
         &self,
         _: tonic::Request<openshell_core::proto::GetServiceRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::ServiceEndpointResponse>, tonic::Status>
-    {
-        Err(tonic::Status::unimplemented("unused"))
+    ) -> Result<Response<openshell_core::proto::ServiceEndpointResponse>, Status> {
+        Err(Status::unimplemented("unused"))
     }
 
     async fn list_services(
         &self,
         _: tonic::Request<openshell_core::proto::ListServicesRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::ListServicesResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("unused"))
+    ) -> Result<Response<openshell_core::proto::ListServicesResponse>, Status> {
+        Err(Status::unimplemented("unused"))
     }
 
     async fn delete_service(
         &self,
         _: tonic::Request<openshell_core::proto::DeleteServiceRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::DeleteServiceResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("unused"))
+    ) -> Result<Response<openshell_core::proto::DeleteServiceResponse>, Status> {
+        Err(Status::unimplemented("unused"))
     }
 
     async fn revoke_ssh_session(
         &self,
         _: tonic::Request<openshell_core::proto::RevokeSshSessionRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::RevokeSshSessionResponse>, tonic::Status>
-    {
-        Ok(tonic::Response::new(
+    ) -> Result<Response<openshell_core::proto::RevokeSshSessionResponse>, Status> {
+        Ok(Response::new(
             openshell_core::proto::RevokeSshSessionResponse::default(),
         ))
     }
@@ -552,264 +540,274 @@ impl openshell_core::proto::open_shell_server::OpenShell for TestOpenShell {
     async fn create_provider(
         &self,
         _: tonic::Request<openshell_core::proto::CreateProviderRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::ProviderResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("test"))
+    ) -> Result<Response<openshell_core::proto::ProviderResponse>, Status> {
+        Err(Status::unimplemented("test"))
     }
 
     async fn get_provider(
         &self,
         _: tonic::Request<openshell_core::proto::GetProviderRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::ProviderResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("test"))
+    ) -> Result<Response<openshell_core::proto::ProviderResponse>, Status> {
+        Err(Status::unimplemented("test"))
     }
 
     async fn list_providers(
         &self,
         _: tonic::Request<openshell_core::proto::ListProvidersRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::ListProvidersResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("test"))
+    ) -> Result<Response<openshell_core::proto::ListProvidersResponse>, Status> {
+        Err(Status::unimplemented("test"))
     }
 
     async fn list_provider_profiles(
         &self,
         _: tonic::Request<openshell_core::proto::ListProviderProfilesRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::ListProviderProfilesResponse>, tonic::Status>
-    {
-        Err(tonic::Status::unimplemented("test"))
+    ) -> Result<Response<openshell_core::proto::ListProviderProfilesResponse>, Status> {
+        Err(Status::unimplemented("test"))
     }
 
     async fn get_provider_profile(
         &self,
         _: tonic::Request<openshell_core::proto::GetProviderProfileRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::ProviderProfileResponse>, tonic::Status>
-    {
-        Err(tonic::Status::unimplemented("test"))
+    ) -> Result<Response<openshell_core::proto::ProviderProfileResponse>, Status> {
+        Err(Status::unimplemented("test"))
     }
 
     async fn import_provider_profiles(
         &self,
         _: tonic::Request<openshell_core::proto::ImportProviderProfilesRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::ImportProviderProfilesResponse>, tonic::Status>
-    {
-        Err(tonic::Status::unimplemented("test"))
+    ) -> Result<Response<openshell_core::proto::ImportProviderProfilesResponse>, Status> {
+        Err(Status::unimplemented("test"))
     }
 
     async fn lint_provider_profiles(
         &self,
         _: tonic::Request<openshell_core::proto::LintProviderProfilesRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::LintProviderProfilesResponse>, tonic::Status>
-    {
-        Err(tonic::Status::unimplemented("test"))
+    ) -> Result<Response<openshell_core::proto::LintProviderProfilesResponse>, Status> {
+        Err(Status::unimplemented("test"))
     }
 
     async fn delete_provider_profile(
         &self,
         _: tonic::Request<openshell_core::proto::DeleteProviderProfileRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::DeleteProviderProfileResponse>, tonic::Status>
-    {
-        Err(tonic::Status::unimplemented("test"))
+    ) -> Result<Response<openshell_core::proto::DeleteProviderProfileResponse>, Status> {
+        Err(Status::unimplemented("test"))
     }
 
     async fn update_provider(
         &self,
         _: tonic::Request<openshell_core::proto::UpdateProviderRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::ProviderResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("test"))
+    ) -> Result<Response<openshell_core::proto::ProviderResponse>, Status> {
+        Err(Status::unimplemented("test"))
+    }
+    async fn get_provider_refresh_status(
+        &self,
+        _: tonic::Request<openshell_core::proto::GetProviderRefreshStatusRequest>,
+    ) -> Result<Response<openshell_core::proto::GetProviderRefreshStatusResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn configure_provider_refresh(
+        &self,
+        _: tonic::Request<openshell_core::proto::ConfigureProviderRefreshRequest>,
+    ) -> Result<Response<openshell_core::proto::ConfigureProviderRefreshResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn rotate_provider_credential(
+        &self,
+        _: tonic::Request<openshell_core::proto::RotateProviderCredentialRequest>,
+    ) -> Result<Response<openshell_core::proto::RotateProviderCredentialResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn delete_provider_refresh(
+        &self,
+        _: tonic::Request<openshell_core::proto::DeleteProviderRefreshRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteProviderRefreshResponse>, Status> {
+        Err(Status::unimplemented("unused"))
     }
 
     async fn delete_provider(
         &self,
         _: tonic::Request<openshell_core::proto::DeleteProviderRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::DeleteProviderResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("test"))
+    ) -> Result<Response<openshell_core::proto::DeleteProviderResponse>, Status> {
+        Err(Status::unimplemented("test"))
     }
 
     type WatchSandboxStream = tokio_stream::wrappers::ReceiverStream<
-        Result<openshell_core::proto::SandboxStreamEvent, tonic::Status>,
+        Result<openshell_core::proto::SandboxStreamEvent, Status>,
     >;
     type ExecSandboxStream = tokio_stream::wrappers::ReceiverStream<
-        Result<openshell_core::proto::ExecSandboxEvent, tonic::Status>,
+        Result<openshell_core::proto::ExecSandboxEvent, Status>,
     >;
     type ConnectSupervisorStream = tokio_stream::wrappers::ReceiverStream<
-        Result<openshell_core::proto::GatewayMessage, tonic::Status>,
+        Result<openshell_core::proto::GatewayMessage, Status>,
     >;
 
     async fn watch_sandbox(
         &self,
         _: tonic::Request<openshell_core::proto::WatchSandboxRequest>,
-    ) -> Result<tonic::Response<Self::WatchSandboxStream>, tonic::Status> {
+    ) -> Result<Response<Self::WatchSandboxStream>, Status> {
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
-        Ok(tonic::Response::new(
-            tokio_stream::wrappers::ReceiverStream::new(rx),
-        ))
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
     }
 
     async fn exec_sandbox(
         &self,
         _: tonic::Request<openshell_core::proto::ExecSandboxRequest>,
-    ) -> Result<tonic::Response<Self::ExecSandboxStream>, tonic::Status> {
+    ) -> Result<Response<Self::ExecSandboxStream>, Status> {
         let (_tx, rx) = tokio::sync::mpsc::channel(1);
-        Ok(tonic::Response::new(
-            tokio_stream::wrappers::ReceiverStream::new(rx),
-        ))
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
     }
 
     type ExecSandboxInteractiveStream = tokio_stream::wrappers::ReceiverStream<
-        Result<openshell_core::proto::ExecSandboxEvent, tonic::Status>,
+        Result<openshell_core::proto::ExecSandboxEvent, Status>,
     >;
     async fn exec_sandbox_interactive(
         &self,
         _: tonic::Request<tonic::Streaming<openshell_core::proto::ExecSandboxInput>>,
-    ) -> Result<tonic::Response<Self::ExecSandboxInteractiveStream>, tonic::Status> {
-        Err(tonic::Status::unimplemented("test"))
+    ) -> Result<Response<Self::ExecSandboxInteractiveStream>, Status> {
+        Err(Status::unimplemented("test"))
     }
 
     async fn update_config(
         &self,
         _: tonic::Request<openshell_core::proto::UpdateConfigRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::UpdateConfigResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("test"))
+    ) -> Result<Response<openshell_core::proto::UpdateConfigResponse>, Status> {
+        Err(Status::unimplemented("test"))
     }
 
     async fn get_sandbox_policy_status(
         &self,
         _: tonic::Request<openshell_core::proto::GetSandboxPolicyStatusRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::GetSandboxPolicyStatusResponse>, tonic::Status>
-    {
-        Err(tonic::Status::unimplemented("test"))
+    ) -> Result<Response<openshell_core::proto::GetSandboxPolicyStatusResponse>, Status> {
+        Err(Status::unimplemented("test"))
     }
 
     async fn list_sandbox_policies(
         &self,
         _: tonic::Request<openshell_core::proto::ListSandboxPoliciesRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::ListSandboxPoliciesResponse>, tonic::Status>
-    {
-        Err(tonic::Status::unimplemented("test"))
+    ) -> Result<Response<openshell_core::proto::ListSandboxPoliciesResponse>, Status> {
+        Err(Status::unimplemented("test"))
     }
 
     async fn report_policy_status(
         &self,
         _: tonic::Request<openshell_core::proto::ReportPolicyStatusRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::ReportPolicyStatusResponse>, tonic::Status>
-    {
-        Err(tonic::Status::unimplemented("test"))
+    ) -> Result<Response<openshell_core::proto::ReportPolicyStatusResponse>, Status> {
+        Err(Status::unimplemented("test"))
     }
 
     async fn get_sandbox_logs(
         &self,
         _: tonic::Request<openshell_core::proto::GetSandboxLogsRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::GetSandboxLogsResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("test"))
+    ) -> Result<Response<openshell_core::proto::GetSandboxLogsResponse>, Status> {
+        Err(Status::unimplemented("test"))
     }
 
     async fn push_sandbox_logs(
         &self,
         _: tonic::Request<tonic::Streaming<openshell_core::proto::PushSandboxLogsRequest>>,
-    ) -> Result<tonic::Response<openshell_core::proto::PushSandboxLogsResponse>, tonic::Status>
-    {
-        Err(tonic::Status::unimplemented("test"))
+    ) -> Result<Response<openshell_core::proto::PushSandboxLogsResponse>, Status> {
+        Err(Status::unimplemented("test"))
     }
 
     async fn submit_policy_analysis(
         &self,
         _request: tonic::Request<openshell_core::proto::SubmitPolicyAnalysisRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::SubmitPolicyAnalysisResponse>, tonic::Status>
-    {
-        Err(tonic::Status::unimplemented("not implemented in test"))
+    ) -> Result<Response<openshell_core::proto::SubmitPolicyAnalysisResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
     }
 
     async fn get_draft_policy(
         &self,
         _request: tonic::Request<openshell_core::proto::GetDraftPolicyRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::GetDraftPolicyResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("not implemented in test"))
+    ) -> Result<Response<openshell_core::proto::GetDraftPolicyResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
     }
 
     async fn approve_draft_chunk(
         &self,
         _request: tonic::Request<openshell_core::proto::ApproveDraftChunkRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::ApproveDraftChunkResponse>, tonic::Status>
-    {
-        Err(tonic::Status::unimplemented("not implemented in test"))
+    ) -> Result<Response<openshell_core::proto::ApproveDraftChunkResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
     }
 
     async fn reject_draft_chunk(
         &self,
         _request: tonic::Request<openshell_core::proto::RejectDraftChunkRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::RejectDraftChunkResponse>, tonic::Status>
-    {
-        Err(tonic::Status::unimplemented("not implemented in test"))
+    ) -> Result<Response<openshell_core::proto::RejectDraftChunkResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
     }
 
     async fn approve_all_draft_chunks(
         &self,
         _request: tonic::Request<openshell_core::proto::ApproveAllDraftChunksRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::ApproveAllDraftChunksResponse>, tonic::Status>
-    {
-        Err(tonic::Status::unimplemented("not implemented in test"))
+    ) -> Result<Response<openshell_core::proto::ApproveAllDraftChunksResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
     }
 
     async fn edit_draft_chunk(
         &self,
         _request: tonic::Request<openshell_core::proto::EditDraftChunkRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::EditDraftChunkResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("not implemented in test"))
+    ) -> Result<Response<openshell_core::proto::EditDraftChunkResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
     }
 
     async fn undo_draft_chunk(
         &self,
         _request: tonic::Request<openshell_core::proto::UndoDraftChunkRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::UndoDraftChunkResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("not implemented in test"))
+    ) -> Result<Response<openshell_core::proto::UndoDraftChunkResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
     }
 
     async fn clear_draft_chunks(
         &self,
         _request: tonic::Request<openshell_core::proto::ClearDraftChunksRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::ClearDraftChunksResponse>, tonic::Status>
-    {
-        Err(tonic::Status::unimplemented("not implemented in test"))
+    ) -> Result<Response<openshell_core::proto::ClearDraftChunksResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
     }
 
     async fn get_draft_history(
         &self,
         _request: tonic::Request<openshell_core::proto::GetDraftHistoryRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::GetDraftHistoryResponse>, tonic::Status>
-    {
-        Err(tonic::Status::unimplemented("not implemented in test"))
+    ) -> Result<Response<openshell_core::proto::GetDraftHistoryResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
     }
 
     async fn connect_supervisor(
         &self,
         _request: tonic::Request<tonic::Streaming<openshell_core::proto::SupervisorMessage>>,
-    ) -> Result<tonic::Response<Self::ConnectSupervisorStream>, tonic::Status> {
-        Err(tonic::Status::unimplemented("not implemented in test"))
+    ) -> Result<Response<Self::ConnectSupervisorStream>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
     }
 
-    type RelayStreamStream = tokio_stream::wrappers::ReceiverStream<
-        Result<openshell_core::proto::RelayFrame, tonic::Status>,
-    >;
+    type RelayStreamStream =
+        tokio_stream::wrappers::ReceiverStream<Result<openshell_core::proto::RelayFrame, Status>>;
 
     async fn relay_stream(
         &self,
         _request: tonic::Request<tonic::Streaming<openshell_core::proto::RelayFrame>>,
-    ) -> Result<tonic::Response<Self::RelayStreamStream>, tonic::Status> {
-        Err(tonic::Status::unimplemented("not implemented in test"))
+    ) -> Result<Response<Self::RelayStreamStream>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
     }
 
     type ForwardTcpStream = std::pin::Pin<
         Box<
-            dyn tokio_stream::Stream<
-                    Item = Result<openshell_core::proto::TcpForwardFrame, tonic::Status>,
-                > + Send,
+            dyn tokio_stream::Stream<Item = Result<openshell_core::proto::TcpForwardFrame, Status>>
+                + Send,
         >,
     >;
 
     async fn forward_tcp(
         &self,
         _request: tonic::Request<tonic::Streaming<openshell_core::proto::TcpForwardFrame>>,
-    ) -> Result<tonic::Response<Self::ForwardTcpStream>, tonic::Status> {
-        Err(tonic::Status::unimplemented("not implemented in test"))
+    ) -> Result<Response<Self::ForwardTcpStream>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
     }
 }
 

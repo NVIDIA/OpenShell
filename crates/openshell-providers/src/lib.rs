@@ -18,9 +18,10 @@ pub use openshell_core::proto::Provider;
 pub use context::{DiscoveryContext, RealDiscoveryContext};
 pub use discovery::discover_with_spec;
 pub use profiles::{
-    ProfileError, ProfileValidationDiagnostic, ProviderTypeProfile, default_profiles,
-    get_default_profile, normalize_profile_id, parse_profile_json, parse_profile_yaml,
-    profile_to_json, profile_to_yaml, profiles_to_json, profiles_to_yaml, validate_profile_set,
+    CredentialRefreshProfile, ProfileError, ProfileValidationDiagnostic, ProviderTypeProfile,
+    default_profiles, get_default_profile, normalize_profile_id, parse_profile_json,
+    parse_profile_yaml, profile_to_json, profile_to_yaml, profiles_to_json, profiles_to_yaml,
+    validate_profile_set,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -143,7 +144,7 @@ impl ProviderRegistry {
 pub fn normalize_provider_type(input: &str) -> Option<&'static str> {
     let normalized = input.trim().to_ascii_lowercase();
     match normalized.as_str() {
-        "claude" => Some("claude"),
+        "claude" | "claude-code" | "claude_code" => Some("claude-code"),
         "codex" => Some("codex"),
         "copilot" => Some("copilot"),
         "opencode" => Some("opencode"),
@@ -177,7 +178,8 @@ mod tests {
         assert_eq!(normalize_provider_type("gitlab"), Some("gitlab"));
         assert_eq!(normalize_provider_type("glab"), Some("gitlab"));
         assert_eq!(normalize_provider_type("gh"), Some("github"));
-        assert_eq!(normalize_provider_type("CLAUDE"), Some("claude"));
+        assert_eq!(normalize_provider_type("CLAUDE"), Some("claude-code"));
+        assert_eq!(normalize_provider_type("claude-code"), Some("claude-code"));
         assert_eq!(normalize_provider_type("generic"), Some("generic"));
         assert_eq!(normalize_provider_type("openai"), Some("openai"));
         assert_eq!(normalize_provider_type("anthropic"), Some("anthropic"));
@@ -190,7 +192,7 @@ mod tests {
     fn detects_provider_from_command_token() {
         assert_eq!(
             detect_provider_from_command(&["claude".to_string()]),
-            Some("claude")
+            Some("claude-code")
         );
         assert_eq!(
             detect_provider_from_command(&["/usr/bin/glab".to_string()]),

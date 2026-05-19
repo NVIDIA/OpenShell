@@ -9,6 +9,7 @@ use crate::tls::{
     grpc_inference_client, require_tls_materials,
 };
 use bytes::Bytes;
+use chrono::DateTime;
 use dialoguer::{Confirm, Select, theme::ColorfulTheme};
 use futures::StreamExt;
 use http_body_util::Full;
@@ -31,21 +32,24 @@ use openshell_core::progress::{
 use openshell_core::proto::ProviderProfileCategory;
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, AttachSandboxProviderRequest,
-    ClearDraftChunksRequest, CreateProviderRequest, CreateSandboxRequest, CreateSshSessionRequest,
-    DeleteProviderProfileRequest, DeleteProviderRequest, DeleteSandboxRequest,
+    ClearDraftChunksRequest, ConfigureProviderRefreshRequest, CreateProviderRequest,
+    CreateSandboxRequest, CreateSshSessionRequest, DeleteProviderProfileRequest,
+    DeleteProviderRefreshRequest, DeleteProviderRequest, DeleteSandboxRequest,
     DeleteServiceRequest, DetachSandboxProviderRequest, ExecSandboxRequest, ExposeServiceRequest,
     GetClusterInferenceRequest, GetDraftHistoryRequest, GetDraftPolicyRequest,
-    GetGatewayConfigRequest, GetProviderProfileRequest, GetProviderRequest,
-    GetSandboxConfigRequest, GetSandboxLogsRequest, GetSandboxPolicyStatusRequest,
-    GetSandboxRequest, GetServiceRequest, HealthRequest, ImportProviderProfilesRequest,
-    LintProviderProfilesRequest, ListProviderProfilesRequest, ListProvidersRequest,
-    ListSandboxPoliciesRequest, ListSandboxProvidersRequest, ListSandboxesRequest,
-    ListServicesRequest, PlatformEvent, PolicySource, PolicyStatus, Provider, ProviderProfile,
+    GetGatewayConfigRequest, GetProviderProfileRequest, GetProviderRefreshStatusRequest,
+    GetProviderRequest, GetSandboxConfigRequest, GetSandboxLogsRequest,
+    GetSandboxPolicyStatusRequest, GetSandboxRequest, GetServiceRequest, HealthRequest,
+    ImportProviderProfilesRequest, LintProviderProfilesRequest, ListProviderProfilesRequest,
+    ListProvidersRequest, ListSandboxPoliciesRequest, ListSandboxProvidersRequest,
+    ListSandboxesRequest, ListServicesRequest, PlatformEvent, PolicySource, PolicyStatus, Provider,
+    ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy, ProviderProfile,
     ProviderProfileDiagnostic, ProviderProfileImportItem, RejectDraftChunkRequest,
-    RevokeSshSessionRequest, Sandbox, SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate,
-    ServiceEndpointResponse, SetClusterInferenceRequest, SettingScope, SettingValue,
-    TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest, UpdateProviderRequest,
-    WatchSandboxRequest, exec_sandbox_event, setting_value, tcp_forward_init,
+    RevokeSshSessionRequest, RotateProviderCredentialRequest, Sandbox, SandboxPhase, SandboxPolicy,
+    SandboxSpec, SandboxTemplate, ServiceEndpointResponse, SetClusterInferenceRequest,
+    SettingScope, SettingValue, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
+    UpdateConfigRequest, UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event,
+    setting_value, tcp_forward_init,
 };
 use openshell_core::settings::{self, SettingValueKind};
 use openshell_core::{ObjectId, ObjectName};
@@ -3423,7 +3427,7 @@ fn inferred_provider_type(command: &[String]) -> Option<String> {
 /// passed through directly; the server validates they exist at sandbox creation.
 ///
 /// `inferred_types` are provider **types** inferred from the trailing command
-/// (e.g. `claude` → type `"claude"`). These are resolved to provider names via
+/// (e.g. `claude` -> type `"claude-code"`). These are resolved to provider names via
 /// a type→name lookup, and missing types may be auto-created interactively.
 ///
 /// Returns a deduplicated list of provider **names** suitable for
@@ -3616,6 +3620,7 @@ async fn auto_create_provider(
                 r#type: provider_type.to_string(),
                 credentials: discovered.credentials.clone(),
                 config: discovered.config.clone(),
+                credential_expires_at_ms: HashMap::new(),
             }),
         };
 
@@ -3657,6 +3662,7 @@ async fn auto_create_provider(
                     r#type: provider_type.to_string(),
                     credentials: discovered.credentials.clone(),
                     config: discovered.config.clone(),
+                    credential_expires_at_ms: HashMap::new(),
                 }),
             };
 
@@ -3747,6 +3753,72 @@ fn parse_credential_pairs(items: &[String]) -> Result<HashMap<String, String>> {
             ));
         }
 
+        map.insert(key.to_string(), value);
+    }
+
+    Ok(map)
+}
+
+pub fn parse_credential_expiry_cli_value(value: &str) -> std::result::Result<i64, String> {
+    parse_credential_expiry_value(value, None).map_err(|err| err.to_string())
+}
+
+fn credential_expiry_value_error(key: Option<&str>, detail: &str) -> miette::Report {
+    key.map_or_else(
+        || miette::miette!("--credential-expires-at value {detail}"),
+        |key| miette::miette!("--credential-expires-at value for '{key}' {detail}"),
+    )
+}
+
+fn parse_credential_expiry_value(value: &str, key: Option<&str>) -> Result<i64> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(credential_expiry_value_error(key, "cannot be empty"));
+    }
+
+    if let Ok(value_ms) = value.parse::<i64>() {
+        if value_ms < 0 {
+            return Err(credential_expiry_value_error(
+                key,
+                "must be greater than or equal to 0",
+            ));
+        }
+        return Ok(value_ms);
+    }
+
+    let parsed = DateTime::parse_from_rfc3339(value).map_err(|_| {
+        credential_expiry_value_error(
+            key,
+            "must be a Unix epoch millisecond timestamp or RFC3339 timestamp",
+        )
+    })?;
+    let value_ms = parsed.timestamp_millis();
+    if value_ms < 0 {
+        return Err(credential_expiry_value_error(
+            key,
+            "must be greater than or equal to 0",
+        ));
+    }
+
+    Ok(value_ms)
+}
+
+fn parse_credential_expiry_pairs(items: &[String]) -> Result<HashMap<String, i64>> {
+    let mut map = HashMap::new();
+
+    for item in items {
+        let Some((key, value)) = item.split_once('=') else {
+            return Err(miette::miette!(
+                "--credential-expires-at expects KEY=TIMESTAMP, got '{item}'"
+            ));
+        };
+        let key = key.trim();
+        if key.is_empty() {
+            return Err(miette::miette!(
+                "--credential-expires-at key cannot be empty"
+            ));
+        }
+        let value = parse_credential_expiry_value(value, Some(key))?;
         map.insert(key.to_string(), value);
     }
 
@@ -4051,10 +4123,20 @@ pub async fn provider_create(
     }
 
     if credential_map.is_empty() {
-        return Err(miette::miette!(
-            "no credentials resolved for provider type '{provider_type}'. \
-             Use --credential KEY[=VALUE] or --from-existing with the appropriate env vars set."
-        ));
+        let allows_refresh_bootstrap = client
+            .get_provider_profile(GetProviderProfileRequest {
+                id: provider_type.clone(),
+            })
+            .await
+            .ok()
+            .and_then(|response| response.into_inner().profile)
+            .is_some_and(|profile| provider_profile_allows_refresh_bootstrap(&profile));
+        if !allows_refresh_bootstrap {
+            return Err(miette::miette!(
+                "no credentials resolved for provider type '{provider_type}'. \
+                 Use --credential KEY[=VALUE] or --from-existing with the appropriate env vars set."
+            ));
+        }
     }
 
     let response = client
@@ -4070,6 +4152,7 @@ pub async fn provider_create(
                 r#type: provider_type.clone(),
                 credentials: credential_map,
                 config: config_map,
+                credential_expires_at_ms: HashMap::new(),
             }),
         })
         .await
@@ -4086,6 +4169,30 @@ pub async fn provider_create(
         provider.object_name()
     );
     Ok(())
+}
+
+fn provider_profile_allows_refresh_bootstrap(profile: &ProviderProfile) -> bool {
+    let required_credentials = profile
+        .credentials
+        .iter()
+        .filter(|credential| credential.required)
+        .collect::<Vec<_>>();
+    !required_credentials.is_empty()
+        && required_credentials.iter().all(|credential| {
+            credential
+                .refresh
+                .as_ref()
+                .is_some_and(|refresh| is_gateway_mintable_refresh_strategy(refresh.strategy))
+        })
+}
+
+fn is_gateway_mintable_refresh_strategy(strategy: i32) -> bool {
+    matches!(
+        ProviderCredentialRefreshStrategy::try_from(strategy),
+        Ok(ProviderCredentialRefreshStrategy::Oauth2RefreshToken
+            | ProviderCredentialRefreshStrategy::Oauth2ClientCredentials
+            | ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt)
+    )
 }
 
 pub async fn provider_get(server: &str, name: &str, tls: &TlsOptions) -> Result<()> {
@@ -4367,6 +4474,224 @@ pub async fn provider_profile_delete(server: &str, id: &str, tls: &TlsOptions) -
     Ok(())
 }
 
+pub async fn provider_refresh_status(
+    server: &str,
+    name: &str,
+    credential_key: Option<&str>,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .get_provider_refresh_status(GetProviderRefreshStatusRequest {
+            provider: name.to_string(),
+            credential_key: credential_key.unwrap_or_default().to_string(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner();
+
+    if response.credentials.is_empty() {
+        if let Some(credential_key) = credential_key {
+            println!(
+                "No refresh configuration found for provider '{name}' credential '{credential_key}'."
+            );
+        } else {
+            println!("No refresh configurations found for provider '{name}'.");
+        }
+        return Ok(());
+    }
+
+    println!("{}", refresh_status_header());
+    for status in response.credentials {
+        print_refresh_status_row(&status);
+    }
+    Ok(())
+}
+
+fn refresh_status_header() -> String {
+    format!(
+        "{:<24}  {:<28}  {:<28}  {:<18}  {:<20}  {:<20}  {:<20}  {}",
+        "PROVIDER".bold(),
+        "CREDENTIAL_KEY".bold(),
+        "STRATEGY".bold(),
+        "STATUS".bold(),
+        "EXPIRES_AT".bold(),
+        "NEXT_REFRESH".bold(),
+        "LAST_REFRESH".bold(),
+        "LAST_ERROR".bold(),
+    )
+}
+
+pub struct ProviderRefreshConfigInput<'a> {
+    pub name: &'a str,
+    pub credential_key: &'a str,
+    pub strategy: &'a str,
+    pub material: &'a [String],
+    pub secret_material_keys: &'a [String],
+    pub credential_expires_at_ms: Option<i64>,
+}
+
+pub async fn provider_refresh_config(
+    server: &str,
+    input: ProviderRefreshConfigInput<'_>,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let strategy = provider_refresh_strategy(input.strategy)?;
+    let material = parse_key_value_pairs(input.material, "--material")?;
+    let mut client = grpc_client(server, tls).await?;
+    let status = client
+        .configure_provider_refresh(ConfigureProviderRefreshRequest {
+            provider: input.name.to_string(),
+            credential_key: input.credential_key.to_string(),
+            strategy: strategy as i32,
+            material,
+            secret_material_keys: input.secret_material_keys.to_vec(),
+            expires_at_ms: input.credential_expires_at_ms,
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner()
+        .status
+        .ok_or_else(|| miette!("provider refresh status missing from response"))?;
+
+    println!(
+        "{} Configured refresh for {} {}",
+        "✓".green().bold(),
+        status.provider_name,
+        status.credential_key
+    );
+    Ok(())
+}
+
+pub async fn provider_rotate(
+    server: &str,
+    name: &str,
+    credential_key: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let status = client
+        .rotate_provider_credential(RotateProviderCredentialRequest {
+            provider: name.to_string(),
+            credential_key: credential_key.to_string(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner()
+        .status
+        .ok_or_else(|| miette!("provider refresh status missing from response"))?;
+
+    if status.last_error.is_empty() {
+        println!(
+            "{} Rotation requested for {} {} ({})",
+            "✓".green().bold(),
+            status.provider_name,
+            status.credential_key,
+            status.status
+        );
+    } else {
+        println!(
+            "Rotation request recorded for {} {} ({}): {}",
+            status.provider_name, status.credential_key, status.status, status.last_error
+        );
+    }
+    Ok(())
+}
+
+pub async fn provider_refresh_delete(
+    server: &str,
+    name: &str,
+    credential_key: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .delete_provider_refresh(DeleteProviderRefreshRequest {
+            provider: name.to_string(),
+            credential_key: credential_key.to_string(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner();
+
+    if response.deleted {
+        println!(
+            "{} Deleted refresh config for {} {}",
+            "✓".green().bold(),
+            name,
+            credential_key
+        );
+    } else {
+        println!("No refresh config found for provider '{name}' credential '{credential_key}'.");
+    }
+    Ok(())
+}
+
+fn provider_refresh_strategy(strategy: &str) -> Result<ProviderCredentialRefreshStrategy> {
+    match strategy {
+        "oauth2_refresh_token" => Ok(ProviderCredentialRefreshStrategy::Oauth2RefreshToken),
+        "oauth2_client_credentials" => {
+            Ok(ProviderCredentialRefreshStrategy::Oauth2ClientCredentials)
+        }
+        "google_service_account_jwt" => {
+            Ok(ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt)
+        }
+        _ => Err(miette!("unsupported provider refresh strategy: {strategy}")),
+    }
+}
+
+fn print_refresh_status_row(status: &ProviderCredentialRefreshStatus) {
+    println!("{}", refresh_status_row(status));
+}
+
+fn refresh_status_row(status: &ProviderCredentialRefreshStatus) -> String {
+    let strategy = ProviderCredentialRefreshStrategy::try_from(status.strategy)
+        .unwrap_or(ProviderCredentialRefreshStrategy::Unspecified);
+    format!(
+        "{:<24}  {:<28}  {:<28}  {:<18}  {:<20}  {:<20}  {:<20}  {}",
+        status.provider_name,
+        status.credential_key,
+        provider_refresh_strategy_name(strategy),
+        status.status,
+        format_optional_epoch_ms(status.expires_at_ms),
+        format_optional_epoch_ms(status.next_refresh_at_ms),
+        format_optional_epoch_ms(status.last_refresh_at_ms),
+        truncate_status_field(&status.last_error, 72),
+    )
+}
+
+fn format_optional_epoch_ms(ms: i64) -> String {
+    if ms > 0 {
+        format_epoch_ms(ms)
+    } else {
+        "-".to_string()
+    }
+}
+
+fn truncate_status_field(value: &str, max_chars: usize) -> String {
+    if value.is_empty() {
+        return "-".to_string();
+    }
+    let mut chars = value.chars();
+    let truncated = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{truncated}...")
+    } else {
+        truncated
+    }
+}
+
+fn provider_refresh_strategy_name(strategy: ProviderCredentialRefreshStrategy) -> &'static str {
+    match strategy {
+        ProviderCredentialRefreshStrategy::Static => "static",
+        ProviderCredentialRefreshStrategy::External => "external",
+        ProviderCredentialRefreshStrategy::Oauth2RefreshToken => "oauth2_refresh_token",
+        ProviderCredentialRefreshStrategy::Oauth2ClientCredentials => "oauth2_client_credentials",
+        ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => "google_service_account_jwt",
+        ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
+    }
+}
+
 fn load_profile_import_items(
     file: Option<&Path>,
     from: Option<&Path>,
@@ -4519,6 +4844,7 @@ pub async fn provider_update(
     from_existing: bool,
     credentials: &[String],
     config: &[String],
+    credential_expires_at: &[String],
     tls: &TlsOptions,
 ) -> Result<()> {
     if from_existing && !credentials.is_empty() {
@@ -4531,6 +4857,7 @@ pub async fn provider_update(
 
     let mut credential_map = parse_credential_pairs(credentials)?;
     let mut config_map = parse_key_value_pairs(config, "--config")?;
+    let credential_expires_at_ms = parse_credential_expiry_pairs(credential_expires_at)?;
 
     if from_existing {
         // Fetch the existing provider to discover its type for credential lookup.
@@ -4576,7 +4903,9 @@ pub async fn provider_update(
                 r#type: String::new(),
                 credentials: credential_map,
                 config: config_map,
+                credential_expires_at_ms: HashMap::new(),
             }),
+            credential_expires_at_ms,
         })
         .await
         .into_diagnostic()?;
@@ -6381,8 +6710,10 @@ mod tests {
         gateway_auth_label, gateway_env_override_warning, gateway_select_with, gateway_type_label,
         git_sync_files, http_health_check, image_requests_gpu, import_local_package_mtls_bundle,
         inferred_provider_type, package_managed_tls_dirs, parse_cli_setting_value,
-        parse_credential_pairs, plaintext_gateway_is_remote, progress_step_from_metadata,
-        provisioning_timeout_message, ready_false_condition_message, resolve_from,
+        parse_credential_expiry_cli_value, parse_credential_expiry_pairs, parse_credential_pairs,
+        plaintext_gateway_is_remote, progress_step_from_metadata,
+        provider_profile_allows_refresh_bootstrap, provisioning_timeout_message,
+        ready_false_condition_message, refresh_status_header, refresh_status_row, resolve_from,
         sandbox_should_persist, service_expose_status_error, service_url_for_gateway,
     };
     use crate::TEST_ENV_LOCK;
@@ -6402,7 +6733,9 @@ mod tests {
         PROGRESS_STEP_STARTING_SANDBOX,
     };
     use openshell_core::proto::{
-        Provider, SandboxCondition, SandboxStatus, datamodel::v1::ObjectMeta,
+        Provider, ProviderCredentialRefresh, ProviderCredentialRefreshStatus,
+        ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileCredential,
+        SandboxCondition, SandboxStatus, datamodel::v1::ObjectMeta,
     };
 
     struct EnvVarGuard {
@@ -6507,6 +6840,48 @@ mod tests {
     }
 
     #[test]
+    fn parse_credential_expiry_pairs_accepts_epoch_millis_and_rfc3339() {
+        let parsed = parse_credential_expiry_pairs(&[
+            "API_TOKEN=1767225600000".to_string(),
+            "MS_GRAPH_ACCESS_TOKEN=2026-01-01T00:00:00Z".to_string(),
+        ])
+        .expect("parse");
+
+        assert_eq!(parsed.get("API_TOKEN"), Some(&1_767_225_600_000));
+        assert_eq!(
+            parsed.get("MS_GRAPH_ACCESS_TOKEN"),
+            Some(&1_767_225_600_000)
+        );
+    }
+
+    #[test]
+    fn parse_credential_expiry_pairs_accepts_zero_to_clear_expiry() {
+        let parsed =
+            parse_credential_expiry_pairs(&["API_TOKEN=0".to_string()]).expect("parse zero");
+
+        assert_eq!(parsed.get("API_TOKEN"), Some(&0));
+    }
+
+    #[test]
+    fn parse_credential_expiry_rejects_invalid_timestamp() {
+        let err = parse_credential_expiry_pairs(&["API_TOKEN=next-week".to_string()])
+            .expect_err("invalid timestamp should error");
+
+        assert!(
+            err.to_string()
+                .contains("must be a Unix epoch millisecond timestamp or RFC3339 timestamp")
+        );
+    }
+
+    #[test]
+    fn parse_credential_expiry_cli_value_accepts_rfc3339_offsets() {
+        let parsed = parse_credential_expiry_cli_value("2026-01-01T01:00:00+01:00")
+            .expect("parse RFC3339 with offset");
+
+        assert_eq!(parsed, 1_767_225_600_000);
+    }
+
+    #[test]
     fn provider_attachment_table_formats_provider_counts() {
         let output = format_provider_attachment_table(
             &[Provider {
@@ -6526,6 +6901,7 @@ mod tests {
                     "https://api.custom.example".to_string(),
                 ))
                 .collect(),
+                credential_expires_at_ms: std::collections::HashMap::new(),
             }],
             false,
         );
@@ -6555,6 +6931,93 @@ mod tests {
             Some(ProvisioningStep::StartingSandbox)
         );
         assert_eq!(progress_step_from_metadata("driver-private-step"), None);
+    }
+
+    #[test]
+    fn refresh_status_table_includes_operational_fields() {
+        let header = refresh_status_header();
+        assert!(header.contains("NEXT_REFRESH"));
+        assert!(header.contains("LAST_REFRESH"));
+        assert!(header.contains("LAST_ERROR"));
+
+        let row = refresh_status_row(&ProviderCredentialRefreshStatus {
+            provider_name: "my-graph".to_string(),
+            provider_id: "provider-id".to_string(),
+            credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
+            strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials as i32,
+            status: "error".to_string(),
+            expires_at_ms: 1_767_225_600_000,
+            next_refresh_at_ms: 1_767_225_660_000,
+            last_refresh_at_ms: 1_767_225_000_000,
+            last_error: "token endpoint returned a very long error message that should be truncated for table readability"
+                .to_string(),
+        });
+
+        assert!(row.contains("my-graph"));
+        assert!(row.contains("MS_GRAPH_ACCESS_TOKEN"));
+        assert!(row.contains("oauth2_client_credentials"));
+        assert!(row.contains("error"));
+        assert!(row.contains("2026-01-01 00:00:00"));
+        assert!(row.contains("..."));
+    }
+
+    #[test]
+    fn refresh_bootstrap_requires_all_required_credentials_to_be_gateway_mintable() {
+        let refresh_token_profile = ProviderProfile {
+            credentials: vec![ProviderProfileCredential {
+                name: "MS_GRAPH_ACCESS_TOKEN".to_string(),
+                required: true,
+                refresh: Some(ProviderCredentialRefresh {
+                    strategy: ProviderCredentialRefreshStrategy::Oauth2RefreshToken as i32,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(provider_profile_allows_refresh_bootstrap(
+            &refresh_token_profile
+        ));
+
+        let mixed_static_profile = ProviderProfile {
+            credentials: vec![
+                ProviderProfileCredential {
+                    name: "ACCESS_TOKEN".to_string(),
+                    required: true,
+                    refresh: Some(ProviderCredentialRefresh {
+                        strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials as i32,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                ProviderProfileCredential {
+                    name: "STATIC_API_KEY".to_string(),
+                    required: true,
+                    refresh: None,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(!provider_profile_allows_refresh_bootstrap(
+            &mixed_static_profile
+        ));
+
+        let optional_refresh_profile = ProviderProfile {
+            credentials: vec![ProviderProfileCredential {
+                name: "OPTIONAL_TOKEN".to_string(),
+                required: false,
+                refresh: Some(ProviderCredentialRefresh {
+                    strategy: ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt as i32,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(!provider_profile_allows_refresh_bootstrap(
+            &optional_refresh_profile
+        ));
     }
 
     #[cfg(feature = "dev-settings")]
@@ -6652,7 +7115,7 @@ mod tests {
     #[test]
     fn inferred_provider_type_returns_type_for_known_command() {
         let result = inferred_provider_type(&["claude".to_string(), "--help".to_string()]);
-        assert_eq!(result, Some("claude".to_string()));
+        assert_eq!(result, Some("claude-code".to_string()));
     }
 
     #[test]
@@ -6681,7 +7144,7 @@ mod tests {
     #[test]
     fn inferred_provider_type_handles_full_path() {
         let result = inferred_provider_type(&["/usr/local/bin/claude".to_string()]);
-        assert_eq!(result, Some("claude".to_string()));
+        assert_eq!(result, Some("claude-code".to_string()));
     }
 
     #[test]

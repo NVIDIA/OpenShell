@@ -8,7 +8,7 @@ use crate::{
 pub struct ClaudeProvider;
 
 pub const SPEC: ProviderDiscoverySpec = ProviderDiscoverySpec {
-    id: "claude",
+    id: "claude-code",
     credential_env_vars: &["ANTHROPIC_API_KEY", "CLAUDE_API_KEY"],
 };
 

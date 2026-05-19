@@ -4,7 +4,7 @@
 //! gRPC service implementation.
 
 pub mod policy;
-mod provider;
+pub mod provider;
 mod sandbox;
 mod service;
 mod validation;
@@ -12,15 +12,17 @@ mod validation;
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveAllDraftChunksResponse, ApproveDraftChunkRequest,
     ApproveDraftChunkResponse, AttachSandboxProviderRequest, AttachSandboxProviderResponse,
-    ClearDraftChunksRequest, ClearDraftChunksResponse, CreateProviderRequest, CreateSandboxRequest,
+    ClearDraftChunksRequest, ClearDraftChunksResponse, ConfigureProviderRefreshRequest,
+    ConfigureProviderRefreshResponse, CreateProviderRequest, CreateSandboxRequest,
     CreateSshSessionRequest, CreateSshSessionResponse, DeleteProviderProfileRequest,
-    DeleteProviderProfileResponse, DeleteProviderRequest, DeleteProviderResponse,
-    DeleteSandboxRequest, DeleteSandboxResponse, DeleteServiceRequest, DeleteServiceResponse,
-    DetachSandboxProviderRequest, DetachSandboxProviderResponse, EditDraftChunkRequest,
-    EditDraftChunkResponse, ExecSandboxEvent, ExecSandboxInput, ExecSandboxRequest,
-    ExposeServiceRequest, GatewayMessage, GetDraftHistoryRequest, GetDraftHistoryResponse,
-    GetDraftPolicyRequest, GetDraftPolicyResponse, GetGatewayConfigRequest,
-    GetGatewayConfigResponse, GetProviderProfileRequest, GetProviderRequest,
+    DeleteProviderProfileResponse, DeleteProviderRefreshRequest, DeleteProviderRefreshResponse,
+    DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
+    DeleteServiceRequest, DeleteServiceResponse, DetachSandboxProviderRequest,
+    DetachSandboxProviderResponse, EditDraftChunkRequest, EditDraftChunkResponse, ExecSandboxEvent,
+    ExecSandboxInput, ExecSandboxRequest, ExposeServiceRequest, GatewayMessage,
+    GetDraftHistoryRequest, GetDraftHistoryResponse, GetDraftPolicyRequest, GetDraftPolicyResponse,
+    GetGatewayConfigRequest, GetGatewayConfigResponse, GetProviderProfileRequest,
+    GetProviderRefreshStatusRequest, GetProviderRefreshStatusResponse, GetProviderRequest,
     GetSandboxConfigRequest, GetSandboxConfigResponse, GetSandboxLogsRequest,
     GetSandboxLogsResponse, GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
     GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
@@ -32,11 +34,11 @@ use openshell_core::proto::{
     ListSandboxesResponse, ListServicesRequest, ListServicesResponse, ProviderProfileResponse,
     ProviderResponse, PushSandboxLogsRequest, PushSandboxLogsResponse, RejectDraftChunkRequest,
     RejectDraftChunkResponse, RelayFrame, ReportPolicyStatusRequest, ReportPolicyStatusResponse,
-    RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResponse, SandboxStreamEvent,
-    ServiceEndpointResponse, ServiceStatus, SubmitPolicyAnalysisRequest,
-    SubmitPolicyAnalysisResponse, SupervisorMessage, TcpForwardFrame, UndoDraftChunkRequest,
-    UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse, UpdateProviderRequest,
-    WatchSandboxRequest, open_shell_server::OpenShell,
+    RevokeSshSessionRequest, RevokeSshSessionResponse, RotateProviderCredentialRequest,
+    RotateProviderCredentialResponse, SandboxResponse, SandboxStreamEvent, ServiceEndpointResponse,
+    ServiceStatus, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, SupervisorMessage,
+    TcpForwardFrame, UndoDraftChunkRequest, UndoDraftChunkResponse, UpdateConfigRequest,
+    UpdateConfigResponse, UpdateProviderRequest, WatchSandboxRequest, open_shell_server::OpenShell,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -389,6 +391,34 @@ impl OpenShell for OpenShellService {
         request: Request<UpdateProviderRequest>,
     ) -> Result<Response<ProviderResponse>, Status> {
         provider::handle_update_provider(&self.state, request).await
+    }
+
+    async fn get_provider_refresh_status(
+        &self,
+        request: Request<GetProviderRefreshStatusRequest>,
+    ) -> Result<Response<GetProviderRefreshStatusResponse>, Status> {
+        provider::handle_get_provider_refresh_status(&self.state, request).await
+    }
+
+    async fn configure_provider_refresh(
+        &self,
+        request: Request<ConfigureProviderRefreshRequest>,
+    ) -> Result<Response<ConfigureProviderRefreshResponse>, Status> {
+        provider::handle_configure_provider_refresh(&self.state, request).await
+    }
+
+    async fn rotate_provider_credential(
+        &self,
+        request: Request<RotateProviderCredentialRequest>,
+    ) -> Result<Response<RotateProviderCredentialResponse>, Status> {
+        provider::handle_rotate_provider_credential(&self.state, request).await
+    }
+
+    async fn delete_provider_refresh(
+        &self,
+        request: Request<DeleteProviderRefreshRequest>,
+    ) -> Result<Response<DeleteProviderRefreshResponse>, Status> {
+        provider::handle_delete_provider_refresh(&self.state, request).await
     }
 
     async fn delete_provider(

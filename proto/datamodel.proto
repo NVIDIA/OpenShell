@@ -38,4 +38,7 @@ message Provider {
   map<string, string> credentials = 3;
   // Non-secret provider configuration.
   map<string, string> config = 4;
+  // Expiration timestamps for credential values, keyed by credential/env var
+  // name. A zero or missing value means the credential does not expire.
+  map<string, int64> credential_expires_at_ms = 5;
 }

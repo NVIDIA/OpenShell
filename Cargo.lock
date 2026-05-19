@@ -3408,6 +3408,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "bytes",
+ "chrono",
  "clap",
  "clap_complete",
  "crossterm 0.28.1",

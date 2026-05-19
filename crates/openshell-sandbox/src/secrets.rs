@@ -26,6 +26,13 @@ fn contains_raw_reserved_marker(value: &str) -> bool {
     value.contains(PLACEHOLDER_PREFIX) || value.contains(PROVIDER_ALIAS_MARKER)
 }
 
+fn current_time_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or_default()
+}
+
 pub fn contains_reserved_credential_marker(value: &str) -> bool {
     if contains_raw_reserved_marker(value) {
         return true;
@@ -84,7 +91,13 @@ pub struct RewriteTargetResult {
 
 #[derive(Clone, Default)]
 pub struct SecretResolver {
-    by_placeholder: HashMap<String, String>,
+    by_placeholder: HashMap<String, SecretValue>,
+}
+
+#[derive(Clone)]
+struct SecretValue {
+    value: String,
+    expires_at_ms: i64,
 }
 
 // Manual `Debug` impl: the auto-derived `Debug` would format the
@@ -107,34 +120,49 @@ impl SecretResolver {
     pub(crate) fn from_provider_env(
         provider_env: HashMap<String, String>,
     ) -> (HashMap<String, String>, Option<Self>) {
-        Self::from_provider_env_for_revision(provider_env, 0)
+        Self::from_provider_env_for_revision(provider_env, HashMap::new(), 0)
     }
 
     pub(crate) fn from_provider_env_for_revision(
         provider_env: HashMap<String, String>,
+        credential_expires_at_ms: HashMap<String, i64>,
         revision: u64,
     ) -> (HashMap<String, String>, Option<Self>) {
-        Self::from_provider_env_for_revision_with_current_aliases(provider_env, revision, false)
+        Self::from_provider_env_for_revision_with_current_aliases(
+            provider_env,
+            credential_expires_at_ms,
+            revision,
+            false,
+        )
     }
 
     pub(crate) fn from_provider_env_for_current_revision(
         provider_env: HashMap<String, String>,
+        credential_expires_at_ms: HashMap<String, i64>,
         revision: u64,
     ) -> (HashMap<String, String>, Option<Self>, Option<Self>) {
         if revision == 0 {
             let (child_env, current_resolver) =
-                Self::from_provider_env_for_revision_with_current_aliases(provider_env, 0, true);
+                Self::from_provider_env_for_revision_with_current_aliases(
+                    provider_env,
+                    credential_expires_at_ms,
+                    0,
+                    true,
+                );
             return (child_env, None, current_resolver);
         }
         let provider_env_for_current = provider_env.clone();
+        let credential_expires_at_ms_for_current = credential_expires_at_ms.clone();
         let (child_env, revision_resolver) =
             Self::from_provider_env_for_revision_with_current_aliases(
                 provider_env,
+                credential_expires_at_ms,
                 revision,
                 false,
             );
         let (_, current_resolver) = Self::from_provider_env_for_revision_with_current_aliases(
             provider_env_for_current,
+            credential_expires_at_ms_for_current,
             revision,
             true,
         );
@@ -143,6 +171,7 @@ impl SecretResolver {
 
     fn from_provider_env_for_revision_with_current_aliases(
         provider_env: HashMap<String, String>,
+        credential_expires_at_ms: HashMap<String, i64>,
         revision: u64,
         include_current_aliases: bool,
     ) -> (HashMap<String, String>, Option<Self>) {
@@ -155,10 +184,17 @@ impl SecretResolver {
 
         for (key, value) in provider_env {
             let placeholder = placeholder_for_env_key_for_revision(&key, revision);
+            let secret = SecretValue {
+                value,
+                expires_at_ms: credential_expires_at_ms
+                    .get(&key)
+                    .copied()
+                    .unwrap_or_default(),
+            };
             child_env.insert(key.clone(), placeholder.clone());
-            by_placeholder.insert(placeholder, value.clone());
+            by_placeholder.insert(placeholder, secret.clone());
             if include_current_aliases && revision != 0 {
-                by_placeholder.insert(placeholder_for_env_key(&key), value.clone());
+                by_placeholder.insert(placeholder_for_env_key(&key), secret.clone());
             }
         }
 
@@ -183,13 +219,20 @@ impl SecretResolver {
     /// contains prohibited control characters (CRLF, null byte).
     pub(crate) fn resolve_placeholder(&self, value: &str) -> Option<&str> {
         let secret = if let Some(secret) = self.by_placeholder.get(value) {
-            secret.as_str()
+            secret
         } else {
             let key = alias_env_key(value)?;
             let canonical = placeholder_for_env_key(key);
-            self.by_placeholder.get(&canonical).map(String::as_str)?
+            self.by_placeholder.get(&canonical)?
         };
-        match validate_resolved_secret(secret) {
+        if secret.expires_at_ms > 0 && secret.expires_at_ms <= current_time_ms() {
+            tracing::warn!(
+                location = "resolve_placeholder",
+                "credential resolution rejected: credential is expired"
+            );
+            return None;
+        }
+        match validate_resolved_secret(&secret.value) {
             Ok(s) => Some(s),
             Err(reason) => {
                 tracing::warn!(

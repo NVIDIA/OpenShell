@@ -38,7 +38,9 @@ use tracing::{debug, info, warn};
 use russh::ChannelMsg;
 use russh::client::AuthResult;
 
-use super::provider::{get_provider_record, is_valid_env_key};
+use super::provider::{
+    get_provider_record, is_valid_env_key, validate_provider_environment_keys_unique,
+};
 use super::validation::{
     level_matches, source_matches, validate_exec_request_fields, validate_policy_safety,
     validate_sandbox_spec,
@@ -80,6 +82,7 @@ pub(super) async fn handle_create_sandbox(
             .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
             .ok_or_else(|| Status::failed_precondition(format!("provider '{name}' not found")))?;
     }
+    validate_provider_environment_keys_unique(state.store.as_ref(), &spec.providers).await?;
 
     // Ensure the template always carries the resolved image.
     let mut spec = spec;
@@ -256,6 +259,18 @@ pub(super) async fn handle_attach_sandbox_provider(
             "providers list exceeds maximum ({MAX_PROVIDERS})"
         )));
     }
+    let mut candidate_spec = spec.clone();
+    dedupe_provider_names(&mut candidate_spec.providers);
+    if !candidate_spec
+        .providers
+        .iter()
+        .any(|name| name == &request.provider_name)
+    {
+        candidate_spec.providers.push(request.provider_name.clone());
+    }
+    validate_sandbox_spec(&request.sandbox_name, &candidate_spec)?;
+    validate_provider_environment_keys_unique(state.store.as_ref(), &candidate_spec.providers)
+        .await?;
 
     let provider_name = request.provider_name.clone();
     let attached = Arc::new(AtomicBool::new(false));
@@ -2068,6 +2083,14 @@ mod tests {
     }
 
     fn test_provider(name: &str, provider_type: &str) -> Provider {
+        test_provider_with_credential_key(name, provider_type, "TOKEN")
+    }
+
+    fn test_provider_with_credential_key(
+        name: &str,
+        provider_type: &str,
+        credential_key: &str,
+    ) -> Provider {
         Provider {
             metadata: Some(ObjectMeta {
                 id: format!("provider-{name}"),
@@ -2077,8 +2100,10 @@ mod tests {
                 resource_version: 0,
             }),
             r#type: provider_type.to_string(),
-            credentials: std::iter::once(("TOKEN".to_string(), "secret".to_string())).collect(),
+            credentials: std::iter::once((credential_key.to_string(), "secret".to_string()))
+                .collect(),
             config: HashMap::new(),
+            credential_expires_at_ms: HashMap::new(),
         }
     }
 
@@ -2435,6 +2460,77 @@ mod tests {
             Some(SandboxPhase::Ready)
         );
     }
+
+    #[tokio::test]
+    async fn create_sandbox_rejects_provider_credential_key_collisions() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("provider-a", "outlook"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_provider("provider-b", "google-drive"))
+            .await
+            .unwrap();
+
+        let err = handle_create_sandbox(
+            &state,
+            Request::new(CreateSandboxRequest {
+                name: "collision".to_string(),
+                spec: Some(openshell_core::proto::SandboxSpec {
+                    providers: vec!["provider-a".to_string(), "provider-b".to_string()],
+                    ..Default::default()
+                }),
+                labels: HashMap::new(),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("TOKEN"));
+        assert!(err.message().contains("provider-a"));
+        assert!(err.message().contains("provider-b"));
+    }
+
+    #[tokio::test]
+    async fn attach_sandbox_provider_rejects_credential_key_collisions() {
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("provider-a", "outlook"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_provider("provider-b", "google-drive"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&test_sandbox("work", vec!["provider-a".to_string()]))
+            .await
+            .unwrap();
+
+        let err = handle_attach_sandbox_provider(
+            &state,
+            Request::new(AttachSandboxProviderRequest {
+                sandbox_name: "work".to_string(),
+                provider_name: "provider-b".to_string(),
+                expected_resource_version: 0,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("TOKEN"));
+        assert!(err.message().contains("provider-a"));
+        assert!(err.message().contains("provider-b"));
+    }
+
     #[tokio::test]
     async fn attach_sandbox_provider_accepts_at_max_providers_limit() {
         let state = test_server_state().await;
@@ -2443,7 +2539,11 @@ mod tests {
         for i in 0..MAX_PROVIDERS {
             state
                 .store
-                .put_message(&test_provider(&format!("provider-{i}"), "generic"))
+                .put_message(&test_provider_with_credential_key(
+                    &format!("provider-{i}"),
+                    "generic",
+                    &format!("TOKEN_{i}"),
+                ))
                 .await
                 .unwrap();
         }
@@ -2493,7 +2593,11 @@ mod tests {
         for i in 0..=MAX_PROVIDERS {
             state
                 .store
-                .put_message(&test_provider(&format!("provider-{i}"), "generic"))
+                .put_message(&test_provider_with_credential_key(
+                    &format!("provider-{i}"),
+                    "generic",
+                    &format!("TOKEN_{i}"),
+                ))
                 .await
                 .unwrap();
         }
@@ -2958,7 +3062,11 @@ mod tests {
         for i in 0..3 {
             state
                 .store
-                .put_message(&test_provider(&format!("provider-{i}"), "generic"))
+                .put_message(&test_provider_with_credential_key(
+                    &format!("provider-{i}"),
+                    "generic",
+                    &format!("TOKEN_{i}"),
+                ))
                 .await
                 .unwrap();
         }

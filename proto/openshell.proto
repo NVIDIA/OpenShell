@@ -102,6 +102,22 @@ service OpenShell {
   // Update an existing provider by name.
   rpc UpdateProvider(UpdateProviderRequest) returns (ProviderResponse);
 
+  // Fetch refresh status for one provider or provider credential.
+  rpc GetProviderRefreshStatus(GetProviderRefreshStatusRequest)
+      returns (GetProviderRefreshStatusResponse);
+
+  // Configure gateway-owned refresh material for one provider credential.
+  rpc ConfigureProviderRefresh(ConfigureProviderRefreshRequest)
+      returns (ConfigureProviderRefreshResponse);
+
+  // Record a gateway-owned refresh request for one provider credential.
+  rpc RotateProviderCredential(RotateProviderCredentialRequest)
+      returns (RotateProviderCredentialResponse);
+
+  // Delete gateway-owned refresh configuration for one provider credential.
+  rpc DeleteProviderRefresh(DeleteProviderRefreshRequest)
+      returns (DeleteProviderRefreshResponse);
+
   // Delete a provider by name.
   rpc DeleteProvider(DeleteProviderRequest) returns (DeleteProviderResponse);
 
@@ -770,6 +786,9 @@ message ListProvidersRequest {
 // Update provider request.
 message UpdateProviderRequest {
   openshell.datamodel.v1.Provider provider = 1;
+  // Optional per-credential expiry timestamps to merge into the provider.
+  // A zero value removes the expiry for that credential.
+  map<string, int64> credential_expires_at_ms = 2;
 }
 
 // Delete provider request.
@@ -822,6 +841,103 @@ message ProviderProfileCredential {
   string auth_style = 5;
   string header_name = 6;
   string query_param = 7;
+  ProviderCredentialRefresh refresh = 8;
+}
+
+enum ProviderCredentialRefreshStrategy {
+  PROVIDER_CREDENTIAL_REFRESH_STRATEGY_UNSPECIFIED = 0;
+  PROVIDER_CREDENTIAL_REFRESH_STRATEGY_STATIC = 1;
+  PROVIDER_CREDENTIAL_REFRESH_STRATEGY_EXTERNAL = 2;
+  PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OAUTH2_REFRESH_TOKEN = 3;
+  PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OAUTH2_CLIENT_CREDENTIALS = 4;
+  PROVIDER_CREDENTIAL_REFRESH_STRATEGY_GOOGLE_SERVICE_ACCOUNT_JWT = 5;
+}
+
+message ProviderCredentialRefreshMaterial {
+  string name = 1;
+  string description = 2;
+  bool required = 3;
+  bool secret = 4;
+}
+
+message ProviderCredentialRefresh {
+  ProviderCredentialRefreshStrategy strategy = 1;
+  string token_url = 2;
+  repeated string scopes = 3;
+  int64 refresh_before_seconds = 4;
+  int64 max_lifetime_seconds = 5;
+  repeated ProviderCredentialRefreshMaterial material = 6;
+}
+
+message ProviderCredentialRefreshStatus {
+  string provider_name = 1;
+  string provider_id = 2;
+  string credential_key = 3;
+  ProviderCredentialRefreshStrategy strategy = 4;
+  string status = 5;
+  int64 expires_at_ms = 6;
+  int64 next_refresh_at_ms = 7;
+  int64 last_refresh_at_ms = 8;
+  string last_error = 9;
+}
+
+message StoredProviderCredentialRefreshState {
+  openshell.datamodel.v1.ObjectMeta metadata = 1;
+  string provider_id = 2;
+  string provider_name = 3;
+  string credential_key = 4;
+  ProviderCredentialRefreshStrategy strategy = 5;
+  map<string, string> material = 6;
+  repeated string secret_material_keys = 7;
+  int64 expires_at_ms = 8;
+  int64 next_refresh_at_ms = 9;
+  int64 last_refresh_at_ms = 10;
+  string status = 11;
+  string last_error = 12;
+  string token_url = 13;
+  repeated string scopes = 14;
+  int64 refresh_before_seconds = 15;
+  int64 max_lifetime_seconds = 16;
+}
+
+message GetProviderRefreshStatusRequest {
+  string provider = 1;
+  string credential_key = 2;
+}
+
+message GetProviderRefreshStatusResponse {
+  repeated ProviderCredentialRefreshStatus credentials = 1;
+}
+
+message ConfigureProviderRefreshRequest {
+  string provider = 1;
+  string credential_key = 2;
+  ProviderCredentialRefreshStrategy strategy = 3;
+  map<string, string> material = 4;
+  repeated string secret_material_keys = 5;
+  optional int64 expires_at_ms = 6;
+}
+
+message ConfigureProviderRefreshResponse {
+  ProviderCredentialRefreshStatus status = 1;
+}
+
+message RotateProviderCredentialRequest {
+  string provider = 1;
+  string credential_key = 2;
+}
+
+message RotateProviderCredentialResponse {
+  ProviderCredentialRefreshStatus status = 1;
+}
+
+message DeleteProviderRefreshRequest {
+  string provider = 1;
+  string credential_key = 2;
+}
+
+message DeleteProviderRefreshResponse {
+  bool deleted = 1;
 }
 
 // Stable provider profile categories used by clients for grouping and filtering.
@@ -914,6 +1030,8 @@ message GetSandboxProviderEnvironmentResponse {
   map<string, string> environment = 1;
   // Fingerprint for the provider credential inputs that produced environment.
   uint64 provider_env_revision = 2;
+  // Expiration timestamps for returned environment variables.
+  map<string, int64> credential_expires_at_ms = 3;
 }
 
 // ---------------------------------------------------------------------------
