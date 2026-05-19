@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       component:
-        description: "Component to build (gateway, supervisor)"
+        description: "Component to build (gateway, supervisor, cli)"
         required: true
         type: string
       timeout-minutes:
@@ -71,6 +71,8 @@ jobs:
       binary_name: ${{ steps.resolve.outputs.binary_name }}
       artifact_prefix: ${{ steps.resolve.outputs.artifact_prefix }}
       image_tag_base: ${{ steps.resolve.outputs.image_tag_base }}
+      features: ${{ steps.resolve.outputs.features }}
+      has_image: ${{ steps.resolve.outputs.has_image }}
     steps:
       - name: Resolve component and platform matrix
         id: resolve
@@ -82,10 +84,20 @@ jobs:
             gateway)
               binary_component=gateway
               binary_name=openshell-gateway
+              features="openshell-core/dev-settings"
+              has_image=true
               ;;
             supervisor)
               binary_component=sandbox
               binary_name=openshell-sandbox
+              features="openshell-core/dev-settings"
+              has_image=true
+              ;;
+            cli)
+              binary_component=cli
+              binary_name=openshell
+              features="bundled-z3"
+              has_image=false
               ;;
             *)
               echo "unsupported component: $component" >&2
@@ -144,6 +156,8 @@ jobs:
             echo "binary_name=$binary_name"
             echo "artifact_prefix=rust-binary-${component}-${binary_component}"
             echo "image_tag_base=$image_tag_base"
+            echo "features=$features"
+            echo "has_image=$has_image"
           } >> "$GITHUB_OUTPUT"
 
   rust-binary:
@@ -162,13 +176,14 @@ jobs:
       cargo-version: ${{ inputs['cargo-version'] }}
       image-tag: ${{ needs.resolve.outputs.image_tag_base }}
       checkout-ref: ${{ inputs['checkout-ref'] }}
-      features: openshell-core/dev-settings
+      features: ${{ needs.resolve.outputs.features }}
       artifact-name: ${{ needs.resolve.outputs.artifact_prefix }}-linux-${{ matrix.arch }}
     secrets: inherit
 
   build:
     name: Build ${{ inputs.component }} (${{ matrix.arch }})
     needs: [resolve, rust-binary]
+    if: needs.resolve.outputs.has_image == 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: ${{ inputs['timeout-minutes'] }}
     strategy:
@@ -262,7 +277,7 @@ jobs:
   merge:
     name: Merge ${{ inputs.component }} manifest
     needs: [resolve, build]
-    if: ${{ inputs.push && inputs['publish-manifest'] }}
+    if: ${{ inputs.push && inputs['publish-manifest'] && needs.resolve.outputs.has_image == 'true' }}
     runs-on: linux-amd64-cpu8
     timeout-minutes: 10
     container:
