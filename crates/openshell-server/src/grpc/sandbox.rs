@@ -2083,6 +2083,14 @@ mod tests {
     }
 
     fn test_provider(name: &str, provider_type: &str) -> Provider {
+        test_provider_with_credential_key(name, provider_type, "TOKEN")
+    }
+
+    fn test_provider_with_credential_key(
+        name: &str,
+        provider_type: &str,
+        credential_key: &str,
+    ) -> Provider {
         Provider {
             metadata: Some(ObjectMeta {
                 id: format!("provider-{name}"),
@@ -2092,7 +2100,8 @@ mod tests {
                 resource_version: 0,
             }),
             r#type: provider_type.to_string(),
-            credentials: std::iter::once(("TOKEN".to_string(), "secret".to_string())).collect(),
+            credentials: std::iter::once((credential_key.to_string(), "secret".to_string()))
+                .collect(),
             config: HashMap::new(),
             credential_expires_at_ms: HashMap::new(),
         }
@@ -2530,7 +2539,11 @@ mod tests {
         for i in 0..MAX_PROVIDERS {
             state
                 .store
-                .put_message(&test_provider(&format!("provider-{i}"), "generic"))
+                .put_message(&test_provider_with_credential_key(
+                    &format!("provider-{i}"),
+                    "generic",
+                    &format!("TOKEN_{i}"),
+                ))
                 .await
                 .unwrap();
         }
@@ -2580,7 +2593,11 @@ mod tests {
         for i in 0..=MAX_PROVIDERS {
             state
                 .store
-                .put_message(&test_provider(&format!("provider-{i}"), "generic"))
+                .put_message(&test_provider_with_credential_key(
+                    &format!("provider-{i}"),
+                    "generic",
+                    &format!("TOKEN_{i}"),
+                ))
                 .await
                 .unwrap();
         }
@@ -3045,7 +3062,11 @@ mod tests {
         for i in 0..3 {
             state
                 .store
-                .put_message(&test_provider(&format!("provider-{i}"), "generic"))
+                .put_message(&test_provider_with_credential_key(
+                    &format!("provider-{i}"),
+                    "generic",
+                    &format!("TOKEN_{i}"),
+                ))
                 .await
                 .unwrap();
         }
