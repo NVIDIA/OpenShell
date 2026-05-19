@@ -21,6 +21,7 @@ const ALLOWED_SANDBOX_METHODS: &[&str] = &[
     "/openshell.v1.OpenShell/PushSandboxLogs",
     "/openshell.v1.OpenShell/SubmitPolicyAnalysis",
     "/openshell.v1.OpenShell/GetDraftPolicy",
+    "/openshell.inference.v1.Inference/GetInferenceBundle",
 ];
 
 pub fn is_sandbox_callable(path: &str) -> bool {
@@ -40,6 +41,9 @@ mod tests {
         assert!(is_sandbox_callable(
             "/openshell.v1.OpenShell/GetSandboxConfig"
         ));
+        assert!(is_sandbox_callable(
+            "/openshell.inference.v1.Inference/GetInferenceBundle"
+        ));
     }
 
     #[test]
@@ -55,6 +59,12 @@ mod tests {
         ));
         assert!(!is_sandbox_callable(
             "/openshell.v1.OpenShell/ApproveDraftChunk"
+        ));
+        assert!(!is_sandbox_callable(
+            "/openshell.inference.v1.Inference/GetClusterInference"
+        ));
+        assert!(!is_sandbox_callable(
+            "/openshell.inference.v1.Inference/SetClusterInference"
         ));
     }
 }

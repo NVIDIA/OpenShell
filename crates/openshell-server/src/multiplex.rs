@@ -1020,12 +1020,35 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn sandbox_principal_can_fetch_inference_bundle() {
+            let mock = Arc::new(MockAuthenticator::returning(Ok(Some(sandbox_principal()))));
+            let chain = AuthenticatorChain::new(vec![mock]);
+            let (recorder, seen) = PrincipalRecorder::new();
+            let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
+
+            let res = router
+                .call(empty_request(
+                    "/openshell.inference.v1.Inference/GetInferenceBundle",
+                ))
+                .await
+                .unwrap();
+
+            assert_eq!(res.status(), 200);
+            assert!(matches!(
+                seen.lock().unwrap().as_ref(),
+                Some(Principal::Sandbox(_))
+            ));
+        }
+
+        #[tokio::test]
         async fn sandbox_principal_is_denied_on_user_and_admin_methods() {
             for path in [
                 "/openshell.v1.OpenShell/ListSandboxes",
                 "/openshell.v1.OpenShell/DeleteSandbox",
                 "/openshell.v1.OpenShell/CreateProvider",
                 "/openshell.v1.OpenShell/ApproveDraftChunk",
+                "/openshell.inference.v1.Inference/GetClusterInference",
+                "/openshell.inference.v1.Inference/SetClusterInference",
             ] {
                 let mock = Arc::new(MockAuthenticator::returning(Ok(Some(sandbox_principal()))));
                 let chain = AuthenticatorChain::new(vec![mock]);
