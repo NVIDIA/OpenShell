@@ -732,19 +732,19 @@ async fn inferred_type_auto_creates_provider() {
     let result = run::ensure_required_providers(
         &mut client,
         &[],
-        &["claude".to_string()],
+        &["claude-code".to_string()],
         Some(true), // --auto-providers
     )
     .await
     .expect("should auto-create the inferred provider");
 
-    assert_eq!(result, vec!["claude".to_string()]);
+    assert_eq!(result, vec!["claude-code".to_string()]);
 
     let providers = ts.openshell.state.providers.lock().await;
     let provider = providers
-        .get("claude")
-        .expect("claude provider should exist");
-    assert_eq!(provider.r#type, "claude");
+        .get("claude-code")
+        .expect("claude-code provider should exist");
+    assert_eq!(provider.r#type, "claude-code");
 }
 
 /// When `--no-auto-providers` is set, missing explicit providers that would
@@ -796,7 +796,7 @@ async fn explicit_and_inferred_providers_combined() {
     let result = run::ensure_required_providers(
         &mut client,
         &["nvidia".to_string()],
-        &["claude".to_string()],
+        &["claude-code".to_string()],
         Some(true),
     )
     .await
@@ -804,12 +804,12 @@ async fn explicit_and_inferred_providers_combined() {
 
     assert_eq!(result.len(), 2);
     assert!(result.contains(&"nvidia".to_string()));
-    assert!(result.contains(&"claude".to_string()));
+    assert!(result.contains(&"claude-code".to_string()));
 
     let providers = ts.openshell.state.providers.lock().await;
     assert_eq!(providers.len(), 2);
     assert!(providers.contains_key("nvidia"));
-    assert!(providers.contains_key("claude"));
+    assert!(providers.contains_key("claude-code"));
 }
 
 /// When an explicit provider name matches an inferred type, the provider
