@@ -165,7 +165,12 @@ in
         ;;
     esac
 
-    echo "OpenShell devenv ready. Run 'mise trust' once, then 'mise install --locked'."
+    mise_trust_status="$(mise trust --show 2>/dev/null || true)"
+    if printf '%s\n' "$mise_trust_status" | grep -q ': untrusted$'; then
+      echo "OpenShell devenv ready. Run 'mise trust' once, then 'mise install --locked'."
+    else
+      echo "OpenShell devenv ready. Run 'mise install --locked'."
+    fi
   '';
 
   enterTest = ''
