@@ -229,13 +229,21 @@ Each table is created atomically via `nft -f` on VM start and torn down atomical
 ## Prerequisites
 
 - macOS on Apple Silicon, or Linux on aarch64/x86_64 with KVM
-- On Linux, `devenv shell` provides the native build prerequisites without
-  installing distro packages with `apt` or `dnf`
+- On macOS and Linux, `devenv shell` provides the native build prerequisites
+  without installing them through Homebrew, `apt`, or `dnf`
+- Xcode Command Line Tools on macOS; the devenv shell uses the host Apple
+  compiler for SDK and libc++ support
 - Rust toolchain
-- e2fsprogs (`mke2fs` or `mkfs.ext4`, plus `debugfs`) for root and overlay disk image creation and QEMU environment injection
-- Guest-supervisor cross-compile toolchain (needed on macOS, and on Linux when host arch ≠ guest arch):
-  - Matching rustup target: `rustup target add aarch64-unknown-linux-gnu` (or `x86_64-unknown-linux-gnu` for an amd64 guest)
-  - `cargo install --locked cargo-zigbuild` and `brew install zig` (or distro equivalent). `vm:supervisor` uses `cargo zigbuild` to cross-compile the in-VM `openshell-sandbox` supervisor binary.
+- e2fsprogs (`mke2fs` or `mkfs.ext4`, plus `debugfs`) for root and overlay disk
+  image creation and QEMU environment injection
+- Guest-supervisor cross-compile toolchain (needed on macOS, and on Linux when
+  host arch differs from guest arch):
+  - Matching rustup target: `rustup target add aarch64-unknown-linux-gnu` (or
+    `x86_64-unknown-linux-gnu` for an amd64 guest)
+  - `mise install --locked` installs Zig and `cargo-zigbuild` where needed.
+    Non-mise setups can install `cargo-zigbuild` and Zig through the host
+    package manager. `vm:supervisor` uses `cargo zigbuild` to cross-compile the
+    in-VM `openshell-sandbox` supervisor binary.
 - [mise](https://mise.jdx.dev/) task runner
 - Docker or Podman socket on the local CLI/gateway host when using
   `openshell sandbox create --from ./Dockerfile` or `--from ./dir`; the CLI

@@ -97,14 +97,17 @@ New issues opened by users without `write`, `maintain`, or `admin` repository pe
 ## Prerequisites
 
 If you use Nix, enter the checked-in devenv shell first. It provides `mise`,
-Z3, `pkg-config`, VM build tools, the Docker CLI, and local workflow CLIs
-without using `apt` or `dnf`:
+Z3, `pkg-config`, platform-specific VM build tools, the Docker CLI, and local
+workflow CLIs without using host package managers for those tools:
 
 ```bash
 devenv shell
 mise trust
 mise install --locked
 ```
+
+On macOS, install Xcode Command Line Tools separately; the devenv shell uses the
+host Apple compiler so C++ builds can see the Apple SDK and libc++ headers.
 
 The Docker daemon/machine still has to be configured on the host. Podman is not
 installed by the devenv shell; if you use the Podman driver, install it on the

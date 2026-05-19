@@ -64,9 +64,12 @@ Local image work should use `mise` tasks rather than direct Docker commands so
 the same staging and tagging assumptions are used locally and in CI.
 
 Local development can run inside the optional Nix/devenv shell. `devenv.nix`
-provides host-native prerequisites such as Z3, `pkg-config`, libclang, e2fsprogs,
-and container client CLIs; `mise` remains the task runner and installs the
-version-pinned language/toolchain entries from `mise.toml`.
+provides host-native prerequisites such as Z3, `pkg-config`, libclang,
+e2fsprogs, container client CLIs, and platform-specific VM build dependencies
+(`elfutils`/`libcap-ng` on Linux, `lld`/`dtc` on macOS); `mise` remains the task
+runner and installs the version-pinned language/toolchain entries from
+`mise.toml`. On macOS the shell uses the host Xcode/Command Line Tools compiler
+so C++ probes build against the Apple SDK and libc++ headers.
 
 ## CI and E2E
 

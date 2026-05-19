@@ -4,6 +4,9 @@
 { pkgs, lib, ... }:
 
 let
+  isLinux = pkgs.stdenv.isLinux;
+  isDarwin = pkgs.stdenv.isDarwin;
+
   z3Dev = lib.getDev pkgs.z3;
   z3Lib = lib.getLib pkgs.z3;
   opensslDev = lib.getDev pkgs.openssl;
@@ -17,6 +20,7 @@ let
   pkgConfigInputs = [
     z3Dev
     opensslDev
+  ] ++ lib.optionals isLinux [
     elfutilsDev
     libcapNgDev
   ];
@@ -24,10 +28,13 @@ let
   nativeLibs = [
     z3Lib
     opensslLib
+    libclangLib
+  ] ++ lib.optionals isLinux [
     elfutilsLib
     libcapNgLib
-    libclangLib
   ];
+
+  libclangSharedLibrary = if isDarwin then "libclang.dylib" else "libclang.so";
 
   pythonWithPyelftools = pkgs.python3.withPackages (ps: [
     ps.pyelftools
@@ -83,12 +90,8 @@ in
     cmake
     cpio
     e2fsprogs
-    elfutils
     flex
-    gcc
     gnumake
-    libcap_ng
-    llvmPackages.libclang
     openssl
     pkg-config
     z3
@@ -99,35 +102,52 @@ in
     # host-installed Podman when that driver is required.
     docker-client
     gh
+  ] ++ lib.optionals isLinux [
+    # Linux-only VM runtime build dependencies.
+    elfutils
+    gcc
+    libcap_ng
+    llvmPackages.libclang
+  ] ++ lib.optionals isDarwin [
+    # macOS VM runtime build dependencies that are otherwise documented as
+    # Homebrew prerequisites. Darwin uses the host Xcode/CLT compiler so C++
+    # probes can see the Apple SDK and libc++ headers.
+    dtc
+    llvmPackages.lld
   ] ++ [
     pythonWithPyelftools
   ];
 
-  env.PKG_CONFIG_PATH = lib.concatStringsSep ":" [
-    (lib.makeSearchPathOutput "dev" "lib/pkgconfig" pkgConfigInputs)
-    (lib.makeSearchPathOutput "dev" "share/pkgconfig" pkgConfigInputs)
-  ];
-  env.LD_LIBRARY_PATH = lib.makeLibraryPath nativeLibs;
-  env.LIBRARY_PATH = lib.makeLibraryPath nativeLibs;
+  env = {
+    PKG_CONFIG_PATH = lib.concatStringsSep ":" [
+      (lib.makeSearchPathOutput "dev" "lib/pkgconfig" pkgConfigInputs)
+      (lib.makeSearchPathOutput "dev" "share/pkgconfig" pkgConfigInputs)
+    ];
+    LIBRARY_PATH = lib.makeLibraryPath nativeLibs;
 
-  env.LIBCLANG_PATH = "${libclangLib}/lib";
-  env.OPENSHELL_LIBKRUNFW_PYTHON = "${pythonWithPyelftools}/bin/python3";
-  env.OPENSHELL_SKIP_SYSTEM_DEPS = "1";
+    LIBCLANG_PATH = "${libclangLib}/lib";
+    OPENSHELL_LIBKRUNFW_PYTHON = "${pythonWithPyelftools}/bin/python3";
+    OPENSHELL_SKIP_SYSTEM_DEPS = "1";
 
-  env.Z3_SYS_Z3_HEADER = "${z3Dev}/include/z3.h";
-  env.Z3_LIBRARY_PATH_OVERRIDE = "${z3Lib}/lib";
+    Z3_SYS_Z3_HEADER = "${z3Dev}/include/z3.h";
+    Z3_LIBRARY_PATH_OVERRIDE = "${z3Lib}/lib";
 
-  # Match CI's Zig-backed musl toolchain so native Nix shells do not leak
-  # glibc-built C objects into static supervisor/CLI links.
-  env.CC_aarch64_unknown_linux_musl = "${aarch64MuslCc}/bin/openshell-zig-aarch64-linux-musl-cc";
-  env.CXX_aarch64_unknown_linux_musl = "${aarch64MuslCxx}/bin/openshell-zig-aarch64-linux-musl-cxx";
-  env.CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER = "${aarch64MuslCc}/bin/openshell-zig-aarch64-linux-musl-cc";
-  env.CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS = "-Clink-self-contained=no";
+    # Match CI's Zig-backed musl toolchain so native Nix shells do not leak
+    # glibc-built C objects into static supervisor/CLI links.
+    CC_aarch64_unknown_linux_musl = "${aarch64MuslCc}/bin/openshell-zig-aarch64-linux-musl-cc";
+    CXX_aarch64_unknown_linux_musl = "${aarch64MuslCxx}/bin/openshell-zig-aarch64-linux-musl-cxx";
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER = "${aarch64MuslCc}/bin/openshell-zig-aarch64-linux-musl-cc";
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS = "-Clink-self-contained=no";
 
-  env.CC_x86_64_unknown_linux_musl = "${x86_64MuslCc}/bin/openshell-zig-x86_64-linux-musl-cc";
-  env.CXX_x86_64_unknown_linux_musl = "${x86_64MuslCxx}/bin/openshell-zig-x86_64-linux-musl-cxx";
-  env.CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER = "${x86_64MuslCc}/bin/openshell-zig-x86_64-linux-musl-cc";
-  env.CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS = "-Clink-self-contained=no";
+    CC_x86_64_unknown_linux_musl = "${x86_64MuslCc}/bin/openshell-zig-x86_64-linux-musl-cc";
+    CXX_x86_64_unknown_linux_musl = "${x86_64MuslCxx}/bin/openshell-zig-x86_64-linux-musl-cxx";
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER = "${x86_64MuslCc}/bin/openshell-zig-x86_64-linux-musl-cc";
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS = "-Clink-self-contained=no";
+  } // lib.optionalAttrs isLinux {
+    LD_LIBRARY_PATH = lib.makeLibraryPath nativeLibs;
+  } // lib.optionalAttrs isDarwin {
+    DYLD_FALLBACK_LIBRARY_PATH = lib.makeLibraryPath nativeLibs;
+  };
 
   enterShell = ''
     echo "OpenShell devenv ready. Run 'mise trust' once, then 'mise install --locked'."
@@ -137,7 +157,7 @@ in
     pkg-config --exists z3
     test -f "$Z3_SYS_Z3_HEADER"
     test -d "$Z3_LIBRARY_PATH_OVERRIDE"
-    test -e "$LIBCLANG_PATH/libclang.so"
+    test -e "$LIBCLANG_PATH/${libclangSharedLibrary}"
     "$OPENSHELL_LIBKRUNFW_PYTHON" -c 'from elftools.elf.elffile import ELFFile'
     test -x "$(command -v mise)"
     test -x "$(command -v mke2fs)"
