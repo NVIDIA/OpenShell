@@ -6515,6 +6515,10 @@ network_policies:
 
     #[cfg(target_os = "linux")]
     #[test]
+    // TODO: exec'ing /bin/sleep (SELinux label bin_t) from a user_home_t test
+    // binary causes /proc/<pid>/exe readlink to return ENOENT on
+    // SELinux-enforcing hosts.  Fix by building a test-sleep-helper binary in
+    // the same crate so it inherits the user_home_t label.
     fn resolve_process_identity_denies_fork_exec_shared_socket_ambiguity() {
         use crate::identity::BinaryIdentityCache;
         use std::ffi::CString;
@@ -6522,8 +6526,29 @@ network_policies:
         use std::os::fd::AsRawFd;
         use std::time::{Duration, Instant};
 
+        struct ChildGuard(libc::pid_t);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                #[allow(unsafe_code)]
+                unsafe {
+                    libc::kill(self.0, libc::SIGKILL);
+                    libc::waitpid(self.0, std::ptr::null_mut(), 0);
+                }
+            }
+        }
+
         if !std::path::Path::new("/bin/sleep").exists() {
             eprintln!("skipping: /bin/sleep not available");
+            return;
+        }
+
+        if std::process::Command::new("getenforce")
+            .output()
+            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "Enforcing")
+        {
+            eprintln!(
+                "skipping: SELinux is enforcing — cross-label /proc/<pid>/exe readlink fails"
+            );
             return;
         }
 
@@ -6567,7 +6592,10 @@ network_policies:
             }
         }
 
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let _guard = ChildGuard(child_pid);
+        let entrypoint_pid = std::process::id();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             if let Ok(link) = std::fs::read_link(format!("/proc/{child_pid}/exe"))
                 && link.to_string_lossy().contains("sleep")
@@ -6576,18 +6604,14 @@ network_policies:
             }
             assert!(
                 Instant::now() < deadline,
-                "child pid {child_pid} did not exec into sleep within 2s"
+                "child pid {child_pid} did not exec into sleep within 5s"
             );
             std::thread::sleep(Duration::from_millis(20));
         }
 
         let cache = BinaryIdentityCache::new();
 
-        // Resolve with a brief retry loop — under heavy CI load the child's
-        // procfs entry can momentarily fail to resolve even though the loop
-        // above just verified `/proc/<pid>/exe` pointed at `sleep`.  Retry a
-        // few times before declaring failure so the test is not flaky.
-        let mut result = resolve_process_identity(std::process::id(), peer_port, &cache);
+        let mut result = resolve_process_identity(entrypoint_pid, peer_port, &cache);
         for _ in 0..5 {
             match &result {
                 Err(err)
@@ -6595,17 +6619,10 @@ network_policies:
                         || err.reason.contains("os error 2") =>
                 {
                     std::thread::sleep(Duration::from_millis(50));
-                    result = resolve_process_identity(std::process::id(), peer_port, &cache);
+                    result = resolve_process_identity(entrypoint_pid, peer_port, &cache);
                 }
                 _ => break,
             }
-        }
-
-        // libc/syscall FFI requires unsafe
-        #[allow(unsafe_code)]
-        unsafe {
-            libc::kill(child_pid, libc::SIGKILL);
-            libc::waitpid(child_pid, std::ptr::null_mut(), 0);
         }
 
         match result {
@@ -6620,7 +6637,7 @@ network_policies:
                     err.reason
                 );
                 assert!(
-                    err.reason.contains(&std::process::id().to_string()),
+                    err.reason.contains(&entrypoint_pid.to_string()),
                     "error should include parent PID; got: {}",
                     err.reason
                 );
