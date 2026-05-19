@@ -1624,6 +1624,7 @@ fn is_terminal_failure_reason(reason: &str) -> bool {
         "dependenciesnotready",
         "starting",
         "containerstarting",
+        "containercreated",
         "healthcheckstarting",
         "inspectfailed",
     ];
@@ -2006,6 +2007,10 @@ mod tests {
             ),
             ("dependenciesnotready", "lowercase also works"),
             ("Starting", "VM is starting"),
+            (
+                "ContainerCreated",
+                "Podman created the container before starting it",
+            ),
         ];
 
         for (reason, message) in transient_cases {
@@ -2043,6 +2048,10 @@ mod tests {
                 "Pod exists with phase: Pending; Service Exists",
             ),
             ("Starting", "VM is starting"),
+            (
+                "ContainerCreated",
+                "Container exists but has not started yet",
+            ),
         ];
 
         for (reason, message) in transient_conditions {
