@@ -4,9 +4,8 @@
 //! gRPC client for fetching sandbox policy, provider environment, and inference
 //! route bundles from `OpenShell` server.
 //!
-//! Every request carries a gateway-minted JWT in the `Authorization` header
-//! (PR 3 of the per-sandbox identity series; see issue #1354). The token is
-//! resolved at startup from one of three sources:
+//! Every request carries a gateway-minted JWT in the `Authorization` header.
+//! The token is resolved at startup from one of three sources:
 //!
 //! 1. `OPENSHELL_SANDBOX_TOKEN` — raw JWT in the env (test harness path).
 //! 2. `OPENSHELL_SANDBOX_TOKEN_FILE` — file containing the JWT (Docker /

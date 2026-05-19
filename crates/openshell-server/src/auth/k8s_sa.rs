@@ -17,13 +17,13 @@
 use super::authenticator::Authenticator;
 use super::principal::{Principal, SandboxIdentitySource, SandboxPrincipal};
 use async_trait::async_trait;
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
-use k8s_openapi::api::core::v1::Pod;
-use kube::api::Api;
-use serde::Deserialize;
-use std::collections::HashMap;
+use k8s_openapi::api::{
+    authentication::v1::{TokenReview, TokenReviewSpec, TokenReviewStatus, UserInfo},
+    core::v1::Pod,
+};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+use kube::api::{Api, PostParams};
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock};
 use tonic::Status;
 use tracing::{debug, info, warn};
 
@@ -36,6 +36,8 @@ pub const ISSUE_SANDBOX_TOKEN_PATH: &str = "/openshell.v1.OpenShell/IssueSandbox
 /// annotation as authoritative; the K8s `Role` granted to the gateway must
 /// not include `patch pods` (see plan §11.8).
 pub const SANDBOX_ID_ANNOTATION: &str = "openshell.io/sandbox-id";
+const POD_NAME_EXTRA: &str = "authentication.kubernetes.io/pod-name";
+const POD_UID_EXTRA: &str = "authentication.kubernetes.io/pod-uid";
 
 /// Resolved identity extracted from a validated SA token + pod lookup.
 #[derive(Debug, Clone)]
@@ -122,266 +124,77 @@ impl Authenticator for K8sServiceAccountAuthenticator {
     }
 }
 
-/// K8s apiserver discovery document (subset of fields used).
-#[derive(Deserialize)]
-struct ApiserverDiscovery {
-    issuer: String,
-    jwks_uri: String,
+#[derive(Debug)]
+struct TokenReviewIdentity {
+    pod_name: String,
+    pod_uid: String,
 }
 
-/// JWKS key set returned by the apiserver's `/openid/v1/jwks` endpoint.
-#[derive(Deserialize)]
-struct JwkSet {
-    keys: Vec<JwkKey>,
-}
-
-#[derive(Deserialize)]
-struct JwkKey {
-    kid: Option<String>,
-    kty: String,
-    #[serde(default)]
-    n: String,
-    #[serde(default)]
-    e: String,
-    alg: Option<String>,
-}
-
-/// Claims subset extracted from a validated projected SA token. `exp`,
-/// `aud`, and `serviceaccount` are validated by `jsonwebtoken` but we
-/// don't read them post-decode — dead-code-allowed so the structural
-/// match against the token shape stays explicit.
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct K8sSaClaims {
-    /// `system:serviceaccount:<namespace>:<sa-name>`
-    sub: String,
-    iss: String,
-    /// The audience claim is always an array for projected SA tokens.
-    #[serde(default)]
-    aud: Vec<String>,
-    exp: i64,
-    #[serde(rename = "kubernetes.io")]
-    kubernetes: K8sClaim,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct K8sClaim {
-    namespace: String,
-    pod: K8sPodClaim,
-    #[serde(default)]
-    serviceaccount: Option<K8sSaClaim>,
-}
-
-#[derive(Debug, Deserialize)]
-struct K8sPodClaim {
-    name: String,
-    uid: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct K8sSaClaim {
-    #[allow(dead_code)]
-    name: String,
-    #[allow(dead_code)]
-    uid: String,
-}
-
-/// JWKS cache for the K8s apiserver's projected `ServiceAccount` token
-/// issuer. Discovery + key fetch lazily on first validate; subsequent
-/// validations are in-process signature checks. Refreshes on `kid` miss
-/// so apiserver key rotation propagates without a restart.
-pub struct K8sApiserverJwks {
-    client: kube::Client,
-    expected_audience: String,
-    state: RwLock<JwksState>,
-    refresh: Mutex<()>,
-}
-
-#[derive(Default)]
-struct JwksState {
-    issuer: Option<String>,
-    jwks_path: Option<String>,
-    keys: HashMap<String, DecodingKey>,
-}
-
-impl K8sApiserverJwks {
-    pub fn new(client: kube::Client, expected_audience: String) -> Self {
-        Self {
-            client,
-            expected_audience,
-            state: RwLock::new(JwksState::default()),
-            refresh: Mutex::new(()),
-        }
-    }
-
-    /// Validate `token`, returning the parsed claims on success.
-    #[allow(clippy::result_large_err)]
-    async fn validate(&self, token: &str) -> Result<K8sSaClaims, Status> {
-        // Decode the header to find the kid first; we lazily load on demand.
-        let header = decode_header(token).map_err(|e| {
-            debug!(error = %e, "K8s SA JWT header decode failed");
-            Status::unauthenticated("invalid token")
-        })?;
-        let kid = header
-            .kid
-            .ok_or_else(|| Status::unauthenticated("invalid token: missing kid"))?;
-
-        let (issuer, key) = if let Some(pair) = self.cached_key(&kid).await {
-            pair
-        } else {
-            self.refresh_keys().await?;
-            self.cached_key(&kid).await.ok_or_else(|| {
-                debug!(kid = %kid, "K8s SA JWT kid not found in apiserver JWKS");
-                Status::unauthenticated("invalid token: unknown signing key")
-            })?
-        };
-
-        let mut validation = Validation::new(Algorithm::RS256);
-        validation.algorithms = vec![Algorithm::RS256];
-        validation.set_issuer(&[&issuer]);
-        validation.set_audience(&[&self.expected_audience]);
-        validation.set_required_spec_claims(&["iss", "aud", "exp", "sub"]);
-
-        let data = decode::<K8sSaClaims>(token, &key, &validation).map_err(|e| {
-            debug!(error = %e, "K8s SA JWT validation failed");
-            Status::unauthenticated(format!("invalid SA token: {e}"))
-        })?;
-        Ok(data.claims)
-    }
-
-    async fn cached_key(&self, kid: &str) -> Option<(String, DecodingKey)> {
-        let state = self.state.read().await;
-        let issuer = state.issuer.clone()?;
-        let key = state.keys.get(kid).cloned()?;
-        Some((issuer, key))
-    }
-
-    /// Fetch the discovery document + JWKS and replace the cached state.
-    /// Coalesces concurrent refreshes so the apiserver sees one fetch.
-    #[allow(clippy::result_large_err)]
-    async fn refresh_keys(&self) -> Result<(), Status> {
-        let _guard = self.refresh.lock().await;
-        info!("refreshing K8s apiserver JWKS");
-        let discovery: ApiserverDiscovery = self
-            .request_apiserver("/.well-known/openid-configuration")
-            .await?;
-        let jwks_path = jwks_path_from_uri(&discovery.jwks_uri).ok_or_else(|| {
-            Status::internal(format!(
-                "apiserver returned unusable jwks_uri '{}'",
-                discovery.jwks_uri
-            ))
-        })?;
-        let jwks: JwkSet = self.request_apiserver(&jwks_path).await?;
-        let mut keys = HashMap::new();
-        for key in &jwks.keys {
-            if key.kty != "RSA" {
-                continue;
-            }
-            let Some(ref kid) = key.kid else {
-                continue;
-            };
-            if let Some(alg) = key.alg.as_deref()
-                && alg != "RS256"
-            {
-                continue;
-            }
-            match DecodingKey::from_rsa_components(&key.n, &key.e) {
-                Ok(dk) => {
-                    keys.insert(kid.clone(), dk);
-                }
-                Err(e) => warn!(kid = %kid, error = %e, "skipped malformed apiserver JWK"),
-            }
-        }
-        info!(
-            count = keys.len(),
-            issuer = %discovery.issuer,
-            "loaded apiserver JWKS"
-        );
-        let mut state = self.state.write().await;
-        state.issuer = Some(discovery.issuer);
-        state.jwks_path = Some(jwks_path);
-        state.keys = keys;
-        Ok(())
-    }
-
-    #[allow(clippy::result_large_err)]
-    async fn request_apiserver<T: serde::de::DeserializeOwned>(
-        &self,
-        path: &str,
-    ) -> Result<T, Status> {
-        let req = http::Request::builder()
-            .uri(path)
-            .body(Vec::new())
-            .map_err(|e| Status::internal(format!("apiserver request build: {e}")))?;
-        self.client
-            .request::<T>(req)
-            .await
-            .map_err(|e| Status::internal(format!("apiserver request failed: {e}")))
-    }
-}
-
-/// Pull a path-only URI out of the `jwks_uri` field. The apiserver's
-/// discovery doc returns an absolute URL (e.g.
-/// `https://kubernetes.default.svc.cluster.local/openid/v1/jwks`); we
-/// strip to the path so `kube::Client::request` can be reused.
-fn jwks_path_from_uri(uri: &str) -> Option<String> {
-    if uri.starts_with('/') {
-        return Some(uri.to_string());
-    }
-    let parsed = url::Url::parse(uri).ok()?;
-    let mut out = parsed.path().to_string();
-    if let Some(q) = parsed.query() {
-        out.push('?');
-        out.push_str(q);
-    }
-    Some(out)
-}
-
-/// Resolver backed by the apiserver's JWKS endpoint (for SA-token
-/// signature verification) and `kube::Client` (for the per-pod
-/// annotation lookup).
+/// Resolver backed by the apiserver's `TokenReview` API and `kube::Client`
+/// for the per-pod annotation lookup.
 pub struct LiveK8sResolver {
-    jwks: Arc<K8sApiserverJwks>,
+    token_reviews_api: Api<TokenReview>,
     pods_api: Api<Pod>,
+    expected_audience: String,
+    sandbox_namespace: String,
 }
 
 impl LiveK8sResolver {
     pub fn new(client: kube::Client, namespace: &str, expected_audience: String) -> Self {
-        let pods_api: Api<Pod> = Api::namespaced(client.clone(), namespace);
-        let jwks = Arc::new(K8sApiserverJwks::new(client, expected_audience));
-        Self { jwks, pods_api }
+        let token_reviews_api: Api<TokenReview> = Api::all(client.clone());
+        let pods_api: Api<Pod> = Api::namespaced(client, namespace);
+        Self {
+            token_reviews_api,
+            pods_api,
+            expected_audience,
+            sandbox_namespace: namespace.to_string(),
+        }
     }
 }
 
 #[async_trait]
 impl K8sIdentityResolver for LiveK8sResolver {
     async fn resolve(&self, token: &str) -> Result<Option<ResolvedK8sIdentity>, Status> {
-        let claims = match self.jwks.validate(token).await {
-            Ok(c) => c,
-            Err(status) if status.code() == tonic::Code::Unauthenticated => {
-                // Returning Ok(None) lets the chain fall through; the
-                // outer router then returns Unauthenticated to the client.
-                return Ok(None);
-            }
-            Err(other) => return Err(other),
+        let review = TokenReview {
+            metadata: ObjectMeta::default(),
+            spec: TokenReviewSpec {
+                audiences: Some(vec![self.expected_audience.clone()]),
+                token: Some(token.to_string()),
+            },
+            status: None,
         };
 
-        debug!(
-            sub = %claims.sub,
-            iss = %claims.iss,
-            pod_name = %claims.kubernetes.pod.name,
-            "validated K8s SA token"
+        let review = self
+            .token_reviews_api
+            .create(&PostParams::default(), &review)
+            .await
+            .map_err(|e| {
+                warn!(error = %e, "K8s TokenReview failed");
+                Status::internal(format!("tokenreview failed: {e}"))
+            })?;
+        let status = review
+            .status
+            .ok_or_else(|| Status::internal("TokenReview response missing status"))?;
+        let Some(identity) =
+            token_review_identity(&status, &self.expected_audience, &self.sandbox_namespace)?
+        else {
+            return Ok(None);
+        };
+
+        info!(
+            pod_name = %identity.pod_name,
+            pod_uid = %identity.pod_uid,
+            "validated K8s SA token via TokenReview"
         );
 
         // Look up the pod and read its sandbox-id annotation.
         let pod = self
             .pods_api
-            .get_opt(&claims.kubernetes.pod.name)
+            .get_opt(&identity.pod_name)
             .await
             .map_err(|e| {
                 warn!(
-                    pod = %claims.kubernetes.pod.name,
+                    pod = %identity.pod_name,
                     error = %e,
                     "failed to fetch sandbox pod for annotation lookup"
                 );
@@ -389,7 +202,7 @@ impl K8sIdentityResolver for LiveK8sResolver {
             })?;
         let Some(pod) = pod else {
             warn!(
-                pod = %claims.kubernetes.pod.name,
+                pod = %identity.pod_name,
                 "sandbox pod referenced by SA token not found in this namespace"
             );
             return Err(Status::not_found("sandbox pod not found"));
@@ -399,10 +212,10 @@ impl K8sIdentityResolver for LiveK8sResolver {
         // `kubernetes.io.pod.uid`. Prevents a replayed token from a
         // recreated pod with the same name.
         let actual_uid = pod.metadata.uid.as_deref().unwrap_or_default();
-        if actual_uid != claims.kubernetes.pod.uid {
+        if actual_uid != identity.pod_uid {
             warn!(
-                pod = %claims.kubernetes.pod.name,
-                claimed_uid = %claims.kubernetes.pod.uid,
+                pod = %identity.pod_name,
+                claimed_uid = %identity.pod_uid,
                 actual_uid = %actual_uid,
                 "SA token pod UID does not match live pod; rejecting"
             );
@@ -419,10 +232,72 @@ impl K8sIdentityResolver for LiveK8sResolver {
 
         Ok(Some(ResolvedK8sIdentity {
             sandbox_id,
-            pod_name: claims.kubernetes.pod.name,
-            pod_uid: claims.kubernetes.pod.uid,
+            pod_name: identity.pod_name,
+            pod_uid: identity.pod_uid,
         }))
     }
+}
+
+#[allow(clippy::result_large_err)]
+fn token_review_identity(
+    status: &TokenReviewStatus,
+    expected_audience: &str,
+    sandbox_namespace: &str,
+) -> Result<Option<TokenReviewIdentity>, Status> {
+    if status.authenticated != Some(true) {
+        debug!(
+            error = status.error.as_deref().unwrap_or_default(),
+            "K8s TokenReview did not authenticate token"
+        );
+        return Ok(None);
+    }
+
+    let audiences = status.audiences.as_deref().unwrap_or_default();
+    if !audiences.iter().any(|aud| aud == expected_audience) {
+        warn!(
+            expected_audience = %expected_audience,
+            audiences = ?audiences,
+            "K8s TokenReview authenticated token without expected audience"
+        );
+        return Err(Status::unauthenticated("SA token audience not accepted"));
+    }
+
+    let user = status
+        .user
+        .as_ref()
+        .ok_or_else(|| Status::permission_denied("TokenReview response missing user info"))?;
+    let username = user
+        .username
+        .as_deref()
+        .ok_or_else(|| Status::permission_denied("TokenReview response missing username"))?;
+    let expected_prefix = format!("system:serviceaccount:{sandbox_namespace}:");
+    if !username.starts_with(&expected_prefix) {
+        warn!(
+            username = %username,
+            sandbox_namespace = %sandbox_namespace,
+            "K8s TokenReview principal is outside the sandbox namespace"
+        );
+        return Err(Status::permission_denied(
+            "SA token is outside the sandbox namespace",
+        ));
+    }
+
+    let pod_name = user_extra_one(user, POD_NAME_EXTRA)?;
+    let pod_uid = user_extra_one(user, POD_UID_EXTRA)?;
+    Ok(Some(TokenReviewIdentity { pod_name, pod_uid }))
+}
+
+#[allow(clippy::result_large_err)]
+fn user_extra_one(user: &UserInfo, key: &str) -> Result<String, Status> {
+    let Some(values) = user.extra.as_ref().and_then(|extra| extra.get(key)) else {
+        return Err(Status::permission_denied("SA token is not pod-bound"));
+    };
+    if values.len() != 1 || values[0].is_empty() {
+        return Err(Status::permission_denied(
+            "SA token has invalid pod binding",
+        ));
+    }
+    Ok(values[0].clone())
 }
 
 #[cfg(test)]
@@ -462,6 +337,7 @@ pub mod test_support {
 mod tests {
     use super::test_support::FakeResolver;
     use super::*;
+    use std::collections::BTreeMap;
 
     fn bearer_headers(token: &str) -> http::HeaderMap {
         let mut h = http::HeaderMap::new();
@@ -472,30 +348,115 @@ mod tests {
         h
     }
 
-    #[test]
-    fn jwks_path_extracts_absolute_url() {
-        let path =
-            jwks_path_from_uri("https://kubernetes.default.svc.cluster.local/openid/v1/jwks")
-                .expect("apiserver-style URL must parse");
-        assert_eq!(path, "/openid/v1/jwks");
+    fn token_review_status(
+        authenticated: bool,
+        audiences: Vec<&str>,
+        username: &str,
+        extra: Vec<(&str, &str)>,
+    ) -> TokenReviewStatus {
+        TokenReviewStatus {
+            authenticated: Some(authenticated),
+            audiences: Some(audiences.into_iter().map(str::to_string).collect()),
+            error: None,
+            user: Some(UserInfo {
+                username: Some(username.to_string()),
+                uid: Some("sa-uid".to_string()),
+                groups: Some(vec![
+                    "system:serviceaccounts".to_string(),
+                    "system:serviceaccounts:openshell".to_string(),
+                    "system:authenticated".to_string(),
+                ]),
+                extra: Some(
+                    extra
+                        .into_iter()
+                        .map(|(k, v)| (k.to_string(), vec![v.to_string()]))
+                        .collect::<BTreeMap<_, _>>(),
+                ),
+            }),
+        }
     }
 
     #[test]
-    fn jwks_path_preserves_relative_path() {
-        let path = jwks_path_from_uri("/openid/v1/jwks").expect("relative path must round-trip");
-        assert_eq!(path, "/openid/v1/jwks");
+    fn token_review_identity_extracts_pod_binding() {
+        let status = token_review_status(
+            true,
+            vec!["openshell-gateway"],
+            "system:serviceaccount:openshell:default",
+            vec![
+                (POD_NAME_EXTRA, "openshell-sandbox-a"),
+                (POD_UID_EXTRA, "uid-a"),
+            ],
+        );
+
+        let identity = token_review_identity(&status, "openshell-gateway", "openshell")
+            .unwrap()
+            .expect("authenticated token should resolve");
+
+        assert_eq!(identity.pod_name, "openshell-sandbox-a");
+        assert_eq!(identity.pod_uid, "uid-a");
     }
 
     #[test]
-    fn jwks_path_preserves_query_string() {
-        let path = jwks_path_from_uri("https://apiserver/openid/v1/jwks?version=v1")
-            .expect("query strings must be preserved");
-        assert_eq!(path, "/openid/v1/jwks?version=v1");
+    fn token_review_identity_returns_none_when_not_authenticated() {
+        let status = TokenReviewStatus {
+            authenticated: Some(false),
+            error: Some("invalid audience".to_string()),
+            ..Default::default()
+        };
+
+        assert!(
+            token_review_identity(&status, "openshell-gateway", "openshell")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
-    fn jwks_path_rejects_garbage() {
-        assert!(jwks_path_from_uri("not a url").is_none());
+    fn token_review_identity_requires_expected_audience() {
+        let status = token_review_status(
+            true,
+            vec!["kubernetes.default.svc"],
+            "system:serviceaccount:openshell:default",
+            vec![
+                (POD_NAME_EXTRA, "openshell-sandbox-a"),
+                (POD_UID_EXTRA, "uid-a"),
+            ],
+        );
+
+        let err = token_review_identity(&status, "openshell-gateway", "openshell")
+            .expect_err("wrong audience must fail closed");
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[test]
+    fn token_review_identity_requires_sandbox_namespace() {
+        let status = token_review_status(
+            true,
+            vec!["openshell-gateway"],
+            "system:serviceaccount:other:default",
+            vec![
+                (POD_NAME_EXTRA, "openshell-sandbox-a"),
+                (POD_UID_EXTRA, "uid-a"),
+            ],
+        );
+
+        let err = token_review_identity(&status, "openshell-gateway", "openshell")
+            .expect_err("other namespace must be rejected");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn token_review_identity_requires_pod_bound_extras() {
+        let status = token_review_status(
+            true,
+            vec!["openshell-gateway"],
+            "system:serviceaccount:openshell:default",
+            vec![],
+        );
+
+        let err = token_review_identity(&status, "openshell-gateway", "openshell")
+            .expect_err("non pod-bound tokens must be rejected");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
 
     #[tokio::test]

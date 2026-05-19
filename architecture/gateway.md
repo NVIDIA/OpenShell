@@ -49,9 +49,12 @@ authorized by role policy when OIDC or edge identity is enabled.
 Sandbox secrets are gateway-signed JWTs bound to a single sandbox ID. Docker,
 Podman, and VM drivers deliver the initial token through supervisor-only
 runtime material; Kubernetes supervisors exchange a projected ServiceAccount
-token through `IssueSandboxToken`. Supervisors renew gateway JWTs in memory
-before expiry. Older tokens are not server-revoked; deployments bound replay
-exposure with short `gateway_jwt.ttl_secs` lifetimes.
+token through `IssueSandboxToken`. The gateway validates that projected token
+with Kubernetes `TokenReview`, checks the returned pod binding against the live
+pod UID, and reads the pod's sandbox annotation before minting the gateway JWT.
+Supervisors renew gateway JWTs in memory before expiry. Older tokens are not
+server-revoked; deployments bound replay exposure with short
+`gateway_jwt.ttl_secs` lifetimes.
 
 Sandbox JWTs are not user credentials. The gRPC router accepts
 `Principal::Sandbox` only on the supervisor-to-gateway RPC allowlist

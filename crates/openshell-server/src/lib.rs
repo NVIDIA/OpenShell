@@ -291,9 +291,8 @@ pub async fn run_server(
     // K8s ServiceAccount bootstrap authenticator. Only constructed when
     // the gateway is running in-cluster (kubelet provides the API host
     // env var) and has a sandbox JWT issuer to mint replacements against;
-    // outside the cluster we can't talk to the apiserver's JWKS endpoint,
-    // and without the issuer there's nothing to exchange the SA token
-    // for.
+    // outside the cluster we can't call the apiserver's TokenReview API,
+    // and without the issuer there's nothing to exchange the SA token for.
     if state.sandbox_jwt_issuer.is_some() && std::env::var_os("KUBERNETES_SERVICE_HOST").is_some() {
         // Pod lookups must target the sandbox namespace (where the K8s
         // driver places sandbox pods), not the gateway's own pod
