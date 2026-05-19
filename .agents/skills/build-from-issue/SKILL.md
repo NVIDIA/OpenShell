@@ -148,6 +148,7 @@ In the prompt, instruct the reviewer to:
    - **Medium**: Multiple files/components, some design decisions, but well-scoped
    - **High**: Cross-cutting changes, architectural decisions needed, significant unknowns
 8. Call out risks, unknowns, and decisions that need stakeholder input.
+9. Assess **LSM compatibility** — if the change touches process identity, `/proc` filesystem access, binary execution, or inter-process visibility, flag whether it will behave differently on hosts running SELinux (enforcing) or AppArmor. In particular, tests that fork+exec into system binaries will fail on SELinux-enforcing hosts due to cross-label `/proc/<pid>/exe` access restrictions.
 
 ### A2: Post the Plan Comment
 
