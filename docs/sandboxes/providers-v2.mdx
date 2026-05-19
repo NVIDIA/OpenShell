@@ -213,8 +213,7 @@ endpoints:
 
 binaries:
   - /usr/bin/curl
-  - path: /usr/local/bin/custom-cli
-    harness: false
+  - /usr/local/bin/custom-cli
 ```
 
 ### Profile Sections
@@ -227,7 +226,7 @@ binaries:
 
 `endpoints` contains the same endpoint object shape as sandbox network policy. A profile can use access presets, protocol-specific allow rules, deny rules, WebSocket credential rewriting, request body credential rewriting, GraphQL fields, and SSRF IP allowlists.
 
-`binaries` contains the executable paths allowed to reach the profile endpoints when the profile contributes policy to a sandbox. Entries can be strings or objects with `path` and `harness`.
+`binaries` contains the executable paths allowed to reach the profile endpoints when the profile contributes policy to a sandbox.
 
 `inference_capable` marks profiles that are intended to participate in inference workflows. It does not currently mount or configure `inference.local`.
 
