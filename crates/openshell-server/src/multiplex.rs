@@ -272,7 +272,7 @@ where
 /// 4. `PermissiveUserAuthenticator` — installed only when no OIDC is
 ///    configured (singleplayer / helm-dev). Catches anything the
 ///    sandbox authenticators didn't claim and produces a synthetic
-///    user principal, preserving the pre-PR-1 "no OIDC = open" posture.
+///    user principal, preserving the existing "no OIDC = open" dev posture.
 ///
 /// When neither OIDC nor gateway-minted JWTs are configured (a barebones
 /// dev gateway), the chain is left as `None` so the router short-circuits
@@ -310,9 +310,9 @@ fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> 
 /// - When no chain is configured (OIDC not configured), forward without
 ///   authentication — preserves today's pass-through behavior.
 /// - Otherwise, run the chain. The first match produces a `Principal`.
-///   `Principal::User` is gated by the RBAC `AuthzPolicy`. The legacy
-///   sandbox marker also inserts the metadata marker for backwards-compat
-///   with handlers that still consume it (PR-1 only; removed in PR 3).
+///   `Principal::User` is gated by the RBAC `AuthzPolicy`.
+///   `Principal::Sandbox` is gated by a supervisor-method allowlist, then
+///   handlers enforce same-sandbox scope on request bodies.
 #[derive(Clone)]
 pub struct AuthGrpcRouter<S> {
     inner: S,
@@ -409,15 +409,26 @@ where
                 Err(status) => return Ok(status_response(status)),
             };
 
-            // Authorize user principals via RBAC. Sandbox principals get
-            // a per-handler `sandbox_id` equality check in PR 4; right now
-            // they bypass RBAC because the public sandbox-class methods
-            // they call were path-bypassed before this refactor too.
-            if let Principal::User(ref user) = principal
-                && let Some(ref policy) = authz_policy
-                && let Err(status) = policy.check(&user.identity, &path)
-            {
-                return Ok(status_response(status));
+            match principal {
+                Principal::User(ref user) => {
+                    if let Some(ref policy) = authz_policy
+                        && let Err(status) = policy.check(&user.identity, &path)
+                    {
+                        return Ok(status_response(status));
+                    }
+                }
+                Principal::Sandbox(_) => {
+                    if !crate::auth::sandbox_methods::is_sandbox_callable(&path) {
+                        return Ok(status_response(tonic::Status::permission_denied(
+                            "sandbox principals may not call this method",
+                        )));
+                    }
+                }
+                Principal::Anonymous => {
+                    return Ok(status_response(tonic::Status::unauthenticated(
+                        "anonymous callers may not call authenticated methods",
+                    )));
+                }
             }
 
             req.extensions_mut().insert(principal);
@@ -925,6 +936,12 @@ mod tests {
                 .unwrap()
         }
 
+        fn grpc_status<B>(res: &Response<B>) -> Option<String> {
+            res.headers()
+                .get("grpc-status")
+                .map(|v| v.to_str().unwrap().to_string())
+        }
+
         fn user_principal(subject: &str) -> Principal {
             Principal::User(UserPrincipal {
                 identity: Identity {
@@ -984,6 +1001,45 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn sandbox_principal_can_call_allowlisted_method() {
+            let mock = Arc::new(MockAuthenticator::returning(Ok(Some(sandbox_principal()))));
+            let chain = AuthenticatorChain::new(vec![mock]);
+            let (recorder, seen) = PrincipalRecorder::new();
+            let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
+
+            let res = router
+                .call(empty_request("/openshell.v1.OpenShell/GetSandboxConfig"))
+                .await
+                .unwrap();
+
+            assert_eq!(res.status(), 200);
+            assert!(matches!(
+                seen.lock().unwrap().as_ref(),
+                Some(Principal::Sandbox(_))
+            ));
+        }
+
+        #[tokio::test]
+        async fn sandbox_principal_is_denied_on_user_and_admin_methods() {
+            for path in [
+                "/openshell.v1.OpenShell/ListSandboxes",
+                "/openshell.v1.OpenShell/DeleteSandbox",
+                "/openshell.v1.OpenShell/CreateProvider",
+                "/openshell.v1.OpenShell/ApproveDraftChunk",
+            ] {
+                let mock = Arc::new(MockAuthenticator::returning(Ok(Some(sandbox_principal()))));
+                let chain = AuthenticatorChain::new(vec![mock]);
+                let (recorder, seen) = PrincipalRecorder::new();
+                let mut router = AuthGrpcRouter::new(recorder, Some(chain), None);
+
+                let res = router.call(empty_request(path)).await.unwrap();
+
+                assert!(seen.lock().unwrap().is_none(), "{path} reached handler");
+                assert_eq!(grpc_status(&res).as_deref(), Some("7"), "{path}");
+            }
+        }
+
+        #[tokio::test]
         async fn missing_principal_returns_unauthenticated() {
             let mock = Arc::new(MockAuthenticator::returning(Ok(None)));
             let chain = AuthenticatorChain::new(vec![mock]);
@@ -995,11 +1051,7 @@ mod tests {
                 .unwrap();
             assert!(seen.lock().unwrap().is_none());
             // tonic sets grpc-status=16 (UNAUTHENTICATED) in trailers.
-            let grpc_status = res
-                .headers()
-                .get("grpc-status")
-                .map(|v| v.to_str().unwrap().to_string());
-            assert_eq!(grpc_status.as_deref(), Some("16"));
+            assert_eq!(grpc_status(&res).as_deref(), Some("16"));
         }
 
         #[tokio::test]
@@ -1015,13 +1067,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(seen.lock().unwrap().is_none());
-            assert_eq!(
-                res.headers()
-                    .get("grpc-status")
-                    .map(|v| v.to_str().unwrap().to_string())
-                    .as_deref(),
-                Some("16")
-            );
+            assert_eq!(grpc_status(&res).as_deref(), Some("16"));
         }
 
         #[tokio::test]

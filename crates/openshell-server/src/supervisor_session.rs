@@ -18,6 +18,7 @@ use openshell_core::proto::{
 };
 
 use crate::ServerState;
+use crate::auth::principal::Principal;
 
 const HEARTBEAT_INTERVAL_SECS: u32 = 15;
 const RELAY_PENDING_TIMEOUT: Duration = Duration::from_secs(10);
@@ -337,16 +338,39 @@ impl SupervisorSessionRegistry {
     /// Returns the `DuplexStream` half that the supervisor side should read/write.
     // `tonic::Status` is large but is the API surface of gRPC handlers.
     #[allow(clippy::result_large_err)]
-    pub fn claim_relay(&self, channel_id: &str) -> Result<tokio::io::DuplexStream, Status> {
+    pub fn claim_relay(
+        &self,
+        channel_id: &str,
+        principal: Option<&Principal>,
+    ) -> Result<tokio::io::DuplexStream, Status> {
         let pending = {
             let mut map = self.pending_relays.lock().unwrap();
-            map.remove(channel_id)
-                .ok_or_else(|| Status::not_found("unknown or expired relay channel"))?
-        };
+            let pending = map
+                .get(channel_id)
+                .ok_or_else(|| Status::not_found("unknown or expired relay channel"))?;
 
-        if pending.created_at.elapsed() > RELAY_PENDING_TIMEOUT {
-            return Err(Status::deadline_exceeded("relay channel timed out"));
-        }
+            if let Some(principal) = principal
+                && let Err(status) = crate::auth::guard::ensure_sandbox_principal_scope(
+                    principal,
+                    &pending.sandbox_id,
+                )
+            {
+                info!(
+                    channel_id = %channel_id,
+                    sandbox_id = %pending.sandbox_id,
+                    "relay stream: rejecting cross-sandbox claim"
+                );
+                return Err(status);
+            }
+
+            if pending.created_at.elapsed() > RELAY_PENDING_TIMEOUT {
+                map.remove(channel_id);
+                return Err(Status::deadline_exceeded("relay channel timed out"));
+            }
+
+            map.remove(channel_id)
+                .expect("pending relay existed before removal")
+        };
 
         // Create a duplex stream pair: one end for the gateway bridge, one for
         // the supervisor HTTP CONNECT handler.
@@ -449,6 +473,7 @@ pub async fn handle_relay_stream(
     >,
     Status,
 > {
+    let principal = request.extensions().get::<Principal>().cloned();
     let mut inbound = request.into_inner();
 
     // First frame must identify the channel.
@@ -470,7 +495,7 @@ pub async fn handle_relay_stream(
     };
 
     // Claim the pending relay. Consumes the entry — it cannot be reused.
-    let supervisor_side = registry.claim_relay(&channel_id)?;
+    let supervisor_side = registry.claim_relay(&channel_id, principal.as_ref())?;
     info!(channel_id = %channel_id, "relay stream: claimed pending relay, bridging");
 
     let (mut read_half, mut write_half) = tokio::io::split(supervisor_side);
@@ -554,6 +579,7 @@ pub async fn handle_connect_supervisor(
     >,
     Status,
 > {
+    let principal = request.extensions().get::<Principal>().cloned();
     let mut inbound = request.into_inner();
 
     // Step 1: Wait for SupervisorHello.
@@ -568,6 +594,9 @@ pub async fn handle_connect_supervisor(
     let sandbox_id = hello.sandbox_id.clone();
     if sandbox_id.is_empty() {
         return Err(Status::invalid_argument("sandbox_id is required"));
+    }
+    if let Some(principal) = principal.as_ref() {
+        crate::auth::guard::ensure_sandbox_principal_scope(principal, &sandbox_id)?;
     }
     require_persisted_sandbox(&state.store, &sandbox_id).await?;
 
@@ -783,6 +812,8 @@ fn handle_supervisor_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::identity::{Identity, IdentityProvider};
+    use crate::auth::principal::{SandboxIdentitySource, SandboxPrincipal, UserPrincipal};
     use crate::persistence::Store;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -829,6 +860,28 @@ mod tests {
             },
             created_at,
         }
+    }
+
+    fn sandbox_principal(sandbox_id: &str) -> Principal {
+        Principal::Sandbox(SandboxPrincipal {
+            sandbox_id: sandbox_id.to_string(),
+            source: SandboxIdentitySource::BootstrapJwt {
+                issuer: "openshell-gateway:test".to_string(),
+            },
+            trust_domain: Some("openshell".to_string()),
+        })
+    }
+
+    fn user_principal(subject: &str) -> Principal {
+        Principal::User(UserPrincipal {
+            identity: Identity {
+                subject: subject.to_string(),
+                display_name: None,
+                roles: vec![],
+                scopes: vec![],
+                provider: IdentityProvider::Oidc,
+            },
+        })
     }
 
     // ---- registry: register / remove ----
@@ -1235,7 +1288,10 @@ mod tests {
     #[test]
     fn claim_relay_unknown_channel() {
         let registry = SupervisorSessionRegistry::new();
-        let err = registry.claim_relay("nonexistent").expect_err("should err");
+        let principal = sandbox_principal("sbx-test");
+        let err = registry
+            .claim_relay("nonexistent", Some(&principal))
+            .expect_err("should err");
         assert_eq!(err.code(), tonic::Code::NotFound);
     }
 
@@ -1248,9 +1304,49 @@ mod tests {
             pending_relay("sbx-test", relay_tx, Instant::now()),
         );
 
-        let result = registry.claim_relay("ch-1");
+        let principal = sandbox_principal("sbx-test");
+        let result = registry.claim_relay("ch-1", Some(&principal));
         assert!(result.is_ok());
         assert!(!registry.pending_relays.lock().unwrap().contains_key("ch-1"));
+    }
+
+    #[test]
+    fn claim_relay_rejects_cross_sandbox_principal_without_consuming_channel() {
+        let registry = SupervisorSessionRegistry::new();
+        let (relay_tx, _relay_rx) = oneshot::channel();
+        registry.pending_relays.lock().unwrap().insert(
+            "ch-cross".to_string(),
+            pending_relay("sbx-owner", relay_tx, Instant::now()),
+        );
+
+        let attacker = sandbox_principal("sbx-attacker");
+        let err = registry
+            .claim_relay("ch-cross", Some(&attacker))
+            .expect_err("cross-sandbox relay claim must fail");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(
+            registry
+                .pending_relays
+                .lock()
+                .unwrap()
+                .contains_key("ch-cross"),
+            "failed cross-sandbox claim must not consume the channel"
+        );
+    }
+
+    #[test]
+    fn claim_relay_rejects_user_principal() {
+        let registry = SupervisorSessionRegistry::new();
+        let (relay_tx, _relay_rx) = oneshot::channel();
+        registry.pending_relays.lock().unwrap().insert(
+            "ch-user".to_string(),
+            pending_relay("sbx-owner", relay_tx, Instant::now()),
+        );
+
+        let err = registry
+            .claim_relay("ch-user", Some(&user_principal("alice")))
+            .expect_err("users are not supervisor identities");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
 
     #[tokio::test]
@@ -1293,7 +1389,7 @@ mod tests {
         );
 
         let err = registry
-            .claim_relay("ch-old")
+            .claim_relay("ch-old", Some(&sandbox_principal("sbx-test")))
             .expect_err("expired entry must fail");
         assert_eq!(err.code(), tonic::Code::DeadlineExceeded);
         // Entry must have been consumed regardless.
@@ -1317,7 +1413,7 @@ mod tests {
         );
 
         let err = registry
-            .claim_relay("ch-1")
+            .claim_relay("ch-1", Some(&sandbox_principal("sbx-test")))
             .expect_err("should err when receiver is gone");
         assert_eq!(err.code(), tonic::Code::Internal);
     }
@@ -1331,7 +1427,9 @@ mod tests {
             pending_relay("sbx-test", relay_tx, Instant::now()),
         );
 
-        let mut supervisor_side = registry.claim_relay("ch-io").expect("claim should succeed");
+        let mut supervisor_side = registry
+            .claim_relay("ch-io", Some(&sandbox_principal("sbx-test")))
+            .expect("claim should succeed");
         let mut gateway_side = relay_rx
             .await
             .expect("gateway side should receive result")

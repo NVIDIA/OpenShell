@@ -53,6 +53,14 @@ token through `IssueSandboxToken`. Supervisors renew gateway JWTs in memory
 before expiry. Older tokens are not server-revoked; deployments bound replay
 exposure with short `gateway_jwt.ttl_secs` lifetimes.
 
+Sandbox JWTs are not user credentials. The gRPC router accepts
+`Principal::Sandbox` only on the supervisor-to-gateway RPC allowlist
+(`ConnectSupervisor`, `RelayStream`, token renewal, config sync, policy status,
+log push, and policy-analysis callbacks). Handlers then compare the
+authenticated sandbox ID with any sandbox ID or name resolved from the request.
+Supervisor control and relay streams require a matching sandbox principal before
+the gateway registers the session or bridges relay bytes.
+
 ## API Surface
 
 The gateway API is organized around platform objects and operational streams:

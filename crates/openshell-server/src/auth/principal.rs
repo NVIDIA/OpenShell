@@ -26,7 +26,7 @@ pub enum Principal {
     User(UserPrincipal),
     /// Sandbox supervisor authenticated by an identity bound to a specific
     /// sandbox UUID. The wrapped `sandbox_id` MUST match any sandbox referenced
-    /// in the request body for sandbox-class methods (PR-4 guard).
+    /// in the request body for sandbox-class methods.
     Sandbox(#[allow(dead_code)] SandboxPrincipal),
     /// Truly unauthenticated caller (health probes, reflection). Sandbox-class
     /// and user-class methods reject this variant.
@@ -43,17 +43,14 @@ pub struct UserPrincipal {
 
 /// Sandbox caller — bound to one specific sandbox UUID.
 ///
-/// `sandbox_id` and `source` are consumed by the PR-4 handler guard; until
-/// then they only exist in the type so the trait shape is stable across the
-/// PR series.
+/// `sandbox_id` and `source` are consumed by the router and handler guards.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct SandboxPrincipal {
-    /// Canonical sandbox UUID. Empty string only for the PR-1 legacy marker;
-    /// PR 2 onwards always populates this from a verified credential.
+    /// Canonical sandbox UUID populated from a verified sandbox credential.
     pub sandbox_id: String,
-    /// How this principal was verified — used for audit logs and to gate the
-    /// PR-4 IDOR check against unverified sources.
+    /// How this principal was verified — used for audit logs and method-specific
+    /// authorization checks.
     pub source: SandboxIdentitySource,
     /// SPIFFE trust domain. Populated when the credential is SPIFFE-shaped;
     /// reserved for future per-sandbox cert / SPIRE authenticators.
@@ -63,18 +60,17 @@ pub struct SandboxPrincipal {
 /// How a [`SandboxPrincipal`] was authenticated.
 ///
 /// Variant fields are populated by the producing authenticator and consumed
-/// by audit logging + the PR-4 IDOR guard. Until PR 4 lands those readers
-/// they look unused to the dead-code lint.
+/// by audit logging and method-specific authorization checks.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum SandboxIdentitySource {
     /// Gateway-minted JWT validated against the gateway's signing key.
     /// Produced by [`super::sandbox_jwt::SandboxJwtAuthenticator`].
     BootstrapJwt { issuer: String },
-    /// Per-sandbox client certificate. Reserved for the v2 channel-bound
-    /// identity follow-up.
+    /// Per-sandbox client certificate. Reserved for channel-bound sandbox
+    /// identity.
     BootstrapCert { fingerprint: String },
-    /// SPIRE-issued SVID. Reserved for the SPIFFE/SPIRE follow-up.
+    /// SPIRE-issued SVID. Reserved for SPIFFE/SPIRE sandbox identity.
     SpiffeSvid { spiffe_id: String },
     /// K8s `ServiceAccount` token used to bootstrap a gateway-minted JWT
     /// via `IssueSandboxToken`. Populated only on that one RPC path.

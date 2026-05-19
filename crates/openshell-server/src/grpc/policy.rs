@@ -2900,9 +2900,9 @@ mod tests {
             .expect("in-memory SQLite store should connect")
     }
 
-    /// Wrap a request with a user `Principal` so handlers' scope guards
-    /// treat the test caller as a CLI user, equivalent to the earlier test
-    /// behavior where requests were not scoped to sandbox callers.
+    /// Wrap a request with a user `Principal` so handler scope guards treat
+    /// the test caller as a CLI user. Most handler tests exercise
+    /// user-facing behavior and should not trip sandbox equality checks.
     fn with_user<T>(mut request: Request<T>) -> Request<T> {
         request
             .extensions_mut()
@@ -2999,7 +2999,7 @@ mod tests {
         assert!(!is_sandbox_caller(&req));
     }
 
-    // ---- PR-4 IDOR guard (issue #1354) ----
+    // ---- Sandbox IDOR guard (issue #1354) ----
 
     #[tokio::test]
     async fn cross_sandbox_get_sandbox_config_denied() {

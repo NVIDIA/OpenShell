@@ -5,7 +5,7 @@
 //!
 //! The gateway signs an Ed25519 JWT for each sandbox at create time and
 //! the sandbox supervisor presents it as `Authorization: Bearer <jwt>` on
-//! every gRPC call (PR 3). This module implements both sides of the
+//! supervisor-to-gateway gRPC calls. This module implements both sides of the
 //! gateway-controlled token:
 //! - [`SandboxJwtIssuer`] mints fresh tokens (called from
 //!   `handle_create_sandbox` and the `IssueSandboxToken` RPC).

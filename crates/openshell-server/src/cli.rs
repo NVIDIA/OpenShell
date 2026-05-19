@@ -336,11 +336,10 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
         });
     }
 
-    // PR-2 wires gateway_jwt via the config file only — there's no CLI
-    // flag yet because the standard deployments (helm chart + RPM init
-    // script) drop the keypair to a known path and pass that path through
-    // the TOML. A CLI shortcut can be added if a singleplayer operator
-    // needs to override.
+    // `gateway_jwt` is configured through TOML. Standard deployments
+    // (helm chart + RPM init script) drop the keypair to a known path and
+    // pass that path through the file. A CLI shortcut can be added if a
+    // singleplayer operator needs to override it.
     if let Some(jwt) = file
         .as_ref()
         .and_then(|f| f.openshell.gateway.gateway_jwt.clone())

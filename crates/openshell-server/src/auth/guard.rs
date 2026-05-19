@@ -9,6 +9,7 @@
 //! already evaluated.
 
 use super::principal::Principal;
+use super::principal::SandboxPrincipal;
 use tonic::Status;
 use tracing::info;
 
@@ -66,6 +67,32 @@ pub fn enforce_sandbox_scope<T>(
     Ok(principal)
 }
 
+/// Require a sandbox principal and reject users or anonymous callers.
+///
+/// Supervisor-only control/data plane RPCs (`ConnectSupervisor`,
+/// `RelayStream`) must be presented by the sandbox supervisor itself.
+/// User principals intentionally pass [`ensure_sandbox_scope`] for normal
+/// CLI/TUI APIs because RBAC is their gate, but they are not valid
+/// supervisor identities.
+#[allow(clippy::result_large_err)]
+pub fn ensure_sandbox_principal_scope(
+    principal: &Principal,
+    claimed_sandbox_id: &str,
+) -> Result<SandboxPrincipal, Status> {
+    match principal {
+        Principal::Sandbox(p) => {
+            ensure_sandbox_scope(principal, claimed_sandbox_id)?;
+            Ok(p.clone())
+        }
+        Principal::User(_) => Err(Status::permission_denied(
+            "supervisor RPCs require a sandbox principal",
+        )),
+        Principal::Anonymous => Err(Status::unauthenticated(
+            "supervisor RPCs require an authenticated sandbox principal",
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,6 +144,20 @@ mod tests {
         let err =
             ensure_sandbox_scope(&Principal::Anonymous, "sbx-1").expect_err("must reject anon");
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
+    }
+
+    #[test]
+    fn sandbox_principal_scope_returns_matching_sandbox() {
+        let principal = sandbox("sbx-1");
+        let scoped = ensure_sandbox_principal_scope(&principal, "sbx-1").expect("scope OK");
+        assert_eq!(scoped.sandbox_id, "sbx-1");
+    }
+
+    #[test]
+    fn sandbox_principal_scope_rejects_users() {
+        let err = ensure_sandbox_principal_scope(&user("alice"), "sbx-1")
+            .expect_err("users are not supervisor identities");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
 
     #[test]

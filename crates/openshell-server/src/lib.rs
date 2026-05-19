@@ -238,10 +238,9 @@ pub async fn run_server(
     );
 
     // Load the gateway-minted sandbox JWT signing key when configured.
-    // Optional in PR 2 so single-driver dev deployments without certgen
-    // continue to start. The helm-deployed gateway and the RPM init script
-    // populate `gateway_jwt` once `certgen` has produced the on-disk
-    // material.
+    // Optional so single-driver dev deployments without certgen continue
+    // to start. The helm-deployed gateway and the RPM init script populate
+    // `gateway_jwt` once `certgen` has produced the on-disk material.
     if let Some(ref jwt) = config.gateway_jwt {
         let signing_pem = std::fs::read(&jwt.signing_key_path).map_err(|e| {
             Error::config(format!(

@@ -356,7 +356,7 @@ impl JwksCache {
 ///
 /// Returns `Ok(None)` when no Bearer header is present, so the chain can fall
 /// through to other authenticators (e.g. the gateway-minted sandbox JWT
-/// authenticator added in PR 2).
+/// authenticator).
 pub struct OidcAuthenticator {
     cache: Arc<JwksCache>,
 }

@@ -19,7 +19,7 @@
 //! - [`super::oidc::OidcAuthenticator`] — user OIDC Bearer tokens
 //! - [`PermissiveUserAuthenticator`] — final-fallback dev-mode catch-all
 //!   that produces a synthetic user principal when no OIDC is
-//!   configured. Preserves the pre-PR-1 "no OIDC = open" posture for
+//!   configured. Preserves the "no OIDC = open" dev posture for
 //!   singleplayer / helm-dev deployments.
 
 use super::identity::{Identity, IdentityProvider};
@@ -99,9 +99,9 @@ impl std::fmt::Debug for AuthenticatorChain {
 /// Final-fallback authenticator that produces a synthetic user principal
 /// for any request the earlier authenticators didn't claim. Used only
 /// when no user-side authentication is configured (no OIDC, no fronting
-/// proxy contract) — the pre-PR-1 gateway accepted such requests with
-/// no auth at all; this preserves that posture in a principal-aware
-/// way so handlers always see *some* principal in extensions.
+/// proxy contract). This preserves the dev-mode open posture in a
+/// principal-aware way so handlers always see *some* principal in
+/// extensions.
 ///
 /// Producing a User principal (rather than Anonymous) means dev-mode
 /// requests pass the per-handler IDOR guard via the User-bypass
