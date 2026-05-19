@@ -16,7 +16,8 @@
 #      call that sleeps on a socket. THE AGENT BURNS ZERO LLM TOKENS WHILE
 #      IT WAITS; this is the load-bearing UX win over polling.
 #   5. The developer (this script, simulating the host side) sees the pending
-#      proposal in `openshell rule get` and approves it.
+#      proposal in `openshell rule get`, including the gateway-side prover
+#      verdict, and approves it.
 #   6. The agent's /wait returns approved within ~1 second of the approval,
 #      retries the original PUT once against the hot-reloaded policy, and
 #      exits.
@@ -382,10 +383,9 @@ start_agent_sandbox() {
 }
 
 # Strip the rule_get output down to the lines a developer needs to make an
-# informed approve/reject decision: rationale, binary, endpoint. Filters the
+# informed approve/reject decision: rationale, validation, binary, endpoint. Filters the
 # noisy fields (UUID, agent-generated rule_name, hardcoded confidence,
-# duplicate Binaries) until `openshell rule get` learns to print L7
-# method/path itself (tracked separately).
+# duplicate Binaries).
 #
 # `openshell rule get` colorizes labels with ANSI escapes; strip them before
 # parsing so the field-name match works in piped contexts.
@@ -394,6 +394,7 @@ summarize_pending() {
     sed 's/\x1b\[[0-9;]*m//g' "$pending" \
         | awk '
             /Rationale:/ { sub(/^[[:space:]]*/, ""); print "  " $0; next }
+            /Validation:/ { sub(/^[[:space:]]*/, ""); print "  " $0; next }
             /Binary:/    { sub(/^[[:space:]]*/, ""); print "  " $0; next }
             /Endpoints:/ { sub(/^[[:space:]]*/, ""); print "  " $0; next }
         '
@@ -421,6 +422,8 @@ EOF
     info "  • agent reads the skill, drafts a narrow ${DIM}addRule${RESET} for exactly that path"
     info "  • agent POSTs to ${DIM}http://policy.local/v1/proposals${RESET}, saves the"
     info "    returned ${DIM}accepted_chunk_ids[0]${RESET}"
+    info "  • gateway merges the proposed rule with the current sandbox policy,"
+    info "    runs the prover, and stores a short validation verdict on the chunk"
     info "  • agent calls ${DIM}GET /v1/proposals/{chunk_id}/wait?timeout=300${RESET}"
     info "    — one HTTP call that sleeps on a socket until the developer decides."
     info "    ${BOLD}Zero LLM tokens burn during this wait.${RESET}"
