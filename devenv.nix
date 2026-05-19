@@ -150,6 +150,21 @@ in
   };
 
   enterShell = ''
+    desired_open_files=8192
+    current_open_files="$(ulimit -Sn 2>/dev/null || ulimit -n 2>/dev/null || echo 0)"
+
+    case "$current_open_files" in
+      ""|*[!0-9]*)
+        ;;
+      *)
+        if [ "$current_open_files" -lt "$desired_open_files" ]; then
+          ulimit -Sn "$desired_open_files" 2>/dev/null \
+            || ulimit -n "$desired_open_files" 2>/dev/null \
+            || echo "Warning: could not raise open file limit to $desired_open_files"
+        fi
+        ;;
+    esac
+
     echo "OpenShell devenv ready. Run 'mise trust' once, then 'mise install --locked'."
   '';
 
