@@ -315,6 +315,8 @@ OpenShell skips expired provider credentials when it builds a sandbox provider e
 
 Refresh configuration is stored separately from the current injectable credential value. The gateway refresh worker reads refresh state, mints a new short-lived token for supported strategies, writes the token back to the provider record, and updates credential expiry metadata.
 
+For a complete Microsoft Graph OAuth2 refresh-token walkthrough, see [Refresh Microsoft Graph Credentials with Providers v2](/get-started/tutorials/microsoft-graph-provider-refresh).
+
 The profile YAML strategy values use underscores, while the CLI `--strategy` values use kebab-case:
 
 | Profile YAML | CLI |
