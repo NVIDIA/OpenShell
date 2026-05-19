@@ -1369,14 +1369,16 @@ async fn cas_update_message_cas_conflicts_on_concurrent_updates() {
     // Track how many updates succeed
     let success_count = Arc::new(AtomicU32::new(0));
 
-    // Spawn 5 concurrent CAS updates (using expected_version = 0 to use current)
+    // Spawn 5 concurrent CAS updates using the same observed version. Passing an
+    // explicit version makes this deterministic: later tasks cannot re-read the
+    // latest committed version and legitimately succeed.
     let mut handles = vec![];
     for i in 0..5 {
         let store = Arc::clone(&store);
         let success_count = Arc::clone(&success_count);
         let handle = tokio::spawn(async move {
             let result = store
-                .update_message_cas::<Sandbox, _>("test-id", 0, |s| {
+                .update_message_cas::<Sandbox, _>("test-id", 1, |s| {
                     s.current_policy_version = i;
                 })
                 .await;
