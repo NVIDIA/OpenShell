@@ -12,7 +12,16 @@ hide = true
 ["build:python:wheel"]
 description = "Build Python wheel with CLI binary (native)"
 depends = ["python:proto"]
-run = "uv run maturin build --release"
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+
+# maturin/auditwheel rewrites the packaged binary's dynamic-library entries when
+# it repairs a wheel. Relink the CLI before each native wheel build so a cached
+# target/release/openshell binary does not point at a prior wheel-local lib name.
+rm -f target/release/openshell target/release/openshell.d target/release/deps/openshell-*
+uv run maturin build --release
+'''
 hide = true
 
 ["python:build"]

@@ -33,10 +33,13 @@ Binary staging is driven by `tasks/scripts/stage-prebuilt-binaries.sh`, which
 runs `cargo build` natively on a matching host or `cargo zigbuild` when
 cross-compiling. Local Docker image tasks infer the target architecture from
 `DOCKER_PLATFORM` when set, otherwise from the container engine host metadata
-with the kernel architecture as the fallback. CI invokes the same staging step
-via the `rust-native-build.yml` workflow (per-architecture, per-component) and
-uploads the result as an artifact that the image build job downloads back into
-the staging directory before running Buildx.
+with the kernel architecture as the fallback. Static musl supervisor builds use
+target C/C++ linker settings from the environment when present, and otherwise
+create Zig-backed wrappers so native Nix shells do not link musl Rust artifacts
+with the host glibc compiler. CI invokes the same staging step via the
+`rust-native-build.yml` workflow (per-architecture, per-component) and uploads
+the result as an artifact that the image build job downloads back into the
+staging directory before running Buildx.
 
 Runtime layout:
 
