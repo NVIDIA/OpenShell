@@ -21,7 +21,8 @@ use openshell_core::proto::{
     GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
     HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
     ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
-    ListSandboxesResponse, Provider, ProviderCredentialRefreshStatus, ProviderProfile,
+    ListSandboxesResponse, Provider, ProviderCredentialRefresh, ProviderCredentialRefreshStatus,
+    ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileCredential,
     ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse,
     RotateProviderCredentialRequest, RotateProviderCredentialResponse, Sandbox, SandboxResponse,
     SandboxStreamEvent, ServiceStatus, SupervisorMessage, UpdateProviderRequest,
@@ -1008,11 +1009,28 @@ async fn provider_refresh_cli_run_functions_wire_requests() {
 #[tokio::test]
 async fn provider_create_allows_empty_credentials_for_gateway_refresh_profiles() {
     let ts = run_server().await;
+    ts.state.profiles.lock().await.insert(
+        "custom-refresh".to_string(),
+        ProviderProfile {
+            id: "custom-refresh".to_string(),
+            display_name: "Custom Refresh".to_string(),
+            credentials: vec![ProviderProfileCredential {
+                name: "ACCESS_TOKEN".to_string(),
+                required: true,
+                refresh: Some(ProviderCredentialRefresh {
+                    strategy: ProviderCredentialRefreshStrategy::Oauth2RefreshToken as i32,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    );
 
     run::provider_create(
         &ts.endpoint,
-        "my-graph",
-        "outlook",
+        "custom-refresh-provider",
+        "custom-refresh",
         false,
         &[],
         &[],
@@ -1022,8 +1040,8 @@ async fn provider_create_allows_empty_credentials_for_gateway_refresh_profiles()
     .expect("provider create");
 
     let stored = ts.state.providers.lock().await;
-    let provider = stored.get("my-graph").expect("provider");
-    assert_eq!(provider.r#type, "outlook");
+    let provider = stored.get("custom-refresh-provider").expect("provider");
+    assert_eq!(provider.r#type, "custom-refresh");
     assert!(provider.credentials.is_empty());
 }
 
