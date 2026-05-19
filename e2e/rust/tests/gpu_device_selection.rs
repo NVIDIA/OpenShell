@@ -21,6 +21,7 @@ const SANDBOX_CREATE_TIMEOUT: Duration = Duration::from_secs(600);
 const CDI_GPU_DEVICE_ALL: &str = "nvidia.com/gpu=all";
 const CDI_GPU_DEVICE_PREFIX: &str = "nvidia.com/gpu=";
 const GPU_PROBE_IMAGE_ENV: &str = "OPENSHELL_E2E_GPU_PROBE_IMAGE";
+const DEFAULT_GPU_PROBE_IMAGE: &str = "nvcr.io/nvidia/base/ubuntu:noble-20251013";
 
 fn gpu_lines(output: &str) -> Vec<String> {
     strip_ansi(output)
@@ -36,13 +37,7 @@ fn gpu_probe_image() -> String {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| {
-            panic!(
-                "{GPU_PROBE_IMAGE_ENV} must be set to a container image that supports \
-                 NVIDIA Container Toolkit CDI injection (set by \
-                 .github/workflows/e2e-gpu-test.yaml in CI)"
-            )
-        })
+        .unwrap_or_else(|| DEFAULT_GPU_PROBE_IMAGE.to_string())
 }
 
 fn object_string<'a>(object: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
