@@ -27,8 +27,8 @@ runs:
         if [[ "$REF_NAME" =~ ^pull-request/([0-9]+)$ ]]; then
           pr_number="${BASH_REMATCH[1]}"
           base_ref=$(gh pr view "$pr_number" --repo "$GH_REPO" --json baseRefName -q '.baseRefName')
-          # The mirrored branch is a push ref, so changed-files needs the true
-          # merge-base to diff the PR head against its base branch.
+          # The mirrored branch is a push ref, so changed-files needs the true merge-base
+          # to diff the PR head against its base branch.
           base_sha=$(gh api "repos/$GH_REPO/compare/$base_ref...$GITHUB_SHA_VALUE" --jq '.merge_base_commit.sha')
           git fetch --no-tags --depth=1 origin "$base_sha"
           echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
