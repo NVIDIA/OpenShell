@@ -62,16 +62,15 @@ the same staging and tagging assumptions are used locally and in CI.
 
 ## CI and E2E
 
-Required checks run on GitHub Actions. E2E and GPU workflows use NVIDIA
-self-hosted runners, so trusted PRs are mirrored by copy-pr-bot into
-`pull-request/<N>` branches before those workflows run.
+Required checks run on GitHub Actions. Workflows that use NVIDIA self-hosted runners trigger from copy-pr-bot mirror branches, so trusted PRs are mirrored into `pull-request/<N>` branches before those workflows run.
 
 The high-level CI model:
 
-1. Standard branch checks run on normal PR activity.
-2. Label-gated E2E and GPU checks run from trusted mirror branches.
-3. Gate jobs verify that the expected non-gate workflow actually ran.
-4. Release workflows rebuild and publish binaries, wheels, images, and docs.
+1. PR-context gate jobs publish required statuses for the PR head commit.
+2. Standard branch checks run from trusted mirror branches.
+3. Label-gated E2E, GPU, and Kubernetes checks run from trusted mirror branches.
+4. Gate jobs verify that the mirror branch matches the PR head and that the expected non-gate workflow actually ran.
+5. Release workflows rebuild and publish binaries, wheels, images, and docs.
 
 See `CI.md` for the contributor workflow and labels.
 
