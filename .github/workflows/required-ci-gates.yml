@@ -113,12 +113,12 @@ jobs:
 
             mirror_sha=$(gh api "repos/$GH_REPO/branches/$MIRROR_REF" --jq '.commit.sha' 2>/dev/null || true)
             if [ -z "$mirror_sha" ]; then
-              post_status "$context" pending "Waiting for copy-pr-bot mirror" "$PR_URL"
+              post_status "$context" pending "Waiting for /ok to test mirror" "$PR_URL"
               return 1
             fi
 
             if [ "$mirror_sha" != "$HEAD_SHA" ]; then
-              post_status "$context" failure "copy-pr-bot mirror is stale" "$PR_URL"
+              post_status "$context" pending "Waiting for /ok to test mirror" "$PR_URL"
               return 1
             fi
 
