@@ -1,0 +1,181 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Use Policy Advisor"
+sidebar-title: "Policy Advisor"
+description: "Let sandboxed agents propose narrow policy changes through policy.local while keeping developer approval in the loop."
+keywords: "Generative AI, Cybersecurity, Policy Advisor, Policy, Sandbox, policy.local, Agent Policy"
+position: 6
+---
+
+Policy advisor lets a running sandboxed agent ask for a narrow network policy change after OpenShell denies a request. The agent submits a draft through `policy.local`, a developer approves or rejects it from outside the sandbox, and approved network policy hot-reloads into the same sandbox.
+
+Policy advisor does not grant access automatically. The structured rule is the approval contract, and the agent's rationale is supporting context.
+
+## Enable Policy Advisor
+
+Policy advisor is disabled by default. Enable it globally when you want every sandbox on the selected gateway to expose the agent proposal surface:
+
+```shell
+openshell settings set --global \
+  --key agent_policy_proposals_enabled \
+  --value true \
+  --yes
+```
+
+You can also enable it for one sandbox, unless the key is managed globally:
+
+```shell
+openshell settings set <sandbox-name> \
+  --key agent_policy_proposals_enabled \
+  --value true
+```
+
+Check the effective setting for a sandbox:
+
+```shell
+openshell settings get <sandbox-name>
+```
+
+The output shows whether `agent_policy_proposals_enabled` is `global`, `sandbox`, or `unset`. A global value overrides sandbox-scoped values. To return control to sandbox-scoped settings, delete the global key:
+
+```shell
+openshell settings delete --global \
+  --key agent_policy_proposals_enabled \
+  --yes
+```
+
+Set the value before creating a sandbox when you want the first denied request to include policy advisor guidance. Running sandboxes poll settings and can enable the surface after startup, but startup enablement gives the agent the clearest first-denial path.
+
+## How It Works
+
+When policy advisor is enabled, the sandbox supervisor turns on three agent-facing surfaces:
+
+- It installs `/etc/openshell/skills/policy_advisor.md` inside the sandbox.
+- It serves `http://policy.local` from inside the sandbox.
+- It adds `next_steps` to L7 `policy_denied` response bodies so the agent can find the skill and local API.
+
+The loop has six steps:
+
+1. A sandboxed process attempts a network request that policy denies.
+2. For inspected REST traffic, OpenShell returns a structured `403` body with fields such as `layer`, `host`, `port`, `binary`, `method`, `path`, `rule_missing`, and `next_steps`.
+3. The agent reads the policy advisor skill, inspects the current policy, and optionally reads recent denial log lines.
+4. The agent submits one or more `addRule` proposals to `http://policy.local/v1/proposals`.
+5. The gateway stores accepted proposals as pending draft chunks for the sandbox.
+6. A developer reviews the draft, approves or rejects it, and the agent waits on `/v1/proposals/{chunk_id}/wait` until a decision is available.
+
+When a proposal is approved, `/wait` reports `policy_reloaded: true` only after the local sandbox policy covers the approved rule. At that point the agent can retry the original denied action once. If a proposal is rejected, `/wait` returns `rejection_reason` and `validation_result` so the agent can revise or stop.
+
+## What Gets Proposed
+
+OpenShell has two proposal paths:
+
+| Path | Source | Typical rule shape |
+|---|---|---|
+| Mechanistic mapper | Aggregated denial summaries from the sandbox. | Groups by host, port, and binary. If L7 request samples are available, it can draft REST method and path rules. Otherwise it drafts an L4 endpoint. |
+| Agent-authored proposal | The in-sandbox agent, using `policy.local`. | Usually a REST `addRule` with exact host, port, binary, method, and path from the structured denial. It can also propose L4 rules for opaque protocols. |
+
+For REST APIs, prefer L7 rules over broad L4 access. A good proposal allows one method and the smallest safe path:
+
+```json
+{
+  "intent_summary": "Allow gh to update documentation in NVIDIA/OpenShell.",
+  "operations": [
+    {
+      "addRule": {
+        "ruleName": "github_contents_docs_write",
+        "rule": {
+          "name": "github_contents_docs_write",
+          "endpoints": [
+            {
+              "host": "api.github.com",
+              "port": 443,
+              "protocol": "rest",
+              "enforcement": "enforce",
+              "rules": [
+                {
+                  "allow": {
+                    "method": "PUT",
+                    "path": "/repos/NVIDIA/OpenShell/contents/docs/**"
+                  }
+                }
+              ]
+            }
+          ],
+          "binaries": [
+            {
+              "path": "/usr/bin/gh"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}
+```
+
+The current `policy.local` JSON shape covers L4 endpoints and REST method or path rules. Use [Customize Sandbox Policies](/sandboxes/policies) or [Policy Schema Reference](/reference/policy-schema) for policy fields that are not part of the agent-authored proposal surface, such as WebSocket credential rewrite, GraphQL operation matching, endpoint path scoping, and provider-owned policy bundles.
+
+Policy advisor proposals do not add `allowed_ips` automatically. If a hostname resolves to an internal or private address, OpenShell's SSRF protections still block the connection until a developer explicitly adds the required `allowed_ips` entry.
+
+## Review Proposals
+
+Review pending chunks from the host:
+
+```shell
+openshell rule get <sandbox-name> --status pending
+```
+
+The output shows the chunk ID, status, rationale, binary, and endpoint summary. For L7 proposals, the endpoint summary includes the protocol, method, and path:
+
+```text
+Endpoints: api.github.com:443 [L7 rest, allow PUT /repos/NVIDIA/OpenShell/contents/docs/**]
+```
+
+Approve only when the structured rule matches the access you intend to grant:
+
+```shell
+openshell rule approve <sandbox-name> --chunk-id <chunk-id>
+```
+
+Reject with guidance when the rule is too broad or points at the wrong target:
+
+```shell
+openshell rule reject <sandbox-name> \
+  --chunk-id <chunk-id> \
+  --reason "Scope this to docs/ paths only."
+```
+
+The rejection reason is returned to the agent through `policy.local`. The agent can use it to draft a narrower proposal.
+
+## Agent API
+
+`policy.local` is available only inside the sandbox and uses plain HTTP:
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /v1/policy/current` | Returns the current effective sandbox policy as YAML. |
+| `GET /v1/denials?last=10` | Returns recent denied OCSF shorthand log lines, newest first. Query strings are redacted before lines are returned to the agent. |
+| `POST /v1/proposals` | Submits `addRule` operations. The response includes `accepted_chunk_ids` and `rejection_reasons`. |
+| `GET /v1/proposals/{chunk_id}` | Returns one proposal's current `pending`, `approved`, or `rejected` status. |
+| `GET /v1/proposals/{chunk_id}/wait?timeout=300` | Holds one HTTP request open until the proposal is approved, rejected, or the timeout expires. |
+
+If policy advisor is disabled, every route returns `404 feature_disabled`, the skill is not installed for new sandboxes, and L7 deny bodies do not advertise `policy.local` routes.
+
+## What to Expect
+
+Approved network rules hot-reload without restarting the sandbox. HTTP L7 keep-alive connections are closed at the reload boundary so the next parsed request uses the new policy. Raw streams remain connection-scoped, as described in [Customize Sandbox Policies](/sandboxes/policies#policy-structure).
+
+Policy advisor emits audit events into the sandbox log. Use these lines to trace the full loop:
+
+```shell
+openshell logs <sandbox-name> --since 10m
+```
+
+Look for `HTTP:* DENIED`, `CONFIG:PROPOSED`, `CONFIG:APPROVED` or `CONFIG:REJECTED`, `CONFIG:LOADED`, and the final allowed request if the agent retries successfully.
+
+## Next Steps
+
+- Use [Customize Sandbox Policies](/sandboxes/policies) for manual policy updates and L7 rule syntax.
+- Use [Policy Schema Reference](/reference/policy-schema) for full YAML field details.
+- Use [Logging](/observability/logging) to interpret OCSF shorthand log entries.
