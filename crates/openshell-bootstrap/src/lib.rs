@@ -21,8 +21,9 @@ use std::sync::Mutex;
 pub(crate) static XDG_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 pub use crate::metadata::{
-    GatewayMetadata, clear_active_gateway, clear_last_sandbox_if_matches,
-    extract_host_from_ssh_destination, get_gateway_metadata, list_gateways, load_active_gateway,
-    load_gateway_metadata, load_last_sandbox, remove_gateway_metadata, resolve_ssh_hostname,
-    save_active_gateway, save_last_sandbox, store_gateway_metadata,
+    GatewayMetadata, GatewayMetadataSource, clear_active_gateway, clear_last_sandbox_if_matches,
+    extract_host_from_ssh_destination, gateway_metadata_source, get_gateway_metadata,
+    list_gateways, load_active_gateway, load_gateway_metadata, load_last_sandbox,
+    remove_gateway_metadata, resolve_ssh_hostname, save_active_gateway, save_last_sandbox,
+    store_gateway_metadata,
 };
