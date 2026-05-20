@@ -124,7 +124,7 @@ async fn websocket_upgrade_through_l7_relay_exchanges_message() {
             .expect("relay should succeed");
 
         match outcome {
-            RelayOutcome::Upgraded { overflow } => {
+            RelayOutcome::Upgraded { overflow, .. } => {
                 // This is what handle_upgrade() does in relay.rs
                 if !overflow.is_empty() {
                     client_proxy.write_all(&overflow).await.unwrap();

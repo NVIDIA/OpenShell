@@ -15,10 +15,15 @@ spec:
       {{- include "openshell.selectorLabels" . | nindent 6 }}
   template:
     metadata:
-      {{- with .Values.podAnnotations }}
       annotations:
+        # Roll the StatefulSet when the rendered gateway TOML changes — the
+        # gateway only reads /etc/openshell/gateway.toml at startup, so
+        # without this annotation a `helm upgrade` that only mutates the
+        # ConfigMap would leave pods running with stale config.
+        checksum/gateway-config: {{ include (print $.Template.BasePath "/gateway-config.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
-      {{- end }}
+        {{- end }}
       labels:
         {{- include "openshell.labels" . | nindent 8 }}
         {{- with .Values.podLabels }}
@@ -47,105 +52,43 @@ spec:
           image: {{ include "openshell.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
-            - --bind-address
-            - "0.0.0.0"
-            - --port
-            - {{ .Values.service.port | quote }}
-            - --health-port
-            - {{ .Values.service.healthPort | quote }}
-            {{- if .Values.service.metricsPort }}
-            - --metrics-port
-            - {{ .Values.service.metricsPort | quote }}
-            {{- end }}
-            - --log-level
-            - {{ .Values.server.logLevel }}
+            - --config
+            - /etc/openshell/gateway.toml
             - --db-url
             - {{ .Values.server.dbUrl | quote }}
           env:
-            - name: OPENSHELL_SANDBOX_NAMESPACE
-              value: {{ .Values.server.sandboxNamespace | quote }}
-            - name: OPENSHELL_SANDBOX_IMAGE
-              value: {{ .Values.server.sandboxImage | quote }}
-            {{- if .Values.server.sandboxImagePullPolicy }}
-            - name: OPENSHELL_SANDBOX_IMAGE_PULL_POLICY
-              value: {{ .Values.server.sandboxImagePullPolicy | quote }}
-            {{- end }}
-            - name: OPENSHELL_SUPERVISOR_IMAGE
-              value: {{ include "openshell.supervisorImage" . | quote }}
-            {{- if .Values.supervisor.image.pullPolicy }}
-            - name: OPENSHELL_SUPERVISOR_IMAGE_PULL_POLICY
-              value: {{ .Values.supervisor.image.pullPolicy | quote }}
-            {{- end }}
-            - name: OPENSHELL_GRPC_ENDPOINT
-              value: {{ if .Values.server.disableTls }}{{ .Values.server.grpcEndpoint | replace "https://" "http://" | quote }}{{ else }}{{ .Values.server.grpcEndpoint | quote }}{{ end }}
-            {{- if .Values.server.sshGatewayHost }}
-            - name: OPENSHELL_SSH_GATEWAY_HOST
-              value: {{ .Values.server.sshGatewayHost | quote }}
-            {{- end }}
-            {{- if .Values.server.sshGatewayPort }}
-            - name: OPENSHELL_SSH_GATEWAY_PORT
-              value: {{ .Values.server.sshGatewayPort | quote }}
-            {{- end }}
-            {{- if .Values.server.hostGatewayIP }}
-            - name: OPENSHELL_HOST_GATEWAY_IP
-              value: {{ .Values.server.hostGatewayIP | quote }}
-            {{- end }}
-            - name: OPENSHELL_SSH_HANDSHAKE_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Values.server.sshHandshakeSecretName | quote }}
-                  key: secret
-            {{- if .Values.server.disableTls }}
-            - name: OPENSHELL_DISABLE_TLS
-              value: "true"
-            {{- else }}
-            - name: OPENSHELL_TLS_CERT
-              value: /etc/openshell-tls/server/tls.crt
-            - name: OPENSHELL_TLS_KEY
-              value: /etc/openshell-tls/server/tls.key
-            - name: OPENSHELL_TLS_CLIENT_CA
-              value: /etc/openshell-tls/client-ca/ca.crt
-            - name: OPENSHELL_CLIENT_TLS_SECRET_NAME
-              value: {{ .Values.server.tls.clientTlsSecretName | quote }}
-            {{- if .Values.server.disableGatewayAuth }}
-            - name: OPENSHELL_DISABLE_GATEWAY_AUTH
-              value: "true"
-            {{- end }}
-            {{- end }}
-            {{- if .Values.server.oidc.issuer }}
-            - name: OPENSHELL_OIDC_ISSUER
-              value: {{ .Values.server.oidc.issuer | quote }}
-            - name: OPENSHELL_OIDC_AUDIENCE
-              value: {{ .Values.server.oidc.audience | quote }}
-            - name: OPENSHELL_OIDC_JWKS_TTL
-              value: {{ .Values.server.oidc.jwksTtl | quote }}
-            {{- if .Values.server.oidc.rolesClaim }}
-            - name: OPENSHELL_OIDC_ROLES_CLAIM
-              value: {{ .Values.server.oidc.rolesClaim | quote }}
-            {{- end }}
-            {{- if .Values.server.oidc.adminRole }}
-            - name: OPENSHELL_OIDC_ADMIN_ROLE
-              value: {{ .Values.server.oidc.adminRole | quote }}
-            {{- end }}
-            {{- if .Values.server.oidc.userRole }}
-            - name: OPENSHELL_OIDC_USER_ROLE
-              value: {{ .Values.server.oidc.userRole | quote }}
-            {{- end }}
-            {{- if .Values.server.oidc.scopesClaim }}
-            - name: OPENSHELL_OIDC_SCOPES_CLAIM
-              value: {{ .Values.server.oidc.scopesClaim | quote }}
-            {{- end }}
+            # All gateway settings live in the ConfigMap-backed TOML file
+            # mounted at /etc/openshell/gateway.toml. The only env var below
+            # is a process-level setting consumed by libraries outside
+            # gateway code (currently just SSL_CERT_FILE for OIDC issuer TLS).
+            {{- if and .Values.server.oidc.issuer .Values.server.oidc.caConfigMapName }}
+            # OIDC issuer custom-CA: rustls/reqwest read SSL_CERT_FILE for
+            # outbound TLS verification. This is a process-level env var
+            # consumed by the TLS stack itself, not by gateway code, so it
+            # cannot be represented in the gateway TOML schema.
+            - name: SSL_CERT_FILE
+              value: /etc/openshell-tls/oidc-ca/ca.crt
             {{- end }}
           volumeMounts:
             - name: openshell-data
               mountPath: /var/openshell
+            - name: gateway-config
+              mountPath: /etc/openshell
+              readOnly: true
             {{- if not .Values.server.disableTls }}
             - name: tls-cert
               mountPath: /etc/openshell-tls/server
               readOnly: true
+            {{- if or .Values.server.tls.clientCaSecretName .Values.pkiInitJob.enabled (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) }}
             - name: tls-client-ca
               mountPath: /etc/openshell-tls/client-ca
               readOnly: true
+            {{- end }}
+            {{- if and .Values.server.oidc.issuer .Values.server.oidc.caConfigMapName }}
+            - name: oidc-ca
+              mountPath: /etc/openshell-tls/oidc-ca
+              readOnly: true
+            {{- end }}
             {{- end }}
           ports:
             - name: grpc
@@ -185,10 +128,14 @@ spec:
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
       volumes:
+        - name: gateway-config
+          configMap:
+            name: {{ include "openshell.fullname" . }}-config
         {{- if not .Values.server.disableTls }}
         - name: tls-cert
           secret:
             secretName: {{ .Values.server.tls.certSecretName }}
+        {{- if or .Values.server.tls.clientCaSecretName .Values.pkiInitJob.enabled (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) }}
         - name: tls-client-ca
           secret:
             {{- if or .Values.pkiInitJob.enabled (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) }}
@@ -199,6 +146,12 @@ spec:
             {{- else }}
             secretName: {{ .Values.server.tls.clientCaSecretName }}
             {{- end }}
+        {{- end }}
+        {{- if and .Values.server.oidc.issuer .Values.server.oidc.caConfigMapName }}
+        - name: oidc-ca
+          configMap:
+            name: {{ .Values.server.oidc.caConfigMapName }}
+        {{- end }}
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

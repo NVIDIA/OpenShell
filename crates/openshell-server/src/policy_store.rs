@@ -54,7 +54,25 @@ pub trait PolicyStoreExt {
         before_version: i64,
     ) -> PersistenceResult<u64>;
 
-    async fn put_draft_chunk(&self, chunk: &DraftChunkRecord) -> PersistenceResult<()>;
+    /// Persist a draft chunk. When `dedup_key` is `Some`, duplicate inserts
+    /// for the same `(sandbox, dedup_key)` fold into the existing row's
+    /// `hit_count` instead of creating a second chunk — appropriate for
+    /// observation-driven proposals from the mechanistic mapper. When
+    /// `None`, the chunk is inserted unconditionally — appropriate for
+    /// agent-authored proposals where each submission is an intentional
+    /// act and the redraft loop relies on every proposal getting its own
+    /// `chunk_id` even when the target endpoint is unchanged.
+    ///
+    /// Returns the **effective** row id. On a fresh insert that equals
+    /// `chunk.id`; on dedup fold-in it is the existing row's id. Callers
+    /// must use the returned id (not `chunk.id`) when reporting the chunk
+    /// to clients — otherwise the response advertises an id that was never
+    /// persisted.
+    async fn put_draft_chunk(
+        &self,
+        chunk: &DraftChunkRecord,
+        dedup_key: Option<&str>,
+    ) -> PersistenceResult<String>;
 
     async fn get_draft_chunk(&self, id: &str) -> PersistenceResult<Option<DraftChunkRecord>>;
 
@@ -64,11 +82,16 @@ pub trait PolicyStoreExt {
         status_filter: Option<&str>,
     ) -> PersistenceResult<Vec<DraftChunkRecord>>;
 
+    /// Update a draft chunk's status, optionally recording a free-form
+    /// `rejection_reason` for the reviewer's note. Pass `Some` only on the
+    /// reject path; other status transitions pass `None` to leave any prior
+    /// reason intact.
     async fn update_draft_chunk_status(
         &self,
         id: &str,
         status: &str,
         decided_at_ms: Option<i64>,
+        rejection_reason: Option<&str>,
     ) -> PersistenceResult<bool>;
 
     async fn update_draft_chunk_rule(
@@ -186,10 +209,14 @@ impl PolicyStoreExt for Store {
         }
     }
 
-    async fn put_draft_chunk(&self, chunk: &DraftChunkRecord) -> PersistenceResult<()> {
+    async fn put_draft_chunk(
+        &self,
+        chunk: &DraftChunkRecord,
+        dedup_key: Option<&str>,
+    ) -> PersistenceResult<String> {
         match self {
-            Self::Postgres(store) => store.put_draft_chunk(chunk).await,
-            Self::Sqlite(store) => store.put_draft_chunk(chunk).await,
+            Self::Postgres(store) => store.put_draft_chunk(chunk, dedup_key).await,
+            Self::Sqlite(store) => store.put_draft_chunk(chunk, dedup_key).await,
         }
     }
 
@@ -216,16 +243,17 @@ impl PolicyStoreExt for Store {
         id: &str,
         status: &str,
         decided_at_ms: Option<i64>,
+        rejection_reason: Option<&str>,
     ) -> PersistenceResult<bool> {
         match self {
             Self::Postgres(store) => {
                 store
-                    .update_draft_chunk_status(id, status, decided_at_ms)
+                    .update_draft_chunk_status(id, status, decided_at_ms, rejection_reason)
                     .await
             }
             Self::Sqlite(store) => {
                 store
-                    .update_draft_chunk_status(id, status, decided_at_ms)
+                    .update_draft_chunk_status(id, status, decided_at_ms, rejection_reason)
                     .await
             }
         }
@@ -301,6 +329,16 @@ pub fn policy_record_from_parts(
     })
 }
 
+/// Observation-mode dedup key: `host|port|binary`. Used by the mechanistic
+/// mapper path where N denials targeting the same endpoint should fold into
+/// one chunk instead of N near-identical chunks. Agent-authored proposals
+/// pass `None` for the `dedup_key` argument to `put_draft_chunk` so each
+/// proposal lands as its own chunk regardless of target — the redraft loop
+/// depends on this.
+pub fn observation_dedup_key(chunk: &DraftChunkRecord) -> String {
+    format!("{}|{}|{}", chunk.host, chunk.port, chunk.binary)
+}
+
 pub fn draft_chunk_payload_from_record(chunk: &DraftChunkRecord) -> PersistenceResult<Vec<u8>> {
     let proposed_rule = if chunk.proposed_rule.is_empty() {
         None
@@ -325,6 +363,8 @@ pub fn draft_chunk_payload_from_record(chunk: &DraftChunkRecord) -> PersistenceR
         port: chunk.port,
         binary: chunk.binary.clone(),
         draft_version: chunk.draft_version,
+        validation_result: chunk.validation_result.clone(),
+        rejection_reason: chunk.rejection_reason.clone(),
     }
     .encode_to_vec())
 }
@@ -365,5 +405,7 @@ pub fn draft_chunk_record_from_parts(
         hit_count: i32::try_from(hit_count).unwrap_or(i32::MAX),
         first_seen_ms: created_at_ms,
         last_seen_ms: updated_at_ms,
+        validation_result: wrapper.validation_result,
+        rejection_reason: wrapper.rejection_reason,
     })
 }

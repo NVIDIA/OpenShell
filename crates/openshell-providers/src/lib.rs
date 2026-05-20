@@ -18,9 +18,10 @@ pub use openshell_core::proto::Provider;
 pub use context::{DiscoveryContext, RealDiscoveryContext};
 pub use discovery::discover_with_spec;
 pub use profiles::{
-    ProfileError, ProfileValidationDiagnostic, ProviderTypeProfile, default_profiles,
-    get_default_profile, normalize_profile_id, parse_profile_json, parse_profile_yaml,
-    profile_to_json, profile_to_yaml, profiles_to_json, profiles_to_yaml, validate_profile_set,
+    CredentialRefreshProfile, ProfileError, ProfileValidationDiagnostic, ProviderTypeProfile,
+    default_profiles, get_default_profile, normalize_profile_id, parse_profile_json,
+    parse_profile_yaml, profile_to_json, profile_to_yaml, profiles_to_json, profiles_to_yaml,
+    validate_profile_set,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -72,6 +73,25 @@ pub trait ProviderPlugin: Send + Sync {
     }
 }
 
+/// Blanket implementation of [`ProviderPlugin`] for [`ProviderDiscoverySpec`].
+///
+/// Providers that only need standard env-var discovery can register their
+/// `SPEC` constant directly, instead of defining a dedicated struct and
+/// repeating the same three-method delegation.
+impl ProviderPlugin for ProviderDiscoverySpec {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+
+    fn discover_existing(&self) -> Result<Option<DiscoveredProvider>, ProviderError> {
+        discover_with_spec(self, &RealDiscoveryContext)
+    }
+
+    fn credential_env_vars(&self) -> &'static [&'static str] {
+        self.credential_env_vars
+    }
+}
+
 #[derive(Default)]
 pub struct ProviderRegistry {
     plugins: HashMap<&'static str, Box<dyn ProviderPlugin>>,
@@ -81,16 +101,16 @@ impl ProviderRegistry {
     #[must_use]
     pub fn new() -> Self {
         let mut registry = Self::default();
-        registry.register(providers::claude::ClaudeProvider);
-        registry.register(providers::codex::CodexProvider);
-        registry.register(providers::copilot::CopilotProvider);
+        registry.register(providers::claude::SPEC);
+        registry.register(providers::codex::SPEC);
+        registry.register(providers::copilot::SPEC);
         registry.register(providers::opencode::OpencodeProvider);
         registry.register(providers::generic::GenericProvider);
-        registry.register(providers::openai::OpenaiProvider);
-        registry.register(providers::anthropic::AnthropicProvider);
-        registry.register(providers::nvidia::NvidiaProvider);
-        registry.register(providers::gitlab::GitlabProvider);
-        registry.register(providers::github::GithubProvider);
+        registry.register(providers::openai::SPEC);
+        registry.register(providers::anthropic::SPEC);
+        registry.register(providers::nvidia::SPEC);
+        registry.register(providers::gitlab::SPEC);
+        registry.register(providers::github::SPEC);
         registry.register(providers::outlook::OutlookProvider);
         registry
     }
@@ -143,7 +163,7 @@ impl ProviderRegistry {
 pub fn normalize_provider_type(input: &str) -> Option<&'static str> {
     let normalized = input.trim().to_ascii_lowercase();
     match normalized.as_str() {
-        "claude" => Some("claude"),
+        "claude" | "claude-code" | "claude_code" => Some("claude-code"),
         "codex" => Some("codex"),
         "copilot" => Some("copilot"),
         "opencode" => Some("opencode"),
@@ -177,7 +197,8 @@ mod tests {
         assert_eq!(normalize_provider_type("gitlab"), Some("gitlab"));
         assert_eq!(normalize_provider_type("glab"), Some("gitlab"));
         assert_eq!(normalize_provider_type("gh"), Some("github"));
-        assert_eq!(normalize_provider_type("CLAUDE"), Some("claude"));
+        assert_eq!(normalize_provider_type("CLAUDE"), Some("claude-code"));
+        assert_eq!(normalize_provider_type("claude-code"), Some("claude-code"));
         assert_eq!(normalize_provider_type("generic"), Some("generic"));
         assert_eq!(normalize_provider_type("openai"), Some("openai"));
         assert_eq!(normalize_provider_type("anthropic"), Some("anthropic"));
@@ -190,7 +211,7 @@ mod tests {
     fn detects_provider_from_command_token() {
         assert_eq!(
             detect_provider_from_command(&["claude".to_string()]),
-            Some("claude")
+            Some("claude-code")
         );
         assert_eq!(
             detect_provider_from_command(&["/usr/bin/glab".to_string()]),

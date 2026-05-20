@@ -143,6 +143,8 @@ Create a sandbox through the active gateway, wait for readiness, then connect or
 | `--no-keep` | Delete sandbox after the initial command or shell exits |
 | `--provider <NAME>` | Provider to attach (repeatable) |
 | `--policy <PATH>` | Path to custom policy YAML |
+| `--cpu <QUANTITY>` | CPU amount for the sandbox (for example: `500m`, `1`, `2.5`) |
+| `--memory <QUANTITY>` | Memory amount for the sandbox (for example: `512Mi`, `4Gi`, `8G`) |
 | `--forward <PORT>` | Forward local port to sandbox (keeps the sandbox alive) |
 | `--tty` | Force pseudo-terminal allocation |
 | `--no-tty` | Disable pseudo-terminal allocation |

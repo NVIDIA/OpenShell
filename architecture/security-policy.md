@@ -43,9 +43,13 @@ with the sandbox's ephemeral CA and inspect method/path or protocol-specific
 metadata before forwarding. The proxy also supports credential injection on
 terminated HTTP streams when policy allows the endpoint.
 
-Raw streams, HTTP upgrades, and long-lived response bodies are connection
-scoped. Policy reloads affect the next connection or the next parsed HTTP
-request; they do not rewrite bytes already being relayed.
+Raw streams and long-lived response bodies are connection scoped. Policy
+reloads affect the next connection or the next parsed HTTP request; they do not
+rewrite bytes already being relayed. HTTP upgrades switch to raw relay by
+default. A `protocol: rest` endpoint can opt in to
+`websocket_credential_rewrite` for client-to-server WebSocket text messages
+after an allowed `101` upgrade; server-to-client traffic and all other upgraded
+protocols remain raw passthrough.
 
 ## Live Updates
 
@@ -71,6 +75,11 @@ recommendations:
 3. The gateway validates and stores draft recommendations.
 4. A human or admin workflow approves or rejects drafts.
 5. Approved drafts merge into the target sandbox policy.
+
+Proposals intentionally omit `allowed_ips`. If a proposed rule targets a host
+that resolves to a private IP, the proxy's runtime SSRF classification blocks
+the connection. The operator must then add an explicit `allowed_ips` entry to
+permit it — a two-step flow that keeps SSRF protection on by default.
 
 The advisor should propose narrow additions and preserve explicit-deny behavior.
 It is a workflow aid, not an automatic permission grant.

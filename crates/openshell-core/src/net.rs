@@ -12,6 +12,31 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+/// Check if an IP address is link-local.
+///
+/// Covers IPv4 `169.254.0.0/16`, IPv6 `fe80::/10`, and IPv4-mapped IPv6
+/// addresses whose embedded IPv4 address is link-local (`::ffff:169.254.x.x`).
+///
+/// This is a point-check helper used to build the always-blocked and
+/// trusted-gateway exemption predicates. For CIDR-range overlap checks see
+/// [`is_always_blocked_net`].
+pub fn is_link_local_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            // fe80::/10 — IPv6 link-local
+            if (v6.segments()[0] & 0xffc0) == 0xfe80 {
+                return true;
+            }
+            // ::ffff:169.254.x.x — IPv4-mapped link-local
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return v4.is_link_local();
+            }
+            false
+        }
+    }
+}
+
 /// Check if an IP address is always blocked regardless of policy.
 ///
 /// Loopback, link-local, and unspecified addresses are never allowed even when
@@ -24,13 +49,12 @@ pub fn is_always_blocked_ip(ip: IpAddr) -> bool {
             if v6.is_loopback() || v6.is_unspecified() {
                 return true;
             }
-            // fe80::/10 — IPv6 link-local
-            if (v6.segments()[0] & 0xffc0) == 0xfe80 {
+            if is_link_local_ip(IpAddr::V6(v6)) {
                 return true;
             }
             // Check IPv4-mapped IPv6 (::ffff:x.x.x.x)
             if let Some(v4) = v6.to_ipv4_mapped() {
-                return v4.is_loopback() || v4.is_link_local() || v4.is_unspecified();
+                return v4.is_loopback() || v4.is_unspecified();
             }
             false
         }
@@ -138,8 +162,7 @@ pub fn is_internal_ip(ip: IpAddr) -> bool {
             if v6.is_loopback() || v6.is_unspecified() {
                 return true;
             }
-            // fe80::/10 — IPv6 link-local
-            if (v6.segments()[0] & 0xffc0) == 0xfe80 {
+            if is_link_local_ip(IpAddr::V6(v6)) {
                 return true;
             }
             // fc00::/7 — IPv6 unique local addresses (ULA)
@@ -189,6 +212,69 @@ fn is_internal_v4(v4: Ipv4Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- is_link_local_ip --
+
+    #[test]
+    fn test_link_local_ip_v4() {
+        assert!(is_link_local_ip(IpAddr::V4(Ipv4Addr::new(169, 254, 0, 1))));
+        assert!(is_link_local_ip(IpAddr::V4(Ipv4Addr::new(
+            169, 254, 169, 254
+        ))));
+        assert!(is_link_local_ip(IpAddr::V4(Ipv4Addr::new(
+            169, 254, 255, 255
+        ))));
+    }
+
+    #[test]
+    fn test_link_local_ip_v6_fe80() {
+        assert!(is_link_local_ip(IpAddr::V6(Ipv6Addr::new(
+            0xfe80, 0, 0, 0, 0, 0, 0, 1
+        ))));
+        // Upper boundary of fe80::/10 (febf:...)
+        assert!(is_link_local_ip(IpAddr::V6(Ipv6Addr::new(
+            0xfebf, 0, 0, 0, 0, 0, 0, 1
+        ))));
+    }
+
+    #[test]
+    fn test_link_local_ip_v6_mapped_v4() {
+        let mapped = Ipv4Addr::new(169, 254, 1, 2).to_ipv6_mapped();
+        assert!(is_link_local_ip(IpAddr::V6(mapped)));
+    }
+
+    #[test]
+    fn test_link_local_ip_not_loopback() {
+        assert!(!is_link_local_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(!is_link_local_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+    }
+
+    #[test]
+    fn test_link_local_ip_not_unspecified() {
+        assert!(!is_link_local_ip(IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+        assert!(!is_link_local_ip(IpAddr::V6(Ipv6Addr::UNSPECIFIED)));
+    }
+
+    #[test]
+    fn test_link_local_ip_not_rfc1918() {
+        assert!(!is_link_local_ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+        assert!(!is_link_local_ip(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1))));
+        assert!(!is_link_local_ip(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1))));
+    }
+
+    #[test]
+    fn test_link_local_ip_not_public() {
+        assert!(!is_link_local_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+        assert!(!is_link_local_ip(IpAddr::V6(Ipv6Addr::new(
+            0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888
+        ))));
+    }
+
+    #[test]
+    fn test_link_local_ip_not_v6_mapped_loopback() {
+        let mapped = Ipv4Addr::LOCALHOST.to_ipv6_mapped();
+        assert!(!is_link_local_ip(IpAddr::V6(mapped)));
+    }
 
     // -- is_always_blocked_ip --
 

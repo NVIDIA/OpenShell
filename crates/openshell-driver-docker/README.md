@@ -30,9 +30,24 @@ contract:
 | `cap_add` | Grants supervisor-only capabilities required for namespace setup and process inspection. |
 | `apparmor=unconfined` | Avoids Docker's default profile blocking required mount operations. |
 | `restart_policy = unless-stopped` | Keeps managed sandboxes resumable across daemon or gateway restarts. |
-| CDI GPU request | Requests all NVIDIA GPUs when the sandbox spec asks for GPU support and daemon CDI support is detected. |
+| CDI GPU request | Uses the sandbox `gpu_device` value when set; otherwise requests all NVIDIA GPUs when the sandbox spec asks for GPU support and daemon CDI support is detected. |
 
 The agent child process does not retain these supervisor privileges.
+
+## Supervisor Binary Resolution
+
+The Docker driver bind-mounts a host-side Linux `openshell-sandbox` binary into
+each sandbox container. Resolution order is:
+
+1. `supervisor_bin` in `[openshell.drivers.docker]`.
+2. A sibling `openshell-sandbox` next to the running `openshell-gateway` binary.
+3. A local Linux cargo target build for the Docker daemon architecture.
+4. `supervisor_image` in `[openshell.drivers.docker]`, or the
+   release-matched default supervisor image, extracting `/openshell-sandbox`.
+
+Release and Docker-image gateway builds bake the matching supervisor image tag
+into the binary at compile time. The default Docker supervisor image is not
+`:latest` unless a custom build explicitly sets that tag.
 
 ## Callback and TLS
 

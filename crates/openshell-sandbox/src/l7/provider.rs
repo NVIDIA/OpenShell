@@ -27,7 +27,10 @@ pub enum RelayOutcome {
     /// Contains any overflow bytes read from upstream past the 101 response
     /// headers that belong to the upgraded protocol. The 101 headers
     /// themselves have already been forwarded to the client.
-    Upgraded { overflow: Vec<u8> },
+    Upgraded {
+        overflow: Vec<u8>,
+        websocket_permessage_deflate: bool,
+    },
 }
 
 /// Body framing for HTTP requests/responses.

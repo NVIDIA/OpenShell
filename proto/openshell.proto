@@ -30,17 +30,49 @@ service OpenShell {
   // List sandboxes.
   rpc ListSandboxes(ListSandboxesRequest) returns (ListSandboxesResponse);
 
+  // List provider records attached to a sandbox.
+  rpc ListSandboxProviders(ListSandboxProvidersRequest)
+      returns (ListSandboxProvidersResponse);
+
+  // Attach a provider record to an existing sandbox.
+  rpc AttachSandboxProvider(AttachSandboxProviderRequest)
+      returns (AttachSandboxProviderResponse);
+
+  // Detach a provider record from an existing sandbox.
+  rpc DetachSandboxProvider(DetachSandboxProviderRequest)
+      returns (DetachSandboxProviderResponse);
+
   // Delete a sandbox by name.
   rpc DeleteSandbox(DeleteSandboxRequest) returns (DeleteSandboxResponse);
 
   // Create a short-lived SSH session for a sandbox.
   rpc CreateSshSession(CreateSshSessionRequest) returns (CreateSshSessionResponse);
 
+  // Create or update a sandbox HTTP service endpoint for local routing.
+  rpc ExposeService(ExposeServiceRequest) returns (ServiceEndpointResponse);
+
+  // Fetch one sandbox HTTP service endpoint.
+  rpc GetService(GetServiceRequest) returns (ServiceEndpointResponse);
+
+  // List sandbox HTTP service endpoints.
+  rpc ListServices(ListServicesRequest) returns (ListServicesResponse);
+
+  // Delete one sandbox HTTP service endpoint.
+  rpc DeleteService(DeleteServiceRequest) returns (DeleteServiceResponse);
+
   // Revoke a previously issued SSH session.
   rpc RevokeSshSession(RevokeSshSessionRequest) returns (RevokeSshSessionResponse);
 
   // Execute a command in a ready sandbox and stream output.
   rpc ExecSandbox(ExecSandboxRequest) returns (stream ExecSandboxEvent);
+
+  // Forward one CLI-side TCP connection to a loopback TCP target in a sandbox.
+  rpc ForwardTcp(stream TcpForwardFrame) returns (stream TcpForwardFrame);
+
+  // Execute an interactive command with bidirectional stdin/stdout streaming.
+  // The first client message MUST carry an ExecSandboxInput with the start
+  // variant. Subsequent messages carry stdin bytes or window resize events.
+  rpc ExecSandboxInteractive(stream ExecSandboxInput) returns (stream ExecSandboxEvent);
 
   // Create a provider.
   rpc CreateProvider(CreateProviderRequest) returns (ProviderResponse);
@@ -69,6 +101,22 @@ service OpenShell {
 
   // Update an existing provider by name.
   rpc UpdateProvider(UpdateProviderRequest) returns (ProviderResponse);
+
+  // Fetch refresh status for one provider or provider credential.
+  rpc GetProviderRefreshStatus(GetProviderRefreshStatusRequest)
+      returns (GetProviderRefreshStatusResponse);
+
+  // Configure gateway-owned refresh material for one provider credential.
+  rpc ConfigureProviderRefresh(ConfigureProviderRefreshRequest)
+      returns (ConfigureProviderRefreshResponse);
+
+  // Record a gateway-owned refresh request for one provider credential.
+  rpc RotateProviderCredential(RotateProviderCredentialRequest)
+      returns (RotateProviderCredentialResponse);
+
+  // Delete gateway-owned refresh configuration for one provider credential.
+  rpc DeleteProviderRefresh(DeleteProviderRefreshRequest)
+      returns (DeleteProviderRefreshResponse);
 
   // Delete a provider by name.
   rpc DeleteProvider(DeleteProviderRequest) returns (DeleteProviderResponse);
@@ -115,8 +163,9 @@ service OpenShell {
   //
   // The supervisor opens this stream at startup and keeps it alive for the
   // sandbox lifetime. The gateway uses it to coordinate relay channels for
-  // SSH connect and ExecSandbox. Raw SSH bytes flow over RelayStream calls
-  // (separate HTTP/2 streams on the same connection), not over this stream.
+  // SSH connect, ExecSandbox, and targetable sandbox services. Raw service
+  // bytes flow over RelayStream calls (separate HTTP/2 streams on the same
+  // connection), not over this stream.
   rpc ConnectSupervisor(stream SupervisorMessage) returns (stream GatewayMessage);
 
   // Raw byte relay between supervisor and gateway.
@@ -125,8 +174,8 @@ service OpenShell {
   // on its ConnectSupervisor stream. The first RelayFrame carries a
   // RelayInit with the channel_id to associate the new HTTP/2 stream with
   // the pending relay slot on the gateway. Subsequent frames carry raw bytes in either
-  // direction between the gateway-side waiter (ssh_tunnel / exec handler)
-  // and the supervisor-side local SSH daemon bridge.
+  // direction between the gateway-side waiter (ForwardTcp / exec handler)
+  // and the supervisor-side target bridge.
   //
   // This rides the same TCP+TLS+HTTP/2 connection as ConnectSupervisor —
   // no new TLS handshake, no reverse HTTP CONNECT.
@@ -248,6 +297,12 @@ message SandboxTemplate {
   google.protobuf.Struct resources = 7;
   // Optional platform-specific volume claim templates.
   google.protobuf.Struct volume_claim_templates = 9;
+  // Enable Kubernetes user namespace isolation (hostUsers: false).
+  // When true, container UID 0 maps to a non-root host UID and capabilities
+  // become namespaced. Requires Kubernetes 1.33+ with user namespace support
+  // available (beta through 1.35, GA in 1.36+) and a supporting runtime.
+  // When unset, the cluster-wide default is used.
+  optional bool user_namespaces = 10;
 }
 
 // User-facing sandbox status derived by the gateway from compute-driver observations.
@@ -333,6 +388,38 @@ message ListSandboxesRequest {
   string label_selector = 3;
 }
 
+// List providers attached to a sandbox request.
+message ListSandboxProvidersRequest {
+  // Sandbox name (canonical lookup key).
+  string sandbox_name = 1;
+}
+
+// Attach provider to sandbox request.
+message AttachSandboxProviderRequest {
+  // Sandbox name (canonical lookup key).
+  string sandbox_name = 1;
+  // Provider name to attach.
+  string provider_name = 2;
+  // Expected resource version for optimistic concurrency control.
+  // If 0, the server uses the current version (backward compatibility).
+  // If non-zero, the server validates that the sandbox's current resource_version
+  // matches this value before applying the mutation, returning ABORTED on mismatch.
+  uint64 expected_resource_version = 3;
+}
+
+// Detach provider from sandbox request.
+message DetachSandboxProviderRequest {
+  // Sandbox name (canonical lookup key).
+  string sandbox_name = 1;
+  // Provider name to detach.
+  string provider_name = 2;
+  // Expected resource version for optimistic concurrency control.
+  // If 0, the server uses the current version (backward compatibility).
+  // If non-zero, the server validates that the sandbox's current resource_version
+  // matches this value before applying the mutation, returning ABORTED on mismatch.
+  uint64 expected_resource_version = 3;
+}
+
 // Delete sandbox request.
 message DeleteSandboxRequest {
   // Sandbox name (canonical lookup key).
@@ -347,6 +434,25 @@ message SandboxResponse {
 // List sandboxes response.
 message ListSandboxesResponse {
   repeated Sandbox sandboxes = 1;
+}
+
+// List providers attached to a sandbox response.
+message ListSandboxProvidersResponse {
+  repeated openshell.datamodel.v1.Provider providers = 1;
+}
+
+// Attach provider to sandbox response.
+message AttachSandboxProviderResponse {
+  Sandbox sandbox = 1;
+  // True when the provider was newly attached. False means it was already attached.
+  bool attached = 2;
+}
+
+// Detach provider from sandbox response.
+message DetachSandboxProviderResponse {
+  Sandbox sandbox = 1;
+  // True when the provider was removed. False means it was not attached.
+  bool detached = 2;
 }
 
 // Delete sandbox response.
@@ -387,16 +493,82 @@ message CreateSshSessionResponse {
   // Gateway scheme. Must be exactly "http" or "https".
   string gateway_scheme = 5;
 
-  // HTTP path for the CONNECT/upgrade endpoint. Must begin with `/`. RFC
-  // 3986 path charset only ([A-Za-z0-9._~!$&'()*+,;=:@/-] plus %HH).
-  // Must not contain `?`, `#`, whitespace, backtick, or backslash.
-  string connect_path = 6;
-
   // Optional host key fingerprint. If non-empty, [A-Za-z0-9:+/=-] only.
   string host_key_fingerprint = 7;
 
   // Expiry timestamp in milliseconds since epoch. 0 means no expiry.
   int64 expires_at_ms = 8;
+}
+
+// Request to expose an HTTP service running inside a sandbox.
+message ExposeServiceRequest {
+  // Sandbox name.
+  string sandbox = 1;
+  // Service name within the sandbox.
+  string service = 2;
+  // Loopback TCP port inside the sandbox.
+  uint32 target_port = 3;
+  // Whether to print/use the browser-facing service URL.
+  bool domain = 4;
+}
+
+// Request to fetch an exposed sandbox service endpoint.
+message GetServiceRequest {
+  // Sandbox name.
+  string sandbox = 1;
+  // Service name within the sandbox. Empty selects the unnamed endpoint.
+  string service = 2;
+}
+
+// Request to list exposed sandbox service endpoints.
+message ListServicesRequest {
+  // Optional sandbox name. Empty lists endpoints for all sandboxes.
+  string sandbox = 1;
+  // Page size. Zero uses the server default.
+  uint32 limit = 2;
+  // Page offset.
+  uint32 offset = 3;
+}
+
+// Response containing exposed sandbox service endpoints.
+message ListServicesResponse {
+  repeated ServiceEndpointResponse services = 1;
+}
+
+// Request to delete an exposed sandbox service endpoint.
+message DeleteServiceRequest {
+  // Sandbox name.
+  string sandbox = 1;
+  // Service name within the sandbox. Empty selects the unnamed endpoint.
+  string service = 2;
+}
+
+// Response for deleting an exposed sandbox service endpoint.
+message DeleteServiceResponse {
+  // True when an endpoint existed and was deleted.
+  bool deleted = 1;
+}
+
+// Persisted sandbox service endpoint.
+message ServiceEndpoint {
+  // Kubernetes-style metadata.
+  openshell.datamodel.v1.ObjectMeta metadata = 1;
+  // Sandbox object ID.
+  string sandbox_id = 2;
+  // Sandbox name.
+  string sandbox_name = 3;
+  // Service name within the sandbox.
+  string service_name = 4;
+  // Loopback TCP port inside the sandbox.
+  uint32 target_port = 5;
+  // Whether browser-facing service routing is enabled for this endpoint.
+  bool domain = 6;
+}
+
+// Response containing a service endpoint and, when available, its local URL.
+message ServiceEndpointResponse {
+  ServiceEndpoint endpoint = 1;
+  string url = 2;
 }
 
 // Revoke SSH session request.
@@ -433,6 +605,12 @@ message ExecSandboxRequest {
 
   // Request a pseudo-terminal for the remote command.
   bool tty = 7;
+
+  // Initial terminal columns (used when tty=true, 0 = use default).
+  uint32 cols = 8;
+
+  // Initial terminal rows (used when tty=true, 0 = use default).
+  uint32 rows = 9;
 }
 
 // One stdout chunk from a sandbox exec.
@@ -458,6 +636,49 @@ message ExecSandboxEvent {
     ExecSandboxExit exit = 3;
   }
 }
+
+// Initial frame for one TCP forward stream.
+message TcpForwardInit {
+  // Sandbox id.
+  string sandbox_id = 1;
+  // Optional service identifier for audit/correlation.
+  string service_id = 4;
+  // Target the gateway should request from the supervisor.
+  oneof target {
+    SshRelayTarget ssh = 5;
+    TcpRelayTarget tcp = 6;
+  }
+  // Optional target-specific authorization token. SSH targets use this as the
+  // short-lived SSH session token issued by CreateSshSession.
+  string authorization_token = 7;
+}
+
+// A single frame on the CLI-to-gateway TCP forward stream.
+message TcpForwardFrame {
+  oneof payload {
+    TcpForwardInit init = 1;
+    bytes data = 2;
+  }
+}
+
+// Client-to-server message for interactive exec.
+message ExecSandboxInput {
+  oneof payload {
+    // First message: exec request metadata.
+    ExecSandboxRequest start = 1;
+    // Subsequent messages: raw stdin bytes.
+    bytes stdin = 2;
+    // Terminal window size change.
+    ExecSandboxWindowResize resize = 3;
+  }
+}
+
+// Terminal window resize event for interactive exec.
+message ExecSandboxWindowResize {
+  uint32 cols = 1;
+  uint32 rows = 2;
+}
+
 
 // SSH session record stored in persistence.
 message SshSession {
@@ -565,6 +786,9 @@ message ListProvidersRequest {
 // Update provider request.
 message UpdateProviderRequest {
   openshell.datamodel.v1.Provider provider = 1;
+  // Optional per-credential expiry timestamps to merge into the provider.
+  // A zero value removes the expiry for that credential.
+  map<string, int64> credential_expires_at_ms = 2;
 }
 
 // Delete provider request.
@@ -617,6 +841,103 @@ message ProviderProfileCredential {
   string auth_style = 5;
   string header_name = 6;
   string query_param = 7;
+  ProviderCredentialRefresh refresh = 8;
+}
+
+enum ProviderCredentialRefreshStrategy {
+  PROVIDER_CREDENTIAL_REFRESH_STRATEGY_UNSPECIFIED = 0;
+  PROVIDER_CREDENTIAL_REFRESH_STRATEGY_STATIC = 1;
+  PROVIDER_CREDENTIAL_REFRESH_STRATEGY_EXTERNAL = 2;
+  PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OAUTH2_REFRESH_TOKEN = 3;
+  PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OAUTH2_CLIENT_CREDENTIALS = 4;
+  PROVIDER_CREDENTIAL_REFRESH_STRATEGY_GOOGLE_SERVICE_ACCOUNT_JWT = 5;
+}
+
+message ProviderCredentialRefreshMaterial {
+  string name = 1;
+  string description = 2;
+  bool required = 3;
+  bool secret = 4;
+}
+
+message ProviderCredentialRefresh {
+  ProviderCredentialRefreshStrategy strategy = 1;
+  string token_url = 2;
+  repeated string scopes = 3;
+  int64 refresh_before_seconds = 4;
+  int64 max_lifetime_seconds = 5;
+  repeated ProviderCredentialRefreshMaterial material = 6;
+}
+
+message ProviderCredentialRefreshStatus {
+  string provider_name = 1;
+  string provider_id = 2;
+  string credential_key = 3;
+  ProviderCredentialRefreshStrategy strategy = 4;
+  string status = 5;
+  int64 expires_at_ms = 6;
+  int64 next_refresh_at_ms = 7;
+  int64 last_refresh_at_ms = 8;
+  string last_error = 9;
+}
+
+message StoredProviderCredentialRefreshState {
+  openshell.datamodel.v1.ObjectMeta metadata = 1;
+  string provider_id = 2;
+  string provider_name = 3;
+  string credential_key = 4;
+  ProviderCredentialRefreshStrategy strategy = 5;
+  map<string, string> material = 6;
+  repeated string secret_material_keys = 7;
+  int64 expires_at_ms = 8;
+  int64 next_refresh_at_ms = 9;
+  int64 last_refresh_at_ms = 10;
+  string status = 11;
+  string last_error = 12;
+  string token_url = 13;
+  repeated string scopes = 14;
+  int64 refresh_before_seconds = 15;
+  int64 max_lifetime_seconds = 16;
+}
+
+message GetProviderRefreshStatusRequest {
+  string provider = 1;
+  string credential_key = 2;
+}
+
+message GetProviderRefreshStatusResponse {
+  repeated ProviderCredentialRefreshStatus credentials = 1;
+}
+
+message ConfigureProviderRefreshRequest {
+  string provider = 1;
+  string credential_key = 2;
+  ProviderCredentialRefreshStrategy strategy = 3;
+  map<string, string> material = 4;
+  repeated string secret_material_keys = 5;
+  optional int64 expires_at_ms = 6;
+}
+
+message ConfigureProviderRefreshResponse {
+  ProviderCredentialRefreshStatus status = 1;
+}
+
+message RotateProviderCredentialRequest {
+  string provider = 1;
+  string credential_key = 2;
+}
+
+message RotateProviderCredentialResponse {
+  ProviderCredentialRefreshStatus status = 1;
+}
+
+message DeleteProviderRefreshRequest {
+  string provider = 1;
+  string credential_key = 2;
+}
+
+message DeleteProviderRefreshResponse {
+  bool deleted = 1;
 }
 
 // Stable provider profile categories used by clients for grouping and filtering.
@@ -707,6 +1028,10 @@ message GetSandboxProviderEnvironmentRequest {
 message GetSandboxProviderEnvironmentResponse {
   // Provider credential environment variables.
   map<string, string> environment = 1;
+  // Fingerprint for the provider credential inputs that produced environment.
+  uint64 provider_env_revision = 2;
+  // Expiration timestamps for returned environment variables.
+  map<string, int64> credential_expires_at_ms = 3;
 }
 
 // ---------------------------------------------------------------------------
@@ -738,6 +1063,12 @@ message UpdateConfigRequest {
   bool global = 6;
   // Batched incremental policy merge operations. Sandbox-scoped only.
   repeated PolicyMergeOperation merge_operations = 7;
+  // Expected resource version for optimistic concurrency control (sandbox-scoped only).
+  // If 0, the server uses the current version (backward compatibility).
+  // If non-zero, the server validates that the sandbox's current resource_version
+  // matches this value before applying the mutation, returning ABORTED on mismatch.
+  // Ignored for global-scoped updates.
+  uint64 expected_resource_version = 8;
 }
 
 message PolicyMergeOperation {
@@ -969,10 +1300,29 @@ message GatewayHeartbeat {}
 // On receiving this, the supervisor should initiate a RelayStream RPC to
 // the gateway, sending a RelayInit in the first RelayFrame to associate
 // the new HTTP/2 stream with the pending relay slot. The supervisor
-// bridges that stream to the local SSH daemon.
+// bridges that stream to the requested local target.
 message RelayOpen {
   // Gateway-allocated channel identifier (UUID).
   string channel_id = 1;
+  // Target the supervisor should dial inside the sandbox.
+  // If absent, supervisors treat the relay as SSH for compatibility.
+  oneof target {
+    SshRelayTarget ssh = 2;
+    TcpRelayTarget tcp = 3;
+  }
+  // Optional service identifier for audit/correlation.
+  string service_id = 5;
+}
+
+// Built-in SSH relay target.
+message SshRelayTarget {}
+
+// TCP target dialed by the supervisor from inside the sandbox.
+message TcpRelayTarget {
+  // Phase 1 accepts loopback only: 127.0.0.1, ::1, or localhost.
+  string host = 1;
+  // Target port. Must fit in u16 and be non-zero.
+  uint32 port = 2;
 }
 
 // Initial RelayStream frame sent by the supervisor to claim a pending relay.
@@ -1110,6 +1460,15 @@ message PolicyChunk {
   int64 last_seen_ms = 15;
   // Binary path that triggered the denial (denormalized for display convenience).
   string binary = 16;
+  // Validation verdict from gateway-side static checks (prover output).
+  // Free-form summary string for human consumption in the inbox card.
+  // Empty until the prover has run for this chunk.
+  string validation_result = 17;
+  // Operator-supplied free-form text accompanying a rejection. Populated
+  // when the reviewer rejects via `RejectDraftChunkRequest.reason`; surfaced
+  // back to the in-sandbox agent so it can revise the proposal.
+  // Empty for non-rejected chunks.
+  string rejection_reason = 18;
 }
 
 // Notification that the draft policy was updated.
@@ -1130,7 +1489,13 @@ message SubmitPolicyAnalysisRequest {
   repeated DenialSummary summaries = 1;
   // Proposed policy chunks (validated by sandbox OPA engine).
   repeated PolicyChunk proposed_chunks = 2;
-  // Analysis mode: "mechanistic" or "llm".
+  // Analysis mode. `mechanistic` is the observation-driven path from the
+  // denial aggregator — chunks targeting the same host|port|binary fold
+  // into one row with hit_count incremented. `agent_authored` is an
+  // intentional proposal from an in-sandbox agent — each submission lands
+  // as its own chunk so the redraft-after-rejection loop has a stable id
+  // to watch. Other values are treated as agent-style (no dedup) so a new
+  // mode does not silently collapse proposals.
   string analysis_mode = 3;
   // Sandbox name.
   string name = 4;
@@ -1143,6 +1508,10 @@ message SubmitPolicyAnalysisResponse {
   uint32 rejected_chunks = 2;
   // Reasons for each rejected chunk.
   repeated string rejection_reasons = 3;
+  // Server-assigned chunk IDs for the accepted chunks, in submission order.
+  // Agents use these to watch proposal state via policy.local's
+  // GET /v1/proposals/{id} and /wait endpoints.
+  repeated string accepted_chunk_ids = 4;
 }
 
 // Get draft policy for a sandbox.
@@ -1305,6 +1674,12 @@ message DraftChunkPayload {
   string binary = 9;
   // Current draft version for the owning sandbox.
   int64 draft_version = 10;
+  // Gateway prover verdict for this chunk; empty until prover runs.
+  // Mirrors PolicyChunk.validation_result.
+  string validation_result = 11;
+  // Operator-supplied free-form rejection text; empty for non-rejected
+  // chunks. Mirrors PolicyChunk.rejection_reason.
+  string rejection_reason = 12;
 }
 
 // Internal stored policy revision row materialized from the generic objects table.
@@ -1339,4 +1714,8 @@ message StoredDraftChunk {
   int32 hit_count = 15;
   int64 first_seen_ms = 16;
   int64 last_seen_ms = 17;
+  // Gateway prover verdict; empty until the prover runs. See PolicyChunk.
+  string validation_result = 18;
+  // Operator-supplied free-form rejection text. See PolicyChunk.
+  string rejection_reason = 19;
 }

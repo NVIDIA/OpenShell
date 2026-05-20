@@ -27,7 +27,7 @@ run = "tasks/scripts/docker-build-image.sh gateway"
 hide = true
 
 ["build:docker:supervisor"]
-description = "Build the supervisor image (FROM scratch, binary only)"
+description = "Build the supervisor image"
 run = "tasks/scripts/docker-build-image.sh supervisor"
 hide = true
 

@@ -22,6 +22,7 @@ class Versions:
     cargo: str
     docker: str
     deb: str
+    snap: str
     rpm_version: str
     rpm_release: str
     git_tag: str
@@ -108,6 +109,11 @@ def _versions_from_parts(
     # Docker tags can't contain '+'.
     docker_version = cargo_version.replace("+", "-")
 
+    # Snap versions cannot contain '+' and are limited to 32 characters.
+    snap_version = re.sub(r"\.d\d{8}$", "", docker_version)
+    if len(snap_version) > 32:
+        raise ValueError(f"snap version must be at most 32 characters: {snap_version}")
+
     # Debian versions use '~' so prereleases sort before the eventual release.
     deb_version = cargo_version
     deb_version = deb_version[1:] if deb_version.startswith("v") else deb_version
@@ -119,6 +125,7 @@ def _versions_from_parts(
         cargo=cargo_version,
         docker=docker_version,
         deb=deb_version,
+        snap=snap_version,
         rpm_version=rpm_version,
         rpm_release=rpm_release,
         git_tag=git_tag,
@@ -149,6 +156,7 @@ def _print_env(versions: Versions) -> None:
     print(f"VERSION_CARGO={versions.cargo}")
     print(f"VERSION_DOCKER={versions.docker}")
     print(f"VERSION_DEB={versions.deb}")
+    print(f"VERSION_SNAP={versions.snap}")
     print(f"VERSION_RPM={versions.rpm_version}")
     print(f"VERSION_RPM_RELEASE={versions.rpm_release}")
     print(f"GIT_TAG={versions.git_tag}")
@@ -166,6 +174,8 @@ def get_version(format: str) -> None:
         print(versions.docker)
     elif format == "deb":
         print(versions.deb)
+    elif format == "snap":
+        print(versions.snap)
     elif format == "rpm-version":
         print(versions.rpm_version)
     elif format == "rpm-release":
@@ -263,12 +273,57 @@ class Openshell < Formula
     resource("openshell-driver-vm").stage do
       libexec.install "openshell-driver-vm"
     end
+
+    (libexec/"openshell-gateway-homebrew-service").write <<~SH
+      #!/bin/sh
+      set -eu
+
+      if [ -z "${{HOME:-}}" ]; then
+        echo "HOME must be set for Docker TLS bind mounts" >&2
+        exit 1
+      fi
+
+      xdg_config_home="${{XDG_CONFIG_HOME:-${{HOME}}/.config}}"
+      xdg_gateway_env="${{xdg_config_home}}/openshell/gateway.env"
+      prefix_gateway_env="#{{var}}/openshell/gateway.env"
+      if [ -f "${{xdg_gateway_env}}" ]; then
+        set -a
+        . "${{xdg_gateway_env}}"
+        set +a
+      elif [ -f "${{prefix_gateway_env}}" ]; then
+        set -a
+        . "${{prefix_gateway_env}}"
+        set +a
+      fi
+
+      docker_tls_dir="${{HOME}}/.local/state/openshell/homebrew/tls"
+      mkdir -p "${{docker_tls_dir}}/server"
+      mkdir -p "${{docker_tls_dir}}/client"
+      chmod 700 "${{docker_tls_dir}}" "${{docker_tls_dir}}/server" "${{docker_tls_dir}}/client"
+      /usr/bin/install -m 0644 "#{{var}}/openshell/tls/ca.crt" "${{docker_tls_dir}}/ca.crt"
+      /usr/bin/install -m 0644 "#{{var}}/openshell/tls/server/tls.crt" "${{docker_tls_dir}}/server/tls.crt"
+      /usr/bin/install -m 0600 "#{{var}}/openshell/tls/server/tls.key" "${{docker_tls_dir}}/server/tls.key"
+      /usr/bin/install -m 0644 "#{{var}}/openshell/tls/client/tls.crt" "${{docker_tls_dir}}/client/tls.crt"
+      /usr/bin/install -m 0600 "#{{var}}/openshell/tls/client/tls.key" "${{docker_tls_dir}}/client/tls.key"
+      export OPENSHELL_LOCAL_TLS_DIR="${{OPENSHELL_LOCAL_TLS_DIR:-${{docker_tls_dir}}}}"
+
+      xdg_gateway_config="${{xdg_config_home}}/openshell/gateway.toml"
+      prefix_gateway_config="#{{var}}/openshell/gateway.toml"
+
+      if [ -z "${{OPENSHELL_GATEWAY_CONFIG:-}}" ] && [ ! -f "${{xdg_gateway_config}}" ] && [ -f "${{prefix_gateway_config}}" ]; then
+        exec "#{{opt_bin}}/openshell-gateway" --config "${{prefix_gateway_config}}"
+      fi
+
+      exec "#{{opt_bin}}/openshell-gateway"
+    SH
+    chmod 0755, libexec/"openshell-gateway-homebrew-service"
   end
 
   def post_install
     (var/"openshell/gateway").mkpath
     (var/"openshell/vm-driver").mkpath
     (var/"log/openshell").mkpath
+    system bin/"openshell-gateway", "generate-certs", "--output-dir", var/"openshell/tls", "--server-san", "host.openshell.internal"
 
     entitlements = var/"openshell/openshell-driver-vm.entitlements.plist"
     entitlements.atomic_write <<~XML
@@ -286,19 +341,7 @@ class Openshell < Formula
   end
 
   service do
-    run opt_bin/"openshell-gateway"
-    environment_variables(
-      OPENSHELL_BIND_ADDRESS: "127.0.0.1",
-      OPENSHELL_SERVER_PORT: "{LOCAL_GATEWAY_PORT}",
-      OPENSHELL_DISABLE_TLS: "true",
-      OPENSHELL_DISABLE_GATEWAY_AUTH: "true",
-      OPENSHELL_DB_URL: "sqlite:#{{var}}/openshell/gateway/openshell.db",
-      OPENSHELL_GRPC_ENDPOINT: "http://127.0.0.1:{LOCAL_GATEWAY_PORT}",
-      OPENSHELL_SSH_GATEWAY_HOST: "127.0.0.1",
-      OPENSHELL_SSH_GATEWAY_PORT: "{LOCAL_GATEWAY_PORT}",
-      OPENSHELL_VM_DRIVER_STATE_DIR: "#{{var}}/openshell/vm-driver",
-      OPENSHELL_DRIVER_DIR: "#{{opt_libexec}}",
-    )
+    run opt_libexec/"openshell-gateway-homebrew-service"
     keep_alive successful_exit: false
     log_path var/"log/openshell/openshell-gateway.out.log"
     error_log_path var/"log/openshell/openshell-gateway.err.log"
@@ -310,7 +353,7 @@ class Openshell < Formula
         brew services restart openshell
 
       Register it with the OpenShell CLI:
-        openshell gateway add http://127.0.0.1:{LOCAL_GATEWAY_PORT} --local --name local
+        openshell gateway add https://127.0.0.1:{LOCAL_GATEWAY_PORT} --local --name openshell
     EOS
   end
 
@@ -368,6 +411,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--deb", action="store_true", help="Print Debian package version only."
     )
     get_version_parser.add_argument(
+        "--snap", action="store_true", help="Print Snap package version only."
+    )
+    get_version_parser.add_argument(
         "--rpm-version", action="store_true", help="Print RPM Version only."
     )
     get_version_parser.add_argument(
@@ -415,6 +461,8 @@ def main() -> None:
             get_version("docker")
         elif args.deb:
             get_version("deb")
+        elif args.snap:
+            get_version("snap")
         elif args.rpm_version:
             get_version("rpm-version")
         elif args.rpm_release:

@@ -9,7 +9,7 @@ pub use openshell_driver_docker::DockerComputeConfig;
 pub use vm::VmComputeConfig;
 
 use crate::grpc::policy::SANDBOX_SETTINGS_OBJECT_TYPE;
-use crate::persistence::{ObjectId, ObjectName, ObjectRecord, ObjectType, Store};
+use crate::persistence::{ObjectId, ObjectName, ObjectRecord, ObjectType, Store, WriteCondition};
 use crate::sandbox_index::SandboxIndex;
 use crate::sandbox_watch::SandboxWatchBus;
 use crate::supervisor_session::SupervisorSessionRegistry;
@@ -275,6 +275,16 @@ impl ComputeRuntime {
         })
     }
 
+    /// Serializes sandbox object read-modify-write operations within this
+    /// gateway process.
+    ///
+    /// This is a temporary single-gateway guard for full-object sandbox writes.
+    /// It is not HA-safe; replace it with DB-backed CAS/resource-version writes
+    /// tracked by #1255 before enabling multiple gateway writers.
+    pub(crate) async fn sandbox_sync_guard(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.sync_lock.clone().lock_owned().await
+    }
+
     pub async fn new_docker(
         config: openshell_core::Config,
         docker_config: DockerComputeConfig,
@@ -412,23 +422,35 @@ impl ComputeRuntime {
     }
 
     pub async fn create_sandbox(&self, sandbox: Sandbox) -> Result<Sandbox, Status> {
-        let existing = self
-            .store
-            .get_message_by_name::<Sandbox>(sandbox.object_name())
-            .await
-            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?;
-        if existing.is_some() {
-            return Err(Status::already_exists(format!(
-                "sandbox '{}' already exists",
-                sandbox.object_name()
-            )));
-        }
+        let sandbox_id = sandbox.object_id().to_string();
 
+        // Create with MustCreate condition to prevent duplicate creation race
         self.sandbox_index.update_from_sandbox(&sandbox);
-        self.store
-            .put_message(&sandbox)
+        let mut sandbox = sandbox;
+        let result = self
+            .store
+            .put_if(
+                Sandbox::object_type(),
+                &sandbox_id,
+                sandbox.object_name(),
+                &sandbox.encode_to_vec(),
+                None,
+                WriteCondition::MustCreate,
+            )
             .await
-            .map_err(|e| Status::internal(format!("persist sandbox failed: {e}")))?;
+            .map_err(|e| {
+                if matches!(
+                    e,
+                    crate::persistence::PersistenceError::UniqueViolation { .. }
+                ) {
+                    Status::already_exists(format!(
+                        "sandbox '{}' already exists",
+                        sandbox.object_name()
+                    ))
+                } else {
+                    Status::internal(format!("persist sandbox failed: {e}"))
+                }
+            })?;
 
         let driver_sandbox = driver_sandbox_from_public(&sandbox);
         match self
@@ -440,6 +462,9 @@ impl ComputeRuntime {
         {
             Ok(_) => {
                 self.sandbox_watch_bus.notify(sandbox.object_id());
+                if let Some(metadata) = sandbox.metadata.as_mut() {
+                    metadata.resource_version = result.resource_version;
+                }
                 Ok(sandbox)
             }
             Err(status) if status.code() == Code::AlreadyExists => {
@@ -473,22 +498,31 @@ impl ComputeRuntime {
     }
 
     pub async fn delete_sandbox(&self, name: &str) -> Result<bool, Status> {
+        // Resolve sandbox ID from name
         let sandbox = self
             .store
             .get_message_by_name::<Sandbox>(name)
             .await
             .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?;
 
-        let Some(mut sandbox) = sandbox else {
+        let Some(sandbox) = sandbox else {
             return Err(Status::not_found("sandbox not found"));
         };
 
         let id = sandbox.object_id().to_string();
-        sandbox.phase = SandboxPhase::Deleting as i32;
-        self.store
-            .put_message(&sandbox)
+
+        // Use CAS to set phase to Deleting
+        // TODO: Accept expected_version from DeleteSandboxRequest for proper client-driven CAS
+        let sandbox = self
+            .store
+            .update_message_cas::<Sandbox, _>(&id, 0, |s| {
+                s.phase = SandboxPhase::Deleting as i32;
+            })
             .await
-            .map_err(|e| Status::internal(format!("persist sandbox failed: {e}")))?;
+            .map_err(|e| {
+                crate::grpc::persistence_error_to_status(e, "set sandbox phase to Deleting")
+            })?;
+
         self.sandbox_index.update_from_sandbox(&sandbox);
         self.sandbox_watch_bus.notify(&id);
         self.cleanup_sandbox_owned_records(&sandbox).await;
@@ -633,30 +667,40 @@ impl ComputeRuntime {
 
     async fn mark_sandbox_error(&self, sandbox: &Sandbox, reason: &str, message: &str) {
         let _guard = self.sync_lock.lock().await;
-        let mut updated = sandbox.clone();
-        updated.phase = SandboxPhase::Error as i32;
-        let updated_name = updated.object_name().to_string();
-        upsert_ready_condition(
-            &mut updated.status,
-            &updated_name,
-            SandboxCondition {
-                r#type: "Ready".to_string(),
-                status: "False".to_string(),
-                reason: reason.to_string(),
-                message: message.to_string(),
-                last_transition_time: String::new(),
-            },
-        );
-        self.sandbox_index.update_from_sandbox(&updated);
-        if let Err(err) = self.store.put_message(&updated).await {
-            warn!(
-                sandbox_id = %sandbox.object_id(),
-                error = %err,
-                "Failed to persist sandbox error state during startup resume"
-            );
-            return;
+        let sandbox_id = sandbox.object_id().to_string();
+        let reason = reason.to_string();
+        let message = message.to_string();
+        match self
+            .store
+            .update_message_cas::<Sandbox, _>(&sandbox_id, 0, |s| {
+                s.phase = SandboxPhase::Error as i32;
+                let name = s.object_name().to_string();
+                upsert_ready_condition(
+                    &mut s.status,
+                    &name,
+                    SandboxCondition {
+                        r#type: "Ready".to_string(),
+                        status: "False".to_string(),
+                        reason: reason.clone(),
+                        message: message.clone(),
+                        last_transition_time: String::new(),
+                    },
+                );
+            })
+            .await
+        {
+            Ok(updated) => {
+                self.sandbox_index.update_from_sandbox(&updated);
+                self.sandbox_watch_bus.notify(&sandbox_id);
+            }
+            Err(err) => {
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    error = %err,
+                    "Failed to persist sandbox error state during startup resume"
+                );
+            }
         }
-        self.sandbox_watch_bus.notify(sandbox.object_id());
     }
 
     async fn watch_loop(self: Arc<Self>) {
@@ -707,7 +751,7 @@ impl ComputeRuntime {
     }
 
     async fn reconcile_store_with_backend(&self, grace_period: Duration) -> Result<(), String> {
-        let sweep_started_at_ms = current_time_ms();
+        let sweep_started_at_ms = openshell_core::time::now_ms();
         let backend_sandboxes = self
             .driver
             .list_sandboxes(Request::new(ListSandboxesRequest {}))
@@ -801,86 +845,136 @@ impl ComputeRuntime {
             .as_ref()
             .map(decode_sandbox_record)
             .transpose()?;
-        let previous = existing.clone();
 
-        let mut status = incoming.status.as_ref().map(public_status_from_driver);
-        rewrite_user_facing_conditions(
-            &mut status,
-            existing.as_ref().and_then(|sandbox| sandbox.spec.as_ref()),
-        );
+        // If no existing record, create initial sandbox (first watch event for this sandbox)
+        if existing.is_none() {
+            use crate::persistence::WriteCondition;
+            let now_ms = openshell_core::time::now_ms();
 
-        let session_connected = self.supervisor_sessions.has_session(&incoming.id);
-        let mut phase = derive_phase(incoming.status.as_ref());
-        let mut sandbox = existing.unwrap_or_else(|| {
-            use crate::persistence::current_time_ms;
-            let now_ms = current_time_ms().unwrap_or(0);
-            Sandbox {
+            let mut status = incoming.status.as_ref().map(public_status_from_driver);
+            rewrite_user_facing_conditions(&mut status, None);
+
+            let session_connected = self.supervisor_sessions.has_session(&incoming.id);
+            let mut phase = derive_phase(incoming.status.as_ref());
+
+            let sandbox_name = incoming.name.clone();
+            if session_connected
+                && matches!(phase, SandboxPhase::Provisioning | SandboxPhase::Unknown)
+            {
+                ensure_supervisor_ready_status(&mut status, &sandbox_name);
+                phase = SandboxPhase::Ready;
+            }
+
+            let sandbox = Sandbox {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: incoming.id.clone(),
-                    name: incoming.name.clone(),
+                    name: sandbox_name,
                     created_at_ms: now_ms,
                     labels: std::collections::HashMap::new(),
+                    resource_version: 0,
                 }),
                 spec: None,
-                status: None,
-                phase: SandboxPhase::Unknown as i32,
+                status,
+                phase: phase as i32,
                 current_policy_version: 0,
-            }
-        });
+            };
 
-        if session_connected && matches!(phase, SandboxPhase::Provisioning | SandboxPhase::Unknown)
-        {
-            ensure_supervisor_ready_status(&mut status, sandbox.object_name());
-            phase = SandboxPhase::Ready;
-        }
+            self.store
+                .put_if(
+                    Sandbox::object_type(),
+                    &incoming.id,
+                    sandbox.object_name(),
+                    &sandbox.encode_to_vec(),
+                    None,
+                    WriteCondition::MustCreate,
+                )
+                .await
+                .map_err(|e| match e {
+                    crate::persistence::PersistenceError::Conflict {
+                        current_resource_version,
+                    } => format!(
+                        "concurrent modification detected during sandbox creation (current resource_version: {})",
+                        current_resource_version
+                            .map_or_else(|| "unknown".to_string(), |v| v.to_string())
+                    ),
+                    other => other.to_string(),
+                })?;
 
-        let old_phase = SandboxPhase::try_from(sandbox.phase).unwrap_or(SandboxPhase::Unknown);
-        if old_phase != phase {
-            info!(
-                sandbox_id = %incoming.id,
-                sandbox_name = %incoming.name,
-                old_phase = ?old_phase,
-                new_phase = ?phase,
-                "Sandbox phase changed"
-            );
-        }
-
-        if phase == SandboxPhase::Error
-            && let Some(ref status) = status
-        {
-            for condition in &status.conditions {
-                if condition.r#type == "Ready"
-                    && condition.status.eq_ignore_ascii_case("false")
-                    && is_terminal_failure_reason(&condition.reason)
-                {
-                    warn!(
-                        sandbox_id = %incoming.id,
-                        sandbox_name = %incoming.name,
-                        reason = %condition.reason,
-                        message = %condition.message,
-                        "Sandbox failed to become ready"
-                    );
-                }
-            }
-        }
-
-        // Update metadata fields
-        if let Some(metadata) = sandbox.metadata.as_mut() {
-            metadata.name = incoming.name;
-        }
-        // Note: namespace field removed from public Sandbox API - it remains internal to DriverSandbox
-        sandbox.status = status;
-        sandbox.phase = phase as i32;
-
-        if previous.as_ref() == Some(&sandbox) {
+            self.sandbox_index.update_from_sandbox(&sandbox);
+            self.sandbox_watch_bus.notify(sandbox.object_id());
             return Ok(());
         }
 
-        self.sandbox_index.update_from_sandbox(&sandbox);
-        self.store
-            .put_message(&sandbox)
+        // Single-attempt CAS: on conflict, the next watch event will naturally retry
+        let session_connected = self.supervisor_sessions.has_session(&incoming.id);
+        let sandbox_name = incoming.name.clone();
+
+        let sandbox = self
+            .store
+            .update_message_cas::<Sandbox, _>(&incoming.id, 0, |sandbox| {
+                let mut status = incoming.status.as_ref().map(public_status_from_driver);
+                rewrite_user_facing_conditions(&mut status, sandbox.spec.as_ref());
+
+                let mut phase = derive_phase(incoming.status.as_ref());
+                if session_connected
+                    && matches!(phase, SandboxPhase::Provisioning | SandboxPhase::Unknown)
+                {
+                    ensure_supervisor_ready_status(&mut status, &sandbox_name);
+                    phase = SandboxPhase::Ready;
+                }
+
+                let old_phase =
+                    SandboxPhase::try_from(sandbox.phase).unwrap_or(SandboxPhase::Unknown);
+                if old_phase != phase {
+                    info!(
+                        sandbox_id = %incoming.id,
+                        sandbox_name = %sandbox_name,
+                        old_phase = ?old_phase,
+                        new_phase = ?phase,
+                        "Sandbox phase changed"
+                    );
+                }
+
+                if phase == SandboxPhase::Error
+                    && let Some(ref status) = status
+                {
+                    for condition in &status.conditions {
+                        if condition.r#type == "Ready"
+                            && condition.status.eq_ignore_ascii_case("false")
+                            && is_terminal_failure_reason(&condition.reason)
+                        {
+                            warn!(
+                                sandbox_id = %incoming.id,
+                                sandbox_name = %sandbox_name,
+                                reason = %condition.reason,
+                                message = %condition.message,
+                                "Sandbox failed to become ready"
+                            );
+                        }
+                    }
+                }
+
+                // Update metadata fields
+                if let Some(metadata) = sandbox.metadata.as_mut() {
+                    metadata.name.clone_from(&sandbox_name);
+                }
+                // Note: namespace field removed from public Sandbox API - it remains internal to DriverSandbox
+                sandbox.status = status;
+                sandbox.phase = phase as i32;
+            })
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| match e {
+                crate::persistence::PersistenceError::Conflict {
+                    current_resource_version,
+                } => format!(
+                    "concurrent modification detected during sandbox reconciliation (current resource_version: {})",
+                    current_resource_version
+                        .map_or_else(|| "unknown".to_string(), |v| v.to_string())
+                ),
+                other => other.to_string(),
+            })?;
+
+        self.sandbox_index.update_from_sandbox(&sandbox);
         self.sandbox_watch_bus.notify(sandbox.object_id());
         Ok(())
     }
@@ -899,38 +993,51 @@ impl ComputeRuntime {
         connected: bool,
     ) -> Result<(), String> {
         let _guard = self.sync_lock.lock().await;
-        let Some(record) = self
+
+        // Use CAS to update sandbox phase based on supervisor session state
+        let result = self
             .store
-            .get(Sandbox::object_type(), sandbox_id)
-            .await
-            .map_err(|e| e.to_string())?
-        else {
-            return Ok(());
+            .update_message_cas::<Sandbox, _>(sandbox_id, 0, |sandbox| {
+                let current_phase =
+                    SandboxPhase::try_from(sandbox.phase).unwrap_or(SandboxPhase::Unknown);
+
+                // Skip if sandbox is in terminal state
+                if current_phase == SandboxPhase::Deleting || current_phase == SandboxPhase::Error {
+                    return;
+                }
+
+                let sandbox_name = sandbox.object_name().to_string();
+                if connected {
+                    ensure_supervisor_ready_status(&mut sandbox.status, &sandbox_name);
+                    sandbox.phase = SandboxPhase::Ready as i32;
+                } else if current_phase == SandboxPhase::Ready {
+                    ensure_supervisor_not_ready_status(&mut sandbox.status, &sandbox_name);
+                    sandbox.phase = SandboxPhase::Provisioning as i32;
+                }
+            })
+            .await;
+
+        // Handle not found gracefully (sandbox may have been deleted)
+        let sandbox = match result {
+            Ok(s) => s,
+            Err(crate::persistence::PersistenceError::Database(ref msg))
+                if msg.contains("not found") =>
+            {
+                return Ok(());
+            }
+            Err(crate::persistence::PersistenceError::Conflict {
+                current_resource_version,
+            }) => {
+                return Err(format!(
+                    "concurrent modification detected (current resource_version: {})",
+                    current_resource_version
+                        .map_or_else(|| "unknown".to_string(), |v| v.to_string())
+                ));
+            }
+            Err(e) => return Err(e.to_string()),
         };
 
-        let mut sandbox = decode_sandbox_record(&record)?;
-        let current_phase = SandboxPhase::try_from(sandbox.phase).unwrap_or(SandboxPhase::Unknown);
-
-        if current_phase == SandboxPhase::Deleting || current_phase == SandboxPhase::Error {
-            return Ok(());
-        }
-
-        let sandbox_name = sandbox.object_name().to_string();
-        if connected {
-            ensure_supervisor_ready_status(&mut sandbox.status, &sandbox_name);
-            sandbox.phase = SandboxPhase::Ready as i32;
-        } else if current_phase == SandboxPhase::Ready {
-            ensure_supervisor_not_ready_status(&mut sandbox.status, &sandbox_name);
-            sandbox.phase = SandboxPhase::Provisioning as i32;
-        } else {
-            return Ok(());
-        }
-
         self.sandbox_index.update_from_sandbox(&sandbox);
-        self.store
-            .put_message(&sandbox)
-            .await
-            .map_err(|e| e.to_string())?;
         self.sandbox_watch_bus.notify(sandbox_id);
         Ok(())
     }
@@ -1056,7 +1163,7 @@ impl ComputeRuntime {
         }
 
         let sandbox = decode_sandbox_record(&current_record)?;
-        let age_ms = current_time_ms().saturating_sub(current_record.created_at_ms);
+        let age_ms = openshell_core::time::now_ms().saturating_sub(current_record.created_at_ms);
         if age_ms < grace_ms {
             return Ok(());
         }
@@ -1230,6 +1337,19 @@ fn build_platform_config(template: &SandboxTemplate) -> Option<prost_types::Stru
         );
     }
 
+    // Invert: the public API uses `user_namespaces: true` (positive sense)
+    // while the K8s driver expects `host_users: false` (K8s convention).
+    // The driver inverts this back via `!host_users` to resolve the final
+    // pod-level `hostUsers` field.
+    if let Some(user_ns) = template.user_namespaces {
+        fields.insert(
+            "host_users".to_string(),
+            Value {
+                kind: Some(Kind::BoolValue(!user_ns)),
+            },
+        );
+    }
+
     // Pass through any resource fields that do not map to the typed
     // DriverResourceRequirements so platform-specific drivers can still see
     // custom resources such as GPU limits.
@@ -1338,15 +1458,6 @@ fn compute_error_from_status(status: Status) -> ComputeError {
         Code::FailedPrecondition => ComputeError::Precondition(status.message().to_string()),
         _ => ComputeError::Message(status.message().to_string()),
     }
-}
-
-fn current_time_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(i64::MAX)
 }
 
 fn decode_sandbox_record(record: &ObjectRecord) -> Result<Sandbox, String> {
@@ -1807,6 +1918,7 @@ mod tests {
                 name: name.to_string(),
                 created_at_ms: 1_000_000,
                 labels: HashMap::new(),
+                resource_version: 0,
             }),
             phase: phase as i32,
             ..Default::default()
@@ -1820,6 +1932,7 @@ mod tests {
                 name: format!("session-{id}"),
                 created_at_ms: 1_000_000,
                 labels: HashMap::new(),
+                resource_version: 0,
             }),
             sandbox_id: sandbox_id.to_string(),
             token: format!("token-{id}"),
@@ -2690,6 +2803,149 @@ mod tests {
         assert_eq!(
             SandboxPhase::try_from(stored.phase).unwrap(),
             SandboxPhase::Ready
+        );
+    }
+
+    #[test]
+    fn build_platform_config_inverts_user_namespaces_to_host_users() {
+        use prost_types::value::Kind;
+
+        // user_namespaces: true  → host_users: false
+        let mut template = SandboxTemplate {
+            user_namespaces: Some(true),
+            ..SandboxTemplate::default()
+        };
+        let config = build_platform_config(&template).expect("config should be Some");
+        let host_users = config
+            .fields
+            .get("host_users")
+            .expect("host_users must exist");
+        assert_eq!(
+            host_users.kind,
+            Some(Kind::BoolValue(false)),
+            "user_namespaces: true must produce host_users: false"
+        );
+
+        // user_namespaces: false → host_users: true
+        template.user_namespaces = Some(false);
+        let config = build_platform_config(&template).expect("config should be Some");
+        let host_users = config
+            .fields
+            .get("host_users")
+            .expect("host_users must exist");
+        assert_eq!(
+            host_users.kind,
+            Some(Kind::BoolValue(true)),
+            "user_namespaces: false must produce host_users: true"
+        );
+
+        // user_namespaces: None → host_users absent
+        template.user_namespaces = None;
+        let config = build_platform_config(&template);
+        assert!(
+            config.is_none() || !config.as_ref().unwrap().fields.contains_key("host_users"),
+            "unset user_namespaces must not produce host_users"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_returns_resource_version_one() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+
+        let mut sandbox = sandbox_record("sb-new", "test-sandbox", SandboxPhase::Provisioning);
+        // Clear metadata to simulate incoming request
+        sandbox.metadata = Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+            id: "sb-new".to_string(),
+            name: "test-sandbox".to_string(),
+            created_at_ms: 1_000_000,
+            labels: HashMap::new(),
+            resource_version: 0,
+        });
+
+        let created = runtime.create_sandbox(sandbox).await.unwrap();
+
+        assert_eq!(
+            created.metadata.as_ref().unwrap().resource_version,
+            1,
+            "create_sandbox should return resource_version: 1 after insert"
+        );
+
+        // Verify database also has resource_version: 1
+        let created_id = created.metadata.as_ref().unwrap().id.clone();
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>(&created_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.metadata.as_ref().unwrap().resource_version,
+            1,
+            "database should have resource_version: 1 after create"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_create_sandbox_rejects_duplicate() {
+        let runtime = Arc::new(test_runtime(Arc::new(TestDriver::default())).await);
+
+        let sandbox = sandbox_record(
+            "sb-concurrent",
+            "test-concurrent",
+            SandboxPhase::Provisioning,
+        );
+
+        // Spawn two concurrent creation attempts for the same sandbox
+        let runtime1 = runtime.clone();
+        let sandbox1 = sandbox.clone();
+        let handle1 = tokio::spawn(async move { runtime1.create_sandbox(sandbox1).await });
+
+        let runtime2 = runtime.clone();
+        let sandbox2 = sandbox.clone();
+        let handle2 = tokio::spawn(async move { runtime2.create_sandbox(sandbox2).await });
+
+        // Wait for both to complete
+        let result1 = handle1.await.unwrap();
+        let result2 = handle2.await.unwrap();
+
+        // Exactly one should succeed, one should fail with AlreadyExists
+        let success_count = [&result1, &result2].iter().filter(|r| r.is_ok()).count();
+        let already_exists_count = [&result1, &result2]
+            .iter()
+            .filter(|r| {
+                r.as_ref()
+                    .err()
+                    .is_some_and(|e| e.code() == Code::AlreadyExists)
+            })
+            .count();
+
+        assert_eq!(
+            success_count, 1,
+            "exactly one creation should succeed, got results: {result1:?} {result2:?}"
+        );
+        assert_eq!(
+            already_exists_count, 1,
+            "exactly one creation should fail with AlreadyExists, got results: {result1:?} {result2:?}"
+        );
+
+        // Verify the successful sandbox can be retrieved by name
+        let created_sandbox = [result1, result2]
+            .into_iter()
+            .find_map(Result::ok)
+            .expect("should have one successful creation");
+        let retrieved = runtime
+            .store
+            .get_message_by_name::<Sandbox>("test-concurrent")
+            .await
+            .unwrap();
+        assert!(
+            retrieved.is_some(),
+            "created sandbox should be retrievable by name"
+        );
+        assert_eq!(
+            retrieved.unwrap().object_id(),
+            created_sandbox.object_id(),
+            "retrieved sandbox should match created sandbox"
         );
     }
 }

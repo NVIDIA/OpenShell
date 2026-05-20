@@ -11,7 +11,7 @@ use crate::objects::{Actor, ConnectionInfo, Endpoint, FirewallRule};
 
 /// OCSF Network Activity Event [4001].
 ///
-/// Proxy CONNECT tunnel events and iptables-level bypass detection.
+/// Proxy CONNECT tunnel events and nftables bypass detection.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct NetworkActivityEvent {
     /// Common base event fields.

@@ -267,6 +267,25 @@ pub(super) fn validate_provider_fields(provider: &Provider) -> Result<(), Status
         MAX_MAP_VALUE_LEN,
         "provider.config",
     )?;
+    if provider.credential_expires_at_ms.len() > MAX_PROVIDER_CREDENTIALS_ENTRIES {
+        return Err(Status::invalid_argument(format!(
+            "provider.credential_expires_at_ms exceeds maximum entries ({} > {MAX_PROVIDER_CREDENTIALS_ENTRIES})",
+            provider.credential_expires_at_ms.len()
+        )));
+    }
+    for (key, value) in &provider.credential_expires_at_ms {
+        if key.len() > MAX_MAP_KEY_LEN {
+            return Err(Status::invalid_argument(format!(
+                "provider.credential_expires_at_ms key exceeds maximum length ({} > {MAX_MAP_KEY_LEN})",
+                key.len()
+            )));
+        }
+        if *value < 0 {
+            return Err(Status::invalid_argument(
+                "provider.credential_expires_at_ms value must be greater than or equal to 0",
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -874,10 +893,12 @@ mod tests {
                 name: name.to_string(),
                 created_at_ms: 1_000_000,
                 labels: HashMap::new(),
+                resource_version: 0,
             }),
             r#type: provider_type.to_string(),
             credentials,
             config,
+            credential_expires_at_ms: HashMap::new(),
         }
     }
 

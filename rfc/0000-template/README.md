@@ -3,7 +3,7 @@ authors:
   - "@your-github-username"
 state: draft
 links:
-  - (related PRs, discussions, or issues)
+  - (related PRs or issues)
 ---
 
 # RFC NNNN - Your Title Here

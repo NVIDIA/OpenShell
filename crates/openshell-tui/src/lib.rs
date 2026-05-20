@@ -18,6 +18,7 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use miette::{IntoDiagnostic, Result};
+use openshell_core::auth::EdgeAuthInterceptor;
 use openshell_core::metadata::{ObjectId, ObjectLabels, ObjectName};
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use ratatui::Terminal;
@@ -41,6 +42,7 @@ pub use theme::ThemeMode;
 /// background, `Dark`/`Light` forces a specific palette.
 pub async fn run(
     channel: Channel,
+    interceptor: EdgeAuthInterceptor,
     gateway_name: &str,
     endpoint: &str,
     theme_mode: ThemeMode,
@@ -50,7 +52,7 @@ pub async fn run(
     // after our own enable_raw_mode() would conflict.
     let detected_theme = theme::detect(theme_mode);
 
-    let client = OpenShellClient::new(channel);
+    let client = OpenShellClient::with_interceptor(channel, interceptor);
     let mut app = App::new(
         client,
         gateway_name.to_string(),
@@ -491,8 +493,8 @@ async fn handle_gateway_switch(app: &mut App) {
     };
 
     match connect_to_gateway(&name, &endpoint).await {
-        Ok(channel) => {
-            app.client = OpenShellClient::new(channel);
+        Ok((channel, interceptor)) => {
+            app.client = OpenShellClient::with_interceptor(channel, interceptor);
             app.gateway_name = name;
             app.endpoint = endpoint;
             app.reset_sandbox_state();
@@ -505,8 +507,76 @@ async fn handle_gateway_switch(app: &mut App) {
     }
 }
 
-/// Build a gRPC channel to a gateway using its mTLS certs on disk.
-async fn connect_to_gateway(name: &str, endpoint: &str) -> Result<Channel> {
+/// Build a gRPC channel and auth interceptor for a gateway.
+///
+/// Checks gateway metadata for the auth mode and loads the appropriate
+/// credentials (mTLS certs or OIDC bearer token).
+async fn connect_to_gateway(name: &str, endpoint: &str) -> Result<(Channel, EdgeAuthInterceptor)> {
+    let meta = openshell_bootstrap::get_gateway_metadata(name);
+
+    if meta.as_ref().and_then(|m| m.auth_mode.as_deref()) == Some("oidc") {
+        let bundle = openshell_bootstrap::oidc_token::load_oidc_token(name).ok_or_else(|| {
+            miette::miette!(
+                "No OIDC token for gateway '{name}'.\n\
+                     Authenticate with: openshell gateway login"
+            )
+        })?;
+        if openshell_bootstrap::oidc_token::is_token_expired(&bundle) {
+            miette::bail!(
+                "OIDC token for gateway '{name}' has expired.\n\
+                 Re-authenticate with: openshell gateway login"
+            );
+        }
+        let interceptor = EdgeAuthInterceptor::new(Some(&bundle.access_token), None)?;
+        let channel = build_oidc_channel(name, endpoint).await?;
+        Ok((channel, interceptor))
+    } else {
+        let channel = build_mtls_channel(name, endpoint).await?;
+        Ok((channel, EdgeAuthInterceptor::noop()))
+    }
+}
+
+/// Build an HTTPS channel for OIDC-authenticated gateways.
+///
+/// Tries mTLS client certs for the transport layer when available (the server
+/// may still require them alongside the bearer token), falls back to CA-only
+/// or system roots.
+async fn build_oidc_channel(name: &str, endpoint: &str) -> Result<Channel> {
+    let mtls_dir = gateway_mtls_dir(name);
+
+    let tls_config = mtls_dir.as_ref().map_or_else(
+        || ClientTlsConfig::new().with_enabled_roots(),
+        |dir| {
+            let ca = std::fs::read(dir.join("ca.crt")).ok();
+            let cert = std::fs::read(dir.join("tls.crt")).ok();
+            let key = std::fs::read(dir.join("tls.key")).ok();
+
+            match (ca, cert, key) {
+                (Some(ca), Some(cert), Some(key)) => ClientTlsConfig::new()
+                    .ca_certificate(Certificate::from_pem(ca))
+                    .identity(Identity::from_pem(cert, key)),
+                (Some(ca), _, _) => {
+                    ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca))
+                }
+                _ => ClientTlsConfig::new().with_enabled_roots(),
+            }
+        },
+    );
+
+    Endpoint::from_shared(endpoint.to_string())
+        .into_diagnostic()?
+        .connect_timeout(Duration::from_secs(10))
+        .http2_keep_alive_interval(Duration::from_secs(10))
+        .keep_alive_while_idle(true)
+        .tls_config(tls_config)
+        .into_diagnostic()?
+        .connect()
+        .await
+        .into_diagnostic()
+}
+
+/// Build a gRPC channel using mTLS client certificates.
+async fn build_mtls_channel(name: &str, endpoint: &str) -> Result<Channel> {
     let mtls_dir = gateway_mtls_dir(name)
         .ok_or_else(|| miette::miette!("cannot determine config directory for gateway {name}"))?;
 
@@ -524,7 +594,7 @@ async fn connect_to_gateway(name: &str, endpoint: &str) -> Result<Channel> {
         .ca_certificate(Certificate::from_pem(ca))
         .identity(Identity::from_pem(cert, key));
 
-    let channel = Endpoint::from_shared(endpoint.to_string())
+    Endpoint::from_shared(endpoint.to_string())
         .into_diagnostic()?
         .connect_timeout(Duration::from_secs(10))
         .http2_keep_alive_interval(Duration::from_secs(10))
@@ -533,9 +603,7 @@ async fn connect_to_gateway(name: &str, endpoint: &str) -> Result<Channel> {
         .into_diagnostic()?
         .connect()
         .await
-        .into_diagnostic()?;
-
-    Ok(channel)
+        .into_diagnostic()
 }
 
 /// Resolve the mTLS cert directory for a gateway.
@@ -839,10 +907,7 @@ async fn handle_shell_connect(
     let gateway_port_u16 = session.gateway_port as u16;
     let (gateway_host, gateway_port) =
         resolve_ssh_gateway(&session.gateway_host, gateway_port_u16, &app.endpoint);
-    let gateway_url = format!(
-        "{}://{}:{gateway_port}{}",
-        session.gateway_scheme, gateway_host, session.connect_path
-    );
+    let gateway_url = format_gateway_url(&session.gateway_scheme, &gateway_host, gateway_port);
 
     // Step 4: Build the ProxyCommand using our own binary.
     let exe = match std::env::current_exe() {
@@ -988,10 +1053,7 @@ async fn handle_exec_command(
     let gateway_port_u16 = session.gateway_port as u16;
     let (gateway_host, gateway_port) =
         resolve_ssh_gateway(&session.gateway_host, gateway_port_u16, &app.endpoint);
-    let gateway_url = format!(
-        "{}://{}:{gateway_port}{}",
-        session.gateway_scheme, gateway_host, session.connect_path
-    );
+    let gateway_url = format_gateway_url(&session.gateway_scheme, &gateway_host, gateway_port);
 
     let exe = match std::env::current_exe() {
         Ok(p) => p,
@@ -1080,7 +1142,8 @@ async fn handle_exec_command(
 
 // SSH utility functions are shared via openshell_core::forward.
 use openshell_core::forward::{
-    build_proxy_command, resolve_ssh_gateway, shell_escape, validate_ssh_session_response,
+    build_proxy_command, format_gateway_url, resolve_ssh_gateway, shell_escape,
+    validate_ssh_session_response,
 };
 
 /// Convert a `SandboxPolicy` proto into styled ratatui lines for the policy viewer.
@@ -1390,7 +1453,9 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
 /// This is called from within the create-sandbox task so the pacman animation
 /// keeps running while forwards are being established.
 async fn start_port_forwards(
-    client: &mut OpenShellClient<Channel>,
+    client: &mut OpenShellClient<
+        tonic::service::interceptor::InterceptedService<Channel, EdgeAuthInterceptor>,
+    >,
     endpoint: &str,
     gateway_name: &str,
     sandbox_name: &str,
@@ -1424,10 +1489,7 @@ async fn start_port_forwards(
     let gateway_port_u16 = session.gateway_port as u16;
     let (gateway_host, gateway_port) =
         resolve_ssh_gateway(&session.gateway_host, gateway_port_u16, endpoint);
-    let gateway_url = format!(
-        "{}://{}:{gateway_port}{}",
-        session.gateway_scheme, gateway_host, session.connect_path
-    );
+    let gateway_url = format_gateway_url(&session.gateway_scheme, &gateway_host, gateway_port);
 
     // Build ProxyCommand.
     let exe = match std::env::current_exe() {
@@ -1565,10 +1627,12 @@ fn spawn_create_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
                         name: provider_name.clone(),
                         created_at_ms: 0,
                         labels: HashMap::new(),
+                        resource_version: 0,
                     }),
                     r#type: ptype.clone(),
                     credentials: credentials.clone(),
                     config: HashMap::default(),
+                    credential_expires_at_ms: HashMap::default(),
                 }),
             };
 
@@ -1655,11 +1719,14 @@ fn spawn_update_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
                     name: name.clone(),
                     created_at_ms: 0,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 r#type: ptype,
                 credentials,
                 config: HashMap::default(),
+                credential_expires_at_ms: HashMap::default(),
             }),
+            credential_expires_at_ms: HashMap::default(),
         };
 
         match tokio::time::timeout(Duration::from_secs(5), client.update_provider(req)).await {
@@ -1998,6 +2065,7 @@ fn spawn_set_global_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
             delete_setting: false,
             global: true,
             merge_operations: vec![],
+            expected_resource_version: 0,
         };
 
         let result = tokio::time::timeout(Duration::from_secs(5), client.update_config(req)).await;
@@ -2033,6 +2101,7 @@ fn spawn_delete_global_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
             delete_setting: true,
             global: true,
             merge_operations: vec![],
+            expected_resource_version: 0,
         };
 
         let result = tokio::time::timeout(Duration::from_secs(5), client.update_config(req)).await;
@@ -2102,6 +2171,7 @@ fn spawn_set_sandbox_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
             delete_setting: false,
             global: false,
             merge_operations: vec![],
+            expected_resource_version: 0,
         };
 
         let result = tokio::time::timeout(Duration::from_secs(5), client.update_config(req)).await;
@@ -2141,6 +2211,7 @@ fn spawn_delete_sandbox_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
             delete_setting: true,
             global: false,
             merge_operations: vec![],
+            expected_resource_version: 0,
         };
 
         let result = tokio::time::timeout(Duration::from_secs(5), client.update_config(req)).await;

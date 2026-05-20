@@ -151,6 +151,14 @@ Suites:
 - Docker suite (`--features e2e-docker`) - common suite plus Docker-only coverage such as Dockerfile image builds, Docker preflight checks, and managed Docker gateway resume.
 - Docker GPU suite (`--features e2e-docker-gpu`) - Docker suite plus GPU sandbox smoke coverage.
 
+GPU device-selection tests compare OpenShell sandboxes against a plain Docker or
+Podman container that requests `--device nvidia.com/gpu=all`. The probe image
+defaults to the image used by the `gateway` stage in
+`deploy/docker/Dockerfile.images`; set `OPENSHELL_E2E_GPU_PROBE_IMAGE` to
+override it. Per-device checks run only for NVIDIA CDI device IDs reported by
+the runtime's discovered devices list, so WSL2 hosts that expose only
+`nvidia.com/gpu=all` skip the index-based cases.
+
 Run the Docker-backed Rust CLI e2e suite:
 
 ```shell

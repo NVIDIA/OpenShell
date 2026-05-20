@@ -11,7 +11,7 @@
 - Proxy: `crates/openshell-sandbox/src/proxy.rs`
 - Policy crate: `crates/openshell-policy/src/lib.rs` (YAML<->proto conversion, validation, restrictive default)
 - Server multiplex: `crates/openshell-server/src/multiplex.rs`
-- SSH tunnel: `crates/openshell-server/src/ssh_tunnel.rs`
+- SSH sessions: `crates/openshell-server/src/ssh_sessions.rs` (session persistence, reaper)
 - Sandbox SSH server: `crates/openshell-sandbox/src/ssh.rs`
 - Providers: `crates/openshell-providers/src/providers/` (per-provider modules)
 - Bootstrap: `crates/openshell-bootstrap/src/lib.rs` (cluster lifecycle)
@@ -27,7 +27,7 @@
 - OPA baked-in rules: `include_str!("../data/sandbox-policy.rego")` in opa.rs
 - Policy loading: gRPC mode (OPENSHELL_SANDBOX_ID + OPENSHELL_ENDPOINT) or file mode (--policy-rules + --policy-data)
 - Env vars: sandbox uses OPENSHELL_* prefix (e.g., OPENSHELL_SANDBOX_ID, OPENSHELL_ENDPOINT, OPENSHELL_POLICY_RULES)
-- CLI flag: `--openshell-endpoint` (NOT `--openshell-endpoint`)
+- CLI flag: `--gateway-endpoint` (direct URL to gateway); resolution: --gateway-endpoint > --gateway > OPENSHELL_GATEWAY env > active_gateway file
 - Provider env injection: both entrypoint process (tokio Command) and SSH shell (std Command)
 - Cluster bootstrap: `sandbox_create_with_bootstrap()` auto-deploys when no cluster exists (main.rs ~line 632)
 - CLI cluster resolution: --cluster flag > OPENSHELL_CLUSTER env > active cluster file
@@ -50,9 +50,9 @@
 - Persistence: single `objects` table, protobuf payloads, Store enum dispatches SQLite vs Postgres by URL prefix
 - Persistence CRUD: upsert ON CONFLICT (id) not (object_type, id); list ORDER BY created_at_ms ASC, name ASC (not id!)
 - --db-url has no code default; Helm values.yaml sets `sqlite:/var/openshell/openshell.db`
-- Object types: "sandbox", "provider", "ssh_session", "inference_route" -- each implements ObjectType/ObjectId/ObjectName
+- Object types: "sandbox", "provider", "ssh_session", "inference_route", "service_endpoint", "provider_profile" -- each implements ObjectType/ObjectId/ObjectName
 - Config: `openshell_core::Config` in `crates/openshell-core/src/config.rs`, all flags have env var fallbacks
-- SSH handshake: "NSSH1" preface + HMAC-SHA256, used in both exec proxy (grpc.rs) and tunnel gateway (ssh_tunnel.rs)
+- SSH transport: CLI opens ForwardTcp gRPC stream (gated by CreateSshSession short-lived token), gateway relays via DuplexStream to supervisor RelayStream, supervisor connects to sandbox russh server over root-only Unix socket (/run/openshell/ssh.sock); channel uses mTLS when https:// endpoint configured, plaintext when http:// (Podman driver does not yet inject mTLS client materials). NSSH1 appears only in openshell-ocsf examples/tests, not on any live code path.
 - Phase derivation: transient reasons (ReconcilerError, DependenciesNotReady) -> Provisioning; all others -> Error
 - Broadcast bus buffer sizes: SandboxWatchBus=128, TracingLogBus=1024, PlatformEventBus=1024
 - Sandbox CRD: `agents.x-k8s.io/v1alpha1/Sandbox`, labels: `openshell.ai/sandbox-id`, `openshell.ai/managed-by`
@@ -75,13 +75,13 @@
 - DNS solution in cluster-entrypoint.sh: iptables DNAT proxy (NOT host-gateway resolv.conf)
 
 ## Sandbox Connect Details
-- CLI SSH module: `crates/openshell-cli/src/ssh.rs` (sandbox_connect, sandbox_exec, sandbox_rsync, sandbox_ssh_proxy)
+- CLI SSH module: `crates/openshell-cli/src/ssh.rs` (sandbox_connect, sandbox_connect_editor, sandbox_forward, sandbox_exec, sandbox_sync_up_files, sandbox_sync_up, sandbox_sync_down, sandbox_ssh_proxy, sandbox_ssh_proxy_by_name)
 - Re-exported from run.rs: `pub use crate::ssh::{...}` for backward compat
 - ssh-proxy subcommand: `Commands::SshProxy` in main.rs (~line 139)
-- Gateway loopback resolution: `resolve_ssh_gateway()` in ssh.rs -- overrides loopback with cluster endpoint host
-- ExecSandbox gRPC: uses single-use TCP proxy + russh client in grpc.rs
+- Gateway loopback resolution: `resolve_ssh_gateway()` in `crates/openshell-core/src/forward.rs:439` -- overrides loopback with cluster endpoint host; imported by ssh.rs and tui
+- ExecSandbox gRPC: uses single-use TCP proxy + russh client in `grpc/sandbox.rs` (handle_exec_sandbox -> stream_exec_over_relay); operates over a relay DuplexStream through the supervisor session, not a direct TCP connection
 - PTY I/O: 3 std::threads (writer, reader, exit) with reader_done sync for SSH protocol ordering
-- SSH daemon: russh server, ephemeral Ed25519 key, pre_exec: setsid -> TIOCSCTTY -> setns -> drop_privileges -> sandbox::apply
+- SSH daemon: russh server, ephemeral Ed25519 key, pre_exec: setsid -> TIOCSCTTY -> setns -> drop_privileges -> harden_child_process -> sandbox::linux::enforce(prepared) [Linux] / sandbox::apply [non-Linux]; sandbox::linux::prepare() runs before fork
 
 ## Policy Reload Details
 - Poll loop: `run_policy_poll_loop()` in lib.rs, spawned after child process, gRPC mode only

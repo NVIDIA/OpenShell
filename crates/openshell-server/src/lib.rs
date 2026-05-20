@@ -20,17 +20,22 @@
 //! [`compute::vm`]; keep this file driver-agnostic going forward.
 
 mod auth;
+pub mod certgen;
 pub mod cli;
 mod compute;
+pub mod config_file;
+mod defaults;
 mod grpc;
 mod http;
 mod inference;
 mod multiplex;
 mod persistence;
 pub(crate) mod policy_store;
+mod provider_refresh;
 mod sandbox_index;
 mod sandbox_watch;
-mod ssh_tunnel;
+mod service_routing;
+mod ssh_sessions;
 pub mod supervisor_session;
 mod tls;
 pub mod tracing_bus;
@@ -49,7 +54,7 @@ use tracing::{debug, error, info, warn};
 
 use compute::{ComputeRuntime, DockerComputeConfig, VmComputeConfig};
 pub use grpc::OpenShellService;
-pub use http::{health_router, http_router, metrics_router};
+pub use http::{health_router, http_router, metrics_router, service_http_router};
 pub use multiplex::{MultiplexService, MultiplexedService};
 use openshell_driver_kubernetes::KubernetesComputeConfig;
 use persistence::Store;
@@ -109,6 +114,15 @@ fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
     )
 }
 
+fn is_benign_connection_close(error: &(dyn std::error::Error + 'static)) -> bool {
+    let msg = error.to_string();
+    msg.contains("connection closed")
+        || msg.contains("connection reset")
+        || msg.contains("connection error")
+        || msg.contains("error reading a body from connection")
+        || msg.contains("broken pipe")
+}
+
 impl ServerState {
     /// Create new server state.
     #[must_use]
@@ -150,21 +164,13 @@ pub async fn run_server(
     config: Config,
     vm_config: VmComputeConfig,
     docker_config: DockerComputeConfig,
+    config_file: Option<config_file::ConfigFile>,
     tracing_log_bus: TracingLogBus,
 ) -> Result<()> {
     let database_url = config.database_url.trim();
     if database_url.is_empty() {
         return Err(Error::config("database_url is required"));
     }
-    let driver = configured_compute_driver(&config)?;
-    if config.ssh_handshake_secret.is_empty()
-        && !matches!(driver, ComputeDriverKind::Docker | ComputeDriverKind::Vm)
-    {
-        return Err(Error::config(
-            "ssh_handshake_secret is required. Set --ssh-handshake-secret or OPENSHELL_SSH_HANDSHAKE_SECRET",
-        ));
-    }
-
     let store = Arc::new(Store::connect(database_url).await?);
 
     let oidc_cache = if let Some(ref oidc) = config.oidc {
@@ -192,6 +198,7 @@ pub async fn run_server(
         &config,
         &vm_config,
         &docker_config,
+        config_file.as_ref(),
         store.clone(),
         sandbox_index.clone(),
         sandbox_watch_bus.clone(),
@@ -219,8 +226,9 @@ pub async fn run_server(
     }
 
     state.compute.spawn_watchers();
-    ssh_tunnel::spawn_session_reaper(store.clone(), Duration::from_secs(3600));
+    ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_secs(3600));
     supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
+    provider_refresh::spawn_refresh_worker(state.clone(), Duration::from_secs(60));
 
     // Create the multiplexed service
     let service = MultiplexService::new(state.clone());
@@ -287,8 +295,8 @@ pub async fn run_server(
         Some(TlsAcceptor::from_files(
             &tls.cert_path,
             &tls.key_path,
-            &tls.client_ca_path,
-            tls.allow_unauthenticated,
+            tls.client_ca_path.as_deref(),
+            tls.require_client_auth,
         )?)
     } else {
         info!("TLS disabled — accepting plaintext connections");
@@ -297,12 +305,14 @@ pub async fn run_server(
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut listener_tasks = Vec::with_capacity(gateway_listeners.len());
+    let enable_loopback_service_http = config.service_routing.enable_loopback_service_http;
     for (listener, listen_addr) in gateway_listeners {
         listener_tasks.push(tokio::spawn(serve_gateway_listener(
             listener,
             listen_addr,
             service.clone(),
             tls_acceptor.clone(),
+            enable_loopback_service_http,
             shutdown_rx.clone(),
         )));
     }
@@ -362,6 +372,7 @@ async fn serve_gateway_listener(
     listen_addr: SocketAddr,
     service: MultiplexService,
     tls_acceptor: Option<TlsAcceptor>,
+    enable_loopback_service_http: bool,
     mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
@@ -383,37 +394,140 @@ async fn serve_gateway_listener(
             }
         };
 
-        spawn_gateway_connection(stream, addr, service.clone(), tls_acceptor.clone());
+        spawn_gateway_connection(
+            stream,
+            addr,
+            listen_addr,
+            service.clone(),
+            tls_acceptor.clone(),
+            enable_loopback_service_http,
+        );
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConnectionProtocol {
+    Tls,
+    PlainHttp,
+    Unknown,
+}
+
+async fn classify_connection_protocol(stream: &TcpStream) -> std::io::Result<ConnectionProtocol> {
+    let mut prefix = [0_u8; 8];
+    let read = stream.peek(&mut prefix).await?;
+    Ok(classify_initial_bytes(&prefix[..read]))
+}
+
+fn classify_initial_bytes(prefix: &[u8]) -> ConnectionProtocol {
+    if looks_like_tls(prefix) {
+        ConnectionProtocol::Tls
+    } else if looks_like_http(prefix) {
+        ConnectionProtocol::PlainHttp
+    } else {
+        ConnectionProtocol::Unknown
+    }
+}
+
+fn looks_like_tls(prefix: &[u8]) -> bool {
+    prefix.len() >= 3 && prefix[0] == 0x16 && prefix[1] == 0x03
+}
+
+fn looks_like_http(prefix: &[u8]) -> bool {
+    const METHODS: [&[u8]; 10] = [
+        b"GET ",
+        b"POST ",
+        b"PUT ",
+        b"PATCH ",
+        b"DELETE ",
+        b"HEAD ",
+        b"OPTIONS ",
+        b"TRACE ",
+        b"CONNECT ",
+        b"PRI ",
+    ];
+
+    if prefix.is_empty() {
+        return false;
+    }
+    METHODS
+        .iter()
+        .any(|method| method.starts_with(prefix) || prefix.starts_with(method))
+}
+
+fn allow_plaintext_service_http(
+    enabled: bool,
+    listen_addr: SocketAddr,
+    peer_addr: SocketAddr,
+) -> bool {
+    enabled && listen_addr.ip().is_loopback() && peer_addr.ip().is_loopback()
 }
 
 fn spawn_gateway_connection(
     stream: TcpStream,
     addr: SocketAddr,
+    listen_addr: SocketAddr,
     service: MultiplexService,
     tls_acceptor: Option<TlsAcceptor>,
+    enable_loopback_service_http: bool,
 ) {
     if let Some(acceptor) = tls_acceptor {
         tokio::spawn(async move {
-            match acceptor.inner().accept(stream).await {
-                Ok(tls_stream) => {
-                    if let Err(e) = service.serve(tls_stream).await {
-                        error!(error = %e, client = %addr, "Connection error");
+            match classify_connection_protocol(&stream).await {
+                Ok(ConnectionProtocol::PlainHttp)
+                    if allow_plaintext_service_http(
+                        enable_loopback_service_http,
+                        listen_addr,
+                        addr,
+                    ) =>
+                {
+                    if let Err(e) = service.serve_service_http(stream).await {
+                        if is_benign_connection_close(e.as_ref()) {
+                            debug!(error = %e, client = %addr, listen = %listen_addr, "Plaintext service HTTP connection closed");
+                        } else {
+                            error!(error = %e, client = %addr, listen = %listen_addr, "Plaintext service HTTP connection error");
+                        }
+                    }
+                }
+                Ok(ConnectionProtocol::PlainHttp) => {
+                    warn!(client = %addr, listen = %listen_addr, "Rejected plaintext HTTP on non-loopback gateway listener");
+                }
+                Ok(ConnectionProtocol::Tls | ConnectionProtocol::Unknown) => {
+                    match acceptor.inner().accept(stream).await {
+                        Ok(tls_stream) => {
+                            let peer_identity = multiplex::extract_peer_identity(&tls_stream);
+                            if let Err(e) = service
+                                .serve_with_peer_identity(tls_stream, peer_identity)
+                                .await
+                            {
+                                if is_benign_connection_close(e.as_ref()) {
+                                    debug!(error = %e, client = %addr, "Connection closed");
+                                } else {
+                                    error!(error = %e, client = %addr, "Connection error");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            if is_benign_tls_handshake_failure(&e) {
+                                debug!(error = %e, client = %addr, "TLS handshake closed early");
+                            } else {
+                                error!(error = %e, client = %addr, "TLS handshake failed");
+                            }
+                        }
                     }
                 }
                 Err(e) => {
-                    if is_benign_tls_handshake_failure(&e) {
-                        debug!(error = %e, client = %addr, "TLS handshake closed early");
-                    } else {
-                        error!(error = %e, client = %addr, "TLS handshake failed");
-                    }
+                    debug!(error = %e, client = %addr, "Failed to inspect connection preface");
                 }
             }
         });
     } else {
         tokio::spawn(async move {
             if let Err(e) = service.serve(stream).await {
-                error!(error = %e, client = %addr, "Connection error");
+                if is_benign_connection_close(e.as_ref()) {
+                    debug!(error = %e, client = %addr, "Connection closed");
+                } else {
+                    error!(error = %e, client = %addr, "Connection error");
+                }
             }
         });
     }
@@ -459,6 +573,7 @@ async fn build_compute_runtime(
     config: &Config,
     vm_config: &VmComputeConfig,
     docker_config: &DockerComputeConfig,
+    file: Option<&config_file::ConfigFile>,
     store: Arc<Store>,
     sandbox_index: SandboxIndex,
     sandbox_watch_bus: SandboxWatchBus,
@@ -470,35 +585,12 @@ async fn build_compute_runtime(
 
     match driver {
         ComputeDriverKind::Kubernetes => {
-            let supervisor_image = std::env::var("OPENSHELL_SUPERVISOR_IMAGE")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| openshell_core::config::DEFAULT_SUPERVISOR_IMAGE.to_string());
-            let supervisor_image_pull_policy =
-                std::env::var("OPENSHELL_SUPERVISOR_IMAGE_PULL_POLICY")
-                    .ok()
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_default();
+            let mut k8s = kubernetes_config_from_file(file)?;
+            if let Ok(size) = std::env::var("OPENSHELL_K8S_WORKSPACE_DEFAULT_STORAGE_SIZE") {
+                k8s.workspace_default_storage_size = size;
+            }
             ComputeRuntime::new_kubernetes(
-                KubernetesComputeConfig {
-                    namespace: config.sandbox_namespace.clone(),
-                    default_image: config.sandbox_image.clone(),
-                    image_pull_policy: config.sandbox_image_pull_policy.clone(),
-                    supervisor_image,
-                    supervisor_image_pull_policy,
-                    grpc_endpoint: config.grpc_endpoint.clone(),
-                    // Filesystem path to the supervisor's Unix-socket SSH daemon.
-                    // The path lives in a root-only directory so only the
-                    // supervisor can connect; the gateway reaches it through the
-                    // RelayStream bridge, not directly. Override via
-                    // `sandbox_ssh_socket_path` in the config for deployments
-                    // where multiple supervisors share a filesystem.
-                    ssh_socket_path: config.sandbox_ssh_socket_path.clone(),
-                    ssh_handshake_secret: config.ssh_handshake_secret.clone(),
-                    ssh_handshake_skew_secs: config.ssh_handshake_skew_secs,
-                    client_tls_secret_name: config.client_tls_secret_name.clone(),
-                    host_gateway_ip: config.host_gateway_ip.clone(),
-                },
+                k8s,
                 store,
                 sandbox_index,
                 sandbox_watch_bus,
@@ -534,63 +626,12 @@ async fn build_compute_runtime(
             .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
         }
         ComputeDriverKind::Podman => {
-            let socket_path = std::env::var("OPENSHELL_PODMAN_SOCKET")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .map_or_else(
-                    openshell_driver_podman::PodmanComputeConfig::default_socket_path,
-                    std::path::PathBuf::from,
-                );
-
-            let network_name = std::env::var("OPENSHELL_NETWORK_NAME")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| openshell_core::config::DEFAULT_NETWORK_NAME.to_string());
-
-            let stop_timeout_secs: u32 = std::env::var("OPENSHELL_STOP_TIMEOUT")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(openshell_core::config::DEFAULT_STOP_TIMEOUT_SECS);
-
-            let supervisor_image = std::env::var("OPENSHELL_SUPERVISOR_IMAGE")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| openshell_core::config::DEFAULT_SUPERVISOR_IMAGE.to_string());
-
-            // TLS client cert paths for sandbox mTLS. When all three are
-            // set, the Podman driver bind-mounts them into sandbox
-            // containers and switches the endpoint to https://.
-            let podman_tls_ca = std::env::var("OPENSHELL_PODMAN_TLS_CA")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .map(std::path::PathBuf::from);
-            let podman_tls_cert = std::env::var("OPENSHELL_PODMAN_TLS_CERT")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .map(std::path::PathBuf::from);
-            let podman_tls_key = std::env::var("OPENSHELL_PODMAN_TLS_KEY")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .map(std::path::PathBuf::from);
+            let mut podman = podman_config_from_file(file)?;
+            podman.gateway_port = config.bind_address.port();
+            apply_podman_local_tls_defaults(config, &mut podman)?;
 
             ComputeRuntime::new_podman(
-                openshell_driver_podman::PodmanComputeConfig {
-                    socket_path,
-                    default_image: config.sandbox_image.clone(),
-                    image_pull_policy: config.sandbox_image_pull_policy.parse().unwrap_or_default(),
-                    grpc_endpoint: config.grpc_endpoint.clone(),
-                    gateway_port: config.bind_address.port(),
-                    sandbox_ssh_socket_path: config.sandbox_ssh_socket_path.clone(),
-                    network_name,
-                    ssh_port: config.sandbox_ssh_port,
-                    ssh_handshake_secret: config.ssh_handshake_secret.clone(),
-                    ssh_handshake_skew_secs: config.ssh_handshake_skew_secs,
-                    stop_timeout_secs,
-                    supervisor_image,
-                    guest_tls_ca: podman_tls_ca,
-                    guest_tls_cert: podman_tls_cert,
-                    guest_tls_key: podman_tls_key,
-                },
+                podman,
                 store,
                 sandbox_index,
                 sandbox_watch_bus,
@@ -603,14 +644,78 @@ async fn build_compute_runtime(
     }
 }
 
+/// Build a [`KubernetesComputeConfig`] from the file's
+/// `[openshell.drivers.kubernetes]` table merged with inheritable
+/// `[openshell.gateway]` defaults. Falls back to the driver's `Default`
+/// when no file is present.
+fn kubernetes_config_from_file(
+    file: Option<&config_file::ConfigFile>,
+) -> Result<KubernetesComputeConfig> {
+    let Some(file) = file else {
+        return Ok(KubernetesComputeConfig::default());
+    };
+    let merged = config_file::driver_table(
+        ComputeDriverKind::Kubernetes,
+        &file.openshell.gateway,
+        file.openshell.drivers.get("kubernetes"),
+    );
+    merged
+        .try_into()
+        .map_err(|e| Error::config(format!("invalid [openshell.drivers.kubernetes] table: {e}")))
+}
+
+/// Same pattern as [`kubernetes_config_from_file`] but for Podman.
+fn podman_config_from_file(
+    file: Option<&config_file::ConfigFile>,
+) -> Result<openshell_driver_podman::PodmanComputeConfig> {
+    let Some(file) = file else {
+        return Ok(openshell_driver_podman::PodmanComputeConfig::default());
+    };
+    let merged = config_file::driver_table(
+        ComputeDriverKind::Podman,
+        &file.openshell.gateway,
+        file.openshell.drivers.get("podman"),
+    );
+    merged
+        .try_into()
+        .map_err(|e| Error::config(format!("invalid [openshell.drivers.podman] table: {e}")))
+}
+
+fn apply_podman_local_tls_defaults(
+    config: &Config,
+    podman: &mut openshell_driver_podman::PodmanComputeConfig,
+) -> Result<()> {
+    if config.tls.is_none()
+        || podman.guest_tls_ca.is_some()
+        || podman.guest_tls_cert.is_some()
+        || podman.guest_tls_key.is_some()
+    {
+        return Ok(());
+    }
+
+    let Some(paths) = defaults::complete_local_tls_paths()
+        .map_err(|e| Error::config(format!("failed to resolve local TLS defaults: {e}")))?
+    else {
+        return Ok(());
+    };
+    podman.guest_tls_ca = Some(paths.ca);
+    podman.guest_tls_cert = Some(paths.client_cert);
+    podman.guest_tls_key = Some(paths.client_key);
+    Ok(())
+}
+
 fn configured_compute_driver(config: &Config) -> Result<ComputeDriverKind> {
     match config.compute_drivers.as_slice() {
-        [] => openshell_core::config::detect_driver().ok_or_else(|| {
-            Error::config(
+        [] => match openshell_core::config::detect_driver() {
+            Some(ComputeDriverKind::Vm) => Err(Error::config(
+                "vm compute driver is opt-in only; set --drivers vm or OPENSHELL_DRIVERS=vm",
+            )),
+            Some(driver) => Ok(driver),
+            None => Err(Error::config(
                 "no compute driver configured and auto-detection found no suitable driver; \
                 set --drivers or OPENSHELL_DRIVERS to kubernetes, podman, docker, or vm",
-            )
-        }),
+            )),
+        },
         [
             driver @ (ComputeDriverKind::Kubernetes
             | ComputeDriverKind::Vm
@@ -631,6 +736,7 @@ fn configured_compute_driver(config: &Config) -> Result<ComputeDriverKind> {
 #[cfg(test)]
 mod tests {
     use super::{
+        ConnectionProtocol, allow_plaintext_service_http, classify_initial_bytes,
         configured_compute_driver, gateway_listener_addresses, is_benign_tls_handshake_failure,
     };
     use openshell_core::{ComputeDriverKind, Config};
@@ -658,13 +764,43 @@ mod tests {
     }
 
     #[test]
+    fn classifies_tls_and_plain_http_prefaces() {
+        assert_eq!(
+            classify_initial_bytes(&[0x16, 0x03, 0x01, 0x00]),
+            ConnectionProtocol::Tls
+        );
+        assert_eq!(
+            classify_initial_bytes(b"GET / HTTP/1.1\r\n"),
+            ConnectionProtocol::PlainHttp
+        );
+        assert_eq!(classify_initial_bytes(b"G"), ConnectionProtocol::PlainHttp);
+        assert_eq!(
+            classify_initial_bytes(b"\x00\x01\x02"),
+            ConnectionProtocol::Unknown
+        );
+    }
+
+    #[test]
+    fn plaintext_service_http_requires_loopback_listener_and_peer() {
+        let loopback: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let peer: SocketAddr = "127.0.0.1:54000".parse().unwrap();
+        let wildcard: SocketAddr = "0.0.0.0:8080".parse().unwrap();
+        let remote_peer: SocketAddr = "192.0.2.10:54000".parse().unwrap();
+
+        assert!(allow_plaintext_service_http(true, loopback, peer));
+        assert!(!allow_plaintext_service_http(false, loopback, peer));
+        assert!(!allow_plaintext_service_http(true, wildcard, peer));
+        assert!(!allow_plaintext_service_http(true, loopback, remote_peer));
+    }
+
+    #[test]
     fn configured_compute_driver_triggers_auto_detection_when_empty() {
         let config = Config::new(None).with_compute_drivers([]);
         // Empty drivers triggers auto-detection, which may return Some or None
         // depending on the environment. This test verifies the auto-detection path
         // is taken rather than immediately returning an error.
         let result = configured_compute_driver(&config);
-        // Either we get a detected driver or an error about none being detected
+        // Either we get a detected driver or an error about none being detected.
         match result {
             Ok(driver) => {
                 assert!(
@@ -680,7 +816,7 @@ mod tests {
             Err(e) => {
                 assert!(
                     e.to_string()
-                        .contains("no compute driver configured and none detected"),
+                        .contains("auto-detection found no suitable driver"),
                     "unexpected error: {e}"
                 );
             }

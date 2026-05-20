@@ -9,11 +9,12 @@ workloads.
 
 - Authenticate clients and sandbox callbacks.
 - Serve gRPC APIs for sandbox lifecycle, provider management, policy updates,
-  settings, inference configuration, logs, and watch streams.
-- Serve HTTP endpoints for health, SSH tunnel upgrades, and edge-auth flows.
+  settings, inference configuration, logs, watch streams, and relay forwarding.
+- Serve HTTP endpoints for health, WebSocket tunnels, and edge-auth flows.
 - Persist domain objects in SQLite or Postgres.
 - Resolve provider credentials and inference bundles for sandbox supervisors.
-- Coordinate supervisor relay sessions for connect, exec, and file sync.
+- Coordinate supervisor relay sessions for connect, exec, file sync, and
+  service forwarding.
 
 The gateway does not enforce agent network policy at request time. That happens
 inside each sandbox, where the supervisor and proxy can observe local process
@@ -24,6 +25,13 @@ identity.
 The gateway listens on one service port and multiplexes gRPC and HTTP traffic.
 The default deployment mode is mTLS: clients and sandbox workloads present a
 certificate signed by the deployment CA before reaching application handlers.
+When that service port is bound to loopback, the listener can also accept
+plaintext HTTP on the same port for sandbox service subdomains only. That local
+browser path is enabled by default and disabled with
+`--enable-loopback-service-http=false`; it never serves gateway APIs, auth,
+health, metrics, or tunnel routes. The plaintext service router also rejects
+browser requests whose Fetch Metadata, Origin, or Referer headers indicate a
+cross-origin or sibling-subdomain request.
 
 Supported auth modes:
 
@@ -44,7 +52,7 @@ The gateway API is organized around platform objects and operational streams:
 
 | Area | Examples |
 |---|---|
-| Sandbox lifecycle | Create, list, delete, watch, exec, SSH session bootstrap. |
+| Sandbox lifecycle | Create, list, delete, watch, exec, SSH session bootstrap, ForwardTcp service forwarding. |
 | Providers | Store provider records, discover credentials, resolve runtime environment. |
 | Policy and settings | Get effective sandbox config, update sandbox policy, manage global settings. |
 | Inference | Set gateway-level model/provider config and resolve sandbox route bundles. |
@@ -75,6 +83,7 @@ The storage schema is intentionally narrow:
 | `version` | Optional monotonically increasing version for scoped records. |
 | `status` | Optional workflow state for records such as policy revisions or draft policy chunks. |
 | `dedup_key` and `hit_count` | Optional policy-advisor fields for coalescing repeated observations. |
+| `resource_version` | Monotonically increasing counter for optimistic concurrency control. Incremented atomically on each update. |
 | `payload` | Prost-encoded protobuf payload for the full domain object. |
 | `created_at_ms` and `updated_at_ms` | Gateway timestamps used for ordering and list output. |
 | `labels` | JSON object carrying Kubernetes-style object labels for filtering and organization. |
@@ -96,8 +105,100 @@ This keeps the gateway data model portable across storage backends and leaves
 room for future stores that can provide the same object, label, version, and
 scope semantics.
 
+The SQLite adapter tightens the on-disk database file to mode `0o600` on every
+connect so that provider API keys, SSH session tokens, and sandbox metadata are
+not readable by other local users on shared hosts. The same restriction is
+reapplied to the `<db>-wal` and `<db>-shm` sidecars (created by SQLite's
+default WAL journal mode), which mirror the same sensitive contents.
+
 Persisted state includes sandboxes, providers, SSH sessions, policy revisions,
 settings, inference configuration, and deployment records.
+
+### Optimistic Concurrency (CAS)
+
+Every object row carries a `resource_version` that the database increments
+atomically on each write. Concurrent mutations use compare-and-swap (CAS): the
+writer reads the current version, applies changes, and writes back with a
+`WHERE resource_version = <expected>` guard. If another writer updated the row
+in between, the guard fails and the caller receives a `Conflict` error.
+
+This matters for HA deployments where multiple gateway replicas share the same
+Postgres database, and for single-node deployments where concurrent gRPC
+handlers or the reconciler mutate the same sandbox.
+
+**Compile-time enforcement.** The unconditional write methods `put` and
+`put_message` are gated behind `#[cfg(test)]`. Production code must use
+`put_if` with an explicit `WriteCondition` or `update_message_cas`. The
+compiler rejects any other write path, making non-CAS writes structurally
+impossible outside of tests.
+
+Every write goes through one of three conditions:
+
+- `MustCreate` -- insert-only. The database rejects the write with a
+  `UniqueViolation` error if a row with that ID already exists. Handlers match
+  on the structured `PersistenceError::UniqueViolation { .. }` variant to
+  distinguish creation conflicts from other failures.
+- `MatchResourceVersion(v)` -- update-only. The database rejects the write
+  with a `Conflict` error if the current version differs from `v`.
+- `Unconditional` -- test-only; not reachable in production builds.
+
+**Creates.** All create paths use `MustCreate` and hydrate the response
+directly from the `WriteResult` returned by `put_if`, which carries the
+assigned `resource_version`, `created_at_ms`, and `updated_at_ms`. This
+eliminates a read-after-write round trip and the race window that would come
+with it.
+
+**Updates.** The `update_message_cas` helper makes a single CAS attempt: it
+fetches the current object, applies a mutation closure, and writes with a
+`MatchResourceVersion` condition. On conflict the persistence layer returns a
+`Conflict` error, which gRPC handlers map to `ABORTED` status so the client
+(or the next watch/reconcile event) can retry with fresh state. There is no
+automatic retry loop.
+
+The helper accepts an `expected_version` parameter that selects between two
+modes:
+
+- **Server-driven** (`expected_version = 0`): the helper uses the version it
+  just read from the database. Internal operations (reconciler, policy status
+  reports, compute phase transitions) use this mode because the caller does
+  not track versions.
+- **Client-driven** (`expected_version != 0`): the helper validates that the
+  caller's version matches the current database version before applying the
+  mutation. If they diverge it returns `Conflict` without attempting the
+  write. Client-facing operations that carry an `expected_resource_version`
+  field use this mode: `AttachSandboxProvider`, `DetachSandboxProvider`,
+  `UpdateProvider`, and `UpdateConfig` (policy backfill path).
+
+**Lists.** The `list_messages` and `list_messages_with_selector` helpers decode
+protobuf payloads from list results and hydrate `resource_version` from the
+authoritative database column into each decoded message, mirroring the
+`get_message` pattern. This ensures list responses carry correct versions
+without requiring callers to manually hydrate each record.
+
+**Deletes.** Delete operations are not yet CAS-protected -- the delete request
+protos do not carry `expected_resource_version`. A `delete_if` primitive exists
+in the persistence layer but is not wired into gRPC handlers.
+
+**Coverage.** All `ObjectMeta`-bearing message types have write-condition
+coverage:
+
+| Type | Create | Update | List |
+|---|---|---|---|
+| Sandbox | `MustCreate` | `update_message_cas` | `list_messages` |
+| Provider | `MustCreate` | `update_message_cas` | `list_messages` |
+| ProviderProfile | `MustCreate` | (immutable) | `list_messages` |
+| InferenceRoute | `MustCreate` | `update_message_cas` | `list_messages` |
+| SandboxPolicy | scoped versioning | scoped versioning | scoped query |
+| Settings | `Mutex`-guarded | `Mutex`-guarded | single-row |
+
+Global settings updates use a Tokio `Mutex` to serialize multi-step
+validation within a single gateway process, with CAS on the underlying
+persistence write as defense in depth. In an HA deployment with multiple
+gateways, the Mutex alone would be insufficient. Sandbox-scoped settings
+rely entirely on CAS without a Mutex.
+
+The `resource_version` is surfaced to clients through `ObjectMeta` in proto
+responses. Database migrations backfill existing rows with version 1.
 
 Policy and runtime settings are delivered together through the effective sandbox
 config path. A gateway-global policy can override sandbox-scoped policy. The
@@ -115,22 +216,107 @@ sequenceDiagram
     participant CLI
     participant GW as Gateway
     participant SUP as Sandbox supervisor
-    participant SSH as Sandbox SSH socket
+    participant Target as Sandbox target
 
     SUP->>GW: ConnectSupervisor stream
-    CLI->>GW: connect / exec / sync request
-    GW->>SUP: RelayOpen(channel)
+    CLI->>GW: ForwardTcp / exec / sync request
+    GW->>SUP: RelayOpen(channel, target)
+    SUP->>Target: Dial SSH socket or loopback service
     SUP->>GW: RelayStream(channel)
-    SUP->>SSH: Bridge bytes to Unix socket
     CLI->>GW: Client bytes
     GW-->>CLI: Client bytes
     GW->>SUP: Relay bytes
     SUP-->>GW: Relay bytes
 ```
 
-The same relay pattern backs interactive SSH, command execution, and file sync.
-The gateway tracks live sessions in memory and persists session records so
-tokens can expire or be revoked.
+The same relay pattern backs interactive SSH, command execution, file sync, and
+local service forwarding. The gateway tracks live sessions in memory and
+persists session records so tokens can expire or be revoked.
+
+`ForwardTcp` is the client-facing byte stream for SSH and service forwarding.
+The first frame is a `TcpForwardInit` that carries the sandbox ID, an
+authorization token from `CreateSshSession`, and an explicit target:
+`target.ssh` for the sandbox SSH socket or `target.tcp` for a loopback service
+inside the sandbox. The gateway validates the token and sandbox readiness,
+sends a targeted `RelayOpen` to the supervisor, then bridges
+`TcpForwardFrame::Data` to `RelayFrame::Data` until either side closes.
+
+Browser service URLs use the same supervisor relay path after host-based
+routing resolves `sandbox--service.<service-routing-domain>` to a stored
+service endpoint. Accepted service routing domains are derived from wildcard
+DNS SANs configured on the gateway server certificate, with
+`openshell.localhost` available by default for loopback gateways. TLS-enabled
+loopback gateways print `http://` URLs when loopback plaintext service HTTP is
+enabled; non-loopback TLS gateways continue to print `https://` URLs.
+
+For `target.tcp`, the gateway only accepts loopback destinations such as
+`localhost`, `127.0.0.0/8`, or `::1`. The gateway never needs to know or dial a
+sandbox pod IP; supervisors connect outbound and bridge only the explicit target
+requested for that relay.
+
+## PKI Bootstrap
+
+`openshell-gateway generate-certs` is the one place mTLS materials are
+created. Both deployment paths use it:
+
+| Output mode | Selector | Layout |
+|---|---|---|
+| Kubernetes Secrets | (default) `--namespace`, `--server-secret-name`, `--client-secret-name` | Two `kubernetes.io/tls` Secrets with `tls.crt` / `tls.key` / `ca.crt`. |
+| Filesystem | `--output-dir <DIR>` | `<dir>/{ca.crt, ca.key, server/tls.{crt,key}, client/tls.{crt,key}}`. Also copies client materials to `$XDG_CONFIG_HOME/openshell/gateways/openshell/mtls/` for CLI auto-discovery. |
+
+On Kubernetes, the Helm chart runs the command via a pre-install/pre-upgrade
+hook Job using the gateway image itself -- no separate cert-generation image,
+no extra mirror burden in air-gapped environments. On the RPM gateway, the
+same command runs from the systemd unit's `ExecStartPre` to bootstrap PKI
+into the user's state directory on first start.
+
+Both modes share the same idempotency contract: all targets present -> skip;
+partial state -> fail with a recovery hint; nothing present -> generate and
+write. This guards mTLS continuity across restarts and upgrades while still
+recovering cleanly if an operator deletes everything and starts over.
+
+Operators who manage PKI externally (cert-manager, an enterprise CA, or
+pre-created Secrets) disable the Helm hook via `pkiInitJob.enabled=false`.
+The chart also ships a `certManager.*` path that produces equivalent Secrets
+through cert-manager `Issuer`/`Certificate` resources.
+
+## Configuration
+
+The gateway reads its configuration from three sources, merged in this
+precedence (highest first):
+
+```
+Gateway CLI flag  >  gateway OPENSHELL_* env var  >  TOML file  >  built-in default
+```
+
+The TOML file is opt-in via `--config <PATH>` / `OPENSHELL_GATEWAY_CONFIG`.
+Driver implementation settings live in the TOML driver tables. See
+`docs/reference/gateway-config.mdx` for worked per-driver examples and RFC
+0003 for the full schema.
+
+`database_url` is env-only and rejected when present in the file
+(`OPENSHELL_DB_URL` / `--db-url`).
+
+### Driver inheritance
+
+`[openshell.gateway]` carries a small set of values (`sandbox_namespace`,
+`default_image`,
+`supervisor_image`, `guest_tls_ca/cert/key`, `client_tls_secret_name`,
+`host_gateway_ip`, `enable_user_namespaces`) that are inherited into each
+driver's `[openshell.drivers.<name>]` table when the driver-specific table
+does not override them. The allowlist is per-driver so a gateway-wide
+default cannot land in a driver that does not understand it (e.g.
+`client_tls_secret_name` is K8s-only).
+
+`image_pull_policy` is intentionally **not** inheritable: Kubernetes uses
+`Always | IfNotPresent | Never` (passed verbatim to the K8s API) while
+Podman uses the lowercase enum `always | missing | never | newer`. No
+value means the same thing in both, so the key lives only under each
+driver's own table.
+
+Driver-specific values that are not part of the inheritance allowlist
+(e.g. Podman `socket_path`, VM `vcpus`) only come from the driver's own
+table.
 
 ## Operational Constraints
 

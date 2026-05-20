@@ -1,0 +1,46 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: sandboxNamespace defaulting
+templates:
+  - templates/gateway-config.yaml
+  - templates/networkpolicy.yaml
+release:
+  name: openshell
+  namespace: my-namespace
+
+tests:
+  - it: defaults sandbox_namespace to release namespace in the TOML config
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'sandbox_namespace\s*=\s*"my-namespace"'
+
+  - it: uses explicit sandboxNamespace when set
+    template: templates/gateway-config.yaml
+    set:
+      server.sandboxNamespace: other-ns
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'sandbox_namespace\s*=\s*"other-ns"'
+
+  - it: defaults NetworkPolicy namespace to release namespace
+    template: templates/networkpolicy.yaml
+    set:
+      networkPolicy.enabled: true
+    asserts:
+      - equal:
+          path: metadata.namespace
+          value: my-namespace
+
+  - it: uses explicit sandboxNamespace for NetworkPolicy
+    template: templates/networkpolicy.yaml
+    set:
+      networkPolicy.enabled: true
+      server.sandboxNamespace: other-ns
+    asserts:
+      - equal:
+          path: metadata.namespace
+          value: other-ns

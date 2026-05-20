@@ -3,7 +3,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Local k3s for Helm / Skaffold workflows using k3d (macOS primary; Linux also supported).
+# Local k3s for Helm / Skaffold workflows using k3d. macOS gets k3d from mise;
+# Linux users should install k3d explicitly or point tests at a kind/existing cluster.
 # Requires Docker running. Writes merged kubeconfig to HELM_K3S_KUBECONFIG or $KUBECONFIG or ./kubeconfig.
 #
 # Multi-worktree: the cluster name is derived from the last component of the current
@@ -20,6 +21,9 @@ ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 _branch="$(git -C "${ROOT}" rev-parse --abbrev-ref HEAD 2>/dev/null)" || _branch=""
 _suffix="$(printf '%s' "${_branch##*/}" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/-*$//')"
 CLUSTER_NAME="${HELM_K3S_CLUSTER_NAME:-openshell-dev${_suffix:+-${_suffix}}}"
+# k3d caps cluster names at 32 chars; validated in cmd_create so the operator
+# gets an actionable hint instead of a deep-stack k3d validation error.
+K3D_CLUSTER_NAME_MAX=32
 # Host port forwarded to port 80 via the k3d load balancer.
 # Used by Envoy Gateway's LoadBalancer service (values-gateway.yaml).
 HOST_LB_PORT="${HELM_K3S_LB_HOST_PORT:-8080}"
@@ -49,7 +53,8 @@ Environment:
   HELM_K3S_KUBECONFIG          kubeconfig file to write/merge (default: repo kubeconfig or \$KUBECONFIG)
   HELM_K3S_LB_HOST_PORT        Host port mapped to load balancer port 80 (default: 8080)
 
-macOS uses k3d (Docker required). Linux uses the same k3d flow when Docker is available.
+macOS uses k3d from mise (Docker required). Linux can use this flow only when
+k3d is installed explicitly; otherwise use kind or an existing cluster context.
 Pair with: mise run helm:skaffold:dev
 EOF
 }
@@ -77,7 +82,12 @@ require_docker() {
 
 require_k3d() {
   if ! command -v k3d >/dev/null 2>&1; then
-    echo "error: k3d not found. Run: mise install" >&2
+    if [[ "$(uname -s)" == "Linux" ]]; then
+      echo "error: k3d not found. This repo no longer installs k3d through mise on Linux." >&2
+      echo "Install k3d explicitly, or use kind/an existing cluster and set OPENSHELL_E2E_KUBE_CONTEXT." >&2
+    else
+      echo "error: k3d not found. Run: mise install" >&2
+    fi
     exit 1
   fi
 }
@@ -153,6 +163,15 @@ cmd_create() {
   require_supported_os
   require_docker
   require_k3d
+
+  if (( ${#CLUSTER_NAME} > K3D_CLUSTER_NAME_MAX )); then
+    cat >&2 <<EOF
+error: derived cluster name '${CLUSTER_NAME}' is ${#CLUSTER_NAME} chars; k3d caps at ${K3D_CLUSTER_NAME_MAX}.
+Set HELM_K3S_CLUSTER_NAME to a shorter name, e.g.:
+  HELM_K3S_CLUSTER_NAME=openshell-dev-${_suffix:0:$(( K3D_CLUSTER_NAME_MAX - 14 ))} mise run helm:k3s:create
+EOF
+    exit 1
+  fi
 
   local lb_port_map="${HOST_LB_PORT}:80@loadbalancer"
 

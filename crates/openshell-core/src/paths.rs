@@ -29,6 +29,24 @@ pub fn openshell_config_dir() -> Result<PathBuf> {
     Ok(xdg_config_dir()?.join("openshell"))
 }
 
+/// Resolve the XDG state base directory.
+///
+/// Returns `$XDG_STATE_HOME` if set, otherwise `$HOME/.local/state`.
+pub fn xdg_state_dir() -> Result<PathBuf> {
+    if let Ok(path) = std::env::var("XDG_STATE_HOME") {
+        return Ok(PathBuf::from(path));
+    }
+    let home = std::env::var("HOME")
+        .into_diagnostic()
+        .wrap_err("HOME is not set")?;
+    Ok(PathBuf::from(home).join(".local").join("state"))
+}
+
+/// The top-level `OpenShell` state directory: `$XDG_STATE_HOME/openshell/`.
+pub fn openshell_state_dir() -> Result<PathBuf> {
+    Ok(xdg_state_dir()?.join("openshell"))
+}
+
 /// Resolve the XDG data base directory.
 ///
 /// Returns `$XDG_DATA_HOME` if set, otherwise `$HOME/.local/share`.
@@ -124,6 +142,15 @@ mod tests {
     #[test]
     fn openshell_config_dir_appends_openshell() {
         let dir = openshell_config_dir().unwrap();
+        assert!(
+            dir.ends_with("openshell"),
+            "expected path ending with 'openshell', got: {dir:?}"
+        );
+    }
+
+    #[test]
+    fn openshell_state_dir_appends_openshell() {
+        let dir = openshell_state_dir().unwrap();
         assert!(
             dir.ends_with("openshell"),
             "expected path ending with 'openshell', got: {dir:?}"

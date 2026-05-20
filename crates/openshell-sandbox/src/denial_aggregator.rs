@@ -11,7 +11,6 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tracing::debug;
 
@@ -124,7 +123,7 @@ impl DenialAggregator {
     /// Ingest a single denial event, merging into existing summary or creating
     /// a new one.
     fn ingest(&mut self, event: DenialEvent) {
-        let now_ms = current_time_ms();
+        let now_ms = openshell_core::time::now_ms();
         let key = (event.host.clone(), event.port, event.binary.clone());
 
         let entry = self
@@ -216,10 +215,4 @@ pub struct FlushableL7Sample {
     pub method: String,
     pub path: String,
     pub count: u32,
-}
-
-fn current_time_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }

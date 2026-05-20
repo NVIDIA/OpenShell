@@ -25,6 +25,7 @@ openshell-vfio = { path = "../openshell-vfio" }
 bollard = { version = "0.20", features = ["ssh"] }
 tokio = { workspace = true }
 tonic = { workspace = true, features = ["transport"] }
+prost = { workspace = true }
 prost-types = { workspace = true }
 futures = { workspace = true }
 tokio-stream = { workspace = true, features = ["net"] }

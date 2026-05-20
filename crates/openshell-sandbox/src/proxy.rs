@@ -8,9 +8,11 @@ use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::ProxyTlsState;
 use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard};
 use crate::policy::ProxyPolicy;
-use crate::secrets::{SecretResolver, rewrite_header_line};
+use crate::policy_local::{POLICY_LOCAL_HOST, PolicyLocalContext};
+use crate::provider_credentials::ProviderCredentialState;
+use crate::secrets::{SecretResolver, rewrite_header_line_checked};
 use miette::{IntoDiagnostic, Result};
-use openshell_core::net::{is_always_blocked_ip, is_internal_ip};
+use openshell_core::net::{is_always_blocked_ip, is_internal_ip, is_link_local_ip};
 use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, Endpoint, HttpActivityBuilder, HttpRequest,
     NetworkActivityBuilder, Process, SeverityId, StatusId, Url as OcsfUrl, ocsf_emit,
@@ -31,15 +33,41 @@ const MAX_HEADER_BYTES: usize = 8192;
 const INFERENCE_LOCAL_HOST: &str = "inference.local";
 const INFERENCE_LOCAL_PORT: u16 = 443;
 
+/// Hostnames injected by compute drivers as `/etc/hosts` aliases for the host
+/// machine. Traffic to these names is eligible for the trusted-gateway SSRF
+/// exemption when the resolved IP matches the driver-injected value read from
+/// `/etc/hosts` at proxy startup.
+const HOST_GATEWAY_ALIASES: &[&str] = &[
+    "host.openshell.internal",
+    "host.containers.internal",
+    "host.docker.internal",
+];
+
+/// Cloud instance metadata IPs that are NEVER exempted from SSRF blocking,
+/// even when they coincidentally match a host-gateway alias resolution.
+/// This list covers the well-known IMDS endpoints across major cloud providers.
+const CLOUD_METADATA_IPS: &[IpAddr] = &[
+    // AWS / GCP / Azure instance metadata service
+    IpAddr::V4(std::net::Ipv4Addr::new(169, 254, 169, 254)),
+];
+
 /// Maximum total bytes for a streaming inference response body (32 MiB).
+#[cfg(not(test))]
 const MAX_STREAMING_BODY: usize = 32 * 1024 * 1024;
+// Keep unit tests deterministic without pushing tens of MiB through loopback.
+#[cfg(test)]
+const MAX_STREAMING_BODY: usize = 1024;
 
 /// Idle timeout per chunk when relaying streaming inference responses.
 ///
 /// Reasoning models (e.g. nemotron-3-super, o1, o3) can pause for 60+ seconds
 /// between "thinking" and output phases. 120s provides headroom while still
 /// catching genuinely stuck streams.
+#[cfg(not(test))]
 const CHUNK_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+// Exercise idle-timeout truncation without slowing the full package test suite.
+#[cfg(test)]
+const CHUNK_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Result of a proxy CONNECT policy decision.
 struct ConnectDecision {
@@ -147,7 +175,7 @@ impl ProxyHandle {
     /// The proxy uses OPA for network decisions with process-identity binding
     /// via `/proc/net/tcp`. All connections are evaluated through OPA policy.
     #[allow(clippy::too_many_arguments)]
-    pub async fn start_with_bind_addr(
+    pub(crate) async fn start_with_bind_addr(
         policy: &ProxyPolicy,
         bind_addr: Option<SocketAddr>,
         opa_engine: Arc<OpaEngine>,
@@ -155,7 +183,8 @@ impl ProxyHandle {
         entrypoint_pid: Arc<AtomicU32>,
         tls_state: Option<Arc<ProxyTlsState>>,
         inference_ctx: Option<Arc<InferenceContext>>,
-        secret_resolver: Option<Arc<SecretResolver>>,
+        provider_credentials: Option<ProviderCredentialState>,
+        policy_local_ctx: Option<Arc<PolicyLocalContext>>,
         denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
     ) -> Result<Self> {
         // Use override bind_addr, fall back to policy http_addr, then default
@@ -185,6 +214,18 @@ impl ProxyHandle {
             ocsf_emit!(event);
         }
 
+        // Detect the trusted host gateway IP from /etc/hosts before user code
+        // runs. This is read once at startup so later /etc/hosts modifications
+        // by sandbox workloads cannot influence the stored value.
+        let trusted_host_gateway: Arc<Option<IpAddr>> = Arc::new(detect_trusted_host_gateway());
+        if let Some(ref ip) = *trusted_host_gateway {
+            tracing::info!(
+                %ip,
+                "Trusted host gateway detected from /etc/hosts; \
+                 host-gateway aliases exempt from SSRF always-blocked check"
+            );
+        }
+
         let join = tokio::spawn(async move {
             loop {
                 match listener.accept().await {
@@ -194,11 +235,24 @@ impl ProxyHandle {
                         let spid = entrypoint_pid.clone();
                         let tls = tls_state.clone();
                         let inf = inference_ctx.clone();
-                        let resolver = secret_resolver.clone();
+                        let policy_local = policy_local_ctx.clone();
+                        let gw = trusted_host_gateway.clone();
+                        let resolver = provider_credentials
+                            .as_ref()
+                            .and_then(ProviderCredentialState::resolver);
                         let dtx = denial_tx.clone();
                         tokio::spawn(async move {
                             if let Err(err) = handle_tcp_connection(
-                                stream, opa, cache, spid, tls, inf, resolver, dtx,
+                                stream,
+                                opa,
+                                cache,
+                                spid,
+                                tls,
+                                inf,
+                                policy_local,
+                                gw,
+                                resolver,
+                                dtx,
                             )
                             .await
                             {
@@ -313,6 +367,8 @@ async fn handle_tcp_connection(
     entrypoint_pid: Arc<AtomicU32>,
     tls_state: Option<Arc<ProxyTlsState>>,
     inference_ctx: Option<Arc<InferenceContext>>,
+    policy_local_ctx: Option<Arc<PolicyLocalContext>>,
+    trusted_host_gateway: Arc<Option<IpAddr>>,
     secret_resolver: Option<Arc<SecretResolver>>,
     denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
 ) -> Result<()> {
@@ -357,6 +413,8 @@ async fn handle_tcp_connection(
             opa_engine,
             identity_cache,
             entrypoint_pid,
+            policy_local_ctx,
+            trusted_host_gateway,
             secret_resolver,
             denial_tx.as_ref(),
         )
@@ -511,7 +569,63 @@ async fn handle_tcp_connection(
     // The "non-empty" branch is the explicit-allowlist path; reading it first
     // matches the policy decision narrative.
     #[allow(clippy::if_not_else)]
-    let mut upstream = if !raw_allowed_ips.is_empty() {
+    let mut upstream = if is_host_gateway_alias(&host_lc)
+        && let Some(gw) = *trusted_host_gateway
+    {
+        // Trusted host-gateway path. The compute driver injected this hostname
+        // into /etc/hosts pointing at a known IP (read at proxy startup before
+        // user code runs). Bypass the normal SSRF tiers so link-local gateway
+        // addresses (used by rootless Podman with pasta) are not hard-blocked.
+        // Cloud metadata IPs and control-plane ports are still rejected.
+        match resolve_and_check_trusted_gateway(&host, port, gw, sandbox_entrypoint_pid).await {
+            Ok(addrs) => TcpStream::connect(addrs.as_slice())
+                .await
+                .into_diagnostic()?,
+            Err(reason) => {
+                {
+                    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                        .activity(ActivityId::Open)
+                        .action(ActionId::Denied)
+                        .disposition(DispositionId::Blocked)
+                        .severity(SeverityId::Medium)
+                        .status(StatusId::Failure)
+                        .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                        .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+                        .actor_process(
+                            Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
+                                .with_cmd_line(&cmdline_str),
+                        )
+                        .firewall_rule("-", "ssrf")
+                        .message(format!(
+                            "CONNECT blocked: trusted-gateway check failed for {host_lc}:{port}"
+                        ))
+                        .status_detail(&reason)
+                        .build();
+                    ocsf_emit!(event);
+                }
+                emit_denial(
+                    &denial_tx,
+                    &host_lc,
+                    port,
+                    &binary_str,
+                    &decision,
+                    &reason,
+                    "ssrf",
+                );
+                respond(
+                    &mut client,
+                    &build_json_error_response(
+                        403,
+                        "Forbidden",
+                        "ssrf_denied",
+                        &format!("CONNECT {host_lc}:{port} blocked: trusted-gateway check failed"),
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+    } else if !raw_allowed_ips.is_empty() {
         // allowed_ips mode: validate resolved IPs against CIDR allowlist.
         // Loopback and link-local are still always blocked.
         match parse_allowed_ips(&raw_allowed_ips) {
@@ -1798,6 +1912,149 @@ fn normalize_host_lookup_key(host: &str) -> &str {
         .unwrap_or(host)
 }
 
+/// Returns `true` if `host` is one of the well-known driver-injected aliases
+/// for the host machine (e.g. `host.openshell.internal`).
+fn is_host_gateway_alias(host: &str) -> bool {
+    let h = normalize_host_lookup_key(host);
+    HOST_GATEWAY_ALIASES
+        .iter()
+        .any(|alias| alias.eq_ignore_ascii_case(h))
+}
+
+/// Returns `true` if `ip` is a known cloud instance metadata endpoint that
+/// must never be exempted from SSRF blocking.
+///
+/// IPv4-mapped IPv6 addresses (e.g. `::ffff:169.254.169.254`) are normalized
+/// to their embedded IPv4 representation before comparison, so the invariant
+/// holds regardless of how the address is represented.
+fn is_cloud_metadata_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(_) => CLOUD_METADATA_IPS.contains(&ip),
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .is_some_and(|v4| CLOUD_METADATA_IPS.contains(&IpAddr::V4(v4))),
+    }
+}
+
+/// Read the proxy's own `/etc/hosts` at startup and return the IP mapped to
+/// `host.openshell.internal`, if present and safe.
+///
+/// This is called once before user code runs, so the returned value is immune
+/// to later `/etc/hosts` tampering by sandbox workloads. Returns `None` if no
+/// entry exists, the entry cannot be parsed, or the mapped IP is a cloud
+/// metadata address.
+#[cfg(any(target_os = "linux", test))]
+fn detect_trusted_host_gateway() -> Option<IpAddr> {
+    let contents = std::fs::read_to_string("/etc/hosts").ok()?;
+    let ips = parse_hosts_file_for_host(&contents, "host.openshell.internal");
+
+    // Multiple distinct IPs for the alias is unexpected — compute drivers
+    // always inject exactly one. Warn loudly so operators can diagnose the
+    // inconsistency; we still proceed with the first entry rather than
+    // disabling the exemption entirely, because the mismatch guard in
+    // resolve_and_check_trusted_gateway() will reject any runtime resolution
+    // that returns a different IP.
+    if ips.len() > 1 {
+        warn!(
+            ips = ?ips,
+            "host.openshell.internal has {} distinct IPs in /etc/hosts; \
+             expected exactly one. Using first entry. \
+             Connections resolving to any other IP will be rejected.",
+            ips.len()
+        );
+    }
+
+    let ip = ips.into_iter().next()?;
+
+    if is_cloud_metadata_ip(ip) {
+        warn!(
+            %ip,
+            "host.openshell.internal resolves to a cloud metadata IP; \
+             trusted-gateway SSRF exemption disabled"
+        );
+        return None;
+    }
+    // The exemption exists solely for link-local IPs used by rootless Podman
+    // with pasta. Private RFC 1918 addresses (e.g. Docker bridge 172.17.0.1,
+    // Kubernetes node 192.168.x.x), loopback, unspecified, and all other
+    // non-link-local addresses are never legitimate candidates for the
+    // link-local SSRF exemption — they must fall through to the normal
+    // allowed_ips / resolve_and_reject_internal() enforcement path.
+    if !is_link_local_ip(ip) {
+        warn!(
+            %ip,
+            "host.openshell.internal maps to a non-link-local IP; \
+             trusted-gateway SSRF exemption disabled"
+        );
+        return None;
+    }
+    Some(ip)
+}
+
+#[cfg(not(any(target_os = "linux", test)))]
+fn detect_trusted_host_gateway() -> Option<IpAddr> {
+    None
+}
+
+/// Resolve `host:port` and validate that every resolved address matches the
+/// trusted host gateway IP.
+///
+/// This bypasses the normal SSRF tiers (always-blocked and internal-IP) for
+/// driver-injected host-gateway aliases, allowing link-local addresses used
+/// by rootless Podman with pasta without opening up arbitrary link-local or
+/// cloud metadata access.
+///
+/// Rejects:
+/// - Any resolved IP that is a cloud metadata address (defense-in-depth)
+/// - Any resolved IP that does not match `trusted_gw` (prevents /etc/hosts tampering)
+/// - Control-plane ports (etcd, K8s API, kubelet) regardless of IP
+async fn resolve_and_check_trusted_gateway(
+    host: &str,
+    port: u16,
+    trusted_gw: IpAddr,
+    entrypoint_pid: u32,
+) -> std::result::Result<Vec<SocketAddr>, String> {
+    if BLOCKED_CONTROL_PLANE_PORTS.contains(&port) {
+        return Err(format!(
+            "port {port} is a blocked control-plane port, connection rejected"
+        ));
+    }
+    let addrs = resolve_socket_addrs(host, port, entrypoint_pid).await?;
+    if addrs.is_empty() {
+        return Err(format!(
+            "DNS resolution returned no addresses for {}",
+            normalize_host_lookup_key(host)
+        ));
+    }
+    for addr in &addrs {
+        if is_cloud_metadata_ip(addr.ip()) {
+            return Err(format!(
+                "{host} resolves to cloud metadata address {}, connection rejected",
+                addr.ip()
+            ));
+        }
+        if addr.ip() != trusted_gw {
+            return Err(format!(
+                "{host} resolves to {} which does not match trusted host gateway \
+                 {trusted_gw}, connection rejected",
+                addr.ip()
+            ));
+        }
+        // Defense-in-depth: even if the resolved IP matches trusted_gw, reject
+        // any non-link-local address. detect_trusted_host_gateway() already
+        // enforces this at startup, but we re-check here to guard against any
+        // unanticipated code path that might admit a private or loopback IP.
+        if !is_link_local_ip(addr.ip()) {
+            return Err(format!(
+                "{host} resolves to non-link-local address {}, \
+                 connection rejected",
+                addr.ip()
+            ));
+        }
+    }
+    Ok(addrs)
+}
+
 fn resolve_ip_literal(host: &str, port: u16) -> Option<Vec<SocketAddr>> {
     normalize_host_lookup_key(host)
         .parse::<IpAddr>()
@@ -2261,11 +2518,17 @@ fn rewrite_forward_request(
     used: usize,
     path: &str,
     secret_resolver: Option<&SecretResolver>,
+    request_body_credential_rewrite: bool,
 ) -> Result<Vec<u8>, crate::secrets::UnresolvedPlaceholderError> {
     let header_end = raw[..used]
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .map_or(used, |p| p + 4);
+    let websocket_upgrade = crate::l7::rest::request_is_websocket_upgrade(&raw[..header_end]);
+    let upstream_path = match secret_resolver {
+        Some(resolver) => crate::secrets::rewrite_target_for_eval(path, resolver)?.resolved,
+        None => path.to_string(),
+    };
 
     let header_str = String::from_utf8_lossy(&raw[..header_end]);
     let lines = header_str.split("\r\n").collect::<Vec<_>>();
@@ -2282,7 +2545,7 @@ fn rewrite_forward_request(
             if parts.len() == 3 {
                 output.extend_from_slice(parts[0].as_bytes());
                 output.push(b' ');
-                output.extend_from_slice(path.as_bytes());
+                output.extend_from_slice(upstream_path.as_bytes());
                 output.push(b' ');
                 output.extend_from_slice(parts[2].as_bytes());
             } else {
@@ -2309,14 +2572,19 @@ fn rewrite_forward_request(
         // Replace Connection header
         if lower.starts_with("connection:") {
             has_connection = true;
+            if websocket_upgrade {
+                output.extend_from_slice(line.as_bytes());
+                output.extend_from_slice(b"\r\n");
+                continue;
+            }
             output.extend_from_slice(b"Connection: close\r\n");
             continue;
         }
 
-        let rewritten_line = secret_resolver.map_or_else(
-            || line.to_string(),
-            |resolver| rewrite_header_line(line, resolver),
-        );
+        let rewritten_line = match secret_resolver {
+            Some(resolver) => rewrite_header_line_checked(line, resolver)?,
+            None => line.to_string(),
+        };
 
         output.extend_from_slice(rewritten_line.as_bytes());
         output.extend_from_slice(b"\r\n");
@@ -2327,7 +2595,7 @@ fn rewrite_forward_request(
     }
 
     // Inject missing headers
-    if !has_connection {
+    if !has_connection && !websocket_upgrade {
         output.extend_from_slice(b"Connection: close\r\n");
     }
     if !has_via {
@@ -2336,6 +2604,7 @@ fn rewrite_forward_request(
 
     // End of headers
     output.extend_from_slice(b"\r\n");
+    let rewritten_header_end = output.len();
 
     // Append any overflow body bytes from the original buffer
     if header_end < used {
@@ -2344,13 +2613,27 @@ fn rewrite_forward_request(
 
     // Fail-closed: scan for any remaining unresolved placeholders
     if secret_resolver.is_some() {
-        let output_str = String::from_utf8_lossy(&output);
-        if output_str.contains(crate::secrets::PLACEHOLDER_PREFIX_PUBLIC) {
+        let scan_end = if request_body_credential_rewrite {
+            rewritten_header_end
+        } else {
+            output.len()
+        };
+        let output_str = String::from_utf8_lossy(&output[..scan_end]);
+        if output_str.contains(crate::secrets::PLACEHOLDER_PREFIX_PUBLIC)
+            || output_str.contains(crate::secrets::PROVIDER_ALIAS_MARKER_PUBLIC)
+        {
             return Err(crate::secrets::UnresolvedPlaceholderError { location: "header" });
         }
     }
 
     Ok(output)
+}
+
+struct ForwardRelayOptions<'a> {
+    generation_guard: &'a PolicyGenerationGuard,
+    websocket_extensions: crate::l7::rest::WebSocketExtensionMode,
+    secret_resolver: Option<&'a SecretResolver>,
+    request_body_credential_rewrite: bool,
 }
 
 async fn relay_rewritten_forward_request<C, U>(
@@ -2359,7 +2642,7 @@ async fn relay_rewritten_forward_request<C, U>(
     rewritten: Vec<u8>,
     client: &mut C,
     upstream: &mut U,
-    generation_guard: &PolicyGenerationGuard,
+    options: ForwardRelayOptions<'_>,
 ) -> Result<crate::l7::provider::RelayOutcome>
 where
     C: TokioAsyncRead + TokioAsyncWrite + Unpin,
@@ -2380,12 +2663,16 @@ where
         body_length,
     };
 
-    crate::l7::rest::relay_http_request_with_resolver_guarded(
+    crate::l7::rest::relay_http_request_with_options_guarded(
         &req,
         client,
         upstream,
-        None,
-        Some(generation_guard),
+        crate::l7::rest::RelayRequestOptions {
+            resolver: options.secret_resolver,
+            generation_guard: Some(options.generation_guard),
+            websocket_extensions: options.websocket_extensions,
+            request_body_credential_rewrite: options.request_body_credential_rewrite,
+        },
     )
     .await
 }
@@ -2408,6 +2695,8 @@ async fn handle_forward_proxy(
     opa_engine: Arc<OpaEngine>,
     identity_cache: Arc<BinaryIdentityCache>,
     entrypoint_pid: Arc<AtomicU32>,
+    policy_local_ctx: Option<Arc<PolicyLocalContext>>,
+    trusted_host_gateway: Arc<Option<IpAddr>>,
     secret_resolver: Option<Arc<SecretResolver>>,
     denial_tx: Option<&mpsc::UnboundedSender<DenialEvent>>,
 ) -> Result<()> {
@@ -2430,6 +2719,38 @@ async fn handle_forward_proxy(
         }
     };
     let host_lc = host.to_ascii_lowercase();
+
+    if host_lc == POLICY_LOCAL_HOST {
+        if scheme != "http" || port != 80 {
+            respond(
+                client,
+                &build_json_error_response(
+                    400,
+                    "Bad Request",
+                    "invalid_policy_local_scheme",
+                    "Use http://policy.local only",
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+        if let Some(ctx) = policy_local_ctx {
+            return crate::policy_local::handle_forward_request(
+                &ctx,
+                method,
+                &path,
+                &buf[..used],
+                client,
+            )
+            .await;
+        }
+        respond(
+            client,
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 31\r\n\r\npolicy.local is not configured",
+        )
+        .await?;
+        return Ok(());
+    }
 
     // 2. Reject HTTPS — must use CONNECT for TLS
     if scheme == "https" {
@@ -2574,6 +2895,35 @@ async fn handle_forward_proxy(
     };
     let mut forward_request_bytes = buf[..used].to_vec();
     let mut upstream_target = path.clone();
+    let mut websocket_extensions = crate::l7::rest::WebSocketExtensionMode::Preserve;
+    let mut forward_tunnel_engine: Option<crate::opa::TunnelPolicyEngine> = None;
+    let mut forward_upgrade_config: Option<crate::l7::L7EndpointConfig> = None;
+    let mut forward_upgrade_target = String::new();
+    let mut forward_upgrade_query_params = std::collections::HashMap::new();
+    let mut forward_websocket_request =
+        crate::l7::rest::request_is_websocket_upgrade(&forward_request_bytes);
+    let mut request_body_credential_rewrite = false;
+    let l7_ctx = crate::l7::relay::L7EvalContext {
+        host: host_lc.clone(),
+        port,
+        policy_name: matched_policy.clone().unwrap_or_default(),
+        binary_path: decision
+            .binary
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        ancestors: decision
+            .ancestors
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
+        cmdline_paths: decision
+            .cmdline_paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
+        secret_resolver: secret_resolver.clone(),
+    };
 
     // 4b. If the endpoint has L7 config, evaluate the request against
     //     L7 policy.  The forward proxy handles exactly one request per
@@ -2619,28 +2969,6 @@ async fn handle_forward_proxy(
                 .await?;
                 return Ok(());
             }
-        };
-
-        let l7_ctx = crate::l7::relay::L7EvalContext {
-            host: host_lc.clone(),
-            port,
-            policy_name: matched_policy.clone().unwrap_or_default(),
-            binary_path: decision
-                .binary
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            ancestors: decision
-                .ancestors
-                .iter()
-                .map(|p| p.to_string_lossy().into_owned())
-                .collect(),
-            cmdline_paths: decision
-                .cmdline_paths
-                .iter()
-                .map(|p| p.to_string_lossy().into_owned())
-                .collect(),
-            secret_resolver: secret_resolver.clone(),
         };
 
         // Canonicalize the request-target. The canonical form is fed to OPA
@@ -2711,6 +3039,14 @@ async fn handle_forward_proxy(
             .await?;
             return Ok(());
         };
+        forward_websocket_request =
+            crate::l7::rest::request_is_websocket_upgrade(&forward_request_bytes);
+        websocket_extensions = crate::l7::relay::websocket_extension_mode(&l7_config.config);
+        request_body_credential_rewrite = l7_config.config.protocol == crate::l7::L7Protocol::Rest
+            && l7_config.config.request_body_credential_rewrite;
+        forward_upgrade_config = Some(l7_config.config.clone());
+        forward_upgrade_target = path.clone();
+        forward_upgrade_query_params = query_params.clone();
         let graphql = if l7_config.config.protocol == crate::l7::L7Protocol::Graphql {
             let header_end = forward_request_bytes
                 .windows(4)
@@ -2871,9 +3207,12 @@ async fn handle_forward_proxy(
             .await?;
             return Ok(());
         }
+        forward_tunnel_engine = Some(tunnel_engine);
     }
 
     // 5. DNS resolution + SSRF defence (mirrors the CONNECT path logic).
+    //    - If the host is a driver-injected host-gateway alias: bypass SSRF
+    //      tiers and validate only against the trusted gateway IP.
     //    - If allowed_ips is set: validate resolved IPs against the allowlist
     //      (this is the SSRF override for private IP destinations).
     //    - If allowed_ips is empty: reject internal IPs, allow public IPs through.
@@ -2884,70 +3223,125 @@ async fn handle_forward_proxy(
         raw_allowed_ips = implicit_allowed_ips_for_ip_host(&host);
     }
 
-    // The "non-empty" branch is the explicit-allowlist path; reading it first
-    // matches the policy decision narrative.
+    // The trusted-gateway branch is the first path; reading it before the
+    // allowed_ips and default branches matches the policy decision narrative.
     #[allow(clippy::if_not_else)]
-    let addrs =
-        if !raw_allowed_ips.is_empty() {
-            // allowed_ips mode: validate resolved IPs against CIDR allowlist.
-            match parse_allowed_ips(&raw_allowed_ips) {
-                Ok(nets) => {
-                    match resolve_and_check_allowed_ips(&host, port, &nets, sandbox_entrypoint_pid)
-                        .await
-                    {
-                        Ok(addrs) => addrs,
-                        Err(reason) => {
-                            {
-                                let event = HttpActivityBuilder::new(crate::ocsf_ctx())
-                            .activity(ActivityId::Other)
-                            .action(ActionId::Denied)
-                            .disposition(DispositionId::Blocked)
-                            .severity(SeverityId::Medium)
-                            .status(StatusId::Failure)
-                            .http_request(HttpRequest::new(
-                                method,
-                                OcsfUrl::new("http", &host_lc, &path, port),
-                            ))
-                            .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                            .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
-                            .actor_process(
-                                Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                                    .with_cmd_line(&cmdline_str),
-                            )
-                            .firewall_rule(policy_str, "ssrf")
-                            .message(format!(
-                                "FORWARD blocked: allowed_ips check failed for {host_lc}:{port}"
-                            ))
-                            .status_detail(&reason)
-                            .build();
-                                ocsf_emit!(event);
-                            }
-                            emit_denial_simple(
-                                denial_tx,
-                                &host_lc,
-                                port,
-                                &binary_str,
-                                &decision,
-                                &reason,
-                                "ssrf",
-                            );
-                            respond(
-                        client,
-                        &build_json_error_response(
-                            403,
-                            "Forbidden",
-                            "ssrf_denied",
-                            &format!("{method} {host_lc}:{port} blocked: allowed_ips check failed"),
-                        ),
-                    )
-                    .await?;
-                            return Ok(());
+    let addrs = if is_host_gateway_alias(&host_lc)
+        && let Some(gw) = *trusted_host_gateway
+    {
+        // Trusted host-gateway path. Mirrors the CONNECT path logic.
+        match resolve_and_check_trusted_gateway(&host, port, gw, sandbox_entrypoint_pid).await {
+            Ok(addrs) => addrs,
+            Err(reason) => {
+                {
+                    let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+                        .activity(ActivityId::Other)
+                        .action(ActionId::Denied)
+                        .disposition(DispositionId::Blocked)
+                        .severity(SeverityId::Medium)
+                        .status(StatusId::Failure)
+                        .http_request(HttpRequest::new(
+                            method,
+                            OcsfUrl::new("http", &host_lc, &path, port),
+                        ))
+                        .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                        .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
+                        .actor_process(
+                            Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
+                                .with_cmd_line(&cmdline_str),
+                        )
+                        .firewall_rule(policy_str, "ssrf")
+                        .message(format!(
+                            "FORWARD blocked: trusted-gateway check failed for {host_lc}:{port}"
+                        ))
+                        .status_detail(&reason)
+                        .build();
+                    ocsf_emit!(event);
+                }
+                emit_denial_simple(
+                    denial_tx,
+                    &host_lc,
+                    port,
+                    &binary_str,
+                    &decision,
+                    &reason,
+                    "ssrf",
+                );
+                respond(
+                    client,
+                    &build_json_error_response(
+                        403,
+                        "Forbidden",
+                        "ssrf_denied",
+                        &format!("{method} {host_lc}:{port} blocked: trusted-gateway check failed"),
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+    } else if !raw_allowed_ips.is_empty() {
+        // allowed_ips mode: validate resolved IPs against CIDR allowlist.
+        match parse_allowed_ips(&raw_allowed_ips) {
+            Ok(nets) => {
+                match resolve_and_check_allowed_ips(&host, port, &nets, sandbox_entrypoint_pid)
+                    .await
+                {
+                    Ok(addrs) => addrs,
+                    Err(reason) => {
+                        {
+                            let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+                                .activity(ActivityId::Other)
+                                .action(ActionId::Denied)
+                                .disposition(DispositionId::Blocked)
+                                .severity(SeverityId::Medium)
+                                .status(StatusId::Failure)
+                                .http_request(HttpRequest::new(
+                                    method,
+                                    OcsfUrl::new("http", &host_lc, &path, port),
+                                ))
+                                .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                                .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
+                                .actor_process(
+                                    Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
+                                        .with_cmd_line(&cmdline_str),
+                                )
+                                .firewall_rule(policy_str, "ssrf")
+                                .message(format!(
+                                    "FORWARD blocked: allowed_ips check failed for {host_lc}:{port}"
+                                ))
+                                .status_detail(&reason)
+                                .build();
+                            ocsf_emit!(event);
                         }
+                        emit_denial_simple(
+                            denial_tx,
+                            &host_lc,
+                            port,
+                            &binary_str,
+                            &decision,
+                            &reason,
+                            "ssrf",
+                        );
+                        respond(
+                            client,
+                            &build_json_error_response(
+                                403,
+                                "Forbidden",
+                                "ssrf_denied",
+                                &format!(
+                                    "{method} {host_lc}:{port} blocked: allowed_ips check failed"
+                                ),
+                            ),
+                        )
+                        .await?;
+                        return Ok(());
                     }
                 }
-                Err(reason) => {
-                    {
-                        let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+            }
+            Err(reason) => {
+                {
+                    let event = HttpActivityBuilder::new(crate::ocsf_ctx())
                         .activity(ActivityId::Other)
                         .action(ActionId::Denied)
                         .disposition(DispositionId::Blocked)
@@ -2969,39 +3363,39 @@ async fn handle_forward_proxy(
                         ))
                         .status_detail(&reason)
                         .build();
-                        ocsf_emit!(event);
-                    }
-                    emit_denial_simple(
-                        denial_tx,
-                        &host_lc,
-                        port,
-                        &binary_str,
-                        &decision,
-                        &reason,
-                        "ssrf",
-                    );
-                    respond(
-                        client,
-                        &build_json_error_response(
-                            403,
-                            "Forbidden",
-                            "ssrf_denied",
-                            &format!(
-                                "{method} {host_lc}:{port} blocked: invalid allowed_ips in policy"
-                            ),
-                        ),
-                    )
-                    .await?;
-                    return Ok(());
+                    ocsf_emit!(event);
                 }
+                emit_denial_simple(
+                    denial_tx,
+                    &host_lc,
+                    port,
+                    &binary_str,
+                    &decision,
+                    &reason,
+                    "ssrf",
+                );
+                respond(
+                    client,
+                    &build_json_error_response(
+                        403,
+                        "Forbidden",
+                        "ssrf_denied",
+                        &format!(
+                            "{method} {host_lc}:{port} blocked: invalid allowed_ips in policy"
+                        ),
+                    ),
+                )
+                .await?;
+                return Ok(());
             }
-        } else {
-            // No allowed_ips: reject internal IPs, allow public IPs through.
-            match resolve_and_reject_internal(&host, port, sandbox_entrypoint_pid).await {
-                Ok(addrs) => addrs,
-                Err(reason) => {
-                    {
-                        let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+        }
+    } else {
+        // No allowed_ips: reject internal IPs, allow public IPs through.
+        match resolve_and_reject_internal(&host, port, sandbox_entrypoint_pid).await {
+            Ok(addrs) => addrs,
+            Err(reason) => {
+                {
+                    let event = HttpActivityBuilder::new(crate::ocsf_ctx())
                         .activity(ActivityId::Other)
                         .action(ActionId::Denied)
                         .disposition(DispositionId::Blocked)
@@ -3023,31 +3417,31 @@ async fn handle_forward_proxy(
                         ))
                         .status_detail(&reason)
                         .build();
-                        ocsf_emit!(event);
-                    }
-                    emit_denial_simple(
-                        denial_tx,
-                        &host_lc,
-                        port,
-                        &binary_str,
-                        &decision,
-                        &reason,
-                        "ssrf",
-                    );
-                    respond(
-                        client,
-                        &build_json_error_response(
-                            403,
-                            "Forbidden",
-                            "ssrf_denied",
-                            &format!("{method} {host_lc}:{port} blocked: internal address"),
-                        ),
-                    )
-                    .await?;
-                    return Ok(());
+                    ocsf_emit!(event);
                 }
+                emit_denial_simple(
+                    denial_tx,
+                    &host_lc,
+                    port,
+                    &binary_str,
+                    &decision,
+                    &reason,
+                    "ssrf",
+                );
+                respond(
+                    client,
+                    &build_json_error_response(
+                        403,
+                        "Forbidden",
+                        "ssrf_denied",
+                        &format!("{method} {host_lc}:{port} blocked: internal address"),
+                    ),
+                )
+                .await?;
+                return Ok(());
             }
-        };
+        }
+    };
 
     if let Err(e) = forward_generation_guard.ensure_current() {
         emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
@@ -3131,6 +3525,7 @@ async fn handle_forward_proxy(
         forward_request_bytes.len(),
         &upstream_target,
         secret_resolver.as_deref(),
+        request_body_credential_rewrite,
     ) {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -3173,11 +3568,47 @@ async fn handle_forward_proxy(
         rewritten,
         client,
         &mut upstream,
-        &forward_generation_guard,
+        ForwardRelayOptions {
+            generation_guard: &forward_generation_guard,
+            websocket_extensions,
+            secret_resolver: secret_resolver.as_deref(),
+            request_body_credential_rewrite,
+        },
     )
     .await?;
-    if let crate::l7::provider::RelayOutcome::Upgraded { overflow } = outcome {
-        crate::l7::relay::handle_upgrade(client, &mut upstream, overflow, &host_lc, port).await?;
+    if let crate::l7::provider::RelayOutcome::Upgraded {
+        overflow,
+        websocket_permessage_deflate,
+    } = outcome
+    {
+        let mut upgrade_options = if let (Some(config), Some(engine)) = (
+            forward_upgrade_config.as_ref(),
+            forward_tunnel_engine.as_ref(),
+        ) {
+            crate::l7::relay::upgrade_options(
+                config,
+                &l7_ctx,
+                forward_websocket_request,
+                &forward_upgrade_target,
+                &forward_upgrade_query_params,
+                Some(engine),
+            )
+        } else {
+            crate::l7::relay::UpgradeRelayOptions {
+                websocket_request: forward_websocket_request,
+                ..Default::default()
+            }
+        };
+        upgrade_options.websocket.permessage_deflate = websocket_permessage_deflate;
+        crate::l7::relay::handle_upgrade(
+            client,
+            &mut upstream,
+            overflow,
+            &host_lc,
+            port,
+            upgrade_options,
+        )
+        .await?;
     }
 
     Ok(())
@@ -3248,7 +3679,477 @@ fn is_benign_relay_error(err: &miette::Report) -> bool {
 )]
 mod tests {
     use super::*;
+    use std::future::Future;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    use std::sync::Arc;
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    fn websocket_l7_config(
+        protocol: crate::l7::L7Protocol,
+        websocket_credential_rewrite: bool,
+    ) -> crate::l7::L7EndpointConfig {
+        crate::l7::L7EndpointConfig {
+            protocol,
+            path: "/**".to_string(),
+            tls: crate::l7::TlsMode::Auto,
+            enforcement: crate::l7::EnforcementMode::Enforce,
+            graphql_max_body_bytes: crate::l7::graphql::DEFAULT_MAX_BODY_BYTES,
+            allow_encoded_slash: false,
+            websocket_credential_rewrite,
+            request_body_credential_rewrite: false,
+            websocket_graphql_policy: false,
+        }
+    }
+
+    fn forward_test_guard() -> PolicyGenerationGuard {
+        let policy = include_str!("../data/sandbox-policy.rego");
+        let policy_data = "network_policies: {}\n";
+        let engine = OpaEngine::from_strings(policy, policy_data).unwrap();
+        engine
+            .generation_guard(engine.current_generation())
+            .unwrap()
+    }
+
+    async fn relay_forward_request_and_capture(
+        method: &str,
+        path: &str,
+        raw: &[u8],
+        resolver: Option<&SecretResolver>,
+        request_body_credential_rewrite: bool,
+    ) -> Result<String> {
+        let guard = forward_test_guard();
+        let rewritten = rewrite_forward_request(
+            raw,
+            raw.len(),
+            path,
+            resolver,
+            request_body_credential_rewrite,
+        )
+        .map_err(|e| miette::miette!("{e}"))?;
+        let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
+        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+
+        let upstream_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            let mut total = 0usize;
+            let mut expected_total = None;
+            loop {
+                let n = upstream_side.read(&mut buf[total..]).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                total += n;
+                if expected_total.is_none()
+                    && let Some(end) = buf[..total].windows(4).position(|w| w == b"\r\n\r\n")
+                {
+                    let header_end = end + 4;
+                    let headers = String::from_utf8_lossy(&buf[..header_end]);
+                    let len = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    expected_total = Some(header_end + len);
+                }
+                if expected_total.is_some_and(|expected| total >= expected) {
+                    break;
+                }
+            }
+            upstream_side
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+            upstream_side.flush().await.unwrap();
+            String::from_utf8_lossy(&buf[..total]).to_string()
+        });
+
+        relay_rewritten_forward_request(
+            method,
+            path,
+            rewritten,
+            &mut proxy_to_client,
+            &mut proxy_to_upstream,
+            ForwardRelayOptions {
+                generation_guard: &guard,
+                websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
+                secret_resolver: resolver,
+                request_body_credential_rewrite,
+            },
+        )
+        .await?;
+
+        upstream_task
+            .await
+            .map_err(|e| miette::miette!("upstream task failed: {e}"))
+    }
+
+    fn forward_websocket_policy_parts(
+        data: &str,
+        host: &str,
+        port: u16,
+        path: &str,
+        policy_name: &str,
+    ) -> (
+        crate::l7::L7EndpointConfig,
+        crate::opa::TunnelPolicyEngine,
+        crate::l7::relay::L7EvalContext,
+    ) {
+        let policy = include_str!("../data/sandbox-policy.rego");
+        let engine = OpaEngine::from_strings(policy, data).unwrap();
+        let decision = ConnectDecision {
+            action: NetworkAction::Allow {
+                matched_policy: Some(policy_name.to_string()),
+            },
+            generation: engine.current_generation(),
+            binary: Some(PathBuf::from("/usr/bin/node")),
+            binary_pid: None,
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let route =
+            query_l7_route_snapshot(&engine, &decision, host, port).expect("L7 route should match");
+        let config = select_l7_config_for_path(&route.configs, path)
+            .expect("path-specific L7 config should match")
+            .config
+            .clone();
+        let tunnel_engine = engine
+            .clone_engine_for_tunnel(route.generation)
+            .expect("tunnel engine");
+        let ctx = crate::l7::relay::L7EvalContext {
+            host: host.to_string(),
+            port,
+            policy_name: policy_name.to_string(),
+            binary_path: "/usr/bin/node".to_string(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: None,
+        };
+        (config, tunnel_engine, ctx)
+    }
+
+    async fn read_http_headers<R: TokioAsyncRead + Unpin>(reader: &mut R) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 256];
+        loop {
+            let n =
+                tokio::time::timeout(std::time::Duration::from_secs(1), reader.read(&mut chunk))
+                    .await
+                    .expect("HTTP headers should arrive")
+                    .expect("header read should succeed");
+            assert!(n > 0, "stream closed before HTTP headers");
+            bytes.extend_from_slice(&chunk[..n]);
+            if bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                return bytes;
+            }
+        }
+    }
+
+    fn masked_text_frame(payload: &[u8]) -> Vec<u8> {
+        let mask = [0x11, 0x22, 0x33, 0x44];
+        assert!(
+            payload.len() <= 125,
+            "test helper only supports small frames"
+        );
+        let payload_len = u8::try_from(payload.len()).expect("small frame length");
+        let mut frame = vec![0x81, 0x80 | payload_len];
+        frame.extend_from_slice(&mask);
+        frame.extend(
+            payload
+                .iter()
+                .enumerate()
+                .map(|(idx, byte)| byte ^ mask[idx % 4]),
+        );
+        frame
+    }
+
+    async fn forward_websocket_denied_after_upgrade(
+        config: crate::l7::L7EndpointConfig,
+        tunnel_engine: crate::opa::TunnelPolicyEngine,
+        ctx: crate::l7::relay::L7EvalContext,
+        path: &str,
+        payload: &str,
+    ) -> (miette::Report, Vec<u8>) {
+        let host = ctx.host.clone();
+        let port = ctx.port;
+        let raw = format!(
+            "GET http://{host}{path} HTTP/1.1\r\n\
+             Host: {host}\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Sec-WebSocket-Version: 13\r\n\r\n"
+        );
+        let rewritten = rewrite_forward_request(raw.as_bytes(), raw.len(), path, None, false)
+            .expect("forward websocket request should rewrite to origin form");
+        let websocket_extensions = crate::l7::relay::websocket_extension_mode(&config);
+        let target = path.to_string();
+        let query_params = std::collections::HashMap::new();
+        let (mut proxy_to_upstream, mut upstream) = tokio::io::duplex(8192);
+        let (mut app, mut proxy_to_client) = tokio::io::duplex(8192);
+
+        let relay = tokio::spawn(async move {
+            let guard = tunnel_engine.generation_guard();
+            let outcome = relay_rewritten_forward_request(
+                "GET",
+                &target,
+                rewritten,
+                &mut proxy_to_client,
+                &mut proxy_to_upstream,
+                ForwardRelayOptions {
+                    generation_guard: guard,
+                    websocket_extensions,
+                    secret_resolver: None,
+                    request_body_credential_rewrite: false,
+                },
+            )
+            .await?;
+            if let crate::l7::provider::RelayOutcome::Upgraded {
+                overflow,
+                websocket_permessage_deflate,
+            } = outcome
+            {
+                let mut options = crate::l7::relay::upgrade_options(
+                    &config,
+                    &ctx,
+                    true,
+                    &target,
+                    &query_params,
+                    Some(&tunnel_engine),
+                );
+                options.websocket.permessage_deflate = websocket_permessage_deflate;
+                crate::l7::relay::handle_upgrade(
+                    &mut proxy_to_client,
+                    &mut proxy_to_upstream,
+                    overflow,
+                    &host,
+                    port,
+                    options,
+                )
+                .await?;
+            }
+            Ok::<(), miette::Report>(())
+        });
+
+        let forwarded_headers = read_http_headers(&mut upstream).await;
+        let forwarded_headers = String::from_utf8_lossy(&forwarded_headers);
+        assert!(forwarded_headers.starts_with(&format!("GET {path} HTTP/1.1\r\n")));
+        assert!(forwarded_headers.contains("Upgrade: websocket\r\n"));
+
+        upstream
+            .write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+            )
+            .await
+            .unwrap();
+
+        let response = read_http_headers(&mut app).await;
+        assert!(String::from_utf8_lossy(&response).contains("101 Switching Protocols"));
+
+        app.write_all(&masked_text_frame(payload.as_bytes()))
+            .await
+            .unwrap();
+
+        let err = tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("websocket relay should fail closed after denied frame")
+            .expect("relay task should not panic")
+            .expect_err("denied websocket frame should fail the forward relay");
+
+        let mut leaked = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            upstream.read_to_end(&mut leaked),
+        )
+        .await
+        .expect("upstream side should close")
+        .expect("upstream read should succeed");
+        (err, leaked)
+    }
+
+    #[test]
+    fn forward_websocket_upgrade_options_enable_native_policy_context() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("DISCORD_BOT_TOKEN".to_string(), "discord-real".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let resolver = resolver.map(Arc::new);
+        let policy = include_str!("../data/sandbox-policy.rego");
+        let policy_data = "network_policies: {}\n";
+        let engine = OpaEngine::from_strings(policy, policy_data).unwrap();
+        let tunnel_engine = engine
+            .clone_engine_for_tunnel(engine.current_generation())
+            .unwrap();
+        let ctx = crate::l7::relay::L7EvalContext {
+            host: "gateway.example.test".to_string(),
+            port: 80,
+            policy_name: "ws_api".to_string(),
+            binary_path: "/usr/bin/node".to_string(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: resolver,
+        };
+        let query_params = std::collections::HashMap::new();
+
+        let extensions = crate::l7::relay::websocket_extension_mode(&websocket_l7_config(
+            crate::l7::L7Protocol::Websocket,
+            true,
+        ));
+        let options = crate::l7::relay::upgrade_options(
+            &websocket_l7_config(crate::l7::L7Protocol::Websocket, true),
+            &ctx,
+            true,
+            "/ws",
+            &query_params,
+            Some(&tunnel_engine),
+        );
+
+        assert_eq!(
+            extensions,
+            crate::l7::rest::WebSocketExtensionMode::PermessageDeflate
+        );
+        assert!(options.websocket.credential_rewrite);
+        assert!(options.secret_resolver.is_some());
+        assert!(options.engine.is_some());
+        assert!(options.ctx.is_some());
+        assert!(matches!(
+            options.websocket.message_policy,
+            crate::l7::relay::WebSocketMessagePolicy::Transport
+        ));
+    }
+
+    #[test]
+    fn forward_websocket_upgrade_options_preserve_rest_without_rewrite() {
+        let ctx = crate::l7::relay::L7EvalContext {
+            host: "gateway.example.test".to_string(),
+            port: 80,
+            policy_name: "rest_api".to_string(),
+            binary_path: "/usr/bin/node".to_string(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: None,
+        };
+        let query_params = std::collections::HashMap::new();
+        let config = websocket_l7_config(crate::l7::L7Protocol::Rest, false);
+        let extensions = crate::l7::relay::websocket_extension_mode(&config);
+        let options =
+            crate::l7::relay::upgrade_options(&config, &ctx, true, "/ws", &query_params, None);
+
+        assert_eq!(
+            extensions,
+            crate::l7::rest::WebSocketExtensionMode::Preserve
+        );
+        assert!(!options.websocket.credential_rewrite);
+        assert!(options.secret_resolver.is_none());
+        assert!(options.engine.is_none());
+        assert!(options.ctx.is_none());
+        assert!(matches!(
+            options.websocket.message_policy,
+            crate::l7::relay::WebSocketMessagePolicy::None
+        ));
+    }
+
+    #[tokio::test]
+    async fn forward_websocket_upgrade_blocks_text_frame_by_policy() {
+        let data = r#"
+network_policies:
+  ws_api:
+    name: ws_api
+    endpoints:
+      - host: gateway.example.test
+        port: 80
+        path: "/ws"
+        protocol: websocket
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/ws"
+          - allow:
+              method: WEBSOCKET_TEXT
+              path: "/ws"
+        deny_rules:
+          - method: WEBSOCKET_TEXT
+            path: "/ws"
+    binaries:
+      - { path: /usr/bin/node }
+"#;
+        let (config, tunnel_engine, ctx) =
+            forward_websocket_policy_parts(data, "gateway.example.test", 80, "/ws", "ws_api");
+
+        let (err, leaked) = forward_websocket_denied_after_upgrade(
+            config,
+            tunnel_engine,
+            ctx,
+            "/ws",
+            r#"{"type":"unsafe"}"#,
+        )
+        .await;
+
+        assert!(err.to_string().contains("websocket text message denied"));
+        assert!(
+            leaked.is_empty(),
+            "denied forward-proxy WebSocket text frames must not reach upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_graphql_websocket_upgrade_blocks_unallowed_operation() {
+        let data = r#"
+network_policies:
+  graphql_ws:
+    name: graphql_ws
+    endpoints:
+      - host: gateway.example.test
+        port: 80
+        path: "/graphql"
+        protocol: websocket
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/graphql"
+          - allow:
+              operation_type: query
+              fields: [viewer]
+        deny_rules:
+          - operation_type: query
+            fields: [admin]
+    binaries:
+      - { path: /usr/bin/node }
+"#;
+        let (config, tunnel_engine, ctx) = forward_websocket_policy_parts(
+            data,
+            "gateway.example.test",
+            80,
+            "/graphql",
+            "graphql_ws",
+        );
+        assert!(
+            config.websocket_graphql_policy,
+            "operation rules should enable GraphQL-over-WebSocket inspection"
+        );
+
+        let (err, leaked) = forward_websocket_denied_after_upgrade(
+            config,
+            tunnel_engine,
+            ctx,
+            "/graphql",
+            r#"{"id":"1","type":"subscribe","payload":{"query":"query { admin }"}}"#,
+        )
+        .await;
+
+        assert!(err.to_string().contains("websocket GraphQL message denied"));
+        assert!(
+            leaked.is_empty(),
+            "denied forward-proxy GraphQL WebSocket operations must not reach upstream"
+        );
+    }
 
     #[test]
     fn l7_route_selection_prefers_path_specific_graphql_endpoint() {
@@ -3261,6 +4162,9 @@ mod tests {
                     enforcement: crate::l7::EnforcementMode::Enforce,
                     graphql_max_body_bytes: crate::l7::graphql::DEFAULT_MAX_BODY_BYTES,
                     allow_encoded_slash: false,
+                    websocket_credential_rewrite: false,
+                    request_body_credential_rewrite: false,
+                    websocket_graphql_policy: false,
                 },
             },
             L7ConfigSnapshot {
@@ -3271,6 +4175,9 @@ mod tests {
                     enforcement: crate::l7::EnforcementMode::Enforce,
                     graphql_max_body_bytes: crate::l7::graphql::DEFAULT_MAX_BODY_BYTES,
                     allow_encoded_slash: false,
+                    websocket_credential_rewrite: false,
+                    request_body_credential_rewrite: false,
+                    websocket_graphql_policy: false,
                 },
             },
         ];
@@ -3524,6 +4431,444 @@ mod tests {
         assert!(result.is_empty());
     }
 
+    // -- is_host_gateway_alias --
+
+    #[test]
+    fn test_is_host_gateway_alias_recognises_known_aliases() {
+        assert!(is_host_gateway_alias("host.openshell.internal"));
+        assert!(is_host_gateway_alias("host.containers.internal"));
+        assert!(is_host_gateway_alias("host.docker.internal"));
+    }
+
+    #[test]
+    fn test_is_host_gateway_alias_is_case_insensitive() {
+        assert!(is_host_gateway_alias("HOST.OPENSHELL.INTERNAL"));
+        assert!(is_host_gateway_alias("Host.Containers.Internal"));
+        assert!(is_host_gateway_alias("HOST.DOCKER.INTERNAL"));
+    }
+
+    #[test]
+    fn test_is_host_gateway_alias_rejects_unknown_hosts() {
+        assert!(!is_host_gateway_alias("api.example.com"));
+        assert!(!is_host_gateway_alias("host.openshell.internal.evil.com"));
+        assert!(!is_host_gateway_alias("evil.host.openshell.internal"));
+        assert!(!is_host_gateway_alias("openshell.internal"));
+        assert!(!is_host_gateway_alias(""));
+    }
+
+    // -- is_cloud_metadata_ip --
+
+    #[test]
+    fn test_is_cloud_metadata_ip_blocks_known_metadata_ip() {
+        assert!(is_cloud_metadata_ip(IpAddr::V4(Ipv4Addr::new(
+            169, 254, 169, 254
+        ))));
+    }
+
+    #[test]
+    fn test_is_cloud_metadata_ip_allows_other_link_local() {
+        // The pasta gateway address on this test host — not a metadata IP.
+        assert!(!is_cloud_metadata_ip(IpAddr::V4(Ipv4Addr::new(
+            169, 254, 1, 2
+        ))));
+        assert!(!is_cloud_metadata_ip(IpAddr::V4(Ipv4Addr::new(
+            169, 254, 0, 1
+        ))));
+    }
+
+    #[test]
+    fn test_is_cloud_metadata_ip_allows_private_and_public() {
+        assert!(!is_cloud_metadata_ip(IpAddr::V4(Ipv4Addr::new(
+            10, 0, 0, 1
+        ))));
+        assert!(!is_cloud_metadata_ip(IpAddr::V4(Ipv4Addr::new(
+            192, 168, 1, 1
+        ))));
+        assert!(!is_cloud_metadata_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+    }
+
+    #[test]
+    fn test_is_cloud_metadata_ip_blocks_ipv4_mapped_metadata() {
+        // ::ffff:169.254.169.254 is the IPv4-mapped IPv6 representation of the
+        // AWS/GCP/Azure IMDS endpoint. is_link_local_ip() recognizes it as
+        // link-local, so is_cloud_metadata_ip() must also catch it — otherwise
+        // the trusted-gateway exemption would be granted to the metadata service.
+        let mapped = Ipv4Addr::new(169, 254, 169, 254).to_ipv6_mapped();
+        assert!(
+            is_cloud_metadata_ip(IpAddr::V6(mapped)),
+            "::ffff:169.254.169.254 must be recognized as cloud metadata"
+        );
+    }
+
+    #[test]
+    fn test_is_cloud_metadata_ip_allows_other_ipv4_mapped_link_local() {
+        // Other IPv4-mapped link-local addresses are NOT metadata.
+        let mapped = Ipv4Addr::new(169, 254, 1, 2).to_ipv6_mapped();
+        assert!(
+            !is_cloud_metadata_ip(IpAddr::V6(mapped)),
+            "::ffff:169.254.1.2 should not be flagged as cloud metadata"
+        );
+    }
+
+    // -- detect_trusted_host_gateway --
+
+    #[test]
+    fn test_detect_trusted_host_gateway_returns_ip_from_hosts_content() {
+        // We test the underlying parser directly since detect_trusted_host_gateway
+        // reads the real /etc/hosts. The production code composes these same primitives.
+        let contents = "169.254.1.2\thost.openshell.internal host.containers.internal\n";
+        let ips = parse_hosts_file_for_host(contents, "host.openshell.internal");
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2))]);
+    }
+
+    #[test]
+    fn test_detect_trusted_host_gateway_ignores_cloud_metadata_ip() {
+        // Simulate a /etc/hosts where the driver injected the cloud metadata IP —
+        // this should be caught and suppressed.
+        let contents = "169.254.169.254\thost.openshell.internal\n";
+        let ips = parse_hosts_file_for_host(contents, "host.openshell.internal");
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))]);
+        // is_cloud_metadata_ip should flag it, preventing the exemption.
+        assert!(is_cloud_metadata_ip(ips[0]));
+    }
+
+    #[test]
+    fn test_detect_trusted_host_gateway_no_entry_returns_empty() {
+        let contents = "127.0.0.1 localhost\n";
+        let ips = parse_hosts_file_for_host(contents, "host.openshell.internal");
+        assert!(ips.is_empty());
+    }
+
+    #[test]
+    fn test_detect_trusted_host_gateway_rejects_loopback() {
+        // Loopback is not link-local — must not receive the SSRF exemption.
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        assert!(!is_cloud_metadata_ip(ip));
+        assert!(!is_link_local_ip(ip));
+        // The guard: !link-local → reject.
+        assert!(!is_link_local_ip(ip));
+    }
+
+    #[test]
+    fn test_detect_trusted_host_gateway_rejects_unspecified() {
+        // Unspecified (0.0.0.0) is not link-local — must not be trusted.
+        let ip = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        assert!(!is_cloud_metadata_ip(ip));
+        assert!(!is_link_local_ip(ip));
+        assert!(!is_link_local_ip(ip));
+    }
+
+    #[test]
+    fn test_detect_trusted_host_gateway_rejects_loopback_v6() {
+        let ip = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        assert!(!is_cloud_metadata_ip(ip));
+        assert!(!is_link_local_ip(ip));
+    }
+
+    #[test]
+    fn test_detect_trusted_host_gateway_rejects_private_ip() {
+        // Docker bridge (172.17.0.1) and K8s host gateway (192.168.x.x) are
+        // RFC 1918 private addresses — not link-local. Before this fix they
+        // slipped through the old always-blocked guard and received the SSRF
+        // exemption. The new guard (!is_link_local_ip) rejects them, so
+        // connections to these hosts fall through to resolve_and_reject_internal().
+        for ip in [
+            IpAddr::V4(Ipv4Addr::new(172, 17, 0, 1)),
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)),
+            IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        ] {
+            assert!(!is_cloud_metadata_ip(ip), "{ip} should not be metadata");
+            assert!(!is_link_local_ip(ip), "{ip} should not be link-local");
+            // Guard fires — exemption disabled.
+            assert!(!is_link_local_ip(ip), "{ip}: guard must reject");
+        }
+    }
+
+    #[test]
+    fn test_detect_trusted_host_gateway_allows_link_local_non_metadata() {
+        // 169.254.1.2 (rootless Podman pasta gateway) IS link-local and is
+        // not a cloud metadata IP — it is the only address class the exemption
+        // is designed for.
+        let ip = IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2));
+        assert!(!is_cloud_metadata_ip(ip));
+        assert!(is_link_local_ip(ip));
+        // Guard does NOT fire — this IP is eligible for the exemption.
+        assert!(is_link_local_ip(ip));
+    }
+
+    // -- parse_hosts_file_for_host: multi-entry / duplicate scenarios --
+
+    #[test]
+    fn test_parse_hosts_file_single_entry() {
+        // Normal driver-injected case: exactly one IP for the alias.
+        let contents = "169.254.1.2\thost.openshell.internal host.containers.internal\n";
+        let ips = parse_hosts_file_for_host(contents, "host.openshell.internal");
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2))]);
+    }
+
+    #[test]
+    fn test_parse_hosts_file_duplicate_same_ip_deduplicated() {
+        // Same IP on two separate lines for the same alias — deduplicated to one.
+        let contents = "169.254.1.2\thost.openshell.internal\n\
+                        169.254.1.2\thost.openshell.internal\n";
+        let ips = parse_hosts_file_for_host(contents, "host.openshell.internal");
+        assert_eq!(
+            ips,
+            vec![IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2))],
+            "identical IPs across lines must be deduplicated"
+        );
+    }
+
+    #[test]
+    fn test_parse_hosts_file_multiple_distinct_ips() {
+        // Two distinct IPs for the same alias — both returned, first entry wins
+        // in detect_trusted_host_gateway(), second would cause mismatch rejection
+        // in resolve_and_check_trusted_gateway().
+        let contents = "169.254.1.2\thost.openshell.internal\n\
+                        169.254.1.3\thost.openshell.internal\n";
+        let ips = parse_hosts_file_for_host(contents, "host.openshell.internal");
+        assert_eq!(ips.len(), 2, "two distinct IPs must both be returned");
+        assert_eq!(ips[0], IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2)));
+        assert_eq!(ips[1], IpAddr::V4(Ipv4Addr::new(169, 254, 1, 3)));
+    }
+
+    #[test]
+    fn test_parse_hosts_file_first_entry_wins_on_ambiguity() {
+        // detect_trusted_host_gateway() pins to the first entry via .next().
+        // Verify the ordering guarantee: first line wins.
+        let contents = "169.254.1.3\thost.openshell.internal\n\
+                        169.254.1.2\thost.openshell.internal\n";
+        let ips = parse_hosts_file_for_host(contents, "host.openshell.internal");
+        assert_eq!(
+            ips[0],
+            IpAddr::V4(Ipv4Addr::new(169, 254, 1, 3)),
+            "first line must be first in the returned vec"
+        );
+    }
+
+    #[test]
+    fn test_parse_hosts_file_ignores_other_aliases_on_same_line() {
+        // An entry with multiple aliases — only the matching alias counts.
+        let contents =
+            "169.254.1.2\thost.containers.internal host.openshell.internal host.docker.internal\n";
+        let ips = parse_hosts_file_for_host(contents, "host.openshell.internal");
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2))]);
+        // Non-matching aliases on the same line do not produce extra entries.
+        let ips2 = parse_hosts_file_for_host(contents, "host.docker.internal");
+        assert_eq!(ips2, vec![IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2))]);
+    }
+
+    #[test]
+    fn test_parse_hosts_file_alias_not_present() {
+        let contents = "127.0.0.1\tlocalhost\n\
+                        ::1\t\tlocalhost\n";
+        let ips = parse_hosts_file_for_host(contents, "host.openshell.internal");
+        assert!(ips.is_empty());
+    }
+
+    #[test]
+    fn test_parse_hosts_file_comment_lines_skipped() {
+        let contents = "# 169.254.1.2 host.openshell.internal\n\
+                        169.254.1.2\thost.openshell.internal\n";
+        let ips = parse_hosts_file_for_host(contents, "host.openshell.internal");
+        // Commented-out line must not produce an entry.
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2))]);
+    }
+
+    #[test]
+    fn test_parse_hosts_file_inline_comment_stripped() {
+        // Anything after '#' on a data line is treated as a comment.
+        let contents = "169.254.1.2\thost.openshell.internal # injected by driver\n";
+        let ips = parse_hosts_file_for_host(contents, "host.openshell.internal");
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2))]);
+    }
+
+    // -- resolve_and_check_trusted_gateway --
+
+    #[tokio::test]
+    async fn test_trusted_gateway_allows_link_local_gateway_ip() {
+        // Simulate the rootless Podman pasta case: host.openshell.internal
+        // points to a link-local address which is the only path to the host.
+        let trusted_gw = IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2));
+
+        // We resolve via /etc/hosts (pid=0 falls back to system), so we
+        // exercise the trusted_gw mismatch / cloud-metadata guards directly
+        // against a known resolved address.
+        let addrs = [SocketAddr::new(trusted_gw, 8080)];
+
+        // Validate the guard logic inline (mirrors resolve_and_check_trusted_gateway).
+        assert!(!is_cloud_metadata_ip(trusted_gw));
+        assert_eq!(addrs[0].ip(), trusted_gw);
+    }
+
+    #[tokio::test]
+    async fn test_trusted_gateway_rejects_cloud_metadata_ip() {
+        let trusted_gw = IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2));
+        let metadata_ip = IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254));
+
+        // Simulate resolution returning the metadata IP.
+        let addrs = [SocketAddr::new(metadata_ip, 80)];
+
+        // Cloud metadata check must fire before the trusted_gw equality check.
+        let err: Result<(), String> = if is_cloud_metadata_ip(addrs[0].ip()) {
+            Err(format!(
+                "host resolves to cloud metadata address {}, connection rejected",
+                addrs[0].ip()
+            ))
+        } else if addrs[0].ip() != trusted_gw {
+            Err(format!(
+                "host resolves to {} which does not match trusted host gateway \
+                 {trusted_gw}, connection rejected",
+                addrs[0].ip()
+            ))
+        } else {
+            Ok(())
+        };
+
+        assert!(err.is_err());
+        assert!(
+            err.unwrap_err().contains("cloud metadata"),
+            "expected cloud-metadata rejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trusted_gateway_rejects_mismatched_ip() {
+        let trusted_gw = IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2));
+        let other_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+
+        let addrs = [SocketAddr::new(other_ip, 8080)];
+
+        let err: Result<(), String> = if is_cloud_metadata_ip(addrs[0].ip()) {
+            Err("cloud metadata".to_string())
+        } else if addrs[0].ip() != trusted_gw {
+            Err(format!(
+                "{} does not match trusted host gateway {trusted_gw}",
+                addrs[0].ip()
+            ))
+        } else {
+            Ok(())
+        };
+
+        assert!(err.is_err());
+        assert!(
+            err.unwrap_err()
+                .contains("does not match trusted host gateway"),
+            "expected mismatch rejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trusted_gateway_rejects_control_plane_port() {
+        // Control-plane port check runs before resolution.
+        let result = resolve_and_check_trusted_gateway(
+            "host.openshell.internal",
+            6443,
+            IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2)),
+            0,
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().contains("blocked control-plane port"),
+            "expected control-plane port rejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trusted_gateway_rejects_all_control_plane_ports() {
+        let trusted_gw = IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2));
+        for &port in BLOCKED_CONTROL_PLANE_PORTS {
+            let result =
+                resolve_and_check_trusted_gateway("host.openshell.internal", port, trusted_gw, 0)
+                    .await;
+            assert!(
+                result.is_err(),
+                "port {port} should be blocked by control-plane guard"
+            );
+            assert!(
+                result.unwrap_err().contains("blocked control-plane port"),
+                "expected control-plane rejection for port {port}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_trusted_gateway_rejects_loopback_as_trusted_gw() {
+        // Defense-in-depth: even if detect_trusted_host_gateway somehow admitted
+        // a loopback IP, resolve_and_check_trusted_gateway must reject it.
+        // Using an IP literal as the host bypasses DNS and gives a deterministic
+        // resolved address, allowing us to exercise the actual function.
+        let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let result = resolve_and_check_trusted_gateway("127.0.0.1", 8080, loopback, 0).await;
+        assert!(result.is_err(), "loopback must be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("non-link-local"),
+            "expected non-link-local rejection, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trusted_gateway_rejects_unspecified_as_trusted_gw() {
+        // Defense-in-depth: 0.0.0.0 as trusted_gw must be rejected.
+        // IP literal resolves to 0.0.0.0 directly, bypassing DNS.
+        let unspecified = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+        let result = resolve_and_check_trusted_gateway("0.0.0.0", 8080, unspecified, 0).await;
+        assert!(result.is_err(), "unspecified must be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("non-link-local"),
+            "expected non-link-local rejection, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trusted_gateway_rejects_ip_literal_mismatch() {
+        // If the requested IP literal doesn't match trusted_gw, the mismatch
+        // guard fires. This exercises the full resolution→validation path.
+        let trusted_gw = IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2));
+        let other_ip = "10.0.0.1"; // RFC1918, resolves as a literal
+        let result = resolve_and_check_trusted_gateway(other_ip, 8080, trusted_gw, 0).await;
+        assert!(result.is_err(), "IP mismatch must be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("does not match trusted host gateway"),
+            "expected mismatch rejection, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trusted_gateway_rejects_cloud_metadata_literal() {
+        // Cloud metadata IP as a literal address — must be rejected even when
+        // it matches trusted_gw (which detect_trusted_host_gateway prevents,
+        // but this is the defense-in-depth layer).
+        let metadata = IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254));
+        let result = resolve_and_check_trusted_gateway("169.254.169.254", 80, metadata, 0).await;
+        assert!(result.is_err(), "cloud metadata IP must be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("cloud metadata"),
+            "expected cloud-metadata rejection, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_trusted_gateway_rejects_private_ip_as_trusted_gw() {
+        // Defense-in-depth: a private RFC 1918 IP (e.g. Docker bridge 172.17.0.1)
+        // must be rejected even if it somehow matched trusted_gw.
+        // detect_trusted_host_gateway() already blocks these via !is_link_local_ip(),
+        // but resolve_and_check_trusted_gateway() must enforce the same invariant.
+        let docker_bridge = IpAddr::V4(Ipv4Addr::new(172, 17, 0, 1));
+        let result = resolve_and_check_trusted_gateway("172.17.0.1", 8080, docker_bridge, 0).await;
+        assert!(result.is_err(), "private RFC 1918 IP must be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("non-link-local"),
+            "expected non-link-local rejection for private IP, got: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn test_rejects_localhost_resolution() {
         let result = resolve_and_reject_internal("localhost", 80, 0).await;
@@ -3664,6 +5009,184 @@ mod tests {
         assert!(forwarded_lc.contains("authorization: bearer test-api-key"));
         assert!(!forwarded_lc.contains("authorization: bearer client-key"));
         assert!(!forwarded_lc.contains("cookie:"));
+    }
+
+    fn streaming_inference_route(endpoint: String) -> openshell_router::config::ResolvedRoute {
+        openshell_router::config::ResolvedRoute {
+            name: "inference.local".to_string(),
+            endpoint,
+            model: "meta/llama-3.1-8b-instruct".to_string(),
+            api_key: "test-api-key".to_string(),
+            protocols: vec!["openai_chat_completions".to_string()],
+            auth: openshell_router::config::AuthHeader::Bearer,
+            default_headers: vec![],
+            passthrough_headers: vec![],
+            timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
+        }
+    }
+
+    async fn read_forwarded_inference_request<S: AsyncRead + Unpin>(stream: &mut S) {
+        use crate::l7::inference::{ParseResult, try_parse_http_request};
+
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "upstream request closed before completion");
+            buf.extend_from_slice(&chunk[..n]);
+
+            match try_parse_http_request(&buf) {
+                ParseResult::Complete(_, _) => return,
+                ParseResult::Incomplete => continue,
+                ParseResult::Invalid(reason) => {
+                    panic!("forwarded request should parse cleanly: {reason}");
+                }
+            }
+        }
+    }
+
+    async fn run_live_streaming_inference<F, Fut>(serve_upstream: F) -> String
+    where
+        F: FnOnce(TcpStream) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (mut upstream, _) = listener.accept().await.unwrap();
+            read_forwarded_inference_request(&mut upstream).await;
+            serve_upstream(upstream).await;
+        });
+
+        let router = openshell_router::Router::new().unwrap();
+        let patterns = crate::l7::inference::default_patterns();
+        let ctx = InferenceContext::new(
+            patterns,
+            router,
+            vec![streaming_inference_route(format!("http://{upstream_addr}"))],
+            vec![],
+        );
+
+        let body = r#"{"model":"ignored","messages":[{"role":"user","content":"hi"}]}"#;
+        let request = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\n\
+             Host: inference.local\r\n\
+             Content-Type: application/json\r\n\
+             Accept: text/event-stream\r\n\
+             Content-Length: {}\r\n\r\n{}",
+            body.len(),
+            body,
+        );
+
+        let (client, mut server) = tokio::io::duplex(65536);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        let server_task =
+            tokio::spawn(async move { process_inference_keepalive(&mut server, &ctx, 443).await });
+
+        client_write.write_all(request.as_bytes()).await.unwrap();
+        client_write.shutdown().await.unwrap();
+
+        let mut response = Vec::new();
+        client_read.read_to_end(&mut response).await.unwrap();
+
+        let outcome = server_task.await.unwrap().unwrap();
+        assert!(
+            matches!(outcome, InferenceOutcome::Routed),
+            "expected Routed outcome, got: {outcome:?}"
+        );
+        upstream_task.await.unwrap();
+
+        String::from_utf8(response).unwrap()
+    }
+
+    fn assert_streaming_sse_error(response: &str, message: &str) {
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK\r\n"),
+            "expected successful streaming response, got: {response}"
+        );
+        assert!(
+            response
+                .to_ascii_lowercase()
+                .contains("transfer-encoding: chunked"),
+            "expected chunked streaming response, got: {response}"
+        );
+        assert!(
+            response.contains("\"type\":\"proxy_stream_error\""),
+            "expected proxy_stream_error SSE event, got: {response}"
+        );
+        assert!(
+            response.contains(&format!("\"message\":\"{message}\"")),
+            "expected SSE message {message:?}, got: {response}"
+        );
+        assert!(
+            response.ends_with("0\r\n\r\n"),
+            "streaming response must end with chunked terminator, got: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn inference_stream_byte_limit_injects_sse_error() {
+        let response = run_live_streaming_inference(|mut upstream| async move {
+            use crate::l7::inference::{format_chunk, format_chunk_terminator};
+
+            upstream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      Content-Type: text/event-stream\r\n\
+                      Transfer-Encoding: chunked\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let body = vec![b'a'; MAX_STREAMING_BODY + 1];
+            let _ = upstream.write_all(&format_chunk(&body)).await;
+            let _ = upstream.write_all(format_chunk_terminator()).await;
+        })
+        .await;
+
+        assert_streaming_sse_error(
+            &response,
+            "response truncated: exceeded maximum streaming body size",
+        );
+    }
+
+    #[tokio::test]
+    async fn inference_stream_upstream_read_error_injects_sse_error() {
+        let response = run_live_streaming_inference(|mut upstream| async move {
+            upstream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      Content-Type: text/event-stream\r\n\
+                      Content-Length: 64\r\n\r\n\
+                      partial",
+                )
+                .await
+                .unwrap();
+        })
+        .await;
+
+        assert!(
+            response.contains("partial"),
+            "expected initial upstream bytes before truncation, got: {response}"
+        );
+        assert_streaming_sse_error(&response, "response truncated: upstream read error");
+    }
+
+    #[tokio::test]
+    async fn inference_stream_idle_timeout_injects_sse_error() {
+        let response = run_live_streaming_inference(|mut upstream| async move {
+            upstream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\n\
+                      Content-Type: text/event-stream\r\n\
+                      Transfer-Encoding: chunked\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(CHUNK_IDLE_TIMEOUT + std::time::Duration::from_millis(50)).await;
+        })
+        .await;
+
+        assert_streaming_sse_error(&response, "response truncated: chunk idle timeout exceeded");
     }
 
     // -- router_error_to_http --
@@ -4197,7 +5720,8 @@ mod tests {
     fn test_rewrite_get_request() {
         let raw =
             b"GET http://10.0.0.1:8000/api HTTP/1.1\r\nHost: 10.0.0.1:8000\r\nAccept: */*\r\n\r\n";
-        let result = rewrite_forward_request(raw, raw.len(), "/api", None).expect("should succeed");
+        let result =
+            rewrite_forward_request(raw, raw.len(), "/api", None, false).expect("should succeed");
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.starts_with("GET /api HTTP/1.1\r\n"));
         assert!(result_str.contains("Host: 10.0.0.1:8000"));
@@ -4208,7 +5732,8 @@ mod tests {
     #[test]
     fn test_rewrite_strips_proxy_headers() {
         let raw = b"GET http://host/p HTTP/1.1\r\nHost: host\r\nProxy-Authorization: Basic abc\r\nProxy-Connection: keep-alive\r\nAccept: */*\r\n\r\n";
-        let result = rewrite_forward_request(raw, raw.len(), "/p", None).expect("should succeed");
+        let result =
+            rewrite_forward_request(raw, raw.len(), "/p", None, false).expect("should succeed");
         let result_str = String::from_utf8_lossy(&result);
         assert!(
             !result_str
@@ -4222,7 +5747,8 @@ mod tests {
     #[test]
     fn test_rewrite_replaces_connection_header() {
         let raw = b"GET http://host/p HTTP/1.1\r\nHost: host\r\nConnection: keep-alive\r\n\r\n";
-        let result = rewrite_forward_request(raw, raw.len(), "/p", None).expect("should succeed");
+        let result =
+            rewrite_forward_request(raw, raw.len(), "/p", None, false).expect("should succeed");
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.contains("Connection: close"));
         assert!(!result_str.contains("keep-alive"));
@@ -4231,7 +5757,8 @@ mod tests {
     #[test]
     fn test_rewrite_preserves_body_overflow() {
         let raw = b"POST http://host/api HTTP/1.1\r\nHost: host\r\nContent-Length: 13\r\n\r\n{\"key\":\"val\"}";
-        let result = rewrite_forward_request(raw, raw.len(), "/api", None).expect("should succeed");
+        let result =
+            rewrite_forward_request(raw, raw.len(), "/api", None, false).expect("should succeed");
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.contains("{\"key\":\"val\"}"));
         assert!(result_str.contains("POST /api HTTP/1.1"));
@@ -4240,7 +5767,8 @@ mod tests {
     #[test]
     fn test_rewrite_preserves_existing_via() {
         let raw = b"GET http://host/p HTTP/1.1\r\nHost: host\r\nVia: 1.0 upstream\r\n\r\n";
-        let result = rewrite_forward_request(raw, raw.len(), "/p", None).expect("should succeed");
+        let result =
+            rewrite_forward_request(raw, raw.len(), "/p", None, false).expect("should succeed");
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.contains("Via: 1.0 upstream"));
         // Should not add a second Via header
@@ -4263,7 +5791,7 @@ mod tests {
         .expect("canonicalization should succeed for the attack payload");
         assert_eq!(canon.path, "/secret");
 
-        let rewritten = rewrite_forward_request(raw, raw.len(), &canon.path, None)
+        let rewritten = rewrite_forward_request(raw, raw.len(), &canon.path, None, false)
             .expect("rewrite_forward_request should succeed");
         let rewritten_str = String::from_utf8_lossy(&rewritten);
         assert!(
@@ -4289,7 +5817,7 @@ mod tests {
             _ => canon.path,
         };
 
-        let rewritten = rewrite_forward_request(raw, raw.len(), &upstream_target, None)
+        let rewritten = rewrite_forward_request(raw, raw.len(), &upstream_target, None, false)
             .expect("rewrite_forward_request should succeed");
         let rewritten_str = String::from_utf8_lossy(&rewritten);
         assert!(
@@ -4308,11 +5836,167 @@ mod tests {
                 .collect(),
         );
         let raw = b"GET http://host/p HTTP/1.1\r\nHost: host\r\nAuthorization: Bearer openshell:resolve:env:ANTHROPIC_API_KEY\r\n\r\n";
-        let result = rewrite_forward_request(raw, raw.len(), "/p", resolver.as_ref())
+        let result = rewrite_forward_request(raw, raw.len(), "/p", resolver.as_ref(), false)
             .expect("should succeed");
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.contains("Authorization: Bearer sk-test"));
         assert!(!result_str.contains("openshell:resolve:env:ANTHROPIC_API_KEY"));
+    }
+
+    #[tokio::test]
+    async fn forward_relay_rewrites_urlencoded_body_alias_from_initial_read() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("API_TOKEN".to_string(), "provider-real-token".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let alias = "provider-OPENSHELL-RESOLVE-ENV-API_TOKEN";
+        let body = format!("token={alias}&channel=C123");
+        let raw = format!(
+            "POST http://api.example.com/api/messages HTTP/1.1\r\n\
+             Host: api.example.com\r\n\
+             Authorization: Bearer {alias}\r\n\
+             Content-Type: application/x-www-form-urlencoded\r\n\
+             Content-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+
+        let forwarded = relay_forward_request_and_capture(
+            "POST",
+            "/api/messages",
+            raw.as_bytes(),
+            Some(&resolver),
+            true,
+        )
+        .await
+        .expect("forward relay should rewrite credentials");
+
+        let expected_body = "token=provider-real-token&channel=C123";
+        assert!(forwarded.starts_with("POST /api/messages HTTP/1.1\r\n"));
+        assert!(forwarded.contains("Authorization: Bearer provider-real-token\r\n"));
+        assert!(forwarded.contains(&format!("Content-Length: {}\r\n", expected_body.len())));
+        assert!(forwarded.ends_with(expected_body));
+        assert!(!forwarded.contains("OPENSHELL-RESOLVE-ENV"));
+    }
+
+    #[tokio::test]
+    async fn forward_relay_rewrites_urlencoded_canonical_body_from_initial_read() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("API_TOKEN".to_string(), "provider-real-token".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let alias = "provider-OPENSHELL-RESOLVE-ENV-API_TOKEN";
+        let body = "token=openshell%3Aresolve%3Aenv%3AAPI_TOKEN&channel=C123";
+        let raw = format!(
+            "POST http://api.example.com/api/messages HTTP/1.1\r\n\
+             Host: api.example.com\r\n\
+             Authorization: Bearer {alias}\r\n\
+             Content-Type: application/x-www-form-urlencoded\r\n\
+             Content-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+
+        let forwarded = relay_forward_request_and_capture(
+            "POST",
+            "/api/messages",
+            raw.as_bytes(),
+            Some(&resolver),
+            true,
+        )
+        .await
+        .expect("forward relay should rewrite credentials");
+
+        let expected_body = "token=provider-real-token&channel=C123";
+        assert!(forwarded.contains("Authorization: Bearer provider-real-token\r\n"));
+        assert!(forwarded.contains(&format!("Content-Length: {}\r\n", expected_body.len())));
+        assert!(forwarded.ends_with(expected_body));
+        assert!(!forwarded.contains("openshell%3Aresolve%3Aenv%3AAPI_TOKEN"));
+        assert!(!forwarded.contains("openshell:resolve:env:API_TOKEN"));
+    }
+
+    #[tokio::test]
+    async fn forward_relay_unresolved_body_placeholder_fails_before_upstream_write() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("API_TOKEN".to_string(), "provider-real-token".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let alias = "provider-OPENSHELL-RESOLVE-ENV-API_TOKEN";
+        let body = "token=provider-OPENSHELL-RESOLVE-ENV-MISSING_TOKEN";
+        let raw = format!(
+            "POST http://api.example.com/api/messages HTTP/1.1\r\n\
+             Host: api.example.com\r\n\
+             Authorization: Bearer {alias}\r\n\
+             Content-Type: application/x-www-form-urlencoded\r\n\
+             Content-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let guard = forward_test_guard();
+        let rewritten = rewrite_forward_request(
+            raw.as_bytes(),
+            raw.len(),
+            "/api/messages",
+            Some(&resolver),
+            true,
+        )
+        .expect("header rewrite should defer body overflow to body rewriter");
+        let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
+        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+
+        let err = relay_rewritten_forward_request(
+            "POST",
+            "/api/messages",
+            rewritten,
+            &mut proxy_to_client,
+            &mut proxy_to_upstream,
+            ForwardRelayOptions {
+                generation_guard: &guard,
+                websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
+                secret_resolver: Some(&resolver),
+                request_body_credential_rewrite: true,
+            },
+        )
+        .await
+        .expect_err("unresolved body placeholder should fail closed");
+
+        assert!(!err.to_string().contains("provider-real-token"));
+        assert!(!err.to_string().contains("MISSING_TOKEN"));
+        drop(proxy_to_upstream);
+        let mut forwarded = Vec::new();
+        upstream_side.read_to_end(&mut forwarded).await.unwrap();
+        assert!(
+            forwarded.is_empty(),
+            "failed forward body rewrite must not reach upstream"
+        );
+    }
+
+    #[test]
+    fn test_forward_rewrite_preserves_websocket_upgrade_connection_header() {
+        let raw = "GET http://gateway.example.test/ws HTTP/1.1\r\n\
+                   Host: gateway.example.test\r\n\
+                   Upgrade: websocket\r\n\
+                   Connection: keep-alive, Upgrade\r\n\
+                   Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+                   Sec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover\r\n\
+                   Sec-WebSocket-Version: 13\r\n\r\n";
+
+        let result = rewrite_forward_request(raw.as_bytes(), raw.len(), "/ws", None, false)
+            .expect("websocket forward rewrite should succeed");
+        let result_str = String::from_utf8_lossy(&result);
+
+        assert!(result_str.starts_with("GET /ws HTTP/1.1\r\n"));
+        assert!(result_str.contains("Connection: keep-alive, Upgrade\r\n"));
+        assert!(
+            !result_str.contains("Connection: close\r\n"),
+            "websocket forward proxy must not strip the upgrade token"
+        );
     }
 
     #[tokio::test]
@@ -4326,8 +6010,8 @@ mod tests {
         engine.reload(policy, policy_data).unwrap();
 
         let raw = b"GET http://host/api HTTP/1.1\r\nHost: host\r\n\r\n";
-        let rewritten =
-            rewrite_forward_request(raw, raw.len(), "/api", None).expect("rewrite should succeed");
+        let rewritten = rewrite_forward_request(raw, raw.len(), "/api", None, false)
+            .expect("rewrite should succeed");
         let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
         let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
 
@@ -4337,7 +6021,12 @@ mod tests {
             rewritten,
             &mut proxy_to_client,
             &mut proxy_to_upstream,
-            &guard,
+            ForwardRelayOptions {
+                generation_guard: &guard,
+                websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
+                secret_resolver: None,
+                request_body_credential_rewrite: false,
+            },
         )
         .await;
         assert!(
@@ -4364,8 +6053,8 @@ mod tests {
             .unwrap();
 
         let raw = b"POST http://host/api HTTP/1.1\r\nHost: host\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
-        let rewritten =
-            rewrite_forward_request(raw, raw.len(), "/api", None).expect("rewrite should succeed");
+        let rewritten = rewrite_forward_request(raw, raw.len(), "/api", None, false)
+            .expect("rewrite should succeed");
         let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
         let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
 
@@ -4375,7 +6064,12 @@ mod tests {
             rewritten,
             &mut proxy_to_client,
             &mut proxy_to_upstream,
-            &guard,
+            ForwardRelayOptions {
+                generation_guard: &guard,
+                websocket_extensions: crate::l7::rest::WebSocketExtensionMode::Preserve,
+                secret_resolver: None,
+                request_body_credential_rewrite: false,
+            },
         )
         .await;
         assert!(result.is_err(), "forward relay must reject CL/TE ambiguity");

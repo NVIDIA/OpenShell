@@ -12,457 +12,38 @@
 //!
 //! Test matrix:
 //!
-//! | `allow_unauthenticated` | client cert | bearer auth header | expected |
-//! |-----------------------|-------------|--------------------|----------|
-//! | false                 | valid       | —                  | OK       |
-//! | false                 | none        | —                  | rejected |
-//! | true                  | valid       | —                  | OK       |
-//! | true                  | none        | present            | OK (*)   |
-//! | true                  | none        | absent             | OK (**)  |
+//! | `client_ca` | client cert  | bearer header | expected                  |
+//! |-------------|-------------|---------------|---------------------------|
+//! | Some        | valid       | —             | OK (cert validated)       |
+//! | Some        | none        | —             | OK (cert optional)        |
+//! | Some        | none        | present       | OK (bearer auth)          |
+//! | Some        | rogue CA    | —             | rejected (bad cert)       |
+//! | None        | none        | —             | OK (HTTPS-only)           |
 //!
-//! (*) Simulates the edge tunnel path: no client cert but a JWT header.
-//! (**) TLS handshake succeeds, but in production the auth middleware (not yet
-//!      implemented) would reject.  This test proves the TLS layer alone does
-//!      not block unauthenticated connections when the flag is set.
+//! Client certificates are always optional when a CA is configured.  They are
+//! validated when present (rogue-CA certs are rejected) but never required.
+//! Authentication is handled at the application layer (OIDC bearer tokens).
+
+mod common;
 
 use bytes::Bytes;
+use common::{PkiBundle, generate_pki, install_rustls_provider, start_test_server};
 use http_body_util::Empty;
 use hyper::{Request, StatusCode};
 use hyper_rustls::HttpsConnectorBuilder;
-use hyper_util::{
-    client::legacy::Client,
-    rt::{TokioExecutor, TokioIo},
-    server::conn::auto::Builder,
-};
-use openshell_core::proto::{
-    CreateProviderRequest, CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse,
-    DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    ExecSandboxEvent, ExecSandboxRequest, GatewayMessage, GetGatewayConfigRequest,
-    GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
-    GetSandboxConfigResponse, GetSandboxProviderEnvironmentRequest,
-    GetSandboxProviderEnvironmentResponse, GetSandboxRequest, HealthRequest, HealthResponse,
-    ListProvidersRequest, ListProvidersResponse, ListSandboxesRequest, ListSandboxesResponse,
-    ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResponse,
-    SandboxStreamEvent, ServiceStatus, SupervisorMessage, UpdateProviderRequest,
-    WatchSandboxRequest,
-    open_shell_client::OpenShellClient,
-    open_shell_server::{OpenShell, OpenShellServer},
-};
-use openshell_server::{MultiplexedService, TlsAcceptor, health_router};
+use hyper_util::{client::legacy::Client, rt::TokioExecutor};
+use openshell_core::proto::{HealthRequest, ServiceStatus, open_shell_client::OpenShellClient};
+use openshell_server::TlsAcceptor;
 use rcgen::{CertificateParams, IsCa, KeyPair};
 use rustls::RootCertStore;
 use rustls::pki_types::CertificateDer;
 use rustls_pemfile::certs;
-use std::io::Write;
-use tempfile::tempdir;
-use tokio::net::TcpListener;
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
+use tonic::Status;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
-use tonic::{Response, Status};
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Client helpers
 // ---------------------------------------------------------------------------
-
-fn install_rustls_provider() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-}
-
-/// Minimal `OpenShell` implementation for testing.
-#[derive(Clone, Default)]
-struct TestOpenShell;
-
-#[tonic::async_trait]
-impl OpenShell for TestOpenShell {
-    async fn health(
-        &self,
-        _request: tonic::Request<HealthRequest>,
-    ) -> Result<Response<HealthResponse>, Status> {
-        Ok(Response::new(HealthResponse {
-            status: ServiceStatus::Healthy.into(),
-            version: "test".to_string(),
-        }))
-    }
-
-    async fn create_sandbox(
-        &self,
-        _request: tonic::Request<CreateSandboxRequest>,
-    ) -> Result<Response<SandboxResponse>, Status> {
-        Ok(Response::new(SandboxResponse::default()))
-    }
-
-    async fn get_sandbox(
-        &self,
-        _request: tonic::Request<GetSandboxRequest>,
-    ) -> Result<Response<SandboxResponse>, Status> {
-        Ok(Response::new(SandboxResponse::default()))
-    }
-
-    async fn list_sandboxes(
-        &self,
-        _request: tonic::Request<ListSandboxesRequest>,
-    ) -> Result<Response<ListSandboxesResponse>, Status> {
-        Ok(Response::new(ListSandboxesResponse::default()))
-    }
-
-    async fn delete_sandbox(
-        &self,
-        _request: tonic::Request<DeleteSandboxRequest>,
-    ) -> Result<Response<DeleteSandboxResponse>, Status> {
-        Ok(Response::new(DeleteSandboxResponse { deleted: true }))
-    }
-
-    async fn get_sandbox_config(
-        &self,
-        _request: tonic::Request<GetSandboxConfigRequest>,
-    ) -> Result<Response<GetSandboxConfigResponse>, Status> {
-        Ok(Response::new(GetSandboxConfigResponse::default()))
-    }
-
-    async fn get_gateway_config(
-        &self,
-        _request: tonic::Request<GetGatewayConfigRequest>,
-    ) -> Result<Response<GetGatewayConfigResponse>, Status> {
-        Ok(Response::new(GetGatewayConfigResponse::default()))
-    }
-
-    async fn get_sandbox_provider_environment(
-        &self,
-        _request: tonic::Request<GetSandboxProviderEnvironmentRequest>,
-    ) -> Result<Response<GetSandboxProviderEnvironmentResponse>, Status> {
-        Ok(Response::new(
-            GetSandboxProviderEnvironmentResponse::default(),
-        ))
-    }
-
-    async fn create_ssh_session(
-        &self,
-        _request: tonic::Request<CreateSshSessionRequest>,
-    ) -> Result<Response<CreateSshSessionResponse>, Status> {
-        Ok(Response::new(CreateSshSessionResponse::default()))
-    }
-
-    async fn revoke_ssh_session(
-        &self,
-        _request: tonic::Request<RevokeSshSessionRequest>,
-    ) -> Result<Response<RevokeSshSessionResponse>, Status> {
-        Ok(Response::new(RevokeSshSessionResponse::default()))
-    }
-
-    async fn create_provider(
-        &self,
-        _request: tonic::Request<CreateProviderRequest>,
-    ) -> Result<Response<ProviderResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn get_provider(
-        &self,
-        _request: tonic::Request<GetProviderRequest>,
-    ) -> Result<Response<ProviderResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn list_providers(
-        &self,
-        _request: tonic::Request<ListProvidersRequest>,
-    ) -> Result<Response<ListProvidersResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn list_provider_profiles(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ListProviderProfilesRequest>,
-    ) -> Result<Response<openshell_core::proto::ListProviderProfilesResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn get_provider_profile(
-        &self,
-        _request: tonic::Request<openshell_core::proto::GetProviderProfileRequest>,
-    ) -> Result<Response<openshell_core::proto::ProviderProfileResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn import_provider_profiles(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ImportProviderProfilesRequest>,
-    ) -> Result<Response<openshell_core::proto::ImportProviderProfilesResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn lint_provider_profiles(
-        &self,
-        _request: tonic::Request<openshell_core::proto::LintProviderProfilesRequest>,
-    ) -> Result<Response<openshell_core::proto::LintProviderProfilesResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn delete_provider_profile(
-        &self,
-        _request: tonic::Request<openshell_core::proto::DeleteProviderProfileRequest>,
-    ) -> Result<Response<openshell_core::proto::DeleteProviderProfileResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn update_provider(
-        &self,
-        _request: tonic::Request<UpdateProviderRequest>,
-    ) -> Result<Response<ProviderResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn delete_provider(
-        &self,
-        _request: tonic::Request<DeleteProviderRequest>,
-    ) -> Result<Response<DeleteProviderResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    type WatchSandboxStream = ReceiverStream<Result<SandboxStreamEvent, Status>>;
-    type ExecSandboxStream = ReceiverStream<Result<ExecSandboxEvent, Status>>;
-    type ConnectSupervisorStream = ReceiverStream<Result<GatewayMessage, Status>>;
-
-    async fn watch_sandbox(
-        &self,
-        _request: tonic::Request<WatchSandboxRequest>,
-    ) -> Result<Response<Self::WatchSandboxStream>, Status> {
-        let (_tx, rx) = mpsc::channel(1);
-        Ok(Response::new(ReceiverStream::new(rx)))
-    }
-
-    async fn exec_sandbox(
-        &self,
-        _request: tonic::Request<ExecSandboxRequest>,
-    ) -> Result<Response<Self::ExecSandboxStream>, Status> {
-        let (_tx, rx) = mpsc::channel(1);
-        Ok(Response::new(ReceiverStream::new(rx)))
-    }
-
-    async fn update_config(
-        &self,
-        _request: tonic::Request<openshell_core::proto::UpdateConfigRequest>,
-    ) -> Result<Response<openshell_core::proto::UpdateConfigResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn get_sandbox_policy_status(
-        &self,
-        _request: tonic::Request<openshell_core::proto::GetSandboxPolicyStatusRequest>,
-    ) -> Result<Response<openshell_core::proto::GetSandboxPolicyStatusResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn list_sandbox_policies(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ListSandboxPoliciesRequest>,
-    ) -> Result<Response<openshell_core::proto::ListSandboxPoliciesResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn report_policy_status(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ReportPolicyStatusRequest>,
-    ) -> Result<Response<openshell_core::proto::ReportPolicyStatusResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn get_sandbox_logs(
-        &self,
-        _request: tonic::Request<openshell_core::proto::GetSandboxLogsRequest>,
-    ) -> Result<Response<openshell_core::proto::GetSandboxLogsResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn push_sandbox_logs(
-        &self,
-        _request: tonic::Request<tonic::Streaming<openshell_core::proto::PushSandboxLogsRequest>>,
-    ) -> Result<Response<openshell_core::proto::PushSandboxLogsResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn submit_policy_analysis(
-        &self,
-        _request: tonic::Request<openshell_core::proto::SubmitPolicyAnalysisRequest>,
-    ) -> Result<Response<openshell_core::proto::SubmitPolicyAnalysisResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn get_draft_policy(
-        &self,
-        _request: tonic::Request<openshell_core::proto::GetDraftPolicyRequest>,
-    ) -> Result<Response<openshell_core::proto::GetDraftPolicyResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn approve_draft_chunk(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ApproveDraftChunkRequest>,
-    ) -> Result<Response<openshell_core::proto::ApproveDraftChunkResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn reject_draft_chunk(
-        &self,
-        _request: tonic::Request<openshell_core::proto::RejectDraftChunkRequest>,
-    ) -> Result<Response<openshell_core::proto::RejectDraftChunkResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn approve_all_draft_chunks(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ApproveAllDraftChunksRequest>,
-    ) -> Result<Response<openshell_core::proto::ApproveAllDraftChunksResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn edit_draft_chunk(
-        &self,
-        _request: tonic::Request<openshell_core::proto::EditDraftChunkRequest>,
-    ) -> Result<Response<openshell_core::proto::EditDraftChunkResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn undo_draft_chunk(
-        &self,
-        _request: tonic::Request<openshell_core::proto::UndoDraftChunkRequest>,
-    ) -> Result<Response<openshell_core::proto::UndoDraftChunkResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn clear_draft_chunks(
-        &self,
-        _request: tonic::Request<openshell_core::proto::ClearDraftChunksRequest>,
-    ) -> Result<Response<openshell_core::proto::ClearDraftChunksResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn get_draft_history(
-        &self,
-        _request: tonic::Request<openshell_core::proto::GetDraftHistoryRequest>,
-    ) -> Result<Response<openshell_core::proto::GetDraftHistoryResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    async fn connect_supervisor(
-        &self,
-        _request: tonic::Request<tonic::Streaming<SupervisorMessage>>,
-    ) -> Result<Response<Self::ConnectSupervisorStream>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-
-    type RelayStreamStream = ReceiverStream<Result<openshell_core::proto::RelayFrame, Status>>;
-
-    async fn relay_stream(
-        &self,
-        _request: tonic::Request<tonic::Streaming<openshell_core::proto::RelayFrame>>,
-    ) -> Result<Response<Self::RelayStreamStream>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// PKI generation
-// ---------------------------------------------------------------------------
-
-#[allow(dead_code, clippy::struct_field_names)]
-struct PkiBundle {
-    ca_cert_pem: Vec<u8>,
-    server_cert_pem: Vec<u8>,
-    server_key_pem: Vec<u8>,
-    client_cert_pem: Vec<u8>,
-    client_key_pem: Vec<u8>,
-}
-
-fn generate_pki() -> (tempfile::TempDir, PkiBundle) {
-    let mut ca_params =
-        CertificateParams::new(Vec::<String>::new()).expect("failed to create CA params");
-    ca_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    ca_params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, "test-ca");
-    let ca_key = KeyPair::generate().expect("failed to generate CA key");
-    let ca_cert = ca_params
-        .self_signed(&ca_key)
-        .expect("failed to sign CA cert");
-
-    let server_params = CertificateParams::new(vec!["localhost".to_string()])
-        .expect("failed to create server params");
-    let server_key = KeyPair::generate().expect("failed to generate server key");
-    let server_cert = server_params
-        .signed_by(&server_key, &ca_cert, &ca_key)
-        .expect("failed to sign server cert");
-
-    let mut client_params =
-        CertificateParams::new(Vec::<String>::new()).expect("failed to create client params");
-    client_params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, "test-client");
-    let client_key = KeyPair::generate().expect("failed to generate client key");
-    let client_cert = client_params
-        .signed_by(&client_key, &ca_cert, &ca_key)
-        .expect("failed to sign client cert");
-
-    let dir = tempdir().expect("failed to create tempdir");
-    let write_file = |name: &str, data: &[u8]| {
-        let path = dir.path().join(name);
-        std::fs::File::create(&path)
-            .and_then(|mut f| f.write_all(data))
-            .expect("failed to write file");
-    };
-
-    write_file("ca.pem", ca_cert.pem().as_bytes());
-    write_file("server-cert.pem", server_cert.pem().as_bytes());
-    write_file("server-key.pem", server_key.serialize_pem().as_bytes());
-    write_file("client-cert.pem", client_cert.pem().as_bytes());
-    write_file("client-key.pem", client_key.serialize_pem().as_bytes());
-
-    let bundle = PkiBundle {
-        ca_cert_pem: ca_cert.pem().into_bytes(),
-        server_cert_pem: server_cert.pem().into_bytes(),
-        server_key_pem: server_key.serialize_pem().into_bytes(),
-        client_cert_pem: client_cert.pem().into_bytes(),
-        client_key_pem: client_key.serialize_pem().into_bytes(),
-    };
-
-    (dir, bundle)
-}
-
-// ---------------------------------------------------------------------------
-// Server + client helpers
-// ---------------------------------------------------------------------------
-
-async fn start_test_server(
-    tls_acceptor: TlsAcceptor,
-) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-
-    let grpc_service = OpenShellServer::new(TestOpenShell);
-    let http_service = health_router();
-    let service = MultiplexedService::new(grpc_service, http_service);
-
-    let handle = tokio::spawn(async move {
-        loop {
-            let Ok((stream, _)) = listener.accept().await else {
-                continue;
-            };
-            let svc = service.clone();
-            let tls = tls_acceptor.clone();
-            tokio::spawn(async move {
-                let Ok(tls_stream) = tls.inner().accept(stream).await else {
-                    return;
-                };
-                let _ = Builder::new(TokioExecutor::new())
-                    .serve_connection(TokioIo::new(tls_stream), svc)
-                    .await;
-            });
-        }
-    });
-
-    (addr, handle)
-}
 
 /// Build a gRPC client with mTLS (CA + client cert).
 async fn grpc_client_mtls(
@@ -608,17 +189,17 @@ fn https_client_no_cert(
 // Tests
 // ===========================================================================
 
-/// Baseline: with `allow_unauthenticated=false` (default), mTLS connections work.
+/// Valid client cert is accepted when a CA is configured.
 #[tokio::test]
-async fn baseline_mtls_works_with_mandatory_client_certs() {
+async fn mtls_valid_client_cert_accepted() {
     install_rustls_provider();
     let (temp, pki) = generate_pki();
 
     let tls_acceptor = TlsAcceptor::from_files(
         &temp.path().join("server-cert.pem"),
         &temp.path().join("server-key.pem"),
-        &temp.path().join("ca.pem"),
-        false, // mandatory mTLS
+        Some(temp.path().join("ca.pem").as_path()),
+        false,
     )
     .unwrap();
 
@@ -648,102 +229,18 @@ async fn baseline_mtls_works_with_mandatory_client_certs() {
     server.abort();
 }
 
-/// Baseline: with `allow_unauthenticated=false`, no-client-cert connections are
-/// rejected at the TLS layer.
+/// No client cert is accepted when a CA is configured — client certs are
+/// always optional.  Auth is deferred to the application layer.
 #[tokio::test]
-async fn baseline_no_cert_rejected_with_mandatory_mtls() {
+async fn no_client_cert_accepted_with_ca_configured() {
     install_rustls_provider();
     let (temp, pki) = generate_pki();
 
     let tls_acceptor = TlsAcceptor::from_files(
         &temp.path().join("server-cert.pem"),
         &temp.path().join("server-key.pem"),
-        &temp.path().join("ca.pem"),
-        false, // mandatory mTLS
-    )
-    .unwrap();
-
-    let (addr, server) = start_test_server(tls_acceptor).await;
-
-    let ca_cert = tonic::transport::Certificate::from_pem(pki.ca_cert_pem.clone());
-    let tls = ClientTlsConfig::new()
-        .ca_certificate(ca_cert)
-        .domain_name("localhost");
-    let endpoint = Endpoint::from_shared(format!("https://localhost:{}", addr.port()))
-        .expect("invalid endpoint")
-        .tls_config(tls)
-        .expect("failed to set tls");
-
-    let result = endpoint.connect().await;
-    if let Ok(channel) = result {
-        let mut client = OpenShellClient::new(channel);
-        let rpc_result = client.health(HealthRequest {}).await;
-        assert!(
-            rpc_result.is_err(),
-            "expected RPC to fail without client cert when mTLS is mandatory"
-        );
-    }
-    // If connect() itself failed, that's also correct — TLS handshake rejected.
-
-    server.abort();
-}
-
-/// With `allow_unauthenticated=true`, mTLS connections still work (dual-auth).
-#[tokio::test]
-async fn dual_auth_mtls_still_accepted() {
-    install_rustls_provider();
-    let (temp, pki) = generate_pki();
-
-    let tls_acceptor = TlsAcceptor::from_files(
-        &temp.path().join("server-cert.pem"),
-        &temp.path().join("server-key.pem"),
-        &temp.path().join("ca.pem"),
-        true, // allow unauthenticated (tunnel mode)
-    )
-    .unwrap();
-
-    let (addr, server) = start_test_server(tls_acceptor).await;
-
-    // gRPC with mTLS should still work
-    let mut grpc = grpc_client_mtls(
-        addr,
-        pki.ca_cert_pem.clone(),
-        pki.client_cert_pem.clone(),
-        pki.client_key_pem.clone(),
-    )
-    .await;
-    let resp = grpc.health(HealthRequest {}).await.unwrap();
-    assert_eq!(resp.get_ref().status, ServiceStatus::Healthy as i32);
-
-    // HTTP with mTLS should still work
-    let client = https_client_mtls(&pki);
-    let req = Request::builder()
-        .method("GET")
-        .uri(format!("https://localhost:{}/healthz", addr.port()))
-        .body(Empty::<Bytes>::new())
-        .unwrap();
-    let resp = client.request(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    server.abort();
-}
-
-/// With `allow_unauthenticated=true`, no-client-cert connections pass the TLS
-/// handshake. This simulates Cloudflare Tunnel re-originating a connection.
-///
-/// The gRPC health check succeeds because there is no auth middleware yet —
-/// this proves the TLS layer is no longer the gate.  When auth middleware is
-/// added, the test should be updated to expect 401 without a valid JWT.
-#[tokio::test]
-async fn tunnel_mode_no_cert_passes_tls_handshake() {
-    install_rustls_provider();
-    let (temp, pki) = generate_pki();
-
-    let tls_acceptor = TlsAcceptor::from_files(
-        &temp.path().join("server-cert.pem"),
-        &temp.path().join("server-key.pem"),
-        &temp.path().join("ca.pem"),
-        true, // allow unauthenticated (tunnel mode)
+        Some(temp.path().join("ca.pem").as_path()),
+        false,
     )
     .unwrap();
 
@@ -755,7 +252,7 @@ async fn tunnel_mode_no_cert_passes_tls_handshake() {
     assert_eq!(
         resp.get_ref().status,
         ServiceStatus::Healthy as i32,
-        "gRPC health check should succeed without client cert in tunnel mode"
+        "gRPC health check should succeed without client cert"
     );
 
     // HTTP without client cert
@@ -769,28 +266,24 @@ async fn tunnel_mode_no_cert_passes_tls_handshake() {
     assert_eq!(
         resp.status(),
         StatusCode::OK,
-        "HTTP health check should succeed without client cert in tunnel mode"
+        "HTTP health check should succeed without client cert"
     );
 
     server.abort();
 }
 
-/// Simulate the steady-state Cloudflare tunnel flow: no client cert, but the
-/// `cf-authorization` header carries a token.  At the TLS level this must
-/// succeed; the header is passed through to the gRPC handler.
-///
-/// Note: We use a dummy token value here. When real JWT verification middleware
-/// is added, this test should use a properly-signed test JWT.
+/// Bearer auth header passes through to the gRPC handler when no client
+/// cert is presented.
 #[tokio::test]
-async fn tunnel_mode_cf_authorization_header_reaches_server() {
+async fn bearer_header_reaches_server_without_client_cert() {
     install_rustls_provider();
     let (temp, pki) = generate_pki();
 
     let tls_acceptor = TlsAcceptor::from_files(
         &temp.path().join("server-cert.pem"),
         &temp.path().join("server-key.pem"),
-        &temp.path().join("ca.pem"),
-        true,
+        Some(temp.path().join("ca.pem").as_path()),
+        false,
     )
     .unwrap();
 
@@ -804,24 +297,24 @@ async fn tunnel_mode_cf_authorization_header_reaches_server() {
     assert_eq!(
         resp.get_ref().status,
         ServiceStatus::Healthy as i32,
-        "gRPC with cf-authorization header should succeed in tunnel mode"
+        "gRPC with bearer header should succeed without client cert"
     );
 
     server.abort();
 }
 
-/// With `allow_unauthenticated=true`, a client cert from a rogue CA is still
-/// rejected by the TLS layer — the verifier still validates presented certs.
+/// A client cert from a rogue CA is rejected at the TLS layer even though
+/// client certs are optional — presented certs are still validated.
 #[tokio::test]
-async fn tunnel_mode_rogue_cert_still_rejected() {
+async fn rogue_cert_rejected() {
     install_rustls_provider();
     let (temp, pki) = generate_pki();
 
     let tls_acceptor = TlsAcceptor::from_files(
         &temp.path().join("server-cert.pem"),
         &temp.path().join("server-key.pem"),
-        &temp.path().join("ca.pem"),
-        true,
+        Some(temp.path().join("ca.pem").as_path()),
+        false,
     )
     .unwrap();
 
@@ -869,10 +362,53 @@ async fn tunnel_mode_rogue_cert_still_rejected() {
         let rpc_result = client.health(HealthRequest {}).await;
         assert!(
             rpc_result.is_err(),
-            "expected RPC to fail with rogue client cert even in tunnel mode"
+            "expected RPC to fail with rogue client cert"
         );
     }
     // If connect() itself failed, that's also correct.
+
+    server.abort();
+}
+
+/// HTTPS-only mode: no client CA configured, so the server never requests
+/// client certificates.  Clients connect with server-only TLS.
+#[tokio::test]
+async fn https_only_no_client_cert_required() {
+    install_rustls_provider();
+    let (temp, pki) = generate_pki();
+
+    let tls_acceptor = TlsAcceptor::from_files(
+        &temp.path().join("server-cert.pem"),
+        &temp.path().join("server-key.pem"),
+        None,
+        false,
+    )
+    .unwrap();
+
+    let (addr, server) = start_test_server(tls_acceptor).await;
+
+    // gRPC without client cert — should succeed (no client certs requested)
+    let mut grpc = grpc_client_no_cert(addr, pki.ca_cert_pem.clone()).await;
+    let resp = grpc.health(HealthRequest {}).await.unwrap();
+    assert_eq!(
+        resp.get_ref().status,
+        ServiceStatus::Healthy as i32,
+        "gRPC health check should succeed in HTTPS-only mode"
+    );
+
+    // HTTP without client cert
+    let client = https_client_no_cert(&pki.ca_cert_pem);
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("https://localhost:{}/healthz", addr.port()))
+        .body(Empty::<Bytes>::new())
+        .unwrap();
+    let resp = client.request(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "HTTP health check should succeed in HTTPS-only mode"
+    );
 
     server.abort();
 }

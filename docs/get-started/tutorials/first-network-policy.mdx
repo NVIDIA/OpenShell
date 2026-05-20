@@ -4,7 +4,7 @@
 title: "Write Your First Sandbox Network Policy"
 sidebar-title: "First Network Policy"
 slug: "get-started/tutorials/first-network-policy"
-description: "See how OpenShell network policies work by creating a sandbox, observing default-deny in action, and applying a fine-grained L7 read-only rule."
+description: "Learn how OpenShell network policies work by creating a sandbox, observing default-deny in action, and applying a fine-grained L7 read-only rule."
 keywords: "Generative AI, Cybersecurity, Tutorial, Policy, Network Policy, Sandbox, Security"
 ---
 
@@ -117,7 +117,7 @@ network_policies:
       - { path: /usr/bin/curl }
 ```
 
-The `filesystem_policy`, `landlock`, and `process` sections preserve the default sandbox settings. This is required because `policy set` replaces the entire policy. The `network_policies` section is the key part: `curl` may make GET, HEAD, and OPTIONS requests to `api.github.com` over HTTPS. Everything else is denied. The proxy auto-detects TLS on HTTPS endpoints and terminates it to inspect each HTTP request and enforce the `read-only` access preset at the method level.
+The `filesystem_policy`, `landlock`, and `process` sections preserve the default sandbox settings. This is required because `policy set` replaces the entire policy. The `network_policies` section is the key part: `curl` can make GET, HEAD, and OPTIONS requests to `api.github.com` over HTTPS. Everything else is denied. The proxy auto-detects TLS on HTTPS endpoints and terminates it to inspect each HTTP request and enforce the `read-only` access preset at the method level.
 
 Apply it:
 

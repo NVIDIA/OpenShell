@@ -91,7 +91,9 @@ The prompt to the reviewer **must** instruct it to:
 
 9. **Check architecture docs** in the `architecture/` directory for relevant documentation about the affected subsystems.
 
-10. **Determine the issue type:** `feat`, `fix`, `refactor`, `chore`, `perf`, or `docs`.
+10. **Assess Linux Security Module (LSM) impact.** If the change involves process identity, `/proc` filesystem access, file labeling, binary execution, or inter-process visibility, call out whether it will behave differently on hosts running SELinux (enforcing) or AppArmor. For example: reading `/proc/<pid>/exe` across an SELinux domain boundary returns ENOENT, not EACCES. Tests that fork+exec into system binaries (different SELinux label) will fail on enforcing hosts. Flag any LSM-sensitive code paths and recommend mitigations.
+
+11. **Determine the issue type:** `feat`, `fix`, `refactor`, `chore`, `perf`, or `docs`.
 
 ### What makes a good investigation prompt
 

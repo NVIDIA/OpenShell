@@ -11,7 +11,7 @@ pub struct FirewallRule {
     /// Rule name (e.g., "default-egress", "bypass-detect").
     pub name: String,
 
-    /// Rule type / engine (e.g., "mechanistic", "opa", "iptables").
+    /// Rule type / engine (e.g., "mechanistic", "opa", "nftables").
     ///
     /// Kept as `String` because this is a project-specific extension field
     /// (not OCSF-enumerated) with runtime-dynamic values from the policy engine.

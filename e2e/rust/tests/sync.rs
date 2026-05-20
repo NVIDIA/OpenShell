@@ -352,3 +352,194 @@ async fn upload_single_file_from_git_repo_only_uploads_that_file() {
 
     guard.cleanup().await;
 }
+
+/// Pre-populate a single file on the sandbox side via `sandbox exec` and pull
+/// it back with `sandbox download`. Exercises `sandbox_sync_down_file` in
+/// isolation (no upload phase).
+#[tokio::test]
+async fn sandbox_download_file_only() {
+    let mut guard =
+        SandboxGuard::create_keep(&["sh", "-c", "echo Ready && sleep infinity"], "Ready")
+            .await
+            .expect("sandbox create --keep");
+
+    guard
+        .exec(&["sh", "-c", "printf greeting-payload > /sandbox/greeting.txt"])
+        .await
+        .expect("seed greeting.txt inside the sandbox");
+
+    let tmpdir = tempfile::tempdir().expect("create tmpdir");
+    let dest = tmpdir.path().join("out");
+    fs::create_dir_all(&dest).expect("create download dir");
+    let dest_str = dest.to_str().expect("dest path is UTF-8");
+
+    guard
+        .download("/sandbox/greeting.txt", dest_str)
+        .await
+        .expect("download greeting.txt");
+
+    let actual = fs::read_to_string(dest.join("greeting.txt")).expect("read greeting.txt");
+    assert_eq!(
+        actual, "greeting-payload",
+        "downloaded file content mismatch"
+    );
+
+    guard.cleanup().await;
+}
+
+/// Pre-populate a small directory tree on the sandbox side via `sandbox exec`
+/// and pull it recursively with `sandbox download`. Exercises
+/// `sandbox_sync_down_directory` in isolation (no upload phase).
+#[tokio::test]
+async fn sandbox_download_directory_only() {
+    let mut guard =
+        SandboxGuard::create_keep(&["sh", "-c", "echo Ready && sleep infinity"], "Ready")
+            .await
+            .expect("sandbox create --keep");
+
+    guard
+        .exec(&[
+            "sh",
+            "-c",
+            "mkdir -p /sandbox/tree/sub \
+             && printf top-level > /sandbox/tree/root.txt \
+             && printf nested > /sandbox/tree/sub/child.txt",
+        ])
+        .await
+        .expect("seed directory tree inside the sandbox");
+
+    let tmpdir = tempfile::tempdir().expect("create tmpdir");
+    let dest = tmpdir.path().join("out");
+    fs::create_dir_all(&dest).expect("create download dir");
+    let dest_str = dest.to_str().expect("dest path is UTF-8");
+
+    guard
+        .download("/sandbox/tree", dest_str)
+        .await
+        .expect("download directory tree");
+
+    let root = fs::read_to_string(dest.join("root.txt")).expect("read root.txt");
+    assert_eq!(root, "top-level", "root.txt content mismatch");
+    let child = fs::read_to_string(dest.join("sub/child.txt")).expect("read sub/child.txt");
+    assert_eq!(child, "nested", "sub/child.txt content mismatch");
+
+    guard.cleanup().await;
+}
+
+/// Assert that an error string carries the two markers of a remote-side
+/// canonicalisation refusal: `resolves to` (proving `realpath -e` ran) and
+/// `outside the` + `sandbox workspace` (proving the boundary check fired).
+///
+/// miette renders the long single-line error wrapped across multiple lines
+/// at terminal width and inserts a `│ ` continuation marker, so a single
+/// long substring like `"outside the sandbox workspace"` is fragile —
+/// match the short markers individually instead.
+fn assert_resolves_outside_workspace(err: &str, label: &str) {
+    assert!(
+        err.contains("resolves to") && err.contains("outside the") && err.contains("sandbox workspace"),
+        "expected resolves-outside-workspace error for {label}, got: {err}"
+    );
+}
+
+/// Regression for the Codex high-severity finding: `validate_sandbox_source_path`
+/// is purely lexical, so a sandbox-side symlink that escapes `/sandbox` could
+/// slip through and let `tar -C` follow the link into the host filesystem.
+/// `resolve_sandbox_source_path` re-validates after `realpath -e` resolves
+/// every component. Cover both shapes from the Codex example: the symlink as
+/// the full source (directory case) and the symlink as a component of the
+/// source path (file case).
+#[tokio::test]
+async fn sandbox_download_rejects_symlinks_pointing_outside_workspace() {
+    let mut guard =
+        SandboxGuard::create_keep(&["sh", "-c", "echo Ready && sleep infinity"], "Ready")
+            .await
+            .expect("sandbox create --keep");
+
+    guard
+        .exec(&[
+            "sh",
+            "-c",
+            "ln -s /etc /sandbox/etc-link && ln -s /etc/passwd /sandbox/passwd-link",
+        ])
+        .await
+        .expect("plant escape symlinks inside the sandbox");
+
+    let tmpdir = tempfile::tempdir().expect("create tmpdir");
+    let dest = tmpdir.path().join("out");
+    fs::create_dir_all(&dest).expect("create download dir");
+    let dest_str = dest.to_str().expect("dest path is UTF-8");
+
+    // Directory-source symlink: /sandbox/etc-link -> /etc
+    let err = guard
+        .download("/sandbox/etc-link", dest_str)
+        .await
+        .expect_err("download of a directory symlink to /etc must be refused");
+    assert_resolves_outside_workspace(&err, "directory symlink");
+
+    // File-source symlink: /sandbox/passwd-link -> /etc/passwd
+    let err = guard
+        .download("/sandbox/passwd-link", dest_str)
+        .await
+        .expect_err("download of a file symlink to /etc/passwd must be refused");
+    assert_resolves_outside_workspace(&err, "file symlink");
+
+    // Path with a symlinked component: /sandbox/etc-link/passwd
+    let err = guard
+        .download("/sandbox/etc-link/passwd", dest_str)
+        .await
+        .expect_err("download via a symlinked path component must be refused");
+    assert_resolves_outside_workspace(&err, "symlinked component");
+
+    // Sanity check: the host destination should still be empty — no file from
+    // /etc should have leaked through on any of the three attempts.
+    assert!(
+        !dest.join("passwd").exists() && !dest.join("etc-link").exists(),
+        "no file should have been written when the source resolves outside the workspace"
+    );
+
+    guard.cleanup().await;
+}
+
+/// Regression for the Codex medium-severity finding: the single-file tar
+/// invocation must wrap the basename behind a `--` separator, otherwise a
+/// sandbox-side filename whose basename starts with `--` (e.g. created by a
+/// malicious agent inside the sandbox) is parsed by GNU tar as an option
+/// rather than a member to archive.
+#[tokio::test]
+async fn sandbox_download_handles_dash_leading_basename() {
+    let mut guard =
+        SandboxGuard::create_keep(&["sh", "-c", "echo Ready && sleep infinity"], "Ready")
+            .await
+            .expect("sandbox create --keep");
+
+    // Quoting the redirect target keeps the leading dashes intact across the
+    // shell parse; the sandbox-side filesystem ends up with a basename that
+    // would be parsed as an option by an unprotected tar invocation.
+    guard
+        .exec(&[
+            "sh",
+            "-c",
+            "printf dash-payload > '/sandbox/--checkpoint-action=evil'",
+        ])
+        .await
+        .expect("seed dash-leading file inside the sandbox");
+
+    let tmpdir = tempfile::tempdir().expect("create tmpdir");
+    let dest = tmpdir.path().join("out");
+    fs::create_dir_all(&dest).expect("create download dir");
+    let dest_str = dest.to_str().expect("dest path is UTF-8");
+
+    guard
+        .download("/sandbox/--checkpoint-action=evil", dest_str)
+        .await
+        .expect("download dash-leading basename");
+
+    let actual =
+        fs::read_to_string(dest.join("--checkpoint-action=evil")).expect("read dash-leading file");
+    assert_eq!(
+        actual, "dash-payload",
+        "dash-leading file content mismatch — tar may have parsed the basename as an option"
+    );
+
+    guard.cleanup().await;
+}

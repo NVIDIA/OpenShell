@@ -184,7 +184,7 @@ impl std::fmt::Display for PolicyMergeError {
                 protocol,
             } => write!(
                 f,
-                "endpoint {host}:{port} uses unsupported protocol '{protocol}'; this operation currently supports only protocol 'rest'"
+                "endpoint {host}:{port} uses unsupported protocol '{protocol}'; this operation currently supports only protocol 'rest' or 'websocket'"
             ),
             Self::EndpointHasNoAllowBase { host, port } => write!(
                 f,
@@ -205,6 +205,78 @@ pub struct PolicyMergeResult {
     pub policy: SandboxPolicy,
     pub warnings: Vec<PolicyMergeWarning>,
     pub changed: bool,
+}
+
+/// Returns true iff `policy` semantically contains the rule an `AddRule`
+/// merge of `proposed` would produce.
+///
+/// "Contains" means: for every endpoint in `proposed`, some rule in
+/// `policy.network_policies` has an endpoint with overlapping
+/// host/path/port set AND containing every L7 allow (method/path) the
+/// proposed endpoint requested, and that rule's binaries cover every
+/// binary in `proposed`.
+///
+/// The sandbox's `policy.local /wait` long-poll uses this to decide when
+/// the local supervisor has actually loaded a policy that includes the
+/// chunk the agent just had approved. A whole-policy hash compare is wrong
+/// in both directions: it can wake the wait on unrelated reloads (false
+/// wakeup) and can fail to wake when the supervisor reloaded between two
+/// `/wait` calls (false sleep). This check is the property the agent
+/// actually cares about — "is my rule in effect right now?".
+///
+/// L4-vs-L7 split: endpoint overlap reuses `endpoints_overlap` so the
+/// L4 surface (host/path/port) lines up with the `add_rule` merge — if
+/// the gateway folded the chunk into an existing rule under a different
+/// key, this check still returns true. The L7 layer is checked
+/// separately because `endpoints_overlap` is intentionally L4-only:
+/// without the L7 check, coverage would return true the instant the
+/// supervisor reloaded *any* change to an overlapping endpoint, even
+/// before the new method/path actually landed — exactly the false-wakeup
+/// mode this fix exists to prevent, just one layer down.
+pub fn policy_covers_rule(policy: &SandboxPolicy, proposed: &NetworkPolicyRule) -> bool {
+    if proposed.endpoints.is_empty() {
+        return false;
+    }
+    proposed.endpoints.iter().all(|target_endpoint| {
+        policy.network_policies.values().any(|rule| {
+            rule.endpoints.iter().any(|endpoint| {
+                endpoints_overlap(endpoint, target_endpoint)
+                    && endpoint_l7_covers(endpoint, target_endpoint)
+            }) && proposed.binaries.iter().all(|target_binary| {
+                rule.binaries
+                    .iter()
+                    .any(|binary| binary.path == target_binary.path)
+            })
+        })
+    })
+}
+
+/// L7 coverage for a single endpoint match. If the proposed endpoint
+/// declared explicit L7 allow rules (method+path), every one of them must
+/// be present in the merged endpoint's `rules`. An empty `proposed.rules`
+/// is treated as "L4-only" and returns true (the endpoint match alone is
+/// sufficient).
+///
+/// Conservative on access presets: if a merged endpoint uses
+/// `access: read-write` instead of explicit rules, this returns false
+/// even though the preset would permit the method at runtime. That
+/// produces a one-cycle re-issue on the agent's side — preferable to a
+/// false-positive coverage signal that lets the agent retry too early.
+fn endpoint_l7_covers(merged: &NetworkEndpoint, proposed: &NetworkEndpoint) -> bool {
+    if proposed.rules.is_empty() {
+        return true;
+    }
+    proposed.rules.iter().all(|proposed_rule| {
+        let Some(proposed_allow) = proposed_rule.allow.as_ref() else {
+            return true;
+        };
+        merged.rules.iter().any(|existing| {
+            existing.allow.as_ref().is_some_and(|existing_allow| {
+                existing_allow.method == proposed_allow.method
+                    && existing_allow.path == proposed_allow.path
+            })
+        })
+    })
 }
 
 pub fn merge_policy(
@@ -265,7 +337,7 @@ fn apply_operation(
                     port: *port,
                 }
             })?;
-            ensure_rest_endpoint(endpoint, host, *port)?;
+            ensure_method_path_endpoint(endpoint, host, *port)?;
             if endpoint.access.is_empty() && endpoint.rules.is_empty() {
                 return Err(PolicyMergeError::EndpointHasNoAllowBase {
                     host: host.clone(),
@@ -281,7 +353,7 @@ fn apply_operation(
                     port: *port,
                 }
             })?;
-            ensure_rest_endpoint(endpoint, host, *port)?;
+            ensure_method_path_endpoint(endpoint, host, *port)?;
             expand_existing_access(endpoint, host, *port, warnings)?;
             append_unique_l7_rules(&mut endpoint.rules, rules);
         }
@@ -462,6 +534,9 @@ fn merge_endpoint(
 
     append_unique_deny_rules(&mut existing.deny_rules, &incoming.deny_rules);
     append_unique_strings(&mut existing.allowed_ips, &incoming.allowed_ips);
+    existing.allow_encoded_slash |= incoming.allow_encoded_slash;
+    existing.websocket_credential_rewrite |= incoming.websocket_credential_rewrite;
+    existing.request_body_credential_rewrite |= incoming.request_body_credential_rewrite;
     normalize_endpoint(existing);
     Ok(())
 }
@@ -568,7 +643,7 @@ fn endpoint_matches_host_port(endpoint: &NetworkEndpoint, host: &str, port: u32)
     endpoint.host.eq_ignore_ascii_case(host) && canonical_ports(endpoint).contains(&port)
 }
 
-fn ensure_rest_endpoint(
+fn ensure_method_path_endpoint(
     endpoint: &NetworkEndpoint,
     host: &str,
     port: u32,
@@ -579,7 +654,7 @@ fn ensure_rest_endpoint(
             port,
         });
     }
-    if endpoint.protocol != "rest" {
+    if !matches!(endpoint.protocol.as_str(), "rest" | "websocket") {
         return Err(PolicyMergeError::UnsupportedEndpointProtocol {
             host: host.to_string(),
             port,
@@ -600,12 +675,13 @@ fn expand_existing_access(
     }
 
     let access = endpoint.access.clone();
-    let expanded =
-        expand_access_preset(&access).ok_or_else(|| PolicyMergeError::UnsupportedAccessPreset {
+    let expanded = expand_access_preset(&endpoint.protocol, &access).ok_or_else(|| {
+        PolicyMergeError::UnsupportedAccessPreset {
             host: host.to_string(),
             port,
             access: access.clone(),
-        })?;
+        }
+    })?;
     endpoint.access.clear();
     append_unique_l7_rules(&mut endpoint.rules, &expanded);
     warnings.push(PolicyMergeWarning::ExpandedAccessPreset {
@@ -616,11 +692,13 @@ fn expand_existing_access(
     Ok(())
 }
 
-fn expand_access_preset(access: &str) -> Option<Vec<L7Rule>> {
-    let methods = match access {
-        "read-only" => vec!["GET", "HEAD", "OPTIONS"],
-        "read-write" => vec!["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH"],
-        "full" => vec!["*"],
+fn expand_access_preset(protocol: &str, access: &str) -> Option<Vec<L7Rule>> {
+    let methods = match (protocol, access) {
+        (_, "full") => vec!["*"],
+        ("websocket", "read-only") => vec!["GET"],
+        ("websocket", "read-write") => vec!["GET", "WEBSOCKET_TEXT"],
+        (_, "read-only") => vec!["GET", "HEAD", "OPTIONS"],
+        (_, "read-write") => vec!["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH"],
         _ => return None,
     };
 
@@ -776,6 +854,7 @@ mod tests {
 
     use super::{
         PolicyMergeError, PolicyMergeOp, PolicyMergeWarning, generated_rule_name, merge_policy,
+        policy_covers_rule,
     };
     use crate::restrictive_default_policy;
     use openshell_core::proto::{
@@ -871,6 +950,96 @@ mod tests {
     }
 
     #[test]
+    fn add_rule_merges_websocket_credential_rewrite_flag() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "existing".to_string(),
+            NetworkPolicyRule {
+                name: "existing".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "realtime.example.com".to_string(),
+                    port: 443,
+                    ports: vec![443],
+                    protocol: "websocket".to_string(),
+                    access: "read-write".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+
+        let incoming = NetworkPolicyRule {
+            name: "incoming".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "realtime.example.com".to_string(),
+                port: 443,
+                ports: vec![443],
+                protocol: "websocket".to_string(),
+                websocket_credential_rewrite: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let result = merge_policy(
+            policy,
+            &[PolicyMergeOp::AddRule {
+                rule_name: "allow_realtime_example_com_443".to_string(),
+                rule: incoming,
+            }],
+        )
+        .expect("merge should succeed");
+
+        let endpoint = &result.policy.network_policies["existing"].endpoints[0];
+        assert!(endpoint.websocket_credential_rewrite);
+    }
+
+    #[test]
+    fn add_rule_merges_request_body_credential_rewrite_flag() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "existing".to_string(),
+            NetworkPolicyRule {
+                name: "existing".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "slack.com".to_string(),
+                    port: 443,
+                    ports: vec![443],
+                    protocol: "rest".to_string(),
+                    access: "read-write".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+
+        let incoming = NetworkPolicyRule {
+            name: "incoming".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "slack.com".to_string(),
+                port: 443,
+                ports: vec![443],
+                protocol: "rest".to_string(),
+                request_body_credential_rewrite: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let result = merge_policy(
+            policy,
+            &[PolicyMergeOp::AddRule {
+                rule_name: "allow_slack_com_443".to_string(),
+                rule: incoming,
+            }],
+        )
+        .expect("merge should succeed");
+
+        let endpoint = &result.policy.network_policies["existing"].endpoints[0];
+        assert!(endpoint.request_body_credential_rewrite);
+    }
+
+    #[test]
     fn add_allow_expands_access_preset() {
         let mut policy = restrictive_default_policy();
         policy.network_policies.insert(
@@ -909,7 +1078,92 @@ mod tests {
     }
 
     #[test]
-    fn add_deny_requires_rest_protocol() {
+    fn add_allow_expands_websocket_access_preset() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "realtime".to_string(),
+            NetworkPolicyRule {
+                name: "realtime".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "realtime.example.com".to_string(),
+                    port: 443,
+                    ports: vec![443],
+                    protocol: "websocket".to_string(),
+                    access: "read-write".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+
+        let result = merge_policy(
+            policy,
+            &[PolicyMergeOp::AddAllowRules {
+                host: "realtime.example.com".to_string(),
+                port: 443,
+                rules: vec![rest_rule("WEBSOCKET_TEXT", "/rooms/private/**")],
+            }],
+        )
+        .expect("merge should succeed");
+
+        let endpoint = &result.policy.network_policies["realtime"].endpoints[0];
+        assert!(endpoint.access.is_empty());
+        assert_eq!(endpoint.rules.len(), 3);
+        assert!(endpoint.rules.contains(&rest_rule("GET", "**")));
+        assert!(endpoint.rules.contains(&rest_rule("WEBSOCKET_TEXT", "**")));
+        assert!(
+            endpoint
+                .rules
+                .contains(&rest_rule("WEBSOCKET_TEXT", "/rooms/private/**"))
+        );
+        assert!(!endpoint.rules.contains(&rest_rule("POST", "**")));
+        assert!(result.warnings.iter().any(|warning| matches!(
+            warning,
+            PolicyMergeWarning::ExpandedAccessPreset { access, .. } if access == "read-write"
+        )));
+    }
+
+    #[test]
+    fn add_deny_accepts_websocket_protocol() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "realtime".to_string(),
+            NetworkPolicyRule {
+                name: "realtime".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "realtime.example.com".to_string(),
+                    port: 443,
+                    ports: vec![443],
+                    protocol: "websocket".to_string(),
+                    access: "read-write".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+
+        let result = merge_policy(
+            policy,
+            &[PolicyMergeOp::AddDenyRules {
+                host: "realtime.example.com".to_string(),
+                port: 443,
+                deny_rules: vec![L7DenyRule {
+                    method: "WEBSOCKET_TEXT".to_string(),
+                    path: "/admin/**".to_string(),
+                    ..Default::default()
+                }],
+            }],
+        )
+        .expect("merge should succeed");
+
+        let endpoint = &result.policy.network_policies["realtime"].endpoints[0];
+        assert_eq!(endpoint.deny_rules.len(), 1);
+        assert_eq!(endpoint.deny_rules[0].method, "WEBSOCKET_TEXT");
+        assert_eq!(endpoint.deny_rules[0].path, "/admin/**");
+    }
+
+    #[test]
+    fn add_deny_rejects_unsupported_protocol() {
         let mut policy = restrictive_default_policy();
         policy.network_policies.insert(
             "db".to_string(),
@@ -1004,6 +1258,298 @@ mod tests {
         .expect("merge should succeed");
 
         assert!(!result.policy.network_policies.contains_key("github"));
+    }
+
+    #[test]
+    fn policy_covers_rule_returns_true_when_merged_rule_present() {
+        let proposed = NetworkPolicyRule {
+            name: "agent_proposed".to_string(),
+            endpoints: vec![endpoint("api.github.com", 443)],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        let merged = merge_policy(
+            restrictive_default_policy(),
+            &[PolicyMergeOp::AddRule {
+                rule_name: "allow_api_github_com_443".to_string(),
+                rule: proposed.clone(),
+            }],
+        )
+        .expect("merge should succeed");
+
+        assert!(policy_covers_rule(&merged.policy, &proposed));
+    }
+
+    #[test]
+    fn policy_covers_rule_returns_false_when_unrelated_rule_present() {
+        let proposed = NetworkPolicyRule {
+            name: "agent_proposed".to_string(),
+            endpoints: vec![endpoint("api.github.com", 443)],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        // Merge an *unrelated* rule for a different host. The proposed rule
+        // for api.github.com is still not present — this is John's
+        // "false-wakeup" case: an unrelated policy reload must not signal
+        // that the agent's rule is loaded.
+        let merged = merge_policy(
+            restrictive_default_policy(),
+            &[PolicyMergeOp::AddRule {
+                rule_name: "allow_api_example_com_443".to_string(),
+                rule: rule_with_endpoint("unrelated", "api.example.com", 443),
+            }],
+        )
+        .expect("merge should succeed");
+
+        assert!(!policy_covers_rule(&merged.policy, &proposed));
+    }
+
+    #[test]
+    fn policy_covers_rule_handles_merge_into_existing_endpoint() {
+        // The merge logic folds a new rule into an existing rule when their
+        // endpoints overlap, even under a different network_policies key.
+        // Coverage must survive that fold — name-keyed checks would miss it.
+        let proposed = NetworkPolicyRule {
+            name: "agent_proposed".to_string(),
+            endpoints: vec![endpoint("api.github.com", 443)],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "preexisting_github".to_string(),
+            NetworkPolicyRule {
+                name: "preexisting_github".to_string(),
+                endpoints: vec![endpoint("api.github.com", 443)],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/git".to_string(),
+                    ..Default::default()
+                }],
+            },
+        );
+
+        let merged = merge_policy(
+            policy,
+            &[PolicyMergeOp::AddRule {
+                rule_name: "allow_api_github_com_443".to_string(),
+                rule: proposed.clone(),
+            }],
+        )
+        .expect("merge should succeed");
+
+        assert!(
+            !merged
+                .policy
+                .network_policies
+                .contains_key("allow_api_github_com_443"),
+            "proposed rule should have been folded into the existing key"
+        );
+        assert!(policy_covers_rule(&merged.policy, &proposed));
+    }
+
+    #[test]
+    fn policy_covers_rule_returns_false_when_binary_missing() {
+        let proposed = NetworkPolicyRule {
+            name: "agent_proposed".to_string(),
+            endpoints: vec![endpoint("api.github.com", 443)],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        // Endpoint exists in the policy but with a *different* binary. The
+        // agent's retry would still be denied; reload coverage should
+        // reflect that.
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "existing".to_string(),
+            NetworkPolicyRule {
+                name: "existing".to_string(),
+                endpoints: vec![endpoint("api.github.com", 443)],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/git".to_string(),
+                    ..Default::default()
+                }],
+            },
+        );
+
+        assert!(!policy_covers_rule(&policy, &proposed));
+    }
+
+    #[test]
+    fn policy_covers_rule_returns_false_for_empty_proposed_endpoints() {
+        // Defensive: a rule with no endpoints carries no signal we can match
+        // on, so coverage is never true.
+        let proposed = NetworkPolicyRule::default();
+        let policy = restrictive_default_policy();
+        assert!(!policy_covers_rule(&policy, &proposed));
+    }
+
+    #[test]
+    fn policy_covers_rule_returns_false_when_proposed_l7_method_not_loaded() {
+        // John's false-wakeup mode at L7: the supervisor has an
+        // overlapping endpoint loaded (e.g. read-only GET), but the
+        // chunk's proposed PUT method is not in the merged endpoint's
+        // rules yet. Coverage must NOT return true here, or the agent
+        // retries the PUT and hits another policy_denied.
+        let proposed = NetworkPolicyRule {
+            name: "agent_put".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "api.github.com".to_string(),
+                port: 443,
+                ports: vec![443],
+                protocol: "rest".to_string(),
+                rules: vec![rest_rule("PUT", "/repos/foo/bar/contents/x.md")],
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "existing_readonly".to_string(),
+            NetworkPolicyRule {
+                name: "existing_readonly".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.github.com".to_string(),
+                    port: 443,
+                    ports: vec![443],
+                    protocol: "rest".to_string(),
+                    rules: vec![rest_rule("GET", "/repos/foo/bar/contents/x.md")],
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/curl".to_string(),
+                    ..Default::default()
+                }],
+            },
+        );
+
+        assert!(
+            !policy_covers_rule(&policy, &proposed),
+            "endpoint overlaps but L7 PUT not loaded yet; must not signal coverage"
+        );
+    }
+
+    #[test]
+    fn policy_covers_rule_returns_true_after_l7_merge_lands() {
+        // Same setup as above, but with the proposed L7 rule merged in.
+        // Coverage must now return true.
+        let proposed = NetworkPolicyRule {
+            name: "agent_put".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "api.github.com".to_string(),
+                port: 443,
+                ports: vec![443],
+                protocol: "rest".to_string(),
+                rules: vec![rest_rule("PUT", "/repos/foo/bar/contents/x.md")],
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "existing".to_string(),
+            NetworkPolicyRule {
+                name: "existing".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.github.com".to_string(),
+                    port: 443,
+                    ports: vec![443],
+                    protocol: "rest".to_string(),
+                    rules: vec![
+                        rest_rule("GET", "/repos/foo/bar/contents/x.md"),
+                        rest_rule("PUT", "/repos/foo/bar/contents/x.md"),
+                    ],
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/curl".to_string(),
+                    ..Default::default()
+                }],
+            },
+        );
+
+        assert!(policy_covers_rule(&policy, &proposed));
+    }
+
+    #[test]
+    fn policy_covers_rule_returns_true_for_l4_only_proposed_when_endpoint_present() {
+        // A chunk that targets a non-REST surface (no L7 rules) needs
+        // only the L4 endpoint match to be considered covered. Empty
+        // proposed.rules must not be treated as "no method matches".
+        let proposed = NetworkPolicyRule {
+            name: "ssh_clone".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "github.com".to_string(),
+                port: 22,
+                ports: vec![22],
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/git".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        let merged = merge_policy(
+            restrictive_default_policy(),
+            &[PolicyMergeOp::AddRule {
+                rule_name: "allow_github_com_22".to_string(),
+                rule: proposed.clone(),
+            }],
+        )
+        .expect("merge should succeed");
+
+        assert!(policy_covers_rule(&merged.policy, &proposed));
+    }
+
+    #[test]
+    fn policy_covers_rule_treats_empty_proposed_binaries_as_any_binary() {
+        // A proposed rule with no binaries is the "any binary" shape.
+        // The merged rule keeps its own binaries; coverage holds iff
+        // endpoint and (vacuously satisfied) binary set match. Document
+        // the semantics so a future reader doesn't flip it accidentally.
+        let proposed = NetworkPolicyRule {
+            name: "any_binary_rule".to_string(),
+            endpoints: vec![endpoint("api.github.com", 443)],
+            binaries: vec![],
+        };
+
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "existing".to_string(),
+            NetworkPolicyRule {
+                name: "existing".to_string(),
+                endpoints: vec![endpoint("api.github.com", 443)],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/curl".to_string(),
+                    ..Default::default()
+                }],
+            },
+        );
+
+        assert!(
+            policy_covers_rule(&policy, &proposed),
+            "empty proposed binaries should match any merged binary set"
+        );
     }
 
     #[test]

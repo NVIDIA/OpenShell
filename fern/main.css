@@ -1004,19 +1004,31 @@ header[role="banner"] > div[class*="bg-(color:--accent)"][class*="text-(color:--
     background: #27c93f;
 }
 .nc-term-body {
+    display: grid;
+    grid-template-rows: repeat(2, 1.8em);
     padding: 16px 20px;
     color: #d4d4d8;
+    overflow-x: auto;
+}
+.nc-term-body > div {
+    min-width: max-content;
+    white-space: nowrap;
 }
 .nc-term-body .nc-ps {
     color: #76b900;
     user-select: none;
 }
 .nc-swap {
-    display: inline-grid;
-    vertical-align: baseline;
+    display: inline-block;
+    position: relative;
+    min-width: 12ch;
+    height: 1.8em;
+    overflow: hidden;
+    vertical-align: top;
 }
 .nc-swap > span {
-    grid-area: 1 / 1;
+    position: absolute;
+    inset: 0 auto auto 0;
     white-space: nowrap;
     opacity: 0;
     animation: nc-cycle 12s ease-in-out infinite;

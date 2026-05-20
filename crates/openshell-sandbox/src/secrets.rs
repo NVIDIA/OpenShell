@@ -6,14 +6,39 @@ use std::collections::HashMap;
 use std::fmt;
 
 const PLACEHOLDER_PREFIX: &str = "openshell:resolve:env:";
+const PROVIDER_ALIAS_MARKER: &str = "OPENSHELL-RESOLVE-ENV-";
 
 /// Public access to the placeholder prefix for fail-closed scanning in other modules.
 pub const PLACEHOLDER_PREFIX_PUBLIC: &str = PLACEHOLDER_PREFIX;
+pub const PROVIDER_ALIAS_MARKER_PUBLIC: &str = PROVIDER_ALIAS_MARKER;
 
 /// Characters that are valid in an env var key name (used to extract
 /// placeholder boundaries within concatenated strings like path segments).
 fn is_env_key_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
+}
+
+fn is_alias_token_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'~')
+}
+
+fn contains_raw_reserved_marker(value: &str) -> bool {
+    value.contains(PLACEHOLDER_PREFIX) || value.contains(PROVIDER_ALIAS_MARKER)
+}
+
+fn current_time_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or_default()
+}
+
+pub fn contains_reserved_credential_marker(value: &str) -> bool {
+    if contains_raw_reserved_marker(value) {
+        return true;
+    }
+    let decoded = percent_decode(value);
+    contains_raw_reserved_marker(&decoded)
 }
 
 // ---------------------------------------------------------------------------
@@ -31,7 +56,7 @@ impl fmt::Display for UnresolvedPlaceholderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "unresolved credential placeholder in {}: detected openshell:resolve:env:* token that could not be resolved",
+            "unresolved credential placeholder in {}: detected reserved credential token that could not be resolved",
             self.location
         )
     }
@@ -64,14 +89,91 @@ pub struct RewriteTargetResult {
 // SecretResolver
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct SecretResolver {
-    by_placeholder: HashMap<String, String>,
+    by_placeholder: HashMap<String, SecretValue>,
+}
+
+#[derive(Clone)]
+struct SecretValue {
+    value: String,
+    expires_at_ms: i64,
+}
+
+// Manual `Debug` impl: the auto-derived `Debug` would format the
+// `by_placeholder` map, exposing both placeholder keys (which reveal which
+// provider env var names are configured) and the resolved secret values
+// themselves. Any accidental `{:?}` in a tracing call, or a
+// derived `Debug` on a containing struct, would write secrets to logs.
+//
+// We expose only the count of registered placeholders without leaking anything.
+impl fmt::Debug for SecretResolver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SecretResolver")
+            .field("placeholders", &self.by_placeholder.len())
+            .finish_non_exhaustive() // Use to show that the struct is not empty
+    }
 }
 
 impl SecretResolver {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn from_provider_env(
         provider_env: HashMap<String, String>,
+    ) -> (HashMap<String, String>, Option<Self>) {
+        Self::from_provider_env_for_revision(provider_env, HashMap::new(), 0)
+    }
+
+    pub(crate) fn from_provider_env_for_revision(
+        provider_env: HashMap<String, String>,
+        credential_expires_at_ms: HashMap<String, i64>,
+        revision: u64,
+    ) -> (HashMap<String, String>, Option<Self>) {
+        Self::from_provider_env_for_revision_with_current_aliases(
+            provider_env,
+            credential_expires_at_ms,
+            revision,
+            false,
+        )
+    }
+
+    pub(crate) fn from_provider_env_for_current_revision(
+        provider_env: HashMap<String, String>,
+        credential_expires_at_ms: HashMap<String, i64>,
+        revision: u64,
+    ) -> (HashMap<String, String>, Option<Self>, Option<Self>) {
+        if revision == 0 {
+            let (child_env, current_resolver) =
+                Self::from_provider_env_for_revision_with_current_aliases(
+                    provider_env,
+                    credential_expires_at_ms,
+                    0,
+                    true,
+                );
+            return (child_env, None, current_resolver);
+        }
+        let provider_env_for_current = provider_env.clone();
+        let credential_expires_at_ms_for_current = credential_expires_at_ms.clone();
+        let (child_env, revision_resolver) =
+            Self::from_provider_env_for_revision_with_current_aliases(
+                provider_env,
+                credential_expires_at_ms,
+                revision,
+                false,
+            );
+        let (_, current_resolver) = Self::from_provider_env_for_revision_with_current_aliases(
+            provider_env_for_current,
+            credential_expires_at_ms_for_current,
+            revision,
+            true,
+        );
+        (child_env, revision_resolver, current_resolver)
+    }
+
+    fn from_provider_env_for_revision_with_current_aliases(
+        provider_env: HashMap<String, String>,
+        credential_expires_at_ms: HashMap<String, i64>,
+        revision: u64,
+        include_current_aliases: bool,
     ) -> (HashMap<String, String>, Option<Self>) {
         if provider_env.is_empty() {
             return (HashMap::new(), None);
@@ -81,12 +183,34 @@ impl SecretResolver {
         let mut by_placeholder = HashMap::with_capacity(provider_env.len());
 
         for (key, value) in provider_env {
-            let placeholder = placeholder_for_env_key(&key);
-            child_env.insert(key, placeholder.clone());
-            by_placeholder.insert(placeholder, value);
+            let placeholder = placeholder_for_env_key_for_revision(&key, revision);
+            let secret = SecretValue {
+                value,
+                expires_at_ms: credential_expires_at_ms
+                    .get(&key)
+                    .copied()
+                    .unwrap_or_default(),
+            };
+            child_env.insert(key.clone(), placeholder.clone());
+            by_placeholder.insert(placeholder, secret.clone());
+            if include_current_aliases && revision != 0 {
+                by_placeholder.insert(placeholder_for_env_key(&key), secret.clone());
+            }
         }
 
         (child_env, Some(Self { by_placeholder }))
+    }
+
+    pub(crate) fn merge<'a>(resolvers: impl IntoIterator<Item = &'a Self>) -> Option<Self> {
+        let mut by_placeholder = HashMap::new();
+        for resolver in resolvers {
+            by_placeholder.extend(resolver.by_placeholder.clone());
+        }
+        if by_placeholder.is_empty() {
+            None
+        } else {
+            Some(Self { by_placeholder })
+        }
     }
 
     /// Resolve a placeholder string to the real secret value.
@@ -94,8 +218,21 @@ impl SecretResolver {
     /// Returns `None` if the placeholder is unknown or the resolved value
     /// contains prohibited control characters (CRLF, null byte).
     pub(crate) fn resolve_placeholder(&self, value: &str) -> Option<&str> {
-        let secret = self.by_placeholder.get(value).map(String::as_str)?;
-        match validate_resolved_secret(secret) {
+        let secret = if let Some(secret) = self.by_placeholder.get(value) {
+            secret
+        } else {
+            let key = alias_env_key(value)?;
+            let canonical = placeholder_for_env_key(key);
+            self.by_placeholder.get(&canonical)?
+        };
+        if secret.expires_at_ms > 0 && secret.expires_at_ms <= current_time_ms() {
+            tracing::warn!(
+                location = "resolve_placeholder",
+                "credential resolution rejected: credential is expired"
+            );
+            return None;
+        }
+        match validate_resolved_secret(&secret.value) {
             Ok(s) => Some(s),
             Err(reason) => {
                 tracing::warn!(
@@ -108,10 +245,13 @@ impl SecretResolver {
         }
     }
 
-    pub(crate) fn rewrite_header_value(&self, value: &str) -> Option<String> {
+    pub(crate) fn rewrite_header_value(
+        &self,
+        value: &str,
+    ) -> Result<Option<String>, UnresolvedPlaceholderError> {
         // Direct placeholder match: `x-api-key: openshell:resolve:env:KEY`
         if let Some(secret) = self.resolve_placeholder(value.trim()) {
-            return Some(secret.to_string());
+            return Ok(Some(secret.to_string()));
         }
 
         let trimmed = value.trim();
@@ -122,60 +262,240 @@ impl SecretResolver {
             .strip_prefix("Basic ")
             .or_else(|| trimmed.strip_prefix("basic "))
             .map(str::trim)
-            && let Some(rewritten) = self.rewrite_basic_auth_token(encoded)
+            && let Some(rewritten) = self.rewrite_basic_auth_token(encoded)?
         {
-            return Some(format!("Basic {rewritten}"));
+            return Ok(Some(format!("Basic {rewritten}")));
         }
 
         // Prefixed placeholder: `Bearer openshell:resolve:env:KEY`
-        let split_at = trimmed.find(char::is_whitespace)?;
+        let Some(split_at) = trimmed.find(char::is_whitespace) else {
+            if contains_reserved_credential_marker(trimmed) {
+                return Err(UnresolvedPlaceholderError { location: "header" });
+            }
+            return Ok(None);
+        };
         let prefix = &trimmed[..split_at];
         let candidate = trimmed[split_at..].trim();
-        let secret = self.resolve_placeholder(candidate)?;
-        Some(format!("{prefix} {secret}"))
+        if let Some(secret) = self.resolve_placeholder(candidate) {
+            return Ok(Some(format!("{prefix} {secret}")));
+        }
+
+        if contains_reserved_credential_marker(candidate) {
+            return Err(UnresolvedPlaceholderError { location: "header" });
+        }
+
+        Ok(None)
+    }
+
+    pub(crate) fn rewrite_text_placeholders(
+        &self,
+        text: &mut String,
+        location: &'static str,
+    ) -> Result<usize, UnresolvedPlaceholderError> {
+        if !contains_raw_reserved_marker(text) {
+            return Ok(0);
+        }
+
+        let mut rewritten = String::with_capacity(text.len());
+        let mut pos = 0;
+        let mut replacements = 0;
+
+        while pos < text.len() {
+            let next_canonical = text[pos..].find(PLACEHOLDER_PREFIX).map(|p| pos + p);
+            let next_alias = text[pos..].find(PROVIDER_ALIAS_MARKER).map(|marker_pos| {
+                let marker_abs = pos + marker_pos;
+                alias_start_for_marker(text, marker_abs)
+            });
+            let Some(abs_start) = [next_canonical, next_alias].into_iter().flatten().min() else {
+                rewritten.push_str(&text[pos..]);
+                break;
+            };
+
+            rewritten.push_str(&text[pos..abs_start]);
+
+            if text[abs_start..].starts_with(PLACEHOLDER_PREFIX) {
+                let Some((token_end, token)) = self.credential_token_at(text, abs_start) else {
+                    return Err(UnresolvedPlaceholderError { location });
+                };
+                let Some(secret) = self.resolve_placeholder(token) else {
+                    return Err(UnresolvedPlaceholderError { location });
+                };
+                rewritten.push_str(secret);
+                replacements += 1;
+                pos = token_end;
+                continue;
+            }
+
+            if let Some((token_end, token)) = alias_token_at(text, abs_start) {
+                let Some(secret) = self.resolve_placeholder(token) else {
+                    return Err(UnresolvedPlaceholderError { location });
+                };
+                rewritten.push_str(secret);
+                replacements += 1;
+                pos = token_end;
+                continue;
+            }
+
+            return Err(UnresolvedPlaceholderError { location });
+        }
+
+        if contains_raw_reserved_marker(&rewritten) {
+            return Err(UnresolvedPlaceholderError { location });
+        }
+
+        *text = rewritten;
+        Ok(replacements)
+    }
+
+    /// Rewrite credential placeholders inside a WebSocket text message.
+    ///
+    /// The message is mutated only after all placeholders resolve
+    /// successfully. The return value is the number of replacements; callers
+    /// must not log the rewritten text.
+    pub(crate) fn rewrite_websocket_text_placeholders(
+        &self,
+        text: &mut String,
+    ) -> Result<usize, UnresolvedPlaceholderError> {
+        self.rewrite_text_placeholders(text, "websocket")
+    }
+
+    fn credential_token_at<'a>(
+        &'a self,
+        text: &'a str,
+        abs_start: usize,
+    ) -> Option<(usize, &'a str)> {
+        self.longest_known_token_match(text, abs_start)
+            .or_else(|| canonical_token_at(text, abs_start))
+            .or_else(|| alias_token_at(text, abs_start))
+    }
+
+    fn longest_known_token_match<'a>(
+        &'a self,
+        text: &str,
+        abs_start: usize,
+    ) -> Option<(usize, &'a str)> {
+        let suffix = &text[abs_start..];
+        self.by_placeholder
+            .keys()
+            .filter_map(|placeholder| {
+                if !suffix.starts_with(placeholder) {
+                    return None;
+                }
+                let key_end = abs_start + placeholder.len();
+                let boundary_ok = token_boundary_ok(text, abs_start, key_end, placeholder);
+                boundary_ok.then_some((key_end, placeholder.as_str()))
+            })
+            .max_by_key(|(_, placeholder)| placeholder.len())
     }
 
     /// Decode a Base64-encoded Basic auth token, resolve any placeholders in
     /// the decoded `username:password` string, and re-encode.
     ///
     /// Returns `None` if decoding fails or no placeholders are found.
-    fn rewrite_basic_auth_token(&self, encoded: &str) -> Option<String> {
+    fn rewrite_basic_auth_token(
+        &self,
+        encoded: &str,
+    ) -> Result<Option<String>, UnresolvedPlaceholderError> {
         let b64 = base64::engine::general_purpose::STANDARD;
-        let decoded_bytes = b64.decode(encoded.trim()).ok()?;
-        let decoded = std::str::from_utf8(&decoded_bytes).ok()?;
+        let Some(decoded_bytes) = b64.decode(encoded.trim()).ok() else {
+            return Ok(None);
+        };
+        let Some(decoded) = std::str::from_utf8(&decoded_bytes).ok() else {
+            return Ok(None);
+        };
 
-        // Check if the decoded string contains any placeholder
-        if !decoded.contains(PLACEHOLDER_PREFIX) {
-            return None;
+        if !contains_raw_reserved_marker(decoded) {
+            return Ok(None);
         }
 
-        // Rewrite all placeholder occurrences in the decoded string
         let mut rewritten = decoded.to_string();
-        for (placeholder, secret) in &self.by_placeholder {
-            if rewritten.contains(placeholder.as_str()) {
-                // Validate the resolved secret for control characters
-                if validate_resolved_secret(secret).is_err() {
-                    tracing::warn!(
-                        location = "basic_auth",
-                        "credential resolution rejected: resolved value contains prohibited characters"
-                    );
-                    return None;
-                }
-                rewritten = rewritten.replace(placeholder.as_str(), secret);
-            }
+        let replacements = self.rewrite_text_placeholders(&mut rewritten, "header")?;
+
+        if replacements == 0 {
+            return Ok(None);
         }
 
-        // Only return if we actually changed something
-        if rewritten == decoded {
-            return None;
-        }
-
-        Some(b64.encode(rewritten.as_bytes()))
+        Ok(Some(b64.encode(rewritten.as_bytes())))
     }
+}
+
+fn alias_start_for_marker(text: &str, marker_abs: usize) -> usize {
+    let mut start = marker_abs;
+    let bytes = text.as_bytes();
+    while start > 0 && is_alias_token_char(bytes[start - 1]) {
+        start -= 1;
+    }
+    start
+}
+
+fn canonical_token_at(text: &str, abs_start: usize) -> Option<(usize, &str)> {
+    if !text[abs_start..].starts_with(PLACEHOLDER_PREFIX) {
+        return None;
+    }
+    let key_start = abs_start + PLACEHOLDER_PREFIX.len();
+    let key_end = text[key_start..]
+        .bytes()
+        .position(|b| !is_env_key_char(b))
+        .map_or(text.len(), |p| key_start + p);
+    (key_end > key_start).then_some((key_end, &text[abs_start..key_end]))
+}
+
+fn alias_token_at(text: &str, abs_start: usize) -> Option<(usize, &str)> {
+    let suffix = &text[abs_start..];
+    let marker_rel = suffix.find(PROVIDER_ALIAS_MARKER)?;
+    if marker_rel == 0 {
+        return None;
+    }
+    let key_start = abs_start + marker_rel + PROVIDER_ALIAS_MARKER.len();
+    let key_end = text[key_start..]
+        .bytes()
+        .position(|b| !is_env_key_char(b))
+        .map_or(text.len(), |p| key_start + p);
+    if key_end == key_start {
+        return None;
+    }
+    let before_ok = abs_start == 0 || !is_alias_token_char(text.as_bytes()[abs_start - 1]);
+    let after_ok = key_end == text.len() || !is_alias_token_char(text.as_bytes()[key_end]);
+    (before_ok && after_ok).then_some((key_end, &text[abs_start..key_end]))
+}
+
+fn alias_env_key(token: &str) -> Option<&str> {
+    let marker_start = token.find(PROVIDER_ALIAS_MARKER)?;
+    if marker_start == 0 {
+        return None;
+    }
+    if !token[..marker_start].bytes().all(is_alias_token_char) {
+        return None;
+    }
+    let key_start = marker_start + PROVIDER_ALIAS_MARKER.len();
+    let key_end = token[key_start..]
+        .bytes()
+        .position(|b| !is_env_key_char(b))
+        .map_or(token.len(), |p| key_start + p);
+    (key_end == token.len() && key_end > key_start).then_some(&token[key_start..key_end])
+}
+
+fn token_boundary_ok(text: &str, abs_start: usize, token_end: usize, token: &str) -> bool {
+    if token.starts_with(PLACEHOLDER_PREFIX) {
+        return token_end == text.len()
+            || !is_env_key_char(text.as_bytes()[token_end])
+            || text[token_end..].starts_with(PLACEHOLDER_PREFIX);
+    }
+    let before_ok = abs_start == 0 || !is_alias_token_char(text.as_bytes()[abs_start - 1]);
+    let after_ok = token_end == text.len() || !is_alias_token_char(text.as_bytes()[token_end]);
+    before_ok && after_ok
 }
 
 pub fn placeholder_for_env_key(key: &str) -> String {
     format!("{PLACEHOLDER_PREFIX}{key}")
+}
+
+pub fn placeholder_for_env_key_for_revision(key: &str, revision: u64) -> String {
+    if revision == 0 {
+        placeholder_for_env_key(key)
+    } else {
+        format!("{PLACEHOLDER_PREFIX}v{revision}_{key}")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -359,8 +679,9 @@ fn rewrite_request_line(
         return unchanged();
     };
 
-    // Only rewrite if the URI contains a placeholder
-    if !uri.contains(PLACEHOLDER_PREFIX) {
+    // Only rewrite if the URI contains a placeholder or a provider-shaped
+    // credential alias, including percent-encoded canonical placeholders.
+    if !contains_reserved_credential_marker(uri) {
         return unchanged();
     }
 
@@ -416,10 +737,6 @@ fn rewrite_uri_path(
     path: &str,
     resolver: &SecretResolver,
 ) -> Result<Option<(String, String)>, UnresolvedPlaceholderError> {
-    if !path.contains(PLACEHOLDER_PREFIX) {
-        return Ok(None);
-    }
-
     let segments: Vec<&str> = path.split('/').collect();
     let mut resolved_segments = Vec::with_capacity(segments.len());
     let mut redacted_segments = Vec::with_capacity(segments.len());
@@ -427,7 +744,7 @@ fn rewrite_uri_path(
 
     for segment in &segments {
         let decoded = percent_decode(segment);
-        if !decoded.contains(PLACEHOLDER_PREFIX) {
+        if !contains_raw_reserved_marker(&decoded) {
             resolved_segments.push(segment.to_string());
             redacted_segments.push(segment.to_string());
             continue;
@@ -467,28 +784,23 @@ fn rewrite_path_segment(
     let bytes = segment.as_bytes();
 
     while pos < bytes.len() {
-        if let Some(start) = segment[pos..].find(PLACEHOLDER_PREFIX) {
-            let abs_start = pos + start;
+        let next_canonical = segment[pos..].find(PLACEHOLDER_PREFIX).map(|p| pos + p);
+        let next_alias = segment[pos..]
+            .find(PROVIDER_ALIAS_MARKER)
+            .map(|marker_pos| {
+                let marker_abs = pos + marker_pos;
+                alias_start_for_marker(segment, marker_abs)
+            });
+        if let Some(abs_start) = [next_canonical, next_alias].into_iter().flatten().min() {
             // Copy literal prefix before the placeholder
             resolved.push_str(&segment[pos..abs_start]);
             redacted.push_str(&segment[pos..abs_start]);
 
-            // Extract the key name using the env var grammar: [A-Za-z_][A-Za-z0-9_]*
-            let key_start = abs_start + PLACEHOLDER_PREFIX.len();
-            let key_end = segment[key_start..]
-                .bytes()
-                .position(|b| !is_env_key_char(b))
-                .map_or(segment.len(), |p| key_start + p);
-
-            if key_end == key_start {
-                // Empty key — not a valid placeholder, copy literally
-                resolved.push_str(&segment[abs_start..abs_start + PLACEHOLDER_PREFIX.len()]);
-                redacted.push_str(&segment[abs_start..abs_start + PLACEHOLDER_PREFIX.len()]);
-                pos = abs_start + PLACEHOLDER_PREFIX.len();
-                continue;
-            }
-
-            let full_placeholder = &segment[abs_start..key_end];
+            let Some((token_end, full_placeholder)) = canonical_token_at(segment, abs_start)
+                .or_else(|| alias_token_at(segment, abs_start))
+            else {
+                return Err(UnresolvedPlaceholderError { location: "path" });
+            };
             if let Some(secret) = resolver.resolve_placeholder(full_placeholder) {
                 validate_credential_for_path(secret).map_err(|reason| {
                     tracing::warn!(
@@ -503,7 +815,7 @@ fn rewrite_path_segment(
             } else {
                 return Err(UnresolvedPlaceholderError { location: "path" });
             }
-            pos = key_end;
+            pos = token_end;
         } else {
             // No more placeholders in remainder
             resolved.push_str(&segment[pos..]);
@@ -522,7 +834,7 @@ fn rewrite_uri_query_params(
     query: &str,
     resolver: &SecretResolver,
 ) -> Result<Option<(String, String)>, UnresolvedPlaceholderError> {
-    if !query.contains(PLACEHOLDER_PREFIX) {
+    if !contains_reserved_credential_marker(query) {
         return Ok(None);
     }
 
@@ -533,15 +845,18 @@ fn rewrite_uri_query_params(
     for param in query.split('&') {
         if let Some((key, value)) = param.split_once('=') {
             let decoded_value = percent_decode(value);
-            if let Some(secret) = resolver.resolve_placeholder(&decoded_value) {
-                resolved_params.push(format!("{key}={}", percent_encode_query(secret)));
+            if contains_raw_reserved_marker(&decoded_value) {
+                let mut rewritten = decoded_value.clone();
+                let replacements =
+                    resolver.rewrite_text_placeholders(&mut rewritten, "query_param")?;
+                if replacements == 0 || contains_raw_reserved_marker(&rewritten) {
+                    return Err(UnresolvedPlaceholderError {
+                        location: "query_param",
+                    });
+                }
+                resolved_params.push(format!("{key}={}", percent_encode_query(&rewritten)));
                 redacted_params.push(format!("{key}=[CREDENTIAL]"));
                 any_rewritten = true;
-            } else if decoded_value.contains(PLACEHOLDER_PREFIX) {
-                // Placeholder detected but not resolved
-                return Err(UnresolvedPlaceholderError {
-                    location: "query_param",
-                });
             } else {
                 resolved_params.push(param.to_string());
                 redacted_params.push(param.to_string());
@@ -611,25 +926,18 @@ pub fn rewrite_http_header_block(
             break;
         }
 
-        output.extend_from_slice(rewrite_header_line(line, resolver).as_bytes());
+        output.extend_from_slice(rewrite_header_line_checked(line, resolver)?.as_bytes());
         output.extend_from_slice(b"\r\n");
     }
 
     output.extend_from_slice(b"\r\n");
     output.extend_from_slice(&raw[header_end..]);
 
-    // Fail-closed scan: check for any remaining unresolved placeholders
-    // in both raw form and percent-decoded form of the output header block.
+    // Fail-closed scan: check for any remaining unresolved placeholders or
+    // provider-shaped aliases in both raw and percent-decoded header bytes.
     let output_header = String::from_utf8_lossy(&output[..output.len().min(header_end + 256)]);
-    if output_header.contains(PLACEHOLDER_PREFIX) {
+    if contains_reserved_credential_marker(&output_header) {
         return Err(UnresolvedPlaceholderError { location: "header" });
-    }
-
-    // Also check percent-decoded form of the request line (F5 — encoded placeholder bypass)
-    let rewritten_rl = output_header.split("\r\n").next().unwrap_or("");
-    let decoded_rl = percent_decode(rewritten_rl);
-    if decoded_rl.contains(PLACEHOLDER_PREFIX) {
-        return Err(UnresolvedPlaceholderError { location: "path" });
     }
 
     Ok(RewriteResult {
@@ -638,14 +946,22 @@ pub fn rewrite_http_header_block(
     })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn rewrite_header_line(line: &str, resolver: &SecretResolver) -> String {
+    rewrite_header_line_checked(line, resolver).unwrap_or_else(|_| line.to_string())
+}
+
+pub fn rewrite_header_line_checked(
+    line: &str,
+    resolver: &SecretResolver,
+) -> Result<String, UnresolvedPlaceholderError> {
     let Some((name, value)) = line.split_once(':') else {
-        return line.to_string();
+        return Ok(line.to_string());
     };
 
-    resolver.rewrite_header_value(value.trim()).map_or_else(
-        || line.to_string(),
-        |rewritten| format!("{name}: {rewritten}"),
+    resolver.rewrite_header_value(value.trim())?.map_or_else(
+        || Ok(line.to_string()),
+        |rewritten| Ok(format!("{name}: {rewritten}")),
     )
 }
 
@@ -660,12 +976,7 @@ pub fn rewrite_target_for_eval(
     target: &str,
     resolver: &SecretResolver,
 ) -> Result<RewriteTargetResult, UnresolvedPlaceholderError> {
-    if !target.contains(PLACEHOLDER_PREFIX) {
-        // Also check percent-decoded form
-        let decoded = percent_decode(target);
-        if decoded.contains(PLACEHOLDER_PREFIX) {
-            return Err(UnresolvedPlaceholderError { location: "path" });
-        }
+    if !contains_reserved_credential_marker(target) {
         return Ok(RewriteTargetResult {
             resolved: target.to_string(),
             redacted: target.to_string(),
@@ -770,6 +1081,50 @@ mod tests {
             ),
             "Authorization: Bearer sk-test"
         );
+    }
+
+    #[test]
+    fn rewrites_provider_shaped_alias_header_values() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [
+                ("API_TOKEN".to_string(), "provider-real-token".to_string()),
+                ("CHAT_APP_TOKEN".to_string(), "app-real-token".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+
+        assert_eq!(
+            rewrite_header_line(
+                "Authorization: Bearer vendor-OPENSHELL-RESOLVE-ENV-API_TOKEN",
+                &resolver,
+            ),
+            "Authorization: Bearer provider-real-token"
+        );
+        assert_eq!(
+            rewrite_header_line(
+                "x-app-token: token.v1-OPENSHELL-RESOLVE-ENV-CHAT_APP_TOKEN",
+                &resolver,
+            ),
+            "x-app-token: app-real-token"
+        );
+    }
+
+    #[test]
+    fn unresolved_provider_shaped_alias_fails_closed() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("API_TOKEN".to_string(), "provider-real-token".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let raw = b"GET / HTTP/1.1\r\nAuthorization: Bearer vendor-OPENSHELL-RESOLVE-ENV-UNKNOWN_TOKEN\r\n\r\n";
+
+        let err = rewrite_http_header_block(raw, Some(&resolver))
+            .expect_err("unknown alias should fail closed");
+
+        assert_eq!(err.location, "header");
     }
 
     #[test]
@@ -1383,6 +1738,29 @@ mod tests {
     }
 
     #[test]
+    fn percent_encoded_canonical_placeholder_in_query_rewrites() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("API_TOKEN".to_string(), "provider-real-token".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let encoded = "openshell%3Aresolve%3Aenv%3AAPI_TOKEN";
+        let raw = format!("GET /api?token={encoded} HTTP/1.1\r\nHost: x\r\n\r\n");
+
+        let result =
+            rewrite_http_header_block(raw.as_bytes(), Some(&resolver)).expect("should rewrite");
+        let rewritten = String::from_utf8(result.rewritten).expect("utf8");
+
+        assert!(rewritten.starts_with("GET /api?token=provider-real-token HTTP/1.1"));
+        assert!(!rewritten.contains("openshell"));
+        assert_eq!(
+            result.redacted_target.as_deref(),
+            Some("/api?token=[CREDENTIAL]")
+        );
+    }
+
+    #[test]
     fn all_resolved_succeeds() {
         let (child_env, resolver) = SecretResolver::from_provider_env(
             [
@@ -1414,6 +1792,129 @@ mod tests {
         let raw = b"GET /api/openshell:resolve:env:KEY HTTP/1.1\r\nHost: x\r\n\r\n";
         let result = rewrite_http_header_block(raw, None).expect("should succeed");
         assert_eq!(raw.as_slice(), result.rewritten.as_slice());
+    }
+
+    #[test]
+    fn rewrite_websocket_text_replaces_placeholders_and_returns_count() {
+        let (child_env, resolver) = SecretResolver::from_provider_env(
+            [
+                ("DISCORD_BOT_TOKEN".to_string(), "real-token".to_string()),
+                ("APP_ID".to_string(), "app-123".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let token = child_env.get("DISCORD_BOT_TOKEN").unwrap();
+        let app_id = child_env.get("APP_ID").unwrap();
+        let mut payload =
+            format!(r#"{{"op":2,"d":{{"token":"{token}","properties":{{"app":"{app_id}"}}}}}}"#);
+
+        let count = resolver
+            .rewrite_websocket_text_placeholders(&mut payload)
+            .expect("rewrite should succeed");
+
+        assert_eq!(count, 2);
+        assert!(payload.contains(r#""token":"real-token""#));
+        assert!(payload.contains(r#""app":"app-123""#));
+        assert!(!payload.contains(PLACEHOLDER_PREFIX));
+    }
+
+    #[test]
+    fn rewrite_websocket_text_replaces_provider_shaped_alias() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("APP_TOKEN".to_string(), "app-real-token".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let mut payload = r#"{"token":"provider-OPENSHELL-RESOLVE-ENV-APP_TOKEN"}"#.to_string();
+
+        let count = resolver
+            .rewrite_websocket_text_placeholders(&mut payload)
+            .expect("alias should rewrite");
+
+        assert_eq!(count, 1);
+        assert_eq!(payload, r#"{"token":"app-real-token"}"#);
+    }
+
+    #[test]
+    fn rewrite_websocket_text_without_placeholder_is_unchanged() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("KEY".to_string(), "secret".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let mut payload = r#"{"op":1,"d":42}"#.to_string();
+
+        let count = resolver
+            .rewrite_websocket_text_placeholders(&mut payload)
+            .expect("rewrite should succeed");
+
+        assert_eq!(count, 0);
+        assert_eq!(payload, r#"{"op":1,"d":42}"#);
+    }
+
+    #[test]
+    fn rewrite_websocket_text_unknown_placeholder_fails_closed_without_mutating() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("KEY".to_string(), "secret".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let original = r#"{"token":"openshell:resolve:env:UNKNOWN"}"#.to_string();
+        let mut payload = original.clone();
+
+        let err = resolver
+            .rewrite_websocket_text_placeholders(&mut payload)
+            .expect_err("unknown placeholder should fail");
+
+        assert_eq!(err.location, "websocket");
+        assert_eq!(payload, original);
+    }
+
+    #[test]
+    fn rewrite_websocket_text_handles_repeated_adjacent_and_unicode_placeholders() {
+        let (child_env, resolver) = SecretResolver::from_provider_env(
+            [
+                ("TOKEN".to_string(), "tok".to_string()),
+                ("APP".to_string(), "app".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let token = child_env.get("TOKEN").unwrap();
+        let app = child_env.get("APP").unwrap();
+        let mut payload = format!("prefix-☃-{token}{app}-{token}-suffix");
+
+        let count = resolver
+            .rewrite_websocket_text_placeholders(&mut payload)
+            .expect("rewrite should succeed");
+
+        assert_eq!(count, 3);
+        assert_eq!(payload, "prefix-☃-tokapp-tok-suffix");
+    }
+
+    #[test]
+    fn rewrite_websocket_text_placeholder_like_prefix_fails_without_mutating() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("KEY".to_string(), "secret".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let original = "openshell:resolve:env:-not-a-key".to_string();
+        let mut payload = original.clone();
+
+        let err = resolver
+            .rewrite_websocket_text_placeholders(&mut payload)
+            .expect_err("placeholder-like prefix should fail closed");
+
+        assert_eq!(err.location, "websocket");
+        assert_eq!(payload, original);
     }
 
     // === Redaction tests ===
@@ -1469,6 +1970,66 @@ mod tests {
 
         assert_eq!(result.resolved, "/v1/chat/completions?format=json");
         assert_eq!(result.redacted, "/v1/chat/completions?format=json");
+    }
+
+    #[test]
+    fn debug_format_does_not_leak_secret_values() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [
+                (
+                    "ANTHROPIC_API_KEY".to_string(),
+                    "sk-very-secret-value-12345".to_string(),
+                ),
+                ("DB_PASSWORD".to_string(), "very-secret-value".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+
+        let plain = format!("{resolver:?}");
+        let pretty = format!("{resolver:#?}");
+
+        for output in [&plain, &pretty] {
+            assert!(
+                !output.contains("sk-very-secret-value-12345"),
+                "secret value leaked via Debug: {output}"
+            );
+            assert!(
+                !output.contains("very-secret-value"),
+                "secret value leaked via Debug: {output}"
+            );
+            assert!(
+                !output.contains("ANTHROPIC_API_KEY"),
+                "placeholder key (env var name) leaked via Debug: {output}"
+            );
+            assert!(
+                !output.contains("DB_PASSWORD"),
+                "placeholder key (env var name) leaked via Debug: {output}"
+            );
+            assert!(
+                !output.contains(PLACEHOLDER_PREFIX),
+                "placeholder prefix leaked via Debug: {output}"
+            );
+            assert!(
+                output.contains("SecretResolver"),
+                "Debug output should still identify the type: {output}"
+            );
+        }
+
+        assert!(
+            plain.contains('2'),
+            "Debug output should expose the placeholder count: {plain}"
+        );
+    }
+
+    #[test]
+    fn debug_format_of_empty_resolver_is_safe() {
+        let resolver = SecretResolver::default();
+        let output = format!("{resolver:?}");
+        assert!(output.contains("SecretResolver"));
+        assert!(output.contains('0'));
+        assert!(!output.contains(PLACEHOLDER_PREFIX));
     }
 
     #[test]

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use openshell_core::config::DEFAULT_SERVER_PORT;
+use openshell_core::config::{CDI_GPU_DEVICE_ALL, DEFAULT_SERVER_PORT};
 use openshell_core::proto::compute::v1::{
     DriverResourceRequirements, DriverSandboxSpec, DriverSandboxTemplate,
 };
@@ -74,7 +74,7 @@ fn container_visible_endpoint_rewrites_loopback_hosts() {
             HOST_OPENSHELL_INTERNAL,
             DEFAULT_SERVER_PORT,
         ),
-        "https://host.openshell.internal:8080/"
+        "https://host.openshell.internal:17670/"
     );
     assert_eq!(
         docker_container_openshell_endpoint(
@@ -82,7 +82,7 @@ fn container_visible_endpoint_rewrites_loopback_hosts() {
             HOST_OPENSHELL_INTERNAL,
             DEFAULT_SERVER_PORT,
         ),
-        "http://host.openshell.internal:8080/"
+        "http://host.openshell.internal:17670/"
     );
     assert_eq!(
         docker_container_openshell_endpoint(
@@ -90,7 +90,7 @@ fn container_visible_endpoint_rewrites_loopback_hosts() {
             HOST_OPENSHELL_INTERNAL,
             DEFAULT_SERVER_PORT,
         ),
-        "https://host.openshell.internal:8080/"
+        "https://host.openshell.internal:17670/"
     );
 }
 
@@ -160,7 +160,99 @@ fn docker_gateway_route_uses_host_gateway_for_docker_desktop() {
     );
     assert_eq!(
         docker_extra_hosts(&DockerGatewayRoute::HostGateway),
-        vec!["host.openshell.internal:host-gateway".to_string()]
+        vec![
+            "host.docker.internal:host-gateway".to_string(),
+            "host.openshell.internal:host-gateway".to_string()
+        ]
+    );
+}
+
+#[test]
+fn docker_gateway_route_uses_host_gateway_for_colima() {
+    let info = SystemInfo {
+        name: Some("colima".to_string()),
+        operating_system: Some("Ubuntu 24.04.4 LTS".to_string()),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        docker_gateway_route(
+            &info,
+            IpAddr::V4(Ipv4Addr::new(172, 20, 0, 1)),
+            DEFAULT_SERVER_PORT,
+            None,
+        ),
+        DockerGatewayRoute::HostGateway
+    );
+    assert_eq!(
+        docker_extra_hosts(&DockerGatewayRoute::HostGateway),
+        vec![
+            "host.docker.internal:host-gateway".to_string(),
+            "host.openshell.internal:host-gateway".to_string()
+        ]
+    );
+}
+
+#[test]
+fn docker_gateway_route_uses_host_gateway_for_colima_named_profile() {
+    let info = SystemInfo {
+        operating_system: Some("Ubuntu 24.04 LTS".to_string()),
+        // `colima start --profile <name>` sets the daemon hostname to
+        // `colima-<name>`; the prefix match still catches it.
+        name: Some("colima-default".to_string()),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        docker_gateway_route(
+            &info,
+            IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
+            DEFAULT_SERVER_PORT,
+            None,
+        ),
+        DockerGatewayRoute::HostGateway
+    );
+}
+
+#[test]
+fn docker_gateway_route_uses_host_gateway_for_rancher_desktop() {
+    let info = SystemInfo {
+        operating_system: Some("Alpine Linux v3.20".to_string()),
+        name: Some("lima-rancher-desktop".to_string()),
+        labels: Some(vec![
+            "dev.rancherdesktop.profile=Rancher Desktop".to_string(),
+        ]),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        docker_gateway_route(
+            &info,
+            IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
+            DEFAULT_SERVER_PORT,
+            None,
+        ),
+        DockerGatewayRoute::HostGateway
+    );
+}
+
+#[test]
+fn docker_gateway_route_uses_host_gateway_for_orbstack() {
+    let info = SystemInfo {
+        operating_system: Some("OrbStack".to_string()),
+        name: Some("orbstack".to_string()),
+        labels: Some(vec!["dev.orbstack.machine_type=docker".to_string()]),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        docker_gateway_route(
+            &info,
+            IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
+            DEFAULT_SERVER_PORT,
+            None,
+        ),
+        DockerGatewayRoute::HostGateway
     );
 }
 
@@ -181,7 +273,7 @@ fn docker_gateway_route_uses_bridge_gateway_for_linux_docker() {
     assert_eq!(
         route,
         DockerGatewayRoute::Bridge {
-            bind_address: "172.18.0.1:8080".parse().unwrap(),
+            bind_address: "172.18.0.1:17670".parse().unwrap(),
             host_alias_ip: IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
         }
     );
@@ -211,7 +303,7 @@ fn docker_gateway_route_prefers_configured_host_gateway_ip() {
     assert_eq!(
         route,
         DockerGatewayRoute::Bridge {
-            bind_address: "172.20.0.4:8080".parse().unwrap(),
+            bind_address: "172.20.0.4:17670".parse().unwrap(),
             host_alias_ip: IpAddr::V4(Ipv4Addr::new(172, 20, 0, 4)),
         }
     );
@@ -235,7 +327,7 @@ fn parse_optional_host_gateway_ip_rejects_invalid_values() {
         parse_optional_host_gateway_ip("not-an-ip")
             .unwrap_err()
             .to_string()
-            .contains("OPENSHELL_HOST_GATEWAY_IP")
+            .contains("host_gateway_ip")
     );
 }
 
@@ -275,6 +367,26 @@ fn docker_resource_limits_rejects_requests() {
 }
 
 #[test]
+fn docker_resource_limits_applies_cpu_and_memory_limits() {
+    let template = DriverSandboxTemplate {
+        image: "img".to_string(),
+        agent_socket_path: String::new(),
+        labels: HashMap::new(),
+        environment: HashMap::new(),
+        resources: Some(DriverResourceRequirements {
+            cpu_limit: "500m".to_string(),
+            memory_limit: "2Gi".to_string(),
+            ..Default::default()
+        }),
+        platform_config: None,
+    };
+
+    let limits = docker_resource_limits(&template).unwrap();
+    assert_eq!(limits.nano_cpus, Some(500_000_000));
+    assert_eq!(limits.memory_bytes, Some(2_147_483_648));
+}
+
+#[test]
 fn build_environment_sets_docker_tls_paths() {
     let env = build_environment(&test_sandbox(), &runtime_config());
     assert!(env.contains(&format!("OPENSHELL_TLS_CA={TLS_CA_MOUNT_PATH}")));
@@ -283,14 +395,6 @@ fn build_environment_sets_docker_tls_paths() {
     assert!(env.contains(&"TEMPLATE_ENV=template".to_string()));
     assert!(env.contains(&"SPEC_ENV=spec".to_string()));
     assert!(env.contains(&"OPENSHELL_SANDBOX_COMMAND=sleep infinity".to_string()));
-    assert!(
-        !env.iter()
-            .any(|entry| entry.starts_with("OPENSHELL_SSH_HANDSHAKE_SECRET="))
-    );
-    assert!(
-        !env.iter()
-            .any(|entry| entry.starts_with("OPENSHELL_SSH_HANDSHAKE_SKEW_SECS="))
-    );
 }
 
 #[test]
@@ -317,11 +421,11 @@ fn build_environment_keeps_path_driver_controlled() {
 }
 
 #[test]
-fn build_mounts_uses_docker_tls_directory() {
-    let mounts = build_mounts(&runtime_config());
-    let targets = mounts
+fn build_binds_uses_docker_tls_directory() {
+    let binds = build_binds(&runtime_config());
+    let targets = binds
         .iter()
-        .filter_map(|mount| mount.target.clone())
+        .filter_map(|bind| bind.split(':').nth(1).map(String::from))
         .collect::<Vec<_>>();
     assert!(targets.contains(&SUPERVISOR_MOUNT_PATH.to_string()));
     assert!(targets.contains(&TLS_CA_MOUNT_PATH.to_string()));
@@ -422,6 +526,30 @@ fn build_container_create_body_maps_gpu_to_all_cdi_device() {
     assert_eq!(
         request.device_ids.as_ref().unwrap(),
         &vec![CDI_GPU_DEVICE_ALL.to_string()]
+    );
+}
+
+#[test]
+fn build_container_create_body_passes_explicit_cdi_device_id_through() {
+    let mut config = runtime_config();
+    config.supports_gpu = true;
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    spec.gpu = true;
+    spec.gpu_device = "nvidia.com/gpu=0".to_string();
+
+    let create_body = build_container_create_body(&sandbox, &config).unwrap();
+    let request = create_body
+        .host_config
+        .as_ref()
+        .and_then(|host_config| host_config.device_requests.as_ref())
+        .and_then(|requests| requests.first())
+        .expect("GPU request should add a Docker device request");
+
+    assert_eq!(request.driver.as_deref(), Some("cdi"));
+    assert_eq!(
+        request.device_ids.as_ref().unwrap(),
+        &vec!["nvidia.com/gpu=0".to_string()]
     );
 }
 
@@ -580,20 +708,17 @@ fn validate_linux_elf_binary_rejects_non_elf_files() {
 
 #[test]
 fn docker_guest_tls_paths_require_all_files_for_https() {
-    let config = Config::new(None).with_grpc_endpoint("https://localhost:8443");
     let tempdir = TempDir::new().unwrap();
     let ca = tempdir.path().join("ca.crt");
     fs::write(&ca, b"ca").unwrap();
 
-    let err = docker_guest_tls_paths(
-        &config,
-        &DockerComputeConfig {
-            guest_tls_ca: Some(ca),
-            ..Default::default()
-        },
-    )
+    let err = docker_guest_tls_paths(&DockerComputeConfig {
+        grpc_endpoint: "https://localhost:8443".to_string(),
+        guest_tls_ca: Some(ca),
+        ..Default::default()
+    })
     .unwrap_err();
-    assert!(err.to_string().contains("--docker-tls-cert"));
+    assert!(err.to_string().contains("guest_tls_cert"));
 }
 
 #[test]
@@ -670,26 +795,26 @@ fn trim_container_name_tail_strips_separators() {
 
 #[test]
 fn docker_guest_tls_paths_rejects_tls_flags_without_https() {
-    let config = Config::new(None).with_grpc_endpoint("http://localhost:8080");
     let tempdir = TempDir::new().unwrap();
     let ca = tempdir.path().join("ca.crt");
     fs::write(&ca, b"ca").unwrap();
 
-    let err = docker_guest_tls_paths(
-        &config,
-        &DockerComputeConfig {
-            guest_tls_ca: Some(ca),
-            ..Default::default()
-        },
-    )
+    let err = docker_guest_tls_paths(&DockerComputeConfig {
+        grpc_endpoint: "http://localhost:8080".to_string(),
+        guest_tls_ca: Some(ca),
+        ..Default::default()
+    })
     .unwrap_err();
     assert!(err.to_string().contains("https://"));
 }
 
 #[test]
 fn docker_guest_tls_paths_allows_plain_http_without_tls_flags() {
-    let config = Config::new(None).with_grpc_endpoint("http://localhost:8080");
-    let result = docker_guest_tls_paths(&config, &DockerComputeConfig::default()).unwrap();
+    let result = docker_guest_tls_paths(&DockerComputeConfig {
+        grpc_endpoint: "http://localhost:8080".to_string(),
+        ..Default::default()
+    })
+    .unwrap();
     assert!(result.is_none());
 }
 
@@ -719,6 +844,22 @@ fn docker_supervisor_image_tag_prefers_explicit_build_tags() {
     assert_eq!(
         resolve_default_docker_supervisor_image_tag(Some(""), Some(""), "0.0.0"),
         "dev",
+    );
+}
+
+#[test]
+fn docker_supervisor_image_tag_sanitizes_build_metadata_for_docker() {
+    assert_eq!(
+        resolve_default_docker_supervisor_image_tag(None, None, "0.0.37-dev.156+g1d3b741ee"),
+        "0.0.37-dev.156-g1d3b741ee",
+    );
+    assert_eq!(
+        resolve_default_docker_supervisor_image_tag(
+            Some("0.0.37-dev.156+g1d3b741ee"),
+            None,
+            "0.0.0",
+        ),
+        "0.0.37-dev.156-g1d3b741ee",
     );
 }
 

@@ -120,3 +120,13 @@ pub enum ComputeDriverError {
     #[error("{0}")]
     Message(String),
 }
+
+impl From<ComputeDriverError> for tonic::Status {
+    fn from(err: ComputeDriverError) -> Self {
+        match err {
+            ComputeDriverError::AlreadyExists => Self::already_exists("sandbox already exists"),
+            ComputeDriverError::Precondition(m) => Self::failed_precondition(m),
+            ComputeDriverError::Message(m) => Self::internal(m),
+        }
+    }
+}

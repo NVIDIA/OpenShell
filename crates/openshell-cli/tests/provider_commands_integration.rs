@@ -1,25 +1,34 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+mod helpers;
+
+use helpers::{
+    EnvVarGuard, build_ca, build_client_cert, build_server_cert, install_rustls_provider,
+};
 use openshell_cli::run;
 use openshell_cli::tls::TlsOptions;
 use openshell_core::proto::open_shell_server::{OpenShell, OpenShellServer};
 use openshell_core::proto::{
-    CreateProviderRequest, CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse,
-    DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    ExecSandboxEvent, ExecSandboxRequest, GatewayMessage, GetGatewayConfigRequest,
-    GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
-    GetSandboxConfigResponse, GetSandboxProviderEnvironmentRequest,
-    GetSandboxProviderEnvironmentResponse, GetSandboxRequest, HealthRequest, HealthResponse,
-    ListProvidersRequest, ListProvidersResponse, ListSandboxesRequest, ListSandboxesResponse,
-    Provider, ProviderProfile, ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse,
-    SandboxResponse, SandboxStreamEvent, ServiceStatus, SupervisorMessage, UpdateProviderRequest,
+    AttachSandboxProviderRequest, AttachSandboxProviderResponse, CreateProviderRequest,
+    CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse,
+    DeleteProviderRefreshRequest, DeleteProviderRefreshResponse, DeleteProviderRequest,
+    DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
+    DetachSandboxProviderRequest, DetachSandboxProviderResponse, ExecSandboxEvent,
+    ExecSandboxInput, ExecSandboxRequest, GatewayMessage, GetGatewayConfigRequest,
+    GetGatewayConfigResponse, GetProviderRefreshStatusRequest, GetProviderRefreshStatusResponse,
+    GetProviderRequest, GetSandboxConfigRequest, GetSandboxConfigResponse,
+    GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
+    HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
+    ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
+    ListSandboxesResponse, Provider, ProviderCredentialRefresh, ProviderCredentialRefreshStatus,
+    ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileCredential,
+    ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse,
+    RotateProviderCredentialRequest, RotateProviderCredentialResponse, Sandbox, SandboxResponse,
+    SandboxStreamEvent, ServiceStatus, SupervisorMessage, UpdateProviderRequest,
     WatchSandboxRequest,
 };
 use openshell_core::{ObjectId, ObjectName};
-use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
-};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -29,41 +38,50 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Certificate as TlsCertificate, Identity, Server, ServerTlsConfig};
 use tonic::{Response, Status};
 
-struct EnvVarGuard {
-    key: &'static str,
-    original: Option<String>,
-}
-
-#[allow(unsafe_code)]
-impl EnvVarGuard {
-    fn set(key: &'static str, value: &str) -> Self {
-        let original = std::env::var(key).ok();
-        unsafe {
-            std::env::set_var(key, value);
-        }
-        Self { key, original }
-    }
-}
-
-#[allow(unsafe_code)]
-impl Drop for EnvVarGuard {
-    fn drop(&mut self) {
-        if let Some(value) = &self.original {
-            unsafe {
-                std::env::set_var(self.key, value);
-            }
-        } else {
-            unsafe {
-                std::env::remove_var(self.key);
-            }
-        }
-    }
-}
-
 #[derive(Clone, Default)]
 struct ProviderState {
     providers: Arc<Mutex<HashMap<String, Provider>>>,
     profiles: Arc<Mutex<HashMap<String, ProviderProfile>>>,
+    refresh_statuses: Arc<Mutex<HashMap<(String, String), ProviderCredentialRefreshStatus>>>,
+    refresh_requests: Arc<Mutex<Vec<ProviderRefreshRequestLog>>>,
+    sandbox_providers: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    sandbox_provider_requests: Arc<Mutex<Vec<SandboxProviderRequestLog>>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ProviderRefreshRequestLog {
+    Status {
+        provider_name: String,
+        credential_key: String,
+    },
+    Configure {
+        provider_name: String,
+        credential_key: String,
+        expires_at_ms: Option<i64>,
+    },
+    Rotate {
+        provider_name: String,
+        credential_key: String,
+    },
+    Delete {
+        provider_name: String,
+        credential_key: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SandboxProviderRequestLog {
+    List {
+        sandbox_name: String,
+    },
+    Attach {
+        sandbox_name: String,
+        provider_name: String,
+    },
+    Detach {
+        sandbox_name: String,
+        provider_name: String,
+    },
 }
 
 #[derive(Clone, Default)]
@@ -92,9 +110,25 @@ impl OpenShell for TestOpenShell {
 
     async fn get_sandbox(
         &self,
-        _request: tonic::Request<GetSandboxRequest>,
+        request: tonic::Request<GetSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
-        Ok(Response::new(SandboxResponse::default()))
+        let name = request.into_inner().name;
+        // Return a minimal sandbox with metadata for CAS operations
+        Ok(Response::new(SandboxResponse {
+            sandbox: Some(Sandbox {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: format!("sb-{name}"),
+                    name,
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 1,
+                }),
+                spec: None,
+                status: None,
+                phase: 0,
+                current_policy_version: 0,
+            }),
+        }))
     }
 
     async fn list_sandboxes(
@@ -102,6 +136,120 @@ impl OpenShell for TestOpenShell {
         _request: tonic::Request<ListSandboxesRequest>,
     ) -> Result<Response<ListSandboxesResponse>, Status> {
         Ok(Response::new(ListSandboxesResponse::default()))
+    }
+
+    async fn list_sandbox_providers(
+        &self,
+        request: tonic::Request<ListSandboxProvidersRequest>,
+    ) -> Result<Response<ListSandboxProvidersResponse>, Status> {
+        let sandbox_name = request.into_inner().sandbox_name;
+        self.state
+            .sandbox_provider_requests
+            .lock()
+            .await
+            .push(SandboxProviderRequestLog::List {
+                sandbox_name: sandbox_name.clone(),
+            });
+        let provider_names = self
+            .state
+            .sandbox_providers
+            .lock()
+            .await
+            .get(&sandbox_name)
+            .cloned()
+            .unwrap_or_default();
+        let providers_by_name = self.state.providers.lock().await;
+        let providers = provider_names
+            .iter()
+            .filter_map(|name| providers_by_name.get(name).cloned())
+            .collect();
+        Ok(Response::new(ListSandboxProvidersResponse { providers }))
+    }
+
+    async fn attach_sandbox_provider(
+        &self,
+        request: tonic::Request<AttachSandboxProviderRequest>,
+    ) -> Result<Response<AttachSandboxProviderResponse>, Status> {
+        let request = request.into_inner();
+        self.state
+            .sandbox_provider_requests
+            .lock()
+            .await
+            .push(SandboxProviderRequestLog::Attach {
+                sandbox_name: request.sandbox_name.clone(),
+                provider_name: request.provider_name.clone(),
+            });
+        if !self
+            .state
+            .providers
+            .lock()
+            .await
+            .contains_key(&request.provider_name)
+        {
+            return Err(Status::failed_precondition("provider not found"));
+        }
+        let mut sandbox_providers = self.state.sandbox_providers.lock().await;
+        let providers = sandbox_providers
+            .entry(request.sandbox_name.clone())
+            .or_default();
+        let attached = if providers.contains(&request.provider_name) {
+            false
+        } else {
+            providers.push(request.provider_name.clone());
+            true
+        };
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                name: request.sandbox_name,
+                ..Default::default()
+            }),
+            spec: Some(openshell_core::proto::SandboxSpec {
+                providers: providers.clone(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        Ok(Response::new(AttachSandboxProviderResponse {
+            sandbox: Some(sandbox),
+            attached,
+        }))
+    }
+
+    async fn detach_sandbox_provider(
+        &self,
+        request: tonic::Request<DetachSandboxProviderRequest>,
+    ) -> Result<Response<DetachSandboxProviderResponse>, Status> {
+        let request = request.into_inner();
+        self.state
+            .sandbox_provider_requests
+            .lock()
+            .await
+            .push(SandboxProviderRequestLog::Detach {
+                sandbox_name: request.sandbox_name.clone(),
+                provider_name: request.provider_name.clone(),
+            });
+        let mut sandbox_providers = self.state.sandbox_providers.lock().await;
+        let providers = sandbox_providers
+            .entry(request.sandbox_name.clone())
+            .or_default();
+        let before_len = providers.len();
+        providers.retain(|name| name != &request.provider_name);
+        let detached = providers.len() != before_len;
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                name: request.sandbox_name,
+                ..Default::default()
+            }),
+            spec: Some(openshell_core::proto::SandboxSpec {
+                providers: providers.clone(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        Ok(Response::new(DetachSandboxProviderResponse {
+            sandbox: Some(sandbox),
+            detached,
+        }))
     }
 
     async fn delete_sandbox(
@@ -139,6 +287,36 @@ impl OpenShell for TestOpenShell {
         _request: tonic::Request<CreateSshSessionRequest>,
     ) -> Result<Response<CreateSshSessionResponse>, Status> {
         Ok(Response::new(CreateSshSessionResponse::default()))
+    }
+
+    async fn expose_service(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ExposeServiceRequest>,
+    ) -> Result<Response<openshell_core::proto::ServiceEndpointResponse>, Status> {
+        Ok(Response::new(
+            openshell_core::proto::ServiceEndpointResponse::default(),
+        ))
+    }
+
+    async fn get_service(
+        &self,
+        _: tonic::Request<openshell_core::proto::GetServiceRequest>,
+    ) -> Result<Response<openshell_core::proto::ServiceEndpointResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn list_services(
+        &self,
+        _: tonic::Request<openshell_core::proto::ListServicesRequest>,
+    ) -> Result<Response<openshell_core::proto::ListServicesResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn delete_service(
+        &self,
+        _: tonic::Request<openshell_core::proto::DeleteServiceRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteServiceResponse>, Status> {
+        Err(Status::unimplemented("unused"))
     }
 
     async fn revoke_ssh_session(
@@ -304,6 +482,19 @@ impl OpenShell for TestOpenShell {
             }
             base
         };
+        let merge_expiry = |mut base: HashMap<String, i64>, incoming: HashMap<String, i64>| {
+            if incoming.is_empty() {
+                return base;
+            }
+            for (k, v) in incoming {
+                if v <= 0 {
+                    base.remove(&k);
+                } else {
+                    base.insert(k, v);
+                }
+            }
+            base
+        };
         let existing_metadata = existing.metadata.clone().unwrap_or_default();
         let provider_metadata = provider.metadata.clone().unwrap_or_default();
         let updated = Provider {
@@ -312,16 +503,140 @@ impl OpenShell for TestOpenShell {
                 name: provider_metadata.name,
                 created_at_ms: existing_metadata.created_at_ms,
                 labels: existing_metadata.labels,
+                resource_version: 0,
             }),
             r#type: existing.r#type,
             credentials: merge(existing.credentials, provider.credentials),
             config: merge(existing.config, provider.config),
+            credential_expires_at_ms: merge_expiry(
+                existing.credential_expires_at_ms,
+                provider.credential_expires_at_ms,
+            ),
         };
         let updated_name = updated.object_name().to_string();
         providers.insert(updated_name, updated.clone());
         Ok(Response::new(ProviderResponse {
             provider: Some(updated),
         }))
+    }
+    async fn get_provider_refresh_status(
+        &self,
+        request: tonic::Request<GetProviderRefreshStatusRequest>,
+    ) -> Result<Response<GetProviderRefreshStatusResponse>, Status> {
+        let request = request.into_inner();
+        self.state
+            .refresh_requests
+            .lock()
+            .await
+            .push(ProviderRefreshRequestLog::Status {
+                provider_name: request.provider.clone(),
+                credential_key: request.credential_key.clone(),
+            });
+        let refresh_statuses = self.state.refresh_statuses.lock().await;
+        let credentials = if request.credential_key.is_empty() {
+            refresh_statuses
+                .values()
+                .filter(|status| status.provider_name == request.provider)
+                .cloned()
+                .collect()
+        } else {
+            refresh_statuses
+                .get(&(request.provider, request.credential_key))
+                .cloned()
+                .into_iter()
+                .collect()
+        };
+        Ok(Response::new(GetProviderRefreshStatusResponse {
+            credentials,
+        }))
+    }
+
+    async fn configure_provider_refresh(
+        &self,
+        request: tonic::Request<openshell_core::proto::ConfigureProviderRefreshRequest>,
+    ) -> Result<Response<openshell_core::proto::ConfigureProviderRefreshResponse>, Status> {
+        let request = request.into_inner();
+        self.state
+            .refresh_requests
+            .lock()
+            .await
+            .push(ProviderRefreshRequestLog::Configure {
+                provider_name: request.provider.clone(),
+                credential_key: request.credential_key.clone(),
+                expires_at_ms: request.expires_at_ms,
+            });
+        let providers = self.state.providers.lock().await;
+        let provider = providers
+            .get(&request.provider)
+            .ok_or_else(|| Status::not_found("provider not found"))?;
+        let status = ProviderCredentialRefreshStatus {
+            provider_name: request.provider.clone(),
+            provider_id: provider.object_id().to_string(),
+            credential_key: request.credential_key.clone(),
+            strategy: request.strategy,
+            status: "configured".to_string(),
+            expires_at_ms: request.expires_at_ms.unwrap_or_default(),
+            next_refresh_at_ms: 0,
+            last_refresh_at_ms: 0,
+            last_error: String::new(),
+        };
+        drop(providers);
+        self.state
+            .refresh_statuses
+            .lock()
+            .await
+            .insert((request.provider, request.credential_key), status.clone());
+        Ok(Response::new(
+            openshell_core::proto::ConfigureProviderRefreshResponse {
+                status: Some(status),
+            },
+        ))
+    }
+
+    async fn rotate_provider_credential(
+        &self,
+        request: tonic::Request<RotateProviderCredentialRequest>,
+    ) -> Result<Response<RotateProviderCredentialResponse>, Status> {
+        let request = request.into_inner();
+        self.state
+            .refresh_requests
+            .lock()
+            .await
+            .push(ProviderRefreshRequestLog::Rotate {
+                provider_name: request.provider.clone(),
+                credential_key: request.credential_key.clone(),
+            });
+        let mut refresh_statuses = self.state.refresh_statuses.lock().await;
+        let status = refresh_statuses
+            .get_mut(&(request.provider, request.credential_key))
+            .ok_or_else(|| Status::not_found("provider refresh state not found"))?;
+        status.status = "rotation_requested".to_string();
+        Ok(Response::new(RotateProviderCredentialResponse {
+            status: Some(status.clone()),
+        }))
+    }
+
+    async fn delete_provider_refresh(
+        &self,
+        request: tonic::Request<DeleteProviderRefreshRequest>,
+    ) -> Result<Response<DeleteProviderRefreshResponse>, Status> {
+        let request = request.into_inner();
+        self.state
+            .refresh_requests
+            .lock()
+            .await
+            .push(ProviderRefreshRequestLog::Delete {
+                provider_name: request.provider.clone(),
+                credential_key: request.credential_key.clone(),
+            });
+        let deleted = self
+            .state
+            .refresh_statuses
+            .lock()
+            .await
+            .remove(&(request.provider, request.credential_key))
+            .is_some();
+        Ok(Response::new(DeleteProviderRefreshResponse { deleted }))
     }
 
     async fn delete_provider(
@@ -369,6 +684,15 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
             rx,
         )))
+    }
+
+    type ExecSandboxInteractiveStream =
+        tokio_stream::wrappers::ReceiverStream<Result<ExecSandboxEvent, Status>>;
+    async fn exec_sandbox_interactive(
+        &self,
+        _request: tonic::Request<tonic::Streaming<ExecSandboxInput>>,
+    ) -> Result<Response<Self::ExecSandboxInteractiveStream>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
     }
 
     async fn update_config(
@@ -492,34 +816,17 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<Self::RelayStreamStream>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
-}
 
-fn install_rustls_provider() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-}
+    type ForwardTcpStream = tokio_stream::wrappers::ReceiverStream<
+        Result<openshell_core::proto::TcpForwardFrame, Status>,
+    >;
 
-fn build_ca() -> (Certificate, KeyPair) {
-    let key_pair = KeyPair::generate().unwrap();
-    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
-    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    let cert = params.self_signed(&key_pair).unwrap();
-    (cert, key_pair)
-}
-
-fn build_server_cert(ca: &Certificate, ca_key: &KeyPair) -> (String, String) {
-    let key_pair = KeyPair::generate().unwrap();
-    let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
-    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-    let cert = params.signed_by(&key_pair, ca, ca_key).unwrap();
-    (cert.pem(), key_pair.serialize_pem())
-}
-
-fn build_client_cert(ca: &Certificate, ca_key: &KeyPair) -> (String, String) {
-    let key_pair = KeyPair::generate().unwrap();
-    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
-    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
-    let cert = params.signed_by(&key_pair, ca, ca_key).unwrap();
-    (cert.pem(), key_pair.serialize_pem())
+    async fn forward_tcp(
+        &self,
+        _request: tonic::Request<tonic::Streaming<openshell_core::proto::TcpForwardFrame>>,
+    ) -> Result<Response<Self::ForwardTcpStream>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
 }
 
 /// Test fixture: TLS-enabled server with matching client certs.
@@ -609,6 +916,7 @@ async fn provider_cli_run_functions_support_full_crud_flow() {
         false,
         &["API_KEY=rotated".to_string()],
         &["profile=prod".to_string()],
+        &[],
         &ts.tls,
     )
     .await
@@ -626,6 +934,199 @@ async fn provider_list_profiles_cli_uses_profile_browsing_rpc() {
     run::provider_list_profiles(&ts.endpoint, "table", &ts.tls)
         .await
         .expect("provider list-profiles");
+}
+
+#[tokio::test]
+async fn provider_refresh_cli_run_functions_wire_requests() {
+    let ts = run_server().await;
+
+    run::provider_create(
+        &ts.endpoint,
+        "my-graph",
+        "outlook",
+        false,
+        &["MS_GRAPH_ACCESS_TOKEN=token".to_string()],
+        &[],
+        &ts.tls,
+    )
+    .await
+    .expect("provider create");
+
+    run::provider_refresh_config(
+        &ts.endpoint,
+        run::ProviderRefreshConfigInput {
+            name: "my-graph",
+            credential_key: "MS_GRAPH_ACCESS_TOKEN",
+            strategy: "oauth2_client_credentials",
+            material: &["tenant_id=tenant".to_string()],
+            secret_material_keys: &["client_secret".to_string()],
+            credential_expires_at_ms: Some(1_767_225_600_000),
+        },
+        &ts.tls,
+    )
+    .await
+    .expect("provider refresh configure");
+    run::provider_refresh_status(
+        &ts.endpoint,
+        "my-graph",
+        Some("MS_GRAPH_ACCESS_TOKEN"),
+        &ts.tls,
+    )
+    .await
+    .expect("provider refresh status");
+    run::provider_rotate(&ts.endpoint, "my-graph", "MS_GRAPH_ACCESS_TOKEN", &ts.tls)
+        .await
+        .expect("provider refresh rotate");
+    run::provider_refresh_delete(&ts.endpoint, "my-graph", "MS_GRAPH_ACCESS_TOKEN", &ts.tls)
+        .await
+        .expect("provider refresh delete");
+
+    let requests = ts.state.refresh_requests.lock().await.clone();
+    assert_eq!(
+        requests,
+        vec![
+            ProviderRefreshRequestLog::Configure {
+                provider_name: "my-graph".to_string(),
+                credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
+                expires_at_ms: Some(1_767_225_600_000),
+            },
+            ProviderRefreshRequestLog::Status {
+                provider_name: "my-graph".to_string(),
+                credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
+            },
+            ProviderRefreshRequestLog::Rotate {
+                provider_name: "my-graph".to_string(),
+                credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
+            },
+            ProviderRefreshRequestLog::Delete {
+                provider_name: "my-graph".to_string(),
+                credential_key: "MS_GRAPH_ACCESS_TOKEN".to_string(),
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn provider_create_allows_empty_credentials_for_gateway_refresh_profiles() {
+    let ts = run_server().await;
+    ts.state.profiles.lock().await.insert(
+        "custom-refresh".to_string(),
+        ProviderProfile {
+            id: "custom-refresh".to_string(),
+            display_name: "Custom Refresh".to_string(),
+            credentials: vec![ProviderProfileCredential {
+                name: "ACCESS_TOKEN".to_string(),
+                required: true,
+                refresh: Some(ProviderCredentialRefresh {
+                    strategy: ProviderCredentialRefreshStrategy::Oauth2RefreshToken as i32,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    );
+
+    run::provider_create(
+        &ts.endpoint,
+        "custom-refresh-provider",
+        "custom-refresh",
+        false,
+        &[],
+        &[],
+        &ts.tls,
+    )
+    .await
+    .expect("provider create");
+
+    let stored = ts.state.providers.lock().await;
+    let provider = stored.get("custom-refresh-provider").expect("provider");
+    assert_eq!(provider.r#type, "custom-refresh");
+    assert!(provider.credentials.is_empty());
+}
+
+#[tokio::test]
+async fn sandbox_provider_cli_run_functions_wire_requests_and_idempotent_results() {
+    let ts = run_server().await;
+
+    run::provider_create(
+        &ts.endpoint,
+        "work-github",
+        "github",
+        false,
+        &["GITHUB_TOKEN=ghp-test".to_string()],
+        &[],
+        &ts.tls,
+    )
+    .await
+    .expect("provider create");
+
+    run::sandbox_provider_attach(&ts.endpoint, "dev-sandbox", "work-github", &ts.tls)
+        .await
+        .expect("sandbox provider attach");
+    run::sandbox_provider_attach(&ts.endpoint, "dev-sandbox", "work-github", &ts.tls)
+        .await
+        .expect("sandbox provider attach is idempotent");
+    run::sandbox_provider_list(&ts.endpoint, "dev-sandbox", &ts.tls)
+        .await
+        .expect("sandbox provider list");
+    run::sandbox_provider_detach(&ts.endpoint, "dev-sandbox", "work-github", &ts.tls)
+        .await
+        .expect("sandbox provider detach");
+    run::sandbox_provider_detach(&ts.endpoint, "dev-sandbox", "work-github", &ts.tls)
+        .await
+        .expect("sandbox provider detach is idempotent");
+
+    let requests = ts.state.sandbox_provider_requests.lock().await.clone();
+    assert_eq!(
+        requests,
+        vec![
+            SandboxProviderRequestLog::Attach {
+                sandbox_name: "dev-sandbox".to_string(),
+                provider_name: "work-github".to_string(),
+            },
+            SandboxProviderRequestLog::Attach {
+                sandbox_name: "dev-sandbox".to_string(),
+                provider_name: "work-github".to_string(),
+            },
+            SandboxProviderRequestLog::List {
+                sandbox_name: "dev-sandbox".to_string(),
+            },
+            SandboxProviderRequestLog::Detach {
+                sandbox_name: "dev-sandbox".to_string(),
+                provider_name: "work-github".to_string(),
+            },
+            SandboxProviderRequestLog::Detach {
+                sandbox_name: "dev-sandbox".to_string(),
+                provider_name: "work-github".to_string(),
+            },
+        ]
+    );
+
+    let providers = ts.state.sandbox_providers.lock().await;
+    assert!(providers.get("dev-sandbox").is_none_or(Vec::is_empty));
+}
+
+#[tokio::test]
+async fn sandbox_provider_attach_cli_surfaces_server_errors() {
+    let ts = run_server().await;
+
+    let err =
+        run::sandbox_provider_attach(&ts.endpoint, "dev-sandbox", "missing-provider", &ts.tls)
+            .await
+            .expect_err("missing provider should fail");
+
+    assert!(
+        err.to_string().contains("provider not found"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(
+        ts.state.sandbox_provider_requests.lock().await.as_slice(),
+        [SandboxProviderRequestLog::Attach {
+            sandbox_name: "dev-sandbox".to_string(),
+            provider_name: "missing-provider".to_string(),
+        }]
+    );
 }
 
 #[tokio::test]
@@ -888,7 +1389,7 @@ async fn provider_create_rejects_key_only_credentials_without_local_env_value() 
 #[tokio::test]
 async fn provider_create_supports_generic_type_and_env_lookup_credentials() {
     let ts = run_server().await;
-    let _guard = EnvVarGuard::set("NAV_GENERIC_TEST_KEY", "generic-value");
+    let _guard = EnvVarGuard::set(&[("NAV_GENERIC_TEST_KEY", "generic-value")]);
 
     run::provider_create(
         &ts.endpoint,
@@ -946,7 +1447,7 @@ async fn provider_create_rejects_combined_from_existing_and_credentials() {
 #[tokio::test]
 async fn provider_create_rejects_empty_env_var_for_key_only_credential() {
     let ts = run_server().await;
-    let _guard = EnvVarGuard::set("NAV_EMPTY_ENV_KEY", "");
+    let _guard = EnvVarGuard::set(&[("NAV_EMPTY_ENV_KEY", "")]);
 
     let err = run::provider_create(
         &ts.endpoint,
@@ -970,7 +1471,7 @@ async fn provider_create_rejects_empty_env_var_for_key_only_credential() {
 #[tokio::test]
 async fn provider_create_supports_nvidia_type_with_nvidia_api_key() {
     let ts = run_server().await;
-    let _guard = EnvVarGuard::set("NVIDIA_API_KEY", "nvapi-live-test");
+    let _guard = EnvVarGuard::set(&[("NVIDIA_API_KEY", "nvapi-live-test")]);
 
     run::provider_create(
         &ts.endpoint,

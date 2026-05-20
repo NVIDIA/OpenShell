@@ -68,6 +68,10 @@ async fn gateway_smoke() {
         sb.create_output,
     );
 
+    if std::env::var_os("OPENSHELL_E2E_EXPECT_VM_OVERLAY").is_some() {
+        assert_vm_overlay_root(&sb.name).await;
+    }
+
     // ── 3. Verify the sandbox appeared in the list ───────────────────
     let mut list_cmd = openshell_cmd();
     list_cmd
@@ -94,4 +98,42 @@ async fn gateway_smoke() {
 
     // ── 4. Cleanup ───────────────────────────────────────────────────
     sb.cleanup().await;
+}
+
+async fn assert_vm_overlay_root(sandbox_name: &str) {
+    let script = concat!(
+        "set -eu; ",
+        "test \"$(stat -f -c %T /)\" = \"overlayfs\"; ",
+        "printf \"overlay-write\\n\" > /sandbox/overlay-check; ",
+        "test \"$(cat /sandbox/overlay-check)\" = \"overlay-write\"; ",
+        "if [ -e /opt/openshell/tls/tls.key ]; then ",
+        "test \"$(stat -c %a /opt/openshell/tls/tls.key)\" = \"600\"; ",
+        "fi; ",
+        "echo vm-overlay-ok",
+    );
+
+    let mut exec_cmd = openshell_cmd();
+    exec_cmd
+        .args(["sandbox", "exec", "--name", sandbox_name, "--no-tty", "--"])
+        .arg("sh")
+        .arg("-lc")
+        .arg(script)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let output = exec_cmd
+        .output()
+        .await
+        .expect("failed to run VM overlay assertion");
+    let combined = strip_ansi(&format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    ));
+
+    assert!(
+        output.status.success() && combined.contains("vm-overlay-ok"),
+        "VM overlay assertion failed (status {:?}):\n{combined}",
+        output.status.code(),
+    );
 }

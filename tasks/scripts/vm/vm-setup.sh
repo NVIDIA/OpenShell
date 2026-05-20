@@ -4,8 +4,9 @@
 
 # One-time setup for the openshell-driver-vm runtime.
 #
-# Downloads pre-built runtime artifacts (libkrun, libkrunfw, gvproxy) from the
-# vm-runtime GitHub Release, or builds them from source when --from-source is set.
+# Downloads pre-built runtime artifacts (libkrun, libkrunfw, gvproxy, umoci)
+# from the vm-runtime GitHub Release, or builds them from source when
+# --from-source is set.
 # After obtaining the runtime, compresses the artifacts for embedding into the
 # openshell-driver-vm binary.
 #
@@ -34,7 +35,7 @@ while [[ $# -gt 0 ]]; do
         --help|-h)
             echo "Usage: $0 [--from-source]"
             echo ""
-            echo "Set up the openshell-driver-vm runtime (libkrun, libkrunfw, gvproxy)."
+            echo "Set up the openshell-driver-vm runtime (libkrun, libkrunfw, gvproxy, umoci)."
             echo ""
             echo "Options:"
             echo "  --from-source   Build runtime from source instead of downloading (~15-45min)"
@@ -100,7 +101,7 @@ OUTPUT_DIR="${OPENSHELL_VM_RUNTIME_COMPRESSED_DIR:-${ROOT}/target/vm-runtime-com
 missing=0
 case "$PLATFORM" in
     darwin-aarch64)
-        for f in libkrun.dylib.zst libkrunfw.5.dylib.zst gvproxy.zst; do
+        for f in libkrun.dylib.zst libkrunfw.5.dylib.zst gvproxy.zst umoci.zst; do
             if [ ! -f "${OUTPUT_DIR}/${f}" ]; then
                 echo "ERROR: Missing ${OUTPUT_DIR}/${f}" >&2
                 missing=1
@@ -108,7 +109,7 @@ case "$PLATFORM" in
         done
         ;;
     linux-aarch64|linux-x86_64)
-        for f in libkrun.so.zst libkrunfw.so.5.zst gvproxy.zst; do
+        for f in libkrun.so.zst libkrunfw.so.5.zst gvproxy.zst umoci.zst; do
             if [ ! -f "${OUTPUT_DIR}/${f}" ]; then
                 echo "ERROR: Missing ${OUTPUT_DIR}/${f}" >&2
                 missing=1

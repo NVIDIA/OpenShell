@@ -5,7 +5,7 @@
 
 //! E2E test: `--provider <type>` auto-creates a provider from local credentials.
 //!
-//! When `--provider claude` is passed and no provider named "claude" exists,
+//! When `--provider claude-code` is passed and no provider named "claude-code" exists,
 //! the CLI should discover `ANTHROPIC_API_KEY` from the local environment,
 //! auto-create a provider, and inject a supervisor-managed placeholder into the
 //! sandbox child process environment.
@@ -24,8 +24,16 @@ use openshell_e2e::harness::binary::openshell_cmd;
 use openshell_e2e::harness::output::{extract_field, strip_ansi};
 
 const TEST_API_KEY: &str = "sk-e2e-auto-provider-test-key";
-const TEST_API_KEY_PLACEHOLDER: &str = "openshell:resolve:env:ANTHROPIC_API_KEY";
 static CLAUDE_PROVIDER_LOCK: Mutex<()> = Mutex::new(());
+
+fn contains_placeholder_for_env_key(output: &str, key: &str) -> bool {
+    let legacy = format!("openshell:resolve:env:{key}");
+    let revision_prefix = "openshell:resolve:env:v";
+    let revision_suffix = format!("_{key}");
+    output.split_whitespace().any(|token| {
+        token == legacy || (token.starts_with(revision_prefix) && token.ends_with(&revision_suffix))
+    })
+}
 
 /// Helper: delete a provider by name, ignoring errors.
 async fn delete_provider(name: &str) {
@@ -60,21 +68,21 @@ async fn delete_sandbox(name: &str) {
     let _ = cmd.status().await;
 }
 
-/// `--provider claude --auto-providers` with `ANTHROPIC_API_KEY` set should
-/// auto-create a "claude" provider and inject a placeholder into the sandbox.
+/// `--provider claude-code --auto-providers` with `ANTHROPIC_API_KEY` set should
+/// auto-create a "claude-code" provider and inject a placeholder into the sandbox.
 #[tokio::test]
 async fn auto_created_provider_credential_available_in_sandbox() {
     let _provider_lock = CLAUDE_PROVIDER_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    if provider_exists("claude").await {
-        eprintln!("Skipping test: existing provider 'claude' would make shared state unsafe");
+    if provider_exists("claude-code").await {
+        eprintln!("Skipping test: existing provider 'claude-code' would make shared state unsafe");
         return;
     }
 
     // Clean up any leftover from a previous run.
-    delete_provider("claude").await;
+    delete_provider("claude-code").await;
 
     // Create a sandbox that prints the ANTHROPIC_API_KEY env var.
     // --auto-providers skips the interactive prompt.
@@ -82,7 +90,7 @@ async fn auto_created_provider_credential_available_in_sandbox() {
     cmd.arg("sandbox")
         .arg("create")
         .arg("--provider")
-        .arg("claude")
+        .arg("claude-code")
         .arg("--auto-providers")
         .arg("--")
         .arg("printenv")
@@ -108,7 +116,7 @@ async fn auto_created_provider_credential_available_in_sandbox() {
     if let Some(ref name) = sandbox_name {
         delete_sandbox(name).await;
     }
-    delete_provider("claude").await;
+    delete_provider("claude-code").await;
 
     // Now assert.
     assert!(
@@ -118,12 +126,12 @@ async fn auto_created_provider_credential_available_in_sandbox() {
     );
 
     assert!(
-        clean.contains("Created provider claude"),
+        clean.contains("Created provider claude-code"),
         "output should confirm provider auto-creation:\n{clean}"
     );
 
     assert!(
-        clean.contains(TEST_API_KEY_PLACEHOLDER),
+        contains_placeholder_for_env_key(&clean, "ANTHROPIC_API_KEY"),
         "sandbox should have placeholder ANTHROPIC_API_KEY in its environment:\n{clean}"
     );
 

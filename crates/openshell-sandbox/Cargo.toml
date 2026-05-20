@@ -58,6 +58,8 @@ uuid = { workspace = true }
 
 # Encoding
 base64 = { workspace = true }
+flate2 = "1"
+sha1 = "0.10"
 
 # IP network / CIDR parsing
 ipnet = "2"
@@ -83,6 +85,7 @@ libc = "0.2"
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
 seccompiler = "0.5"
+tempfile = "3"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]

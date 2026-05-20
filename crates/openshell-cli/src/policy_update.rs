@@ -18,6 +18,7 @@ pub struct PolicyUpdatePlan {
     pub preview_operations: Vec<PolicyMergeOp>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_policy_update_plan(
     add_endpoints: &[String],
     remove_endpoints: &[String],
@@ -41,7 +42,6 @@ pub fn build_policy_update_plan(
             "--rule-name is only supported when exactly one --add-endpoint is provided"
         ));
     }
-
     let mut merge_operations = Vec::new();
     let mut preview_operations = Vec::new();
 
@@ -155,6 +155,40 @@ pub fn build_policy_update_plan(
     })
 }
 
+fn ensure_websocket_credential_rewrite_protocol(
+    spec: &str,
+    endpoint: &NetworkEndpoint,
+) -> Result<()> {
+    if matches!(endpoint.protocol.as_str(), "rest" | "websocket") {
+        return Ok(());
+    }
+    let protocol = if endpoint.protocol.is_empty() {
+        "<empty>"
+    } else {
+        endpoint.protocol.as_str()
+    };
+    Err(miette!(
+        "websocket-credential-rewrite endpoint option requires --add-endpoint protocol segment to be 'rest' or 'websocket'; got '{protocol}' in '{spec}'"
+    ))
+}
+
+fn ensure_request_body_credential_rewrite_protocol(
+    spec: &str,
+    endpoint: &NetworkEndpoint,
+) -> Result<()> {
+    if endpoint.protocol == "rest" {
+        return Ok(());
+    }
+    let protocol = if endpoint.protocol.is_empty() {
+        "<empty>"
+    } else {
+        endpoint.protocol.as_str()
+    };
+    Err(miette!(
+        "request-body-credential-rewrite endpoint option requires --add-endpoint protocol segment to be 'rest'; got '{protocol}' in '{spec}'"
+    ))
+}
+
 fn group_allow_rules(specs: &[String]) -> Result<BTreeMap<(String, u32), Vec<L7Rule>>> {
     let mut grouped = BTreeMap::new();
     for spec in specs {
@@ -257,9 +291,9 @@ fn parse_remove_endpoint_spec(spec: &str) -> Result<(String, u32)> {
 
 fn parse_add_endpoint_spec(spec: &str) -> Result<NetworkEndpoint> {
     let parts = spec.split(':').collect::<Vec<_>>();
-    if !(2..=5).contains(&parts.len()) {
+    if !(2..=6).contains(&parts.len()) {
         return Err(miette!(
-            "--add-endpoint expects host:port[:access[:protocol[:enforcement]]], got '{spec}'"
+            "--add-endpoint expects host:port[:access[:protocol[:enforcement[:options]]]], got '{spec}'"
         ));
     }
 
@@ -269,10 +303,16 @@ fn parse_add_endpoint_spec(spec: &str) -> Result<NetworkEndpoint> {
     let access = parts.get(2).copied().unwrap_or("").trim();
     let protocol = parts.get(3).copied().unwrap_or("").trim();
     let enforcement = parts.get(4).copied().unwrap_or("").trim();
+    let options = parts.get(5).copied().unwrap_or("").trim();
 
     if parts.len() == 3 && access.is_empty() {
         return Err(miette!(
             "--add-endpoint has an empty access segment in '{spec}'; omit it entirely if you do not need access or protocol fields"
+        ));
+    }
+    if parts.len() == 6 && options.is_empty() {
+        return Err(miette!(
+            "--add-endpoint has an empty options segment in '{spec}'; omit it entirely if you do not need endpoint options"
         ));
     }
     if !enforcement.is_empty() && protocol.is_empty() {
@@ -285,9 +325,9 @@ fn parse_add_endpoint_spec(spec: &str) -> Result<NetworkEndpoint> {
             "--add-endpoint access segment must be one of read-only, read-write, or full; got '{access}' in '{spec}'"
         ));
     }
-    if !protocol.is_empty() && !matches!(protocol, "rest" | "sql") {
+    if !protocol.is_empty() && !matches!(protocol, "rest" | "websocket" | "sql") {
         return Err(miette!(
-            "--add-endpoint protocol segment must be 'rest' or 'sql'; got '{protocol}' in '{spec}'"
+            "--add-endpoint protocol segment must be 'rest', 'websocket', or 'sql'; got '{protocol}' in '{spec}'"
         ));
     }
     if !enforcement.is_empty() && !matches!(enforcement, "enforce" | "audit") {
@@ -296,7 +336,7 @@ fn parse_add_endpoint_spec(spec: &str) -> Result<NetworkEndpoint> {
         ));
     }
 
-    Ok(NetworkEndpoint {
+    let mut endpoint = NetworkEndpoint {
         host,
         port,
         ports: vec![port],
@@ -304,7 +344,65 @@ fn parse_add_endpoint_spec(spec: &str) -> Result<NetworkEndpoint> {
         enforcement: enforcement.to_string(),
         access: access.to_string(),
         ..Default::default()
-    })
+    };
+    apply_add_endpoint_options(spec, &mut endpoint, options)?;
+    Ok(endpoint)
+}
+
+fn apply_add_endpoint_options(
+    spec: &str,
+    endpoint: &mut NetworkEndpoint,
+    options: &str,
+) -> Result<()> {
+    if options.is_empty() {
+        return Ok(());
+    }
+
+    for option in options.split(',') {
+        let option = option.trim();
+        if option.is_empty() {
+            return Err(miette!(
+                "--add-endpoint options segment must not contain empty options in '{spec}'"
+            ));
+        }
+        match option {
+            "websocket-credential-rewrite" => {
+                ensure_websocket_credential_rewrite_protocol(spec, endpoint)?;
+                endpoint.websocket_credential_rewrite = true;
+            }
+            "request-body-credential-rewrite" => {
+                ensure_request_body_credential_rewrite_protocol(spec, endpoint)?;
+                endpoint.request_body_credential_rewrite = true;
+            }
+            _ => {
+                let Some(allowed_ip) = option.strip_prefix("allowed-ip=") else {
+                    return Err(miette!(
+                        "--add-endpoint options segment supports only 'websocket-credential-rewrite', 'request-body-credential-rewrite', and 'allowed-ip=<CIDR-or-IP>'; got '{option}' in '{spec}'"
+                    ));
+                };
+                let allowed_ip = allowed_ip.trim();
+                if allowed_ip.is_empty() {
+                    return Err(miette!(
+                        "--add-endpoint allowed-ip option must include a CIDR or IP value in '{spec}'"
+                    ));
+                }
+                if allowed_ip.contains(char::is_whitespace) {
+                    return Err(miette!(
+                        "--add-endpoint allowed-ip option must not contain whitespace in '{spec}'"
+                    ));
+                }
+                if !endpoint
+                    .allowed_ips
+                    .iter()
+                    .any(|existing| existing == allowed_ip)
+                {
+                    endpoint.allowed_ips.push(allowed_ip.to_string());
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn parse_host(flag: &str, spec: &str, host: &str) -> Result<String> {
@@ -352,7 +450,30 @@ fn dedup_strings(values: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::build_policy_update_plan;
+    use super::{
+        PolicyUpdatePlan, build_policy_update_plan as build_policy_update_plan_with_options,
+    };
+    use openshell_policy::PolicyMergeOp;
+
+    fn build_policy_update_plan(
+        add_endpoints: &[String],
+        remove_endpoints: &[String],
+        add_deny: &[String],
+        add_allow: &[String],
+        remove_rules: &[String],
+        binaries: &[String],
+        rule_name: Option<&str>,
+    ) -> miette::Result<PolicyUpdatePlan> {
+        build_policy_update_plan_with_options(
+            add_endpoints,
+            remove_endpoints,
+            add_deny,
+            add_allow,
+            remove_rules,
+            binaries,
+            rule_name,
+        )
+    }
 
     #[test]
     fn parse_add_endpoint_basic_l4() {
@@ -390,6 +511,229 @@ mod tests {
             None,
         )
         .expect("plan should build");
+    }
+
+    #[test]
+    fn parse_add_endpoint_accepts_websocket_protocol() {
+        let plan = build_policy_update_plan(
+            &["realtime.example.com:443:read-write:websocket:enforce".to_string()],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+        )
+        .expect("plan should build");
+
+        let PolicyMergeOp::AddRule { rule, .. } = &plan.preview_operations[0] else {
+            panic!("expected add-rule preview");
+        };
+        let endpoint = &rule.endpoints[0];
+        assert_eq!(endpoint.host, "realtime.example.com");
+        assert_eq!(endpoint.protocol, "websocket");
+        assert_eq!(endpoint.access, "read-write");
+        assert_eq!(endpoint.enforcement, "enforce");
+    }
+
+    #[test]
+    fn parse_add_endpoint_enables_websocket_credential_rewrite() {
+        let plan = build_policy_update_plan(
+            &["realtime.example.com:443:read-write:websocket:enforce:websocket-credential-rewrite"
+                .to_string()],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+        )
+        .expect("plan should build");
+
+        let PolicyMergeOp::AddRule { rule, .. } = &plan.preview_operations[0] else {
+            panic!("expected add-rule preview");
+        };
+        assert!(rule.endpoints[0].websocket_credential_rewrite);
+    }
+
+    #[test]
+    fn parse_add_endpoint_enables_websocket_credential_rewrite_on_rest_compat_endpoint() {
+        let plan = build_policy_update_plan(
+            &[
+                "realtime.example.com:443:read-write:rest:enforce:websocket-credential-rewrite"
+                    .to_string(),
+            ],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+        )
+        .expect("plan should build");
+
+        let PolicyMergeOp::AddRule { rule, .. } = &plan.preview_operations[0] else {
+            panic!("expected add-rule preview");
+        };
+        assert!(rule.endpoints[0].websocket_credential_rewrite);
+    }
+
+    #[test]
+    fn parse_add_endpoint_enables_request_body_credential_rewrite_on_rest_endpoint() {
+        let plan = build_policy_update_plan(
+            &[
+                "api.example.com:443:read-write:rest:enforce:request-body-credential-rewrite"
+                    .to_string(),
+            ],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+        )
+        .expect("plan should build");
+
+        let PolicyMergeOp::AddRule { rule, .. } = &plan.preview_operations[0] else {
+            panic!("expected add-rule preview");
+        };
+        let endpoint = &rule.endpoints[0];
+        assert_eq!(endpoint.protocol, "rest");
+        assert!(endpoint.request_body_credential_rewrite);
+    }
+
+    #[test]
+    fn parse_add_endpoint_merges_allowed_ips_with_websocket_options() {
+        let plan = build_policy_update_plan(
+            &[
+                "realtime.example.com:443:read-write:websocket:enforce:websocket-credential-rewrite,allowed-ip=10.0.0.0/8,allowed-ip=172.16.0.0/12,allowed-ip=10.0.0.0/8"
+                    .to_string(),
+            ],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+        )
+        .expect("plan should build");
+
+        let PolicyMergeOp::AddRule { rule, .. } = &plan.preview_operations[0] else {
+            panic!("expected add-rule preview");
+        };
+        let endpoint = &rule.endpoints[0];
+        assert!(endpoint.websocket_credential_rewrite);
+        assert_eq!(
+            endpoint.allowed_ips,
+            vec!["10.0.0.0/8".to_string(), "172.16.0.0/12".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_add_endpoint_accepts_allowed_ip_on_rest_endpoint() {
+        let plan = build_policy_update_plan(
+            &["api.example.com:443:read-write:rest:enforce:allowed-ip=192.168.0.0/16".to_string()],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+        )
+        .expect("plan should build");
+
+        let PolicyMergeOp::AddRule { rule, .. } = &plan.preview_operations[0] else {
+            panic!("expected add-rule preview");
+        };
+        assert_eq!(rule.endpoints[0].allowed_ips, vec!["192.168.0.0/16"]);
+    }
+
+    #[test]
+    fn parse_add_endpoint_rejects_empty_allowed_ip() {
+        let error = build_policy_update_plan(
+            &["api.example.com:443:read-write:rest:enforce:allowed-ip=".to_string()],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+        )
+        .expect_err("plan should fail");
+        assert!(error.to_string().contains("allowed-ip option"));
+    }
+
+    #[test]
+    fn websocket_credential_rewrite_rejects_l4_endpoint() {
+        let error = build_policy_update_plan(
+            &["realtime.example.com:443::::websocket-credential-rewrite".to_string()],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+        )
+        .expect_err("plan should fail");
+        assert!(error.to_string().contains("protocol segment"));
+    }
+
+    #[test]
+    fn request_body_credential_rewrite_rejects_non_rest_endpoint() {
+        let error = build_policy_update_plan(
+            &[
+                "realtime.example.com:443:read-write:websocket:enforce:request-body-credential-rewrite"
+                    .to_string(),
+            ],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+        )
+        .expect_err("plan should fail");
+
+        assert!(error.to_string().contains("protocol segment"));
+        assert!(error.to_string().contains("'rest'"));
+    }
+
+    #[test]
+    fn parse_add_endpoint_rejects_unknown_options() {
+        let error = build_policy_update_plan(
+            &["realtime.example.com:443:read-write:websocket:enforce:future-option".to_string()],
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+        )
+        .expect_err("plan should fail");
+        assert!(error.to_string().contains("options segment"));
+    }
+
+    #[test]
+    fn parse_add_allow_accepts_websocket_text_method() {
+        let plan = build_policy_update_plan(
+            &[],
+            &[],
+            &[],
+            &["realtime.example.com:443:websocket_text:/v1/messages/**".to_string()],
+            &[],
+            &[],
+            None,
+        )
+        .expect("plan should build");
+
+        let PolicyMergeOp::AddAllowRules { host, port, rules } = &plan.preview_operations[0] else {
+            panic!("expected add-allow preview");
+        };
+        assert_eq!(host, "realtime.example.com");
+        assert_eq!(*port, 443);
+        let allow = rules[0].allow.as_ref().expect("allow rule");
+        assert_eq!(allow.method, "WEBSOCKET_TEXT");
+        assert_eq!(allow.path, "/v1/messages/**");
     }
 
     #[test]

@@ -1,0 +1,569 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Providers v2"
+sidebar-title: "Providers v2"
+description: "Use provider profiles to attach credentials, network policy, and refresh metadata to OpenShell sandboxes."
+keywords: "Generative AI, Cybersecurity, Providers, Provider Profiles, Credentials, Policy, Sandbox"
+position: 4
+---
+
+Providers v2 turns providers from credential records into profile-backed access bundles. A provider profile describes the credentials, endpoints, binaries, policy rules, and refresh behavior for a provider type. A provider instance stores the concrete credential and config values for one gateway.
+
+Use Providers v2 when you want provider-owned policy rules to travel with provider credentials. For example, a GitHub provider can describe both `GITHUB_TOKEN` and the GitHub API endpoints that a sandbox needs, so users do not have to copy the same network policy into every sandbox.
+
+## Why Providers v2 Exists
+
+Provider credentials and network policy were previously configured through separate workflows. A user could create a GitHub provider that stored `GITHUB_TOKEN`, but the sandbox still needed a separate policy that allowed `api.github.com`, selected the right binaries, and configured REST enforcement.
+
+Providers v2 keeps those pieces together:
+
+| Need | Providers v2 behavior |
+|---|---|
+| Repeatable provider setup | Built-in and custom provider profiles define reusable provider types. |
+| Provider-aware policy | Attached providers contribute `_provider_*` network policy entries to the effective sandbox policy. |
+| Custom provider definitions | You can export, edit, lint, import, list, and delete custom profiles. |
+| Runtime provider lifecycle | You can list, attach, and detach providers on existing sandboxes. |
+| Credential rotation | Provider refresh metadata lets the gateway refresh short-lived access tokens and update provider records. |
+| Backward compatibility | Credential delivery still uses environment placeholders and proxy rewrite. |
+
+## Enable Providers v2
+
+Provider profile policy composition is controlled by the gateway-level `providers_v2_enabled` setting. Enable it on the active gateway:
+
+```shell
+openshell settings set --global --key providers_v2_enabled --value true
+```
+
+When the setting is disabled or unset, providers keep the existing credential-only behavior. Sandboxes still receive provider credential placeholders, but attached provider profiles do not add network policy entries to the effective policy.
+
+To disable provider profile policy composition, delete the setting:
+
+```shell
+openshell settings delete --global --key providers_v2_enabled
+```
+
+<Note>
+The feature flag controls provider-derived policy layers. It does not change the current credential injection model. OpenShell still injects placeholder environment variables into sandbox processes and resolves those placeholders in outbound HTTP traffic.
+</Note>
+
+## Available Features
+
+Providers v2 currently includes these user-facing features:
+
+- Built-in provider profiles stored in the `providers/` directory of the GitHub repository.
+- `openshell provider list-profiles` with table, YAML, and JSON output.
+- `openshell provider profile export`, `import`, `lint`, and `delete` for custom profiles.
+- Provider instances created from built-in or imported profile IDs with `openshell provider create --type <id>`.
+- Just-in-time effective policy composition from sandbox policy plus attached provider profiles.
+- Runtime sandbox provider lifecycle commands under `openshell sandbox provider list|attach|detach`.
+- Credential refresh configuration with `openshell provider refresh status|configure|rotate|delete`.
+- Credential expiry metadata with `openshell provider update --credential-expires-at`; values accept Unix epoch milliseconds or ISO/RFC3339 timestamps.
+
+## Roadmap
+
+The following Providers v2 design items are not part of the current behavior:
+
+| Roadmap item | Current behavior |
+|---|---|
+| Profile-driven explicit credential injection | Profile `auth_style`, `header_name`, and `query_param` fields are stored and validated, but runtime injection still depends on environment placeholders generated from provider credentials. |
+| Endpoint and binary scoped credential injection | Provider profile endpoints and binaries affect policy composition. They do not yet restrict which outbound requests can receive credential injection. |
+| Credential verification on create | `openshell provider create` does not yet probe provider verification endpoints or expose `--no-verify`. |
+| Automatic credential scope extraction | OpenShell does not yet inspect upstream provider responses to discover credential scopes. |
+| Inference mounting from attached providers | `inference_capable` is profile metadata. Attaching an inference-capable provider does not yet create `inference.local` routes. |
+| Multi-provider inference routing | Path-based routing such as `inference.local/openai/...` and `inference.local/anthropic/...` is not yet wired to provider profiles. |
+| Policy prover integration | OpenShell does not yet run the policy prover automatically on sandbox startup or block startup based on prover findings. |
+| Refresh telemetry as OCSF events | Credential refresh logs are secret-safe gateway logs. OCSF refresh events and metrics are future work. |
+
+Use [Inference Routing](/sandboxes/inference-routing) for the current `inference.local` model.
+
+## Provider Profiles
+
+A provider profile defines a provider type. It contains metadata, credential declarations, endpoint policy, binary policy, inference metadata, and optional credential refresh metadata.
+
+List available profiles:
+
+```shell
+openshell provider list-profiles
+```
+
+Export a built-in profile as YAML:
+
+```shell
+openshell provider profile export github -o yaml > github-profile.yaml
+```
+
+Lint a profile before importing it:
+
+```shell
+openshell provider profile lint -f github-profile.yaml
+```
+
+Import one profile file:
+
+```shell
+openshell provider profile import -f github-profile.yaml
+```
+
+Import all non-recursive `*.yaml`, `*.yml`, and `*.json` files from a directory:
+
+```shell
+openshell provider profile import --from ./provider-profiles
+```
+
+Custom profile IDs must use lowercase kebab-case with `a-z`, `0-9`, and `-`. Built-in profile IDs and legacy provider aliases are reserved. Built-in profiles are read-only, and OpenShell rejects deleting a custom profile while a sandbox-attached provider uses it.
+
+### Category Enum
+
+The `category` field controls how `openshell provider list-profiles` groups profiles. Use one of these canonical YAML values:
+
+| Value | Use for |
+|---|---|
+| `other` | Profiles that do not fit a more specific category. This is the default when omitted. |
+| `inference` | Model and inference API providers. |
+| `agent` | Agent CLIs and coding tools. |
+| `source_control` | Git hosting, repository, and source control providers. |
+| `messaging` | Chat, email, notification, and messaging APIs. |
+| `data` | Data storage, file, database, and document APIs. |
+| `knowledge` | Search, retrieval, and knowledge-base providers. |
+
+### Profile Schema
+
+Provider profile YAML and JSON use this shape. Treat this as a field map, not a profile to import verbatim. The endpoint and rule fields mirror the network policy schema used under `network_policies`. Refer to [Policy Schema Reference](/reference/policy-schema) for field semantics.
+
+```yaml wordWrap showLineNumbers={false}
+id: custom-api
+display_name: Custom API
+description: Custom API access for sandbox agents
+category: data
+inference_capable: false
+
+credentials:
+  - name: api_token
+    description: API access token
+    env_vars: [CUSTOM_API_TOKEN]
+    required: true
+
+    # Accepted values: basic, bearer, header, query.
+    # These fields describe the intended credential placement.
+    # Runtime injection still uses env placeholder resolution today.
+    auth_style: bearer
+    header_name: authorization
+    query_param: api_key
+
+    refresh:
+      # Accepted values:
+      # static, external, oauth2_refresh_token,
+      # oauth2_client_credentials, google_service_account_jwt.
+      strategy: oauth2_client_credentials
+      token_url: https://login.example.com/oauth2/token
+      scopes: [api.read, api.write]
+      refresh_before_seconds: 300
+      max_lifetime_seconds: 3600
+      material:
+        - name: client_id
+          description: OAuth client ID
+          required: true
+          secret: false
+        - name: client_secret
+          description: OAuth client secret
+          required: true
+          secret: true
+
+endpoints:
+  - host: api.example.com
+    port: 443
+    path: /v1/**
+    protocol: rest
+    tls: ""
+    access: read-write
+    enforcement: enforce
+    allowed_ips: []
+    ports: []
+    allow_encoded_slash: false
+    websocket_credential_rewrite: false
+    request_body_credential_rewrite: false
+    persisted_queries: deny
+    graphql_max_body_bytes: 65536
+    rules:
+      - allow:
+          method: GET
+          path: /v1/projects/**
+          command: ""
+          query:
+            tag:
+              any: ["prod-*", "staging-*"]
+          operation_type: ""
+          operation_name: ""
+          fields: []
+    deny_rules:
+      - method: DELETE
+        path: /v1/projects/**
+        command: ""
+        query: {}
+        operation_type: ""
+        operation_name: ""
+        fields: []
+    graphql_persisted_queries:
+      # Key must match the request's persisted query hash or saved-query ID.
+      9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08:
+        operation_type: query
+        operation_name: GetProject
+        fields: [project]
+
+binaries:
+  - /usr/bin/curl
+  - /usr/local/bin/custom-cli
+```
+
+### Profile Sections
+
+`id`, `display_name`, and `description` identify the profile. `id` is the value passed to `openshell provider create --type`.
+
+`category` groups profiles in `openshell provider list-profiles`. Use one of the values in the category enum.
+
+`credentials` declares the credential names, environment variables, auth metadata, and optional refresh metadata for the provider type. The current runtime still exposes configured credential keys as placeholder environment variables and resolves placeholders in outbound HTTP requests.
+
+`endpoints` contains the same endpoint object shape as sandbox network policy. A profile can use access presets, protocol-specific allow rules, deny rules, WebSocket credential rewriting, request body credential rewriting, GraphQL fields, and SSRF IP allowlists.
+
+`binaries` contains the executable paths allowed to reach the profile endpoints when the profile contributes policy to a sandbox.
+
+`inference_capable` marks profiles that are intended to participate in inference workflows. It does not currently mount or configure `inference.local`.
+
+### Refresh Metadata
+
+Credential refresh metadata belongs to one credential declaration. The profile defines allowed defaults, such as token URL, scopes, refresh lead time, maximum lifetime, and required material keys. The provider instance stores the actual refresh material.
+
+Profile YAML can declare these refresh strategies:
+
+| Strategy | Behavior |
+|---|---|
+| `static` | Current credentials are updated through `openshell provider update`. The gateway does not mint a token. |
+| `external` | An external process updates current credentials through `openshell provider update`. The gateway does not mint a token. |
+| `oauth2_refresh_token` | The gateway exchanges a refresh token for a short-lived access token. |
+| `oauth2_client_credentials` | The gateway mints a short-lived access token with OAuth2 client credentials. |
+| `google_service_account_jwt` | The gateway signs a Google service account JWT and exchanges it for an access token. |
+
+`openshell provider refresh configure` accepts only gateway-mintable strategies: `oauth2-refresh-token`, `oauth2-client-credentials`, and `google-service-account-jwt`. Use `openshell provider update` for `static` and `external` refresh patterns.
+
+Gateway-managed refresh strategies use these material keys:
+
+| Strategy | Material keys |
+|---|---|
+| `oauth2_refresh_token` | `client_id`, `refresh_token`, optional `client_secret`. |
+| `oauth2_client_credentials` | `client_id`, `client_secret`, optional `tenant_id` for Microsoft Entra token URLs. |
+| `google_service_account_jwt` | `client_email`, `private_key`, optional `subject` or `sub`. |
+
+OpenShell keeps token endpoints profile-owned. Refresh material cannot override `token_url` or `token_uri` during refresh configuration.
+
+## Provider Instances
+
+A provider instance stores concrete credentials and config for a profile type. Built-in profile IDs and imported custom profile IDs are accepted by `--type`.
+
+Create a GitHub provider from the built-in `github` profile:
+
+```shell
+openshell provider create \
+  --name work-github \
+  --type github \
+  --credential GITHUB_TOKEN
+```
+
+Create a provider from local credentials discovered by the provider implementation:
+
+```shell
+openshell provider create \
+  --name work-claude \
+  --type claude \
+  --from-existing
+```
+
+Create a provider from an imported custom profile:
+
+```shell
+openshell provider create \
+  --name custom-api \
+  --type custom-api \
+  --credential CUSTOM_API_TOKEN
+```
+
+Inspect the provider:
+
+```shell
+openshell provider get custom-api
+```
+
+Update provider credentials:
+
+```shell
+openshell provider update custom-api --credential CUSTOM_API_TOKEN
+```
+
+Set or clear credential expiry metadata:
+
+```shell
+openshell provider update custom-api \
+  --credential CUSTOM_API_TOKEN="$CUSTOM_API_TOKEN" \
+  --credential-expires-at CUSTOM_API_TOKEN=2026-01-01T00:00:00Z
+```
+
+Use an ISO/RFC3339 timestamp or Unix epoch milliseconds. Use `0` as the timestamp to clear expiry for a credential key.
+
+OpenShell skips expired provider credentials when it builds a sandbox provider environment. Running sandboxes also reject expired retained credential generations during placeholder resolution, so stale placeholders fail closed instead of forwarding unresolved or expired credential material.
+
+## Configure Credential Refresh
+
+Refresh configuration is stored separately from the current injectable credential value. The gateway refresh worker reads refresh state, mints a new short-lived token for supported strategies, writes the token back to the provider record, and updates credential expiry metadata.
+
+For a complete Microsoft Graph OAuth2 refresh-token walkthrough, see [Refresh Microsoft Graph Credentials with Providers v2](/get-started/tutorials/microsoft-graph-provider-refresh).
+
+The profile YAML strategy values use underscores, while the CLI `--strategy` values use kebab-case:
+
+| Profile YAML | CLI |
+|---|---|
+| `oauth2_refresh_token` | `oauth2-refresh-token` |
+| `oauth2_client_credentials` | `oauth2-client-credentials` |
+| `google_service_account_jwt` | `google-service-account-jwt` |
+
+Create the provider instance first:
+
+```shell
+openshell provider create \
+  --name my-graph \
+  --type outlook \
+  --credential MS_GRAPH_ACCESS_TOKEN
+```
+
+Configure OAuth2 client credentials refresh:
+
+```shell
+openshell provider refresh configure my-graph \
+  --credential-key MS_GRAPH_ACCESS_TOKEN \
+  --strategy oauth2-client-credentials \
+  --material tenant_id="$MS_TENANT_ID" \
+  --material client_id="$MS_CLIENT_ID" \
+  --material client_secret="$MS_CLIENT_SECRET" \
+  --secret-material-key client_secret \
+  --credential-expires-at 2026-01-01T00:00:00Z
+```
+
+Configure OAuth2 refresh-token refresh:
+
+```shell
+openshell provider refresh configure my-graph \
+  --credential-key MS_GRAPH_ACCESS_TOKEN \
+  --strategy oauth2-refresh-token \
+  --material client_id="$MS_CLIENT_ID" \
+  --material refresh_token="$MS_REFRESH_TOKEN" \
+  --material client_secret="$MS_CLIENT_SECRET" \
+  --secret-material-key refresh_token \
+  --secret-material-key client_secret
+```
+
+Configure Google service account JWT refresh:
+
+```shell
+openshell provider create \
+  --name drive-work \
+  --type google-drive \
+  --credential GOOGLE_DRIVE_ACCESS_TOKEN
+
+openshell provider refresh configure drive-work \
+  --credential-key GOOGLE_DRIVE_ACCESS_TOKEN \
+  --strategy google-service-account-jwt \
+  --material client_email="$GOOGLE_CLIENT_EMAIL" \
+  --material private_key="$GOOGLE_PRIVATE_KEY" \
+  --secret-material-key private_key
+```
+
+<Note>
+`--secret-material-key` takes the name of a `--material` key, not the secret value. For example, use `--material client_secret="$MS_CLIENT_SECRET"` with `--secret-material-key client_secret`. The key should match a material entry so OpenShell can record that material field as sensitive when it stores refresh state. The gateway uses the material values to mint future access tokens, but only the `--credential-key` value, such as `MS_GRAPH_ACCESS_TOKEN`, becomes the injectable provider credential. If a refresh response rotates an OAuth refresh token, OpenShell stores the new `refresh_token` material and marks `refresh_token` as secret automatically.
+</Note>
+
+Use `--credential-expires-at` when the current provider credential already has a known expiry timestamp. For refresh-managed keys, the value can be Unix epoch milliseconds or an ISO/RFC3339 timestamp such as `2026-01-01T00:00:00Z` or `2026-01-01T01:00:00+01:00`. OpenShell stores that value as epoch milliseconds in both refresh state and provider credential metadata. Later gateway-managed refreshes replace it with the minted token expiry.
+
+Force a refresh immediately:
+
+```shell
+openshell provider refresh rotate my-graph \
+  --credential-key MS_GRAPH_ACCESS_TOKEN
+```
+
+Check refresh status:
+
+```shell
+openshell provider refresh status my-graph
+```
+
+The status table reports operational state without printing token values or refresh material:
+
+```text
+PROVIDER                CREDENTIAL_KEY                STRATEGY                     STATUS              EXPIRES_AT            NEXT_REFRESH          LAST_REFRESH          LAST_ERROR
+my-graph                MS_GRAPH_ACCESS_TOKEN         oauth2_refresh_token         refreshed           2026-06-01 00:00:00   2026-05-31 23:50:00   2026-05-31 23:00:00   -
+```
+
+When no refresh configuration exists, the CLI distinguishes whole-provider checks from credential-specific checks:
+
+```text
+No refresh configurations found for provider 'my-graph'.
+No refresh configuration found for provider 'my-graph' credential 'MS_GRAPH_ACCESS_TOKEN'.
+```
+
+Delete refresh state for one credential:
+
+```shell
+openshell provider refresh delete my-graph \
+  --credential-key MS_GRAPH_ACCESS_TOKEN
+```
+
+Deleting refresh state clears the provider credential expiry only when that expiry came from the deleted refresh state. If you later set a different expiry manually with `openshell provider update --credential-expires-at`, OpenShell preserves the manual value.
+
+### Refresh Logs
+
+The gateway emits secret-safe refresh logs during each worker sweep. Use these logs to check which credentials the gateway is watching, when the next refresh is due, and whether a credential is already refreshed.
+
+```text
+2026-05-16T19:42:34.705768Z  INFO openshell_server::provider_refresh: provider credential refresh worker sweep watched_count=1 due_count=0 rotation_requested_count=0
+2026-05-16T19:42:34.705905Z  INFO openshell_server::provider_refresh: provider credential refresh watch provider=outlook-email credential_key=MS_GRAPH_ACCESS_TOKEN strategy=oauth2_refresh_token status=refreshed expires_at_ms=1778961995456 seconds_until_expiry=1440 next_refresh_at_ms=1778961395456 last_refresh_at_ms=1778958395456 seconds_until_refresh=840 due=false rotation_requested=false
+```
+
+The sweep line summarizes how many credential refresh records the worker inspected. The watch line shows the provider, credential key, strategy, refresh status, expiry time, next refresh time, and whether refresh is due or manually requested. It does not include access-token values or refresh material.
+
+<Note>
+Refresh updates the provider record. Sandboxes receive the updated credential through the same placeholder environment and proxy rewrite path as other provider credentials.
+</Note>
+
+## Launch Sandboxes with Providers
+
+Attach providers when creating a sandbox with repeated `--provider` flags:
+
+```shell
+openshell sandbox create \
+  --name provider-demo \
+  --provider work-claude \
+  --provider work-github \
+  -- claude
+```
+
+When `providers_v2_enabled=true`, each attached provider with a matching profile contributes a provider policy layer to the sandbox effective policy. When the setting is disabled, the sandbox receives provider credentials but not provider-derived policy entries.
+
+List providers attached to a sandbox:
+
+```shell
+openshell sandbox provider list provider-demo
+```
+
+The list output includes provider name, provider type, credential key count, and config key count.
+
+## Policy Composition
+
+OpenShell stores sandbox-authored policy and provider attachments separately. When a sandbox asks for its effective policy, the gateway composes the current sandbox policy with provider policy layers just in time.
+
+For example, the built-in GitHub profile contains these endpoints and binaries:
+
+```yaml wordWrap showLineNumbers={false}
+id: github
+display_name: GitHub
+category: source_control
+credentials:
+  - name: api_token
+    env_vars: [GITHUB_TOKEN, GH_TOKEN]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+endpoints:
+  - host: api.github.com
+    port: 443
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+  - host: github.com
+    port: 443
+    protocol: rest
+    access: read-only
+    enforcement: enforce
+binaries: [/usr/bin/gh, /usr/local/bin/gh, /usr/bin/git, /usr/local/bin/git]
+```
+
+If a sandbox attaches a provider named `work-github`, the effective policy includes a generated provider rule:
+
+```yaml wordWrap showLineNumbers={false}
+network_policies:
+  custom_pypi:
+    name: custom_pypi
+    endpoints:
+      - host: pypi.org
+        port: 443
+        protocol: rest
+        access: read-only
+        enforcement: enforce
+    binaries:
+      - path: /usr/bin/python
+
+  _provider_work_github:
+    name: _provider_work_github
+    endpoints:
+      - host: api.github.com
+        port: 443
+        protocol: rest
+        access: read-write
+        enforcement: enforce
+      - host: github.com
+        port: 443
+        protocol: rest
+        access: read-only
+        enforcement: enforce
+    binaries:
+      - path: /usr/bin/gh
+      - path: /usr/local/bin/gh
+      - path: /usr/bin/git
+      - path: /usr/local/bin/git
+```
+
+Inspect the effective policy:
+
+```shell
+openshell policy get provider-demo
+```
+
+Composition follows these rules:
+
+- Provider policy entries use reserved `_provider_*` keys derived from provider instance names.
+- Provider policy entries are derived data. OpenShell does not persist them back into the sandbox-authored policy.
+- If a user-authored rule already uses the same key, OpenShell keeps the user rule and adds a numeric suffix to the provider rule.
+- Provider and user rules are concatenated. Overlapping endpoints remain separate rules.
+- A gateway global policy override suppresses provider-derived policy layers.
+
+## Attach and Detach Providers
+
+Attach an existing provider to a running sandbox:
+
+```shell
+openshell sandbox provider attach provider-demo work-github
+```
+
+Detach a provider:
+
+```shell
+openshell sandbox provider detach provider-demo work-github
+```
+
+Attach and detach are idempotent. Attach validates that the provider exists before mutating the sandbox, and provider deletion fails while the provider is attached to any sandbox.
+
+### Runtime Limitations
+
+Provider attach and detach update the persisted sandbox provider list. Running sandboxes poll for provider environment revisions and effective policy changes.
+
+The policy effect applies to future effective policy reads after the sandbox observes the update. The credential environment effect applies only to new process launches after the update is observed, such as later SSH, exec, or SFTP sessions.
+
+Already-running processes keep the environment they started with. OpenShell does not mutate a live process environment after provider attach, detach, or credential update. If a long-running process needs a newly attached provider credential placeholder, restart that process or launch a new process after the sandbox has observed the provider update.
+
+Detaching a provider removes its provider policy layer from future effective policy reads and removes its credential placeholders from future process environments. It does not remove environment variables from already-running processes.
+
+OpenShell rejects provider updates and refresh configuration when they would make two providers attached to the same sandbox expose the same active credential environment key. Use provider-specific credential names when one sandbox needs multiple providers with overlapping upstream concepts.
+
+## Next Steps
+
+- Use [Providers](/sandboxes/manage-providers) for the current provider command reference.
+- Use [Customize Sandbox Policies](/sandboxes/policies) to apply user-authored policy rules.
+- Use [Policy Schema Reference](/reference/policy-schema) for endpoint and L7 rule field details.

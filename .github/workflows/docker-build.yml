@@ -42,6 +42,11 @@ on:
         required: false
         type: string
         default: ""
+      image-registry:
+        description: "Docker registry and org prefix (e.g. docker.io/aible, ghcr.io/nvidia/openshell)"
+        required: false
+        type: string
+        default: "ghcr.io/nvidia/openshell"
 
 env:
   MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -150,11 +155,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}
-    uses: ./.github/workflows/shadow-rust-native-build.yml
+    uses: ./.github/workflows/rust-native-build.yml
     with:
       component: ${{ needs.resolve.outputs.binary_component }}
       arch: ${{ matrix.arch }}
       cargo-version: ${{ inputs['cargo-version'] }}
+      image-tag: ${{ needs.resolve.outputs.image_tag_base }}
       checkout-ref: ${{ inputs['checkout-ref'] }}
       features: openshell-core/dev-settings
       artifact-name: ${{ needs.resolve.outputs.artifact_prefix }}-linux-${{ matrix.arch }}
@@ -181,11 +187,11 @@ jobs:
         - /etc/buildkit:/etc/buildkit:ro
     env:
       IMAGE_TAG: ${{ needs.resolve.outputs.platform_count == '1' && needs.resolve.outputs.image_tag_base || format('{0}-{1}', needs.resolve.outputs.image_tag_base, matrix.arch) }}
-      IMAGE_REGISTRY: ghcr.io/nvidia/openshell
+      IMAGE_REGISTRY: ${{ inputs['image-registry'] }}
       DOCKER_PUSH: ${{ inputs.push && '1' || '0' }}
       DOCKER_PLATFORM: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           ref: ${{ inputs['checkout-ref'] || github.sha }}
           fetch-depth: 0
@@ -196,18 +202,24 @@ jobs:
       - name: Install tools
         run: mise install --locked
 
-      - name: Log in to GHCR
+      - name: Log in to registry
         if: ${{ inputs.push }}
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+        run: |
+          set -euo pipefail
+          registry=$(echo "${{ inputs['image-registry'] }}" | cut -d/ -f1)
+          if [[ "$registry" == "ghcr.io" ]]; then
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          else
+            echo "${{ secrets.REGISTRY_TOKEN }}" | docker login "$registry" -u "${{ secrets.REGISTRY_USER }}" --password-stdin
+          fi
 
       - name: Set up buildx (local driver)
         uses: ./.github/actions/setup-buildx
         with:
-          driver: local
           buildkitd-config: /etc/buildkit/buildkitd.toml
 
       - name: Download Rust binary artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: ${{ needs.resolve.outputs.artifact_prefix }}-linux-${{ matrix.arch }}
           path: prebuilt-rust-binary
@@ -238,7 +250,6 @@ jobs:
             --cache-to "type=gha,mode=max,scope=${{ inputs.component }}-${{ matrix.arch }}"
 
       - name: Smoke check ${{ inputs.component }} image
-        if: ${{ !inputs.push }}
         run: |
           set -euo pipefail
           image="${IMAGE_REGISTRY}/${{ inputs.component }}:${IMAGE_TAG}"
@@ -249,7 +260,7 @@ jobs:
               grep -q '^openshell-gateway ' <<<"$output"
               ;;
             supervisor)
-              output="$(docker run --rm --platform "${{ matrix.platform }}" "$image" --version)"
+              output="$(docker run --rm --platform "${{ matrix.platform }}" --entrypoint /openshell-sandbox "$image" --version)"
               echo "$output"
               grep -q '^openshell-sandbox ' <<<"$output"
               ;;
@@ -269,13 +280,20 @@ jobs:
       volumes:
         - /var/run/docker.sock:/var/run/docker.sock
     steps:
-      - name: Log in to GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Log in to registry
+        run: |
+          set -euo pipefail
+          registry=$(echo "${{ inputs['image-registry'] }}" | cut -d/ -f1)
+          if [[ "$registry" == "ghcr.io" ]]; then
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          else
+            echo "${{ secrets.REGISTRY_TOKEN }}" | docker login "$registry" -u "${{ secrets.REGISTRY_USER }}" --password-stdin
+          fi
 
       - name: Create multi-arch manifest
         run: |
           set -euo pipefail
-          image="ghcr.io/nvidia/openshell/${{ inputs.component }}"
+          image="${{ inputs['image-registry'] }}/${{ inputs.component }}"
           refs=()
           for arch in ${{ needs.resolve.outputs.arches }}; do
             refs+=("${image}:${{ needs.resolve.outputs.image_tag_base }}-${arch}")

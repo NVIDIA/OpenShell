@@ -25,6 +25,16 @@ use tracing::debug;
 /// Value of `SECCOMP_SET_MODE_FILTER` (linux/seccomp.h).
 const SECCOMP_SET_MODE_FILTER: u64 = 1;
 
+// libc 0.2.185 omits `SYS_kexec_file_load` from the musl/aarch64 bindings even
+// though the kernel exposes syscall 294. Fall back to the literal so the
+// supervisor's seccomp filter still blocks fileless kernel-image loads when
+// built statically against musl on aarch64.
+#[cfg(all(target_arch = "aarch64", target_env = "musl"))]
+#[allow(non_upper_case_globals)]
+const SYS_kexec_file_load: libc::c_long = 294;
+#[cfg(not(all(target_arch = "aarch64", target_env = "musl")))]
+use libc::SYS_kexec_file_load;
+
 /// Apply the supervisor seccomp filter across the running process.
 ///
 /// This runs after privileged startup helpers complete and synchronizes the
@@ -81,7 +91,7 @@ fn build_supervisor_prelude_rules() -> BTreeMap<i64, Vec<SeccompRule>> {
         libc::SYS_finit_module,
         libc::SYS_delete_module,
         libc::SYS_kexec_load,
-        libc::SYS_kexec_file_load,
+        SYS_kexec_file_load,
     ] {
         rules.entry(syscall).or_default();
     }
@@ -423,7 +433,7 @@ mod tests {
             libc::SYS_finit_module,
             libc::SYS_delete_module,
             libc::SYS_kexec_load,
-            libc::SYS_kexec_file_load,
+            SYS_kexec_file_load,
         ] {
             assert!(
                 filter_rules.contains_key(&syscall),

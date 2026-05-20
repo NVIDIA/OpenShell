@@ -81,3 +81,47 @@ Namespaced Issuer (selfSigned) for cert-manager CA bootstrap.
 {{- define "openshell.issuerSelfSigned" -}}
 {{- printf "%s-selfsigned" (include "openshell.fullname" .) | trunc 63 | trimSuffix "-" }}
 {{- end }}
+
+{{/*
+Namespace where sandbox pods are created. An explicit
+.Values.server.sandboxNamespace is used verbatim. Otherwise it defaults to
+.Release.Namespace so `helm install -n my-ns` works without extra overrides.
+*/}}
+{{- define "openshell.sandboxNamespace" -}}
+{{- .Values.server.sandboxNamespace | default .Release.Namespace -}}
+{{- end }}
+
+{{/*
+gRPC endpoint sandbox pods use to call back into the gateway. An explicit
+.Values.server.grpcEndpoint is used verbatim. Otherwise it is derived from
+the in-cluster Service DNS, release namespace, service port, and disableTls
+flag — so the default value works for any release name or namespace without
+override.
+*/}}
+{{/*
+Supervisor sideload method. When supervisor.sideloadMethod is set, use it
+verbatim. Otherwise auto-detect from the cluster version: the ImageVolume
+feature gate is enabled by default starting in K8s v1.35 (GA in v1.36).
+Clusters on v1.33-v1.34 can opt in by setting sideloadMethod explicitly
+after enabling the feature gate.
+*/}}
+{{- define "openshell.supervisorSideloadMethod" -}}
+{{- if .Values.supervisor.sideloadMethod -}}
+{{- .Values.supervisor.sideloadMethod -}}
+{{- else -}}
+{{- if semverCompare ">=1.35-0" .Capabilities.KubeVersion.Version -}}
+image-volume
+{{- else -}}
+init-container
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{- define "openshell.grpcEndpoint" -}}
+{{- if .Values.server.grpcEndpoint -}}
+{{- .Values.server.grpcEndpoint -}}
+{{- else -}}
+{{- $scheme := ternary "http" "https" (default false .Values.server.disableTls) -}}
+{{- printf "%s://%s.%s.svc.cluster.local:%d" $scheme (include "openshell.fullname" .) .Release.Namespace (int .Values.service.port) -}}
+{{- end -}}
+{{- end }}

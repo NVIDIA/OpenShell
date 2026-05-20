@@ -50,6 +50,15 @@ pub struct RegisteredSetting {
 /// 5. Add a unit test in this module's `tests` section to cover the new key.
 pub const PROVIDERS_V2_ENABLED_KEY: &str = "providers_v2_enabled";
 
+/// Sandbox-level opt-in for the agent-driven policy proposal surface.
+///
+/// When true, the supervisor installs the `policy_advisor` skill, serves
+/// the `policy.local` API routes, and includes `next_steps` in L7 deny
+/// bodies. See `crates/openshell-sandbox/src/policy_local.rs`. Defaults to
+/// false. Independent of the per-proposal developer approval gate, which
+/// still applies when this flag is on.
+pub const AGENT_POLICY_PROPOSALS_ENABLED_KEY: &str = "agent_policy_proposals_enabled";
+
 pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
     // Gateway-level opt-in for provider profile policy composition. Defaults
     // to false when unset.
@@ -62,6 +71,12 @@ pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
     // to the human-readable shorthand log. Defaults to false (no JSONL written).
     RegisteredSetting {
         key: "ocsf_json_enabled",
+        kind: SettingValueKind::Bool,
+    },
+    // Sandbox-level opt-in for the agent-driven policy proposal surface.
+    // See AGENT_POLICY_PROPOSALS_ENABLED_KEY for details. Defaults to false.
+    RegisteredSetting {
+        key: AGENT_POLICY_PROPOSALS_ENABLED_KEY,
         kind: SettingValueKind::Bool,
     },
     // Test-only keys live behind the `dev-settings` feature flag so they

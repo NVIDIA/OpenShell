@@ -38,6 +38,10 @@ use openshell_core::proto::compute::v1::{
     GetCapabilitiesRequest, compute_driver_client::ComputeDriverClient,
 };
 use openshell_core::{Config, Error, Result};
+#[cfg(unix)]
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+#[cfg(unix)]
+use std::path::Path;
 use std::path::PathBuf;
 #[cfg(unix)]
 use std::{io::ErrorKind, process::Stdio, sync::Arc, time::Duration};
@@ -52,9 +56,12 @@ use tonic::transport::Endpoint;
 use tower::service_fn;
 
 const DRIVER_BIN_NAME: &str = "openshell-driver-vm";
+const COMPUTE_DRIVER_SOCKET_RUN_DIR: &str = "run";
+const COMPUTE_DRIVER_SOCKET_NAME: &str = "compute-driver.sock";
 
 /// Configuration for launching and talking to the VM compute driver.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct VmComputeConfig {
     /// Working directory for VM driver sandbox state.
     pub state_dir: PathBuf,
@@ -66,6 +73,12 @@ pub struct VmComputeConfig {
     /// Default sandbox image the driver should use when a request omits one.
     pub default_image: String,
 
+    /// Gateway gRPC endpoint the sandbox guest connects back to.
+    pub grpc_endpoint: String,
+
+    /// Bootstrap image used to boot and prepare VM sandbox target images.
+    pub bootstrap_image: String,
+
     /// libkrun log level used by the VM driver helper.
     pub krun_log_level: u32,
 
@@ -74,6 +87,9 @@ pub struct VmComputeConfig {
 
     /// Default memory allocation for VM sandboxes, in MiB.
     pub mem_mib: u32,
+
+    /// Writable overlay disk size for each VM sandbox, in MiB.
+    pub overlay_disk_mib: u64,
 
     /// Host-side CA certificate for the guest's mTLS client bundle.
     pub guest_tls_ca: Option<PathBuf>,
@@ -89,7 +105,10 @@ impl VmComputeConfig {
     /// Default working directory for VM driver state.
     #[must_use]
     pub fn default_state_dir() -> PathBuf {
-        PathBuf::from("target/openshell-vm-driver")
+        openshell_core::paths::openshell_state_dir().map_or_else(
+            |_| PathBuf::from("target/openshell-vm-driver"),
+            |dir| dir.join("vm-driver"),
+        )
     }
 
     /// Default libkrun log level.
@@ -110,6 +129,12 @@ impl VmComputeConfig {
         2048
     }
 
+    /// Default writable overlay disk size, in MiB.
+    #[must_use]
+    pub const fn default_overlay_disk_mib() -> u64 {
+        4096
+    }
+
     #[must_use]
     fn default_driver_search_dirs(home: Option<PathBuf>) -> Vec<PathBuf> {
         let mut dirs = Vec::new();
@@ -128,10 +153,13 @@ impl Default for VmComputeConfig {
         Self {
             state_dir: Self::default_state_dir(),
             driver_dir: None,
-            default_image: String::new(),
+            default_image: openshell_core::image::default_sandbox_image(),
+            grpc_endpoint: String::new(),
+            bootstrap_image: String::new(),
             krun_log_level: Self::default_krun_log_level(),
             vcpus: Self::default_vcpus(),
             mem_mib: Self::default_mem_mib(),
+            overlay_disk_mib: Self::default_overlay_disk_mib(),
             guest_tls_ca: None,
             guest_tls_cert: None,
             guest_tls_key: None,
@@ -151,7 +179,7 @@ pub struct VmGuestTlsPaths {
 ///
 /// Resolution order:
 /// 1. `{driver_dir}/openshell-driver-vm`, where `driver_dir` comes from
-///    `--driver-dir` / `OPENSHELL_DRIVER_DIR`.
+///    `[openshell.drivers.vm].driver_dir`.
 /// 2. Conventional install directories:
 ///    `~/.local/libexec/openshell`, `/usr/libexec/openshell`,
 ///    `/usr/local/libexec/openshell`, `/usr/local/libexec`.
@@ -191,13 +219,27 @@ pub fn resolve_compute_driver_bin(vm_config: &VmComputeConfig) -> Result<PathBuf
         .collect::<Vec<_>>()
         .join(", ");
     Err(Error::config(format!(
-        "vm compute driver binary not found (searched {searched_display}); install it under --driver-dir / OPENSHELL_DRIVER_DIR, a conventional libexec path such as ~/.local/libexec/openshell, /usr/libexec/openshell, or /usr/local/libexec{{,/openshell}}, or place it next to the gateway binary"
+        "vm compute driver binary not found (searched {searched_display}); install it under [openshell.drivers.vm].driver_dir, a conventional libexec path such as ~/.local/libexec/openshell, /usr/libexec/openshell, or /usr/local/libexec{{,/openshell}}, or place it next to the gateway binary"
     )))
 }
 
 fn resolve_driver_search_dirs(vm_config: &VmComputeConfig) -> Vec<PathBuf> {
     vm_config.driver_dir.clone().map_or_else(
-        || VmComputeConfig::default_driver_search_dirs(std::env::var_os("HOME").map(PathBuf::from)),
+        || {
+            let mut dirs = Vec::new();
+            if let Ok(current_exe) = std::env::current_exe()
+                && let Some(prefix) = current_exe.parent().and_then(Path::parent)
+            {
+                push_unique_path(&mut dirs, prefix.join("libexec"));
+                push_unique_path(&mut dirs, prefix.join("libexec").join("openshell"));
+            }
+            for dir in VmComputeConfig::default_driver_search_dirs(
+                std::env::var_os("HOME").map(PathBuf::from),
+            ) {
+                push_unique_path(&mut dirs, dir);
+            }
+            dirs
+        },
         |dir| vec![dir],
     )
 }
@@ -210,15 +252,156 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
 
 /// Path of the Unix domain socket the driver will listen on.
 pub fn compute_driver_socket_path(vm_config: &VmComputeConfig) -> PathBuf {
-    vm_config.state_dir.join("compute-driver.sock")
+    vm_config
+        .state_dir
+        .join(COMPUTE_DRIVER_SOCKET_RUN_DIR)
+        .join(COMPUTE_DRIVER_SOCKET_NAME)
+}
+
+#[cfg(unix)]
+fn prepare_compute_driver_socket_path(
+    vm_config: &VmComputeConfig,
+    socket_path: &Path,
+) -> Result<()> {
+    let expected_uid = current_euid();
+    prepare_vm_state_dir(&vm_config.state_dir, expected_uid)?;
+    let parent = socket_path.parent().ok_or_else(|| {
+        Error::execution(format!(
+            "vm compute driver socket path '{}' has no parent directory",
+            socket_path.display()
+        ))
+    })?;
+    prepare_private_socket_dir(parent, expected_uid)?;
+    remove_stale_socket(socket_path, expected_uid)
+}
+
+#[cfg(unix)]
+fn current_euid() -> u32 {
+    nix::unistd::Uid::effective().as_raw()
+}
+
+#[cfg(unix)]
+fn prepare_vm_state_dir(state_dir: &Path, expected_uid: u32) -> Result<()> {
+    std::fs::create_dir_all(state_dir).map_err(|err| {
+        Error::execution(format!(
+            "failed to create vm driver state dir '{}': {err}",
+            state_dir.display()
+        ))
+    })?;
+    let metadata = checked_directory_metadata(state_dir, expected_uid, "vm driver state dir")?;
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode != 0o700 {
+        std::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700)).map_err(
+            |err| {
+                Error::execution(format!(
+                    "failed to restrict vm driver state dir '{}': {err}",
+                    state_dir.display()
+                ))
+            },
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn prepare_private_socket_dir(socket_dir: &Path, expected_uid: u32) -> Result<()> {
+    std::fs::create_dir_all(socket_dir).map_err(|err| {
+        Error::execution(format!(
+            "failed to create vm compute driver socket dir '{}': {err}",
+            socket_dir.display()
+        ))
+    })?;
+    let _ = checked_directory_metadata(socket_dir, expected_uid, "vm compute driver socket dir")?;
+    std::fs::set_permissions(socket_dir, std::fs::Permissions::from_mode(0o700)).map_err(|err| {
+        Error::execution(format!(
+            "failed to restrict vm compute driver socket dir '{}': {err}",
+            socket_dir.display()
+        ))
+    })
+}
+
+#[cfg(unix)]
+fn checked_directory_metadata(
+    path: &Path,
+    expected_uid: u32,
+    label: &str,
+) -> Result<std::fs::Metadata> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|err| {
+        Error::execution(format!(
+            "failed to stat {label} '{}': {err}",
+            path.display()
+        ))
+    })?;
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        return Err(Error::execution(format!(
+            "{label} '{}' is a symlink; refusing to use it",
+            path.display()
+        )));
+    }
+    if !file_type.is_dir() {
+        return Err(Error::execution(format!(
+            "{label} '{}' is not a directory",
+            path.display()
+        )));
+    }
+    if metadata.uid() != expected_uid {
+        return Err(Error::execution(format!(
+            "{label} '{}' is owned by uid {} but current euid is {}",
+            path.display(),
+            metadata.uid(),
+            expected_uid
+        )));
+    }
+    Ok(metadata)
+}
+
+#[cfg(unix)]
+fn remove_stale_socket(socket_path: &Path, expected_uid: u32) -> Result<()> {
+    let metadata = match std::fs::symlink_metadata(socket_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(Error::execution(format!(
+                "failed to stat vm compute driver socket '{}': {err}",
+                socket_path.display()
+            )));
+        }
+    };
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        return Err(Error::execution(format!(
+            "vm compute driver socket '{}' is a symlink; refusing to remove it",
+            socket_path.display()
+        )));
+    }
+    if metadata.uid() != expected_uid {
+        return Err(Error::execution(format!(
+            "vm compute driver socket '{}' is owned by uid {} but current euid is {}",
+            socket_path.display(),
+            metadata.uid(),
+            expected_uid
+        )));
+    }
+    if !file_type.is_socket() {
+        return Err(Error::execution(format!(
+            "vm compute driver socket path '{}' exists but is not a Unix socket",
+            socket_path.display()
+        )));
+    }
+    std::fs::remove_file(socket_path).map_err(|err| {
+        Error::execution(format!(
+            "failed to remove stale vm compute driver socket '{}': {err}",
+            socket_path.display()
+        ))
+    })
 }
 
 #[cfg(unix)]
 pub fn compute_driver_guest_tls_paths(
-    config: &Config,
     vm_config: &VmComputeConfig,
 ) -> Result<Option<VmGuestTlsPaths>> {
-    if !config.grpc_endpoint.starts_with("https://") {
+    if !vm_config.grpc_endpoint.starts_with("https://") {
         return Ok(None);
     }
 
@@ -229,23 +412,23 @@ pub fn compute_driver_guest_tls_paths(
     ];
     if provided.iter().all(Option::is_none) {
         return Err(Error::config(
-            "vm compute driver requires --vm-tls-ca, --vm-tls-cert, and --vm-tls-key when OPENSHELL_GRPC_ENDPOINT uses https://",
+            "vm compute driver requires guest_tls_ca, guest_tls_cert, and guest_tls_key when grpc_endpoint uses https://",
         ));
     }
 
     let Some(ca) = vm_config.guest_tls_ca.clone() else {
         return Err(Error::config(
-            "--vm-tls-ca is required when VM guest TLS materials are configured",
+            "guest_tls_ca is required when VM guest TLS materials are configured",
         ));
     };
     let Some(cert) = vm_config.guest_tls_cert.clone() else {
         return Err(Error::config(
-            "--vm-tls-cert is required when VM guest TLS materials are configured",
+            "guest_tls_cert is required when VM guest TLS materials are configured",
         ));
     };
     let Some(key) = vm_config.guest_tls_key.clone() else {
         return Err(Error::config(
-            "--vm-tls-key is required when VM guest TLS materials are configured",
+            "guest_tls_key is required when VM guest TLS materials are configured",
         ));
     };
 
@@ -269,7 +452,7 @@ pub async fn spawn(
     config: &Config,
     vm_config: &VmComputeConfig,
 ) -> Result<(Channel, Arc<ManagedDriverProcess>)> {
-    if config.grpc_endpoint.trim().is_empty() {
+    if vm_config.grpc_endpoint.trim().is_empty() {
         return Err(Error::config(
             "grpc_endpoint is required when using the vm compute driver",
         ));
@@ -277,25 +460,8 @@ pub async fn spawn(
 
     let driver_bin = resolve_compute_driver_bin(vm_config)?;
     let socket_path = compute_driver_socket_path(vm_config);
-    let guest_tls_paths = compute_driver_guest_tls_paths(config, vm_config)?;
-    if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            Error::execution(format!(
-                "failed to create vm compute driver socket dir '{}': {e}",
-                parent.display()
-            ))
-        })?;
-    }
-    match std::fs::remove_file(&socket_path) {
-        Ok(()) => {}
-        Err(err) if err.kind() == ErrorKind::NotFound => {}
-        Err(err) => {
-            return Err(Error::execution(format!(
-                "failed to remove stale vm compute driver socket '{}': {err}",
-                socket_path.display()
-            )));
-        }
-    }
+    let guest_tls_paths = compute_driver_guest_tls_paths(vm_config)?;
+    prepare_compute_driver_socket_path(vm_config, &socket_path)?;
 
     let mut command = Command::new(&driver_bin);
     command.kill_on_drop(true);
@@ -303,30 +469,30 @@ pub async fn spawn(
     command.stdout(Stdio::inherit());
     command.stderr(Stdio::inherit());
     command.arg("--bind-socket").arg(&socket_path);
+    command
+        .arg("--expected-peer-pid")
+        .arg(std::process::id().to_string());
     command.arg("--log-level").arg(&config.log_level);
     command
         .arg("--openshell-endpoint")
-        .arg(&config.grpc_endpoint);
+        .arg(&vm_config.grpc_endpoint);
     command.arg("--state-dir").arg(&vm_config.state_dir);
     if !vm_config.default_image.trim().is_empty() {
         command.arg("--default-image").arg(&vm_config.default_image);
     }
-    // Only forward the handshake secret when one is configured. The VM
-    // driver does not consume it, but accepts it for parity with the
-    // Kubernetes/Podman drivers; passing an empty value is noise.
-    if !config.ssh_handshake_secret.is_empty() {
+    if !vm_config.bootstrap_image.trim().is_empty() {
         command
-            .arg("--ssh-handshake-secret")
-            .arg(&config.ssh_handshake_secret);
+            .arg("--bootstrap-image")
+            .arg(&vm_config.bootstrap_image);
     }
-    command
-        .arg("--ssh-handshake-skew-secs")
-        .arg(config.ssh_handshake_skew_secs.to_string());
     command
         .arg("--krun-log-level")
         .arg(vm_config.krun_log_level.to_string());
     command.arg("--vcpus").arg(vm_config.vcpus.to_string());
     command.arg("--mem-mib").arg(vm_config.mem_mib.to_string());
+    command
+        .arg("--overlay-disk-mib")
+        .arg(vm_config.overlay_disk_mib.to_string());
     if let Some(tls) = guest_tls_paths {
         command.arg("--guest-tls-ca").arg(tls.ca);
         command.arg("--guest-tls-cert").arg(tls.cert);
@@ -356,7 +522,7 @@ pub async fn spawn(
 
 #[cfg(unix)]
 async fn wait_for_compute_driver(
-    socket_path: &std::path::Path,
+    socket_path: &Path,
     child: &mut tokio::process::Child,
 ) -> Result<Channel> {
     let mut last_error: Option<String> = None;
@@ -395,7 +561,7 @@ async fn wait_for_compute_driver(
 }
 
 #[cfg(unix)]
-async fn connect_compute_driver(socket_path: &std::path::Path) -> Result<Channel> {
+async fn connect_compute_driver(socket_path: &Path) -> Result<Channel> {
     let socket_path = socket_path.to_path_buf();
     let display_path = socket_path.clone();
     Endpoint::from_static("http://[::]:50051")
@@ -415,11 +581,12 @@ async fn connect_compute_driver(socket_path: &std::path::Path) -> Result<Channel
 #[cfg(all(test, unix))]
 mod tests {
     use super::{
-        VmComputeConfig, compute_driver_guest_tls_paths, resolve_compute_driver_bin,
+        VmComputeConfig, compute_driver_guest_tls_paths, compute_driver_socket_path, current_euid,
+        prepare_compute_driver_socket_path, prepare_vm_state_dir, resolve_compute_driver_bin,
         resolve_driver_search_dirs,
     };
-    use openshell_core::{Config, TlsConfig};
     use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener as StdUnixListener;
     use std::path::PathBuf;
     use tempfile::tempdir;
 
@@ -448,8 +615,7 @@ mod tests {
         let err = resolve_compute_driver_bin(&vm_config)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("--driver-dir"));
-        assert!(err.contains("OPENSHELL_DRIVER_DIR"));
+        assert!(err.contains("[openshell.drivers.vm].driver_dir"));
         assert!(err.contains("openshell-driver-vm"));
     }
 
@@ -467,27 +633,16 @@ mod tests {
 
     #[test]
     fn vm_compute_driver_tls_requires_explicit_guest_bundle() {
-        let dir = tempdir().unwrap();
-        let server_cert = dir.path().join("server.crt");
-        let server_key = dir.path().join("server.key");
-        let server_ca = dir.path().join("client-ca.crt");
-        std::fs::write(&server_cert, "server-cert").unwrap();
-        std::fs::write(&server_key, "server-key").unwrap();
-        std::fs::write(&server_ca, "client-ca").unwrap();
+        let vm_config = VmComputeConfig {
+            grpc_endpoint: "https://gateway.internal:8443".to_string(),
+            ..Default::default()
+        };
 
-        let config = Config::new(Some(TlsConfig {
-            cert_path: server_cert,
-            key_path: server_key,
-            client_ca_path: server_ca,
-            allow_unauthenticated: false,
-        }))
-        .with_grpc_endpoint("https://gateway.internal:8443");
-
-        let err = compute_driver_guest_tls_paths(&config, &VmComputeConfig::default())
+        let err = compute_driver_guest_tls_paths(&vm_config)
             .expect_err("https vm endpoints should require an explicit guest client bundle");
         assert!(
             err.to_string()
-                .contains("--vm-tls-ca, --vm-tls-cert, and --vm-tls-key")
+                .contains("guest_tls_ca, guest_tls_cert, and guest_tls_key")
         );
     }
 
@@ -496,14 +651,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let server_cert = dir.path().join("server.crt");
         let server_key = dir.path().join("server.key");
-        let server_ca = dir.path().join("client-ca.crt");
         let guest_ca = dir.path().join("guest-ca.crt");
         let guest_cert = dir.path().join("guest.crt");
         let guest_key = dir.path().join("guest.key");
         for path in [
             &server_cert,
             &server_key,
-            &server_ca,
             &guest_ca,
             &guest_cert,
             &guest_key,
@@ -511,21 +664,15 @@ mod tests {
             std::fs::write(path, path.display().to_string()).unwrap();
         }
 
-        let config = Config::new(Some(TlsConfig {
-            cert_path: server_cert.clone(),
-            key_path: server_key.clone(),
-            client_ca_path: server_ca,
-            allow_unauthenticated: false,
-        }))
-        .with_grpc_endpoint("https://gateway.internal:8443");
         let vm_config = VmComputeConfig {
+            grpc_endpoint: "https://gateway.internal:8443".to_string(),
             guest_tls_ca: Some(guest_ca.clone()),
             guest_tls_cert: Some(guest_cert.clone()),
             guest_tls_key: Some(guest_key.clone()),
             ..Default::default()
         };
 
-        let guest_paths = compute_driver_guest_tls_paths(&config, &vm_config)
+        let guest_paths = compute_driver_guest_tls_paths(&vm_config)
             .unwrap()
             .expect("https vm endpoints should pass an explicit guest client bundle");
         assert_eq!(guest_paths.ca, guest_ca);
@@ -533,5 +680,184 @@ mod tests {
         assert_eq!(guest_paths.key, guest_key);
         assert_ne!(guest_paths.cert, server_cert);
         assert_ne!(guest_paths.key, server_key);
+    }
+
+    #[test]
+    fn compute_driver_socket_path_uses_private_run_dir() {
+        let state_dir = PathBuf::from("/tmp/openshell-vm-state");
+        let vm_config = VmComputeConfig {
+            state_dir: state_dir.clone(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            compute_driver_socket_path(&vm_config),
+            state_dir.join("run").join("compute-driver.sock")
+        );
+    }
+
+    #[test]
+    fn prepare_compute_driver_socket_path_creates_private_run_dir() {
+        let dir = tempdir().unwrap();
+        let vm_config = VmComputeConfig {
+            state_dir: dir.path().join("state"),
+            ..Default::default()
+        };
+        let socket_path = compute_driver_socket_path(&vm_config);
+
+        prepare_compute_driver_socket_path(&vm_config, &socket_path).unwrap();
+
+        let mode = std::fs::metadata(vm_config.state_dir.join("run"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn prepare_compute_driver_socket_path_restricts_existing_run_dir() {
+        let dir = tempdir().unwrap();
+        let vm_config = VmComputeConfig {
+            state_dir: dir.path().join("state"),
+            ..Default::default()
+        };
+        let run_dir = vm_config.state_dir.join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::set_permissions(&run_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let socket_path = compute_driver_socket_path(&vm_config);
+
+        prepare_compute_driver_socket_path(&vm_config, &socket_path).unwrap();
+
+        let mode = std::fs::metadata(run_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn prepare_compute_driver_socket_path_restricts_existing_state_dir() {
+        let dir = tempdir().unwrap();
+        let vm_config = VmComputeConfig {
+            state_dir: dir.path().join("state"),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&vm_config.state_dir).unwrap();
+        std::fs::set_permissions(&vm_config.state_dir, std::fs::Permissions::from_mode(0o777))
+            .unwrap();
+        let socket_path = compute_driver_socket_path(&vm_config);
+
+        prepare_compute_driver_socket_path(&vm_config, &socket_path).unwrap();
+
+        let mode = std::fs::metadata(vm_config.state_dir)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn prepare_compute_driver_socket_path_rejects_symlinked_state_dir() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("target");
+        let state_link = dir.path().join("state-link");
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &state_link).unwrap();
+        let vm_config = VmComputeConfig {
+            state_dir: state_link,
+            ..Default::default()
+        };
+        let socket_path = compute_driver_socket_path(&vm_config);
+
+        let err = prepare_compute_driver_socket_path(&vm_config, &socket_path)
+            .expect_err("symlinked state dir should be rejected")
+            .to_string();
+        assert!(err.contains("is a symlink"));
+    }
+
+    #[test]
+    fn prepare_compute_driver_socket_path_rejects_symlinked_run_dir() {
+        let dir = tempdir().unwrap();
+        let vm_config = VmComputeConfig {
+            state_dir: dir.path().join("state"),
+            ..Default::default()
+        };
+        let target = dir.path().join("run-target");
+        std::fs::create_dir_all(&vm_config.state_dir).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::os::unix::fs::symlink(&target, vm_config.state_dir.join("run")).unwrap();
+        let socket_path = compute_driver_socket_path(&vm_config);
+
+        let err = prepare_compute_driver_socket_path(&vm_config, &socket_path)
+            .expect_err("symlinked run dir should be rejected")
+            .to_string();
+        assert!(err.contains("is a symlink"));
+    }
+
+    #[test]
+    fn prepare_vm_state_dir_rejects_wrong_owner() {
+        let dir = tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let wrong_uid = if current_euid() == u32::MAX {
+            u32::MAX - 1
+        } else {
+            current_euid() + 1
+        };
+
+        let err = prepare_vm_state_dir(&state_dir, wrong_uid)
+            .expect_err("wrong owner should be rejected")
+            .to_string();
+        assert!(err.contains("is owned by uid"));
+    }
+
+    #[test]
+    fn prepare_compute_driver_socket_path_rejects_symlinked_socket() {
+        let dir = tempdir().unwrap();
+        let vm_config = VmComputeConfig {
+            state_dir: dir.path().join("state"),
+            ..Default::default()
+        };
+        let socket_path = compute_driver_socket_path(&vm_config);
+        std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink("/tmp/not-a-socket", &socket_path).unwrap();
+
+        let err = prepare_compute_driver_socket_path(&vm_config, &socket_path)
+            .expect_err("symlinked socket should be rejected")
+            .to_string();
+        assert!(err.contains("is a symlink"));
+    }
+
+    #[test]
+    fn prepare_compute_driver_socket_path_rejects_non_socket_stale_path() {
+        let dir = tempdir().unwrap();
+        let vm_config = VmComputeConfig {
+            state_dir: dir.path().join("state"),
+            ..Default::default()
+        };
+        let socket_path = compute_driver_socket_path(&vm_config);
+        std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+        std::fs::write(&socket_path, "not a socket").unwrap();
+
+        let err = prepare_compute_driver_socket_path(&vm_config, &socket_path)
+            .expect_err("regular file should be rejected")
+            .to_string();
+        assert!(err.contains("is not a Unix socket"));
+    }
+
+    #[test]
+    fn prepare_compute_driver_socket_path_removes_same_owner_stale_socket() {
+        let dir = tempdir().unwrap();
+        let vm_config = VmComputeConfig {
+            state_dir: dir.path().join("state"),
+            ..Default::default()
+        };
+        let socket_path = compute_driver_socket_path(&vm_config);
+        std::fs::create_dir_all(socket_path.parent().unwrap()).unwrap();
+        let listener = StdUnixListener::bind(&socket_path).unwrap();
+
+        prepare_compute_driver_socket_path(&vm_config, &socket_path).unwrap();
+
+        drop(listener);
+        assert!(!socket_path.exists());
     }
 }

@@ -10,7 +10,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::{embedded_runtime, ffi, procguard};
+use crate::{embedded_runtime, ffi, nft_ruleset, procguard, rootfs};
 
 pub const VM_RUNTIME_DIR_ENV: &str = "OPENSHELL_VM_RUNTIME_DIR";
 
@@ -18,7 +18,7 @@ pub const VM_RUNTIME_DIR_ENV: &str = "OPENSHELL_VM_RUNTIME_DIR";
 /// Used by the SIGTERM/SIGINT handler to forward signals to the VM.
 static CHILD_PID: AtomicI32 = AtomicI32::new(0);
 
-/// PID of the helper process (gvproxy for libkrun, virtiofsd for QEMU).
+/// PID of the helper process (gvproxy for libkrun; zero for QEMU).
 /// Zero when not running. Used by the SIGTERM/SIGINT handler and
 /// procguard cleanup callback to ensure the helper doesn't outlive the
 /// launcher (especially on macOS where `PR_SET_PDEATHSIG` is absent).
@@ -45,7 +45,9 @@ const COMPAT_NET_FEATURES: u32 = NET_FEATURE_CSUM
     | NET_FEATURE_HOST_UFO;
 
 pub struct VmLaunchConfig {
-    pub rootfs: PathBuf,
+    pub root_disk: PathBuf,
+    pub overlay_disk: PathBuf,
+    pub image_disk: Option<PathBuf>,
     pub vcpus: u8,
     pub mem_mib: u32,
     pub exec_path: String,
@@ -96,11 +98,22 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
         .as_deref()
         .ok_or("host_ip is required for QEMU backend")?;
 
-    if !config.rootfs.is_dir() {
+    if !config.root_disk.is_file() {
         return Err(format!(
-            "rootfs directory not found: {}",
-            config.rootfs.display()
+            "root disk image not found: {}",
+            config.root_disk.display()
         ));
+    }
+    if !config.overlay_disk.is_file() {
+        return Err(format!(
+            "overlay disk image not found: {}",
+            config.overlay_disk.display()
+        ));
+    }
+    if let Some(image_disk) = &config.image_disk
+        && !image_disk.is_file()
+    {
+        return Err(format!("image disk not found: {}", image_disk.display()));
     }
 
     if let Err(err) = procguard::die_with_parent_cleanup(procguard_kill_children) {
@@ -111,69 +124,12 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
     check_kvm_access()?;
 
     let guest_env = qemu_guest_env_vars(config, host_dns_server());
-    write_guest_env_file(&config.rootfs, &guest_env)?;
-
-    let rootfs_str = config.rootfs.to_str().ok_or("rootfs path not UTF-8")?;
-    let sandbox_dir = config.rootfs.parent().unwrap_or(&config.rootfs);
-    let sock_prefix = tap_device.trim_start_matches("vmtap-");
-    let virtiofsd_sock_dir = PathBuf::from(format!("/tmp/ovm-qemu-{sock_prefix}"));
-    std::fs::create_dir_all(&virtiofsd_sock_dir)
-        .map_err(|e| format!("create virtiofsd sock dir: {e}"))?;
-    let virtiofsd_sock = virtiofsd_sock_dir.join("virtiofsd.sock");
-    let shm_path = format!("/dev/shm/ovm-qemu-{sock_prefix}");
-
-    std::fs::create_dir_all(&shm_path).map_err(|e| format!("create shm dir: {e}"))?;
+    write_guest_env_file(&config.overlay_disk, &guest_env)?;
 
     let runtime_dir = qemu_runtime_dir()?;
-
     let gw_port = config.gateway_port.unwrap_or(0);
     setup_tap_networking(tap_device, host_ip, gw_port)?;
     let mut tap_guard = TapGuard::new(tap_device.to_string(), host_ip.to_string(), gw_port);
-
-    let virtiofsd_log = sandbox_dir.join("virtiofsd.log");
-    let virtiofsd_log_file =
-        std::fs::File::create(&virtiofsd_log).map_err(|e| format!("create virtiofsd log: {e}"))?;
-
-    let virtiofsd_bin = {
-        let runtime_virtiofsd = runtime_dir.join("virtiofsd");
-        if runtime_virtiofsd.is_file() {
-            runtime_virtiofsd
-        } else {
-            PathBuf::from("virtiofsd")
-        }
-    };
-
-    let mut virtiofsd_cmd = StdCommand::new(&virtiofsd_bin);
-    virtiofsd_cmd
-        .arg("--socket-path")
-        .arg(&virtiofsd_sock)
-        .arg("--shared-dir")
-        .arg(rootfs_str)
-        .arg("--cache=auto")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(virtiofsd_log_file);
-
-    #[cfg(target_os = "linux")]
-    {
-        use nix::sys::signal::Signal;
-        use std::os::unix::process::CommandExt as _;
-        unsafe {
-            virtiofsd_cmd.pre_exec(|| {
-                nix::sys::prctl::set_pdeathsig(Signal::SIGKILL)
-                    .map_err(|err| std::io::Error::other(format!("pdeathsig: {err}")))
-            });
-        }
-    }
-
-    let virtiofsd_child = virtiofsd_cmd
-        .spawn()
-        .map_err(|e| format!("failed to start virtiofsd: {e}"))?;
-    let virtiofsd_pid = virtiofsd_child.id().cast_signed();
-    GVPROXY_PID.store(virtiofsd_pid, Ordering::Relaxed);
-    let mut virtiofsd_guard = GvproxyGuard::new(virtiofsd_child);
-
-    wait_for_path(&virtiofsd_sock, Duration::from_secs(5), "virtiofsd socket")?;
 
     let vmlinux = runtime_dir.join("vmlinux");
     if !vmlinux.is_file() {
@@ -198,20 +154,7 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
         .arg(&vmlinux)
         .arg("-append")
         .arg(&kernel_cmdline)
-        .arg("-chardev")
-        .arg(format!(
-            "socket,id=virtiofs,path={}",
-            virtiofsd_sock.display()
-        ))
-        .arg("-device")
-        .arg("vhost-user-fs-pci,chardev=virtiofs,tag=rootfs")
-        .arg("-object")
-        .arg(format!(
-            "memory-backend-memfd,id=mem,size={}M,share=on",
-            config.mem_mib
-        ))
-        .arg("-numa")
-        .arg("node,memdev=mem")
+        .args(qemu_disk_args(config))
         .arg("-netdev")
         .arg(format!(
             "tap,id=net0,ifname={tap_device},script=no,downscript=no"
@@ -263,15 +206,8 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
         .map_err(|e| format!("failed to wait for QEMU: {e}"))?;
 
     CHILD_PID.store(0, Ordering::Relaxed);
-    unsafe {
-        libc::kill(virtiofsd_pid, libc::SIGTERM);
-    }
-    virtiofsd_guard.disarm();
-    GVPROXY_PID.store(0, Ordering::Relaxed);
     teardown_tap_networking(tap_device, host_ip, gw_port);
     tap_guard.disarm();
-    let _ = std::fs::remove_dir_all(&shm_path);
-    let _ = std::fs::remove_dir_all(&virtiofsd_sock_dir);
 
     if status.success() {
         Ok(())
@@ -280,12 +216,42 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
     }
 }
 
-/// Write environment variables into the rootfs so the guest init script
-/// can source them. virtiofs shares the host rootfs directory into the guest.
-fn write_guest_env_file(rootfs: &Path, env_vars: &[String]) -> Result<(), String> {
-    let srv_dir = rootfs.join("srv");
-    std::fs::create_dir_all(&srv_dir).map_err(|e| format!("create /srv in rootfs: {e}"))?;
-    let env_file = srv_dir.join("openshell-env.sh");
+fn qemu_disk_args(config: &VmLaunchConfig) -> Vec<String> {
+    let mut args = vec![
+        "-drive".to_string(),
+        format!(
+            "file={},if=none,format=raw,id=rootfs,readonly=on",
+            config.root_disk.display()
+        ),
+        "-device".to_string(),
+        "virtio-blk-pci,drive=rootfs".to_string(),
+        "-drive".to_string(),
+        format!(
+            "file={},if=none,format=raw,id=overlay",
+            config.overlay_disk.display()
+        ),
+        "-device".to_string(),
+        "virtio-blk-pci,drive=overlay".to_string(),
+    ];
+    if let Some(image_disk) = &config.image_disk {
+        args.extend([
+            "-drive".to_string(),
+            format!(
+                "file={},if=none,format=raw,id=image,readonly=on",
+                image_disk.display()
+            ),
+            "-device".to_string(),
+            "virtio-blk-pci,drive=image".to_string(),
+        ]);
+    }
+    args
+}
+
+/// Write environment variables into the overlay disk so the guest init script
+/// can source them after the overlay root is mounted. QEMU does not provide a
+/// `krun_set_exec` equivalent, so the launcher injects this small per-sandbox
+/// file into the overlay upperdir before boot.
+fn write_guest_env_file(overlay_disk: &Path, env_vars: &[String]) -> Result<(), String> {
     let mut content = String::new();
     for var in env_vars {
         if let Some((key, value)) = var.split_once('=') {
@@ -293,8 +259,11 @@ fn write_guest_env_file(rootfs: &Path, env_vars: &[String]) -> Result<(), String
             let _ = writeln!(content, "export {key}=\"{}\"", shell_escape(value));
         }
     }
-    std::fs::write(&env_file, &content).map_err(|e| format!("write guest env file: {e}"))?;
-    Ok(())
+    rootfs::write_rootfs_image_file(
+        overlay_disk,
+        "/upper/srv/openshell-env.sh",
+        content.as_bytes(),
+    )
 }
 
 fn qemu_guest_env_vars(config: &VmLaunchConfig, dns_server: Option<String>) -> Vec<String> {
@@ -331,9 +300,9 @@ fn shell_escape(s: &str) -> String {
 fn build_kernel_cmdline(config: &VmLaunchConfig) -> String {
     let mut parts = vec![
         "console=ttyS0".to_string(),
-        "root=rootfs".to_string(),
-        "rootfstype=virtiofs".to_string(),
-        "rw".to_string(),
+        "root=/dev/vda".to_string(),
+        "rootfstype=ext4".to_string(),
+        "ro".to_string(),
         "panic=-1".to_string(),
         format!("init={}", config.exec_path),
     ];
@@ -444,6 +413,12 @@ fn setup_tap_networking(tap_device: &str, host_ip: &str, gateway_port: u16) -> R
     enable_ip_forwarding()?;
 
     let subnet = tap_subnet_from_host_ip(host_ip);
+    let table_name = nft_ruleset::teardown_table_name(tap_device);
+
+    // Delete any stale nftables table from a previous driver run.
+    let _ = run_cmd("nft", &["delete", "table", "ip", &table_name]);
+
+    // Clean up legacy iptables rules from older driver versions.
     let _ = run_cmd(
         "iptables",
         &[
@@ -457,27 +432,10 @@ fn setup_tap_networking(tap_device: &str, host_ip: &str, gateway_port: u16) -> R
             "MASQUERADE",
         ],
     );
-    run_cmd(
-        "iptables",
-        &[
-            "-t",
-            "nat",
-            "-A",
-            "POSTROUTING",
-            "-s",
-            &subnet,
-            "-j",
-            "MASQUERADE",
-        ],
-    )?;
     let _ = run_cmd(
         "iptables",
         &["-D", "FORWARD", "-i", tap_device, "-j", "ACCEPT"],
     );
-    run_cmd(
-        "iptables",
-        &["-A", "FORWARD", "-i", tap_device, "-j", "ACCEPT"],
-    )?;
     let _ = run_cmd(
         "iptables",
         &[
@@ -493,25 +451,6 @@ fn setup_tap_networking(tap_device: &str, host_ip: &str, gateway_port: u16) -> R
             "ACCEPT",
         ],
     );
-    run_cmd(
-        "iptables",
-        &[
-            "-A",
-            "FORWARD",
-            "-o",
-            tap_device,
-            "-m",
-            "state",
-            "--state",
-            "RELATED,ESTABLISHED",
-            "-j",
-            "ACCEPT",
-        ],
-    )?;
-    // Allow guest → host traffic only to the gateway gRPC port.
-    // Previous versions accepted ALL inbound traffic from the TAP
-    // interface; scope to the specific port so the guest cannot reach
-    // other host services.
     let port_str = gateway_port.to_string();
     let _ = run_cmd(
         "iptables",
@@ -519,17 +458,24 @@ fn setup_tap_networking(tap_device: &str, host_ip: &str, gateway_port: u16) -> R
             "-D", "INPUT", "-i", tap_device, "-p", "tcp", "--dport", &port_str, "-j", "ACCEPT",
         ],
     );
-    run_cmd(
+    let _ = run_cmd(
         "iptables",
-        &[
-            "-A", "INPUT", "-i", tap_device, "-p", "tcp", "--dport", &port_str, "-j", "ACCEPT",
-        ],
-    )?;
+        &["-D", "INPUT", "-i", tap_device, "-j", "ACCEPT"],
+    );
+
+    // Load nftables ruleset atomically.
+    let ruleset = nft_ruleset::generate_tap_ruleset(tap_device, &subnet, gateway_port);
+    run_nft_stdin(&ruleset)?;
 
     Ok(())
 }
 
 fn teardown_tap_networking(tap_device: &str, host_ip: &str, gateway_port: u16) {
+    // Delete the entire nftables table — single atomic operation.
+    let table_name = nft_ruleset::teardown_table_name(tap_device);
+    let _ = run_cmd("nft", &["delete", "table", "ip", &table_name]);
+
+    // Clean up legacy iptables rules from older driver versions.
     let subnet = tap_subnet_from_host_ip(host_ip);
     let _ = run_cmd(
         "iptables",
@@ -550,8 +496,6 @@ fn teardown_tap_networking(tap_device: &str, host_ip: &str, gateway_port: u16) {
         "iptables",
         &["-D", "FORWARD", "-i", tap_device, "-j", "ACCEPT"],
     );
-    // Remove the port-scoped INPUT rule. Also try the legacy blanket
-    // rule so stale rules from older driver versions are cleaned up.
     if gateway_port > 0 {
         let port_str = gateway_port.to_string();
         let _ = run_cmd(
@@ -578,6 +522,7 @@ fn teardown_tap_networking(tap_device: &str, host_ip: &str, gateway_port: u16) {
             "MASQUERADE",
         ],
     );
+
     let _ = run_cmd("ip", &["link", "set", tap_device, "down"]);
     let _ = run_cmd("ip", &["tuntap", "del", "dev", tap_device, "mode", "tap"]);
 }
@@ -611,6 +556,35 @@ fn run_cmd(cmd: &str, args: &[&str]) -> Result<(), String> {
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         Err(format!("{cmd} {} failed: {stderr}", args.join(" ")))
+    }
+}
+
+fn run_nft_stdin(ruleset: &str) -> Result<(), String> {
+    use std::io::Write;
+
+    let mut child = StdCommand::new("nft")
+        .args(["-f", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to run nft: {e}"))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(ruleset.as_bytes())
+            .map_err(|e| format!("failed to write nft ruleset: {e}"))?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("failed to wait for nft: {e}"))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!("nft -f - failed: {stderr}"))
     }
 }
 
@@ -674,11 +648,22 @@ fn procguard_kill_children() {
 }
 
 fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
-    if !config.rootfs.is_dir() {
+    if !config.root_disk.is_file() {
         return Err(format!(
-            "rootfs directory not found: {}",
-            config.rootfs.display()
+            "root disk image not found: {}",
+            config.root_disk.display()
         ));
+    }
+    if !config.overlay_disk.is_file() {
+        return Err(format!(
+            "overlay disk image not found: {}",
+            config.overlay_disk.display()
+        ));
+    }
+    if let Some(image_disk) = &config.image_disk
+        && !image_disk.is_file()
+    {
+        return Err(format!("image disk not found: {}", image_disk.display()));
     }
 
     // Arm procguard first, BEFORE we spawn gvproxy or fork libkrun, so
@@ -702,7 +687,11 @@ fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
 
     let vm = VmContext::create(&runtime_dir, config.log_level)?;
     vm.set_vm_config(config.vcpus, config.mem_mib)?;
-    vm.set_root(&config.rootfs)?;
+    vm.set_disks(
+        &config.root_disk,
+        &config.overlay_disk,
+        config.image_disk.as_deref(),
+    )?;
     vm.set_workdir(&config.workdir)?;
 
     // Run gvproxy strictly as the guest's virtual NIC / DHCP / router.
@@ -731,7 +720,7 @@ fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
     //     on its own service ports (DNS:53, DHCP, HTTP API:80).
     //
     // That network plane is also what the sandbox supervisor's
-    // per-sandbox netns (veth pair + iptables, see
+    // per-sandbox netns (veth pair + nftables, see
     // `openshell-sandbox/src/sandbox/linux/netns.rs`) branches off of;
     // libkrun's built-in TSI socket impersonation would not satisfy
     // those kernel-level primitives.
@@ -749,12 +738,12 @@ fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
             ));
         }
 
-        let sock_base = gvproxy_socket_base(&config.rootfs)?;
+        let sock_base = gvproxy_socket_base(&config.overlay_disk)?;
         let net_sock = sock_base.with_extension("v");
         let _ = std::fs::remove_file(&net_sock);
         let _ = std::fs::remove_file(sock_base.with_extension("v-krun.sock"));
 
-        let run_dir = config.rootfs.parent().unwrap_or(&config.rootfs);
+        let run_dir = config.overlay_disk.parent().unwrap_or(&config.overlay_disk);
         let gvproxy_log = run_dir.join("gvproxy.log");
         let gvproxy_log_file = std::fs::File::create(&gvproxy_log)
             .map_err(|e| format!("create gvproxy log {}: {e}", gvproxy_log.display()))?;
@@ -1013,11 +1002,74 @@ impl VmContext {
         )
     }
 
-    fn set_root(&self, rootfs: &Path) -> Result<(), String> {
-        let rootfs_c = path_to_cstring(rootfs)?;
+    fn set_disks(
+        &self,
+        root_disk: &Path,
+        overlay_disk: &Path,
+        image_disk: Option<&Path>,
+    ) -> Result<(), String> {
+        let root_disk_c = path_to_cstring(root_disk)?;
+        let block_id_c = CString::new("root").map_err(|e| format!("invalid block id: {e}"))?;
         check(
-            unsafe { (self.krun.krun_set_root)(self.ctx_id, rootfs_c.as_ptr()) },
-            "krun_set_root",
+            unsafe {
+                (self.krun.krun_add_disk)(
+                    self.ctx_id,
+                    block_id_c.as_ptr(),
+                    root_disk_c.as_ptr(),
+                    true,
+                )
+            },
+            "krun_add_disk",
+        )?;
+
+        let overlay_disk_c = path_to_cstring(overlay_disk)?;
+        let overlay_block_id_c =
+            CString::new("overlay").map_err(|e| format!("invalid block id: {e}"))?;
+        check(
+            unsafe {
+                (self.krun.krun_add_disk)(
+                    self.ctx_id,
+                    overlay_block_id_c.as_ptr(),
+                    overlay_disk_c.as_ptr(),
+                    false,
+                )
+            },
+            "krun_add_disk",
+        )?;
+
+        if let Some(image_disk) = image_disk {
+            let image_disk_c = path_to_cstring(image_disk)?;
+            let image_block_id_c =
+                CString::new("image").map_err(|e| format!("invalid image block id: {e}"))?;
+            check(
+                unsafe {
+                    (self.krun.krun_add_disk)(
+                        self.ctx_id,
+                        image_block_id_c.as_ptr(),
+                        image_disk_c.as_ptr(),
+                        true,
+                    )
+                },
+                "krun_add_disk",
+            )?;
+        }
+
+        let device_c =
+            CString::new("/dev/vda").map_err(|e| format!("invalid root disk device: {e}"))?;
+        let fstype_c =
+            CString::new("ext4").map_err(|e| format!("invalid root disk fstype: {e}"))?;
+        let options_c =
+            CString::new("ro").map_err(|e| format!("invalid root disk options: {e}"))?;
+        check(
+            unsafe {
+                (self.krun.krun_set_root_disk_remount)(
+                    self.ctx_id,
+                    device_c.as_ptr(),
+                    fstype_c.as_ptr(),
+                    options_c.as_ptr(),
+                )
+            },
+            "krun_set_root_disk_remount",
         )
     }
 
@@ -1234,8 +1286,8 @@ fn secure_socket_base(subdir: &str) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-fn gvproxy_socket_base(rootfs: &Path) -> Result<PathBuf, String> {
-    Ok(secure_socket_base("osd-gv")?.join(hash_path_id(rootfs)))
+fn gvproxy_socket_base(overlay_disk: &Path) -> Result<PathBuf, String> {
+    Ok(secure_socket_base("osd-gv")?.join(hash_path_id(overlay_disk)))
 }
 
 fn install_signal_forwarding(pid: i32) {
@@ -1342,7 +1394,9 @@ mod tests {
 
     fn qemu_config() -> VmLaunchConfig {
         VmLaunchConfig {
-            rootfs: PathBuf::from("/rootfs"),
+            root_disk: PathBuf::from("/rootfs.ext4"),
+            overlay_disk: PathBuf::from("/overlay.ext4"),
+            image_disk: None,
             vcpus: 2,
             mem_mib: 2048,
             exec_path: "/srv/openshell-vm-sandbox-init.sh".to_string(),
@@ -1377,11 +1431,72 @@ mod tests {
     fn kernel_cmdline_keeps_guest_init_metadata_out_of_proc_cmdline() {
         let cmdline = build_kernel_cmdline(&qemu_config());
 
+        assert!(cmdline.contains("root=/dev/vda"));
+        assert!(cmdline.contains("rootfstype=ext4"));
+        assert!(cmdline.contains(" ro"));
         assert!(cmdline.contains("ip=10.0.128.2::10.0.128.1:255.255.255.252:sandbox::off"));
         assert!(cmdline.contains("firmware_class.path=/lib/firmware"));
         assert!(!cmdline.contains("VM_NET_IP="));
         assert!(!cmdline.contains("VM_NET_GW="));
         assert!(!cmdline.contains("VM_NET_DNS="));
         assert!(!cmdline.contains("GPU_ENABLED="));
+    }
+
+    #[test]
+    fn qemu_disk_args_attach_base_readonly_and_overlay_readwrite() {
+        let args = qemu_disk_args(&qemu_config());
+
+        assert!(args.contains(&"-drive".to_string()));
+        assert!(
+            args.contains(
+                &"file=/rootfs.ext4,if=none,format=raw,id=rootfs,readonly=on".to_string()
+            )
+        );
+        assert!(args.contains(&"virtio-blk-pci,drive=rootfs".to_string()));
+        assert!(args.contains(&"file=/overlay.ext4,if=none,format=raw,id=overlay".to_string()));
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.contains("id=overlay,readonly=on"))
+        );
+        assert!(args.contains(&"virtio-blk-pci,drive=overlay".to_string()));
+    }
+
+    #[test]
+    fn qemu_disk_args_attach_prepared_image_readonly_when_present() {
+        let mut config = qemu_config();
+        config.image_disk = Some(PathBuf::from("/image-rootfs.ext4"));
+
+        let args = qemu_disk_args(&config);
+
+        assert!(args.contains(
+            &"file=/image-rootfs.ext4,if=none,format=raw,id=image,readonly=on".to_string()
+        ));
+        assert!(args.contains(&"virtio-blk-pci,drive=image".to_string()));
+    }
+
+    #[test]
+    fn gvproxy_socket_base_is_per_sandbox_overlay_path() {
+        let first =
+            gvproxy_socket_base(Path::new("/tmp/openshell-vm/sandboxes/first/overlay.ext4"))
+                .expect("first socket base");
+        let second =
+            gvproxy_socket_base(Path::new("/tmp/openshell-vm/sandboxes/second/overlay.ext4"))
+                .expect("second socket base");
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn tap_subnet_from_host_ip_calculates_slash30_base() {
+        assert_eq!(tap_subnet_from_host_ip("10.0.128.1"), "10.0.128.0/30");
+        assert_eq!(tap_subnet_from_host_ip("10.0.128.2"), "10.0.128.0/30");
+        assert_eq!(tap_subnet_from_host_ip("10.0.128.5"), "10.0.128.4/30");
+    }
+
+    #[test]
+    fn tap_subnet_from_host_ip_handles_invalid_ip() {
+        let result = tap_subnet_from_host_ip("not-an-ip");
+        assert_eq!(result, "not-an-ip/30");
     }
 }

@@ -1,7 +1,7 @@
 ---
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-title: "OpenShell Security Best Practices — Controls, Risks, and Configuration Guidance"
+title: "OpenShell Security Best Practices for Controls, Risks, and Configuration Guidance"
 sidebar-title: "Security Best Practices"
 slug: "security/best-practices"
 description: "A guide to every configurable security control in OpenShell: defaults, what you can change, and the risks of each choice."
@@ -63,6 +63,20 @@ Even if a process ignores proxy environment variables, it can only reach the pro
 | Risk if bypassed | Without network namespace isolation, a process could connect directly to the internet, bypassing all policy enforcement. |
 | Recommendation | No action needed. OpenShell enforces this automatically. |
 
+### User Namespace Isolation
+
+Kubernetes user namespaces (`hostUsers: false`) map container UID 0 to an unprivileged host UID.
+Capabilities like `CAP_SYS_ADMIN` become namespaced. They grant power over container-local resources only, not the host.
+This provides defense-in-depth: even if a container escape vulnerability exists, the attacker lands as an unprivileged host user.
+
+| Aspect | Detail |
+|---|---|
+| Default | Disabled. Set `server.enableUserNamespaces: true` in Helm values or `enable_user_namespaces = true` in the gateway config to enable cluster-wide. |
+| What you can change | Enable cluster-wide through Helm or gateway config. Override per-sandbox through the `user_namespaces` field on `SandboxTemplate` in the API. |
+| Prerequisites | Kubernetes 1.33+ with user namespace support available (beta through 1.35, GA in 1.36+), a container runtime that supports user namespaces (containerd 2.0+, CRI-O 1.25+), and Linux 5.12+ for ID-mapped mounts. |
+| Risk if enabled with GPU | NVIDIA device plugin compatibility with user namespaces is unverified. OpenShell logs a warning when both GPU and user namespaces are active on the same sandbox. |
+| Recommendation | Enable on non-GPU clusters running Kubernetes with user namespace support available (1.33+ beta, 1.36+ GA) for stronger host isolation. Test GPU workloads separately before enabling on GPU clusters. |
+
 ### Binary Identity Binding
 
 The proxy identifies which binary initiated each connection by reading `/proc/<pid>/exe` (the kernel-trusted executable path).
@@ -83,9 +97,9 @@ The `protocol` field on an endpoint controls whether the proxy inspects individu
 | Aspect | Detail |
 |---|---|
 | Default | Endpoints without a `protocol` field use L4-only enforcement: the proxy checks host, port, and binary, then relays the TCP stream without inspecting payloads. |
-| What you can change | Add `protocol: rest` to enable per-request HTTP method/path inspection, or `protocol: graphql` to inspect GraphQL operation type, operation name, and root fields. Pair either protocol with `rules` or access presets (`full`, `read-only`, `read-write`). |
+| What you can change | Add `protocol: rest` to enable per-request HTTP method/path inspection, `protocol: websocket` to inspect RFC 6455 upgrade handshakes and client text messages, or `protocol: graphql` to inspect GraphQL-over-HTTP operation type, operation name, and root fields. WebSocket endpoints can also use GraphQL operation rules for GraphQL-over-WebSocket messages. Pair inspected protocols with `rules` or access presets (`full`, `read-only`, `read-write`). REST endpoints that need credential placeholders in supported text request bodies can set `request_body_credential_rewrite: true`. |
 | Risk if relaxed | L4-only endpoints allow the agent to send any data through the tunnel after the initial connection is permitted. The proxy cannot see HTTP methods, paths, or GraphQL operations. Adding `access: full` with L7 inspection enables observability but permits all inspected actions. |
-| Recommendation | Use `protocol: rest` with specific `rules` for APIs where intent is encoded in method and path. Use `protocol: graphql` for GraphQL APIs where destructive operations are body-encoded. Prefer `access: read-only` or explicit allowlists, and deny hash-only persisted queries unless you maintain a trusted registry. Omit `protocol` for non-HTTP protocols (WebSocket, gRPC streaming). |
+| Recommendation | Use `protocol: rest` with specific `rules` for APIs where intent is encoded in method and path. Add `request_body_credential_rewrite: true` only for REST APIs that require OpenShell-managed credentials in UTF-8 JSON, form, or text request bodies. Use `protocol: graphql` for GraphQL-over-HTTP APIs where destructive operations are body-encoded. Use `protocol: websocket` for RFC 6455 endpoints, with explicit `GET` and `WEBSOCKET_TEXT` rules for raw text protocols or explicit GraphQL operation rules for GraphQL-over-WebSocket. Prefer `access: read-only` or explicit allowlists, and deny hash-only persisted queries unless you maintain a trusted registry. Omit `protocol` for non-HTTP protocols. For WebSocket endpoints that must carry placeholder credentials in client text frames, add `websocket_credential_rewrite: true`. |
 
 ### Enforcement Mode (`audit` vs `enforce`)
 
@@ -96,7 +110,7 @@ When L7 inspection is active, the `enforcement` field controls whether the proxy
 | Default | `audit`. The proxy logs violations but forwards traffic. |
 | What you can change | Set `enforcement: enforce` to block requests that do not match any `rules` entry. Denied requests receive a `403 Forbidden` response with a JSON body describing the violation. |
 | Risk if relaxed | `audit` mode provides visibility but does not prevent unauthorized actions. An agent can still perform write or delete operations on an API even if the rules would deny them. |
-| Recommendation | Start with `audit` to understand traffic patterns and verify that rules are correct. Switch to `enforce` once you have validated that the rules match the intended access pattern. |
+| Recommendation | Start with `audit` to understand traffic patterns and verify that rules are correct. Switch to `enforce` after you validate that the rules match the intended access pattern. |
 
 ### TLS Handling
 
@@ -106,7 +120,7 @@ This enables credential injection and L7 inspection without explicit configurati
 
 | Aspect | Detail |
 |---|---|
-| Default | Auto-detect and terminate. OpenShell generates the sandbox CA at startup and injects it into the process trust stores (`NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`). |
+| Default | Auto-detect and terminate. OpenShell generates the sandbox CA at startup and injects it into the process trust stores (`NODE_EXTRA_CA_CERTS`, `DENO_CERT`, `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`). |
 | What you can change | Set `tls: skip` on an endpoint to disable TLS detection and termination for that endpoint. Use this for client-certificate mTLS to upstream or non-standard binary protocols. |
 | Risk if relaxed | `tls: skip` disables credential injection and L7 inspection for that endpoint. The proxy relays encrypted traffic without seeing the contents. |
 | Recommendation | Use auto-detect (the default) for most endpoints. Use `tls: skip` only when the upstream requires the client's own TLS certificate (mTLS) or uses a non-HTTP protocol. |
@@ -211,7 +225,7 @@ OpenShell applies seccomp in two phases. A narrow supervisor-startup prelude run
 The sandbox supervisor applies enforcement in a specific order during process startup.
 This ordering is intentional: named network-namespace setup still relies on privileged helpers, and privilege dropping still needs `/etc/group` and `/etc/passwd`, which Landlock subsequently restricts.
 
-1. Privileged supervisor bootstrap helpers, including network-namespace setup and optional `iptables` probes.
+1. Privileged supervisor bootstrap helpers, including network-namespace setup and optional `nft` probes.
 2. Supervisor startup prelude seccomp (`PR_SET_NO_NEW_PRIVS` plus the early syscall denylist) synchronized across runtime threads.
 3. Network namespace entry (`setns`) in child `pre_exec`.
 4. Privilege drop (`initgroups` + `setgid` + `setuid`).
@@ -247,14 +261,14 @@ For Helm deployments, provide a CA and certificate bundle through the Kubernetes
 
 | Aspect | Detail |
 |---|---|
-| Default | mTLS required. Both client and server present certificates that the deployment CA signed. |
-| What you can change | Enable dual-auth mode (`allow_unauthenticated=true`) for Cloudflare Tunnel deployments, or disable TLS entirely for trusted reverse-proxy setups. |
-| Risk if relaxed | Dual-auth mode accepts clients without certificates and defers authentication to the HTTP layer (Cloudflare JWT). Disabling TLS removes transport-level authentication entirely. |
+| Default | mTLS required for gateway APIs and sandbox callbacks. TLS-enabled loopback gateways also accept plaintext HTTP for sandbox service hostnames by default. |
+| What you can change | Enable dual-auth mode (`allow_unauthenticated=true`) for Cloudflare Tunnel deployments, disable TLS entirely for trusted reverse-proxy setups, or disable loopback service HTTP with `--enable-loopback-service-http=false`. |
+| Risk if relaxed | Dual-auth mode accepts clients without certificates and defers authentication to the HTTP layer (Cloudflare JWT). Disabling TLS removes transport-level authentication entirely. Loopback service HTTP is local-only and rejects cross-origin browser requests, but any local process can still reach exposed service URLs directly. |
 | Recommendation | Use mTLS (the default) unless deploying behind Cloudflare or a trusted reverse proxy. |
 
 ### SSH Tunnel Authentication
 
-SSH connections to sandboxes travel through the gateway over the sandbox's existing mTLS session. On top of the gateway's transport authentication (mTLS by default), each SSH connect call also carries a short-lived session token scoped to a specific sandbox. The sandbox never exposes an SSH port on the network — its SSH daemon listens on a local Unix socket that only the sandbox's own supervisor process can reach.
+SSH connections to sandboxes travel through the gateway over the sandbox's existing mTLS session. On top of the gateway's transport authentication (mTLS by default), each SSH connect call also carries a short-lived session token scoped to a specific sandbox. The sandbox never exposes an SSH port on the network. Its SSH daemon listens on a local Unix socket that only the sandbox's own supervisor process can reach.
 
 | Aspect | Detail |
 |---|---|
@@ -269,12 +283,12 @@ The following patterns weaken security without providing meaningful benefit.
 
 | Mistake | Why it matters | What to do instead |
 |---------|---------------|-------------------|
-| Omitting `protocol: rest` on REST API endpoints | Without `protocol: rest`, the proxy uses L4-only enforcement. It allows the TCP stream through after checking host, port, and binary, but cannot inspect individual HTTP requests. | Add `protocol: rest` with specific `rules` to enable per-request method and path control. |
-| Using `access: full` when finer rules would suffice | `access: full` with `protocol: rest` enables inspection but allows all HTTP methods and paths. | Use `access: read-only` or explicit `rules` to restrict what the agent can do at the HTTP level. |
+| Omitting an inspected protocol on REST or WebSocket API endpoints | Without `protocol: rest` or `protocol: websocket`, the proxy uses L4-only enforcement. It allows the TCP stream through after checking host, port, and binary, but cannot inspect individual HTTP requests or WebSocket text messages. | Add `protocol: rest` or `protocol: websocket` with specific `rules` to enable method and path control. |
+| Using `access: full` when finer rules would suffice | `access: full` with `protocol: rest` or `protocol: websocket` enables inspection but allows all methods and paths for that protocol. | Use `access: read-only` or explicit `rules` to restrict what the agent can do at the L7 level. |
 | Adding endpoints permanently when operator approval would suffice | Adding endpoints to the policy YAML makes them permanently reachable across all instances. | Use operator approval. Approved endpoints persist within the sandbox instance but reset on re-creation. |
 | Using broad binary globs | A glob like `/**` allows any binary to reach the endpoint, defeating binary-scoped enforcement. | Scope globs to specific directories (for example, `/sandbox/.vscode-server/**`). |
 | Skipping TLS termination on HTTPS APIs | Setting `tls: skip` disables credential injection and L7 inspection. | Use the default auto-detect behavior unless the upstream requires client-certificate mTLS. |
-| Setting `enforcement: enforce` before auditing | Jumping to `enforce` without first running in `audit` mode risks breaking the agent's workflow. | Start with `audit`, review the logs, and switch to `enforce` once you have validated the rules. |
+| Setting `enforcement: enforce` before auditing | Jumping to `enforce` without first running in `audit` mode risks breaking the agent's workflow. | Start with `audit`, review the logs, and switch to `enforce` after you validate the rules. |
 
 ## Related Topics
 

@@ -14,23 +14,29 @@ Every compute driver runs the OpenShell supervisor inside the sandbox workload. 
 
 ## Configure a Compute Driver
 
-Configure the compute driver on the gateway. Current releases accept one driver per gateway:
+Configure the compute driver on the gateway. Current releases accept one driver per gateway. Set `compute_drivers` in the gateway TOML file:
 
-```shell
-openshell-gateway --drivers docker
+```toml
+[openshell.gateway]
+compute_drivers = ["docker"]
 ```
 
-You can also set the driver with `OPENSHELL_DRIVERS`. Supported values are `docker`, `podman`, `kubernetes`, and `vm`.
+Supported values are `docker`, `podman`, `kubernetes`, and `vm`.
 
-When `--drivers` and `OPENSHELL_DRIVERS` are unset, the gateway auto-detects Kubernetes, then Podman, then Docker. The VM driver is never auto-detected; configure it explicitly with `--drivers vm`.
+When `compute_drivers` is unset, the gateway auto-detects Kubernetes, then Podman, then Docker by CLI availability or a local Unix socket. The VM driver is never auto-detected; configure it explicitly with `compute_drivers = ["vm"]` or set `OPENSHELL_DRIVERS=vm` in the launch environment.
 
 Common gateway options:
 
-| Option | Environment variable | Description |
-|---|---|---|
-| `--drivers <driver>` | `OPENSHELL_DRIVERS` | Select the compute driver. Supported values are `docker`, `podman`, `kubernetes`, and `vm`. |
-| `--sandbox-image <image>` | `OPENSHELL_SANDBOX_IMAGE` | Set the default sandbox image used when a sandbox create request does not specify one. |
-| `--grpc-endpoint <url>` | `OPENSHELL_GRPC_ENDPOINT` | Set the gateway callback endpoint that sandbox workloads use to connect back to OpenShell. |
+| Gateway TOML option | Description |
+|---|---|
+| `compute_drivers = ["<driver>"]` | Select the compute driver. Supported values are `docker`, `podman`, `kubernetes`, and `vm`. |
+
+Set driver-specific values such as sandbox images, callback endpoints, network names, TLS material, and VM sizing in the gateway TOML file. See the [Gateway Configuration File](./gateway-config) reference for the full `[openshell.drivers.<name>]` schema.
+
+Sandbox create supports `--cpu` and `--memory` for per-sandbox compute sizing.
+Docker and Podman apply them as runtime limits. Kubernetes applies them as both
+container requests and limits. The VM driver accepts the fields but currently
+ignores them.
 
 ## Docker Driver
 
@@ -38,13 +44,9 @@ Common gateway options:
 
 The gateway talks to the Docker daemon to create sandbox containers. Docker is also required for local image builds from directories or Dockerfiles.
 
-| Option | Environment variable | Description |
-|---|---|---|
-| `--drivers docker` | `OPENSHELL_DRIVERS=docker` | Select the Docker compute driver. |
-| `--docker-network-name <name>` | `OPENSHELL_DOCKER_NETWORK_NAME` | Override the bridge network used by Docker sandbox containers. |
-| `--docker-supervisor-bin <path>` | `OPENSHELL_DOCKER_SUPERVISOR_BIN` | Use a local Linux `openshell-sandbox` binary instead of resolving or extracting one automatically. |
-| `--docker-supervisor-image <image>` | `OPENSHELL_DOCKER_SUPERVISOR_IMAGE` | Override the image used to extract the Linux `openshell-sandbox` binary. |
-| `--docker-tls-ca`, `--docker-tls-cert`, `--docker-tls-key` | `OPENSHELL_DOCKER_TLS_CA`, `OPENSHELL_DOCKER_TLS_CERT`, `OPENSHELL_DOCKER_TLS_KEY` | Mount sandbox client TLS materials into Docker containers for mTLS callback to the gateway. |
+For maintainer-level implementation details, refer to the [Docker driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-docker/README.md).
+
+Select Docker with `compute_drivers = ["docker"]` in `[openshell.gateway]`. Configure Docker driver values such as `grpc_endpoint`, `network_name`, `supervisor_bin`, `supervisor_image`, `image_pull_policy`, and `guest_tls_*` in `[openshell.drivers.docker]`.
 
 For GPU-backed Docker sandboxes, configure Docker CDI before starting the gateway so OpenShell can detect the daemon capability.
 
@@ -54,14 +56,9 @@ For GPU-backed Docker sandboxes, configure Docker CDI before starting the gatewa
 
 The gateway talks to the Podman API socket. The Podman driver requires Podman 5.x, cgroups v2, rootless networking, and an active Podman user socket.
 
-| Option | Environment variable | Description |
-|---|---|---|
-| `--drivers podman` | `OPENSHELL_DRIVERS=podman` | Select the Podman compute driver. |
-| None | `OPENSHELL_PODMAN_SOCKET` | Override the Podman API socket path. |
-| None | `OPENSHELL_NETWORK_NAME` | Override the Podman bridge network. |
-| None | `OPENSHELL_SUPERVISOR_IMAGE` | Override the image containing the `openshell-sandbox` supervisor binary. |
-| None | `OPENSHELL_STOP_TIMEOUT` | Set the container stop timeout in seconds. |
-| None | `OPENSHELL_PODMAN_TLS_CA`, `OPENSHELL_PODMAN_TLS_CERT`, `OPENSHELL_PODMAN_TLS_KEY` | Mount sandbox client TLS materials into Podman containers for mTLS callback to the gateway. |
+For maintainer-level implementation details, refer to the [Podman driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-podman/README.md) and [Podman networking notes](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-podman/NETWORKING.md).
+
+Select Podman with `compute_drivers = ["podman"]` in `[openshell.gateway]`. Configure Podman driver values such as `socket_path`, `network_name`, `supervisor_image`, `stop_timeout_secs`, `image_pull_policy`, `grpc_endpoint`, and `guest_tls_*` in `[openshell.drivers.podman]`.
 
 ## MicroVM Driver
 
@@ -69,15 +66,44 @@ MicroVM-backed sandboxes run inside VM-backed isolation instead of a container b
 
 The gateway uses the VM compute driver to create VM-backed sandboxes. MicroVM requires host virtualization support. It uses [libkrun](https://github.com/containers/libkrun) with Apple's [Hypervisor framework](https://developer.apple.com/documentation/hypervisor) on macOS, KVM on Linux, and [QEMU](https://www.qemu.org/) for GPU-backed sandboxes on Linux.
 
-| Option | Environment variable | Description |
-|---|---|---|
-| `--drivers vm` | `OPENSHELL_DRIVERS=vm` | Select the VM compute driver. VM is never auto-detected. |
-| `--driver-dir <path>` | `OPENSHELL_DRIVER_DIR` | Search a custom directory for `openshell-driver-vm`. |
-| `--vm-driver-state-dir <path>` | `OPENSHELL_VM_DRIVER_STATE_DIR` | Store VM rootfs, console logs, runtime state, and image-rootfs cache under this directory. |
-| `--vm-driver-vcpus <count>` | `OPENSHELL_VM_DRIVER_VCPUS` | Set the default vCPU count for VM sandboxes. |
-| `--vm-driver-mem-mib <mib>` | `OPENSHELL_VM_DRIVER_MEM_MIB` | Set the default memory allocation for VM sandboxes in MiB. |
-| `--vm-krun-log-level <level>` | `OPENSHELL_VM_KRUN_LOG_LEVEL` | Set the libkrun log level for VM helper processes. |
-| `--vm-tls-ca`, `--vm-tls-cert`, `--vm-tls-key` | `OPENSHELL_VM_TLS_CA`, `OPENSHELL_VM_TLS_CERT`, `OPENSHELL_VM_TLS_KEY` | Copy sandbox client TLS materials into VM guests for mTLS callback to the gateway. |
+The VM driver boots a cached immutable bootstrap ext4 root disk. When the requested sandbox image differs from the bootstrap image, the driver stages the registry image as an OCI layout, unpacks it inside a bootstrap VM with `umoci`, and caches the prepared image disk by image identity. Each sandbox receives that prepared disk read-only plus its own writable `overlay.ext4` disk for `/`, including `/sandbox` writes and runtime TLS material. The overlay persists for the sandbox lifetime and is deleted with the sandbox state directory.
+
+VM sandbox creation follows the same progress model as Kubernetes-backed sandboxes. The gateway accepts the sandbox, then the VM driver publishes watch events while it resolves the image, prepares or reuses the bootstrap and prepared image caches, creates the writable overlay, and starts the VM launcher.
+
+On gateway restart, the gateway starts a fresh VM driver process. The driver scans its state directory for accepted sandbox launch records, restarts those VMs, and reuses each sandbox's existing `overlay.ext4` so files written inside the sandbox remain available after the supervisor reconnects.
+
+For maintainer-level implementation details, refer to the [VM driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-vm/README.md).
+
+### Enable the VM Driver
+
+The VM driver is opt-in. Release packages can install `openshell-driver-vm`, but the gateway does not select it unless you configure the driver explicitly.
+
+Enable VM by setting `compute_drivers = ["vm"]` in the gateway TOML file:
+
+```toml
+[openshell.gateway]
+compute_drivers = ["vm"]
+```
+
+For a launch-time override, set `OPENSHELL_DRIVERS=vm` in the gateway environment and restart the service.
+
+Configure VM driver values such as `grpc_endpoint`, `driver_dir`, `state_dir`, `default_image`, `bootstrap_image`, `vcpus`, `mem_mib`, `overlay_disk_mib`, `krun_log_level`, and `guest_tls_*` in `[openshell.drivers.vm]`. The VM `state_dir` stores overlay disks, console logs, runtime state, image-rootfs cache, and the private `run/compute-driver.sock` socket.
+
+The gateway starts `openshell-driver-vm` over a private Unix socket and passes its process ID so the driver can reject unexpected local clients. The driver's standalone TCP listener is disabled unless `--allow-unauthenticated-tcp` is set for local development.
+
+### Local image resolution
+
+The VM driver resolves sandbox images from a local container engine before falling back to registry pulls. It tries Docker first, then falls back to the Podman socket (Docker-compatible API). On Linux with Podman, enable the API socket so the driver can find local images:
+
+```shell
+systemctl --user start podman.socket
+```
+
+### Host Firewall
+
+The VM driver creates nftables rules on the host for each sandbox VM's TAP network interface. These rules provide NAT for VM connectivity and defense-in-depth isolation: unsolicited inbound connections to the VM are dropped, and the VM can only reach the gateway port on the host. Primary security enforcement (proxy-only egress and bypass detection) is handled by the sandbox supervisor inside the VM guest.
+
+On hosts with restrictive firewalls (e.g. firewalld), the host firewall may additionally block VM traffic that the driver's rules accept. If VM sandboxes cannot reach the network, verify that the host firewall allows forwarding and input for `vmtap-*` interfaces. See the [VM driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-vm/README.md#host-side-nftables-rules) for details.
 
 ## Kubernetes Driver
 
@@ -85,13 +111,16 @@ Kubernetes-backed sandboxes run as pods in the configured sandbox namespace. Use
 
 Helm deployments set Kubernetes driver values through the chart.
 
-| Gateway option | Environment variable | Helm value | Description |
-|---|---|---|---|
-| `--drivers kubernetes` | `OPENSHELL_DRIVERS=kubernetes` | Not applicable | Select the Kubernetes compute driver. |
-| `--sandbox-namespace <namespace>` | `OPENSHELL_SANDBOX_NAMESPACE` | `server.sandboxNamespace` | Set the namespace for sandbox resources. |
-| `--sandbox-image <image>` | `OPENSHELL_SANDBOX_IMAGE` | `server.sandboxImage` | Set the default sandbox image. |
-| `--sandbox-image-pull-policy <policy>` | `OPENSHELL_SANDBOX_IMAGE_PULL_POLICY` | `server.sandboxImagePullPolicy` | Set the Kubernetes image pull policy for sandbox pods. |
-| `--grpc-endpoint <url>` | `OPENSHELL_GRPC_ENDPOINT` | `server.grpcEndpoint` | Set the gateway callback endpoint reachable from sandbox pods. |
-| `--client-tls-secret-name <name>` | `OPENSHELL_CLIENT_TLS_SECRET_NAME` | `server.tls.clientTlsSecretName` | Mount sandbox client TLS materials from a Kubernetes secret. |
+For maintainer-level implementation details, refer to the [Kubernetes driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-kubernetes/README.md).
+
+| Gateway configuration | Helm value | Description |
+|---|---|---|
+| `compute_drivers = ["kubernetes"]` | Not applicable | Select the Kubernetes compute driver. |
+| `[openshell.drivers.kubernetes].namespace` | `server.sandboxNamespace` | Set the namespace for sandbox resources. The Helm chart defaults to the release namespace when left empty. |
+| `default_image` | `server.sandboxImage` | Set the default sandbox image. |
+| `image_pull_policy` | `server.sandboxImagePullPolicy` | Set the Kubernetes image pull policy for sandbox pods. |
+| `grpc_endpoint` | `server.grpcEndpoint` | Set the gateway callback endpoint reachable from sandbox pods. |
+| `client_tls_secret_name` | `server.tls.clientTlsSecretName` | Mount sandbox client TLS materials from a Kubernetes secret. |
+| `supervisor_sideload_method` | `supervisor.sideloadMethod` | How the supervisor binary is delivered into sandbox pods. Leave empty to auto-detect from cluster version. Set to `image-volume` to mount the supervisor OCI image directly as a volume (requires Kubernetes 1.33+ with the ImageVolume feature gate; GA in 1.36), or `init-container` to copy it through an init container on older clusters. |
 
 The Kubernetes driver creates namespaced `agents.x-k8s.io/v1alpha1` `Sandbox` resources from the Kubernetes SIG Apps [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) project. The Agent Sandbox controller turns those resources into sandbox pods and related storage.

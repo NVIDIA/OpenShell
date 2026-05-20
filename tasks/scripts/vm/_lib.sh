@@ -30,6 +30,82 @@ detect_platform() {
     esac
 }
 
+# ── Runtime dependency downloads ────────────────────────────────────────
+
+# Download a Linux guest umoci binary for the requested architecture.
+# Usage: download_umoci_binary <output> <version> <guest_arch>
+download_umoci_binary() {
+    local output="$1"
+    local version="$2"
+    local guest_arch="$3"
+    local suffix
+
+    case "$guest_arch" in
+        arm64|aarch64) suffix="arm64" ;;
+        amd64|x86_64)  suffix="amd64" ;;
+        *)
+            echo "Error: Unsupported guest architecture for umoci: ${guest_arch}" >&2
+            return 1
+            ;;
+    esac
+
+    local base_url="https://github.com/opencontainers/umoci/releases/download/${version}"
+    local candidates=("umoci.linux.${suffix}" "umoci.${suffix}")
+    local error_log last_error asset
+    error_log="$(mktemp)"
+    last_error=""
+
+    echo "    Downloading umoci ${version} for linux/${suffix}..."
+    for asset in "${candidates[@]}"; do
+        if curl -fsSL -o "$output" "${base_url}/${asset}" 2>"$error_log"; then
+            chmod +x "$output"
+            rm -f "$error_log"
+            return 0
+        fi
+        last_error="$(cat "$error_log")"
+        rm -f "$output"
+    done
+
+    rm -f "$error_log"
+    echo "Error: failed to download umoci ${version} for linux/${suffix}" >&2
+    if [ -n "$last_error" ]; then
+        echo "$last_error" >&2
+    fi
+    return 1
+}
+
+# Map a VM runtime platform to the Linux guest umoci architecture.
+# Usage: umoci_guest_arch_for_platform <platform>
+umoci_guest_arch_for_platform() {
+    local platform="$1"
+
+    case "$platform" in
+        linux-aarch64|darwin-aarch64) echo "arm64" ;;
+        linux-x86_64)                 echo "amd64" ;;
+        *)
+            echo "Error: Unsupported platform for umoci guest binary: ${platform}" >&2
+            return 1
+            ;;
+    esac
+}
+
+# Ensure an extracted runtime directory contains the guest umoci binary.
+# Usage: ensure_umoci_for_platform <runtime_dir> <platform> <version>
+ensure_umoci_for_platform() {
+    local runtime_dir="$1"
+    local platform="$2"
+    local version="$3"
+
+    if [ -f "${runtime_dir}/umoci" ]; then
+        return 0
+    fi
+
+    local guest_arch
+    guest_arch="$(umoci_guest_arch_for_platform "$platform")"
+    echo "    Runtime tarball has no umoci"
+    download_umoci_binary "${runtime_dir}/umoci" "$version" "$guest_arch"
+}
+
 # ── Compression helpers ─────────────────────────────────────────────────
 
 # Compress a single file with zstd level 19, reporting sizes.

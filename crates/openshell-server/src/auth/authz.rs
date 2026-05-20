@@ -22,6 +22,9 @@ const ADMIN_METHODS: &[&str] = &[
     "/openshell.v1.OpenShell/CreateProvider",
     "/openshell.v1.OpenShell/UpdateProvider",
     "/openshell.v1.OpenShell/DeleteProvider",
+    "/openshell.v1.OpenShell/ConfigureProviderRefresh",
+    "/openshell.v1.OpenShell/RotateProviderCredential",
+    "/openshell.v1.OpenShell/DeleteProviderRefresh",
     // Global config and policy
     "/openshell.v1.OpenShell/UpdateConfig",
     // Draft policy approvals
@@ -41,8 +44,14 @@ const SCOPED_METHODS: &[(&str, &str)] = &[
     // sandbox:read
     ("/openshell.v1.OpenShell/GetSandbox", "sandbox:read"),
     ("/openshell.v1.OpenShell/ListSandboxes", "sandbox:read"),
+    (
+        "/openshell.v1.OpenShell/ListSandboxProviders",
+        "sandbox:read",
+    ),
     ("/openshell.v1.OpenShell/WatchSandbox", "sandbox:read"),
     ("/openshell.v1.OpenShell/GetSandboxLogs", "sandbox:read"),
+    ("/openshell.v1.OpenShell/GetService", "sandbox:read"),
+    ("/openshell.v1.OpenShell/ListServices", "sandbox:read"),
     (
         "/openshell.v1.OpenShell/GetSandboxPolicyStatus",
         "sandbox:read",
@@ -55,15 +64,42 @@ const SCOPED_METHODS: &[(&str, &str)] = &[
     ("/openshell.v1.OpenShell/CreateSandbox", "sandbox:write"),
     ("/openshell.v1.OpenShell/DeleteSandbox", "sandbox:write"),
     ("/openshell.v1.OpenShell/ExecSandbox", "sandbox:write"),
+    ("/openshell.v1.OpenShell/ForwardTcp", "sandbox:write"),
     ("/openshell.v1.OpenShell/CreateSshSession", "sandbox:write"),
     ("/openshell.v1.OpenShell/RevokeSshSession", "sandbox:write"),
+    ("/openshell.v1.OpenShell/ExposeService", "sandbox:write"),
+    ("/openshell.v1.OpenShell/DeleteService", "sandbox:write"),
+    (
+        "/openshell.v1.OpenShell/AttachSandboxProvider",
+        "sandbox:write",
+    ),
+    (
+        "/openshell.v1.OpenShell/DetachSandboxProvider",
+        "sandbox:write",
+    ),
     // provider:read
     ("/openshell.v1.OpenShell/GetProvider", "provider:read"),
     ("/openshell.v1.OpenShell/ListProviders", "provider:read"),
+    (
+        "/openshell.v1.OpenShell/GetProviderRefreshStatus",
+        "provider:read",
+    ),
     // provider:write
     ("/openshell.v1.OpenShell/CreateProvider", "provider:write"),
     ("/openshell.v1.OpenShell/UpdateProvider", "provider:write"),
     ("/openshell.v1.OpenShell/DeleteProvider", "provider:write"),
+    (
+        "/openshell.v1.OpenShell/ConfigureProviderRefresh",
+        "provider:write",
+    ),
+    (
+        "/openshell.v1.OpenShell/RotateProviderCredential",
+        "provider:write",
+    ),
+    (
+        "/openshell.v1.OpenShell/DeleteProviderRefresh",
+        "provider:write",
+    ),
     // config:read
     ("/openshell.v1.OpenShell/GetGatewayConfig", "config:read"),
     ("/openshell.v1.OpenShell/GetSandboxConfig", "config:read"),
@@ -400,7 +436,47 @@ mod tests {
         );
         assert!(
             policy
+                .check(&id, "/openshell.v1.OpenShell/ListSandboxProviders")
+                .is_ok()
+        );
+        assert!(
+            policy
+                .check(&id, "/openshell.v1.OpenShell/ListServices")
+                .is_ok()
+        );
+        assert!(
+            policy
+                .check(&id, "/openshell.v1.OpenShell/GetService")
+                .is_ok()
+        );
+        assert!(
+            policy
                 .check(&id, "/openshell.v1.OpenShell/CreateSandbox")
+                .is_ok()
+        );
+        assert!(
+            policy
+                .check(&id, "/openshell.v1.OpenShell/ForwardTcp")
+                .is_ok()
+        );
+        assert!(
+            policy
+                .check(&id, "/openshell.v1.OpenShell/ExposeService")
+                .is_ok()
+        );
+        assert!(
+            policy
+                .check(&id, "/openshell.v1.OpenShell/DeleteService")
+                .is_ok()
+        );
+        assert!(
+            policy
+                .check(&id, "/openshell.v1.OpenShell/AttachSandboxProvider")
+                .is_ok()
+        );
+        assert!(
+            policy
+                .check(&id, "/openshell.v1.OpenShell/DetachSandboxProvider")
                 .is_ok()
         );
     }
@@ -414,11 +490,76 @@ mod tests {
                 .check(&id, "/openshell.v1.OpenShell/ListSandboxes")
                 .is_ok()
         );
+        assert!(
+            policy
+                .check(&id, "/openshell.v1.OpenShell/ListServices")
+                .is_ok()
+        );
+        assert!(
+            policy
+                .check(&id, "/openshell.v1.OpenShell/GetService")
+                .is_ok()
+        );
         let err = policy
-            .check(&id, "/openshell.v1.OpenShell/CreateSandbox")
+            .check(&id, "/openshell.v1.OpenShell/AttachSandboxProvider")
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
         assert!(err.message().contains("sandbox:write"));
+
+        let err = policy
+            .check(&id, "/openshell.v1.OpenShell/ExposeService")
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(err.message().contains("sandbox:write"));
+
+        let err = policy
+            .check(&id, "/openshell.v1.OpenShell/DeleteService")
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(err.message().contains("sandbox:write"));
+    }
+
+    #[test]
+    fn provider_refresh_methods_require_provider_scopes_and_admin_for_writes() {
+        let policy = scoped_policy();
+        let reader = identity_with_roles_and_scopes(&["openshell-user"], &["provider:read"]);
+        assert!(
+            policy
+                .check(&reader, "/openshell.v1.OpenShell/GetProviderRefreshStatus")
+                .is_ok()
+        );
+
+        let writer_without_admin =
+            identity_with_roles_and_scopes(&["openshell-user"], &["provider:write"]);
+        let err = policy
+            .check(
+                &writer_without_admin,
+                "/openshell.v1.OpenShell/ConfigureProviderRefresh",
+            )
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(err.message().contains("openshell-admin"));
+
+        let admin_without_scope =
+            identity_with_roles_and_scopes(&["openshell-admin"], &["provider:read"]);
+        let err = policy
+            .check(
+                &admin_without_scope,
+                "/openshell.v1.OpenShell/RotateProviderCredential",
+            )
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(err.message().contains("provider:write"));
+
+        let admin_writer =
+            identity_with_roles_and_scopes(&["openshell-admin"], &["provider:write"]);
+        for method in [
+            "/openshell.v1.OpenShell/ConfigureProviderRefresh",
+            "/openshell.v1.OpenShell/RotateProviderCredential",
+            "/openshell.v1.OpenShell/DeleteProviderRefresh",
+        ] {
+            assert!(policy.check(&admin_writer, method).is_ok(), "{method}");
+        }
     }
 
     #[test]

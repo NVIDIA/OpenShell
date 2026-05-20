@@ -1,30 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{
-    ProviderDiscoverySpec, ProviderError, ProviderPlugin, RealDiscoveryContext, discover_with_spec,
-};
-
-pub struct ClaudeProvider;
+use crate::ProviderDiscoverySpec;
 
 pub const SPEC: ProviderDiscoverySpec = ProviderDiscoverySpec {
-    id: "claude",
+    id: "claude-code",
     credential_env_vars: &["ANTHROPIC_API_KEY", "CLAUDE_API_KEY"],
 };
-
-impl ProviderPlugin for ClaudeProvider {
-    fn id(&self) -> &'static str {
-        SPEC.id
-    }
-
-    fn discover_existing(&self) -> Result<Option<crate::DiscoveredProvider>, ProviderError> {
-        discover_with_spec(&SPEC, &RealDiscoveryContext)
-    }
-
-    fn credential_env_vars(&self) -> &'static [&'static str] {
-        SPEC.credential_env_vars
-    }
-}
 
 #[cfg(test)]
 mod tests {

@@ -15,7 +15,6 @@ use std::pin::Pin;
 use tonic::{Request, Response, Status};
 
 use crate::PodmanComputeDriver;
-use openshell_core::ComputeDriverError;
 
 #[derive(Debug, Clone)]
 pub struct ComputeDriverService {
@@ -38,7 +37,7 @@ impl ComputeDriver for ComputeDriverService {
         self.driver
             .capabilities()
             .map(Response::new)
-            .map_err(status_from_driver_error)
+            .map_err(Status::from)
     }
 
     async fn validate_sandbox_create(
@@ -51,7 +50,7 @@ impl ComputeDriver for ComputeDriverService {
             .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
         self.driver
             .validate_sandbox_create(&sandbox)
-            .map_err(status_from_driver_error)?;
+            .map_err(Status::from)?;
         Ok(Response::new(ValidateSandboxCreateResponse {}))
     }
 
@@ -68,7 +67,7 @@ impl ComputeDriver for ComputeDriverService {
             .driver
             .get_sandbox(&request.sandbox_name)
             .await
-            .map_err(status_from_driver_error)?
+            .map_err(Status::from)?
             .ok_or_else(|| Status::not_found("sandbox not found"))?;
 
         if !request.sandbox_id.is_empty() && request.sandbox_id != sandbox.id {
@@ -86,11 +85,7 @@ impl ComputeDriver for ComputeDriverService {
         &self,
         _request: Request<ListSandboxesRequest>,
     ) -> Result<Response<ListSandboxesResponse>, Status> {
-        let sandboxes = self
-            .driver
-            .list_sandboxes()
-            .await
-            .map_err(status_from_driver_error)?;
+        let sandboxes = self.driver.list_sandboxes().await.map_err(Status::from)?;
         Ok(Response::new(ListSandboxesResponse { sandboxes }))
     }
 
@@ -105,7 +100,7 @@ impl ComputeDriver for ComputeDriverService {
         self.driver
             .create_sandbox(&sandbox)
             .await
-            .map_err(status_from_driver_error)?;
+            .map_err(Status::from)?;
         Ok(Response::new(CreateSandboxResponse {}))
     }
 
@@ -120,7 +115,7 @@ impl ComputeDriver for ComputeDriverService {
         self.driver
             .stop_sandbox(&request.sandbox_name)
             .await
-            .map_err(status_from_driver_error)?;
+            .map_err(Status::from)?;
         Ok(Response::new(StopSandboxResponse {}))
     }
 
@@ -139,7 +134,7 @@ impl ComputeDriver for ComputeDriverService {
             .driver
             .delete_sandbox(&request.sandbox_id, &request.sandbox_name)
             .await
-            .map_err(status_from_driver_error)?;
+            .map_err(Status::from)?;
         Ok(Response::new(DeleteSandboxResponse { deleted }))
     }
 
@@ -150,21 +145,9 @@ impl ComputeDriver for ComputeDriverService {
         &self,
         _request: Request<WatchSandboxesRequest>,
     ) -> Result<Response<Self::WatchSandboxesStream>, Status> {
-        let stream = self
-            .driver
-            .watch_sandboxes()
-            .await
-            .map_err(status_from_driver_error)?;
+        let stream = self.driver.watch_sandboxes().await.map_err(Status::from)?;
         let stream = stream.map(|item| item.map_err(|err| Status::internal(err.to_string())));
         Ok(Response::new(Box::pin(stream)))
-    }
-}
-
-fn status_from_driver_error(err: ComputeDriverError) -> Status {
-    match err {
-        ComputeDriverError::AlreadyExists => Status::already_exists("sandbox already exists"),
-        ComputeDriverError::Precondition(message) => Status::failed_precondition(message),
-        ComputeDriverError::Message(message) => Status::internal(message),
     }
 }
 
@@ -173,23 +156,15 @@ mod tests {
     use super::*;
     use crate::config::PodmanComputeConfig;
     use crate::container;
-    use http_body_util::Full;
-    use hyper::body::Bytes;
-    use hyper::server::conn::http1;
-    use hyper::service::service_fn;
-    use hyper::{Response as HyperResponse, StatusCode};
-    use hyper_util::rt::TokioIo;
-    use std::collections::VecDeque;
-    use std::convert::Infallible;
+    use crate::test_utils::{StubResponse, spawn_podman_stub, unique_socket_path};
+    use hyper::StatusCode;
+    use openshell_core::ComputeDriverError;
     use std::path::PathBuf;
-    use std::sync::{Arc, Mutex};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn precondition_driver_errors_map_to_failed_precondition_status() {
-        let status = status_from_driver_error(ComputeDriverError::Precondition(
-            "sandbox container is not running".to_string(),
-        ));
+        let status: Status =
+            ComputeDriverError::Precondition("sandbox container is not running".to_string()).into();
 
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
         assert_eq!(status.message(), "sandbox container is not running");
@@ -197,100 +172,8 @@ mod tests {
 
     #[test]
     fn already_exists_driver_errors_map_to_already_exists_status() {
-        let status = status_from_driver_error(ComputeDriverError::AlreadyExists);
+        let status: Status = ComputeDriverError::AlreadyExists.into();
         assert_eq!(status.code(), tonic::Code::AlreadyExists);
-    }
-
-    #[derive(Clone)]
-    struct StubResponse {
-        status: StatusCode,
-        body: String,
-    }
-
-    impl StubResponse {
-        fn new(status: StatusCode, body: impl Into<String>) -> Self {
-            Self {
-                status,
-                body: body.into(),
-            }
-        }
-    }
-
-    fn unique_socket_path(test_name: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should be after unix epoch")
-            .as_nanos();
-        PathBuf::from(format!(
-            "/tmp/openshell-podman-grpc-{test_name}-{}-{nanos}.sock",
-            std::process::id()
-        ))
-    }
-
-    fn spawn_podman_stub(
-        test_name: &str,
-        responses: Vec<StubResponse>,
-    ) -> (
-        PathBuf,
-        Arc<Mutex<Vec<String>>>,
-        tokio::task::JoinHandle<()>,
-    ) {
-        let socket_path = unique_socket_path(test_name);
-        let _ = std::fs::remove_file(&socket_path);
-        let listener =
-            tokio::net::UnixListener::bind(&socket_path).expect("test socket should bind");
-        let request_log = Arc::new(Mutex::new(Vec::new()));
-        let response_queue = Arc::new(Mutex::new(VecDeque::from(responses)));
-        let expected = response_queue
-            .lock()
-            .expect("response queue lock should not be poisoned")
-            .len();
-        let socket_path_for_task = socket_path.clone();
-        let log_for_task = request_log.clone();
-        let queue_for_task = response_queue;
-        let handle = tokio::spawn(async move {
-            for _ in 0..expected {
-                let (stream, _) = listener.accept().await.expect("test stub should accept");
-                let log = log_for_task.clone();
-                let queue = queue_for_task.clone();
-                let result = http1::Builder::new()
-                    .serve_connection(
-                        TokioIo::new(stream),
-                        service_fn(move |req| {
-                            let log = log.clone();
-                            let queue = queue.clone();
-                            async move {
-                                let path = req.uri().path_and_query().map_or_else(
-                                    || req.uri().path().to_string(),
-                                    |pq| pq.as_str().to_string(),
-                                );
-                                log.lock()
-                                    .expect("request log lock should not be poisoned")
-                                    .push(format!("{} {}", req.method(), path));
-                                let response = queue
-                                    .lock()
-                                    .expect("response queue lock should not be poisoned")
-                                    .pop_front()
-                                    .expect("stub response should exist");
-                                Ok::<_, Infallible>(
-                                    HyperResponse::builder()
-                                        .status(response.status)
-                                        .body(Full::new(Bytes::from(response.body)))
-                                        .expect("stub response should build"),
-                                )
-                            }
-                        }),
-                    )
-                    .await;
-                // The one-shot test client can close the Unix socket after the
-                // response, which Hyper reports as a shutdown error. Let the
-                // request log assertions below decide whether the stub served
-                // the expected API calls.
-                let _ = result;
-            }
-            let _ = std::fs::remove_file(&socket_path_for_task);
-        });
-        (socket_path, request_log, handle)
     }
 
     fn test_service(socket_path: PathBuf) -> ComputeDriverService {
@@ -348,14 +231,12 @@ mod tests {
         let sandbox_name = "demo";
         let container_name = container::container_name(sandbox_name);
         let volume_name = container::volume_name(sandbox_id);
-        let secret_name = container::secret_name(sandbox_id);
         let (socket_path, request_log, handle) = spawn_podman_stub(
             "forward-id",
             vec![
                 StubResponse::new(StatusCode::NOT_FOUND, r#"{"message":"gone"}"#),
                 StubResponse::new(StatusCode::NOT_FOUND, r#"{"message":"gone"}"#),
                 StubResponse::new(StatusCode::NOT_FOUND, r#"{"message":"gone"}"#),
-                StubResponse::new(StatusCode::NO_CONTENT, ""),
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
             ],
         );
@@ -403,10 +284,6 @@ mod tests {
                 format!(
                     "DELETE {}",
                     api_path(&format!("/libpod/volumes/{volume_name}"))
-                ),
-                format!(
-                    "DELETE {}",
-                    api_path(&format!("/libpod/secrets/{secret_name}"))
                 ),
             ]
         );

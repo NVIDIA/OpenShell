@@ -8,6 +8,7 @@ use clap_complete::engine::ArgValueCompleter;
 use clap_complete::env::CompleteEnv;
 use miette::Result;
 use owo_colors::OwoColorize;
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -197,6 +198,7 @@ const HELP_TEMPLATE: &str = "\
 
 \x1b[1mSANDBOX COMMANDS\x1b[0m
   sandbox:     Manage sandboxes
+  service:     Expose sandbox services
   forward:     Manage port forwarding to a sandbox
   logs:        View sandbox logs
   policy:      Manage sandbox policy
@@ -266,8 +268,21 @@ const FORWARD_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
 \x1b[1mEXAMPLES\x1b[0m
   $ openshell forward start 8080
   $ openshell forward start 3000 my-sandbox
+  $ openshell forward service my-sandbox --target-port 8000 --local 8000
   $ openshell forward stop 8080
   $ openshell forward list
+";
+
+const SERVICE_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
+  svc
+
+\x1b[1mEXAMPLES\x1b[0m
+  $ openshell service expose my-sandbox 8080
+  $ openshell service expose my-sandbox 8080 web
+  $ openshell service list
+  $ openshell service list my-sandbox
+  $ openshell service get my-sandbox web
+  $ openshell service delete my-sandbox web
 ";
 
 const LOGS_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
@@ -287,6 +302,7 @@ const POLICY_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
   $ openshell policy get my-sandbox
   $ openshell policy set my-sandbox --policy policy.yaml
   $ openshell policy update my-sandbox --add-endpoint api.github.com:443:read-only:rest:enforce
+  $ openshell policy update my-sandbox --add-endpoint realtime.example.com:443:read-write:websocket:enforce:websocket-credential-rewrite,allowed-ip=10.0.0.0/8
   $ openshell policy update my-sandbox --add-allow 'api.github.com:443:GET:/repos/**'
   $ openshell policy set --global --policy policy.yaml
   $ openshell policy delete --global
@@ -405,6 +421,13 @@ enum Commands {
     Forward {
         #[command(subcommand)]
         command: Option<ForwardCommands>,
+    },
+
+    /// Manage sandbox services.
+    #[command(alias = "svc", after_help = SERVICE_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    Service {
+        #[command(subcommand)]
+        command: Option<ServiceCommands>,
     },
 
     /// View sandbox logs.
@@ -624,13 +647,30 @@ fn normalize_completion_script(output: Vec<u8>, executable: &std::path::Path) ->
 }
 
 #[derive(Clone, Debug, ValueEnum)]
-enum ProviderProfileOutput {
+enum OutputFormat {
     Table,
     Yaml,
     Json,
 }
 
-impl ProviderProfileOutput {
+#[derive(Clone, Debug, ValueEnum)]
+enum CliProviderRefreshStrategy {
+    Oauth2RefreshToken,
+    Oauth2ClientCredentials,
+    GoogleServiceAccountJwt,
+}
+
+impl CliProviderRefreshStrategy {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Oauth2RefreshToken => "oauth2_refresh_token",
+            Self::Oauth2ClientCredentials => "oauth2_client_credentials",
+            Self::GoogleServiceAccountJwt => "google_service_account_jwt",
+        }
+    }
+}
+
+impl OutputFormat {
     fn as_str(&self) -> &'static str {
         match self {
             Self::Table => "table",
@@ -685,6 +725,10 @@ enum ProviderCommands {
         config: Vec<String>,
     },
 
+    /// Manage provider credential refresh.
+    #[command(subcommand, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    Refresh(ProviderRefreshCommands),
+
     /// Fetch a provider by name.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Get {
@@ -713,8 +757,8 @@ enum ProviderCommands {
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     ListProfiles {
         /// Output format.
-        #[arg(short = 'o', long = "output", value_enum, default_value_t = ProviderProfileOutput::Table)]
-        output: ProviderProfileOutput,
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
     },
 
     /// Manage provider profiles.
@@ -743,6 +787,10 @@ enum ProviderCommands {
         /// Provider config key/value pair.
         #[arg(long = "config", value_name = "KEY=VALUE")]
         config: Vec<String>,
+
+        /// Credential expiry (`KEY=TIMESTAMP`). Accepts epoch milliseconds or RFC3339. A zero timestamp clears expiry.
+        #[arg(long = "credential-expires-at", value_name = "KEY=TIMESTAMP")]
+        credential_expires_at: Vec<String>,
     },
 
     /// Delete providers by name.
@@ -755,6 +803,77 @@ enum ProviderCommands {
 }
 
 #[derive(Subcommand, Debug)]
+enum ProviderRefreshCommands {
+    /// Show provider credential refresh status.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Status {
+        /// Provider name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_provider_names))]
+        name: String,
+
+        /// Optional credential key to filter by.
+        #[arg(long = "credential-key")]
+        credential_key: Option<String>,
+    },
+
+    /// Configure refresh metadata for a provider credential.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Configure {
+        /// Provider name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_provider_names))]
+        name: String,
+
+        /// Injectable credential key, for example `MS_GRAPH_ACCESS_TOKEN`.
+        #[arg(long = "credential-key")]
+        credential_key: String,
+
+        /// Refresh strategy.
+        #[arg(long, value_enum)]
+        strategy: CliProviderRefreshStrategy,
+
+        /// Non-injectable refresh material (`KEY=VALUE`).
+        #[arg(long = "material", value_name = "KEY=VALUE")]
+        material: Vec<String>,
+
+        /// Material keys that are secret and must not be exposed.
+        #[arg(long = "secret-material-key", value_name = "KEY")]
+        secret_material_keys: Vec<String>,
+
+        /// Expiry for the current credential. Accepts epoch milliseconds or RFC3339.
+        #[arg(
+            long = "credential-expires-at",
+            value_name = "TIMESTAMP",
+            value_parser = run::parse_credential_expiry_cli_value
+        )]
+        credential_expires_at: Option<i64>,
+    },
+
+    /// Record a gateway-owned credential rotation request.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Rotate {
+        /// Provider name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_provider_names))]
+        name: String,
+
+        /// Injectable credential key, for example `MS_GRAPH_ACCESS_TOKEN`.
+        #[arg(long = "credential-key")]
+        credential_key: String,
+    },
+
+    /// Delete refresh metadata for a provider credential.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Delete {
+        /// Provider name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_provider_names))]
+        name: String,
+
+        /// Injectable credential key, for example `MS_GRAPH_ACCESS_TOKEN`.
+        #[arg(long = "credential-key")]
+        credential_key: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum ProviderProfileCommands {
     /// Export a provider profile.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
@@ -763,8 +882,8 @@ enum ProviderProfileCommands {
         id: String,
 
         /// Output format.
-        #[arg(short = 'o', long = "output", value_enum, default_value_t = ProviderProfileOutput::Yaml)]
-        output: ProviderProfileOutput,
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Yaml)]
+        output: OutputFormat,
     },
 
     /// Import provider profiles from a file or directory.
@@ -1061,10 +1180,19 @@ enum SandboxCommands {
         #[arg(long)]
         gpu: bool,
 
-        /// Target a specific GPU by PCI address (e.g. "0000:2d:00.0") or index (e.g. "0", "1").
-        /// Only valid with --gpu. When omitted with --gpu, the first available GPU is assigned.
+        /// Target a driver-specific GPU device. Docker and Podman use CDI device IDs
+        /// (for example "nvidia.com/gpu=0"); VM uses a PCI BDF or index.
+        /// Only valid with --gpu. When omitted with --gpu, the driver uses its default GPU selection.
         #[arg(long, requires = "gpu")]
         gpu_device: Option<String>,
+
+        /// CPU limit for the sandbox (for example: 500m, 1, 2.5).
+        #[arg(long)]
+        cpu: Option<String>,
+
+        /// Memory limit for the sandbox (for example: 512Mi, 4Gi, 8G).
+        #[arg(long)]
+        memory: Option<String>,
 
         /// Provider names to attach to this sandbox.
         #[arg(long = "provider")]
@@ -1135,16 +1263,20 @@ enum SandboxCommands {
         offset: u32,
 
         /// Print only sandbox ids (one per line).
-        #[arg(long, conflicts_with = "names")]
+        #[arg(long, conflicts_with_all = ["names", "output"])]
         ids: bool,
 
         /// Print only sandbox names (one per line).
-        #[arg(long, conflicts_with = "ids")]
+        #[arg(long, conflicts_with_all = ["ids", "output"])]
         names: bool,
 
         /// Filter sandboxes by label selector (key1=value1,key2=value2).
         #[arg(long)]
         selector: Option<String>,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table, conflicts_with_all = ["ids", "names"])]
+        output: OutputFormat,
     },
 
     /// Delete a sandbox by name.
@@ -1260,6 +1392,45 @@ enum SandboxCommands {
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
     },
+
+    /// Manage providers attached to a sandbox.
+    #[command(subcommand)]
+    Provider(SandboxProviderCommands),
+}
+
+#[derive(Subcommand, Debug)]
+enum SandboxProviderCommands {
+    /// List providers attached to a sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    List {
+        /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+    },
+
+    /// Attach a provider to a sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Attach {
+        /// Sandbox name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: String,
+
+        /// Provider name to attach.
+        #[arg(add = ArgValueCompleter::new(completers::complete_provider_names))]
+        provider: String,
+    },
+
+    /// Detach a provider from a sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Detach {
+        /// Sandbox name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: String,
+
+        /// Provider name to detach.
+        #[arg(add = ArgValueCompleter::new(completers::complete_provider_names))]
+        provider: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1364,7 +1535,7 @@ enum PolicyCommands {
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
 
-        /// Add or merge an endpoint: host:port[:access[:protocol[:enforcement]]].
+        /// Add or merge an endpoint: host:port[:access[:protocol[:enforcement[:options]]]].
         #[arg(long = "add-endpoint")]
         add_endpoints: Vec<String>,
 
@@ -1372,11 +1543,11 @@ enum PolicyCommands {
         #[arg(long = "remove-endpoint")]
         remove_endpoints: Vec<String>,
 
-        /// Add a REST allow rule: `host:port:METHOD:path_glob`.
+        /// Add a REST or WebSocket method/path allow rule: `host:port:METHOD:path_glob`.
         #[arg(long = "add-allow")]
         add_allow: Vec<String>,
 
-        /// Add a REST deny rule: `host:port:METHOD:path_glob`.
+        /// Add a REST or WebSocket method/path deny rule: `host:port:METHOD:path_glob`.
         #[arg(long = "add-deny")]
         add_deny: Vec<String>,
 
@@ -1572,6 +1743,82 @@ enum ForwardCommands {
     /// List active port forwards.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     List,
+
+    /// Forward a local TCP port to a loopback service inside a sandbox over gRPC.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Service {
+        /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+
+        /// Target service port inside the sandbox.
+        #[arg(long)]
+        target_port: u16,
+
+        /// Target service host inside the sandbox. Phase 1 accepts loopback only.
+        #[arg(long, default_value = "127.0.0.1")]
+        target_host: String,
+
+        /// Local bind address and port: `[bind_address:]port`. Defaults to the target port. Use port 0 for dynamic assignment.
+        #[arg(long)]
+        local: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ServiceCommands {
+    /// Expose an HTTP service running inside a sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Expose {
+        /// Sandbox name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        sandbox: String,
+
+        /// Loopback TCP port inside the sandbox.
+        #[arg(value_name = "TARGET-PORT")]
+        target_port: u16,
+
+        /// Service name.
+        service: Option<String>,
+    },
+
+    /// List exposed sandbox service endpoints.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    List {
+        /// Sandbox name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        sandbox: Option<String>,
+
+        /// Maximum number of endpoints to return.
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+
+        /// Number of endpoints to skip.
+        #[arg(long, default_value_t = 0)]
+        offset: u32,
+    },
+
+    /// Show one exposed sandbox service endpoint.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Get {
+        /// Sandbox name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        sandbox: String,
+
+        /// Service name. Omit for the unnamed endpoint.
+        service: Option<String>,
+    },
+
+    /// Delete one exposed sandbox service endpoint.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Delete {
+        /// Sandbox name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        sandbox: String,
+
+        /// Service name. Omit for the unnamed endpoint.
+        service: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -1814,6 +2061,27 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+            ForwardCommands::Service {
+                name,
+                target_port,
+                target_host,
+                local,
+            } => {
+                let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+                let mut tls = tls.with_gateway_name(&ctx.name);
+                apply_auth(&mut tls, &ctx.name);
+                let name = resolve_sandbox_name(name, &ctx.name)?;
+                let local = local.unwrap_or_else(|| target_port.to_string());
+                run::service_forward_tcp(
+                    &ctx.endpoint,
+                    &name,
+                    Some(&local),
+                    &target_host,
+                    target_port,
+                    &tls,
+                )
+                .await?;
+            }
             ForwardCommands::Start {
                 port,
                 name,
@@ -1837,6 +2105,43 @@ async fn main() -> Result<()> {
             }
         },
 
+        // -----------------------------------------------------------
+        // Service exposure
+        // -----------------------------------------------------------
+        Some(Commands::Service {
+            command: Some(command),
+        }) => {
+            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let mut tls = tls.with_gateway_name(&ctx.name);
+            apply_auth(&mut tls, &ctx.name);
+            match command {
+                ServiceCommands::Expose {
+                    sandbox,
+                    service,
+                    target_port,
+                } => {
+                    let service = service.unwrap_or_default();
+                    run::service_expose(&ctx.endpoint, &sandbox, &service, target_port, &tls)
+                        .await?;
+                }
+                ServiceCommands::List {
+                    sandbox,
+                    limit,
+                    offset,
+                } => {
+                    run::service_list(&ctx.endpoint, sandbox.as_deref(), limit, offset, &tls)
+                        .await?;
+                }
+                ServiceCommands::Get { sandbox, service } => {
+                    let service = service.unwrap_or_default();
+                    run::service_get(&ctx.endpoint, &sandbox, &service, &tls).await?;
+                }
+                ServiceCommands::Delete { sandbox, service } => {
+                    let service = service.unwrap_or_default();
+                    run::service_delete(&ctx.endpoint, &sandbox, &service, &tls).await?;
+                }
+            }
+        }
         // -----------------------------------------------------------
         // Top-level logs (was `sandbox logs`)
         // -----------------------------------------------------------
@@ -2168,6 +2473,8 @@ async fn main() -> Result<()> {
                     editor,
                     gpu,
                     gpu_device,
+                    cpu,
+                    memory,
                     providers,
                     policy,
                     forward,
@@ -2197,7 +2504,7 @@ async fn main() -> Result<()> {
                     };
 
                     // Parse --label flags into a HashMap<String, String>.
-                    let mut labels_map = std::collections::HashMap::new();
+                    let mut labels_map = HashMap::new();
                     for label_str in &labels {
                         let parts: Vec<&str> = label_str.splitn(2, '=').collect();
                         if parts.len() != 2 {
@@ -2234,6 +2541,8 @@ async fn main() -> Result<()> {
                         keep,
                         gpu,
                         gpu_device.as_deref(),
+                        cpu.as_deref(),
+                        memory.as_deref(),
                         editor,
                         &providers,
                         policy.as_deref(),
@@ -2291,12 +2600,8 @@ async fn main() -> Result<()> {
                     let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
                     let mut tls = tls.with_gateway_name(&ctx.name);
                     apply_auth(&mut tls, &ctx.name);
-                    let local_dest = std::path::Path::new(dest.as_deref().unwrap_or("."));
-                    eprintln!(
-                        "Downloading sandbox:{} -> {}",
-                        sandbox_path,
-                        local_dest.display()
-                    );
+                    let local_dest = dest.as_deref().unwrap_or(".");
+                    eprintln!("Downloading sandbox:{sandbox_path} -> {local_dest}");
                     run::sandbox_sync_down(&ctx.endpoint, &name, &sandbox_path, local_dest, &tls)
                         .await?;
                     eprintln!("{} Download complete", "✓".green().bold());
@@ -2322,6 +2627,7 @@ async fn main() -> Result<()> {
                             ids,
                             names,
                             selector,
+                            output,
                         } => {
                             run::sandbox_list(
                                 endpoint,
@@ -2330,6 +2636,7 @@ async fn main() -> Result<()> {
                                 ids,
                                 names,
                                 selector.as_deref(),
+                                output.as_str(),
                                 &tls,
                             )
                             .await?;
@@ -2385,6 +2692,20 @@ async fn main() -> Result<()> {
                             let name = resolve_sandbox_name(name, &ctx.name)?;
                             run::print_ssh_config(&ctx.name, &name);
                         }
+                        SandboxCommands::Provider(command) => match command {
+                            SandboxProviderCommands::List { name } => {
+                                let name = resolve_sandbox_name(name, &ctx.name)?;
+                                run::sandbox_provider_list(endpoint, &name, &tls).await?;
+                            }
+                            SandboxProviderCommands::Attach { name, provider } => {
+                                run::sandbox_provider_attach(endpoint, &name, &provider, &tls)
+                                    .await?;
+                            }
+                            SandboxProviderCommands::Detach { name, provider } => {
+                                run::sandbox_provider_detach(endpoint, &name, &provider, &tls)
+                                    .await?;
+                            }
+                        },
                     }
                 }
             }
@@ -2416,6 +2737,55 @@ async fn main() -> Result<()> {
                     )
                     .await?;
                 }
+                ProviderCommands::Refresh(command) => match command {
+                    ProviderRefreshCommands::Status {
+                        name,
+                        credential_key,
+                    } => {
+                        run::provider_refresh_status(
+                            endpoint,
+                            &name,
+                            credential_key.as_deref(),
+                            &tls,
+                        )
+                        .await?;
+                    }
+                    ProviderRefreshCommands::Configure {
+                        name,
+                        credential_key,
+                        strategy,
+                        material,
+                        secret_material_keys,
+                        credential_expires_at,
+                    } => {
+                        run::provider_refresh_config(
+                            endpoint,
+                            run::ProviderRefreshConfigInput {
+                                name: &name,
+                                credential_key: &credential_key,
+                                strategy: strategy.as_str(),
+                                material: &material,
+                                secret_material_keys: &secret_material_keys,
+                                credential_expires_at_ms: credential_expires_at,
+                            },
+                            &tls,
+                        )
+                        .await?;
+                    }
+                    ProviderRefreshCommands::Rotate {
+                        name,
+                        credential_key,
+                    } => {
+                        run::provider_rotate(endpoint, &name, &credential_key, &tls).await?;
+                    }
+                    ProviderRefreshCommands::Delete {
+                        name,
+                        credential_key,
+                    } => {
+                        run::provider_refresh_delete(endpoint, &name, &credential_key, &tls)
+                            .await?;
+                    }
+                },
                 ProviderCommands::Get { name } => {
                     run::provider_get(endpoint, &name, &tls).await?;
                 }
@@ -2460,6 +2830,7 @@ async fn main() -> Result<()> {
                     from_existing,
                     credentials,
                     config,
+                    credential_expires_at,
                 } => {
                     run::provider_update(
                         endpoint,
@@ -2467,6 +2838,7 @@ async fn main() -> Result<()> {
                         from_existing,
                         &credentials,
                         &config,
+                        &credential_expires_at,
                         &tls,
                     )
                     .await?;
@@ -2481,7 +2853,11 @@ async fn main() -> Result<()> {
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_auth(&mut tls, &ctx.name);
             let channel = openshell_cli::tls::build_channel(&ctx.endpoint, &tls).await?;
-            openshell_tui::run(channel, &ctx.name, &ctx.endpoint, theme).await?;
+            let interceptor = openshell_core::auth::EdgeAuthInterceptor::new(
+                tls.oidc_token.as_deref(),
+                tls.edge_token.as_deref(),
+            )?;
+            openshell_tui::run(channel, interceptor, &ctx.name, &ctx.endpoint, theme).await?;
         }
         Some(Commands::Completions { shell }) => {
             let exe = std::env::current_exe()
@@ -2557,6 +2933,13 @@ async fn main() -> Result<()> {
             Cli::command()
                 .find_subcommand_mut("forward")
                 .expect("forward subcommand exists")
+                .print_help()
+                .expect("Failed to print help");
+        }
+        Some(Commands::Service { command: None }) => {
+            Cli::command()
+                .find_subcommand_mut("service")
+                .expect("service subcommand exists")
                 .print_help()
                 .expect("Failed to print help");
         }
@@ -2719,6 +3102,30 @@ mod tests {
             names.contains(&"completions".to_string()),
             "expected 'completions' in candidates, got: {names:?}"
         );
+    }
+
+    #[test]
+    fn sandbox_provider_subcommands_parse() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "provider",
+            "attach",
+            "work-sandbox",
+            "work-github",
+        ])
+        .expect("sandbox provider attach should parse");
+
+        let Some(Commands::Sandbox {
+            command:
+                Some(SandboxCommands::Provider(SandboxProviderCommands::Attach { name, provider })),
+        }) = cli.command
+        else {
+            panic!("expected sandbox provider attach command");
+        };
+
+        assert_eq!(name, "work-sandbox");
+        assert_eq!(provider, "work-github");
     }
 
     #[test]
@@ -3144,7 +3551,7 @@ mod tests {
             cli.command,
             Some(Commands::Provider {
                 command: Some(ProviderCommands::ListProfiles {
-                    output: ProviderProfileOutput::Table
+                    output: OutputFormat::Table
                 })
             })
         ));
@@ -3159,7 +3566,7 @@ mod tests {
             cli.command,
             Some(Commands::Provider {
                 command: Some(ProviderCommands::ListProfiles {
-                    output: ProviderProfileOutput::Json
+                    output: OutputFormat::Json
                 })
             })
         ));
@@ -3182,7 +3589,7 @@ mod tests {
             Some(Commands::Provider {
                 command: Some(ProviderCommands::Profile(ProviderProfileCommands::Export {
                     id,
-                    output: ProviderProfileOutput::Yaml
+                    output: OutputFormat::Yaml
                 }))
             }) if id == "custom-api"
         ));
@@ -3220,6 +3627,66 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_list_default_output_is_table() {
+        let cli = Cli::try_parse_from(["openshell", "sandbox", "list"])
+            .expect("sandbox list should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::List {
+                    output: OutputFormat::Table,
+                    ..
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn sandbox_list_accepts_output_json() {
+        let cli = Cli::try_parse_from(["openshell", "sandbox", "list", "-o", "json"])
+            .expect("sandbox list -o json should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::List {
+                    output: OutputFormat::Json,
+                    ..
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn sandbox_list_accepts_output_yaml() {
+        let cli = Cli::try_parse_from(["openshell", "sandbox", "list", "-o", "yaml"])
+            .expect("sandbox list -o yaml should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::List {
+                    output: OutputFormat::Yaml,
+                    ..
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn sandbox_list_json_conflicts_with_ids() {
+        let result = Cli::try_parse_from(["openshell", "sandbox", "list", "-o", "json", "--ids"]);
+        assert!(result.is_err(), "--ids and -o json should conflict");
+    }
+
+    #[test]
+    fn sandbox_list_json_conflicts_with_names() {
+        let result = Cli::try_parse_from(["openshell", "sandbox", "list", "-o", "json", "--names"]);
+        assert!(result.is_err(), "--names and -o json should conflict");
+    }
+
+    #[test]
     fn provider_create_accepts_custom_profile_type_ids() {
         let cli = Cli::try_parse_from([
             "openshell",
@@ -3250,6 +3717,155 @@ mod tests {
             }
             other => panic!("expected provider create command, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn provider_refresh_commands_parse() {
+        let status = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "refresh",
+            "status",
+            "my-graph",
+            "--credential-key",
+            "MS_GRAPH_ACCESS_TOKEN",
+        ])
+        .expect("provider refresh status should parse");
+        assert!(matches!(
+            status.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::Refresh(ProviderRefreshCommands::Status {
+                    name,
+                    credential_key: Some(key)
+                }))
+            }) if name == "my-graph" && key == "MS_GRAPH_ACCESS_TOKEN"
+        ));
+
+        let config = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "refresh",
+            "configure",
+            "my-graph",
+            "--credential-key",
+            "MS_GRAPH_ACCESS_TOKEN",
+            "--strategy",
+            "oauth2-client-credentials",
+            "--material",
+            "tenant_id=abc",
+            "--secret-material-key",
+            "client_secret",
+            "--credential-expires-at",
+            "1767225600000",
+        ])
+        .expect("provider refresh configure should parse");
+        assert!(matches!(
+            config.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::Refresh(
+                    ProviderRefreshCommands::Configure {
+                        strategy: CliProviderRefreshStrategy::Oauth2ClientCredentials,
+                        credential_expires_at: Some(1_767_225_600_000),
+                        ..
+                    }
+                ))
+            })
+        ));
+
+        let rotate = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "refresh",
+            "rotate",
+            "my-graph",
+            "--credential-key",
+            "MS_GRAPH_ACCESS_TOKEN",
+        ])
+        .expect("provider refresh rotate should parse");
+        assert!(matches!(
+            rotate.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::Refresh(ProviderRefreshCommands::Rotate {
+                    name,
+                    credential_key
+                }))
+            }) if name == "my-graph" && credential_key == "MS_GRAPH_ACCESS_TOKEN"
+        ));
+
+        let delete = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "refresh",
+            "delete",
+            "my-graph",
+            "--credential-key",
+            "MS_GRAPH_ACCESS_TOKEN",
+        ])
+        .expect("provider refresh delete should parse");
+        assert!(matches!(
+            delete.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::Refresh(ProviderRefreshCommands::Delete {
+                    name,
+                    credential_key
+                }))
+            }) if name == "my-graph" && credential_key == "MS_GRAPH_ACCESS_TOKEN"
+        ));
+    }
+
+    #[test]
+    fn provider_update_accepts_credential_expiry() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "update",
+            "my-graph",
+            "--credential",
+            "MS_GRAPH_ACCESS_TOKEN=abc",
+            "--credential-expires-at",
+            "MS_GRAPH_ACCESS_TOKEN=1767225600000",
+        ])
+        .expect("provider update should parse credential expiry");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::Update {
+                    credential_expires_at,
+                    ..
+                })
+            }) if credential_expires_at == vec!["MS_GRAPH_ACCESS_TOKEN=1767225600000"]
+        ));
+    }
+
+    #[test]
+    fn provider_refresh_config_accepts_rfc3339_credential_expiry() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "refresh",
+            "configure",
+            "my-graph",
+            "--credential-key",
+            "MS_GRAPH_ACCESS_TOKEN",
+            "--strategy",
+            "oauth2-client-credentials",
+            "--credential-expires-at",
+            "2026-01-01T00:00:00Z",
+        ])
+        .expect("provider refresh configure should parse RFC3339 credential expiry");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::Refresh(
+                    ProviderRefreshCommands::Configure {
+                        credential_expires_at: Some(1_767_225_600_000),
+                        ..
+                    }
+                ))
+            })
+        ));
     }
 
     #[test]
@@ -3396,6 +4012,221 @@ mod tests {
             } else {
                 panic!("expected SandboxCommands::Create");
             }
+        }
+    }
+
+    #[test]
+    fn sandbox_create_resource_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--cpu",
+            "500m",
+            "--memory",
+            "2Gi",
+            "--",
+            "claude",
+        ])
+        .expect("sandbox create resource flags should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Create {
+                        cpu,
+                        memory,
+                        command,
+                        ..
+                    }),
+                ..
+            }) => {
+                assert_eq!(cpu.as_deref(), Some("500m"));
+                assert_eq!(memory.as_deref(), Some("2Gi"));
+                assert_eq!(command, vec!["claude".to_string()]);
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_expose_accepts_positional_target_port_and_service() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "service",
+            "expose",
+            "my-sandbox",
+            "8080",
+            "api",
+        ])
+        .expect("service expose positional target port should parse");
+
+        match cli.command {
+            Some(Commands::Service {
+                command:
+                    Some(ServiceCommands::Expose {
+                        sandbox,
+                        target_port,
+                        service,
+                    }),
+            }) => {
+                assert_eq!(sandbox, "my-sandbox");
+                assert_eq!(target_port, 8080);
+                assert_eq!(service.as_deref(), Some("api"));
+            }
+            other => panic!("expected service expose command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_expose_allows_omitted_service_name() {
+        let cli = Cli::try_parse_from(["openshell", "service", "expose", "my-sandbox", "8080"])
+            .expect("service expose should allow omitting the service name");
+
+        match cli.command {
+            Some(Commands::Service {
+                command:
+                    Some(ServiceCommands::Expose {
+                        sandbox,
+                        target_port,
+                        service,
+                    }),
+            }) => {
+                assert_eq!(sandbox, "my-sandbox");
+                assert_eq!(target_port, 8080);
+                assert_eq!(service, None);
+            }
+            other => panic!("expected service expose command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_alias_parses_service_commands() {
+        let cli = Cli::try_parse_from(["openshell", "svc", "expose", "my-sandbox", "8080"])
+            .expect("svc alias should parse service commands");
+
+        match cli.command {
+            Some(Commands::Service {
+                command:
+                    Some(ServiceCommands::Expose {
+                        sandbox,
+                        target_port,
+                        service,
+                    }),
+            }) => {
+                assert_eq!(sandbox, "my-sandbox");
+                assert_eq!(target_port, 8080);
+                assert_eq!(service, None);
+            }
+            other => panic!("expected service expose command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_list_accepts_optional_sandbox_and_paging() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "service",
+            "list",
+            "my-sandbox",
+            "--limit",
+            "10",
+            "--offset",
+            "2",
+        ])
+        .expect("service list should parse optional sandbox and paging");
+
+        match cli.command {
+            Some(Commands::Service {
+                command:
+                    Some(ServiceCommands::List {
+                        sandbox,
+                        limit,
+                        offset,
+                    }),
+            }) => {
+                assert_eq!(sandbox.as_deref(), Some("my-sandbox"));
+                assert_eq!(limit, 10);
+                assert_eq!(offset, 2);
+            }
+            other => panic!("expected service list command, got: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["openshell", "service", "list"])
+            .expect("service list should allow omitting sandbox");
+
+        match cli.command {
+            Some(Commands::Service {
+                command:
+                    Some(ServiceCommands::List {
+                        sandbox,
+                        limit,
+                        offset,
+                    }),
+            }) => {
+                assert_eq!(sandbox, None);
+                assert_eq!(limit, 100);
+                assert_eq!(offset, 0);
+            }
+            other => panic!("expected service list command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_get_accepts_optional_service_name() {
+        let cli = Cli::try_parse_from(["openshell", "service", "get", "my-sandbox", "api"])
+            .expect("service get should parse service name");
+
+        match cli.command {
+            Some(Commands::Service {
+                command: Some(ServiceCommands::Get { sandbox, service }),
+            }) => {
+                assert_eq!(sandbox, "my-sandbox");
+                assert_eq!(service.as_deref(), Some("api"));
+            }
+            other => panic!("expected service get command, got: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["openshell", "service", "get", "my-sandbox"])
+            .expect("service get should allow omitting service name");
+
+        match cli.command {
+            Some(Commands::Service {
+                command: Some(ServiceCommands::Get { sandbox, service }),
+            }) => {
+                assert_eq!(sandbox, "my-sandbox");
+                assert_eq!(service, None);
+            }
+            other => panic!("expected service get command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn service_delete_accepts_optional_service_name() {
+        let cli = Cli::try_parse_from(["openshell", "service", "delete", "my-sandbox", "api"])
+            .expect("service delete should parse service name");
+
+        match cli.command {
+            Some(Commands::Service {
+                command: Some(ServiceCommands::Delete { sandbox, service }),
+            }) => {
+                assert_eq!(sandbox, "my-sandbox");
+                assert_eq!(service.as_deref(), Some("api"));
+            }
+            other => panic!("expected service delete command, got: {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["openshell", "service", "delete", "my-sandbox"])
+            .expect("service delete should allow omitting service name");
+
+        match cli.command {
+            Some(Commands::Service {
+                command: Some(ServiceCommands::Delete { sandbox, service }),
+            }) => {
+                assert_eq!(sandbox, "my-sandbox");
+                assert_eq!(service, None);
+            }
+            other => panic!("expected service delete command, got: {other:?}"),
         }
     }
 }

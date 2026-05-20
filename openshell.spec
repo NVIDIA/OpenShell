@@ -2,10 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 %global crate openshell
-%global openshell_cargo_version %{version}
+%global openshell_version 0.0.37
+%global openshell_cargo_version %{openshell_version}
 # Python dist-info metadata intentionally follows the RPM Version. Dev build
 # identity is represented by Release for RPM packages.
-%global openshell_python_version %{version}
+%global openshell_python_version %{openshell_version}
 
 # Cargo/Rust builds with vendored deps do not produce debugsource listings
 # in the format redhat-rpm-config expects (especially on EPEL).
@@ -18,14 +19,14 @@
 %global image_tag dev
 
 Name:           openshell
-Version:        0.0.37
-Release:        1.20260506170246815148.rpm.dev.106.g99e94469%{?dist}
+Version:        %{openshell_version}
+Release:        1.20260518180028805757.podman.toml.gateway.listener.11.g8c0cb7c8%{?dist}
 Summary:        Safe, sandboxed runtimes for autonomous AI agents
 
 License:        Apache-2.0
 URL:            https://github.com/NVIDIA/OpenShell
-Source0: openshell-0.0.37.tar.gz
-Source1: openshell-0.0.37-vendor.tar.xz
+Source0: openshell-%{openshell_version}.tar.gz
+Source1: openshell-%{openshell_version}-vendor.tar.xz
 
 ExclusiveArch:  x86_64 aarch64
 
@@ -53,7 +54,7 @@ BuildRequires:  pandoc
 BuildRequires:  python3-devel
 
 # Runtime: container runtime for package-managed gateway sandboxes.
-# Podman is preferred; Docker is also supported via --container-runtime flag.
+# The gateway auto-detects Podman when the package-managed service starts.
 Recommends:     podman
 
 %description
@@ -71,9 +72,9 @@ Requires:       %{name} = %{version}-%{release}
 
 %description gateway
 OpenShell gateway server providing the control-plane API for sandbox
-lifecycle management. This package configures the gateway to use the
-Podman compute driver, pulling sandbox and supervisor images from
-ghcr.io/nvidia/openshell.
+lifecycle management. This package installs Podman-oriented defaults in
+gateway TOML while leaving compute driver selection to gateway auto-detection
+or explicit operator configuration.
 
 # --- Python SDK sub-package ---
 %package -n python3-%{name}
@@ -119,7 +120,6 @@ cargo build --release --bin openshell --bin openshell-gateway
 # Build man pages from markdown
 pandoc -s -t man deploy/man/openshell.1.md -o openshell.1
 pandoc -s -t man deploy/man/openshell-gateway.8.md -o openshell-gateway.8
-pandoc -s -t man deploy/man/openshell-gateway.env.5.md -o openshell-gateway.env.5
 
 %install
 # --- CLI binary ---
@@ -128,49 +128,41 @@ install -Dpm 0755 target/release/%{name} %{buildroot}%{_bindir}/%{name}
 # --- Gateway binary ---
 install -Dpm 0755 target/release/%{name}-gateway %{buildroot}%{_bindir}/%{name}-gateway
 
-# --- Gateway systemd user unit (rootless Podman) ---
+# --- Default gateway TOML config template ---
+# Shipped as a read-only reference in %{_datadir}. The systemd unit seeds a
+# user-level copy at ~/.config/openshell/gateway.toml on first start.
+install -Dpm 0644 deploy/rpm/gateway.toml.default %{buildroot}%{_datadir}/%{name}-gateway/gateway.toml.default
+
+# --- Gateway systemd user unit ---
 # Installed to the systemd user unit directory so any user can run:
 #   systemctl --user enable --now openshell-gateway.service
-# Podman socket activation provides the container API.
 install -d %{buildroot}%{_userunitdir}
 cat > %{buildroot}%{_userunitdir}/%{name}-gateway.service << 'EOF'
 [Unit]
 Description=OpenShell Gateway (user)
 Documentation=https://github.com/NVIDIA/OpenShell
 After=podman.socket
-Requires=podman.socket
+Wants=podman.socket
 
 [Service]
 Type=exec
-# Self-contained defaults for rootless operation with mTLS.
-#
-# PKI and gateway.env are auto-generated on first start. Client certs
-# are placed in ~/.config/openshell/gateways/openshell/mtls/ so the
-# CLI discovers them automatically.
+# On first start the unit seeds a default TOML config and generates PKI.
+# Client certs are placed in ~/.config/openshell/gateways/openshell/mtls/ so
+# the CLI discovers them automatically.
 # See /usr/share/doc/openshell-gateway/ for details.
+
+# Seed a default TOML config on first start if the user has not created one.
+# The template ships at /usr/share/openshell-gateway/gateway.toml.default.
+# Edit ~/.config/openshell/gateway.toml to customize.
+# %%E expands to $XDG_CONFIG_HOME (~/.config) in user units.
+ExecStartPre=/bin/sh -c 'test -f %%E/openshell/gateway.toml || install -Dm644 /usr/share/openshell-gateway/gateway.toml.default %%E/openshell/gateway.toml'
 
 # Auto-generate PKI on first start if not present.
 # %%S expands to $XDG_STATE_HOME (~/.local/state) in user units.
-ExecStartPre=%{_libexecdir}/openshell/init-pki.sh %%S/openshell/tls
+ExecStartPre=/usr/bin/openshell-gateway generate-certs --output-dir %%S/openshell/tls --server-san host.openshell.internal
 
-# Auto-generate gateway.env (SSH handshake secret + commented config
-# reference) on first start if not present.
-# %%E expands to $XDG_CONFIG_HOME (~/.config) in user units.
-ExecStartPre=%{_libexecdir}/openshell/init-gateway-env.sh %%E/openshell/gateway.env
+# Optional OPENSHELL_* overrides.
 EnvironmentFile=-%%E/openshell/gateway.env
-Environment=OPENSHELL_BIND_ADDRESS=0.0.0.0
-Environment=OPENSHELL_DRIVERS=podman
-Environment=OPENSHELL_DB_URL=sqlite://%%S/openshell/gateway.db
-Environment=OPENSHELL_SUPERVISOR_IMAGE=ghcr.io/nvidia/openshell/supervisor:%{image_tag}
-Environment=OPENSHELL_SANDBOX_IMAGE=ghcr.io/nvidia/openshell-community/sandboxes/base:latest
-# mTLS: auto-generated certs in the state directory.
-Environment=OPENSHELL_TLS_CERT=%%S/openshell/tls/server/tls.crt
-Environment=OPENSHELL_TLS_KEY=%%S/openshell/tls/server/tls.key
-Environment=OPENSHELL_TLS_CLIENT_CA=%%S/openshell/tls/ca.crt
-# Podman driver: client certs bind-mounted into sandbox containers.
-Environment=OPENSHELL_PODMAN_TLS_CA=%%S/openshell/tls/ca.crt
-Environment=OPENSHELL_PODMAN_TLS_CERT=%%S/openshell/tls/client/tls.crt
-Environment=OPENSHELL_PODMAN_TLS_KEY=%%S/openshell/tls/client/tls.key
 ExecStart=/usr/bin/openshell-gateway
 StateDirectory=openshell
 Restart=on-failure
@@ -186,15 +178,6 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 WantedBy=default.target
 EOF
 
-# --- PKI bootstrap script and gateway env generator ---
-install -d %{buildroot}%{_libexecdir}/%{name}
-install -pm 0755 deploy/rpm/init-pki.sh %{buildroot}%{_libexecdir}/%{name}/init-pki.sh
-install -pm 0755 deploy/rpm/init-gateway-env.sh %{buildroot}%{_libexecdir}/%{name}/init-gateway-env.sh
-# Patch commented image defaults to match the build type (dev or latest).
-# The source file uses :latest as a generic reference; the installed copy
-# reflects what this RPM actually expects from the registry.
-sed -i 's|supervisor:latest|supervisor:%{image_tag}|' %{buildroot}%{_libexecdir}/%{name}/init-gateway-env.sh
-
 # --- Gateway documentation ---
 install -d %{buildroot}%{_docdir}/%{name}-gateway
 install -pm 0644 deploy/rpm/QUICKSTART.md %{buildroot}%{_docdir}/%{name}-gateway/QUICKSTART.md
@@ -204,7 +187,6 @@ install -pm 0644 deploy/rpm/TROUBLESHOOTING.md %{buildroot}%{_docdir}/%{name}-ga
 # --- Man pages ---
 install -Dpm 0644 openshell.1 %{buildroot}%{_mandir}/man1/openshell.1
 install -Dpm 0644 openshell-gateway.8 %{buildroot}%{_mandir}/man8/openshell-gateway.8
-install -Dpm 0644 openshell-gateway.env.5 %{buildroot}%{_mandir}/man5/openshell-gateway.env.5
 
 # --- Python SDK ---
 # Install Python SDK modules (test files are intentionally excluded)
@@ -249,6 +231,15 @@ touch %{buildroot}%{python3_sitelib}/%{name}-%{openshell_python_version}.dist-in
 # build environment.
 PYTHONPATH=%{buildroot}%{python3_sitelib} %{python3} -c "from importlib.metadata import version; v = version('openshell'); print(v); assert v == '%{openshell_python_version}', f'expected %{openshell_python_version}, got {v}'"
 
+# Verify the RPM default TOML config template was installed.
+# A missing template means first-start seeding silently falls back to the
+# binary default of 127.0.0.1, which breaks Podman sandbox connectivity.
+test -f %{buildroot}%{_datadir}/%{name}-gateway/gateway.toml.default
+
+# Verify the systemd unit references the template in its ExecStartPre seed step.
+# If this grep fails, the first-start seeding logic was removed from the unit.
+grep -q 'gateway.toml.default' %{buildroot}%{_userunitdir}/%{name}-gateway.service
+
 %post gateway
 %systemd_user_post %{name}-gateway.service
 
@@ -275,10 +266,8 @@ PYTHONPATH=%{buildroot}%{python3_sitelib} %{python3} -c "from importlib.metadata
 %doc %{_docdir}/%{name}-gateway/TROUBLESHOOTING.md
 %{_bindir}/%{name}-gateway
 %{_userunitdir}/%{name}-gateway.service
-%{_libexecdir}/%{name}/init-pki.sh
-%{_libexecdir}/%{name}/init-gateway-env.sh
+%{_datadir}/%{name}-gateway/gateway.toml.default
 %{_mandir}/man8/openshell-gateway.8*
-%{_mandir}/man5/openshell-gateway.env.5*
 
 %files -n python3-%{name}
 %license LICENSE

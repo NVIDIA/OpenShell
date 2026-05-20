@@ -10,72 +10,20 @@
 //! gateway process, so they skip this restart-only coverage.
 
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use openshell_e2e::harness::binary::openshell_cmd;
+use openshell_e2e::harness::cli::{
+    sandbox_names, wait_for_healthy, wait_for_sandbox_exec_contains,
+};
 use openshell_e2e::harness::gateway::ManagedGateway;
-use openshell_e2e::harness::output::strip_ansi;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use tokio::time::sleep;
 
 const MANAGED_BY_LABEL_FILTER: &str = "label=openshell.ai/managed-by=openshell";
 const READY_MARKER: &str = "gateway-resume-ready";
+const RESUME_FILE: &str = "/sandbox/gateway-resume-state";
 const SANDBOX_NAMESPACE_LABEL: &str = "openshell.ai/sandbox-namespace";
 const SANDBOX_NAME_LABEL: &str = "openshell.ai/sandbox-name";
-
-async fn run_cli(args: &[&str]) -> (String, i32) {
-    let mut cmd = openshell_cmd();
-    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
-
-    let output = cmd.output().await.expect("spawn openshell");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = format!("{stdout}{stderr}");
-    let code = output.status.code().unwrap_or(-1);
-    (combined, code)
-}
-
-async fn wait_for_healthy(timeout: Duration) -> Result<(), String> {
-    let start = Instant::now();
-    let mut last_output: String;
-
-    loop {
-        let (output, code) = run_cli(&["status"]).await;
-        let clean = strip_ansi(&output);
-        let lower = clean.to_lowercase();
-        if code == 0
-            && (lower.contains("healthy")
-                || lower.contains("running")
-                || lower.contains("connected"))
-        {
-            return Ok(());
-        }
-        last_output = clean;
-
-        if start.elapsed() > timeout {
-            return Err(format!(
-                "gateway did not become healthy within {}s. Last output:\n{last_output}",
-                timeout.as_secs()
-            ));
-        }
-        sleep(Duration::from_secs(2)).await;
-    }
-}
-
-async fn sandbox_names() -> Result<Vec<String>, String> {
-    let (output, code) = run_cli(&["sandbox", "list", "--names"]).await;
-    let clean = strip_ansi(&output);
-    if code != 0 {
-        return Err(format!("sandbox list failed (exit {code}):\n{clean}"));
-    }
-
-    Ok(clean
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(ToOwned::to_owned)
-        .collect())
-}
 
 fn sandbox_container_id(namespace: &str, sandbox_name: &str) -> Result<String, String> {
     let namespace_filter = format!("label={SANDBOX_NAMESPACE_LABEL}={namespace}");
@@ -148,7 +96,7 @@ async fn wait_for_container_running(
     expected: bool,
     timeout: Duration,
 ) -> Result<(), String> {
-    let start = Instant::now();
+    let start = std::time::Instant::now();
     let mut last_state: String;
 
     loop {
@@ -187,16 +135,21 @@ async fn docker_gateway_restart_resumes_running_sandbox() {
         .await
         .expect("gateway should start healthy");
 
-    let mut sandbox = SandboxGuard::create_keep(
-        &[
-            "sh",
-            "-c",
-            "echo gateway-resume-ready; while true; do sleep 1; done",
-        ],
-        READY_MARKER,
-    )
-    .await
-    .expect("create long-running sandbox");
+    let script = format!(
+        "echo before-restart > {RESUME_FILE}; echo {READY_MARKER}; while true; do sleep 1; done"
+    );
+    let mut sandbox = SandboxGuard::create_keep(&["sh", "-lc", &script], READY_MARKER)
+        .await
+        .expect("create long-running sandbox");
+
+    let before_restart = sandbox
+        .exec(&["cat", RESUME_FILE])
+        .await
+        .expect("read sandbox state before restart");
+    assert!(
+        before_restart.contains("before-restart"),
+        "sandbox state was not written before restart:\n{before_restart}"
+    );
 
     wait_for_container_running(&namespace, &sandbox.name, true, Duration::from_secs(60))
         .await
@@ -221,6 +174,15 @@ async fn docker_gateway_restart_resumes_running_sandbox() {
         "sandbox '{}' should still be listed after gateway restart. Names: {names:?}",
         sandbox.name
     );
+
+    wait_for_sandbox_exec_contains(
+        &sandbox.name,
+        &["cat", RESUME_FILE],
+        "before-restart",
+        Duration::from_secs(240),
+    )
+    .await
+    .expect("sandbox should become ready again with its state preserved");
 
     sandbox.cleanup().await;
 }

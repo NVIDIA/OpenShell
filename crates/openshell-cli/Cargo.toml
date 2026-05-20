@@ -23,6 +23,7 @@ openshell-prover = { path = "../openshell-prover" }
 openshell-tui = { path = "../openshell-tui" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yml = { workspace = true }
 prost-types = { workspace = true }
 
 # Async runtime
@@ -32,6 +33,7 @@ tokio = { workspace = true }
 tonic = { workspace = true, features = ["tls", "tls-native-roots"] }
 
 # CLI
+chrono = "0.4"
 clap = { workspace = true }
 clap_complete = { workspace = true }
 crossterm = { workspace = true }
@@ -58,6 +60,7 @@ anyhow = { workspace = true }
 
 # File archiving (tar-over-SSH sync)
 tar = "0.4"
+tempfile = "3"
 
 # OIDC/Auth
 oauth2 = "5"
@@ -68,6 +71,7 @@ tokio-tungstenite = { workspace = true }
 
 # Streams
 futures = { workspace = true }
+tokio-stream = { workspace = true }
 nix = { workspace = true }
 
 # URL parsing
@@ -90,6 +94,5 @@ rcgen = { version = "0.13", features = ["crypto", "pem"] }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
 temp-env = "0.3"
-tempfile = "3"
 tokio-stream = { workspace = true }
 url = { workspace = true }
