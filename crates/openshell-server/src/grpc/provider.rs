@@ -639,7 +639,7 @@ use openshell_core::proto::{
 };
 use openshell_providers::{
     CredentialRefreshProfile, ProfileValidationDiagnostic, ProviderTypeProfile, default_profiles,
-    get_default_profile, normalize_profile_id, validate_profile_set,
+    get_default_profile, normalize_profile_id, normalize_provider_type, validate_profile_set,
 };
 use std::sync::Arc;
 use tonic::{Request, Response};
@@ -649,14 +649,24 @@ pub(super) async fn handle_create_provider(
     request: Request<CreateProviderRequest>,
 ) -> Result<Response<ProviderResponse>, Status> {
     let req = request.into_inner();
-    let provider = req
-        .provider
-        .ok_or_else(|| Status::invalid_argument("provider is required"))?;
-    let provider = create_provider_record(state.store.as_ref(), provider).await?;
-
-    Ok(Response::new(ProviderResponse {
-        provider: Some(provider),
-    }))
+    let Some(provider) = req.provider else {
+        emit_provider_lifecycle("custom", "create", "failure");
+        return Err(Status::invalid_argument("provider is required"));
+    };
+    let provider_type = provider.r#type.clone();
+    let result = create_provider_record(state.store.as_ref(), provider).await;
+    match result {
+        Ok(provider) => {
+            emit_provider_lifecycle(&provider.r#type, "create", "success");
+            Ok(Response::new(ProviderResponse {
+                provider: Some(provider),
+            }))
+        }
+        Err(err) => {
+            emit_provider_lifecycle(&provider_type, "create", "failure");
+            Err(err)
+        }
+    }
 }
 
 pub(super) async fn handle_get_provider(
@@ -1082,17 +1092,27 @@ pub(super) async fn handle_update_provider(
     request: Request<UpdateProviderRequest>,
 ) -> Result<Response<ProviderResponse>, Status> {
     let req = request.into_inner();
-    let mut provider = req
-        .provider
-        .ok_or_else(|| Status::invalid_argument("provider is required"))?;
+    let Some(mut provider) = req.provider else {
+        emit_provider_lifecycle("custom", "update", "failure");
+        return Err(Status::invalid_argument("provider is required"));
+    };
+    let provider_type = provider.r#type.clone();
     provider
         .credential_expires_at_ms
         .extend(req.credential_expires_at_ms);
-    let provider = update_provider_record(state.store.as_ref(), provider).await?;
-
-    Ok(Response::new(ProviderResponse {
-        provider: Some(provider),
-    }))
+    let result = update_provider_record(state.store.as_ref(), provider).await;
+    match result {
+        Ok(provider) => {
+            emit_provider_lifecycle(&provider.r#type, "update", "success");
+            Ok(Response::new(ProviderResponse {
+                provider: Some(provider),
+            }))
+        }
+        Err(err) => {
+            emit_provider_lifecycle(&provider_type, "update", "failure");
+            Err(err)
+        }
+    }
 }
 
 pub(super) async fn handle_get_provider_refresh_status(
@@ -1431,9 +1451,62 @@ pub(super) async fn handle_delete_provider(
     request: Request<DeleteProviderRequest>,
 ) -> Result<Response<DeleteProviderResponse>, Status> {
     let name = request.into_inner().name;
-    let deleted = delete_provider_record(state.store.as_ref(), &name).await?;
+    let provider_profile = provider_profile_for_name(state.store.as_ref(), &name).await;
+    let result = delete_provider_record(state.store.as_ref(), &name).await;
+    match result {
+        Ok(deleted) => {
+            let outcome = if deleted { "success" } else { "failure" };
+            emit_provider_profile_lifecycle(
+                provider_profile.as_deref().unwrap_or("custom"),
+                "delete",
+                outcome,
+            );
+            Ok(Response::new(DeleteProviderResponse { deleted }))
+        }
+        Err(err) => {
+            emit_provider_profile_lifecycle(
+                provider_profile.as_deref().unwrap_or("custom"),
+                "delete",
+                "failure",
+            );
+            Err(err)
+        }
+    }
+}
 
-    Ok(Response::new(DeleteProviderResponse { deleted }))
+fn emit_provider_lifecycle(provider_type: &str, operation: &str, outcome: &str) {
+    let provider_profile = telemetry_provider_profile(provider_type);
+    emit_provider_profile_lifecycle(&provider_profile, operation, outcome);
+}
+
+fn emit_provider_profile_lifecycle(provider_profile: &str, operation: &str, outcome: &str) {
+    openshell_core::telemetry::emit_provider_lifecycle(operation, outcome, provider_profile);
+}
+
+async fn provider_profile_for_name(store: &Store, name: &str) -> Option<String> {
+    store
+        .get_message_by_name::<Provider>(name)
+        .await
+        .ok()
+        .flatten()
+        .map(|provider| telemetry_provider_profile(&provider.r#type))
+}
+
+fn telemetry_provider_profile(provider_type: &str) -> String {
+    match normalize_provider_type(provider_type) {
+        Some("anthropic") => "anthropic",
+        Some("claude" | "claude-code") => "claude",
+        Some("codex") => "codex",
+        Some("copilot") => "copilot",
+        Some("github") => "github",
+        Some("gitlab") => "gitlab",
+        Some("nvidia") => "nvidia",
+        Some("openai") => "openai",
+        Some("opencode") => "opencode",
+        Some("outlook") => "outlook",
+        _ => "custom",
+    }
+    .to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -1477,6 +1550,19 @@ mod tests {
         assert!(!is_valid_env_key("BAD KEY"));
         assert!(!is_valid_env_key("X=Y"));
         assert!(!is_valid_env_key("X;rm -rf /"));
+    }
+
+    #[test]
+    fn telemetry_provider_profile_maps_unknown_to_custom() {
+        assert_eq!(telemetry_provider_profile("CLAUDE"), "claude");
+        assert_eq!(telemetry_provider_profile("github"), "github");
+        assert_eq!(telemetry_provider_profile("gh"), "github");
+        assert_eq!(telemetry_provider_profile("glab"), "gitlab");
+        assert_eq!(telemetry_provider_profile("outlook"), "outlook");
+        assert_eq!(telemetry_provider_profile("generic"), "custom");
+        assert_eq!(telemetry_provider_profile("unknown-private"), "custom");
+        assert_eq!(telemetry_provider_profile("acme-internal"), "custom");
+        assert_eq!(telemetry_provider_profile("corp-llm-prod"), "custom");
     }
 
     fn provider_with_values(name: &str, provider_type: &str) -> Provider {

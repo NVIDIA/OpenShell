@@ -24,6 +24,7 @@ pub mod progress;
 pub mod proto;
 pub mod sandbox_env;
 pub mod settings;
+pub mod telemetry;
 pub mod time;
 
 pub use config::{

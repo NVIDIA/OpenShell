@@ -3506,6 +3506,10 @@ fn build_guest_environment(
         ]));
     }
     environment.extend(merged_environment(sandbox));
+    environment.insert(
+        openshell_core::sandbox_env::TELEMETRY_ENABLED.to_string(),
+        openshell_core::telemetry::enabled_env_value().to_string(),
+    );
     environment.remove(openshell_core::sandbox_env::SANDBOX_TOKEN);
     environment.remove(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE);
     if sandbox
@@ -4442,6 +4446,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use tonic::Code;
 
+    static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
     #[test]
     fn vm_pulling_layer_event_adds_progress_detail_metadata() {
         let mut event = platform_event(
@@ -5044,6 +5051,52 @@ mod tests {
             "{}={GUEST_SANDBOX_TOKEN_PATH}",
             openshell_core::sandbox_env::SANDBOX_TOKEN_FILE
         )));
+    }
+
+    #[test]
+    fn build_guest_environment_uses_deployment_telemetry_toggle() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        temp_env::with_vars(
+            [(
+                openshell_core::sandbox_env::TELEMETRY_ENABLED,
+                Some("false"),
+            )],
+            || {
+                let config = VmDriverConfig {
+                    openshell_endpoint: "http://127.0.0.1:8080".to_string(),
+                    ..Default::default()
+                };
+                let sandbox = Sandbox {
+                    id: "sandbox-123".to_string(),
+                    name: "sandbox-123".to_string(),
+                    spec: Some(SandboxSpec {
+                        environment: HashMap::from([(
+                            openshell_core::sandbox_env::TELEMETRY_ENABLED.to_string(),
+                            "true".to_string(),
+                        )]),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+
+                let env = build_guest_environment(&sandbox, &config, None);
+                let telemetry_entries = env
+                    .iter()
+                    .filter(|entry| {
+                        entry.starts_with(&format!(
+                            "{}=",
+                            openshell_core::sandbox_env::TELEMETRY_ENABLED
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+
+                assert_eq!(telemetry_entries.len(), 1);
+                assert_eq!(
+                    telemetry_entries[0],
+                    &format!("{}=false", openshell_core::sandbox_env::TELEMETRY_ENABLED)
+                );
+            },
+        );
     }
 
     #[test]

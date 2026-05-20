@@ -57,6 +57,62 @@ pub(super) async fn handle_create_sandbox(
     state: &Arc<ServerState>,
     request: Request<CreateSandboxRequest>,
 ) -> Result<Response<SandboxResponse>, Status> {
+    let create_request = request.get_ref().clone();
+    let result = handle_create_sandbox_inner(state, request).await;
+    emit_sandbox_create_telemetry(
+        state,
+        &create_request,
+        if result.is_ok() { "success" } else { "failure" },
+    );
+    result
+}
+
+fn emit_sandbox_create_telemetry(
+    state: &Arc<ServerState>,
+    request: &CreateSandboxRequest,
+    outcome: &str,
+) {
+    let compute_driver = telemetry_compute_driver(state.compute.driver_kind());
+    let Some(spec) = request.spec.as_ref() else {
+        openshell_core::telemetry::emit_sandbox_create(
+            outcome,
+            false,
+            0,
+            false,
+            "undefined",
+            compute_driver,
+        );
+        return;
+    };
+    let template_source = if spec
+        .template
+        .as_ref()
+        .is_some_and(|template| !template.image.trim().is_empty())
+    {
+        "image"
+    } else {
+        "default"
+    };
+    openshell_core::telemetry::emit_sandbox_create(
+        outcome,
+        spec.gpu,
+        spec.providers.len() as u64,
+        spec.policy.is_some(),
+        template_source,
+        compute_driver,
+    );
+}
+
+fn telemetry_compute_driver(
+    driver_kind: Option<openshell_core::ComputeDriverKind>,
+) -> &'static str {
+    driver_kind.map_or("unknown", openshell_core::ComputeDriverKind::as_str)
+}
+
+async fn handle_create_sandbox_inner(
+    state: &Arc<ServerState>,
+    request: Request<CreateSandboxRequest>,
+) -> Result<Response<SandboxResponse>, Status> {
     use crate::persistence::current_time_ms;
 
     let request = request.into_inner();
@@ -412,12 +468,35 @@ pub(super) async fn handle_delete_sandbox(
     state: &Arc<ServerState>,
     request: Request<DeleteSandboxRequest>,
 ) -> Result<Response<DeleteSandboxResponse>, Status> {
+    let result = handle_delete_sandbox_inner(state, request).await;
+    let outcome = match &result {
+        Ok(response) if response.get_ref().deleted => "success",
+        _ => "failure",
+    };
+    openshell_core::telemetry::emit_lifecycle("sandbox", "delete", outcome);
+    result
+}
+
+async fn handle_delete_sandbox_inner(
+    state: &Arc<ServerState>,
+    request: Request<DeleteSandboxRequest>,
+) -> Result<Response<DeleteSandboxResponse>, Status> {
     let name = request.into_inner().name;
     if name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
 
+    let sandbox_id = state
+        .store
+        .get_message_by_name::<Sandbox>(&name)
+        .await
+        .ok()
+        .flatten()
+        .map(|sandbox| sandbox.object_id().to_string());
     let deleted = state.compute.delete_sandbox(&name).await?;
+    if deleted && let Some(sandbox_id) = sandbox_id {
+        state.telemetry.end_sandbox_session(&sandbox_id);
+    }
     info!(sandbox_name = %name, "DeleteSandbox request completed successfully");
     Ok(Response::new(DeleteSandboxResponse { deleted }))
 }
@@ -1856,6 +1935,27 @@ mod tests {
     use std::collections::HashMap;
 
     // ---- shell_escape ----
+
+    #[test]
+    fn telemetry_compute_driver_uses_resolved_driver_kind() {
+        assert_eq!(
+            telemetry_compute_driver(Some(openshell_core::ComputeDriverKind::Docker)),
+            "docker"
+        );
+        assert_eq!(
+            telemetry_compute_driver(Some(openshell_core::ComputeDriverKind::Kubernetes)),
+            "kubernetes"
+        );
+        assert_eq!(
+            telemetry_compute_driver(Some(openshell_core::ComputeDriverKind::Podman)),
+            "podman"
+        );
+        assert_eq!(
+            telemetry_compute_driver(Some(openshell_core::ComputeDriverKind::Vm)),
+            "vm"
+        );
+        assert_eq!(telemetry_compute_driver(None), "unknown");
+    }
 
     #[test]
     fn shell_escape_safe_chars_pass_through() {

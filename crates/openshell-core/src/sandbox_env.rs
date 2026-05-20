@@ -26,6 +26,9 @@ pub const LOG_LEVEL: &str = "OPENSHELL_LOG_LEVEL";
 /// Shell command to run inside the sandbox.
 pub const SANDBOX_COMMAND: &str = "OPENSHELL_SANDBOX_COMMAND";
 
+/// Deployment-controlled telemetry toggle propagated to the sandbox supervisor.
+pub const TELEMETRY_ENABLED: &str = "OPENSHELL_TELEMETRY_ENABLED";
+
 /// Path to the CA certificate for mTLS communication with the gateway.
 pub const TLS_CA: &str = "OPENSHELL_TLS_CA";
 
