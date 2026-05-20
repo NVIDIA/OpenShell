@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::paths::{active_gateway_path, gateways_dir, last_sandbox_path};
+use crate::paths::{
+    active_gateway_path, gateways_dir, last_sandbox_path, system_active_gateway_path,
+    system_gateways_dir,
+};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::paths::ensure_parent_dir_restricted;
 use serde::{Deserialize, Serialize};
@@ -68,6 +71,15 @@ pub struct GatewayMetadata {
     /// Local VM driver state directory for standalone VM gateways.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vm_driver_state_dir: Option<PathBuf>,
+}
+
+/// Storage layer that provides a gateway metadata record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatewayMetadataSource {
+    /// Per-user metadata under `$XDG_CONFIG_HOME/openshell/gateways`.
+    User,
+    /// Installer-provided metadata under `OPENSHELL_SYSTEM_GATEWAY_DIR`.
+    System,
 }
 
 fn stored_metadata_path(name: &str) -> Result<PathBuf> {
@@ -148,8 +160,37 @@ pub fn store_gateway_metadata(name: &str, metadata: &GatewayMetadata) -> Result<
     Ok(())
 }
 
+/// Return where a gateway metadata record would be loaded from.
+pub fn gateway_metadata_source(name: &str) -> Result<Option<GatewayMetadataSource>> {
+    let primary = stored_metadata_path(name)?;
+    if primary.exists() {
+        return Ok(Some(GatewayMetadataSource::User));
+    }
+
+    let system = system_gateways_dir().map(|d| d.join(name).join("metadata.json"));
+    if system.as_ref().is_some_and(|p| p.exists()) {
+        return Ok(Some(GatewayMetadataSource::System));
+    }
+
+    Ok(None)
+}
+
 pub fn load_gateway_metadata(name: &str) -> Result<GatewayMetadata> {
-    let path = stored_metadata_path(name)?;
+    let primary = stored_metadata_path(name)?;
+    let system = system_gateways_dir().map(|d| d.join(name).join("metadata.json"));
+    let path = if primary.exists() {
+        primary
+    } else if let Some(p) = system.as_ref().filter(|p| p.exists()) {
+        p.clone()
+    } else {
+        return Err(miette::miette!(
+            "no metadata found for gateway '{name}' (looked in {} and {})",
+            primary.display(),
+            system
+                .as_ref()
+                .map_or_else(|| "<unset>".into(), |p| p.display().to_string()),
+        ));
+    };
     let contents = std::fs::read_to_string(&path)
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to read metadata from {}", path.display()))?;
@@ -175,12 +216,19 @@ pub fn save_active_gateway(name: &str) -> Result<()> {
 
 /// Load the active gateway name from persistent storage.
 ///
-/// Returns `None` if no active gateway has been set.
+/// Returns `None` if no active gateway has been set. Falls back to the
+/// system-level active gateway file when no per-user selection exists, so
+/// installer-provided defaults can take effect on a fresh system.
 pub fn load_active_gateway() -> Option<String> {
-    let path = active_gateway_path().ok()?;
-    let contents = std::fs::read_to_string(&path).ok()?;
-    let name = contents.trim().to_string();
-    if name.is_empty() { None } else { Some(name) }
+    let read = |path: PathBuf| {
+        let contents = std::fs::read_to_string(&path).ok()?;
+        let name = contents.trim().to_string();
+        (!name.is_empty()).then_some(name)
+    };
+    active_gateway_path()
+        .ok()
+        .and_then(read)
+        .or_else(|| system_active_gateway_path().and_then(read))
 }
 
 /// Save the last-used sandbox name for a gateway to persistent storage.
@@ -218,29 +266,43 @@ pub fn clear_last_sandbox_if_matches(gateway: &str, sandbox: &str) {
 
 /// List all gateways that have stored metadata.
 ///
-/// Scans `$XDG_CONFIG_HOME/openshell/gateways/` for subdirectories containing
-/// `metadata.json` and returns the parsed metadata for each.
+/// Scans `$XDG_CONFIG_HOME/openshell/gateways/` and, when set, the
+/// `OPENSHELL_SYSTEM_GATEWAY_DIR` directory. Per-user entries shadow
+/// system entries on name collision.
 pub fn list_gateways() -> Result<Vec<GatewayMetadata>> {
-    let dir = gateways_dir()?;
-    if !dir.exists() {
-        return Ok(Vec::new());
-    }
-
     let mut gateways = Vec::new();
-    let entries = std::fs::read_dir(&dir)
-        .into_diagnostic()
-        .wrap_err_with(|| format!("failed to read directory {}", dir.display()))?;
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    for entry in entries {
-        let entry = entry.into_diagnostic()?;
-        let path = entry.path();
-        // Only consider directories that contain a metadata.json file
-        if path.is_dir() {
-            let gateway_name = entry.file_name().to_string_lossy().to_string();
-            if let Ok(metadata) = load_gateway_metadata(&gateway_name) {
+    let mut scan = |dir: PathBuf| -> Result<()> {
+        if !dir.exists() {
+            return Ok(());
+        }
+        let entries = std::fs::read_dir(&dir)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to read directory {}", dir.display()))?;
+        for entry in entries {
+            let entry = entry.into_diagnostic()?;
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if seen.contains(&name) {
+                continue;
+            }
+            if let Ok(contents) = std::fs::read_to_string(path.join("metadata.json"))
+                && let Ok(metadata) = serde_json::from_str::<GatewayMetadata>(&contents)
+            {
+                seen.insert(name);
                 gateways.push(metadata);
             }
         }
+        Ok(())
+    };
+
+    scan(gateways_dir()?)?;
+    if let Some(system) = system_gateways_dir() {
+        scan(system)?;
     }
 
     // Sort by name for stable output
@@ -435,6 +497,189 @@ mod tests {
                 load_last_sandbox("gateway-b"),
                 Some("sandbox-b".to_string())
             );
+        });
+    }
+
+    // ── system gateway dir fallback ───────────────────────────────────
+
+    /// Helper: hold the shared XDG test lock, point `XDG_CONFIG_HOME` at
+    /// `user` and `OPENSHELL_SYSTEM_GATEWAY_DIR` at `system`, run `f`, then
+    /// restore both env vars.
+    #[allow(unsafe_code)]
+    fn with_tmp_xdg_and_system<F: FnOnce()>(
+        user: &std::path::Path,
+        system: &std::path::Path,
+        f: F,
+    ) {
+        let _guard = crate::XDG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let orig_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        let orig_sys = std::env::var(crate::paths::SYSTEM_GATEWAY_DIR_ENV).ok();
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", user);
+            std::env::set_var(crate::paths::SYSTEM_GATEWAY_DIR_ENV, system);
+        }
+        crate::paths::reset_system_gateways_dir_cache();
+        f();
+        unsafe {
+            match orig_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+            match orig_sys {
+                Some(v) => std::env::set_var(crate::paths::SYSTEM_GATEWAY_DIR_ENV, v),
+                None => std::env::remove_var(crate::paths::SYSTEM_GATEWAY_DIR_ENV),
+            }
+        }
+        crate::paths::reset_system_gateways_dir_cache();
+    }
+
+    /// Write a `<dir>/<name>/metadata.json` file for the given endpoint.
+    fn write_system_metadata(dir: &std::path::Path, name: &str, endpoint: &str) {
+        let gw_dir = dir.join(name);
+        std::fs::create_dir_all(&gw_dir).unwrap();
+        let meta = GatewayMetadata {
+            name: name.to_string(),
+            gateway_endpoint: endpoint.to_string(),
+            ..Default::default()
+        };
+        std::fs::write(
+            gw_dir.join("metadata.json"),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn load_active_gateway_falls_back_to_system_dir() {
+        let user = tempfile::tempdir().unwrap();
+        let system = tempfile::tempdir().unwrap();
+        with_tmp_xdg_and_system(user.path(), system.path(), || {
+            std::fs::write(system.path().join("active_gateway"), "from-system").unwrap();
+            assert_eq!(load_active_gateway(), Some("from-system".to_string()));
+        });
+    }
+
+    #[test]
+    fn load_active_gateway_prefers_user_over_system() {
+        let user = tempfile::tempdir().unwrap();
+        let system = tempfile::tempdir().unwrap();
+        with_tmp_xdg_and_system(user.path(), system.path(), || {
+            save_active_gateway("from-user").unwrap();
+            std::fs::write(system.path().join("active_gateway"), "from-system").unwrap();
+            assert_eq!(load_active_gateway(), Some("from-user".to_string()));
+        });
+    }
+
+    #[test]
+    fn load_gateway_metadata_falls_back_to_system_dir() {
+        let user = tempfile::tempdir().unwrap();
+        let system = tempfile::tempdir().unwrap();
+        with_tmp_xdg_and_system(user.path(), system.path(), || {
+            write_system_metadata(system.path(), "sys-gw", "unix:///tmp/sys.sock");
+            let meta = load_gateway_metadata("sys-gw").unwrap();
+            assert_eq!(meta.name, "sys-gw");
+            assert_eq!(meta.gateway_endpoint, "unix:///tmp/sys.sock");
+        });
+    }
+
+    #[test]
+    fn gateway_metadata_source_reports_user_system_and_missing() {
+        let user = tempfile::tempdir().unwrap();
+        let system = tempfile::tempdir().unwrap();
+        with_tmp_xdg_and_system(user.path(), system.path(), || {
+            write_system_metadata(system.path(), "sys-gw", "unix:///tmp/sys.sock");
+            assert_eq!(
+                gateway_metadata_source("sys-gw").unwrap(),
+                Some(GatewayMetadataSource::System)
+            );
+
+            let user_meta = GatewayMetadata {
+                name: "user-gw".to_string(),
+                gateway_endpoint: "https://user-endpoint".to_string(),
+                ..Default::default()
+            };
+            store_gateway_metadata("user-gw", &user_meta).unwrap();
+            assert_eq!(
+                gateway_metadata_source("user-gw").unwrap(),
+                Some(GatewayMetadataSource::User)
+            );
+
+            assert_eq!(gateway_metadata_source("missing").unwrap(), None);
+        });
+    }
+
+    #[test]
+    fn load_gateway_metadata_error_mentions_both_search_paths() {
+        let user = tempfile::tempdir().unwrap();
+        let system = tempfile::tempdir().unwrap();
+        with_tmp_xdg_and_system(user.path(), system.path(), || {
+            let err = load_gateway_metadata("missing").unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("missing"), "expected name in error: {msg}");
+            assert!(
+                msg.contains(user.path().to_str().unwrap()),
+                "expected user path in error: {msg}"
+            );
+            assert!(
+                msg.contains(system.path().to_str().unwrap()),
+                "expected system path in error: {msg}"
+            );
+        });
+    }
+
+    #[test]
+    fn load_gateway_metadata_prefers_user_over_system() {
+        let user = tempfile::tempdir().unwrap();
+        let system = tempfile::tempdir().unwrap();
+        with_tmp_xdg_and_system(user.path(), system.path(), || {
+            let user_meta = GatewayMetadata {
+                name: "shared".to_string(),
+                gateway_endpoint: "https://user-endpoint".to_string(),
+                ..Default::default()
+            };
+            store_gateway_metadata("shared", &user_meta).unwrap();
+            write_system_metadata(system.path(), "shared", "https://system-endpoint");
+            let meta = load_gateway_metadata("shared").unwrap();
+            assert_eq!(meta.gateway_endpoint, "https://user-endpoint");
+        });
+    }
+
+    #[test]
+    fn list_gateways_merges_user_and_system() {
+        let user = tempfile::tempdir().unwrap();
+        let system = tempfile::tempdir().unwrap();
+        with_tmp_xdg_and_system(user.path(), system.path(), || {
+            let user_meta = GatewayMetadata {
+                name: "alpha".to_string(),
+                gateway_endpoint: "https://alpha".to_string(),
+                ..Default::default()
+            };
+            store_gateway_metadata("alpha", &user_meta).unwrap();
+            write_system_metadata(system.path(), "beta", "https://beta");
+            let gateways = list_gateways().unwrap();
+            assert_eq!(gateways.len(), 2);
+            assert_eq!(gateways[0].name, "alpha");
+            assert_eq!(gateways[1].name, "beta");
+        });
+    }
+
+    #[test]
+    fn list_gateways_user_shadows_system_on_collision() {
+        let user = tempfile::tempdir().unwrap();
+        let system = tempfile::tempdir().unwrap();
+        with_tmp_xdg_and_system(user.path(), system.path(), || {
+            let user_meta = GatewayMetadata {
+                name: "local-vm".to_string(),
+                gateway_endpoint: "https://user-override".to_string(),
+                ..Default::default()
+            };
+            store_gateway_metadata("local-vm", &user_meta).unwrap();
+            write_system_metadata(system.path(), "local-vm", "unix:///tmp/sys.sock");
+            let gateways = list_gateways().unwrap();
+            assert_eq!(gateways.len(), 1);
+            assert_eq!(gateways[0].gateway_endpoint, "https://user-override");
         });
     }
 }

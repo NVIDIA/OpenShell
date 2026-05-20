@@ -19,10 +19,10 @@ use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use miette::{IntoDiagnostic, Result, WrapErr, miette};
 use openshell_bootstrap::{
-    GatewayMetadata, clear_active_gateway, clear_last_sandbox_if_matches,
-    extract_host_from_ssh_destination, get_gateway_metadata, list_gateways, load_active_gateway,
-    remove_gateway_metadata, resolve_ssh_hostname, save_active_gateway, save_last_sandbox,
-    store_gateway_metadata,
+    GatewayMetadata, GatewayMetadataSource, clear_active_gateway, clear_last_sandbox_if_matches,
+    extract_host_from_ssh_destination, gateway_metadata_source, get_gateway_metadata,
+    list_gateways, load_active_gateway, remove_gateway_metadata, resolve_ssh_hostname,
+    save_active_gateway, save_last_sandbox, store_gateway_metadata,
 };
 use openshell_core::progress::{
     PROGRESS_ACTIVE_DETAIL_KEY, PROGRESS_ACTIVE_STEP_KEY, PROGRESS_COMPLETE_LABEL_KEY,
@@ -1458,11 +1458,20 @@ fn remove_gateway_registration(name: &str) {
 
 /// Remove a local gateway registration without touching the gateway service.
 pub fn gateway_remove(name: &str) -> Result<()> {
-    if get_gateway_metadata(name).is_none() {
-        return Err(miette::miette!(
-            "No gateway metadata found for '{name}'.\n\
-             List available gateways: openshell gateway select"
-        ));
+    match gateway_metadata_source(name)? {
+        Some(GatewayMetadataSource::User) => {}
+        Some(GatewayMetadataSource::System) => {
+            return Err(miette::miette!(
+                "Gateway registration '{name}' is installed by the system and cannot be removed from user config.\n\
+                 Register a per-user gateway with the same name to override it, or select another gateway."
+            ));
+        }
+        None => {
+            return Err(miette::miette!(
+                "No gateway metadata found for '{name}'.\n\
+                 List available gateways: openshell gateway select"
+            ));
+        }
     }
 
     remove_gateway_registration(name);

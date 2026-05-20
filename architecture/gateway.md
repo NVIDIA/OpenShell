@@ -358,6 +358,18 @@ Driver-specific values that are not part of the inheritance allowlist
 (e.g. Podman `socket_path`, VM `vcpus`) only come from the driver's own
 table.
 
+### Installer-seeded gateway registry
+
+The CLI reads its active-gateway and per-gateway metadata from
+`$XDG_CONFIG_HOME/openshell/`. Installers (snap, deb, systemd units) that
+want to surface a deployment-provided gateway without requiring the user to
+register it set `OPENSHELL_SYSTEM_GATEWAY_DIR` to a read-only registry with
+the same layout (`<dir>/<name>/metadata.json` plus an optional top-level
+`active_gateway` file). The CLI falls back to this directory when no per-user
+entry exists; per-user entries shadow system entries on name collision. System
+entries are read-only from the CLI, so `gateway remove` rejects a pure system
+entry instead of pretending to delete installer-owned state.
+
 ## Operational Constraints
 
 - Gateway TLS and client certificate distribution are deployment concerns owned
