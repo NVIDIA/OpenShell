@@ -1,0 +1,7 @@
+{
+  "number": 42,
+  "title": "Add a safe agent-to-agent design review workflow",
+  "body": "We want a demo where multiple sandboxed agents collaborate on a GitHub issue using A2A. The demo should show Agent Card discovery, streaming task updates, scoped REST paths, credential isolation, and a clear final artifact. It should include a smoke test and documentation for users.",
+  "url": "https://github.com/NVIDIA/OpenShell/issues/42",
+  "labels": ["example", "area:policy", "agent-comms"]
+}

@@ -1,0 +1,122 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Run an A2A Agent Design Review"
+sidebar-title: "A2A Design Review"
+slug: "get-started/tutorials/a2a-design-review"
+description: "Run multiple A2A-compatible agents in isolated OpenShell sandboxes and use them to review a GitHub issue from different perspectives."
+keywords: "Generative AI, Cybersecurity, Tutorial, A2A, Agent2Agent, Multi-Agent, Sandbox, Policy"
+---
+
+This tutorial runs a small Agent2Agent (A2A) design-review mesh. Four remote agents review a GitHub issue from different perspectives, stream task updates, and return markdown artifacts. OpenShell runs each remote agent in its own sandbox so the agents can collaborate without sharing files, credentials, or unrelated network access.
+
+After completing this tutorial, you understand:
+
+- How A2A Agent Cards let a client agent discover remote agent capabilities.
+- How A2A message and streaming endpoints support iterative collaboration.
+- How OpenShell isolates each remote agent while still exposing its service through the gateway.
+- Why A2A's HTTP+JSON shape maps cleanly to OpenShell REST path enforcement.
+
+## Prerequisites
+
+- A working OpenShell installation. Complete the [Quickstart](/get-started/quickstart) before proceeding.
+- A running OpenShell gateway.
+- Node.js 18 or newer on your host machine.
+
+<Tip>
+You can run the protocol smoke without a gateway:
+
+```shell
+DEMO_LOCAL_ONLY=1 bash examples/a2a-design-review/demo.sh
+```
+
+The local smoke starts the same A2A agents on loopback and writes the same review artifact.
+</Tip>
+
+<Steps toc={true}>
+
+## Start the Gateway
+
+For local development, start the Docker-backed gateway:
+
+```shell
+mise run gateway:docker
+```
+
+Verify that the CLI can reach it:
+
+```shell
+openshell status
+```
+
+## Run the Demo
+
+From the repository root, run:
+
+```shell
+bash examples/a2a-design-review/demo.sh
+```
+
+The script creates one sandbox per remote A2A agent, uploads the agent server, and starts the HTTP service inside each sandbox. It then exposes each service through the gateway and runs the host-side orchestrator.
+
+The orchestrator fetches each Agent Card from:
+
+```text
+/.well-known/agent-card.json
+```
+
+Then it sends review work to:
+
+```text
+/message:stream
+```
+
+Each agent streams task state updates and returns a markdown artifact. Later agents receive the artifacts that earlier agents produced, so the review evolves over multiple rounds.
+
+## Review a Real Issue
+
+By default the demo uses an offline sample issue so it can run without GitHub API access. Point it at any public GitHub issue with `DEMO_ISSUE_URL`:
+
+```shell
+DEMO_ISSUE_URL=https://github.com/NVIDIA/OpenShell/issues/123 \
+  bash examples/a2a-design-review/demo.sh
+```
+
+To use the latest open issue from a repository:
+
+```shell
+DEMO_USE_SAMPLE_ISSUE=0 DEMO_REPO=NVIDIA/OpenShell \
+  bash examples/a2a-design-review/demo.sh
+```
+
+Set `GITHUB_TOKEN` or `GH_TOKEN` if you need higher API rate limits or private repository access. The token is used by the host-side orchestrator to fetch issue text; the remote worker agents do not receive it.
+
+## Inspect the Artifact
+
+The demo writes a markdown review under `examples/a2a-design-review/` by default. Set `DEMO_OUTPUT` to choose a different path:
+
+```shell
+DEMO_OUTPUT=/tmp/a2a-design-review.md \
+  bash examples/a2a-design-review/demo.sh
+```
+
+The artifact includes:
+
+- The issue title and URL.
+- The discovered A2A agents and their skills.
+- A round-by-round transcript of planner, security, implementation, and critic artifacts.
+
+## Understand the Boundary
+
+The worker sandbox policy grants no outbound network access. The workers receive A2A messages through OpenShell service routing and return artifacts on the same request path.
+
+For a production version, keep the A2A communication policy separate from tool and storage policies:
+
+- Allow only the A2A discovery, message, stream, and task paths between agents.
+- Attach GitHub or other tool providers only to agents that need them.
+- Scope write access to one repository path or API operation.
+- Treat Agent Cards, messages, artifacts, and task status as untrusted input before placing them into model context.
+
+A2A handles collaboration. OpenShell defines what each collaborator can actually call, know, and change.
+
+</Steps>
