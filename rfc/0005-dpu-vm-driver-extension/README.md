@@ -3,6 +3,7 @@ authors:
   - "@cheese-head"
 state: review
 ---
+
 # RFC 0005 - DPU VM-Driver Extension
 
 ## Summary
@@ -13,7 +14,9 @@ BlueField as the first concrete coordinator backend.
 
 The extension lets the VM driver attach a DPU-backed VF/SF to a sandbox
 VM, pass the device through to the guest, and delegate L2/L3/L4 network
-policy enforcement to a DPU-side coordinator.
+policy enforcement to a DPU-side coordinator. When the coordinator
+supports storage provisioning, the same extension boundary can also
+provide a DPU-provisioned rootfs block device to the VM driver.
 
 Default OpenShell builds and deployments without DPU hardware are
 unchanged. The extension runs only when `dpu` is listed in VM-driver
@@ -35,17 +38,21 @@ extension config.
   domains can be added explicitly.
 - Keep DPU operator settings separate from portable sandbox resource
   requests.
+- Use the VM driver's typed launch-plan attachments for VF/SF, vDPA, and
+  DPU-provisioned storage rather than raw QEMU argument injection.
 
 ## Non-Goals
 
-- Changing the VM-driver lifecycle extension API.
+- Defining a separate VM-driver lifecycle extension API.
 - Shipping DOCA SDK, Comch transport, or vendor-proprietary link
   dependencies.
 - Replacing the in-guest OPA/L7 proxy.
-- A final public API for "DPU-only networking" or TAP suppression.
+- A final public API for choosing DPU-only networking, vDPA, or
+  DPU-provisioned rootfs.
 - Multi-DPU per-host scheduling.
 - Moving a running sandbox between DPUs.
 - Live migration or hot-plug of DPU attachments.
+- A required SNAP implementation in the first upstream slice.
 
 ## Core Components
 
@@ -57,7 +64,8 @@ registers as `dpu` in the VM driver's extension registry.
 The extension:
 
 - calls a `DpuCoordinator` before VM launch to allocate a VF/SF;
-- contributes validated VM launcher arguments for the device;
+- updates the VM launch plan with typed network, device, and optional
+  storage attachments;
 - persists attachment state under the sandbox's extension state;
 - reports launch, detach, policy, and health events;
 - detaches on sandbox delete;
@@ -71,8 +79,10 @@ The trait covers:
 
 - `health`: firmware, SR-IOV mode, OVS offload, and required control
   checks;
-- `attach`: allocate a VF/SF, install initial enforcement, and return
-  VM attachment details;
+- `attach`: allocate a VF/SF or vDPA endpoint, install initial
+  enforcement, and return typed VM attachment details;
+- `provision_rootfs` (optional capability): prepare or expose a
+  DPU-backed rootfs/block device and return a typed storage attachment;
 - `detach`: idempotently release an attachment;
 - `list`: report coordinator-known attachments;
 - `reconcile`: compare host-restored state with coordinator state;
@@ -100,6 +110,8 @@ host extension contract.
 the BlueField ARM cores and owns:
 
 - VF/SF allocation;
+- vDPA endpoint allocation when supported;
+- optional DPU-backed rootfs/block-device provisioning;
 - representor and OVS programming;
 - policy application and verification;
 - durable on-DPU attachment registry;
@@ -204,8 +216,9 @@ The VM driver realizes that request after it has been selected:
 resource requirement
   -> gateway selects VM driver
   -> VM driver builds launch plan
-  -> dpu extension allocates VF/SF
-  -> VM launch receives validated attachment args
+  -> dpu extension allocates VF/SF, vDPA, or DPU rootfs as requested
+  -> dpu extension updates typed launch-plan attachments
+  -> VM driver validates and renders the final launch plan
 ```
 
 Deployment-specific settings remain extension config, including:
@@ -220,6 +233,26 @@ Deployment-specific settings remain extension config, including:
 
 Public request fields describe what the sandbox needs. DPU extension
 config describes how this deployment provides it.
+
+## VM Launch Plan Integration
+
+The DPU extension consumes the VM driver's typed launch plan. It does
+not primarily contribute raw QEMU arguments.
+
+The extension may update:
+
+- `plan.network`: replace the default TAP attachment with
+  `VmNetworkAttachment::VfioPci` for a VF/SF, or
+  `VmNetworkAttachment::Vdpa` for a vDPA endpoint;
+- `plan.devices`: add supporting `VmDeviceAttachment::VfioPci` devices
+  when the DPU integration needs a non-network PCI device passed through;
+- `plan.rootfs`: replace the default host-file root block device with
+  `VmStorageAttachment::DpuProvisioned` when the coordinator exposes a
+  DPU-provisioned rootfs/block device.
+
+The default QEMU path still uses host-file rootfs plus TAP/vsock. A DPU
+extension can deliberately omit TAP by replacing `plan.network` before
+the driver validates and renders the launcher configuration.
 
 ## Operator Configuration
 
@@ -260,7 +293,8 @@ VM driver selected
   -> coordinator.attach
   -> coordinator installs initial enforcement
   -> extension returns PersistedExtensionState
-  -> extension contributes VM attachment args
+  -> extension updates plan.network / plan.devices / plan.rootfs
+  -> VM driver validates and renders typed attachments
   -> VM driver launches sandbox
   -> extension reports bound or detaches on launch failure
 ```
@@ -277,6 +311,18 @@ gateway deletes sandbox
 
 The attachment lifetime equals the sandbox lifetime. VM process exit
 does not immediately detach the DPU resource; delete does.
+
+### DPU-Provisioned Rootfs
+
+If the coordinator advertises rootfs provisioning, `attach` or
+`provision_rootfs` may return a DPU-backed block device. The host
+extension represents that as `VmStorageAttachment::DpuProvisioned`.
+
+The RFC intentionally keeps the storage backend behind the coordinator
+trait. A BlueField implementation may use SNAP, NVMe emulation, a block
+device exposed to the host, or another mechanism, but the VM driver only
+sees the typed storage attachment and renders it into the QEMU storage
+configuration.
 
 ## Initial Policy Bootstrap
 
@@ -363,9 +409,10 @@ With that topology:
 
 Important limitation:
 
-- The QEMU path still has TAP + virtio-net unless a future DPU-only
-  network profile suppresses it. A compromised guest can use TAP if
-  that path is present. This RFC enforces the VF/SF data path; it does
+- The default QEMU path still has TAP + virtio-net. A DPU extension must
+  replace the network plan and omit TAP for deployments that require all
+  guest egress to traverse the DPU-controlled data path. If TAP remains
+  present, this RFC enforces only the VF/SF or vDPA data path and does
   not claim all guest egress is DPU-enforced.
 
 ## mTLS and Identity
@@ -408,11 +455,12 @@ The extension and coordinator emit:
 
 - Should the DPU resource class be a standard typed device class or a
   generic resource extension?
-- Should a DPU-only network profile suppress TAP for DPU-attached
-  sandboxes?
+- What public resource/profile should select DPU-only networking, vDPA,
+  or DPU-provisioned rootfs?
 - Should `reconcile_mode` remain advisory by default for DPU, or should
   some deployments opt into authoritative by default?
 - Should the shared DPU proto remain vendor-neutral, or should vendors
   own separate coordinator protos behind the same trait?
 - Should topology verification fail closed automatically at coordinator
   startup?
+
