@@ -46,6 +46,7 @@ use openshell_core::{ComputeDriverKind, Config, Error, Result};
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
@@ -628,6 +629,9 @@ async fn build_compute_runtime(
         ComputeDriverKind::Podman => {
             let mut podman = podman_config_from_file(file)?;
             podman.gateway_port = config.bind_address.port();
+            if let Ok(p) = std::env::var("OPENSHELL_PODMAN_SOCKET") {
+                podman.socket_path = PathBuf::from(p);
+            }
             apply_podman_local_tls_defaults(config, &mut podman)?;
 
             ComputeRuntime::new_podman(
