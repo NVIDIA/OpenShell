@@ -793,7 +793,7 @@ mod tests {
         let acceptor = TlsAcceptor::from_files(
             &dir.path().join("server-cert.pem"),
             &dir.path().join("server-key.pem"),
-            &dir.path().join("ca.pem"),
+            Some(&dir.path().join("ca.pem")),
             false,
         )
         .expect("failed to build tls acceptor");
