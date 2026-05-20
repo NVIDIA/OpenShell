@@ -144,6 +144,12 @@ The following steps outline the hot-reload policy update workflow.
    openshell policy get <name> --full > current-policy.yaml
    ```
 
+   Use JSON output when you want to inspect the policy with `jq`:
+
+   ```shell
+   openshell policy get <name> --full --json | jq '.revision.policy.network_policies'
+   ```
+
 5. Edit the YAML: add or adjust `network_policies` entries, binaries, `access`, or `rules`.
 
 6. Push the updated policy when you need a full replacement. Exit codes: 0 = loaded, 1 = validation failed, 124 = timeout.

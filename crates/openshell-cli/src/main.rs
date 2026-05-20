@@ -1587,9 +1587,13 @@ enum PolicyCommands {
         #[arg(long = "rev", default_value_t = 0)]
         rev: u32,
 
-        /// Print the full policy as YAML.
+        /// Include the full policy payload in the output.
         #[arg(long)]
         full: bool,
+
+        /// Print policy revision metadata and optional full policy as JSON.
+        #[arg(long)]
+        json: bool,
 
         /// Show the global policy revision.
         #[arg(long)]
@@ -2267,13 +2271,16 @@ async fn main() -> Result<()> {
                     name,
                     rev,
                     full,
+                    json,
                     global,
                 } => {
                     if global {
-                        run::sandbox_policy_get_global(&ctx.endpoint, rev, full, &tls).await?;
+                        run::sandbox_policy_get_global(&ctx.endpoint, rev, full, json, &tls)
+                            .await?;
                     } else {
                         let name = resolve_sandbox_name(name, &ctx.name)?;
-                        run::sandbox_policy_get(&ctx.endpoint, &name, rev, full, &tls).await?;
+                        run::sandbox_policy_get(&ctx.endpoint, &name, rev, full, json, &tls)
+                            .await?;
                     }
                 }
                 PolicyCommands::List {
@@ -3932,6 +3939,26 @@ mod tests {
                 assert!(yes);
             }
             other => panic!("expected policy delete command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn policy_get_accepts_json_flag() {
+        let cli = Cli::try_parse_from(["openshell", "policy", "get", "demo", "--full", "--json"])
+            .expect("policy get --json should parse");
+
+        match cli.command {
+            Some(Commands::Policy {
+                command:
+                    Some(PolicyCommands::Get {
+                        name, full, json, ..
+                    }),
+            }) => {
+                assert_eq!(name.as_deref(), Some("demo"));
+                assert!(full);
+                assert!(json);
+            }
+            other => panic!("expected policy get command, got: {other:?}"),
         }
     }
 

@@ -46,10 +46,10 @@ use openshell_core::proto::{
     ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy, ProviderProfile,
     ProviderProfileDiagnostic, ProviderProfileImportItem, RejectDraftChunkRequest,
     RevokeSshSessionRequest, RotateProviderCredentialRequest, Sandbox, SandboxPhase, SandboxPolicy,
-    SandboxSpec, SandboxTemplate, ServiceEndpointResponse, SetClusterInferenceRequest,
-    SettingScope, SettingValue, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
-    UpdateConfigRequest, UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event,
-    setting_value, tcp_forward_init,
+    SandboxPolicyRevision, SandboxSpec, SandboxTemplate, ServiceEndpointResponse,
+    SetClusterInferenceRequest, SettingScope, SettingValue, TcpForwardFrame, TcpForwardInit,
+    TcpRelayTarget, UpdateConfigRequest, UpdateProviderRequest, WatchSandboxRequest,
+    exec_sandbox_event, setting_value, tcp_forward_init,
 };
 use openshell_core::settings::{self, SettingValueKind};
 use openshell_core::{ObjectId, ObjectName};
@@ -6086,6 +6086,7 @@ pub async fn sandbox_policy_get(
     name: &str,
     version: u32,
     full: bool,
+    json: bool,
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
@@ -6101,6 +6102,17 @@ pub async fn sandbox_policy_get(
 
     let inner = status_resp.into_inner();
     if let Some(rev) = inner.revision {
+        if json {
+            print_policy_get_json(
+                "sandbox",
+                Some(name),
+                Some(inner.active_version),
+                &rev,
+                full,
+            )?;
+            return Ok(());
+        }
+
         let status = PolicyStatus::try_from(rev.status).unwrap_or(PolicyStatus::Unspecified);
         println!("Version:      {}", rev.version);
         println!("Hash:         {}", rev.policy_hash);
@@ -6137,6 +6149,7 @@ pub async fn sandbox_policy_get_global(
     server: &str,
     version: u32,
     full: bool,
+    json: bool,
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
@@ -6152,6 +6165,11 @@ pub async fn sandbox_policy_get_global(
 
     let inner = status_resp.into_inner();
     if let Some(rev) = inner.revision {
+        if json {
+            print_policy_get_json("global", None, None, &rev, full)?;
+            return Ok(());
+        }
+
         let status = PolicyStatus::try_from(rev.status).unwrap_or(PolicyStatus::Unspecified);
         println!("Scope:        global");
         println!("Version:      {}", rev.version);
@@ -6179,6 +6197,96 @@ pub async fn sandbox_policy_get_global(
     }
 
     Ok(())
+}
+
+fn print_policy_get_json(
+    scope: &str,
+    name: Option<&str>,
+    active_version: Option<u32>,
+    revision: &SandboxPolicyRevision,
+    include_policy: bool,
+) -> Result<()> {
+    let value = policy_get_json_value(scope, name, active_version, revision, include_policy)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&value).into_diagnostic()?
+    );
+    Ok(())
+}
+
+fn policy_get_json_value(
+    scope: &str,
+    name: Option<&str>,
+    active_version: Option<u32>,
+    revision: &SandboxPolicyRevision,
+    include_policy: bool,
+) -> Result<serde_json::Value> {
+    let mut revision_obj = serde_json::Map::new();
+    revision_obj.insert("version".to_string(), serde_json::json!(revision.version));
+    revision_obj.insert("hash".to_string(), serde_json::json!(revision.policy_hash));
+    revision_obj.insert(
+        "status".to_string(),
+        serde_json::json!(policy_status_json_name(revision.status)),
+    );
+    revision_obj.insert(
+        "created_at_ms".to_string(),
+        serde_json::json!(revision.created_at_ms),
+    );
+    revision_obj.insert(
+        "loaded_at_ms".to_string(),
+        serde_json::json!(revision.loaded_at_ms),
+    );
+    if !revision.load_error.is_empty() {
+        revision_obj.insert(
+            "load_error".to_string(),
+            serde_json::json!(revision.load_error),
+        );
+    }
+    if include_policy {
+        let policy = revision
+            .policy
+            .as_ref()
+            .map(sandbox_policy_json_value)
+            .transpose()?
+            .unwrap_or(serde_json::Value::Null);
+        revision_obj.insert("policy".to_string(), policy);
+    }
+
+    let mut root = serde_json::Map::new();
+    root.insert("scope".to_string(), serde_json::json!(scope));
+    if let Some(name) = name {
+        root.insert("name".to_string(), serde_json::json!(name));
+    }
+    if let Some(active_version) = active_version {
+        root.insert(
+            "active_version".to_string(),
+            serde_json::json!(active_version),
+        );
+    }
+    root.insert(
+        "revision".to_string(),
+        serde_json::Value::Object(revision_obj),
+    );
+
+    Ok(serde_json::Value::Object(root))
+}
+
+fn policy_status_json_name(status: i32) -> &'static str {
+    match PolicyStatus::try_from(status).unwrap_or(PolicyStatus::Unspecified) {
+        PolicyStatus::Unspecified => "unspecified",
+        PolicyStatus::Pending => "pending",
+        PolicyStatus::Loaded => "loaded",
+        PolicyStatus::Failed => "failed",
+        PolicyStatus::Superseded => "superseded",
+    }
+}
+
+fn sandbox_policy_json_value(policy: &SandboxPolicy) -> Result<serde_json::Value> {
+    let yaml_str = openshell_policy::serialize_sandbox_policy(policy)
+        .wrap_err("failed to serialize policy to YAML")?;
+    serde_yml::from_str(&yaml_str)
+        .into_diagnostic()
+        .wrap_err("failed to convert policy to JSON")
 }
 
 pub async fn sandbox_policy_list(
@@ -6232,7 +6340,7 @@ pub async fn sandbox_policy_list_global(server: &str, limit: u32, tls: &TlsOptio
     Ok(())
 }
 
-fn print_policy_revision_table(revisions: &[openshell_core::proto::SandboxPolicyRevision]) {
+fn print_policy_revision_table(revisions: &[SandboxPolicyRevision]) {
     println!(
         "{:<8} {:<14} {:<12} {:<24} ERROR",
         "VERSION", "HASH", "STATUS", "CREATED"
@@ -6711,7 +6819,7 @@ mod tests {
         git_sync_files, http_health_check, image_requests_gpu, import_local_package_mtls_bundle,
         inferred_provider_type, package_managed_tls_dirs, parse_cli_setting_value,
         parse_credential_expiry_cli_value, parse_credential_expiry_pairs, parse_credential_pairs,
-        plaintext_gateway_is_remote, progress_step_from_metadata,
+        plaintext_gateway_is_remote, policy_get_json_value, progress_step_from_metadata,
         provider_profile_allows_refresh_bootstrap, provisioning_timeout_message,
         ready_false_condition_message, refresh_status_header, refresh_status_row, resolve_from,
         sandbox_should_persist, service_expose_status_error, service_url_for_gateway,
@@ -6733,9 +6841,10 @@ mod tests {
         PROGRESS_STEP_STARTING_SANDBOX,
     };
     use openshell_core::proto::{
-        Provider, ProviderCredentialRefresh, ProviderCredentialRefreshStatus,
-        ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileCredential,
-        SandboxCondition, SandboxStatus, datamodel::v1::ObjectMeta,
+        FilesystemPolicy, PolicyStatus, Provider, ProviderCredentialRefresh,
+        ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy, ProviderProfile,
+        ProviderProfileCredential, SandboxCondition, SandboxPolicy, SandboxPolicyRevision,
+        SandboxStatus, datamodel::v1::ObjectMeta,
     };
 
     struct EnvVarGuard {
@@ -7110,6 +7219,60 @@ mod tests {
         assert!(build_sandbox_resource_limits(Some("half"), None).is_err());
         assert!(build_sandbox_resource_limits(None, Some("0Gi")).is_err());
         assert!(build_sandbox_resource_limits(None, Some("1.5Gi")).is_err());
+    }
+
+    #[test]
+    fn policy_get_json_includes_metadata_and_full_policy_when_requested() {
+        let revision = SandboxPolicyRevision {
+            version: 7,
+            policy_hash: "sha256:test".to_string(),
+            status: PolicyStatus::Loaded as i32,
+            created_at_ms: 10,
+            loaded_at_ms: 20,
+            policy: Some(SandboxPolicy {
+                version: 1,
+                filesystem: Some(FilesystemPolicy {
+                    include_workdir: true,
+                    read_only: vec!["/usr".to_string()],
+                    read_write: vec!["/sandbox".to_string()],
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let value = policy_get_json_value("sandbox", Some("demo"), Some(7), &revision, true)
+            .expect("policy JSON should render");
+
+        assert_eq!(value["scope"].as_str(), Some("sandbox"));
+        assert_eq!(value["name"].as_str(), Some("demo"));
+        assert_eq!(value["active_version"].as_u64(), Some(7));
+        assert_eq!(value["revision"]["version"].as_u64(), Some(7));
+        assert_eq!(value["revision"]["hash"].as_str(), Some("sha256:test"));
+        assert_eq!(value["revision"]["status"].as_str(), Some("loaded"));
+        assert_eq!(value["revision"]["policy"]["version"].as_u64(), Some(1));
+        assert_eq!(
+            value["revision"]["policy"]["filesystem_policy"]["read_write"][0].as_str(),
+            Some("/sandbox")
+        );
+    }
+
+    #[test]
+    fn policy_get_json_omits_policy_without_full() {
+        let revision = SandboxPolicyRevision {
+            version: 3,
+            policy_hash: "sha256:test".to_string(),
+            status: PolicyStatus::Pending as i32,
+            ..Default::default()
+        };
+
+        let value = policy_get_json_value("global", None, None, &revision, false)
+            .expect("policy JSON should render");
+
+        assert_eq!(value["scope"].as_str(), Some("global"));
+        assert!(value.get("name").is_none());
+        assert!(value.get("active_version").is_none());
+        assert!(value["revision"].get("policy").is_none());
     }
 
     #[test]
