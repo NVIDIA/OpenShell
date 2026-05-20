@@ -54,5 +54,11 @@ zstd = "0.13"
 [target.'cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd", target_os = "dragonfly"))'.dependencies]
 polling = "3.11"
 
+[target.'cfg(not(target_os = "macos"))'.build-dependencies]
+openshell-sandbox = { path = "../openshell-sandbox", artifact = "bin:openshell-sandbox", target = "target" }
+
+[target.'cfg(target_os = "macos")'.build-dependencies]
+openshell-sandbox = { path = "../openshell-sandbox", artifact = "bin:openshell-sandbox", target = "aarch64-unknown-linux-gnu" }
+
 [lints]
 workspace = true

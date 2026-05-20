@@ -3550,6 +3550,7 @@ dependencies = [
  "nix",
  "oci-client",
  "openshell-core",
+ "openshell-sandbox",
  "openshell-vfio",
  "polling",
  "prost",
