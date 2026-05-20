@@ -4,7 +4,7 @@
 //! gRPC service implementation.
 
 pub mod policy;
-mod provider;
+pub mod provider;
 mod sandbox;
 mod service;
 mod validation;
@@ -12,15 +12,17 @@ mod validation;
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveAllDraftChunksResponse, ApproveDraftChunkRequest,
     ApproveDraftChunkResponse, AttachSandboxProviderRequest, AttachSandboxProviderResponse,
-    ClearDraftChunksRequest, ClearDraftChunksResponse, CreateProviderRequest, CreateSandboxRequest,
+    ClearDraftChunksRequest, ClearDraftChunksResponse, ConfigureProviderRefreshRequest,
+    ConfigureProviderRefreshResponse, CreateProviderRequest, CreateSandboxRequest,
     CreateSshSessionRequest, CreateSshSessionResponse, DeleteProviderProfileRequest,
-    DeleteProviderProfileResponse, DeleteProviderRequest, DeleteProviderResponse,
-    DeleteSandboxRequest, DeleteSandboxResponse, DeleteServiceRequest, DeleteServiceResponse,
-    DetachSandboxProviderRequest, DetachSandboxProviderResponse, EditDraftChunkRequest,
-    EditDraftChunkResponse, ExecSandboxEvent, ExecSandboxInput, ExecSandboxRequest,
-    ExposeServiceRequest, GatewayMessage, GetDraftHistoryRequest, GetDraftHistoryResponse,
-    GetDraftPolicyRequest, GetDraftPolicyResponse, GetGatewayConfigRequest,
-    GetGatewayConfigResponse, GetProviderProfileRequest, GetProviderRequest,
+    DeleteProviderProfileResponse, DeleteProviderRefreshRequest, DeleteProviderRefreshResponse,
+    DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
+    DeleteServiceRequest, DeleteServiceResponse, DetachSandboxProviderRequest,
+    DetachSandboxProviderResponse, EditDraftChunkRequest, EditDraftChunkResponse, ExecSandboxEvent,
+    ExecSandboxInput, ExecSandboxRequest, ExposeServiceRequest, GatewayMessage,
+    GetDraftHistoryRequest, GetDraftHistoryResponse, GetDraftPolicyRequest, GetDraftPolicyResponse,
+    GetGatewayConfigRequest, GetGatewayConfigResponse, GetProviderProfileRequest,
+    GetProviderRefreshStatusRequest, GetProviderRefreshStatusResponse, GetProviderRequest,
     GetSandboxConfigRequest, GetSandboxConfigResponse, GetSandboxLogsRequest,
     GetSandboxLogsResponse, GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
     GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
@@ -32,11 +34,11 @@ use openshell_core::proto::{
     ListSandboxesResponse, ListServicesRequest, ListServicesResponse, ProviderProfileResponse,
     ProviderResponse, PushSandboxLogsRequest, PushSandboxLogsResponse, RejectDraftChunkRequest,
     RejectDraftChunkResponse, RelayFrame, ReportPolicyStatusRequest, ReportPolicyStatusResponse,
-    RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResponse, SandboxStreamEvent,
-    ServiceEndpointResponse, ServiceStatus, SubmitPolicyAnalysisRequest,
-    SubmitPolicyAnalysisResponse, SupervisorMessage, TcpForwardFrame, UndoDraftChunkRequest,
-    UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse, UpdateProviderRequest,
-    WatchSandboxRequest, open_shell_server::OpenShell,
+    RevokeSshSessionRequest, RevokeSshSessionResponse, RotateProviderCredentialRequest,
+    RotateProviderCredentialResponse, SandboxResponse, SandboxStreamEvent, ServiceEndpointResponse,
+    ServiceStatus, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, SupervisorMessage,
+    TcpForwardFrame, UndoDraftChunkRequest, UndoDraftChunkResponse, UpdateConfigRequest,
+    UpdateConfigResponse, UpdateProviderRequest, WatchSandboxRequest, open_shell_server::OpenShell,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -391,6 +393,34 @@ impl OpenShell for OpenShellService {
         provider::handle_update_provider(&self.state, request).await
     }
 
+    async fn get_provider_refresh_status(
+        &self,
+        request: Request<GetProviderRefreshStatusRequest>,
+    ) -> Result<Response<GetProviderRefreshStatusResponse>, Status> {
+        provider::handle_get_provider_refresh_status(&self.state, request).await
+    }
+
+    async fn configure_provider_refresh(
+        &self,
+        request: Request<ConfigureProviderRefreshRequest>,
+    ) -> Result<Response<ConfigureProviderRefreshResponse>, Status> {
+        provider::handle_configure_provider_refresh(&self.state, request).await
+    }
+
+    async fn rotate_provider_credential(
+        &self,
+        request: Request<RotateProviderCredentialRequest>,
+    ) -> Result<Response<RotateProviderCredentialResponse>, Status> {
+        provider::handle_rotate_provider_credential(&self.state, request).await
+    }
+
+    async fn delete_provider_refresh(
+        &self,
+        request: Request<DeleteProviderRefreshRequest>,
+    ) -> Result<Response<DeleteProviderRefreshResponse>, Status> {
+        provider::handle_delete_provider_refresh(&self.state, request).await
+    }
+
     async fn delete_provider(
         &self,
         request: Request<DeleteProviderRequest>,
@@ -558,6 +588,45 @@ impl OpenShell for OpenShellService {
     ) -> Result<Response<Self::RelayStreamStream>, Status> {
         crate::supervisor_session::handle_relay_stream(&self.state.supervisor_sessions, request)
             .await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared test support
+// ---------------------------------------------------------------------------
+
+/// Shared test helpers for grpc submodule unit tests.
+#[cfg(test)]
+pub mod test_support {
+    use std::sync::Arc;
+
+    use crate::ServerState;
+    use crate::compute::new_test_runtime;
+    use crate::persistence::Store;
+    use crate::sandbox_index::SandboxIndex;
+    use crate::sandbox_watch::SandboxWatchBus;
+    use crate::supervisor_session::SupervisorSessionRegistry;
+    use crate::tracing_bus::TracingLogBus;
+    use openshell_core::Config;
+
+    /// Build an in-memory `ServerState` for unit tests.
+    pub async fn test_server_state() -> Arc<ServerState> {
+        let store = Arc::new(
+            Store::connect("sqlite::memory:?cache=shared")
+                .await
+                .unwrap(),
+        );
+        let compute = new_test_runtime(store.clone()).await;
+        Arc::new(ServerState::new(
+            Config::new(None).with_database_url("sqlite::memory:?cache=shared"),
+            store,
+            compute,
+            SandboxIndex::new(),
+            SandboxWatchBus::new(),
+            TracingLogBus::new(),
+            Arc::new(SupervisorSessionRegistry::new()),
+            None,
+        ))
     }
 }
 

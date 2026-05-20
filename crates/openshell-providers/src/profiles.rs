@@ -7,7 +7,9 @@
 
 use openshell_core::proto::{
     GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule, NetworkBinary, NetworkEndpoint,
-    NetworkPolicyRule, ProviderProfile, ProviderProfileCategory, ProviderProfileCredential,
+    NetworkPolicyRule, ProviderCredentialRefresh, ProviderCredentialRefreshMaterial,
+    ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileCategory,
+    ProviderProfileCredential,
 };
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
@@ -15,16 +17,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 const BUILT_IN_PROFILE_YAMLS: &[&str] = &[
-    include_str!("../../../providers/anthropic.yaml"),
-    include_str!("../../../providers/claude.yaml"),
-    include_str!("../../../providers/codex.yaml"),
-    include_str!("../../../providers/copilot.yaml"),
+    include_str!("../../../providers/claude-code.yaml"),
     include_str!("../../../providers/github.yaml"),
-    include_str!("../../../providers/gitlab.yaml"),
     include_str!("../../../providers/nvidia.yaml"),
-    include_str!("../../../providers/openai.yaml"),
-    include_str!("../../../providers/opencode.yaml"),
-    include_str!("../../../providers/outlook.yaml"),
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -84,6 +79,39 @@ pub struct CredentialProfile {
     pub header_name: String,
     #[serde(default)]
     pub query_param: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh: Option<CredentialRefreshProfile>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CredentialRefreshProfile {
+    #[serde(
+        default = "default_refresh_strategy",
+        deserialize_with = "deserialize_refresh_strategy",
+        serialize_with = "serialize_refresh_strategy"
+    )]
+    pub strategy: ProviderCredentialRefreshStrategy,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub token_url: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub refresh_before_seconds: i64,
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub max_lifetime_seconds: i64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub material: Vec<CredentialRefreshMaterialProfile>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct CredentialRefreshMaterialProfile {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub secret: bool,
 }
 
 // These YAML/JSON DTOs mirror the network policy protos intentionally. Keep
@@ -240,6 +268,10 @@ impl ProviderTypeProfile {
                     auth_style: credential.auth_style.clone(),
                     header_name: credential.header_name.clone(),
                     query_param: credential.query_param.clone(),
+                    refresh: credential
+                        .refresh
+                        .as_ref()
+                        .map(credential_refresh_from_proto),
                 })
                 .collect(),
             endpoints: profile.endpoints.iter().map(endpoint_from_proto).collect(),
@@ -279,6 +311,7 @@ impl ProviderTypeProfile {
                     auth_style: credential.auth_style.clone(),
                     header_name: credential.header_name.clone(),
                     query_param: credential.query_param.clone(),
+                    refresh: credential.refresh.as_ref().map(credential_refresh_to_proto),
                 })
                 .collect(),
             endpoints: self.endpoints.iter().map(endpoint_to_proto).collect(),
@@ -358,6 +391,15 @@ fn is_zero(value: &u32) -> bool {
     *value == 0
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero_i64(value: &i64) -> bool {
+    *value == 0
+}
+
+fn default_refresh_strategy() -> ProviderCredentialRefreshStrategy {
+    ProviderCredentialRefreshStrategy::Unspecified
+}
+
 fn deserialize_category<'de, D>(deserializer: D) -> Result<ProviderProfileCategory, D::Error>
 where
     D: Deserializer<'de>,
@@ -376,6 +418,28 @@ where
     S: Serializer,
 {
     serializer.serialize_str(provider_profile_category_to_yaml(*category))
+}
+
+fn deserialize_refresh_strategy<'de, D>(
+    deserializer: D,
+) -> Result<ProviderCredentialRefreshStrategy, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    provider_refresh_strategy_from_yaml(&raw)
+        .ok_or_else(|| de::Error::custom(format!("unsupported provider refresh strategy: {raw}")))
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn serialize_refresh_strategy<S>(
+    strategy: &ProviderCredentialRefreshStrategy,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serializer.serialize_str(provider_refresh_strategy_to_yaml(*strategy))
 }
 
 #[must_use]
@@ -402,6 +466,78 @@ pub fn provider_profile_category_to_yaml(category: ProviderProfileCategory) -> &
         ProviderProfileCategory::Data => "data",
         ProviderProfileCategory::Knowledge => "knowledge",
         ProviderProfileCategory::Other | ProviderProfileCategory::Unspecified => "other",
+    }
+}
+
+#[must_use]
+pub fn provider_refresh_strategy_from_yaml(raw: &str) -> Option<ProviderCredentialRefreshStrategy> {
+    match raw.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "" => Some(ProviderCredentialRefreshStrategy::Unspecified),
+        "static" => Some(ProviderCredentialRefreshStrategy::Static),
+        "external" => Some(ProviderCredentialRefreshStrategy::External),
+        "oauth2_refresh_token" => Some(ProviderCredentialRefreshStrategy::Oauth2RefreshToken),
+        "oauth2_client_credentials" => {
+            Some(ProviderCredentialRefreshStrategy::Oauth2ClientCredentials)
+        }
+        "google_service_account_jwt" => {
+            Some(ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt)
+        }
+        _ => None,
+    }
+}
+
+#[must_use]
+pub fn provider_refresh_strategy_to_yaml(
+    strategy: ProviderCredentialRefreshStrategy,
+) -> &'static str {
+    match strategy {
+        ProviderCredentialRefreshStrategy::Static => "static",
+        ProviderCredentialRefreshStrategy::External => "external",
+        ProviderCredentialRefreshStrategy::Oauth2RefreshToken => "oauth2_refresh_token",
+        ProviderCredentialRefreshStrategy::Oauth2ClientCredentials => "oauth2_client_credentials",
+        ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => "google_service_account_jwt",
+        ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
+    }
+}
+
+fn credential_refresh_from_proto(refresh: &ProviderCredentialRefresh) -> CredentialRefreshProfile {
+    CredentialRefreshProfile {
+        strategy: ProviderCredentialRefreshStrategy::try_from(refresh.strategy)
+            .unwrap_or(ProviderCredentialRefreshStrategy::Unspecified),
+        token_url: refresh.token_url.clone(),
+        scopes: refresh.scopes.clone(),
+        refresh_before_seconds: refresh.refresh_before_seconds,
+        max_lifetime_seconds: refresh.max_lifetime_seconds,
+        material: refresh
+            .material
+            .iter()
+            .map(|material| CredentialRefreshMaterialProfile {
+                name: material.name.clone(),
+                description: material.description.clone(),
+                required: material.required,
+                secret: material.secret,
+            })
+            .collect(),
+    }
+}
+
+fn credential_refresh_to_proto(refresh: &CredentialRefreshProfile) -> ProviderCredentialRefresh {
+    ProviderCredentialRefresh {
+        strategy: refresh.strategy as i32,
+        token_url: refresh.token_url.clone(),
+        scopes: refresh.scopes.clone(),
+        refresh_before_seconds: refresh.refresh_before_seconds,
+        max_lifetime_seconds: refresh.max_lifetime_seconds,
+        material: refresh
+            .material
+            .iter()
+            .map(|material| ProviderCredentialRefreshMaterial {
+                name: material.name.clone(),
+                description: material.description.clone(),
+                required: material.required,
+                secret: material.secret,
+            })
+            .collect(),
     }
 }
 
@@ -789,6 +925,52 @@ pub fn validate_profile_set(
                     format!("unsupported auth_style: {}", credential.auth_style),
                 )),
             }
+
+            if let Some(refresh) = credential.refresh.as_ref() {
+                if refresh.strategy == ProviderCredentialRefreshStrategy::Unspecified {
+                    diagnostics.push(ProfileValidationDiagnostic::error(
+                        source,
+                        profile_id,
+                        "credentials.refresh.strategy",
+                        "refresh strategy is required",
+                    ));
+                }
+                if refresh.refresh_before_seconds < 0 {
+                    diagnostics.push(ProfileValidationDiagnostic::error(
+                        source,
+                        profile_id,
+                        "credentials.refresh.refresh_before_seconds",
+                        "refresh_before_seconds must be greater than or equal to 0",
+                    ));
+                }
+                if refresh.max_lifetime_seconds < 0 {
+                    diagnostics.push(ProfileValidationDiagnostic::error(
+                        source,
+                        profile_id,
+                        "credentials.refresh.max_lifetime_seconds",
+                        "max_lifetime_seconds must be greater than or equal to 0",
+                    ));
+                }
+                let mut material_names = HashSet::new();
+                for material in &refresh.material {
+                    let name = material.name.trim();
+                    if name.is_empty() {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            profile_id,
+                            "credentials.refresh.material.name",
+                            "refresh material name is required",
+                        ));
+                    } else if !material_names.insert(name.to_string()) {
+                        diagnostics.push(ProfileValidationDiagnostic::error(
+                            source,
+                            profile_id,
+                            "credentials.refresh.material.name",
+                            format!("duplicate refresh material name: {name}"),
+                        ));
+                    }
+                }
+            }
         }
 
         for (index, endpoint) in profile.endpoints.iter().enumerate() {
@@ -885,10 +1067,10 @@ mod tests {
 
     #[test]
     fn credential_env_vars_are_deduplicated_in_profile_order() {
-        let profile = get_default_profile("copilot").expect("copilot profile");
+        let profile = get_default_profile("claude-code").expect("claude-code profile");
         assert_eq!(
             profile.credential_env_vars(),
-            vec!["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"]
+            vec!["ANTHROPIC_API_KEY", "CLAUDE_API_KEY"]
         );
     }
 
@@ -908,6 +1090,48 @@ credentials:
         assert_eq!(profile.id, "example");
         assert_eq!(profile.category, ProviderProfileCategory::Other);
         assert_eq!(profile.credential_env_vars(), vec!["EXAMPLE_API_KEY"]);
+    }
+
+    #[test]
+    fn profile_refresh_metadata_round_trips_through_proto_and_yaml() {
+        let profile = parse_profile_yaml(
+            r"
+id: ms-graph
+display_name: Microsoft Graph
+credentials:
+  - name: access_token
+    env_vars: [MS_GRAPH_ACCESS_TOKEN]
+    refresh:
+      strategy: oauth2_client_credentials
+      token_url: https://login.microsoftonline.com/common/oauth2/v2.0/token
+      scopes: [https://graph.microsoft.com/.default]
+      refresh_before_seconds: 300
+      material:
+        - name: tenant_id
+          required: true
+        - name: client_secret
+          required: true
+          secret: true
+",
+        )
+        .expect("profile should parse");
+
+        let refresh = profile.credentials[0].refresh.as_ref().expect("refresh");
+        assert_eq!(
+            refresh.token_url,
+            "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+        );
+        assert_eq!(refresh.material.len(), 2);
+
+        let from_proto = ProviderTypeProfile::from_proto(&profile.to_proto());
+        assert_eq!(
+            from_proto.credentials[0].refresh,
+            profile.credentials[0].refresh
+        );
+
+        let exported = profile_to_yaml(&from_proto).expect("yaml");
+        assert!(exported.contains("oauth2_client_credentials"));
+        assert!(exported.contains("client_secret"));
     }
 
     #[test]

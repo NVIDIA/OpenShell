@@ -522,6 +522,12 @@ pub(super) async fn compute_provider_env_revision(
                 for key in credential_keys {
                     hasher.update(key.as_bytes());
                 }
+                let mut expiry_keys: Vec<_> = provider.credential_expires_at_ms.keys().collect();
+                expiry_keys.sort();
+                for key in expiry_keys {
+                    hasher.update(key.as_bytes());
+                    hasher.update(provider.credential_expires_at_ms[key].to_le_bytes());
+                }
             }
             None => {
                 hasher.update(b"missing");
@@ -625,21 +631,22 @@ pub(super) async fn handle_get_sandbox_provider_environment(
     let provider_names = spec.providers;
     let provider_env_revision =
         compute_provider_env_revision(state.store.as_ref(), &provider_names).await?;
-    let environment =
+    let provider_environment =
         super::provider::resolve_provider_environment(state.store.as_ref(), &provider_names)
             .await?;
 
     info!(
         sandbox_id = %sandbox_id,
         provider_count = provider_names.len(),
-        env_count = environment.len(),
+        env_count = provider_environment.environment.len(),
         provider_env_revision,
         "GetSandboxProviderEnvironment request completed successfully"
     );
 
     Ok(Response::new(GetSandboxProviderEnvironmentResponse {
-        environment,
+        environment: provider_environment.environment,
         provider_env_revision,
+        credential_expires_at_ms: provider_environment.credential_expires_at_ms,
     }))
 }
 
@@ -2821,14 +2828,7 @@ fn materialize_global_settings(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ServerState;
-    use crate::compute::new_test_runtime;
-    use crate::persistence::Store;
-    use crate::sandbox_index::SandboxIndex;
-    use crate::sandbox_watch::SandboxWatchBus;
-    use crate::supervisor_session::SupervisorSessionRegistry;
-    use crate::tracing_bus::TracingLogBus;
-    use openshell_core::Config;
+    use crate::grpc::test_support::test_server_state;
     use std::collections::HashMap;
     use std::sync::Arc;
     use tonic::Code;
@@ -2922,6 +2922,7 @@ mod tests {
             credentials: std::iter::once(("GITHUB_TOKEN".to_string(), "ghp-test".to_string()))
                 .collect(),
             config: HashMap::new(),
+            credential_expires_at_ms: HashMap::new(),
         }
     }
 
@@ -3959,25 +3960,6 @@ mod tests {
         assert_eq!(policy.version, 1);
         assert!(policy.filesystem.is_some());
         assert_eq!(policy.process.unwrap().run_as_user, "sandbox");
-    }
-
-    async fn test_server_state() -> Arc<ServerState> {
-        let store = Arc::new(
-            Store::connect("sqlite::memory:?cache=shared")
-                .await
-                .unwrap(),
-        );
-        let compute = new_test_runtime(store.clone()).await;
-        Arc::new(ServerState::new(
-            Config::new(None).with_database_url("sqlite::memory:?cache=shared"),
-            store,
-            compute,
-            SandboxIndex::new(),
-            SandboxWatchBus::new(),
-            TracingLogBus::new(),
-            Arc::new(SupervisorSessionRegistry::new()),
-            None,
-        ))
     }
 
     #[tokio::test]

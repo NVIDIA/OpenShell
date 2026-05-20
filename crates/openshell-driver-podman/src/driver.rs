@@ -528,18 +528,9 @@ fn check_subuid_range() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http_body_util::Full;
-    use hyper::body::Bytes;
-    use hyper::server::conn::http1;
-    use hyper::service::service_fn;
-    use hyper::{Response, StatusCode};
-    use hyper_util::rt::TokioIo;
-    use std::collections::VecDeque;
-    use std::convert::Infallible;
+    use crate::test_utils::{StubResponse, spawn_podman_stub};
+    use hyper::StatusCode;
     use std::path::PathBuf;
-    use std::sync::{Arc, Mutex};
-    use std::time::{SystemTime, UNIX_EPOCH};
-    use tokio::net::UnixListener;
 
     #[test]
     fn podman_driver_error_from_conflict() {
@@ -625,32 +616,6 @@ mod tests {
         assert_eq!(cfg.grpc_endpoint, "https://gateway.internal:9000");
     }
 
-    #[derive(Clone)]
-    struct StubResponse {
-        status: StatusCode,
-        body: String,
-    }
-
-    impl StubResponse {
-        fn new(status: StatusCode, body: impl Into<String>) -> Self {
-            Self {
-                status,
-                body: body.into(),
-            }
-        }
-    }
-
-    fn unique_socket_path(test_name: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should be after unix epoch")
-            .as_nanos();
-        PathBuf::from(format!(
-            "/tmp/openshell-podman-{test_name}-{}-{nanos}.sock",
-            std::process::id()
-        ))
-    }
-
     fn test_driver(socket_path: PathBuf) -> PodmanComputeDriver {
         let config = PodmanComputeConfig {
             socket_path,
@@ -662,71 +627,6 @@ mod tests {
 
     fn api_path(path: &str) -> String {
         format!("/v5.0.0{path}")
-    }
-
-    fn spawn_podman_stub(
-        test_name: &str,
-        responses: Vec<StubResponse>,
-    ) -> (
-        PathBuf,
-        Arc<Mutex<Vec<String>>>,
-        tokio::task::JoinHandle<()>,
-    ) {
-        let socket_path = unique_socket_path(test_name);
-        let _ = std::fs::remove_file(&socket_path);
-        let listener = UnixListener::bind(&socket_path).expect("test socket should bind");
-        let request_log = Arc::new(Mutex::new(Vec::new()));
-        let response_queue = Arc::new(Mutex::new(VecDeque::from(responses)));
-        let expected = response_queue
-            .lock()
-            .expect("response queue lock should not be poisoned")
-            .len();
-        let socket_path_for_task = socket_path.clone();
-        let log_for_task = request_log.clone();
-        let queue_for_task = response_queue;
-        let handle = tokio::spawn(async move {
-            for _ in 0..expected {
-                let (stream, _) = listener.accept().await.expect("test stub should accept");
-                let log = log_for_task.clone();
-                let queue = queue_for_task.clone();
-                let result = http1::Builder::new()
-                    .serve_connection(
-                        TokioIo::new(stream),
-                        service_fn(move |req| {
-                            let log = log.clone();
-                            let queue = queue.clone();
-                            async move {
-                                let path = req.uri().path_and_query().map_or_else(
-                                    || req.uri().path().to_string(),
-                                    |pq| pq.as_str().to_string(),
-                                );
-                                log.lock()
-                                    .expect("request log lock should not be poisoned")
-                                    .push(format!("{} {}", req.method(), path));
-                                let response = queue
-                                    .lock()
-                                    .expect("response queue lock should not be poisoned")
-                                    .pop_front()
-                                    .expect("stub response should exist");
-                                Ok::<_, Infallible>(
-                                    Response::builder()
-                                        .status(response.status)
-                                        .body(Full::new(Bytes::from(response.body)))
-                                        .expect("stub response should build"),
-                                )
-                            }
-                        }),
-                    )
-                    .await;
-                // The one-shot test client can close the Unix socket after the
-                // response, which Hyper reports as a shutdown error. Let the
-                // request log assertions below decide whether the stub served
-                // the expected API calls.
-                let _ = result;
-            }
-            let _ = std::fs::remove_file(&socket_path_for_task);
-        });
-        (socket_path, request_log, handle)
     }
 
     #[tokio::test]

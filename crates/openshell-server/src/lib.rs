@@ -31,6 +31,7 @@ mod inference;
 mod multiplex;
 mod persistence;
 pub(crate) mod policy_store;
+mod provider_refresh;
 mod sandbox_index;
 mod sandbox_watch;
 mod service_routing;
@@ -227,6 +228,7 @@ pub async fn run_server(
     state.compute.spawn_watchers();
     ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_secs(3600));
     supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
+    provider_refresh::spawn_refresh_worker(state.clone(), Duration::from_secs(60));
 
     // Create the multiplexed service
     let service = MultiplexService::new(state.clone());
@@ -583,7 +585,10 @@ async fn build_compute_runtime(
 
     match driver {
         ComputeDriverKind::Kubernetes => {
-            let k8s = kubernetes_config_from_file(file)?;
+            let mut k8s = kubernetes_config_from_file(file)?;
+            if let Ok(size) = std::env::var("OPENSHELL_K8S_WORKSPACE_DEFAULT_STORAGE_SIZE") {
+                k8s.workspace_default_storage_size = size;
+            }
             ComputeRuntime::new_kubernetes(
                 k8s,
                 store,

@@ -33,6 +33,7 @@ tokio = { workspace = true }
 tonic = { workspace = true, features = ["tls", "tls-native-roots"] }
 
 # CLI
+chrono = "0.4"
 clap = { workspace = true }
 clap_complete = { workspace = true }
 crossterm = { workspace = true }

@@ -1341,7 +1341,6 @@ async fn cas_update_message_cas_succeeds() {
 async fn cas_update_message_cas_conflicts_on_concurrent_updates() {
     use openshell_core::proto::Sandbox;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU32, Ordering};
 
     let store = Arc::new(
         Store::connect("sqlite::memory:?cache=shared")
@@ -1366,24 +1365,18 @@ async fn cas_update_message_cas_conflicts_on_concurrent_updates() {
 
     store.put_message(&sandbox).await.unwrap();
 
-    // Track how many updates succeed
-    let success_count = Arc::new(AtomicU32::new(0));
-
-    // Spawn 5 concurrent CAS updates (using expected_version = 0 to use current)
+    // Spawn 5 concurrent CAS updates using the same observed version. Passing an
+    // explicit version makes this deterministic: later tasks cannot re-read the
+    // latest committed version and legitimately succeed.
     let mut handles = vec![];
     for i in 0..5 {
         let store = Arc::clone(&store);
-        let success_count = Arc::clone(&success_count);
         let handle = tokio::spawn(async move {
-            let result = store
-                .update_message_cas::<Sandbox, _>("test-id", 0, |s| {
+            store
+                .update_message_cas::<Sandbox, _>("test-id", 1, |s| {
                     s.current_policy_version = i;
                 })
-                .await;
-            if result.is_ok() {
-                success_count.fetch_add(1, Ordering::SeqCst);
-            }
-            result
+                .await
         });
         handles.push(handle);
     }
@@ -1394,7 +1387,7 @@ async fn cas_update_message_cas_conflicts_on_concurrent_updates() {
         .map(|r| r.unwrap())
         .collect();
 
-    // Only one should succeed; others fail with Conflict due to single-attempt CAS
+    // Only one should succeed; others fail with Conflict due to single-attempt CAS.
     let successes = results.iter().filter(|r| r.is_ok()).count();
     let conflicts = results
         .iter()
@@ -1402,7 +1395,6 @@ async fn cas_update_message_cas_conflicts_on_concurrent_updates() {
         .count();
     assert_eq!(successes, 1, "exactly one concurrent update should succeed");
     assert_eq!(conflicts, 4, "four updates should fail with Conflict");
-    assert_eq!(success_count.load(Ordering::SeqCst), 1);
 
     // Final version should be 2 (initial 1 + 1 successful update)
     let final_sandbox = store

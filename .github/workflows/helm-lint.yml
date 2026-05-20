@@ -7,12 +7,6 @@ on:
   push:
     branches:
       - "pull-request/[0-9]+"
-    paths:
-      - "deploy/helm/**"
-      - "mise.toml"
-      - "mise.lock"
-      - "tasks/helm.toml"
-      - ".github/workflows/helm-lint.yml"
   workflow_dispatch:
 
 env:
@@ -36,15 +30,53 @@ jobs:
     outputs:
       should_run: ${{ steps.gate.outputs.should_run }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - id: gate
         uses: ./.github/actions/pr-gate
 
-  helm-lint:
-    name: Helm Lint
+  helm_changes:
+    name: Detect Helm changes
     needs: pr_metadata
     if: needs.pr_metadata.outputs.should_run == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      should_run: ${{ steps.default.outputs.should_run || steps.changes.outputs.any_changed }}
+    steps:
+      - id: default
+        if: github.event_name != 'push'
+        shell: bash
+        run: echo "should_run=true" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        if: github.event_name == 'push'
+
+      - id: merge-base
+        if: github.event_name == 'push'
+        uses: ./.github/actions/pr-merge-base
+        with:
+          gh_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: changes
+        if: github.event_name == 'push'
+        uses: tj-actions/changed-files@aa08304bd477b800d468db44fe10f6c61f7f7b11 # v42.1.0
+        with:
+          base_sha: ${{ steps.merge-base.outputs.base_sha }}
+          skip_initial_fetch: ${{ steps.merge-base.outputs.base_sha != '' }}
+          files: |
+            deploy/helm/**
+            mise.toml
+            mise.lock
+            tasks/helm.toml
+            .github/workflows/helm-lint.yml
+
+  helm-lint:
+    name: Helm Lint
+    needs: [pr_metadata, helm_changes]
+    if: needs.pr_metadata.outputs.should_run == 'true' && needs.helm_changes.outputs.should_run == 'true'
     runs-on: linux-amd64-cpu8
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
@@ -52,7 +84,7 @@ jobs:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Install tools
         run: mise install --locked

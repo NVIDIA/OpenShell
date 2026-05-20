@@ -47,7 +47,7 @@ jobs:
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Mark workspace safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -63,7 +63,7 @@ jobs:
             --output artifacts/vm-runtime-linux-aarch64.tar.zst
 
       - name: Upload runtime artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: vm-runtime-linux-arm64
           path: artifacts/vm-runtime-linux-aarch64.tar.zst
@@ -73,7 +73,7 @@ jobs:
       # the aarch64 Linux kernel as a byte array — it is OS-agnostic and can
       # be compiled into a .dylib by Apple's cc without rebuilding the kernel.
       - name: Upload kernel.c for macOS build
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: kernel-c-arm64
           path: |
@@ -97,7 +97,7 @@ jobs:
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Mark workspace safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -113,7 +113,7 @@ jobs:
             --output artifacts/vm-runtime-linux-x86_64.tar.zst
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: vm-runtime-linux-amd64
           path: artifacts/vm-runtime-linux-x86_64.tar.zst
@@ -130,7 +130,7 @@ jobs:
     env:
       RUSTC_WRAPPER: ""
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Install dependencies
         run: |
@@ -140,7 +140,7 @@ jobs:
           brew install lld dtc xz
 
       - name: Download pre-built kernel.c
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: kernel-c-arm64
           path: target/kernel-artifact
@@ -156,7 +156,7 @@ jobs:
             --output artifacts/vm-runtime-darwin-aarch64.tar.zst
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: vm-runtime-macos-arm64
           path: artifacts/vm-runtime-darwin-aarch64.tar.zst
@@ -176,17 +176,17 @@ jobs:
       attestations: write
       artifact-metadata: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Download all runtime artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: vm-runtime-*
           path: release/
           merge-multiple: true
 
       - name: Attest VM runtime artifacts
-        uses: actions/attest@v4
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4
         with:
           subject-path: |
             release/vm-runtime-linux-aarch64.tar.zst
@@ -201,7 +201,7 @@ jobs:
           git push --force origin vm-runtime
 
       - name: Prune stale runtime assets from vm-runtime release
-        uses: actions/github-script@v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         with:
           script: |
             const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
@@ -224,7 +224,7 @@ jobs:
             }
 
       - name: Create / update vm-runtime GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
         with:
           name: OpenShell VM Runtime
           prerelease: true

@@ -2,10 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 %global crate openshell
-%global openshell_cargo_version %{version}
+%global openshell_version 0.0.37
+%global openshell_cargo_version %{openshell_version}
 # Python dist-info metadata intentionally follows the RPM Version. Dev build
 # identity is represented by Release for RPM packages.
-%global openshell_python_version %{version}
+%global openshell_python_version %{openshell_version}
 
 # Cargo/Rust builds with vendored deps do not produce debugsource listings
 # in the format redhat-rpm-config expects (especially on EPEL).
@@ -18,14 +19,14 @@
 %global image_tag dev
 
 Name:           openshell
-Version:        0.0.37
-Release:        1.20260506170246815148.rpm.dev.106.g99e94469%{?dist}
+Version:        %{openshell_version}
+Release:        1.20260518180028805757.podman.toml.gateway.listener.11.g8c0cb7c8%{?dist}
 Summary:        Safe, sandboxed runtimes for autonomous AI agents
 
 License:        Apache-2.0
 URL:            https://github.com/NVIDIA/OpenShell
-Source0: openshell-0.0.37.tar.gz
-Source1: openshell-0.0.37-vendor.tar.xz
+Source0: openshell-%{openshell_version}.tar.gz
+Source1: openshell-%{openshell_version}-vendor.tar.xz
 
 ExclusiveArch:  x86_64 aarch64
 
@@ -127,6 +128,11 @@ install -Dpm 0755 target/release/%{name} %{buildroot}%{_bindir}/%{name}
 # --- Gateway binary ---
 install -Dpm 0755 target/release/%{name}-gateway %{buildroot}%{_bindir}/%{name}-gateway
 
+# --- Default gateway TOML config template ---
+# Shipped as a read-only reference in %{_datadir}. The systemd unit seeds a
+# user-level copy at ~/.config/openshell/gateway.toml on first start.
+install -Dpm 0644 deploy/rpm/gateway.toml.default %{buildroot}%{_datadir}/%{name}-gateway/gateway.toml.default
+
 # --- Gateway systemd user unit ---
 # Installed to the systemd user unit directory so any user can run:
 #   systemctl --user enable --now openshell-gateway.service
@@ -140,11 +146,16 @@ Wants=podman.socket
 
 [Service]
 Type=exec
-# PKI is auto-generated on first start. Client certs are placed in
-# ~/.config/openshell/gateways/openshell/mtls/ so the CLI discovers them
-# automatically. Gateway runtime defaults are used unless a TOML config
-# exists in the default user config location or OPENSHELL_GATEWAY_CONFIG is set.
+# On first start the unit seeds a default TOML config and generates PKI.
+# Client certs are placed in ~/.config/openshell/gateways/openshell/mtls/ so
+# the CLI discovers them automatically.
 # See /usr/share/doc/openshell-gateway/ for details.
+
+# Seed a default TOML config on first start if the user has not created one.
+# The template ships at /usr/share/openshell-gateway/gateway.toml.default.
+# Edit ~/.config/openshell/gateway.toml to customize.
+# %%E expands to $XDG_CONFIG_HOME (~/.config) in user units.
+ExecStartPre=/bin/sh -c 'test -f %%E/openshell/gateway.toml || install -Dm644 /usr/share/openshell-gateway/gateway.toml.default %%E/openshell/gateway.toml'
 
 # Auto-generate PKI on first start if not present.
 # %%S expands to $XDG_STATE_HOME (~/.local/state) in user units.
@@ -220,6 +231,15 @@ touch %{buildroot}%{python3_sitelib}/%{name}-%{openshell_python_version}.dist-in
 # build environment.
 PYTHONPATH=%{buildroot}%{python3_sitelib} %{python3} -c "from importlib.metadata import version; v = version('openshell'); print(v); assert v == '%{openshell_python_version}', f'expected %{openshell_python_version}, got {v}'"
 
+# Verify the RPM default TOML config template was installed.
+# A missing template means first-start seeding silently falls back to the
+# binary default of 127.0.0.1, which breaks Podman sandbox connectivity.
+test -f %{buildroot}%{_datadir}/%{name}-gateway/gateway.toml.default
+
+# Verify the systemd unit references the template in its ExecStartPre seed step.
+# If this grep fails, the first-start seeding logic was removed from the unit.
+grep -q 'gateway.toml.default' %{buildroot}%{_userunitdir}/%{name}-gateway.service
+
 %post gateway
 %systemd_user_post %{name}-gateway.service
 
@@ -246,6 +266,7 @@ PYTHONPATH=%{buildroot}%{python3_sitelib} %{python3} -c "from importlib.metadata
 %doc %{_docdir}/%{name}-gateway/TROUBLESHOOTING.md
 %{_bindir}/%{name}-gateway
 %{_userunitdir}/%{name}-gateway.service
+%{_datadir}/%{name}-gateway/gateway.toml.default
 %{_mandir}/man8/openshell-gateway.8*
 
 %files -n python3-%{name}

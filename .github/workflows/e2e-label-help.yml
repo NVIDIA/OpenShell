@@ -1,6 +1,6 @@
 name: E2E Label Help
 
-# When a `test:e2e` / `test:e2e-gpu` label is applied, post a PR comment
+# When a `test:e2e*` label is applied, post a PR comment
 # telling the maintainer the next manual step. We don't dispatch the workflow
 # ourselves: a workflow_dispatch-triggered run does not surface in the PR's
 # Checks tab, so we'd lose in-progress visibility. Instead we point the
@@ -62,7 +62,7 @@ jobs:
               workflow_link="[$workflow_name](https://github.com/$GH_REPO/actions/workflows/$workflow_file)"
               instructions="Open $workflow_link, find the run for commit \`$short_pr\`, and click **Re-run all jobs** to execute with the label set."
             fi
-            body="Label \`$LABEL_NAME\` applied for \`$short_pr\`. $instructions The \`E2E Gate\` check on this PR will flip green automatically once the run finishes."
+            body="Label \`$LABEL_NAME\` applied for \`$short_pr\`. $instructions The matching required CI gate status on this PR will flip green automatically once the run finishes."
           fi
 
           gh pr comment "$PR_NUMBER" --body "$body"

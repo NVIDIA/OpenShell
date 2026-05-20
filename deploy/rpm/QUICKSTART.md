@@ -65,10 +65,11 @@ On first start, the gateway automatically generates:
 
 - A self-signed PKI bundle (CA, server cert, client cert) for mTLS
 
-> **Note:** The gateway binds to `127.0.0.1:17670` by default. Mutual
-> TLS (mTLS) is enabled automatically on first start, requiring a valid
-> client certificate for every connection. See CONFIGURATION.md for
-> details.
+> **Note:** The RPM default configuration binds to `0.0.0.0:17670` so
+> Podman sandbox containers can reach the gateway over the host network
+> bridge. Mutual TLS (mTLS) is enabled automatically on first start,
+> requiring a valid client certificate for every connection. See
+> CONFIGURATION.md for details.
 
 Verify the service is running:
 

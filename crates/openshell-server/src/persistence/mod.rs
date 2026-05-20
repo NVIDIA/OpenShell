@@ -19,6 +19,11 @@ use thiserror::Error;
 pub use postgres::PostgresStore;
 pub use sqlite::SqliteStore;
 
+/// Object type string for sandbox policy records.
+pub const POLICY_OBJECT_TYPE: &str = "sandbox_policy";
+/// Object type string for draft policy chunk records.
+pub const DRAFT_CHUNK_OBJECT_TYPE: &str = "draft_policy_chunk";
+
 pub type PersistenceResult<T> = Result<T, PersistenceError>;
 
 /// Persistence-layer error type.
@@ -227,6 +232,30 @@ impl Store {
         }
     }
 
+    /// Insert or update a generic named object with an application-owned scope.
+    pub async fn put_scoped(
+        &self,
+        object_type: &str,
+        id: &str,
+        name: &str,
+        scope: &str,
+        payload: &[u8],
+        labels: Option<&str>,
+    ) -> PersistenceResult<()> {
+        match self {
+            Self::Postgres(store) => {
+                store
+                    .put_scoped(object_type, id, name, scope, payload, labels)
+                    .await
+            }
+            Self::Sqlite(store) => {
+                store
+                    .put_scoped(object_type, id, name, scope, payload, labels)
+                    .await
+            }
+        }
+    }
+
     /// Fetch an object by id.
     pub async fn get(
         &self,
@@ -280,6 +309,20 @@ impl Store {
         }
     }
 
+    /// List objects by type and application-owned scope.
+    pub async fn list_by_scope(
+        &self,
+        object_type: &str,
+        scope: &str,
+        limit: u32,
+        offset: u32,
+    ) -> PersistenceResult<Vec<ObjectRecord>> {
+        match self {
+            Self::Postgres(store) => store.list_by_scope(object_type, scope, limit, offset).await,
+            Self::Sqlite(store) => store.list_by_scope(object_type, scope, limit, offset).await,
+        }
+    }
+
     /// List objects by type with label selector filtering.
     /// Label selector format: "key1=value1,key2=value2" (comma-separated equality matches).
     pub async fn list_with_selector(
@@ -306,6 +349,34 @@ impl Store {
     // -----------------------------------------------------------------------
     // Generic protobuf message helpers
     // -----------------------------------------------------------------------
+
+    /// Insert or update a protobuf message under an application-owned scope.
+    pub async fn put_scoped_message<
+        T: Message + ObjectType + ObjectId + ObjectName + ObjectLabels,
+    >(
+        &self,
+        message: &T,
+        scope: &str,
+    ) -> PersistenceResult<()> {
+        let labels_map = message.object_labels();
+        let labels_json = if labels_map.as_ref().is_none_or(HashMap::is_empty) {
+            None
+        } else {
+            Some(serde_json::to_string(&labels_map).map_err(|e| {
+                PersistenceError::Encode(format!("failed to serialize labels: {e}"))
+            })?)
+        };
+
+        self.put_scoped(
+            T::object_type(),
+            message.object_id(),
+            message.object_name(),
+            scope,
+            &message.encode_to_vec(),
+            labels_json.as_deref(),
+        )
+        .await
+    }
 
     /// Fetch and decode a protobuf message by id.
     pub async fn get_message<T: Message + Default + ObjectType + SetResourceVersion>(

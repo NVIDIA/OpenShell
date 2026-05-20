@@ -653,6 +653,23 @@ enum OutputFormat {
     Json,
 }
 
+#[derive(Clone, Debug, ValueEnum)]
+enum CliProviderRefreshStrategy {
+    Oauth2RefreshToken,
+    Oauth2ClientCredentials,
+    GoogleServiceAccountJwt,
+}
+
+impl CliProviderRefreshStrategy {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Oauth2RefreshToken => "oauth2_refresh_token",
+            Self::Oauth2ClientCredentials => "oauth2_client_credentials",
+            Self::GoogleServiceAccountJwt => "google_service_account_jwt",
+        }
+    }
+}
+
 impl OutputFormat {
     fn as_str(&self) -> &'static str {
         match self {
@@ -707,6 +724,10 @@ enum ProviderCommands {
         #[arg(long = "config", value_name = "KEY=VALUE")]
         config: Vec<String>,
     },
+
+    /// Manage provider credential refresh.
+    #[command(subcommand, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    Refresh(ProviderRefreshCommands),
 
     /// Fetch a provider by name.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
@@ -766,6 +787,10 @@ enum ProviderCommands {
         /// Provider config key/value pair.
         #[arg(long = "config", value_name = "KEY=VALUE")]
         config: Vec<String>,
+
+        /// Credential expiry (`KEY=TIMESTAMP`). Accepts epoch milliseconds or RFC3339. A zero timestamp clears expiry.
+        #[arg(long = "credential-expires-at", value_name = "KEY=TIMESTAMP")]
+        credential_expires_at: Vec<String>,
     },
 
     /// Delete providers by name.
@@ -774,6 +799,77 @@ enum ProviderCommands {
         /// Provider names.
         #[arg(required = true, num_args = 1.., value_name = "NAME", add = ArgValueCompleter::new(completers::complete_provider_names))]
         names: Vec<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ProviderRefreshCommands {
+    /// Show provider credential refresh status.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Status {
+        /// Provider name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_provider_names))]
+        name: String,
+
+        /// Optional credential key to filter by.
+        #[arg(long = "credential-key")]
+        credential_key: Option<String>,
+    },
+
+    /// Configure refresh metadata for a provider credential.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Configure {
+        /// Provider name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_provider_names))]
+        name: String,
+
+        /// Injectable credential key, for example `MS_GRAPH_ACCESS_TOKEN`.
+        #[arg(long = "credential-key")]
+        credential_key: String,
+
+        /// Refresh strategy.
+        #[arg(long, value_enum)]
+        strategy: CliProviderRefreshStrategy,
+
+        /// Non-injectable refresh material (`KEY=VALUE`).
+        #[arg(long = "material", value_name = "KEY=VALUE")]
+        material: Vec<String>,
+
+        /// Material keys that are secret and must not be exposed.
+        #[arg(long = "secret-material-key", value_name = "KEY")]
+        secret_material_keys: Vec<String>,
+
+        /// Expiry for the current credential. Accepts epoch milliseconds or RFC3339.
+        #[arg(
+            long = "credential-expires-at",
+            value_name = "TIMESTAMP",
+            value_parser = run::parse_credential_expiry_cli_value
+        )]
+        credential_expires_at: Option<i64>,
+    },
+
+    /// Record a gateway-owned credential rotation request.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Rotate {
+        /// Provider name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_provider_names))]
+        name: String,
+
+        /// Injectable credential key, for example `MS_GRAPH_ACCESS_TOKEN`.
+        #[arg(long = "credential-key")]
+        credential_key: String,
+    },
+
+    /// Delete refresh metadata for a provider credential.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Delete {
+        /// Provider name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_provider_names))]
+        name: String,
+
+        /// Injectable credential key, for example `MS_GRAPH_ACCESS_TOKEN`.
+        #[arg(long = "credential-key")]
+        credential_key: String,
     },
 }
 
@@ -2641,6 +2737,55 @@ async fn main() -> Result<()> {
                     )
                     .await?;
                 }
+                ProviderCommands::Refresh(command) => match command {
+                    ProviderRefreshCommands::Status {
+                        name,
+                        credential_key,
+                    } => {
+                        run::provider_refresh_status(
+                            endpoint,
+                            &name,
+                            credential_key.as_deref(),
+                            &tls,
+                        )
+                        .await?;
+                    }
+                    ProviderRefreshCommands::Configure {
+                        name,
+                        credential_key,
+                        strategy,
+                        material,
+                        secret_material_keys,
+                        credential_expires_at,
+                    } => {
+                        run::provider_refresh_config(
+                            endpoint,
+                            run::ProviderRefreshConfigInput {
+                                name: &name,
+                                credential_key: &credential_key,
+                                strategy: strategy.as_str(),
+                                material: &material,
+                                secret_material_keys: &secret_material_keys,
+                                credential_expires_at_ms: credential_expires_at,
+                            },
+                            &tls,
+                        )
+                        .await?;
+                    }
+                    ProviderRefreshCommands::Rotate {
+                        name,
+                        credential_key,
+                    } => {
+                        run::provider_rotate(endpoint, &name, &credential_key, &tls).await?;
+                    }
+                    ProviderRefreshCommands::Delete {
+                        name,
+                        credential_key,
+                    } => {
+                        run::provider_refresh_delete(endpoint, &name, &credential_key, &tls)
+                            .await?;
+                    }
+                },
                 ProviderCommands::Get { name } => {
                     run::provider_get(endpoint, &name, &tls).await?;
                 }
@@ -2685,6 +2830,7 @@ async fn main() -> Result<()> {
                     from_existing,
                     credentials,
                     config,
+                    credential_expires_at,
                 } => {
                     run::provider_update(
                         endpoint,
@@ -2692,6 +2838,7 @@ async fn main() -> Result<()> {
                         from_existing,
                         &credentials,
                         &config,
+                        &credential_expires_at,
                         &tls,
                     )
                     .await?;
@@ -3570,6 +3717,155 @@ mod tests {
             }
             other => panic!("expected provider create command, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn provider_refresh_commands_parse() {
+        let status = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "refresh",
+            "status",
+            "my-graph",
+            "--credential-key",
+            "MS_GRAPH_ACCESS_TOKEN",
+        ])
+        .expect("provider refresh status should parse");
+        assert!(matches!(
+            status.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::Refresh(ProviderRefreshCommands::Status {
+                    name,
+                    credential_key: Some(key)
+                }))
+            }) if name == "my-graph" && key == "MS_GRAPH_ACCESS_TOKEN"
+        ));
+
+        let config = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "refresh",
+            "configure",
+            "my-graph",
+            "--credential-key",
+            "MS_GRAPH_ACCESS_TOKEN",
+            "--strategy",
+            "oauth2-client-credentials",
+            "--material",
+            "tenant_id=abc",
+            "--secret-material-key",
+            "client_secret",
+            "--credential-expires-at",
+            "1767225600000",
+        ])
+        .expect("provider refresh configure should parse");
+        assert!(matches!(
+            config.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::Refresh(
+                    ProviderRefreshCommands::Configure {
+                        strategy: CliProviderRefreshStrategy::Oauth2ClientCredentials,
+                        credential_expires_at: Some(1_767_225_600_000),
+                        ..
+                    }
+                ))
+            })
+        ));
+
+        let rotate = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "refresh",
+            "rotate",
+            "my-graph",
+            "--credential-key",
+            "MS_GRAPH_ACCESS_TOKEN",
+        ])
+        .expect("provider refresh rotate should parse");
+        assert!(matches!(
+            rotate.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::Refresh(ProviderRefreshCommands::Rotate {
+                    name,
+                    credential_key
+                }))
+            }) if name == "my-graph" && credential_key == "MS_GRAPH_ACCESS_TOKEN"
+        ));
+
+        let delete = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "refresh",
+            "delete",
+            "my-graph",
+            "--credential-key",
+            "MS_GRAPH_ACCESS_TOKEN",
+        ])
+        .expect("provider refresh delete should parse");
+        assert!(matches!(
+            delete.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::Refresh(ProviderRefreshCommands::Delete {
+                    name,
+                    credential_key
+                }))
+            }) if name == "my-graph" && credential_key == "MS_GRAPH_ACCESS_TOKEN"
+        ));
+    }
+
+    #[test]
+    fn provider_update_accepts_credential_expiry() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "update",
+            "my-graph",
+            "--credential",
+            "MS_GRAPH_ACCESS_TOKEN=abc",
+            "--credential-expires-at",
+            "MS_GRAPH_ACCESS_TOKEN=1767225600000",
+        ])
+        .expect("provider update should parse credential expiry");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::Update {
+                    credential_expires_at,
+                    ..
+                })
+            }) if credential_expires_at == vec!["MS_GRAPH_ACCESS_TOKEN=1767225600000"]
+        ));
+    }
+
+    #[test]
+    fn provider_refresh_config_accepts_rfc3339_credential_expiry() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "refresh",
+            "configure",
+            "my-graph",
+            "--credential-key",
+            "MS_GRAPH_ACCESS_TOKEN",
+            "--strategy",
+            "oauth2-client-credentials",
+            "--credential-expires-at",
+            "2026-01-01T00:00:00Z",
+        ])
+        .expect("provider refresh configure should parse RFC3339 credential expiry");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Provider {
+                command: Some(ProviderCommands::Refresh(
+                    ProviderRefreshCommands::Configure {
+                        credential_expires_at: Some(1_767_225_600_000),
+                        ..
+                    }
+                ))
+            })
+        ));
     }
 
     #[test]

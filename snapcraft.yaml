@@ -77,11 +77,11 @@ parts:
       cargo build --release --locked -p openshell-server --bin openshell-gateway
       cargo build --release --locked -p openshell-sandbox --bin openshell-sandbox
 
-      install -D -m 0755 "$CRAFT_PROJECT_DIR/target/release/openshell" \
+      install -D -m 0755 "$CRAFT_PART_BUILD/target/release/openshell" \
         "$CRAFT_PART_INSTALL/bin/openshell"
-      install -D -m 0755 "$CRAFT_PROJECT_DIR/target/release/openshell-gateway" \
+      install -D -m 0755 "$CRAFT_PART_BUILD/target/release/openshell-gateway" \
         "$CRAFT_PART_INSTALL/bin/openshell-gateway"
-      install -D -m 0755 "$CRAFT_PROJECT_DIR/target/release/openshell-sandbox" \
+      install -D -m 0755 "$CRAFT_PART_BUILD/target/release/openshell-sandbox" \
         "$CRAFT_PART_INSTALL/bin/openshell-sandbox"
       install -D -m 0755 "$CRAFT_PROJECT_DIR/deploy/snap/bin/openshell-gateway-wrapper" \
         "$CRAFT_PART_INSTALL/bin/openshell-gateway-wrapper"

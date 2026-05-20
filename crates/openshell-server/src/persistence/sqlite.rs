@@ -17,8 +17,7 @@ use std::str::FromStr;
 
 static SQLITE_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/sqlite");
 
-const POLICY_OBJECT_TYPE: &str = "sandbox_policy";
-const DRAFT_CHUNK_OBJECT_TYPE: &str = "draft_policy_chunk";
+use super::{DRAFT_CHUNK_OBJECT_TYPE, POLICY_OBJECT_TYPE};
 
 #[derive(Debug, Clone)]
 pub struct SqliteStore {
@@ -247,6 +246,42 @@ WHERE "object_type" = ?1 AND "id" = ?2 AND "resource_version" = ?3
         }
     }
 
+    pub async fn put_scoped(
+        &self,
+        object_type: &str,
+        id: &str,
+        name: &str,
+        scope: &str,
+        payload: &[u8],
+        labels: Option<&str>,
+    ) -> PersistenceResult<()> {
+        let now_ms = current_time_ms();
+
+        sqlx::query(
+            r#"
+INSERT INTO "objects" ("object_type", "id", "name", "scope", "payload", "created_at_ms", "updated_at_ms", "labels", "resource_version")
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, 1)
+ON CONFLICT ("object_type", "name") WHERE "name" IS NOT NULL DO UPDATE SET
+    "scope" = excluded."scope",
+    "payload" = excluded."payload",
+    "updated_at_ms" = excluded."updated_at_ms",
+    "labels" = excluded."labels",
+    "resource_version" = "objects"."resource_version" + 1
+"#,
+        )
+        .bind(object_type)
+        .bind(id)
+        .bind(name)
+        .bind(scope)
+        .bind(payload)
+        .bind(now_ms)
+        .bind(labels.unwrap_or("{}"))
+        .execute(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        Ok(())
+    }
+
     pub async fn get(
         &self,
         object_type: &str,
@@ -335,6 +370,33 @@ LIMIT ?2 OFFSET ?3
 "#,
         )
         .bind(object_type)
+        .bind(i64::from(limit))
+        .bind(i64::from(offset))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+
+        Ok(rows.into_iter().map(row_to_object_record).collect())
+    }
+
+    pub async fn list_by_scope(
+        &self,
+        object_type: &str,
+        scope: &str,
+        limit: u32,
+        offset: u32,
+    ) -> PersistenceResult<Vec<ObjectRecord>> {
+        let rows = sqlx::query(
+            r#"
+SELECT "object_type", "id", "name", "payload", "created_at_ms", "updated_at_ms", "labels"
+FROM "objects"
+WHERE "object_type" = ?1 AND "scope" = ?2
+ORDER BY "created_at_ms" ASC, "name" ASC
+LIMIT ?3 OFFSET ?4
+"#,
+        )
+        .bind(object_type)
+        .bind(scope)
         .bind(i64::from(limit))
         .bind(i64::from(offset))
         .fetch_all(&self.pool)

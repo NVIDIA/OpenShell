@@ -146,6 +146,36 @@ applies to every PR — use judgment.
 - **Supply chain:** Do new dependencies introduce known vulnerabilities or
   unmaintained transitive dependencies?
 
+### Linux Security Module (LSM) compatibility
+
+OpenShell runs on hosts with SELinux or AppArmor in enforcing mode.
+Review changes that interact with the `/proc` filesystem, process
+identity, binary execution, or inter-process visibility for
+LSM-related issues:
+
+- **`/proc/<pid>/exe` across domain boundaries:** On SELinux-enforcing
+  hosts, readlink on `/proc/<pid>/exe` returns ENOENT (not EACCES) when
+  the target process has a different SELinux label than the caller.
+  This affects any code that resolves binary identity after fork+exec
+  into a differently-labeled binary (e.g., system binaries under
+  `bin_t` vs. build artifacts under `user_home_t`).
+
+- **Tests that fork+exec into system binaries:** Tests that fork a child
+  and exec into `/bin/sleep`, `/usr/bin/cat`, or similar will fail on
+  SELinux-enforcing hosts because the child transitions to a different
+  domain, making its `/proc` entries unreadable to the parent. Flag
+  these tests and recommend either using a same-label helper binary or
+  skipping on enforcing hosts with a TODO.
+
+- **File labeling and Landlock interaction:** New files created in
+  non-standard paths may inherit unexpected SELinux labels. Verify that
+  Landlock and SELinux policies do not conflict.
+
+- **Socket and IPC visibility:** SELinux can restrict `/proc/<pid>/fd`
+  and `/proc/<pid>/net` visibility across domain boundaries. Code that
+  scans these paths for socket ownership should handle access failures
+  gracefully.
+
 ## Principles
 
 - Don't nitpick style unless it harms readability. Trust `rustfmt` and the
