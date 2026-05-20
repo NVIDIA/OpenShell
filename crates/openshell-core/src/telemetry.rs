@@ -15,11 +15,11 @@ const TELEMETRY_EVENT_QUEUE_CAPACITY: usize = 1024;
 const MAX_TELEMETRY_INTEGER: u64 = 9_223_372_036_854_775_807;
 const CLIENT_ID: &str = "415437562476676";
 const DEFAULT_ENDPOINT: &str = "https://events.telemetry.data-uat.nvidia.com/v1.1/events/json";
-const EVENT_SCHEMA_VERSION: &str = "3.0";
+const EVENT_SCHEMA_VERSION: &str = "4.0";
 const EVENT_PROTOCOL_VERSION: &str = "1.6";
 const EVENT_SYSTEM_VERSION: &str = "openshell-telemetry/1.0";
 const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
-const SOURCE: &str = "openshell";
+const SOURCE: TelemetrySource = TelemetrySource::OpenShell;
 static TELEMETRY_SENDER: OnceLock<Option<mpsc::SyncSender<TelemetryEvent>>> = OnceLock::new();
 
 #[derive(Debug)]
@@ -28,6 +28,253 @@ struct TelemetryEvent {
     name: &'static str,
     event_ts: String,
     event: Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TelemetrySource {
+    OpenShell,
+}
+
+impl TelemetrySource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenShell => "openshell",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelemetryOutcome {
+    Success,
+    Failure,
+}
+
+impl TelemetryOutcome {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failure => "failure",
+        }
+    }
+
+    #[must_use]
+    pub const fn from_success(success: bool) -> Self {
+        if success {
+            Self::Success
+        } else {
+            Self::Failure
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleResource {
+    Sandbox,
+    SandboxPolicy,
+}
+
+impl LifecycleResource {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sandbox => "sandbox",
+            Self::SandboxPolicy => "sandbox_policy",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleOperation {
+    Create,
+    Delete,
+    Update,
+}
+
+impl LifecycleOperation {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Delete => "delete",
+            Self::Update => "update",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyDecisionOperation {
+    Approve,
+    Reject,
+    Undo,
+    ApproveAll,
+}
+
+impl PolicyDecisionOperation {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Approve => "approve",
+            Self::Reject => "reject",
+            Self::Undo => "undo",
+            Self::ApproveAll => "approve_all",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxTemplateSource {
+    Default,
+    Image,
+    Undefined,
+}
+
+impl SandboxTemplateSource {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Image => "image",
+            Self::Undefined => "undefined",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TelemetryComputeDriver {
+    Docker,
+    Kubernetes,
+    Podman,
+    Vm,
+    Unknown,
+}
+
+impl TelemetryComputeDriver {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Docker => "docker",
+            Self::Kubernetes => "kubernetes",
+            Self::Podman => "podman",
+            Self::Vm => "vm",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    #[must_use]
+    pub fn from_raw(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "docker" => Self::Docker,
+            "k8s" | "kubernetes" => Self::Kubernetes,
+            "podman" => Self::Podman,
+            "vm" => Self::Vm,
+            _ => Self::Unknown,
+        }
+    }
+
+    #[must_use]
+    pub const fn from_driver_kind(driver_kind: Option<crate::ComputeDriverKind>) -> Self {
+        match driver_kind {
+            Some(crate::ComputeDriverKind::Docker) => Self::Docker,
+            Some(crate::ComputeDriverKind::Kubernetes) => Self::Kubernetes,
+            Some(crate::ComputeDriverKind::Podman) => Self::Podman,
+            Some(crate::ComputeDriverKind::Vm) => Self::Vm,
+            None => Self::Unknown,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderProfile {
+    Anthropic,
+    Claude,
+    Codex,
+    Copilot,
+    Github,
+    Gitlab,
+    Nvidia,
+    Openai,
+    Opencode,
+    Outlook,
+    Custom,
+}
+
+impl ProviderProfile {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Copilot => "copilot",
+            Self::Github => "github",
+            Self::Gitlab => "gitlab",
+            Self::Nvidia => "nvidia",
+            Self::Openai => "openai",
+            Self::Opencode => "opencode",
+            Self::Outlook => "outlook",
+            Self::Custom => "custom",
+        }
+    }
+
+    #[must_use]
+    pub fn from_raw(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "anthropic" => Self::Anthropic,
+            "claude" | "claude-code" => Self::Claude,
+            "codex" => Self::Codex,
+            "copilot" => Self::Copilot,
+            "github" | "gh" => Self::Github,
+            "gitlab" | "glab" => Self::Gitlab,
+            "nvidia" => Self::Nvidia,
+            "openai" => Self::Openai,
+            "opencode" => Self::Opencode,
+            "outlook" => Self::Outlook,
+            _ => Self::Custom,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DenyGroup {
+    Bypass,
+    ConnectPolicy,
+    ForwardPolicy,
+    L7ParseRejection,
+    L7Policy,
+    PolicyStale,
+    Ssrf,
+    Unknown,
+}
+
+impl DenyGroup {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bypass => "bypass",
+            Self::ConnectPolicy => "connect_policy",
+            Self::ForwardPolicy => "forward_policy",
+            Self::L7ParseRejection => "l7_parse_rejection",
+            Self::L7Policy => "l7_policy",
+            Self::PolicyStale => "policy_stale",
+            Self::Ssrf => "ssrf",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    #[must_use]
+    pub fn from_raw(raw: &str) -> Self {
+        match raw {
+            "connect_policy" | "connect" | "l4_deny" => Self::ConnectPolicy,
+            "forward_policy" | "forward" => Self::ForwardPolicy,
+            "l7_policy" | "l7" | "l7_deny" | "forward-l7-deny" => Self::L7Policy,
+            "l7_parse_rejection" | "parse_rejection" => Self::L7ParseRejection,
+            "ssrf" => Self::Ssrf,
+            "bypass" => Self::Bypass,
+            "policy_stale" => Self::PolicyStale,
+            _ => Self::Unknown,
+        }
+    }
 }
 
 pub fn enabled() -> bool {
@@ -180,105 +427,89 @@ fn emit_event(name: &'static str, event: Value) {
     );
 }
 
-pub fn emit_lifecycle(resource: &str, operation: &str, outcome: &str) {
-    let Some(resource) = lifecycle_resource(resource) else {
-        return;
-    };
-    let Some(operation) = lifecycle_operation(operation) else {
-        return;
-    };
-    let Some(outcome) = telemetry_outcome(outcome) else {
-        return;
-    };
+pub fn emit_lifecycle(
+    resource: LifecycleResource,
+    operation: LifecycleOperation,
+    outcome: TelemetryOutcome,
+) {
     emit_event(
         "openshell_lifecycle_event",
         json!({
-            "nvidiaSource": SOURCE,
-            "resource": resource,
-            "operation": operation,
-            "outcome": outcome,
+            "nvidiaSource": SOURCE.as_str(),
+            "resource": resource.as_str(),
+            "operation": operation.as_str(),
+            "outcome": outcome.as_str(),
         }),
     );
 }
 
-pub fn emit_provider_lifecycle(operation: &str, outcome: &str, provider_profile: &str) {
-    let Some(operation) = lifecycle_operation(operation) else {
-        return;
-    };
-    let Some(outcome) = telemetry_outcome(outcome) else {
-        return;
-    };
-    let provider_profile = provider_profile_bucket(provider_profile);
+pub fn emit_provider_lifecycle(
+    operation: LifecycleOperation,
+    outcome: TelemetryOutcome,
+    provider_profile: ProviderProfile,
+) {
     emit_event(
         "openshell_provider_lifecycle_event",
         json!({
-            "nvidiaSource": SOURCE,
-            "operation": operation,
-            "outcome": outcome,
-            "providerProfile": provider_profile,
+            "nvidiaSource": SOURCE.as_str(),
+            "operation": operation.as_str(),
+            "outcome": outcome.as_str(),
+            "providerProfile": provider_profile.as_str(),
         }),
     );
 }
 
 pub fn emit_sandbox_create(
-    outcome: &str,
+    outcome: TelemetryOutcome,
     requested_gpu: bool,
     provider_count: u64,
     has_custom_policy: bool,
-    template_source: &str,
-    compute_driver: &str,
+    template_source: SandboxTemplateSource,
+    compute_driver: TelemetryComputeDriver,
 ) {
-    let Some(outcome) = telemetry_outcome(outcome) else {
-        return;
-    };
     if !valid_count(provider_count) {
         return;
     }
-    let template_source = sandbox_template_source_bucket(template_source);
-    let compute_driver = compute_driver_bucket(compute_driver);
     emit_event(
         "openshell_sandbox_create_event",
         json!({
-            "nvidiaSource": SOURCE,
-            "outcome": outcome,
+            "nvidiaSource": SOURCE.as_str(),
+            "outcome": outcome.as_str(),
             "requestedGpu": requested_gpu,
             "providerCount": provider_count,
             "hasCustomPolicy": has_custom_policy,
-            "templateSource": template_source,
-            "computeDriver": compute_driver,
+            "templateSource": template_source.as_str(),
+            "computeDriver": compute_driver.as_str(),
         }),
     );
 }
 
-pub fn emit_policy_decision(operation: &str, outcome: &str, rule_count: u64) {
-    let Some(operation) = policy_decision_operation(operation) else {
-        return;
-    };
-    let Some(outcome) = telemetry_outcome(outcome) else {
-        return;
-    };
+pub fn emit_policy_decision(
+    operation: PolicyDecisionOperation,
+    outcome: TelemetryOutcome,
+    rule_count: u64,
+) {
     if !valid_count(rule_count) {
         return;
     }
     emit_event(
         "openshell_policy_decision_event",
         json!({
-            "nvidiaSource": SOURCE,
-            "operation": operation,
-            "outcome": outcome,
+            "nvidiaSource": SOURCE.as_str(),
+            "operation": operation.as_str(),
+            "outcome": outcome.as_str(),
             "ruleCount": rule_count,
         }),
     );
 }
 
-pub fn emit_sandbox_activity_summary<I, S>(
+pub fn emit_sandbox_activity_summary<I>(
     network_activity_count: u64,
     denied_action_count: u64,
     denial_rate_pct: f64,
     denials_by_group: I,
 ) where
-    I: IntoIterator<Item = (S, u64)>,
-    S: Into<String>,
+    I: IntoIterator<Item = (DenyGroup, u64)>,
 {
     if !valid_count(network_activity_count)
         || !valid_count(denied_action_count)
@@ -292,12 +523,12 @@ pub fn emit_sandbox_activity_summary<I, S>(
     };
     let rows: Vec<Value> = denials_by_group
         .into_iter()
-        .map(|(group, count)| json!({ "denyGroup": group, "deniedCount": count }))
+        .map(|(group, count)| json!({ "denyGroup": group.as_str(), "deniedCount": count }))
         .collect();
     emit_event(
         "openshell_sandbox_activity_summary_event",
         json!({
-            "nvidiaSource": SOURCE,
+            "nvidiaSource": SOURCE.as_str(),
             "networkActivityCount": network_activity_count,
             "deniedActionCount": denied_action_count,
             "denialRatePct": denial_rate_pct,
@@ -310,109 +541,24 @@ fn valid_count(value: u64) -> bool {
     value <= MAX_TELEMETRY_INTEGER
 }
 
-fn telemetry_outcome(raw: &str) -> Option<&'static str> {
-    match raw {
-        "success" => Some("success"),
-        "failure" => Some("failure"),
-        _ => None,
-    }
-}
-
-fn lifecycle_resource(raw: &str) -> Option<&'static str> {
-    match raw {
-        "sandbox" => Some("sandbox"),
-        "sandbox_policy" => Some("sandbox_policy"),
-        _ => None,
-    }
-}
-
-fn lifecycle_operation(raw: &str) -> Option<&'static str> {
-    match raw {
-        "create" => Some("create"),
-        "delete" => Some("delete"),
-        "update" => Some("update"),
-        _ => None,
-    }
-}
-
-fn policy_decision_operation(raw: &str) -> Option<&'static str> {
-    match raw {
-        "approve" => Some("approve"),
-        "reject" => Some("reject"),
-        "undo" => Some("undo"),
-        "approve_all" => Some("approve_all"),
-        _ => None,
-    }
-}
-
-fn sandbox_template_source_bucket(raw: &str) -> &'static str {
-    match raw {
-        "default" => "default",
-        "image" => "image",
-        _ => "undefined",
-    }
-}
-
-fn compute_driver_bucket(raw: &str) -> &'static str {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "docker" => "docker",
-        "k8s" | "kubernetes" => "kubernetes",
-        "podman" => "podman",
-        "vm" => "vm",
-        _ => "unknown",
-    }
-}
-
-fn provider_profile_bucket(raw: &str) -> &'static str {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "anthropic" => "anthropic",
-        "claude" => "claude",
-        "codex" => "codex",
-        "copilot" => "copilot",
-        "github" => "github",
-        "gitlab" => "gitlab",
-        "nvidia" => "nvidia",
-        "openai" => "openai",
-        "opencode" => "opencode",
-        "outlook" => "outlook",
-        _ => "custom",
-    }
-}
-
-fn deny_group_bucket(raw: &str) -> &'static str {
-    match raw {
-        "connect_policy" | "connect" | "l4_deny" => "connect_policy",
-        "forward_policy" | "forward" => "forward_policy",
-        "l7_policy" | "l7" | "l7_deny" | "forward-l7-deny" => "l7_policy",
-        "l7_parse_rejection" | "parse_rejection" => "l7_parse_rejection",
-        "ssrf" => "ssrf",
-        "bypass" => "bypass",
-        "policy_stale" => "policy_stale",
-        _ => "unknown",
-    }
-}
-
-fn sanitize_denials_by_group<I, S>(denials_by_group: I) -> Option<BTreeMap<&'static str, u64>>
+fn sanitize_denials_by_group<I>(denials_by_group: I) -> Option<BTreeMap<DenyGroup, u64>>
 where
-    I: IntoIterator<Item = (S, u64)>,
-    S: Into<String>,
+    I: IntoIterator<Item = (DenyGroup, u64)>,
 {
-    let mut sanitized = BTreeMap::<&'static str, u64>::new();
+    let mut sanitized = BTreeMap::<DenyGroup, u64>::new();
     for (group, count) in denials_by_group {
         if !valid_count(count) {
             return None;
         }
-        let group = group.into();
-        let bucket = deny_group_bucket(&group);
         let next_count = sanitized
-            .get(bucket)
+            .get(&group)
             .copied()
             .unwrap_or(0)
             .checked_add(count)?;
         if !valid_count(next_count) {
             return None;
         }
-        sanitized.insert(bucket, next_count);
+        sanitized.insert(group, next_count);
     }
     Some(sanitized)
 }
@@ -455,7 +601,7 @@ mod tests {
         let payload = build_payload(
             "openshell_sandbox_create_event",
             json!({
-                "nvidiaSource": SOURCE,
+                "nvidiaSource": SOURCE.as_str(),
                 "outcome": "success",
                 "requestedGpu": false,
                 "providerCount": 1,
@@ -476,19 +622,37 @@ mod tests {
             payload["events"][0]["name"],
             "openshell_sandbox_create_event"
         );
-        assert_eq!(payload["events"][0]["parameters"]["nvidiaSource"], SOURCE);
+        assert_eq!(
+            payload["events"][0]["parameters"]["nvidiaSource"],
+            SOURCE.as_str()
+        );
         assert_eq!(payload["events"][0]["ts"], "2026-05-18T00:00:00.000Z");
         assert_eq!(payload["sentTs"], "2026-05-18T00:00:01.000Z");
     }
 
     #[test]
     fn compute_driver_values_are_sanitized() {
-        assert_eq!(compute_driver_bucket("docker"), "docker");
-        assert_eq!(compute_driver_bucket("k8s"), "kubernetes");
-        assert_eq!(compute_driver_bucket("KUBERNETES"), "kubernetes");
-        assert_eq!(compute_driver_bucket("vm"), "vm");
-        assert_eq!(compute_driver_bucket("podman"), "podman");
-        assert_eq!(compute_driver_bucket("private-driver"), "unknown");
+        assert_eq!(
+            TelemetryComputeDriver::from_raw("docker").as_str(),
+            "docker"
+        );
+        assert_eq!(
+            TelemetryComputeDriver::from_raw("k8s").as_str(),
+            "kubernetes"
+        );
+        assert_eq!(
+            TelemetryComputeDriver::from_raw("KUBERNETES").as_str(),
+            "kubernetes"
+        );
+        assert_eq!(TelemetryComputeDriver::from_raw("vm").as_str(), "vm");
+        assert_eq!(
+            TelemetryComputeDriver::from_raw("podman").as_str(),
+            "podman"
+        );
+        assert_eq!(
+            TelemetryComputeDriver::from_raw("private-driver").as_str(),
+            "unknown"
+        );
     }
 
     #[test]
@@ -499,7 +663,7 @@ mod tests {
             name: "openshell_lifecycle_event",
             event_ts: "2026-05-18T00:00:00.000Z".to_string(),
             event: json!({
-                "nvidiaSource": SOURCE,
+                "nvidiaSource": SOURCE.as_str(),
                 "resource": "sandbox",
                 "operation": "create",
                 "outcome": "success",
@@ -512,33 +676,36 @@ mod tests {
 
     #[test]
     fn telemetry_validation_maps_privacy_sensitive_strings_to_safe_buckets() {
-        assert_eq!(provider_profile_bucket("corp-llm-prod"), "custom");
         assert_eq!(
-            sandbox_template_source_bucket("ghcr.io/acme/private:latest"),
-            "undefined"
+            ProviderProfile::from_raw("corp-llm-prod"),
+            ProviderProfile::Custom
         );
-        assert_eq!(deny_group_bucket("host=private.example"), "unknown");
+        assert_eq!(
+            DenyGroup::from_raw("host=private.example"),
+            DenyGroup::Unknown
+        );
     }
 
     #[test]
-    fn telemetry_validation_rejects_schema_invalid_values() {
-        assert_eq!(lifecycle_resource("gateway"), None);
-        assert_eq!(lifecycle_operation("restart"), None);
-        assert_eq!(policy_decision_operation("merge_internal_rule"), None);
-        assert_eq!(telemetry_outcome("partial"), None);
+    fn telemetry_enums_serialize_to_expected_strings() {
+        assert_eq!(LifecycleResource::SandboxPolicy.as_str(), "sandbox_policy");
+        assert_eq!(LifecycleOperation::Delete.as_str(), "delete");
+        assert_eq!(PolicyDecisionOperation::ApproveAll.as_str(), "approve_all");
+        assert_eq!(TelemetryOutcome::Failure.as_str(), "failure");
+        assert_eq!(SandboxTemplateSource::Undefined.as_str(), "undefined");
         assert!(!valid_count(MAX_TELEMETRY_INTEGER + 1));
     }
 
     #[test]
     fn activity_groups_are_sanitized_and_aggregated() {
         let rows = sanitize_denials_by_group([
-            ("connect".to_string(), 1),
-            ("connect_policy".to_string(), 2),
-            ("host=private.example".to_string(), 3),
+            (DenyGroup::from_raw("connect"), 1),
+            (DenyGroup::from_raw("connect_policy"), 2),
+            (DenyGroup::from_raw("host=private.example"), 3),
         ])
         .expect("rows should sanitize");
 
-        assert_eq!(rows.get("connect_policy"), Some(&3));
-        assert_eq!(rows.get("unknown"), Some(&3));
+        assert_eq!(rows.get(&DenyGroup::ConnectPolicy), Some(&3));
+        assert_eq!(rows.get(&DenyGroup::Unknown), Some(&3));
     }
 }

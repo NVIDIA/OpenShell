@@ -23,6 +23,10 @@ use openshell_core::proto::{
     TcpRelayTarget, WatchSandboxRequest, relay_open, tcp_forward_init,
 };
 use openshell_core::proto::{Sandbox, SandboxPhase, SandboxTemplate, SshSession};
+use openshell_core::telemetry::{
+    LifecycleOperation, LifecycleResource, SandboxTemplateSource, TelemetryComputeDriver,
+    TelemetryOutcome,
+};
 use openshell_core::{ObjectId, ObjectName};
 use prost::Message;
 use std::net::IpAddr;
@@ -62,7 +66,7 @@ pub(super) async fn handle_create_sandbox(
     emit_sandbox_create_telemetry(
         state,
         &create_request,
-        if result.is_ok() { "success" } else { "failure" },
+        TelemetryOutcome::from_success(result.is_ok()),
     );
     result
 }
@@ -70,7 +74,7 @@ pub(super) async fn handle_create_sandbox(
 fn emit_sandbox_create_telemetry(
     state: &Arc<ServerState>,
     request: &CreateSandboxRequest,
-    outcome: &str,
+    outcome: TelemetryOutcome,
 ) {
     let compute_driver = telemetry_compute_driver(state.compute.driver_kind());
     let Some(spec) = request.spec.as_ref() else {
@@ -79,7 +83,7 @@ fn emit_sandbox_create_telemetry(
             false,
             0,
             false,
-            "undefined",
+            SandboxTemplateSource::Undefined,
             compute_driver,
         );
         return;
@@ -89,9 +93,9 @@ fn emit_sandbox_create_telemetry(
         .as_ref()
         .is_some_and(|template| !template.image.trim().is_empty())
     {
-        "image"
+        SandboxTemplateSource::Image
     } else {
-        "default"
+        SandboxTemplateSource::Default
     };
     openshell_core::telemetry::emit_sandbox_create(
         outcome,
@@ -105,8 +109,8 @@ fn emit_sandbox_create_telemetry(
 
 fn telemetry_compute_driver(
     driver_kind: Option<openshell_core::ComputeDriverKind>,
-) -> &'static str {
-    driver_kind.map_or("unknown", openshell_core::ComputeDriverKind::as_str)
+) -> TelemetryComputeDriver {
+    TelemetryComputeDriver::from_driver_kind(driver_kind)
 }
 
 async fn handle_create_sandbox_inner(
@@ -470,10 +474,14 @@ pub(super) async fn handle_delete_sandbox(
 ) -> Result<Response<DeleteSandboxResponse>, Status> {
     let result = handle_delete_sandbox_inner(state, request).await;
     let outcome = match &result {
-        Ok(response) if response.get_ref().deleted => "success",
-        _ => "failure",
+        Ok(response) if response.get_ref().deleted => TelemetryOutcome::Success,
+        _ => TelemetryOutcome::Failure,
     };
-    openshell_core::telemetry::emit_lifecycle("sandbox", "delete", outcome);
+    openshell_core::telemetry::emit_lifecycle(
+        LifecycleResource::Sandbox,
+        LifecycleOperation::Delete,
+        outcome,
+    );
     result
 }
 
@@ -1940,21 +1948,24 @@ mod tests {
     fn telemetry_compute_driver_uses_resolved_driver_kind() {
         assert_eq!(
             telemetry_compute_driver(Some(openshell_core::ComputeDriverKind::Docker)),
-            "docker"
+            TelemetryComputeDriver::Docker
         );
         assert_eq!(
             telemetry_compute_driver(Some(openshell_core::ComputeDriverKind::Kubernetes)),
-            "kubernetes"
+            TelemetryComputeDriver::Kubernetes
         );
         assert_eq!(
             telemetry_compute_driver(Some(openshell_core::ComputeDriverKind::Podman)),
-            "podman"
+            TelemetryComputeDriver::Podman
         );
         assert_eq!(
             telemetry_compute_driver(Some(openshell_core::ComputeDriverKind::Vm)),
-            "vm"
+            TelemetryComputeDriver::Vm
         );
-        assert_eq!(telemetry_compute_driver(None), "unknown");
+        assert_eq!(
+            telemetry_compute_driver(None),
+            TelemetryComputeDriver::Unknown
+        );
     }
 
     #[test]

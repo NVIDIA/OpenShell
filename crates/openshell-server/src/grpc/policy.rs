@@ -37,6 +37,9 @@ use openshell_core::proto::{
     L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, Provider, Sandbox,
     SandboxPolicy as ProtoSandboxPolicy,
 };
+use openshell_core::telemetry::{
+    LifecycleOperation, LifecycleResource, PolicyDecisionOperation, TelemetryOutcome,
+};
 use openshell_core::{
     VERSION,
     settings::{self, SettingValueKind},
@@ -88,11 +91,19 @@ const GLOBAL_POLICY_SANDBOX_ID: &str = "__global__";
 const MERGE_RETRY_LIMIT: usize = 5;
 
 fn emit_sandbox_policy_update_success() {
-    openshell_core::telemetry::emit_lifecycle("sandbox_policy", "update", "success");
+    openshell_core::telemetry::emit_lifecycle(
+        LifecycleResource::SandboxPolicy,
+        LifecycleOperation::Update,
+        TelemetryOutcome::Success,
+    );
 }
 
 fn emit_sandbox_policy_update_failure() {
-    openshell_core::telemetry::emit_lifecycle("sandbox_policy", "update", "failure");
+    openshell_core::telemetry::emit_lifecycle(
+        LifecycleResource::SandboxPolicy,
+        LifecycleOperation::Update,
+        TelemetryOutcome::Failure,
+    );
 }
 
 fn should_emit_config_update_policy_telemetry(sandbox_caller: bool) -> bool {
@@ -115,12 +126,20 @@ fn emit_full_policy_update_success(sandbox_caller: bool, next_version: i64) {
     }
 }
 
-fn emit_policy_decision_success(operation: &str, rule_count: u64) {
-    openshell_core::telemetry::emit_policy_decision(operation, "success", rule_count);
+fn emit_policy_decision_success(operation: PolicyDecisionOperation, rule_count: u64) {
+    openshell_core::telemetry::emit_policy_decision(
+        operation,
+        TelemetryOutcome::Success,
+        rule_count,
+    );
 }
 
-fn emit_policy_decision_failure(operation: &str, rule_count: u64) {
-    openshell_core::telemetry::emit_policy_decision(operation, "failure", rule_count);
+fn emit_policy_decision_failure(operation: PolicyDecisionOperation, rule_count: u64) {
+    openshell_core::telemetry::emit_policy_decision(
+        operation,
+        TelemetryOutcome::Failure,
+        rule_count,
+    );
 }
 
 fn emit_gateway_policy_audit_log(
@@ -2453,7 +2472,7 @@ pub(super) async fn handle_approve_draft_chunk(
 ) -> Result<Response<ApproveDraftChunkResponse>, Status> {
     let result = handle_approve_draft_chunk_inner(state, request).await;
     if result.is_err() {
-        emit_policy_decision_failure("approve", 1);
+        emit_policy_decision_failure(PolicyDecisionOperation::Approve, 1);
     }
     result
 }
@@ -2539,7 +2558,7 @@ async fn handle_approve_draft_chunk_inner(
         "ApproveDraftChunk: rule merged successfully"
     );
     emit_sandbox_policy_update_success();
-    emit_policy_decision_success("approve", 1);
+    emit_policy_decision_success(PolicyDecisionOperation::Approve, 1);
 
     Ok(Response::new(ApproveDraftChunkResponse {
         policy_version: u32::try_from(version).unwrap_or(0),
@@ -2553,7 +2572,7 @@ pub(super) async fn handle_reject_draft_chunk(
 ) -> Result<Response<RejectDraftChunkResponse>, Status> {
     let result = handle_reject_draft_chunk_inner(state, request).await;
     if result.is_err() {
-        emit_policy_decision_failure("reject", 1);
+        emit_policy_decision_failure(PolicyDecisionOperation::Reject, 1);
     }
     result
 }
@@ -2639,7 +2658,7 @@ async fn handle_reject_draft_chunk_inner(
         .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
 
     state.sandbox_watch_bus.notify(&sandbox_id);
-    emit_policy_decision_success("reject", 1);
+    emit_policy_decision_success(PolicyDecisionOperation::Reject, 1);
 
     Ok(Response::new(RejectDraftChunkResponse {}))
 }
@@ -2650,7 +2669,7 @@ pub(super) async fn handle_approve_all_draft_chunks(
 ) -> Result<Response<ApproveAllDraftChunksResponse>, Status> {
     let result = handle_approve_all_draft_chunks_inner(state, request).await;
     if result.is_err() {
-        emit_policy_decision_failure("approve_all", 0);
+        emit_policy_decision_failure(PolicyDecisionOperation::ApproveAll, 0);
     }
     result
 }
@@ -2763,7 +2782,10 @@ async fn handle_approve_all_draft_chunks_inner(
         policy_hash = %last_hash,
         "ApproveAllDraftChunks: bulk approval complete"
     );
-    emit_policy_decision_success("approve_all", u64::from(chunks_approved));
+    emit_policy_decision_success(
+        PolicyDecisionOperation::ApproveAll,
+        u64::from(chunks_approved),
+    );
 
     Ok(Response::new(ApproveAllDraftChunksResponse {
         policy_version: u32::try_from(last_version).unwrap_or(0),
@@ -2832,7 +2854,7 @@ pub(super) async fn handle_undo_draft_chunk(
 ) -> Result<Response<UndoDraftChunkResponse>, Status> {
     let result = handle_undo_draft_chunk_inner(state, request).await;
     if result.is_err() {
-        emit_policy_decision_failure("undo", 1);
+        emit_policy_decision_failure(PolicyDecisionOperation::Undo, 1);
     }
     result
 }
@@ -2914,7 +2936,7 @@ async fn handle_undo_draft_chunk_inner(
         "UndoDraftChunk: rule removed, chunk reverted to pending"
     );
     emit_sandbox_policy_update_success();
-    emit_policy_decision_success("undo", 1);
+    emit_policy_decision_success(PolicyDecisionOperation::Undo, 1);
 
     Ok(Response::new(UndoDraftChunkResponse {
         policy_version: u32::try_from(version).unwrap_or(0),
