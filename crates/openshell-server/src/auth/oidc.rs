@@ -51,6 +51,8 @@ const SANDBOX_METHODS: &[&str] = &[
     "/openshell.v1.OpenShell/SubmitPolicyAnalysis",
     "/openshell.sandbox.v1.SandboxService/GetSandboxConfig",
     "/openshell.inference.v1.Inference/GetInferenceBundle",
+    "/openshell.v1.OpenShell/ConnectSupervisor",
+    "/openshell.v1.OpenShell/RelayStream",
 ];
 
 /// Methods that accept either an OIDC Bearer token (CLI users, full scope)
@@ -469,6 +471,10 @@ mod tests {
         assert!(is_sandbox_method(
             "/openshell.inference.v1.Inference/GetInferenceBundle"
         ));
+        assert!(is_sandbox_method(
+            "/openshell.v1.OpenShell/ConnectSupervisor"
+        ));
+        assert!(is_sandbox_method("/openshell.v1.OpenShell/RelayStream"));
     }
 
     #[test]
