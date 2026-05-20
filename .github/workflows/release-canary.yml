@@ -84,7 +84,7 @@ jobs:
       KIND_GATEWAY_NAME: kind
     steps:
       - name: Install Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@v5
 
       - name: Create kind cluster
         uses: helm/kind-action@v1
