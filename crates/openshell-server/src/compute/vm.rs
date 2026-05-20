@@ -153,7 +153,7 @@ impl Default for VmComputeConfig {
         Self {
             state_dir: Self::default_state_dir(),
             driver_dir: None,
-            default_image: default_sandbox_image(),
+            default_image: openshell_core::image::default_sandbox_image(),
             grpc_endpoint: String::new(),
             bootstrap_image: String::new(),
             krun_log_level: Self::default_krun_log_level(),
@@ -165,13 +165,6 @@ impl Default for VmComputeConfig {
             guest_tls_key: None,
         }
     }
-}
-
-fn default_sandbox_image() -> String {
-    format!(
-        "{}/base:latest",
-        openshell_core::image::DEFAULT_COMMUNITY_REGISTRY
-    )
 }
 
 #[cfg(unix)]

@@ -5,6 +5,13 @@
 
 use crate::proto::compute::v1::DriverSandbox;
 
+/// Path to the sandbox supervisor binary inside the container image.
+///
+/// All compute drivers must launch this binary as the container entrypoint to
+/// start the sandboxed environment.  The value must be kept in sync with the
+/// path used when building the `openshell-sandbox` image layer.
+pub const SUPERVISOR_IMAGE_BINARY_PATH: &str = "/openshell-sandbox";
+
 /// Return the effective log level for a sandbox.
 ///
 /// Uses the level from the sandbox spec when non-empty, falling back to

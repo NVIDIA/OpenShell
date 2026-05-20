@@ -13,6 +13,7 @@ use kube::core::gvk::GroupVersionKind;
 use kube::core::{DynamicObject, ObjectMeta};
 use kube::runtime::watcher::{self, Event};
 use kube::{Client, Error as KubeError};
+use openshell_core::driver_utils::SUPERVISOR_IMAGE_BINARY_PATH;
 use openshell_core::progress::{
     PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX, PROGRESS_STEP_STARTING_SANDBOX,
     mark_progress_active, mark_progress_complete, mark_progress_detail,
@@ -766,13 +767,6 @@ fn supervisor_volume_mount() -> serde_json::Value {
         "readOnly": true
     })
 }
-
-/// Path of the supervisor binary inside the supervisor image.
-///
-/// The supervisor image places the binary at the filesystem root. We invoke
-/// it directly so the init path does not depend on shell utilities or PATH
-/// resolution inside the image.
-const SUPERVISOR_IMAGE_BINARY_PATH: &str = "/openshell-sandbox";
 
 /// Build an image volume that mounts the supervisor OCI image directly.
 ///

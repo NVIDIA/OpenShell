@@ -19,6 +19,7 @@ use bollard::query_parameters::{
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use openshell_core::config::{DEFAULT_DOCKER_NETWORK_NAME, DEFAULT_STOP_TIMEOUT_SECS};
+use openshell_core::driver_utils::SUPERVISOR_IMAGE_BINARY_PATH;
 use openshell_core::gpu::cdi_gpu_device_ids;
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
@@ -67,10 +68,6 @@ const DOCKER_NETWORK_DRIVER: &str = "bridge";
 /// pulls this image and extracts the binary to a host-side cache when no
 /// explicit `supervisor_bin` override or local build is available.
 const DEFAULT_DOCKER_SUPERVISOR_IMAGE_REPO: &str = "ghcr.io/nvidia/openshell/supervisor";
-
-/// Path to the supervisor binary inside the `openshell/supervisor` image
-/// (a `FROM scratch` image containing only the binary).
-const SUPERVISOR_IMAGE_BINARY_PATH: &str = "/openshell-sandbox";
 
 /// Return the default `ghcr.io/nvidia/openshell/supervisor:<tag>` reference
 /// used when no supervisor binary override is provided.
@@ -173,7 +170,7 @@ pub struct DockerComputeConfig {
 impl Default for DockerComputeConfig {
     fn default() -> Self {
         Self {
-            default_image: default_sandbox_image(),
+            default_image: openshell_core::image::default_sandbox_image(),
             image_pull_policy: String::new(),
             sandbox_namespace: "default".to_string(),
             grpc_endpoint: String::new(),
@@ -187,13 +184,6 @@ impl Default for DockerComputeConfig {
             ssh_socket_path: "/run/openshell/ssh.sock".to_string(),
         }
     }
-}
-
-fn default_sandbox_image() -> String {
-    format!(
-        "{}/base:latest",
-        openshell_core::image::DEFAULT_COMMUNITY_REGISTRY
-    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -180,7 +180,7 @@ impl Default for PodmanComputeConfig {
     fn default() -> Self {
         Self {
             socket_path: Self::default_socket_path(),
-            default_image: default_sandbox_image(),
+            default_image: openshell_core::image::default_sandbox_image(),
             image_pull_policy: ImagePullPolicy::default(),
             grpc_endpoint: String::new(),
             gateway_port: openshell_core::config::DEFAULT_SERVER_PORT,
@@ -193,13 +193,6 @@ impl Default for PodmanComputeConfig {
             guest_tls_key: None,
         }
     }
-}
-
-fn default_sandbox_image() -> String {
-    format!(
-        "{}/base:latest",
-        openshell_core::image::DEFAULT_COMMUNITY_REGISTRY
-    )
 }
 
 impl std::fmt::Debug for PodmanComputeConfig {
