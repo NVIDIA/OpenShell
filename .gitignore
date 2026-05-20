@@ -168,6 +168,7 @@ logs/
 tmp/
 temp/
 *.tmp
+e2e/gpu/images/.build/
 
 # Secrets/credentials (should never be committed)
 *.pem
