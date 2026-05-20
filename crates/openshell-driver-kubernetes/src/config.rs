@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 /// Default Kubernetes namespace for sandbox resources.
 pub const DEFAULT_K8S_NAMESPACE: &str = "openshell";
 
+/// Default Kubernetes `ServiceAccount` assigned to sandbox pods.
+pub const DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME: &str = "default";
+
 /// Default storage size for the workspace PVC.
 pub const DEFAULT_WORKSPACE_STORAGE_SIZE: &str = "2Gi";
 
@@ -51,6 +54,9 @@ impl std::str::FromStr for SupervisorSideloadMethod {
 #[serde(default, deny_unknown_fields)]
 pub struct KubernetesComputeConfig {
     pub namespace: String,
+    /// Kubernetes `ServiceAccount` assigned to sandbox pods and accepted by
+    /// the gateway's `TokenReview` bootstrap authenticator.
+    pub service_account_name: String,
     pub default_image: String,
     pub image_pull_policy: String,
     /// Image that provides the `openshell-sandbox` supervisor binary.
@@ -91,6 +97,7 @@ impl Default for KubernetesComputeConfig {
     fn default() -> Self {
         Self {
             namespace: DEFAULT_K8S_NAMESPACE.to_string(),
+            service_account_name: DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME.to_string(),
             default_image: openshell_core::image::default_sandbox_image(),
             // Default empty so the gateway omits `imagePullPolicy` from pod
             // specs and Kubernetes applies its own default (Always for `latest`,
@@ -140,11 +147,29 @@ mod tests {
     }
 
     #[test]
+    fn default_service_account_name_is_default() {
+        let cfg = KubernetesComputeConfig::default();
+        assert_eq!(
+            cfg.service_account_name,
+            DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME
+        );
+    }
+
+    #[test]
     fn serde_override_workspace_storage_size() {
         let json = serde_json::json!({
             "workspace_default_storage_size": "10Gi"
         });
         let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
         assert_eq!(cfg.workspace_default_storage_size, "10Gi");
+    }
+
+    #[test]
+    fn serde_override_service_account_name() {
+        let json = serde_json::json!({
+            "service_account_name": "openshell-sandbox"
+        });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.service_account_name, "openshell-sandbox");
     }
 }

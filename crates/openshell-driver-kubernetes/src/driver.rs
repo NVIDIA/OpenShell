@@ -4,7 +4,8 @@
 //! Kubernetes compute driver.
 
 use crate::config::{
-    DEFAULT_WORKSPACE_STORAGE_SIZE, KubernetesComputeConfig, SupervisorSideloadMethod,
+    DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_WORKSPACE_STORAGE_SIZE, KubernetesComputeConfig,
+    SupervisorSideloadMethod,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::{Event as KubeEventObj, Node};
@@ -320,6 +321,7 @@ impl KubernetesComputeDriver {
             supervisor_image: &self.config.supervisor_image,
             supervisor_image_pull_policy: &self.config.supervisor_image_pull_policy,
             supervisor_sideload_method: self.config.supervisor_sideload_method,
+            service_account_name: &self.config.service_account_name,
             sandbox_id: &sandbox.id,
             sandbox_name: &sandbox.name,
             grpc_endpoint: &self.config.grpc_endpoint,
@@ -1048,6 +1050,7 @@ struct SandboxPodParams<'a> {
     supervisor_image: &'a str,
     supervisor_image_pull_policy: &'a str,
     supervisor_sideload_method: SupervisorSideloadMethod,
+    service_account_name: &'a str,
     sandbox_id: &'a str,
     sandbox_name: &'a str,
     grpc_endpoint: &'a str,
@@ -1069,6 +1072,7 @@ impl Default for SandboxPodParams<'_> {
             supervisor_image: "",
             supervisor_image_pull_policy: "",
             supervisor_sideload_method: SupervisorSideloadMethod::default(),
+            service_account_name: DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
             sandbox_id: "",
             sandbox_name: "",
             grpc_endpoint: "",
@@ -1221,6 +1225,13 @@ fn sandbox_template_to_k8s(
                  NVIDIA device plugin compatibility is unverified"
             );
         }
+    }
+
+    if !params.service_account_name.is_empty() {
+        spec.insert(
+            "serviceAccountName".to_string(),
+            serde_json::json!(params.service_account_name),
+        );
     }
 
     // Disable service account token auto-mounting for security hardening.
@@ -2489,6 +2500,32 @@ mod tests {
             pod_template["spec"]["automountServiceAccountToken"],
             serde_json::json!(false),
             "service account token auto-mounting must be disabled for security hardening"
+        );
+    }
+
+    #[test]
+    fn sandbox_template_sets_configured_service_account_name() {
+        let params = SandboxPodParams {
+            service_account_name: "openshell-sandbox",
+            ..Default::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+
+        assert_eq!(
+            pod_template["spec"]["serviceAccountName"],
+            serde_json::json!("openshell-sandbox"),
+            "sandbox pods must run under the configured service account"
+        );
+        assert_eq!(
+            pod_template["spec"]["automountServiceAccountToken"],
+            serde_json::json!(false),
+            "explicit service account selection must not re-enable default token automounting"
         );
     }
 

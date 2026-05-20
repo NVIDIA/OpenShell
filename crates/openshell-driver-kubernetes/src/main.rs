@@ -10,8 +10,8 @@ use tracing_subscriber::EnvFilter;
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_driver_kubernetes::{
-    ComputeDriverService, KubernetesComputeConfig, KubernetesComputeDriver,
-    SupervisorSideloadMethod,
+    ComputeDriverService, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, KubernetesComputeConfig,
+    KubernetesComputeDriver, SupervisorSideloadMethod,
 };
 
 #[derive(Parser, Debug)]
@@ -30,6 +30,13 @@ struct Args {
 
     #[arg(long, env = "OPENSHELL_SANDBOX_NAMESPACE", default_value = "default")]
     sandbox_namespace: String,
+
+    #[arg(
+        long,
+        env = "OPENSHELL_K8S_SANDBOX_SERVICE_ACCOUNT",
+        default_value = DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME
+    )]
+    sandbox_service_account: String,
 
     #[arg(long, env = "OPENSHELL_SANDBOX_IMAGE")]
     sandbox_image: Option<String>,
@@ -88,6 +95,7 @@ async fn main() -> Result<()> {
 
     let driver = KubernetesComputeDriver::new(KubernetesComputeConfig {
         namespace: args.sandbox_namespace,
+        service_account_name: args.sandbox_service_account,
         default_image: args.sandbox_image.unwrap_or_default(),
         image_pull_policy: args.sandbox_image_pull_policy.unwrap_or_default(),
         supervisor_image: args

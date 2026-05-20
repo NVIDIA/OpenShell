@@ -212,6 +212,18 @@ helm -n openshell get values openshell | grep sandboxNamespace
 
 Then inspect sandbox resources in that namespace.
 
+Check the configured sandbox service account when TokenReview bootstrap or
+sandbox registration fails. Helm creates a dedicated sandbox service account by
+default and writes it to `[openshell.drivers.kubernetes].service_account_name`;
+the gateway rejects projected tokens from other service accounts.
+
+```bash
+helm -n openshell get values openshell | grep -A3 sandboxServiceAccount
+kubectl -n <sandbox-namespace> get serviceaccount openshell-sandbox
+kubectl -n openshell get configmap openshell-config -o jsonpath='{.data.gateway\.toml}'
+kubectl -n <sandbox-namespace> get sandbox <sandbox-name> -o jsonpath='{.spec.template.spec.serviceAccountName}{"\n"}'
+```
+
 ### Step 6: Check VM-Backed Gateways
 
 Use the VM driver logs and host diagnostics available in the user's environment. Verify:

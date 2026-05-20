@@ -15,7 +15,7 @@ use crate::ServerState;
 use crate::auth::principal::{Principal, SandboxIdentitySource};
 use openshell_core::proto::{
     IssueSandboxTokenRequest, IssueSandboxTokenResponse, RefreshSandboxTokenRequest,
-    RefreshSandboxTokenResponse,
+    RefreshSandboxTokenResponse, Sandbox,
 };
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
@@ -61,6 +61,8 @@ pub async fn handle_issue_sandbox_token(
         );
         Status::unavailable("sandbox JWT minting is not configured on this gateway")
     })?;
+
+    ensure_sandbox_exists(state, &sandbox.sandbox_id).await?;
 
     let minted = issuer.mint(&sandbox.sandbox_id)?;
     info!(
@@ -110,6 +112,8 @@ pub async fn handle_refresh_sandbox_token(
         Status::unavailable("sandbox JWT minting is not configured on this gateway")
     })?;
 
+    ensure_sandbox_exists(state, &sandbox.sandbox_id).await?;
+
     let minted = issuer.mint(&sandbox.sandbox_id)?;
     info!(
         sandbox_id = %sandbox.sandbox_id,
@@ -120,6 +124,21 @@ pub async fn handle_refresh_sandbox_token(
         token: minted.token,
         expires_at_ms: minted.expires_at_ms,
     }))
+}
+
+async fn ensure_sandbox_exists(state: &Arc<ServerState>, sandbox_id: &str) -> Result<(), Status> {
+    if sandbox_id.is_empty() {
+        return Err(Status::invalid_argument("sandbox_id is required"));
+    }
+
+    state
+        .store
+        .get_message::<Sandbox>(sandbox_id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -136,6 +155,9 @@ mod tests {
     use crate::tracing_bus::TracingLogBus;
     use openshell_bootstrap::jwt::generate_jwt_key;
     use openshell_core::Config;
+    use openshell_core::proto::datamodel::v1::ObjectMeta;
+    use openshell_core::proto::{Sandbox, SandboxPhase, SandboxSpec};
+    use std::collections::HashMap;
     use std::time::Duration;
 
     async fn state_with_issuer() -> Arc<ServerState> {
@@ -165,7 +187,28 @@ mod tests {
         )
         .unwrap();
         state.sandbox_jwt_issuer = Some(Arc::new(issuer));
-        Arc::new(state)
+        let state = Arc::new(state);
+        insert_sandbox(&state, "sandbox-a").await;
+        state
+    }
+
+    async fn insert_sandbox(state: &Arc<ServerState>, sandbox_id: &str) {
+        let sandbox = Sandbox {
+            metadata: Some(ObjectMeta {
+                id: sandbox_id.to_string(),
+                name: sandbox_id.to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::default(),
+                resource_version: 0,
+            }),
+            spec: Some(SandboxSpec {
+                policy: None,
+                ..Default::default()
+            }),
+            phase: SandboxPhase::Ready as i32,
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
     }
 
     fn sandbox_principal(sandbox_id: &str) -> Principal {
@@ -190,6 +233,62 @@ mod tests {
             .into_inner();
         assert!(!resp.token.is_empty());
         assert!(resp.expires_at_ms > 0);
+    }
+
+    #[tokio::test]
+    async fn refresh_rejects_missing_sandbox() {
+        let state = state_with_issuer().await;
+        let mut req = Request::new(RefreshSandboxTokenRequest {});
+        req.extensions_mut()
+            .insert(sandbox_principal("sandbox-deleted"));
+        let err = handle_refresh_sandbox_token(&state, req)
+            .await
+            .expect_err("missing sandbox must not refresh");
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn issue_returns_token_for_existing_sandbox() {
+        use crate::auth::principal::SandboxIdentitySource;
+
+        let state = state_with_issuer().await;
+        let mut req = Request::new(IssueSandboxTokenRequest {});
+        req.extensions_mut()
+            .insert(Principal::Sandbox(SandboxPrincipal {
+                sandbox_id: "sandbox-a".to_string(),
+                source: SandboxIdentitySource::K8sServiceAccount {
+                    pod_name: "pod-a".to_string(),
+                    pod_uid: "uid-a".to_string(),
+                },
+                trust_domain: Some("openshell".to_string()),
+            }));
+        let resp = handle_issue_sandbox_token(&state, req)
+            .await
+            .expect("issue OK")
+            .into_inner();
+        assert!(!resp.token.is_empty());
+        assert!(resp.expires_at_ms > 0);
+    }
+
+    #[tokio::test]
+    async fn issue_rejects_missing_sandbox() {
+        use crate::auth::principal::SandboxIdentitySource;
+
+        let state = state_with_issuer().await;
+        let mut req = Request::new(IssueSandboxTokenRequest {});
+        req.extensions_mut()
+            .insert(Principal::Sandbox(SandboxPrincipal {
+                sandbox_id: "sandbox-deleted".to_string(),
+                source: SandboxIdentitySource::K8sServiceAccount {
+                    pod_name: "pod-a".to_string(),
+                    pod_uid: "uid-a".to_string(),
+                },
+                trust_domain: Some("openshell".to_string()),
+            }));
+        let err = handle_issue_sandbox_token(&state, req)
+            .await
+            .expect_err("missing sandbox must not receive a token");
+        assert_eq!(err.code(), tonic::Code::NotFound);
     }
 
     #[tokio::test]
@@ -255,6 +354,7 @@ mod tests {
             Arc::new(SupervisorSessionRegistry::new()),
             None,
         ));
+        insert_sandbox(&state, "sandbox-a").await;
         let mut req = Request::new(RefreshSandboxTokenRequest {});
         req.extensions_mut().insert(sandbox_principal("sandbox-a"));
         let err = handle_refresh_sandbox_token(&state, req)

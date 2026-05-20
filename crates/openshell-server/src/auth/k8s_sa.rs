@@ -137,10 +137,16 @@ pub struct LiveK8sResolver {
     pods_api: Api<Pod>,
     expected_audience: String,
     sandbox_namespace: String,
+    expected_service_account: String,
 }
 
 impl LiveK8sResolver {
-    pub fn new(client: kube::Client, namespace: &str, expected_audience: String) -> Self {
+    pub fn new(
+        client: kube::Client,
+        namespace: &str,
+        expected_audience: String,
+        expected_service_account: String,
+    ) -> Self {
         let token_reviews_api: Api<TokenReview> = Api::all(client.clone());
         let pods_api: Api<Pod> = Api::namespaced(client, namespace);
         Self {
@@ -148,6 +154,7 @@ impl LiveK8sResolver {
             pods_api,
             expected_audience,
             sandbox_namespace: namespace.to_string(),
+            expected_service_account,
         }
     }
 }
@@ -175,8 +182,12 @@ impl K8sIdentityResolver for LiveK8sResolver {
         let status = review
             .status
             .ok_or_else(|| Status::internal("TokenReview response missing status"))?;
-        let Some(identity) =
-            token_review_identity(&status, &self.expected_audience, &self.sandbox_namespace)?
+        let Some(identity) = token_review_identity(
+            &status,
+            &self.expected_audience,
+            &self.sandbox_namespace,
+            &self.expected_service_account,
+        )?
         else {
             return Ok(None);
         };
@@ -184,6 +195,7 @@ impl K8sIdentityResolver for LiveK8sResolver {
         info!(
             pod_name = %identity.pod_name,
             pod_uid = %identity.pod_uid,
+            service_account = %self.expected_service_account,
             "validated K8s SA token via TokenReview"
         );
 
@@ -243,6 +255,7 @@ fn token_review_identity(
     status: &TokenReviewStatus,
     expected_audience: &str,
     sandbox_namespace: &str,
+    expected_service_account: &str,
 ) -> Result<Option<TokenReviewIdentity>, Status> {
     if status.authenticated != Some(true) {
         debug!(
@@ -270,15 +283,17 @@ fn token_review_identity(
         .username
         .as_deref()
         .ok_or_else(|| Status::permission_denied("TokenReview response missing username"))?;
-    let expected_prefix = format!("system:serviceaccount:{sandbox_namespace}:");
-    if !username.starts_with(&expected_prefix) {
+    let expected_username =
+        format!("system:serviceaccount:{sandbox_namespace}:{expected_service_account}");
+    if username != expected_username {
         warn!(
             username = %username,
             sandbox_namespace = %sandbox_namespace,
-            "K8s TokenReview principal is outside the sandbox namespace"
+            service_account = %expected_service_account,
+            "K8s TokenReview principal is not the configured sandbox service account"
         );
         return Err(Status::permission_denied(
-            "SA token is outside the sandbox namespace",
+            "SA token is not from the configured sandbox service account",
         ));
     }
 
@@ -388,7 +403,7 @@ mod tests {
             ],
         );
 
-        let identity = token_review_identity(&status, "openshell-gateway", "openshell")
+        let identity = token_review_identity(&status, "openshell-gateway", "openshell", "default")
             .unwrap()
             .expect("authenticated token should resolve");
 
@@ -405,7 +420,7 @@ mod tests {
         };
 
         assert!(
-            token_review_identity(&status, "openshell-gateway", "openshell")
+            token_review_identity(&status, "openshell-gateway", "openshell", "default")
                 .unwrap()
                 .is_none()
         );
@@ -423,7 +438,7 @@ mod tests {
             ],
         );
 
-        let err = token_review_identity(&status, "openshell-gateway", "openshell")
+        let err = token_review_identity(&status, "openshell-gateway", "openshell", "default")
             .expect_err("wrong audience must fail closed");
         assert_eq!(err.code(), tonic::Code::Unauthenticated);
     }
@@ -440,8 +455,25 @@ mod tests {
             ],
         );
 
-        let err = token_review_identity(&status, "openshell-gateway", "openshell")
+        let err = token_review_identity(&status, "openshell-gateway", "openshell", "default")
             .expect_err("other namespace must be rejected");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[test]
+    fn token_review_identity_requires_configured_service_account() {
+        let status = token_review_status(
+            true,
+            vec!["openshell-gateway"],
+            "system:serviceaccount:openshell:other",
+            vec![
+                (POD_NAME_EXTRA, "openshell-sandbox-a"),
+                (POD_UID_EXTRA, "uid-a"),
+            ],
+        );
+
+        let err = token_review_identity(&status, "openshell-gateway", "openshell", "default")
+            .expect_err("other service account must be rejected");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }
 
@@ -454,7 +486,7 @@ mod tests {
             vec![],
         );
 
-        let err = token_review_identity(&status, "openshell-gateway", "openshell")
+        let err = token_review_identity(&status, "openshell-gateway", "openshell", "default")
             .expect_err("non pod-bound tokens must be rejected");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
     }

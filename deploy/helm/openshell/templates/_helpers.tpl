@@ -60,6 +60,17 @@ Create the name of the service account to use
 {{- end }}
 
 {{/*
+Create the name of the service account assigned to sandbox pods
+*/}}
+{{- define "openshell.sandboxServiceAccountName" -}}
+{{- if .Values.sandboxServiceAccount.create }}
+{{- default (printf "%s-sandbox" (include "openshell.fullname" .) | trunc 63 | trimSuffix "-") .Values.sandboxServiceAccount.name }}
+{{- else }}
+{{- default "default" .Values.sandboxServiceAccount.name }}
+{{- end }}
+{{- end }}
+
+{{/*
 Gateway image reference. Uses image.tag when set; falls back to .Chart.AppVersion
 so a released chart automatically pulls the matching image without extra overrides.
 */}}

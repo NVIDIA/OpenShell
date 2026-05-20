@@ -48,6 +48,14 @@ serviceAccount:
   # -- Existing service account name to use when serviceAccount.create is false.
   name: ""
 
+sandboxServiceAccount:
+  # -- Create a service account for sandbox pods.
+  create: true
+  # -- Annotations to add to the generated sandbox service account.
+  annotations: {}
+  # -- Existing service account name for sandbox pods when sandboxServiceAccount.create is false.
+  name: ""
+
 # -- Extra annotations to add to the gateway pod.
 podAnnotations: {}
 # -- Extra labels to add to the gateway pod.

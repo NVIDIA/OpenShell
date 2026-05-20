@@ -112,6 +112,8 @@ pub struct GatewayFileSection {
     #[serde(default)]
     pub client_tls_secret_name: Option<String>,
     #[serde(default)]
+    pub service_account_name: Option<String>,
+    #[serde(default)]
     pub host_gateway_ip: Option<String>,
     #[serde(default)]
     pub enable_user_namespaces: Option<bool>,
@@ -252,6 +254,7 @@ fn inheritable_keys(driver: ComputeDriverKind) -> &'static [&'static str] {
             "default_image",
             "supervisor_image",
             "client_tls_secret_name",
+            "service_account_name",
             "host_gateway_ip",
             "enable_user_namespaces",
             "sa_token_ttl_secs",
@@ -287,6 +290,7 @@ fn gateway_inherited_value(g: &GatewayFileSection, key: &str) -> Option<toml::Va
         "default_image" => g.default_image.as_deref().map(string_value),
         "supervisor_image" => g.supervisor_image.as_deref().map(string_value),
         "client_tls_secret_name" => g.client_tls_secret_name.as_deref().map(string_value),
+        "service_account_name" => g.service_account_name.as_deref().map(string_value),
         "host_gateway_ip" => g.host_gateway_ip.as_deref().map(string_value),
         "enable_user_namespaces" => g.enable_user_namespaces.map(toml::Value::Boolean),
         "sa_token_ttl_secs" => g.sa_token_ttl_secs.map(toml::Value::Integer),
@@ -343,6 +347,7 @@ sandbox_namespace = "agents"
 default_image = "ghcr.io/nvidia/openshell/sandbox:latest"
 supervisor_image = "ghcr.io/nvidia/openshell/supervisor:latest"
 client_tls_secret_name = "openshell-sandbox-tls"
+service_account_name = "openshell-sandbox"
 
 [openshell.gateway.tls]
 cert_path = "/etc/openshell/certs/gateway.pem"

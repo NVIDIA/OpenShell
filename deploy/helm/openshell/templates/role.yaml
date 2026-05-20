@@ -5,6 +5,7 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: {{ include "openshell.fullname" . }}-sandbox
+  namespace: {{ include "openshell.sandboxNamespace" . }}
   labels:
     {{- include "openshell.labels" . | nindent 4 }}
 rules:
@@ -29,11 +30,12 @@ rules:
       - get
       - list
       - watch
-  # Per-sandbox identity (issue #1354): TokenReview authenticates the
-  # projected SA token, then the gateway resolves the returned pod name
-  # and UID to the pod's `openshell.io/sandbox-id` annotation. patch is
-  # intentionally NOT granted — the annotation is set once at pod create
-  # and must remain immutable for the lifetime of the sandbox.
+  # Per-sandbox identity: TokenReview authenticates the projected token from
+  # the configured sandbox service account, then the gateway resolves the
+  # returned pod name and UID to the pod's `openshell.io/sandbox-id`
+  # annotation. patch is intentionally NOT granted — the annotation is set
+  # once at pod create and must remain immutable for the lifetime of the
+  # sandbox.
   - apiGroups:
       - ""
     resources:

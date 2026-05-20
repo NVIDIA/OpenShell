@@ -33,6 +33,23 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.gateway\][^\[]*?grpc_endpoint'
 
+  - it: renders the sandbox service account name under [openshell.drivers.kubernetes]
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?service_account_name\s*=\s*"openshell-sandbox"'
+
+  - it: uses the configured existing sandbox service account name
+    template: templates/gateway-config.yaml
+    set:
+      sandboxServiceAccount.create: false
+      sandboxServiceAccount.name: precreated-sandbox
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?service_account_name\s*=\s*"precreated-sandbox"'
+
   - it: omits server_sans when no DNS SANs are configured
     template: templates/gateway-config.yaml
     asserts:

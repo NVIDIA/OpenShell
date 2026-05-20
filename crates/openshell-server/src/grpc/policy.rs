@@ -11,6 +11,7 @@
 #![allow(clippy::items_after_statements)] // DB_PORTS const inside function
 
 use crate::ServerState;
+use crate::auth::principal::Principal;
 use crate::persistence::{DraftChunkRecord, ObjectId, ObjectName, ObjectType, PolicyRecord, Store};
 use crate::policy_store::PolicyStoreExt;
 use openshell_core::proto::policy_merge_operation;
@@ -317,10 +318,8 @@ fn truncate_for_log(input: &str, max_chars: usize) -> String {
 #[cfg(test)]
 fn is_sandbox_caller<T>(request: &Request<T>) -> bool {
     matches!(
-        request
-            .extensions()
-            .get::<crate::auth::principal::Principal>(),
-        Some(crate::auth::principal::Principal::Sandbox(_))
+        request.extensions().get::<Principal>(),
+        Some(Principal::Sandbox(_))
     )
 }
 
@@ -668,14 +667,8 @@ pub(super) async fn handle_update_config(
     state: &Arc<ServerState>,
     request: Request<UpdateConfigRequest>,
 ) -> Result<Response<UpdateConfigResponse>, Status> {
-    let principal = request
-        .extensions()
-        .get::<crate::auth::principal::Principal>()
-        .cloned();
-    let sandbox_caller = matches!(
-        principal,
-        Some(crate::auth::principal::Principal::Sandbox(_))
-    );
+    let principal = request.extensions().get::<Principal>().cloned();
+    let sandbox_caller = matches!(principal, Some(Principal::Sandbox(_)));
     let req = request.into_inner();
     if sandbox_caller {
         validate_sandbox_caller_update(&req)?;
@@ -1342,11 +1335,11 @@ pub(super) async fn handle_push_sandbox_logs(
 ) -> Result<Response<PushSandboxLogsResponse>, Status> {
     let principal = request
         .extensions()
-        .get::<crate::auth::principal::Principal>()
+        .get::<Principal>()
         .cloned()
         .ok_or_else(|| Status::unauthenticated("missing principal"))?;
     let mut stream = request.into_inner();
-    let mut validated = false;
+    let mut validated_sandbox_id = None;
 
     while let Some(batch) = stream
         .message()
@@ -1357,19 +1350,13 @@ pub(super) async fn handle_push_sandbox_logs(
             continue;
         }
 
-        if !validated {
-            // The streaming RPC carries the sandbox_id in every frame, but
-            // the equality check only needs to run once on the first frame
-            // — the principal is stable across the stream.
-            crate::auth::guard::ensure_sandbox_scope(&principal, &batch.sandbox_id)?;
-            state
-                .store
-                .get_message::<Sandbox>(&batch.sandbox_id)
-                .await
-                .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-                .ok_or_else(|| Status::not_found("sandbox not found"))?;
-            validated = true;
-        }
+        ensure_log_stream_sandbox_scope(
+            state,
+            &principal,
+            &batch.sandbox_id,
+            &mut validated_sandbox_id,
+        )
+        .await?;
 
         for log in batch.logs.into_iter().take(100) {
             let mut log = log;
@@ -1382,6 +1369,32 @@ pub(super) async fn handle_push_sandbox_logs(
     Ok(Response::new(PushSandboxLogsResponse {}))
 }
 
+async fn ensure_log_stream_sandbox_scope(
+    state: &Arc<ServerState>,
+    principal: &Principal,
+    sandbox_id: &str,
+    validated_sandbox_id: &mut Option<String>,
+) -> Result<(), Status> {
+    if let Some(validated) = validated_sandbox_id.as_deref() {
+        if sandbox_id != validated {
+            return Err(Status::permission_denied(
+                "log stream sandbox_id changed after validation",
+            ));
+        }
+        return Ok(());
+    }
+
+    crate::auth::guard::ensure_sandbox_scope(principal, sandbox_id)?;
+    state
+        .store
+        .get_message::<Sandbox>(sandbox_id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    *validated_sandbox_id = Some(sandbox_id.to_string());
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Draft policy recommendation handlers
 // ---------------------------------------------------------------------------
@@ -1392,7 +1405,7 @@ pub(super) async fn handle_submit_policy_analysis(
 ) -> Result<Response<SubmitPolicyAnalysisResponse>, Status> {
     let principal = request
         .extensions()
-        .get::<crate::auth::principal::Principal>()
+        .get::<Principal>()
         .cloned()
         .ok_or_else(|| Status::unauthenticated("missing principal"))?;
     let req = request.into_inner();
@@ -1528,7 +1541,7 @@ pub(super) async fn handle_get_draft_policy(
 ) -> Result<Response<GetDraftPolicyResponse>, Status> {
     let principal = request
         .extensions()
-        .get::<crate::auth::principal::Principal>()
+        .get::<Principal>()
         .cloned()
         .ok_or_else(|| Status::unauthenticated("missing principal"))?;
     let req = request.into_inner();
@@ -3165,6 +3178,41 @@ mod tests {
         handle_get_sandbox_config(&state, req)
             .await
             .expect("user principal must succeed");
+    }
+
+    #[tokio::test]
+    async fn log_stream_scope_rejects_sandbox_id_change_after_validation() {
+        let state = test_server_state().await;
+        for id in ["sb-a", "sb-b"] {
+            let sandbox = test_sandbox(id, id, ProtoSandboxPolicy::default(), vec![]);
+            state.store.put_message(&sandbox).await.unwrap();
+        }
+        let req = with_sandbox(Request::new(()), "sb-a");
+        let principal = req.extensions().get::<Principal>().unwrap().clone();
+        let mut validated = None;
+
+        ensure_log_stream_sandbox_scope(&state, &principal, "sb-a", &mut validated)
+            .await
+            .expect("first frame should validate");
+        let err = ensure_log_stream_sandbox_scope(&state, &principal, "sb-b", &mut validated)
+            .await
+            .expect_err("later frame must not switch sandbox ids");
+
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn log_stream_scope_rejects_missing_sandbox() {
+        let state = test_server_state().await;
+        let req = with_sandbox(Request::new(()), "sb-a");
+        let principal = req.extensions().get::<Principal>().unwrap().clone();
+        let mut validated = None;
+
+        let err = ensure_log_stream_sandbox_scope(&state, &principal, "sb-a", &mut validated)
+            .await
+            .expect_err("missing sandbox must not validate");
+
+        assert_eq!(err.code(), Code::NotFound);
     }
 
     // ---- Sandbox without policy ----

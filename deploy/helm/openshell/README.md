@@ -124,6 +124,9 @@ cert-manager alternative.
 | probes.startup.timeoutSeconds | int | `1` | Startup probe timeout, in seconds. |
 | replicaCount | int | `1` | Number of OpenShell gateway replicas. |
 | resources | object | `{}` | Gateway pod resource requests and limits. |
+| sandboxServiceAccount.annotations | object | `{}` | Annotations to add to the generated sandbox service account. |
+| sandboxServiceAccount.create | bool | `true` | Create a service account for sandbox pods. |
+| sandboxServiceAccount.name | string | `""` | Existing service account name for sandbox pods when sandboxServiceAccount.create is false. |
 | securityContext.allowPrivilegeEscalation | bool | `false` | Whether the gateway container can gain additional privileges. |
 | securityContext.capabilities.drop | list | `["ALL"]` | Linux capabilities dropped from the gateway container. |
 | securityContext.runAsNonRoot | bool | `true` | Require the gateway container to run as a non-root user. |
