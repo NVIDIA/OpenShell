@@ -5,7 +5,7 @@
 //!
 //! The proxy emits a [`DenialEvent`] each time a connection or request is
 //! denied. The [`DenialAggregator`] receives these events via an MPSC channel,
-//! deduplicates them by `(host, port, binary)` key, and maintains running
+//! deduplicates them by `(host, port)` key, and maintains running
 //! counters. Periodically, the aggregator flushes accumulated summaries
 //! upstream to the gateway via `SubmitPolicyAnalysis`.
 
@@ -21,10 +21,6 @@ pub struct DenialEvent {
     pub host: String,
     /// Destination port that was denied.
     pub port: u16,
-    /// Binary path that initiated the connection (if resolved).
-    pub binary: String,
-    /// Ancestor binary paths from process tree walk.
-    pub ancestors: Vec<String>,
     /// Reason for denial (e.g. "no matching policy", "internal address").
     pub deny_reason: String,
     /// Denial stage: "connect", "forward", "ssrf", "l7", "bypass".
@@ -35,13 +31,11 @@ pub struct DenialEvent {
     pub l7_path: Option<String>,
 }
 
-/// Aggregated denial summary keyed by `(host, port, binary)`.
+/// Aggregated denial summary keyed by `(host, port)`.
 #[derive(Debug, Clone)]
 struct AggregatedDenial {
     host: String,
     port: u16,
-    binary: String,
-    ancestors: Vec<String>,
     deny_reason: String,
     denial_stage: String,
     first_seen_ms: i64,
@@ -63,8 +57,8 @@ struct L7Sample {
 /// summaries. It is designed to be spawned as a background tokio task.
 pub struct DenialAggregator {
     rx: mpsc::UnboundedReceiver<DenialEvent>,
-    /// Accumulated denials keyed by `(host, port, binary)`.
-    summaries: HashMap<(String, u16, String), AggregatedDenial>,
+    /// Accumulated denials keyed by `(host, port)`.
+    summaries: HashMap<(String, u16), AggregatedDenial>,
     /// Flush interval in seconds.
     flush_interval_secs: u64,
 }
@@ -124,7 +118,7 @@ impl DenialAggregator {
     /// a new one.
     fn ingest(&mut self, event: DenialEvent) {
         let now_ms = openshell_core::time::now_ms();
-        let key = (event.host.clone(), event.port, event.binary.clone());
+        let key = (event.host.clone(), event.port);
 
         let entry = self
             .summaries
@@ -132,8 +126,6 @@ impl DenialAggregator {
             .or_insert_with(|| AggregatedDenial {
                 host: event.host.clone(),
                 port: event.port,
-                binary: event.binary.clone(),
-                ancestors: event.ancestors.clone(),
                 deny_reason: event.deny_reason.clone(),
                 denial_stage: event.denial_stage.clone(),
                 first_seen_ms: now_ms,
@@ -171,8 +163,6 @@ impl DenialAggregator {
             .map(|(_, v)| FlushableDenialSummary {
                 host: v.host,
                 port: v.port,
-                binary: v.binary,
-                ancestors: v.ancestors,
                 deny_reason: v.deny_reason,
                 denial_stage: v.denial_stage,
                 first_seen_ms: v.first_seen_ms,
@@ -198,8 +188,6 @@ impl DenialAggregator {
 pub struct FlushableDenialSummary {
     pub host: String,
     pub port: u16,
-    pub binary: String,
-    pub ancestors: Vec<String>,
     pub deny_reason: String,
     pub denial_stage: String,
     pub first_seen_ms: i64,

@@ -19,4 +19,3 @@ endpoints:
     protocol: rest
     access: read-write
     enforcement: enforce
-binaries: [/usr/bin/curl, /usr/local/bin/curl]

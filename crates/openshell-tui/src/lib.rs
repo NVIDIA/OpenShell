@@ -1282,15 +1282,6 @@ fn render_policy_lines(
                 }
             }
 
-            // Binaries.
-            let binary_paths: Vec<&str> = rule.binaries.iter().map(|b| b.path.as_str()).collect();
-            if !binary_paths.is_empty() {
-                lines.push(Line::from(vec![
-                    Span::styled("    Binaries: ", t.muted),
-                    Span::styled(binary_paths.join(", "), t.text),
-                ]));
-            }
-
             lines.push(Line::from(""));
         }
     }

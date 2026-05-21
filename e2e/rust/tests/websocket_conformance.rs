@@ -292,10 +292,6 @@ network_policies:
           - "172.0.0.0/8"
           - "192.168.0.0/16"
           - "fc00::/7"
-    binaries:
-      - path: /usr/bin/python*
-      - path: /usr/local/bin/python*
-      - path: /sandbox/.uv/python/*/bin/python*
 "#
     );
     file.write_all(policy.as_bytes())

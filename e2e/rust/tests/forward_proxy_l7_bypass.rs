@@ -81,11 +81,6 @@ network_policies:
           - allow:
               method: GET
               path: /allowed
-    binaries:
-      - path: /usr/bin/curl
-      - path: /usr/bin/python*
-      - path: /usr/local/bin/python*
-      - path: /sandbox/.uv/python/*/bin/python*
 "#
     );
     file.write_all(policy.as_bytes())

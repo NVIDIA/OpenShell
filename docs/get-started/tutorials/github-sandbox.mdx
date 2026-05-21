@@ -204,19 +204,12 @@ network_policies:
       - { host: sentry.io, port: 443 }
       - { host: raw.githubusercontent.com, port: 443 }
       - { host: platform.claude.com, port: 443 }
-    binaries:
-      - { path: /usr/local/bin/claude }
-      - { path: /usr/bin/node }
 
   # NVIDIA inference endpoint
   nvidia_inference:
     name: nvidia-inference
     endpoints:
       - { host: integrate.api.nvidia.com, port: 443 }
-    binaries:
-      - { path: /usr/bin/curl }
-      - { path: /bin/bash }
-      - { path: /usr/local/bin/opencode }
 
   # ── GitHub: git operations (clone, fetch, push) ──────────────
 
@@ -237,8 +230,6 @@ network_policies:
           - allow:
               method: POST
               path: "/<org>/<repo>.git/git-receive-pack"
-    binaries:
-      - { path: /usr/bin/git }
 
   # ── GitHub: REST API ─────────────────────────────────────────
 
@@ -270,11 +261,6 @@ network_policies:
         deny_rules:
           - operation_type: mutation
             fields: [deleteRepository, deleteRef, updateBranchProtectionRule]
-    binaries:
-      - { path: /usr/local/bin/claude }
-      - { path: /usr/local/bin/opencode }
-      - { path: /usr/bin/gh }
-      - { path: /usr/bin/curl }
 
   # ── Package managers ─────────────────────────────────────────
 
@@ -287,13 +273,6 @@ network_policies:
       - { host: objects.githubusercontent.com, port: 443 }
       - { host: api.github.com, port: 443 }
       - { host: downloads.python.org, port: 443 }
-    binaries:
-      - { path: /sandbox/.venv/bin/python }
-      - { path: /sandbox/.venv/bin/python3 }
-      - { path: /sandbox/.venv/bin/pip }
-      - { path: "/sandbox/.uv/python/**/python*" }
-      - { path: /usr/local/bin/uv }
-      - { path: "/sandbox/.uv/python/**" }
 
   # ── VS Code Remote ──────────────────────────────────────────
 
@@ -305,11 +284,6 @@ network_policies:
       - { host: vscode.download.prss.microsoft.com, port: 443 }
       - { host: marketplace.visualstudio.com, port: 443 }
       - { host: "*.gallerycdn.vsassets.io", port: 443 }
-    binaries:
-      - { path: /usr/bin/curl }
-      - { path: /usr/bin/wget }
-      - { path: "/sandbox/.vscode-server/**" }
-      - { path: "/sandbox/.vscode-remote-containers/**" }
 ```
 
 The following table summarizes the two GitHub-specific blocks:

@@ -1298,7 +1298,7 @@ mod tests {
                         "port": 443,
                         "websocket_credential_rewrite": true
                     }],
-                    "binaries": []
+
                 }
             }
         });
@@ -1322,7 +1322,7 @@ mod tests {
                         "protocol": "websocket",
                         "request_body_credential_rewrite": true
                     }],
-                    "binaries": []
+
                 }
             }
         });
@@ -1346,7 +1346,7 @@ mod tests {
                         "protocol": "websocket",
                         "access": "read-write"
                     }],
-                    "binaries": []
+
                 }
             }
         });
@@ -1377,7 +1377,7 @@ mod tests {
                             {"allow": {"operation_type": "subscription", "fields": ["messageAdded"]}}
                         ]
                     }],
-                    "binaries": []
+
                 }
             }
         });
@@ -1400,7 +1400,7 @@ mod tests {
                             {"allow": {"fields": ["messageAdded"]}}
                         ]
                     }],
-                    "binaries": []
+
                 }
             }
         });
@@ -1425,7 +1425,7 @@ mod tests {
                             {"allow": {"method": "WEBSOCKET_TEXT", "path": "/graphql", "operation_type": "subscription"}}
                         ]
                     }],
-                    "binaries": []
+
                 }
             }
         });
@@ -1451,7 +1451,7 @@ mod tests {
                             {"allow": {"operation_type": "query"}}
                         ]
                     }],
-                    "binaries": []
+
                 }
             }
         });
@@ -1476,7 +1476,7 @@ mod tests {
                         "access": "read-only",
                         "rules": [{"allow": {"method": "GET", "path": "**"}}]
                     }],
-                    "binaries": []
+
                 }
             }
         });
@@ -1494,7 +1494,7 @@ mod tests {
                         "port": 443,
                         "protocol": "rest"
                     }],
-                    "binaries": []
+
                 }
             }
         });
@@ -1518,7 +1518,7 @@ mod tests {
                         "enforcement": "enforce",
                         "rules": [{"allow": {"command": "SELECT"}}]
                     }],
-                    "binaries": []
+
                 }
             }
         });
@@ -1538,7 +1538,7 @@ mod tests {
                         "protocol": "rest",
                         "access": "full"
                     }],
-                    "binaries": []
+
                 }
             }
         });
@@ -1565,7 +1565,7 @@ mod tests {
                         "protocol": "rest",
                         "access": "read-only"
                     }],
-                    "binaries": []
+
                 }
             }
         });
@@ -1589,7 +1589,7 @@ mod tests {
                         "protocol": "rest",
                         "access": "read-only"
                     }],
-                    "binaries": []
+
                 }
             }
         });
@@ -1612,7 +1612,7 @@ mod tests {
                         "protocol": "rest",
                         "access": "read-only"
                     }],
-                    "binaries": []
+
                 }
             }
         });
@@ -1641,7 +1641,7 @@ mod tests {
                         "protocol": "rest",
                         "access": "full"
                     }],
-                    "binaries": []
+
                 }
             }
         });
@@ -1665,7 +1665,7 @@ mod tests {
                         "protocol": "graphql",
                         "access": "read-only"
                     }],
-                    "binaries": []
+
                 }
             }
         });
@@ -1695,7 +1695,7 @@ mod tests {
                             }
                         }]
                     }],
-                    "binaries": []
+
                 }
             }
         });
@@ -1718,7 +1718,7 @@ mod tests {
                         "access": "full",
                         "persisted_queries": "allow_all"
                     }],
-                    "binaries": []
+
                 }
             }
         });
@@ -1738,7 +1738,7 @@ mod tests {
                         "host": "api.example.com",
                         "port": 443
                     }],
-                    "binaries": []
+
                 }
             }
         });
@@ -1761,7 +1761,7 @@ mod tests {
                         "host": "*",
                         "port": 443
                     }],
-                    "binaries": []
+
                 }
             }
         });
@@ -1781,7 +1781,7 @@ mod tests {
                         "host": "**",
                         "port": 443
                     }],
-                    "binaries": []
+
                 }
             }
         });
@@ -1801,7 +1801,7 @@ mod tests {
                         "host": "*com",
                         "port": 443
                     }],
-                    "binaries": []
+
                 }
             }
         });
@@ -1821,7 +1821,7 @@ mod tests {
                         "host": "*.com",
                         "port": 443
                     }],
-                    "binaries": []
+
                 }
             }
         });
@@ -1841,7 +1841,7 @@ mod tests {
                         "host": "**.org",
                         "port": 443
                     }],
-                    "binaries": []
+
                 }
             }
         });
@@ -1861,7 +1861,7 @@ mod tests {
                         "host": "*.example.com",
                         "port": 443
                     }],
-                    "binaries": []
+
                 }
             }
         });
@@ -1886,7 +1886,7 @@ mod tests {
                         "port": 443,
                         "ports": [443, 8443]
                     }],
-                    "binaries": []
+
                 }
             }
         });
@@ -1911,7 +1911,7 @@ mod tests {
                         "protocol": "rest",
                         "access": "read-only"
                     }],
-                    "binaries": []
+
                 }
             }
         });
@@ -1942,7 +1942,7 @@ mod tests {
                             }
                         }]
                     }],
-                    "binaries": []
+
                 }
             }
         });
@@ -1972,7 +1972,7 @@ mod tests {
                             }
                         }]
                     }],
-                    "binaries": []
+
                 }
             }
         });
@@ -2002,7 +2002,7 @@ mod tests {
                             }
                         }]
                     }],
-                    "binaries": []
+
                 }
             }
         });
@@ -2038,7 +2038,7 @@ mod tests {
                             }
                         }]
                     }],
-                    "binaries": []
+
                 }
             }
         });
@@ -2074,7 +2074,7 @@ mod tests {
                             }
                         }]
                     }],
-                    "binaries": []
+
                 }
             }
         });
@@ -2112,7 +2112,7 @@ mod tests {
                             }
                         }]
                     }],
-                    "binaries": []
+
                 }
             }
         });
@@ -2135,7 +2135,7 @@ mod tests {
                         "port": 443,
                         "deny_rules": [{ "method": "POST", "path": "/admin" }]
                     }],
-                    "binaries": []
+
                 }
             }
         });
@@ -2159,7 +2159,7 @@ mod tests {
                         "protocol": "rest",
                         "deny_rules": [{ "method": "POST", "path": "/admin" }]
                     }],
-                    "binaries": []
+
                 }
             }
         });
@@ -2184,7 +2184,7 @@ mod tests {
                         "access": "full",
                         "deny_rules": []
                     }],
-                    "binaries": []
+
                 }
             }
         });
@@ -2212,7 +2212,7 @@ mod tests {
                             { "method": "PUT", "path": "/repos/*/branches/*/protection" }
                         ]
                     }],
-                    "binaries": []
+
                 }
             }
         });
@@ -2239,7 +2239,7 @@ mod tests {
                             "query": { "type": { "any": [] } }
                         }]
                     }],
-                    "binaries": []
+
                 }
             }
         });
@@ -2268,7 +2268,7 @@ mod tests {
                             "query": { "force": 123 }
                         }]
                     }],
-                    "binaries": []
+
                 }
             }
         });
@@ -2301,7 +2301,7 @@ mod tests {
                             }
                         }]
                     }],
-                    "binaries": []
+
                 }
             }
         });

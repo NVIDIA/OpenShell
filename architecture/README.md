@@ -96,7 +96,7 @@ flowchart TB
 | Control-plane identity | Authentication and authorization for users, operators, and API clients. External identity verification belongs to identity drivers. |
 | Sandbox identity | Workload identity for supervisors and sandbox-to-sandbox authorization. Identity issuance or verification belongs to sandbox identity drivers. |
 | Supervisor | Sandbox-local security boundary. It prepares isolation, fetches config, injects credentials, runs relay endpoints, starts the proxy, and launches restricted agent processes. |
-| Policy proxy | Mandatory egress path for agent traffic. It enforces destination, binary identity, SSRF, TLS/L7, credential injection, and inference interception rules. |
+| Policy proxy | Mandatory egress path for agent traffic. It enforces destination, SSRF, TLS/L7, credential injection, and inference interception rules. |
 | Inference router | Sandbox-local forwarding for `https://inference.local` to configured model backends. |
 
 ## Integrating with the Ecosystem

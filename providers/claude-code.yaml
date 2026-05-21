@@ -29,4 +29,3 @@ endpoints:
     protocol: rest
     access: read-write
     enforcement: enforce
-binaries: [/usr/bin/claude, /usr/local/bin/claude]

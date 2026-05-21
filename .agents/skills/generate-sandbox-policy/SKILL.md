@@ -78,9 +78,6 @@ Regardless of tier, extract (or infer) these from the user's description:
 | **Methods** | Specific HTTP methods to allow | Only for custom/fine-grained |
 | **Paths** | Specific URL paths or patterns | Only for custom/fine-grained |
 | **Enforcement** | `enforce` or `audit`? Default to `enforce`. | No — has a default |
-| **Binary** | Which binary/process should have access | Yes — ask if not stated |
-
-If the host and access level are clear but binaries are not specified, ask the user which binary or process will be making the requests. Suggest common defaults like `/usr/bin/curl`, `/usr/local/bin/claude`, etc.
 
 ## Step 2: Refine Scope (Clarification Loop)
 
@@ -92,7 +89,6 @@ Always ask about these if the user hasn't already specified them:
 
 | Missing info | Question to ask |
 |-------------|----------------|
-| **Binary** not specified | "Which binary or process will make these requests? (e.g., `/usr/bin/curl`, `/usr/local/bin/claude`)" |
 | **Port** not specified | "Which port does this API use? (443 for HTTPS is typical)" |
 | **Enforcement** not stated | "Should policy violations be blocked (`enforce`) or just logged for review (`audit`)? I'll default to `enforce` if you're not sure." |
 
@@ -105,7 +101,6 @@ Ask these when the user's intent is broad and more specificity is possible:
 | "Full access" / "allow everything" | "Do you actually need DELETE access, or would read-write (everything except DELETE) be enough?" |
 | "Allow access to api.example.com" (no method/path detail) | "Do you know which specific API paths or operations you need? If so, I can lock the policy down to just those. Otherwise I'll use a broad preset." |
 | L4-only / "just pass it through" | "L4-only means the proxy won't inspect HTTP traffic at all — any method and path will be allowed. Are you sure you don't want at least read-only or read-write restriction?" |
-| Wildcard binary (`/usr/bin/*`) | "A wildcard binary pattern means any binary in that directory can use this policy. Can you narrow it to specific binaries?" |
 | Multiple hosts in one policy | "Do all of these hosts need the same access level? If some need tighter restrictions, I can split them into separate policies." |
 | `access: full` with `enforcement: audit` | "Full access in audit mode means nothing is actually restricted — all traffic flows through and violations are only logged. Is that intentional, or did you want to enforce restrictions?" |
 | `**` path glob on all rules | "Using `**` on all paths allows any URL path. Do you know the specific API path prefixes you need (e.g., `/api/v1/`)?" |
@@ -262,9 +257,9 @@ network_policies:
         # Optional: allow private IP destinations (CIDR or exact IP)
         # allowed_ips:
         #   - "10.0.5.0/24"
-    binaries:
-      - { path: <binary_path> }
 ```
+
+> **Note:** Binary allowlisting has been removed. The `binaries:` field is accepted in policy YAML for backward compatibility but is silently ignored — do not generate it in new policies.
 
 ### Deny Rules
 
@@ -287,8 +282,6 @@ github_api:
           path: "/repos/*/branches/*/protection"
         - method: "*"
           path: "/repos/*/rulesets"
-  binaries:
-    - { path: /usr/bin/curl }
 ```
 
 Deny rules support the same matching capabilities as allow rules: `method`, `path`, `command` (SQL), and `query` parameter matchers. When generating policies, prefer deny rules when the user needs broad access with a small set of blocked operations — it produces a shorter, more maintainable policy than enumerating 60+ allow rules.
@@ -311,8 +304,6 @@ internal_api:
       port: 8080
       allowed_ips:
         - "10.0.5.0/24"
-  binaries:
-    - { path: /usr/bin/curl }
 ```
 
 ### Policy Key Naming
@@ -345,9 +336,8 @@ Before presenting the policy to the user, verify correctness **and** flag breadt
 
 ### Structural Checks
 
-- [ ] Every policy has `name`, `endpoints`, and `binaries`
+- [ ] Every policy has `name` and `endpoints`
 - [ ] Every endpoint has `host` and `port`
-- [ ] Every binary has `path`
 - [ ] Policy key matches `name` field
 
 ### Breadth Warnings
@@ -360,7 +350,6 @@ Evaluate the generated policy for overly broad access and **include warnings in 
 | **`access: full`** | "This policy allows all HTTP methods (including DELETE) on all paths. If you don't need DELETE, `read-write` is safer. If you only need to read, `read-only` is the most restrictive option." |
 | **`access: full` + `enforcement: audit`** | "Full access in audit mode provides no actual restriction — all traffic flows through. This is effectively a monitoring-only policy." |
 | **`access: read-write`** when user hasn't confirmed write need | "This policy allows POST, PUT, and PATCH on all paths. If you only need to read data, `read-only` is more restrictive." |
-| **Wildcard binary** (`*` or `**` in binary path) | "This policy allows any binary matching the glob pattern. A compromised or unexpected binary in that directory could use this policy. Consider listing specific binary paths." |
 | **`**` path glob** on all explicit rules | "All rules use `**` path patterns, which match any URL path. This is equivalent to a preset — consider using `access: read-only` (or similar) for clarity, or narrowing paths if you know the API structure." |
 | **Multiple broad endpoints** in one policy | "This policy grants the same broad access to N different hosts. If any of these hosts needs tighter restrictions later, you'll need to split the policy." |
 | **Hostless `allowed_ips`** (no `host` field) | "This endpoint has no `host` — any domain resolving to the allowed IP range on this port will be permitted. Consider adding a `host` field to restrict which domains can use this allowlist." |
@@ -396,12 +385,12 @@ The policy needs to go somewhere. Determine which mode applies:
    - Whether the file uses compact (`{ host: ..., port: ... }`) or expanded YAML style
 
 2. **Check for conflicts**:
-   - Does a policy with the same key already exist? If so, ask the user whether to **replace** it, **merge** new endpoints/binaries into it, or use a different key.
+   - Does a policy with the same key already exist? If so, ask the user whether to **replace** it, **merge** new endpoints into it, or use a different key.
    - Does an existing policy already cover the same host:port? Warn the user — overlapping endpoint coverage across policies causes OPA evaluation errors (complete rule conflict).
 
 3. **Apply the change**:
    - **Adding a new policy**: Insert the new policy block under `network_policies`, maintaining the file's existing indentation and style.
-   - **Modifying an existing policy**: Edit the specific policy in place — add/remove endpoints, change access presets, update rules, add binaries, etc.
+   - **Modifying an existing policy**: Edit the specific policy in place — add/remove endpoints, change access presets, update rules, etc.
    - **Removing a policy**: Delete the policy block if the user asks.
 
 4. **Preserve everything else**: Do not modify `filesystem_policy`, `landlock`, `process`, or other policies unless the user explicitly asks.
@@ -458,7 +447,7 @@ Show the generated policy YAML with:
 
 After presenting or applying the policy, ask if the user wants to:
 - Tighten or loosen any rules
-- Add more endpoints or binaries
+- Add more endpoints
 - Switch between enforce/audit mode
 - Move from a preset to explicit rules (or vice versa)
 - Apply the policy to a file (if presented only)
@@ -473,8 +462,6 @@ my_api:
   name: my_api
   endpoints:
     - { host: api.example.com, port: 443 }
-  binaries:
-    - { path: /usr/bin/curl }
 ```
 
 ### HTTPS API with Read-Only Preset
@@ -489,8 +476,6 @@ my_api_readonly:
       tls: terminate
       enforcement: enforce
       access: read-only
-  binaries:
-    - { path: /usr/bin/curl }
 ```
 
 ### HTTPS API with Explicit Rules
@@ -511,9 +496,6 @@ my_api_custom:
         - allow:
             method: POST
             path: "/api/v1/data"
-  binaries:
-    - { path: /usr/bin/curl }
-    - { path: /usr/local/bin/myapp }
 ```
 
 ### HTTP (non-TLS) Internal API
@@ -533,8 +515,6 @@ internal_svc:
         - allow:
             method: POST
             path: "/api/v1/jobs"
-  binaries:
-    - { path: /usr/bin/curl }
 ```
 
 ### Private IP Access (Host + Allowlist)
@@ -547,8 +527,6 @@ internal_db:
       port: 5432
       allowed_ips:
         - "10.0.5.0/24"
-  binaries:
-    - { path: /usr/bin/curl }
 ```
 
 ### Private IP Access (Hostless — Any Domain in Range)
@@ -561,8 +539,6 @@ private_services:
       allowed_ips:
         - "10.0.5.0/24"
         - "10.0.6.0/24"
-  binaries:
-    - { path: /usr/bin/curl }
 ```
 
 ## Additional Resources

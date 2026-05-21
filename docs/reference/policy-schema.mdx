@@ -28,7 +28,7 @@ network_policies: { ... }
 | `filesystem_policy` | object | No | Static | Controls which directories the agent can read and write. |
 | `landlock` | object | No | Static | Configures Landlock LSM enforcement behavior. |
 | `process` | object | No | Static | Sets the user and group the agent process runs as. |
-| `network_policies` | map | No | Dynamic | Declares which binaries can reach which network endpoints. |
+| `network_policies` | map | No | Dynamic | Declares which network endpoints sandboxes can reach. |
 
 Static fields are set at sandbox creation time. Changing them requires destroying and recreating the sandbox. Dynamic fields can be updated on a running sandbox with `openshell policy update` for incremental merges or `openshell policy set` for full replacement, and take effect without restarting.
 
@@ -134,7 +134,11 @@ process:
 
 **Category:** Dynamic
 
-A map of named network policy entries. Each entry declares a set of endpoints and a set of binaries. Only the listed binaries are permitted to connect to the listed endpoints. The map key is a logical identifier. The `name` field inside the entry is the display name used in logs.
+A map of named network policy entries. Each entry declares a set of endpoints the sandbox can reach. The map key is a logical identifier. The `name` field inside the entry is the display name used in logs.
+
+<Warning>
+**Removed in this release:** The `binaries` field previously restricted which process paths could reach an endpoint, using `/proc/<pid>/exe` lookups and SHA-256 TOFU hashing. This control was removed because it is bypassable: runtime injection via environment variables (for example, `BUN_OPTIONS`, `NODE_OPTIONS`) or the dynamic linker (`LD_PRELOAD`) allows arbitrary code to execute inside a trusted binary's process while the kernel-reported executable path remains unchanged. Policy enforcement is now destination-based only (host and port). Existing `binaries:` fields in policy YAML are accepted and silently ignored.
+</Warning>
 
 ### Network Policy Entry
 
@@ -144,7 +148,7 @@ Each entry in the `network_policies` map has the following fields:
 |---|---|---|---|
 | `name` | string | No | Display name for the policy entry. Used in log output. Defaults to the map key. |
 | `endpoints` | list of endpoint objects | Yes | Hosts and ports this entry permits. |
-| `binaries` | list of binary objects | Yes | Executables allowed to connect to these endpoints. |
+| `binaries` | list of binary objects | No | Accepted in YAML for backward compatibility but silently ignored. Policy enforcement is destination-based only. |
 
 ### Endpoint Object
 
@@ -358,11 +362,11 @@ endpoints:
 
 ### Binary Object
 
-Identifies an executable that is permitted to use the associated endpoints.
+The `binaries` field is accepted for backward compatibility but is silently ignored. Binary path allowlisting was removed because it is bypassable. See the [Network Policies](#network-policies) section for details.
 
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `path` | string | Yes | Filesystem path to the executable. Supports glob patterns with `*` and `**`. For example, `/sandbox/.vscode-server/**` matches any executable under that directory tree. |
+| Field | Type | Description |
+|---|---|---|
+| `path` | string | Accepted but ignored. Was previously the filesystem path to the executable. |
 
 ### Full Example
 
@@ -378,10 +382,6 @@ network_policies:
         protocol: rest
         enforcement: enforce
         access: read-only
-    binaries:
-      - path: /usr/local/bin/claude
-      - path: /usr/bin/node
-      - path: /usr/bin/gh
   npm_registry:
     name: npm-registry
     endpoints:
@@ -390,7 +390,4 @@ network_policies:
         protocol: rest
         access: read-only
         allow_encoded_slash: true
-    binaries:
-      - path: /usr/bin/npm
-      - path: /usr/bin/node
 ```

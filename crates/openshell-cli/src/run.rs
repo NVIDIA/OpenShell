@@ -5915,7 +5915,6 @@ pub async fn sandbox_policy_update(
     add_deny: &[String],
     add_allow: &[String],
     remove_rules: &[String],
-    binaries: &[String],
     rule_name: Option<&str>,
     dry_run: bool,
     wait: bool,
@@ -5932,7 +5931,6 @@ pub async fn sandbox_policy_update(
         add_deny,
         add_allow,
         remove_rules,
-        binaries,
         rule_name,
     )?;
 
@@ -6446,9 +6444,6 @@ pub async fn sandbox_draft_get(
         println!("  {} {}", "Chunk:".dimmed(), chunk.id);
         println!("  {} {}", "Status:".dimmed(), status_colored);
         println!("  {} {}", "Rule:".dimmed(), chunk.rule_name);
-        if !chunk.binary.is_empty() {
-            println!("  {} {}", "Binary:".dimmed(), chunk.binary);
-        }
         println!(
             "  {} {:.0}%",
             "Confidence:".dimmed(),
@@ -6466,10 +6461,6 @@ pub async fn sandbox_draft_get(
 
         if let Some(ref rule) = chunk.proposed_rule {
             println!("  {} {}", "Endpoints:".dimmed(), format_endpoints(rule));
-            if !rule.binaries.is_empty() {
-                let bins: Vec<&str> = rule.binaries.iter().map(|b| b.path.as_str()).collect();
-                println!("  {} {}", "Binaries:".dimmed(), bins.join(", "));
-            }
         }
 
         if chunk.hit_count > 1 {

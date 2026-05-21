@@ -1106,7 +1106,6 @@ mod tests {
     use crate::l7::relay::L7EvalContext;
     use crate::opa::{NetworkInput, OpaEngine};
     use crate::secrets::SecretResolver;
-    use std::path::PathBuf;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const TEST_POLICY: &str = include_str!("../../data/sandbox-policy.rego");
@@ -1130,8 +1129,6 @@ network_policies:
           - allow:
               operation_type: subscription
               fields: [messageAdded]
-    binaries:
-      - { path: /usr/bin/node }
 "#;
 
     fn resolver() -> (HashMap<String, String>, SecretResolver) {
@@ -1250,9 +1247,6 @@ network_policies:
         let network_input = NetworkInput {
             host: "realtime.graphql.test".into(),
             port: 443,
-            binary_path: PathBuf::from("/usr/bin/node"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
             cmdline_paths: vec![],
         };
         let generation = engine
@@ -1266,8 +1260,6 @@ network_policies:
             host: "realtime.graphql.test".into(),
             port: 443,
             policy_name: "graphql_ws".into(),
-            binary_path: "/usr/bin/node".into(),
-            ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
         };

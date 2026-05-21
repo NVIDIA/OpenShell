@@ -1458,10 +1458,10 @@ mod tests {
     use crate::grpc::test_support::test_server_state;
     use openshell_core::proto::{
         DeleteProviderProfileRequest, GetProviderProfileRequest, ImportProviderProfilesRequest,
-        L7Allow, L7Rule, LintProviderProfilesRequest, ListProviderProfilesRequest, NetworkBinary,
-        NetworkEndpoint, ProviderCredentialRefresh, ProviderCredentialRefreshMaterial,
-        ProviderProfile, ProviderProfileCategory, ProviderProfileCredential,
-        ProviderProfileImportItem, Sandbox, SandboxSpec,
+        L7Allow, L7Rule, LintProviderProfilesRequest, ListProviderProfilesRequest, NetworkEndpoint,
+        ProviderCredentialRefresh, ProviderCredentialRefreshMaterial, ProviderProfile,
+        ProviderProfileCategory, ProviderProfileCredential, ProviderProfileImportItem, Sandbox,
+        SandboxSpec,
     };
     use openshell_core::{ObjectId, ObjectName};
     use std::collections::HashMap;
@@ -1518,7 +1518,6 @@ mod tests {
             category: ProviderProfileCategory::Other as i32,
             credentials: Vec::new(),
             endpoints: Vec::new(),
-            binaries: Vec::new(),
             inference_capable: false,
         }
     }
@@ -1925,10 +1924,6 @@ mod tests {
                             path: "/v1".to_string(),
                             ..Default::default()
                         }],
-                        binaries: vec![NetworkBinary {
-                            path: "/usr/bin/advanced".to_string(),
-                            harness: true,
-                        }],
                         inference_capable: false,
                     }),
                     source: "advanced-api.yaml".to_string(),
@@ -1965,7 +1960,6 @@ mod tests {
         );
         assert!(endpoint.allow_encoded_slash);
         assert_eq!(endpoint.path, "/v1");
-        assert!(fetched.binaries[0].harness);
     }
 
     #[tokio::test]
@@ -2962,7 +2956,6 @@ mod tests {
                             }),
                         }],
                         endpoints: vec![],
-                        binaries: vec![],
                         inference_capable: false,
                     }),
                     source: "delegated-refresh-api.yaml".to_string(),

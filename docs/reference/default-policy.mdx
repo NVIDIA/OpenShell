@@ -16,11 +16,11 @@ The following table shows the coverage of the default policy for common agents.
 | Agent | Coverage | Action Required |
 |---|---|---|
 | Claude Code | Full | None. Works out of the box. |
-| OpenCode | Partial | Add `opencode.ai` endpoint and OpenCode binary paths. |
-| Codex | None | Provide a complete custom policy with OpenAI endpoints and Codex binary paths. |
+| OpenCode | Partial | Add `opencode.ai` endpoint to the policy for full functionality. |
+| Codex | None | Provide a complete custom policy with OpenAI endpoints. |
 
 <Info>
-If you run a non-Claude agent without a custom policy, the agent's API calls are denied by the proxy. You must provide a policy that declares the agent's endpoints and binaries.
+If you run a non-Claude agent without a custom policy, the agent's API calls are denied by the proxy. You must provide a policy that declares the agent's endpoints.
 
 </Info>
 

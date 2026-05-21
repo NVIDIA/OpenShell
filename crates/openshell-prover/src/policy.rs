@@ -82,8 +82,6 @@ struct NetworkPolicyRuleDef {
     name: Option<String>,
     #[serde(default)]
     endpoints: Vec<EndpointDef>,
-    #[serde(default)]
-    binaries: Vec<BinaryDef>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -121,11 +119,6 @@ struct L7AllowDef {
     path: String,
     #[serde(default)]
     command: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct BinaryDef {
-    path: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -234,18 +227,11 @@ impl Endpoint {
     }
 }
 
-/// A binary path entry in a network policy rule.
-#[derive(Debug, Clone)]
-pub struct Binary {
-    pub path: String,
-}
-
-/// A named network policy rule containing endpoints and binaries.
+/// A named network policy rule containing endpoints.
 #[derive(Debug, Clone)]
 pub struct NetworkPolicyRule {
     pub name: String,
     pub endpoints: Vec<Endpoint>,
-    pub binaries: Vec<Binary>,
 }
 
 /// Filesystem access policy.
@@ -298,33 +284,6 @@ impl PolicyModel {
         for (name, rule) in &self.network_policies {
             for ep in &rule.endpoints {
                 result.push((name.as_str(), ep));
-            }
-        }
-        result
-    }
-
-    /// Deduplicated list of all binary paths across all policies.
-    pub fn all_binaries(&self) -> Vec<&Binary> {
-        let mut seen = HashSet::new();
-        let mut result = Vec::new();
-        for rule in self.network_policies.values() {
-            for b in &rule.binaries {
-                if seen.insert(&b.path) {
-                    result.push(b);
-                }
-            }
-        }
-        result
-    }
-
-    /// All (binary, `policy_name`, endpoint) triples.
-    pub fn binary_endpoint_pairs(&self) -> Vec<(&Binary, &str, &Endpoint)> {
-        let mut result = Vec::new();
-        for (name, rule) in &self.network_policies {
-            for b in &rule.binaries {
-                for ep in &rule.endpoints {
-                    result.push((b, name.as_str(), ep));
-                }
             }
         }
         result
@@ -388,21 +347,8 @@ pub fn parse_policy_str(yaml: &str) -> Result<PolicyModel> {
                 })
                 .collect();
 
-            let binaries = rule_raw
-                .binaries
-                .into_iter()
-                .map(|b| Binary { path: b.path })
-                .collect();
-
             let name = rule_raw.name.unwrap_or_else(|| key.clone());
-            network_policies.insert(
-                key,
-                NetworkPolicyRule {
-                    name,
-                    endpoints,
-                    binaries,
-                },
-            );
+            network_policies.insert(key, NetworkPolicyRule { name, endpoints });
         }
     }
 

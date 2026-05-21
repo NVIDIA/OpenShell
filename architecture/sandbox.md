@@ -39,7 +39,7 @@ OpenShell uses overlapping controls rather than a single sandbox primitive:
 | Process policy | The child process runs as a non-root user with reduced privileges. |
 | Seccomp | Blocks dangerous syscalls, including raw socket paths that bypass the proxy. |
 | Network namespace | Forces ordinary agent egress through the local CONNECT proxy. |
-| Policy proxy | Evaluates destination, binary identity, TLS/L7 rules, SSRF checks, and inference interception. |
+| Policy proxy | Evaluates destination, TLS/L7 rules, SSRF checks, and inference interception. |
 
 The supervisor may enrich baseline filesystem allowances for runtime-required
 paths, such as proxy support files or GPU device paths when a GPU is present.
@@ -47,8 +47,8 @@ paths, such as proxy support files or GPU device paths when a GPU is present.
 ## Network and Inference
 
 All ordinary agent egress is routed through the sandbox proxy. The proxy
-identifies the calling binary, checks trust-on-first-use binary identity, rejects
-unsafe internal destinations, and evaluates the active policy.
+rejects unsafe internal destinations and evaluates the active policy against the
+destination host and port.
 
 `https://inference.local` is special. It bypasses OPA network policy and is
 handled by the inference interception path:

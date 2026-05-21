@@ -57,8 +57,10 @@ message NetworkPolicyRule {
   string name = 1;
   // Allowed endpoint (host:port) pairs.
   repeated NetworkEndpoint endpoints = 2;
-  // Allowed binary identities.
-  repeated NetworkBinary binaries = 3;
+  // Binary allowlisting was removed (field number 3 is reserved/tombstoned).
+  // Do not reuse field number 3.
+  reserved 3;
+  reserved "binaries";
 }
 
 // A network endpoint (host + port) with optional L7 inspection config.
@@ -192,12 +194,9 @@ message L7QueryMatcher {
   repeated string any = 2;
 }
 
-// A binary identity for network policy matching.
-message NetworkBinary {
-  string path = 1;
-  // Deprecated: the harness concept has been removed. This field is ignored.
-  bool harness = 2 [deprecated = true];
-}
+// REMOVED MESSAGE: NetworkBinary (was a top-level message, no field numbers to reserve).
+// Binary allowlisting via /proc/<pid>/exe was removed as bypassable via LD_PRELOAD.
+// Do not reintroduce a message named NetworkBinary.
 
 // Request to get sandbox settings by sandbox ID.
 message GetSandboxConfigRequest {

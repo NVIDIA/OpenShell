@@ -9,7 +9,6 @@ pub mod bypass_monitor;
 mod child_env;
 pub mod denial_aggregator;
 mod grpc_client;
-mod identity;
 pub mod l7;
 pub mod log_push;
 pub mod mechanistic_mapper;
@@ -167,7 +166,6 @@ pub(crate) mod test_helpers {
     }
 }
 
-use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::{
     CertCache, ProxyTlsState, SandboxCa, build_upstream_client_config, read_system_ca_bundle,
     write_ca_files,
@@ -405,11 +403,6 @@ pub async fn run_sandbox(
     );
     let provider_env = provider_credentials.snapshot().child_env.clone();
 
-    // Create identity cache for SHA256 TOFU when OPA is active
-    let identity_cache = opa_engine
-        .as_ref()
-        .map(|_| Arc::new(BinaryIdentityCache::new()));
-
     // Prepare filesystem: create and chown read_write directories
     prepare_filesystem(&policy)?;
 
@@ -581,10 +574,6 @@ pub async fn run_sandbox(
             miette::miette!("Proxy mode requires an OPA engine (--rego-policy and --rego-data)")
         })?;
 
-        let cache = identity_cache.clone().ok_or_else(|| {
-            miette::miette!("Proxy mode requires an identity cache (OPA engine must be configured)")
-        })?;
-
         // If we have a network namespace, bind to the veth host IP so sandboxed
         // processes can reach the proxy via TCP.
         #[cfg(target_os = "linux")]
@@ -618,7 +607,6 @@ pub async fn run_sandbox(
             proxy_policy,
             bind_addr,
             engine,
-            cache,
             entrypoint_pid.clone(),
             tls_state,
             inference_ctx,
@@ -868,66 +856,6 @@ pub async fn run_sandbox(
             .build()
     );
 
-    // Spawn a task to resolve policy binary symlinks after the container
-    // filesystem becomes accessible via /proc/<pid>/root/. This expands
-    // symlinks like /usr/bin/python3 → /usr/bin/python3.11 in the OPA
-    // policy data so that either path matches at evaluation time.
-    //
-    // We cannot do this synchronously here because the child process has
-    // just been spawned and its mount namespace / procfs entries may not
-    // be fully populated yet. Instead, we probe with retries until
-    // /proc/<pid>/root/ is accessible or we exhaust attempts.
-    if let (Some(engine), Some(proto)) = (&opa_engine, &retained_proto) {
-        let resolve_engine = engine.clone();
-        let resolve_proto = proto.clone();
-        let resolve_pid = entrypoint_pid.clone();
-        tokio::spawn(async move {
-            let pid = resolve_pid.load(Ordering::Acquire);
-            let probe_path = format!("/proc/{pid}/root/");
-            // Retry up to 10 times with 500ms intervals (5s total).
-            // The child's mount namespace is typically ready within a
-            // few hundred ms of spawn.
-            for attempt in 1..=10 {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                if std::fs::metadata(&probe_path).is_ok() {
-                    info!(
-                        pid = pid,
-                        attempt = attempt,
-                        "Container filesystem accessible, resolving policy binary symlinks"
-                    );
-                    match resolve_engine.reload_from_proto_with_pid(&resolve_proto, pid) {
-                        Ok(()) => {
-                            info!(
-                                pid = pid,
-                                "Policy binary symlink resolution complete \
-                                 (check logs above for per-binary results)"
-                            );
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Failed to rebuild OPA engine with symlink resolution \
-                                 (non-fatal, falling back to literal path matching): {e}"
-                            );
-                        }
-                    }
-                    return;
-                }
-                debug!(
-                    pid = pid,
-                    attempt = attempt,
-                    probe_path = %probe_path,
-                    "Container filesystem not yet accessible, retrying symlink resolution"
-                );
-            }
-            warn!(
-                "Container filesystem /proc/{pid}/root/ not accessible after 10 attempts (5s); \
-                 binary symlink resolution skipped. Policy binary paths will be matched literally. \
-                 If binaries are symlinks, use canonical paths in your policy \
-                 (run 'readlink -f <path>' inside the sandbox)"
-            );
-        });
-    }
-
     // Spawn background policy poll task (gRPC mode only).
     if let (Some(id), Some(endpoint), Some(engine)) =
         (&sandbox_id, &openshell_endpoint, &opa_engine)
@@ -936,7 +864,6 @@ pub async fn run_sandbox(
         let poll_endpoint = endpoint.clone();
         let poll_engine = engine.clone();
         let poll_ocsf_enabled = ocsf_enabled.clone();
-        let poll_pid = entrypoint_pid.clone();
         let poll_provider_credentials = provider_credentials.clone();
         let poll_policy_local = policy_local_ctx.clone();
         let poll_interval_secs: u64 = std::env::var("OPENSHELL_POLICY_POLL_INTERVAL_SECS")
@@ -947,7 +874,6 @@ pub async fn run_sandbox(
             endpoint: poll_endpoint,
             sandbox_id: poll_id,
             opa_engine: poll_engine,
-            entrypoint_pid: poll_pid,
             interval_secs: poll_interval_secs,
             ocsf_enabled: poll_ocsf_enabled,
             provider_credentials: poll_provider_credentials,
@@ -1691,7 +1617,6 @@ mod baseline_tests {
                     port: 443,
                     ..Default::default()
                 }],
-                ..Default::default()
             },
         );
 
@@ -2239,8 +2164,6 @@ async fn flush_proposals_to_gateway(
             sandbox_id: String::new(),
             host: s.host,
             port: u32::from(s.port),
-            binary: s.binary,
-            ancestors: s.ancestors,
             deny_reason: s.deny_reason,
             first_seen_ms: s.first_seen_ms,
             last_seen_ms: s.last_seen_ms,
@@ -2248,7 +2171,6 @@ async fn flush_proposals_to_gateway(
             suppressed_count: 0,
             total_count: s.count,
             sample_cmdlines: s.sample_cmdlines,
-            binary_sha256: String::new(),
             persistent: false,
             denial_stage: s.denial_stage,
             l7_request_samples: s
@@ -2284,16 +2206,12 @@ async fn flush_proposals_to_gateway(
     Ok(())
 }
 
-/// `reload_from_proto_with_pid()`. Reports load success/failure back to the
-/// server. On failure, the previous engine is untouched (LKG behavior).
-///
-/// When the entrypoint PID is available, policy reloads include symlink
-/// resolution for binary paths via the container filesystem.
+/// Context for the background policy poll loop. Reports load success/failure
+/// back to the server. On failure, the previous engine is untouched (LKG behavior).
 struct PolicyPollLoopContext {
     endpoint: String,
     sandbox_id: String,
     opa_engine: Arc<OpaEngine>,
-    entrypoint_pid: Arc<AtomicU32>,
     interval_secs: u64,
     ocsf_enabled: Arc<std::sync::atomic::AtomicBool>,
     provider_credentials: provider_credentials::ProviderCredentialState,
@@ -2415,8 +2333,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
                 continue;
             };
 
-            let pid = ctx.entrypoint_pid.load(Ordering::Acquire);
-            match ctx.opa_engine.reload_from_proto_with_pid(policy, pid) {
+            match ctx.opa_engine.reload_from_proto(policy) {
                 Ok(()) => {
                     if let Some(policy_local_ctx) = ctx.policy_local_ctx.as_ref() {
                         policy_local_ctx.set_current_policy(policy.clone()).await;
@@ -2920,8 +2837,6 @@ network_policies:
     name: test
     endpoints:
       - { host: example.com, port: 443 }
-    binaries:
-      - { path: /usr/bin/curl }
 "#,
         )
         .unwrap();

@@ -1360,7 +1360,6 @@ mod tests {
                     port: 443,
                     ..Default::default()
                 }],
-                ..Default::default()
             },
         );
         let err = validate_policy_safety(&policy).unwrap_err();

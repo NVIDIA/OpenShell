@@ -1555,10 +1555,6 @@ enum PolicyCommands {
         #[arg(long = "remove-rule")]
         remove_rules: Vec<String>,
 
-        /// Add binaries to each --add-endpoint rule.
-        #[arg(long = "binary", value_hint = ValueHint::FilePath)]
-        binaries: Vec<String>,
-
         /// Override the generated rule name when exactly one --add-endpoint is provided.
         #[arg(long = "rule-name")]
         rule_name: Option<String>,
@@ -2239,7 +2235,6 @@ async fn main() -> Result<()> {
                     add_allow,
                     add_deny,
                     remove_rules,
-                    binaries,
                     rule_name,
                     dry_run,
                     wait,
@@ -2254,7 +2249,6 @@ async fn main() -> Result<()> {
                         &add_deny,
                         &add_allow,
                         &remove_rules,
-                        &binaries,
                         rule_name.as_deref(),
                         dry_run,
                         wait,

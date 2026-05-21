@@ -209,8 +209,6 @@ network_policies:
         protocol: rest
         enforcement: enforce
         access: full
-    binaries:
-      - { path: /usr/bin/curl }
 YAML
 )
 
@@ -234,8 +232,6 @@ network_policies:
         protocol: rest
         enforcement: enforce
         access: read-only
-    binaries:
-      - { path: /usr/bin/curl }
 YAML
 )
 
@@ -259,8 +255,6 @@ network_policies:
         protocol: rest
         enforcement: enforce
         access: full
-    binaries:
-      - { path: /usr/bin/curl }
 YAML
 )
 
@@ -282,8 +276,6 @@ network_policies:
       - host: api.github.com
         port: 443
         tls: skip
-    binaries:
-      - { path: /usr/bin/curl }
 YAML
 )
 

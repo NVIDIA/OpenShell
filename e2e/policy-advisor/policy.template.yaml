@@ -24,5 +24,3 @@ network_policies:
         protocol: rest
         enforcement: enforce
         access: read-only
-    binaries:
-      - { path: /usr/bin/curl }

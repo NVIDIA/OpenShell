@@ -3,16 +3,23 @@
 
 //! Linux `/proc` filesystem reading for process identity.
 //!
-//! Provides functions to resolve binary paths and compute file hashes
-//! for process-identity binding in the OPA proxy policy engine.
+//! Provides functions to resolve binary paths for observability logging in
+//! the OPA proxy policy engine.
+//!
+//! NOTE: Binary allowlisting using `/proc/<pid>/exe` (both SHA256 TOFU and
+//! path matching) was removed because it is bypassable via `LD_PRELOAD`. An
+//! attacker writes `evil.so` to `/tmp/evil.so` (writable by default policy)
+//! and runs `LD_PRELOAD=/tmp/evil.so /usr/bin/curl https://example.com`. The
+//! proxy sees `/usr/bin/curl` as the binary, the path matches — but
+//! `evil.so`'s constructor already ran before `main()` and can make arbitrary
+//! syscalls. Binary path data is kept for observability only; it is not used
+//! for security gating.
 
 use miette::Result;
 #[cfg(target_os = "linux")]
 use std::collections::HashSet;
-use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
-use tracing::debug;
 
 /// Where a socket owner was discovered while scanning `/proc`.
 #[cfg(target_os = "linux")]
@@ -116,14 +123,6 @@ pub fn binary_path(pid: i32) -> Result<PathBuf> {
 /// Resolve the binary path of the TCP peer inside a sandbox network namespace.
 ///
 /// Uses `/proc/<entrypoint_pid>/net/tcp` to find the socket inode for the given
-/// ephemeral port, then scans the entrypoint process tree to find which PID owns
-/// that socket, and finally reads `/proc/<pid>/exe` to get the binary path.
-#[cfg(target_os = "linux")]
-pub fn resolve_tcp_peer_binary(entrypoint_pid: u32, peer_port: u16) -> Result<PathBuf> {
-    let owner = resolve_single_tcp_peer_owner(entrypoint_pid, peer_port)?;
-    binary_path(owner.pid.cast_signed())
-}
-
 /// Resolve all process owners for the TCP peer inside a sandbox network namespace.
 ///
 /// Multiple processes can legitimately hold the same socket inode after `fork()`
@@ -137,37 +136,6 @@ pub fn resolve_tcp_peer_socket_owners(
     let inode = parse_proc_net_tcp(entrypoint_pid, peer_port)?;
     let owners = find_socket_inode_owners(inode, entrypoint_pid)?;
     Ok(TcpPeerSocketOwners { inode, owners })
-}
-
-/// Resolve exactly one owner for the TCP peer, failing closed on ambiguity.
-#[cfg(target_os = "linux")]
-fn resolve_single_tcp_peer_owner(entrypoint_pid: u32, peer_port: u16) -> Result<SocketOwner> {
-    let socket_owners = resolve_tcp_peer_socket_owners(entrypoint_pid, peer_port)?;
-    match socket_owners.owners.as_slice() {
-        [owner] => Ok(owner.clone()),
-        owners => {
-            let mut pids: Vec<u32> = owners.iter().map(|owner| owner.pid).collect();
-            pids.sort_unstable();
-            Err(miette::miette!(
-                "Ambiguous socket ownership for inode {}: PIDs [{}] all hold the same socket",
-                socket_owners.inode,
-                pids.iter()
-                    .map(u32::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ))
-        }
-    }
-}
-
-/// Like `resolve_tcp_peer_binary`, but also returns the PID that owns the socket.
-///
-/// Needed for the ancestor walk: we must know the PID to walk `/proc/<pid>/status` `PPid` chain.
-#[cfg(target_os = "linux")]
-pub fn resolve_tcp_peer_identity(entrypoint_pid: u32, peer_port: u16) -> Result<(PathBuf, u32)> {
-    let owner = resolve_single_tcp_peer_owner(entrypoint_pid, peer_port)?;
-    let path = binary_path(owner.pid.cast_signed())?;
-    Ok((path, owner.pid))
 }
 
 /// Read the `PPid` (parent PID) from `/proc/<pid>/status`.
@@ -466,47 +434,10 @@ fn collect_descendant_pids_with_depth(root_pid: u32) -> Vec<DescendantPid> {
     pids
 }
 
-/// Compute the SHA256 hash of a file, returned as a hex-encoded string.
-///
-/// Used for binary integrity verification in the trust-on-first-use (TOFU)
-/// model: the proxy hashes a binary on first network request and caches the
-/// result. Subsequent requests from the same binary path must produce the
-/// same hash, or the request is denied.
-pub fn file_sha256(path: &Path) -> Result<String> {
-    use sha2::{Digest, Sha256};
-    use std::io::Read;
-
-    let start = std::time::Instant::now();
-    let mut file = std::fs::File::open(path)
-        .map_err(|e| miette::miette!("Failed to open {}: {e}", path.display()))?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 65536].into_boxed_slice();
-    let mut total_read = 0u64;
-    loop {
-        let n = file
-            .read(&mut buf)
-            .map_err(|e| miette::miette!("Failed to read {}: {e}", path.display()))?;
-        if n == 0 {
-            break;
-        }
-        total_read += n as u64;
-        hasher.update(&buf[..n]);
-    }
-
-    let hash = hasher.finalize();
-    debug!(
-        "        file_sha256: {}ms size={} path={}",
-        start.elapsed().as_millis(),
-        total_read,
-        path.display()
-    );
-    Ok(hex::encode(hash))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::path::Path;
 
     /// Block until `/proc/<pid>/exe` points at `target`. `Command::spawn` returns
     /// once the child is scheduled, not once it has completed `exec()`; on
@@ -552,35 +483,6 @@ mod tests {
                 Err(err) => panic!("spawn failed after {attempts} ETXTBSY retries: {err}"),
             }
         }
-    }
-
-    #[test]
-    fn file_sha256_computes_correct_hash() {
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
-        tmp.write_all(b"hello world").unwrap();
-        tmp.flush().unwrap();
-
-        let hash = file_sha256(tmp.path()).unwrap();
-        // SHA256 of "hello world"
-        assert_eq!(
-            hash,
-            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
-        );
-    }
-
-    #[test]
-    fn file_sha256_different_content_different_hash() {
-        let mut tmp1 = tempfile::NamedTempFile::new().unwrap();
-        tmp1.write_all(b"content a").unwrap();
-        tmp1.flush().unwrap();
-
-        let mut tmp2 = tempfile::NamedTempFile::new().unwrap();
-        tmp2.write_all(b"content b").unwrap();
-        tmp2.flush().unwrap();
-
-        let hash1 = file_sha256(tmp1.path()).unwrap();
-        let hash2 = file_sha256(tmp2.path()).unwrap();
-        assert_ne!(hash1, hash2);
     }
 
     #[cfg(target_os = "linux")]

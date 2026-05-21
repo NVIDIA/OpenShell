@@ -3,9 +3,9 @@
 
 //! Formal policy verification for `OpenShell` sandboxes.
 //!
-//! Encodes sandbox policies, binary capabilities, and credential scopes as Z3
-//! SMT constraints, then checks reachability queries to detect data exfiltration
-//! paths and write-bypass violations.
+//! Encodes sandbox policies and credential scopes as Z3 SMT constraints,
+//! then checks reachability queries to detect data exfiltration paths and
+//! write-bypass violations.
 
 pub mod accepted_risks;
 pub mod credentials;
@@ -32,7 +32,7 @@ use report::{render_compact, render_report};
 /// - `1` — fail (critical or high findings present)
 /// - `2` — input error
 ///
-/// Binary and API capability registries are embedded at compile time.
+/// The API capability registry is embedded at compile time.
 /// Pass `registry_dir` to override with a custom filesystem registry.
 pub fn prove(
     policy_path: &str,
@@ -43,21 +43,14 @@ pub fn prove(
 ) -> Result<i32> {
     let policy = parse_policy(Path::new(policy_path))?;
 
-    let (credential_set, binary_registry) = match registry_dir {
+    let credential_set = match registry_dir {
         Some(dir) => {
-            let dir = Path::new(dir);
-            (
-                credentials::load_credential_set_from_dir(Path::new(credentials_path), dir)?,
-                registry::load_binary_registry_from_dir(dir)?,
-            )
+            credentials::load_credential_set_from_dir(Path::new(credentials_path), Path::new(dir))?
         }
-        None => (
-            credentials::load_credential_set_embedded(Path::new(credentials_path))?,
-            registry::load_embedded_binary_registry()?,
-        ),
+        None => credentials::load_credential_set_embedded(Path::new(credentials_path))?,
     };
 
-    let z3_model = build_model(policy, credential_set, binary_registry);
+    let z3_model = build_model(policy, credential_set);
     let mut findings = run_all_queries(&z3_model);
 
     if let Some(ar_path) = accepted_risks_path {
@@ -97,7 +90,6 @@ mod tests {
         let rule = &model.network_policies["github_api"];
         assert_eq!(rule.name, "github-api");
         assert_eq!(rule.endpoints.len(), 2);
-        assert!(rule.binaries.len() >= 4);
     }
 
     // 2. Verify readable_paths.
@@ -157,28 +149,23 @@ filesystem_policy:
         assert_eq!(sandbox_count, 1);
     }
 
-    // 6. End-to-end: git push bypass findings detected (uses embedded registry).
+    // 6. End-to-end: L4-only endpoint findings detected.
     #[test]
-    fn test_git_push_bypass_findings() {
+    fn test_l4_only_findings() {
         let policy_path = testdata_dir().join("policy.yaml");
         let creds_path = testdata_dir().join("credentials.yaml");
 
         let pol = parse_policy(&policy_path).expect("parse policy");
         let cred_set = credentials::load_credential_set_embedded(&creds_path).expect("load creds");
-        let bin_reg = registry::load_embedded_binary_registry().expect("load registry");
 
-        let z3_model = build_model(pol, cred_set, bin_reg);
+        let z3_model = build_model(pol, cred_set);
         let findings = run_all_queries(&z3_model);
 
         let query_types: std::collections::HashSet<&str> =
             findings.iter().map(|f| f.query.as_str()).collect();
         assert!(
             query_types.contains("data_exfiltration"),
-            "expected data_exfiltration finding"
-        );
-        assert!(
-            query_types.contains("write_bypass"),
-            "expected write_bypass finding"
+            "expected data_exfiltration finding: L4-only endpoint with readable filesystem"
         );
         assert!(
             findings.iter().any(|f| matches!(
@@ -197,9 +184,8 @@ filesystem_policy:
 
         let pol = parse_policy(&policy_path).expect("parse policy");
         let cred_set = credentials::load_credential_set_embedded(&creds_path).expect("load creds");
-        let bin_reg = registry::load_embedded_binary_registry().expect("load registry");
 
-        let z3_model = build_model(pol, cred_set, bin_reg);
+        let z3_model = build_model(pol, cred_set);
         let findings = run_all_queries(&z3_model);
 
         assert!(

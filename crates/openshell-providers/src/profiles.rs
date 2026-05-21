@@ -3,15 +3,12 @@
 
 //! Declarative provider type profiles.
 
-#![allow(deprecated)] // NetworkBinary::harness remains in the public proto for compatibility.
-
 use openshell_core::proto::{
-    GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule, NetworkBinary, NetworkEndpoint,
+    GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule, NetworkEndpoint,
     NetworkPolicyRule, ProviderCredentialRefresh, ProviderCredentialRefreshMaterial,
     ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileCategory,
     ProviderProfileCredential,
 };
-use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
@@ -117,8 +114,8 @@ pub struct CredentialRefreshMaterialProfile {
 // These YAML/JSON DTOs mirror the network policy protos intentionally. Keep
 // every lossless conversion below in sync with proto/sandbox.proto. If a field
 // is added to NetworkEndpoint, L7Rule, L7Allow, L7DenyRule, L7QueryMatcher,
-// GraphqlOperation, or NetworkBinary, add it here and in both conversion
-// directions unless the import/lint path explicitly rejects it.
+// or GraphqlOperation, add it here and in both conversion directions unless
+// the import/lint path explicitly rejects it.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct EndpointProfile {
     pub host: String,
@@ -216,12 +213,6 @@ pub struct GraphqlOperationProfile {
     pub fields: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BinaryProfile {
-    pub path: String,
-    pub harness: bool,
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ProviderTypeProfile {
     pub id: String,
@@ -238,8 +229,6 @@ pub struct ProviderTypeProfile {
     pub credentials: Vec<CredentialProfile>,
     #[serde(default)]
     pub endpoints: Vec<EndpointProfile>,
-    #[serde(default)]
-    pub binaries: Vec<BinaryProfile>,
     #[serde(default)]
     pub inference_capable: bool,
 }
@@ -275,7 +264,6 @@ impl ProviderTypeProfile {
                 })
                 .collect(),
             endpoints: profile.endpoints.iter().map(endpoint_from_proto).collect(),
-            binaries: profile.binaries.iter().map(binary_from_proto).collect(),
             inference_capable: profile.inference_capable,
         }
     }
@@ -315,7 +303,6 @@ impl ProviderTypeProfile {
                 })
                 .collect(),
             endpoints: self.endpoints.iter().map(endpoint_to_proto).collect(),
-            binaries: self.binaries.iter().map(binary_to_proto).collect(),
             inference_capable: self.inference_capable,
         }
     }
@@ -325,54 +312,6 @@ impl ProviderTypeProfile {
         NetworkPolicyRule {
             name: rule_name.to_string(),
             endpoints: self.endpoints.iter().map(endpoint_to_proto).collect(),
-            binaries: self.binaries.iter().map(binary_to_proto).collect(),
-        }
-    }
-}
-
-impl Serialize for BinaryProfile {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        if !self.harness {
-            return serializer.serialize_str(&self.path);
-        }
-        let mut state = serializer.serialize_struct("BinaryProfile", 2)?;
-        state.serialize_field("path", &self.path)?;
-        state.serialize_field("harness", &self.harness)?;
-        state.end()
-    }
-}
-
-impl<'de> Deserialize<'de> for BinaryProfile {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum BinaryProfileInput {
-            Path(String),
-            Object(BinaryProfileObject),
-        }
-
-        #[derive(Deserialize)]
-        struct BinaryProfileObject {
-            path: String,
-            #[serde(default)]
-            harness: bool,
-        }
-
-        match BinaryProfileInput::deserialize(deserializer)? {
-            BinaryProfileInput::Path(path) => Ok(Self {
-                path,
-                harness: false,
-            }),
-            BinaryProfileInput::Object(binary) => Ok(Self {
-                path: binary.path,
-                harness: binary.harness,
-            }),
         }
     }
 }
@@ -594,20 +533,6 @@ fn endpoint_from_proto(endpoint: &NetworkEndpoint) -> EndpointProfile {
             .collect(),
         graphql_max_body_bytes: endpoint.graphql_max_body_bytes,
         path: endpoint.path.clone(),
-    }
-}
-
-fn binary_to_proto(binary: &BinaryProfile) -> NetworkBinary {
-    NetworkBinary {
-        path: binary.path.clone(),
-        harness: binary.harness,
-    }
-}
-
-fn binary_from_proto(binary: &NetworkBinary) -> BinaryProfile {
-    BinaryProfile {
-        path: binary.path.clone(),
-        harness: binary.harness,
     }
 }
 
@@ -983,17 +908,6 @@ pub fn validate_profile_set(
                 ));
             }
         }
-
-        for (index, binary) in profile.binaries.iter().enumerate() {
-            if binary.path.trim().is_empty() {
-                diagnostics.push(ProfileValidationDiagnostic::error(
-                    source,
-                    profile_id,
-                    format!("binaries[{index}]"),
-                    "binary path must not be empty",
-                ));
-            }
-        }
     }
     diagnostics
 }
@@ -1062,7 +976,6 @@ mod tests {
             ProviderProfileCategory::SourceControl as i32
         );
         assert_eq!(proto.endpoints.len(), 2);
-        assert_eq!(proto.binaries.len(), 4);
     }
 
     #[test]
@@ -1142,7 +1055,6 @@ credentials:
 
         assert_eq!(parsed.id, "github");
         assert_eq!(parsed.category, ProviderProfileCategory::SourceControl);
-        assert_eq!(parsed.binaries[0].path, "/usr/bin/gh");
     }
 
     #[test]
@@ -1179,9 +1091,6 @@ endpoints:
         fields: [viewer]
     graphql_max_body_bytes: 131072
     path: /graphql
-binaries:
-  - path: /usr/bin/custom
-    harness: true
 ",
         )
         .expect("profile should parse");
@@ -1217,7 +1126,6 @@ binaries:
                 .map(|operation| operation.operation_name.as_str()),
             Some("Viewer")
         );
-        assert!(proto.binaries[0].harness);
 
         let reparsed = parse_profile_yaml(&profile_to_yaml(&profile).expect("serialize YAML"))
             .expect("serialized profile should parse");
@@ -1225,7 +1133,6 @@ binaries:
         assert_eq!(reprotoo.endpoints[0].rules.len(), 1);
         assert_eq!(reprotoo.endpoints[0].deny_rules.len(), 1);
         assert_eq!(reprotoo.endpoints[0].ports, vec![443, 8443]);
-        assert!(reprotoo.binaries[0].harness);
     }
 
     #[test]
@@ -1244,7 +1151,6 @@ credentials:
 endpoints:
   - host: ""
     port: 0
-binaries: ["", /usr/bin/broken]
 "#,
         )
         .expect("profile should parse");
@@ -1265,7 +1171,6 @@ binaries: ["", /usr/bin/broken]
                 .iter()
                 .any(|message| message.starts_with("invalid endpoint"))
         );
-        assert!(messages.contains(&"binary path must not be empty"));
     }
 
     #[test]
@@ -1280,7 +1185,6 @@ binaries: ["", /usr/bin/broken]
                     category: ProviderProfileCategory::Other,
                     credentials: Vec::new(),
                     endpoints: Vec::new(),
-                    binaries: Vec::new(),
                     inference_capable: false,
                 },
             ),
@@ -1293,7 +1197,6 @@ binaries: ["", /usr/bin/broken]
                     category: ProviderProfileCategory::Other,
                     credentials: Vec::new(),
                     endpoints: Vec::new(),
-                    binaries: Vec::new(),
                     inference_capable: false,
                 },
             ),
@@ -1306,7 +1209,6 @@ binaries: ["", /usr/bin/broken]
                     category: ProviderProfileCategory::Other,
                     credentials: Vec::new(),
                     endpoints: Vec::new(),
-                    binaries: Vec::new(),
                     inference_capable: false,
                 },
             ),

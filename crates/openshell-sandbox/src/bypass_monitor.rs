@@ -260,17 +260,9 @@ pub fn spawn(
 
             // Send to denial aggregator if available.
             if let Some(ref tx) = denial_tx {
-                let ancestors_vec: Vec<String> = if ancestors == "-" {
-                    vec![]
-                } else {
-                    ancestors.split(" -> ").map(String::from).collect()
-                };
-
                 let _ = tx.send(DenialEvent {
                     host: event.dst_addr.clone(),
                     port: event.dst_port,
-                    binary: binary.clone(),
-                    ancestors: ancestors_vec,
                     deny_reason: "direct connection bypassed HTTP CONNECT proxy".to_string(),
                     denial_stage: "bypass".to_string(),
                     l7_method: None,

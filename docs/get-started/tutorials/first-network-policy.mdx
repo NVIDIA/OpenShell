@@ -82,14 +82,14 @@ openshell logs demo --since 5m
 You see a line like:
 
 ```text
-action=deny dst_host=api.github.com dst_port=443 binary=/usr/bin/curl deny_reason="no matching network policy"
+action=deny dst_host=api.github.com dst_port=443 deny_reason="no matching network policy"
 ```
 
-Every denied connection is logged with the destination, the binary that attempted it, and the reason. Nothing gets out silently.
+Every denied connection is logged with the destination and reason. Nothing gets out silently.
 
 ## Apply a Read-Only GitHub API Policy
 
-To allow the sandbox to reach the GitHub API, define a network policy that grants read-only access. The policy specifies which host, port, binary, and HTTP methods are permitted. Create a file called `github_readonly.yaml` with the following content:
+To allow the sandbox to reach the GitHub API, define a network policy that grants read-only access. The policy specifies which host, port, and HTTP methods are permitted. Create a file called `github_readonly.yaml` with the following content:
 
 ```yaml
 version: 1
@@ -113,11 +113,9 @@ network_policies:
         protocol: rest
         enforcement: enforce
         access: read-only
-    binaries:
-      - { path: /usr/bin/curl }
 ```
 
-The `filesystem_policy`, `landlock`, and `process` sections preserve the default sandbox settings. This is required because `policy set` replaces the entire policy. The `network_policies` section is the key part: `curl` can make GET, HEAD, and OPTIONS requests to `api.github.com` over HTTPS. Everything else is denied. The proxy auto-detects TLS on HTTPS endpoints and terminates it to inspect each HTTP request and enforce the `read-only` access preset at the method level.
+The `filesystem_policy`, `landlock`, and `process` sections preserve the default sandbox settings. This is required because `policy set` replaces the entire policy. The `network_policies` section is the key part: the sandbox can make GET, HEAD, and OPTIONS requests to `api.github.com` over HTTPS. Everything else is denied. The proxy auto-detects TLS on HTTPS endpoints and terminates it to inspect each HTTP request and enforce the `read-only` access preset at the method level.
 
 Apply it:
 
@@ -130,7 +128,6 @@ openshell policy set demo --policy github_readonly.yaml --wait
 <Tip>
 This tutorial uses `curl` and `read-only` access to keep things simple. When building policies for real workloads:
 
-- To scope the policy to an agent, replace the `binaries` section with your agent's binary, such as `/usr/local/bin/claude`, instead of `curl`.
 - To grant write access, change `access: read-only` to `read-write` or add explicit `rules` for specific paths. Refer to the [Policy Schema](/reference/policy-schema).
 - To allow additional endpoints, stack multiple policies in the same file for PyPI, npm, or your internal APIs. Refer to [Policies](/sandboxes/policies) for examples.
 

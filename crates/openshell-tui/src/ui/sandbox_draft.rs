@@ -124,12 +124,6 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 spans.push(Span::styled("  ", t.muted));
                 spans.push(Span::styled(endpoint_str, t.accent));
             }
-            // Show binary name (just the filename, not full path) if present.
-            if !chunk.binary.is_empty() {
-                let bin_short = chunk.binary.rsplit('/').next().unwrap_or(&chunk.binary);
-                spans.push(Span::styled("  ", t.muted));
-                spans.push(Span::styled(format!("({bin_short})"), t.muted));
-            }
             spans.push(Span::raw("  "));
             spans.push(Span::styled(format!("[{}]", chunk.status), status_style));
             spans.push(Span::styled(
@@ -198,14 +192,6 @@ pub fn draw_detail_popup(
         ]),
     ];
 
-    // Binary (denormalized from the denial).
-    if !chunk.binary.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("Binary:     ", t.muted),
-            Span::styled(&chunk.binary, t.text),
-        ]));
-    }
-
     // Hit count (accumulated real denial count) and first/last seen.
     lines.push(Line::from(vec![
         Span::styled("Denied:     ", t.muted),
@@ -237,18 +223,6 @@ pub fn draw_detail_popup(
                 Span::styled("-> ", t.muted),
                 Span::styled(format!("{}:{}", ep.host, ep.port), t.accent),
             ]));
-        }
-
-        // Binaries.
-        if !rule.binaries.is_empty() {
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled("Binaries:", t.muted)));
-            for b in &rule.binaries {
-                lines.push(Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled(&b.path, t.text),
-                ]));
-            }
         }
     }
 
@@ -392,17 +366,12 @@ pub fn draw_approve_all_popup(
             (chunk.rule_name.clone(), endpoint_str)
         };
 
-        let mut row_spans = vec![
+        let row_spans = vec![
             Span::styled("  -> ", t.muted),
             Span::styled(name_str, t.text),
             Span::styled("  ", t.muted),
             Span::styled(ep_str, t.accent),
         ];
-        if !chunk.binary.is_empty() {
-            let bin_short = chunk.binary.rsplit('/').next().unwrap_or(&chunk.binary);
-            row_spans.push(Span::styled("  ", t.muted));
-            row_spans.push(Span::styled(format!("({bin_short})"), t.muted));
-        }
         lines.push(Line::from(row_spans));
     }
 

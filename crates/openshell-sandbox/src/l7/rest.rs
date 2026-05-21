@@ -87,7 +87,6 @@ impl L7Provider for RestProvider {
 pub(crate) struct DenyResponseContext<'a> {
     pub(crate) host: Option<&'a str>,
     pub(crate) port: Option<u16>,
-    pub(crate) binary: Option<&'a str>,
 }
 
 impl RestProvider {
@@ -1267,7 +1266,6 @@ fn deny_response_body(
     let target = redacted_target.unwrap_or(&req.target);
     let context = context.unwrap_or_default();
     let host = non_empty(context.host);
-    let binary = non_empty(context.binary);
 
     let mut rule_missing = serde_json::Map::new();
     rule_missing.insert("type".to_string(), serde_json::json!("rest_allow"));
@@ -1279,9 +1277,6 @@ fn deny_response_body(
     }
     if let Some(port) = context.port {
         rule_missing.insert("port".to_string(), serde_json::json!(port));
-    }
-    if let Some(binary) = binary {
-        rule_missing.insert("binary".to_string(), serde_json::json!(binary));
     }
 
     let mut body = serde_json::Map::new();
@@ -1301,9 +1296,6 @@ fn deny_response_body(
     }
     if let Some(port) = context.port {
         body.insert("port".to_string(), serde_json::json!(port));
-    }
-    if let Some(binary) = binary {
-        body.insert("binary".to_string(), serde_json::json!(binary));
     }
     body.insert(
         "rule_missing".to_string(),
@@ -2300,7 +2292,6 @@ mod tests {
             Some(DenyResponseContext {
                 host: Some("api.github.com"),
                 port: Some(443),
-                binary: Some("/usr/bin/gh"),
             }),
         );
 
@@ -2311,7 +2302,6 @@ mod tests {
         assert_eq!(body["method"], "PUT");
         assert_eq!(body["host"], "api.github.com");
         assert_eq!(body["port"], 443);
-        assert_eq!(body["binary"], "/usr/bin/gh");
         assert_eq!(body["path"], "/repos/NVIDIA/OpenShell/contents/README.md");
         assert_eq!(
             body["rule"],
@@ -2326,7 +2316,6 @@ mod tests {
         );
         assert_eq!(body["rule_missing"]["host"], "api.github.com");
         assert_eq!(body["rule_missing"]["port"], 443);
-        assert_eq!(body["rule_missing"]["binary"], "/usr/bin/gh");
         assert_eq!(body["next_steps"][0]["action"], "read_skill");
         assert_eq!(
             body["next_steps"][0]["path"],
@@ -2361,7 +2350,6 @@ mod tests {
                 Some(DenyResponseContext {
                     host: Some("api.github.com"),
                     port: Some(443),
-                    binary: Some("/usr/bin/gh"),
                 }),
             )
             .await

@@ -96,7 +96,6 @@ mod tests {
                 allow_encoded_slash: false,
                 ..Default::default()
             }],
-            binaries: Vec::new(),
         }
     }
 

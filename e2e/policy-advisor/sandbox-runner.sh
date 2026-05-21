@@ -112,11 +112,7 @@ payload = {
                             ],
                         }
                     ],
-                    "binaries": [
-                        {
-                            "path": "/usr/bin/curl",
-                        }
-                    ],
+
                 },
             }
         }
@@ -164,7 +160,7 @@ payload = {
                         "allow": {"method": "GET", "path": f"/{rule_id}"}
                     }],
                 }],
-                "binaries": [{"path": "/usr/bin/curl"}],
+
             },
         }
     }],

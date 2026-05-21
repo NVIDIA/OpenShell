@@ -6,9 +6,8 @@ use std::collections::{BTreeMap, HashMap};
 use miette::{Result, miette};
 use openshell_core::proto::policy_merge_operation;
 use openshell_core::proto::{
-    AddAllowRules, AddDenyRules, AddNetworkRule, L7Allow, L7DenyRule, L7Rule, NetworkBinary,
-    NetworkEndpoint, NetworkPolicyRule, PolicyMergeOperation, RemoveNetworkEndpoint,
-    RemoveNetworkRule,
+    AddAllowRules, AddDenyRules, AddNetworkRule, L7Allow, L7DenyRule, L7Rule, NetworkEndpoint,
+    NetworkPolicyRule, PolicyMergeOperation, RemoveNetworkEndpoint, RemoveNetworkRule,
 };
 use openshell_policy::{PolicyMergeOp, generated_rule_name};
 
@@ -25,15 +24,8 @@ pub fn build_policy_update_plan(
     add_deny: &[String],
     add_allow: &[String],
     remove_rules: &[String],
-    binaries: &[String],
     rule_name: Option<&str>,
 ) -> Result<PolicyUpdatePlan> {
-    if binaries.iter().any(|binary| binary.trim().is_empty()) {
-        return Err(miette!("--binary values must not be empty"));
-    }
-    if !binaries.is_empty() && add_endpoints.is_empty() {
-        return Err(miette!("--binary can only be used with --add-endpoint"));
-    }
     if rule_name.is_some() && add_endpoints.is_empty() {
         return Err(miette!("--rule-name can only be used with --add-endpoint"));
     }
@@ -45,7 +37,6 @@ pub fn build_policy_update_plan(
     let mut merge_operations = Vec::new();
     let mut preview_operations = Vec::new();
 
-    let deduped_binaries = dedup_strings(binaries);
     for spec in add_endpoints {
         let endpoint = parse_add_endpoint_spec(spec)?;
         let target_rule_name = rule_name
@@ -58,13 +49,6 @@ pub fn build_policy_update_plan(
         let rule = NetworkPolicyRule {
             name: target_rule_name.clone(),
             endpoints: vec![endpoint.clone()],
-            binaries: deduped_binaries
-                .iter()
-                .map(|path| NetworkBinary {
-                    path: path.clone(),
-                    ..Default::default()
-                })
-                .collect(),
         };
         merge_operations.push(PolicyMergeOperation {
             operation: Some(policy_merge_operation::Operation::AddRule(AddNetworkRule {
@@ -437,17 +421,6 @@ fn parse_port(flag: &str, spec: &str, port: &str) -> Result<u32> {
     Ok(parsed)
 }
 
-fn dedup_strings(values: &[String]) -> Vec<String> {
-    let mut deduped = Vec::new();
-    for value in values {
-        let trimmed = value.trim();
-        if !trimmed.is_empty() && !deduped.iter().any(|existing| existing == trimmed) {
-            deduped.push(trimmed.to_string());
-        }
-    }
-    deduped
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -461,7 +434,6 @@ mod tests {
         add_deny: &[String],
         add_allow: &[String],
         remove_rules: &[String],
-        binaries: &[String],
         rule_name: Option<&str>,
     ) -> miette::Result<PolicyUpdatePlan> {
         build_policy_update_plan_with_options(
@@ -470,16 +442,14 @@ mod tests {
             add_deny,
             add_allow,
             remove_rules,
-            binaries,
             rule_name,
         )
     }
 
     #[test]
     fn parse_add_endpoint_basic_l4() {
-        let plan =
-            build_policy_update_plan(&["ghcr.io:443".to_string()], &[], &[], &[], &[], &[], None)
-                .expect("plan should build");
+        let plan = build_policy_update_plan(&["ghcr.io:443".to_string()], &[], &[], &[], &[], None)
+            .expect("plan should build");
         assert_eq!(plan.merge_operations.len(), 1);
         assert_eq!(plan.preview_operations.len(), 1);
     }
@@ -488,7 +458,6 @@ mod tests {
     fn parse_add_endpoint_rejects_bad_access() {
         let error = build_policy_update_plan(
             &["api.github.com:443:write-ish".to_string()],
-            &[],
             &[],
             &[],
             &[],
@@ -507,7 +476,6 @@ mod tests {
             &[],
             &[],
             &[],
-            &[],
             None,
         )
         .expect("plan should build");
@@ -517,7 +485,6 @@ mod tests {
     fn parse_add_endpoint_accepts_websocket_protocol() {
         let plan = build_policy_update_plan(
             &["realtime.example.com:443:read-write:websocket:enforce".to_string()],
-            &[],
             &[],
             &[],
             &[],
@@ -538,16 +505,8 @@ mod tests {
 
     #[test]
     fn parse_add_endpoint_enables_websocket_credential_rewrite() {
-        let plan = build_policy_update_plan(
-            &["realtime.example.com:443:read-write:websocket:enforce:websocket-credential-rewrite"
-                .to_string()],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            None,
-        )
+        let plan = build_policy_update_plan(&["realtime.example.com:443:read-write:websocket:enforce:websocket-credential-rewrite"
+            .to_string()], &[], &[], &[], &[], None)
         .expect("plan should build");
 
         let PolicyMergeOp::AddRule { rule, .. } = &plan.preview_operations[0] else {
@@ -563,7 +522,6 @@ mod tests {
                 "realtime.example.com:443:read-write:rest:enforce:websocket-credential-rewrite"
                     .to_string(),
             ],
-            &[],
             &[],
             &[],
             &[],
@@ -589,7 +547,6 @@ mod tests {
             &[],
             &[],
             &[],
-            &[],
             None,
         )
         .expect("plan should build");
@@ -604,18 +561,10 @@ mod tests {
 
     #[test]
     fn parse_add_endpoint_merges_allowed_ips_with_websocket_options() {
-        let plan = build_policy_update_plan(
-            &[
-                "realtime.example.com:443:read-write:websocket:enforce:websocket-credential-rewrite,allowed-ip=10.0.0.0/8,allowed-ip=172.16.0.0/12,allowed-ip=10.0.0.0/8"
-                    .to_string(),
-            ],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            None,
-        )
+        let plan = build_policy_update_plan(&[
+            "realtime.example.com:443:read-write:websocket:enforce:websocket-credential-rewrite,allowed-ip=10.0.0.0/8,allowed-ip=172.16.0.0/12,allowed-ip=10.0.0.0/8"
+                .to_string(),
+        ], &[], &[], &[], &[], None)
         .expect("plan should build");
 
         let PolicyMergeOp::AddRule { rule, .. } = &plan.preview_operations[0] else {
@@ -633,7 +582,6 @@ mod tests {
     fn parse_add_endpoint_accepts_allowed_ip_on_rest_endpoint() {
         let plan = build_policy_update_plan(
             &["api.example.com:443:read-write:rest:enforce:allowed-ip=192.168.0.0/16".to_string()],
-            &[],
             &[],
             &[],
             &[],
@@ -656,7 +604,6 @@ mod tests {
             &[],
             &[],
             &[],
-            &[],
             None,
         )
         .expect_err("plan should fail");
@@ -671,7 +618,6 @@ mod tests {
             &[],
             &[],
             &[],
-            &[],
             None,
         )
         .expect_err("plan should fail");
@@ -680,18 +626,10 @@ mod tests {
 
     #[test]
     fn request_body_credential_rewrite_rejects_non_rest_endpoint() {
-        let error = build_policy_update_plan(
-            &[
-                "realtime.example.com:443:read-write:websocket:enforce:request-body-credential-rewrite"
-                    .to_string(),
-            ],
-            &[],
-            &[],
-            &[],
-            &[],
-            &[],
-            None,
-        )
+        let error = build_policy_update_plan(&[
+            "realtime.example.com:443:read-write:websocket:enforce:request-body-credential-rewrite"
+                .to_string(),
+        ], &[], &[], &[], &[], None)
         .expect_err("plan should fail");
 
         assert!(error.to_string().contains("protocol segment"));
@@ -702,7 +640,6 @@ mod tests {
     fn parse_add_endpoint_rejects_unknown_options() {
         let error = build_policy_update_plan(
             &["realtime.example.com:443:read-write:websocket:enforce:future-option".to_string()],
-            &[],
             &[],
             &[],
             &[],
@@ -720,7 +657,6 @@ mod tests {
             &[],
             &[],
             &["realtime.example.com:443:websocket_text:/v1/messages/**".to_string()],
-            &[],
             &[],
             None,
         )
@@ -744,7 +680,6 @@ mod tests {
             &["api.github.com:443::/repos/**".to_string()],
             &[],
             &[],
-            &[],
             None,
         )
         .expect_err("plan should fail");
@@ -759,7 +694,6 @@ mod tests {
             &[],
             &["api.github.com:443:GET:repos/**".to_string()],
             &[],
-            &[],
             None,
         )
         .expect_err("plan should fail");
@@ -770,7 +704,6 @@ mod tests {
     fn parse_add_endpoint_rejects_enforcement_without_protocol() {
         let error = build_policy_update_plan(
             &["api.github.com:443:read-only::enforce".to_string()],
-            &[],
             &[],
             &[],
             &[],
@@ -793,7 +726,6 @@ mod tests {
             &[],
             &[],
             &[],
-            &[],
             None,
         )
         .expect_err("plan should fail");
@@ -801,18 +733,9 @@ mod tests {
     }
 
     #[test]
-    fn binary_requires_add_endpoint() {
-        let error =
-            build_policy_update_plan(&[], &[], &[], &[], &[], &["/usr/bin/gh".to_string()], None)
-                .expect_err("plan should fail");
-        assert!(error.to_string().contains("--binary"));
-    }
-
-    #[test]
     fn rule_name_rejects_multiple_add_endpoints() {
         let error = build_policy_update_plan(
             &["api.github.com:443".to_string(), "ghcr.io:443".to_string()],
-            &[],
             &[],
             &[],
             &[],

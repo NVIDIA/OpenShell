@@ -1148,7 +1148,6 @@ credentials:
 endpoints:
   - host: api.custom.example
     port: 443
-binaries: [/usr/bin/custom]
 ",
     )
     .unwrap();
@@ -1208,7 +1207,6 @@ category: other
 endpoints:
   - host: api.yaml.example
     port: 443
-binaries: [/usr/bin/yaml-client]
 ",
     )
     .unwrap();
@@ -1221,7 +1219,6 @@ binaries: [/usr/bin/yaml-client]
   "category": "other",
   "credentials": [],
   "endpoints": [{"host": "api.json.example", "port": 443}],
-  "binaries": ["/usr/bin/json-client"],
   "inference_capable": false
 }"#,
     )
@@ -1268,9 +1265,6 @@ endpoints:
         path: /admin/**
     allow_encoded_slash: true
     path: /v1
-binaries:
-  - path: /usr/bin/advanced
-    harness: true
 ",
     )
     .unwrap();
@@ -1298,7 +1292,6 @@ binaries:
     assert_eq!(endpoint.allowed_ips, vec!["10.0.0.0/24"]);
     assert!(endpoint.allow_encoded_slash);
     assert_eq!(endpoint.path, "/v1");
-    assert!(profile.binaries[0].harness);
 }
 
 #[tokio::test]

@@ -329,14 +329,14 @@ pub fn policy_record_from_parts(
     })
 }
 
-/// Observation-mode dedup key: `host|port|binary`. Used by the mechanistic
+/// Observation-mode dedup key: `host|port`. Used by the mechanistic
 /// mapper path where N denials targeting the same endpoint should fold into
 /// one chunk instead of N near-identical chunks. Agent-authored proposals
 /// pass `None` for the `dedup_key` argument to `put_draft_chunk` so each
 /// proposal lands as its own chunk regardless of target — the redraft loop
 /// depends on this.
 pub fn observation_dedup_key(chunk: &DraftChunkRecord) -> String {
-    format!("{}|{}|{}", chunk.host, chunk.port, chunk.binary)
+    format!("{}|{}", chunk.host, chunk.port)
 }
 
 pub fn draft_chunk_payload_from_record(chunk: &DraftChunkRecord) -> PersistenceResult<Vec<u8>> {
@@ -361,7 +361,6 @@ pub fn draft_chunk_payload_from_record(chunk: &DraftChunkRecord) -> PersistenceR
         decided_at_ms: chunk.decided_at_ms.unwrap_or(0),
         host: chunk.host.clone(),
         port: chunk.port,
-        binary: chunk.binary.clone(),
         draft_version: chunk.draft_version,
         validation_result: chunk.validation_result.clone(),
         rejection_reason: chunk.rejection_reason.clone(),
@@ -401,7 +400,6 @@ pub fn draft_chunk_record_from_parts(
         decided_at_ms: (wrapper.decided_at_ms > 0).then_some(wrapper.decided_at_ms),
         host: wrapper.host,
         port: wrapper.port,
-        binary: wrapper.binary,
         hit_count: i32::try_from(hit_count).unwrap_or(i32::MAX),
         first_seen_ms: created_at_ms,
         last_seen_ms: updated_at_ms,

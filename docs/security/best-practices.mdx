@@ -41,7 +41,7 @@ The CONNECT proxy and OPA policy engine enforce all network controls at the gate
 
 Every outbound connection from the sandbox goes through the CONNECT proxy.
 The proxy evaluates each connection against the OPA policy engine.
-If no `network_policies` entry matches the destination host, port, and calling binary, the proxy denies the connection.
+If no `network_policies` entry matches the destination host and port, the proxy denies the connection.
 
 | Aspect | Detail |
 |---|---|
@@ -77,18 +77,9 @@ This provides defense-in-depth: even if a container escape vulnerability exists,
 | Risk if enabled with GPU | NVIDIA device plugin compatibility with user namespaces is unverified. OpenShell logs a warning when both GPU and user namespaces are active on the same sandbox. |
 | Recommendation | Enable on non-GPU clusters running Kubernetes with user namespace support available (1.33+ beta, 1.36+ GA) for stronger host isolation. Test GPU workloads separately before enabling on GPU clusters. |
 
-### Binary Identity Binding
+### Binary Allowlisting (Removed)
 
-The proxy identifies which binary initiated each connection by reading `/proc/<pid>/exe` (the kernel-trusted executable path).
-It walks the process tree for ancestor binaries and parses `/proc/<pid>/cmdline` for script interpreters.
-The proxy SHA256-hashes each binary on first use (trust-on-first-use). If someone replaces a binary mid-session, the hash mismatch triggers an immediate deny.
-
-| Aspect | Detail |
-|---|---|
-| Default | Every `network_policies` entry requires a `binaries` list. Only listed binaries can reach the associated endpoints. Binary paths support glob patterns (`*` for one path component, `**` for recursive). |
-| What you can change | Add binaries to an endpoint entry. Use glob patterns for directory-scoped access (for example, `/sandbox/.vscode-server/**`). |
-| Risk if relaxed | Broad glob patterns (like `/**`) allow any binary to reach the endpoint, defeating the purpose of binary-scoped enforcement. |
-| Recommendation | Scope binaries to the specific executables that need each endpoint. Use narrow globs when the exact path varies (for example, across Python virtual environments). |
+Binary path allowlisting was previously supported to restrict which process paths could reach each endpoint, using `/proc/<pid>/exe` lookups and SHA-256 TOFU hashing. This control was removed because it is bypassable: runtime injection via environment variables such as `BUN_OPTIONS` or `NODE_OPTIONS`, or the dynamic linker (`LD_PRELOAD`), allows arbitrary code to execute inside a trusted binary's process while the kernel-reported executable path remains unchanged. The `binaries:` field in policy YAML is accepted for backward compatibility and silently ignored. Policy enforcement is now destination-based only (host and port).
 
 ### L4-Only vs L7 Inspection
 
@@ -96,7 +87,7 @@ The `protocol` field on an endpoint controls whether the proxy inspects individu
 
 | Aspect | Detail |
 |---|---|
-| Default | Endpoints without a `protocol` field use L4-only enforcement: the proxy checks host, port, and binary, then relays the TCP stream without inspecting payloads. |
+| Default | Endpoints without a `protocol` field use L4-only enforcement: the proxy checks host and port, then relays the TCP stream without inspecting payloads. |
 | What you can change | Add `protocol: rest` to enable per-request HTTP method/path inspection, `protocol: websocket` to inspect RFC 6455 upgrade handshakes and client text messages, or `protocol: graphql` to inspect GraphQL-over-HTTP operation type, operation name, and root fields. WebSocket endpoints can also use GraphQL operation rules for GraphQL-over-WebSocket messages. Pair inspected protocols with `rules` or access presets (`full`, `read-only`, `read-write`). REST endpoints that need credential placeholders in supported text request bodies can set `request_body_credential_rewrite: true`. |
 | Risk if relaxed | L4-only endpoints allow the agent to send any data through the tunnel after the initial connection is permitted. The proxy cannot see HTTP methods, paths, or GraphQL operations. Adding `access: full` with L7 inspection enables observability but permits all inspected actions. |
 | Recommendation | Use `protocol: rest` with specific `rules` for APIs where intent is encoded in method and path. Add `request_body_credential_rewrite: true` only for REST APIs that require OpenShell-managed credentials in UTF-8 JSON, form, or text request bodies. Use `protocol: graphql` for GraphQL-over-HTTP APIs where destructive operations are body-encoded. Use `protocol: websocket` for RFC 6455 endpoints, with explicit `GET` and `WEBSOCKET_TEXT` rules for raw text protocols or explicit GraphQL operation rules for GraphQL-over-WebSocket. Prefer `access: read-only` or explicit allowlists, and deny hash-only persisted queries unless you maintain a trusted registry. Omit `protocol` for non-HTTP protocols. For WebSocket endpoints that must carry placeholder credentials in client text frames, add `websocket_credential_rewrite: true`. |
@@ -283,10 +274,9 @@ The following patterns weaken security without providing meaningful benefit.
 
 | Mistake | Why it matters | What to do instead |
 |---------|---------------|-------------------|
-| Omitting an inspected protocol on REST or WebSocket API endpoints | Without `protocol: rest` or `protocol: websocket`, the proxy uses L4-only enforcement. It allows the TCP stream through after checking host, port, and binary, but cannot inspect individual HTTP requests or WebSocket text messages. | Add `protocol: rest` or `protocol: websocket` with specific `rules` to enable method and path control. |
+| Omitting an inspected protocol on REST or WebSocket API endpoints | Without `protocol: rest` or `protocol: websocket`, the proxy uses L4-only enforcement. It allows the TCP stream through after checking host and port, but cannot inspect individual HTTP requests or WebSocket text messages. | Add `protocol: rest` or `protocol: websocket` with specific `rules` to enable method and path control. |
 | Using `access: full` when finer rules would suffice | `access: full` with `protocol: rest` or `protocol: websocket` enables inspection but allows all methods and paths for that protocol. | Use `access: read-only` or explicit `rules` to restrict what the agent can do at the L7 level. |
 | Adding endpoints permanently when operator approval would suffice | Adding endpoints to the policy YAML makes them permanently reachable across all instances. | Use operator approval. Approved endpoints persist within the sandbox instance but reset on re-creation. |
-| Using broad binary globs | A glob like `/**` allows any binary to reach the endpoint, defeating binary-scoped enforcement. | Scope globs to specific directories (for example, `/sandbox/.vscode-server/**`). |
 | Skipping TLS termination on HTTPS APIs | Setting `tls: skip` disables credential injection and L7 inspection. | Use the default auto-detect behavior unless the upstream requires client-certificate mTLS. |
 | Setting `enforcement: enforce` before auditing | Jumping to `enforce` without first running in `audit` mode risks breaking the agent's workflow. | Start with `audit`, review the logs, and switch to `enforce` after you validate the rules. |
 

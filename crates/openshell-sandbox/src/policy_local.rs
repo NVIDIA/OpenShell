@@ -5,7 +5,7 @@
 
 use miette::{IntoDiagnostic, Result};
 use openshell_core::proto::{
-    L7Allow, L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, PolicyChunk,
+    L7Allow, L7DenyRule, L7Rule, NetworkEndpoint, NetworkPolicyRule, PolicyChunk,
     SandboxPolicy as ProtoSandboxPolicy,
 };
 use openshell_ocsf::{ConfigStateChangeBuilder, SeverityId, StateId, StatusId, ocsf_emit};
@@ -650,12 +650,7 @@ fn summarize_chunk_for_audit(chunk: &PolicyChunk) -> String {
         .and_then(|r| r.allow.as_ref())
         .map(|a| format!(" {} {}", a.method, a.path))
         .unwrap_or_default();
-    let binary = if chunk.binary.is_empty() {
-        String::new()
-    } else {
-        format!(" by {}", chunk.binary)
-    };
-    format!("on {endpoint}{l7}{binary}")
+    format!("on {endpoint}{l7}")
 }
 
 /// `GET /v1/proposals/{chunk_id}` — immediate state. One gateway call, no loop.
@@ -781,7 +776,6 @@ fn chunk_state_payload(
         "chunk_id": chunk.id,
         "status": chunk.status,
         "rule_name": chunk.rule_name,
-        "binary": chunk.binary,
         "rejection_reason": chunk.rejection_reason,
         "validation_result": chunk.validation_result,
     });
@@ -966,12 +960,6 @@ fn policy_chunk_from_add_rule(
         rule.name.clone_from(&rule_name);
     }
 
-    let binary = rule
-        .binaries
-        .first()
-        .map(|binary| binary.path.clone())
-        .unwrap_or_default();
-
     Ok(PolicyChunk {
         id: String::new(),
         status: "pending".to_string(),
@@ -988,7 +976,6 @@ fn policy_chunk_from_add_rule(
         hit_count: 1,
         first_seen_ms: 0,
         last_seen_ms: 0,
-        binary,
         validation_result: String::new(),
         rejection_reason: String::new(),
     })
@@ -1006,19 +993,10 @@ fn network_rule_from_json(
         .into_iter()
         .map(network_endpoint_from_json)
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    let binaries = rule
-        .binaries
-        .into_iter()
-        .map(|binary| NetworkBinary {
-            path: binary.path,
-            ..Default::default()
-        })
-        .collect();
 
     Ok(NetworkPolicyRule {
         name: rule.name.unwrap_or_default(),
         endpoints,
-        binaries,
     })
 }
 
@@ -1227,8 +1205,6 @@ struct NetworkPolicyRuleJson {
     name: Option<String>,
     #[serde(default)]
     endpoints: Vec<NetworkEndpointJson>,
-    #[serde(default)]
-    binaries: Vec<NetworkBinaryJson>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1254,11 +1230,6 @@ struct NetworkEndpointJson {
     deny_rules: Vec<L7DenyRuleJson>,
     #[serde(default)]
     allow_encoded_slash: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct NetworkBinaryJson {
-    path: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1315,11 +1286,6 @@ mod tests {
                                         }
                                     ]
                                 }
-                            ],
-                            "binaries": [
-                                {
-                                    "path": "/usr/bin/gh"
-                                }
                             ]
                         }
                     }
@@ -1332,7 +1298,6 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].rule_name, "github_api_repo_create");
         assert_eq!(chunks[0].rationale, "Allow gh to create one repo.");
-        assert_eq!(chunks[0].binary, "/usr/bin/gh");
         let rule = chunks[0].proposed_rule.as_ref().unwrap();
         assert_eq!(rule.name, "github_api_repo_create");
         assert_eq!(rule.endpoints[0].host, "api.github.com");
@@ -1656,7 +1621,6 @@ mod tests {
             id: "chunk-x".to_string(),
             status: "rejected".to_string(),
             rule_name: "allow_example".to_string(),
-            binary: "/usr/bin/curl".to_string(),
             rejection_reason: "scope too broad".to_string(),
             validation_result: "no exfil paths".to_string(),
             ..Default::default()
@@ -1683,7 +1647,6 @@ mod tests {
             id: "chunk-y".to_string(),
             status: "approved".to_string(),
             rule_name: "allow_github".to_string(),
-            binary: "/usr/bin/curl".to_string(),
             ..Default::default()
         };
         let reloaded = chunk_state_payload(&chunk, false, true);
@@ -1750,11 +1713,10 @@ mod tests {
     }
 
     #[test]
-    fn summarize_chunk_for_audit_includes_endpoint_l7_path_and_binary() {
+    fn summarize_chunk_for_audit_includes_endpoint_l7_path() {
         let chunk = PolicyChunk {
             id: "ignored".to_string(),
             rule_name: "github_write".to_string(),
-            binary: "/usr/bin/curl".to_string(),
             proposed_rule: Some(NetworkPolicyRule {
                 name: "github_write".to_string(),
                 endpoints: vec![NetworkEndpoint {
@@ -1769,17 +1731,12 @@ mod tests {
                     }],
                     ..Default::default()
                 }],
-                binaries: vec![NetworkBinary {
-                    path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
-                }],
             }),
             ..Default::default()
         };
         let summary = summarize_chunk_for_audit(&chunk);
         assert!(summary.contains("api.github.com:443"));
         assert!(summary.contains("PUT /repos/foo/bar/contents/x.md"));
-        assert!(summary.contains("/usr/bin/curl"));
     }
 
     // Helpers — synthetic proposed rule + policy with that rule already
@@ -1791,10 +1748,6 @@ mod tests {
                 host: "api.github.com".to_string(),
                 port: 443,
                 ports: vec![443],
-                ..Default::default()
-            }],
-            binaries: vec![NetworkBinary {
-                path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
         }
@@ -1854,10 +1807,6 @@ mod tests {
                         host: "api.example.com".to_string(),
                         port: 443,
                         ports: vec![443],
-                        ..Default::default()
-                    }],
-                    binaries: vec![NetworkBinary {
-                        path: "/usr/bin/curl".to_string(),
                         ..Default::default()
                     }],
                 }));

@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 
 use openshell_core::proto::{
-    L7Allow, L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, SandboxPolicy,
+    L7Allow, L7DenyRule, L7Rule, NetworkEndpoint, NetworkPolicyRule, SandboxPolicy,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -30,10 +30,6 @@ pub enum PolicyMergeOp {
         host: String,
         port: u32,
         rules: Vec<L7Rule>,
-    },
-    RemoveBinary {
-        rule_name: String,
-        binary_path: String,
     },
 }
 
@@ -213,8 +209,7 @@ pub struct PolicyMergeResult {
 /// "Contains" means: for every endpoint in `proposed`, some rule in
 /// `policy.network_policies` has an endpoint with overlapping
 /// host/path/port set AND containing every L7 allow (method/path) the
-/// proposed endpoint requested, and that rule's binaries cover every
-/// binary in `proposed`.
+/// proposed endpoint requested.
 ///
 /// The sandbox's `policy.local /wait` long-poll uses this to decide when
 /// the local supervisor has actually loaded a policy that includes the
@@ -242,10 +237,6 @@ pub fn policy_covers_rule(policy: &SandboxPolicy, proposed: &NetworkPolicyRule) 
             rule.endpoints.iter().any(|endpoint| {
                 endpoints_overlap(endpoint, target_endpoint)
                     && endpoint_l7_covers(endpoint, target_endpoint)
-            }) && proposed.binaries.iter().all(|target_binary| {
-                rule.binaries
-                    .iter()
-                    .any(|binary| binary.path == target_binary.path)
             })
         })
     })
@@ -357,21 +348,6 @@ fn apply_operation(
             expand_existing_access(endpoint, host, *port, warnings)?;
             append_unique_l7_rules(&mut endpoint.rules, rules);
         }
-        PolicyMergeOp::RemoveBinary {
-            rule_name,
-            binary_path,
-        } => {
-            let should_remove = if let Some(rule) = policy.network_policies.get_mut(rule_name) {
-                let original_len = rule.binaries.len();
-                rule.binaries.retain(|binary| binary.path != *binary_path);
-                original_len != rule.binaries.len() && rule.binaries.is_empty()
-            } else {
-                false
-            };
-            if should_remove {
-                policy.network_policies.remove(rule_name);
-            }
-        }
     }
     Ok(())
 }
@@ -425,8 +401,6 @@ fn merge_rules(
     incoming_rule: &NetworkPolicyRule,
     warnings: &mut Vec<PolicyMergeWarning>,
 ) -> Result<(), PolicyMergeError> {
-    append_unique_binaries(&mut existing_rule.binaries, &incoming_rule.binaries);
-
     for incoming_endpoint in &incoming_rule.endpoints {
         let mut incoming_endpoint = incoming_endpoint.clone();
         normalize_endpoint(&mut incoming_endpoint);
@@ -720,15 +694,6 @@ fn expand_access_preset(protocol: &str, access: &str) -> Option<Vec<L7Rule>> {
     )
 }
 
-fn append_unique_binaries(existing: &mut Vec<NetworkBinary>, incoming: &[NetworkBinary]) {
-    let mut seen: HashSet<String> = existing.iter().map(|binary| binary.path.clone()).collect();
-    for binary in incoming {
-        if seen.insert(binary.path.clone()) {
-            existing.push(binary.clone());
-        }
-    }
-}
-
 fn append_unique_strings(existing: &mut Vec<String>, incoming: &[String]) {
     let mut seen: HashSet<String> = existing.iter().cloned().collect();
     for value in incoming {
@@ -758,7 +723,6 @@ fn normalize_rule(rule: &mut NetworkPolicyRule) {
     for endpoint in &mut rule.endpoints {
         normalize_endpoint(endpoint);
     }
-    dedup_binaries(&mut rule.binaries);
 }
 
 fn normalize_endpoint(endpoint: &mut NetworkEndpoint) {
@@ -775,11 +739,6 @@ fn normalize_endpoint(endpoint: &mut NetworkEndpoint) {
 fn dedup_strings(values: &mut Vec<String>) {
     let mut seen = HashSet::new();
     values.retain(|value| seen.insert(value.clone()));
-}
-
-fn dedup_binaries(values: &mut Vec<NetworkBinary>) {
-    let mut seen = HashSet::new();
-    values.retain(|binary| seen.insert(binary.path.clone()));
 }
 
 fn dedup_l7_rules(values: &mut Vec<L7Rule>) {
@@ -854,12 +813,9 @@ mod tests {
 
     use super::{
         PolicyMergeError, PolicyMergeOp, PolicyMergeWarning, generated_rule_name, merge_policy,
-        policy_covers_rule,
     };
     use crate::restrictive_default_policy;
-    use openshell_core::proto::{
-        L7Allow, L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule,
-    };
+    use openshell_core::proto::{L7Allow, L7DenyRule, L7Rule, NetworkEndpoint, NetworkPolicyRule};
 
     fn endpoint(host: &str, port: u32) -> NetworkEndpoint {
         NetworkEndpoint {
@@ -874,7 +830,6 @@ mod tests {
         NetworkPolicyRule {
             name: name.to_string(),
             endpoints: vec![endpoint(host, port)],
-            ..Default::default()
         }
     }
 
@@ -908,10 +863,6 @@ mod tests {
             NetworkPolicyRule {
                 name: "existing".to_string(),
                 endpoints: vec![endpoint("api.github.com", 443)],
-                binaries: vec![NetworkBinary {
-                    path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
-                }],
             },
         );
 
@@ -924,10 +875,6 @@ mod tests {
                 protocol: "rest".to_string(),
                 enforcement: "enforce".to_string(),
                 rules: vec![rest_rule("GET", "/repos/**")],
-                ..Default::default()
-            }],
-            binaries: vec![NetworkBinary {
-                path: "/usr/bin/gh".to_string(),
                 ..Default::default()
             }],
         };
@@ -946,7 +893,6 @@ mod tests {
         assert_eq!(endpoint.protocol, "rest");
         assert_eq!(endpoint.enforcement, "enforce");
         assert_eq!(endpoint.rules.len(), 1);
-        assert_eq!(rule.binaries.len(), 2);
     }
 
     #[test]
@@ -964,7 +910,6 @@ mod tests {
                     access: "read-write".to_string(),
                     ..Default::default()
                 }],
-                ..Default::default()
             },
         );
 
@@ -978,7 +923,6 @@ mod tests {
                 websocket_credential_rewrite: true,
                 ..Default::default()
             }],
-            ..Default::default()
         };
 
         let result = merge_policy(
@@ -1009,7 +953,6 @@ mod tests {
                     access: "read-write".to_string(),
                     ..Default::default()
                 }],
-                ..Default::default()
             },
         );
 
@@ -1023,7 +966,6 @@ mod tests {
                 request_body_credential_rewrite: true,
                 ..Default::default()
             }],
-            ..Default::default()
         };
 
         let result = merge_policy(
@@ -1054,7 +996,6 @@ mod tests {
                     access: "read-only".to_string(),
                     ..Default::default()
                 }],
-                ..Default::default()
             },
         );
 
@@ -1092,7 +1033,6 @@ mod tests {
                     access: "read-write".to_string(),
                     ..Default::default()
                 }],
-                ..Default::default()
             },
         );
 
@@ -1138,7 +1078,6 @@ mod tests {
                     access: "read-write".to_string(),
                     ..Default::default()
                 }],
-                ..Default::default()
             },
         );
 
@@ -1177,7 +1116,6 @@ mod tests {
                     access: "full".to_string(),
                     ..Default::default()
                 }],
-                ..Default::default()
             },
         );
 
@@ -1214,7 +1152,6 @@ mod tests {
                     ports: vec![80, 443],
                     ..Default::default()
                 }],
-                ..Default::default()
             },
         );
 
@@ -1231,325 +1168,6 @@ mod tests {
         let endpoint = &result.policy.network_policies["multi"].endpoints[0];
         assert_eq!(endpoint.ports, vec![80]);
         assert_eq!(endpoint.port, 80);
-    }
-
-    #[test]
-    fn remove_binary_removes_rule_when_last_binary_is_deleted() {
-        let mut policy = restrictive_default_policy();
-        policy.network_policies.insert(
-            "github".to_string(),
-            NetworkPolicyRule {
-                name: "github".to_string(),
-                endpoints: vec![endpoint("api.github.com", 443)],
-                binaries: vec![NetworkBinary {
-                    path: "/usr/bin/gh".to_string(),
-                    ..Default::default()
-                }],
-            },
-        );
-
-        let result = merge_policy(
-            policy,
-            &[PolicyMergeOp::RemoveBinary {
-                rule_name: "github".to_string(),
-                binary_path: "/usr/bin/gh".to_string(),
-            }],
-        )
-        .expect("merge should succeed");
-
-        assert!(!result.policy.network_policies.contains_key("github"));
-    }
-
-    #[test]
-    fn policy_covers_rule_returns_true_when_merged_rule_present() {
-        let proposed = NetworkPolicyRule {
-            name: "agent_proposed".to_string(),
-            endpoints: vec![endpoint("api.github.com", 443)],
-            binaries: vec![NetworkBinary {
-                path: "/usr/bin/curl".to_string(),
-                ..Default::default()
-            }],
-        };
-
-        let merged = merge_policy(
-            restrictive_default_policy(),
-            &[PolicyMergeOp::AddRule {
-                rule_name: "allow_api_github_com_443".to_string(),
-                rule: proposed.clone(),
-            }],
-        )
-        .expect("merge should succeed");
-
-        assert!(policy_covers_rule(&merged.policy, &proposed));
-    }
-
-    #[test]
-    fn policy_covers_rule_returns_false_when_unrelated_rule_present() {
-        let proposed = NetworkPolicyRule {
-            name: "agent_proposed".to_string(),
-            endpoints: vec![endpoint("api.github.com", 443)],
-            binaries: vec![NetworkBinary {
-                path: "/usr/bin/curl".to_string(),
-                ..Default::default()
-            }],
-        };
-
-        // Merge an *unrelated* rule for a different host. The proposed rule
-        // for api.github.com is still not present — this is John's
-        // "false-wakeup" case: an unrelated policy reload must not signal
-        // that the agent's rule is loaded.
-        let merged = merge_policy(
-            restrictive_default_policy(),
-            &[PolicyMergeOp::AddRule {
-                rule_name: "allow_api_example_com_443".to_string(),
-                rule: rule_with_endpoint("unrelated", "api.example.com", 443),
-            }],
-        )
-        .expect("merge should succeed");
-
-        assert!(!policy_covers_rule(&merged.policy, &proposed));
-    }
-
-    #[test]
-    fn policy_covers_rule_handles_merge_into_existing_endpoint() {
-        // The merge logic folds a new rule into an existing rule when their
-        // endpoints overlap, even under a different network_policies key.
-        // Coverage must survive that fold — name-keyed checks would miss it.
-        let proposed = NetworkPolicyRule {
-            name: "agent_proposed".to_string(),
-            endpoints: vec![endpoint("api.github.com", 443)],
-            binaries: vec![NetworkBinary {
-                path: "/usr/bin/curl".to_string(),
-                ..Default::default()
-            }],
-        };
-
-        let mut policy = restrictive_default_policy();
-        policy.network_policies.insert(
-            "preexisting_github".to_string(),
-            NetworkPolicyRule {
-                name: "preexisting_github".to_string(),
-                endpoints: vec![endpoint("api.github.com", 443)],
-                binaries: vec![NetworkBinary {
-                    path: "/usr/bin/git".to_string(),
-                    ..Default::default()
-                }],
-            },
-        );
-
-        let merged = merge_policy(
-            policy,
-            &[PolicyMergeOp::AddRule {
-                rule_name: "allow_api_github_com_443".to_string(),
-                rule: proposed.clone(),
-            }],
-        )
-        .expect("merge should succeed");
-
-        assert!(
-            !merged
-                .policy
-                .network_policies
-                .contains_key("allow_api_github_com_443"),
-            "proposed rule should have been folded into the existing key"
-        );
-        assert!(policy_covers_rule(&merged.policy, &proposed));
-    }
-
-    #[test]
-    fn policy_covers_rule_returns_false_when_binary_missing() {
-        let proposed = NetworkPolicyRule {
-            name: "agent_proposed".to_string(),
-            endpoints: vec![endpoint("api.github.com", 443)],
-            binaries: vec![NetworkBinary {
-                path: "/usr/bin/curl".to_string(),
-                ..Default::default()
-            }],
-        };
-
-        // Endpoint exists in the policy but with a *different* binary. The
-        // agent's retry would still be denied; reload coverage should
-        // reflect that.
-        let mut policy = restrictive_default_policy();
-        policy.network_policies.insert(
-            "existing".to_string(),
-            NetworkPolicyRule {
-                name: "existing".to_string(),
-                endpoints: vec![endpoint("api.github.com", 443)],
-                binaries: vec![NetworkBinary {
-                    path: "/usr/bin/git".to_string(),
-                    ..Default::default()
-                }],
-            },
-        );
-
-        assert!(!policy_covers_rule(&policy, &proposed));
-    }
-
-    #[test]
-    fn policy_covers_rule_returns_false_for_empty_proposed_endpoints() {
-        // Defensive: a rule with no endpoints carries no signal we can match
-        // on, so coverage is never true.
-        let proposed = NetworkPolicyRule::default();
-        let policy = restrictive_default_policy();
-        assert!(!policy_covers_rule(&policy, &proposed));
-    }
-
-    #[test]
-    fn policy_covers_rule_returns_false_when_proposed_l7_method_not_loaded() {
-        // John's false-wakeup mode at L7: the supervisor has an
-        // overlapping endpoint loaded (e.g. read-only GET), but the
-        // chunk's proposed PUT method is not in the merged endpoint's
-        // rules yet. Coverage must NOT return true here, or the agent
-        // retries the PUT and hits another policy_denied.
-        let proposed = NetworkPolicyRule {
-            name: "agent_put".to_string(),
-            endpoints: vec![NetworkEndpoint {
-                host: "api.github.com".to_string(),
-                port: 443,
-                ports: vec![443],
-                protocol: "rest".to_string(),
-                rules: vec![rest_rule("PUT", "/repos/foo/bar/contents/x.md")],
-                ..Default::default()
-            }],
-            binaries: vec![NetworkBinary {
-                path: "/usr/bin/curl".to_string(),
-                ..Default::default()
-            }],
-        };
-
-        let mut policy = restrictive_default_policy();
-        policy.network_policies.insert(
-            "existing_readonly".to_string(),
-            NetworkPolicyRule {
-                name: "existing_readonly".to_string(),
-                endpoints: vec![NetworkEndpoint {
-                    host: "api.github.com".to_string(),
-                    port: 443,
-                    ports: vec![443],
-                    protocol: "rest".to_string(),
-                    rules: vec![rest_rule("GET", "/repos/foo/bar/contents/x.md")],
-                    ..Default::default()
-                }],
-                binaries: vec![NetworkBinary {
-                    path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
-                }],
-            },
-        );
-
-        assert!(
-            !policy_covers_rule(&policy, &proposed),
-            "endpoint overlaps but L7 PUT not loaded yet; must not signal coverage"
-        );
-    }
-
-    #[test]
-    fn policy_covers_rule_returns_true_after_l7_merge_lands() {
-        // Same setup as above, but with the proposed L7 rule merged in.
-        // Coverage must now return true.
-        let proposed = NetworkPolicyRule {
-            name: "agent_put".to_string(),
-            endpoints: vec![NetworkEndpoint {
-                host: "api.github.com".to_string(),
-                port: 443,
-                ports: vec![443],
-                protocol: "rest".to_string(),
-                rules: vec![rest_rule("PUT", "/repos/foo/bar/contents/x.md")],
-                ..Default::default()
-            }],
-            binaries: vec![NetworkBinary {
-                path: "/usr/bin/curl".to_string(),
-                ..Default::default()
-            }],
-        };
-
-        let mut policy = restrictive_default_policy();
-        policy.network_policies.insert(
-            "existing".to_string(),
-            NetworkPolicyRule {
-                name: "existing".to_string(),
-                endpoints: vec![NetworkEndpoint {
-                    host: "api.github.com".to_string(),
-                    port: 443,
-                    ports: vec![443],
-                    protocol: "rest".to_string(),
-                    rules: vec![
-                        rest_rule("GET", "/repos/foo/bar/contents/x.md"),
-                        rest_rule("PUT", "/repos/foo/bar/contents/x.md"),
-                    ],
-                    ..Default::default()
-                }],
-                binaries: vec![NetworkBinary {
-                    path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
-                }],
-            },
-        );
-
-        assert!(policy_covers_rule(&policy, &proposed));
-    }
-
-    #[test]
-    fn policy_covers_rule_returns_true_for_l4_only_proposed_when_endpoint_present() {
-        // A chunk that targets a non-REST surface (no L7 rules) needs
-        // only the L4 endpoint match to be considered covered. Empty
-        // proposed.rules must not be treated as "no method matches".
-        let proposed = NetworkPolicyRule {
-            name: "ssh_clone".to_string(),
-            endpoints: vec![NetworkEndpoint {
-                host: "github.com".to_string(),
-                port: 22,
-                ports: vec![22],
-                ..Default::default()
-            }],
-            binaries: vec![NetworkBinary {
-                path: "/usr/bin/git".to_string(),
-                ..Default::default()
-            }],
-        };
-
-        let merged = merge_policy(
-            restrictive_default_policy(),
-            &[PolicyMergeOp::AddRule {
-                rule_name: "allow_github_com_22".to_string(),
-                rule: proposed.clone(),
-            }],
-        )
-        .expect("merge should succeed");
-
-        assert!(policy_covers_rule(&merged.policy, &proposed));
-    }
-
-    #[test]
-    fn policy_covers_rule_treats_empty_proposed_binaries_as_any_binary() {
-        // A proposed rule with no binaries is the "any binary" shape.
-        // The merged rule keeps its own binaries; coverage holds iff
-        // endpoint and (vacuously satisfied) binary set match. Document
-        // the semantics so a future reader doesn't flip it accidentally.
-        let proposed = NetworkPolicyRule {
-            name: "any_binary_rule".to_string(),
-            endpoints: vec![endpoint("api.github.com", 443)],
-            binaries: vec![],
-        };
-
-        let mut policy = restrictive_default_policy();
-        policy.network_policies.insert(
-            "existing".to_string(),
-            NetworkPolicyRule {
-                name: "existing".to_string(),
-                endpoints: vec![endpoint("api.github.com", 443)],
-                binaries: vec![NetworkBinary {
-                    path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
-                }],
-            },
-        );
-
-        assert!(
-            policy_covers_rule(&policy, &proposed),
-            "empty proposed binaries should match any merged binary set"
-        );
     }
 
     #[test]

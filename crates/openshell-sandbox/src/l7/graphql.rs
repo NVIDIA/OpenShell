@@ -785,8 +785,6 @@ network_policies:
         deny_rules:
           - operation_type: mutation
             fields: [deleteRepository]
-    binaries:
-      - { path: /usr/bin/python3 }
 ";
         let engine = crate::opa::OpaEngine::from_strings(
             include_str!("../../data/sandbox-policy.rego"),
@@ -797,8 +795,6 @@ network_policies:
             host: "host.openshell.internal".to_string(),
             port: 8080,
             policy_name: "test_graphql_l7".to_string(),
-            binary_path: "/usr/bin/python3".to_string(),
-            ancestors: Vec::new(),
             cmdline_paths: Vec::new(),
             secret_resolver: None,
         };

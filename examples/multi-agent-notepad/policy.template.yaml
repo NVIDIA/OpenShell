@@ -23,10 +23,6 @@ network_policies:
       - { host: auth.openai.com, port: 443, protocol: rest, enforcement: enforce, access: full }
       - { host: chatgpt.com, port: 443, protocol: rest, enforcement: enforce, access: full }
       - { host: ab.chatgpt.com, port: 443, protocol: rest, enforcement: enforce, access: full }
-    binaries:
-      - { path: /usr/bin/codex }
-      - { path: /usr/bin/node }
-      - { path: "/usr/lib/node_modules/@openai/**" }
 
   codex_plugins:
     name: codex-plugins
@@ -42,10 +38,6 @@ network_policies:
           - allow:
               method: POST
               path: "/openai/plugins.git/git-upload-pack"
-    binaries:
-      - { path: /usr/bin/git }
-      - { path: /usr/lib/git-core/git-remote-http }
-      - { path: "/usr/lib/node_modules/@openai/**" }
 
   github_memory:
     name: github-memory
@@ -67,5 +59,3 @@ network_policies:
           - allow:
               method: PUT
               path: "/repos/__OWNER__/__REPO__/contents/runs/__RUN_ID__/**"
-    binaries:
-      - { path: /usr/bin/curl }

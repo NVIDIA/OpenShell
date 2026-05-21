@@ -11,6 +11,10 @@ use crate::policy::PolicyIntent;
 
 /// Check for data exfiltration paths from readable filesystem to writable
 /// egress channels.
+///
+/// Without binary allowlisting, this flags any L4-only endpoint when the
+/// sandbox has readable filesystem paths — the agent can use any tool
+/// available in its environment to send data over an uninspected channel.
 pub fn check_data_exfiltration(model: &ReachabilityModel) -> Vec<Finding> {
     if model.policy.filesystem_policy.readable_paths().is_empty() {
         return Vec::new();
@@ -18,54 +22,24 @@ pub fn check_data_exfiltration(model: &ReachabilityModel) -> Vec<Finding> {
 
     let mut exfil_paths: Vec<ExfilPath> = Vec::new();
 
-    for bpath in &model.binary_paths {
-        let cap = model.binary_registry.get_or_unknown(bpath);
-        if !cap.can_exfiltrate {
-            continue;
-        }
+    for eid in &model.endpoints {
+        let ep_is_l7 = is_endpoint_l7_enforced(&model.policy, &eid.host, eid.port);
 
-        for eid in &model.endpoints {
-            let expr = model.can_exfil_via_endpoint(bpath, eid);
-
-            if model.check_sat(&expr) == SatResult::Sat {
-                // Determine L7 status and mechanism
-                let ep_is_l7 = is_endpoint_l7_enforced(&model.policy, &eid.host, eid.port);
-                let bypass = cap.bypasses_l7();
-
-                let (l7_status, mut mechanism) = if bypass {
-                    (
-                        "l7_bypassed".to_owned(),
-                        format!(
-                            "{} — uses non-HTTP protocol, bypasses L7 inspection",
-                            cap.description
-                        ),
-                    )
-                } else if !ep_is_l7 {
-                    (
-                        "l4_only".to_owned(),
-                        format!(
-                            "L4-only endpoint — no HTTP inspection, {bpath} can send arbitrary data"
-                        ),
-                    )
-                } else {
-                    // L7 is enforced and allows write — policy is
-                    // working as intended. Not a finding.
-                    continue;
-                };
-
-                if !cap.exfil_mechanism.is_empty() {
-                    mechanism = format!("{}. Exfil via: {}", mechanism, cap.exfil_mechanism);
-                }
-
-                exfil_paths.push(ExfilPath {
-                    binary: bpath.clone(),
-                    endpoint_host: eid.host.clone(),
-                    endpoint_port: eid.port,
-                    mechanism,
-                    policy_name: eid.policy_name.clone(),
-                    l7_status,
-                });
-            }
+        // L4-only endpoints allow arbitrary data egress — any process in the
+        // sandbox can open a TCP connection and send filesystem contents.
+        if !ep_is_l7 {
+            exfil_paths.push(ExfilPath {
+                binary: String::new(),
+                endpoint_host: eid.host.clone(),
+                endpoint_port: eid.port,
+                mechanism: format!(
+                    "L4-only endpoint — no HTTP inspection; any sandbox process can \
+                     send arbitrary data to {}:{}",
+                    eid.host, eid.port
+                ),
+                policy_name: eid.policy_name.clone(),
+                l7_status: "l4_only".to_owned(),
+            });
         }
     }
 
@@ -74,99 +48,79 @@ pub fn check_data_exfiltration(model: &ReachabilityModel) -> Vec<Finding> {
     }
 
     let readable = model.policy.filesystem_policy.readable_paths();
-    let has_l4_only = exfil_paths.iter().any(|p| p.l7_status == "l4_only");
-    let has_bypass = exfil_paths.iter().any(|p| p.l7_status == "l7_bypassed");
-    let risk = if has_l4_only || has_bypass {
-        RiskLevel::Critical
-    } else {
-        RiskLevel::High
-    };
-
-    let mut remediation = Vec::new();
-    if has_l4_only {
-        remediation.push(
-            "Add `protocol: rest` with specific L7 rules to L4-only endpoints \
-             to enable HTTP inspection and restrict to safe methods/paths."
-                .to_owned(),
-        );
-    }
-    if has_bypass {
-        remediation.push(
-            "Binaries using non-HTTP protocols (git, ssh, nc) bypass L7 inspection. \
-             Remove these binaries from the policy if write access is not intended, \
-             or restrict credential scopes to read-only."
-                .to_owned(),
-        );
-    }
-    remediation
-        .push("Restrict filesystem read access to only the paths the agent needs.".to_owned());
-
+    let n_paths = exfil_paths.len();
     let paths: Vec<FindingPath> = exfil_paths.into_iter().map(FindingPath::Exfil).collect();
 
-    let n_paths = paths.len();
     vec![Finding {
         query: "data_exfiltration".to_owned(),
         title: "Data Exfiltration Paths Detected".to_owned(),
         description: format!(
-            "{n_paths} exfiltration path(s) found from {} readable filesystem path(s) to external endpoints.",
+            "{n_paths} exfiltration path(s) found from {} readable filesystem path(s) to \
+             L4-only external endpoints.",
             readable.len()
         ),
-        risk,
+        risk: RiskLevel::Critical,
         paths,
-        remediation,
+        remediation: vec![
+            "Add `protocol: rest` with specific L7 rules to L4-only endpoints \
+             to enable HTTP inspection and restrict to safe methods/paths."
+                .to_owned(),
+            "Restrict filesystem read access to only the paths the agent needs.".to_owned(),
+        ],
         accepted: false,
         accepted_reason: String::new(),
     }]
 }
 
 /// Check for write capabilities that bypass read-only policy intent.
+///
+/// Without binary allowlisting this checks whether:
+/// - A read-only-intent endpoint is L4-only (any process can bypass method filtering), or
+/// - A read-only-intent endpoint has credentials with write scopes.
 pub fn check_write_bypass(model: &ReachabilityModel) -> Vec<Finding> {
     let mut bypass_paths: Vec<WriteBypassPath> = Vec::new();
 
     for (policy_name, rule) in &model.policy.network_policies {
         for ep in &rule.endpoints {
-            // Only check endpoints where the intent is read-only or L4-only
             let intent = ep.intent();
             if !matches!(intent, PolicyIntent::ReadOnly) {
                 continue;
             }
 
             for port in ep.effective_ports() {
-                for b in &rule.binaries {
-                    let cap = model.binary_registry.get_or_unknown(&b.path);
+                let eid = crate::model::EndpointId {
+                    policy_name: policy_name.clone(),
+                    host: ep.host.clone(),
+                    port,
+                };
 
-                    // Check: binary bypasses L7 and can write
-                    if cap.bypasses_l7() && cap.can_write() {
-                        let cred_actions = collect_credential_actions(model, &ep.host, &cap);
-                        if !cred_actions.is_empty()
-                            || model.credentials.credentials_for_host(&ep.host).is_empty()
-                        {
-                            bypass_paths.push(WriteBypassPath {
-                                binary: b.path.clone(),
-                                endpoint_host: ep.host.clone(),
-                                endpoint_port: port,
-                                policy_name: policy_name.clone(),
-                                policy_intent: intent.to_string(),
-                                bypass_reason: "l7_bypass_protocol".to_owned(),
-                                credential_actions: cred_actions,
-                            });
-                        }
-                    }
-
-                    // Check: L4-only endpoint + binary can construct HTTP + credential has write
-                    if !ep.is_l7_enforced() && cap.can_construct_http {
-                        let cred_actions = collect_credential_actions(model, &ep.host, &cap);
+                let expr = model.endpoint_allows_write(&eid);
+                if model.check_sat(&expr) == SatResult::Sat {
+                    if ep.is_l7_enforced() {
+                        // L7 enforced but write methods allowed and credential has write scope
+                        let cred_actions = collect_credential_actions(model, &ep.host);
                         if !cred_actions.is_empty() {
                             bypass_paths.push(WriteBypassPath {
-                                binary: b.path.clone(),
+                                binary: String::new(),
                                 endpoint_host: ep.host.clone(),
                                 endpoint_port: port,
                                 policy_name: policy_name.clone(),
                                 policy_intent: intent.to_string(),
-                                bypass_reason: "l4_only".to_owned(),
+                                bypass_reason: "credential_write_scope".to_owned(),
                                 credential_actions: cred_actions,
                             });
                         }
+                    } else {
+                        // L4-only: no HTTP method filtering — any process can send writes
+                        bypass_paths.push(WriteBypassPath {
+                            binary: String::new(),
+                            endpoint_host: ep.host.clone(),
+                            endpoint_port: port,
+                            policy_name: policy_name.clone(),
+                            policy_intent: intent.to_string(),
+                            bypass_reason: "l4_only".to_owned(),
+                            credential_actions: collect_credential_actions(model, &ep.host),
+                        });
                     }
                 }
             }
@@ -192,9 +146,6 @@ pub fn check_write_bypass(model: &ReachabilityModel) -> Vec<Finding> {
         remediation: vec![
             "For L4-only endpoints: add `protocol: rest` with `access: read-only` \
              to enable HTTP method filtering."
-                .to_owned(),
-            "For L7-bypassing binaries (git, ssh, nc): remove them from the policy's \
-             binary list if write access is not intended."
                 .to_owned(),
             "Restrict credential scopes to read-only where possible.".to_owned(),
         ],
@@ -228,11 +179,7 @@ fn is_endpoint_l7_enforced(policy: &crate::policy::PolicyModel, host: &str, port
 }
 
 /// Collect human-readable credential action descriptions for a host.
-fn collect_credential_actions(
-    model: &ReachabilityModel,
-    host: &str,
-    _cap: &crate::registry::BinaryCapability,
-) -> Vec<String> {
+fn collect_credential_actions(model: &ReachabilityModel, host: &str) -> Vec<String> {
     let creds = model.credentials.credentials_for_host(host);
     let api = model.credentials.api_for_host(host);
     let mut actions = Vec::new();

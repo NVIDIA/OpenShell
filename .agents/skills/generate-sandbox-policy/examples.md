@@ -26,11 +26,9 @@ network_policies:
     endpoints:
       - { host: api.anthropic.com, port: 443 }
       - { host: statsig.anthropic.com, port: 443 }
-    binaries:
-      - { path: /usr/local/bin/claude }
 ```
 
-No `protocol`, `rules`, or `access` — this is pure L4 (host:port + binary identity check).
+No `protocol`, `rules`, or `access` — this is pure L4 (host:port check).
 
 ---
 
@@ -50,8 +48,6 @@ network_policies:
         protocol: rest
         enforcement: enforce
         access: read-only
-    binaries:
-      - { path: /usr/bin/curl }
 ```
 
 Allows GET, HEAD, OPTIONS on all paths. Blocks POST, PUT, PATCH, DELETE.
@@ -72,8 +68,6 @@ network_policies:
         protocol: rest
         enforcement: enforce
         access: full
-    binaries:
-      - { path: /usr/local/bin/opencode }
 ```
 
 Allows all HTTP methods on all paths.
@@ -94,8 +88,6 @@ network_policies:
         protocol: rest
         enforcement: audit
         access: read-write
-    binaries:
-      - { path: /app/bin/worker }
 ```
 
 Allows GET, HEAD, OPTIONS, POST, PUT, PATCH. Blocks DELETE. Audit mode logs violations without blocking.
@@ -121,11 +113,9 @@ network_policies:
         protocol: rest
         enforcement: enforce
         access: read-only
-    binaries:
-      - { path: /usr/bin/curl }
 ```
 
-Same preset applied to multiple hosts in one policy because the binary set is the same.
+Same preset applied to multiple hosts in one policy.
 
 ---
 
@@ -169,8 +159,6 @@ network_policies:
           - allow:
               method: GET
               path: "/v1/models/*"
-    binaries:
-      - { path: /usr/bin/curl }
 ```
 
 Without auto-discovery, this would have been `access: full` or `access: read-write`. The search enabled a much tighter policy.
@@ -215,8 +203,6 @@ network_policies:
           - allow:
               method: POST
               path: "/v1/chat/completions"
-    binaries:
-      - { path: /usr/bin/curl }
 ```
 
 Note: added `/v1/models/*` alongside `/v1/models` since listing models and getting a specific model are both common read operations.
@@ -251,8 +237,6 @@ network_policies:
           - allow:
               method: POST
               path: "/repos/*/issues"
-    binaries:
-      - { path: /usr/bin/curl }
 ```
 
 Cannot use `access: read-only` here because we also need POST on one path. The explicit rules replicate the read-only preset and add the targeted write.
@@ -304,8 +288,6 @@ network_policies:
         protocol: rest
         enforcement: enforce
         access: read-only
-    binaries:
-      - { path: /usr/bin/curl }
 ```
 
 **What this allows**: GET, HEAD, OPTIONS on any path.
@@ -341,7 +323,6 @@ Endpoints:
 - Scope: `integrate.api.nvidia.com:443`
 - Methods: POST on `/v1/chat/completions`, GET on `/v1/models` and `/v1/models/*`
 - No preset fits — need explicit rules
-- Two binaries
 
 ### Output
 
@@ -364,9 +345,6 @@ network_policies:
           - allow:
               method: POST
               path: "/v1/chat/completions"
-    binaries:
-      - { path: /usr/bin/curl }
-      - { path: /usr/local/bin/opencode }
 ```
 
 **What this allows**: GET `/v1/models`, GET `/v1/models/{id}`, POST `/v1/chat/completions`.
@@ -415,8 +393,6 @@ network_policies:
         protocol: rest
         enforcement: audit
         access: read-write
-    binaries:
-      - { path: /usr/bin/curl }
 ```
 
 **What this allows**: GET, HEAD, OPTIONS, POST, PUT, PATCH on all paths.
@@ -535,8 +511,6 @@ network_policies:
           - allow:
               method: GET
               path: "/projects/*/members"
-    binaries:
-      - { path: /app/bin/pm-cli }
 ```
 
 **What this allows**: Full CRUD on projects and tasks, GET-only on members.
@@ -552,9 +526,9 @@ network_policies:
 
 ### Analysis
 
-- Anthropic API: L4-only (no inspection), standard claude binary
+- Anthropic API: L4-only (no inspection)
 - Internal docs: L7 with read-only, HTTP so no TLS config needed
-- Two separate policies because different binaries
+- Two separate policies for different access levels
 
 ### Output
 
@@ -565,8 +539,6 @@ network_policies:
     endpoints:
       - { host: api.anthropic.com, port: 443 }
       - { host: statsig.anthropic.com, port: 443 }
-    binaries:
-      - { path: /usr/local/bin/claude }
 
   internal_docs_readonly:
     name: internal_docs_readonly
@@ -576,19 +548,17 @@ network_policies:
         protocol: rest
         enforcement: enforce
         access: read-only
-    binaries:
-      - { path: /usr/local/bin/claude }
 ```
 
 **Note**: The first policy has no `protocol` field — this means L4-only (host:port check, no HTTP inspection). The second policy has `protocol: rest` so every HTTP request is inspected.
 
 ---
 
-## Example 6: Wildcard Binary Patterns
+## Example 6: Targeted Read Metrics Policy
 
 ### Input: User Intent
 
-> "Any binary under /usr/local/bin/ should be able to hit our metrics endpoint at metrics.corp.com:443, but only GET /metrics and GET /api/v1/query. Enforce it."
+> "Allow access to our metrics endpoint at metrics.corp.com:443, but only GET /metrics and GET /api/v1/query. Enforce it."
 
 ### Output
 
@@ -608,11 +578,7 @@ network_policies:
           - allow:
               method: GET
               path: "/api/v1/query"
-    binaries:
-      - { path: "/usr/local/bin/*" }
 ```
-
-**Note**: The `*` glob in the binary path matches any binary directly inside `/usr/local/bin/` but does not cross `/` boundaries. Use `/usr/local/**` to match recursively.
 
 ---
 
@@ -635,8 +601,6 @@ network_policies:
         port: 8080
         allowed_ips:
           - "10.0.5.0/24"
-    binaries:
-      - { path: /usr/bin/curl }
 ```
 
 **What this allows**: Connections to `api.internal.corp:8080` when DNS resolves to any IP in `10.0.5.0/24`.
@@ -659,8 +623,6 @@ network_policies:
         allowed_ips:
           - "10.0.5.0/24"
           - "10.0.6.0/24"
-    binaries:
-      - { path: /usr/local/bin/opencode }
 ```
 
 **What this allows**: Any hostname on port 8080 whose DNS resolves to `10.0.5.0/24` or `10.0.6.0/24`.
@@ -688,8 +650,6 @@ network_policies:
         access: read-only
         allowed_ips:
           - "172.16.1.50"
-    binaries:
-      - { path: /usr/bin/curl }
 ```
 
 **What this allows**: GET, HEAD, OPTIONS on any path to `db-proxy.internal:3128`, only if it resolves to `172.16.1.50`.
@@ -710,8 +670,6 @@ network_policies:
         port: 9090
         allowed_ips:
           - "10.0.5.20"
-    binaries:
-      - { path: /usr/bin/curl }
 ```
 
 An exact IP is treated as `/32` — only that specific address is permitted.
@@ -742,8 +700,6 @@ An exact IP is treated as `/32` — only that specific address is permitted.
         protocol: rest
         enforcement: enforce
         access: read-only
-    binaries:
-      - { path: /usr/bin/curl }
 ```
 
 The agent uses `StrReplace` to insert after the last existing policy in the `network_policies` block. All other sections (`filesystem_policy`, `landlock`, `process`) are untouched.
@@ -768,8 +724,6 @@ Before:
     endpoints:
       - { host: api.anthropic.com, port: 443 }
       - { host: statsig.anthropic.com, port: 443 }
-    binaries:
-      - { path: /usr/local/bin/claude }
 ```
 
 After:
@@ -780,8 +734,6 @@ After:
       - { host: api.anthropic.com, port: 443 }
       - { host: statsig.anthropic.com, port: 443 }
       - { host: sentry.io, port: 443 }
-    binaries:
-      - { path: /usr/local/bin/claude }
 ```
 
 ---
@@ -843,8 +795,6 @@ network_policies:
         protocol: rest
         enforcement: enforce
         access: read-only
-    binaries:
-      - { path: /usr/local/bin/claude }
 
   anthropic_full:
     name: anthropic_full
@@ -854,8 +804,6 @@ network_policies:
         protocol: rest
         enforcement: enforce
         access: full
-    binaries:
-      - { path: /usr/local/bin/claude }
 ```
 
 The agent notes that `filesystem_policy`, `landlock`, and `process` are sensible defaults that may need adjustment, and that gateway inference is configured separately via `openshell inference set/get` rather than an `inference` policy block.

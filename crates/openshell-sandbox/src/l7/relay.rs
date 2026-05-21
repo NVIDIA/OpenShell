@@ -29,11 +29,7 @@ pub struct L7EvalContext {
     pub port: u16,
     /// Matched policy name from L4 evaluation.
     pub policy_name: String,
-    /// Binary path (for cross-layer Rego evaluation).
-    pub binary_path: String,
-    /// Ancestor paths.
-    pub ancestors: Vec<String>,
-    /// Cmdline paths.
+    /// Cmdline-derived paths for script detection / observability.
     pub cmdline_paths: Vec<String>,
     /// Supervisor-only placeholder resolver for outbound headers.
     pub(crate) secret_resolver: Option<Arc<SecretResolver>>,
@@ -295,7 +291,6 @@ where
                     Some(crate::l7::rest::DenyResponseContext {
                         host: Some(&ctx.host),
                         port: Some(ctx.port),
-                        binary: Some(&ctx.binary_path),
                     }),
                 )
                 .await?;
@@ -387,7 +382,6 @@ where
                     Some(crate::l7::rest::DenyResponseContext {
                         host: Some(&ctx.host),
                         port: Some(ctx.port),
-                        binary: Some(&ctx.binary_path),
                     }),
                 )
                 .await?;
@@ -685,7 +679,6 @@ where
                     Some(crate::l7::rest::DenyResponseContext {
                         host: Some(&ctx.host),
                         port: Some(ctx.port),
-                        binary: Some(&ctx.binary_path),
                     }),
                 )
                 .await?;
@@ -813,7 +806,6 @@ where
                     Some(crate::l7::rest::DenyResponseContext {
                         host: Some(&ctx.host),
                         port: Some(ctx.port),
-                        binary: Some(&ctx.binary_path),
                     }),
                 )
                 .await?;
@@ -1036,7 +1028,6 @@ where
                     Some(crate::l7::rest::DenyResponseContext {
                         host: Some(&ctx.host),
                         port: Some(ctx.port),
-                        binary: Some(&ctx.binary_path),
                     }),
                 )
                 .await?;
@@ -1111,11 +1102,6 @@ pub fn evaluate_l7_request(
         "network": {
             "host": ctx.host,
             "port": ctx.port,
-        },
-        "exec": {
-            "path": ctx.binary_path,
-            "ancestors": ctx.ancestors,
-            "cmdline_paths": ctx.cmdline_paths,
         },
         "request": {
             "method": request.action,
@@ -1293,7 +1279,6 @@ where
 mod tests {
     use super::*;
     use crate::opa::{NetworkInput, OpaEngine};
-    use std::path::PathBuf;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
     const TEST_POLICY: &str = include_str!("../../data/sandbox-policy.rego");
@@ -1346,16 +1331,11 @@ network_policies:
           - allow:
               method: GET
               path: "/ws"
-    binaries:
-      - { path: /usr/bin/node }
 "#;
         let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
         let input = NetworkInput {
             host: "gateway.example.test".into(),
             port: 443,
-            binary_path: PathBuf::from("/usr/bin/node"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
             cmdline_paths: vec![],
         };
         let generation = engine
@@ -1367,8 +1347,6 @@ network_policies:
             host: "gateway.example.test".into(),
             port: 443,
             policy_name: "ws_api".into(),
-            binary_path: "/usr/bin/node".into(),
-            ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
         };
@@ -1400,8 +1378,6 @@ network_policies:
           - allow:
               method: GET
               path: "/ws"
-    binaries:
-      - { path: /usr/bin/node }
 "#;
         let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
         let tunnel_engine = engine
@@ -1422,8 +1398,6 @@ network_policies:
             host: "gateway.example.test".into(),
             port: 443,
             policy_name: "route_api".into(),
-            binary_path: "/usr/bin/node".into(),
-            ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
         };
@@ -1500,8 +1474,6 @@ network_policies:
               method: WEBSOCKET_TEXT
               path: "/ws"
         websocket_credential_rewrite: true
-    binaries:
-      - { path: /usr/bin/node }
 "#;
         let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
         let tunnel_engine = engine
@@ -1526,8 +1498,6 @@ network_policies:
             host: "gateway.example.test".into(),
             port: 443,
             policy_name: "route_api".into(),
-            binary_path: "/usr/bin/node".into(),
-            ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: resolver.map(Arc::new),
         };
@@ -1617,8 +1587,6 @@ network_policies:
               operation_type: query
               fields: [viewer]
         websocket_credential_rewrite: true
-    binaries:
-      - { path: /usr/bin/node }
 "#;
         let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
         let tunnel_engine = engine
@@ -1643,8 +1611,6 @@ network_policies:
             host: "gateway.example.test".into(),
             port: 443,
             policy_name: "route_api".into(),
-            binary_path: "/usr/bin/node".into(),
-            ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: resolver.map(Arc::new),
         };
@@ -1776,8 +1742,6 @@ network_policies:
           - allow:
               method: POST
               path: "/write"
-    binaries:
-      - { path: /usr/bin/curl }
 "#;
         let reloaded_data = r#"
 network_policies:
@@ -1792,16 +1756,11 @@ network_policies:
           - allow:
               method: GET
               path: "/write"
-    binaries:
-      - { path: /usr/bin/curl }
 "#;
         let engine = OpaEngine::from_strings(TEST_POLICY, initial_data).unwrap();
         let input = NetworkInput {
             host: "api.example.test".into(),
             port: 8080,
-            binary_path: PathBuf::from("/usr/bin/curl"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
             cmdline_paths: vec![],
         };
         let (endpoint_config, generation) = engine
@@ -1813,8 +1772,6 @@ network_policies:
             host: "api.example.test".into(),
             port: 8080,
             policy_name: "rest_api".into(),
-            binary_path: "/usr/bin/curl".into(),
-            ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
         };
@@ -1900,8 +1857,6 @@ network_policies:
             host: "api.example.test".into(),
             port: 8080,
             policy_name: "rest_api".into(),
-            binary_path: "/usr/bin/curl".into(),
-            ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
         };

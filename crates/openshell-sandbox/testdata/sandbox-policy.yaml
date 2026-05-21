@@ -35,9 +35,6 @@ network_policies:
     endpoints:
       - { host: api.anthropic.com, port: 443 }
       - { host: statsig.anthropic.com, port: 443 }
-    binaries:
-      - { path: /usr/local/bin/claude }
-      - { path: /usr/bin/node }
 
   github_ssh_over_https:
     name: github-ssh-over-https
@@ -53,8 +50,6 @@ network_policies:
           - allow:
               method: POST
               path: "/**/git-upload-pack"
-    binaries:
-      - { path: /usr/bin/git }
 
   copilot:
     name: copilot
@@ -70,15 +65,8 @@ network_policies:
       - { host: default.exp-tas.com, port: 443 }
       - { host: origin-tracker.githubusercontent.com, port: 443 }
       - { host: release-assets.githubusercontent.com, port: 443 }
-    binaries:
-      - { path: "/usr/lib/node_modules/@github/copilot/node_modules/@github/**/copilot" }
-      - { path: /usr/local/bin/copilot }
-      - { path: "/home/*/.local/bin/copilot" }
-      - { path: /usr/bin/node }
 
   gitlab:
     name: gitlab
     endpoints:
       - { host: gitlab.com, port: 443 }
-    binaries:
-      - { path: /usr/bin/glab }

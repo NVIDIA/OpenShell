@@ -177,8 +177,6 @@ network_policies:
           - "172.0.0.0/8"
           - "192.168.0.0/16"
           - "fc00::/7"
-    binaries:
-      - path: /usr/bin/curl
 "#
     );
     file.write_all(policy.as_bytes())

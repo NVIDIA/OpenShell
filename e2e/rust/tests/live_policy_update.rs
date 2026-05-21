@@ -52,8 +52,6 @@ fn write_policy(hosts: &[&str]) -> Result<NamedTempFile, String> {
     endpoints:
       - host: {host}
         port: 443
-    binaries:
-      - path: "/**"
 "#
         );
     }

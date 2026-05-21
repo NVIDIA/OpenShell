@@ -14,7 +14,7 @@ For the field-by-field YAML reference, use
 |---|---|
 | Filesystem | Landlock restricts read-only and read-write paths. |
 | Process | The supervisor launches the agent as an unprivileged user with reduced capabilities. |
-| Network | The proxy evaluates destination, port, calling binary, and optional L7 rules. |
+| Network | The proxy evaluates destination, port, and optional L7 rules. |
 | Inference | `inference.local` is configured through gateway inference settings, not OPA network policy. |
 | Runtime settings | Typed settings are delivered with policy and can be global or sandbox scoped. |
 
@@ -26,12 +26,11 @@ dynamic and can be hot-reloaded when the new policy validates successfully.
 Ordinary network traffic follows this order:
 
 1. Force traffic through the sandbox proxy with namespace and seccomp controls.
-2. Identify the calling binary and compare its trusted identity.
-3. Reject hard-blocked destinations, including unsafe internal IP ranges unless
+2. Reject hard-blocked destinations, including unsafe internal IP ranges unless
    explicitly allowed.
-4. Match the destination and binary against network policy blocks.
-5. Apply optional HTTP/L7 rules for endpoints that enable protocol inspection.
-6. Allow, deny, audit, or log according to the matched policy.
+3. Match the destination against network policy blocks.
+4. Apply optional HTTP/L7 rules for endpoints that enable protocol inspection.
+5. Allow, deny, audit, or log according to the matched policy.
 
 Explicit deny and hardening checks win over allow rules. If no rule matches, the
 request is denied.

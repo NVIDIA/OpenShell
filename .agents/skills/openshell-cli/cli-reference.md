@@ -256,7 +256,6 @@ Incrementally merge live network policy changes into the current sandbox policy.
 | `--add-allow <SPEC>` | repeatable | `host:port:METHOD:path_glob`. Adds REST allow rules to an existing `protocol: rest` endpoint. |
 | `--add-deny <SPEC>` | repeatable | `host:port:METHOD:path_glob`. Adds REST deny rules to an existing `protocol: rest` endpoint that already has an allow base. |
 | `--remove-rule <NAME>` | repeatable | Deletes a named network rule. |
-| `--binary <PATH>` | repeatable | Adds binaries to each `--add-endpoint` rule. Valid only with `--add-endpoint`. |
 | `--rule-name <NAME>` | none | Overrides the generated rule name. Valid only when exactly one `--add-endpoint` is provided. |
 | `--dry-run` | false | Preview the merged policy locally without sending an update to the gateway. |
 | `--wait` | false | Wait for the sandbox to confirm the new policy revision is loaded. |

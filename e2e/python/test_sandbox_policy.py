@@ -57,9 +57,6 @@ def _policy_for_python_proxy_tests() -> sandbox_pb2.SandboxPolicy:
                 endpoints=[
                     sandbox_pb2.NetworkEndpoint(host="api.openai.com", port=443)
                 ],
-                binaries=[
-                    sandbox_pb2.NetworkBinary(path="/sandbox/.uv/python/**/python*")
-                ],
             )
         },
     )
@@ -429,7 +426,6 @@ def test_l4_no_policy_denies_all(
                 endpoints=[
                     sandbox_pb2.NetworkEndpoint(host="example.com", port=443),
                 ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
             ),
         },
     )
@@ -451,7 +447,6 @@ def test_l4_wildcard_binary_allows_any_binary(
                 endpoints=[
                     sandbox_pb2.NetworkEndpoint(host="api.anthropic.com", port=443),
                 ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
             ),
         },
     )
@@ -483,7 +478,6 @@ def test_l4_binary_restricted_denies_wrong_binary(
                 endpoints=[
                     sandbox_pb2.NetworkEndpoint(host="api.anthropic.com", port=443),
                 ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/usr/bin/curl")],
             ),
         },
     )
@@ -506,7 +500,6 @@ def test_l4_wrong_port_denied(
                 endpoints=[
                     sandbox_pb2.NetworkEndpoint(host="api.anthropic.com", port=443),
                 ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
             ),
         },
     )
@@ -539,16 +532,12 @@ def test_l4_cross_policy_denied(
                 endpoints=[
                     sandbox_pb2.NetworkEndpoint(host="api.anthropic.com", port=443),
                 ],
-                binaries=[
-                    sandbox_pb2.NetworkBinary(path="/sandbox/.uv/python/**/python*")
-                ],
             ),
             "other": sandbox_pb2.NetworkPolicyRule(
                 name="other",
                 endpoints=[
                     sandbox_pb2.NetworkEndpoint(host="example.com", port=443),
                 ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/usr/bin/curl")],
             ),
         },
     )
@@ -589,7 +578,6 @@ def test_l4_non_connect_method_rejected(
                 endpoints=[
                     sandbox_pb2.NetworkEndpoint(host="example.com", port=443),
                 ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
             ),
         },
     )
@@ -611,7 +599,6 @@ def test_l4_log_fields(
                 endpoints=[
                     sandbox_pb2.NetworkEndpoint(host="api.anthropic.com", port=443),
                 ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
             ),
         },
     )
@@ -660,7 +647,6 @@ def test_ssrf_blocks_loopback_despite_policy_allow(
                 endpoints=[
                     sandbox_pb2.NetworkEndpoint(host="127.0.0.1", port=80),
                 ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
             ),
         },
     )
@@ -682,7 +668,6 @@ def test_ssrf_blocks_metadata_endpoint_despite_policy_allow(
                 endpoints=[
                     sandbox_pb2.NetworkEndpoint(host="169.254.169.254", port=80),
                 ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
             ),
         },
     )
@@ -710,7 +695,6 @@ def test_ssrf_log_shows_blocked_address(
                 endpoints=[
                     sandbox_pb2.NetworkEndpoint(host="127.0.0.1", port=80),
                 ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
             ),
         },
     )
@@ -766,7 +750,6 @@ def test_ssrf_allowed_ips_permits_private_ip(
                         allowed_ips=["10.200.0.0/24"],
                     ),
                 ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
             ),
         },
     )
@@ -800,7 +783,6 @@ def test_ssrf_allowed_ips_hostless_permits_private_ip(
                         allowed_ips=["10.200.0.0/24"],
                     ),
                 ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
             ),
         },
     )
@@ -830,7 +812,6 @@ def test_ssrf_private_ip_allowed_with_literal_ip_host(
                     # No allowed_ips — but host is a literal IP, so implicit
                     sandbox_pb2.NetworkEndpoint(host="10.200.0.1", port=19999),
                 ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
             ),
         },
     )
@@ -867,7 +848,6 @@ def test_ssrf_loopback_blocked_even_with_allowed_ips(
                         allowed_ips=["127.0.0.0/8"],
                     ),
                 ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
             ),
         },
     )
@@ -918,7 +898,6 @@ def test_l7_tls_full_access_allows_all(
                         access="full",
                     ),
                 ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
             ),
         },
     )
@@ -954,7 +933,6 @@ def test_l7_tls_read_only_denies_post(
                         access="read-only",
                     ),
                 ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
             ),
         },
     )
@@ -998,7 +976,6 @@ def test_l7_tls_audit_mode_allows_but_logs(
                         access="read-only",
                     ),
                 ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
             ),
         },
     )
@@ -1045,7 +1022,6 @@ def test_l7_tls_explicit_path_rules(
                         ],
                     ),
                 ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
             ),
         },
     )
@@ -1106,7 +1082,6 @@ def test_l7_tls_ca_trust_store_injected(
                 endpoints=[
                     sandbox_pb2.NetworkEndpoint(host="example.com", port=443),
                 ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
             ),
         },
     )
@@ -1139,7 +1114,6 @@ def test_l7_tls_deny_response_format(
                         access="read-only",
                     ),
                 ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
             ),
         },
     )
@@ -1183,7 +1157,6 @@ def test_l7_tls_log_fields(
                         access="full",
                     ),
                 ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
             ),
         },
     )
@@ -1243,7 +1216,6 @@ def test_l7_query_matchers_enforced(
                         ],
                     ),
                 ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
             ),
         },
     )
@@ -1340,7 +1312,6 @@ def test_l7_rule_without_query_matcher_allows_any_query_params(
                         ],
                     ),
                 ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
             ),
         },
     )
@@ -1392,7 +1363,6 @@ def test_forward_proxy_allows_private_ip_with_allowed_ips(
                         allowed_ips=["10.200.0.0/24"],
                     ),
                 ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
             ),
         },
     )
@@ -1431,7 +1401,6 @@ def test_forward_proxy_allows_private_ip_host_without_allowed_ips(
                         port=_FORWARD_PROXY_PORT,
                     ),
                 ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
             ),
         },
     )
@@ -1468,7 +1437,6 @@ def test_forward_proxy_rejects_https_scheme(
                         allowed_ips=["10.200.0.0/24"],
                     ),
                 ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
             ),
         },
     )
@@ -1504,7 +1472,6 @@ def test_forward_proxy_denied_no_policy_match(
                         allowed_ips=["10.200.0.0/24"],
                     ),
                 ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
             ),
         },
     )
@@ -1543,7 +1510,6 @@ def test_forward_proxy_public_ip_denied(
                         allowed_ips=["93.184.0.0/16"],
                     ),
                 ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
             ),
         },
     )
@@ -1574,7 +1540,6 @@ def test_forward_proxy_log_fields(
                         allowed_ips=["10.200.0.0/24"],
                     ),
                 ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
             ),
         },
     )
@@ -1670,7 +1635,6 @@ def test_baseline_enrichment_missing_filesystem_policy(
                     endpoints=[
                         sandbox_pb2.NetworkEndpoint(host="example.com", port=443),
                     ],
-                    binaries=[sandbox_pb2.NetworkBinary(path="/**")],
                 ),
             },
         ),
@@ -1716,7 +1680,6 @@ def test_baseline_enrichment_incomplete_filesystem_policy(
                     endpoints=[
                         sandbox_pb2.NetworkEndpoint(host="example.com", port=443),
                     ],
-                    binaries=[sandbox_pb2.NetworkBinary(path="/**")],
                 ),
             },
         ),
@@ -1765,7 +1728,6 @@ def test_multi_port_allows_all_listed_ports(
                         host="api.anthropic.com", ports=[443, 80]
                     ),
                 ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
             ),
         },
     )
@@ -1795,7 +1757,6 @@ def test_multi_port_denies_unlisted_port(
                         host="api.anthropic.com", ports=[443, 80]
                     ),
                 ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
             ),
         },
     )
@@ -1818,7 +1779,6 @@ def test_single_port_backwards_compat(
                 endpoints=[
                     sandbox_pb2.NetworkEndpoint(host="api.anthropic.com", port=443),
                 ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
             ),
         },
     )
@@ -1859,7 +1819,6 @@ def test_host_wildcard_matches_subdomain(
                         port=443,
                     ),
                 ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
             ),
         },
     )
@@ -1904,7 +1863,6 @@ def test_host_wildcard_rejects_bare_domain(
                         port=443,
                     ),
                 ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
             ),
         },
     )
@@ -1935,7 +1893,6 @@ def test_host_wildcard_rejects_deep_subdomain(
                         port=443,
                     ),
                 ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
             ),
         },
     )
@@ -1975,7 +1932,6 @@ def test_overlapping_policies_do_not_crash_opa(
                         port=_FORWARD_PROXY_PORT,
                     ),
                 ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
             ),
             "approved_rule": sandbox_pb2.NetworkPolicyRule(
                 name="approved_rule",
@@ -1986,7 +1942,6 @@ def test_overlapping_policies_do_not_crash_opa(
                         allowed_ips=["10.200.0.0/24"],
                     ),
                 ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
             ),
         },
     )
@@ -2023,7 +1978,6 @@ def test_overlapping_policies_l7_connect_does_not_crash(
                         access="read-only",
                     ),
                 ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
             ),
             "auto_approved_api": sandbox_pb2.NetworkPolicyRule(
                 name="auto_approved_api",
@@ -2036,7 +1990,6 @@ def test_overlapping_policies_l7_connect_does_not_crash(
                         access="read-only",
                     ),
                 ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
             ),
         },
     )

@@ -5,8 +5,8 @@
 //! draft `NetworkPolicyRule` proposals.
 //!
 //! This is the "zero-LLM" baseline for policy recommendations. It inspects
-//! denial patterns (host, port, binary, frequency) and generates concrete rules
-//! that would allow the denied connections, annotated with confidence scores and
+//! denial patterns (host, port, frequency) and generates concrete rules that
+//! would allow the denied connections, annotated with confidence scores and
 //! security notes.
 //!
 //! The LLM-powered `PolicyAdvisor` (issue #205) wraps and enriches these
@@ -14,7 +14,7 @@
 
 use openshell_core::net::is_always_blocked_ip;
 use openshell_core::proto::{
-    DenialSummary, L7Allow, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, PolicyChunk,
+    DenialSummary, L7Allow, L7Rule, NetworkEndpoint, NetworkPolicyRule, PolicyChunk,
 };
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -43,10 +43,9 @@ const WELL_KNOWN_PORTS: &[(u16, &str)] = &[
 
 /// Generate draft `PolicyChunk` proposals from denial summaries.
 ///
-/// Groups denials by `(host, port, binary)`, then for each group generates a
-/// `PolicyChunk` with a `NetworkPolicyRule` allowing that endpoint for that
-/// single binary. This produces one proposal per binary so each
-/// `(sandbox_id, host, port, binary)` maps to exactly one DB row.
+/// Groups denials by `(host, port)`, then for each group generates a
+/// `PolicyChunk` with a `NetworkPolicyRule` allowing that endpoint.
+/// Each `(sandbox_id, host, port)` maps to exactly one DB row.
 ///
 /// Proposals never include `allowed_ips`. If the user applies a proposed rule
 /// and the host resolves to a private IP, the proxy's SSRF defense will deny
@@ -57,24 +56,19 @@ const WELL_KNOWN_PORTS: &[(u16, &str)] = &[
 ///
 /// Returns an empty vec if there are no actionable denials.
 pub fn generate_proposals(summaries: &[DenialSummary]) -> Vec<PolicyChunk> {
-    // Group denials by (host, port, binary).
-    let mut groups: HashMap<(String, u32, String), Vec<&DenialSummary>> = HashMap::new();
+    // Group denials by (host, port).
+    let mut groups: HashMap<(String, u32), Vec<&DenialSummary>> = HashMap::new();
 
     for summary in summaries {
-        let binary_key = if summary.binary.is_empty() {
-            String::new()
-        } else {
-            summary.binary.clone()
-        };
         groups
-            .entry((summary.host.clone(), summary.port, binary_key))
+            .entry((summary.host.clone(), summary.port))
             .or_default()
             .push(summary);
     }
 
     let mut proposals = Vec::new();
 
-    for ((host, port, binary), denials) in &groups {
+    for ((host, port), denials) in &groups {
         let rule_name = generate_rule_name(host, *port);
 
         let mut total_count: u32 = 0;
@@ -140,31 +134,14 @@ pub fn generate_proposals(summaries: &[DenialSummary]) -> Vec<PolicyChunk> {
             }
         };
 
-        let binaries: Vec<NetworkBinary> = if binary.is_empty() {
-            vec![]
-        } else {
-            vec![NetworkBinary {
-                path: binary.clone(),
-                ..Default::default()
-            }]
-        };
-
         let proposed_rule = NetworkPolicyRule {
             name: rule_name.clone(),
             endpoints: vec![endpoint],
-            binaries,
         };
 
         // Compute confidence.
         #[allow(clippy::cast_possible_truncation)]
         let confidence = compute_confidence(total_count, *port as u16, is_ssrf);
-
-        // Generate rationale.
-        let binary_list = if binary.is_empty() {
-            "unknown binary".to_string()
-        } else {
-            short_binary_name(binary)
-        };
 
         #[allow(clippy::cast_possible_truncation)]
         let port_u16 = *port as u16;
@@ -179,16 +156,13 @@ pub fn generate_proposals(summaries: &[DenialSummary]) -> Vec<PolicyChunk> {
         let rationale = if has_l7 && !l7_methods.is_empty() {
             let paths: Vec<String> = l7_methods.keys().map(|(m, p)| format!("{m} {p}")).collect();
             format!(
-                "Allow {binary_list} to connect to {host}:{port}{port_name} \
+                "Allow connections to {host}:{port}{port_name} \
                  with L7 inspection. \
                  Allowed paths: {}.",
                 paths.join(", ")
             )
         } else {
-            format!(
-                "Allow {binary_list} to connect to \
-                 {host}:{port}{port_name}."
-            )
+            format!("Allow connections to {host}:{port}{port_name}.")
         };
 
         // Generate security notes.
@@ -216,7 +190,6 @@ pub fn generate_proposals(summaries: &[DenialSummary]) -> Vec<PolicyChunk> {
             hit_count: total_count.cast_signed(),
             first_seen_ms,
             last_seen_ms,
-            binary: binary.clone(),
             validation_result: String::new(),
             rejection_reason: String::new(),
         });
@@ -232,11 +205,10 @@ pub fn generate_proposals(summaries: &[DenialSummary]) -> Vec<PolicyChunk> {
     proposals
 }
 
-/// Generate a rule name that doesn't conflict with existing rules.
 /// Generate a deterministic, idempotent rule name from host and port.
 ///
 /// The same `(host, port)` always produces the same name. DB-level dedup on
-/// `(sandbox_id, host, port, binary)` handles collisions — no need to check
+/// `(sandbox_id, host, port)` handles collisions — no need to check
 /// existing rule names.
 fn generate_rule_name(host: &str, port: u32) -> String {
     let sanitized = host
@@ -408,11 +380,6 @@ fn looks_like_id(segment: &str) -> bool {
     false
 }
 
-/// Extract just the binary name from a full path.
-fn short_binary_name(path: &str) -> String {
-    path.rsplit('/').next().unwrap_or(path).to_string()
-}
-
 /// Check if a destination host is always-blocked.
 ///
 /// For literal IP hosts, checks against [`is_always_blocked_ip`].
@@ -473,8 +440,6 @@ mod tests {
             sandbox_id: "test".to_string(),
             host: "api.example.com".to_string(),
             port: 443,
-            binary: "/usr/bin/curl".to_string(),
-            ancestors: vec![],
             deny_reason: "no matching policy".to_string(),
             first_seen_ms: 1000,
             last_seen_ms: 2000,
@@ -482,7 +447,6 @@ mod tests {
             suppressed_count: 0,
             total_count: 5,
             sample_cmdlines: vec![],
-            binary_sha256: String::new(),
             persistent: false,
             denial_stage: "connect".to_string(),
             l7_request_samples: vec![],
@@ -498,8 +462,6 @@ mod tests {
         assert_eq!(rule.endpoints.len(), 1);
         assert_eq!(rule.endpoints[0].host, "api.example.com");
         assert_eq!(rule.endpoints[0].port, 443);
-        assert_eq!(rule.binaries.len(), 1);
-        assert_eq!(rule.binaries[0].path, "/usr/bin/curl");
 
         // No L7 fields when no samples provided.
         assert!(rule.endpoints[0].protocol.is_empty());
@@ -517,8 +479,6 @@ mod tests {
             sandbox_id: "test".to_string(),
             host: "icanhazdadjoke.com".to_string(),
             port: 443,
-            binary: "/usr/bin/python3".to_string(),
-            ancestors: vec![],
             deny_reason: "l7 deny".to_string(),
             first_seen_ms: 1000,
             last_seen_ms: 2000,
@@ -526,7 +486,6 @@ mod tests {
             suppressed_count: 0,
             total_count: 3,
             sample_cmdlines: vec![],
-            binary_sha256: String::new(),
             persistent: false,
             denial_stage: "l7_deny".to_string(),
             l7_request_samples: vec![
@@ -616,7 +575,6 @@ mod tests {
         let summaries = vec![DenialSummary {
             host: "127.0.0.1".to_string(),
             port: 80,
-            binary: "/usr/bin/curl".to_string(),
             count: 5,
             first_seen_ms: 1000,
             last_seen_ms: 2000,
@@ -636,7 +594,6 @@ mod tests {
         let summaries = vec![DenialSummary {
             host: "169.254.169.254".to_string(),
             port: 80,
-            binary: "/usr/bin/curl".to_string(),
             count: 5,
             first_seen_ms: 1000,
             last_seen_ms: 2000,
@@ -656,7 +613,6 @@ mod tests {
         let summaries = vec![DenialSummary {
             host: "localhost".to_string(),
             port: 8080,
-            binary: "/usr/bin/curl".to_string(),
             count: 3,
             first_seen_ms: 1000,
             last_seen_ms: 2000,
@@ -676,7 +632,6 @@ mod tests {
         let summaries = vec![DenialSummary {
             host: "api.github.com".to_string(),
             port: 443,
-            binary: "/usr/bin/curl".to_string(),
             count: 5,
             first_seen_ms: 1000,
             last_seen_ms: 2000,

@@ -418,7 +418,7 @@ Watch for `deny` actions that indicate the user's work is being blocked by polic
 When denied actions are observed:
 
 1. Prefer incremental updates for additive network changes:
-   `openshell policy update work-session --add-endpoint api.github.com:443:read-only:rest:enforce --binary /usr/bin/gh --wait`
+   `openshell policy update work-session --add-endpoint api.github.com:443:read-only:rest:enforce --wait`
    `openshell policy update work-session --add-allow 'api.github.com:443:POST:/repos/*/issues' --wait`
 2. Use full YAML replacement when the change is broad or touches non-network fields:
    `openshell policy get work-session --full > policy.yaml`
@@ -537,7 +537,7 @@ $ openshell sandbox upload --help
 | Create with custom policy | `openshell sandbox create --policy ./p.yaml` |
 | Connect to sandbox | `openshell sandbox connect <name>` |
 | Stream live logs | `openshell logs <name> --tail` |
-| Incremental policy update | `openshell policy update <name> --add-endpoint host:443:read-only:rest:enforce --binary /usr/bin/curl --wait` |
+| Incremental policy update | `openshell policy update <name> --add-endpoint host:443:read-only:rest:enforce --wait` |
 | Pull current policy | `openshell policy get <name> --full > p.yaml` |
 | Push updated policy | `openshell policy set <name> --policy p.yaml --wait` |
 | Policy revision history | `openshell policy list <name>` |

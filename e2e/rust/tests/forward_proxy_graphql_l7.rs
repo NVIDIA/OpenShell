@@ -115,10 +115,6 @@ network_policies:
         deny_rules:
           - operation_type: mutation
             fields: [deleteRepository]
-    binaries:
-      - path: /usr/bin/python*
-      - path: /usr/local/bin/python*
-      - path: /sandbox/.uv/python/*/bin/python*
 "#
     );
     file.write_all(policy.as_bytes())

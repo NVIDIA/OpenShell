@@ -33,7 +33,7 @@ use openshell_core::proto::{
     UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse,
 };
 use openshell_core::proto::{
-    L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, Provider, Sandbox,
+    L7DenyRule, L7Rule, NetworkEndpoint, NetworkPolicyRule, Provider, Sandbox,
     SandboxPolicy as ProtoSandboxPolicy,
 };
 use openshell_core::{
@@ -163,10 +163,6 @@ fn summarize_cli_policy_merge_op(operation: &PolicyMergeOp) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
-        PolicyMergeOp::RemoveBinary {
-            rule_name,
-            binary_path,
-        } => format!("remove-binary {rule_name} {binary_path}"),
     }
 }
 
@@ -187,8 +183,7 @@ fn summarize_add_endpoint(rule_name: &str, rule: &NetworkPolicyRule) -> String {
         .map(summarize_endpoint)
         .collect::<Vec<_>>()
         .join(", ");
-    let binaries = summarize_binaries(&rule.binaries);
-    format!("add-endpoint {rule_name} endpoints=[{endpoints}] binaries=[{binaries}]")
+    format!("add-endpoint {rule_name} endpoints=[{endpoints}]")
 }
 
 fn summarize_add_rule(rule_name: &str, rule: &NetworkPolicyRule) -> String {
@@ -198,8 +193,7 @@ fn summarize_add_rule(rule_name: &str, rule: &NetworkPolicyRule) -> String {
         .map(summarize_endpoint)
         .collect::<Vec<_>>()
         .join(", ");
-    let binaries = summarize_binaries(&rule.binaries);
-    format!("add-rule {rule_name} endpoints=[{endpoints}] binaries=[{binaries}]")
+    format!("add-rule {rule_name} endpoints=[{endpoints}]")
 }
 
 fn summarize_endpoint(endpoint: &NetworkEndpoint) -> String {
@@ -288,14 +282,6 @@ fn summarize_l7_match(method: &str, path: &str, command: &str, query_count: usiz
     } else {
         parts.join(" ")
     }
-}
-
-fn summarize_binaries(binaries: &[NetworkBinary]) -> String {
-    binaries
-        .iter()
-        .map(|binary| binary.path.as_str())
-        .collect::<Vec<_>>()
-        .join(", ")
 }
 
 fn summarize_draft_chunk_rule(chunk: &DraftChunkRecord) -> Result<String, Status> {
@@ -1396,10 +1382,6 @@ pub(super) async fn handle_submit_policy_analysis(
             .and_then(|r| r.endpoints.first())
             .map(|ep| (ep.host.to_lowercase(), ep.port as i32))
             .unwrap_or_default();
-        let ep_binary = rule_ref
-            .and_then(|r| r.binaries.first())
-            .map(|b| b.path.clone())
-            .unwrap_or_default();
 
         let record = DraftChunkRecord {
             // The handler proposes an id; the store may swap it for an
@@ -1421,7 +1403,6 @@ pub(super) async fn handle_submit_policy_analysis(
             decided_at_ms: None,
             host: ep_host,
             port: ep_port,
-            binary: ep_binary,
             hit_count: chunk.hit_count.clamp(1, 100),
             first_seen_ms: if chunk.first_seen_ms > 0 {
                 chunk.first_seen_ms
@@ -1671,8 +1652,8 @@ pub(super) async fn handle_reject_draft_chunk(
             sandbox.object_name(),
             "removed",
             format!(
-                "gateway removed previously approved draft chunk {}: remove-binary {} {}",
-                req.chunk_id, chunk.rule_name, chunk.binary
+                "gateway removed previously approved draft chunk {}: rule {}",
+                req.chunk_id, chunk.rule_name
             ),
             version,
             &hash,
@@ -1929,8 +1910,8 @@ pub(super) async fn handle_undo_draft_chunk(
         sandbox.object_name(),
         "removed",
         format!(
-            "gateway reverted approved draft chunk {}: remove-binary {} {}",
-            req.chunk_id, chunk.rule_name, chunk.binary
+            "gateway reverted approved draft chunk {}: rule {}",
+            req.chunk_id, chunk.rule_name
         ),
         version,
         &hash,
@@ -2140,7 +2121,6 @@ fn draft_chunk_record_to_proto(record: &DraftChunkRecord) -> Result<PolicyChunk,
         hit_count: record.hit_count,
         first_seen_ms: record.first_seen_ms,
         last_seen_ms: record.last_seen_ms,
-        binary: record.binary.clone(),
         validation_result: record.validation_result.clone(),
         rejection_reason: record.rejection_reason.clone(),
         ..Default::default()
@@ -2341,19 +2321,7 @@ fn parse_merge_operations(
                 policy_merge_operation::Operation::AddAllowRules(add_allow_rules) => {
                     parse_proto_add_allow_rules(index, add_allow_rules)
                 }
-                policy_merge_operation::Operation::RemoveBinary(remove_binary) => {
-                    let rule_name = remove_binary.rule_name.trim();
-                    let binary_path = remove_binary.binary_path.trim();
-                    if rule_name.is_empty() || binary_path.is_empty() {
-                        return Err(Status::invalid_argument(format!(
-                            "merge_operations[{index}].remove_binary requires rule_name and binary_path"
-                        )));
-                    }
-                    Ok(PolicyMergeOp::RemoveBinary {
-                        rule_name: rule_name.to_string(),
-                        binary_path: binary_path.to_string(),
-                    })
-                }
+
             }
         })
         .collect()
@@ -2548,9 +2516,8 @@ async fn remove_chunk_from_policy(
         state.store.as_ref(),
         sandbox_id,
         None,
-        &[PolicyMergeOp::RemoveBinary {
+        &[PolicyMergeOp::RemoveRule {
             rule_name: chunk.rule_name.clone(),
-            binary_path: chunk.binary.clone(),
         }],
     )
     .await
@@ -2937,7 +2904,6 @@ mod tests {
                         port: 443,
                         ..Default::default()
                     }],
-                    ..Default::default()
                 },
             ))
             .collect(),
@@ -3042,7 +3008,6 @@ mod tests {
                         port: 443,
                         ..Default::default()
                     }],
-                    binaries: Vec::new(),
                     inference_capable: false,
                 }),
             })
@@ -3095,10 +3060,6 @@ mod tests {
                         path: "/v1".to_string(),
                         ..Default::default()
                     }],
-                    binaries: vec![NetworkBinary {
-                        path: "/usr/bin/custom".to_string(),
-                        harness: true,
-                    }],
                     inference_capable: false,
                 }),
             })
@@ -3117,7 +3078,6 @@ mod tests {
         assert_eq!(layers[0].rule.endpoints[0].allowed_ips, vec!["10.0.0.0/24"]);
         assert!(layers[0].rule.endpoints[0].allow_encoded_slash);
         assert_eq!(layers[0].rule.endpoints[0].path, "/v1");
-        assert!(layers[0].rule.binaries[0].harness);
     }
 
     #[tokio::test]
@@ -3147,7 +3107,6 @@ mod tests {
                         port: 443,
                         ..Default::default()
                     }],
-                    binaries: Vec::new(),
                     inference_capable: false,
                 }),
             })
@@ -3635,9 +3594,8 @@ mod tests {
         };
         use openshell_core::proto::{
             AttachSandboxProviderRequest, DetachSandboxProviderRequest,
-            GetSandboxProviderEnvironmentRequest, ImportProviderProfilesRequest, NetworkBinary,
-            ProviderProfile, ProviderProfileCategory, ProviderProfileCredential,
-            ProviderProfileImportItem,
+            GetSandboxProviderEnvironmentRequest, ImportProviderProfilesRequest, ProviderProfile,
+            ProviderProfileCategory, ProviderProfileCredential, ProviderProfileImportItem,
         };
 
         let state = test_server_state().await;
@@ -3672,10 +3630,6 @@ mod tests {
                                 }),
                             }],
                             ..Default::default()
-                        }],
-                        binaries: vec![NetworkBinary {
-                            path: "/usr/bin/custom".to_string(),
-                            harness: true,
                         }],
                         inference_capable: false,
                     }),
@@ -3735,7 +3689,6 @@ mod tests {
         assert_eq!(custom_rule.endpoints[0].host, "api.custom.example");
         assert_eq!(custom_rule.endpoints[0].protocol, "rest");
         assert_eq!(custom_rule.endpoints[0].rules.len(), 1);
-        assert_eq!(custom_rule.binaries[0].path, "/usr/bin/custom");
 
         let attached_env = handle_get_sandbox_provider_environment(
             &state,
@@ -3812,7 +3765,6 @@ mod tests {
                         port: 443,
                         ..Default::default()
                     }],
-                    ..Default::default()
                 },
             ))
             .collect(),
@@ -3846,7 +3798,6 @@ mod tests {
                         port: 443,
                         ..Default::default()
                     }],
-                    ..Default::default()
                 },
             ))
             .collect(),
@@ -3965,7 +3916,7 @@ mod tests {
     #[tokio::test]
     async fn draft_chunk_handler_lifecycle_round_trip() {
         use openshell_core::proto::{
-            GetDraftPolicyRequest, NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxSpec,
+            GetDraftPolicyRequest, NetworkEndpoint, SandboxPhase, SandboxSpec,
         };
 
         let state = test_server_state().await;
@@ -3994,10 +3945,6 @@ mod tests {
                 port: 443,
                 ..Default::default()
             }],
-            binaries: vec![NetworkBinary {
-                path: "/usr/bin/curl".to_string(),
-                ..Default::default()
-            }],
         };
 
         let submit = handle_submit_policy_analysis(
@@ -4012,7 +3959,6 @@ mod tests {
                     hit_count: 3,
                     first_seen_ms: 100,
                     last_seen_ms: 200,
-                    binary: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -4176,7 +4122,7 @@ mod tests {
     /// feedback loop hangs off this guarantee.
     #[tokio::test]
     async fn reject_with_reason_persists_into_chunk_for_agent_readback() {
-        use openshell_core::proto::{NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxSpec};
+        use openshell_core::proto::{NetworkEndpoint, SandboxPhase, SandboxSpec};
 
         let state = test_server_state().await;
         let sandbox_name = "agent-feedback-loop".to_string();
@@ -4202,10 +4148,6 @@ mod tests {
             endpoints: vec![NetworkEndpoint {
                 host: "api.example.com".to_string(),
                 port: 443,
-                ..Default::default()
-            }],
-            binaries: vec![NetworkBinary {
-                path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
         };
@@ -4274,7 +4216,7 @@ mod tests {
     /// find it because the SQL ON CONFLICT had silently kept the prior row.
     #[tokio::test]
     async fn agent_authored_submits_for_same_endpoint_do_not_dedup() {
-        use openshell_core::proto::{NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxSpec};
+        use openshell_core::proto::{NetworkEndpoint, SandboxPhase, SandboxSpec};
 
         let state = test_server_state().await;
         let sandbox_name = "redraft-loop".to_string();
@@ -4306,10 +4248,6 @@ mod tests {
             endpoints: vec![NetworkEndpoint {
                 host: "api.example.com".to_string(),
                 port: 443,
-                ..Default::default()
-            }],
-            binaries: vec![NetworkBinary {
-                path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
         };
@@ -4388,7 +4326,7 @@ mod tests {
     /// mechanistic dedup.
     #[tokio::test]
     async fn mechanistic_submits_for_same_endpoint_dedup_into_one_chunk() {
-        use openshell_core::proto::{NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxSpec};
+        use openshell_core::proto::{NetworkEndpoint, SandboxPhase, SandboxSpec};
 
         let state = test_server_state().await;
         let sandbox_name = "mechanistic-dedup".to_string();
@@ -4414,10 +4352,6 @@ mod tests {
             endpoints: vec![NetworkEndpoint {
                 host: "api.example.com".to_string(),
                 port: 443,
-                ..Default::default()
-            }],
-            binaries: vec![NetworkBinary {
-                path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
         };
@@ -4462,7 +4396,7 @@ mod tests {
         assert_eq!(
             draft.chunks.len(),
             1,
-            "two mechanistic submits for the same host|port|binary must dedup; got {} chunks",
+            "two mechanistic submits for the same host|port must dedup; got {} chunks",
             draft.chunks.len()
         );
         // Both submits must report the same effective id — the id of the
@@ -4488,7 +4422,7 @@ mod tests {
     /// undo, so the test walks that sequence.
     #[tokio::test]
     async fn undo_after_reject_clears_stale_rejection_reason() {
-        use openshell_core::proto::{NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxSpec};
+        use openshell_core::proto::{NetworkEndpoint, SandboxPhase, SandboxSpec};
 
         let state = test_server_state().await;
         let sandbox_name = "undo-clears-reason".to_string();
@@ -4514,10 +4448,6 @@ mod tests {
             endpoints: vec![NetworkEndpoint {
                 host: "api.example.com".to_string(),
                 port: 443,
-                ..Default::default()
-            }],
-            binaries: vec![NetworkBinary {
-                path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
         };
@@ -4595,7 +4525,7 @@ mod tests {
 
     #[tokio::test]
     async fn draft_chunk_handlers_reject_cross_sandbox_chunk_ids() {
-        use openshell_core::proto::{NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxSpec};
+        use openshell_core::proto::{NetworkEndpoint, SandboxPhase, SandboxSpec};
 
         let state = test_server_state().await;
         let sandbox_a = Sandbox {
@@ -4638,10 +4568,6 @@ mod tests {
                 port: 443,
                 ..Default::default()
             }],
-            binaries: vec![NetworkBinary {
-                path: "/usr/bin/curl".to_string(),
-                ..Default::default()
-            }],
         };
 
         handle_submit_policy_analysis(
@@ -4656,7 +4582,6 @@ mod tests {
                     hit_count: 3,
                     first_seen_ms: 100,
                     last_seen_ms: 200,
-                    binary: "/usr/bin/curl".to_string(),
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -4790,16 +4715,12 @@ mod tests {
                     enforcement: "enforce".to_string(),
                     ..Default::default()
                 }],
-                binaries: vec![NetworkBinary {
-                    path: "/usr/bin/curl".to_string(),
-                    ..Default::default()
-                }],
             },
         };
 
         assert_eq!(
             summarize_cli_policy_merge_op(&operation),
-            "add-endpoint github_api endpoints=[api.github.com:443 protocol=rest access=read-only enforcement=enforce] binaries=[/usr/bin/curl]"
+            "add-endpoint github_api endpoints=[api.github.com:443 protocol=rest access=read-only enforcement=enforce]"
         );
     }
 
@@ -4818,16 +4739,12 @@ mod tests {
                     websocket_credential_rewrite: true,
                     ..Default::default()
                 }],
-                binaries: vec![NetworkBinary {
-                    path: "/usr/bin/node".to_string(),
-                    ..Default::default()
-                }],
             },
         };
 
         assert_eq!(
             summarize_cli_policy_merge_op(&operation),
-            "add-endpoint realtime_api endpoints=[realtime.example.com:443 protocol=websocket access=read-write enforcement=enforce websocket_credential_rewrite=true] binaries=[/usr/bin/node]"
+            "add-endpoint realtime_api endpoints=[realtime.example.com:443 protocol=websocket access=read-write enforcement=enforce websocket_credential_rewrite=true]"
         );
     }
 
@@ -4846,16 +4763,12 @@ mod tests {
                     request_body_credential_rewrite: true,
                     ..Default::default()
                 }],
-                binaries: vec![NetworkBinary {
-                    path: "/usr/bin/node".to_string(),
-                    ..Default::default()
-                }],
             },
         };
 
         assert_eq!(
             summarize_cli_policy_merge_op(&operation),
-            "add-endpoint slack_api endpoints=[slack.com:443 protocol=rest access=read-write enforcement=enforce request_body_credential_rewrite=true] binaries=[/usr/bin/node]"
+            "add-endpoint slack_api endpoints=[slack.com:443 protocol=rest access=read-write enforcement=enforce request_body_credential_rewrite=true]"
         );
     }
 
@@ -4863,7 +4776,7 @@ mod tests {
 
     #[tokio::test]
     async fn merge_chunk_into_policy_adds_first_network_rule_to_empty_policy() {
-        use openshell_core::proto::{NetworkBinary, NetworkEndpoint, NetworkPolicyRule};
+        use openshell_core::proto::{NetworkEndpoint, NetworkPolicyRule};
 
         let store = Store::connect("sqlite::memory:").await.unwrap();
         let rule = NetworkPolicyRule {
@@ -4871,10 +4784,6 @@ mod tests {
             endpoints: vec![NetworkEndpoint {
                 host: "google.com".to_string(),
                 port: 443,
-                ..Default::default()
-            }],
-            binaries: vec![NetworkBinary {
-                path: "/usr/bin/curl".to_string(),
                 ..Default::default()
             }],
         };
@@ -4892,7 +4801,6 @@ mod tests {
             decided_at_ms: None,
             host: "google.com".to_string(),
             port: 443,
-            binary: "/usr/bin/curl".to_string(),
             hit_count: 1,
             first_seen_ms: 0,
             last_seen_ms: 0,
@@ -4919,14 +4827,11 @@ mod tests {
             .expect("merged rule should be present");
         assert_eq!(stored_rule.endpoints[0].host, "google.com");
         assert_eq!(stored_rule.endpoints[0].port, 443);
-        assert_eq!(stored_rule.binaries[0].path, "/usr/bin/curl");
     }
 
     #[tokio::test]
     async fn merge_chunk_merges_into_existing_rule_by_host_port() {
-        use openshell_core::proto::{
-            NetworkBinary, NetworkEndpoint, NetworkPolicyRule, SandboxPolicy,
-        };
+        use openshell_core::proto::{NetworkEndpoint, NetworkPolicyRule, SandboxPolicy};
 
         let store = Store::connect("sqlite::memory:").await.unwrap();
         let sandbox_id = "sb-merge";
@@ -4939,10 +4844,6 @@ mod tests {
                     endpoints: vec![NetworkEndpoint {
                         host: "192.168.1.100".to_string(),
                         port: 8567,
-                        ..Default::default()
-                    }],
-                    binaries: vec![NetworkBinary {
-                        path: "/usr/bin/curl".to_string(),
                         ..Default::default()
                     }],
                 },
@@ -4969,10 +4870,6 @@ mod tests {
                 allowed_ips: vec!["192.168.1.100".to_string()],
                 ..Default::default()
             }],
-            binaries: vec![NetworkBinary {
-                path: "/usr/bin/curl".to_string(),
-                ..Default::default()
-            }],
         };
         let chunk = DraftChunkRecord {
             id: "chunk-merge".to_string(),
@@ -4988,7 +4885,6 @@ mod tests {
             decided_at_ms: None,
             host: "192.168.1.100".to_string(),
             port: 8567,
-            binary: "/usr/bin/curl".to_string(),
             hit_count: 1,
             first_seen_ms: 0,
             last_seen_ms: 0,
@@ -5025,9 +4921,7 @@ mod tests {
 
     #[tokio::test]
     async fn merge_chunk_new_host_port_inserts_new_entry() {
-        use openshell_core::proto::{
-            NetworkBinary, NetworkEndpoint, NetworkPolicyRule, SandboxPolicy,
-        };
+        use openshell_core::proto::{NetworkEndpoint, NetworkPolicyRule, SandboxPolicy};
 
         let store = Store::connect("sqlite::memory:").await.unwrap();
         let sandbox_id = "sb-new";
@@ -5040,10 +4934,6 @@ mod tests {
                     endpoints: vec![NetworkEndpoint {
                         host: "api.example.com".to_string(),
                         port: 443,
-                        ..Default::default()
-                    }],
-                    binaries: vec![NetworkBinary {
-                        path: "/usr/bin/curl".to_string(),
                         ..Default::default()
                     }],
                 },
@@ -5070,10 +4960,6 @@ mod tests {
                 allowed_ips: vec!["10.0.0.5".to_string()],
                 ..Default::default()
             }],
-            binaries: vec![NetworkBinary {
-                path: "/usr/bin/curl".to_string(),
-                ..Default::default()
-            }],
         };
         let chunk = DraftChunkRecord {
             id: "chunk-new".to_string(),
@@ -5089,7 +4975,6 @@ mod tests {
             decided_at_ms: None,
             host: "10.0.0.5".to_string(),
             port: 8080,
-            binary: "/usr/bin/curl".to_string(),
             hit_count: 1,
             first_seen_ms: 0,
             last_seen_ms: 0,
@@ -5132,7 +5017,6 @@ mod tests {
                         access: "read-only".to_string(),
                         ..Default::default()
                     }],
-                    ..Default::default()
                 },
             ))
             .collect(),
@@ -5209,7 +5093,6 @@ mod tests {
                 allowed_ips: vec!["127.0.0.1".to_string()],
                 ..Default::default()
             }],
-            binaries: vec![],
         };
         let result = validate_rule_not_always_blocked(&rule);
         assert!(result.is_err());
@@ -5230,7 +5113,6 @@ mod tests {
                 allowed_ips: vec!["169.254.169.254".to_string()],
                 ..Default::default()
             }],
-            binaries: vec![],
         };
         let result = validate_rule_not_always_blocked(&rule);
         assert!(result.is_err());
@@ -5248,7 +5130,6 @@ mod tests {
                 port: 80,
                 ..Default::default()
             }],
-            binaries: vec![],
         };
         let result = validate_rule_not_always_blocked(&rule);
         assert!(result.is_err());
@@ -5266,7 +5147,6 @@ mod tests {
                 port: 8080,
                 ..Default::default()
             }],
-            binaries: vec![],
         };
         let result = validate_rule_not_always_blocked(&rule);
         assert!(result.is_err());
@@ -5285,7 +5165,6 @@ mod tests {
                 allowed_ips: vec!["10.0.5.0/24".to_string()],
                 ..Default::default()
             }],
-            binaries: vec![],
         };
         let result = validate_rule_not_always_blocked(&rule);
         assert!(result.is_ok());
@@ -5302,7 +5181,6 @@ mod tests {
                 port: 443,
                 ..Default::default()
             }],
-            binaries: vec![],
         };
         let result = validate_rule_not_always_blocked(&rule);
         assert!(result.is_ok());

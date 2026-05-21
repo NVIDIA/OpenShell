@@ -42,9 +42,3 @@ network_policies:
       # No protocol field — L4 only.
       - host: github.com
         port: 443
-    binaries:
-      - { path: /usr/local/bin/claude }
-      - { path: /usr/bin/git }
-      - { path: /usr/bin/curl }
-      - { path: /usr/bin/gh }
-      - { path: /sandbox/.uv/python/**/python3* }

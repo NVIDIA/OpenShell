@@ -31,7 +31,7 @@ process:
   run_as_user: sandbox
   run_as_group: sandbox
 
-# Dynamic: hot-reloadable. Named blocks of endpoints + binaries allowed to reach them.
+# Dynamic: hot-reloadable. Named blocks of endpoints the sandbox can reach.
 network_policies:
   my_api:
     name: my-api
@@ -41,8 +41,6 @@ network_policies:
         protocol: rest
         enforcement: enforce
         access: full
-    binaries:
-      - path: /usr/bin/curl
 
 ```
 
@@ -56,7 +54,7 @@ Raw streams are connection-scoped and outside L7 live-reload guarantees. This in
 | `filesystem_policy` | Static | Controls which directories the agent can access on disk. Paths are split into `read_only` and `read_write` lists. Any path not listed in either list is inaccessible. Set `include_workdir: true` to automatically add the agent's working directory to `read_write`. [Landlock LSM](https://docs.kernel.org/security/landlock.html) enforces these restrictions at the kernel level. |
 | `landlock` | Static | Configures Landlock LSM enforcement behavior. Set `compatibility` to `best_effort` (skip individual inaccessible paths while applying remaining rules) or `hard_requirement` (fail if any path is inaccessible or the required kernel ABI is unavailable). Refer to the [Policy Schema Reference](/reference/policy-schema#landlock) for the full behavior table. |
 | `process` | Static | Sets the OS-level identity for the agent process. `run_as_user` and `run_as_group` default to `sandbox`. Root (`root` or `0`) is rejected. The agent also runs with seccomp filters that block dangerous system calls. |
-| `network_policies` | Dynamic | Controls network access for ordinary outbound traffic from the sandbox. Each block has a name, a list of endpoints (host, port, protocol, and optional rules), and a list of binaries allowed to use those endpoints. <br />Every outbound connection except `https://inference.local` goes through the proxy, which queries the [policy engine](/about/how-it-works#core-components) with the destination and calling binary. A connection is allowed only when both match an entry in the same policy block. <br />For endpoints with `protocol: rest`, the proxy auto-detects TLS and terminates it so each HTTP request can be checked against that endpoint's `rules` (method and path). For endpoints with `protocol: websocket`, the proxy validates the RFC 6455 upgrade and evaluates `GET` rules for the handshake plus either `WEBSOCKET_TEXT` rules for raw client text messages or GraphQL operation rules for GraphQL-over-WebSocket messages. Set `websocket_credential_rewrite: true` only when a WebSocket or REST compatibility endpoint must keep placeholder credentials in sandbox-owned text frames and resolve them at the OpenShell relay boundary. <br />Endpoints without `protocol` allow the TCP stream through without inspecting payloads. <br />If no endpoint matches, the connection is denied. Configure managed inference separately through [Inference Routing](/sandboxes/inference-routing). |
+| `network_policies` | Dynamic | Controls network access for ordinary outbound traffic from the sandbox. Each block has a name and a list of endpoints (host, port, protocol, and optional rules). <br />Every outbound connection except `https://inference.local` goes through the proxy, which queries the [policy engine](/about/how-it-works#core-components) with the destination host and port. A connection is allowed when the destination matches an endpoint in a policy block. <br />For endpoints with `protocol: rest`, the proxy auto-detects TLS and terminates it so each HTTP request can be checked against that endpoint's `rules` (method and path). For endpoints with `protocol: websocket`, the proxy validates the RFC 6455 upgrade and evaluates `GET` rules for the handshake plus either `WEBSOCKET_TEXT` rules for raw client text messages or GraphQL operation rules for GraphQL-over-WebSocket messages. Set `websocket_credential_rewrite: true` only when a WebSocket or REST compatibility endpoint must keep placeholder credentials in sandbox-owned text frames and resolve them at the OpenShell relay boundary. <br />Endpoints without `protocol` allow the TCP stream through without inspecting payloads. <br />If no endpoint matches, the connection is denied. Configure managed inference separately through [Inference Routing](/sandboxes/inference-routing). |
 
 ## Baseline Filesystem Paths
 
@@ -117,18 +115,17 @@ The following steps outline the hot-reload policy update workflow.
 
 1. Create the sandbox with your initial policy by following [Apply a Custom Policy](#apply-a-custom-policy) above (or set `OPENSHELL_SANDBOX_POLICY`).
 
-2. Monitor denials. Each log entry shows host, port, binary, and reason. Alternatively, use `openshell term` for a live dashboard.
+2. Monitor denials. Each log entry shows host, port, and reason. Alternatively, use `openshell term` for a live dashboard.
 
    ```shell
    openshell logs <name> --tail --source sandbox
    ```
 
-3. For additive network changes, use `openshell policy update`. This is the fastest path for adding endpoints, binaries, or REST and WebSocket allow/deny rules without replacing the full policy. The full option and format reference is in [Incremental Policy Updates](#incremental-policy-updates).
+3. For additive network changes, use `openshell policy update`. This is the fastest path for adding endpoints or REST and WebSocket allow/deny rules without replacing the full policy. The full option and format reference is in [Incremental Policy Updates](#incremental-policy-updates).
 
    ```shell
    openshell policy update <name> \
      --add-endpoint api.github.com:443:read-only:rest:enforce \
-     --binary /usr/bin/gh \
      --wait
 
    openshell policy update <name> \
@@ -144,7 +141,7 @@ The following steps outline the hot-reload policy update workflow.
    openshell policy get <name> --full > current-policy.yaml
    ```
 
-5. Edit the YAML: add or adjust `network_policies` entries, binaries, `access`, or `rules`.
+5. Edit the YAML: add or adjust `network_policies` entries, `access`, or `rules`.
 
 6. Push the updated policy when you need a full replacement. Exit codes: 0 = loaded, 1 = validation failed, 124 = timeout.
 
@@ -177,12 +174,11 @@ The incremental update surface is split into endpoint-level operations and metho
 
 | Flag | What it changes | Typical use |
 |---|---|---|
-| `--add-endpoint <SPEC>` | Creates or merges a network rule and endpoint. | Allow a new host and port, optionally with `access`, `protocol`, `enforcement`, endpoint options, and binaries. |
+| `--add-endpoint <SPEC>` | Creates or merges a network rule and endpoint. | Allow a new host and port, optionally with `access`, `protocol`, `enforcement`, and endpoint options. |
 | `--remove-endpoint <SPEC>` | Removes one host and port match from the current policy. | Drop a stale endpoint or remove one port from a multi-port endpoint. |
 | `--remove-rule <NAME>` | Deletes a named `network_policies` entry. | Remove a whole rule by name when you no longer need it. |
 | `--add-allow <SPEC>` | Appends method/path allow rules to an existing REST or WebSocket endpoint. | Permit one additional REST method/path or WebSocket `WEBSOCKET_TEXT` path on an API that is already configured. |
 | `--add-deny <SPEC>` | Appends method/path deny rules to an existing REST or WebSocket endpoint. | Block a sensitive REST path or WebSocket text-message path under an endpoint that is otherwise allowed. |
-| `--binary <PATH>` | Adds binaries to every `--add-endpoint` rule in the same command. | Bind a new endpoint to one or more executables. |
 | `--rule-name <NAME>` | Overrides the generated rule name. | Keep a stable human-chosen rule name when adding exactly one endpoint. |
 | `--dry-run` | Shows the merged policy locally and does not call the gateway. | Review the result before persisting it. |
 | `--wait` | Polls until the sandbox reports that the new revision loaded. | Confirm the change took effect before continuing. |
@@ -192,13 +188,13 @@ The incremental update surface is split into endpoint-level operations and metho
 
 ### Add Endpoint Compared to Allow and Deny
 
-`--add-endpoint` works at the endpoint and rule level. It creates a new `network_policies` entry when needed, or merges into an existing rule that already covers the same host and port. Use it when you define where traffic can go and which binaries can send it.
+`--add-endpoint` works at the endpoint and rule level. It creates a new `network_policies` entry when needed, or merges into an existing rule that already covers the same host and port. Use it when you define where traffic can go.
 
-`--add-allow` and `--add-deny` work at the method/path rule level. They do not create binaries, and they do not create a new endpoint. They modify an existing endpoint that already has `protocol: rest` or `protocol: websocket`.
+`--add-allow` and `--add-deny` work at the method/path rule level. They do not create a new endpoint. They modify an existing endpoint that already has `protocol: rest` or `protocol: websocket`.
 
 This is the practical difference:
 
-- Use `--add-endpoint` to say "allow this binary to reach `api.github.com:443`."
+- Use `--add-endpoint` to say "allow traffic to reach `api.github.com:443`."
 - Use `--add-allow` to say "for that existing REST endpoint, also allow `POST /repos/*/issues`."
 - Use `--add-deny` to say "for that existing REST endpoint, explicitly deny `POST /admin/**`."
 - Use `--add-allow` to say "for that existing WebSocket endpoint, also allow client text messages on `/v1/realtime/**`."
@@ -252,7 +248,7 @@ For example:
 - `realtime.example.com:443:read-write:websocket` is valid.
 - `api.github.com:443::rest` is invalid. It does not mean "allow all traffic." An L7 endpoint with `protocol` but no `access` or `rules` is rejected when the policy loads.
 
-Endpoint options belong to the individual `--add-endpoint` spec. When you pass multiple `--add-endpoint` flags in one command, every `--binary` value applies to every added endpoint in that command. If different endpoints need different binaries, use separate `policy update` commands.
+Endpoint options belong to the individual `--add-endpoint` spec. When you pass multiple `--add-endpoint` flags in one command, OpenShell applies them as one atomic merge batch.
 
 If you do not pass `--rule-name`, OpenShell generates one from the host and port, such as `allow_api_github_com_443`.
 
@@ -295,7 +291,7 @@ Path globs follow the same semantics as YAML allow and deny rules:
 - `/repos/*/issues` matches one repository owner or name segment in the middle.
 - `/repos/**` matches everything under `/repos/`.
 
-The rule-level commands only modify method and path constraints. They do not change binaries, hostnames, ports, protocol settings, or WebSocket message payload matching.
+The rule-level commands only modify method and path constraints. They do not change hostnames, ports, protocol settings, or WebSocket message payload matching.
 
 ### Common Workflows
 
@@ -309,12 +305,10 @@ Use `--add-endpoint` when you need a new host and port and do not need REST insp
 openshell policy update demo \
   --add-endpoint pypi.org:443 \
   --add-endpoint files.pythonhosted.org:443 \
-  --binary /usr/bin/pip \
-  --binary /usr/local/bin/uv \
   --wait
 ```
 
-This creates or merges endpoint entries and binds them to the listed binaries. It does not create inspected method/path rules.
+This creates or merges endpoint entries. It does not create inspected method/path rules.
 
 #### Create a REST endpoint with a base allow set
 
@@ -323,7 +317,6 @@ Use `--add-endpoint` first when the endpoint does not exist yet.
 ```shell
 openshell policy update demo \
   --add-endpoint api.github.com:443:read-only:rest:enforce \
-  --binary /usr/bin/gh \
   --wait
 ```
 
@@ -339,7 +332,7 @@ openshell policy update demo \
   --wait
 ```
 
-This keeps the existing endpoint definition and appends one new allow rule. It does not add binaries or change the endpoint host and port.
+This keeps the existing endpoint definition and appends one new allow rule. It does not change the endpoint host and port.
 
 #### Add a REST deny rule under an allowed endpoint
 
@@ -360,7 +353,6 @@ Use `--add-endpoint` with `protocol: websocket` when the destination is an RFC 6
 ```shell
 openshell policy update demo \
   --add-endpoint realtime.example.com:443:read-write:websocket:enforce:websocket-credential-rewrite \
-  --binary /usr/bin/node \
   --wait
 ```
 
@@ -446,12 +438,11 @@ openshell settings get <name>
 
 ## Debug Denied Requests
 
-Check `openshell logs <name> --tail --source sandbox` for the denied host, path, and binary.
+Check `openshell logs <name> --tail --source sandbox` for the denied host and path.
 
 When triaging denied requests, check:
 
 - Destination host and port to confirm which endpoint is missing.
-- Calling binary path to confirm which `binaries` entry needs to be added or adjusted.
 - HTTP method and path for REST endpoints, or `GET` / `WEBSOCKET_TEXT` and the upgraded request path for WebSocket endpoints, to confirm which `rules` entry needs to be added or adjusted.
 
 Then push the updated policy as described above.
@@ -479,9 +470,6 @@ Allow `pip install` and `uv pip install` to reach PyPI:
         port: 443
       - host: files.pythonhosted.org
         port: 443
-    binaries:
-      - { path: /usr/bin/pip }
-      - { path: /usr/local/bin/uv }
 ```
 
 Endpoints without `protocol` use TCP passthrough, where the proxy allows the stream without inspecting payloads. If the stream is HTTP and TLS is auto-terminated, the proxy can still rewrite configured credential placeholders and closes keep-alive passthrough tunnels on policy reload before forwarding another request. WebSocket text-frame policy requires an explicit `protocol: websocket` endpoint. WebSocket payload credential rewrite can also be enabled on a `protocol: rest` compatibility endpoint with `websocket_credential_rewrite: true`. REST request body credential rewrite requires an inspected `protocol: rest` endpoint with `request_body_credential_rewrite: true`.
@@ -537,9 +525,6 @@ For an end-to-end walkthrough that combines this policy with a GitHub credential
         deny_rules:
           - operation_type: mutation
             fields: [deleteRepository, deleteRef, updateBranchProtectionRule]
-    binaries:
-      - { path: /usr/local/bin/claude }
-      - { path: /usr/bin/gh }
 ```
 
 Endpoints with `protocol: rest` enable HTTP request inspection and can opt in to supported text request body credential rewrite. Endpoints with `protocol: websocket` validate WebSocket upgrades and inspect client text messages on the upgraded request path. WebSocket endpoints can also classify GraphQL-over-WebSocket operation messages with the same operation rules used by GraphQL-over-HTTP. Endpoints with `protocol: graphql` parse GraphQL-over-HTTP payloads before evaluating rules. The endpoint-level `path` field lets these protocols share `api.github.com:443` without treating GraphQL payloads as plain REST `POST /graphql` requests.
@@ -567,8 +552,6 @@ REST rules can also constrain query parameter values:
                 slug: "skill-*"
                 version:
                   any: ["1.*", "2.*"]
-    binaries:
-      - { path: /usr/bin/curl }
 ```
 
 `query` matchers are case-sensitive and run on decoded values. If a request has duplicate keys (for example, `tag=a&tag=b`), every value for that key must match the configured glob(s).
@@ -599,8 +582,6 @@ GraphQL endpoint policies currently require full policy YAML applied with `opens
         deny_rules:
           - operation_type: mutation
             fields: [deleteRepository]
-    binaries:
-      - { path: /usr/bin/gh }
 ```
 
 For allow rules, every selected root field in an operation must match one of the configured `fields` globs. For deny rules, one matching root field blocks the request. Batched GraphQL requests are fail-closed: if any operation is malformed, denied, or unregistered, the whole HTTP request is denied.
@@ -631,8 +612,6 @@ Some APIs carry GraphQL operations over RFC 6455 WebSockets, commonly for subscr
               operation_type: query
               fields: [viewer]
         websocket_credential_rewrite: true
-    binaries:
-      - { path: /usr/bin/node }
 ```
 
 When a WebSocket endpoint has GraphQL operation policy, client operation messages are fail-closed on malformed JSON, unsupported message types, parse errors, unregistered hash-only persisted queries, or unallowed operations. Use GraphQL operation rules for client messages rather than a raw `WEBSOCKET_TEXT` allow rule. Protocol lifecycle messages such as `connection_init`, `ping`, `pong`, and `complete` are allowed without payload logging; if `websocket_credential_rewrite: true` is set, placeholders inside those text messages are resolved before forwarding.

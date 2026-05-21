@@ -1,10 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! HTTP CONNECT proxy with OPA policy evaluation and process-identity binding.
+//! HTTP CONNECT proxy with OPA policy evaluation.
 
 use crate::denial_aggregator::DenialEvent;
-use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::ProxyTlsState;
 use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard};
 use crate::policy::ProxyPolicy;
@@ -74,13 +73,7 @@ struct ConnectDecision {
     action: NetworkAction,
     /// Policy generation used for the L4 network decision.
     generation: u64,
-    /// Resolved binary path.
-    binary: Option<PathBuf>,
-    /// PID owning the socket.
-    binary_pid: Option<u32>,
-    /// Ancestor binary paths from process tree walk.
-    ancestors: Vec<PathBuf>,
-    /// Cmdline-derived absolute paths (for script detection).
+    /// Cmdline-derived absolute paths (for script detection / observability).
     cmdline_paths: Vec<PathBuf>,
 }
 
@@ -179,7 +172,6 @@ impl ProxyHandle {
         policy: &ProxyPolicy,
         bind_addr: Option<SocketAddr>,
         opa_engine: Arc<OpaEngine>,
-        identity_cache: Arc<BinaryIdentityCache>,
         entrypoint_pid: Arc<AtomicU32>,
         tls_state: Option<Arc<ProxyTlsState>>,
         inference_ctx: Option<Arc<InferenceContext>>,
@@ -231,7 +223,6 @@ impl ProxyHandle {
                 match listener.accept().await {
                     Ok((stream, _addr)) => {
                         let opa = opa_engine.clone();
-                        let cache = identity_cache.clone();
                         let spid = entrypoint_pid.clone();
                         let tls = tls_state.clone();
                         let inf = inference_ctx.clone();
@@ -245,7 +236,6 @@ impl ProxyHandle {
                             if let Err(err) = handle_tcp_connection(
                                 stream,
                                 opa,
-                                cache,
                                 spid,
                                 tls,
                                 inf,
@@ -304,8 +294,6 @@ fn emit_denial(
     tx: &Option<mpsc::UnboundedSender<DenialEvent>>,
     host: &str,
     port: u16,
-    binary: &str,
-    decision: &ConnectDecision,
     reason: &str,
     stage: &str,
 ) {
@@ -313,12 +301,6 @@ fn emit_denial(
         let _ = tx.send(DenialEvent {
             host: host.to_string(),
             port,
-            binary: binary.to_string(),
-            ancestors: decision
-                .ancestors
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect(),
             deny_reason: reason.to_string(),
             denial_stage: stage.to_string(),
             l7_method: None,
@@ -333,8 +315,6 @@ fn emit_denial_simple(
     tx: Option<&mpsc::UnboundedSender<DenialEvent>>,
     host: &str,
     port: u16,
-    binary: &str,
-    decision: &ConnectDecision,
     reason: &str,
     stage: &str,
 ) {
@@ -342,12 +322,6 @@ fn emit_denial_simple(
         let _ = tx.send(DenialEvent {
             host: host.to_string(),
             port,
-            binary: binary.to_string(),
-            ancestors: decision
-                .ancestors
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect(),
             deny_reason: reason.to_string(),
             denial_stage: stage.to_string(),
             l7_method: None,
@@ -363,7 +337,6 @@ fn emit_denial_simple(
 async fn handle_tcp_connection(
     mut client: TcpStream,
     opa_engine: Arc<OpaEngine>,
-    identity_cache: Arc<BinaryIdentityCache>,
     entrypoint_pid: Arc<AtomicU32>,
     tls_state: Option<Arc<ProxyTlsState>>,
     inference_ctx: Option<Arc<InferenceContext>>,
@@ -411,7 +384,6 @@ async fn handle_tcp_connection(
             used,
             &mut client,
             opa_engine,
-            identity_cache,
             entrypoint_pid,
             policy_local_ctx,
             trusted_host_gateway,
@@ -455,20 +427,12 @@ async fn handle_tcp_connection(
 
     // Evaluate OPA policy with process-identity binding.
     // Wrapped in spawn_blocking because identity resolution does heavy sync I/O:
-    // /proc scanning + SHA256 hashing of binaries (e.g. node at 124MB).
+    // /proc scanning for process-identity binding via /proc/net/tcp.
     let opa_clone = opa_engine.clone();
-    let cache_clone = identity_cache.clone();
     let pid_clone = entrypoint_pid.clone();
     let host_clone = host_lc.clone();
     let decision = tokio::task::spawn_blocking(move || {
-        evaluate_opa_tcp(
-            peer_addr,
-            &opa_clone,
-            &cache_clone,
-            &pid_clone,
-            &host_clone,
-            port,
-        )
+        evaluate_opa_tcp(peer_addr, &opa_clone, &pid_clone, &host_clone, port)
     })
     .await
     .map_err(|e| miette::miette!("identity resolution task panicked: {e}"))?;
@@ -480,23 +444,6 @@ async fn handle_tcp_connection(
     };
 
     // Build log context fields (shared by deny log below and deferred allow log after L7 check)
-    let binary_str = decision
-        .binary
-        .as_ref()
-        .map_or_else(|| "-".to_string(), |p| p.display().to_string());
-    let pid_str = decision
-        .binary_pid
-        .map_or_else(|| "-".to_string(), |p| p.to_string());
-    let ancestors_str = if decision.ancestors.is_empty() {
-        "-".to_string()
-    } else {
-        decision
-            .ancestors
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(" -> ")
-    };
     let cmdline_str = if decision.cmdline_paths.is_empty() {
         "-".to_string()
     } else {
@@ -521,24 +468,13 @@ async fn handle_tcp_connection(
             .status(StatusId::Failure)
             .dst_endpoint(Endpoint::from_domain(&host_lc, port))
             .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
-            .actor_process(
-                Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                    .with_cmd_line(&cmdline_str),
-            )
+            .actor_process(Process::new("-", 0).with_cmd_line(&cmdline_str))
             .firewall_rule("-", "opa")
             .message(format!("CONNECT denied {host_lc}:{port}"))
             .status_detail(&deny_reason)
             .build();
         ocsf_emit!(event);
-        emit_denial(
-            &denial_tx,
-            &host_lc,
-            port,
-            &binary_str,
-            &decision,
-            &deny_reason,
-            "connect",
-        );
+        emit_denial(&denial_tx, &host_lc, port, &deny_reason, "connect");
         respond(
             &mut client,
             &build_json_error_response(
@@ -591,10 +527,7 @@ async fn handle_tcp_connection(
                         .status(StatusId::Failure)
                         .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                         .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
-                        .actor_process(
-                            Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                                .with_cmd_line(&cmdline_str),
-                        )
+                        .actor_process(Process::new("-", 0).with_cmd_line(&cmdline_str))
                         .firewall_rule("-", "ssrf")
                         .message(format!(
                             "CONNECT blocked: trusted-gateway check failed for {host_lc}:{port}"
@@ -603,15 +536,7 @@ async fn handle_tcp_connection(
                         .build();
                     ocsf_emit!(event);
                 }
-                emit_denial(
-                    &denial_tx,
-                    &host_lc,
-                    port,
-                    &binary_str,
-                    &decision,
-                    &reason,
-                    "ssrf",
-                );
+                emit_denial(&denial_tx, &host_lc, port, &reason, "ssrf");
                 respond(
                     &mut client,
                     &build_json_error_response(
@@ -646,10 +571,7 @@ async fn handle_tcp_connection(
                                 .status(StatusId::Failure)
                                 .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                                 .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
-                                .actor_process(
-                                    Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                                        .with_cmd_line(&cmdline_str),
-                                )
+                                .actor_process(Process::new("-", 0).with_cmd_line(&cmdline_str))
                                 .firewall_rule("-", "ssrf")
                                 .message(format!(
                                     "CONNECT blocked: allowed_ips check failed for {host_lc}:{port}"
@@ -658,15 +580,7 @@ async fn handle_tcp_connection(
                                 .build();
                             ocsf_emit!(event);
                         }
-                        emit_denial(
-                            &denial_tx,
-                            &host_lc,
-                            port,
-                            &binary_str,
-                            &decision,
-                            &reason,
-                            "ssrf",
-                        );
+                        emit_denial(&denial_tx, &host_lc, port, &reason, "ssrf");
                         respond(
                             &mut client,
                             &build_json_error_response(
@@ -693,10 +607,7 @@ async fn handle_tcp_connection(
                         .status(StatusId::Failure)
                         .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                         .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
-                        .actor_process(
-                            Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                                .with_cmd_line(&cmdline_str),
-                        )
+                        .actor_process(Process::new("-", 0).with_cmd_line(&cmdline_str))
                         .firewall_rule("-", "ssrf")
                         .message(format!(
                             "CONNECT blocked: invalid allowed_ips in policy for {host_lc}:{port}"
@@ -705,15 +616,7 @@ async fn handle_tcp_connection(
                         .build();
                     ocsf_emit!(event);
                 }
-                emit_denial(
-                    &denial_tx,
-                    &host_lc,
-                    port,
-                    &binary_str,
-                    &decision,
-                    &reason,
-                    "ssrf",
-                );
+                emit_denial(&denial_tx, &host_lc, port, &reason, "ssrf");
                 respond(
                     &mut client,
                     &build_json_error_response(
@@ -743,10 +646,7 @@ async fn handle_tcp_connection(
                         .status(StatusId::Failure)
                         .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                         .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
-                        .actor_process(
-                            Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                                .with_cmd_line(&cmdline_str),
-                        )
+                        .actor_process(Process::new("-", 0).with_cmd_line(&cmdline_str))
                         .firewall_rule("-", "ssrf")
                         .message(format!(
                             "CONNECT blocked: internal address {host_lc}:{port}"
@@ -755,15 +655,7 @@ async fn handle_tcp_connection(
                         .build();
                     ocsf_emit!(event);
                 }
-                emit_denial(
-                    &denial_tx,
-                    &host_lc,
-                    port,
-                    &binary_str,
-                    &decision,
-                    &reason,
-                    "ssrf",
-                );
+                emit_denial(&denial_tx, &host_lc, port, &reason, "ssrf");
                 respond(
                     &mut client,
                     &build_json_error_response(
@@ -809,10 +701,7 @@ async fn handle_tcp_connection(
             .status(StatusId::Success)
             .dst_endpoint(Endpoint::from_domain(&host_lc, port))
             .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
-            .actor_process(
-                Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                    .with_cmd_line(&cmdline_str),
-            )
+            .actor_process(Process::new("-", 0).with_cmd_line(&cmdline_str))
             .firewall_rule(policy_str, "opa")
             .message(format!("{connect_msg} allowed {host_lc}:{port}"))
             .build();
@@ -829,16 +718,6 @@ async fn handle_tcp_connection(
         host: host_lc.clone(),
         port,
         policy_name: matched_policy.clone().unwrap_or_default(),
-        binary_path: decision
-            .binary
-            .as_ref()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default(),
-        ancestors: decision
-            .ancestors
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect(),
         cmdline_paths: decision
             .cmdline_paths
             .iter()
@@ -1067,191 +946,31 @@ async fn handle_tcp_connection(
     Ok(())
 }
 
-/// Resolved process identity for a TCP peer: binary path, PID, ancestor chain,
-/// cmdline paths, and the TOFU-verified binary hash.
-///
-/// Produced by [`resolve_process_identity`]; consumed by [`evaluate_opa_tcp`]
-/// and by the identity-chain regression tests.
-#[cfg(target_os = "linux")]
-struct ResolvedIdentity {
-    bin_path: PathBuf,
-    binary_pid: u32,
-    ancestors: Vec<PathBuf>,
-    cmdline_paths: Vec<PathBuf>,
-    bin_hash: String,
-}
-
-#[cfg(target_os = "linux")]
-#[derive(Debug, Eq, PartialEq)]
-struct PolicyIdentityKey {
-    bin_path: PathBuf,
-    ancestors: Vec<PathBuf>,
-    cmdline_paths: Vec<PathBuf>,
-    bin_hash: String,
-}
-
-#[cfg(target_os = "linux")]
-impl ResolvedIdentity {
-    fn policy_key(&self) -> PolicyIdentityKey {
-        PolicyIdentityKey {
-            bin_path: self.bin_path.clone(),
-            ancestors: self.ancestors.clone(),
-            cmdline_paths: self.cmdline_paths.clone(),
-            bin_hash: self.bin_hash.clone(),
-        }
-    }
-}
-
-/// Error from [`resolve_process_identity`]. Carries the deny reason and
-/// whatever partial identity data was resolved before the failure so the
-/// caller can include it in the [`ConnectDecision`] and OCSF event.
-#[cfg(target_os = "linux")]
-struct IdentityError {
-    reason: String,
-    binary: Option<PathBuf>,
-    binary_pid: Option<u32>,
-    ancestors: Vec<PathBuf>,
-}
-
-#[cfg(target_os = "linux")]
-fn resolve_owner_identity(
-    owner_pid: u32,
-    entrypoint_pid: u32,
-    identity_cache: &BinaryIdentityCache,
-) -> std::result::Result<ResolvedIdentity, IdentityError> {
-    let bin_path =
-        crate::procfs::binary_path(owner_pid.cast_signed()).map_err(|e| IdentityError {
-            reason: format!("failed to resolve peer binary for PID {owner_pid}: {e}"),
-            binary: None,
-            binary_pid: Some(owner_pid),
-            ancestors: vec![],
-        })?;
-
-    let bin_hash = identity_cache
-        .verify_or_cache(&bin_path)
-        .map_err(|e| IdentityError {
-            reason: format!("binary integrity check failed: {e}"),
-            binary: Some(bin_path.clone()),
-            binary_pid: Some(owner_pid),
-            ancestors: vec![],
-        })?;
-
-    let ancestors = crate::procfs::collect_ancestor_binaries(owner_pid, entrypoint_pid);
-
-    for ancestor in &ancestors {
-        identity_cache
-            .verify_or_cache(ancestor)
-            .map_err(|e| IdentityError {
-                reason: format!(
-                    "ancestor integrity check failed for {}: {e}",
-                    ancestor.display()
-                ),
-                binary: Some(bin_path.clone()),
-                binary_pid: Some(owner_pid),
-                ancestors: ancestors.clone(),
-            })?;
-    }
-
-    let mut exclude = ancestors.clone();
-    exclude.push(bin_path.clone());
-    let cmdline_paths = crate::procfs::collect_cmdline_paths(owner_pid, entrypoint_pid, &exclude);
-
-    Ok(ResolvedIdentity {
-        bin_path,
-        binary_pid: owner_pid,
-        ancestors,
-        cmdline_paths,
-        bin_hash,
-    })
-}
-
-/// Resolve the identity of the process owning a TCP peer connection.
+/// Collect cmdline-derived paths for the process owning a TCP peer connection.
 ///
 /// Walks `/proc/<entrypoint_pid>/net/tcp` to find the socket inode, locates
-/// every owning PID, reads `/proc/<pid>/exe`, TOFU-verifies each binary hash,
-/// walks each ancestor chain verifying every ancestor, and collects
-/// cmdline-derived absolute paths for script detection.
-///
-/// This is the identity-resolution block of [`evaluate_opa_tcp`] extracted
-/// into a standalone helper so it can be exercised by Linux-only regression
-/// tests without a full OPA engine. The key invariant under test is that on
-/// a hot-swap of the peer binary, the failure mode is
-/// `"Binary integrity violation"` (from the identity cache) rather than
-/// `"Failed to stat ... (deleted)"` (from the kernel-tainted path).
+/// the owning PID, and collects cmdline-derived absolute paths for script
+/// detection / observability. Returns an empty vec on any failure.
 #[cfg(target_os = "linux")]
-fn resolve_process_identity(
-    entrypoint_pid: u32,
-    peer_port: u16,
-    identity_cache: &BinaryIdentityCache,
-) -> std::result::Result<ResolvedIdentity, IdentityError> {
-    let socket_owners = crate::procfs::resolve_tcp_peer_socket_owners(entrypoint_pid, peer_port)
-        .map_err(|e| IdentityError {
-            reason: format!("failed to resolve peer binary: {e}"),
-            binary: None,
-            binary_pid: None,
-            ancestors: vec![],
-        })?;
-
-    let mut identities = Vec::with_capacity(socket_owners.owners.len());
-    for owner in &socket_owners.owners {
-        identities.push(resolve_owner_identity(
-            owner.pid,
-            entrypoint_pid,
-            identity_cache,
-        )?);
-    }
-
-    let Some(first_identity) = identities.first() else {
-        return Err(IdentityError {
-            reason: format!(
-                "failed to resolve peer binary: no process found owning socket inode {}",
-                socket_owners.inode
-            ),
-            binary: None,
-            binary_pid: None,
-            ancestors: vec![],
-        });
+fn collect_peer_cmdline_paths(entrypoint_pid: u32, peer_port: u16) -> Vec<PathBuf> {
+    let Ok(socket_owners) =
+        crate::procfs::resolve_tcp_peer_socket_owners(entrypoint_pid, peer_port)
+    else {
+        return vec![];
     };
 
-    let first_key = first_identity.policy_key();
-    if identities
-        .iter()
-        .skip(1)
-        .any(|identity| identity.policy_key() != first_key)
-    {
-        let mut pids: Vec<u32> = identities
-            .iter()
-            .map(|identity| identity.binary_pid)
-            .collect();
-        pids.sort_unstable();
-        return Err(IdentityError {
-            reason: format!(
-                "ambiguous shared socket ownership: inode {} is held by PIDs [{}] with different policy identities",
-                socket_owners.inode,
-                pids.iter()
-                    .map(u32::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-            binary: None,
-            binary_pid: None,
-            ancestors: vec![],
-        });
-    }
+    let Some(owner) = socket_owners.owners.first() else {
+        return vec![];
+    };
 
-    let mut identity = identities.swap_remove(0);
-    if let Some(lowest_pid) = socket_owners.owners.iter().map(|owner| owner.pid).min() {
-        identity.binary_pid = lowest_pid;
-    }
-    Ok(identity)
+    crate::procfs::collect_cmdline_paths(owner.pid, entrypoint_pid, &[])
 }
 
-/// Evaluate OPA policy for a TCP connection with identity binding via /proc/net/tcp.
+/// Evaluate OPA policy for a TCP connection.
 #[cfg(target_os = "linux")]
 fn evaluate_opa_tcp(
     peer_addr: SocketAddr,
     engine: &OpaEngine,
-    identity_cache: &BinaryIdentityCache,
     entrypoint_pid: &AtomicU32,
     host: &str,
     port: u16,
@@ -1259,63 +978,25 @@ fn evaluate_opa_tcp(
     use crate::opa::NetworkInput;
     use std::sync::atomic::Ordering;
 
-    let deny = |reason: String,
-                binary: Option<PathBuf>,
-                binary_pid: Option<u32>,
-                ancestors: Vec<PathBuf>,
-                cmdline_paths: Vec<PathBuf>|
-     -> ConnectDecision {
-        ConnectDecision {
-            action: NetworkAction::Deny { reason },
-            generation: engine.current_generation(),
-            binary,
-            binary_pid,
-            ancestors,
-            cmdline_paths,
-        }
-    };
-
     let pid = entrypoint_pid.load(Ordering::Acquire);
     if pid == 0 {
-        return deny(
-            "entrypoint process not yet spawned".into(),
-            None,
-            None,
-            vec![],
-            vec![],
-        );
+        return ConnectDecision {
+            action: NetworkAction::Deny {
+                reason: "entrypoint process not yet spawned".into(),
+            },
+            generation: engine.current_generation(),
+            cmdline_paths: vec![],
+        };
     }
 
     let total_start = std::time::Instant::now();
     let peer_port = peer_addr.port();
 
-    let identity = match resolve_process_identity(pid, peer_port, identity_cache) {
-        Ok(id) => id,
-        Err(err) => {
-            return deny(
-                err.reason,
-                err.binary,
-                err.binary_pid,
-                err.ancestors,
-                vec![],
-            );
-        }
-    };
-
-    let ResolvedIdentity {
-        bin_path,
-        binary_pid,
-        ancestors,
-        cmdline_paths,
-        bin_hash,
-    } = identity;
+    let cmdline_paths = collect_peer_cmdline_paths(pid, peer_port);
 
     let input = NetworkInput {
         host: host.to_string(),
         port,
-        binary_path: bin_path.clone(),
-        binary_sha256: bin_hash,
-        ancestors: ancestors.clone(),
         cmdline_paths: cmdline_paths.clone(),
     };
 
@@ -1323,18 +1004,15 @@ fn evaluate_opa_tcp(
         Ok((action, generation)) => ConnectDecision {
             action,
             generation,
-            binary: Some(bin_path),
-            binary_pid: Some(binary_pid),
-            ancestors,
             cmdline_paths,
         },
-        Err(e) => deny(
-            format!("policy evaluation error: {e}"),
-            Some(bin_path),
-            Some(binary_pid),
-            ancestors,
+        Err(e) => ConnectDecision {
+            action: NetworkAction::Deny {
+                reason: format!("policy evaluation error: {e}"),
+            },
+            generation: engine.current_generation(),
             cmdline_paths,
-        ),
+        },
     };
     debug!(
         "evaluate_opa_tcp TOTAL: {}ms host={host} port={port}",
@@ -1343,24 +1021,20 @@ fn evaluate_opa_tcp(
     result
 }
 
-/// Non-Linux stub: OPA identity binding requires /proc.
+/// Non-Linux stub: OPA evaluation requires /proc for peer identification.
 #[cfg(not(target_os = "linux"))]
 fn evaluate_opa_tcp(
     _peer_addr: SocketAddr,
     engine: &OpaEngine,
-    _identity_cache: &BinaryIdentityCache,
     _entrypoint_pid: &AtomicU32,
     _host: &str,
     _port: u16,
 ) -> ConnectDecision {
     ConnectDecision {
         action: NetworkAction::Deny {
-            reason: "identity binding unavailable on this platform".into(),
+            reason: "proxy evaluation unavailable on this platform".into(),
         },
         generation: engine.current_generation(),
-        binary: None,
-        binary_pid: None,
-        ancestors: vec![],
         cmdline_paths: vec![],
     }
 }
@@ -1809,9 +1483,6 @@ fn query_l7_route_snapshot(
     let input = crate::opa::NetworkInput {
         host: host.to_string(),
         port,
-        binary_path: decision.binary.clone().unwrap_or_default(),
-        binary_sha256: String::new(),
-        ancestors: decision.ancestors.clone(),
         cmdline_paths: decision.cmdline_paths.clone(),
     };
 
@@ -1868,9 +1539,6 @@ fn query_tls_mode(
     let input = crate::opa::NetworkInput {
         host: host.to_string(),
         port,
-        binary_path: decision.binary.clone().unwrap_or_default(),
-        binary_sha256: String::new(),
-        ancestors: decision.ancestors.clone(),
         cmdline_paths: decision.cmdline_paths.clone(),
     };
 
@@ -2364,9 +2032,6 @@ fn query_allowed_ips(
     let input = crate::opa::NetworkInput {
         host: host.to_string(),
         port,
-        binary_path: decision.binary.clone().unwrap_or_default(),
-        binary_sha256: String::new(),
-        ancestors: decision.ancestors.clone(),
         cmdline_paths: decision.cmdline_paths.clone(),
     };
 
@@ -2693,7 +2358,6 @@ async fn handle_forward_proxy(
     used: usize,
     client: &mut TcpStream,
     opa_engine: Arc<OpaEngine>,
-    identity_cache: Arc<BinaryIdentityCache>,
     entrypoint_pid: Arc<AtomicU32>,
     policy_local_ctx: Option<Arc<PolicyLocalContext>>,
     trusted_host_gateway: Arc<Option<IpAddr>>,
@@ -2781,40 +2445,15 @@ async fn handle_forward_proxy(
     let _local_addr = client.local_addr().into_diagnostic()?;
 
     let opa_clone = opa_engine.clone();
-    let cache_clone = identity_cache.clone();
     let pid_clone = entrypoint_pid.clone();
     let host_clone = host_lc.clone();
     let decision = tokio::task::spawn_blocking(move || {
-        evaluate_opa_tcp(
-            peer_addr,
-            &opa_clone,
-            &cache_clone,
-            &pid_clone,
-            &host_clone,
-            port,
-        )
+        evaluate_opa_tcp(peer_addr, &opa_clone, &pid_clone, &host_clone, port)
     })
     .await
     .map_err(|e| miette::miette!("identity resolution task panicked: {e}"))?;
 
     // Build log context
-    let binary_str = decision
-        .binary
-        .as_ref()
-        .map_or_else(|| "-".to_string(), |p| p.display().to_string());
-    let pid_str = decision
-        .binary_pid
-        .map_or_else(|| "-".to_string(), |p| p.to_string());
-    let ancestors_str = if decision.ancestors.is_empty() {
-        "-".to_string()
-    } else {
-        decision
-            .ancestors
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(" -> ")
-    };
     let cmdline_str = if decision.cmdline_paths.is_empty() {
         "-".to_string()
     } else {
@@ -2843,24 +2482,13 @@ async fn handle_forward_proxy(
                     ))
                     .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                     .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
-                    .actor_process(
-                        Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                            .with_cmd_line(&cmdline_str),
-                    )
+                    .actor_process(Process::new("-", 0).with_cmd_line(&cmdline_str))
                     .firewall_rule("-", "opa")
                     .message(format!("FORWARD denied {method} {host_lc}:{port}{path}"))
                     .build();
                 ocsf_emit!(event);
             }
-            emit_denial_simple(
-                denial_tx,
-                &host_lc,
-                port,
-                &binary_str,
-                &decision,
-                reason,
-                "forward",
-            );
+            emit_denial_simple(denial_tx, &host_lc, port, reason, "forward");
             respond(
                 client,
                 &build_json_error_response(
@@ -2907,16 +2535,6 @@ async fn handle_forward_proxy(
         host: host_lc.clone(),
         port,
         policy_name: matched_policy.clone().unwrap_or_default(),
-        binary_path: decision
-            .binary
-            .as_ref()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default(),
-        ancestors: decision
-            .ancestors
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned())
-            .collect(),
         cmdline_paths: decision
             .cmdline_paths
             .iter()
@@ -3171,7 +2789,7 @@ async fn handle_forward_proxy(
                 .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                 .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
                 .actor_process(
-                    Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
+                    Process::new("-", 0)
                         .with_cmd_line(&cmdline_str),
                 )
                 .firewall_rule(policy_str, engine_type)
@@ -3186,15 +2804,7 @@ async fn handle_forward_proxy(
             || (!allowed && l7_config.config.enforcement == crate::l7::EnforcementMode::Enforce);
 
         if effectively_denied {
-            emit_denial_simple(
-                denial_tx,
-                &host_lc,
-                port,
-                &binary_str,
-                &decision,
-                &reason,
-                "forward-l7-deny",
-            );
+            emit_denial_simple(denial_tx, &host_lc, port, &reason, "forward-l7-deny");
             respond(
                 client,
                 &build_json_error_response(
@@ -3246,10 +2856,7 @@ async fn handle_forward_proxy(
                         ))
                         .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                         .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
-                        .actor_process(
-                            Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                                .with_cmd_line(&cmdline_str),
-                        )
+                        .actor_process(Process::new("-", 0).with_cmd_line(&cmdline_str))
                         .firewall_rule(policy_str, "ssrf")
                         .message(format!(
                             "FORWARD blocked: trusted-gateway check failed for {host_lc}:{port}"
@@ -3258,15 +2865,7 @@ async fn handle_forward_proxy(
                         .build();
                     ocsf_emit!(event);
                 }
-                emit_denial_simple(
-                    denial_tx,
-                    &host_lc,
-                    port,
-                    &binary_str,
-                    &decision,
-                    &reason,
-                    "ssrf",
-                );
+                emit_denial_simple(denial_tx, &host_lc, port, &reason, "ssrf");
                 respond(
                     client,
                     &build_json_error_response(
@@ -3302,10 +2901,7 @@ async fn handle_forward_proxy(
                                 ))
                                 .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                                 .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
-                                .actor_process(
-                                    Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                                        .with_cmd_line(&cmdline_str),
-                                )
+                                .actor_process(Process::new("-", 0).with_cmd_line(&cmdline_str))
                                 .firewall_rule(policy_str, "ssrf")
                                 .message(format!(
                                     "FORWARD blocked: allowed_ips check failed for {host_lc}:{port}"
@@ -3314,15 +2910,7 @@ async fn handle_forward_proxy(
                                 .build();
                             ocsf_emit!(event);
                         }
-                        emit_denial_simple(
-                            denial_tx,
-                            &host_lc,
-                            port,
-                            &binary_str,
-                            &decision,
-                            &reason,
-                            "ssrf",
-                        );
+                        emit_denial_simple(denial_tx, &host_lc, port, &reason, "ssrf");
                         respond(
                             client,
                             &build_json_error_response(
@@ -3353,10 +2941,7 @@ async fn handle_forward_proxy(
                         ))
                         .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                         .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
-                        .actor_process(
-                            Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                                .with_cmd_line(&cmdline_str),
-                        )
+                        .actor_process(Process::new("-", 0).with_cmd_line(&cmdline_str))
                         .firewall_rule(policy_str, "ssrf")
                         .message(format!(
                             "FORWARD blocked: invalid allowed_ips in policy for {host_lc}:{port}"
@@ -3365,15 +2950,7 @@ async fn handle_forward_proxy(
                         .build();
                     ocsf_emit!(event);
                 }
-                emit_denial_simple(
-                    denial_tx,
-                    &host_lc,
-                    port,
-                    &binary_str,
-                    &decision,
-                    &reason,
-                    "ssrf",
-                );
+                emit_denial_simple(denial_tx, &host_lc, port, &reason, "ssrf");
                 respond(
                     client,
                     &build_json_error_response(
@@ -3407,10 +2984,7 @@ async fn handle_forward_proxy(
                         ))
                         .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                         .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
-                        .actor_process(
-                            Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                                .with_cmd_line(&cmdline_str),
-                        )
+                        .actor_process(Process::new("-", 0).with_cmd_line(&cmdline_str))
                         .firewall_rule(policy_str, "ssrf")
                         .message(format!(
                             "FORWARD blocked: internal IP without allowed_ips for {host_lc}:{port}"
@@ -3419,15 +2993,7 @@ async fn handle_forward_proxy(
                         .build();
                     ocsf_emit!(event);
                 }
-                emit_denial_simple(
-                    denial_tx,
-                    &host_lc,
-                    port,
-                    &binary_str,
-                    &decision,
-                    &reason,
-                    "ssrf",
-                );
+                emit_denial_simple(denial_tx, &host_lc, port, &reason, "ssrf");
                 respond(
                     client,
                     &build_json_error_response(
@@ -3472,10 +3038,7 @@ async fn handle_forward_proxy(
                 ))
                 .dst_endpoint(Endpoint::from_domain(&host_lc, port))
                 .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
-                .actor_process(
-                    Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                        .with_cmd_line(&cmdline_str),
-                )
+                .actor_process(Process::new("-", 0).with_cmd_line(&cmdline_str))
                 .message(format!(
                     "FORWARD upstream connect failed for {host_lc}:{port}: {e}"
                 ))
@@ -3509,10 +3072,7 @@ async fn handle_forward_proxy(
             ))
             .dst_endpoint(Endpoint::from_domain(&host_lc, port))
             .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
-            .actor_process(
-                Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                    .with_cmd_line(&cmdline_str),
-            )
+            .actor_process(Process::new("-", 0).with_cmd_line(&cmdline_str))
             .firewall_rule(policy_str, "opa")
             .message(format!("FORWARD allowed {method} {host_lc}:{port}{path}"))
             .build();
@@ -3806,9 +3366,6 @@ mod tests {
                 matched_policy: Some(policy_name.to_string()),
             },
             generation: engine.current_generation(),
-            binary: Some(PathBuf::from("/usr/bin/node")),
-            binary_pid: None,
-            ancestors: vec![],
             cmdline_paths: vec![],
         };
         let route =
@@ -3824,8 +3381,6 @@ mod tests {
             host: host.to_string(),
             port,
             policy_name: policy_name.to_string(),
-            binary_path: "/usr/bin/node".to_string(),
-            ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
         };
@@ -3989,8 +3544,6 @@ mod tests {
             host: "gateway.example.test".to_string(),
             port: 80,
             policy_name: "ws_api".to_string(),
-            binary_path: "/usr/bin/node".to_string(),
-            ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: resolver,
         };
@@ -4029,8 +3582,6 @@ mod tests {
             host: "gateway.example.test".to_string(),
             port: 80,
             policy_name: "rest_api".to_string(),
-            binary_path: "/usr/bin/node".to_string(),
-            ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
         };
@@ -4076,8 +3627,6 @@ network_policies:
         deny_rules:
           - method: WEBSOCKET_TEXT
             path: "/ws"
-    binaries:
-      - { path: /usr/bin/node }
 "#;
         let (config, tunnel_engine, ctx) =
             forward_websocket_policy_parts(data, "gateway.example.test", 80, "/ws", "ws_api");
@@ -4120,8 +3669,6 @@ network_policies:
         deny_rules:
           - operation_type: query
             fields: [admin]
-    binaries:
-      - { path: /usr/bin/node }
 "#;
         let (config, tunnel_engine, ctx) = forward_websocket_policy_parts(
             data,
@@ -6349,287 +5896,5 @@ network_policies:
         // Verify body length matches
         let body_start = resp_str.find("\r\n\r\n").unwrap() + 4;
         assert_eq!(resp_str[body_start..].len(), cl);
-    }
-
-    /// End-to-end regression for the `docker cp` hot-swap hazard that
-    /// motivated `binary_path()` stripping the kernel's `" (deleted)"`
-    /// suffix (PR #844).
-    ///
-    /// Before the strip, the identity-resolution chain inside
-    /// `evaluate_opa_tcp` failed with `"Failed to stat
-    /// /opt/openshell/bin/openshell-sandbox (deleted)"` because
-    /// `BinaryIdentityCache::verify_or_cache()` tried to `metadata()` the
-    /// tainted path. That masked the real security signal: a live process
-    /// was now bound to a *different* binary on disk than the one that was
-    /// TOFU-cached. After the strip, `binary_path()` returns a path that
-    /// stats fine, the cache rehashes the new bytes, and the hash mismatch
-    /// surfaces as a `Binary integrity violation` error — the contract this
-    /// PR is trying to establish.
-    ///
-    /// Test shape (from the review comment on the initial PR):
-    /// 1. Start a `TcpListener` in the test process.
-    /// 2. Copy `/bin/bash` to a temp path we control.
-    /// 3. Prime `BinaryIdentityCache` with that temp binary's hash.
-    /// 4. Spawn the temp bash as a child with a `/dev/tcp` one-liner that
-    ///    opens a real TCP connection to the listener and holds it open.
-    /// 5. Accept the connection on the listener side and capture the peer's
-    ///    ephemeral port — that's what `resolve_process_identity` uses to
-    ///    walk `/proc/net/tcp` back to the child PID.
-    /// 6. Overwrite the temp bash on disk with different bytes to simulate
-    ///    a `docker cp` hot-swap. The running child is unaffected (it still
-    ///    executes from its in-memory image), but `/proc/<child>/exe` will
-    ///    now readlink to `" (deleted)"` OR the overwritten file, depending
-    ///    on whether the filesystem reused the inode.
-    /// 7. Call `resolve_process_identity` and assert:
-    ///    - the error reason contains `"Binary integrity violation"` (the
-    ///      cache detected the tampered on-disk bytes), and
-    ///    - the error reason does NOT contain `"Failed to stat"` or
-    ///      `"(deleted)"` (the old pre-strip failure mode).
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn resolve_process_identity_surfaces_binary_integrity_violation_on_hot_swap() {
-        use crate::identity::BinaryIdentityCache;
-        use std::io::Read;
-        use std::net::TcpListener;
-        use std::os::unix::fs::PermissionsExt;
-        use std::process::{Command, Stdio};
-        use std::time::Duration;
-
-        // Skip if /bin/bash is not present (e.g. minimal containers).
-        if !std::path::Path::new("/bin/bash").exists() {
-            eprintln!("skipping: /bin/bash not available");
-            return;
-        }
-
-        // 1. Start a listener on loopback.
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let listener_port = listener.local_addr().unwrap().port();
-
-        // 2. Copy /bin/bash to a temp path.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let bash_v1 = tmp.path().join("hotswap-bash");
-        std::fs::copy("/bin/bash", &bash_v1).expect("copy bash");
-        std::fs::set_permissions(&bash_v1, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        // 3. Prime the cache with the v1 hash of the temp bash.
-        let cache = BinaryIdentityCache::new();
-        let v1_hash = cache
-            .verify_or_cache(&bash_v1)
-            .expect("prime cache with v1 bash hash");
-        assert!(!v1_hash.is_empty());
-
-        // 4. Spawn the temp bash with a /dev/tcp one-liner that opens a real
-        //    connection to the listener and sleeps to keep it open. The
-        //    `read -t` blocks on stdin so the shell stays resident.
-        let script = format!("exec 3<>/dev/tcp/127.0.0.1/{listener_port}; sleep 30 <&3");
-        let mut child = Command::new(&bash_v1)
-            .arg("-c")
-            .arg(&script)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn hotswap-bash child");
-
-        // 5. Accept on the listener side, capture the peer port.
-        listener.set_nonblocking(false).expect("blocking listener");
-        let (mut stream, peer_addr) = match listener.accept() {
-            Ok(pair) => pair,
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("failed to accept child connection: {e}");
-            }
-        };
-        let peer_port = peer_addr.port();
-        // Drain any spurious data; we just need the socket open.
-        stream
-            .set_read_timeout(Some(Duration::from_millis(50)))
-            .ok();
-        let mut buf = [0u8; 16];
-        let _ = stream.read(&mut buf);
-
-        // Give the kernel a moment so /proc/<pid>/net/tcp and
-        // /proc/<pid>/fd/ both reflect the ESTABLISHED socket.
-        std::thread::sleep(Duration::from_millis(50));
-
-        // 6. Simulate `docker cp`: unlink the running binary and create a
-        //    fresh file with different bytes at the same path. Writing
-        //    in place via O_TRUNC is rejected by the kernel with ETXTBSY
-        //    because the inode is still being executed. Unlink is cheap:
-        //    the inode persists in memory via the child's exec mapping,
-        //    so the child keeps running, but a new inode now lives at
-        //    `bash_v1` with a different SHA-256.
-        std::fs::remove_file(&bash_v1).expect("unlink running bash_v1");
-        let tampered_bytes = b"#!/bin/sh\n# tampered bash v2 from hotswap test\nexit 0\n";
-        std::fs::write(&bash_v1, tampered_bytes).expect("write replacement bytes");
-
-        // 7. Resolve identity through the real helper and assert the
-        //    contract: we want "Binary integrity violation", not
-        //    "Failed to stat ... (deleted)".
-        let test_pid = std::process::id();
-        let result = resolve_process_identity(test_pid, peer_port, &cache);
-
-        // Always clean up the child before asserting so a failure doesn't
-        // leak a sleeping process across test runs.
-        let _ = child.kill();
-        let _ = child.wait();
-
-        match result {
-            Ok(_) => panic!(
-                "resolve_process_identity unexpectedly succeeded after hot-swap; \
-                 the cache should have detected the tampered on-disk bytes"
-            ),
-            Err(err) => {
-                assert!(
-                    err.reason.contains("Binary integrity violation"),
-                    "expected 'Binary integrity violation' error, got: {}",
-                    err.reason
-                );
-                assert!(
-                    !err.reason.contains("Failed to stat"),
-                    "pre-PR-#844 failure mode leaked: {}",
-                    err.reason
-                );
-                assert!(
-                    !err.reason.contains("(deleted)"),
-                    "resolved path still contains '(deleted)' suffix: {}",
-                    err.reason
-                );
-                // The binary field should be populated — we did resolve a
-                // path before failing.
-                assert!(
-                    err.binary.is_some(),
-                    "expected resolved binary path on integrity failure"
-                );
-                if let Some(path) = &err.binary {
-                    assert!(
-                        !path.to_string_lossy().contains("(deleted)"),
-                        "resolved binary path still tainted: {}",
-                        path.display()
-                    );
-                }
-            }
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn resolve_process_identity_denies_fork_exec_shared_socket_ambiguity() {
-        use crate::identity::BinaryIdentityCache;
-        use std::ffi::CString;
-        use std::net::{TcpListener, TcpStream};
-        use std::os::fd::AsRawFd;
-        use std::time::{Duration, Instant};
-
-        if !std::path::Path::new("/bin/sleep").exists() {
-            eprintln!("skipping: /bin/sleep not available");
-            return;
-        }
-
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
-        let listener_port = listener.local_addr().unwrap().port();
-        let stream = TcpStream::connect(("127.0.0.1", listener_port)).expect("connect");
-        let peer_port = stream.local_addr().unwrap().port();
-        let (_accepted, _) = listener.accept().expect("accept");
-
-        let fd = stream.as_raw_fd();
-        // libc/syscall FFI requires unsafe
-        #[allow(unsafe_code)]
-        unsafe {
-            let flags = libc::fcntl(fd, libc::F_GETFD);
-            assert!(flags >= 0, "F_GETFD failed");
-            assert_eq!(
-                libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC),
-                0,
-                "F_SETFD failed"
-            );
-        }
-
-        let sleep_path = CString::new("/bin/sleep").unwrap();
-        let arg0 = CString::new("sleep").unwrap();
-        let arg1 = CString::new("30").unwrap();
-        // libc/syscall FFI requires unsafe
-        #[allow(unsafe_code)]
-        let child_pid = unsafe { libc::fork() };
-        assert!(child_pid >= 0, "fork failed");
-        if child_pid == 0 {
-            // libc/syscall FFI requires unsafe
-            #[allow(unsafe_code)]
-            unsafe {
-                libc::execl(
-                    sleep_path.as_ptr(),
-                    arg0.as_ptr(),
-                    arg1.as_ptr(),
-                    std::ptr::null::<libc::c_char>(),
-                );
-                libc::_exit(127);
-            }
-        }
-
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            if let Ok(link) = std::fs::read_link(format!("/proc/{child_pid}/exe"))
-                && link.to_string_lossy().contains("sleep")
-            {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "child pid {child_pid} did not exec into sleep within 2s"
-            );
-            std::thread::sleep(Duration::from_millis(20));
-        }
-
-        let cache = BinaryIdentityCache::new();
-
-        // Resolve with a brief retry loop — under heavy CI load the child's
-        // procfs entry can momentarily fail to resolve even though the loop
-        // above just verified `/proc/<pid>/exe` pointed at `sleep`.  Retry a
-        // few times before declaring failure so the test is not flaky.
-        let mut result = resolve_process_identity(std::process::id(), peer_port, &cache);
-        for _ in 0..5 {
-            match &result {
-                Err(err)
-                    if err.reason.contains("No such file or directory")
-                        || err.reason.contains("os error 2") =>
-                {
-                    std::thread::sleep(Duration::from_millis(50));
-                    result = resolve_process_identity(std::process::id(), peer_port, &cache);
-                }
-                _ => break,
-            }
-        }
-
-        // libc/syscall FFI requires unsafe
-        #[allow(unsafe_code)]
-        unsafe {
-            libc::kill(child_pid, libc::SIGKILL);
-            libc::waitpid(child_pid, std::ptr::null_mut(), 0);
-        }
-
-        match result {
-            Ok(identity) => panic!(
-                "resolve_process_identity unexpectedly succeeded for shared socket owned by PID {}",
-                identity.binary_pid
-            ),
-            Err(err) => {
-                assert!(
-                    err.reason.contains("ambiguous shared socket ownership"),
-                    "expected ambiguous socket ownership error, got: {}",
-                    err.reason
-                );
-                assert!(
-                    err.reason.contains(&std::process::id().to_string()),
-                    "error should include parent PID; got: {}",
-                    err.reason
-                );
-                assert!(
-                    err.reason.contains(&child_pid.to_string()),
-                    "error should include child PID; got: {}",
-                    err.reason
-                );
-            }
-        }
     }
 }

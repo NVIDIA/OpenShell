@@ -112,7 +112,7 @@ then launches the agent under the active policy.
 |---|---|
 | Process | Drops privileges, applies process identity rules, disables privilege escalation paths, and starts the agent as a restricted child process. |
 | Filesystem | Applies filesystem policy before the agent starts so undeclared paths are inaccessible and declared paths are read-only or read-write as configured. |
-| Network | Routes ordinary egress through the policy proxy so destination, port, binary identity, and L7 request rules can be evaluated before traffic leaves the sandbox. |
+| Network | Routes ordinary egress through the policy proxy so destination, port, and L7 request rules can be evaluated before traffic leaves the sandbox. |
 | Credentials | Receives credential material from the gateway and injects it only through configured policy paths or request-time proxy rules. |
 | Inference | Intercepts `https://inference.local` and forwards model traffic through the configured inference route instead of exposing provider credentials to the agent. |
 | Observability | Emits local security and lifecycle logs, pushes sandbox logs to the gateway, and keeps relay endpoints available for connect, exec, and file transfer operations. |

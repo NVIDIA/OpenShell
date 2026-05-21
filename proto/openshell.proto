@@ -960,7 +960,10 @@ message ProviderProfile {
   ProviderProfileCategory category = 4;
   repeated ProviderProfileCredential credentials = 5;
   repeated openshell.sandbox.v1.NetworkEndpoint endpoints = 6;
-  repeated openshell.sandbox.v1.NetworkBinary binaries = 7;
+  // Field 7 (binaries / NetworkBinary) removed: binary allowlisting has been
+  // removed as a security control (bypassable via LD_PRELOAD).
+  reserved 7;
+  reserved "binaries";
   bool inference_capable = 8;
 }
 
@@ -1078,8 +1081,11 @@ message PolicyMergeOperation {
     RemoveNetworkRule remove_rule = 3;
     AddDenyRules add_deny_rules = 4;
     AddAllowRules add_allow_rules = 5;
-    RemoveNetworkBinary remove_binary = 6;
+    // Field 6 (remove_binary / RemoveNetworkBinary) removed: binary allowlisting
+    // was removed as a security control (bypassable via LD_PRELOAD).
   }
+  reserved 6;
+  reserved "remove_binary";
 }
 
 message AddNetworkRule {
@@ -1109,10 +1115,9 @@ message AddAllowRules {
   repeated openshell.sandbox.v1.L7Rule rules = 3;
 }
 
-message RemoveNetworkBinary {
-  string rule_name = 1;
-  string binary_path = 2;
-}
+// RemoveNetworkBinary was removed. Binary allowlisting has been removed
+// as a security control (bypassable via LD_PRELOAD).
+// message RemoveNetworkBinary { string rule_name = 1; string binary_path = 2; }
 
 // Update sandbox policy response.
 message UpdateConfigResponse {
@@ -1396,10 +1401,9 @@ message DenialSummary {
   string host = 2;
   // Denied destination port.
   uint32 port = 3;
-  // Binary that attempted the connection.
-  string binary = 4;
-  // Process ancestor chain.
-  repeated string ancestors = 5;
+  // Fields 4 (binary) and 5 (ancestors) removed: binary allowlisting has been removed.
+  reserved 4, 5;
+  reserved "binary", "ancestors";
   // Denial reason from OPA evaluation.
   string deny_reason = 6;
   // First denial timestamp (ms since epoch).
@@ -1414,8 +1418,9 @@ message DenialSummary {
   uint32 total_count = 11;
   // Distinct cmdline strings observed (sanitized of credentials).
   repeated string sample_cmdlines = 12;
-  // SHA-256 of the binary for audit trail.
-  string binary_sha256 = 13;
+  // Field 13 (binary_sha256) removed: binary allowlisting has been removed.
+  reserved 13;
+  reserved "binary_sha256";
   // True if emitted by stale-flush rather than threshold.
   bool persistent = 14;
   // Denial category: "l4_deny", "l7_deny", "l7_audit", "ssrf".
@@ -1458,8 +1463,9 @@ message PolicyChunk {
   int64 first_seen_ms = 14;
   // Most recent time this endpoint was re-proposed (ms since epoch).
   int64 last_seen_ms = 15;
-  // Binary path that triggered the denial (denormalized for display convenience).
-  string binary = 16;
+  // Field 16 (binary) removed: binary allowlisting has been removed.
+  reserved 16;
+  reserved "binary";
   // Validation verdict from gateway-side static checks (prover output).
   // Free-form summary string for human consumption in the inbox card.
   // Empty until the prover has run for this chunk.
@@ -1670,8 +1676,9 @@ message DraftChunkPayload {
   string host = 7;
   // Denormalized endpoint port for dedup and display.
   int32 port = 8;
-  // Binary path that triggered the denial.
-  string binary = 9;
+  // Field 9 (binary) removed: binary allowlisting has been removed.
+  reserved 9;
+  reserved "binary";
   // Current draft version for the owning sandbox.
   int64 draft_version = 10;
   // Gateway prover verdict for this chunk; empty until prover runs.
@@ -1710,7 +1717,9 @@ message StoredDraftChunk {
   optional int64 decided_at_ms = 11;
   string host = 12;
   int32 port = 13;
-  string binary = 14;
+  // Field 14 (binary) removed: binary allowlisting has been removed.
+  reserved 14;
+  reserved "binary";
   int32 hit_count = 15;
   int64 first_seen_ms = 16;
   int64 last_seen_ms = 17;

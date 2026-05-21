@@ -19,8 +19,7 @@ use std::path::Path;
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::proto::{
     FilesystemPolicy, GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule,
-    LandlockPolicy, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, ProcessPolicy,
-    SandboxPolicy,
+    LandlockPolicy, NetworkEndpoint, NetworkPolicyRule, ProcessPolicy, SandboxPolicy,
 };
 use serde::{Deserialize, Serialize};
 
@@ -82,8 +81,11 @@ struct NetworkPolicyRuleDef {
     name: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     endpoints: Vec<NetworkEndpointDef>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    binaries: Vec<NetworkBinaryDef>,
+    /// Accepted for backwards compatibility with policies written before binary
+    /// allowlisting was removed. The value is ignored — policy evaluation is
+    /// now purely destination-based (host + port).
+    #[serde(default, skip_serializing)]
+    binaries: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -218,16 +220,6 @@ struct L7DenyRuleDef {
     fields: Vec<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NetworkBinaryDef {
-    path: String,
-    /// Deprecated: ignored. Kept for backward compat with existing YAML files.
-    #[serde(default, skip_serializing)]
-    #[allow(dead_code)]
-    harness: bool,
-}
-
 // ---------------------------------------------------------------------------
 // YAML → proto conversion
 // ---------------------------------------------------------------------------
@@ -237,6 +229,15 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
         .network_policies
         .into_iter()
         .map(|(key, rule)| {
+            if !rule.binaries.is_empty() {
+                tracing::info!(
+                    rule = %key,
+                    "policy rule contains 'binaries' field which is no longer \
+                     evaluated; binary allowlisting has been removed and this \
+                     field is ignored — policy enforcement is now destination-based \
+                     (host + port) only"
+                );
+            }
             let proto_rule = NetworkPolicyRule {
                 name: if rule.name.is_empty() {
                     key.clone()
@@ -345,14 +346,6 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                                 .collect(),
                             graphql_max_body_bytes: e.graphql_max_body_bytes,
                         }
-                    })
-                    .collect(),
-                binaries: rule
-                    .binaries
-                    .into_iter()
-                    .map(|b| NetworkBinary {
-                        path: b.path,
-                        ..Default::default()
                     })
                     .collect(),
             };
@@ -512,14 +505,7 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                         }
                     })
                     .collect(),
-                binaries: rule
-                    .binaries
-                    .iter()
-                    .map(|b| NetworkBinaryDef {
-                        path: b.path.clone(),
-                        harness: false,
-                    })
-                    .collect(),
+                binaries: Vec::new(),
             };
             (key.clone(), yaml_rule)
         })
@@ -895,8 +881,6 @@ network_policies:
         allowed_ips:
           - "10.0.5.0/24"
           - "10.0.6.0/24"
-    binaries:
-      - path: /usr/bin/curl
 "#;
         let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
         let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
@@ -917,10 +901,8 @@ network_policies:
   my_api:
     name: my-custom-api-name
     endpoints:
-      - host: api.example.com
-        port: 443
-    binaries:
-      - path: /usr/bin/curl
+        - host: api.example.com
+          port: 443
 ";
         let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
         assert_eq!(proto1.network_policies["my_api"].name, "my-custom-api-name");
@@ -997,8 +979,6 @@ network_policies:
     name: test_policy
     endpoints:
       - { host: example.com, port: 443 }
-    binaries:
-      - { path: /usr/bin/curl }
 ";
         let policy = parse_sandbox_policy(yaml).expect("should parse");
         assert_eq!(policy.network_policies.len(), 1);
@@ -1007,8 +987,6 @@ network_policies:
         assert_eq!(rule.endpoints.len(), 1);
         assert_eq!(rule.endpoints[0].host, "example.com");
         assert_eq!(rule.endpoints[0].port, 443);
-        assert_eq!(rule.binaries.len(), 1);
-        assert_eq!(rule.binaries[0].path, "/usr/bin/curl");
     }
 
     #[test]
@@ -1030,8 +1008,6 @@ network_policies:
                 slug: "my-*"
                 tag:
                   any: ["foo-*", "bar-*"]
-    binaries:
-      - path: /usr/bin/curl
 "#;
         let proto = parse_sandbox_policy(yaml).expect("parse failed");
         let allow = proto.network_policies["query_test"].endpoints[0].rules[0]
@@ -1058,6 +1034,36 @@ network_policies:
     fn parse_rejects_unknown_fields() {
         let yaml = "version: 1\nbogus_field: true\n";
         assert!(parse_sandbox_policy(yaml).is_err());
+    }
+
+    #[test]
+    fn parse_accepts_binaries_field_and_ignores_it() {
+        // Policies written before binary allowlisting was removed may contain
+        // a `binaries:` field. It must be accepted (not rejected) and silently
+        // dropped — policy enforcement is now destination-based only.
+        let yaml = r"
+version: 1
+network_policies:
+  my_api:
+    endpoints:
+      - host: api.example.com
+        ports: [443]
+    binaries:
+      - path: /usr/bin/curl
+        harness: false
+      - path: /usr/bin/node
+        harness: true
+";
+        let proto = parse_sandbox_policy(yaml).expect("should accept binaries field");
+        // The endpoint is preserved; the binaries field is silently dropped.
+        assert_eq!(
+            proto.network_policies["my_api"].endpoints[0].host,
+            "api.example.com"
+        );
+        assert_eq!(
+            proto.network_policies["my_api"].endpoints[0].ports,
+            vec![443]
+        );
     }
 
     #[test]
@@ -1277,7 +1283,6 @@ network_policies:
                     port: 443,
                     ..Default::default()
                 }],
-                ..Default::default()
             },
         );
         let violations = validate_sandbox_policy(&policy).unwrap_err();
@@ -1300,7 +1305,6 @@ network_policies:
                     port: 443,
                     ..Default::default()
                 }],
-                ..Default::default()
             },
         );
         let violations = validate_sandbox_policy(&policy).unwrap_err();
@@ -1323,7 +1327,6 @@ network_policies:
                     port: 443,
                     ..Default::default()
                 }],
-                ..Default::default()
             },
         );
         assert!(validate_sandbox_policy(&policy).is_ok());
@@ -1341,7 +1344,6 @@ network_policies:
                     port: 443,
                     ..Default::default()
                 }],
-                ..Default::default()
             },
         );
         assert!(validate_sandbox_policy(&policy).is_ok());
@@ -1383,8 +1385,6 @@ network_policies:
     name: test
     endpoints:
       - { host: api.example.com, ports: [80, 443] }
-    binaries:
-      - { path: /usr/bin/curl }
 ";
         let policy = parse_sandbox_policy(yaml).expect("should parse");
         let ep = &policy.network_policies["test"].endpoints[0];
@@ -1402,8 +1402,6 @@ network_policies:
     name: test
     endpoints:
       - { host: api.example.com, port: 443 }
-    binaries:
-      - { path: /usr/bin/curl }
 ";
         let policy = parse_sandbox_policy(yaml).expect("should parse");
         let ep = &policy.network_policies["test"].endpoints[0];
@@ -1426,8 +1424,6 @@ network_policies:
         rules:
           - allow:
               operation_type: query
-    binaries:
-      - { path: /usr/bin/curl }
 "#;
         let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
         let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
@@ -1451,8 +1447,6 @@ network_policies:
         ports:
           - 80
           - 443
-    binaries:
-      - { path: /usr/bin/curl }
 ";
         let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
         let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
@@ -1473,8 +1467,6 @@ network_policies:
     name: test
     endpoints:
       - { host: api.example.com, port: 443 }
-    binaries:
-      - { path: /usr/bin/curl }
 ";
         let proto = parse_sandbox_policy(yaml).expect("parse failed");
         let yaml_out = serialize_sandbox_policy(&proto).expect("serialize failed");
@@ -1498,8 +1490,6 @@ network_policies:
     name: test
     endpoints:
       - { host: "*.example.com", port: 443 }
-    binaries:
-      - { path: /usr/bin/curl }
 "#;
         let policy = parse_sandbox_policy(yaml).expect("should parse");
         let ep = &policy.network_policies["test"].endpoints[0];
@@ -1516,8 +1506,6 @@ network_policies:
     endpoints:
       - host: "*.example.com"
         port: 443
-    binaries:
-      - { path: /usr/bin/curl }
 "#;
         let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
         let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
@@ -1545,8 +1533,6 @@ network_policies:
             path: "/repos/*/pulls/*/reviews"
           - method: PUT
             path: "/repos/*/branches/*/protection"
-    binaries:
-      - path: /usr/bin/curl
 "#;
         let proto = parse_sandbox_policy(yaml).expect("parse failed");
         let ep = &proto.network_policies["github"].endpoints[0];
@@ -1576,8 +1562,6 @@ network_policies:
             path: "/repos/*/branches/*/protection"
             query:
               force: "true"
-    binaries:
-      - path: /usr/bin/curl
 "#;
         let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
         let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
@@ -1610,8 +1594,6 @@ network_policies:
             query:
               type:
                 any: ["admin-*", "root-*"]
-    binaries:
-      - path: /usr/bin/curl
 "#;
         let proto = parse_sandbox_policy(yaml).expect("parse failed");
         let deny = &proto.network_policies["test"].endpoints[0].deny_rules[0];
@@ -1648,8 +1630,6 @@ network_policies:
         deny_rules:
           - operation_type: mutation
             fields: [deleteRepository]
-    binaries:
-      - path: /usr/bin/curl
 ";
         let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
         let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
@@ -1683,8 +1663,6 @@ network_policies:
         enforcement: enforce
         access: full
         websocket_credential_rewrite: true
-    binaries:
-      - path: /usr/bin/node
 ";
         let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
         let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
@@ -1710,8 +1688,6 @@ network_policies:
         enforcement: enforce
         access: read-write
         request_body_credential_rewrite: true
-    binaries:
-      - path: /usr/bin/node
 ";
         let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
         let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
@@ -1734,8 +1710,6 @@ network_policies:
         port: 443
         protocol: rest
         access: full
-    binaries:
-      - path: /usr/bin/node
 ";
         let proto = parse_sandbox_policy(yaml).expect("parse failed");
         let ep = &proto.network_policies["gateway"].endpoints[0];
