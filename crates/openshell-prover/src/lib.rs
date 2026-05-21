@@ -157,9 +157,13 @@ filesystem_policy:
         assert_eq!(sandbox_count, 1);
     }
 
-    // 6. End-to-end: git push bypass findings detected (uses embedded registry).
+    // 6. End-to-end: testdata policy with a github credential in scope and a
+    // bypass-L7 binary (git) emits a calibrated data_exfiltration finding.
+    // Under the v1 calibration, all emissions consolidate into the
+    // data_exfiltration query at RiskLevel::High; the legacy write_bypass
+    // query is a no-op pending a future intent-aware redesign.
     #[test]
-    fn test_git_push_bypass_findings() {
+    fn test_calibrated_findings_for_github_policy() {
         let policy_path = testdata_dir().join("policy.yaml");
         let creds_path = testdata_dir().join("credentials.yaml");
 
@@ -174,18 +178,20 @@ filesystem_policy:
             findings.iter().map(|f| f.query.as_str()).collect();
         assert!(
             query_types.contains("data_exfiltration"),
-            "expected data_exfiltration finding"
+            "expected data_exfiltration finding for bypass-L7 binary with credential in scope, \
+             got query types: {query_types:?}"
         );
+        // v1 emits only data_exfiltration; write_bypass is reserved.
         assert!(
-            query_types.contains("write_bypass"),
-            "expected write_bypass finding"
+            !query_types.contains("write_bypass"),
+            "write_bypass is a no-op in v1; got: {findings:?}"
         );
+        // Every v1 finding is HIGH.
         assert!(
-            findings.iter().any(|f| matches!(
-                f.risk,
-                finding::RiskLevel::Critical | finding::RiskLevel::High
-            )),
-            "expected at least one critical/high finding"
+            findings
+                .iter()
+                .all(|f| matches!(f.risk, finding::RiskLevel::High)),
+            "v1 emits only HIGH; got: {findings:?}"
         );
     }
 

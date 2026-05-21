@@ -52,6 +52,8 @@ DEMO_FILE_PATH="${DEMO_FILE_DIR}/${DEMO_RUN_ID}.md"
 DEMO_SANDBOX_NAME="${DEMO_SANDBOX_NAME:-policy-demo-${DEMO_RUN_ID}}"
 DEMO_CODEX_PROVIDER_NAME="${DEMO_CODEX_PROVIDER_NAME:-codex-policy-demo-${DEMO_RUN_ID}}"
 DEMO_GITHUB_PROVIDER_NAME="${DEMO_GITHUB_PROVIDER_NAME:-github-policy-demo-${DEMO_RUN_ID}}"
+DEMO_CODEX_MODEL="${DEMO_CODEX_MODEL:-gpt-5}"
+DEMO_CODEX_LOCAL_BIN="${DEMO_CODEX_LOCAL_BIN:-}"
 DEMO_MANUAL_APPROVE="${DEMO_MANUAL_APPROVE:-0}"
 # Manual approvals need more headroom than the auto-approve loop — a human
 # reads the proposal, thinks, and decides. Bump the default to 30 min when
@@ -220,7 +222,7 @@ resolve_github_token() {
 
 resolve_codex_auth() {
     [[ -f "${HOME}/.codex/auth.json" ]] || fail "missing local Codex sign-in; run: codex login"
-    export CODEX_AUTH_ACCESS_TOKEN CODEX_AUTH_REFRESH_TOKEN CODEX_AUTH_ACCOUNT_ID
+    export CODEX_AUTH_ACCESS_TOKEN CODEX_AUTH_REFRESH_TOKEN CODEX_AUTH_ACCOUNT_ID DEMO_CODEX_MODEL
     CODEX_AUTH_ACCESS_TOKEN="$(jq -r '.tokens.access_token // empty' "${HOME}/.codex/auth.json")"
     CODEX_AUTH_REFRESH_TOKEN="$(jq -r '.tokens.refresh_token // empty' "${HOME}/.codex/auth.json")"
     CODEX_AUTH_ACCOUNT_ID="$(jq -r '.tokens.account_id // empty' "${HOME}/.codex/auth.json")"
@@ -331,7 +333,13 @@ render_payload() {
         -e "s|{{FILE_PATH}}|${DEMO_FILE_PATH}|g" \
         -e "s|{{RUN_ID}}|${DEMO_RUN_ID}|g" \
         "$TASK_TEMPLATE" > "${PAYLOAD_DIR}/agent-task.md"
-    cp "$SANDBOX_AGENT" "${PAYLOAD_DIR}/sandbox-agent.sh"
+    sed "s|DEMO_CODEX_MODEL=\"\${DEMO_CODEX_MODEL:-gpt-5}\"|DEMO_CODEX_MODEL=\"\${DEMO_CODEX_MODEL:-${DEMO_CODEX_MODEL}}\"|" \
+        "$SANDBOX_AGENT" > "${PAYLOAD_DIR}/sandbox-agent.sh"
+    if [[ -n "$DEMO_CODEX_LOCAL_BIN" ]]; then
+        [[ -x "$DEMO_CODEX_LOCAL_BIN" ]] || fail "DEMO_CODEX_LOCAL_BIN is not executable: $DEMO_CODEX_LOCAL_BIN"
+        cp "$DEMO_CODEX_LOCAL_BIN" "${PAYLOAD_DIR}/codex"
+        chmod +x "${PAYLOAD_DIR}/codex"
+    fi
     cp "$POLICY_TEMPLATE" "$POLICY_FILE"
 }
 
@@ -383,9 +391,14 @@ start_agent_sandbox() {
 }
 
 # Strip the rule_get output down to the lines a developer needs to make an
-# informed approve/reject decision: rationale, validation, binary, endpoint. Filters the
-# noisy fields (UUID, agent-generated rule_name, hardcoded confidence,
-# duplicate Binaries).
+# informed approve/reject decision: rationale, validation, binary, endpoint.
+# Filters the noisy fields (UUID, agent-generated rule_name, hardcoded
+# confidence, duplicate Binaries).
+#
+# `validation_result` can span multiple lines (`prover: N findings` followed
+# by one indented finding line per detected risk), so when a `Validation:`
+# label appears we also print any subsequent indented lines until we hit the
+# next labeled field.
 #
 # `openshell rule get` colorizes labels with ANSI escapes; strip them before
 # parsing so the field-name match works in piped contexts.
@@ -393,10 +406,13 @@ summarize_pending() {
     local pending="$1"
     sed 's/\x1b\[[0-9;]*m//g' "$pending" \
         | awk '
-            /Rationale:/ { sub(/^[[:space:]]*/, ""); print "  " $0; next }
-            /Validation:/ { sub(/^[[:space:]]*/, ""); print "  " $0; next }
-            /Binary:/    { sub(/^[[:space:]]*/, ""); print "  " $0; next }
-            /Endpoints:/ { sub(/^[[:space:]]*/, ""); print "  " $0; next }
+            BEGIN { in_validation = 0 }
+            /Rationale:/  { in_validation = 0; sub(/^[[:space:]]*/, ""); print "  " $0; next }
+            /Validation:/ { in_validation = 1; sub(/^[[:space:]]*/, ""); print "  " $0; next }
+            /Binary:/     { in_validation = 0; sub(/^[[:space:]]*/, ""); print "  " $0; next }
+            /Endpoints:/  { in_validation = 0; sub(/^[[:space:]]*/, ""); print "  " $0; next }
+            in_validation && /^[[:space:]]{2,}\[/ { sub(/^[[:space:]]*/, ""); print "    " $0; next }
+            { in_validation = 0 }
         '
 }
 
@@ -422,13 +438,16 @@ EOF
     info "  • agent reads the skill, drafts a narrow ${DIM}addRule${RESET} for exactly that path"
     info "  • agent POSTs to ${DIM}http://policy.local/v1/proposals${RESET}, saves the"
     info "    returned ${DIM}accepted_chunk_ids[0]${RESET}"
-    info "  • gateway merges the proposed rule with the current sandbox policy,"
-    info "    runs the prover, and stores a short validation verdict on the chunk"
+    info "  • gateway runs the prover. ${BOLD}If the proposal introduces no new"
+    info "    findings, the gateway auto-approves it without human action${RESET}"
+    info "    — the audit trail records ${DIM}auto-approved: no new prover findings${RESET}"
+    info "    (source = mechanistic or agent_authored). Proposals that flag a"
+    info "    HIGH finding land in pending for human review instead."
     info "  • agent calls ${DIM}GET /v1/proposals/{chunk_id}/wait?timeout=300${RESET}"
-    info "    — one HTTP call that sleeps on a socket until the developer decides."
-    info "    ${BOLD}Zero LLM tokens burn during this wait.${RESET}"
+    info "    — auto-approvals return in ~1s. Human review pauses on a socket;"
+    info "    ${BOLD}zero LLM tokens burn during the wait${RESET}."
     info ""
-    info "${DIM}Watching for the pending draft on the gateway...${RESET}"
+    info "${DIM}Watching for any proposal that didn't auto-approve...${RESET}"
 }
 
 # In DEMO_MANUAL_APPROVE mode, swap auto-approve for a human-in-the-loop pause.
@@ -478,7 +497,10 @@ approve_pending_until_agent_exits() {
     approval_count=0
 
     while true; do
-        # Agent finished? Drain its exit status and we're done.
+        # Agent finished? Drain its exit status and we're done. Under v1
+        # auto-approval, the agent's narrow L7 proposals auto-approve at the
+        # gateway and the agent can exit without any escalation surfacing
+        # here. That's the success case — no human action required.
         if ! kill -0 "$AGENT_PID" >/dev/null 2>&1; then
             spin_clear
             if ! wait "$AGENT_PID"; then
@@ -487,25 +509,36 @@ approve_pending_until_agent_exits() {
             fi
             AGENT_PID=""
             if (( approval_count == 0 )); then
-                fail "agent exited before any pending proposal appeared"
+                info "agent exited cleanly with zero escalations (all proposals auto-approved)"
+            else
+                info "agent exited after ${approval_count} escalation(s) approved on the demo's behalf"
             fi
-            info "agent exited after ${approval_count} approval(s)"
             return
         fi
 
-        # Anything pending? Approve and keep watching — the agent may
-        # redraft if a previous proposal didn't yield the access it needed.
+        # Anything pending? That means the gateway prover declined to
+        # auto-approve — a HIGH finding flagged the proposal. The demo
+        # approves it anyway (acting as a friendly reviewer) so the script
+        # can run end-to-end, but the same proposal in production would wait
+        # for a real human decision.
         if "$OPENSHELL_BIN" rule get "$DEMO_SANDBOX_NAME" --status pending >"$pending" 2>/dev/null \
             && grep -q "Chunk:" "$pending" && grep -q "pending" "$pending"; then
             spin_clear
             info ""
-            info "${GREEN}proposal received:${RESET}"
+            info "${GREEN}escalation: human review required (proposal did not auto-approve)${RESET}"
             summarize_pending "$pending"
 
             if [[ "$DEMO_MANUAL_APPROVE" == "1" ]]; then
                 approve_manually "$pending"
             else
-                step "Approving — the agent's /wait will return within ~1s"
+                info ""
+                info "  ${BOLD}↑ this is what you're approving:${RESET}"
+                info "    • the structured rule above (Endpoints + Binary) is the contract"
+                info "    • the Validation line carries the prover's verdict — read it before approving"
+                info ""
+                spin_wait "letting the proposal land before approving" 2
+                spin_clear
+                step "Approving on behalf of the demo — the agent's /wait will return within ~1s"
                 "$OPENSHELL_BIN" rule approve-all "$DEMO_SANDBOX_NAME" \
                     | awk '/approved/ { print "  " $0 }'
             fi

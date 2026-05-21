@@ -46,8 +46,12 @@ operations. Each `addRule` carries a complete narrow `NetworkPolicyRule`.
    `port`, `binary`, `rule_missing`, and `detail` as evidence.
 2. Fetch the current policy from `/v1/policy/current`.
 3. Fetch recent denials from `/v1/denials` if the response body is incomplete.
-4. Prefer L7 REST rules for REST APIs. Use L4 only for non-REST protocols or
-   when the client tunnels opaque traffic that OpenShell cannot inspect.
+4. Prefer L7 REST rules for REST APIs. **Narrow L7 proposals against
+   inspectable hosts auto-approve without human review** (see Auto-approval
+   below). L4 grants for the same host with a credential in scope always
+   require human approval, so L7 is the agent-speed path. Use L4 only when
+   the binary's wire protocol is opaque to L7 inspection (`ssh`, `nc`,
+   `git-remote-http`) or the host has no documented REST surface.
 5. Draft the narrowest rule: exact host, exact port, exact binary when known,
    exact method, and the smallest safe path.
 6. Submit the proposal, save `accepted_chunk_ids` from the response, and
@@ -119,10 +123,55 @@ A complete narrow REST-inspected rule looks like this:
 }
 ```
 
+## Auto-approval
+
+The gateway runs a deterministic prover on every proposal and auto-approves
+when the proposal introduces no new findings. You get agent speed for
+proposals the prover can bound; everything else escalates to a human.
+
+What the prover flags (and therefore keeps in human review):
+
+- **Link-local hosts** (`169.254.0.0/16`, `fe80::/10`). Cloud metadata
+  endpoints like `169.254.169.254` live here. **Never** propose access to
+  these — the proposal will always escalate, regardless of credentials.
+- **L4 grants** (no `protocol: rest`) to a host where a sandbox credential
+  is in scope. The L4 layer has no inspection; combined with a privileged
+  credential, this is unbounded reachability.
+- **Bypass-L7 binaries** (`/usr/bin/git`, `/usr/lib/git-core/git-remote-http`,
+  `/usr/bin/ssh`, `/usr/bin/nc`) bound to any host where a credential is in
+  scope. Wire protocols opaque to L7 inspection are unbounded by L7 scoping.
+
+What auto-approves:
+
+- L7 (REST) rules with explicit `method` + exact `path` against
+  inspectable hosts.
+- Any proposal that adds no path the prover can reach with a privileged
+  binary against a credentialed host.
+
+If your proposal escalates and you need it sooner, narrow it: an L7 method/path
+scope often turns an "L4 with credential" finding into "no new findings."
+
+## Refining an earlier auto-suggested rule
+
+When the sandbox observes a denial it cannot scope to L7 — e.g., a binary
+trying to connect to a host the proxy hasn't seen at the application layer
+— it auto-drafts a broad L4 proposal so the operator has something concrete
+to look at. These mechanistic drafts are visible to you alongside any other
+pending proposals.
+
+If you see a pending mechanistic L4 draft you can do better than, just
+submit a refined L7 proposal for the same `(host, port, binary)`. The
+gateway will automatically reject the mechanistic draft with reason
+"superseded by chunk X" — no extra cleanup or `supersedes_chunk_id` needed.
+The new submission wins by structural overlap.
+
 ## Norms
 
 - Do not propose wildcard hosts such as `**` or `*.com`.
 - Do not propose `access: full` to fix a single denied REST request.
+- Do not propose access to link-local addresses (`169.254.0.0/16`,
+  `fe80::/10`). Cloud-metadata endpoints there can hand out the host's
+  credentials.
 - Do not include query strings, tokens, credentials, or secret values in
   paths.
 - Explain uncertainty in `intent_summary` instead of widening the rule.

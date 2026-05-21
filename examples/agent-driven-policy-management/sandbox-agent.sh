@@ -74,9 +74,20 @@ cd "$WORK"
 # compare runs.
 DEMO_CODEX_REASONING="${DEMO_CODEX_REASONING:-low}"
 
-exec codex exec \
+# Pin the model to one that ChatGPT-account Codex users can reach. Codex's
+# default (`gpt-5.2-codex`) is API-account-only and fails ChatGPT-auth with
+# `400 invalid_request_error: model not supported`. Override with
+# DEMO_CODEX_MODEL if your account supports something better.
+DEMO_CODEX_MODEL="${DEMO_CODEX_MODEL:-gpt-5}"
+CODEX_BIN="${CODEX_BIN:-codex}"
+if [[ -x /sandbox/payload/codex ]]; then
+    CODEX_BIN="/sandbox/payload/codex"
+fi
+
+exec "$CODEX_BIN" exec \
     --skip-git-repo-check \
     --sandbox danger-full-access \
     --ephemeral \
+    -c "model=\"${DEMO_CODEX_MODEL}\"" \
     -c "model_reasoning_effort=\"${DEMO_CODEX_REASONING}\"" \
     "$(cat /sandbox/payload/agent-task.md)"

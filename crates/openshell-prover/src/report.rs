@@ -39,6 +39,18 @@ fn compact_detail(finding: &Finding) -> String {
                 }
             }
             let mut parts = Vec::new();
+            if let Some(eps) = by_status.get("link_local") {
+                let mut sorted: Vec<&String> = eps.iter().collect();
+                sorted.sort();
+                parts.push(format!(
+                    "link-local (cloud metadata): {}",
+                    sorted
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
             if let Some(eps) = by_status.get("l4_only") {
                 let mut sorted: Vec<&String> = eps.iter().collect();
                 sorted.sort();
@@ -104,6 +116,25 @@ fn compact_detail(finding: &Finding) -> String {
             }
         }
         _ => String::new(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// One-line shorthand (for embedding findings in other tools' output)
+// ---------------------------------------------------------------------------
+
+/// Format a finding as a single uncolored line for embedding in other
+/// human-facing surfaces (gateway `validation_result`, demo output, logs).
+///
+/// Shape: `[<RISK>] <query>: <detail>` — e.g.
+/// `[HIGH] data_exfiltration: L4-only: api.github.com:443`. Falls back to
+/// `[<RISK>] <query>` when no detail is available.
+pub fn finding_shorthand(finding: &Finding) -> String {
+    let detail = compact_detail(finding);
+    if detail.is_empty() {
+        format!("[{}] {}", risk_label(finding.risk), finding.query)
+    } else {
+        format!("[{}] {}: {detail}", risk_label(finding.risk), finding.query)
     }
 }
 
@@ -349,6 +380,7 @@ fn render_exfil_paths(paths: &[FindingPath]) {
     for path in paths {
         if let FindingPath::Exfil(p) = path {
             let l7_display = match p.l7_status.as_str() {
+                "link_local" => format!("{}", "link-local".bold().red()),
                 "l4_only" => format!("{}", "L4-only".red()),
                 "l7_bypassed" => format!("{}", "bypassed".red()),
                 "l7_allows_write" => format!("{}", "L7 write".yellow()),
@@ -390,4 +422,80 @@ fn render_write_bypass_paths(paths: &[FindingPath]) {
         }
     }
     println!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::finding::{ExfilPath, WriteBypassPath};
+
+    fn exfil_finding(l7_status: &str, host: &str, port: u16) -> Finding {
+        Finding {
+            query: "data_exfiltration".to_owned(),
+            title: "Data exfiltration possible".to_owned(),
+            description: String::new(),
+            risk: RiskLevel::High,
+            paths: vec![FindingPath::Exfil(ExfilPath {
+                binary: "/usr/bin/curl".to_owned(),
+                endpoint_host: host.to_owned(),
+                endpoint_port: port,
+                mechanism: String::new(),
+                policy_name: String::new(),
+                l7_status: l7_status.to_owned(),
+            })],
+            remediation: vec![],
+            accepted: false,
+            accepted_reason: String::new(),
+        }
+    }
+
+    #[test]
+    fn finding_shorthand_renders_exfil_l4_only() {
+        let f = exfil_finding("l4_only", "api.github.com", 443);
+        assert_eq!(
+            finding_shorthand(&f),
+            "[HIGH] data_exfiltration: L4-only: api.github.com:443"
+        );
+    }
+
+    #[test]
+    fn finding_shorthand_renders_write_bypass() {
+        let f = Finding {
+            query: "write_bypass".to_owned(),
+            title: String::new(),
+            description: String::new(),
+            risk: RiskLevel::High,
+            paths: vec![FindingPath::WriteBypass(WriteBypassPath {
+                binary: "/usr/bin/curl".to_owned(),
+                endpoint_host: "api.github.com".to_owned(),
+                endpoint_port: 443,
+                policy_name: String::new(),
+                policy_intent: String::new(),
+                bypass_reason: "l4_only".to_owned(),
+                credential_actions: vec![],
+            })],
+            remediation: vec![],
+            accepted: false,
+            accepted_reason: String::new(),
+        };
+        assert_eq!(
+            finding_shorthand(&f),
+            "[HIGH] write_bypass: L4-only (no inspection): api.github.com:443"
+        );
+    }
+
+    #[test]
+    fn finding_shorthand_falls_back_when_detail_empty() {
+        let f = Finding {
+            query: "unknown_query".to_owned(),
+            title: String::new(),
+            description: String::new(),
+            risk: RiskLevel::Critical,
+            paths: vec![],
+            remediation: vec![],
+            accepted: false,
+            accepted_reason: String::new(),
+        };
+        assert_eq!(finding_shorthand(&f), "[CRITICAL] unknown_query");
+    }
 }

@@ -89,21 +89,51 @@ because it changes the effective access model for every sandbox on the gateway.
 ## Policy Advisor
 
 The policy advisor pipeline turns observed denials into draft policy
-recommendations:
+recommendations. There are two proposers (sandbox-side mechanistic mapper,
+agent-authored via `policy.local`); the gateway is the single referee.
 
-1. The sandbox aggregates denied network events.
-2. A mechanistic mapper proposes minimal endpoint, binary, or rule additions.
-3. The gateway validates and stores draft recommendations.
-4. A human or admin workflow approves or rejects drafts.
-5. Approved drafts merge into the target sandbox policy.
+1. **Submit.** Both proposers POST through the same `SubmitPolicyAnalysis`
+   path. Each chunk is persisted with its `analysis_mode` for audit provenance.
+2. **Validate.** The gateway runs the prover (`openshell-prover`) on every
+   chunk regardless of mode. The prover builds a Z3 model from the merged
+   policy plus the sandbox's attached-provider credential set, then computes
+   the delta of findings between the current baseline and the merged policy.
+3. **Auto-approval gate (proposer-agnostic).** If the delta is empty
+   (`prover: no new findings`), the gateway internally invokes the approve
+   path with actor identity `system:auto`. The audit event uses
+   `CONFIG:APPROVED` and carries `auto=true`, `source=<mode>`,
+   `prover_delta=empty` as unmapped fields, with message text
+   `"auto-approved: no new prover findings"` — never `safe`.
+4. **Implicit supersede.** On any successful submission, the gateway scans
+   the sandbox's pending chunks for matches on `(host, port, binary)` and
+   auto-rejects the older ones with reason `"superseded by chunk X"`. This
+   gives the agent a refinement path (broad mechanistic L4 → narrow agent
+   L7) without an explicit `supersedes_chunk_id` field.
+5. **Escalation.** Anything else lands in `pending` for human review.
+
+The v1 prover calibration emits `HIGH` findings (the only severity used) on:
+
+- **Link-local endpoints** (`169.254.0.0/16`, `fe80::/10`), unconditionally
+  — covers cloud metadata endpoints (AWS IMDS, GCP metadata) which serve
+  credentials and so are dangerous even with no sandbox credential present.
+- **L4 grants** to a host where a sandbox credential is in scope.
+- **Bypass-L7 binaries** (`git-remote-http`, `ssh`, `nc`) bound to a host
+  where a sandbox credential is in scope.
+
+"Credential in scope" is sandbox-coarse, not binary-fine: a credential is
+considered in scope if the sandbox has a provider attached whose
+`target_hosts` include the proposed endpoint's host. v1 does not model
+credential scopes (read-only vs write); presence is enough.
 
 Proposals intentionally omit `allowed_ips`. If a proposed rule targets a host
 that resolves to a private IP, the proxy's runtime SSRF classification blocks
 the connection. The operator must then add an explicit `allowed_ips` entry to
 permit it — a two-step flow that keeps SSRF protection on by default.
 
-The advisor should propose narrow additions and preserve explicit-deny behavior.
-It is a workflow aid, not an automatic permission grant.
+The advisor proposes narrow additions and preserves explicit-deny behavior.
+Auto-approval is gated on prover determinism, not human judgment; an LLM-based
+contextual reviewer is a deliberate future addition layered on top of the
+deterministic prover gate.
 
 ## Security Logging
 

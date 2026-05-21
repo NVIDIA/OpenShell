@@ -300,22 +300,40 @@ impl OcsfEvent {
                     },
                 );
                 let what = e.base.message.as_deref().unwrap_or("config");
-                let version_ctx = e
+                // Bracketed suffix carries the structured provenance fields a
+                // reviewer needs to scan a CONFIG audit line. Auto-approval
+                // emits `auto`/`source`/`prover_delta`; every config change
+                // also carries `policy_version` and `policy_hash`. Order is
+                // stable so logs are greppable.
+                let suffix = e
                     .base
                     .unmapped
                     .as_ref()
-                    .and_then(|u| {
-                        let ver = u.get("policy_version").and_then(|v| v.as_str());
-                        let hash = u.get("policy_hash").and_then(|v| v.as_str());
-                        match (ver, hash) {
-                            (Some(v), Some(h)) => Some(format!(" [version:{v} hash:{h}]")),
-                            (Some(v), None) => Some(format!(" [version:{v}]")),
-                            _ => None,
+                    .map(|u| {
+                        let mut parts: Vec<String> = Vec::new();
+                        let mut push = |key: &str| {
+                            if let Some(value) = u.get(key).and_then(|v| v.as_str()) {
+                                parts.push(format!("{key}:{value}"));
+                            }
+                        };
+                        push("auto");
+                        push("source");
+                        push("prover_delta");
+                        if let Some(ver) = u.get("policy_version").and_then(|v| v.as_str()) {
+                            parts.push(format!("version:{ver}"));
+                        }
+                        if let Some(hash) = u.get("policy_hash").and_then(|v| v.as_str()) {
+                            parts.push(format!("hash:{hash}"));
+                        }
+                        if parts.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" [{}]", parts.join(" "))
                         }
                     })
                     .unwrap_or_default();
 
-                format!("CONFIG:{state} {sev} {what}{version_ctx}")
+                format!("CONFIG:{state} {sev} {what}{suffix}")
             }
 
             Self::Base(e) => {

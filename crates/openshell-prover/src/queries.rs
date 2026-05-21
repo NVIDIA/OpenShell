@@ -2,20 +2,57 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Verification queries: `check_data_exfiltration` and `check_write_bypass`.
+//!
+//! v1 calibration (see `architecture/plans/agentic-policy-approval-loop.md`):
+//! the prover emits a finding only when the proposal shape is genuinely
+//! unbounded for our model. The three rows that fire today:
+//!
+//! 1. **Link-local host** (`169.254.0.0/16`, `fe80::/10`) — emits regardless
+//!    of credential context. Cloud metadata endpoints (AWS IMDS, GCP metadata)
+//!    serve credentials, so the credential-presence model is fundamentally
+//!    wrong for them.
+//! 2. **Bypass-L7 binary** (git smart-HTTP, ssh, nc) **with a credential in
+//!    scope for the host** — the L7 proxy cannot meaningfully inspect the
+//!    wire protocol even when scope looks tight, and an authenticated
+//!    privileged action is available.
+//! 3. **L4-only endpoint** (no `protocol: rest|graphql`) **with a credential
+//!    in scope for the host** — no L7 inspection at all, and authenticated
+//!    privileged action is available.
+//!
+//! All emitted findings carry `RiskLevel::High`. The `Critical` variant is
+//! retained in the enum but unused in v1; we'll introduce a tier when a
+//! behavioral distinction earns it.
+
+use std::net::IpAddr;
 
 use z3::SatResult;
 
-use crate::finding::{ExfilPath, Finding, FindingPath, RiskLevel, WriteBypassPath};
+use crate::finding::{ExfilPath, Finding, FindingPath, RiskLevel};
 use crate::model::ReachabilityModel;
-use crate::policy::PolicyIntent;
 
-/// Check for data exfiltration paths from readable filesystem to writable
-/// egress channels.
-pub fn check_data_exfiltration(model: &ReachabilityModel) -> Vec<Finding> {
-    if model.policy.filesystem_policy.readable_paths().is_empty() {
-        return Vec::new();
+/// Return true iff the host string parses as an IP in a reserved link-local
+/// range (IPv4 `169.254.0.0/16` or IPv6 `fe80::/10`).
+///
+/// Hostname-only strings (not parseable as IPs) return false. We don't
+/// perform DNS resolution at validation time; the model evaluates the policy
+/// as written.
+pub(crate) fn is_link_local(host: &str) -> bool {
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) => v4.is_link_local(),
+        Ok(IpAddr::V6(v6)) => v6.is_unicast_link_local(),
+        Err(_) => false,
     }
+}
 
+/// Check for data exfiltration / privileged-action paths against the v1
+/// calibration table above.
+///
+/// We deliberately do NOT gate on `filesystem_policy.readable_paths()` being
+/// non-empty: most v1 risks (link-local IMDS, L4+credential authenticated
+/// writes, bypass-binary + credential) don't require *readable* filesystem
+/// content to be dangerous. The credential itself is the lever, not what's
+/// in `/etc/`.
+pub fn check_data_exfiltration(model: &ReachabilityModel) -> Vec<Finding> {
     let mut exfil_paths: Vec<ExfilPath> = Vec::new();
 
     for bpath in &model.binary_paths {
@@ -28,28 +65,53 @@ pub fn check_data_exfiltration(model: &ReachabilityModel) -> Vec<Finding> {
             let expr = model.can_exfil_via_endpoint(bpath, eid);
 
             if model.check_sat(&expr) == SatResult::Sat {
-                // Determine L7 status and mechanism
-                let ep_is_l7 = is_endpoint_l7_enforced(&model.policy, &eid.host, eid.port);
+                let host_is_link_local = is_link_local(&eid.host);
+                let has_credential = !model.credentials.credentials_for_host(&eid.host).is_empty();
+                // Check the L7 enforcement of THIS specific rule (eid.policy_name),
+                // not any rule for the same host:port. Two rules can coexist on
+                // the same endpoint — one L7-scoped, one L4-only — and each
+                // must be evaluated on its own terms. Otherwise iteration order
+                // (HashMap) leaks into the verdict.
+                let ep_is_l7 = is_endpoint_in_rule_l7_enforced(
+                    &model.policy,
+                    &eid.policy_name,
+                    &eid.host,
+                    eid.port,
+                );
                 let bypass = cap.bypasses_l7();
 
-                let (l7_status, mut mechanism) = if bypass {
+                // v1 emission table — see module docs.
+                let (l7_status, mut mechanism) = if host_is_link_local {
+                    (
+                        "link_local".to_owned(),
+                        format!(
+                            "Link-local endpoint — {bpath} can reach the host's metadata range \
+                             (cloud-credential exfiltration territory regardless of declared scopes)"
+                        ),
+                    )
+                } else if bypass && has_credential {
                     (
                         "l7_bypassed".to_owned(),
                         format!(
-                            "{} — uses non-HTTP protocol, bypasses L7 inspection",
+                            "{} — uses non-HTTP protocol, bypasses L7 inspection, and a credential \
+                             is in scope for this host",
                             cap.description
                         ),
                     )
-                } else if !ep_is_l7 {
+                } else if !ep_is_l7 && has_credential {
                     (
                         "l4_only".to_owned(),
                         format!(
-                            "L4-only endpoint — no HTTP inspection, {bpath} can send arbitrary data"
+                            "L4-only endpoint with a credential in scope — no HTTP inspection, \
+                             {bpath} can send arbitrary authenticated requests"
                         ),
                     )
                 } else {
-                    // L7 is enforced and allows write — policy is
-                    // working as intended. Not a finding.
+                    // v1: any other SAT path is bounded enough that it
+                    // doesn't earn a finding. Examples that fall here:
+                    //   - L7-enforced with bounded action set (working as intended)
+                    //   - L4-only with no credential in scope (no privileged action available)
+                    //   - bypass-L7 binary with no credential in scope (no auth to exercise)
                     continue;
                 };
 
@@ -74,15 +136,21 @@ pub fn check_data_exfiltration(model: &ReachabilityModel) -> Vec<Finding> {
     }
 
     let readable = model.policy.filesystem_policy.readable_paths();
+    let n_readable = readable.len();
     let has_l4_only = exfil_paths.iter().any(|p| p.l7_status == "l4_only");
     let has_bypass = exfil_paths.iter().any(|p| p.l7_status == "l7_bypassed");
-    let risk = if has_l4_only || has_bypass {
-        RiskLevel::Critical
-    } else {
-        RiskLevel::High
-    };
+    let has_link_local = exfil_paths.iter().any(|p| p.l7_status == "link_local");
 
     let mut remediation = Vec::new();
+    if has_link_local {
+        remediation.push(
+            "Endpoint host is in a link-local range (cloud-metadata territory). \
+             Sandboxes should not reach these endpoints — reaching them can return \
+             host credentials the sandbox should not have. If access is truly \
+             intended, the policy must be approved by a human operator."
+                .to_owned(),
+        );
+    }
     if has_l4_only {
         remediation.push(
             "Add `protocol: rest` with specific L7 rules to L4-only endpoints \
@@ -93,8 +161,7 @@ pub fn check_data_exfiltration(model: &ReachabilityModel) -> Vec<Finding> {
     if has_bypass {
         remediation.push(
             "Binaries using non-HTTP protocols (git, ssh, nc) bypass L7 inspection. \
-             Remove these binaries from the policy if write access is not intended, \
-             or restrict credential scopes to read-only."
+             Remove these binaries from the policy if write access is not intended."
                 .to_owned(),
         );
     }
@@ -108,10 +175,9 @@ pub fn check_data_exfiltration(model: &ReachabilityModel) -> Vec<Finding> {
         query: "data_exfiltration".to_owned(),
         title: "Data Exfiltration Paths Detected".to_owned(),
         description: format!(
-            "{n_paths} exfiltration path(s) found from {} readable filesystem path(s) to external endpoints.",
-            readable.len()
+            "{n_paths} path(s) flagged by v1 calibration ({n_readable} readable filesystem path(s) in scope)."
         ),
-        risk,
+        risk: RiskLevel::High,
         paths,
         remediation,
         accepted: false,
@@ -119,88 +185,14 @@ pub fn check_data_exfiltration(model: &ReachabilityModel) -> Vec<Finding> {
     }]
 }
 
-/// Check for write capabilities that bypass read-only policy intent.
-pub fn check_write_bypass(model: &ReachabilityModel) -> Vec<Finding> {
-    let mut bypass_paths: Vec<WriteBypassPath> = Vec::new();
-
-    for (policy_name, rule) in &model.policy.network_policies {
-        for ep in &rule.endpoints {
-            // Only check endpoints where the intent is read-only or L4-only
-            let intent = ep.intent();
-            if !matches!(intent, PolicyIntent::ReadOnly) {
-                continue;
-            }
-
-            for port in ep.effective_ports() {
-                for b in &rule.binaries {
-                    let cap = model.binary_registry.get_or_unknown(&b.path);
-
-                    // Check: binary bypasses L7 and can write
-                    if cap.bypasses_l7() && cap.can_write() {
-                        let cred_actions = collect_credential_actions(model, &ep.host, &cap);
-                        if !cred_actions.is_empty()
-                            || model.credentials.credentials_for_host(&ep.host).is_empty()
-                        {
-                            bypass_paths.push(WriteBypassPath {
-                                binary: b.path.clone(),
-                                endpoint_host: ep.host.clone(),
-                                endpoint_port: port,
-                                policy_name: policy_name.clone(),
-                                policy_intent: intent.to_string(),
-                                bypass_reason: "l7_bypass_protocol".to_owned(),
-                                credential_actions: cred_actions,
-                            });
-                        }
-                    }
-
-                    // Check: L4-only endpoint + binary can construct HTTP + credential has write
-                    if !ep.is_l7_enforced() && cap.can_construct_http {
-                        let cred_actions = collect_credential_actions(model, &ep.host, &cap);
-                        if !cred_actions.is_empty() {
-                            bypass_paths.push(WriteBypassPath {
-                                binary: b.path.clone(),
-                                endpoint_host: ep.host.clone(),
-                                endpoint_port: port,
-                                policy_name: policy_name.clone(),
-                                policy_intent: intent.to_string(),
-                                bypass_reason: "l4_only".to_owned(),
-                                credential_actions: cred_actions,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if bypass_paths.is_empty() {
-        return Vec::new();
-    }
-
-    let n = bypass_paths.len();
-    let paths: Vec<FindingPath> = bypass_paths
-        .into_iter()
-        .map(FindingPath::WriteBypass)
-        .collect();
-
-    vec![Finding {
-        query: "write_bypass".to_owned(),
-        title: "Write Bypass Detected — Read-Only Intent Violated".to_owned(),
-        description: format!("{n} path(s) allow write operations despite read-only policy intent."),
-        risk: RiskLevel::High,
-        paths,
-        remediation: vec![
-            "For L4-only endpoints: add `protocol: rest` with `access: read-only` \
-             to enable HTTP method filtering."
-                .to_owned(),
-            "For L7-bypassing binaries (git, ssh, nc): remove them from the policy's \
-             binary list if write access is not intended."
-                .to_owned(),
-            "Restrict credential scopes to read-only where possible.".to_owned(),
-        ],
-        accepted: false,
-        accepted_reason: String::new(),
-    }]
+/// Reserved for future intent-aware write-bypass logic.
+///
+/// v1 consolidates all emission into `check_data_exfiltration` per the
+/// calibration table; this function returns empty so the public API stays
+/// stable while we figure out what shape an intent-aware check should take
+/// in v2.
+pub fn check_write_bypass(_model: &ReachabilityModel) -> Vec<Finding> {
+    Vec::new()
 }
 
 /// Run both verification queries.
@@ -215,39 +207,69 @@ pub fn run_all_queries(model: &ReachabilityModel) -> Vec<Finding> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Check whether an endpoint in the policy is L7-enforced.
-fn is_endpoint_l7_enforced(policy: &crate::policy::PolicyModel, host: &str, port: u16) -> bool {
-    for rule in policy.network_policies.values() {
-        for ep in &rule.endpoints {
-            if ep.host == host && ep.effective_ports().contains(&port) {
-                return ep.is_l7_enforced();
-            }
+/// Check whether the specific (`policy_name`, host, port) endpoint is
+/// L7-enforced.
+///
+/// Importantly, this is **per-rule**, not aggregated across the whole policy.
+/// Two rules can target the same `host:port` with different enforcement (one
+/// L7, one L4); each is evaluated on its own terms so the prover doesn't
+/// leak `HashMap` iteration order into the verdict.
+fn is_endpoint_in_rule_l7_enforced(
+    policy: &crate::policy::PolicyModel,
+    policy_name: &str,
+    host: &str,
+    port: u16,
+) -> bool {
+    let Some(rule) = policy.network_policies.get(policy_name) else {
+        return false;
+    };
+    for ep in &rule.endpoints {
+        if ep.host.eq_ignore_ascii_case(host) && ep.effective_ports().contains(&port) {
+            return ep.is_l7_enforced();
         }
     }
     false
 }
 
-/// Collect human-readable credential action descriptions for a host.
-fn collect_credential_actions(
-    model: &ReachabilityModel,
-    host: &str,
-    _cap: &crate::registry::BinaryCapability,
-) -> Vec<String> {
-    let creds = model.credentials.credentials_for_host(host);
-    let api = model.credentials.api_for_host(host);
-    let mut actions = Vec::new();
+// `collect_credential_actions` removed in v1 along with the original
+// `check_write_bypass` logic. When intent-aware write-bypass detection is
+// reintroduced, this helper (or its successor) will live here.
 
-    for cred in &creds {
-        if let Some(api) = api {
-            for wa in api.write_actions_for_scopes(&cred.scopes) {
-                actions.push(format!("{} {} ({})", wa.method, wa.path, wa.action));
-            }
-        } else {
-            actions.push(format!(
-                "credential '{}' has scopes: {:?}",
-                cred.name, cred.scopes
-            ));
-        }
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_link_local_recognises_ipv4_169_254() {
+        assert!(is_link_local("169.254.169.254"));
+        assert!(is_link_local("169.254.0.1"));
+        assert!(is_link_local("169.254.255.255"));
     }
-    actions
+
+    #[test]
+    fn is_link_local_recognises_ipv6_fe80() {
+        assert!(is_link_local("fe80::1"));
+        assert!(is_link_local("fe80::abcd:ef01"));
+    }
+
+    #[test]
+    fn is_link_local_rejects_non_link_local_ips() {
+        assert!(!is_link_local("8.8.8.8"));
+        assert!(!is_link_local("10.0.0.1"));
+        assert!(!is_link_local("192.168.1.1"));
+        assert!(!is_link_local("::1"));
+        assert!(!is_link_local("2001:db8::1"));
+    }
+
+    #[test]
+    fn is_link_local_rejects_hostnames() {
+        // We don't DNS-resolve; hostname strings always return false.
+        assert!(!is_link_local("api.github.com"));
+        assert!(!is_link_local("metadata.google.internal"));
+        assert!(!is_link_local(""));
+    }
 }

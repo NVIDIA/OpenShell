@@ -135,17 +135,26 @@ pub struct CredentialSet {
 }
 
 impl CredentialSet {
-    /// Credentials that target a given host.
+    /// Credentials that target a given host. Comparison is case-insensitive
+    /// so a policy author writing `API.github.com` matches credentials
+    /// registered for `api.github.com`.
     pub fn credentials_for_host(&self, host: &str) -> Vec<&Credential> {
+        let needle = host.to_ascii_lowercase();
         self.credentials
             .iter()
-            .filter(|c| c.target_hosts.iter().any(|h| h == host))
+            .filter(|c| {
+                c.target_hosts
+                    .iter()
+                    .any(|h| h.eq_ignore_ascii_case(&needle))
+            })
             .collect()
     }
 
-    /// API capability registry for a given host.
+    /// API capability registry for a given host. Case-insensitive match.
     pub fn api_for_host(&self, host: &str) -> Option<&ApiCapability> {
-        self.api_registries.values().find(|api| api.host == host)
+        self.api_registries
+            .values()
+            .find(|api| api.host.eq_ignore_ascii_case(host))
     }
 }
 

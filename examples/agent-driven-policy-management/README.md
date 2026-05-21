@@ -82,6 +82,8 @@ reject with `--reason "scope to docs/ paths only"` and the agent reads
 | `DEMO_KEEP_SANDBOX` | `0` (set `1` to inspect the sandbox after the demo) |
 | `DEMO_MANUAL_APPROVE` | `0` (set `1` to pause for host-side `rule approve` / `rule reject --reason`) |
 | `DEMO_APPROVAL_TIMEOUT_SECS` | `240` (auto), `1800` (manual mode) |
+| `DEMO_CODEX_MODEL` | `gpt-5` (pinned for ChatGPT-account compatibility; override if your account supports a different model) |
+| `DEMO_CODEX_REASONING` | `low` (the demo task is mechanical; `medium`/`high` slow it down without changing outcomes) |
 | `OPENSHELL_BIN` | `target/debug/openshell` if present, else `openshell` on `PATH` |
 
 ## What the agent sees
@@ -103,16 +105,29 @@ with three parts, each with a different trust level:
 | `validation_result` (prover output) | gateway-side prover | trust signal — but this surface is in progress (see [RFC 0001](../../rfc/0001-agent-driven-policy-management.md)) |
 
 The MVP today shows the structured rule plus the agent's rationale in
-`openshell rule get` and the TUI inbox panel. With prover validation wired into
-the gateway, `openshell rule get` also shows `Validation:` for agent-authored
-chunks, for example `prover passed supported checks; narrow L7 method/path
-scope`, a prover finding plus `needs human: L4/no method-path scope`, or
-`validation unavailable` when the proposed effective policy uses features the
-prover does not model yet. The demo's `openshell rule approve-all`
-auto-approves to keep the loop short — in a real session a developer reviews
-the structured grant and the validation result before pressing `a`. For now,
-**always approve based on the structured rule and control-plane validation, not
-the agent's rationale.**
+`openshell rule get` and the TUI inbox panel. With prover validation wired
+into the gateway, `openshell rule get` also shows a `Validation:` line for
+agent-authored chunks. The value is the prover's verdict in OCSF-shorthand
+style — one short, scannable string per chunk:
+
+```text
+Validation: prover: no new findings
+```
+
+```text
+Validation: prover: 1 new finding
+              [HIGH] data_exfiltration: L4-only: api.github.com:443
+```
+
+Other possible verdicts: `validation unavailable` (gateway-side prover infra
+issue — surfaces in the gateway log, not as proposal failure), `merge failed:
+…` (proposal won't merge into the current policy), and `policy invalid: …`
+(merged policy fails the structural safety check).
+
+Read the structured rule (Endpoints + Binary). Read the Validation line.
+Approve if both look right. The demo's `openshell rule approve-all`
+auto-approves to keep the loop short; in a real session a developer makes
+that judgment per chunk before pressing `a`.
 
 ## Going further
 
