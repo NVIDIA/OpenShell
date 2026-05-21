@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      publish-dev-release:
+        description: "Update :dev images, the dev GitHub release, Helm chart, and wheel publishing"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -77,6 +83,7 @@ jobs:
   tag-ghcr-dev:
     name: Tag GHCR Images as Dev
     needs: [build-gateway, build-supervisor]
+    if: github.event_name == 'push' || inputs['publish-dev-release']
     runs-on: linux-amd64-cpu8
     timeout-minutes: 10
     steps:
@@ -793,6 +800,7 @@ jobs:
           cat release/openshell.rb
 
       - name: Attest VM driver artifacts
+        if: github.event_name == 'push' || inputs['publish-dev-release']
         uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4
         with:
           subject-path: |
@@ -801,6 +809,7 @@ jobs:
             release/openshell-driver-vm-aarch64-apple-darwin.tar.gz
 
       - name: Prune managed assets from dev release
+        if: github.event_name == 'push' || inputs['publish-dev-release']
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         with:
           script: |
@@ -849,6 +858,7 @@ jobs:
             core.info(`Summary: deleted=${deleted}, skipped=${skipped}`);
 
       - name: Move dev tag
+        if: github.event_name == 'push' || inputs['publish-dev-release']
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -856,6 +866,7 @@ jobs:
           git push --force origin dev
 
       - name: Create / update GitHub Release
+        if: github.event_name == 'push' || inputs['publish-dev-release']
         uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
         with:
           name: OpenShell Development Build
@@ -894,9 +905,18 @@ jobs:
             release/openshell-gateway-checksums-sha256.txt
             release/openshell-sandbox-checksums-sha256.txt
 
+      - name: Upload dry-run dev release artifacts
+        if: github.event_name == 'workflow_dispatch' && !inputs['publish-dev-release']
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: dev-release-dry-run-artifacts
+          path: release/
+          retention-days: 5
+
   release-helm:
     name: Release Helm Chart (OCI, dev)
     needs: [tag-ghcr-dev]
+    if: github.event_name == 'push' || inputs['publish-dev-release']
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -914,6 +934,7 @@ jobs:
   trigger-wheel-publish:
     name: Trigger Wheel Publish
     needs: [compute-versions, release-dev]
+    if: github.event_name == 'push' || inputs['publish-dev-release']
     runs-on: [self-hosted, nv]
     timeout-minutes: 10
     steps:
