@@ -12,7 +12,7 @@
 //! Subcommands:
 //! - `get-sandbox-config --sandbox-id <id>` — call `GetSandboxConfig`
 //! - `refresh` — call `RefreshSandboxToken`
-//! - `show-token` — print the raw gateway JWT bytes
+//! - `show-token` — print a token fingerprint and expiry, never the bearer
 //! - `show-principal` — pretty-print the decoded JWT claims
 //!   (no signature verification — the supervisor already trusts the
 //!   token's origin)
@@ -22,6 +22,7 @@ use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::proto::{
     GetSandboxConfigRequest, RefreshSandboxTokenRequest, open_shell_client::OpenShellClient,
 };
+use sha2::{Digest, Sha256};
 
 use crate::grpc_client::{AuthedChannel, connect_channel_pub};
 
@@ -54,7 +55,7 @@ usage: openshell-sandbox debug-rpc <command> [options]
 commands:
   get-sandbox-config --sandbox-id <UUID>  call GetSandboxConfig
   refresh                                 renew the gateway JWT
-  show-token                              print raw gateway JWT
+  show-token                              print JWT fingerprint and expiry
   show-principal                          print decoded JWT claims
 
 requires: OPENSHELL_ENDPOINT in env, plus one of OPENSHELL_SANDBOX_TOKEN,
@@ -109,10 +110,7 @@ async fn run_refresh() -> Result<i32> {
     match resp {
         Ok(r) => {
             let inner = r.into_inner();
-            println!(
-                "token={}\nexpires_at_ms={}",
-                inner.token, inner.expires_at_ms
-            );
+            print_token_summary(&inner.token, Some(inner.expires_at_ms));
             Ok(0)
         }
         Err(status) => {
@@ -124,12 +122,21 @@ async fn run_refresh() -> Result<i32> {
 
 fn run_show_token() -> Result<i32> {
     let token = read_local_token()?;
-    println!("{token}");
+    print_token_summary(&token, None);
     Ok(0)
 }
 
 fn run_show_principal() -> Result<i32> {
     let token = read_local_token()?;
+    let claims = decode_token_claims(&token)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&claims).into_diagnostic()?
+    );
+    Ok(0)
+}
+
+fn decode_token_claims(token: &str) -> Result<serde_json::Value> {
     let payload_b64 = token
         .split('.')
         .nth(1)
@@ -138,14 +145,42 @@ fn run_show_principal() -> Result<i32> {
         .decode(payload_b64)
         .into_diagnostic()
         .wrap_err("failed to base64-decode token payload")?;
-    let claims: serde_json::Value = serde_json::from_slice(&payload)
+    serde_json::from_slice(&payload)
         .into_diagnostic()
-        .wrap_err("failed to parse token payload as JSON")?;
+        .wrap_err("failed to parse token payload as JSON")
+}
+
+fn print_token_summary(token: &str, expires_at_ms: Option<i64>) {
+    let claims = decode_token_claims(token).unwrap_or(serde_json::Value::Null);
+    let fingerprint = token_fingerprint(token);
+    let expires_at_ms = expires_at_ms
+        .or_else(|| {
+            claims
+                .get("exp")
+                .and_then(serde_json::Value::as_i64)
+                .map(|s| s.saturating_mul(1000))
+        })
+        .unwrap_or_default();
+    let sandbox_id = claims
+        .get("sandbox_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let subject = claims
+        .get("sub")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let issuer = claims
+        .get("iss")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
     println!(
-        "{}",
-        serde_json::to_string_pretty(&claims).into_diagnostic()?
+        "fingerprint={fingerprint}\nexpires_at_ms={expires_at_ms}\nsandbox_id={sandbox_id}\nsubject={subject}\nissuer={issuer}"
     );
-    Ok(0)
+}
+
+fn token_fingerprint(token: &str) -> String {
+    let digest = Sha256::digest(token.as_bytes());
+    format!("sha256:{}", &hex::encode(digest)[..16])
 }
 
 /// Read the token from the env/file/SA-bootstrap chain, but only the

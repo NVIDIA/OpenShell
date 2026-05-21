@@ -22,11 +22,13 @@ The CLI loads gateway metadata from disk to determine the endpoint URL and authe
 
 ## Authentication Modes
 
-The CLI uses one of four connection modes depending on the gateway's authentication configuration.
+The CLI uses one of these authentication modes depending on the gateway's configuration.
 
 ### mTLS
 
-The default mode for self-managed gateways. Every CLI request presents a client certificate to prove identity, and the gateway verifies that certificate against a configured client CA.
+The default mode for local Docker, Podman, and VM gateways without OIDC. The CLI presents a client certificate during the TLS handshake, and the gateway can map the verified certificate subject to a local user principal when mTLS user authentication is enabled.
+
+mTLS user authentication is for local single-user gateways. Kubernetes deployments must use OIDC or a trusted access proxy for user authentication; the Helm chart does not render `mtls_auth`.
 
 Set these environment variables before starting the gateway:
 
@@ -35,6 +37,7 @@ Set these environment variables before starting the gateway:
 | `OPENSHELL_TLS_CERT` | Path to the gateway server certificate. |
 | `OPENSHELL_TLS_KEY` | Path to the gateway server private key. |
 | `OPENSHELL_TLS_CLIENT_CA` | Path to the CA certificate that verifies CLI client certificates. |
+| `OPENSHELL_ENABLE_MTLS_AUTH` | Set to `true` to authenticate CLI callers from verified client certificates. Defaults on for local Docker, Podman, and VM gateways with no OIDC issuer. |
 
 For local access, the server certificate must be valid for the endpoint the CLI uses. Include `localhost` and `127.0.0.1` in the certificate SANs when users connect to a local gateway through loopback.
 
@@ -52,17 +55,18 @@ The CLI loads its mTLS bundle from `~/.config/openshell/gateways/<name>/mtls/`:
 
 The connection flow:
 
-1. The CLI loads the three certificate files.
+1. The CLI loads the certificate files.
 2. Opens a TCP connection to the gateway endpoint.
 3. Performs a TLS handshake, presenting the client certificate.
 4. The gateway verifies the client certificate against its CA.
-5. An HTTP/2 channel is established. All CLI commands use this channel.
+5. When mTLS user authentication is enabled, the gateway maps the verified certificate subject to a user principal.
+6. The gateway authorizes the gRPC method.
 
 ### OIDC
 
-Gateways can validate OpenID Connect access tokens on gRPC requests. Configure OIDC when you want users, operators, or automation to authenticate with an identity provider such as Keycloak, Entra ID, or Okta instead of relying only on client certificates.
+Gateways can validate OpenID Connect access tokens on gRPC requests. Configure OIDC when you want users, operators, or automation to authenticate with an identity provider such as Keycloak, Entra ID, or Okta.
 
-OIDC is application-layer authentication. TLS still controls the transport. If TLS client certificates remain required, the CLI must also have an mTLS bundle for the gateway. To accept OIDC bearer tokens without client certificates, keep TLS enabled and disable the mTLS client certificate requirement with `--disable-gateway-auth`, then configure OIDC on the same gateway.
+OIDC is application-layer authentication. TLS still controls the transport. If TLS client certificates remain required, the CLI must also have an mTLS bundle for the gateway.
 
 Configure the gateway with an issuer and audience:
 
@@ -123,7 +127,7 @@ The connection flow:
 
 If `OPENSHELL_OIDC_SCOPES_CLAIM` is set, the gateway also enforces scopes. It accepts space-delimited scope strings such as `scope: "openid sandbox:read"` and JSON arrays such as `scp: ["sandbox:read"]`. Standard OIDC scopes such as `openid`, `profile`, `email`, and `offline_access` are ignored for authorization. `openshell:all` grants access to all scoped methods.
 
-Supervisor-to-gateway RPCs do not use user OIDC tokens. The gRPC channel's mTLS handshake is the trust boundary: the gateway treats requests with a verified client cert and no `Authorization: Bearer` header as sandbox-class callers. Log upload, policy status, credential environment lookup, inference bundle lookup, and sandbox config sync run with sandbox-restricted scope, while CLI users present a Bearer token for full-scope access. Operators using `--disable-gateway-auth` (TLS terminated at a fronting proxy) must enforce caller authentication at the proxy, since the gateway does not see a verified client cert in that mode.
+Supervisor-to-gateway RPCs do not use user OIDC tokens or mTLS user identity. Each sandbox supervisor presents a gateway-minted `Authorization: Bearer` token scoped to its sandbox ID. Log upload, policy status, credential environment lookup, inference bundle lookup, and sandbox config sync run with sandbox-restricted scope, while CLI users authenticate with OIDC, edge auth, local mTLS user authentication, or an explicitly enabled unauthenticated local developer mode.
 
 Re-authenticate an OIDC gateway with:
 
@@ -164,6 +168,8 @@ Register a plaintext gateway with an explicit `http://` endpoint:
 ```shell
 openshell gateway add http://127.0.0.1:17670 --local
 ```
+
+For Kubernetes local development, the Helm Skaffold overlay enables `[openshell.gateway.auth] allow_unauthenticated_users = true` so a port-forwarded plaintext gateway works without OIDC or mTLS user credentials. Leave this disabled for shared and production clusters.
 
 This stores the gateway with `auth_mode = plaintext`, skips mTLS client certificate lookup, and does not open the browser login flow.
 

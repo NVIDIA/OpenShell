@@ -36,6 +36,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "${ROOT}/e2e/support/gateway-common.sh"
 
 e2e_preserve_mise_dirs
+e2e_align_docker_host_with_cli_context
 
 WORKDIR_PARENT="${TMPDIR:-/tmp}"
 WORKDIR_PARENT="${WORKDIR_PARENT%/}"

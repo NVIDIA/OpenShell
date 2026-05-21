@@ -25,7 +25,7 @@ pub struct GatewayMetadata {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub resolved_host: Option<String>,
 
-    /// Auth mode: `None` or `"mtls"` = mTLS (default), `"plaintext"` = direct HTTP,
+    /// Auth mode: `None` or `"mtls"` = mTLS, `"plaintext"` = direct HTTP,
     /// `"cloudflare_jwt"` = CF JWT.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_mode: Option<String>,

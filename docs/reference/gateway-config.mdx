@@ -92,7 +92,6 @@ client_tls_secret_name = "openshell-client-tls"
 cert_path             = "/etc/openshell/certs/gateway.pem"
 key_path              = "/etc/openshell/certs/gateway-key.pem"
 client_ca_path        = "/etc/openshell/certs/client-ca.pem"
-allow_unauthenticated = false
 
 [openshell.gateway.gateway_jwt]
 signing_key_path = "/etc/openshell/jwt/signing.pem"
@@ -100,6 +99,9 @@ public_key_path  = "/etc/openshell/jwt/public.pem"
 kid_path         = "/etc/openshell/jwt/kid"
 gateway_id       = "openshell"
 ttl_secs         = 3600
+
+[openshell.gateway.auth]
+allow_unauthenticated_users = false
 
 [openshell.gateway.oidc]
 issuer        = "https://idp.example.com/realms/openshell"
@@ -109,6 +111,10 @@ roles_claim   = "realm_access.roles"
 admin_role    = "openshell-admin"
 user_role     = "openshell-user"
 ```
+
+Local Docker, Podman, and VM gateways can also set `[openshell.gateway.mtls_auth] enabled = true` to authenticate CLI callers from verified client certificates. Kubernetes deployments must leave this unset and use OIDC or a trusted access proxy; the Helm chart does not render this table.
+
+`[openshell.gateway.auth] allow_unauthenticated_users = true` is an unsafe local-development and trusted-proxy escape hatch. It accepts user-facing CLI/API calls without OIDC or mTLS credentials while sandbox supervisors still authenticate with gateway-minted sandbox JWTs. Leave it false for shared and production gateways.
 
 `image_pull_policy` is intentionally not a shared gateway key. Kubernetes uses `Always | IfNotPresent | Never` while Podman uses `always | missing | never | newer`. Set it inside the relevant driver table.
 

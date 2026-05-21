@@ -17,13 +17,7 @@
 //! - [`super::k8s_sa::K8sServiceAccountAuthenticator`] — K8s projected SA
 //!   tokens (path-scoped to `IssueSandboxToken`)
 //! - [`super::oidc::OidcAuthenticator`] — user OIDC Bearer tokens
-//! - [`PermissiveUserAuthenticator`] — final-fallback dev-mode catch-all
-//!   that produces a synthetic user principal when no OIDC is
-//!   configured. Preserves the "no OIDC = open" dev posture for
-//!   singleplayer / helm-dev deployments.
-
-use super::identity::{Identity, IdentityProvider};
-use super::principal::{Principal, UserPrincipal};
+use super::principal::Principal;
 use async_trait::async_trait;
 use std::sync::Arc;
 use tonic::Status;
@@ -93,48 +87,6 @@ impl std::fmt::Debug for AuthenticatorChain {
         f.debug_struct("AuthenticatorChain")
             .field("len", &self.authenticators.len())
             .finish()
-    }
-}
-
-/// Final-fallback authenticator that produces a synthetic user principal
-/// for any request the earlier authenticators didn't claim. Used only
-/// when no user-side authentication is configured (no OIDC, no fronting
-/// proxy contract). This preserves the dev-mode open posture in a
-/// principal-aware way so handlers always see *some* principal in
-/// extensions.
-///
-/// Producing a User principal (rather than Anonymous) means dev-mode
-/// requests pass the per-handler IDOR guard via the User-bypass
-/// branch — equivalent to "RBAC was the user's gate" with the dev
-/// default of "every caller is a user."
-pub struct PermissiveUserAuthenticator {
-    subject: String,
-}
-
-impl PermissiveUserAuthenticator {
-    pub fn new(subject: impl Into<String>) -> Self {
-        Self {
-            subject: subject.into(),
-        }
-    }
-}
-
-#[async_trait]
-impl Authenticator for PermissiveUserAuthenticator {
-    async fn authenticate(
-        &self,
-        _headers: &http::HeaderMap,
-        _path: &str,
-    ) -> Result<Option<Principal>, Status> {
-        Ok(Some(Principal::User(UserPrincipal {
-            identity: Identity {
-                subject: self.subject.clone(),
-                display_name: None,
-                roles: vec![],
-                scopes: vec![],
-                provider: IdentityProvider::Internal,
-            },
-        })))
     }
 }
 

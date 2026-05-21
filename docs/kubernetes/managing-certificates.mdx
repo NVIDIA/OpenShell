@@ -8,7 +8,7 @@ keywords: "Generative AI, Cybersecurity, Kubernetes, cert-manager, PKI, TLS, mTL
 position: 2
 ---
 
-The OpenShell gateway requires mTLS certificates for sandbox supervisors and clients. The Helm chart supports two ways to provision and manage them:
+The OpenShell gateway uses mTLS certificates for transport between the gateway and sandbox supervisors. These certificates are not Kubernetes user authentication; configure OIDC or a trusted access proxy for user access. The Helm chart supports two ways to provision and manage the certificate bundle:
 
 | Mode | When to use |
 |---|---|

@@ -122,9 +122,9 @@ fn resolve_gateway_name(gateway_flag: &Option<String>) -> Option<String> {
 
 /// Apply authentication token from local storage based on gateway auth mode.
 ///
-/// Handles both Cloudflare Access (`edge_token`) and OIDC (`oidc_token`)
-/// auth modes by loading the stored token and setting it on `TlsOptions`.
-/// For OIDC, automatically refreshes the token if it's near expiry.
+/// Handles Cloudflare Access and OIDC auth modes by loading the stored token
+/// and setting it on `TlsOptions`. For OIDC, automatically refreshes the token
+/// if it's near expiry.
 fn apply_auth(tls: &mut TlsOptions, gateway_name: &str) {
     let Some(meta) = get_gateway_metadata(gateway_name) else {
         return;

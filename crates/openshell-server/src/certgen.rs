@@ -15,8 +15,8 @@
 //!   picks them up automatically.
 //!
 //! Both modes share the same idempotency contract: all targets present →
-//! skip; partial state → error with a recovery hint; nothing present →
-//! generate and write.
+//! skip; legacy TLS-only state → add the JWT signing material; partial
+//! state → error with a recovery hint; nothing present → generate and write.
 
 use clap::Args;
 use k8s_openapi::ByteString;
@@ -95,14 +95,16 @@ pub async fn run(args: CertgenArgs) -> Result<()> {
 #[derive(Debug, PartialEq, Eq)]
 enum K8sAction {
     SkipExists,
+    CreateJwtOnly,
     PartialState,
-    Create,
+    CreateAll,
 }
 
 fn decide_k8s(server_exists: bool, client_exists: bool, jwt_exists: bool) -> K8sAction {
     match (server_exists, client_exists, jwt_exists) {
         (true, true, true) => K8sAction::SkipExists,
-        (false, false, false) => K8sAction::Create,
+        (true, true, false) => K8sAction::CreateJwtOnly,
+        (false, false, false) => K8sAction::CreateAll,
         _ => K8sAction::PartialState,
     }
 }
@@ -168,7 +170,25 @@ async fn run_kubernetes(args: &CertgenArgs, bundle: &PkiBundle) -> Result<()> {
                  kubectl delete secret -n {namespace} {server_name} {client_name} {jwt_name}",
             ));
         }
-        K8sAction::Create => {}
+        K8sAction::CreateJwtOnly => {
+            let jwt_secret = jwt_signing_secret(
+                jwt_name,
+                &bundle.jwt_signing_key_pem,
+                &bundle.jwt_public_key_pem,
+                &bundle.jwt_key_id,
+            );
+            api.create(&PostParams::default(), &jwt_secret)
+                .await
+                .into_diagnostic()
+                .wrap_err_with(|| format!("failed to create secret {jwt_name}"))?;
+            info!(
+                namespace = %namespace,
+                jwt = %jwt_name,
+                "JWT signing secret created for existing TLS install."
+            );
+            return Ok(());
+        }
+        K8sAction::CreateAll => {}
     }
 
     let server_secret = tls_secret(
@@ -265,8 +285,9 @@ fn jwt_signing_secret(name: &str, signing_pem: &str, public_pem: &str, kid: &str
 #[derive(Debug, PartialEq, Eq)]
 enum LocalAction {
     Skip,
+    CreateJwtOnly,
     PartialState,
-    Create,
+    CreateAll,
 }
 
 /// Layout under `<dir>`:
@@ -315,6 +336,22 @@ impl LocalPaths {
         }
     }
 
+    fn tls_files(&self) -> [&Path; 6] {
+        [
+            &self.ca_crt,
+            &self.ca_key,
+            &self.server_crt,
+            &self.server_key,
+            &self.client_crt,
+            &self.client_key,
+        ]
+    }
+
+    fn jwt_files(&self) -> [&Path; 3] {
+        [&self.jwt_signing, &self.jwt_public, &self.jwt_kid]
+    }
+
+    #[cfg(test)]
     fn all_files(&self) -> [&Path; 9] {
         [
             &self.ca_crt,
@@ -329,15 +366,20 @@ impl LocalPaths {
         ]
     }
 
-    fn existence_count(&self) -> usize {
-        self.all_files().iter().filter(|p| p.exists()).count()
+    fn tls_existence_count(&self) -> usize {
+        self.tls_files().iter().filter(|p| p.exists()).count()
+    }
+
+    fn jwt_existence_count(&self) -> usize {
+        self.jwt_files().iter().filter(|p| p.exists()).count()
     }
 }
 
-fn decide_local(present: usize) -> LocalAction {
-    match present {
-        9 => LocalAction::Skip,
-        0 => LocalAction::Create,
+fn decide_local(tls_present: usize, jwt_present: usize) -> LocalAction {
+    match (tls_present, jwt_present) {
+        (6, 3) => LocalAction::Skip,
+        (6, 0) => LocalAction::CreateJwtOnly,
+        (0, 0) => LocalAction::CreateAll,
         _ => LocalAction::PartialState,
     }
 }
@@ -345,9 +387,15 @@ fn decide_local(present: usize) -> LocalAction {
 fn run_local(dir: &Path, server_sans: &[String]) -> Result<()> {
     let paths = LocalPaths::resolve(dir);
 
-    let bundle = match decide_local(paths.existence_count()) {
+    let bundle = match decide_local(paths.tls_existence_count(), paths.jwt_existence_count()) {
         LocalAction::Skip => {
             info!(dir = %dir.display(), "PKI files already exist, skipping.");
+            read_local_bundle(&paths)?
+        }
+        LocalAction::CreateJwtOnly => {
+            let bundle = generate_pki(server_sans)?;
+            write_local_jwt_bundle(&bundle, &paths)?;
+            info!(dir = %dir.display(), "JWT signing files created for existing TLS install.");
             read_local_bundle(&paths)?
         }
         LocalAction::PartialState => {
@@ -357,7 +405,7 @@ fn run_local(dir: &Path, server_sans: &[String]) -> Result<()> {
                 dir = dir.display(),
             ));
         }
-        LocalAction::Create => {
+        LocalAction::CreateAll => {
             let bundle = generate_pki(server_sans)?;
             write_local_bundle(dir, &bundle, &paths)?;
             info!(dir = %dir.display(), "PKI files created.");
@@ -458,6 +506,35 @@ fn write_local_bundle(dir: &Path, bundle: &PkiBundle, paths: &LocalPaths) -> Res
     Ok(())
 }
 
+fn write_local_jwt_bundle(bundle: &PkiBundle, paths: &LocalPaths) -> Result<()> {
+    let temp = sibling_temp_dir(&paths.jwt_dir);
+    if temp.exists() {
+        std::fs::remove_dir_all(&temp)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to remove stale {}", temp.display()))?;
+    }
+
+    create_dir_restricted(&temp)?;
+    write_pem(&temp.join("signing.pem"), &bundle.jwt_signing_key_pem, true)?;
+    write_pem(&temp.join("public.pem"), &bundle.jwt_public_key_pem, false)?;
+    write_pem(&temp.join("kid"), &bundle.jwt_key_id, false)?;
+
+    create_dir_restricted(&paths.jwt_dir)?;
+    let renames: [(PathBuf, &Path); 3] = [
+        (temp.join("signing.pem"), paths.jwt_signing.as_path()),
+        (temp.join("public.pem"), paths.jwt_public.as_path()),
+        (temp.join("kid"), paths.jwt_kid.as_path()),
+    ];
+    for (from, to) in &renames {
+        std::fs::rename(from, to)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to move {} -> {}", from.display(), to.display()))?;
+    }
+
+    let _ = std::fs::remove_dir_all(&temp);
+    Ok(())
+}
+
 fn write_pem(path: &Path, contents: &str, owner_only: bool) -> Result<()> {
     std::fs::write(path, contents)
         .into_diagnostic()
@@ -493,6 +570,7 @@ mod tests {
     use super::{
         K8sAction, LocalAction, LocalPaths, decide_k8s, decide_local, jwt_signing_secret,
         read_local_bundle, sibling_temp_dir, tls_secret, write_local_bundle,
+        write_local_jwt_bundle,
     };
     use openshell_bootstrap::pki::generate_pki;
     use std::path::Path;
@@ -506,7 +584,12 @@ mod tests {
 
     #[test]
     fn decide_k8s_create_when_none_exist() {
-        assert_eq!(decide_k8s(false, false, false), K8sAction::Create);
+        assert_eq!(decide_k8s(false, false, false), K8sAction::CreateAll);
+    }
+
+    #[test]
+    fn decide_k8s_creates_jwt_only_for_existing_tls() {
+        assert_eq!(decide_k8s(true, true, false), K8sAction::CreateJwtOnly);
     }
 
     #[test]
@@ -515,7 +598,6 @@ mod tests {
             (true, false, false),
             (false, true, false),
             (false, false, true),
-            (true, true, false),
             (true, false, true),
             (false, true, true),
         ];
@@ -556,18 +638,32 @@ mod tests {
 
     #[test]
     fn decide_local_skip_when_all_nine_present() {
-        assert_eq!(decide_local(9), LocalAction::Skip);
+        assert_eq!(decide_local(6, 3), LocalAction::Skip);
     }
 
     #[test]
     fn decide_local_create_when_none_present() {
-        assert_eq!(decide_local(0), LocalAction::Create);
+        assert_eq!(decide_local(0, 0), LocalAction::CreateAll);
     }
 
     #[test]
-    fn decide_local_partial_for_any_count_in_between() {
-        for n in 1..=8 {
-            assert_eq!(decide_local(n), LocalAction::PartialState, "n = {n}");
+    fn decide_local_creates_jwt_only_for_existing_tls() {
+        assert_eq!(decide_local(6, 0), LocalAction::CreateJwtOnly);
+    }
+
+    #[test]
+    fn decide_local_partial_for_incomplete_tls_or_jwt_sets() {
+        for tls in 0..=6 {
+            for jwt in 0..=3 {
+                if matches!((tls, jwt), (6, 3 | 0) | (0, 0)) {
+                    continue;
+                }
+                assert_eq!(
+                    decide_local(tls, jwt),
+                    LocalAction::PartialState,
+                    "tls={tls} jwt={jwt}"
+                );
+            }
         }
     }
 
@@ -614,6 +710,27 @@ mod tests {
         assert!(ca.contains("BEGIN CERTIFICATE"));
         let server_key = std::fs::read_to_string(&paths.server_key).unwrap();
         assert!(server_key.contains("BEGIN PRIVATE KEY"));
+    }
+
+    #[test]
+    fn write_local_jwt_bundle_preserves_existing_tls_files() {
+        let parent = tempfile::tempdir().expect("tempdir");
+        let dir = parent.path().join("tls");
+        let old_bundle = generate_pki(&[]).expect("generate_pki");
+        let new_bundle = generate_pki(&[]).expect("generate_pki");
+        let paths = LocalPaths::resolve(&dir);
+
+        write_local_bundle(&dir, &old_bundle, &paths).expect("write_local_bundle");
+        std::fs::remove_dir_all(&paths.jwt_dir).expect("remove jwt dir");
+
+        write_local_jwt_bundle(&new_bundle, &paths).expect("write_local_jwt_bundle");
+
+        let read = read_local_bundle(&paths).expect("read_local_bundle");
+        assert_eq!(read.ca_cert_pem, old_bundle.ca_cert_pem);
+        assert_eq!(read.server_cert_pem, old_bundle.server_cert_pem);
+        assert_eq!(read.client_cert_pem, old_bundle.client_cert_pem);
+        assert_eq!(read.jwt_key_id, new_bundle.jwt_key_id);
+        assert_eq!(read.jwt_public_key_pem, new_bundle.jwt_public_key_pem);
     }
 
     #[test]

@@ -23,8 +23,12 @@ identity.
 ## Protocol and Auth
 
 The gateway listens on one service port and multiplexes gRPC and HTTP traffic.
-The default deployment mode is mTLS: clients and sandbox workloads present a
-certificate signed by the deployment CA before reaching application handlers.
+The default local single-user deployment mode is mTLS user authentication:
+clients present a certificate signed by the local deployment CA, and the
+gateway maps the verified certificate subject to a user principal. Kubernetes
+deployments use mTLS for transport only and require OIDC or a trusted access
+proxy for user authentication unless the explicit unsafe local-development
+`allow_unauthenticated_users` switch is enabled.
 When that service port is bound to loopback, the listener can also accept
 plaintext HTTP on the same port for sandbox service subdomains only. That local
 browser path is enabled by default and disabled with
@@ -37,14 +41,15 @@ Supported auth modes:
 
 | Mode | Use |
 |---|---|
-| mTLS | Default direct gateway access for CLI, SDK, TUI, and sandbox callbacks. |
+| mTLS user auth | Local single-user Docker, Podman, and VM gateway access. |
 | Plaintext | Local development or a trusted reverse proxy boundary. |
+| Unauthenticated local users | Trusted Kubernetes dev or fully trusted proxy deployments only. |
 | Cloudflare JWT | Edge-authenticated deployments where Cloudflare Access supplies identity. |
 | OIDC | Bearer-token auth for users, with browser PKCE or client credentials login. |
 
-Sandbox supervisor RPCs authenticate with either mTLS material or a sandbox
-secret depending on the runtime and deployment mode. User-facing mutations are
-authorized by role policy when OIDC or edge identity is enabled.
+Sandbox supervisor RPCs authenticate with gateway-minted sandbox JWTs when that
+authenticator is configured; mTLS does not grant sandbox identity. User-facing
+mutations are authorized by role policy when OIDC or edge identity is enabled.
 
 Sandbox secrets are gateway-signed JWTs bound to a single sandbox ID. Docker,
 Podman, and VM drivers deliver the initial token through supervisor-only

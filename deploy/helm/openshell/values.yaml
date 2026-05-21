@@ -175,6 +175,11 @@ server:
   # -- Enable plaintext HTTP routing for loopback sandbox service URLs on
   # TLS-enabled gateways.
   enableLoopbackServiceHttp: true
+  auth:
+    # -- UNSAFE: accept unauthenticated CLI/user requests as a local developer
+    # principal. Intended only for trusted local Skaffold/k3d development or a
+    # fully trusted fronting proxy. Leave false for shared or production clusters.
+    allowUnauthenticatedUsers: false
   tls:
     # -- K8s secret (type kubernetes.io/tls) with tls.crt and tls.key for the server.
     certSecretName: openshell-server-tls

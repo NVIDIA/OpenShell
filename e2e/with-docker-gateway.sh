@@ -57,6 +57,9 @@ else
   fi
   WORKDIR_PARENT="${TMPDIR:-/tmp}"
 fi
+
+e2e_align_docker_host_with_cli_context
+
 WORKDIR_PARENT="${WORKDIR_PARENT%/}"
 WORKDIR="$(mktemp -d "${WORKDIR_PARENT}/openshell-e2e-gateway.XXXXXX")"
 GATEWAY_BIN=""
@@ -433,6 +436,7 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
   printf '[openshell]\nversion = 1\n\n'
   printf '[openshell.gateway]\nlog_level = "info"\n\n'
   e2e_write_gateway_jwt_config "${JWT_DIR}" "openshell-e2e-docker-${HOST_PORT}"
+  e2e_write_gateway_mtls_auth_config
   printf '[openshell.drivers.docker]\n'
   printf 'sandbox_namespace = %s\n'    "$(toml_string "${E2E_NAMESPACE}")"
   printf 'network_name = %s\n'         "$(toml_string "${DOCKER_NETWORK_NAME}")"

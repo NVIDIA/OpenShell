@@ -40,6 +40,29 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?service_account_name\s*=\s*"openshell-sandbox"'
 
+  - it: does not render local mTLS user auth for Kubernetes deployments
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.gateway\.mtls_auth\]'
+
+  - it: does not allow unauthenticated users by default
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.gateway\.auth\]'
+
+  - it: renders explicit unauthenticated user dev mode when enabled
+    template: templates/gateway-config.yaml
+    set:
+      server.auth.allowUnauthenticatedUsers: true
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.auth\].*?allow_unauthenticated_users\s*=\s*true'
+
   - it: uses the configured existing sandbox service account name
     template: templates/gateway-config.yaml
     set:

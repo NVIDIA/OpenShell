@@ -67,6 +67,21 @@ e2e_preserve_mise_dirs() {
   fi
 }
 
+e2e_align_docker_host_with_cli_context() {
+  if [ -n "${DOCKER_HOST:-}" ] || ! command -v docker >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local endpoint
+  endpoint="$(docker context inspect --format '{{ .Endpoints.docker.Host }}' 2>/dev/null || true)"
+  if [ -z "${endpoint}" ] || [ "${endpoint}" = "<no value>" ]; then
+    return 0
+  fi
+
+  export DOCKER_HOST="${endpoint}"
+  echo "Using Docker endpoint from active context: ${DOCKER_HOST}"
+}
+
 e2e_register_plaintext_gateway() {
   local config_home=$1
   local name=$2
@@ -139,6 +154,11 @@ e2e_write_gateway_jwt_config() {
   printf 'kid_path = %s\n'         "$(e2e_toml_string "${jwt_dir}/kid")"
   printf 'gateway_id = %s\n'       "$(e2e_toml_string "${gateway_id}")"
   printf 'ttl_secs = 3600\n\n'
+}
+
+e2e_write_gateway_mtls_auth_config() {
+  printf '[openshell.gateway.mtls_auth]\n'
+  printf 'enabled = true\n\n'
 }
 
 e2e_build_gateway_binaries() {

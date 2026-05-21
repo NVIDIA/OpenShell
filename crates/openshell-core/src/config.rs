@@ -205,6 +205,17 @@ pub struct Config {
     #[serde(default)]
     pub oidc: Option<OidcConfig>,
 
+    /// Gateway user authentication behavior.
+    #[serde(default)]
+    pub auth: GatewayAuthConfig,
+
+    /// mTLS user authentication configuration. When enabled, a verified TLS
+    /// client certificate can authenticate CLI/SDK callers as a
+    /// `Principal::User`. This is for local single-user gateways only;
+    /// sandbox identity is always carried by gateway-minted sandbox JWTs.
+    #[serde(default)]
+    pub mtls_auth: MtlsAuthConfig,
+
     /// Gateway-minted sandbox JWT configuration. When `Some`, the gateway
     /// loads the signing key from disk and accepts gateway-issued sandbox
     /// JWTs as `Principal::Sandbox`. Required for the per-sandbox identity
@@ -320,6 +331,27 @@ pub struct OidcConfig {
     pub scopes_claim: String,
 }
 
+/// mTLS user authentication for local, single-user gateways.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MtlsAuthConfig {
+    /// When true, the gateway maps a verified TLS client certificate into a
+    /// user principal. Keep disabled for Kubernetes deployments because
+    /// Kubernetes sandbox pods and external users must not share user auth.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+/// Gateway user authentication settings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GatewayAuthConfig {
+    /// When true, unauthenticated user/CLI calls are accepted as a local
+    /// developer principal. This is an unsafe local-development escape hatch
+    /// for trusted, non-shared gateways. Sandbox supervisor calls still use
+    /// gateway-minted sandbox JWTs.
+    #[serde(default)]
+    pub allow_unauthenticated_users: bool,
+}
+
 const fn default_jwks_ttl_secs() -> u64 {
     3600
 }
@@ -378,6 +410,8 @@ impl Config {
             log_level: default_log_level(),
             tls,
             oidc: None,
+            auth: GatewayAuthConfig::default(),
+            mtls_auth: MtlsAuthConfig::default(),
             gateway_jwt: None,
             database_url: String::new(),
             compute_drivers: vec![],
@@ -604,6 +638,12 @@ mod tests {
     fn config_new_disables_health_bind_by_default() {
         let cfg = Config::new(None);
         assert!(cfg.health_bind_address.is_none());
+    }
+
+    #[test]
+    fn config_disables_unauthenticated_users_by_default() {
+        let cfg = Config::new(None);
+        assert!(!cfg.auth.allow_unauthenticated_users);
     }
 
     #[test]

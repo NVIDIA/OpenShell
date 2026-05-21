@@ -26,7 +26,10 @@ pub mod sandbox_env;
 pub mod settings;
 pub mod time;
 
-pub use config::{ComputeDriverKind, Config, GatewayJwtConfig, OidcConfig, TlsConfig};
+pub use config::{
+    ComputeDriverKind, Config, GatewayAuthConfig, GatewayJwtConfig, MtlsAuthConfig, OidcConfig,
+    TlsConfig,
+};
 pub use error::{ComputeDriverError, Error, Result};
 pub use metadata::{GetResourceVersion, ObjectId, ObjectLabels, ObjectName, SetResourceVersion};
 

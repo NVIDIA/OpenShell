@@ -25,7 +25,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use openshell_core::config::ComputeDriverKind;
-use openshell_core::{GatewayJwtConfig, OidcConfig, TlsConfig};
+use openshell_core::{GatewayAuthConfig, GatewayJwtConfig, MtlsAuthConfig, OidcConfig, TlsConfig};
 use serde::{Deserialize, Serialize};
 
 /// Latest schema version this build understands.
@@ -140,6 +140,10 @@ pub struct GatewayFileSection {
     pub tls: Option<TlsConfig>,
     #[serde(default)]
     pub oidc: Option<OidcConfig>,
+    #[serde(default)]
+    pub auth: Option<GatewayAuthConfig>,
+    #[serde(default)]
+    pub mtls_auth: Option<MtlsAuthConfig>,
     #[serde(default)]
     pub gateway_jwt: Option<GatewayJwtConfig>,
 
@@ -373,6 +377,18 @@ grpc_endpoint = "https://openshell-gateway.agents.svc:8080"
         assert!(gw.tls.is_some());
         assert!(gw.oidc.is_some());
         assert!(file.openshell.drivers.contains_key("kubernetes"));
+    }
+
+    #[test]
+    fn parses_gateway_auth_config() {
+        let toml = r"
+[openshell.gateway.auth]
+allow_unauthenticated_users = true
+";
+        let tmp = write_tmp(toml);
+        let file = load(tmp.path()).expect("valid auth config parses");
+        let auth = file.openshell.gateway.auth.expect("auth config");
+        assert!(auth.allow_unauthenticated_users);
     }
 
     #[test]

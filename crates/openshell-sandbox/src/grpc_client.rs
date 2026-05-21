@@ -46,9 +46,25 @@ pub type AuthedChannel = InterceptedService<Channel, AuthInterceptor>;
 /// rebuilding the channel.
 type TokenSlot = Arc<RwLock<AsciiMetadataValue>>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenSource {
+    Env,
+    File,
+    K8sServiceAccount,
+}
+
+#[derive(Debug)]
+struct AcquiredToken {
+    token: String,
+    source: TokenSource,
+}
+
 /// Process-wide token slot. Initialized by the first [`connect_channel`]
 /// call and shared with every subsequent client and the renewal loop.
 static TOKEN_SLOT: OnceLock<TokenSlot> = OnceLock::new();
+
+/// Source used to acquire the process-wide token slot.
+static TOKEN_SOURCE: OnceLock<TokenSource> = OnceLock::new();
 
 /// One-shot guard so the renewal loop spawns at most once per process.
 static REFRESH_SPAWNED: OnceLock<()> = OnceLock::new();
@@ -167,17 +183,22 @@ async fn build_plain_channel(endpoint: &str) -> Result<Channel> {
 /// spawned once per process via [`REFRESH_SPAWNED`].
 async fn connect_channel(endpoint: &str) -> Result<AuthedChannel> {
     let channel = build_plain_channel(endpoint).await?;
-    let slot = if let Some(existing) = TOKEN_SLOT.get() {
-        existing.clone()
+    let (slot, source) = if let Some(existing) = TOKEN_SLOT.get() {
+        let source = TOKEN_SOURCE.get().copied().unwrap_or(TokenSource::Env);
+        (existing.clone(), source)
     } else {
-        let token = acquire_sandbox_token(endpoint, &channel).await?;
-        install_token_slot(&token)?
+        let acquired = acquire_sandbox_token(endpoint, &channel).await?;
+        let slot = install_token_slot(&acquired.token)?;
+        let _ = TOKEN_SOURCE.set(acquired.source);
+        (slot, acquired.source)
     };
+    let plain_channel = channel.clone();
     let intercepted = InterceptedService::new(channel, AuthInterceptor::new(slot.clone()));
     if REFRESH_SPAWNED.set(()).is_ok() {
         let refresh_channel = intercepted.clone();
+        let endpoint = endpoint.to_string();
         tokio::spawn(async move {
-            refresh_token_loop(refresh_channel, slot).await;
+            refresh_token_loop(refresh_channel, slot, source, endpoint, plain_channel).await;
         });
     }
     Ok(intercepted)
@@ -189,12 +210,15 @@ async fn connect_channel(endpoint: &str) -> Result<AuthedChannel> {
 /// actual network call lives inside this function only on the K8s
 /// bootstrap path, which uses `plain_channel` to call `IssueSandboxToken`
 /// once before the steady-state Bearer-authenticated channel is built.
-async fn acquire_sandbox_token(endpoint: &str, plain_channel: &Channel) -> Result<String> {
+async fn acquire_sandbox_token(endpoint: &str, plain_channel: &Channel) -> Result<AcquiredToken> {
     if let Ok(t) = std::env::var(sandbox_env::SANDBOX_TOKEN)
         && !t.is_empty()
     {
         debug!(source = "env", "loaded sandbox token");
-        return Ok(t);
+        return Ok(AcquiredToken {
+            token: t,
+            source: TokenSource::Env,
+        });
     }
 
     if let Ok(path) = std::env::var(sandbox_env::SANDBOX_TOKEN_FILE)
@@ -204,35 +228,19 @@ async fn acquire_sandbox_token(endpoint: &str, plain_channel: &Channel) -> Resul
             .into_diagnostic()
             .wrap_err_with(|| format!("failed to read sandbox token from {path}"))?;
         debug!(source = "file", path = %path, "loaded sandbox token");
-        return Ok(contents.trim().to_string());
+        return Ok(AcquiredToken {
+            token: contents.trim().to_string(),
+            source: TokenSource::File,
+        });
     }
 
     if let Ok(sa_path) = std::env::var(sandbox_env::K8S_SA_TOKEN_FILE)
         && !sa_path.is_empty()
     {
-        let sa_token = std::fs::read_to_string(&sa_path)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to read K8s SA token from {sa_path}"))?
-            .trim()
-            .to_string();
-        info!(endpoint = %endpoint, "exchanging K8s ServiceAccount token for sandbox JWT");
-        // The bootstrap exchange uses a one-off interceptor pinned to the
-        // SA token; the resulting gateway JWT becomes the value in the
-        // shared `TOKEN_SLOT` once `connect_channel` returns.
-        let bootstrap_slot: TokenSlot = Arc::new(RwLock::new(
-            AsciiMetadataValue::try_from(format!("Bearer {sa_token}"))
-                .into_diagnostic()
-                .wrap_err("SA token contained characters not valid for a header value")?,
-        ));
-        let interceptor = AuthInterceptor::new(bootstrap_slot);
-        let bootstrap = InterceptedService::new(plain_channel.clone(), interceptor);
-        let mut client = OpenShellClient::new(bootstrap);
-        let resp = client
-            .issue_sandbox_token(IssueSandboxTokenRequest {})
-            .await
-            .into_diagnostic()
-            .wrap_err("IssueSandboxToken bootstrap exchange failed")?;
-        return Ok(resp.into_inner().token);
+        return Ok(AcquiredToken {
+            token: acquire_k8s_sandbox_token(endpoint, plain_channel, &sa_path).await?,
+            source: TokenSource::K8sServiceAccount,
+        });
     }
 
     Err(miette::miette!(
@@ -241,6 +249,36 @@ async fn acquire_sandbox_token(endpoint: &str, plain_channel: &Channel) -> Resul
         sandbox_env::SANDBOX_TOKEN_FILE,
         sandbox_env::K8S_SA_TOKEN_FILE,
     ))
+}
+
+async fn acquire_k8s_sandbox_token(
+    endpoint: &str,
+    plain_channel: &Channel,
+    sa_path: &str,
+) -> Result<String> {
+    let sa_token = std::fs::read_to_string(sa_path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read K8s SA token from {sa_path}"))?
+        .trim()
+        .to_string();
+    info!(endpoint = %endpoint, "exchanging K8s ServiceAccount token for sandbox JWT");
+    // The bootstrap exchange uses a one-off interceptor pinned to the
+    // SA token; the resulting gateway JWT becomes the value in the
+    // shared `TOKEN_SLOT` once `connect_channel` returns.
+    let bootstrap_slot: TokenSlot = Arc::new(RwLock::new(
+        AsciiMetadataValue::try_from(format!("Bearer {sa_token}"))
+            .into_diagnostic()
+            .wrap_err("SA token contained characters not valid for a header value")?,
+    ));
+    let interceptor = AuthInterceptor::new(bootstrap_slot);
+    let bootstrap = InterceptedService::new(plain_channel.clone(), interceptor);
+    let mut client = OpenShellClient::new(bootstrap);
+    let resp = client
+        .issue_sandbox_token(IssueSandboxTokenRequest {})
+        .await
+        .into_diagnostic()
+        .wrap_err("IssueSandboxToken bootstrap exchange failed")?;
+    Ok(resp.into_inner().token)
 }
 
 /// Build an authenticated channel for direct external use (e.g. the
@@ -254,7 +292,13 @@ pub async fn connect_channel_pub(endpoint: &str) -> Result<AuthedChannel> {
 /// in-flight and future clients pick it up on their next request. The
 /// loop never panics: every failure is logged and re-attempted after a
 /// bounded backoff.
-async fn refresh_token_loop(channel: AuthedChannel, slot: TokenSlot) {
+async fn refresh_token_loop(
+    channel: AuthedChannel,
+    slot: TokenSlot,
+    source: TokenSource,
+    endpoint: String,
+    plain_channel: Channel,
+) {
     let mut client = OpenShellClient::new(channel);
     loop {
         let sleep = compute_refresh_delay(&slot);
@@ -276,17 +320,59 @@ async fn refresh_token_loop(channel: AuthedChannel, slot: TokenSlot) {
                 }
             }
             Err(status) => {
+                if status.code() == tonic::Code::Unauthenticated
+                    && source == TokenSource::K8sServiceAccount
+                {
+                    if let Some(sa_path) = std::env::var(sandbox_env::K8S_SA_TOKEN_FILE)
+                        .ok()
+                        .filter(|p| !p.is_empty())
+                    {
+                        match acquire_k8s_sandbox_token(&endpoint, &plain_channel, &sa_path).await {
+                            Ok(new_token) => {
+                                match AsciiMetadataValue::try_from(format!("Bearer {new_token}")) {
+                                    Ok(value) => {
+                                        if let Ok(mut guard) = slot.write() {
+                                            *guard = value;
+                                            info!(
+                                                "rebootstrapped gateway sandbox JWT after refresh authentication failure"
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                    Err(e) => warn!(
+                                        error = %e,
+                                        "rebootstrapped JWT contained invalid header bytes"
+                                    ),
+                                }
+                            }
+                            Err(e) => warn!(
+                                error = %e,
+                                "K8s ServiceAccount bootstrap retry failed after refresh authentication failure"
+                            ),
+                        }
+                    } else {
+                        warn!(
+                            "RefreshSandboxToken returned Unauthenticated and K8s SA token file is unavailable"
+                        );
+                    }
+                } else if status.code() == tonic::Code::Unauthenticated {
+                    warn!(
+                        source = ?source,
+                        "RefreshSandboxToken returned Unauthenticated; static token sources cannot rebootstrap automatically"
+                    );
+                }
                 warn!(error = %status, "RefreshSandboxToken failed; will retry");
                 // Backoff so we don't spin against a sustained failure.
-                tokio::time::sleep(Duration::from_secs(60)).await;
+                tokio::time::sleep(Duration::from_secs(10)).await;
             }
         }
     }
 }
 
 /// Compute the next refresh delay: 80 % of the time remaining until the
-/// current token's `exp`, plus up to 10 % jitter, floored at 60 s and
-/// capped at 12 h. If the token can't be parsed (legacy/non-JWT bearer)
+/// current token's `exp`, plus up to 10 % jitter, with a small lower bound
+/// for already-expired tokens and capped at 12 h. If the token can't be parsed
+/// (legacy/non-JWT bearer)
 /// default to 6 h.
 fn compute_refresh_delay(slot: &TokenSlot) -> Duration {
     let token = slot
@@ -302,7 +388,11 @@ fn compute_refresh_delay(slot: &TokenSlot) -> Duration {
     )
     .unwrap_or(i64::MAX);
     let remaining_ms = parse_jwt_exp_ms(bearer).map_or(21_600_000, |exp| exp - now_ms); // 6 h fallback
-    let mut delay_ms = (remaining_ms.max(0) * 8 / 10).clamp(60_000, 43_200_000);
+    let mut delay_ms = if remaining_ms <= 0 {
+        1_000
+    } else {
+        (remaining_ms * 8 / 10).clamp(1_000, 43_200_000)
+    };
     // Up to 10 % jitter, derived deterministically from token bytes so
     // unit tests are reproducible without injecting an RNG.
     let jitter_pct = (token.len() % 10) as u64;
@@ -373,9 +463,9 @@ mod auth_tests {
     }
 
     #[test]
-    fn compute_refresh_delay_floors_at_60_seconds() {
-        // Already-expired token still produces a 60 s floor so the loop
-        // doesn't busy-spin.
+    fn compute_refresh_delay_uses_short_delay_for_expired_token() {
+        // Already-expired token still produces a small positive delay so the
+        // loop doesn't busy-spin.
         use base64::Engine as _;
         let exp = 1; // past
         let payload =
@@ -384,7 +474,27 @@ mod auth_tests {
         let bearer = AsciiMetadataValue::try_from(format!("Bearer {token}")).unwrap();
         let slot: TokenSlot = Arc::new(RwLock::new(bearer));
         let delay = compute_refresh_delay(&slot);
-        assert!(delay.as_secs() >= 60);
+        assert!((1..60).contains(&delay.as_secs()));
+    }
+
+    #[test]
+    fn compute_refresh_delay_supports_short_token_ttl() {
+        use base64::Engine as _;
+        let now_s = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let exp = now_s + 30;
+        let payload_json = format!(r#"{{"exp":{exp}}}"#);
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload_json);
+        let token = format!("h.{payload}.s");
+        let bearer = AsciiMetadataValue::try_from(format!("Bearer {token}")).unwrap();
+        let slot: TokenSlot = Arc::new(RwLock::new(bearer));
+        let delay = compute_refresh_delay(&slot);
+        assert!(
+            delay.as_secs() < 30,
+            "expected refresh before 30s expiry, got {delay:?}",
+        );
     }
 }
 

@@ -59,9 +59,12 @@ data:
     cert_path             = "/etc/openshell-tls/server/tls.crt"
     key_path              = "/etc/openshell-tls/server/tls.key"
     client_ca_path        = "/etc/openshell-tls/client-ca/ca.crt"
-    {{- if .Values.server.disableGatewayAuth }}
-    allow_unauthenticated = true
     {{- end }}
+
+    {{- if .Values.server.auth.allowUnauthenticatedUsers }}
+
+    [openshell.gateway.auth]
+    allow_unauthenticated_users = true
     {{- end }}
 
     [openshell.gateway.gateway_jwt]

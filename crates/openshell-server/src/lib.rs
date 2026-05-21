@@ -47,11 +47,16 @@ use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::LazyLock;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
+
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 use compute::{ComputeRuntime, DockerComputeConfig, VmComputeConfig};
 pub use grpc::OpenShellService;

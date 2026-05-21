@@ -427,7 +427,7 @@ fn build_environment_keeps_path_driver_controlled() {
 
 #[test]
 fn build_binds_uses_docker_tls_directory() {
-    let binds = build_binds(&runtime_config());
+    let binds = build_binds(&test_sandbox(), &runtime_config()).unwrap();
     let targets = binds
         .iter()
         .filter_map(|bind| bind.split(':').nth(1).map(String::from))
@@ -441,6 +441,27 @@ fn build_binds_uses_docker_tls_directory() {
             .iter()
             .all(|target| target.starts_with(TLS_MOUNT_DIR) || target == SUPERVISOR_MOUNT_PATH)
     );
+}
+
+#[test]
+fn build_environment_uses_token_file_without_raw_token_env() {
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    spec.sandbox_token = "secret.jwt.value".to_string();
+    spec.environment.insert(
+        openshell_core::sandbox_env::SANDBOX_TOKEN.to_string(),
+        "user-provided-token".to_string(),
+    );
+
+    let env = build_environment(&sandbox, &runtime_config());
+
+    assert!(!env.iter().any(|entry| {
+        entry.starts_with(&format!("{}=", openshell_core::sandbox_env::SANDBOX_TOKEN))
+    }));
+    assert!(env.contains(&format!(
+        "{}={SANDBOX_TOKEN_MOUNT_PATH}",
+        openshell_core::sandbox_env::SANDBOX_TOKEN_FILE
+    )));
 }
 
 #[test]
