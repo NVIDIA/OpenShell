@@ -16,9 +16,9 @@ export OPENSHELL_INSTALL_SH_TEST=1
 
 assert_glibc_preflight_passes() {
   local name=$1
-  local getconf_output=$2
+  local ldd_output=$2
 
-  if ! (export OPENSHELL_TEST_GETCONF_OUTPUT="$getconf_output"; require_linux_package_glibc) >"$out" 2>"$err"; then
+  if ! (export OPENSHELL_TEST_GETCONF_UNAVAILABLE=1 OPENSHELL_TEST_LDD_OUTPUT="$ldd_output"; require_linux_package_glibc) >"$out" 2>"$err"; then
     echo "FAIL: ${name}" >&2
     cat "$err" >&2 || true
     exit 1
@@ -45,7 +45,8 @@ assert_glibc_preflight_fails() {
 }
 
 setup_glibc_228() {
-  export OPENSHELL_TEST_GETCONF_OUTPUT="glibc 2.28"
+  export OPENSHELL_TEST_GETCONF_UNAVAILABLE=1
+  export OPENSHELL_TEST_LDD_OUTPUT="ldd (GNU libc) 2.28"
 }
 
 setup_missing_glibc() {
@@ -54,6 +55,7 @@ setup_missing_glibc() {
 }
 
 setup_getconf_musl() {
+  export OPENSHELL_TEST_LDD_UNAVAILABLE=1
   export OPENSHELL_TEST_GETCONF_OUTPUT="musl libc"
 }
 
@@ -63,10 +65,16 @@ setup_ldd_musl() {
 }
 
 assert_glibc_preflight_passes "glibc 2.31 passes" "glibc 2.31"
-assert_glibc_preflight_passes "glibc 2.35 passes" "glibc 2.35"
+assert_glibc_preflight_passes "glibc 2.35 passes" "ldd (GNU libc) 2.35"
 
-if ! (export OPENSHELL_TEST_GETCONF_UNAVAILABLE=1 OPENSHELL_TEST_LDD_OUTPUT="ldd (GNU libc) 2.35"; require_linux_package_glibc) >"$out" 2>"$err"; then
-  echo "FAIL: ldd glibc fallback passes" >&2
+if ! (export OPENSHELL_TEST_LDD_UNAVAILABLE=1 OPENSHELL_TEST_GETCONF_OUTPUT="glibc 2.35"; require_linux_package_glibc) >"$out" 2>"$err"; then
+  echo "FAIL: getconf glibc fallback passes" >&2
+  cat "$err" >&2 || true
+  exit 1
+fi
+
+if ! (export OPENSHELL_TEST_LDD_OUTPUT="not ldd" OPENSHELL_TEST_GETCONF_OUTPUT="glibc 2.35"; require_linux_package_glibc) >"$out" 2>"$err"; then
+  echo "FAIL: unparseable ldd output falls back to getconf" >&2
   cat "$err" >&2 || true
   exit 1
 fi

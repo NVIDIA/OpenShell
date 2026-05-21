@@ -169,6 +169,19 @@ ldd_version_output() {
 }
 
 detect_glibc_version() {
+  _ldd_output="$(ldd_version_output 2>&1 || true)"
+  case "$_ldd_output" in
+    *[Mm][Uu][Ss][Ll]* | *[Aa][Ll][Pp][Ii][Nn][Ee]*)
+      return 2
+      ;;
+  esac
+
+  _ldd_version="$(printf '%s\n' "$_ldd_output" | awk 'FNR == 1 && match($NF, /^[0-9]+\.[0-9]+/) { print substr($NF, RSTART, RLENGTH); exit }')"
+  if [ -n "$_ldd_version" ]; then
+    printf '%s\n' "$_ldd_version"
+    return 0
+  fi
+
   _getconf_output="$(getconf_gnu_libc_version 2>/dev/null || true)"
   case "$_getconf_output" in
     glibc\ [0-9]*.[0-9]*)
@@ -179,27 +192,6 @@ detect_glibc_version() {
       return 2
       ;;
   esac
-
-  _ldd_output="$(ldd_version_output 2>&1 || true)"
-  case "$_ldd_output" in
-    *[Mm][Uu][Ss][Ll]* | *[Aa][Ll][Pp][Ii][Nn][Ee]*)
-      return 2
-      ;;
-  esac
-
-  # uv's installer parses the glibc version from the first ldd line's final field.
-  _ldd_version="$(printf '%s\n' "$_ldd_output" | awk 'FNR == 1 { print $NF; exit }')"
-  case "$_ldd_version" in
-    [0-9]*.[0-9]*)
-      ;;
-    *)
-      _ldd_version=""
-      ;;
-  esac
-  if [ -n "$_ldd_version" ]; then
-    printf '%s\n' "$_ldd_version"
-    return 0
-  fi
 
   return 1
 }
