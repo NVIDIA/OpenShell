@@ -1177,9 +1177,10 @@ fn sandbox_template_to_k8s(
     }
     // Carry the sandbox UUID as a pod annotation so the gateway can resolve
     // a projected SA token claim (pod name + uid) back to a sandbox identity
-    // when the supervisor calls `IssueSandboxToken` at startup. The gateway's
-    // K8s Role does NOT grant `patch pods`, so this annotation is
-    // effectively immutable post-create (see plan §11.8).
+    // when the supervisor calls `IssueSandboxToken` at startup. The gateway
+    // also verifies the pod's controlling Sandbox ownerReference against the
+    // live CR before accepting this annotation. Its K8s Role does NOT grant
+    // `patch pods`, so this annotation is effectively immutable post-create.
     let mut pod_annotations = platform_config_struct(template, "annotations")
         .and_then(|v| match v {
             serde_json::Value::Object(map) => Some(map),

@@ -56,10 +56,11 @@ Podman, and VM drivers deliver the initial token through supervisor-only
 runtime material; Kubernetes supervisors exchange a projected ServiceAccount
 token through `IssueSandboxToken`. The gateway validates that projected token
 with Kubernetes `TokenReview`, requires the configured sandbox service account,
-checks the returned pod binding against the live pod UID, and reads the pod's
-sandbox annotation before minting the gateway JWT. Supervisors renew gateway
-JWTs in memory before expiry only while the sandbox record still exists. Older
-tokens are not server-revoked; deployments bound replay exposure with short
+checks the returned pod binding against the live pod UID, and verifies the pod's
+controlling `Sandbox` ownerReference against the live Sandbox CR UID and
+sandbox-id label before minting the gateway JWT. Supervisors renew gateway JWTs
+in memory before expiry only while the sandbox record still exists. Older tokens
+are not server-revoked; deployments bound replay exposure with short
 `gateway_jwt.ttl_secs` lifetimes.
 
 Gateway JWT signing-key rotation is currently an offline operator action. The

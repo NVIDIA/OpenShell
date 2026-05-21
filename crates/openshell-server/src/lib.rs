@@ -870,8 +870,8 @@ mod tests {
     use super::{
         ConnectionProtocol, MultiplexService, ServerState, TlsAcceptor,
         allow_plaintext_service_http, classify_initial_bytes, configured_compute_driver,
-        gateway_listener_addresses, is_benign_tls_handshake_failure, serve_gateway_listener,
-        kubernetes_config_for_k8s_sa_bootstrap,
+        gateway_listener_addresses, is_benign_tls_handshake_failure,
+        kubernetes_config_for_k8s_sa_bootstrap, serve_gateway_listener,
     };
     use openshell_core::{
         ComputeDriverKind, Config,
