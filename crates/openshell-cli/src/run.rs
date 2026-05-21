@@ -6128,6 +6128,32 @@ pub async fn sandbox_policy_get(
     output: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    let mut stderr = std::io::stderr().lock();
+    sandbox_policy_get_to_writer(
+        server,
+        name,
+        version,
+        full,
+        output,
+        tls,
+        &mut stdout,
+        &mut stderr,
+    )
+    .await
+}
+
+#[doc(hidden)]
+pub async fn sandbox_policy_get_to_writer<W: Write, E: Write>(
+    server: &str,
+    name: &str,
+    version: u32,
+    full: bool,
+    output: &str,
+    tls: &TlsOptions,
+    stdout: &mut W,
+    stderr: &mut E,
+) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
 
     let status_resp = client
@@ -6152,39 +6178,45 @@ pub async fn sandbox_policy_get(
                     status,
                     full,
                 )?;
-                println!("{}", serde_json::to_string_pretty(&obj).into_diagnostic()?);
+                writeln!(
+                    stdout,
+                    "{}",
+                    serde_json::to_string_pretty(&obj).into_diagnostic()?
+                )
+                .into_diagnostic()?;
                 return Ok(());
             }
             "table" => {}
             _ => return Err(miette!("unsupported output format: {output}")),
         }
 
-        println!("Version:      {}", rev.version);
-        println!("Hash:         {}", rev.policy_hash);
-        println!("Status:       {status:?}");
-        println!("Active:       {}", inner.active_version);
+        writeln!(stdout, "Version:      {}", rev.version).into_diagnostic()?;
+        writeln!(stdout, "Hash:         {}", rev.policy_hash).into_diagnostic()?;
+        writeln!(stdout, "Status:       {status:?}").into_diagnostic()?;
+        writeln!(stdout, "Active:       {}", inner.active_version).into_diagnostic()?;
         if rev.created_at_ms > 0 {
-            println!("Created:      {} ms", rev.created_at_ms);
+            writeln!(stdout, "Created:      {} ms", rev.created_at_ms).into_diagnostic()?;
         }
         if rev.loaded_at_ms > 0 {
-            println!("Loaded:       {} ms", rev.loaded_at_ms);
+            writeln!(stdout, "Loaded:       {} ms", rev.loaded_at_ms).into_diagnostic()?;
         }
         if !rev.load_error.is_empty() {
-            println!("Error:        {}", rev.load_error);
+            writeln!(stdout, "Error:        {}", rev.load_error).into_diagnostic()?;
         }
 
         if full {
             if let Some(ref policy) = rev.policy {
-                println!("---");
+                writeln!(stdout, "---").into_diagnostic()?;
                 let yaml_str = openshell_policy::serialize_sandbox_policy(policy)
                     .wrap_err("failed to serialize policy to YAML")?;
-                print!("{yaml_str}");
+                write!(stdout, "{yaml_str}").into_diagnostic()?;
             } else {
-                eprintln!("Policy payload not available for this version");
+                writeln!(stderr, "Policy payload not available for this version")
+                    .into_diagnostic()?;
             }
         }
     } else {
-        eprintln!("No policy history found for sandbox '{name}'");
+        writeln!(stderr, "No policy history found for sandbox '{name}'").into_diagnostic()?;
     }
 
     Ok(())

@@ -1606,7 +1606,7 @@ enum PolicyCommands {
         #[arg(long = "rev", default_value_t = 0)]
         rev: u32,
 
-        /// Print the full policy as YAML.
+        /// Include the full policy payload.
         #[arg(long)]
         full: bool,
 
