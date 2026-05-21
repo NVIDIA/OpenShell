@@ -1113,7 +1113,9 @@ mod tests {
         let result1 = handle1.await.unwrap();
         let result2 = handle2.await.unwrap();
 
-        // One should succeed with MustCreate, the other should fail
+        // If both tasks observe a missing route before either insert commits, MustCreate
+        // should let exactly one win. If the scheduler serializes them, the second call
+        // may legitimately observe the new route and take the update path.
         let successes = [&result1, &result2].iter().filter(|r| r.is_ok()).count();
         let failures = [&result1, &result2]
             .iter()
@@ -1127,22 +1129,40 @@ mod tests {
             })
             .count();
 
-        assert_eq!(
-            successes, 1,
-            "exactly one create should succeed, got: {result1:?}, {result2:?}"
+        assert!(
+            successes == 1 || successes == 2,
+            "one racing create should succeed, or both serialized upserts should succeed, got: {result1:?}, {result2:?}"
         );
-        assert_eq!(
-            failures, 1,
-            "exactly one create should fail, got: {result1:?}, {result2:?}"
-        );
+        if successes == 1 {
+            assert_eq!(
+                failures, 1,
+                "the losing racing create should fail, got: {result1:?}, {result2:?}"
+            );
+        } else {
+            assert_eq!(
+                failures, 0,
+                "serialized upserts should not fail, got: {result1:?}, {result2:?}"
+            );
+            let mut versions = [&result1, &result2]
+                .into_iter()
+                .map(|result| result.as_ref().expect("success").route.version)
+                .collect::<Vec<_>>();
+            versions.sort_unstable();
+            assert_eq!(
+                versions,
+                vec![1, 2],
+                "serialized create-then-update should return versions 1 and 2"
+            );
+        }
 
-        // Only one route should exist
+        // Only one route should exist.
         let route = store
             .get_message_by_name::<InferenceRoute>(CLUSTER_INFERENCE_ROUTE_NAME)
             .await
             .expect("fetch")
             .expect("route should exist");
-        assert_eq!(route.version, 1);
+        let expected_version = if successes == 1 { 1 } else { 2 };
+        assert_eq!(route.version, expected_version);
     }
 
     #[tokio::test]
