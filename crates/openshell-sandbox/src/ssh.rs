@@ -1489,7 +1489,7 @@ mod tests {
 
         // Skip if running as root: drop_privileges would try to switch to
         // "sandbox" which may not exist in the test environment.
-        if nix::unistd::geteuid().is_root() {
+        if rustix::process::geteuid().is_root() {
             return;
         }
 

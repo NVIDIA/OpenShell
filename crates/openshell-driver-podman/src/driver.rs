@@ -111,7 +111,7 @@ impl PodmanComputeDriver {
         // Rootless pre-flight: warn if subuid/subgid ranges look missing.
         // Not a hard error because some systems configure these via LDAP or
         // other mechanisms that /etc/subuid does not reflect.
-        if nix::unistd::getuid().as_raw() != 0 {
+        if rustix::process::getuid().as_raw() != 0 {
             check_subuid_range();
         }
 

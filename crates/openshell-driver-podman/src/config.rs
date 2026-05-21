@@ -167,7 +167,7 @@ impl PodmanComputeConfig {
         {
             std::env::var("XDG_RUNTIME_DIR").map_or_else(
                 |_| {
-                    let uid = nix::unistd::getuid();
+                    let uid = rustix::process::getuid().as_raw();
                     PathBuf::from(format!("/run/user/{uid}/podman/podman.sock"))
                 },
                 |xdg| PathBuf::from(xdg).join("podman/podman.sock"),
@@ -243,7 +243,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         temp_env::with_vars([("XDG_RUNTIME_DIR", None::<&str>)], || {
             let path = PodmanComputeConfig::default_socket_path();
-            let uid = nix::unistd::getuid();
+            let uid = rustix::process::getuid().as_raw();
             assert_eq!(
                 path,
                 PathBuf::from(format!("/run/user/{uid}/podman/podman.sock"))

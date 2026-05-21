@@ -29,45 +29,36 @@ fn inject_provider_env(cmd: &mut Command, provider_env: &HashMap<String, String>
 }
 
 #[cfg(unix)]
-#[allow(unsafe_code, clippy::borrow_as_ptr)]
 pub fn harden_child_process() -> Result<()> {
-    let core_limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    let rc = unsafe { libc::setrlimit(libc::RLIMIT_CORE, &raw const core_limit) };
-    if rc != 0 {
-        return Err(miette::miette!(
-            "Failed to disable core dumps: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
+    use rustix::process::{Resource, Rlimit, setrlimit};
+
+    setrlimit(
+        Resource::Core,
+        Rlimit {
+            current: Some(0),
+            maximum: Some(0),
+        },
+    )
+    .map_err(|e| miette::miette!("Failed to disable core dumps: {e}"))?;
 
     // Limit process creation to prevent fork bombs. 512 processes per UID is
     // sufficient for typical agent workloads (shell, compilers, language servers)
     // while preventing runaway forking. Set as a hard limit so the sandbox user
     // cannot raise it after privilege drop.
-    let nproc_limit = libc::rlimit {
-        rlim_cur: 512,
-        rlim_max: 512,
-    };
-    let rc = unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &raw const nproc_limit) };
-    if rc != 0 {
-        return Err(miette::miette!(
-            "Failed to set RLIMIT_NPROC: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
+    setrlimit(
+        Resource::Nproc,
+        Rlimit {
+            current: Some(512),
+            maximum: Some(512),
+        },
+    )
+    .map_err(|e| miette::miette!("Failed to set RLIMIT_NPROC: {e}"))?;
 
     #[cfg(target_os = "linux")]
     {
-        let rc = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
-        if rc != 0 {
-            return Err(miette::miette!(
-                "Failed to set PR_SET_DUMPABLE=0: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
+        use rustix::process::{DumpableBehavior, set_dumpable_behavior};
+        set_dumpable_behavior(DumpableBehavior::NotDumpable)
+            .map_err(|e| miette::miette!("Failed to set PR_SET_DUMPABLE=0: {e}"))?;
     }
 
     Ok(())

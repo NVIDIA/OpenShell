@@ -277,7 +277,7 @@ fn prepare_compute_driver_socket_path(
 
 #[cfg(unix)]
 fn current_euid() -> u32 {
-    nix::unistd::Uid::effective().as_raw()
+    rustix::process::geteuid().as_raw()
 }
 
 #[cfg(unix)]

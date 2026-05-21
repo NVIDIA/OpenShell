@@ -88,7 +88,7 @@ rand = { workspace = true }
 petname = "2"
 ipnet = "2"
 tempfile = "3"
-nix = { workspace = true }
+rustix = { workspace = true }
 x509-parser = "0.16"
 
 [features]

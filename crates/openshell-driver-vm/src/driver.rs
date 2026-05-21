@@ -2549,9 +2549,8 @@ impl ComputeDriver for VmDriver {
 }
 
 #[cfg(target_os = "linux")]
-#[allow(unsafe_code)] // libc::geteuid is a thin syscall wrapper
 fn check_gpu_privileges() -> Result<(), String> {
-    if unsafe { libc::geteuid() } != 0 {
+    if !rustix::process::geteuid().is_root() {
         return Err(
             "GPU support requires root privileges for VFIO bind/unbind and TAP networking. \
              Run with sudo or ensure CAP_SYS_ADMIN + CAP_NET_ADMIN capabilities are set."
