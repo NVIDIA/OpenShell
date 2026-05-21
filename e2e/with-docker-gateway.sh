@@ -78,6 +78,10 @@ DOCKER_SUPERVISOR_ARGS=()
 # Isolate CLI/SDK gateway metadata from the developer's real config.
 export XDG_CONFIG_HOME="${WORKDIR}/config"
 export XDG_DATA_HOME="${WORKDIR}/data"
+# Docker e2e runs in a GitHub Actions container while talking to the host
+# Docker daemon. Keep gateway state in the host-visible workdir so driver-owned
+# bind mounts, including sandbox JWT files, resolve on both sides.
+export XDG_STATE_HOME="${WORKDIR}/state"
 
 cleanup() {
   local exit_code=$?
@@ -394,7 +398,7 @@ PKI_DIR="${WORKDIR}/pki"
 e2e_generate_pki "${GATEWAY_BIN}" "${PKI_DIR}"
 
 HOST_PORT=$(e2e_pick_port)
-STATE_DIR="${WORKDIR}/state"
+STATE_DIR="${XDG_STATE_HOME}"
 mkdir -p "${STATE_DIR}"
 JWT_DIR="${STATE_DIR}/jwt"
 

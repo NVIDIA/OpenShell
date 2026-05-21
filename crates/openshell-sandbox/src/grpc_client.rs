@@ -66,6 +66,11 @@ static TOKEN_SLOT: OnceLock<TokenSlot> = OnceLock::new();
 /// Source used to acquire the process-wide token slot.
 static TOKEN_SOURCE: OnceLock<TokenSource> = OnceLock::new();
 
+/// Serializes the first token acquisition. Several supervisor subsystems
+/// connect during startup; without this guard they can all observe an empty
+/// [`TOKEN_SLOT`] and perform duplicate K8s bootstrap exchanges.
+static TOKEN_INIT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// One-shot guard so the renewal loop spawns at most once per process.
 static REFRESH_SPAWNED: OnceLock<()> = OnceLock::new();
 
@@ -183,15 +188,7 @@ async fn build_plain_channel(endpoint: &str) -> Result<Channel> {
 /// spawned once per process via [`REFRESH_SPAWNED`].
 async fn connect_channel(endpoint: &str) -> Result<AuthedChannel> {
     let channel = build_plain_channel(endpoint).await?;
-    let (slot, source) = if let Some(existing) = TOKEN_SLOT.get() {
-        let source = TOKEN_SOURCE.get().copied().unwrap_or(TokenSource::Env);
-        (existing.clone(), source)
-    } else {
-        let acquired = acquire_sandbox_token(endpoint, &channel).await?;
-        let slot = install_token_slot(&acquired.token)?;
-        let _ = TOKEN_SOURCE.set(acquired.source);
-        (slot, acquired.source)
-    };
+    let (slot, source) = token_slot(endpoint, &channel).await?;
     let plain_channel = channel.clone();
     let intercepted = InterceptedService::new(channel, AuthInterceptor::new(slot.clone()));
     if REFRESH_SPAWNED.set(()).is_ok() {
@@ -202,6 +199,25 @@ async fn connect_channel(endpoint: &str) -> Result<AuthedChannel> {
         });
     }
     Ok(intercepted)
+}
+
+async fn token_slot(endpoint: &str, plain_channel: &Channel) -> Result<(TokenSlot, TokenSource)> {
+    if let Some(existing) = TOKEN_SLOT.get() {
+        let source = TOKEN_SOURCE.get().copied().unwrap_or(TokenSource::Env);
+        return Ok((existing.clone(), source));
+    }
+
+    let _guard = TOKEN_INIT_LOCK.lock().await;
+
+    if let Some(existing) = TOKEN_SLOT.get() {
+        let source = TOKEN_SOURCE.get().copied().unwrap_or(TokenSource::Env);
+        return Ok((existing.clone(), source));
+    }
+
+    let acquired = acquire_sandbox_token(endpoint, plain_channel).await?;
+    let slot = install_token_slot(&acquired.token)?;
+    let _ = TOKEN_SOURCE.set(acquired.source);
+    Ok((slot, acquired.source))
 }
 
 /// Resolve the sandbox JWT used to authenticate every outbound RPC.
