@@ -97,6 +97,11 @@ jobs:
       - name: Fetch tags
         run: git fetch --tags --force
 
+      - name: Configure GHA sccache backend
+        # Exposes ACTIONS_CACHE_URL / ACTIONS_RUNTIME_TOKEN before `mise install`
+        # compiles cargo-installed tools through RUSTC_WRAPPER=sccache.
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+
       - name: Install tools
         run: mise install --locked
 
@@ -153,11 +158,6 @@ jobs:
             echo "target=$target"
             echo "zig_target=$zig_target"
           } >> "$GITHUB_OUTPUT"
-
-      - name: Configure GHA sccache backend
-        # Exposes ACTIONS_CACHE_URL / ACTIONS_RUNTIME_TOKEN so sccache (wrapped
-        # around rustc via mise's RUSTC_WRAPPER) can initialize the GHA cache.
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
 
       - name: Cache Rust target and registry
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
