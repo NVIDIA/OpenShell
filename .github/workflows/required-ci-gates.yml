@@ -36,6 +36,7 @@ jobs:
           PR_HEAD_SHA_FROM_EVENT: ${{ github.event.pull_request.head.sha }}
           PR_LABELS_FROM_EVENT: ${{ toJSON(github.event.pull_request.labels.*.name) }}
           WORKFLOW_RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          WORKFLOW_RUN_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
           WORKFLOW_RUN_EVENT: ${{ github.event.workflow_run.event }}
         shell: bash
         run: |
@@ -73,10 +74,30 @@ jobs:
             LABELS_JSON=$(jq -c . <<< "$PR_LABELS_FROM_EVENT")
           }
 
+          load_pr_context() {
+            PR_NUMBER="$1"
+
+            local pr state
+            pr=$(gh api "repos/$GH_REPO/pulls/$PR_NUMBER")
+            state=$(jq -r '.state' <<< "$pr")
+            if [ "$state" != "open" ]; then
+              echo "PR #$PR_NUMBER is $state; nothing to publish."
+              exit 0
+            fi
+
+            HEAD_SHA=$(jq -r '.head.sha' <<< "$pr")
+            LABELS_JSON=$(gh api "repos/$GH_REPO/issues/$PR_NUMBER" --jq '[.labels[].name]')
+          }
+
           resolve_workflow_run_event() {
             if [ "$WORKFLOW_RUN_EVENT" != "push" ]; then
               echo "Ignoring workflow_run from event '$WORKFLOW_RUN_EVENT'."
               exit 0
+            fi
+
+            if [[ "$WORKFLOW_RUN_HEAD_BRANCH" =~ ^pull-request/([0-9]+)$ ]]; then
+              load_pr_context "${BASH_REMATCH[1]}"
+              return
             fi
 
             local associated_prs pr
@@ -87,10 +108,7 @@ jobs:
               exit 0
             fi
 
-            PR_NUMBER=$(jq -r '.number' <<< "$pr")
-            pr=$(gh api "repos/$GH_REPO/pulls/$PR_NUMBER")
-            HEAD_SHA=$(jq -r '.head.sha' <<< "$pr")
-            LABELS_JSON=$(gh api "repos/$GH_REPO/issues/$PR_NUMBER" --jq '[.labels[].name]')
+            load_pr_context "$(jq -r '.number' <<< "$pr")"
           }
 
           resolve_context() {

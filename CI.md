@@ -113,8 +113,6 @@ The bot's full administrator documentation is internal to NVIDIA. The only comma
 | `.github/actions/pr-gate/action.yml` | Composite action that resolves PR metadata and verifies the required label is set. |
 | `.github/actions/pr-merge-base/action.yml` | Composite action that resolves and fetches the merge-base commit for `pull-request/<N>` push workflows. |
 | `.github/workflows/required-ci-gates.yml` | Posts required PR-head statuses for push-based CI workflows. This is what branch protection should require. |
-| `.github/workflows/e2e-gate.yml` | Posts the required `E2E Gate` check on the PR. Re-evaluates after the gated workflow completes. |
-| `.github/workflows/e2e-gate-check.yml` | Reusable gate logic shared by E2E and GPU E2E. |
 | `.github/workflows/e2e-label-help.yml` | When a `test:e2e*` label is applied, posts a PR comment telling the maintainer the next manual step (re-run an existing workflow run, or `/ok to test <SHA>` to refresh the mirror). |
 
 ## Release workflows
