@@ -28,8 +28,8 @@ pub const SANDBOX_COMMAND: &str = "OPENSHELL_SANDBOX_COMMAND";
 
 /// Sandbox-local loopback HTTP proxy URL managed by the supervisor.
 ///
-/// This is distinct from HTTP_PROXY/HTTPS_PROXY, which continue to point at the
-/// gateway-side proxy address for ordinary proxy-aware clients.
+/// This is distinct from `HTTP_PROXY`/`HTTPS_PROXY`, which continue to point
+/// at the gateway-side proxy address for ordinary proxy-aware clients.
 pub const LOOPBACK_PROXY_URL: &str = "OPENSHELL_LOOPBACK_PROXY_URL";
 
 /// Path to the CA certificate for mTLS communication with the gateway.

@@ -679,6 +679,7 @@ fn session_user_and_home(policy: &SandboxPolicy) -> (String, String) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_child_env(
     cmd: &mut Command,
     session_home: &str,

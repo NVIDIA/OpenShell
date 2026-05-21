@@ -23,7 +23,6 @@ use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Duration as StdDuration;
 use tokio::io::{
     AsyncRead as TokioAsyncRead, AsyncReadExt, AsyncWrite as TokioAsyncWrite, AsyncWriteExt,
 };
@@ -67,10 +66,10 @@ const MAX_STREAMING_BODY: usize = 1024;
 /// between "thinking" and output phases. 120s provides headroom while still
 /// catching genuinely stuck streams.
 #[cfg(not(test))]
-const CHUNK_IDLE_TIMEOUT: StdDuration = StdDuration::from_secs(120);
+const CHUNK_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 // Exercise idle-timeout truncation without slowing the full package test suite.
 #[cfg(test)]
-const CHUNK_IDLE_TIMEOUT: StdDuration = StdDuration::from_millis(100);
+const CHUNK_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Result of a proxy CONNECT policy decision.
 struct ConnectDecision {
@@ -178,6 +177,7 @@ pub struct LoopbackProxyHandle {
     http_addr: SocketAddr,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
+    host_join: TokioJoinHandle<()>,
 }
 
 impl ProxyHandle {
@@ -348,8 +348,21 @@ impl LoopbackProxyHandle {
 
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let (accepted_tx, accepted_rx) = mpsc::unbounded_channel();
 
-        let thread = std::thread::Builder::new()
+        let host_join = spawn_loopback_dispatch_task(
+            accepted_rx,
+            opa_engine,
+            identity_cache,
+            entrypoint_pid,
+            tls_state,
+            inference_ctx,
+            provider_credentials,
+            policy_local_ctx,
+            denial_tx,
+        );
+
+        let thread = match std::thread::Builder::new()
             .name("openshell-loopback-proxy".to_string())
             .spawn(move || {
                 run_loopback_proxy_thread(
@@ -357,30 +370,28 @@ impl LoopbackProxyHandle {
                     listen_addr,
                     ready_tx,
                     shutdown_rx,
-                    opa_engine,
-                    identity_cache,
-                    entrypoint_pid,
-                    tls_state,
-                    inference_ctx,
-                    provider_credentials,
-                    policy_local_ctx,
-                    denial_tx,
+                    accepted_tx,
                 );
-            })
-            .into_diagnostic()?;
+            }) {
+            Ok(thread) => thread,
+            Err(err) => {
+                host_join.abort();
+                return Err(err).into_diagnostic();
+            }
+        };
 
-        let http_addr = match ready_rx.recv_timeout(StdDuration::from_secs(5)) {
+        // Wait for an explicit ready/error signal instead of timing out. The
+        // thread borrows the sandbox netns fd for setns(), so returning early
+        // could orphan a thread that later observes a closed or reused fd.
+        let http_addr = match ready_rx.recv() {
             Ok(Ok(addr)) => addr,
             Ok(Err(message)) => {
                 let _ = thread.join();
+                host_join.abort();
                 return Err(miette::miette!("{message}"));
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                return Err(miette::miette!(
-                    "Loopback proxy did not start within 5 seconds on {listen_addr}"
-                ));
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(std::sync::mpsc::RecvError) => {
+                host_join.abort();
                 return Err(miette::miette!(
                     "Loopback proxy thread exited before startup on {listen_addr}"
                 ));
@@ -391,6 +402,7 @@ impl LoopbackProxyHandle {
             http_addr,
             shutdown: Some(shutdown_tx),
             thread: Some(thread),
+            host_join,
         })
     }
 
@@ -401,11 +413,8 @@ impl LoopbackProxyHandle {
 
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
-fn run_loopback_proxy_thread(
-    netns_fd: RawFd,
-    listen_addr: SocketAddr,
-    ready_tx: std::sync::mpsc::Sender<std::result::Result<SocketAddr, String>>,
-    shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+fn spawn_loopback_dispatch_task(
+    mut accepted_rx: mpsc::UnboundedReceiver<std::net::TcpStream>,
     opa_engine: Arc<OpaEngine>,
     identity_cache: Arc<BinaryIdentityCache>,
     entrypoint_pid: Arc<AtomicU32>,
@@ -414,6 +423,68 @@ fn run_loopback_proxy_thread(
     provider_credentials: Option<ProviderCredentialState>,
     policy_local_ctx: Option<Arc<PolicyLocalContext>>,
     denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
+) -> TokioJoinHandle<()> {
+    tokio::spawn(async move {
+        // Detect the trusted host gateway from the supervisor context, matching
+        // the primary gateway proxy. The loopback thread only accepts sandbox
+        // sockets; policy, DNS, credential rewrite, and upstream dialing remain
+        // on this host-side task.
+        let trusted_host_gateway: Arc<Option<IpAddr>> = Arc::new(detect_trusted_host_gateway());
+        while let Some(stream) = accepted_rx.recv().await {
+            if let Err(err) = stream.set_nonblocking(true) {
+                let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                    .activity(ActivityId::Fail)
+                    .severity(SeverityId::Low)
+                    .status(StatusId::Failure)
+                    .message(format!(
+                        "Loopback proxy failed to set stream nonblocking: {err}"
+                    ))
+                    .build();
+                ocsf_emit!(event);
+                continue;
+            }
+
+            match TcpStream::from_std(stream) {
+                Ok(stream) => {
+                    spawn_proxy_connection(
+                        stream,
+                        opa_engine.clone(),
+                        identity_cache.clone(),
+                        entrypoint_pid.clone(),
+                        tls_state.clone(),
+                        inference_ctx.clone(),
+                        policy_local_ctx.clone(),
+                        trusted_host_gateway.clone(),
+                        provider_credentials
+                            .as_ref()
+                            .and_then(ProviderCredentialState::resolver),
+                        denial_tx.clone(),
+                    );
+                }
+                Err(err) => {
+                    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                        .activity(ActivityId::Fail)
+                        .severity(SeverityId::Low)
+                        .status(StatusId::Failure)
+                        .message(format!(
+                            "Loopback proxy failed to register accepted stream: {err}"
+                        ))
+                        .build();
+                    ocsf_emit!(event);
+                }
+            }
+        }
+    })
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn run_loopback_proxy_thread(
+    netns_fd: RawFd,
+    listen_addr: SocketAddr,
+    ready_tx: std::sync::mpsc::Sender<std::result::Result<SocketAddr, String>>,
+    shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+    accepted_tx: mpsc::UnboundedSender<std::net::TcpStream>,
 ) {
     let startup_failure_tx = ready_tx.clone();
     let result = (|| -> std::result::Result<(), String> {
@@ -453,7 +524,6 @@ fn run_loopback_proxy_thread(
                 }
             };
 
-            let trusted_host_gateway: Arc<Option<IpAddr>> = Arc::new(detect_trusted_host_gateway());
             let _ = ready_tx.send(Ok(local_addr));
 
             let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
@@ -476,20 +546,31 @@ fn run_loopback_proxy_thread(
                     accepted = listener.accept() => {
                         match accepted {
                             Ok((stream, _addr)) => {
-                                spawn_proxy_connection(
-                                    stream,
-                                    opa_engine.clone(),
-                                    identity_cache.clone(),
-                                    entrypoint_pid.clone(),
-                                    tls_state.clone(),
-                                    inference_ctx.clone(),
-                                    policy_local_ctx.clone(),
-                                    trusted_host_gateway.clone(),
-                                    provider_credentials
-                                        .as_ref()
-                                        .and_then(ProviderCredentialState::resolver),
-                                    denial_tx.clone(),
-                                );
+                                match stream.into_std() {
+                                    Ok(stream) => {
+                                        if accepted_tx.send(stream).is_err() {
+                                            let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                                                .activity(ActivityId::Fail)
+                                                .severity(SeverityId::Low)
+                                                .status(StatusId::Failure)
+                                                .message("Loopback proxy dispatcher exited".to_string())
+                                                .build();
+                                            ocsf_emit!(event);
+                                            break;
+                                        }
+                                    }
+                                    Err(err) => {
+                                        let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                                            .activity(ActivityId::Fail)
+                                            .severity(SeverityId::Low)
+                                            .status(StatusId::Failure)
+                                            .message(format!(
+                                                "Loopback proxy failed to detach accepted stream: {err}"
+                                            ))
+                                            .build();
+                                        ocsf_emit!(event);
+                                    }
+                                }
                             }
                             Err(err) => {
                                 let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
@@ -530,6 +611,7 @@ impl Drop for LoopbackProxyHandle {
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+        self.host_join.abort();
     }
 }
 

@@ -117,6 +117,7 @@ impl ProcessHandle {
     ///
     /// Returns an error if the process fails to start.
     #[cfg(not(target_os = "linux"))]
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         program: &str,
         args: &[String],
@@ -275,6 +276,7 @@ impl ProcessHandle {
     }
 
     #[cfg(not(target_os = "linux"))]
+    #[allow(clippy::too_many_arguments)]
     fn spawn_impl(
         program: &str,
         args: &[String],
