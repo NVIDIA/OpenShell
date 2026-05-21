@@ -161,7 +161,9 @@ ExecStartPre=/bin/sh -c 'test -f %%E/openshell/gateway.toml || install -Dm644 /u
 # %%S expands to $XDG_STATE_HOME (~/.local/state) in user units.
 ExecStartPre=/usr/bin/openshell-gateway generate-certs --output-dir %%S/openshell/tls --server-san host.openshell.internal
 
-# Optional OPENSHELL_* overrides.
+# gateway.env is honored for backward compatibility with pre-1415 installs.
+# New installs use runtime defaults; create gateway.toml to override.
+# See TROUBLESHOOTING.md for the env-to-TOML migration guide.
 EnvironmentFile=-%%E/openshell/gateway.env
 ExecStart=/usr/bin/openshell-gateway
 StateDirectory=openshell

@@ -11,6 +11,7 @@ use crate::watcher::{
 };
 use openshell_core::ComputeDriverError;
 use openshell_core::proto::compute::v1::{DriverSandbox, GetCapabilitiesResponse};
+use std::time::Duration;
 use tracing::{info, warn};
 
 impl From<PodmanApiError> for ComputeDriverError {
@@ -57,6 +58,9 @@ fn validated_container_name(sandbox_name: &str) -> Result<String, ComputeDriverE
 impl PodmanComputeDriver {
     /// Create a new driver, verifying the Podman socket is reachable.
     pub async fn new(mut config: PodmanComputeConfig) -> Result<Self, PodmanApiError> {
+        const MAX_PING_RETRIES: u32 = 5;
+        const PING_RETRY_DELAY: Duration = Duration::from_secs(2);
+
         if !config.socket_path.exists() {
             if cfg!(target_os = "macos") {
                 warn!(
@@ -80,8 +84,27 @@ impl PodmanComputeDriver {
 
         let client = PodmanClient::new(config.socket_path.clone());
 
-        // Verify connectivity.
-        client.ping().await?;
+        // Verify connectivity, retrying briefly to tolerate transient socket
+        // unavailability (e.g. podman.socket restarting after a package
+        // upgrade). The systemd unit uses Wants=podman.socket (not Requires),
+        // so the gateway may start while the socket is briefly re-activating.
+        let mut attempts = 0;
+        loop {
+            match client.ping().await {
+                Ok(()) => break,
+                Err(e) if attempts < MAX_PING_RETRIES => {
+                    attempts += 1;
+                    warn!(
+                        attempt = attempts,
+                        max_retries = MAX_PING_RETRIES,
+                        error = %e,
+                        "Podman socket not ready, retrying"
+                    );
+                    tokio::time::sleep(PING_RETRY_DELAY).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
 
         // Verify cgroups v2, detect rootless mode, and log system info.
         match client.system_info().await {

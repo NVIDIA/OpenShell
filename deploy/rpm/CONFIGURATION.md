@@ -195,6 +195,11 @@ configuration is required.
 
 ## Configuration reference
 
+> **Upgrading from a previous release?** See the
+> ["Migrating from gateway.env"](TROUBLESHOOTING.md#migrating-from-gatewayenv)
+> section in TROUBLESHOOTING.md for the env-to-TOML mapping and notes on
+> the default port, bind address, and database path changes.
+
 Gateway and driver settings have local runtime defaults. The gateway reads
 `~/.config/openshell/gateway.toml` when that file exists. Set
 `OPENSHELL_GATEWAY_CONFIG` in the launch environment to use a different file.

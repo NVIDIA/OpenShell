@@ -214,11 +214,18 @@ After upgrading the RPM packages:
 
 ```shell
 sudo dnf update openshell openshell-gateway
+systemctl --user restart podman.socket
 systemctl --user restart openshell-gateway
 ```
 
 The SQLite database schema is auto-migrated on startup. Running
 sandboxes are stopped during the restart.
+
+Restarting `podman.socket` after a package upgrade is recommended: if the
+unit file changed on disk during the upgrade, the running socket may become
+non-functional until restarted, causing the gateway to fail with a
+connection error on `/run/user/<uid>/podman/podman.sock`. The gateway
+retries briefly on startup, but a stale socket will not recover on its own.
 
 Package upgrades do not overwrite `~/.config/openshell/gateway.toml` when you
 create one. New gateway process options can be added manually by referencing
@@ -230,3 +237,65 @@ To pick up new container images after an upgrade:
 podman pull ghcr.io/nvidia/openshell/supervisor:latest
 podman pull ghcr.io/nvidia/openshell-community/sandboxes/base:latest
 ```
+
+### Migrating from gateway.env
+
+Previous releases generated `~/.config/openshell/gateway.env` on first
+start and used it to configure the gateway at launch. The gateway now
+starts from built-in runtime defaults and reads
+`~/.config/openshell/gateway.toml` when that file exists.
+
+If you have a `gateway.env` file it is still honored: the systemd unit
+reads it via `EnvironmentFile` on every start. You can leave it in place
+or delete it. New installs no longer generate one.
+
+To migrate settings to TOML, create `~/.config/openshell/gateway.toml`
+and map the relevant variables:
+
+| Environment variable | TOML equivalent |
+|---|---|
+| `OPENSHELL_BIND_ADDRESS=A` + `OPENSHELL_SERVER_PORT=P` | `bind_address = "A:P"` under `[openshell.gateway]` |
+| `OPENSHELL_DRIVERS=podman` | `compute_drivers = ["podman"]` under `[openshell.gateway]` |
+| `OPENSHELL_DISABLE_TLS=true` | `disable_tls = true` under `[openshell.gateway]` |
+| `OPENSHELL_TLS_CERT=PATH` | `cert_path = "PATH"` under `[openshell.gateway.tls]` |
+| `OPENSHELL_TLS_KEY=PATH` | `key_path = "PATH"` under `[openshell.gateway.tls]` |
+| `OPENSHELL_TLS_CLIENT_CA=PATH` | `client_ca_path = "PATH"` under `[openshell.gateway.tls]` |
+| `OPENSHELL_DB_URL=URL` | env-only — not accepted in TOML; keep in env or drop-in override |
+| `OPENSHELL_LOG_LEVEL=debug` | env-only — keep as `Environment=OPENSHELL_LOG_LEVEL=debug` in a drop-in |
+
+Other breaking changes in this release:
+
+- **Default port changed from 8080 to 17670.** If you registered the
+  gateway at `https://127.0.0.1:8080`, re-register it:
+
+  ```shell
+  openshell gateway add --local https://127.0.0.1:17670
+  ```
+
+- **Default bind address changed from `0.0.0.0` to `127.0.0.1`.** If
+  you relied on network-accessible access without an explicit bind
+  address, add the following to `~/.config/openshell/gateway.toml`:
+
+  ```toml
+  [openshell.gateway]
+  bind_address = "0.0.0.0:17670"
+  ```
+
+  Also update your firewall rule if applicable:
+
+  ```shell
+  sudo firewall-cmd --remove-port=8080/tcp --permanent
+  sudo firewall-cmd --add-port=17670/tcp --permanent
+  sudo firewall-cmd --reload
+  ```
+
+- **Database path changed** from `~/.local/state/openshell/gateway.db`
+  to `~/.local/state/openshell/gateway/openshell.db`. Existing gateway
+  state (registered sandboxes, etc.) is not migrated automatically. To
+  preserve state across the upgrade, move the file before restarting:
+
+  ```shell
+  mkdir -p ~/.local/state/openshell/gateway
+  mv ~/.local/state/openshell/gateway.db \
+     ~/.local/state/openshell/gateway/openshell.db
+  ```
