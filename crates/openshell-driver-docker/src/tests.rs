@@ -3,6 +3,10 @@
 
 use super::*;
 use openshell_core::config::{CDI_GPU_DEVICE_ALL, DEFAULT_SERVER_PORT};
+use openshell_core::driver_utils::{
+    LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
+    LABEL_SANDBOX_NAMESPACE,
+};
 use openshell_core::proto::compute::v1::{
     DriverResourceRequirements, DriverSandboxSpec, DriverSandboxTemplate,
 };
@@ -441,12 +445,12 @@ fn build_binds_uses_docker_tls_directory() {
 #[test]
 fn managed_container_label_filters_include_gateway_namespace() {
     let filters =
-        managed_container_label_filters("tenant-a", [format!("{SANDBOX_ID_LABEL_KEY}=sbx-123")]);
+        managed_container_label_filters("tenant-a", [format!("{LABEL_SANDBOX_ID}=sbx-123")]);
     let labels = filters.get("label").unwrap();
 
-    assert!(labels.contains(&format!("{MANAGED_BY_LABEL_KEY}={MANAGED_BY_LABEL_VALUE}")));
-    assert!(labels.contains(&format!("{SANDBOX_NAMESPACE_LABEL_KEY}=tenant-a")));
-    assert!(labels.contains(&format!("{SANDBOX_ID_LABEL_KEY}=sbx-123")));
+    assert!(labels.contains(&format!("{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE}")));
+    assert!(labels.contains(&format!("{LABEL_SANDBOX_NAMESPACE}=tenant-a")));
+    assert!(labels.contains(&format!("{LABEL_SANDBOX_ID}=sbx-123")));
 }
 
 #[test]
@@ -462,7 +466,7 @@ fn build_container_create_body_clears_inherited_cmd() {
         create_body
             .labels
             .as_ref()
-            .and_then(|labels| labels.get(SANDBOX_NAMESPACE_LABEL_KEY)),
+            .and_then(|labels| labels.get(LABEL_SANDBOX_NAMESPACE)),
         Some(&"default".to_string())
     );
     let host_config = create_body.host_config.as_ref().unwrap();
@@ -606,7 +610,7 @@ fn build_container_create_body_uses_runtime_namespace_label() {
     let labels = create_body.labels.expect("labels are populated");
 
     assert_eq!(
-        labels.get(SANDBOX_NAMESPACE_LABEL_KEY),
+        labels.get(LABEL_SANDBOX_NAMESPACE),
         Some(&"tenant-a".to_string()),
         "namespace label must reflect the driver's runtime config"
     );
@@ -618,12 +622,9 @@ fn driver_status_keeps_running_sandboxes_provisioning_with_stable_message() {
         id: Some("cid".to_string()),
         names: Some(vec!["/openshell-demo".to_string()]),
         labels: Some(HashMap::from([
-            (SANDBOX_ID_LABEL_KEY.to_string(), "sbx-1".to_string()),
-            (SANDBOX_NAME_LABEL_KEY.to_string(), "demo".to_string()),
-            (
-                SANDBOX_NAMESPACE_LABEL_KEY.to_string(),
-                "default".to_string(),
-            ),
+            (LABEL_SANDBOX_ID.to_string(), "sbx-1".to_string()),
+            (LABEL_SANDBOX_NAME.to_string(), "demo".to_string()),
+            (LABEL_SANDBOX_NAMESPACE.to_string(), "default".to_string()),
         ])),
         state: Some(ContainerSummaryStateEnum::RUNNING),
         status: Some("Up 2 seconds".to_string()),
@@ -675,12 +676,9 @@ fn driver_status_marks_restarting_sandboxes_as_error() {
         id: Some("cid".to_string()),
         names: Some(vec!["/openshell-demo".to_string()]),
         labels: Some(HashMap::from([
-            (SANDBOX_ID_LABEL_KEY.to_string(), "sbx-1".to_string()),
-            (SANDBOX_NAME_LABEL_KEY.to_string(), "demo".to_string()),
-            (
-                SANDBOX_NAMESPACE_LABEL_KEY.to_string(),
-                "default".to_string(),
-            ),
+            (LABEL_SANDBOX_ID.to_string(), "sbx-1".to_string()),
+            (LABEL_SANDBOX_NAME.to_string(), "demo".to_string()),
+            (LABEL_SANDBOX_NAMESPACE.to_string(), "default".to_string()),
         ])),
         state: Some(ContainerSummaryStateEnum::RESTARTING),
         status: Some("Restarting (1) 2 seconds ago".to_string()),

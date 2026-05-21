@@ -27,14 +27,15 @@
 mod common;
 
 use bytes::Bytes;
-use common::{PkiBundle, generate_pki, install_rustls_provider, start_test_server};
+use common::{
+    PkiBundle, generate_pki, generate_rogue_pki, install_rustls_provider, start_test_server,
+};
 use http_body_util::Empty;
 use hyper::{Request, StatusCode};
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use openshell_core::proto::{HealthRequest, ServiceStatus, open_shell_client::OpenShellClient};
 use openshell_server::TlsAcceptor;
-use rcgen::{CertificateParams, IsCa, KeyPair};
 use rustls::RootCertStore;
 use rustls::pki_types::CertificateDer;
 use rustls_pemfile::certs;
@@ -321,32 +322,11 @@ async fn rogue_cert_rejected() {
     let (addr, server) = start_test_server(tls_acceptor).await;
 
     // Generate a rogue CA + client cert
-    let mut rogue_ca_params =
-        CertificateParams::new(Vec::<String>::new()).expect("failed to create rogue CA params");
-    rogue_ca_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    rogue_ca_params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, "rogue-ca");
-    let rogue_ca_key = KeyPair::generate().expect("failed to generate rogue CA key");
-    let rogue_ca_cert = rogue_ca_params
-        .self_signed(&rogue_ca_key)
-        .expect("failed to sign rogue CA cert");
-
-    let mut rogue_client_params =
-        CertificateParams::new(Vec::<String>::new()).expect("failed to create rogue client params");
-    rogue_client_params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, "rogue-client");
-    let rogue_client_key = KeyPair::generate().expect("failed to generate rogue client key");
-    let rogue_client_cert = rogue_client_params
-        .signed_by(&rogue_client_key, &rogue_ca_cert, &rogue_ca_key)
-        .expect("failed to sign rogue client cert");
+    let rogue = generate_rogue_pki();
 
     let ca_cert = tonic::transport::Certificate::from_pem(pki.ca_cert_pem.clone());
-    let identity = tonic::transport::Identity::from_pem(
-        rogue_client_cert.pem(),
-        rogue_client_key.serialize_pem(),
-    );
+    let identity =
+        tonic::transport::Identity::from_pem(rogue.client_cert_pem, rogue.client_key_pem);
     let tls = ClientTlsConfig::new()
         .ca_certificate(ca_cert)
         .identity(identity)

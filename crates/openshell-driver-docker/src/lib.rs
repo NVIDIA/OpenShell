@@ -19,7 +19,10 @@ use bollard::query_parameters::{
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use openshell_core::config::{DEFAULT_DOCKER_NETWORK_NAME, DEFAULT_STOP_TIMEOUT_SECS};
-use openshell_core::driver_utils::SUPERVISOR_IMAGE_BINARY_PATH;
+use openshell_core::driver_utils::{
+    LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
+    LABEL_SANDBOX_NAMESPACE, SUPERVISOR_IMAGE_BINARY_PATH,
+};
 use openshell_core::gpu::cdi_gpu_device_ids;
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
@@ -47,12 +50,6 @@ use url::Url;
 const WATCH_BUFFER: usize = 128;
 const WATCH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const WATCH_POLL_MAX_BACKOFF: Duration = Duration::from_secs(30);
-
-const MANAGED_BY_LABEL_KEY: &str = "openshell.ai/managed-by";
-const MANAGED_BY_LABEL_VALUE: &str = "openshell";
-const SANDBOX_ID_LABEL_KEY: &str = "openshell.ai/sandbox-id";
-const SANDBOX_NAME_LABEL_KEY: &str = "openshell.ai/sandbox-name";
-const SANDBOX_NAMESPACE_LABEL_KEY: &str = "openshell.ai/sandbox-namespace";
 
 const SUPERVISOR_MOUNT_PATH: &str = "/opt/openshell/bin/openshell-sandbox";
 const TLS_CA_MOUNT_PATH: &str = "/etc/openshell/tls/client/ca.crt";
@@ -683,9 +680,9 @@ impl DockerComputeDriver {
     ) -> Result<Option<ContainerSummary>, Status> {
         let mut label_filter_values = Vec::new();
         if !sandbox_id.is_empty() {
-            label_filter_values.push(format!("{SANDBOX_ID_LABEL_KEY}={sandbox_id}"));
+            label_filter_values.push(format!("{LABEL_SANDBOX_ID}={sandbox_id}"));
         } else if !sandbox_name.is_empty() {
-            label_filter_values.push(format!("{SANDBOX_NAME_LABEL_KEY}={sandbox_name}"));
+            label_filter_values.push(format!("{LABEL_SANDBOX_NAME}={sandbox_name}"));
         }
 
         let filters =
@@ -706,15 +703,15 @@ impl DockerComputeDriver {
                 return false;
             };
             let namespace_matches = labels
-                .get(SANDBOX_NAMESPACE_LABEL_KEY)
+                .get(LABEL_SANDBOX_NAMESPACE)
                 .is_some_and(|value| value == &self.config.sandbox_namespace);
             let id_matches = sandbox_id.is_empty()
                 || labels
-                    .get(SANDBOX_ID_LABEL_KEY)
+                    .get(LABEL_SANDBOX_ID)
                     .is_some_and(|value| value == sandbox_id);
             let name_matches = sandbox_name.is_empty()
                 || labels
-                    .get(SANDBOX_NAME_LABEL_KEY)
+                    .get(LABEL_SANDBOX_NAME)
                     .is_some_and(|value| value == sandbox_name);
             namespace_matches && id_matches && name_matches
         }))
@@ -1015,17 +1012,17 @@ fn build_container_create_body(
     let resource_limits = docker_resource_limits(template)?;
     let mut labels = template.labels.clone();
     labels.insert(
-        MANAGED_BY_LABEL_KEY.to_string(),
-        MANAGED_BY_LABEL_VALUE.to_string(),
+        LABEL_MANAGED_BY.to_string(),
+        LABEL_MANAGED_BY_VALUE.to_string(),
     );
-    labels.insert(SANDBOX_ID_LABEL_KEY.to_string(), sandbox.id.clone());
-    labels.insert(SANDBOX_NAME_LABEL_KEY.to_string(), sandbox.name.clone());
+    labels.insert(LABEL_SANDBOX_ID.to_string(), sandbox.id.clone());
+    labels.insert(LABEL_SANDBOX_NAME.to_string(), sandbox.name.clone());
     // The list/get/find paths filter by `config.sandbox_namespace`, so use
     // the same value here. `DriverSandbox.namespace` is unset on the request
     // path (the gateway elides it), and using it would produce containers
     // that the driver itself cannot find afterwards.
     labels.insert(
-        SANDBOX_NAMESPACE_LABEL_KEY.to_string(),
+        LABEL_SANDBOX_NAMESPACE.to_string(),
         config.sandbox_namespace.clone(),
     );
 
@@ -1217,8 +1214,8 @@ async fn ensure_bridge_network(docker: &Docker, network_name: &str) -> CoreResul
             driver: Some(DOCKER_NETWORK_DRIVER.to_string()),
             attachable: Some(true),
             labels: Some(HashMap::from([(
-                MANAGED_BY_LABEL_KEY.to_string(),
-                MANAGED_BY_LABEL_VALUE.to_string(),
+                LABEL_MANAGED_BY.to_string(),
+                LABEL_MANAGED_BY_VALUE.to_string(),
             )])),
             ..Default::default()
         })
@@ -1397,10 +1394,10 @@ fn sandbox_from_container_summary(
     readiness: &dyn SupervisorReadiness,
 ) -> Option<DriverSandbox> {
     let labels = summary.labels.as_ref()?;
-    let id = labels.get(SANDBOX_ID_LABEL_KEY)?.clone();
-    let name = labels.get(SANDBOX_NAME_LABEL_KEY)?.clone();
+    let id = labels.get(LABEL_SANDBOX_ID)?.clone();
+    let name = labels.get(LABEL_SANDBOX_NAME)?.clone();
     let namespace = labels
-        .get(SANDBOX_NAMESPACE_LABEL_KEY)
+        .get(LABEL_SANDBOX_NAMESPACE)
         .cloned()
         .unwrap_or_default();
 
@@ -1573,8 +1570,8 @@ fn managed_container_label_filters(
     extra_values: impl IntoIterator<Item = String>,
 ) -> HashMap<String, Vec<String>> {
     let mut values = vec![
-        format!("{MANAGED_BY_LABEL_KEY}={MANAGED_BY_LABEL_VALUE}"),
-        format!("{SANDBOX_NAMESPACE_LABEL_KEY}={sandbox_namespace}"),
+        format!("{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE}"),
+        format!("{LABEL_SANDBOX_NAMESPACE}={sandbox_namespace}"),
     ];
     values.extend(extra_values);
     label_filters(values)

@@ -5,6 +5,28 @@
 
 use crate::proto::compute::v1::DriverSandbox;
 
+// ---------------------------------------------------------------------------
+// Sandbox container/pod label keys (openshell.ai/ namespace)
+// ---------------------------------------------------------------------------
+
+/// Container/pod label that identifies this resource as managed by `OpenShell`.
+/// Value should be `"openshell"`.
+pub const LABEL_MANAGED_BY: &str = "openshell.ai/managed-by";
+
+/// Expected value for [`LABEL_MANAGED_BY`].
+pub const LABEL_MANAGED_BY_VALUE: &str = "openshell";
+
+/// Container/pod label carrying the sandbox ID.
+pub const LABEL_SANDBOX_ID: &str = "openshell.ai/sandbox-id";
+
+/// Container/pod label carrying the sandbox name.
+pub const LABEL_SANDBOX_NAME: &str = "openshell.ai/sandbox-name";
+
+/// Container/pod label carrying the sandbox namespace.
+pub const LABEL_SANDBOX_NAMESPACE: &str = "openshell.ai/sandbox-namespace";
+
+// ---------------------------------------------------------------------------
+
 /// Path to the sandbox supervisor binary inside the container image.
 ///
 /// All compute drivers must launch this binary as the container entrypoint to

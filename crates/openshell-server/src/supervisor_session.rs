@@ -786,6 +786,14 @@ mod tests {
     use crate::persistence::Store;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    async fn test_store() -> Arc<Store> {
+        Arc::new(
+            Store::connect("sqlite::memory:?cache=shared")
+                .await
+                .expect("in-memory SQLite store should connect"),
+        )
+    }
+
     /// Returns a shutdown sender with its receiver immediately dropped. Tests
     /// that don't observe the shutdown signal can use this to satisfy the
     /// `register` signature without the receiver noise.
@@ -1200,11 +1208,7 @@ mod tests {
 
     #[tokio::test]
     async fn require_persisted_sandbox_rejects_missing_sandbox() {
-        let store = Arc::new(
-            Store::connect("sqlite::memory:?cache=shared")
-                .await
-                .unwrap(),
-        );
+        let store = test_store().await;
 
         let err = require_persisted_sandbox(&store, "missing")
             .await
@@ -1215,11 +1219,7 @@ mod tests {
 
     #[tokio::test]
     async fn require_persisted_sandbox_accepts_existing_sandbox() {
-        let store = Arc::new(
-            Store::connect("sqlite::memory:?cache=shared")
-                .await
-                .unwrap(),
-        );
+        let store = test_store().await;
         store
             .put_message(&sandbox_record("sbx-1", "sandbox-one"))
             .await

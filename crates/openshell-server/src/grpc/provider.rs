@@ -1445,6 +1445,12 @@ mod tests {
     use super::*;
     use crate::grpc::MAX_MAP_KEY_LEN;
     use crate::grpc::test_support::test_server_state;
+
+    async fn test_store() -> Store {
+        Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .expect("in-memory SQLite store should connect")
+    }
     use openshell_core::proto::{
         DeleteProviderProfileRequest, GetProviderProfileRequest, ImportProviderProfilesRequest,
         L7Allow, L7Rule, LintProviderProfilesRequest, ListProviderProfilesRequest, NetworkBinary,
@@ -2612,9 +2618,7 @@ mod tests {
 
     #[tokio::test]
     async fn provider_crud_round_trip_and_semantics() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
 
         let created = provider_with_values("gitlab-local", "gitlab");
         let persisted = create_provider_record(&store, created.clone())
@@ -2706,9 +2710,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_provider_removes_scoped_refresh_states() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
 
         let provider = create_provider_record(
             &store,
@@ -2755,9 +2757,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_provider_rejects_attached_provider() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
 
         create_provider_record(&store, provider_with_values("gitlab-local", "gitlab"))
             .await
@@ -2793,9 +2793,7 @@ mod tests {
 
     #[tokio::test]
     async fn provider_create_and_update_return_correct_resource_version() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
 
         // Create provider and verify resource_version: 1 in response
         let created = provider_with_values("test-provider", "openai");
@@ -3081,9 +3079,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_provider_empty_maps_is_noop() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
 
         let created = provider_with_values("noop-test", "nvidia");
         let persisted = create_provider_record(&store, created).await.unwrap();
@@ -3130,9 +3126,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_provider_empty_value_deletes_key() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
 
         let created = provider_with_values("delete-key-test", "openai");
         create_provider_record(&store, created).await.unwrap();
@@ -3183,9 +3177,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_provider_empty_type_preserves_existing() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
 
         let created = provider_with_values("type-preserve-test", "anthropic");
         create_provider_record(&store, created).await.unwrap();
@@ -3214,9 +3206,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_provider_rejects_type_change() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
 
         let created = provider_with_values("type-change-test", "nvidia");
         create_provider_record(&store, created).await.unwrap();
@@ -3246,9 +3236,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_provider_validates_merged_result() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
 
         let created = provider_with_values("validate-merge-test", "gitlab");
         create_provider_record(&store, created).await.unwrap();
@@ -3278,14 +3266,14 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_provider_env_empty_list_returns_empty() {
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
         let result = resolve_provider_environment(&store, &[]).await.unwrap();
         assert!(result.is_empty());
     }
 
     #[tokio::test]
     async fn resolve_provider_env_injects_credentials() {
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
         let provider = Provider {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: String::new(),
@@ -3320,7 +3308,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_provider_env_skips_expired_credentials_and_returns_expiry_metadata() {
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
         let now_ms = crate::persistence::current_time_ms();
         let provider = Provider {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
@@ -3360,7 +3348,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_provider_env_unknown_name_returns_error() {
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
         let err = resolve_provider_environment(&store, &["nonexistent".to_string()])
             .await
             .unwrap_err();
@@ -3370,7 +3358,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_provider_env_skips_invalid_credential_keys() {
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
         let provider = Provider {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: String::new(),
@@ -3402,7 +3390,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_provider_env_multiple_providers_merge() {
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
         create_provider_record(
             &store,
             Provider {
@@ -3457,7 +3445,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_provider_env_rejects_duplicate_credential_keys() {
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
         create_provider_record(
             &store,
             Provider {
@@ -3514,7 +3502,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_provider_rejects_credential_key_collision_for_attached_sandbox() {
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
         create_provider_record(
             &store,
             Provider {
@@ -3607,7 +3595,7 @@ mod tests {
     async fn handler_flow_resolves_credentials_from_sandbox_providers() {
         use openshell_core::proto::{Sandbox, SandboxPhase, SandboxSpec};
 
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
 
         create_provider_record(
             &store,
@@ -3667,7 +3655,7 @@ mod tests {
     async fn handler_flow_returns_empty_when_no_providers() {
         use openshell_core::proto::{Sandbox, SandboxPhase, SandboxSpec};
 
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
 
         let sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
@@ -3701,14 +3689,14 @@ mod tests {
     async fn handler_flow_returns_none_for_unknown_sandbox() {
         use openshell_core::proto::Sandbox;
 
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
         let result = store.get_message::<Sandbox>("nonexistent").await.unwrap();
         assert!(result.is_none());
     }
 
     #[tokio::test]
     async fn update_provider_validates_before_write() {
-        let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
+        let store = Arc::new(test_store().await);
 
         // Create a valid provider
         let provider = provider_with_values("test-validate-provider", "test-type");
@@ -3780,11 +3768,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_create_provider_rejects_duplicate() {
-        let store = Arc::new(
-            Store::connect("sqlite::memory:?cache=shared")
-                .await
-                .unwrap(),
-        );
+        let store = Arc::new(test_store().await);
 
         let provider = provider_with_values("test-concurrent-provider", "test-type");
 

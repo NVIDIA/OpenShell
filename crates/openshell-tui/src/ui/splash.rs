@@ -11,6 +11,8 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
 
+use super::centered_rect;
+
 // ---------------------------------------------------------------------------
 // ANSI Shadow figlet art — OPEN (6 lines, 35 display cols)
 // ---------------------------------------------------------------------------
@@ -116,24 +118,4 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, theme: &crate::theme::Theme) {
     ]);
 
     frame.render_widget(footer, chunks[2]);
-}
-
-fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
-    let vert = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length((area.height.saturating_sub(height)) / 2),
-            Constraint::Length(height),
-            Constraint::Min(0),
-        ])
-        .split(area);
-    let horiz = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length((area.width.saturating_sub(width)) / 2),
-            Constraint::Length(width),
-            Constraint::Min(0),
-        ])
-        .split(vert[1]);
-    horiz[1]
 }

@@ -2,11 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
 
 use crate::app::{App, LogLine};
+
+use super::centered_rect;
 
 pub fn draw(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let t = &app.theme;
@@ -200,26 +202,6 @@ pub fn draw_detail_popup(
             .wrap(Wrap { trim: false }),
         popup_area,
     );
-}
-
-fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
-    let vert = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length((area.height.saturating_sub(height)) / 2),
-            Constraint::Length(height),
-            Constraint::Min(0),
-        ])
-        .split(area);
-    let horiz = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length((area.width.saturating_sub(width)) / 2),
-            Constraint::Length(width),
-            Constraint::Min(0),
-        ])
-        .split(vert[1]);
-    horiz[1]
 }
 
 // ---------------------------------------------------------------------------

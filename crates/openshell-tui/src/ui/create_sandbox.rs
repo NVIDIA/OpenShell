@@ -8,6 +8,8 @@ use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
 
 use crate::app::{App, CreateFormField, CreatePhase};
 
+use super::centered_rect;
+
 /// Draw the create sandbox modal overlay.
 pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let Some(form) = &app.create_form else {
@@ -417,24 +419,4 @@ fn draw_text_field(
         Line::from(Span::styled(format!("  {value}"), t.text))
     };
     frame.render_widget(Paragraph::new(display), chunks[1]);
-}
-
-fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
-    let vert = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length((area.height.saturating_sub(height)) / 2),
-            Constraint::Length(height),
-            Constraint::Min(0),
-        ])
-        .split(area);
-    let horiz = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length((area.width.saturating_sub(width)) / 2),
-            Constraint::Length(width),
-            Constraint::Min(0),
-        ])
-        .split(vert[1]);
-    horiz[1]
 }

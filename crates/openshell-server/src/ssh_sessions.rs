@@ -83,6 +83,12 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    async fn test_store() -> Store {
+        Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .expect("in-memory SQLite store should connect")
+    }
+
     fn make_session(id: &str, sandbox_id: &str, expires_at_ms: i64, revoked: bool) -> SshSession {
         SshSession {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
@@ -105,9 +111,7 @@ mod tests {
 
     #[tokio::test]
     async fn reaper_deletes_expired_sessions() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
 
         let expired = make_session("expired1", "sbx1", now_ms() - 60_000, false);
         store.put_message(&expired).await.unwrap();
@@ -137,9 +141,7 @@ mod tests {
 
     #[tokio::test]
     async fn reaper_deletes_revoked_sessions() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
 
         let revoked = make_session("revoked1", "sbx1", 0, true);
         store.put_message(&revoked).await.unwrap();
@@ -169,9 +171,7 @@ mod tests {
 
     #[tokio::test]
     async fn reaper_preserves_zero_expiry_sessions() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
 
         let no_expiry = make_session("noexpiry1", "sbx1", 0, false);
         store.put_message(&no_expiry).await.unwrap();

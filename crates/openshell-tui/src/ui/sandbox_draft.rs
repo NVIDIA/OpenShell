@@ -6,10 +6,12 @@
 use crate::app::App;
 use openshell_core::proto::PolicyChunk;
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
+
+use super::centered_rect;
 
 /// Draw the network rules panel (list view with highlight bar).
 pub fn draw(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
@@ -440,24 +442,4 @@ fn format_short_time(epoch_ms: i64) -> String {
     let minutes = (time_of_day % 3600) / 60;
     let seconds = time_of_day % 60;
     format!("{hours:02}:{minutes:02}:{seconds:02}")
-}
-
-fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
-    let vert = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length((area.height.saturating_sub(height)) / 2),
-            Constraint::Length(height),
-            Constraint::Min(0),
-        ])
-        .split(area);
-    let horiz = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length((area.width.saturating_sub(width)) / 2),
-            Constraint::Length(width),
-            Constraint::Min(0),
-        ])
-        .split(vert[1]);
-    horiz[1]
 }

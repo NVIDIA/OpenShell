@@ -2833,6 +2833,12 @@ mod tests {
     use std::sync::Arc;
     use tonic::Code;
 
+    async fn test_store() -> Store {
+        Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .expect("in-memory SQLite store should connect")
+    }
+
     #[test]
     fn sandbox_caller_update_validation_allows_sandbox_policy_sync() {
         let req = UpdateConfigRequest {
@@ -2882,7 +2888,7 @@ mod tests {
     async fn sandbox_without_policy_stores_successfully() {
         use openshell_core::proto::{SandboxPhase, SandboxSpec};
 
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
 
         let sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
@@ -3002,7 +3008,7 @@ mod tests {
 
     #[tokio::test]
     async fn provider_policy_layers_skip_unknown_provider_types() {
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
         store
             .put_message(&test_provider("custom-provider", "custom"))
             .await
@@ -3017,7 +3023,7 @@ mod tests {
 
     #[tokio::test]
     async fn provider_policy_layers_skip_custom_profile_for_legacy_provider_type() {
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
         store
             .put_message(&test_provider("custom-provider", "generic"))
             .await
@@ -3059,7 +3065,7 @@ mod tests {
     #[tokio::test]
     #[allow(deprecated)]
     async fn provider_policy_layers_include_custom_provider_profiles() {
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
         store
             .put_message(&test_provider("work-custom", "custom-api"))
             .await
@@ -3122,7 +3128,7 @@ mod tests {
 
     #[tokio::test]
     async fn provider_policy_layers_normalize_custom_provider_type_ids() {
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
         store
             .put_message(&test_provider("work-custom", " Custom-API "))
             .await
@@ -3164,7 +3170,7 @@ mod tests {
 
     #[tokio::test]
     async fn provider_policy_layers_include_known_provider_profiles() {
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
         store
             .put_message(&test_provider("work-github", "github"))
             .await
@@ -3905,7 +3911,7 @@ mod tests {
     async fn sandbox_policy_backfill_on_update_when_no_baseline() {
         use openshell_core::proto::{FilesystemPolicy, LandlockPolicy, SandboxPhase, SandboxSpec};
 
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
 
         let sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
@@ -4865,7 +4871,7 @@ mod tests {
     async fn merge_chunk_into_policy_adds_first_network_rule_to_empty_policy() {
         use openshell_core::proto::{NetworkBinary, NetworkEndpoint, NetworkPolicyRule};
 
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
         let rule = NetworkPolicyRule {
             name: "google".to_string(),
             endpoints: vec![NetworkEndpoint {
@@ -4928,7 +4934,7 @@ mod tests {
             NetworkBinary, NetworkEndpoint, NetworkPolicyRule, SandboxPolicy,
         };
 
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
         let sandbox_id = "sb-merge";
 
         let initial_policy = SandboxPolicy {
@@ -5029,7 +5035,7 @@ mod tests {
             NetworkBinary, NetworkEndpoint, NetworkPolicyRule, SandboxPolicy,
         };
 
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
         let sandbox_id = "sb-new";
 
         let initial_policy = SandboxPolicy {
@@ -5116,7 +5122,7 @@ mod tests {
             L7Allow, L7DenyRule, L7Rule, NetworkEndpoint, NetworkPolicyRule, SandboxPolicy,
         };
 
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
         let sandbox_id = "sb-concurrent-merge";
 
         let initial_policy = SandboxPolicy {
@@ -5687,9 +5693,7 @@ mod tests {
 
     #[tokio::test]
     async fn global_settings_load_returns_default_when_empty() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
         let settings = load_global_settings(&store).await.unwrap();
         assert!(settings.settings.is_empty());
         assert_eq!(settings.revision, 0);
@@ -5697,9 +5701,7 @@ mod tests {
 
     #[tokio::test]
     async fn sandbox_settings_load_returns_default_when_empty() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
         let settings = load_sandbox_settings(&store, "nonexistent").await.unwrap();
         assert!(settings.settings.is_empty());
         assert_eq!(settings.revision, 0);
@@ -5707,9 +5709,7 @@ mod tests {
 
     #[tokio::test]
     async fn global_settings_save_and_load_round_trip() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
 
         let mut settings = StoredSettings::default();
         settings.settings.insert(
@@ -5736,9 +5736,7 @@ mod tests {
 
     #[tokio::test]
     async fn sandbox_settings_save_and_load_round_trip() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
 
         let sandbox_name = "my-sandbox";
         let mut settings = StoredSettings::default();
@@ -5760,11 +5758,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_global_setting_mutations_are_serialized() {
-        let store = Arc::new(
-            Store::connect("sqlite::memory:?cache=shared")
-                .await
-                .unwrap(),
-        );
+        let store = Arc::new(test_store().await);
         let mutex = Arc::new(tokio::sync::Mutex::new(()));
 
         let n = 50;
@@ -5795,11 +5789,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_global_setting_mutations_without_lock_can_lose_writes() {
-        let store = Arc::new(
-            Store::connect("sqlite::memory:?cache=shared")
-                .await
-                .unwrap(),
-        );
+        let store = Arc::new(test_store().await);
 
         let n = 50;
         let mut handles = Vec::with_capacity(n);
@@ -5866,9 +5856,7 @@ mod tests {
 
     #[tokio::test]
     async fn conflict_guard_sandbox_set_blocked_when_global_exists() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
 
         let mut global = StoredSettings::default();
         global.settings.insert(
@@ -5885,9 +5873,7 @@ mod tests {
 
     #[tokio::test]
     async fn conflict_guard_sandbox_delete_blocked_when_global_exists() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
 
         let mut global = StoredSettings::default();
         global
@@ -5902,9 +5888,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_unlock_sandbox_set_succeeds_after_global_delete() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
 
         // Create initial global settings
         let mut global = StoredSettings::default();
@@ -5966,7 +5950,7 @@ mod tests {
 
     #[tokio::test]
     async fn save_settings_detects_concurrent_modification() {
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
 
         // Create initial settings
         let mut settings = StoredSettings {

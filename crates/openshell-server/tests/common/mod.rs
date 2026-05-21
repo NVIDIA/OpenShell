@@ -557,3 +557,41 @@ pub async fn start_test_server(
 
     (addr, handle)
 }
+
+/// Rogue PKI bundle: client cert + key not signed by the server's CA.
+pub struct RoguePkiBundle {
+    pub client_cert_pem: String,
+    pub client_key_pem: String,
+}
+
+/// Generate a rogue CA and a client certificate signed by that CA.
+///
+/// Used to verify that the server rejects mTLS connections from clients whose
+/// certificate chain does not trace back to the trusted CA.
+pub fn generate_rogue_pki() -> RoguePkiBundle {
+    let mut rogue_ca_params =
+        CertificateParams::new(Vec::<String>::new()).expect("failed to create rogue CA params");
+    rogue_ca_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    rogue_ca_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "rogue-ca");
+    let rogue_ca_key = KeyPair::generate().expect("failed to generate rogue CA key");
+    let rogue_ca_cert = rogue_ca_params
+        .self_signed(&rogue_ca_key)
+        .expect("failed to sign rogue CA cert");
+
+    let mut rogue_client_params =
+        CertificateParams::new(Vec::<String>::new()).expect("failed to create rogue client params");
+    rogue_client_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "rogue-client");
+    let rogue_client_key = KeyPair::generate().expect("failed to generate rogue client key");
+    let rogue_client_cert = rogue_client_params
+        .signed_by(&rogue_client_key, &rogue_ca_cert, &rogue_ca_key)
+        .expect("failed to sign rogue client cert");
+
+    RoguePkiBundle {
+        client_cert_pem: rogue_client_cert.pem(),
+        client_key_pem: rogue_client_key.serialize_pem(),
+    }
+}

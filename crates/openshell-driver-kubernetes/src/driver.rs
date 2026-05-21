@@ -13,7 +13,9 @@ use kube::core::gvk::GroupVersionKind;
 use kube::core::{DynamicObject, ObjectMeta};
 use kube::runtime::watcher::{self, Event};
 use kube::{Client, Error as KubeError};
-use openshell_core::driver_utils::SUPERVISOR_IMAGE_BINARY_PATH;
+use openshell_core::driver_utils::{
+    LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, SUPERVISOR_IMAGE_BINARY_PATH,
+};
 use openshell_core::progress::{
     PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX, PROGRESS_STEP_STARTING_SANDBOX,
     mark_progress_active, mark_progress_complete, mark_progress_detail,
@@ -72,9 +74,7 @@ const KUBE_API_TIMEOUT: Duration = Duration::from_secs(30);
 const SANDBOX_GROUP: &str = "agents.x-k8s.io";
 const SANDBOX_VERSION: &str = "v1alpha1";
 pub const SANDBOX_KIND: &str = "Sandbox";
-const SANDBOX_ID_LABEL: &str = "openshell.ai/sandbox-id";
-const SANDBOX_MANAGED_LABEL: &str = "openshell.ai/managed-by";
-const SANDBOX_MANAGED_VALUE: &str = "openshell";
+
 const GPU_RESOURCE_NAME: &str = "nvidia.com/gpu";
 const GPU_RESOURCE_QUANTITY: &str = "1";
 
@@ -552,17 +552,17 @@ impl KubernetesComputeDriver {
 
 fn sandbox_labels(sandbox: &Sandbox) -> BTreeMap<String, String> {
     let mut labels = BTreeMap::new();
-    labels.insert(SANDBOX_ID_LABEL.to_string(), sandbox.id.clone());
+    labels.insert(LABEL_SANDBOX_ID.to_string(), sandbox.id.clone());
     labels.insert(
-        SANDBOX_MANAGED_LABEL.to_string(),
-        SANDBOX_MANAGED_VALUE.to_string(),
+        LABEL_MANAGED_BY.to_string(),
+        LABEL_MANAGED_BY_VALUE.to_string(),
     );
     labels
 }
 
 fn sandbox_id_from_object(obj: &DynamicObject) -> Result<String, String> {
     if let Some(labels) = obj.metadata.labels.as_ref()
-        && let Some(id) = labels.get(SANDBOX_ID_LABEL)
+        && let Some(id) = labels.get(LABEL_SANDBOX_ID)
     {
         return Ok(id.clone());
     }

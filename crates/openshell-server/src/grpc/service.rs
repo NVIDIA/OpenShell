@@ -275,26 +275,8 @@ fn is_dns_label(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::grpc::test_support::test_server_state;
     use openshell_core::proto::SandboxPhase;
-
-    async fn test_server_state() -> Arc<ServerState> {
-        let store = Arc::new(
-            crate::persistence::Store::connect("sqlite::memory:?cache=shared")
-                .await
-                .unwrap(),
-        );
-        let compute = crate::compute::new_test_runtime(store.clone()).await;
-        Arc::new(ServerState::new(
-            openshell_core::Config::new(None).with_database_url("sqlite::memory:?cache=shared"),
-            store,
-            compute,
-            crate::sandbox_index::SandboxIndex::new(),
-            crate::sandbox_watch::SandboxWatchBus::new(),
-            crate::tracing_bus::TracingLogBus::new(),
-            Arc::new(crate::supervisor_session::SupervisorSessionRegistry::new()),
-            None,
-        ))
-    }
 
     async fn seed_sandbox(state: &Arc<ServerState>, name: &str) {
         state
