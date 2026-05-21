@@ -3,7 +3,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Local k3s for Helm / Skaffold workflows using k3d (macOS primary; Linux also supported).
+# Local k3s for Helm / Skaffold workflows using k3d. macOS gets k3d from mise;
+# Linux users should install k3d explicitly or point tests at a kind/existing cluster.
 # Requires Docker running. Writes merged kubeconfig to HELM_K3S_KUBECONFIG or $KUBECONFIG or ./kubeconfig.
 #
 # Multi-worktree: the cluster name is derived from the last component of the current
@@ -52,7 +53,8 @@ Environment:
   HELM_K3S_KUBECONFIG          kubeconfig file to write/merge (default: repo kubeconfig or \$KUBECONFIG)
   HELM_K3S_LB_HOST_PORT        Host port mapped to load balancer port 80 (default: 8080)
 
-macOS uses k3d (Docker required). Linux uses the same k3d flow when Docker is available.
+macOS uses k3d from mise (Docker required). Linux can use this flow only when
+k3d is installed explicitly; otherwise use kind or an existing cluster context.
 Pair with: mise run helm:skaffold:dev
 EOF
 }
@@ -80,7 +82,12 @@ require_docker() {
 
 require_k3d() {
   if ! command -v k3d >/dev/null 2>&1; then
-    echo "error: k3d not found. Run: mise install" >&2
+    if [[ "$(uname -s)" == "Linux" ]]; then
+      echo "error: k3d not found. This repo no longer installs k3d through mise on Linux." >&2
+      echo "Install k3d explicitly, or use kind/an existing cluster and set OPENSHELL_E2E_KUBE_CONTEXT." >&2
+    else
+      echo "error: k3d not found. Run: mise install" >&2
+    fi
     exit 1
   fi
 }

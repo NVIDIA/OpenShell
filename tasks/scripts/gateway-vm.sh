@@ -38,6 +38,7 @@ GATEWAY_NAME="${OPENSHELL_VM_GATEWAY_NAME:-vm-dev}"
 STATE_DIR="${OPENSHELL_VM_GATEWAY_STATE_DIR:-${ROOT}/.cache/gateway-vm}"
 SANDBOX_NAMESPACE="${OPENSHELL_SANDBOX_NAMESPACE:-vm-dev}"
 SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-${COMMUNITY_SANDBOX_IMAGE:-ghcr.io/nvidia/openshell-community/sandboxes/base:latest}}"
+VM_BOOTSTRAP_IMAGE="${OPENSHELL_VM_BOOTSTRAP_IMAGE:-}"
 SANDBOX_IMAGE_PULL_POLICY="${OPENSHELL_SANDBOX_IMAGE_PULL_POLICY:-IfNotPresent}"
 LOG_LEVEL="${OPENSHELL_LOG_LEVEL:-info}"
 GATEWAY_BIN="${ROOT}/target/debug/openshell-gateway"
@@ -57,7 +58,9 @@ normalize_arch() {
 }
 
 normalize_bool() {
-  case "${1,,}" in
+  local val
+  val="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "${val}" in
     1|true|yes|on) echo "true" ;;
     0|false|no|off) echo "false" ;;
     *)
@@ -272,7 +275,8 @@ DISABLE_TLS="$(normalize_bool "${OPENSHELL_DISABLE_TLS:-true}")"
 # Build prerequisites: VM runtime artifacts + bundled supervisor.
 if [ ! -d "${COMPRESSED_DIR}" ] \
     || ! find "${COMPRESSED_DIR}" -maxdepth 1 -name 'libkrun*.zst' | grep -q . \
-    || [ ! -f "${COMPRESSED_DIR}/gvproxy.zst" ]; then
+    || [ ! -f "${COMPRESSED_DIR}/gvproxy.zst" ] \
+    || [ ! -f "${COMPRESSED_DIR}/umoci.zst" ]; then
   echo "==> Preparing embedded VM runtime (mise run vm:setup)"
   mise run vm:setup
 fi
@@ -305,6 +309,23 @@ fi
 
 mkdir -p "${STATE_DIR}"
 mkdir -p "${VM_DRIVER_STATE_DIR}"
+chmod 700 "${VM_DRIVER_STATE_DIR}"
+CONFIG_PATH="${STATE_DIR}/gateway.toml"
+cat >"${CONFIG_PATH}" <<EOF
+[openshell]
+version = 1
+
+[openshell.gateway]
+compute_drivers = ["vm"]
+disable_tls = ${DISABLE_TLS}
+
+[openshell.drivers.vm]
+default_image = "${SANDBOX_IMAGE}"
+bootstrap_image = "${VM_BOOTSTRAP_IMAGE}"
+grpc_endpoint = "${GRPC_ENDPOINT}"
+driver_dir = "${DRIVER_DIR}"
+state_dir = "${VM_DRIVER_STATE_DIR}"
+EOF
 
 GATEWAY_ENDPOINT="http://127.0.0.1:${PORT}"
 register_gateway_metadata "${GATEWAY_NAME}" "${GATEWAY_ENDPOINT}" "${PORT}" "${VM_DRIVER_STATE_DIR}"
@@ -326,16 +347,11 @@ echo "or by setting OPENSHELL_GATEWAY (e.g. in .env)."
 echo
 
 GATEWAY_ARGS=(
+  --config "${CONFIG_PATH}"
   --port "${PORT}"
   --log-level "${LOG_LEVEL}"
   --drivers vm
   --db-url "sqlite:${STATE_DIR}/gateway.db?mode=rwc"
-  --sandbox-namespace "${SANDBOX_NAMESPACE}"
-  --sandbox-image "${SANDBOX_IMAGE}"
-  --sandbox-image-pull-policy "${SANDBOX_IMAGE_PULL_POLICY}"
-  --grpc-endpoint "${GRPC_ENDPOINT}"
-  --driver-dir "${DRIVER_DIR}"
-  --vm-driver-state-dir "${VM_DRIVER_STATE_DIR}"
 )
 
 if [ "${DISABLE_TLS}" = "true" ]; then

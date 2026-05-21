@@ -12,7 +12,8 @@ OpenShell builds these main artifacts:
 |---|---|
 | Gateway binary | `crates/openshell-server` |
 | CLI package and Python SDK | `python/openshell` plus Rust binaries where packaged |
-| Gateway and supervisor container images | `deploy/docker/Dockerfile.images` |
+| Gateway container image | `deploy/docker/Dockerfile.gateway` |
+| Supervisor container image | `deploy/docker/Dockerfile.supervisor` |
 | Helm chart | `deploy/helm/openshell` |
 | VM driver/runtime assets | `crates/openshell-driver-vm` |
 | Published docs site | `docs/` rendered by Fern config in `fern/` |
@@ -21,10 +22,31 @@ Sandbox community images are built outside this repository.
 
 ## Container Builds
 
-The Docker image pipeline stages prebuilt Rust binaries, then builds container
-images from `deploy/docker/Dockerfile.images`. CI builds native artifacts on the
-target architecture, stages them under `deploy/docker/.build/`, and then uses
-Buildx to publish per-architecture images and multi-architecture tags.
+The Docker image pipeline is a two-step flow: build the Rust binary natively
+for the target architecture, then assemble the container image from the
+prebuilt binary. The gateway image is built from `deploy/docker/Dockerfile.gateway`
+and the supervisor image from `deploy/docker/Dockerfile.supervisor`. Neither
+Dockerfile compiles Rust — both copy a staged binary out of
+`deploy/docker/.build/prebuilt-binaries/<arch>/` into the final image.
+
+Binary staging is driven by `tasks/scripts/stage-prebuilt-binaries.sh`, which
+runs `cargo build` natively on a matching host or `cargo zigbuild` when
+cross-compiling. Local Docker image tasks infer the target architecture from
+`DOCKER_PLATFORM` when set, otherwise from the container engine host metadata
+with the kernel architecture as the fallback. CI invokes the same staging step
+via the `rust-native-build.yml` workflow (per-architecture, per-component) and
+uploads the result as an artifact that the image build job downloads back into
+the staging directory before running Buildx.
+
+Runtime layout:
+
+- **Gateway**: `gcr.io/distroless/cc-debian13:nonroot` base, GNU-linked binary at
+  `/usr/local/bin/openshell-gateway`, runs as UID/GID `1000:1000`.
+- **Supervisor**: `scratch` base, static musl binary at `/openshell-sandbox`.
+  Static linkage is required because the image is mounted/extracted into
+  sandbox environments (Docker extraction, Podman image volumes, Kubernetes
+  init-container copy-self) and cannot rely on a dynamic loader.
+
 Gateway image builds bake the corresponding supervisor image tag into the
 gateway binary so Docker sandboxes do not depend on `:latest` by default.
 Package formulas also pin Docker supervisor extraction to the matching release
@@ -40,16 +62,15 @@ the same staging and tagging assumptions are used locally and in CI.
 
 ## CI and E2E
 
-Required checks run on GitHub Actions. E2E and GPU workflows use NVIDIA
-self-hosted runners, so trusted PRs are mirrored by copy-pr-bot into
-`pull-request/<N>` branches before those workflows run.
+Required checks run on GitHub Actions. Workflows that use NVIDIA self-hosted runners trigger from copy-pr-bot mirror branches, so trusted PRs are mirrored into `pull-request/<N>` branches before those workflows run.
 
 The high-level CI model:
 
-1. Standard branch checks run on normal PR activity.
-2. Label-gated E2E and GPU checks run from trusted mirror branches.
-3. Gate jobs verify that the expected non-gate workflow actually ran.
-4. Release workflows rebuild and publish binaries, wheels, images, and docs.
+1. PR-context gate jobs publish required statuses for the PR head commit.
+2. Standard branch checks run from trusted mirror branches.
+3. Label-gated E2E, GPU, and Kubernetes checks run from trusted mirror branches.
+4. Gate jobs verify that the mirror branch matches the PR head and that the expected non-gate workflow actually ran.
+5. Release workflows rebuild and publish binaries, wheels, images, and docs.
 
 See `CI.md` for the contributor workflow and labels.
 

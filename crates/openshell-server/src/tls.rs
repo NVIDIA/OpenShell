@@ -19,17 +19,19 @@ pub struct TlsAcceptor {
 }
 
 impl TlsAcceptor {
-    /// Create a new TLS acceptor from certificate, key, and client CA files.
+    /// Create a new TLS acceptor from certificate and key files.
     ///
-    /// When `allow_unauthenticated` is `false` (the default), the server
-    /// enforces mTLS — all clients must present a valid certificate signed
-    /// by the given CA.
+    /// When `client_ca_path` is `Some` and `require_client_auth` is `true`,
+    /// the TLS handshake rejects connections that do not present a valid
+    /// client certificate signed by the given CA.
     ///
-    /// When `allow_unauthenticated` is `true`, the TLS handshake succeeds
-    /// even without a client certificate. This is required when the server
-    /// sits behind a reverse proxy (e.g. Cloudflare Tunnel) that terminates
-    /// TLS and cannot forward client certificates.  Application-layer
-    /// middleware must then enforce authentication (e.g. via a JWT header).
+    /// When `client_ca_path` is `Some` and `require_client_auth` is `false`,
+    /// client certificates are validated against the CA but not required.
+    /// Clients may connect without a certificate; presented certs from an
+    /// unknown CA are still rejected.
+    ///
+    /// When `client_ca_path` is `None`, the server does not request client
+    /// certificates at all (HTTPS-only).
     ///
     /// # Errors
     ///
@@ -37,33 +39,40 @@ impl TlsAcceptor {
     pub fn from_files(
         cert_path: &Path,
         key_path: &Path,
-        client_ca_path: &Path,
-        allow_unauthenticated: bool,
+        client_ca_path: Option<&Path>,
+        require_client_auth: bool,
     ) -> Result<Self> {
         let certs = load_certs(cert_path)?;
         let key = load_key(key_path)?;
 
-        let ca_certs = load_certs(client_ca_path)?;
-        let mut root_store = rustls::RootCertStore::empty();
-        for cert in ca_certs {
-            root_store
-                .add(cert)
-                .map_err(|e| Error::tls(format!("failed to add CA certificate: {e}")))?;
-        }
+        let mut config = if let Some(ca_path) = client_ca_path {
+            let ca_certs = load_certs(ca_path)?;
+            let mut root_store = rustls::RootCertStore::empty();
+            for cert in ca_certs {
+                root_store
+                    .add(cert)
+                    .map_err(|e| Error::tls(format!("failed to add CA certificate: {e}")))?;
+            }
 
-        let verifier_builder = WebPkiClientVerifier::builder(Arc::new(root_store));
-        let verifier = if allow_unauthenticated {
-            verifier_builder.allow_unauthenticated()
+            let verifier_builder = WebPkiClientVerifier::builder(Arc::new(root_store));
+            let verifier = if require_client_auth {
+                verifier_builder
+            } else {
+                verifier_builder.allow_unauthenticated()
+            }
+            .build()
+            .map_err(|e| Error::tls(format!("failed to build client verifier: {e}")))?;
+
+            ServerConfig::builder()
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(certs, key)
+                .map_err(|e| Error::tls(format!("failed to create TLS config: {e}")))?
         } else {
-            verifier_builder
-        }
-        .build()
-        .map_err(|e| Error::tls(format!("failed to build client verifier: {e}")))?;
-
-        let mut config = ServerConfig::builder()
-            .with_client_cert_verifier(verifier)
-            .with_single_cert(certs, key)
-            .map_err(|e| Error::tls(format!("failed to create TLS config: {e}")))?;
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(certs, key)
+                .map_err(|e| Error::tls(format!("failed to create TLS config: {e}")))?
+        };
 
         config
             .alpn_protocols

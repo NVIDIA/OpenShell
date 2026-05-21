@@ -5,6 +5,8 @@ pub mod config;
 pub mod driver;
 pub mod grpc;
 
-pub use config::KubernetesComputeConfig;
+pub use config::{
+    DEFAULT_WORKSPACE_STORAGE_SIZE, KubernetesComputeConfig, SupervisorSideloadMethod,
+};
 pub use driver::{KubernetesComputeDriver, KubernetesDriverError};
 pub use grpc::ComputeDriverService;

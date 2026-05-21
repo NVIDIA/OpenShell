@@ -11,6 +11,7 @@ use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_driver_kubernetes::{
     ComputeDriverService, KubernetesComputeConfig, KubernetesComputeDriver,
+    SupervisorSideloadMethod,
 };
 
 #[derive(Parser, Debug)]
@@ -46,12 +47,6 @@ struct Args {
     )]
     sandbox_ssh_socket_path: String,
 
-    #[arg(long, env = "OPENSHELL_SSH_HANDSHAKE_SECRET")]
-    ssh_handshake_secret: String,
-
-    #[arg(long, env = "OPENSHELL_SSH_HANDSHAKE_SKEW_SECS", default_value_t = 300)]
-    ssh_handshake_skew_secs: u64,
-
     #[arg(long, env = "OPENSHELL_CLIENT_TLS_SECRET_NAME")]
     client_tls_secret_name: Option<String>,
 
@@ -63,6 +58,13 @@ struct Args {
 
     #[arg(long, env = "OPENSHELL_SUPERVISOR_IMAGE_PULL_POLICY")]
     supervisor_image_pull_policy: Option<String>,
+
+    #[arg(
+        long,
+        env = "OPENSHELL_SUPERVISOR_SIDELOAD_METHOD",
+        default_value = "image-volume"
+    )]
+    supervisor_sideload_method: SupervisorSideloadMethod,
 
     #[arg(long, env = "OPENSHELL_ENABLE_USER_NAMESPACES")]
     enable_user_namespaces: bool,
@@ -85,13 +87,18 @@ async fn main() -> Result<()> {
             .supervisor_image
             .unwrap_or_else(|| openshell_core::config::DEFAULT_SUPERVISOR_IMAGE.to_string()),
         supervisor_image_pull_policy: args.supervisor_image_pull_policy.unwrap_or_default(),
+        supervisor_sideload_method: args.supervisor_sideload_method,
         grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
         ssh_socket_path: args.sandbox_ssh_socket_path,
-        ssh_handshake_secret: args.ssh_handshake_secret,
-        ssh_handshake_skew_secs: args.ssh_handshake_skew_secs,
         client_tls_secret_name: args.client_tls_secret_name.unwrap_or_default(),
         host_gateway_ip: args.host_gateway_ip.unwrap_or_default(),
         enable_user_namespaces: args.enable_user_namespaces,
+        workspace_default_storage_size: std::env::var(
+            "OPENSHELL_K8S_WORKSPACE_DEFAULT_STORAGE_SIZE",
+        )
+        .unwrap_or_else(|_| {
+            openshell_driver_kubernetes::DEFAULT_WORKSPACE_STORAGE_SIZE.to_string()
+        }),
     })
     .await
     .into_diagnostic()?;

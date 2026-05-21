@@ -13,6 +13,15 @@
 /// Override at runtime with the `OPENSHELL_COMMUNITY_REGISTRY` env var.
 pub const DEFAULT_COMMUNITY_REGISTRY: &str = "ghcr.io/nvidia/openshell-community/sandboxes";
 
+/// Return the default sandbox image reference (`{registry}/base:latest`).
+///
+/// Used by all compute drivers as the fallback image when none is specified in
+/// the sandbox spec.
+#[must_use]
+pub fn default_sandbox_image() -> String {
+    format!("{DEFAULT_COMMUNITY_REGISTRY}/base:latest")
+}
+
 /// Resolve a user-supplied image string into a fully-qualified reference.
 ///
 /// Resolution rules (applied in order):

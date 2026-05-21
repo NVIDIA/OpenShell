@@ -55,28 +55,16 @@ After the Gateway is provisioned, Envoy Gateway creates a LoadBalancer service i
 kubectl -n openshell get svc -l gateway.envoyproxy.io/owning-gateway-name=openshell
 ```
 
-Once the `EXTERNAL-IP` is assigned, register the gateway with the CLI:
+After the `EXTERNAL-IP` is assigned, register the gateway with the CLI:
 
 ```shell
 openshell gateway add http://<external-ip> --name production
 openshell status
 ```
 
-## Configure SSH relay
+## SSH Relay
 
-For sandbox SSH connections to work through the external address, set `server.sshGatewayHost` and `server.sshGatewayPort` to the hostname and port that CLI clients can reach:
-
-```shell
-helm upgrade openshell \
-  oci://ghcr.io/nvidia/openshell/helm-chart \
-  --version <version> \
-  --namespace openshell \
-  --set grpcRoute.enabled=true \
-  --set grpcRoute.gateway.create=true \
-  --set grpcRoute.gateway.className=eg \
-  --set server.sshGatewayHost=<external-hostname> \
-  --set server.sshGatewayPort=<ssh-port>
-```
+Sandbox SSH uses the gateway endpoint registered with the CLI. No separate Helm SSH host or port values are required.
 
 ## Next Steps
 

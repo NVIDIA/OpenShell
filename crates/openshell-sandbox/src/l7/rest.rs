@@ -9,13 +9,18 @@
 
 use crate::l7::provider::{BodyLength, L7Provider, L7Request, RelayOutcome};
 use crate::opa::PolicyGenerationGuard;
-use crate::secrets::rewrite_http_header_block;
+use crate::secrets::{
+    SecretResolver, contains_reserved_credential_marker, rewrite_http_header_block,
+};
+use base64::Engine as _;
 use miette::{IntoDiagnostic, Result, miette};
-use std::collections::HashMap;
+use sha1::{Digest, Sha1};
+use std::collections::{HashMap, HashSet};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::debug;
 
 const MAX_HEADER_BYTES: usize = 16384; // 16 KiB for HTTP headers
+const MAX_REWRITE_BODY_BYTES: usize = 256 * 1024;
 const RELAY_BUF_SIZE: usize = 8192;
 /// Idle timeout for `relay_until_eof`.  If no data arrives within this window
 /// the body is considered complete.  Prevents blocking on servers that keep
@@ -343,7 +348,7 @@ pub(crate) async fn relay_http_request_with_resolver<C, U>(
     req: &L7Request,
     client: &mut C,
     upstream: &mut U,
-    resolver: Option<&crate::secrets::SecretResolver>,
+    resolver: Option<&SecretResolver>,
 ) -> Result<RelayOutcome>
 where
     C: AsyncRead + AsyncWrite + Unpin,
@@ -356,8 +361,47 @@ pub(crate) async fn relay_http_request_with_resolver_guarded<C, U>(
     req: &L7Request,
     client: &mut C,
     upstream: &mut U,
-    resolver: Option<&crate::secrets::SecretResolver>,
+    resolver: Option<&SecretResolver>,
     generation_guard: Option<&PolicyGenerationGuard>,
+) -> Result<RelayOutcome>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    U: AsyncRead + AsyncWrite + Unpin,
+{
+    relay_http_request_with_options_guarded(
+        req,
+        client,
+        upstream,
+        RelayRequestOptions {
+            resolver,
+            generation_guard,
+            websocket_extensions: WebSocketExtensionMode::Preserve,
+            request_body_credential_rewrite: false,
+        },
+    )
+    .await
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum WebSocketExtensionMode {
+    #[default]
+    Preserve,
+    PermessageDeflate,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct RelayRequestOptions<'a> {
+    pub(crate) resolver: Option<&'a SecretResolver>,
+    pub(crate) generation_guard: Option<&'a PolicyGenerationGuard>,
+    pub(crate) websocket_extensions: WebSocketExtensionMode,
+    pub(crate) request_body_credential_rewrite: bool,
+}
+
+pub(crate) async fn relay_http_request_with_options_guarded<C, U>(
+    req: &L7Request,
+    client: &mut C,
+    upstream: &mut U,
+    options: RelayRequestOptions<'_>,
 ) -> Result<RelayOutcome>
 where
     C: AsyncRead + AsyncWrite + Unpin,
@@ -368,88 +412,815 @@ where
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .map_or(req.raw_header.len(), |p| p + 4);
+    let header_str = std::str::from_utf8(&req.raw_header[..header_end])
+        .map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
+    let client_requested_upgrade = client_requested_upgrade(header_str);
+    let websocket_request = if options.websocket_extensions == WebSocketExtensionMode::Preserve {
+        None
+    } else {
+        parse_websocket_upgrade_request(&req.raw_header[..header_end])?
+    };
 
-    let rewrite_result = rewrite_http_header_block(&req.raw_header[..header_end], resolver)
+    let (header_bytes, expected_websocket_extension) = rewrite_websocket_extensions_for_mode(
+        &req.raw_header[..header_end],
+        options.websocket_extensions,
+        websocket_request.is_some(),
+    )?;
+    let websocket_response =
+        websocket_request
+            .as_ref()
+            .map(|request| WebSocketResponseValidation {
+                expected_accept: websocket_accept_for_key(&request.sec_key),
+                expected_extension: expected_websocket_extension.clone(),
+                offered_subprotocols: request.subprotocols.clone(),
+            });
+
+    let rewrite_result = rewrite_http_header_block(&header_bytes, options.resolver)
         .map_err(|e| miette!("credential injection failed: {e}"))?;
 
-    if let Some(guard) = generation_guard {
+    if let Some(guard) = options.generation_guard {
         guard.ensure_current()?;
     }
 
-    upstream
-        .write_all(&rewrite_result.rewritten)
-        .await
-        .into_diagnostic()?;
-
-    let overflow = &req.raw_header[header_end..];
-    if !overflow.is_empty() {
-        if let Some(guard) = generation_guard {
-            guard.ensure_current()?;
+    if options.request_body_credential_rewrite {
+        let body = collect_and_rewrite_request_body(
+            req,
+            client,
+            &rewrite_result.rewritten,
+            header_str,
+            &req.raw_header[header_end..],
+            options.resolver,
+            options.generation_guard,
+        )
+        .await?;
+        upstream.write_all(&body.headers).await.into_diagnostic()?;
+        if !body.body.is_empty() {
+            upstream.write_all(&body.body).await.into_diagnostic()?;
         }
-        upstream.write_all(overflow).await.into_diagnostic()?;
-    }
-    let overflow_len = overflow.len() as u64;
+    } else {
+        upstream
+            .write_all(&rewrite_result.rewritten)
+            .await
+            .into_diagnostic()?;
 
-    match req.body_length {
-        BodyLength::ContentLength(len) => {
-            let remaining = len.saturating_sub(overflow_len);
-            if remaining > 0 {
-                relay_fixed(client, upstream, remaining, generation_guard).await?;
+        let overflow = &req.raw_header[header_end..];
+        if !overflow.is_empty() {
+            if let Some(guard) = options.generation_guard {
+                guard.ensure_current()?;
             }
+            upstream.write_all(overflow).await.into_diagnostic()?;
         }
-        BodyLength::Chunked => {
-            relay_chunked(
-                client,
-                upstream,
-                &req.raw_header[header_end..],
-                generation_guard,
-            )
-            .await?;
+        let overflow_len = overflow.len() as u64;
+
+        match req.body_length {
+            BodyLength::ContentLength(len) => {
+                let remaining = len.saturating_sub(overflow_len);
+                if remaining > 0 {
+                    relay_fixed(client, upstream, remaining, options.generation_guard).await?;
+                }
+            }
+            BodyLength::Chunked => {
+                relay_chunked(
+                    client,
+                    upstream,
+                    &req.raw_header[header_end..],
+                    options.generation_guard,
+                )
+                .await?;
+            }
+            BodyLength::None => {}
         }
-        BodyLength::None => {}
     }
     upstream.flush().await.into_diagnostic()?;
 
-    let outcome = relay_response(&req.action, upstream, client).await?;
+    let outcome = relay_response(
+        &req.action,
+        upstream,
+        client,
+        RelayResponseOptions {
+            websocket_extensions: options.websocket_extensions,
+            websocket: websocket_response,
+            client_requested_upgrade,
+        },
+    )
+    .await?;
 
-    // Validate that the client actually requested an upgrade before accepting
-    // a 101 from upstream. Per RFC 9110 Section 7.8, the server MUST NOT send
-    // 101 unless the client sent Upgrade + Connection: Upgrade headers. A
-    // non-compliant or malicious upstream could send an unsolicited 101 to
-    // bypass L7 inspection.
-    if matches!(outcome, RelayOutcome::Upgraded { .. }) {
-        let header_str = String::from_utf8_lossy(&req.raw_header[..header_end]);
-        if !client_requested_upgrade(&header_str) {
-            openshell_ocsf::ocsf_emit!(
-                openshell_ocsf::DetectionFindingBuilder::new(crate::ocsf_ctx())
-                    .activity(openshell_ocsf::ActivityId::Open)
-                    .action(openshell_ocsf::ActionId::Denied)
-                    .disposition(openshell_ocsf::DispositionId::Blocked)
-                    .severity(openshell_ocsf::SeverityId::High)
-                    .confidence(openshell_ocsf::ConfidenceId::High)
-                    .is_alert(true)
-                    .finding_info(
-                        openshell_ocsf::FindingInfo::new(
-                            "unsolicited-101-upgrade",
-                            "Unsolicited 101 Switching Protocols",
-                        )
-                        .with_desc(&format!(
-                            "Upstream sent 101 without client Upgrade request for {} {} — \
-                             possible L7 inspection bypass. Connection closed.",
-                            req.action, req.target,
-                        )),
-                    )
-                    .message(format!(
-                        "Unsolicited 101 upgrade blocked: {} {}",
-                        req.action, req.target,
-                    ))
-                    .build()
-            );
-            return Ok(RelayOutcome::Consumed);
+    Ok(outcome)
+}
+
+struct PreparedRequestBody {
+    headers: Vec<u8>,
+    body: Vec<u8>,
+}
+
+async fn collect_and_rewrite_request_body<C: AsyncRead + Unpin>(
+    req: &L7Request,
+    client: &mut C,
+    rewritten_headers: &[u8],
+    original_header_str: &str,
+    already_read: &[u8],
+    resolver: Option<&SecretResolver>,
+    generation_guard: Option<&PolicyGenerationGuard>,
+) -> Result<PreparedRequestBody> {
+    match req.body_length {
+        BodyLength::None => {
+            if body_bytes_contain_reserved_marker(already_read) {
+                return Err(miette!(
+                    "request body credential rewrite cannot resolve placeholders without explicit body framing"
+                ));
+            }
+            Ok(PreparedRequestBody {
+                headers: rewritten_headers.to_vec(),
+                body: already_read.to_vec(),
+            })
+        }
+        BodyLength::ContentLength(len) => {
+            let len = usize::try_from(len)
+                .map_err(|_| miette!("request body is too large for credential rewrite"))?;
+            if len > MAX_REWRITE_BODY_BYTES {
+                return Err(miette!(
+                    "request body credential rewrite buffers at most {MAX_REWRITE_BODY_BYTES} bytes"
+                ));
+            }
+            let mut body = Vec::with_capacity(len);
+            let initial_len = already_read.len().min(len);
+            body.extend_from_slice(&already_read[..initial_len]);
+            let mut remaining = len.saturating_sub(initial_len);
+            let mut buf = [0u8; RELAY_BUF_SIZE];
+            while remaining > 0 {
+                let to_read = remaining.min(buf.len());
+                let n = client.read(&mut buf[..to_read]).await.into_diagnostic()?;
+                if n == 0 {
+                    return Err(miette!(
+                        "Connection closed with {remaining} body bytes remaining"
+                    ));
+                }
+                if let Some(guard) = generation_guard {
+                    guard.ensure_current()?;
+                }
+                body.extend_from_slice(&buf[..n]);
+                remaining -= n;
+            }
+            let (headers, body) =
+                rewrite_buffered_body(rewritten_headers, original_header_str, body, resolver)?;
+            Ok(PreparedRequestBody { headers, body })
+        }
+        BodyLength::Chunked => {
+            let body = collect_chunked_body(client, already_read, generation_guard).await?;
+            if body_bytes_contain_reserved_marker(&body) {
+                return Err(miette!(
+                    "request body credential rewrite does not support chunked bodies containing credential placeholders"
+                ));
+            }
+            Ok(PreparedRequestBody {
+                headers: rewritten_headers.to_vec(),
+                body,
+            })
+        }
+    }
+}
+
+fn rewrite_buffered_body(
+    headers: &[u8],
+    original_header_str: &str,
+    body: Vec<u8>,
+    resolver: Option<&SecretResolver>,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    if body.is_empty() {
+        return Ok((headers.to_vec(), body));
+    }
+
+    let content_type = content_type(original_header_str);
+    if !is_rewritable_content_type(content_type.as_deref()) {
+        if body_bytes_contain_reserved_marker(&body) {
+            return Err(miette!(
+                "request body credential rewrite found placeholders in an unsupported content type"
+            ));
+        }
+        return Ok((headers.to_vec(), body));
+    }
+
+    let mut text = String::from_utf8(body)
+        .map_err(|_| miette!("request body credential rewrite requires UTF-8 text bodies"))?;
+    if !contains_reserved_credential_marker(&text) {
+        return Ok((headers.to_vec(), text.into_bytes()));
+    }
+
+    let Some(resolver) = resolver else {
+        return Err(miette!(
+            "request body credential rewrite found placeholders but no resolver is available"
+        ));
+    };
+
+    let replacements = if content_type.as_deref() == Some("application/x-www-form-urlencoded") {
+        let (rewritten, replacements) = rewrite_form_urlencoded_body(&text, resolver)?;
+        text = rewritten;
+        replacements
+    } else {
+        resolver
+            .rewrite_text_placeholders(&mut text, "request_body")
+            .map_err(|e| miette!("credential injection failed: {e}"))?
+    };
+    if replacements == 0 || contains_reserved_credential_marker(&text) {
+        return Err(miette!(
+            "request body credential rewrite left unresolved credential placeholders"
+        ));
+    }
+
+    let body = text.into_bytes();
+    let headers = set_content_length(headers, body.len())?;
+    Ok((headers, body))
+}
+
+fn rewrite_form_urlencoded_body(body: &str, resolver: &SecretResolver) -> Result<(String, usize)> {
+    let mut rewritten = String::with_capacity(body.len());
+    let mut replacements = 0usize;
+
+    for (idx, field) in body.split('&').enumerate() {
+        if idx > 0 {
+            rewritten.push('&');
+        }
+
+        let (name, value) = field
+            .split_once('=')
+            .map_or((field, None), |(name, value)| (name, Some(value)));
+        let decoded_name = form_url_decode(name)?;
+        if contains_reserved_credential_marker(&decoded_name) {
+            return Err(miette!(
+                "request body credential rewrite does not support placeholders in form field names"
+            ));
+        }
+
+        rewritten.push_str(name);
+        let Some(value) = value else {
+            continue;
+        };
+
+        rewritten.push('=');
+        let decoded_value = form_url_decode(value)?;
+        if !contains_reserved_credential_marker(&decoded_value) {
+            rewritten.push_str(value);
+            continue;
+        }
+
+        let mut rewritten_value = decoded_value;
+        let field_replacements = resolver
+            .rewrite_text_placeholders(&mut rewritten_value, "request_body")
+            .map_err(|e| miette!("credential injection failed: {e}"))?;
+        if field_replacements == 0 || contains_reserved_credential_marker(&rewritten_value) {
+            return Err(miette!(
+                "request body credential rewrite left unresolved credential placeholders"
+            ));
+        }
+        replacements += field_replacements;
+        rewritten.push_str(&form_url_encode(&rewritten_value));
+    }
+
+    Ok((rewritten, replacements))
+}
+
+fn form_url_decode(input: &str) -> Result<String> {
+    let bytes = input.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut pos = 0usize;
+
+    while pos < bytes.len() {
+        match bytes[pos] {
+            b'+' => {
+                decoded.push(b' ');
+                pos += 1;
+            }
+            b'%' if pos + 2 < bytes.len() => {
+                if let (Some(hi), Some(lo)) = (hex_value(bytes[pos + 1]), hex_value(bytes[pos + 2]))
+                {
+                    decoded.push((hi << 4) | lo);
+                    pos += 3;
+                } else {
+                    decoded.push(bytes[pos]);
+                    pos += 1;
+                }
+            }
+            byte => {
+                decoded.push(byte);
+                pos += 1;
+            }
         }
     }
 
-    Ok(outcome)
+    String::from_utf8(decoded).map_err(|_| {
+        miette!("request body credential rewrite requires UTF-8 form-url-encoded fields")
+    })
+}
+
+fn form_url_encode(input: &str) -> String {
+    let mut encoded = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'*' => {
+                encoded.push(byte as char);
+            }
+            b' ' => encoded.push('+'),
+            _ => {
+                use std::fmt::Write as _;
+                let _ = write!(encoded, "%{byte:02X}");
+            }
+        }
+    }
+    encoded
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+async fn collect_chunked_body<C: AsyncRead + Unpin>(
+    client: &mut C,
+    already_read: &[u8],
+    generation_guard: Option<&PolicyGenerationGuard>,
+) -> Result<Vec<u8>> {
+    let mut read_buf = [0u8; RELAY_BUF_SIZE];
+    let mut parse_buf = Vec::from(already_read);
+    let mut pos = 0usize;
+
+    loop {
+        if parse_buf.len() > MAX_REWRITE_BODY_BYTES {
+            return Err(miette!(
+                "request body credential rewrite buffers at most {MAX_REWRITE_BODY_BYTES} bytes"
+            ));
+        }
+
+        let size_line_end = loop {
+            if let Some(end) = find_crlf(&parse_buf, pos) {
+                break end;
+            }
+            let n = client.read(&mut read_buf).await.into_diagnostic()?;
+            if n == 0 {
+                return Err(miette!("Chunked body ended before chunk-size line"));
+            }
+            if let Some(guard) = generation_guard {
+                guard.ensure_current()?;
+            }
+            parse_buf.extend_from_slice(&read_buf[..n]);
+            if parse_buf.len() > MAX_REWRITE_BODY_BYTES {
+                return Err(miette!(
+                    "request body credential rewrite buffers at most {MAX_REWRITE_BODY_BYTES} bytes"
+                ));
+            }
+        };
+
+        let size_line = std::str::from_utf8(&parse_buf[pos..size_line_end])
+            .into_diagnostic()
+            .map_err(|_| miette!("Invalid UTF-8 in chunk-size line"))?;
+        let size_token = size_line
+            .split(';')
+            .next()
+            .map(str::trim)
+            .unwrap_or_default();
+        let chunk_size = usize::from_str_radix(size_token, 16)
+            .into_diagnostic()
+            .map_err(|_| miette!("Invalid chunk size token: {size_token:?}"))?;
+        pos = size_line_end + 2;
+
+        if chunk_size == 0 {
+            loop {
+                let trailer_end = loop {
+                    if let Some(end) = find_crlf(&parse_buf, pos) {
+                        break end;
+                    }
+                    let n = client.read(&mut read_buf).await.into_diagnostic()?;
+                    if n == 0 {
+                        return Err(miette!("Chunked body ended before trailer terminator"));
+                    }
+                    if let Some(guard) = generation_guard {
+                        guard.ensure_current()?;
+                    }
+                    parse_buf.extend_from_slice(&read_buf[..n]);
+                    if parse_buf.len() > MAX_REWRITE_BODY_BYTES {
+                        return Err(miette!(
+                            "request body credential rewrite buffers at most {MAX_REWRITE_BODY_BYTES} bytes"
+                        ));
+                    }
+                };
+                let trailer_line = &parse_buf[pos..trailer_end];
+                pos = trailer_end + 2;
+                if trailer_line.is_empty() {
+                    return Ok(parse_buf);
+                }
+            }
+        }
+
+        let chunk_end = pos
+            .checked_add(chunk_size)
+            .ok_or_else(|| miette!("Chunk size overflow"))?;
+        let chunk_with_crlf_end = chunk_end
+            .checked_add(2)
+            .ok_or_else(|| miette!("Chunk size overflow"))?;
+        while parse_buf.len() < chunk_with_crlf_end {
+            let n = client.read(&mut read_buf).await.into_diagnostic()?;
+            if n == 0 {
+                return Err(miette!("Chunked body ended mid-chunk"));
+            }
+            if let Some(guard) = generation_guard {
+                guard.ensure_current()?;
+            }
+            parse_buf.extend_from_slice(&read_buf[..n]);
+            if parse_buf.len() > MAX_REWRITE_BODY_BYTES {
+                return Err(miette!(
+                    "request body credential rewrite buffers at most {MAX_REWRITE_BODY_BYTES} bytes"
+                ));
+            }
+        }
+        if &parse_buf[chunk_end..chunk_with_crlf_end] != b"\r\n" {
+            return Err(miette!("Chunk missing terminating CRLF"));
+        }
+        pos = chunk_with_crlf_end;
+    }
+}
+
+fn content_type(headers: &str) -> Option<String> {
+    headers.lines().skip(1).find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim().eq_ignore_ascii_case("content-type").then(|| {
+            value
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+        })
+    })
+}
+
+fn is_rewritable_content_type(content_type: Option<&str>) -> bool {
+    let Some(content_type) = content_type else {
+        return false;
+    };
+    content_type == "application/json"
+        || content_type == "application/x-www-form-urlencoded"
+        || content_type.starts_with("text/")
+}
+
+fn body_bytes_contain_reserved_marker(body: &[u8]) -> bool {
+    if body.is_empty() {
+        return false;
+    }
+    String::from_utf8_lossy(body)
+        .split('\0')
+        .any(contains_reserved_credential_marker)
+}
+
+fn set_content_length(headers: &[u8], len: usize) -> Result<Vec<u8>> {
+    use std::fmt::Write as _;
+
+    let header_str =
+        std::str::from_utf8(headers).map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
+    let mut out = String::with_capacity(header_str.len() + 32);
+    let mut inserted = false;
+    for line in header_str.split("\r\n") {
+        if line.is_empty() {
+            if !inserted {
+                let _ = write!(out, "Content-Length: {len}\r\n");
+            }
+            out.push_str("\r\n");
+            break;
+        }
+        if line
+            .split_once(':')
+            .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
+        {
+            if !inserted {
+                let _ = write!(out, "Content-Length: {len}\r\n");
+                inserted = true;
+            }
+            continue;
+        }
+        out.push_str(line);
+        out.push_str("\r\n");
+    }
+    Ok(out.into_bytes())
+}
+
+pub(crate) fn request_is_websocket_upgrade(raw_header: &[u8]) -> bool {
+    let header_end = raw_header
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map_or(raw_header.len(), |p| p + 4);
+    validate_websocket_upgrade_request(&raw_header[..header_end]).unwrap_or(false)
+}
+
+fn rewrite_websocket_extensions_for_mode(
+    raw_header: &[u8],
+    mode: WebSocketExtensionMode,
+    websocket_request: bool,
+) -> Result<(Vec<u8>, Option<String>)> {
+    if !websocket_request || mode == WebSocketExtensionMode::Preserve {
+        return Ok((raw_header.to_vec(), None));
+    }
+    match mode {
+        WebSocketExtensionMode::Preserve => Ok((raw_header.to_vec(), None)),
+        WebSocketExtensionMode::PermessageDeflate => {
+            rewrite_websocket_extensions_for_permessage_deflate(raw_header)
+        }
+    }
+}
+
+fn rewrite_websocket_extensions_for_permessage_deflate(
+    raw_header: &[u8],
+) -> Result<(Vec<u8>, Option<String>)> {
+    let header_str = std::str::from_utf8(raw_header)
+        .map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
+    let safe_offer = supported_permessage_deflate_offer(header_str)?;
+    let mut out = Vec::with_capacity(raw_header.len());
+    let mut inserted = false;
+
+    for line in header_str.split_inclusive("\r\n") {
+        let bare = line.strip_suffix("\r\n").unwrap_or(line);
+        if bare
+            .to_ascii_lowercase()
+            .starts_with("sec-websocket-extensions:")
+        {
+            continue;
+        }
+        if bare.is_empty() && !inserted {
+            if let Some(offer) = safe_offer.as_deref() {
+                out.extend_from_slice(b"Sec-WebSocket-Extensions: ");
+                out.extend_from_slice(offer.as_bytes());
+                out.extend_from_slice(b"\r\n");
+            }
+            inserted = true;
+        }
+        out.extend_from_slice(line.as_bytes());
+    }
+    Ok((out, safe_offer))
+}
+
+fn supported_permessage_deflate_offer(header_str: &str) -> Result<Option<String>> {
+    for offer in websocket_extension_offers(header_str)? {
+        if !offer.name.eq_ignore_ascii_case("permessage-deflate") {
+            continue;
+        }
+        let mut client_no_context_takeover = false;
+        let mut server_no_context_takeover = false;
+        let mut unsupported = false;
+        let mut seen = HashSet::new();
+        for param in &offer.params {
+            let name = param.name.to_ascii_lowercase();
+            if param.value.is_some() || !seen.insert(name.clone()) {
+                unsupported = true;
+                break;
+            }
+            if name == "client_no_context_takeover" {
+                client_no_context_takeover = true;
+            } else if name == "server_no_context_takeover" {
+                server_no_context_takeover = true;
+            } else {
+                unsupported = true;
+                break;
+            }
+        }
+        if client_no_context_takeover && !unsupported {
+            let mut offer = "permessage-deflate; client_no_context_takeover".to_string();
+            if server_no_context_takeover {
+                offer.push_str("; server_no_context_takeover");
+            }
+            return Ok(Some(offer));
+        }
+    }
+    Ok(None)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WebSocketExtensionOffer {
+    name: String,
+    params: Vec<WebSocketExtensionParam>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WebSocketExtensionParam {
+    name: String,
+    value: Option<String>,
+}
+
+fn websocket_extension_offers(header_str: &str) -> Result<Vec<WebSocketExtensionOffer>> {
+    let mut offers = Vec::new();
+    for line in header_str.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("sec-websocket-extensions") {
+            continue;
+        }
+        for extension in value.split(',') {
+            let mut parts = extension.split(';').map(str::trim);
+            let Some(extension_name) = parts.next().filter(|name| !name.is_empty()) else {
+                return Err(miette!("invalid WebSocket extension offer"));
+            };
+            if !is_http_token(extension_name) {
+                return Err(miette!("invalid WebSocket extension token"));
+            }
+            let mut params = Vec::new();
+            for param in parts {
+                if param.is_empty() {
+                    return Err(miette!("invalid WebSocket extension parameter"));
+                }
+                let (param_name, param_value) = match param.split_once('=') {
+                    Some((name, value)) => {
+                        let value = value.trim();
+                        if value.is_empty() || value.starts_with('"') || !is_http_token(value) {
+                            return Err(miette!("unsupported WebSocket extension parameter value"));
+                        }
+                        (name.trim(), Some(value.to_string()))
+                    }
+                    None => (param, None),
+                };
+                if param_name.is_empty() || !is_http_token(param_name) {
+                    return Err(miette!("invalid WebSocket extension parameter"));
+                }
+                params.push(WebSocketExtensionParam {
+                    name: param_name.to_string(),
+                    value: param_value,
+                });
+            }
+            offers.push(WebSocketExtensionOffer {
+                name: extension_name.to_string(),
+                params,
+            });
+        }
+    }
+    Ok(offers)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WebSocketUpgradeRequest {
+    sec_key: String,
+    subprotocols: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WebSocketResponseValidation {
+    expected_accept: String,
+    expected_extension: Option<String>,
+    offered_subprotocols: Vec<String>,
+}
+
+fn validate_websocket_upgrade_request(raw_header: &[u8]) -> Result<bool> {
+    parse_websocket_upgrade_request(raw_header).map(|request| request.is_some())
+}
+
+fn parse_websocket_upgrade_request(raw_header: &[u8]) -> Result<Option<WebSocketUpgradeRequest>> {
+    let header_str = std::str::from_utf8(raw_header)
+        .map_err(|_| miette!("HTTP headers contain invalid UTF-8"))?;
+    let mut lines = header_str.lines();
+    let Some(request_line) = lines.next() else {
+        return Ok(None);
+    };
+    let method = request_line.split_whitespace().next().unwrap_or_default();
+    let mut headers = WebSocketUpgradeHeaders::default();
+
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim().to_ascii_lowercase();
+        let value = value.trim();
+        match name.as_str() {
+            "upgrade" if header_value_contains_token(value, "websocket") => {
+                headers.upgrade_websocket = true;
+            }
+            "connection" if header_value_contains_token(value, "upgrade") => {
+                headers.connection_upgrade = true;
+            }
+            "sec-websocket-key" => {
+                headers.sec_key_count += 1;
+                headers.sec_key = Some(value.to_string());
+            }
+            "sec-websocket-version" => {
+                headers.version_count += 1;
+                headers.version = Some(value.to_string());
+            }
+            "sec-websocket-protocol" => {
+                headers.subprotocols.extend(parse_http_token_list(value)?);
+            }
+            _ => {}
+        }
+    }
+
+    if !headers.is_attempt() {
+        return Ok(None);
+    }
+    if !method.eq_ignore_ascii_case("GET") {
+        return Err(miette!("websocket upgrade request must use GET"));
+    }
+    if !headers.upgrade_websocket {
+        return Err(miette!(
+            "websocket upgrade request missing Upgrade: websocket"
+        ));
+    }
+    if !headers.connection_upgrade {
+        return Err(miette!(
+            "websocket upgrade request missing Connection: Upgrade"
+        ));
+    }
+    if headers.sec_key_count != 1 {
+        return Err(miette!(
+            "websocket upgrade request must include exactly one Sec-WebSocket-Key"
+        ));
+    }
+    let key = headers.sec_key.as_deref().unwrap_or_default();
+    let decoded_key = base64::engine::general_purpose::STANDARD
+        .decode(key.as_bytes())
+        .map_err(|_| miette!("websocket upgrade request has invalid Sec-WebSocket-Key"))?;
+    if decoded_key.len() != 16 {
+        return Err(miette!(
+            "websocket upgrade request has invalid Sec-WebSocket-Key length"
+        ));
+    }
+    if headers.version_count != 1 || headers.version.as_deref() != Some("13") {
+        return Err(miette!(
+            "websocket upgrade request must use Sec-WebSocket-Version: 13"
+        ));
+    }
+    Ok(Some(WebSocketUpgradeRequest {
+        sec_key: key.to_string(),
+        subprotocols: headers.subprotocols,
+    }))
+}
+
+fn websocket_accept_for_key(sec_key: &str) -> String {
+    const WEBSOCKET_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    let mut hasher = Sha1::new();
+    hasher.update(sec_key.as_bytes());
+    hasher.update(WEBSOCKET_GUID.as_bytes());
+    base64::engine::general_purpose::STANDARD.encode(hasher.finalize())
+}
+
+fn header_value_contains_token(value: &str, expected: &str) -> bool {
+    value
+        .split(',')
+        .any(|token| token.trim().eq_ignore_ascii_case(expected))
+}
+
+fn parse_http_token_list(value: &str) -> Result<Vec<String>> {
+    let mut tokens = Vec::new();
+    for token in value.split(',') {
+        let token = token.trim();
+        if token.is_empty() || !is_http_token(token) {
+            return Err(miette!("invalid HTTP token list"));
+        }
+        tokens.push(token.to_string());
+    }
+    Ok(tokens)
+}
+
+fn is_http_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.as_bytes().iter().all(|byte| {
+            matches!(
+                byte,
+                b'!' | b'#'
+                    | b'$'
+                    | b'%'
+                    | b'&'
+                    | b'\''
+                    | b'*'
+                    | b'+'
+                    | b'-'
+                    | b'.'
+                    | b'^'
+                    | b'_'
+                    | b'`'
+                    | b'|'
+                    | b'~'
+                    | b'0'..=b'9'
+                    | b'A'..=b'Z'
+                    | b'a'..=b'z'
+            )
+        })
+}
+
+#[derive(Default)]
+struct WebSocketUpgradeHeaders {
+    upgrade_websocket: bool,
+    connection_upgrade: bool,
+    sec_key: Option<String>,
+    sec_key_count: usize,
+    version: Option<String>,
+    version_count: usize,
+    subprotocols: Vec<String>,
+}
+
+impl WebSocketUpgradeHeaders {
+    fn is_attempt(&self) -> bool {
+        self.upgrade_websocket || self.sec_key.is_some() || self.version.is_some()
+    }
 }
 
 /// Send a 403 Forbidden JSON deny response.
@@ -768,10 +1539,28 @@ fn find_crlf(buf: &[u8], start: usize) -> Option<usize> {
         .map(|offset| start + offset)
 }
 
+#[derive(Clone)]
+struct RelayResponseOptions {
+    websocket_extensions: WebSocketExtensionMode,
+    client_requested_upgrade: bool,
+    websocket: Option<WebSocketResponseValidation>,
+}
+
+impl Default for RelayResponseOptions {
+    fn default() -> Self {
+        Self {
+            websocket_extensions: WebSocketExtensionMode::Preserve,
+            client_requested_upgrade: true,
+            websocket: None,
+        }
+    }
+}
+
 async fn relay_response<U, C>(
     request_method: &str,
     upstream: &mut U,
     client: &mut C,
+    options: RelayResponseOptions,
 ) -> Result<RelayOutcome>
 where
     U: AsyncRead + Unpin,
@@ -825,6 +1614,14 @@ where
     // from upstream beyond the headers are overflow that belong to the
     // upgraded protocol and must be forwarded before switching.
     if status_code == 101 {
+        if !options.client_requested_upgrade {
+            return Ok(RelayOutcome::Consumed);
+        }
+        let websocket_permessage_deflate = validate_websocket_response(
+            &header_str,
+            options.websocket_extensions,
+            options.websocket.as_ref(),
+        )?;
         client
             .write_all(&buf[..header_end])
             .await
@@ -836,7 +1633,10 @@ where
             overflow_bytes = overflow.len(),
             "101 Switching Protocols — signaling protocol upgrade"
         );
-        return Ok(RelayOutcome::Upgraded { overflow });
+        return Ok(RelayOutcome::Upgraded {
+            overflow,
+            websocket_permessage_deflate,
+        });
     }
 
     // Bodiless responses (HEAD, 1xx, 204, 304): forward headers only, skip body
@@ -936,6 +1736,159 @@ fn parse_connection_close(headers: &str) -> bool {
         }
     }
     false
+}
+
+fn validate_websocket_response(
+    headers: &str,
+    mode: WebSocketExtensionMode,
+    websocket: Option<&WebSocketResponseValidation>,
+) -> Result<bool> {
+    let Some(validation) = websocket else {
+        return validate_websocket_response_extensions_preserved(headers, mode);
+    };
+
+    let mut upgrade_websocket = false;
+    let mut connection_upgrade = false;
+    let mut accept_count = 0usize;
+    let mut accept_matches = false;
+    let mut subprotocol_count = 0usize;
+    let mut selected_subprotocol = None;
+
+    for line in headers.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim().to_ascii_lowercase();
+        let value = value.trim();
+        match name.as_str() {
+            "upgrade" if header_value_contains_token(value, "websocket") => {
+                upgrade_websocket = true;
+            }
+            "connection" if header_value_contains_token(value, "upgrade") => {
+                connection_upgrade = true;
+            }
+            "sec-websocket-accept" => {
+                accept_count += 1;
+                accept_matches = value == validation.expected_accept;
+            }
+            "sec-websocket-protocol" => {
+                subprotocol_count += 1;
+                if !is_http_token(value) {
+                    return Err(miette!(
+                        "websocket upgrade response has invalid Sec-WebSocket-Protocol"
+                    ));
+                }
+                selected_subprotocol = Some(value.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    if !upgrade_websocket {
+        return Err(miette!(
+            "websocket upgrade response missing Upgrade: websocket"
+        ));
+    }
+    if !connection_upgrade {
+        return Err(miette!(
+            "websocket upgrade response missing Connection: Upgrade"
+        ));
+    }
+    if accept_count != 1 || !accept_matches {
+        return Err(miette!(
+            "websocket upgrade response has invalid Sec-WebSocket-Accept"
+        ));
+    }
+    if subprotocol_count > 1 {
+        return Err(miette!(
+            "websocket upgrade response has multiple Sec-WebSocket-Protocol headers"
+        ));
+    }
+    if let Some(protocol) = selected_subprotocol
+        && !validation
+            .offered_subprotocols
+            .iter()
+            .any(|offered| offered == &protocol)
+    {
+        return Err(miette!(
+            "upstream selected WebSocket subprotocol that was not offered"
+        ));
+    }
+
+    let actual_extension = normalized_websocket_extension(headers)?;
+    match (&validation.expected_extension, actual_extension.as_deref()) {
+        (None, Some(_)) => Err(miette!(
+            "upstream negotiated WebSocket extension that was not offered"
+        )),
+        (None | Some(_), None) => Ok(false),
+        (Some(expected), Some(actual)) if expected.eq_ignore_ascii_case(actual) => Ok(true),
+        (Some(_), Some(_)) => Err(miette!(
+            "upstream negotiated WebSocket extension that does not match the safe offer"
+        )),
+    }
+}
+
+fn validate_websocket_response_extensions_preserved(
+    headers: &str,
+    mode: WebSocketExtensionMode,
+) -> Result<bool> {
+    match mode {
+        WebSocketExtensionMode::Preserve => Ok(false),
+        WebSocketExtensionMode::PermessageDeflate => {
+            let offers = websocket_extension_offers(headers)?;
+            if offers.is_empty() {
+                Ok(false)
+            } else {
+                Err(miette!(
+                    "upstream negotiated WebSocket extension that was not offered"
+                ))
+            }
+        }
+    }
+}
+
+fn normalized_websocket_extension(headers: &str) -> Result<Option<String>> {
+    let offers = websocket_extension_offers(headers)?;
+    if offers.is_empty() {
+        return Ok(None);
+    }
+    if offers.len() != 1 {
+        return Err(miette!("upstream negotiated multiple WebSocket extensions"));
+    }
+    let offer = &offers[0];
+    if !offer.name.eq_ignore_ascii_case("permessage-deflate") {
+        return Err(miette!(
+            "upstream negotiated unsupported WebSocket extension"
+        ));
+    }
+    let mut client_no_context_takeover = false;
+    let mut server_no_context_takeover = false;
+    let mut seen = HashSet::new();
+    for param in &offer.params {
+        let name = param.name.to_ascii_lowercase();
+        if param.value.is_some() || !seen.insert(name.clone()) {
+            return Err(miette!(
+                "upstream negotiated unsupported permessage-deflate parameter"
+            ));
+        }
+        if name == "client_no_context_takeover" {
+            client_no_context_takeover = true;
+        } else if name == "server_no_context_takeover" {
+            server_no_context_takeover = true;
+        } else {
+            return Err(miette!(
+                "upstream negotiated unsupported permessage-deflate parameter"
+            ));
+        }
+    }
+    let mut normalized = String::from("permessage-deflate");
+    if client_no_context_takeover {
+        normalized.push_str("; client_no_context_takeover");
+    }
+    if server_no_context_takeover {
+        normalized.push_str("; server_no_context_takeover");
+    }
+    Ok(Some(normalized))
 }
 
 /// Check if the client request headers contain both `Upgrade` and
@@ -1046,9 +1999,285 @@ mod tests {
     use super::*;
     use crate::opa::OpaEngine;
     use crate::secrets::SecretResolver;
-    use base64::Engine as _;
+    use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
+    use std::sync::Arc;
 
     const TEST_POLICY: &str = include_str!("../../data/sandbox-policy.rego");
+    const VALID_WS_KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
+    const VALID_WS_ACCEPT: &str = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
+    const TEXT_OPCODE: u8 = 0x1;
+
+    #[derive(Debug)]
+    struct CapturedFrame {
+        fin_opcode: u8,
+        masked: bool,
+        payload: Vec<u8>,
+    }
+
+    async fn read_http_header_block<R: AsyncRead + Unpin>(reader: &mut R) -> Vec<u8> {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let mut header = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                reader.read_exact(&mut byte).await.unwrap();
+                header.push(byte[0]);
+                if header.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            header
+        })
+        .await
+        .expect("HTTP header block should arrive")
+    }
+
+    async fn read_websocket_frame<R: AsyncRead + Unpin>(reader: &mut R) -> CapturedFrame {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let mut prefix = [0u8; 2];
+            reader.read_exact(&mut prefix).await.unwrap();
+            let masked = prefix[1] & 0x80 != 0;
+            let mut payload_len = u64::from(prefix[1] & 0x7f);
+            if payload_len == 126 {
+                let mut extended = [0u8; 2];
+                reader.read_exact(&mut extended).await.unwrap();
+                payload_len = u64::from(u16::from_be_bytes(extended));
+            } else if payload_len == 127 {
+                let mut extended = [0u8; 8];
+                reader.read_exact(&mut extended).await.unwrap();
+                payload_len = u64::from_be_bytes(extended);
+            }
+            let mut mask_key = [0u8; 4];
+            if masked {
+                reader.read_exact(&mut mask_key).await.unwrap();
+            }
+            let payload_len = usize::try_from(payload_len).unwrap();
+            let mut payload = vec![0u8; payload_len];
+            reader.read_exact(&mut payload).await.unwrap();
+            if masked {
+                apply_test_mask(&mut payload, mask_key);
+            }
+            CapturedFrame {
+                fin_opcode: prefix[0],
+                masked,
+                payload,
+            }
+        })
+        .await
+        .expect("WebSocket frame should arrive")
+    }
+
+    fn masked_frame_with_rsv(opcode: u8, rsv: u8, payload: &[u8]) -> Vec<u8> {
+        let mask_key = [0x37, 0xfa, 0x21, 0x3d];
+        let mut frame = Vec::new();
+        frame.push(0x80 | rsv | opcode);
+        write_test_payload_len(&mut frame, 0x80, payload.len());
+        frame.extend_from_slice(&mask_key);
+        let mut masked = payload.to_vec();
+        apply_test_mask(&mut masked, mask_key);
+        frame.extend_from_slice(&masked);
+        frame
+    }
+
+    fn unmasked_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::new();
+        frame.push(0x80 | opcode);
+        write_test_payload_len(&mut frame, 0, payload.len());
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    fn write_test_payload_len(frame: &mut Vec<u8>, mask_bit: u8, payload_len: usize) {
+        if payload_len < 126 {
+            frame.push(mask_bit | payload_len as u8);
+        } else if u16::try_from(payload_len).is_ok() {
+            frame.push(mask_bit | 0x7e);
+            frame.extend_from_slice(&(payload_len as u16).to_be_bytes());
+        } else {
+            frame.push(mask_bit | 0x7f);
+            frame.extend_from_slice(&(payload_len as u64).to_be_bytes());
+        }
+    }
+
+    fn apply_test_mask(payload: &mut [u8], mask_key: [u8; 4]) {
+        for (index, byte) in payload.iter_mut().enumerate() {
+            *byte ^= mask_key[index % 4];
+        }
+    }
+
+    fn compress_test_permessage_deflate(payload: &[u8]) -> Vec<u8> {
+        let mut compressor = Compress::new(Compression::fast(), false);
+        let mut out = Vec::with_capacity(payload.len().saturating_add(128));
+        loop {
+            let consumed = usize::try_from(compressor.total_in()).unwrap();
+            if consumed >= payload.len() {
+                break;
+            }
+            let before_in = compressor.total_in();
+            let before_out = compressor.total_out();
+            let status = compressor
+                .compress_vec(&payload[consumed..], &mut out, FlushCompress::None)
+                .unwrap();
+            if matches!(status, Status::BufError)
+                || (compressor.total_in() == before_in && compressor.total_out() == before_out)
+            {
+                out.reserve(out.capacity().max(1024));
+            }
+        }
+        loop {
+            out.reserve(64);
+            let before_out = compressor.total_out();
+            compressor
+                .compress_vec(&[], &mut out, FlushCompress::Sync)
+                .unwrap();
+            if out.ends_with(&[0x00, 0x00, 0xff, 0xff]) {
+                break;
+            }
+            if compressor.total_out() == before_out {
+                out.reserve(out.capacity().max(1024));
+            }
+        }
+        out.truncate(out.len() - 4);
+        out
+    }
+
+    fn decompress_test_permessage_deflate(payload: &[u8]) -> Vec<u8> {
+        let mut decoder = Decompress::new(false);
+        let mut input = Vec::with_capacity(payload.len() + 4);
+        input.extend_from_slice(payload);
+        input.extend_from_slice(&[0x00, 0x00, 0xff, 0xff]);
+        let mut out = Vec::new();
+        let mut input_pos = 0usize;
+        let mut scratch = [0u8; RELAY_BUF_SIZE];
+        loop {
+            let before_in = decoder.total_in();
+            let before_out = decoder.total_out();
+            let status = decoder
+                .decompress(&input[input_pos..], &mut scratch, FlushDecompress::Sync)
+                .unwrap();
+            let read = usize::try_from(decoder.total_in() - before_in).unwrap();
+            let written = usize::try_from(decoder.total_out() - before_out).unwrap();
+            input_pos += read;
+            out.extend_from_slice(&scratch[..written]);
+            if matches!(status, Status::StreamEnd) {
+                break;
+            }
+            if input_pos >= input.len() && written < scratch.len() {
+                break;
+            }
+            assert!(
+                read != 0 || written != 0,
+                "test permessage-deflate decompression did not make progress"
+            );
+        }
+        out
+    }
+
+    fn websocket_request(extension: Option<&str>) -> L7Request {
+        let mut raw_header = format!(
+            "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {VALID_WS_KEY}\r\n"
+        );
+        if let Some(extension) = extension {
+            raw_header.push_str("Sec-WebSocket-Extensions: ");
+            raw_header.push_str(extension);
+            raw_header.push_str("\r\n");
+        }
+        raw_header.push_str("Sec-WebSocket-Version: 13\r\n\r\n");
+        L7Request {
+            action: "GET".to_string(),
+            target: "/ws".to_string(),
+            query_params: HashMap::new(),
+            raw_header: raw_header.into_bytes(),
+            body_length: BodyLength::None,
+        }
+    }
+
+    async fn run_upgraded_websocket_case(
+        request_extension: Option<&'static str>,
+        response_extension: Option<&'static str>,
+        extension_mode: WebSocketExtensionMode,
+        resolver: Option<Arc<SecretResolver>>,
+        client_frame: Vec<u8>,
+    ) -> (String, CapturedFrame) {
+        let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(16384);
+        let (mut client_app, mut proxy_to_client) = tokio::io::duplex(16384);
+        let req = websocket_request(request_extension);
+        let resolver_for_header = resolver.clone();
+        let resolver_for_upgrade = resolver.clone();
+
+        let upstream_task = tokio::spawn(async move {
+            let forwarded = read_http_header_block(&mut upstream_side).await;
+            let forwarded = String::from_utf8(forwarded).unwrap();
+            let mut response = format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {VALID_WS_ACCEPT}\r\n"
+            );
+            if let Some(extension) = response_extension {
+                response.push_str("Sec-WebSocket-Extensions: ");
+                response.push_str(extension);
+                response.push_str("\r\n");
+            }
+            response.push_str("\r\n");
+            upstream_side.write_all(response.as_bytes()).await.unwrap();
+            upstream_side.flush().await.unwrap();
+            let frame = read_websocket_frame(&mut upstream_side).await;
+            (forwarded, frame)
+        });
+
+        let relay_task = tokio::spawn(async move {
+            let outcome = relay_http_request_with_options_guarded(
+                &req,
+                &mut proxy_to_client,
+                &mut proxy_to_upstream,
+                RelayRequestOptions {
+                    resolver: resolver_for_header.as_deref(),
+                    websocket_extensions: extension_mode,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("handshake relay should succeed");
+            let RelayOutcome::Upgraded {
+                overflow,
+                websocket_permessage_deflate,
+            } = outcome
+            else {
+                panic!("expected upgraded relay outcome");
+            };
+            let credential_rewrite = resolver_for_upgrade.is_some();
+            crate::l7::relay::handle_upgrade(
+                &mut proxy_to_client,
+                &mut proxy_to_upstream,
+                overflow,
+                "example.com",
+                443,
+                crate::l7::relay::UpgradeRelayOptions {
+                    websocket_request: true,
+                    websocket: crate::l7::relay::WebSocketUpgradeBehavior {
+                        credential_rewrite,
+                        permessage_deflate: websocket_permessage_deflate,
+                        ..Default::default()
+                    },
+                    secret_resolver: resolver_for_upgrade,
+                    target: "/ws".to_string(),
+                    policy_name: "test-policy".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await
+        });
+
+        let response = read_http_header_block(&mut client_app).await;
+        assert!(
+            String::from_utf8_lossy(&response).contains("101 Switching Protocols"),
+            "client must receive the upgrade before frame relay starts"
+        );
+        client_app.write_all(&client_frame).await.unwrap();
+        client_app.flush().await.unwrap();
+
+        let result = upstream_task.await.expect("upstream task should complete");
+        drop(client_app);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), relay_task).await;
+        result
+    }
 
     #[test]
     fn deny_response_body_is_agent_readable_and_redacted() {
@@ -1711,7 +2940,12 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            relay_response("GET", &mut upstream_read, &mut client_write),
+            relay_response(
+                "GET",
+                &mut upstream_read,
+                &mut client_write,
+                RelayResponseOptions::default(),
+            ),
         )
         .await
         .expect("relay_response should not deadlock");
@@ -1752,7 +2986,12 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            relay_response("GET", &mut upstream_read, &mut client_write),
+            relay_response(
+                "GET",
+                &mut upstream_read,
+                &mut client_write,
+                RelayResponseOptions::default(),
+            ),
         )
         .await
         .expect("must not block when no Connection: close");
@@ -1788,7 +3027,12 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            relay_response("HEAD", &mut upstream_read, &mut client_write),
+            relay_response(
+                "HEAD",
+                &mut upstream_read,
+                &mut client_write,
+                RelayResponseOptions::default(),
+            ),
         )
         .await
         .expect("HEAD relay must not deadlock waiting for body");
@@ -1821,7 +3065,12 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            relay_response("GET", &mut upstream_read, &mut client_write),
+            relay_response(
+                "GET",
+                &mut upstream_read,
+                &mut client_write,
+                RelayResponseOptions::default(),
+            ),
         )
         .await
         .expect("204 relay must not deadlock");
@@ -1856,7 +3105,12 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            relay_response("GET", &mut upstream_read, &mut client_write),
+            relay_response(
+                "GET",
+                &mut upstream_read,
+                &mut client_write,
+                RelayResponseOptions::default(),
+            ),
         )
         .await
         .expect("must not block when chunked body is complete in overflow");
@@ -1895,7 +3149,12 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            relay_response("GET", &mut upstream_read, &mut client_write),
+            relay_response(
+                "GET",
+                &mut upstream_read,
+                &mut client_write,
+                RelayResponseOptions::default(),
+            ),
         )
         .await
         .expect("must not block when chunked response has trailers");
@@ -1933,7 +3192,12 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            relay_response("GET", &mut upstream_read, &mut client_write),
+            relay_response(
+                "GET",
+                &mut upstream_read,
+                &mut client_write,
+                RelayResponseOptions::default(),
+            ),
         )
         .await
         .expect("normal relay must not deadlock");
@@ -1964,7 +3228,12 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            relay_response("GET", &mut upstream_read, &mut client_write),
+            relay_response(
+                "GET",
+                &mut upstream_read,
+                &mut client_write,
+                RelayResponseOptions::default(),
+            ),
         )
         .await
         .expect("relay must not deadlock");
@@ -2005,14 +3274,19 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            relay_response("GET", &mut upstream_read, &mut client_write),
+            relay_response(
+                "GET",
+                &mut upstream_read,
+                &mut client_write,
+                RelayResponseOptions::default(),
+            ),
         )
         .await
         .expect("relay_response should not deadlock");
 
         let outcome = result.expect("relay_response should succeed");
         match outcome {
-            RelayOutcome::Upgraded { overflow } => {
+            RelayOutcome::Upgraded { overflow, .. } => {
                 assert_eq!(
                     &overflow, b"\x81\x05hello",
                     "overflow should contain WebSocket frame data"
@@ -2047,13 +3321,18 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            relay_response("GET", &mut upstream_read, &mut client_write),
+            relay_response(
+                "GET",
+                &mut upstream_read,
+                &mut client_write,
+                RelayResponseOptions::default(),
+            ),
         )
         .await
         .expect("relay_response should not deadlock");
 
         match result.expect("should succeed") {
-            RelayOutcome::Upgraded { overflow } => {
+            RelayOutcome::Upgraded { overflow, .. } => {
                 assert!(overflow.is_empty(), "no overflow expected");
             }
             other => panic!("Expected Upgraded, got {other:?}"),
@@ -2179,6 +3458,553 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn opted_in_websocket_relay_rejects_invalid_upgrade_before_upstream_write() {
+        let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
+        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+
+        let req = L7Request {
+            action: "GET".to_string(),
+            target: "/ws".to_string(),
+            query_params: HashMap::new(),
+            raw_header: b"GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\r\n".to_vec(),
+            body_length: BodyLength::None,
+        };
+
+        let result = relay_http_request_with_options_guarded(
+            &req,
+            &mut proxy_to_client,
+            &mut proxy_to_upstream,
+            RelayRequestOptions {
+                websocket_extensions: WebSocketExtensionMode::PermessageDeflate,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "missing Sec-WebSocket-Key must fail closed"
+        );
+        drop(proxy_to_upstream);
+        let mut forwarded = Vec::new();
+        upstream_side.read_to_end(&mut forwarded).await.unwrap();
+        assert!(
+            forwarded.is_empty(),
+            "invalid opted-in upgrade must not reach upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn opted_in_websocket_relay_strips_request_extensions_and_rejects_response_extensions() {
+        let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
+        let (mut app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+
+        let req = L7Request {
+            action: "GET".to_string(),
+            target: "/ws".to_string(),
+            query_params: HashMap::new(),
+            raw_header: format!(
+                "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {VALID_WS_KEY}\r\nSec-WebSocket-Extensions: permessage-deflate\r\nSec-WebSocket-Version: 13\r\n\r\n"
+            )
+            .into_bytes(),
+            body_length: BodyLength::None,
+        };
+
+        let upstream_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let mut total = 0;
+            loop {
+                let n = upstream_side.read(&mut buf[total..]).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                total += n;
+                if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let forwarded = String::from_utf8_lossy(&buf[..total]);
+            assert!(
+                !forwarded
+                    .to_ascii_lowercase()
+                    .contains("sec-websocket-extensions"),
+                "opted-in request must strip extension negotiation"
+            );
+            upstream_side
+                .write_all(
+                    format!(
+                        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {VALID_WS_ACCEPT}\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            upstream_side.flush().await.unwrap();
+        });
+
+        let result = relay_http_request_with_options_guarded(
+            &req,
+            &mut proxy_to_client,
+            &mut proxy_to_upstream,
+            RelayRequestOptions {
+                websocket_extensions: WebSocketExtensionMode::PermessageDeflate,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let err = result.expect_err("upstream extension negotiation must fail closed");
+        assert!(err.to_string().contains("not offered"));
+        upstream_task.await.expect("upstream task should complete");
+
+        drop(proxy_to_client);
+        let mut received = Vec::new();
+        app_side.read_to_end(&mut received).await.unwrap();
+        assert!(
+            received.is_empty(),
+            "rejected extension negotiation must not forward 101 headers"
+        );
+    }
+
+    #[tokio::test]
+    async fn permessage_deflate_mode_allows_supported_no_context_takeover() {
+        let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
+        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+
+        let req = L7Request {
+            action: "GET".to_string(),
+            target: "/ws".to_string(),
+            query_params: HashMap::new(),
+            raw_header: format!(
+                "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {VALID_WS_KEY}\r\nSec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover; server_no_context_takeover\r\nSec-WebSocket-Version: 13\r\n\r\n"
+            )
+            .into_bytes(),
+            body_length: BodyLength::None,
+        };
+
+        let upstream_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let mut total = 0;
+            loop {
+                let n = upstream_side.read(&mut buf[total..]).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                total += n;
+                if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let forwarded = String::from_utf8_lossy(&buf[..total]).to_ascii_lowercase();
+            assert!(forwarded.contains(
+                "sec-websocket-extensions: permessage-deflate; client_no_context_takeover; server_no_context_takeover"
+            ));
+            upstream_side
+                .write_all(
+                    format!(
+                        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {VALID_WS_ACCEPT}\r\nSec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover; server_no_context_takeover\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            upstream_side.flush().await.unwrap();
+        });
+
+        let outcome = relay_http_request_with_options_guarded(
+            &req,
+            &mut proxy_to_client,
+            &mut proxy_to_upstream,
+            RelayRequestOptions {
+                websocket_extensions: WebSocketExtensionMode::PermessageDeflate,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("safe permessage-deflate negotiation should pass");
+
+        assert!(
+            matches!(
+                outcome,
+                RelayOutcome::Upgraded {
+                    websocket_permessage_deflate: true,
+                    ..
+                }
+            ),
+            "safe permessage-deflate must be marked negotiated"
+        );
+        upstream_task.await.expect("upstream task should complete");
+    }
+
+    #[tokio::test]
+    async fn websocket_conformance_preserve_mode_relays_raw_frames_without_validation() {
+        let (forwarded, frame) = run_upgraded_websocket_case(
+            None,
+            None,
+            WebSocketExtensionMode::Preserve,
+            None,
+            unmasked_frame(TEXT_OPCODE, b"raw-unmasked"),
+        )
+        .await;
+
+        assert!(
+            forwarded.contains("Upgrade: websocket"),
+            "raw preserve path should still forward the upgrade request"
+        );
+        assert!(
+            !frame.masked,
+            "raw preserve path must not validate or rewrite client frame masking"
+        );
+        assert_eq!(frame.fin_opcode & 0x0f, TEXT_OPCODE);
+        assert_eq!(frame.payload, b"raw-unmasked");
+    }
+
+    #[tokio::test]
+    async fn websocket_conformance_rewrite_mode_rewrites_text_after_upgrade() {
+        let (child_env, resolver) = SecretResolver::from_provider_env(
+            [("DISCORD_BOT_TOKEN".to_string(), "real-token".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let placeholder = child_env.get("DISCORD_BOT_TOKEN").unwrap();
+        let payload = format!(r#"{{"op":2,"d":{{"token":"{placeholder}"}}}}"#);
+
+        let (forwarded, frame) = run_upgraded_websocket_case(
+            None,
+            None,
+            WebSocketExtensionMode::PermessageDeflate,
+            resolver.map(Arc::new),
+            masked_frame_with_rsv(TEXT_OPCODE, 0, payload.as_bytes()),
+        )
+        .await;
+
+        assert!(
+            !forwarded
+                .to_ascii_lowercase()
+                .contains("sec-websocket-extensions"),
+            "plain rewrite path should not offer compression when the client did not offer a safe subset"
+        );
+        assert!(frame.masked, "parsed relay must preserve client masking");
+        assert_eq!(frame.fin_opcode & 0x0f, TEXT_OPCODE);
+        assert_eq!(
+            String::from_utf8(frame.payload).unwrap(),
+            r#"{"op":2,"d":{"token":"real-token"}}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_conformance_deflate_rewrites_compressed_text_after_upgrade() {
+        let (child_env, resolver) = SecretResolver::from_provider_env(
+            [("DISCORD_BOT_TOKEN".to_string(), "real-token".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let placeholder = child_env.get("DISCORD_BOT_TOKEN").unwrap();
+        let payload = format!(r#"{{"op":2,"d":{{"token":"{placeholder}"}}}}"#);
+        let compressed = compress_test_permessage_deflate(payload.as_bytes());
+
+        let (forwarded, frame) = run_upgraded_websocket_case(
+            Some("permessage-deflate; server_no_context_takeover; client_no_context_takeover"),
+            Some("permessage-deflate; server_no_context_takeover; client_no_context_takeover"),
+            WebSocketExtensionMode::PermessageDeflate,
+            resolver.map(Arc::new),
+            masked_frame_with_rsv(TEXT_OPCODE, 0x40, &compressed),
+        )
+        .await;
+
+        assert!(
+            forwarded.to_ascii_lowercase().contains(
+                "sec-websocket-extensions: permessage-deflate; client_no_context_takeover; server_no_context_takeover"
+            ),
+            "safe extension offer should be canonicalized before forwarding"
+        );
+        assert!(frame.masked, "parsed relay must preserve client masking");
+        assert_eq!(frame.fin_opcode & 0x0f, TEXT_OPCODE);
+        assert!(
+            frame.fin_opcode & 0x40 != 0,
+            "rewritten compressed text must retain RSV1"
+        );
+        assert_eq!(
+            String::from_utf8(decompress_test_permessage_deflate(&frame.payload)).unwrap(),
+            r#"{"op":2,"d":{"token":"real-token"}}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn opted_in_websocket_relay_rejects_invalid_accept_before_forwarding_101() {
+        let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
+        let (mut app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+
+        let req = L7Request {
+            action: "GET".to_string(),
+            target: "/ws".to_string(),
+            query_params: HashMap::new(),
+            raw_header: format!(
+                "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {VALID_WS_KEY}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+            )
+            .into_bytes(),
+            body_length: BodyLength::None,
+        };
+
+        let upstream_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let mut total = 0;
+            loop {
+                let n = upstream_side.read(&mut buf[total..]).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                total += n;
+                if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            upstream_side
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: invalid\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            upstream_side.flush().await.unwrap();
+        });
+
+        let result = relay_http_request_with_options_guarded(
+            &req,
+            &mut proxy_to_client,
+            &mut proxy_to_upstream,
+            RelayRequestOptions {
+                websocket_extensions: WebSocketExtensionMode::PermessageDeflate,
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let err = result.expect_err("invalid Sec-WebSocket-Accept must fail closed");
+        assert!(err.to_string().contains("Sec-WebSocket-Accept"));
+        upstream_task.await.expect("upstream task should complete");
+
+        drop(proxy_to_client);
+        let mut received = Vec::new();
+        app_side.read_to_end(&mut received).await.unwrap();
+        assert!(
+            received.is_empty(),
+            "invalid websocket response must not forward 101 headers"
+        );
+    }
+
+    #[test]
+    fn websocket_accept_matches_rfc_6455_sample() {
+        assert_eq!(websocket_accept_for_key(VALID_WS_KEY), VALID_WS_ACCEPT);
+    }
+
+    #[test]
+    fn strict_response_validation_rejects_missing_upgrade_headers() {
+        let validation = WebSocketResponseValidation {
+            expected_accept: VALID_WS_ACCEPT.to_string(),
+            expected_extension: None,
+            offered_subprotocols: Vec::new(),
+        };
+
+        let err = validate_websocket_response(
+            "HTTP/1.1 101 Switching Protocols\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+            WebSocketExtensionMode::PermessageDeflate,
+            Some(&validation),
+        )
+        .expect_err("missing Upgrade/Connection must fail");
+
+        assert!(err.to_string().contains("Upgrade: websocket"));
+    }
+
+    #[test]
+    fn permessage_deflate_response_must_match_exact_safe_offer() {
+        let validation = WebSocketResponseValidation {
+            expected_accept: VALID_WS_ACCEPT.to_string(),
+            expected_extension: Some(
+                "permessage-deflate; client_no_context_takeover; server_no_context_takeover"
+                    .to_string(),
+            ),
+            offered_subprotocols: Vec::new(),
+        };
+
+        let err = validate_websocket_response(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover\r\n\r\n",
+            WebSocketExtensionMode::PermessageDeflate,
+            Some(&validation),
+        )
+        .expect_err("extension response must exactly match the safe offer");
+
+        assert!(err.to_string().contains("safe offer"));
+    }
+
+    #[test]
+    fn permessage_deflate_offer_requires_client_no_context_takeover() {
+        let raw = format!(
+            "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {VALID_WS_KEY}\r\nSec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+        assert!(
+            supported_permessage_deflate_offer(&raw)
+                .expect("valid unsupported extension offer should parse")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn permessage_deflate_offer_canonicalizes_safe_params() {
+        let raw = format!(
+            "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {VALID_WS_KEY}\r\nSec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+
+        assert_eq!(
+            supported_permessage_deflate_offer(&raw)
+                .expect("safe extension offer should parse")
+                .as_deref(),
+            Some("permessage-deflate; client_no_context_takeover; server_no_context_takeover")
+        );
+    }
+
+    #[test]
+    fn permessage_deflate_offer_rejects_duplicate_safe_params() {
+        let raw = format!(
+            "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {VALID_WS_KEY}\r\nSec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover; client_no_context_takeover\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+
+        assert!(
+            supported_permessage_deflate_offer(&raw)
+                .expect("duplicate safe param should parse but not be supported")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn permessage_deflate_offer_rejects_quoted_values() {
+        let raw = format!(
+            "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {VALID_WS_KEY}\r\nSec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover=\"true\"\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+
+        let err = supported_permessage_deflate_offer(&raw)
+            .expect_err("quoted permessage-deflate parameter values should fail closed");
+        assert!(err.to_string().contains("parameter value"));
+    }
+
+    #[test]
+    fn permessage_deflate_response_accepts_reordered_safe_params() {
+        let validation = WebSocketResponseValidation {
+            expected_accept: VALID_WS_ACCEPT.to_string(),
+            expected_extension: Some(
+                "permessage-deflate; client_no_context_takeover; server_no_context_takeover"
+                    .to_string(),
+            ),
+            offered_subprotocols: Vec::new(),
+        };
+
+        let negotiated = validate_websocket_response(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover\r\n\r\n",
+            WebSocketExtensionMode::PermessageDeflate,
+            Some(&validation),
+        )
+        .expect("reordered safe extension params should canonicalize");
+
+        assert!(negotiated);
+    }
+
+    #[test]
+    fn permessage_deflate_response_rejects_duplicate_safe_params() {
+        let validation = WebSocketResponseValidation {
+            expected_accept: VALID_WS_ACCEPT.to_string(),
+            expected_extension: Some("permessage-deflate; client_no_context_takeover".to_string()),
+            offered_subprotocols: Vec::new(),
+        };
+
+        let err = validate_websocket_response(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover; client_no_context_takeover\r\n\r\n",
+            WebSocketExtensionMode::PermessageDeflate,
+            Some(&validation),
+        )
+        .expect_err("duplicate extension params should fail closed");
+
+        assert!(err.to_string().contains("unsupported permessage-deflate"));
+    }
+
+    #[test]
+    fn preserve_mode_leaves_malformed_extension_response_raw() {
+        let negotiated = validate_websocket_response(
+            "HTTP/1.1 101 Switching Protocols\r\nSec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover=\"true\"\r\n\r\n",
+            WebSocketExtensionMode::Preserve,
+            None,
+        )
+        .expect("preserve mode should not parse or reject raw extension negotiation");
+
+        assert!(!negotiated);
+    }
+
+    #[test]
+    fn parse_websocket_upgrade_request_tracks_subprotocols() {
+        let raw = format!(
+            "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {VALID_WS_KEY}\r\nSec-WebSocket-Protocol: chat, superchat\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+
+        let request = parse_websocket_upgrade_request(raw.as_bytes())
+            .expect("request should parse")
+            .expect("request should be websocket");
+
+        assert_eq!(request.subprotocols, ["chat", "superchat"]);
+    }
+
+    #[test]
+    fn strict_response_validation_allows_offered_subprotocol() {
+        let validation = WebSocketResponseValidation {
+            expected_accept: VALID_WS_ACCEPT.to_string(),
+            expected_extension: None,
+            offered_subprotocols: vec!["chat".to_string(), "superchat".to_string()],
+        };
+
+        let negotiated = validate_websocket_response(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Protocol: superchat\r\n\r\n",
+            WebSocketExtensionMode::PermessageDeflate,
+            Some(&validation),
+        )
+        .expect("offered subprotocol should validate");
+
+        assert!(!negotiated);
+    }
+
+    #[test]
+    fn strict_response_validation_rejects_unoffered_subprotocol() {
+        let validation = WebSocketResponseValidation {
+            expected_accept: VALID_WS_ACCEPT.to_string(),
+            expected_extension: None,
+            offered_subprotocols: vec!["chat".to_string()],
+        };
+
+        let err = validate_websocket_response(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Protocol: admin\r\n\r\n",
+            WebSocketExtensionMode::PermessageDeflate,
+            Some(&validation),
+        )
+        .expect_err("unoffered subprotocol should fail closed");
+
+        assert!(err.to_string().contains("subprotocol"));
+    }
+
+    #[test]
+    fn strict_response_validation_rejects_multiple_subprotocol_headers() {
+        let validation = WebSocketResponseValidation {
+            expected_accept: VALID_WS_ACCEPT.to_string(),
+            expected_extension: None,
+            offered_subprotocols: vec!["chat".to_string(), "superchat".to_string()],
+        };
+
+        let err = validate_websocket_response(
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Protocol: chat\r\nSec-WebSocket-Protocol: superchat\r\n\r\n",
+            WebSocketExtensionMode::PermessageDeflate,
+            Some(&validation),
+        )
+        .expect_err("multiple selected subprotocols should fail closed");
+
+        assert!(err.to_string().contains("Sec-WebSocket-Protocol"));
+    }
+
+    #[tokio::test]
     async fn relay_request_guard_blocks_stale_generation_before_upstream_write() {
         let policy_data = "network_policies: {}\n";
         let engine = OpaEngine::from_strings(TEST_POLICY, policy_data).unwrap();
@@ -2241,6 +4067,94 @@ mod tests {
     fn client_requested_upgrade_handles_comma_separated_connection() {
         let headers = "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\n\r\n";
         assert!(client_requested_upgrade(headers));
+    }
+
+    #[test]
+    fn request_is_websocket_upgrade_detects_websocket_upgrade() {
+        let raw = format!(
+            "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\nSec-WebSocket-Key: {VALID_WS_KEY}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+        assert!(request_is_websocket_upgrade(raw.as_bytes()));
+    }
+
+    #[test]
+    fn request_is_websocket_upgrade_rejects_missing_key() {
+        let raw = b"GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\r\n";
+        assert!(!request_is_websocket_upgrade(raw));
+        assert!(validate_websocket_upgrade_request(raw).is_err());
+    }
+
+    #[test]
+    fn request_is_websocket_upgrade_rejects_wrong_method() {
+        let raw = format!(
+            "POST /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {VALID_WS_KEY}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+        assert!(!request_is_websocket_upgrade(raw.as_bytes()));
+        assert!(validate_websocket_upgrade_request(raw.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn request_is_websocket_upgrade_rejects_wrong_version() {
+        let raw = format!(
+            "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {VALID_WS_KEY}\r\nSec-WebSocket-Version: 12\r\n\r\n"
+        );
+        assert!(!request_is_websocket_upgrade(raw.as_bytes()));
+        assert!(validate_websocket_upgrade_request(raw.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn validate_websocket_upgrade_ignores_plain_rest_request() {
+        let raw = b"GET /api HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        assert!(!request_is_websocket_upgrade(raw));
+        assert!(!validate_websocket_upgrade_request(raw).expect("plain request should parse"));
+    }
+
+    #[test]
+    fn validate_websocket_upgrade_ignores_non_websocket_upgrade() {
+        let raw = b"GET /h2c HTTP/1.1\r\nHost: example.com\r\nUpgrade: h2c\r\nConnection: Upgrade\r\n\r\n";
+        assert!(!request_is_websocket_upgrade(raw));
+        assert!(!validate_websocket_upgrade_request(raw).expect("h2c request should parse"));
+    }
+
+    #[test]
+    fn strip_websocket_extensions_removes_extension_negotiation() {
+        let raw = format!(
+            "GET /ws HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {VALID_WS_KEY}\r\nSec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+
+        let (stripped, offered) = rewrite_websocket_extensions_for_mode(
+            raw.as_bytes(),
+            WebSocketExtensionMode::PermessageDeflate,
+            true,
+        )
+        .expect("strip should succeed");
+        assert!(offered.is_none());
+        let stripped = String::from_utf8(stripped).unwrap();
+
+        assert!(stripped.contains("Upgrade: websocket\r\n"));
+        assert!(stripped.contains("Sec-WebSocket-Key: "));
+        assert!(stripped.contains("Sec-WebSocket-Version: 13\r\n"));
+        assert!(
+            !stripped
+                .to_ascii_lowercase()
+                .contains("sec-websocket-extensions")
+        );
+        assert!(stripped.ends_with("\r\n\r\n"));
+    }
+
+    #[test]
+    fn strip_websocket_extensions_leaves_non_websocket_request_unchanged() {
+        let raw = b"GET /api HTTP/1.1\r\nHost: example.com\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\n";
+
+        let (stripped, offered) = rewrite_websocket_extensions_for_mode(
+            raw,
+            WebSocketExtensionMode::PermessageDeflate,
+            false,
+        )
+        .expect("strip should succeed");
+
+        assert!(offered.is_none());
+        assert_eq!(stripped, raw);
     }
 
     #[test]
@@ -2512,6 +4426,257 @@ mod tests {
             .await
             .map_err(|e| miette!("upstream task failed: {e}"))?;
         Ok(forwarded)
+    }
+
+    async fn relay_and_capture_with_options(
+        raw_header: Vec<u8>,
+        body_length: BodyLength,
+        resolver: Option<&SecretResolver>,
+        request_body_credential_rewrite: bool,
+    ) -> Result<String> {
+        let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
+        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+
+        let header_str = String::from_utf8_lossy(&raw_header);
+        let first_line = header_str.lines().next().unwrap_or("");
+        let parts: Vec<&str> = first_line.splitn(3, ' ').collect();
+        let action = parts.first().unwrap_or(&"GET").to_string();
+        let target = parts.get(1).unwrap_or(&"/").to_string();
+
+        let req = L7Request {
+            action,
+            target,
+            query_params: HashMap::new(),
+            raw_header,
+            body_length,
+        };
+
+        let upstream_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 8192];
+            let mut total = 0usize;
+            let mut header_end = None;
+            let mut expected_total = None;
+            loop {
+                let n = upstream_side.read(&mut buf[total..]).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                total += n;
+                if header_end.is_none()
+                    && let Some(end) = buf[..total].windows(4).position(|w| w == b"\r\n\r\n")
+                {
+                    let end = end + 4;
+                    let headers = String::from_utf8_lossy(&buf[..end]);
+                    let len = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    header_end = Some(end);
+                    expected_total = Some(end + len);
+                }
+                if expected_total.is_some_and(|expected| total >= expected) {
+                    break;
+                }
+            }
+            upstream_side
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+            upstream_side.flush().await.unwrap();
+            String::from_utf8_lossy(&buf[..total]).to_string()
+        });
+
+        relay_http_request_with_options_guarded(
+            &req,
+            &mut proxy_to_client,
+            &mut proxy_to_upstream,
+            RelayRequestOptions {
+                resolver,
+                request_body_credential_rewrite,
+                ..Default::default()
+            },
+        )
+        .await?;
+
+        upstream_task
+            .await
+            .map_err(|e| miette!("upstream task failed: {e}"))
+    }
+
+    #[tokio::test]
+    async fn relay_request_body_rewrites_provider_alias_header_and_urlencoded_token() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("API_TOKEN".to_string(), "provider-real-token".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let alias = "provider.v1-OPENSHELL-RESOLVE-ENV-API_TOKEN";
+        let body = format!("token={alias}&channel=C123");
+        let raw = format!(
+            "POST /api/messages HTTP/1.1\r\n\
+             Host: api.example.com\r\n\
+             Authorization: Bearer {alias}\r\n\
+             Content-Type: application/x-www-form-urlencoded\r\n\
+             Content-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+
+        let forwarded = relay_and_capture_with_options(
+            raw.into_bytes(),
+            BodyLength::ContentLength(body.len() as u64),
+            Some(&resolver),
+            true,
+        )
+        .await
+        .expect("relay should succeed");
+
+        let expected_body = "token=provider-real-token&channel=C123";
+        assert!(forwarded.contains("Authorization: Bearer provider-real-token\r\n"));
+        assert!(forwarded.contains(&format!("Content-Length: {}\r\n", expected_body.len())));
+        assert!(forwarded.ends_with(expected_body));
+        assert!(!forwarded.contains("OPENSHELL-RESOLVE-ENV"));
+    }
+
+    #[tokio::test]
+    async fn relay_request_body_rewrites_percent_encoded_canonical_urlencoded_token() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("API_TOKEN".to_string(), "provider-real-token".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let body = "token=openshell%3Aresolve%3Aenv%3AAPI_TOKEN&note=hello+world";
+        let raw = format!(
+            "POST /api/messages HTTP/1.1\r\n\
+             Host: api.example.com\r\n\
+             Content-Type: application/x-www-form-urlencoded\r\n\
+             Content-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+
+        let forwarded = relay_and_capture_with_options(
+            raw.into_bytes(),
+            BodyLength::ContentLength(body.len() as u64),
+            Some(&resolver),
+            true,
+        )
+        .await
+        .expect("relay should succeed");
+
+        let expected_body = "token=provider-real-token&note=hello+world";
+        assert!(forwarded.contains(&format!("Content-Length: {}\r\n", expected_body.len())));
+        assert!(forwarded.ends_with(expected_body));
+        assert!(!forwarded.contains("openshell%3Aresolve%3Aenv%3AAPI_TOKEN"));
+        assert!(!forwarded.contains("openshell:resolve:env:API_TOKEN"));
+    }
+
+    #[tokio::test]
+    async fn relay_request_body_unresolved_alias_fails_before_upstream_write() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("API_TOKEN".to_string(), "provider-real-token".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let body = "token=provider-OPENSHELL-RESOLVE-ENV-APP_TOKEN";
+        let raw = format!(
+            "POST /api/connections.open HTTP/1.1\r\n\
+             Host: api.example.com\r\n\
+             Content-Type: application/x-www-form-urlencoded\r\n\
+             Content-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let req = L7Request {
+            action: "POST".to_string(),
+            target: "/api/connections.open".to_string(),
+            query_params: HashMap::new(),
+            raw_header: raw.into_bytes(),
+            body_length: BodyLength::ContentLength(body.len() as u64),
+        };
+        let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
+        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+
+        let err = relay_http_request_with_options_guarded(
+            &req,
+            &mut proxy_to_client,
+            &mut proxy_to_upstream,
+            RelayRequestOptions {
+                resolver: Some(&resolver),
+                request_body_credential_rewrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("unknown body alias should fail closed");
+
+        assert!(!err.to_string().contains("provider-real-token"));
+        drop(proxy_to_upstream);
+        let mut forwarded = Vec::new();
+        upstream_side.read_to_end(&mut forwarded).await.unwrap();
+        assert!(
+            forwarded.is_empty(),
+            "failed body rewrite must not reach upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_request_body_unresolved_encoded_canonical_fails_before_upstream_write() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("API_TOKEN".to_string(), "provider-real-token".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let resolver = resolver.expect("resolver");
+        let body = "token=openshell%3Aresolve%3Aenv%3AMISSING_TOKEN";
+        let raw = format!(
+            "POST /api/messages HTTP/1.1\r\n\
+             Host: api.example.com\r\n\
+             Content-Type: application/x-www-form-urlencoded\r\n\
+             Content-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let req = L7Request {
+            action: "POST".to_string(),
+            target: "/api/messages".to_string(),
+            query_params: HashMap::new(),
+            raw_header: raw.into_bytes(),
+            body_length: BodyLength::ContentLength(body.len() as u64),
+        };
+        let (mut proxy_to_upstream, mut upstream_side) = tokio::io::duplex(8192);
+        let (mut _app_side, mut proxy_to_client) = tokio::io::duplex(8192);
+
+        let err = relay_http_request_with_options_guarded(
+            &req,
+            &mut proxy_to_client,
+            &mut proxy_to_upstream,
+            RelayRequestOptions {
+                resolver: Some(&resolver),
+                request_body_credential_rewrite: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("unknown encoded body placeholder should fail closed");
+
+        assert!(!err.to_string().contains("provider-real-token"));
+        assert!(!err.to_string().contains("MISSING_TOKEN"));
+        drop(proxy_to_upstream);
+        let mut forwarded = Vec::new();
+        upstream_side.read_to_end(&mut forwarded).await.unwrap();
+        assert!(
+            forwarded.is_empty(),
+            "failed body rewrite must not reach upstream"
+        );
     }
 
     #[tokio::test]

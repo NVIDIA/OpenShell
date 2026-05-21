@@ -33,10 +33,7 @@ spec:
       sandboxImagePullPolicy: __SANDBOX_IMAGE_PULL_POLICY__
       supervisorImage: ghcr.io/nvidia/openshell/supervisor:latest
       dbUrl: __DB_URL__
-      sshGatewayHost: __SSH_GATEWAY_HOST__
-      sshGatewayPort: __SSH_GATEWAY_PORT__
       hostGatewayIP: __HOST_GATEWAY_IP__
-      disableGatewayAuth: __DISABLE_GATEWAY_AUTH__
       disableTls: __DISABLE_TLS__
       oidc:
         issuer: "__OIDC_ISSUER__"

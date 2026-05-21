@@ -1,0 +1,35 @@
+# syntax=docker/dockerfile:1.4
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Supervisor image build.
+#
+# The final image is `scratch`: it only carries the static `openshell-sandbox`
+# binary used by Docker extraction, Podman image volumes, and the Kubernetes
+# init container copy-self path. A static musl binary lets the image stay
+# `scratch` while still being executable as an init container.
+#
+# The Rust binary is built natively before this image build runs and staged at:
+#   deploy/docker/.build/prebuilt-binaries/<arch>/openshell-sandbox
+#
+# Use tasks/scripts/docker-build-image.sh supervisor (or `mise run build:docker:supervisor`)
+# to stage the binary and build the image in one step. CI builds the binary
+# per-architecture via the `rust-native-build.yml` workflow (with the musl
+# target) and uploads it as an artifact, which is downloaded into the same
+# staging directory before the image build job runs.
+
+FROM scratch AS supervisor
+
+ARG TARGETARCH
+
+# --chmod=0550 drops world-execute and survives the actions/upload-artifact
+# + download-artifact roundtrip (which strips exec perms). Ownership is left
+# at root (0:0) deliberately: the Podman driver mounts this image as a
+# read-only image volume into the sandbox container and drops DAC_OVERRIDE,
+# so the container's UID 0 must own the binary to read+exec it. Mode 0550
+# (r-xr-x---) is the security win; the chown to a non-root UID was breaking
+# Podman without buying anything since the container is always UID 0.
+COPY --chmod=0550 deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-sandbox /openshell-sandbox
+
+ENTRYPOINT ["/openshell-sandbox"]

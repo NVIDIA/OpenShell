@@ -42,6 +42,11 @@ on:
         required: false
         type: string
         default: ""
+      publish-manifest:
+        description: "Push the bare-SHA manifest. Set false for single-arch branch workflows."
+        required: false
+        type: boolean
+        default: true
 
 env:
   MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -181,12 +186,12 @@ jobs:
         # inside the container so setup-buildx can read it.
         - /etc/buildkit:/etc/buildkit:ro
     env:
-      IMAGE_TAG: ${{ needs.resolve.outputs.platform_count == '1' && needs.resolve.outputs.image_tag_base || format('{0}-{1}', needs.resolve.outputs.image_tag_base, matrix.arch) }}
+      IMAGE_TAG: ${{ format('{0}-{1}', needs.resolve.outputs.image_tag_base, matrix.arch) }}
       IMAGE_REGISTRY: ghcr.io/nvidia/openshell
       DOCKER_PUSH: ${{ inputs.push && '1' || '0' }}
       DOCKER_PLATFORM: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           ref: ${{ inputs['checkout-ref'] || github.sha }}
           fetch-depth: 0
@@ -207,7 +212,7 @@ jobs:
           buildkitd-config: /etc/buildkit/buildkitd.toml
 
       - name: Download Rust binary artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: ${{ needs.resolve.outputs.artifact_prefix }}-linux-${{ matrix.arch }}
           path: prebuilt-rust-binary
@@ -257,7 +262,7 @@ jobs:
   merge:
     name: Merge ${{ inputs.component }} manifest
     needs: [resolve, build]
-    if: ${{ inputs.push && needs.resolve.outputs.platform_count != '1' }}
+    if: ${{ inputs.push && inputs['publish-manifest'] }}
     runs-on: linux-amd64-cpu8
     timeout-minutes: 10
     container:

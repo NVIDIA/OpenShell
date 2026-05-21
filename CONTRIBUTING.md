@@ -75,6 +75,7 @@ Skills live in `.agents/skills/`. Your agent's harness can discover and load the
 | Reviewing       | `review-github-pr`        | Summarize PR diffs and key design decisions                                                         |
 | Reviewing       | `review-security-issue`   | Assess security issues for severity and remediation                                                 |
 | Reviewing       | `watch-github-actions`    | Monitor CI pipeline status and logs                                                                 |
+| Reviewing       | `test-release-canary`     | Dispatch and iterate on the Release Canary workflow that smoke-tests published artifacts            |
 | Triage          | `triage-issue`            | Assess, classify, and route community-filed issues                                                  |
 | Platform        | `generate-sandbox-policy` | Generate YAML sandbox policies from requirements or API docs                                        |
 | Platform        | `tui-development`         | Development guide for the ratatui-based terminal UI                                                 |
@@ -152,10 +153,6 @@ cargo build -p openshell-prover --features bundled-z3
 # One-time trust
 mise trust
 
-# Podman and Kubernetes drivers require an SSH handshake secret.
-# Set any value for local development:
-export OPENSHELL_SSH_HANDSHAKE_SECRET=dev-secret
-
 # Run a standalone gateway for local development
 mise run gateway
 ```
@@ -178,15 +175,16 @@ openshell sandbox create -- codex
 
 These are the primary `mise` tasks for day-to-day development:
 
-| Task               | Purpose                                                 |
-| ------------------ | ------------------------------------------------------- |
-| `mise run gateway` | Run a standalone gateway for local development          |
-| `mise run sandbox` | Create or reconnect to the dev sandbox                  |
-| `mise run test`    | Default test suite                                      |
-| `mise run e2e`     | Default end-to-end test lane                            |
-| `mise run ci`      | Full local CI checks (lint, compile/type checks, tests) |
-| `mise run docs`    | Validate Fern docs locally                              |
-| `mise run clean`   | Clean build artifacts                                   |
+| Task                 | Purpose                                                 |
+| -------------------- | ------------------------------------------------------- |
+| `mise run gateway`   | Run a standalone gateway for local development          |
+| `mise run sandbox`   | Create or reconnect to the dev sandbox                  |
+| `mise run test`      | Default test suite                                      |
+| `mise run e2e`       | Default end-to-end test lane                            |
+| `mise run ci`        | Full local CI checks (lint, compile/type checks, tests) |
+| `mise run docs`      | Validate Fern docs locally                              |
+| `mise run helm:docs` | Regenerate the Helm chart README                        |
+| `mise run clean`     | Clean build artifacts                                   |
 
 ## Project Structure
 
@@ -285,4 +283,4 @@ DCO sign-off is separate from cryptographic commit signing. CI requires signing 
 
 ## CI
 
-How E2E runs in CI, the `test:e2e` / `test:e2e-gpu` labels, copy-pr-bot, and commit-signing setup are documented in [CI.md](CI.md).
+How PR CI runs, the `test:e2e` / `test:e2e-gpu` / `test:e2e-kubernetes` labels, copy-pr-bot, and commit-signing setup are documented in [CI.md](CI.md).

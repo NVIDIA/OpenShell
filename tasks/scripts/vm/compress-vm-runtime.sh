@@ -4,9 +4,9 @@
 
 # Gather VM runtime artifacts from local sources and compress for embedding.
 #
-# This script collects libkrun, libkrunfw, and gvproxy from local sources
-# (Homebrew on macOS, built from source on Linux) and compresses them with
-# zstd for embedding into the openshell-driver-vm binary.
+# This script collects libkrun, libkrunfw, gvproxy, and the guest OCI unpacker
+# from local sources or pinned releases and compresses them with zstd for
+# embedding into the openshell-driver-vm binary.
 #
 # Usage:
 #   ./compress-vm-runtime.sh
@@ -26,9 +26,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/_lib.sh"
 ROOT="$(vm_lib_root)"
 
-# Source pins for gvproxy version.
+# Source pins for runtime tool versions.
 source "${ROOT}/crates/openshell-driver-vm/runtime/pins.env" 2>/dev/null || true
 GVPROXY_VERSION="${GVPROXY_VERSION:-v0.8.8}"
+UMOCI_VERSION="${UMOCI_VERSION:-v0.6.0}"
 
 # ── macOS dylib portability helpers ─────────────────────────────────────
 
@@ -57,6 +58,12 @@ OUTPUT_DIR="${OPENSHELL_VM_RUNTIME_COMPRESSED_DIR:-${ROOT}/target/vm-runtime-com
 
 mkdir -p "$OUTPUT_DIR"
 
+download_umoci_for_guest() {
+    local output="$1"
+    local guest_arch="$2"
+    download_umoci_binary "$output" "${UMOCI_VERSION}" "$guest_arch"
+}
+
 # ── Fast path: compressed artifacts already present (e.g. from vm:setup) ──
 
 _check_compressed_artifacts() {
@@ -65,12 +72,12 @@ _check_compressed_artifacts() {
     platform="$(uname -s)-$(uname -m)"
     case "$platform" in
         Darwin-arm64)
-            for f in libkrun.dylib.zst libkrunfw.5.dylib.zst gvproxy.zst; do
+            for f in libkrun.dylib.zst libkrunfw.5.dylib.zst gvproxy.zst umoci.zst; do
                 [ -f "${dir}/${f}" ] || return 1
             done
             ;;
         Linux-*)
-            for f in libkrun.so.zst libkrunfw.so.5.zst gvproxy.zst; do
+            for f in libkrun.so.zst libkrunfw.so.5.zst gvproxy.zst umoci.zst; do
                 [ -f "${dir}/${f}" ] || return 1
             done
             ;;
@@ -119,6 +126,23 @@ if [ -n "${VM_RUNTIME_TARBALL:-}" ]; then
 
     # Extract tarball contents
     zstd -d "${VM_RUNTIME_TARBALL}" --stdout | tar -xf - -C "$WORK_DIR"
+
+    VM_RUNTIME_PLATFORM="${VM_RUNTIME_PLATFORM:-}"
+    if [ -z "$VM_RUNTIME_PLATFORM" ]; then
+        case "$(basename "$VM_RUNTIME_TARBALL")" in
+            vm-runtime-darwin-aarch64.tar.zst) VM_RUNTIME_PLATFORM="darwin-aarch64" ;;
+            vm-runtime-linux-aarch64.tar.zst)  VM_RUNTIME_PLATFORM="linux-aarch64" ;;
+            vm-runtime-linux-x86_64.tar.zst)   VM_RUNTIME_PLATFORM="linux-x86_64" ;;
+        esac
+    fi
+    if [ ! -f "${WORK_DIR}/umoci" ]; then
+        if [ -z "$VM_RUNTIME_PLATFORM" ]; then
+            echo "Error: VM_RUNTIME_TARBALL has no umoci and platform could not be inferred." >&2
+            echo "       Set VM_RUNTIME_PLATFORM to linux-aarch64, linux-x86_64, or darwin-aarch64." >&2
+            exit 1
+        fi
+        ensure_umoci_for_platform "$WORK_DIR" "$VM_RUNTIME_PLATFORM" "$UMOCI_VERSION"
+    fi
 
     echo "    Extracted files:"
     ls -lah "$WORK_DIR"
@@ -211,6 +235,7 @@ case "$(uname -s)-$(uname -m)" in
       echo "Error: gvproxy not found. Install Podman Desktop or run: brew install gvproxy" >&2
       exit 1
     fi
+    download_umoci_for_guest "$WORK_DIR/umoci" "arm64"
     ;;
     
   Linux-*)
@@ -256,6 +281,7 @@ case "$(uname -s)-$(uname -m)" in
         "https://github.com/containers/gvisor-tap-vsock/releases/download/${GVPROXY_VERSION}/gvproxy-linux-${GVPROXY_ARCH}"
       chmod +x "$WORK_DIR/gvproxy"
     fi
+    download_umoci_for_guest "$WORK_DIR/umoci" "$ARCH"
     ;;
     
   *)

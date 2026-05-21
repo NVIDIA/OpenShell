@@ -6,6 +6,8 @@ pub mod config;
 pub(crate) mod container;
 pub mod driver;
 pub mod grpc;
+#[cfg(test)]
+pub(crate) mod test_utils;
 pub(crate) mod watcher;
 
 pub use config::PodmanComputeConfig;

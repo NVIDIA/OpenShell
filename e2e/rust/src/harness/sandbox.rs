@@ -349,6 +349,52 @@ impl SandboxGuard {
         Ok(combined)
     }
 
+    /// Run a one-shot command inside the sandbox via `openshell sandbox exec`.
+    ///
+    /// Used by tests that need to pre-populate sandbox-side state (create
+    /// files, symlinks, directories) without going through the upload flow.
+    /// Stdout and stderr are captured and returned together; PTY allocation
+    /// is disabled so the call is suitable for non-interactive setups.
+    ///
+    /// # Arguments
+    ///
+    /// * `argv` — Command and arguments to execute (passed after `--`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the CLI exits non-zero.
+    pub async fn exec(&self, argv: &[&str]) -> Result<String, String> {
+        let mut cmd = openshell_cmd();
+        cmd.arg("sandbox")
+            .arg("exec")
+            .arg("--name")
+            .arg(&self.name)
+            .arg("--no-tty")
+            .arg("--");
+        for arg in argv {
+            cmd.arg(arg);
+        }
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+        let output = cmd
+            .output()
+            .await
+            .map_err(|e| format!("failed to spawn openshell exec: {e}"))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let combined = format!("{stdout}{stderr}");
+
+        if !output.status.success() {
+            return Err(format!(
+                "sandbox exec failed (exit {:?}):\n{combined}",
+                output.status.code()
+            ));
+        }
+
+        Ok(combined)
+    }
+
     /// Download files from the sandbox via `openshell sandbox download`.
     ///
     /// # Arguments

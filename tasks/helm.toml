@@ -3,6 +3,25 @@
 
 # Helm chart tasks
 
+["helm:docs"]
+description = "Generate the openshell Helm chart README from Chart.yaml, values.yaml, and README.md.gotmpl"
+run = "helm-docs --chart-search-root deploy/helm/openshell"
+
+["helm:docs:check"]
+description = "Verify the openshell Helm chart README is generated and up to date"
+run = """
+  set -e
+  tmp="$(mktemp)"
+  trap 'rm -f "$tmp"' EXIT
+
+  helm-docs --chart-search-root deploy/helm/openshell --dry-run > "$tmp"
+  if ! diff -u deploy/helm/openshell/README.md "$tmp"; then
+    echo "Helm chart README is out of sync. Run: mise run helm:docs" >&2
+    exit 1
+  fi
+"""
+hide = true
+
 ["helm:lint"]
 description = "Lint the openshell Helm chart (defaults + all CI configuration variants)"
 run = """
@@ -17,6 +36,16 @@ run = """
     helm lint deploy/helm/openshell -f "$f"
   done
   echo "All variants passed."
+"""
+
+["helm:test"]
+description = "Run Helm chart unit tests"
+run = """
+  set -e
+  if ! helm plugin list | grep -q unittest; then
+    helm plugin install https://github.com/helm-unittest/helm-unittest --verify=false
+  fi
+  helm unittest deploy/helm/openshell
 """
 
 ["helm:skaffold:dev"]
@@ -40,10 +69,11 @@ dir = "deploy/helm/openshell"
 run = "skaffold diagnose"
 hide = true
 
-# Local k3s via k3d (Docker required). On macOS this is the supported path for a lightweight cluster to pair with helm:skaffold:* .
+# Local k3s via k3d (Docker required). macOS gets k3d from mise; Linux users
+# should install k3d explicitly or point workflows at an existing/kind cluster.
 
 ["helm:k3s:create"]
-description = "Create a local k3s cluster with k3d and merge kubeconfig (macOS/Linux + Docker; use with helm:skaffold:dev)"
+description = "Create a local k3s cluster with k3d and merge kubeconfig (macOS via mise; Linux requires explicit k3d install; use with helm:skaffold:dev)"
 run = "tasks/scripts/helm-k3s-local.sh create"
 
 ["helm:k3s:delete"]

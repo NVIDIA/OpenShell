@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[env]
+# z3-sys bindgen needs the z3 include path. On some distros (e.g. RHEL/Fedora)
+# the header lives in /usr/include/z3/ rather than /usr/include/. The extra -I
+# is harmless on systems where the path doesn't exist.
+BINDGEN_EXTRA_CLANG_ARGS = "-I/usr/include/z3"

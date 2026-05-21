@@ -24,11 +24,12 @@ pub fn proxy_env_vars(proxy_url: &str) -> [(&'static str, String); 9] {
 pub fn tls_env_vars(
     ca_cert_path: &Path,
     combined_bundle_path: &Path,
-) -> [(&'static str, String); 5] {
+) -> [(&'static str, String); 6] {
     let ca_cert_path = ca_cert_path.display().to_string();
     let combined_bundle_path = combined_bundle_path.display().to_string();
     [
-        ("NODE_EXTRA_CA_CERTS", ca_cert_path),
+        ("NODE_EXTRA_CA_CERTS", ca_cert_path.clone()),
+        ("DENO_CERT", ca_cert_path),
         ("SSL_CERT_FILE", combined_bundle_path.clone()),
         ("REQUESTS_CA_BUNDLE", combined_bundle_path.clone()),
         ("CURL_CA_BUNDLE", combined_bundle_path.clone()),
@@ -81,6 +82,7 @@ mod tests {
         let stdout = String::from_utf8(output.stdout).expect("utf8");
 
         assert!(stdout.contains("NODE_EXTRA_CA_CERTS=/etc/openshell-tls/openshell-ca.pem"));
+        assert!(stdout.contains("DENO_CERT=/etc/openshell-tls/openshell-ca.pem"));
         assert!(stdout.contains("SSL_CERT_FILE=/etc/openshell-tls/ca-bundle.pem"));
         assert!(stdout.contains("REQUESTS_CA_BUNDLE=/etc/openshell-tls/ca-bundle.pem"));
         assert!(stdout.contains("CURL_CA_BUNDLE=/etc/openshell-tls/ca-bundle.pem"));

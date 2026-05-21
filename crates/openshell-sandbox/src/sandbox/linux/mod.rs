@@ -5,6 +5,7 @@
 
 mod landlock;
 pub mod netns;
+mod nft_ruleset;
 mod seccomp;
 
 use crate::policy::SandboxPolicy;

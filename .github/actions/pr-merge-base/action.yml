@@ -1,0 +1,37 @@
+name: PR Merge Base
+description: Resolve and fetch the merge-base commit needed to diff a copy-pr-bot pull-request/<N> push against the PR base branch.
+
+inputs:
+  gh_token:
+    description: GitHub token for PR and compare API calls.
+    required: true
+
+outputs:
+  base_sha:
+    description: Merge-base commit SHA for pull-request/<N> refs, or empty for other refs.
+    value: ${{ steps.merge-base.outputs.base_sha }}
+
+runs:
+  using: composite
+  steps:
+    - id: merge-base
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.gh_token }}
+        GH_REPO: ${{ github.repository }}
+        REF_NAME: ${{ github.ref_name }}
+        GITHUB_SHA_VALUE: ${{ github.sha }}
+      run: |
+        set -euo pipefail
+
+        if [[ "$REF_NAME" =~ ^pull-request/([0-9]+)$ ]]; then
+          pr_number="${BASH_REMATCH[1]}"
+          base_ref=$(gh pr view "$pr_number" --repo "$GH_REPO" --json baseRefName -q '.baseRefName')
+          # The mirrored branch is a push ref, so changed-files needs the true merge-base
+          # to diff the PR head against its base branch.
+          base_sha=$(gh api "repos/$GH_REPO/compare/$base_ref...$GITHUB_SHA_VALUE" --jq '.merge_base_commit.sha')
+          git fetch --no-tags --depth=1 origin "$base_sha"
+          echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
+        else
+          echo "base_sha=" >> "$GITHUB_OUTPUT"
+        fi

@@ -603,6 +603,64 @@ start_user_gateway() {
   wait_for_local_gateway_status
 }
 
+dump_local_gateway_diagnostics() {
+  _lines="${OPENSHELL_INSTALL_LOG_LINES:-80}"
+  case "$_lines" in
+    "" | *[!0-9]*)
+      _lines=80
+      ;;
+  esac
+
+  info "dumping recent local gateway diagnostics..."
+  case "${PLATFORM:-}" in
+    darwin)
+      dump_homebrew_gateway_diagnostics "$_lines"
+      ;;
+    linux)
+      dump_user_service_gateway_diagnostics "$_lines"
+      ;;
+    *)
+      info "no gateway log collector is available for platform: ${PLATFORM:-unknown}"
+      ;;
+  esac
+}
+
+dump_homebrew_gateway_diagnostics() {
+  _lines="$1"
+  _brew_prefix="$(as_target_user brew --prefix 2>/dev/null || true)"
+  [ -n "$_brew_prefix" ] || _brew_prefix="/opt/homebrew"
+
+  info "Homebrew service status:"
+  as_target_user brew services info "${HOMEBREW_TAP}/${HOMEBREW_FORMULA_NAME}" >&2 || true
+
+  for _log_file in \
+    "${_brew_prefix}/var/log/openshell/openshell-gateway.err.log" \
+    "${_brew_prefix}/var/log/openshell/openshell-gateway.out.log"; do
+    if [ -f "$_log_file" ]; then
+      info "last ${_lines} lines from ${_log_file}:"
+      tail -n "$_lines" "$_log_file" >&2 || true
+    else
+      info "gateway log not found: ${_log_file}"
+    fi
+  done
+}
+
+dump_user_service_gateway_diagnostics() {
+  _lines="$1"
+
+  if has_cmd systemctl; then
+    info "openshell-gateway user service status:"
+    as_target_user systemctl --user status openshell-gateway --no-pager >&2 || true
+  fi
+
+  if has_cmd journalctl; then
+    info "last ${_lines} lines from openshell-gateway user journal:"
+    as_target_user journalctl --user -u openshell-gateway --no-pager -n "$_lines" >&2 || true
+  else
+    info "journalctl not found; cannot dump openshell-gateway user journal"
+  fi
+}
+
 wait_for_local_gateway_listener() {
   _timeout="${OPENSHELL_INSTALL_GATEWAY_TIMEOUT:-30}"
   _elapsed=0
@@ -622,7 +680,8 @@ wait_for_local_gateway_listener() {
     _elapsed=$((_elapsed + 1))
   done
 
-  printf '%s\n' "$_last_output" >&2
+  [ -z "$_last_output" ] || printf '%s\n' "$_last_output" >&2
+  dump_local_gateway_diagnostics
   error "local gateway listener did not become reachable at ${_probe_url} within ${_timeout}s"
 }
 
@@ -646,7 +705,8 @@ wait_for_local_gateway_status() {
     _elapsed=$((_elapsed + 1))
   done
 
-  printf '%s\n' "$_status_output" >&2
+  [ -z "$_status_output" ] || printf '%s\n' "$_status_output" >&2
+  dump_local_gateway_diagnostics
   error "openshell status did not report connected within ${_timeout}s"
 }
 

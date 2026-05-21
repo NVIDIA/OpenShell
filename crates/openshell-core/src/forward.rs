@@ -462,11 +462,31 @@ pub fn resolve_ssh_gateway(
             // Remote cluster: use the remote host but keep the cluster URL port.
             return (host.to_string(), cluster_port);
         }
-        // Local cluster: both loopback — use cluster URL's port (Docker-mapped).
+        // Both endpoints loopback. The unspecified addresses (0.0.0.0 / ::)
+        // are bind-only — they aren't valid connect targets and aren't in TLS
+        // cert SANs, so fall back to the cluster URL's host (which the CLI
+        // is already using to reach the gateway).
+        if gateway_host == "0.0.0.0" || gateway_host == "::" {
+            return (host.to_string(), cluster_port);
+        }
         return (gateway_host.to_string(), cluster_port);
     }
 
     (gateway_host.to_string(), gateway_port)
+}
+
+/// Format a gateway URL, bracketing IPv6 literals when needed.
+pub fn format_gateway_url(scheme: &str, host: &str, port: u16) -> String {
+    let host = if host
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_ipv6())
+        && !host.starts_with('[')
+    {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    format!("{scheme}://{host}:{port}")
 }
 
 /// Shell-escape a value for use inside a `ProxyCommand` string.
@@ -525,14 +545,11 @@ pub enum SshSessionResponseError {
     InvalidScheme,
     #[error("gateway_port must be in range 1..=65535")]
     InvalidPort,
-    #[error("connect_path must start with '/'")]
-    ConnectPathNotAbsolute,
 }
 
 const MAX_SANDBOX_ID_LEN: usize = 128;
 const MAX_TOKEN_LEN: usize = 4096;
 const MAX_GATEWAY_HOST_LEN: usize = 253;
-const MAX_CONNECT_PATH_LEN: usize = 2048;
 const MAX_FINGERPRINT_LEN: usize = 256;
 
 fn is_sandbox_id_byte(b: u8) -> bool {
@@ -549,33 +566,6 @@ fn is_gateway_host_byte(b: u8) -> bool {
     // DNS hostname (alphanumeric + `.-`), IPv4, or bracketed IPv6 (`[::1]`).
     // Rejects Unicode — callers must Punycode-encode IDN hosts before emitting.
     b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'[' | b']')
-}
-
-fn is_connect_path_byte(b: u8) -> bool {
-    // RFC 3986 path charset (pchar) without `?`, `#`, space, backtick, or
-    // backslash. `%` is permitted so percent-encoded segments round-trip.
-    b.is_ascii_alphanumeric()
-        || matches!(
-            b,
-            b'-' | b'.'
-                | b'_'
-                | b'~'
-                | b'!'
-                | b'$'
-                | b'&'
-                | b'\''
-                | b'('
-                | b')'
-                | b'*'
-                | b'+'
-                | b','
-                | b';'
-                | b'='
-                | b':'
-                | b'@'
-                | b'/'
-                | b'%'
-        )
 }
 
 fn is_fingerprint_byte(b: u8) -> bool {
@@ -611,25 +601,6 @@ pub fn validate_ssh_session_response(
     }
     if resp.gateway_port == 0 || resp.gateway_port > u32::from(u16::MAX) {
         return Err(SshSessionResponseError::InvalidPort);
-    }
-    if resp.connect_path.is_empty() {
-        return Err(SshSessionResponseError::Empty {
-            field: "connect_path",
-        });
-    }
-    if !resp.connect_path.starts_with('/') {
-        return Err(SshSessionResponseError::ConnectPathNotAbsolute);
-    }
-    if resp.connect_path.len() > MAX_CONNECT_PATH_LEN {
-        return Err(SshSessionResponseError::TooLong {
-            field: "connect_path",
-            max: MAX_CONNECT_PATH_LEN,
-        });
-    }
-    if !resp.connect_path.bytes().all(is_connect_path_byte) {
-        return Err(SshSessionResponseError::InvalidChars {
-            field: "connect_path",
-        });
     }
     if !resp.host_key_fingerprint.is_empty() {
         if resp.host_key_fingerprint.len() > MAX_FINGERPRINT_LEN {
@@ -729,10 +700,40 @@ mod tests {
     }
 
     #[test]
+    fn resolve_ssh_gateway_swaps_zeros_for_loopback_cluster_host() {
+        // The gateway binds 0.0.0.0 but advertises that bind address via the
+        // SSH session response. 0.0.0.0 is not a valid connect target and is
+        // not in any TLS cert SAN; fall through to the cluster URL's host.
+        let (host, port) = resolve_ssh_gateway("0.0.0.0", 8080, "https://127.0.0.1:9000");
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, 9000);
+    }
+
+    #[test]
     fn resolve_ssh_gateway_handles_invalid_cluster_url() {
         let (host, port) = resolve_ssh_gateway("127.0.0.1", 8080, "not-a-url");
         assert_eq!(host, "127.0.0.1");
         assert_eq!(port, 8080);
+    }
+
+    #[test]
+    fn format_gateway_url_brackets_ipv6_literals() {
+        assert_eq!(
+            format_gateway_url("https", "::1", 8080),
+            "https://[::1]:8080"
+        );
+    }
+
+    #[test]
+    fn format_gateway_url_leaves_dns_and_bracketed_ipv6_unchanged() {
+        assert_eq!(
+            format_gateway_url("https", "gateway.example.com", 443),
+            "https://gateway.example.com:443"
+        );
+        assert_eq!(
+            format_gateway_url("https", "[::1]", 8080),
+            "https://[::1]:8080"
+        );
     }
 
     #[test]
@@ -757,7 +758,6 @@ mod tests {
             gateway_scheme: "https".to_string(),
             gateway_host: "gateway.example.com".to_string(),
             gateway_port: 443,
-            connect_path: "/connect/ssh".to_string(),
             host_key_fingerprint: String::new(),
             expires_at_ms: 0,
         }
@@ -854,33 +854,6 @@ mod tests {
                 validate_ssh_session_response(&r),
                 Err(SshSessionResponseError::InvalidPort)
             ));
-        }
-    }
-
-    #[test]
-    fn validate_ssh_session_response_rejects_connect_path_without_leading_slash() {
-        let mut r = valid_session_response();
-        r.connect_path = "connect/ssh".to_string();
-        assert!(matches!(
-            validate_ssh_session_response(&r),
-            Err(SshSessionResponseError::ConnectPathNotAbsolute)
-        ));
-    }
-
-    #[test]
-    fn validate_ssh_session_response_rejects_injected_connect_path() {
-        // `$`, `(`, `)` are valid RFC 3986 sub-delims (pchar) so the validator
-        // permits them; shell_escape is the second defensive layer. The
-        // following characters are rejected at the validator boundary because
-        // they are either unambiguously hostile in a shell context or invalid
-        // per RFC 3986 in the path component.
-        for bad in ["/x`id`y", "/x y", "/x\nb", "/x\\b", "/x?q=1", "/x#frag"] {
-            let mut r = valid_session_response();
-            r.connect_path = bad.to_string();
-            assert!(
-                validate_ssh_session_response(&r).is_err(),
-                "expected reject for connect_path={bad:?}"
-            );
         }
     }
 

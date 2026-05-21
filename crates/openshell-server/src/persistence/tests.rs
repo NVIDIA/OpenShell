@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{ObjectType, Store, generate_name};
+use super::{ObjectType, PersistenceError, Store, generate_name};
 use crate::policy_store::PolicyStoreExt;
 use openshell_core::proto::{ObjectForTest, SandboxPolicy};
 use prost::Message;
@@ -32,6 +32,183 @@ async fn sqlite_connect_runs_embedded_migrations() {
 
     let records = store.list("sandbox", 10, 0).await.unwrap();
     assert!(records.is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sqlite_connect_restricts_db_file_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp.path().join("openshell.db");
+    let url = format!("sqlite:{}?mode=rwc", db_path.display());
+
+    let _store = Store::connect(&url).await.expect("connect to sqlite");
+
+    let mode = std::fs::metadata(&db_path)
+        .expect("db file exists")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "expected 0600, got {mode:04o}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sqlite_connect_tightens_existing_db_file_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp.path().join("openshell.db");
+    let url = format!("sqlite:{}?mode=rwc", db_path.display());
+
+    // First connect creates the file; close the pool by dropping the store.
+    {
+        let _store = Store::connect(&url).await.expect("initial connect");
+    }
+
+    // Simulate a pre-existing database left with permissive permissions
+    // (e.g., from an older gateway version that lacked this hardening).
+    std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o644))
+        .expect("loosen permissions");
+
+    let _store = Store::connect(&url).await.expect("reconnect to sqlite");
+
+    let mode = std::fs::metadata(&db_path)
+        .expect("db file exists")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "expected 0600, got {mode:04o}");
+}
+
+// The next three tests cover `restrict_db_file_permissions` against the
+// WAL/SHM sidecars at increasing levels of fidelity:
+//
+// 1. `_tightens_main_and_wal_and_shm_files`: synthetic empty files, proves
+//    the chmod loop walks all three paths.
+// 2. `_skips_missing_sidecars`: proves the `exists()` guard, which is the
+//    actual production path today (sqlx 0.8 doesn't default to WAL and
+//    doesn't accept `journal_mode` as a URL parameter).
+// 3. `_handles_real_sqlite_wal_files`: opens a real sqlx pool with
+//    `SqliteJournalMode::Wal` via the builder API so SQLite materializes
+//    real `-wal` and `-shm` files, then checks the helper tightens them.
+
+#[cfg(unix)]
+#[test]
+fn restrict_db_file_permissions_tightens_main_and_wal_and_shm_files() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp.path().join("openshell.db");
+    let [wal_path, shm_path] = super::sqlite::sqlite_sidecar_paths(&db_path);
+
+    // Simulate a SQLite database in WAL mode whose three files were left
+    // world-readable (older gateway version, or non-zero umask at creation).
+    for path in [&db_path, &wal_path, &shm_path] {
+        std::fs::write(path, b"").expect("create file");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).expect("set 0o644");
+    }
+
+    super::sqlite::restrict_db_file_permissions(&db_path).expect("restrict permissions");
+
+    for path in [&db_path, &wal_path, &shm_path] {
+        let mode = std::fs::metadata(path)
+            .expect("file exists")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode,
+            0o600,
+            "expected 0600 on {}, got {mode:04o}",
+            path.display()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn restrict_db_file_permissions_skips_missing_sidecars() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp.path().join("openshell.db");
+    let [wal_path, shm_path] = super::sqlite::sqlite_sidecar_paths(&db_path);
+
+    // Only the main DB file exists (non-WAL journal mode, or pre-write WAL).
+    std::fs::write(&db_path, b"").expect("create file");
+    std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o644)).expect("set 0o644");
+
+    super::sqlite::restrict_db_file_permissions(&db_path).expect("restrict permissions");
+
+    assert!(!wal_path.exists(), "WAL sidecar should not be created");
+    assert!(!shm_path.exists(), "SHM sidecar should not be created");
+
+    let mode = std::fs::metadata(&db_path)
+        .expect("db file exists")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "expected 0600, got {mode:04o}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn restrict_db_file_permissions_handles_real_sqlite_wal_files() {
+    use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+    use std::os::unix::fs::PermissionsExt;
+    use std::str::FromStr;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let db_path = tmp.path().join("openshell.db");
+    let url = format!("sqlite:{}", db_path.display());
+
+    // sqlx does not parse `journal_mode` from the connection URL — callers
+    // must opt into WAL via the builder API.
+    let options = SqliteConnectOptions::from_str(&url)
+        .expect("parse url")
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal);
+
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .expect("connect with WAL");
+
+    // Force a write so SQLite definitely materializes a non-empty WAL on disk.
+    sqlx::query("CREATE TABLE _hardening_probe (x INTEGER)")
+        .execute(&pool)
+        .await
+        .expect("write");
+
+    let [wal_path, shm_path] = super::sqlite::sqlite_sidecar_paths(&db_path);
+    assert!(wal_path.exists(), "WAL should exist after write");
+    assert!(shm_path.exists(), "SHM should exist after WAL write");
+
+    // Loosen permissions on every file to simulate what an older gateway
+    // version (or a non-zero default umask) would have left behind.
+    for path in [&db_path, &wal_path, &shm_path] {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644))
+            .expect("loosen permissions");
+    }
+
+    super::sqlite::restrict_db_file_permissions(&db_path).expect("restrict permissions");
+
+    for path in [&db_path, &wal_path, &shm_path] {
+        let mode = std::fs::metadata(path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode,
+            0o600,
+            "expected 0600 on {}, got {mode:04o}",
+            path.display()
+        );
+    }
 }
 
 #[tokio::test]
@@ -784,4 +961,453 @@ fn parse_label_selector_handles_whitespace() {
     assert_eq!(result.len(), 2);
     assert_eq!(result.get("env"), Some(&"prod".to_string()));
     assert_eq!(result.get("tier"), Some(&"frontend".to_string()));
+}
+
+// ---------------------------------------------------------------------------
+// CAS (compare-and-swap) tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn cas_put_if_must_create_succeeds() {
+    use super::WriteCondition;
+
+    let store = Store::connect("sqlite::memory:?cache=shared")
+        .await
+        .unwrap();
+
+    let result = store
+        .put_if(
+            "sandbox",
+            "id-1",
+            "new-sandbox",
+            b"payload",
+            None,
+            WriteCondition::MustCreate,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.resource_version, 1);
+
+    let record = store.get("sandbox", "id-1").await.unwrap().unwrap();
+    assert_eq!(record.resource_version, 1);
+    assert_eq!(record.payload, b"payload");
+}
+
+#[tokio::test]
+async fn cas_put_if_must_create_fails_on_duplicate() {
+    use super::{PersistenceError, WriteCondition};
+
+    let store = Store::connect("sqlite::memory:?cache=shared")
+        .await
+        .unwrap();
+
+    // First insert succeeds
+    store
+        .put_if(
+            "sandbox",
+            "id-1",
+            "sandbox-1",
+            b"payload1",
+            None,
+            WriteCondition::MustCreate,
+        )
+        .await
+        .unwrap();
+
+    // Second insert with same ID fails
+    let result = store
+        .put_if(
+            "sandbox",
+            "id-1",
+            "sandbox-2",
+            b"payload2",
+            None,
+            WriteCondition::MustCreate,
+        )
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(PersistenceError::UniqueViolation { .. })
+    ));
+}
+
+#[tokio::test]
+async fn cas_put_if_match_version_succeeds() {
+    use super::WriteCondition;
+
+    let store = Store::connect("sqlite::memory:?cache=shared")
+        .await
+        .unwrap();
+
+    // Create initial object
+    store
+        .put_if(
+            "sandbox",
+            "id-1",
+            "sandbox-1",
+            b"v1",
+            None,
+            WriteCondition::MustCreate,
+        )
+        .await
+        .unwrap();
+
+    // Update with correct version
+    let result = store
+        .put_if(
+            "sandbox",
+            "id-1",
+            "sandbox-1",
+            b"v2",
+            None,
+            WriteCondition::MatchResourceVersion(1),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.resource_version, 2);
+
+    let record = store.get("sandbox", "id-1").await.unwrap().unwrap();
+    assert_eq!(record.resource_version, 2);
+    assert_eq!(record.payload, b"v2");
+}
+
+#[tokio::test]
+async fn cas_put_if_match_version_fails_on_mismatch() {
+    use super::{PersistenceError, WriteCondition};
+
+    let store = Store::connect("sqlite::memory:?cache=shared")
+        .await
+        .unwrap();
+
+    // Create initial object
+    store
+        .put_if(
+            "sandbox",
+            "id-1",
+            "sandbox-1",
+            b"v1",
+            None,
+            WriteCondition::MustCreate,
+        )
+        .await
+        .unwrap();
+
+    // Update with wrong version
+    let result = store
+        .put_if(
+            "sandbox",
+            "id-1",
+            "sandbox-1",
+            b"v2",
+            None,
+            WriteCondition::MatchResourceVersion(99),
+        )
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(PersistenceError::Conflict {
+            current_resource_version: Some(1)
+        })
+    ));
+
+    // Original payload unchanged
+    let record = store.get("sandbox", "id-1").await.unwrap().unwrap();
+    assert_eq!(record.resource_version, 1);
+    assert_eq!(record.payload, b"v1");
+}
+
+#[tokio::test]
+async fn cas_delete_if_succeeds_with_correct_version() {
+    use super::WriteCondition;
+
+    let store = Store::connect("sqlite::memory:?cache=shared")
+        .await
+        .unwrap();
+
+    store
+        .put_if(
+            "sandbox",
+            "id-1",
+            "sandbox-1",
+            b"payload",
+            None,
+            WriteCondition::MustCreate,
+        )
+        .await
+        .unwrap();
+
+    let deleted = store.delete_if("sandbox", "id-1", 1).await.unwrap();
+    assert!(deleted);
+
+    let record = store.get("sandbox", "id-1").await.unwrap();
+    assert!(record.is_none());
+}
+
+#[tokio::test]
+async fn cas_delete_if_fails_with_wrong_version() {
+    use super::{PersistenceError, WriteCondition};
+
+    let store = Store::connect("sqlite::memory:?cache=shared")
+        .await
+        .unwrap();
+
+    store
+        .put_if(
+            "sandbox",
+            "id-1",
+            "sandbox-1",
+            b"payload",
+            None,
+            WriteCondition::MustCreate,
+        )
+        .await
+        .unwrap();
+
+    let result = store.delete_if("sandbox", "id-1", 99).await;
+    assert!(matches!(
+        result,
+        Err(PersistenceError::Conflict {
+            current_resource_version: Some(1)
+        })
+    ));
+
+    // Object still exists
+    let record = store.get("sandbox", "id-1").await.unwrap().unwrap();
+    assert_eq!(record.resource_version, 1);
+}
+
+#[tokio::test]
+async fn cas_resource_version_increments() {
+    use super::WriteCondition;
+
+    let store = Store::connect("sqlite::memory:?cache=shared")
+        .await
+        .unwrap();
+
+    // Create
+    let r1 = store
+        .put_if(
+            "sandbox",
+            "id-1",
+            "sandbox-1",
+            b"v1",
+            None,
+            WriteCondition::MustCreate,
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1.resource_version, 1);
+
+    // Update 1
+    let r2 = store
+        .put_if(
+            "sandbox",
+            "id-1",
+            "sandbox-1",
+            b"v2",
+            None,
+            WriteCondition::MatchResourceVersion(1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r2.resource_version, 2);
+
+    // Update 2
+    let r3 = store
+        .put_if(
+            "sandbox",
+            "id-1",
+            "sandbox-1",
+            b"v3",
+            None,
+            WriteCondition::MatchResourceVersion(2),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r3.resource_version, 3);
+
+    let record = store.get("sandbox", "id-1").await.unwrap().unwrap();
+    assert_eq!(record.resource_version, 3);
+}
+
+#[tokio::test]
+async fn cas_concurrent_updates_one_succeeds() {
+    use super::WriteCondition;
+    use std::sync::Arc;
+
+    let store = Arc::new(
+        Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .unwrap(),
+    );
+
+    // Create initial object
+    store
+        .put_if(
+            "sandbox",
+            "id-1",
+            "sandbox-1",
+            b"initial",
+            None,
+            WriteCondition::MustCreate,
+        )
+        .await
+        .unwrap();
+
+    // Spawn 10 concurrent updates trying to update from version 1
+    let mut handles = vec![];
+    for i in 0..10 {
+        let store = Arc::clone(&store);
+        let handle = tokio::spawn(async move {
+            store
+                .put_if(
+                    "sandbox",
+                    "id-1",
+                    "sandbox-1",
+                    format!("update-{i}").as_bytes(),
+                    None,
+                    WriteCondition::MatchResourceVersion(1),
+                )
+                .await
+        });
+        handles.push(handle);
+    }
+
+    let results: Vec<_> = futures::future::join_all(handles)
+        .await
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect();
+
+    // Exactly one should succeed, rest should conflict
+    let successes = results.iter().filter(|r| r.is_ok()).count();
+    let conflicts = results.iter().filter(|r| r.is_err()).count();
+
+    assert_eq!(successes, 1);
+    assert_eq!(conflicts, 9);
+
+    // Final version should be 2
+    let record = store.get("sandbox", "id-1").await.unwrap().unwrap();
+    assert_eq!(record.resource_version, 2);
+}
+
+#[tokio::test]
+async fn cas_update_message_cas_succeeds() {
+    use openshell_core::proto::Sandbox;
+
+    let store = Store::connect("sqlite::memory:?cache=shared")
+        .await
+        .unwrap();
+
+    // Create a sandbox
+    let sandbox = Sandbox {
+        metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+            id: "test-id".to_string(),
+            name: "test-sandbox".to_string(),
+            created_at_ms: 1000,
+            labels: std::collections::HashMap::new(),
+            resource_version: 0,
+        }),
+        spec: None,
+        status: None,
+        phase: 0,
+        current_policy_version: 0,
+    };
+
+    store.put_message(&sandbox).await.unwrap();
+
+    // Update using CAS with expected_version = 0 (use current version)
+    let updated = store
+        .update_message_cas::<Sandbox, _>("test-id", 0, |s| {
+            s.phase = 2; // Set to Ready
+            s.current_policy_version = 42;
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(updated.phase, 2);
+    assert_eq!(updated.current_policy_version, 42);
+    assert_eq!(
+        updated.metadata.as_ref().map_or(0, |m| m.resource_version),
+        2
+    );
+}
+
+#[tokio::test]
+async fn cas_update_message_cas_conflicts_on_concurrent_updates() {
+    use openshell_core::proto::Sandbox;
+    use std::sync::Arc;
+
+    let store = Arc::new(
+        Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .unwrap(),
+    );
+
+    // Create a sandbox
+    let sandbox = Sandbox {
+        metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+            id: "test-id".to_string(),
+            name: "test-sandbox".to_string(),
+            created_at_ms: 1000,
+            labels: std::collections::HashMap::new(),
+            resource_version: 0,
+        }),
+        spec: None,
+        status: None,
+        phase: 0,
+        current_policy_version: 0,
+    };
+
+    store.put_message(&sandbox).await.unwrap();
+
+    // Spawn 5 concurrent CAS updates using the same observed version. Passing an
+    // explicit version makes this deterministic: later tasks cannot re-read the
+    // latest committed version and legitimately succeed.
+    let mut handles = vec![];
+    for i in 0..5 {
+        let store = Arc::clone(&store);
+        let handle = tokio::spawn(async move {
+            store
+                .update_message_cas::<Sandbox, _>("test-id", 1, |s| {
+                    s.current_policy_version = i;
+                })
+                .await
+        });
+        handles.push(handle);
+    }
+
+    let results: Vec<_> = futures::future::join_all(handles)
+        .await
+        .into_iter()
+        .map(|r| r.unwrap())
+        .collect();
+
+    // Only one should succeed; others fail with Conflict due to single-attempt CAS.
+    let successes = results.iter().filter(|r| r.is_ok()).count();
+    let conflicts = results
+        .iter()
+        .filter(|r| matches!(r, Err(PersistenceError::Conflict { .. })))
+        .count();
+    assert_eq!(successes, 1, "exactly one concurrent update should succeed");
+    assert_eq!(conflicts, 4, "four updates should fail with Conflict");
+
+    // Final version should be 2 (initial 1 + 1 successful update)
+    let final_sandbox = store
+        .get_message::<Sandbox>("test-id")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        final_sandbox
+            .metadata
+            .as_ref()
+            .map_or(0, |m| m.resource_version),
+        2,
+        "resource_version should be 2 (initial 1 + 1 successful update)"
+    );
 }

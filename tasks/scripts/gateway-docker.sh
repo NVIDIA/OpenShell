@@ -156,6 +156,22 @@ fi
 chmod +x "${SUPERVISOR_BIN}"
 
 mkdir -p "${STATE_DIR}"
+CONFIG_PATH="${STATE_DIR}/gateway.toml"
+cat >"${CONFIG_PATH}" <<EOF
+[openshell]
+version = 1
+
+[openshell.gateway]
+compute_drivers = ["docker"]
+disable_tls = true
+
+[openshell.drivers.docker]
+default_image = "${SANDBOX_IMAGE}"
+image_pull_policy = "${SANDBOX_IMAGE_PULL_POLICY}"
+sandbox_namespace = "${SANDBOX_NAMESPACE}"
+grpc_endpoint = "${GRPC_ENDPOINT}"
+supervisor_bin = "${SUPERVISOR_BIN}"
+EOF
 
 GATEWAY_ENDPOINT="http://127.0.0.1:${PORT}"
 register_gateway_metadata "${GATEWAY_NAME}" "${GATEWAY_ENDPOINT}" "${PORT}"
@@ -172,13 +188,9 @@ echo "  openshell gateway select ${GATEWAY_NAME}"
 echo
 
 exec "${GATEWAY_BIN}" \
+  --config "${CONFIG_PATH}" \
   --port "${PORT}" \
   --log-level "${LOG_LEVEL}" \
   --drivers docker \
   --disable-tls \
-  --db-url "sqlite:${STATE_DIR}/gateway.db?mode=rwc" \
-  --sandbox-namespace "${SANDBOX_NAMESPACE}" \
-  --sandbox-image "${SANDBOX_IMAGE}" \
-  --sandbox-image-pull-policy "${SANDBOX_IMAGE_PULL_POLICY}" \
-  --grpc-endpoint "${GRPC_ENDPOINT}" \
-  --docker-supervisor-bin "${SUPERVISOR_BIN}"
+  --db-url "sqlite:${STATE_DIR}/gateway.db?mode=rwc"

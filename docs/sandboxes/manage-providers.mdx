@@ -12,6 +12,10 @@ AI agents typically need credentials to access external services: an API key for
 
 Create and manage providers that supply credentials to sandboxes.
 
+<Info>
+Providers v2 is available for profile-backed provider policy, provider-owned network rules, and gateway-managed credential refresh. This page remains the credential-focused provider command reference. For the new workflow, see [Providers v2](/sandboxes/providers-v2).
+</Info>
+
 Provider profiles include metadata for known endpoints and binaries. View
 the available profiles before creating a provider:
 
@@ -82,8 +86,62 @@ openshell provider get my-claude
 Update a provider's credentials:
 
 ```shell
-openshell provider update my-claude --type claude --from-existing
+openshell provider update my-claude --from-existing
 ```
+
+Set or clear a credential expiry timestamp:
+
+```shell
+openshell provider update my-graph \
+  --credential MS_GRAPH_ACCESS_TOKEN="$MS_GRAPH_ACCESS_TOKEN" \
+  --credential-expires-at MS_GRAPH_ACCESS_TOKEN=1767225600000
+```
+
+Use `0` as the timestamp to clear expiry for a credential key.
+
+## Credential Refresh
+
+Provider refresh stores non-injectable refresh material separately from the
+provider's current credential values. The gateway can mint OAuth2 client
+credentials tokens and Google service account JWT tokens, then write the current
+access token back to the provider record for sandbox injection.
+
+Configure refresh metadata for one injectable credential key:
+
+```shell
+openshell provider refresh configure my-graph \
+  --credential-key MS_GRAPH_ACCESS_TOKEN \
+  --strategy oauth2-client-credentials \
+  --material tenant_id="$TENANT_ID" \
+  --material client_id="$CLIENT_ID" \
+  --material client_secret="$CLIENT_SECRET" \
+  --secret-material-key client_secret \
+  --credential-expires-at 1767225600000
+```
+
+Check refresh status:
+
+```shell
+openshell provider refresh status my-graph
+```
+
+Delete refresh metadata for a credential:
+
+```shell
+openshell provider refresh delete my-graph \
+  --credential-key MS_GRAPH_ACCESS_TOKEN
+```
+
+Force a gateway-managed refresh for one credential:
+
+```shell
+openshell provider refresh rotate my-graph --credential-key MS_GRAPH_ACCESS_TOKEN
+```
+
+External refresh systems should continue to push new current credentials through
+`openshell provider update`. The `--credential-expires-at` option works for
+static credentials, externally refreshed credentials, and gateway-managed
+refresh strategies.
 
 Delete a provider:
 
@@ -177,7 +235,7 @@ The following provider types are supported.
 | `codex` | `OPENAI_API_KEY` | OpenAI Codex |
 | `copilot` | `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN` | GitHub Copilot CLI |
 | `generic` | User-defined | Any service with custom credentials |
-| `github` | `GITHUB_TOKEN`, `GH_TOKEN` | GitHub API, `gh` CLI — refer to [GitHub Sandbox](/get-started/tutorials/github-sandbox) |
+| `github` | `GITHUB_TOKEN`, `GH_TOKEN` | GitHub API and `gh` CLI. Refer to [GitHub Sandbox](/get-started/tutorials/github-sandbox). |
 | `gitlab` | `GITLAB_TOKEN`, `GLAB_TOKEN`, `CI_JOB_TOKEN` | GitLab API, `glab` CLI |
 | `nvidia` | `NVIDIA_API_KEY` | NVIDIA API Catalog |
 | `openai` | `OPENAI_API_KEY` | Any OpenAI-compatible endpoint. Set `--config OPENAI_BASE_URL` to point to the provider. Refer to [Inference Routing](/sandboxes/inference-routing). |

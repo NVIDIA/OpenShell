@@ -78,6 +78,19 @@ pub fn classify_request(request: &L7Request, body: &[u8]) -> GraphqlRequestInfo 
     }
 }
 
+pub fn classify_json_envelope_value(value: &Value) -> GraphqlRequestInfo {
+    match classify_json_envelope(value) {
+        Ok(operations) => GraphqlRequestInfo {
+            operations,
+            error: None,
+        },
+        Err(err) => GraphqlRequestInfo {
+            operations: Vec::new(),
+            error: Some(err),
+        },
+    }
+}
+
 fn classify_request_inner(
     request: &L7Request,
     body: &[u8],

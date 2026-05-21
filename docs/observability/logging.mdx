@@ -20,7 +20,7 @@ Internal operational events use Rust's `tracing` framework with a conventional f
 2026-04-01T03:28:39.175Z INFO openshell_sandbox: Creating OPA engine from proto policy data
 ```
 
-These events cover startup plumbing, gRPC communication, and internal state transitions that are useful for debugging but don't represent security-relevant decisions.
+These events cover startup plumbing, gRPC communication, and internal state transitions that are useful for debugging but do not represent security-relevant decisions.
 
 ### OCSF structured events
 
@@ -40,7 +40,7 @@ In the log file, OCSF events appear in a shorthand format with an `OCSF` level l
 
 The `OCSF` label at column 25 distinguishes structured events from standard `INFO` tracing at the same position. Both formats appear in the same file.
 
-When viewed through the CLI or TUI, which receive logs via gRPC, the same distinction applies:
+When viewed through the CLI or TUI, which receive logs through gRPC, the same distinction applies:
 
 ```text
 [1775014132.118] [sandbox] [OCSF ] [ocsf] NET:OPEN [INFO] ALLOWED /usr/bin/curl(58) -> api.github.com:443 [policy:github_api engine:opa]

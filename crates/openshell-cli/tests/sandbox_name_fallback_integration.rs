@@ -1,6 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+mod helpers;
+
+use helpers::{
+    EnvVarGuard, build_ca, build_client_cert, build_server_cert, install_rustls_provider,
+};
 use openshell_bootstrap::{load_last_sandbox, save_last_sandbox};
 use openshell_cli::run;
 use openshell_cli::tls::TlsOptions;
@@ -10,17 +15,14 @@ use openshell_core::proto::{
     CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse, DeleteProviderRequest,
     DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     DetachSandboxProviderRequest, DetachSandboxProviderResponse, ExecSandboxEvent,
-    ExecSandboxRequest, GatewayMessage, GetGatewayConfigRequest, GetGatewayConfigResponse,
-    GetProviderRequest, GetSandboxConfigRequest, GetSandboxConfigResponse,
-    GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
-    HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
-    ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
-    ListSandboxesResponse, ProviderResponse, Sandbox, SandboxPolicy, SandboxResponse,
-    SandboxStreamEvent, ServiceStatus, SupervisorMessage, UpdateProviderRequest,
-    WatchSandboxRequest,
-};
-use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+    ExecSandboxInput, ExecSandboxRequest, GatewayMessage, GetGatewayConfigRequest,
+    GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
+    GetSandboxConfigResponse, GetSandboxProviderEnvironmentRequest,
+    GetSandboxProviderEnvironmentResponse, GetSandboxRequest, HealthRequest, HealthResponse,
+    ListProvidersRequest, ListProvidersResponse, ListSandboxProvidersRequest,
+    ListSandboxProvidersResponse, ListSandboxesRequest, ListSandboxesResponse, ProviderResponse,
+    Sandbox, SandboxPolicy, SandboxResponse, SandboxStreamEvent, ServiceStatus, SupervisorMessage,
+    UpdateProviderRequest, WatchSandboxRequest,
 };
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -29,50 +31,6 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Certificate as TlsCertificate, Identity, Server, ServerTlsConfig};
 use tonic::{Response, Status};
-
-// Serialise tests that mutate XDG_CONFIG_HOME so concurrent threads
-// don't clobber each other's environment.
-static XDG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-struct EnvVarGuard {
-    key: &'static str,
-    original: Option<String>,
-    _xdg_lock: std::sync::MutexGuard<'static, ()>,
-}
-
-#[allow(unsafe_code)]
-impl EnvVarGuard {
-    fn set(key: &'static str, value: &str) -> Self {
-        let lock = XDG_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let original = std::env::var(key).ok();
-        unsafe {
-            std::env::set_var(key, value);
-        }
-        Self {
-            key,
-            original,
-            _xdg_lock: lock,
-        }
-    }
-}
-
-#[allow(unsafe_code)]
-impl Drop for EnvVarGuard {
-    fn drop(&mut self) {
-        if let Some(value) = &self.original {
-            unsafe {
-                std::env::set_var(self.key, value);
-            }
-        } else {
-            unsafe {
-                std::env::remove_var(self.key);
-            }
-        }
-        // _xdg_lock drops here, releasing the mutex
-    }
-}
 
 // ── mock OpenShell server ─────────────────────────────────────────────
 
@@ -119,6 +77,7 @@ impl OpenShell for TestOpenShell {
                     name,
                     created_at_ms: 0,
                     labels: std::collections::HashMap::new(),
+                    resource_version: 0,
                 }),
                 ..Default::default()
             }),
@@ -201,6 +160,36 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(CreateSshSessionResponse::default()))
     }
 
+    async fn expose_service(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ExposeServiceRequest>,
+    ) -> Result<Response<openshell_core::proto::ServiceEndpointResponse>, Status> {
+        Ok(Response::new(
+            openshell_core::proto::ServiceEndpointResponse::default(),
+        ))
+    }
+
+    async fn get_service(
+        &self,
+        _: tonic::Request<openshell_core::proto::GetServiceRequest>,
+    ) -> Result<Response<openshell_core::proto::ServiceEndpointResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn list_services(
+        &self,
+        _: tonic::Request<openshell_core::proto::ListServicesRequest>,
+    ) -> Result<Response<openshell_core::proto::ListServicesResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn delete_service(
+        &self,
+        _: tonic::Request<openshell_core::proto::DeleteServiceRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteServiceResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
     async fn revoke_ssh_session(
         &self,
         _request: tonic::Request<openshell_core::proto::RevokeSshSessionRequest>,
@@ -272,6 +261,33 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<ProviderResponse>, Status> {
         Ok(Response::new(ProviderResponse::default()))
     }
+    async fn get_provider_refresh_status(
+        &self,
+        _: tonic::Request<openshell_core::proto::GetProviderRefreshStatusRequest>,
+    ) -> Result<Response<openshell_core::proto::GetProviderRefreshStatusResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn configure_provider_refresh(
+        &self,
+        _: tonic::Request<openshell_core::proto::ConfigureProviderRefreshRequest>,
+    ) -> Result<Response<openshell_core::proto::ConfigureProviderRefreshResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn rotate_provider_credential(
+        &self,
+        _: tonic::Request<openshell_core::proto::RotateProviderCredentialRequest>,
+    ) -> Result<Response<openshell_core::proto::RotateProviderCredentialResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn delete_provider_refresh(
+        &self,
+        _: tonic::Request<openshell_core::proto::DeleteProviderRefreshRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteProviderRefreshResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
 
     async fn delete_provider(
         &self,
@@ -305,6 +321,15 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
             rx,
         )))
+    }
+
+    type ExecSandboxInteractiveStream =
+        tokio_stream::wrappers::ReceiverStream<Result<ExecSandboxEvent, Status>>;
+    async fn exec_sandbox_interactive(
+        &self,
+        _request: tonic::Request<tonic::Streaming<ExecSandboxInput>>,
+    ) -> Result<Response<Self::ExecSandboxInteractiveStream>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
     }
 
     async fn update_config(
@@ -428,36 +453,17 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<Self::RelayStreamStream>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
-}
 
-// ── helpers ───────────────────────────────────────────────────────────
+    type ForwardTcpStream = tokio_stream::wrappers::ReceiverStream<
+        Result<openshell_core::proto::TcpForwardFrame, Status>,
+    >;
 
-fn install_rustls_provider() {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-}
-
-fn build_ca() -> (Certificate, KeyPair) {
-    let key_pair = KeyPair::generate().unwrap();
-    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
-    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    let cert = params.self_signed(&key_pair).unwrap();
-    (cert, key_pair)
-}
-
-fn build_server_cert(ca: &Certificate, ca_key: &KeyPair) -> (String, String) {
-    let key_pair = KeyPair::generate().unwrap();
-    let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
-    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-    let cert = params.signed_by(&key_pair, ca, ca_key).unwrap();
-    (cert.pem(), key_pair.serialize_pem())
-}
-
-fn build_client_cert(ca: &Certificate, ca_key: &KeyPair) -> (String, String) {
-    let key_pair = KeyPair::generate().unwrap();
-    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
-    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
-    let cert = params.signed_by(&key_pair, ca, ca_key).unwrap();
-    (cert.pem(), key_pair.serialize_pem())
+    async fn forward_tcp(
+        &self,
+        _request: tonic::Request<tonic::Streaming<openshell_core::proto::TcpForwardFrame>>,
+    ) -> Result<Response<Self::ForwardTcpStream>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
 }
 
 struct TestServer {
@@ -556,7 +562,7 @@ async fn sandbox_get_policy_only_round_trip() {
 async fn sandbox_get_with_persisted_last_sandbox() {
     let ts = run_server().await;
     let xdg_dir = tempfile::tempdir().unwrap();
-    let _guard = EnvVarGuard::set("XDG_CONFIG_HOME", xdg_dir.path().to_str().unwrap());
+    let _guard = EnvVarGuard::set(&[("XDG_CONFIG_HOME", xdg_dir.path().to_str().unwrap())]);
 
     // Persist a last-used sandbox for "integration-cluster".
     save_last_sandbox("integration-cluster", "persisted-sb")
@@ -585,7 +591,7 @@ async fn sandbox_get_with_persisted_last_sandbox() {
 async fn explicit_name_takes_precedence_over_persisted() {
     let ts = run_server().await;
     let xdg_dir = tempfile::tempdir().unwrap();
-    let _guard = EnvVarGuard::set("XDG_CONFIG_HOME", xdg_dir.path().to_str().unwrap());
+    let _guard = EnvVarGuard::set(&[("XDG_CONFIG_HOME", xdg_dir.path().to_str().unwrap())]);
 
     // Persist one name, but supply a different one explicitly.
     save_last_sandbox("my-cluster", "old-sandbox").expect("save should succeed");

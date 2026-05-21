@@ -5,9 +5,11 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use openshell_core::auth::EdgeAuthInterceptor;
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::setting_value;
 use openshell_core::settings::{self, SettingValueKind};
+use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 
 // ---------------------------------------------------------------------------
@@ -413,7 +415,7 @@ pub struct App {
     // Active gateway connection
     pub gateway_name: String,
     pub endpoint: String,
-    pub client: OpenShellClient<Channel>,
+    pub client: OpenShellClient<InterceptedService<Channel, EdgeAuthInterceptor>>,
     pub status_text: String,
 
     // Gateway list
@@ -580,7 +582,7 @@ pub fn format_labels(labels: &HashMap<String, String>) -> String {
 impl App {
     #[allow(clippy::large_types_passed_by_value)] // Theme is Copy; one-shot ctor
     pub fn new(
-        client: OpenShellClient<Channel>,
+        client: OpenShellClient<InterceptedService<Channel, EdgeAuthInterceptor>>,
         gateway_name: String,
         endpoint: String,
         theme: crate::theme::Theme,

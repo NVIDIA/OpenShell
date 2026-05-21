@@ -196,6 +196,9 @@ artifacts/
 # Local mise settings
 mise.local.toml
 
+# Local Codex app state
+.codex/
+
 # Ignore plans for now
 architecture/plans
 
@@ -211,6 +214,10 @@ rfc.md
 *.tar.gz
 *.tar.xz
 *.tar.bz2
+
+# Snap build artifacts
+*.snap
+*.comp
 
 # Markdown/mermaid lint tooling deps
 scripts/lint-mermaid/node_modules/

@@ -1,0 +1,185 @@
+name: Required CI Gates
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+  workflow_run:
+    workflows:
+      - Branch Checks
+      - Branch E2E Checks
+      - GPU Test
+      - Branch Kubernetes E2E
+      - Helm Lint
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+  statuses: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.workflow_run.head_sha || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    name: Publish required CI gate statuses
+    runs-on: ubuntu-latest
+    steps:
+      - name: Evaluate required CI gates
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER_FROM_EVENT: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA_FROM_EVENT: ${{ github.event.pull_request.head.sha }}
+          PR_LABELS_FROM_EVENT: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          WORKFLOW_RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          WORKFLOW_RUN_EVENT: ${{ github.event.workflow_run.event }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          post_status() {
+            local context="$1"
+            local state="$2"
+            local description="$3"
+            local target_url="${4:-}"
+
+            args=(
+              --method POST
+              "repos/$GH_REPO/statuses/$HEAD_SHA"
+              -f "state=$state"
+              -f "context=$context"
+              -f "description=$description"
+            )
+            if [ -n "$target_url" ]; then
+              args+=(-f "target_url=$target_url")
+            fi
+
+            echo "$context: $state - $description"
+            gh api "${args[@]}" >/dev/null
+          }
+
+          has_label() {
+            local label="$1"
+            jq -e --arg label "$label" 'index($label) != null' <<< "$LABELS_JSON" >/dev/null
+          }
+
+          resolve_pull_request_event() {
+            PR_NUMBER="$PR_NUMBER_FROM_EVENT"
+            HEAD_SHA="$PR_HEAD_SHA_FROM_EVENT"
+            LABELS_JSON=$(jq -c . <<< "$PR_LABELS_FROM_EVENT")
+          }
+
+          resolve_workflow_run_event() {
+            if [ "$WORKFLOW_RUN_EVENT" != "push" ]; then
+              echo "Ignoring workflow_run from event '$WORKFLOW_RUN_EVENT'."
+              exit 0
+            fi
+
+            local associated_prs pr
+            associated_prs=$(gh api "repos/$GH_REPO/commits/$WORKFLOW_RUN_HEAD_SHA/pulls")
+            pr=$(jq -c 'map(select(.state == "open"))[0] // empty' <<< "$associated_prs")
+            if [ -z "$pr" ]; then
+              echo "No open PR associated with $WORKFLOW_RUN_HEAD_SHA; nothing to publish."
+              exit 0
+            fi
+
+            PR_NUMBER=$(jq -r '.number' <<< "$pr")
+            pr=$(gh api "repos/$GH_REPO/pulls/$PR_NUMBER")
+            HEAD_SHA=$(jq -r '.head.sha' <<< "$pr")
+            LABELS_JSON=$(gh api "repos/$GH_REPO/issues/$PR_NUMBER" --jq '[.labels[].name]')
+          }
+
+          resolve_context() {
+            if [ "$EVENT_NAME" = "pull_request_target" ]; then
+              resolve_pull_request_event
+            elif [ "$EVENT_NAME" = "workflow_run" ]; then
+              resolve_workflow_run_event
+            else
+              echo "Unsupported event '$EVENT_NAME'."
+              exit 1
+            fi
+
+            PR_URL="https://github.com/$GH_REPO/pull/$PR_NUMBER"
+            MIRROR_REF="pull-request/$PR_NUMBER"
+          }
+
+          verify_mirror() {
+            local context="$1"
+            local mirror_sha
+
+            mirror_sha=$(gh api "repos/$GH_REPO/branches/$MIRROR_REF" --jq '.commit.sha' 2>/dev/null || true)
+            if [ -z "$mirror_sha" ]; then
+              post_status "$context" pending "Waiting for /ok to test mirror" "$PR_URL"
+              return 1
+            fi
+
+            if [ "$mirror_sha" != "$HEAD_SHA" ]; then
+              post_status "$context" pending "Waiting for /ok to test mirror" "$PR_URL"
+              return 1
+            fi
+
+            return 0
+          }
+
+          evaluate_workflow() {
+            local context="$1"
+            local workflow_file="$2"
+            local workflow_name="$3"
+            local required_label="${4:-}"
+            local workflow_url="https://github.com/$GH_REPO/actions/workflows/$workflow_file"
+
+            if [ -n "$required_label" ] && ! has_label "$required_label"; then
+              post_status "$context" success "$required_label not applied" "$PR_URL"
+              return 0
+            fi
+
+            if ! verify_mirror "$context"; then
+              return 0
+            fi
+
+            local runs latest run_id status conclusion run_url real_success
+            runs=$(gh api "repos/$GH_REPO/actions/workflows/$workflow_file/runs?head_sha=$HEAD_SHA&event=push" --jq '.workflow_runs')
+            latest=$(jq -c --arg branch "$MIRROR_REF" '[.[] | select(.head_branch == $branch)] | sort_by(.created_at) | reverse | .[0] // empty' <<< "$runs")
+
+            if [ -z "$latest" ]; then
+              post_status "$context" pending "Waiting for $workflow_name" "$workflow_url"
+              return 0
+            fi
+
+            run_id=$(jq -r '.id' <<< "$latest")
+            status=$(jq -r '.status' <<< "$latest")
+            conclusion=$(jq -r '.conclusion' <<< "$latest")
+            run_url=$(jq -r '.html_url' <<< "$latest")
+
+            if [ "$status" != "completed" ]; then
+              post_status "$context" pending "$workflow_name is $status" "$run_url"
+              return 0
+            fi
+
+            if [ "$conclusion" != "success" ]; then
+              post_status "$context" failure "$workflow_name concluded $conclusion" "$run_url"
+              return 0
+            fi
+
+            real_success=$(gh api "repos/$GH_REPO/actions/runs/$run_id/jobs?per_page=100" \
+              --jq '[.jobs[] | select(.conclusion == "success" and .name != "Resolve PR metadata")] | length')
+
+            if [ "$real_success" -lt 1 ]; then
+              post_status "$context" failure "No real CI jobs ran" "$run_url"
+              return 0
+            fi
+
+            post_status "$context" success "$workflow_name passed" "$run_url"
+          }
+
+          resolve_context
+
+          evaluate_workflow "OpenShell / Branch Checks" "branch-checks.yml" "Branch Checks"
+          evaluate_workflow "OpenShell / E2E" "branch-e2e.yml" "Branch E2E Checks" "test:e2e"
+          evaluate_workflow "OpenShell / GPU E2E" "test-gpu.yml" "GPU Test" "test:e2e-gpu"
+          evaluate_workflow "OpenShell / Kubernetes E2E" "branch-kubernetes-e2e.yml" "Branch Kubernetes E2E" "test:e2e-kubernetes"
+          evaluate_workflow "OpenShell / Helm Lint" "helm-lint.yml" "Helm Lint"

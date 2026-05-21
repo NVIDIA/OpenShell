@@ -54,7 +54,7 @@ You can also run a one-off command without an interactive shell:
 openshell sandbox connect my-sandbox -- cat /var/log/openshell.2026-04-01.log
 ```
 
-The log files inside the sandbox contain the complete record, including events that may have been dropped from the gRPC push channel under load. The push channel is bounded and drops events rather than blocking.
+The log files inside the sandbox contain the complete record, including events that the gRPC push channel can drop under load. The push channel is bounded and drops events rather than blocking.
 
 ## Filtering by Event Type
 

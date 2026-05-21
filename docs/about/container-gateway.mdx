@@ -1,0 +1,148 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Running the Gateway as a Container"
+sidebar-title: "Container Gateway"
+description: "Run the OpenShell gateway using docker run or docker-compose without the installer."
+keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Docker, Podman, docker-compose, container, immutable OS, bootc, rpm-ostree"
+position: 4
+---
+
+Use this approach when you want to run the OpenShell gateway as a container instead of installing it with the system package manager. This is useful on immutable OS distributions (Fedora CoreOS, bootc-based images, Silverblue) where the standard installer is not appropriate, or anywhere you prefer a container-first workflow.
+
+The gateway image is published at `ghcr.io/nvidia/openshell/gateway`.
+
+## Quick Start
+
+This example runs the gateway locally with TLS disabled. It is suitable for development on a single machine. Binding to `127.0.0.1` prevents remote access without authentication.
+
+```shell
+docker run -d \
+  --name openshell-gateway \
+  --restart unless-stopped \
+  -p 127.0.0.1:8080:8080 \
+  -v openshell-state:/var/openshell \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -e OPENSHELL_DRIVERS=docker \
+  -e OPENSHELL_DB_URL=sqlite:/var/openshell/openshell.db \
+  -e OPENSHELL_DISABLE_TLS=true \
+  ghcr.io/nvidia/openshell/gateway:latest
+```
+
+Register the gateway with the CLI:
+
+```shell
+openshell gateway add http://127.0.0.1:8080 --local --name local
+```
+
+Confirm the CLI can reach the gateway:
+
+```shell
+openshell status
+```
+
+<Warning>
+Disabling TLS removes authentication. Binding to `127.0.0.1` limits access to the local machine. If you expose the port on `0.0.0.0`, enable mTLS to prevent unauthenticated access.
+</Warning>
+
+## Full mTLS Setup
+
+To run the gateway with mutual TLS, generate the PKI bundle first, then start the gateway with the cert paths configured.
+
+Bootstrap the PKI into a local state directory:
+
+```shell
+mkdir -p ~/.local/state/openshell/tls
+
+docker run --rm \
+  -v "$HOME/.local/state/openshell:/home/openshell/.local/state/openshell" \
+  -v "$HOME/.config/openshell:/home/openshell/.config/openshell" \
+  ghcr.io/nvidia/openshell/gateway:latest \
+  generate-certs --output-dir /home/openshell/.local/state/openshell/tls
+```
+
+This writes the server and client certificates under `~/.local/state/openshell/tls/` and copies the client bundle to `~/.config/openshell/gateways/openshell/mtls/` so the CLI picks it up automatically.
+
+Start the gateway with mTLS enabled:
+
+```shell
+docker run -d \
+  --name openshell-gateway \
+  --restart unless-stopped \
+  -p 127.0.0.1:8080:8080 \
+  -v "$HOME/.local/state/openshell:/home/openshell/.local/state/openshell" \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -e OPENSHELL_DRIVERS=docker \
+  -e OPENSHELL_DB_URL=sqlite:/home/openshell/.local/state/openshell/openshell.db \
+  -e OPENSHELL_TLS_CERT=/home/openshell/.local/state/openshell/tls/server/tls.crt \
+  -e OPENSHELL_TLS_KEY=/home/openshell/.local/state/openshell/tls/server/tls.key \
+  -e OPENSHELL_TLS_CLIENT_CA=/home/openshell/.local/state/openshell/tls/ca.crt \
+  -e OPENSHELL_DOCKER_TLS_CA=/home/openshell/.local/state/openshell/tls/ca.crt \
+  -e OPENSHELL_DOCKER_TLS_CERT=/home/openshell/.local/state/openshell/tls/client/tls.crt \
+  -e OPENSHELL_DOCKER_TLS_KEY=/home/openshell/.local/state/openshell/tls/client/tls.key \
+  ghcr.io/nvidia/openshell/gateway:latest
+```
+
+Register the gateway with mTLS:
+
+```shell
+openshell gateway add https://127.0.0.1:8080 --local --name local
+```
+
+## Docker Compose
+
+Save the following as `compose.yml`. This uses the TLS-disabled configuration bound to localhost, suitable for local development.
+
+```yaml
+services:
+  gateway:
+    image: ghcr.io/nvidia/openshell/gateway:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - openshell-state:/var/openshell
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      OPENSHELL_DRIVERS: docker
+      OPENSHELL_DB_URL: "sqlite:/var/openshell/openshell.db"
+      OPENSHELL_DISABLE_TLS: "true"
+
+volumes:
+  openshell-state:
+```
+
+Start the gateway:
+
+```shell
+docker compose up -d
+```
+
+Register the gateway with the CLI:
+
+```shell
+openshell gateway add http://127.0.0.1:8080 --local --name local
+```
+
+## Using Podman
+
+Replace `docker` with `podman` in the commands above. Mount the Podman socket instead of the Docker socket and set the driver to `podman`:
+
+```shell
+podman run -d \
+  --name openshell-gateway \
+  -p 127.0.0.1:8080:8080 \
+  -v openshell-state:/var/openshell \
+  -v "$XDG_RUNTIME_DIR/podman/podman.sock:/var/run/podman.sock" \
+  -e OPENSHELL_DRIVERS=podman \
+  -e OPENSHELL_PODMAN_SOCKET=/var/run/podman.sock \
+  -e OPENSHELL_DB_URL=sqlite:/var/openshell/openshell.db \
+  -e OPENSHELL_DISABLE_TLS=true \
+  ghcr.io/nvidia/openshell/gateway:latest
+```
+
+## Next Steps
+
+- To create your first sandbox, refer to the [Quickstart](/get-started/quickstart).
+- To control what the agent can access, refer to [Policies](/sandboxes/policies).
+- For environment variable reference, refer to [Sandbox Compute Drivers](/reference/sandbox-compute-drivers).

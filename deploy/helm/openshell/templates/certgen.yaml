@@ -95,7 +95,7 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
-          command: ["openshell-gateway"]
+          command: ["/usr/local/bin/openshell-gateway"]
           args:
             - generate-certs
             - --server-secret-name={{ .Values.server.tls.certSecretName }}

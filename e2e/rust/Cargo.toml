@@ -17,19 +17,24 @@ publish = false
 
 [features]
 e2e = []
-e2e-docker = ["e2e"]
-e2e-docker-gpu = ["e2e-docker"]
+# Selects tests that rely on `host.openshell.internal` (the sandbox's stable
+# alias to the host running test fixtures). docker and podman wire the alias
+# unconditionally; the kube driver only does so when the chart's
+# `server.hostGatewayIP` is set, so `e2e-kubernetes` does NOT imply this and
+# the helm wrapper opts in explicitly when it has resolved an IP.
+e2e-host-gateway = ["e2e"]
+e2e-docker = ["e2e", "e2e-host-gateway"]
+e2e-gpu = ["e2e"]
+e2e-docker-gpu = ["e2e-docker", "e2e-gpu"]
 e2e-kubernetes = ["e2e"]
+e2e-podman = ["e2e", "e2e-host-gateway"]
+e2e-podman-gpu = ["e2e-podman", "e2e-gpu"]
+e2e-vm = ["e2e"]
 
 [[test]]
 name = "custom_image"
 path = "tests/custom_image.rs"
 required-features = ["e2e-docker"]
-
-[[test]]
-name = "docker_gpu"
-path = "tests/docker_gpu.rs"
-required-features = ["e2e-docker-gpu"]
 
 [[test]]
 name = "docker_preflight"
@@ -42,13 +47,50 @@ path = "tests/gateway_resume.rs"
 required-features = ["e2e-docker"]
 
 [[test]]
+name = "podman_gateway_resume"
+path = "tests/podman_gateway_resume.rs"
+required-features = ["e2e-podman"]
+
+[[test]]
+name = "vm_gateway_resume"
+path = "tests/vm_gateway_resume.rs"
+required-features = ["e2e-vm"]
+
+[[test]]
+name = "websocket_conformance"
+path = "tests/websocket_conformance.rs"
+required-features = ["e2e-host-gateway"]
+
+[[test]]
 name = "user_namespaces"
 path = "tests/user_namespaces.rs"
 required-features = ["e2e-kubernetes"]
 
+[[test]]
+name = "host_gateway_alias"
+path = "tests/host_gateway_alias.rs"
+required-features = ["e2e-host-gateway"]
+
+[[test]]
+name = "forward_proxy_l7_bypass"
+path = "tests/forward_proxy_l7_bypass.rs"
+required-features = ["e2e-host-gateway"]
+
+[[test]]
+name = "forward_proxy_graphql_l7"
+path = "tests/forward_proxy_graphql_l7.rs"
+required-features = ["e2e-host-gateway"]
+
+[[test]]
+name = "gpu_device_selection"
+path = "tests/gpu_device_selection.rs"
+required-features = ["e2e-gpu"]
+
 [dependencies]
+base64 = "0.22"
 tokio = { version = "1.43", features = ["full"] }
 tempfile = "3"
+sha1 = "0.10"
 sha2 = "0.10"
 hex = "0.4"
 rand = "0.9"

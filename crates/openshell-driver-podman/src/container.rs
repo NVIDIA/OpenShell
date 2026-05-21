@@ -4,7 +4,7 @@
 //! Container spec construction for the Podman driver.
 
 use crate::config::PodmanComputeConfig;
-use openshell_core::config::CDI_GPU_DEVICE_ALL;
+use openshell_core::gpu::cdi_gpu_device_ids;
 use openshell_core::proto::compute::v1::DriverSandbox;
 use serde::Serialize;
 use serde_json::Value;
@@ -61,15 +61,6 @@ pub fn container_name(sandbox_name: &str) -> String {
 #[must_use]
 pub fn volume_name(sandbox_id: &str) -> String {
     format!("{VOLUME_PREFIX}{sandbox_id}-workspace")
-}
-
-/// Podman secret name prefix.
-const SECRET_PREFIX: &str = "openshell-handshake-";
-
-/// Build the Podman secret name for a sandbox's SSH handshake secret.
-#[must_use]
-pub fn secret_name(sandbox_id: &str) -> String {
-    format!("{SECRET_PREFIX}{sandbox_id}")
 }
 
 /// Truncate a container ID to 12 characters (standard short form).
@@ -252,7 +243,10 @@ fn build_env(
     // 1. User-supplied environment (lowest priority).
     if let Some(s) = spec {
         if !s.log_level.is_empty() {
-            env.insert("OPENSHELL_LOG_LEVEL".into(), s.log_level.clone());
+            env.insert(
+                openshell_core::sandbox_env::LOG_LEVEL.into(),
+                s.log_level.clone(),
+            );
         }
         for (k, v) in &s.environment {
             env.insert(k.clone(), v.clone());
@@ -265,30 +259,44 @@ fn build_env(
     }
 
     // 2. Required driver vars (highest priority -- always overwrite).
-    env.insert("OPENSHELL_SANDBOX".into(), sandbox.name.clone());
-    env.insert("OPENSHELL_SANDBOX_ID".into(), sandbox.id.clone());
-    env.insert("OPENSHELL_ENDPOINT".into(), config.grpc_endpoint.clone());
     env.insert(
-        "OPENSHELL_SSH_SOCKET_PATH".into(),
+        openshell_core::sandbox_env::SANDBOX.into(),
+        sandbox.name.clone(),
+    );
+    env.insert(
+        openshell_core::sandbox_env::SANDBOX_ID.into(),
+        sandbox.id.clone(),
+    );
+    env.insert(
+        openshell_core::sandbox_env::ENDPOINT.into(),
+        config.grpc_endpoint.clone(),
+    );
+    env.insert(
+        openshell_core::sandbox_env::SSH_SOCKET_PATH.into(),
         config.sandbox_ssh_socket_path.clone(),
     );
-    // NOTE: The SSH handshake secret is injected via a Podman secret
-    // (see the "secrets" field below) rather than a plaintext env var.
-    // This prevents exposure through `podman inspect`.
-    env.insert(
-        "OPENSHELL_SSH_HANDSHAKE_SKEW_SECS".into(),
-        config.ssh_handshake_skew_secs.to_string(),
-    );
     env.insert("OPENSHELL_CONTAINER_IMAGE".into(), image.to_string());
-    env.insert("OPENSHELL_SANDBOX_COMMAND".into(), "sleep infinity".into());
+    env.insert(
+        openshell_core::sandbox_env::SANDBOX_COMMAND.into(),
+        "sleep infinity".into(),
+    );
 
     // 3. TLS client cert paths (when mTLS is enabled). These point to
     //    the container-side mount paths where the cert files are
     //    bind-mounted from the host.
     if config.tls_enabled() {
-        env.insert("OPENSHELL_TLS_CA".into(), TLS_CA_MOUNT_PATH.into());
-        env.insert("OPENSHELL_TLS_CERT".into(), TLS_CERT_MOUNT_PATH.into());
-        env.insert("OPENSHELL_TLS_KEY".into(), TLS_KEY_MOUNT_PATH.into());
+        env.insert(
+            openshell_core::sandbox_env::TLS_CA.into(),
+            TLS_CA_MOUNT_PATH.into(),
+        );
+        env.insert(
+            openshell_core::sandbox_env::TLS_CERT.into(),
+            TLS_CERT_MOUNT_PATH.into(),
+        );
+        env.insert(
+            openshell_core::sandbox_env::TLS_KEY.into(),
+            TLS_KEY_MOUNT_PATH.into(),
+        );
     }
 
     env
@@ -345,13 +353,13 @@ fn build_resource_limits(sandbox: &DriverSandbox) -> ResourceLimits {
 
 /// Build CDI GPU device list if GPU is requested.
 fn build_devices(sandbox: &DriverSandbox) -> Option<Vec<LinuxDevice>> {
-    if sandbox.spec.as_ref().is_some_and(|s| s.gpu) {
-        Some(vec![LinuxDevice {
-            path: CDI_GPU_DEVICE_ALL.into(),
-        }])
-    } else {
-        None
-    }
+    let spec = sandbox.spec.as_ref()?;
+    cdi_gpu_device_ids(spec.gpu, &spec.gpu_device).map(|device_ids| {
+        device_ids
+            .into_iter()
+            .map(|path| LinuxDevice { path })
+            .collect()
+    })
 }
 
 /// Build the Podman container creation JSON spec.
@@ -482,7 +490,8 @@ pub fn build_container_spec(sandbox: &DriverSandbox, config: &PodmanComputeConfi
                 "CMD-SHELL".into(),
                 format!(
                     "test -e /var/run/openshell-ssh-ready || test -S {} || ss -tlnp | grep -q :{}",
-                    config.sandbox_ssh_socket_path, config.ssh_port
+                    config.sandbox_ssh_socket_path,
+                    openshell_core::config::DEFAULT_SSH_PORT
                 ),
             ],
             interval: 3_000_000_000,
@@ -491,16 +500,7 @@ pub fn build_container_spec(sandbox: &DriverSandbox, config: &PodmanComputeConfi
             start_period: 5_000_000_000,
         },
         resource_limits,
-        // Inject the SSH handshake secret via Podman's secret_env map so it
-        // does not appear in `podman inspect` output. The libpod SpecGenerator
-        // uses `secret_env` (map of env_var → secret_name) for env-type secrets,
-        // distinct from `secrets` which only handles file mounts under /run/secrets/.
-        // The secret is created by the driver before the container
-        // (see `PodmanComputeDriver::create_sandbox`).
-        secret_env: BTreeMap::from([(
-            "OPENSHELL_SSH_HANDSHAKE_SECRET".into(),
-            secret_name(&sandbox.id),
-        )]),
+        secret_env: BTreeMap::new(),
         stop_timeout: config.stop_timeout_secs,
         // Inject stable host aliases into /etc/hosts so sandbox containers can
         // reach services on the host. `host.openshell.internal` is the driver-
@@ -570,7 +570,7 @@ pub fn build_container_spec(sandbox: &DriverSandbox, config: &PodmanComputeConfi
         // the host, so we must use the published host port on 127.0.0.1 instead.
         portmappings: vec![PortMapping {
             host_port: 0,
-            container_port: config.ssh_port,
+            container_port: openshell_core::config::DEFAULT_SSH_PORT,
             protocol: "tcp".into(),
         }],
     };
@@ -606,13 +606,18 @@ fn parse_cpu_to_microseconds(quantity: &str) -> Option<u64> {
 /// (decimal), as well as plain byte values.
 fn parse_memory_to_bytes(quantity: &str) -> Option<u64> {
     let suffixes: &[(&str, u64)] = &[
+        ("Ei", 1024 * 1024 * 1024 * 1024 * 1024 * 1024),
+        ("Pi", 1024 * 1024 * 1024 * 1024 * 1024),
         ("Ti", 1024 * 1024 * 1024 * 1024),
         ("Gi", 1024 * 1024 * 1024),
         ("Mi", 1024 * 1024),
         ("Ki", 1024),
+        ("E", 1_000_000_000_000_000_000),
+        ("P", 1_000_000_000_000_000),
         ("T", 1_000_000_000_000),
         ("G", 1_000_000_000),
         ("M", 1_000_000),
+        ("K", 1_000),
         ("k", 1_000),
     ];
 
@@ -656,11 +661,43 @@ mod tests {
     fn parse_memory_decimal_suffixes() {
         assert_eq!(parse_memory_to_bytes("1G"), Some(1_000_000_000));
         assert_eq!(parse_memory_to_bytes("500M"), Some(500_000_000));
+        assert_eq!(parse_memory_to_bytes("1K"), Some(1_000));
     }
 
     #[test]
     fn parse_memory_plain_bytes() {
         assert_eq!(parse_memory_to_bytes("1048576"), Some(1_048_576));
+    }
+
+    #[test]
+    fn container_spec_applies_cpu_and_memory_limits() {
+        use openshell_core::proto::compute::v1::{
+            DriverResourceRequirements, DriverSandboxSpec, DriverSandboxTemplate,
+        };
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                resources: Some(DriverResourceRequirements {
+                    cpu_limit: "500m".to_string(),
+                    memory_limit: "2Gi".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let config = test_config();
+        let spec = build_container_spec(&sandbox, &config);
+
+        assert_eq!(
+            spec["resource_limits"]["cpu"]["quota"].as_u64(),
+            Some(50_000)
+        );
+        assert_eq!(
+            spec["resource_limits"]["memory"]["limit"].as_u64(),
+            Some(2 * 1024 * 1024 * 1024)
+        );
     }
 
     #[test]
@@ -677,14 +714,56 @@ mod tests {
     }
 
     #[test]
-    fn secret_name_uses_id() {
-        assert_eq!(secret_name("abc-123"), "openshell-handshake-abc-123");
-    }
-
-    #[test]
     fn short_id_truncates() {
         assert_eq!(short_id("abc123def456789"), "abc123def456");
         assert_eq!(short_id("short"), "short");
+    }
+
+    #[test]
+    fn container_spec_omits_devices_without_gpu_request() {
+        let sandbox = test_sandbox("test-id", "test-name");
+        let config = test_config();
+        let spec = build_container_spec(&sandbox, &config);
+
+        assert!(spec.get("devices").is_none());
+    }
+
+    #[test]
+    fn container_spec_maps_empty_gpu_request_to_all_cdi_device() {
+        use openshell_core::config::CDI_GPU_DEVICE_ALL;
+        use openshell_core::proto::compute::v1::DriverSandboxSpec;
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            gpu: true,
+            ..Default::default()
+        });
+        let config = test_config();
+        let spec = build_container_spec(&sandbox, &config);
+
+        assert_eq!(
+            spec["devices"][0]["path"].as_str(),
+            Some(CDI_GPU_DEVICE_ALL)
+        );
+    }
+
+    #[test]
+    fn container_spec_passes_explicit_cdi_device_id_through() {
+        use openshell_core::proto::compute::v1::DriverSandboxSpec;
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            gpu: true,
+            gpu_device: "nvidia.com/gpu=0".to_string(),
+            ..Default::default()
+        });
+        let config = test_config();
+        let spec = build_container_spec(&sandbox, &config);
+
+        assert_eq!(
+            spec["devices"][0]["path"].as_str(),
+            Some("nvidia.com/gpu=0")
+        );
     }
 
     #[test]
@@ -736,34 +815,6 @@ mod tests {
     }
 
     #[test]
-    fn container_spec_uses_secret_env_not_plaintext() {
-        let sandbox = test_sandbox("test-id", "test-name");
-        let config = test_config();
-        let spec = build_container_spec(&sandbox, &config);
-
-        // The handshake secret must NOT appear in the plaintext env map.
-        let env_map = spec["env"].as_object().expect("env should be an object");
-        assert!(
-            !env_map.contains_key("OPENSHELL_SSH_HANDSHAKE_SECRET"),
-            "handshake secret should not be in plaintext env"
-        );
-
-        // It should appear in secret_env (the libpod env-type secret map) instead.
-        let secret_env = spec["secret_env"]
-            .as_object()
-            .expect("secret_env should be an object");
-        assert!(
-            secret_env.contains_key("OPENSHELL_SSH_HANDSHAKE_SECRET"),
-            "secret_env should map OPENSHELL_SSH_HANDSHAKE_SECRET to its secret name"
-        );
-        assert_eq!(
-            secret_env["OPENSHELL_SSH_HANDSHAKE_SECRET"].as_str(),
-            Some("openshell-handshake-test-id"),
-            "secret_env value should be the Podman secret name for the sandbox"
-        );
-    }
-
-    #[test]
     fn container_spec_sets_sandbox_name_in_env() {
         let sandbox = test_sandbox("test-id", "my-sandbox");
         let config = test_config();
@@ -771,7 +822,9 @@ mod tests {
 
         let env_map = spec["env"].as_object().expect("env should be an object");
         assert_eq!(
-            env_map.get("OPENSHELL_SANDBOX").and_then(|v| v.as_str()),
+            env_map
+                .get(openshell_core::sandbox_env::SANDBOX)
+                .and_then(|v| v.as_str()),
             Some("my-sandbox"),
         );
     }
@@ -961,7 +1014,6 @@ mod tests {
             default_image: "test-image:latest".to_string(),
             grpc_endpoint: "http://localhost:50051".to_string(),
             sandbox_ssh_socket_path: "/run/openshell/test-ssh.sock".to_string(),
-            ssh_handshake_secret: "test-secret-value".to_string(),
             ..PodmanComputeConfig::default()
         }
     }
@@ -984,7 +1036,7 @@ mod tests {
         let vol = &image_volumes[0];
         assert_eq!(
             vol["source"].as_str(),
-            Some("openshell/supervisor:latest"),
+            Some("ghcr.io/nvidia/openshell/supervisor:latest"),
             "image volume source should be the supervisor image"
         );
         assert_eq!(

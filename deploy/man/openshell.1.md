@@ -190,7 +190,7 @@ development task, or behind a cloud reverse proxy.
 
 Register the local RPM gateway and create a sandbox:
 
-    openshell gateway add --local https://127.0.0.1:8080
+    openshell gateway add --local https://127.0.0.1:17670
     openshell sandbox create -- claude
 
 List sandboxes and connect to one:
@@ -208,7 +208,7 @@ Check gateway health:
 
 # SEE ALSO
 
-**openshell-gateway**(8), **openshell-gateway.env**(5)
+**openshell-gateway**(8)
 
 Full documentation: *https://docs.nvidia.com/openshell/*
 

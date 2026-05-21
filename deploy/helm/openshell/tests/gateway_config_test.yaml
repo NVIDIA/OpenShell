@@ -1,0 +1,68 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: gateway TOML config shape
+templates:
+  - templates/gateway-config.yaml
+  - templates/statefulset.yaml
+release:
+  name: openshell
+  namespace: my-namespace
+
+tests:
+  # Regression for Drew's P2: a ConfigMap-only mutation in `helm upgrade`
+  # must roll the StatefulSet, otherwise pods keep running with stale config.
+  - it: annotates the StatefulSet pod template with a ConfigMap checksum
+    template: templates/statefulset.yaml
+    asserts:
+      - exists:
+          path: spec.template.metadata.annotations["checksum/gateway-config"]
+
+
+  # Regression for the P1 bug Drew flagged: grpc_endpoint MUST live in the
+  # Kubernetes driver table, not in [openshell.gateway]. The gateway-side
+  # schema has `deny_unknown_fields` and no `grpc_endpoint` field, so writing
+  # it at gateway scope makes `config_file::load` reject the default install.
+  - it: renders grpc_endpoint under [openshell.drivers.kubernetes], not [openshell.gateway]
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?grpc_endpoint'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\][^\[]*?grpc_endpoint'
+
+  - it: omits server_sans when no DNS SANs are configured
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'server_sans\s*='
+
+  - it: emits disable_tls=true and omits the [openshell.gateway.tls] section when disableTls is set
+    set:
+      server.disableTls: true
+      certManager.enabled: false
+      pkiInitJob.enabled: false
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'disable_tls\s*=\s*true'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.gateway\.tls\]'
+
+  - it: renders server_sans from certManager.serverDnsNames
+    set:
+      certManager.enabled: true
+      certManager.serverDnsNames:
+        - openshell
+        - "*.dev.openshell.localhost"
+      pkiInitJob.enabled: false
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'server_sans\s*=\s*\["openshell", "\*\.dev\.openshell\.localhost"\]'

@@ -8,6 +8,7 @@ use openshell_core::proto::{
     L7Allow, L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, PolicyChunk,
     SandboxPolicy as ProtoSandboxPolicy,
 };
+use openshell_ocsf::{ConfigStateChangeBuilder, SeverityId, StateId, StatusId, ocsf_emit};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -31,6 +32,25 @@ pub const SKILL_PATH: &str = "/etc/openshell/skills/policy_advisor.md";
 pub const ROUTE_POLICY_CURRENT: &str = "/v1/policy/current";
 pub const ROUTE_DENIALS: &str = "/v1/denials";
 pub const ROUTE_PROPOSALS: &str = "/v1/proposals";
+/// Per-proposal status and long-poll routes live below this prefix:
+///   `GET /v1/proposals/{chunk_id}`              — immediate status
+///   `GET /v1/proposals/{chunk_id}/wait?timeout` — long-poll until terminal
+/// Trailing slash differentiates from the bare `POST /v1/proposals` submit.
+const ROUTE_PROPOSALS_PREFIX: &str = "/v1/proposals/";
+
+/// Long-poll bounds for `GET /v1/proposals/{id}/wait?timeout=<s>`. The agent
+/// re-issues on timeout, so the cap is a hold ceiling, not a hard limit on
+/// how long the agent can wait overall.
+const PROPOSAL_WAIT_DEFAULT_SECS: u64 = 60;
+const PROPOSAL_WAIT_MIN_SECS: u64 = 1;
+const PROPOSAL_WAIT_MAX_SECS: u64 = 300;
+const PROPOSAL_WAIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+/// Minimum window the reload-readiness phase gets after a chunk
+/// terminalizes, even if the caller's deadline is shorter. Without this,
+/// approvals that arrive at T-50ms always return `policy_reloaded=false`
+/// and force a re-issue. 500ms is well below typical supervisor poll
+/// latency but enough to cover the in-memory coverage check.
+const RELOAD_WAIT_MIN_FLOOR: std::time::Duration = std::time::Duration::from_millis(500);
 
 const MAX_POLICY_LOCAL_BODY_BYTES: usize = 64 * 1024;
 /// Hard ceiling on how long a single request body read can stall. Bounds a
@@ -135,6 +155,9 @@ async fn route_request(
         ("GET", ROUTE_POLICY_CURRENT) => current_policy_response(ctx).await,
         ("GET", ROUTE_DENIALS) => recent_denials_response(ctx, query).await,
         ("POST", ROUTE_PROPOSALS) => submit_proposal(ctx, body).await,
+        ("GET", path) if path.starts_with(ROUTE_PROPOSALS_PREFIX) => {
+            proposal_state_route(ctx, path, query).await
+        }
         _ => (
             404,
             serde_json::json!({
@@ -143,6 +166,42 @@ async fn route_request(
             }),
         ),
     }
+}
+
+/// Parse `{chunk_id}` (status) or `{chunk_id}/wait` (long-poll) from the path
+/// suffix and dispatch. Empty `chunk_id` or extra segments return 404 so a
+/// malformed path cannot trigger a gateway call.
+async fn proposal_state_route(
+    ctx: &PolicyLocalContext,
+    path: &str,
+    query: &str,
+) -> (u16, serde_json::Value) {
+    let suffix = path
+        .strip_prefix(ROUTE_PROPOSALS_PREFIX)
+        .unwrap_or_default();
+    let (chunk_id, wait) = match suffix.split_once('/') {
+        Some((id, "wait")) => (id, true),
+        Some(_) => return not_found_payload(path),
+        None => (suffix, false),
+    };
+    if chunk_id.is_empty() {
+        return not_found_payload(path);
+    }
+    if wait {
+        proposal_wait_response(ctx, chunk_id, query).await
+    } else {
+        proposal_status_response(ctx, chunk_id).await
+    }
+}
+
+fn not_found_payload(path: &str) -> (u16, serde_json::Value) {
+    (
+        404,
+        serde_json::json!({
+            "error": "not_found",
+            "detail": format!("policy.local proposal sub-route not found: {path}")
+        }),
+    )
 }
 
 /// Build the `next_steps` array embedded in the L7 deny body so the agent has
@@ -428,6 +487,12 @@ async fn submit_proposal(ctx: &PolicyLocalContext, body: &[u8]) -> (u16, serde_j
         }
     };
 
+    // Pre-compute the audit summaries before handing `chunks` to the
+    // gateway client (which consumes the vec). The summaries pair up with
+    // the gateway's `accepted_chunk_ids` by index for the propose events
+    // emitted after submit returns.
+    let audit_summaries: Vec<String> = chunks.iter().map(summarize_chunk_for_audit).collect();
+
     let response = match client
         .submit_policy_analysis(sandbox_name, vec![], chunks, "agent_authored")
         .await
@@ -444,6 +509,27 @@ async fn submit_proposal(ctx: &PolicyLocalContext, body: &[u8]) -> (u16, serde_j
         }
     };
 
+    // One OCSF event per accepted chunk so the audit trace in
+    // `openshell logs <sandbox>` carries the propose beat alongside the
+    // proxy deny and policy reload that bracket it.
+    //
+    // The gateway compresses its `accepted_chunk_ids` by skipping rejected
+    // chunks (`grpc/policy.rs:1357-1436`); the proto does not promise 1:1
+    // ordering against the request. Today client-side validation catches
+    // both rejection causes (missing rule_name, missing proposed_rule)
+    // before submit, so the lengths match in practice. If they don't, we
+    // can't safely pair audit_summaries by index — fall back to a generic
+    // event per accepted chunk_id rather than mis-attribute a summary.
+    let pairing_is_safe = response.accepted_chunk_ids.len() == audit_summaries.len();
+    for (idx, chunk_id) in response.accepted_chunk_ids.iter().enumerate() {
+        let summary = if pairing_is_safe {
+            audit_summaries[idx].as_str()
+        } else {
+            "(summary unavailable: gateway partially accepted)"
+        };
+        emit_policy_propose_event(chunk_id, summary);
+    }
+
     (
         202,
         serde_json::json!({
@@ -451,8 +537,390 @@ async fn submit_proposal(ctx: &PolicyLocalContext, body: &[u8]) -> (u16, serde_j
             "accepted_chunks": response.accepted_chunks,
             "rejected_chunks": response.rejected_chunks,
             "rejection_reasons": response.rejection_reasons,
+            "accepted_chunk_ids": response.accepted_chunk_ids,
         }),
     )
+}
+
+/// Emit one CONFIG:PROPOSED audit event for an agent-authored proposal that
+/// the gateway just accepted. The message names the `chunk_id`, the binary,
+/// and the endpoint the agent is asking to reach — what a developer needs
+/// to see in the audit trace to correlate against the inbox card.
+fn emit_policy_propose_event(chunk_id: &str, summary: &str) {
+    ocsf_emit!(
+        ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+            .severity(SeverityId::Informational)
+            .status(StatusId::Success)
+            .state(StateId::Other, "PROPOSED")
+            .unmapped("chunk_id", serde_json::json!(chunk_id))
+            .message(format!(
+                "agent_authored proposal chunk:{chunk_id} {summary}"
+            ))
+            .build()
+    );
+}
+
+/// Emit one CONFIG:APPROVED or CONFIG:REJECTED audit event observed by the
+/// `/wait` poll loop. The reviewer's free-form `rejection_reason` (if any)
+/// is included verbatim so the audit trace shows what guidance the agent
+/// received.
+fn emit_policy_decision_event(chunk: &PolicyChunk) {
+    let summary = summarize_chunk_for_audit(chunk);
+    match chunk.status.as_str() {
+        "approved" => ocsf_emit!(
+            ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+                .severity(SeverityId::Informational)
+                .status(StatusId::Success)
+                .state(StateId::Enabled, "APPROVED")
+                .unmapped("chunk_id", serde_json::json!(chunk.id))
+                .message(format!("chunk:{} approved {summary}", chunk.id))
+                .build()
+        ),
+        "rejected" => {
+            // The reviewer's free-form rejection_reason is opaque user
+            // input. The agent reads the raw text via `GET /v1/proposals/
+            // {id}` to redraft; the OCSF surface (which can be shipped to
+            // external SIEMs per AGENTS.md) gets a sanitized copy — caps
+            // length and strips control characters so a stray credential
+            // or escape sequence cannot leak into the audit log.
+            let sanitized = sanitize_reason_for_audit(&chunk.rejection_reason);
+            let reason_display = if sanitized.is_empty() {
+                "(no guidance)".to_string()
+            } else {
+                format!("\"{sanitized}\"")
+            };
+            ocsf_emit!(
+                ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+                    .severity(SeverityId::Low)
+                    .status(StatusId::Success)
+                    .state(StateId::Disabled, "REJECTED")
+                    .unmapped("chunk_id", serde_json::json!(chunk.id))
+                    .unmapped("rejection_reason", serde_json::json!(sanitized))
+                    .message(format!(
+                        "chunk:{} rejected {summary} reason:{reason_display}",
+                        chunk.id
+                    ))
+                    .build()
+            );
+        }
+        // Caller is gated on `is_terminal_status`, so a non-terminal status
+        // here is a code change that broke the invariant. Warn loudly so
+        // the audit gap doesn't go silent.
+        other => tracing::warn!(
+            chunk_id = %chunk.id,
+            status = %other,
+            "emit_policy_decision_event called on non-terminal status; no audit event emitted"
+        ),
+    }
+}
+
+/// Sanitize a free-form reviewer-typed string before it lands in the OCSF
+/// audit surface. The agent still reads the raw text via the API — this is
+/// audit-side defense only.
+fn sanitize_reason_for_audit(raw: &str) -> String {
+    const MAX_CHARS: usize = 200;
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| !c.is_control() || *c == ' ')
+        .take(MAX_CHARS)
+        .collect();
+    if raw.chars().count() > MAX_CHARS {
+        format!("{cleaned}…")
+    } else {
+        cleaned
+    }
+}
+
+/// One-line audit description of a chunk's target: binary, host, port, and
+/// L7 method/path if present. Used by both the propose and approve/reject
+/// audit events so the trace can be grepped by endpoint without parsing
+/// JSON.
+fn summarize_chunk_for_audit(chunk: &PolicyChunk) -> String {
+    let Some(rule) = chunk.proposed_rule.as_ref() else {
+        return format!("rule_name:{}", chunk.rule_name);
+    };
+    let endpoint = rule.endpoints.first().map_or_else(
+        || "unknown".to_string(),
+        |ep| format!("{}:{}", ep.host, ep.port),
+    );
+    let l7 = rule
+        .endpoints
+        .first()
+        .and_then(|ep| ep.rules.first())
+        .and_then(|r| r.allow.as_ref())
+        .map(|a| format!(" {} {}", a.method, a.path))
+        .unwrap_or_default();
+    let binary = if chunk.binary.is_empty() {
+        String::new()
+    } else {
+        format!(" by {}", chunk.binary)
+    };
+    format!("on {endpoint}{l7}{binary}")
+}
+
+/// `GET /v1/proposals/{chunk_id}` — immediate state. One gateway call, no loop.
+async fn proposal_status_response(
+    ctx: &PolicyLocalContext,
+    chunk_id: &str,
+) -> (u16, serde_json::Value) {
+    let session = match open_lookup_session(ctx).await {
+        Ok(session) => session,
+        Err(err) => return err,
+    };
+    fetch_chunk_or_404(&session, chunk_id, false).await
+}
+
+/// `GET /v1/proposals/{chunk_id}/wait?timeout=<s>` — block until terminal or
+/// timeout. Returns the chunk's current state on a status transition; on
+/// timeout, returns the still-pending state with `timed_out: true` so the
+/// agent can re-issue without ambiguity. The agent's wait costs zero LLM
+/// tokens — the tool call sits in a socket recv until we return.
+async fn proposal_wait_response(
+    ctx: &PolicyLocalContext,
+    chunk_id: &str,
+    query: &str,
+) -> (u16, serde_json::Value) {
+    let session = match open_lookup_session(ctx).await {
+        Ok(session) => session,
+        Err(err) => return err,
+    };
+    let timeout_secs = parse_timeout_query(query);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        match fetch_chunk(&session, chunk_id).await {
+            Ok(Some(chunk)) if is_terminal_status(&chunk.status) => {
+                // Audit beat: emit at the moment this sandbox observes the
+                // decision so the trace correlates with the proxy events
+                // bracketing the loop. Multiple waiters on the same chunk
+                // each fire one event — acceptable for a wakeup audit.
+                emit_policy_decision_event(&chunk);
+                let policy_reloaded = if chunk.status == "approved" {
+                    // Hold the wait until the local supervisor has loaded a
+                    // policy that semantically contains this chunk's
+                    // proposed rule. Reloads triggered by *other* chunks or
+                    // settings changes do not wake us; a missing
+                    // proposed_rule (defensive) skips the check and
+                    // returns reloaded=false so the agent can decide.
+                    //
+                    // Floor the reload-wait window to RELOAD_WAIT_MIN_FLOOR
+                    // so an approval that arrives at T-50ms still gets a
+                    // realistic shot at seeing the reload. Worst case we
+                    // overshoot the caller's deadline by this floor —
+                    // preferable to returning reloaded=false on every
+                    // short-budget call and forcing the agent to re-issue.
+                    let reload_deadline = std::cmp::max(
+                        deadline,
+                        tokio::time::Instant::now() + RELOAD_WAIT_MIN_FLOOR,
+                    );
+                    match chunk.proposed_rule.as_ref() {
+                        Some(rule) => {
+                            wait_for_local_policy_to_cover(ctx, rule, reload_deadline).await
+                        }
+                        None => false,
+                    }
+                } else {
+                    // Rejected: no reload semantics — the agent reads
+                    // rejection_reason and redrafts.
+                    false
+                };
+                return (200, chunk_state_payload(&chunk, false, policy_reloaded));
+            }
+            Ok(Some(chunk)) => {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return (200, chunk_state_payload(&chunk, true, false));
+                }
+                let sleep_for = std::cmp::min(remaining, PROPOSAL_WAIT_POLL_INTERVAL);
+                tokio::time::sleep(sleep_for).await;
+            }
+            Ok(None) => return chunk_not_found_payload(chunk_id),
+            Err(err) => return err,
+        }
+    }
+}
+
+fn chunk_not_found_payload(chunk_id: &str) -> (u16, serde_json::Value) {
+    (
+        404,
+        error_payload(
+            "chunk_not_found",
+            format!("chunk '{chunk_id}' is not present in this sandbox's draft policy"),
+        ),
+    )
+}
+
+async fn fetch_chunk_or_404(
+    session: &LookupSession<'_>,
+    chunk_id: &str,
+    timed_out: bool,
+) -> (u16, serde_json::Value) {
+    match fetch_chunk(session, chunk_id).await {
+        Ok(Some(chunk)) => (200, chunk_state_payload(&chunk, timed_out, false)),
+        Ok(None) => chunk_not_found_payload(chunk_id),
+        Err(err) => err,
+    }
+}
+
+/// Build the agent-facing response for a chunk.
+///
+/// Selection rule: include the fields the agent needs to decide what to do
+/// next on the redraft loop — identity (`chunk_id`, `status`), the proposal
+/// it submitted (`rule_name`, `binary`), the two feedback signals
+/// (`rejection_reason` from the reviewer, `validation_result` from the
+/// gateway prover), and (on /wait) `policy_reloaded` so the agent can tell
+/// "approved AND the new rule is loaded — safe to retry" from "approved
+/// but the supervisor hasn't reloaded yet — re-issue /wait or surface to
+/// user". Display-only proto fields (`hit_count`, `confidence`, `stage`,
+/// timing) are left off until a concrete agent need surfaces them.
+fn chunk_state_payload(
+    chunk: &PolicyChunk,
+    timed_out: bool,
+    policy_reloaded: bool,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "chunk_id": chunk.id,
+        "status": chunk.status,
+        "rule_name": chunk.rule_name,
+        "binary": chunk.binary,
+        "rejection_reason": chunk.rejection_reason,
+        "validation_result": chunk.validation_result,
+    });
+    if timed_out {
+        payload["timed_out"] = serde_json::json!(true);
+    }
+    if chunk.status == "approved" {
+        payload["policy_reloaded"] = serde_json::json!(policy_reloaded);
+    }
+    payload
+}
+
+fn is_terminal_status(status: &str) -> bool {
+    matches!(status, "approved" | "rejected")
+}
+
+/// After a chunk is approved upstream, wait until the local supervisor has
+/// loaded a policy that semantically contains the chunk's proposed rule.
+/// Returns `true` if coverage was observed before the deadline, `false`
+/// otherwise — the caller reports that bool back to the agent as
+/// `policy_reloaded` so it can decide whether to retry immediately or
+/// re-issue `/wait`.
+///
+/// Why rule-coverage instead of whole-policy diff (as we used to do):
+///
+/// 1. **False sleep.** If the agent re-issues `/wait` after a `timed_out`
+///    response, the chunk may have approved AND the supervisor may have
+///    reloaded between the two `/wait` calls. A diff-based check snapshots
+///    the already-updated policy as baseline and then waits forever for
+///    another change. The skill tells the agent to re-issue on
+///    `timed_out`, so the diff approach is broken on the happy path.
+/// 2. **False wakeup.** Any unrelated reload (another agent's approval,
+///    settings change) flips a whole-policy diff, but the chunk's actual
+///    rule may not be loaded yet. The agent retries, hits another
+///    `policy_denied`, and the revise-loop fires with no real signal to
+///    revise on.
+///
+/// The polling cadence here is faster than `PROPOSAL_WAIT_POLL_INTERVAL`
+/// (which paces upstream gateway calls). This loop only reads in-memory
+/// state, so 200ms gives a responsive handoff to the agent's retry once
+/// the supervisor's own policy poll catches up.
+async fn wait_for_local_policy_to_cover(
+    ctx: &PolicyLocalContext,
+    proposed_rule: &NetworkPolicyRule,
+    deadline: tokio::time::Instant,
+) -> bool {
+    const TICK: std::time::Duration = std::time::Duration::from_millis(200);
+    loop {
+        // Clone the snapshot out of the RwLock before running coverage —
+        // otherwise the read guard is held across `policy_covers_rule`'s
+        // iteration of `network_policies`, serializing a writer (supervisor
+        // reload) on the very thing we're waiting for. Clone-per-tick on
+        // a few-KB struct is cheap for the bounded wait window here.
+        let snapshot = ctx.current_policy.read().await.clone();
+        if let Some(policy) = snapshot.as_ref()
+            && openshell_policy::policy_covers_rule(policy, proposed_rule)
+        {
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        tokio::time::sleep(std::cmp::min(remaining, TICK)).await;
+    }
+}
+
+/// Parse `?timeout=<s>` from the query string. Default applies for missing
+/// or unparseable values; bounds clamp to keep the agent's hold ceiling
+/// sane. Re-issue is the right pattern for longer waits.
+fn parse_timeout_query(query: &str) -> u64 {
+    let raw = query
+        .split('&')
+        .filter_map(|kv| kv.split_once('='))
+        .find(|(k, _)| *k == "timeout")
+        .map_or("", |(_, v)| v);
+    raw.parse::<u64>()
+        .unwrap_or(PROPOSAL_WAIT_DEFAULT_SECS)
+        .clamp(PROPOSAL_WAIT_MIN_SECS, PROPOSAL_WAIT_MAX_SECS)
+}
+
+/// One connected gateway client + the validated sandbox name. Built once
+/// per request and reused for every `fetch_chunk` call in a wait loop so a
+/// 60-second wait does one TLS handshake, not sixty.
+struct LookupSession<'a> {
+    client: crate::grpc_client::CachedOpenShellClient,
+    sandbox_name: &'a str,
+}
+
+/// Validate ctx and open one gateway channel. Failures map to the canonical
+/// error payload shape used by both `/proposals/{id}` and `/wait`.
+async fn open_lookup_session(
+    ctx: &PolicyLocalContext,
+) -> std::result::Result<LookupSession<'_>, (u16, serde_json::Value)> {
+    let endpoint = ctx.gateway_endpoint.as_deref().ok_or_else(|| {
+        (
+            503,
+            error_payload(
+                "gateway_unavailable",
+                "proposal state lookup requires a gateway-connected sandbox".to_string(),
+            ),
+        )
+    })?;
+    let sandbox_name = ctx
+        .sandbox_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            (
+                503,
+                error_payload(
+                    "sandbox_name_unavailable",
+                    "proposal state lookup requires a sandbox name".to_string(),
+                ),
+            )
+        })?;
+    let client = crate::grpc_client::CachedOpenShellClient::connect(endpoint)
+        .await
+        .map_err(|e| (502, error_payload("gateway_connect_failed", e.to_string())))?;
+    Ok(LookupSession {
+        client,
+        sandbox_name,
+    })
+}
+
+/// One gateway call: list the sandbox's draft chunks and find the matching
+/// id. Returns `Ok(None)` only when the gateway responded successfully but
+/// no chunk in this sandbox matches.
+async fn fetch_chunk(
+    session: &LookupSession<'_>,
+    chunk_id: &str,
+) -> std::result::Result<Option<PolicyChunk>, (u16, serde_json::Value)> {
+    let chunks = session
+        .client
+        .get_draft_policy(session.sandbox_name, "")
+        .await
+        .map_err(|e| (502, error_payload("gateway_lookup_failed", e.to_string())))?;
+    Ok(chunks.into_iter().find(|c| c.id == chunk_id))
 }
 
 fn proposal_chunks_from_body(body: &[u8]) -> std::result::Result<Vec<PolicyChunk>, String> {
@@ -521,6 +989,8 @@ fn policy_chunk_from_add_rule(
         first_seen_ms: 0,
         last_seen_ms: 0,
         binary,
+        validation_result: String::new(),
+        rejection_reason: String::new(),
     })
 }
 
@@ -619,6 +1089,8 @@ fn network_endpoint_from_json(
         ports,
         deny_rules,
         allow_encoded_slash: endpoint.allow_encoded_slash,
+        websocket_credential_rewrite: false,
+        request_body_credential_rewrite: false,
         // GraphQL persisted-query knobs and path scoping default empty —
         // agent proposals don't author them today.
         persisted_queries: String::new(),
@@ -1153,5 +1625,357 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(body).unwrap();
         assert_eq!(body["format"], "yaml");
         assert!(body["policy_yaml"].as_str().unwrap().contains("version: 1"));
+    }
+
+    #[test]
+    fn parse_timeout_query_defaults_and_clamps() {
+        assert_eq!(parse_timeout_query(""), PROPOSAL_WAIT_DEFAULT_SECS);
+        assert_eq!(parse_timeout_query("timeout="), PROPOSAL_WAIT_DEFAULT_SECS);
+        assert_eq!(
+            parse_timeout_query("timeout=abc"),
+            PROPOSAL_WAIT_DEFAULT_SECS
+        );
+        assert_eq!(parse_timeout_query("timeout=30"), 30);
+        assert_eq!(parse_timeout_query("foo=1&timeout=45"), 45);
+        // Below floor clamps up; above ceiling clamps down.
+        assert_eq!(parse_timeout_query("timeout=0"), PROPOSAL_WAIT_MIN_SECS);
+        assert_eq!(parse_timeout_query("timeout=9999"), PROPOSAL_WAIT_MAX_SECS);
+    }
+
+    #[test]
+    fn is_terminal_status_matches_only_approved_and_rejected() {
+        assert!(!is_terminal_status("pending"));
+        assert!(is_terminal_status("approved"));
+        assert!(is_terminal_status("rejected"));
+        assert!(!is_terminal_status(""));
+    }
+
+    #[test]
+    fn chunk_state_payload_surfaces_loop_fields() {
+        let chunk = PolicyChunk {
+            id: "chunk-x".to_string(),
+            status: "rejected".to_string(),
+            rule_name: "allow_example".to_string(),
+            binary: "/usr/bin/curl".to_string(),
+            rejection_reason: "scope too broad".to_string(),
+            validation_result: "no exfil paths".to_string(),
+            ..Default::default()
+        };
+        let pending = chunk_state_payload(&chunk, false, false);
+        assert_eq!(pending["chunk_id"], "chunk-x");
+        assert_eq!(pending["status"], "rejected");
+        assert_eq!(pending["rejection_reason"], "scope too broad");
+        assert_eq!(pending["validation_result"], "no exfil paths");
+        // timed_out and policy_reloaded only appear when relevant.
+        assert!(pending.get("timed_out").is_none());
+        assert!(
+            pending.get("policy_reloaded").is_none(),
+            "policy_reloaded is only meaningful for approved chunks"
+        );
+
+        let timed = chunk_state_payload(&chunk, true, false);
+        assert_eq!(timed["timed_out"], true);
+    }
+
+    #[test]
+    fn chunk_state_payload_includes_policy_reloaded_when_approved() {
+        let chunk = PolicyChunk {
+            id: "chunk-y".to_string(),
+            status: "approved".to_string(),
+            rule_name: "allow_github".to_string(),
+            binary: "/usr/bin/curl".to_string(),
+            ..Default::default()
+        };
+        let reloaded = chunk_state_payload(&chunk, false, true);
+        assert_eq!(reloaded["status"], "approved");
+        assert_eq!(reloaded["policy_reloaded"], true);
+
+        let not_reloaded = chunk_state_payload(&chunk, false, false);
+        assert_eq!(not_reloaded["policy_reloaded"], false);
+    }
+
+    #[tokio::test]
+    async fn proposal_routes_reject_malformed_paths() {
+        let _guard = ProposalsFlagGuard::set(true).await;
+        let ctx = PolicyLocalContext::new(None, None, None);
+
+        // Empty chunk_id after the prefix is 404, not a wildcard list.
+        let (status, _) = route_request(&ctx, "GET", "/v1/proposals/", &[]).await;
+        assert_eq!(status, 404);
+
+        // More than one segment after the id (not "/wait") is 404, not a
+        // partial match. Prevents `/v1/proposals/abc/extra` from silently
+        // dispatching as a status lookup for "abc/extra".
+        let (status, _) = route_request(&ctx, "GET", "/v1/proposals/abc/extra", &[]).await;
+        assert_eq!(status, 404);
+
+        // Trailing path after `/wait` also 404 — must not match the wait
+        // arm as a wildcard.
+        let (status, _) = route_request(&ctx, "GET", "/v1/proposals/abc/wait/extra", &[]).await;
+        assert_eq!(status, 404);
+    }
+
+    #[tokio::test]
+    async fn proposal_status_route_returns_503_when_no_gateway() {
+        let _guard = ProposalsFlagGuard::set(true).await;
+        let ctx = PolicyLocalContext::new(None, None, Some("test-sandbox".to_string()));
+
+        let (status, body) = route_request(&ctx, "GET", "/v1/proposals/chunk-id", &[]).await;
+        assert_eq!(status, 503);
+        assert_eq!(body["error"], "gateway_unavailable");
+    }
+
+    #[tokio::test]
+    async fn proposal_wait_route_returns_503_when_no_gateway() {
+        let _guard = ProposalsFlagGuard::set(true).await;
+        let ctx = PolicyLocalContext::new(None, None, Some("test-sandbox".to_string()));
+
+        let (status, body) =
+            route_request(&ctx, "GET", "/v1/proposals/chunk-id/wait?timeout=1", &[]).await;
+        assert_eq!(status, 503);
+        assert_eq!(body["error"], "gateway_unavailable");
+    }
+
+    #[tokio::test]
+    async fn proposal_routes_return_feature_disabled_when_flag_off() {
+        let _guard = ProposalsFlagGuard::set(false).await;
+        let ctx = PolicyLocalContext::new(None, None, Some("test-sandbox".to_string()));
+
+        let (status, body) = route_request(&ctx, "GET", "/v1/proposals/abc", &[]).await;
+        assert_eq!(status, 404);
+        assert_eq!(body["error"], "feature_disabled");
+
+        let (status, _) = route_request(&ctx, "GET", "/v1/proposals/abc/wait", &[]).await;
+        assert_eq!(status, 404);
+    }
+
+    #[test]
+    fn summarize_chunk_for_audit_includes_endpoint_l7_path_and_binary() {
+        let chunk = PolicyChunk {
+            id: "ignored".to_string(),
+            rule_name: "github_write".to_string(),
+            binary: "/usr/bin/curl".to_string(),
+            proposed_rule: Some(NetworkPolicyRule {
+                name: "github_write".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.github.com".to_string(),
+                    port: 443,
+                    rules: vec![L7Rule {
+                        allow: Some(L7Allow {
+                            method: "PUT".to_string(),
+                            path: "/repos/foo/bar/contents/x.md".to_string(),
+                            ..Default::default()
+                        }),
+                    }],
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/curl".to_string(),
+                    ..Default::default()
+                }],
+            }),
+            ..Default::default()
+        };
+        let summary = summarize_chunk_for_audit(&chunk);
+        assert!(summary.contains("api.github.com:443"));
+        assert!(summary.contains("PUT /repos/foo/bar/contents/x.md"));
+        assert!(summary.contains("/usr/bin/curl"));
+    }
+
+    // Helpers — synthetic proposed rule + policy with that rule already
+    // merged. Both reused across reload-readiness tests.
+    fn proposed_curl_rule_for_github() -> NetworkPolicyRule {
+        NetworkPolicyRule {
+            name: "agent_proposed".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "api.github.com".to_string(),
+                port: 443,
+                ports: vec![443],
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        }
+    }
+
+    fn policy_with_rule(rule: NetworkPolicyRule) -> ProtoSandboxPolicy {
+        ProtoSandboxPolicy {
+            version: 1,
+            network_policies: HashMap::from([(rule.name.clone(), rule)]),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_returns_reloaded_true_when_rule_already_loaded() {
+        // John's false-sleep case: the supervisor has already reloaded a
+        // policy containing the proposed rule before /wait starts. A
+        // whole-policy diff would never see another change and burn the
+        // full timeout. Rule-coverage must return immediately.
+        let proposed = proposed_curl_rule_for_github();
+        let ctx = PolicyLocalContext::new(Some(policy_with_rule(proposed.clone())), None, None);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+
+        let start = tokio::time::Instant::now();
+        let reloaded = wait_for_local_policy_to_cover(&ctx, &proposed, deadline).await;
+        let elapsed = start.elapsed();
+
+        assert!(reloaded, "should report reloaded=true on coverage");
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "should return immediately, not poll-and-wait; took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_does_not_wake_on_unrelated_policy_change() {
+        // John's false-wakeup case: a *different* rule gets added to the
+        // local policy (other agent's approval, settings change, etc.).
+        // The agent's specific rule is still not loaded. A diff-based
+        // check would wake here; coverage must not.
+        let proposed = proposed_curl_rule_for_github();
+        // Start with a policy that does NOT contain the proposed rule.
+        let initial = ProtoSandboxPolicy {
+            version: 1,
+            ..Default::default()
+        };
+        let ctx = PolicyLocalContext::new(Some(initial), None, None);
+
+        // Concurrently, an unrelated rule lands. We must not return.
+        let unrelated_load = {
+            let policy = ctx.current_policy.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                *policy.write().await = Some(policy_with_rule(NetworkPolicyRule {
+                    name: "unrelated".to_string(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: "api.example.com".to_string(),
+                        port: 443,
+                        ports: vec![443],
+                        ..Default::default()
+                    }],
+                    binaries: vec![NetworkBinary {
+                        path: "/usr/bin/curl".to_string(),
+                        ..Default::default()
+                    }],
+                }));
+            })
+        };
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(400);
+        let start = tokio::time::Instant::now();
+        let reloaded = wait_for_local_policy_to_cover(&ctx, &proposed, deadline).await;
+        unrelated_load.await.unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(
+            !reloaded,
+            "must not wake on an unrelated reload; coverage was never satisfied"
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_millis(350),
+            "should have held until the deadline; only waited {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_wakes_when_matching_rule_arrives_mid_flight() {
+        // Sandbox starts without the rule, then a reload lands containing
+        // it. /wait should observe coverage and return reloaded=true.
+        let proposed = proposed_curl_rule_for_github();
+        let ctx = PolicyLocalContext::new(
+            Some(ProtoSandboxPolicy {
+                version: 1,
+                ..Default::default()
+            }),
+            None,
+            None,
+        );
+
+        let matching_load = {
+            let policy = ctx.current_policy.clone();
+            let target = proposed.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                *policy.write().await = Some(policy_with_rule(target));
+            })
+        };
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let start = tokio::time::Instant::now();
+        let reloaded = wait_for_local_policy_to_cover(&ctx, &proposed, deadline).await;
+        matching_load.await.unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(reloaded, "should report reloaded=true after coverage lands");
+        assert!(
+            elapsed < std::time::Duration::from_millis(800),
+            "should return shortly after coverage; took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_returns_reloaded_false_at_deadline_when_no_coverage() {
+        // Deadline budget exhausted, the proposed rule never showed up.
+        // Coverage check returns false — the agent gets policy_reloaded=
+        // false and decides whether to retry blind or re-issue /wait.
+        let proposed = proposed_curl_rule_for_github();
+        let ctx = PolicyLocalContext::new(
+            Some(ProtoSandboxPolicy {
+                version: 1,
+                ..Default::default()
+            }),
+            None,
+            None,
+        );
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(300);
+        let start = tokio::time::Instant::now();
+        let reloaded = wait_for_local_policy_to_cover(&ctx, &proposed, deadline).await;
+        let elapsed = start.elapsed();
+
+        assert!(!reloaded);
+        assert!(
+            elapsed >= std::time::Duration::from_millis(250),
+            "should wait until ~deadline; only waited {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(800),
+            "should not extend past deadline by much; took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn sanitize_reason_for_audit_strips_control_chars_and_caps_length() {
+        // Tabs and newlines are stripped; ordinary printable chars survive;
+        // multi-byte characters count as one char in the cap.
+        let raw = "line one\nline\ttwo\u{0001}\u{0007}";
+        let cleaned = sanitize_reason_for_audit(raw);
+        assert!(!cleaned.contains('\n'));
+        assert!(!cleaned.contains('\t'));
+        assert!(!cleaned.contains('\u{0001}'));
+        assert!(cleaned.contains("line one"));
+        assert!(cleaned.contains("linetwo"));
+
+        // Length cap with ellipsis marker so a downstream reader can tell
+        // the audit string is truncated.
+        let long: String = "x".repeat(500);
+        let capped = sanitize_reason_for_audit(&long);
+        assert!(capped.chars().count() <= 201);
+        assert!(capped.ends_with('…'));
+
+        // Empty input maps to empty output (caller renders "(no guidance)").
+        assert_eq!(sanitize_reason_for_audit(""), "");
+    }
+
+    #[test]
+    fn summarize_chunk_for_audit_falls_back_to_rule_name_without_rule() {
+        let chunk = PolicyChunk {
+            rule_name: "fallback".to_string(),
+            proposed_rule: None,
+            ..Default::default()
+        };
+        assert_eq!(summarize_chunk_for_audit(&chunk), "rule_name:fallback");
     }
 }

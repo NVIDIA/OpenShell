@@ -590,7 +590,7 @@ impl SshHandler {
 /// the calling thread's network namespace permanently — a tokio blocking-pool
 /// thread could be reused for unrelated tasks and must not be contaminated.
 /// On non-Linux platforms (no network namespace support), we connect directly.
-async fn connect_in_netns(
+pub async fn connect_in_netns(
     addr: &str,
     netns_fd: Option<RawFd>,
 ) -> std::io::Result<tokio::net::TcpStream> {
@@ -680,7 +680,7 @@ fn apply_child_env(
     let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into());
 
     cmd.env_clear()
-        .env("OPENSHELL_SANDBOX", "1")
+        .env(openshell_core::sandbox_env::SANDBOX, "1")
         .env("HOME", session_home)
         .env("USER", session_user)
         .env("SHELL", "/bin/bash")

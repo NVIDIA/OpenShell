@@ -3,231 +3,284 @@
 
 # Default values for OpenShell
 
+# -- Number of OpenShell gateway replicas.
 replicaCount: 1
 
 image:
+  # -- Gateway image repository.
   repository: ghcr.io/nvidia/openshell/gateway
+  # -- Gateway image pull policy.
   pullPolicy: IfNotPresent
+  # -- Gateway image tag. Defaults to the chart appVersion when empty.
   tag: ""
 
-# Supervisor image — provides the openshell-sandbox binary that is copied into
-# sandbox pods via an init container. tag defaults to appVersion (same as the
-# gateway image) so both stay in sync when the chart is released.
+# Supervisor image - provides the openshell-sandbox binary injected into sandbox
+# pods. tag defaults to appVersion (same as the gateway image) so both stay in
+# sync when the chart is released.
 supervisor:
   image:
+    # -- Supervisor image repository.
     repository: ghcr.io/nvidia/openshell/supervisor
+    # -- Supervisor image pull policy. Defaults to the gateway image pull policy when empty.
     pullPolicy: ""
+    # -- Supervisor image tag. Defaults to the chart appVersion when empty.
     tag: ""
+  # -- How the supervisor binary is delivered into sandbox pods.
+  # Empty (default) = auto-detect from cluster version:
+  #   K8s >= v1.35 -> "image-volume" (ImageVolume enabled by default; GA in v1.36)
+  #   K8s < v1.35 -> "init-container" (copies via init container + emptyDir)
+  # On K8s v1.33-v1.34 with the ImageVolume feature gate manually enabled,
+  # set this to "image-volume" explicitly.
+  sideloadMethod: ""
 
+# -- Image pull secrets attached to gateway and helper pods.
 imagePullSecrets: []
+# -- Override the chart name used in generated resource names.
 nameOverride: "openshell"
+# -- Override the full generated resource name.
 fullnameOverride: ""
 
 serviceAccount:
+  # -- Create a service account for the gateway.
   create: true
+  # -- Annotations to add to the generated service account.
   annotations: {}
+  # -- Existing service account name to use when serviceAccount.create is false.
   name: ""
 
+# -- Extra annotations to add to the gateway pod.
 podAnnotations: {}
+# -- Extra labels to add to the gateway pod.
 podLabels: {}
 
 podSecurityContext:
+  # -- fsGroup assigned to the gateway pod.
   fsGroup: 1000
 
 securityContext:
+  # -- Require the gateway container to run as a non-root user.
   runAsNonRoot: true
+  # -- UID assigned to the gateway container.
   runAsUser: 1000
+  # -- Whether the gateway container can gain additional privileges.
   allowPrivilegeEscalation: false
   capabilities:
+    # -- Linux capabilities dropped from the gateway container.
     drop:
       - ALL
 
 service:
+  # -- Kubernetes Service type for the gateway.
   type: ClusterIP
+  # -- Gateway gRPC/HTTP service port.
   port: 8080
+  # -- Gateway health service port.
   healthPort: 8081
+  # -- Gateway metrics service port.
   metricsPort: 9090
 
 # Pod restart behavior and health probe tuning.
 podLifecycle:
+  # -- Grace period, in seconds, before Kubernetes terminates the gateway pod.
   terminationGracePeriodSeconds: 5
 
 probes:
   startup:
+    # -- Startup probe period, in seconds.
     periodSeconds: 2
+    # -- Startup probe timeout, in seconds.
     timeoutSeconds: 1
+    # -- Startup probe failure threshold before the container is killed.
     failureThreshold: 30
   liveness:
+    # -- Liveness probe initial delay, in seconds.
     initialDelaySeconds: 2
+    # -- Liveness probe period, in seconds.
     periodSeconds: 5
+    # -- Liveness probe timeout, in seconds.
     timeoutSeconds: 1
+    # -- Liveness probe failure threshold before the container is restarted.
     failureThreshold: 3
   readiness:
+    # -- Readiness probe initial delay, in seconds.
     initialDelaySeconds: 1
+    # -- Readiness probe period, in seconds.
     periodSeconds: 2
+    # -- Readiness probe timeout, in seconds.
     timeoutSeconds: 1
+    # -- Readiness probe failure threshold before the pod is marked not ready.
     failureThreshold: 3
 
+# -- Gateway pod resource requests and limits.
 resources: {}
 
+# -- Node selector for the gateway pod.
 nodeSelector: {}
 
+# -- Tolerations for the gateway pod.
 tolerations: []
 
+# -- Affinity rules for the gateway pod.
 affinity: {}
 
 # Server configuration
 server:
+  # -- Gateway log level.
   logLevel: info
-  # Namespace where sandbox pods are created. Defaults to the Helm release
+  # -- Namespace where sandbox pods are created. Defaults to the Helm release
   # namespace (.Release.Namespace) when left empty.
   sandboxNamespace: ""
+  # -- Gateway database URL.
   dbUrl: "sqlite:/var/openshell/openshell.db"
+  # -- Default sandbox image used when requests do not specify one.
   sandboxImage: "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
-  # Kubernetes imagePullPolicy for sandbox pods.  Empty = Kubernetes default
-  # (Always for :latest, IfNotPresent otherwise).  Set to "Always" for dev
+  # -- Kubernetes imagePullPolicy for sandbox pods. Empty = Kubernetes default
+  # (Always for :latest, IfNotPresent otherwise). Set to "Always" for dev
   # clusters so new images are picked up without manual eviction.
   sandboxImagePullPolicy: ""
-  # gRPC endpoint sandboxes call back into the gateway. Leave empty to derive
+  # -- Default storage size for the workspace PVC in sandbox pods.
+  # Uses Kubernetes quantity syntax (e.g. "2Gi", "10Gi", "500Mi").
+  # Empty = built-in default (2Gi).
+  workspaceDefaultStorageSize: ""
+  # -- gRPC endpoint sandboxes call back into the gateway. Leave empty to derive
   # it from the chart fullname, release namespace, service port, and
-  # disableTls flag (i.e. <scheme>://<fullname>.<namespace>.svc.cluster.local:<port>).
+  # disableTls flag, for example https://openshell.openshell.svc.cluster.local:8080.
   # Override only when sandboxes must reach the gateway via a different
   # hostname (e.g. an external ingress or a host alias).
   grpcEndpoint: ""
-  # Public host/port returned to CLI clients for SSH proxy CONNECT requests.
-  # For local clusters the default 127.0.0.1:8080 is correct; for remote
-  # clusters these should be set to the externally reachable host and port.
-  sshGatewayHost: ""
-  sshGatewayPort: 0
   # TLS configuration for the server. The server always terminates mTLS
   # directly and requires client certificates.
-  # Name of the Kubernetes Secret holding the NSSH1 HMAC handshake key.
-  # The secret must contain a `secret` key with the hex-encoded HMAC key.
-  # By default a pre-install/pre-upgrade hook creates it when missing (see sshHandshake).
-  sshHandshakeSecretName: "openshell-ssh-handshake"
-  # Host gateway IP for sandbox pod hostAliases. When set, sandbox pods get
+  # -- Host gateway IP for sandbox pod hostAliases. When set, sandbox pods get
   # hostAliases entries mapping host.docker.internal and host.openshell.internal
   # to this IP, allowing them to reach services running on the Docker host.
   # Auto-detected by the cluster entrypoint script.
   hostGatewayIP: ""
-  # Enable Kubernetes user namespace isolation (hostUsers: false) for sandbox
+  # -- Enable Kubernetes user namespace isolation (hostUsers: false) for sandbox
   # pods. Requires Kubernetes 1.33+ with user namespace support available
   # (beta through 1.35, GA in 1.36+), plus a supporting container runtime and
   # Linux 5.12+. When enabled, container UID 0 maps to an unprivileged host
   # UID and capabilities become namespaced.
   enableUserNamespaces: false
-  # Disable gateway authentication (mTLS client certificate requirement).
-  # Set to true when the gateway sits behind a reverse proxy (e.g.
-  # Cloudflare Tunnel) that terminates TLS.
-  disableGatewayAuth: false
-  # Disable TLS entirely — the server listens on plaintext HTTP.
+  # -- Disable TLS entirely - the server listens on plaintext HTTP.
   # Set to true when a reverse proxy / tunnel terminates TLS at the edge.
   disableTls: false
+  # -- Enable plaintext HTTP routing for loopback sandbox service URLs on
+  # TLS-enabled gateways.
+  enableLoopbackServiceHttp: true
   tls:
-    # K8s secret (type kubernetes.io/tls) with tls.crt and tls.key for the server
+    # -- K8s secret (type kubernetes.io/tls) with tls.crt and tls.key for the server.
     certSecretName: openshell-server-tls
-    # K8s secret with ca.crt for client certificate verification
+    # -- K8s secret with ca.crt for client certificate verification (mTLS).
+    # Set to "" to disable mTLS and run HTTPS-only (use OIDC for auth instead).
     clientCaSecretName: openshell-server-client-ca
-    # K8s secret mounted into sandbox pods for mTLS to the server
+    # -- K8s secret mounted into sandbox pods for mTLS to the server.
     clientTlsSecretName: openshell-client-tls
   # OIDC (OpenID Connect) configuration for JWT-based authentication.
   # When issuer is set, the server validates Bearer tokens on gRPC requests.
   oidc:
-    # OIDC issuer URL (e.g. https://keycloak.example.com/realms/openshell).
+    # -- OIDC issuer URL (e.g. https://keycloak.example.com/realms/openshell).
     issuer: ""
-    # Expected audience claim for the API resource server.
+    # -- Expected audience claim for the API resource server.
     # This should match the server's --oidc-audience, NOT the CLI client ID.
     audience: "openshell-cli"
-    # JWKS key cache TTL in seconds.
+    # -- JWKS key cache TTL in seconds.
     jwksTtl: 3600
-    # Dot-separated path to the roles array in the JWT claims.
+    # -- Dot-separated path to the roles array in the JWT claims.
     # Keycloak: "realm_access.roles", Entra ID: "roles", Okta: "groups".
     rolesClaim: ""
-    # Role name for admin access. Leave empty (with userRole also empty) for
+    # -- Role name for admin access. Leave empty (with userRole also empty) for
     # authentication-only mode. Both must be set or both empty.
     adminRole: ""
-    # Role name for standard user access.
+    # -- Role name for standard user access.
     userRole: ""
-    # Dot-separated path to the scopes array in the JWT claims.
+    # -- Dot-separated path to the scopes array in the JWT claims.
     scopesClaim: ""
+    # -- Name of a ConfigMap containing a CA certificate bundle (key: ca.crt)
+    # for verifying the OIDC issuer's TLS certificate. Required when the
+    # issuer uses a non-public CA (e.g. OpenShift ingress, private PKI).
+    caConfigMapName: ""
 
 # NetworkPolicy restricting SSH ingress on sandbox pods to the gateway only.
 networkPolicy:
+  # -- Create a NetworkPolicy restricting SSH ingress on sandbox pods to the gateway.
   enabled: true
-
-# NSSH1 SSH gateway handshake Secret (`server.sshHandshakeSecretName`).
-# Helm hook creates it only when the Secret does not already exist (safe upgrades).
-# Set sshHandshake.value from a gitignored values file for a stable dev secret.
-sshHandshake:
-  hook:
-    enabled: true
-  # 64 hex chars (32 bytes), matching openshell-bootstrap. If empty, Helm generates
-  # a random value at install template time (two UUIDs, dashes stripped).
-  value: ""
 
 # PKI bootstrap via a pre-install/pre-upgrade hook Job.
 # Runs `openshell-gateway generate-certs` to create the server and client TLS
 # Secrets in-cluster. Key material is written directly to K8s Secrets and
 # never appears in Helm release history. Idempotent: existing secrets are
-# left untouched on upgrade. Reuses the gateway image — no extra image to
+# left untouched on upgrade. Reuses the gateway image - no extra image to
 # mirror in air-gapped environments.
 #
 # The server certificate already includes the built-in cluster SANs
 # (`openshell`, `openshell.openshell.svc`, the cluster.local FQDN, `localhost`,
-# `host.docker.internal`, and `127.0.0.1`) baked into the gateway binary. The
-# lists below are *additional* SANs appended on top — typically a public
-# hostname or load-balancer IP for remote deployments.
+# `openshell.localhost`, `*.openshell.localhost`, `host.docker.internal`, and
+# `127.0.0.1`) baked into the gateway binary. The lists below are additional
+# SANs appended on top. Wildcard DNS SANs also enable sandbox service URLs under
+# that domain, for example `*.apps.example.com` enables
+# `<sandbox>--<service>.apps.example.com`.
 pkiInitJob:
+  # -- Run a pre-install/pre-upgrade Job that creates gateway and client mTLS Secrets.
   enabled: true
-  # Extra DNS SANs to append to the server certificate.
+  # -- Extra DNS SANs to append to the server certificate.
   serverDnsNames: []
-  # Extra IP SANs to append to the server certificate.
+  # -- Extra IP SANs to append to the server certificate.
   serverIpAddresses: []
 
 # cert-manager Certificate/Issuer resources (requires cert-manager CRDs in-cluster).
 # Uses namespaced Issuers only (no ClusterIssuer). Does not install cert-manager itself.
 certManager:
+  # -- Create cert-manager Issuer and Certificate resources instead of using the PKI bootstrap Job.
   enabled: false
-  # Secret created for the intermediate CA (Certificate with isCA: true).
+  # -- Secret created for the intermediate CA (Certificate with isCA: true).
   caSecretName: openshell-ca-tls
-  # Mount gateway client CA from the server TLS secret's ca.crt (populated by
+  # -- Mount gateway client CA from the server TLS secret's ca.crt (populated by
   # cert-manager for certs issued by a CA Issuer). Avoids a separate
   # openshell-server-client-ca Secret.
   clientCaFromServerTlsSecret: true
+  # -- Duration for cert-manager-issued certificates.
   certificateDuration: 8760h
+  # -- Renewal window for cert-manager-issued certificates.
   certificateRenewBefore: 720h
+  # -- DNS SANs on the cert-manager-issued server certificate.
   serverDnsNames:
     - openshell
     - openshell.openshell.svc
     - openshell.openshell.svc.cluster.local
     - localhost
+    - openshell.localhost
+    - "*.openshell.localhost"
     - host.docker.internal
+  # -- IP SANs on the cert-manager-issued server certificate.
   serverIpAddresses:
     - 127.0.0.1
 
-# Kubernetes Gateway API — HTTPRoute and Gateway resources.
+# Kubernetes Gateway API - HTTPRoute and Gateway resources.
 # Requires a Gateway API controller in the cluster. Install Envoy Gateway via
 # the skaffold.yaml releases or independently:
 #   helm install eg oci://docker.io/envoyproxy/gateway-helm \
 #     --version v1.4.1 -n envoy-gateway-system --create-namespace
 grpcRoute:
+  # -- Create a Gateway API GRPCRoute for the gateway service.
   enabled: false
-  # Hostnames the GRPCRoute matches on. Leave empty to match all hosts.
+  # -- Hostnames the GRPCRoute matches on. Leave empty to match all hosts.
   hostnames: []
   gateway:
-    # When true, a Gateway resource is created in the release namespace.
+    # -- When true, a Gateway resource is created in the release namespace.
     # Set to false and provide name/namespace to attach to a pre-existing Gateway.
     create: false
-    # GatewayClass to reference. Envoy Gateway installs one named "eg".
+    # -- GatewayClass to reference. Envoy Gateway installs one named "eg".
     className: "eg"
-    # Name of the Gateway resource. Defaults to the chart fullname.
+    # -- Name of the Gateway resource. Defaults to the chart fullname.
     name: ""
-    # Namespace of the Gateway referenced by the GRPCRoute parentRef.
+    # -- Namespace of the Gateway referenced by the GRPCRoute parentRef.
     # Defaults to the release namespace.
     namespace: ""
     # Listener settings (only used when gateway.create is true).
     listener:
+      # -- Listener port for the generated Gateway resource.
       port: 80
+      # -- Listener protocol for the generated Gateway resource.
       protocol: HTTP
-      # "Same" restricts attached routes to the release namespace; "All" allows any namespace.
+      # -- "Same" restricts attached routes to the release namespace; "All" allows any namespace.
       allowedRoutes: Same

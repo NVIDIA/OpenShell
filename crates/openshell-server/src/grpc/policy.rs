@@ -216,6 +216,12 @@ fn summarize_endpoint(endpoint: &NetworkEndpoint) -> String {
     if !endpoint.tls.is_empty() {
         parts.push(format!("tls={}", endpoint.tls));
     }
+    if endpoint.websocket_credential_rewrite {
+        parts.push("websocket_credential_rewrite=true".to_string());
+    }
+    if endpoint.request_body_credential_rewrite {
+        parts.push("request_body_credential_rewrite=true".to_string());
+    }
     if !endpoint.allowed_ips.is_empty() {
         parts.push(format!("allowed_ips={}", endpoint.allowed_ips.len()));
     }
@@ -308,31 +314,31 @@ fn truncate_for_log(input: &str, max_chars: usize) -> String {
     }
 }
 
-fn is_sandbox_secret_authenticated<T>(request: &Request<T>) -> bool {
-    oidc::is_sandbox_secret_authenticated(request.metadata())
+fn is_sandbox_caller<T>(request: &Request<T>) -> bool {
+    oidc::is_sandbox_caller(request.metadata())
 }
 
-/// Sandbox-secret-authenticated callers may only perform sandbox-scoped policy
-/// sync. They must not be able to mutate global config or sandbox settings.
-fn validate_sandbox_secret_update(req: &UpdateConfigRequest) -> Result<(), Status> {
+/// Sandbox-class callers may only perform sandbox-scoped policy sync. They
+/// must not mutate global config or sandbox settings.
+fn validate_sandbox_caller_update(req: &UpdateConfigRequest) -> Result<(), Status> {
     if req.global {
         return Err(Status::permission_denied(
-            "sandbox secret cannot mutate global config",
+            "sandbox callers cannot mutate global config",
         ));
     }
     if req.delete_setting {
         return Err(Status::permission_denied(
-            "sandbox secret cannot delete settings",
+            "sandbox callers cannot delete settings",
         ));
     }
     if req.name.trim().is_empty() {
         return Err(Status::permission_denied(
-            "sandbox secret may only perform sandbox policy sync",
+            "sandbox callers may only perform sandbox policy sync",
         ));
     }
     if req.policy.is_none() || !req.setting_key.trim().is_empty() {
         return Err(Status::permission_denied(
-            "sandbox secret may only perform sandbox policy sync",
+            "sandbox callers may only perform sandbox policy sync",
         ));
     }
     Ok(())
@@ -516,6 +522,12 @@ pub(super) async fn compute_provider_env_revision(
                 for key in credential_keys {
                     hasher.update(key.as_bytes());
                 }
+                let mut expiry_keys: Vec<_> = provider.credential_expires_at_ms.keys().collect();
+                expiry_keys.sort();
+                for key in expiry_keys {
+                    hasher.update(key.as_bytes());
+                    hasher.update(provider.credential_expires_at_ms[key].to_le_bytes());
+                }
             }
             None => {
                 hasher.update(b"missing");
@@ -619,21 +631,22 @@ pub(super) async fn handle_get_sandbox_provider_environment(
     let provider_names = spec.providers;
     let provider_env_revision =
         compute_provider_env_revision(state.store.as_ref(), &provider_names).await?;
-    let environment =
+    let provider_environment =
         super::provider::resolve_provider_environment(state.store.as_ref(), &provider_names)
             .await?;
 
     info!(
         sandbox_id = %sandbox_id,
         provider_count = provider_names.len(),
-        env_count = environment.len(),
+        env_count = provider_environment.environment.len(),
         provider_env_revision,
         "GetSandboxProviderEnvironment request completed successfully"
     );
 
     Ok(Response::new(GetSandboxProviderEnvironmentResponse {
-        environment,
+        environment: provider_environment.environment,
         provider_env_revision,
+        credential_expires_at_ms: provider_environment.credential_expires_at_ms,
     }))
 }
 
@@ -645,10 +658,10 @@ pub(super) async fn handle_update_config(
     state: &Arc<ServerState>,
     request: Request<UpdateConfigRequest>,
 ) -> Result<Response<UpdateConfigResponse>, Status> {
-    let sandbox_secret_auth = is_sandbox_secret_authenticated(&request);
+    let sandbox_caller = is_sandbox_caller(&request);
     let req = request.into_inner();
-    if sandbox_secret_auth {
-        validate_sandbox_secret_update(&req)?;
+    if sandbox_caller {
+        validate_sandbox_caller_update(&req)?;
     }
     let key = req.setting_key.trim();
     let has_policy = req.policy.is_some();
@@ -1000,32 +1013,29 @@ pub(super) async fn handle_update_config(
         validate_static_fields_unchanged(baseline_policy, &new_policy)?;
         validate_policy_safety(&new_policy)?;
     } else {
+        // Backfill spec.policy using CAS (first-time policy discovery)
         let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
-        let mut sandbox = state
+        let sandbox_id = sandbox.object_id().to_string();
+        let new_policy_clone = new_policy.clone();
+        state
             .store
-            .get_message::<Sandbox>(&sandbox_id)
+            .update_message_cas::<Sandbox, _>(
+                &sandbox_id,
+                req.expected_resource_version,
+                |sandbox| {
+                    if let Some(ref mut spec) = sandbox.spec
+                        && spec.policy.is_none()
+                    {
+                        spec.policy = Some(new_policy_clone.clone());
+                    }
+                },
+            )
             .await
-            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-            .ok_or_else(|| Status::not_found("sandbox not found"))?;
-        let spec = sandbox
-            .spec
-            .as_mut()
-            .ok_or_else(|| Status::internal("sandbox has no spec"))?;
-        if let Some(baseline_policy) = spec.policy.as_ref() {
-            validate_static_fields_unchanged(baseline_policy, &new_policy)?;
-            validate_policy_safety(&new_policy)?;
-        } else {
-            spec.policy = Some(new_policy.clone());
-            state
-                .store
-                .put_message(&sandbox)
-                .await
-                .map_err(|e| Status::internal(format!("backfill spec.policy failed: {e}")))?;
-            info!(
-                sandbox_id = %sandbox_id,
-                "UpdateConfig: backfilled spec.policy from sandbox-discovered policy"
-            );
-        }
+            .map_err(|e| super::persistence_error_to_status(e, "backfill spec.policy"))?;
+        info!(
+            sandbox_id = %sandbox_id,
+            "UpdateConfig: backfilled spec.policy from sandbox-discovered policy"
+        );
     }
 
     let latest = state
@@ -1190,7 +1200,7 @@ pub(super) async fn handle_report_policy_status(
     };
 
     let loaded_at_ms = if status_str == "loaded" {
-        Some(current_time_ms().map_err(|e| Status::internal(format!("timestamp error: {e}")))?)
+        Some(current_time_ms())
     } else {
         None
     };
@@ -1222,11 +1232,19 @@ pub(super) async fn handle_report_policy_status(
             .store
             .supersede_older_policies(&req.sandbox_id, version)
             .await;
+
+        // Update current_policy_version using CAS
+        // TODO: Accept expected_version from UpdateConfigRequest for proper client-driven CAS
         let _sandbox_sync_guard = state.compute.sandbox_sync_guard().await;
-        if let Ok(Some(mut sandbox)) = state.store.get_message::<Sandbox>(&req.sandbox_id).await {
-            sandbox.current_policy_version = req.version;
-            let _ = state.store.put_message(&sandbox).await;
-        }
+        let version_to_set = req.version;
+        state
+            .store
+            .update_message_cas::<Sandbox, _>(&req.sandbox_id, 0, |sandbox| {
+                sandbox.current_policy_version = version_to_set;
+            })
+            .await
+            .map_err(|e| super::persistence_error_to_status(e, "update current_policy_version"))?;
+
         state.sandbox_watch_bus.notify(&req.sandbox_id);
     }
 
@@ -1352,6 +1370,7 @@ pub(super) async fn handle_submit_policy_analysis(
     let mut accepted: u32 = 0;
     let mut rejected: u32 = 0;
     let mut rejection_reasons: Vec<String> = Vec::new();
+    let mut accepted_chunk_ids: Vec<String> = Vec::new();
 
     for chunk in &req.proposed_chunks {
         if chunk.rule_name.is_empty() {
@@ -1365,9 +1384,7 @@ pub(super) async fn handle_submit_policy_analysis(
             continue;
         }
 
-        let chunk_id = uuid::Uuid::new_v4().to_string();
-        let now_ms =
-            current_time_ms().map_err(|e| Status::internal(format!("timestamp error: {e}")))?;
+        let now_ms = current_time_ms();
         let proposed_rule_bytes = chunk
             .proposed_rule
             .as_ref()
@@ -1385,7 +1402,10 @@ pub(super) async fn handle_submit_policy_analysis(
             .unwrap_or_default();
 
         let record = DraftChunkRecord {
-            id: chunk_id,
+            // The handler proposes an id; the store may swap it for an
+            // existing row's id on dedup. Always trust `effective_id` for
+            // anything user-facing.
+            id: uuid::Uuid::new_v4().to_string(),
             sandbox_id: sandbox_id.clone(),
             draft_version,
             status: "pending".to_string(),
@@ -1413,13 +1433,23 @@ pub(super) async fn handle_submit_policy_analysis(
             } else {
                 now_ms
             },
+            validation_result: String::new(),
+            rejection_reason: String::new(),
         };
-        state
+        // Mechanistic mode dedups N denials targeting the same endpoint
+        // into one chunk. All other modes (agent-authored proposals, future
+        // modes) submit each chunk as a distinct row — the redraft loop
+        // relies on it, and the conservative default for an unknown mode
+        // is to keep the proposal rather than silently fold it away.
+        let dedup_key = matches!(req.analysis_mode.as_str(), "mechanistic")
+            .then(|| crate::policy_store::observation_dedup_key(&record));
+        let effective_id = state
             .store
-            .put_draft_chunk(&record)
+            .put_draft_chunk(&record, dedup_key.as_deref())
             .await
             .map_err(|e| Status::internal(format!("persist draft chunk failed: {e}")))?;
         accepted += 1;
+        accepted_chunk_ids.push(effective_id);
     }
 
     state.sandbox_watch_bus.notify(&sandbox_id);
@@ -1437,6 +1467,7 @@ pub(super) async fn handle_submit_policy_analysis(
         accepted_chunks: accepted,
         rejected_chunks: rejected,
         rejection_reasons,
+        accepted_chunk_ids,
     }))
 }
 
@@ -1549,11 +1580,10 @@ pub(super) async fn handle_approve_draft_chunk(
         merge_chunk_into_policy(state.store.as_ref(), &sandbox_id, &chunk).await?;
     let chunk_summary = summarize_draft_chunk_rule(&chunk)?;
 
-    let now_ms =
-        current_time_ms().map_err(|e| Status::internal(format!("timestamp error: {e}")))?;
+    let now_ms = current_time_ms();
     state
         .store
-        .update_draft_chunk_status(&req.chunk_id, "approved", Some(now_ms))
+        .update_draft_chunk_status(&req.chunk_id, "approved", Some(now_ms), None)
         .await
         .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
 
@@ -1649,11 +1679,18 @@ pub(super) async fn handle_reject_draft_chunk(
         );
     }
 
-    let now_ms =
-        current_time_ms().map_err(|e| Status::internal(format!("timestamp error: {e}")))?;
+    let now_ms = current_time_ms();
+    // Persist the reviewer's free-form `reason` into the chunk's
+    // `rejection_reason` field so the in-sandbox agent can read it back via
+    // GetDraftPolicy / policy.local and revise the proposal.
+    let persisted_reason = if req.reason.is_empty() {
+        None
+    } else {
+        Some(req.reason.as_str())
+    };
     state
         .store
-        .update_draft_chunk_status(&req.chunk_id, "rejected", Some(now_ms))
+        .update_draft_chunk_status(&req.chunk_id, "rejected", Some(now_ms), persisted_reason)
         .await
         .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
 
@@ -1731,11 +1768,10 @@ pub(super) async fn handle_approve_all_draft_chunks(
         last_hash = hash;
         let chunk_summary = summarize_draft_chunk_rule(chunk)?;
 
-        let now_ms =
-            current_time_ms().map_err(|e| Status::internal(format!("timestamp error: {e}")))?;
+        let now_ms = current_time_ms();
         state
             .store
-            .update_draft_chunk_status(&chunk.id, "approved", Some(now_ms))
+            .update_draft_chunk_status(&chunk.id, "approved", Some(now_ms), None)
             .await
             .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
 
@@ -1878,9 +1914,12 @@ pub(super) async fn handle_undo_draft_chunk(
 
     let (version, hash) = remove_chunk_from_policy(state, &sandbox_id, &chunk).await?;
 
+    // Clear any prior rejection_reason on the way back to "pending" so an
+    // agent reading the chunk via policy.local cannot see a stale guidance
+    // string left over from a previous reject → undo round.
     state
         .store
-        .update_draft_chunk_status(&req.chunk_id, "pending", None)
+        .update_draft_chunk_status(&req.chunk_id, "pending", None, Some(""))
         .await
         .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
 
@@ -2102,6 +2141,8 @@ fn draft_chunk_record_to_proto(record: &DraftChunkRecord) -> Result<PolicyChunk,
         first_seen_ms: record.first_seen_ms,
         last_seen_ms: record.last_seen_ms,
         binary: record.binary.clone(),
+        validation_result: record.validation_result.clone(),
+        rejection_reason: record.rejection_reason.clone(),
         ..Default::default()
     })
 }
@@ -2141,6 +2182,7 @@ fn generate_security_notes(host: &str, port: u16) -> String {
         || host.starts_with("192.168.")
         || host == "localhost"
         || host.starts_with("127.")
+        || host.starts_with("169.254.")
     {
         notes.push(format!(
             "Destination '{host}' appears to be an internal/private address."
@@ -2637,8 +2679,11 @@ async fn load_settings_record(
         .await
         .map_err(|e| Status::internal(format!("fetch settings failed: {e}")))?;
     if let Some(record) = record {
-        serde_json::from_slice::<StoredSettings>(&record.payload)
-            .map_err(|e| Status::internal(format!("decode settings payload failed: {e}")))
+        let mut settings = serde_json::from_slice::<StoredSettings>(&record.payload)
+            .map_err(|e| Status::internal(format!("decode settings payload failed: {e}")))?;
+        // Populate resource_version from database record for CAS
+        settings.resource_version = record.resource_version;
+        Ok(settings)
     } else {
         Ok(StoredSettings::default())
     }
@@ -2650,18 +2695,43 @@ async fn save_settings_record(
     name: &str,
     settings: &StoredSettings,
 ) -> Result<(), Status> {
+    use crate::persistence::WriteCondition;
+
     let payload = serde_json::to_vec(settings)
         .map_err(|e| Status::internal(format!("encode settings payload failed: {e}")))?;
-    store
-        .put(
-            object_type,
-            &uuid::Uuid::new_v4().to_string(),
-            name,
-            &payload,
-            None,
+
+    let (id, condition) = if settings.resource_version == 0 {
+        // Create new settings (resource_version 0 means never persisted)
+        (uuid::Uuid::new_v4().to_string(), WriteCondition::MustCreate)
+    } else {
+        // Update existing with CAS on the version from when it was loaded
+        // Fetch the record to get the stable ID
+        let existing = store
+            .get_by_name(object_type, name)
+            .await
+            .map_err(|e| Status::internal(format!("fetch settings for CAS failed: {e}")))?
+            .ok_or_else(|| Status::not_found("settings disappeared since load"))?;
+
+        (
+            existing.id,
+            WriteCondition::MatchResourceVersion(settings.resource_version),
         )
+    };
+
+    // Single-attempt CAS write
+    store
+        .put_if(object_type, &id, name, &payload, None, condition)
         .await
-        .map_err(|e| Status::internal(format!("persist settings failed: {e}")))?;
+        .map_err(|e| match e {
+            crate::persistence::PersistenceError::Conflict { .. } => {
+                Status::aborted("settings were modified concurrently; please retry")
+            }
+            crate::persistence::PersistenceError::UniqueViolation { .. } => {
+                Status::aborted("settings were created concurrently; please retry")
+            }
+            other => super::persistence_error_to_status(other, "persist settings"),
+        })?;
+
     Ok(())
 }
 
@@ -2758,59 +2828,52 @@ fn materialize_global_settings(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ServerState;
-    use crate::compute::new_test_runtime;
-    use crate::persistence::Store;
-    use crate::sandbox_index::SandboxIndex;
-    use crate::sandbox_watch::SandboxWatchBus;
-    use crate::supervisor_session::SupervisorSessionRegistry;
-    use crate::tracing_bus::TracingLogBus;
-    use openshell_core::Config;
+    use crate::grpc::test_support::test_server_state;
     use std::collections::HashMap;
     use std::sync::Arc;
     use tonic::Code;
 
     #[test]
-    fn sandbox_secret_update_validation_allows_sandbox_policy_sync() {
+    fn sandbox_caller_update_validation_allows_sandbox_policy_sync() {
         let req = UpdateConfigRequest {
             name: "sandbox-1".to_string(),
             policy: Some(ProtoSandboxPolicy::default()),
             ..Default::default()
         };
-        assert!(validate_sandbox_secret_update(&req).is_ok());
+        assert!(validate_sandbox_caller_update(&req).is_ok());
     }
 
     #[test]
-    fn sandbox_secret_update_validation_rejects_global_mutation() {
+    fn sandbox_caller_update_validation_rejects_global_mutation() {
         let req = UpdateConfigRequest {
             global: true,
             policy: Some(ProtoSandboxPolicy::default()),
             ..Default::default()
         };
-        let err = validate_sandbox_secret_update(&req).unwrap_err();
+        let err = validate_sandbox_caller_update(&req).unwrap_err();
         assert_eq!(err.code(), Code::PermissionDenied);
     }
 
     #[test]
-    fn sandbox_secret_update_validation_rejects_setting_mutation() {
+    fn sandbox_caller_update_validation_rejects_setting_mutation() {
         let req = UpdateConfigRequest {
             name: "sandbox-1".to_string(),
             setting_key: "inference.model".to_string(),
             setting_value: Some(SettingValue { value: None }),
             ..Default::default()
         };
-        let err = validate_sandbox_secret_update(&req).unwrap_err();
+        let err = validate_sandbox_caller_update(&req).unwrap_err();
         assert_eq!(err.code(), Code::PermissionDenied);
     }
 
     #[test]
-    fn sandbox_secret_marker_detected_from_metadata() {
+    fn sandbox_caller_marker_detected_from_metadata() {
         let mut req = Request::new(());
         req.metadata_mut().insert(
             oidc::INTERNAL_AUTH_SOURCE_HEADER,
-            oidc::AUTH_SOURCE_SANDBOX_SECRET.parse().unwrap(),
+            oidc::AUTH_SOURCE_SANDBOX.parse().unwrap(),
         );
-        assert!(is_sandbox_secret_authenticated(&req));
+        assert!(is_sandbox_caller(&req));
     }
 
     // ---- Sandbox without policy ----
@@ -2827,6 +2890,7 @@ mod tests {
                 name: "no-policy-sandbox".to_string(),
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
+                resource_version: 0,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -2852,11 +2916,13 @@ mod tests {
                 name: name.to_string(),
                 created_at_ms: 1_000_000,
                 labels: HashMap::new(),
+                resource_version: 0,
             }),
             r#type: provider_type.to_string(),
             credentials: std::iter::once(("GITHUB_TOKEN".to_string(), "ghp-test".to_string()))
                 .collect(),
             config: HashMap::new(),
+            credential_expires_at_ms: HashMap::new(),
         }
     }
 
@@ -2893,6 +2959,7 @@ mod tests {
                 name: name.to_string(),
                 created_at_ms: 1_000_000,
                 labels: HashMap::new(),
+                resource_version: 0,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(policy),
@@ -2912,6 +2979,7 @@ mod tests {
                 StoredSettingValue::Bool(true),
             ))
             .collect(),
+            ..Default::default()
         };
         save_global_settings(state.store.as_ref(), &global_settings)
             .await
@@ -2961,6 +3029,7 @@ mod tests {
                     name: "generic".to_string(),
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 profile: Some(openshell_core::proto::ProviderProfile {
                     id: "generic".to_string(),
@@ -3002,6 +3071,7 @@ mod tests {
                     name: "custom-api".to_string(),
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 profile: Some(openshell_core::proto::ProviderProfile {
                     id: "custom-api".to_string(),
@@ -3064,6 +3134,7 @@ mod tests {
                     name: "custom-api".to_string(),
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 profile: Some(openshell_core::proto::ProviderProfile {
                     id: "custom-api".to_string(),
@@ -3490,6 +3561,7 @@ mod tests {
             Request::new(AttachSandboxProviderRequest {
                 sandbox_name: "attach-lifecycle".to_string(),
                 provider_name: "work-github".to_string(),
+                expected_resource_version: 0,
             }),
         )
         .await
@@ -3525,6 +3597,7 @@ mod tests {
             Request::new(DetachSandboxProviderRequest {
                 sandbox_name: "attach-lifecycle".to_string(),
                 provider_name: "work-github".to_string(),
+                expected_resource_version: 0,
             }),
         )
         .await
@@ -3648,6 +3721,7 @@ mod tests {
             Request::new(AttachSandboxProviderRequest {
                 sandbox_name: "custom-attach-lifecycle".to_string(),
                 provider_name: "work-custom".to_string(),
+                expected_resource_version: 0,
             }),
         )
         .await
@@ -3686,6 +3760,7 @@ mod tests {
             Request::new(DetachSandboxProviderRequest {
                 sandbox_name: "custom-attach-lifecycle".to_string(),
                 provider_name: "work-custom".to_string(),
+                expected_resource_version: 0,
             }),
         )
         .await
@@ -3749,6 +3824,7 @@ mod tests {
                 name: "global-profile-sandbox".to_string(),
                 created_at_ms: 1_000_000,
                 labels: HashMap::new(),
+                resource_version: 0,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(sandbox_policy),
@@ -3790,6 +3866,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            ..Default::default()
         };
         save_global_settings(state.store.as_ref(), &global_settings)
             .await
@@ -3836,6 +3913,7 @@ mod tests {
                 name: "backfill-sandbox".to_string(),
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
+                resource_version: 0,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -3884,27 +3962,6 @@ mod tests {
         assert_eq!(policy.process.unwrap().run_as_user, "sandbox");
     }
 
-    async fn test_server_state() -> Arc<ServerState> {
-        let store = Arc::new(
-            Store::connect("sqlite::memory:?cache=shared")
-                .await
-                .unwrap(),
-        );
-        let compute = new_test_runtime(store.clone()).await;
-        Arc::new(ServerState::new(
-            Config::new(None)
-                .with_database_url("sqlite::memory:?cache=shared")
-                .with_ssh_handshake_secret("test-secret"),
-            store,
-            compute,
-            SandboxIndex::new(),
-            SandboxWatchBus::new(),
-            TracingLogBus::new(),
-            Arc::new(SupervisorSessionRegistry::new()),
-            None,
-        ))
-    }
-
     #[tokio::test]
     async fn draft_chunk_handler_lifecycle_round_trip() {
         use openshell_core::proto::{
@@ -3918,6 +3975,7 @@ mod tests {
                 name: "draft-flow".to_string(),
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
+                resource_version: 0,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -3965,6 +4023,8 @@ mod tests {
         .into_inner();
         assert_eq!(submit.accepted_chunks, 1);
         assert_eq!(submit.rejected_chunks, 0);
+        assert_eq!(submit.accepted_chunk_ids.len(), 1);
+        assert!(!submit.accepted_chunk_ids[0].is_empty());
 
         let draft_policy = handle_get_draft_policy(
             &state,
@@ -4110,6 +4170,429 @@ mod tests {
         assert!(history_after_clear.entries.is_empty());
     }
 
+    /// A reviewer's free-form rejection reason must round-trip through
+    /// persistence and surface on the chunk via `GetDraftPolicy`, so the
+    /// in-sandbox agent can read the guidance and redraft. The MVP-v2 agent
+    /// feedback loop hangs off this guarantee.
+    #[tokio::test]
+    async fn reject_with_reason_persists_into_chunk_for_agent_readback() {
+        use openshell_core::proto::{NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxSpec};
+
+        let state = test_server_state().await;
+        let sandbox_name = "agent-feedback-loop".to_string();
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-feedback".to_string(),
+                name: sandbox_name.clone(),
+                created_at_ms: 1_000_000,
+                labels: std::collections::HashMap::new(),
+                resource_version: 0,
+            }),
+            spec: Some(SandboxSpec {
+                policy: None,
+                ..Default::default()
+            }),
+            phase: SandboxPhase::Ready as i32,
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let proposed_rule = NetworkPolicyRule {
+            name: "allow_example".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "api.example.com".to_string(),
+                port: 443,
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        let submit = handle_submit_policy_analysis(
+            &state,
+            Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.clone(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "allow_example".to_string(),
+                    proposed_rule: Some(proposed_rule),
+                    rationale: "agent intent".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let chunk_id = submit.accepted_chunk_ids[0].clone();
+
+        let guidance = "scope to docs/ paths only, not all repo contents";
+        handle_reject_draft_chunk(
+            &state,
+            Request::new(RejectDraftChunkRequest {
+                name: sandbox_name.clone(),
+                chunk_id: chunk_id.clone(),
+                reason: guidance.to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let draft = handle_get_draft_policy(
+            &state,
+            Request::new(GetDraftPolicyRequest {
+                name: sandbox_name,
+                status_filter: String::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let rejected = draft
+            .chunks
+            .iter()
+            .find(|c| c.id == chunk_id)
+            .expect("rejected chunk should still be visible");
+        assert_eq!(rejected.status, "rejected");
+        assert_eq!(
+            rejected.rejection_reason, guidance,
+            "reviewer's free-form reason must round-trip into the chunk for agent readback"
+        );
+        // validation_result is unpopulated until the prover runs (#1097).
+        assert!(rejected.validation_result.is_empty());
+    }
+
+    /// Two agent-authored proposals targeting the same host/port/binary must
+    /// each persist as a distinct chunk. The mechanistic-mode dedup
+    /// (`host|port|binary`) is wrong for agent intent: the redraft loop
+    /// relies on the second submission landing as its own chunk so the
+    /// reviewer can decide on it independently. Regression test for the bug
+    /// where Flow B of `e2e/policy-advisor/wait-smoke.sh` saw a fresh
+    /// `chunk_id` returned from submit but `RejectDraftChunk` could not
+    /// find it because the SQL ON CONFLICT had silently kept the prior row.
+    #[tokio::test]
+    async fn agent_authored_submits_for_same_endpoint_do_not_dedup() {
+        use openshell_core::proto::{NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxSpec};
+
+        let state = test_server_state().await;
+        let sandbox_name = "redraft-loop".to_string();
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-redraft".to_string(),
+                name: sandbox_name.clone(),
+                created_at_ms: 1_000_000,
+                labels: std::collections::HashMap::new(),
+                resource_version: 0,
+            }),
+            spec: Some(SandboxSpec {
+                policy: None,
+                ..Default::default()
+            }),
+            phase: SandboxPhase::Ready as i32,
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+
+        // Two proposals with the same host|port|binary (so the mechanistic
+        // dedup_key would collide) but distinct rule names and L7 paths —
+        // proves the gateway distinguishes them by intentional act and not
+        // by payload hash. If a future dedup-by-payload-hash regression
+        // landed, this test would still fail because the chunk_ids would
+        // still need to be distinct.
+        let make_rule = |rule_name: &str| NetworkPolicyRule {
+            name: rule_name.to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "api.example.com".to_string(),
+                port: 443,
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        let submit_one = |rule_name: &str, rule: NetworkPolicyRule| {
+            let state = state.clone();
+            let sandbox_name = sandbox_name.clone();
+            let rule_name = rule_name.to_string();
+            async move {
+                handle_submit_policy_analysis(
+                    &state,
+                    Request::new(SubmitPolicyAnalysisRequest {
+                        name: sandbox_name,
+                        analysis_mode: "agent_authored".to_string(),
+                        proposed_chunks: vec![PolicyChunk {
+                            rule_name,
+                            proposed_rule: Some(rule),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap()
+                .into_inner()
+            }
+        };
+
+        let first = submit_one("allow_first", make_rule("allow_first")).await;
+        let second = submit_one("allow_second", make_rule("allow_second")).await;
+
+        assert_eq!(first.accepted_chunk_ids.len(), 1);
+        assert_eq!(second.accepted_chunk_ids.len(), 1);
+        assert_ne!(
+            first.accepted_chunk_ids[0], second.accepted_chunk_ids[0],
+            "second agent-authored proposal for the same endpoint must get its own chunk_id, not dedup"
+        );
+
+        let draft = handle_get_draft_policy(
+            &state,
+            Request::new(GetDraftPolicyRequest {
+                name: sandbox_name.clone(),
+                status_filter: String::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let ids: Vec<_> = draft.chunks.iter().map(|c| c.id.as_str()).collect();
+        assert!(
+            ids.contains(&first.accepted_chunk_ids[0].as_str())
+                && ids.contains(&second.accepted_chunk_ids[0].as_str()),
+            "both reported chunk_ids must be persisted; got: {ids:?}"
+        );
+
+        // Reject the second by id to prove the gateway can actually find
+        // what the submit response claimed to have created — this is the
+        // exact path the smoke test exercises end-to-end.
+        handle_reject_draft_chunk(
+            &state,
+            Request::new(RejectDraftChunkRequest {
+                name: sandbox_name,
+                chunk_id: second.accepted_chunk_ids[0].clone(),
+                reason: "redraft test".to_string(),
+            }),
+        )
+        .await
+        .expect("reject must find the chunk_id the submit response just promised");
+    }
+
+    /// Complement to the agent-authored test above: mechanistic-mode
+    /// submissions for the same endpoint must STILL dedup. The
+    /// observation-driven path relies on N denials folding into one chunk
+    /// instead of N near-identical chunks. Lock the behavior in so a future
+    /// change to the dedup branch doesn't accidentally also turn off
+    /// mechanistic dedup.
+    #[tokio::test]
+    async fn mechanistic_submits_for_same_endpoint_dedup_into_one_chunk() {
+        use openshell_core::proto::{NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxSpec};
+
+        let state = test_server_state().await;
+        let sandbox_name = "mechanistic-dedup".to_string();
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-mech-dedup".to_string(),
+                name: sandbox_name.clone(),
+                created_at_ms: 1_000_000,
+                labels: std::collections::HashMap::new(),
+                resource_version: 0,
+            }),
+            spec: Some(SandboxSpec {
+                policy: None,
+                ..Default::default()
+            }),
+            phase: SandboxPhase::Ready as i32,
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let proposed_rule = NetworkPolicyRule {
+            name: "allow_example".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "api.example.com".to_string(),
+                port: 443,
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+        let submit_one = || {
+            let state = state.clone();
+            let sandbox_name = sandbox_name.clone();
+            let rule = proposed_rule.clone();
+            async move {
+                handle_submit_policy_analysis(
+                    &state,
+                    Request::new(SubmitPolicyAnalysisRequest {
+                        name: sandbox_name,
+                        analysis_mode: "mechanistic".to_string(),
+                        proposed_chunks: vec![PolicyChunk {
+                            rule_name: "allow_example".to_string(),
+                            proposed_rule: Some(rule),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap()
+                .into_inner()
+            }
+        };
+        let first = submit_one().await;
+        let second = submit_one().await;
+        assert_eq!(first.accepted_chunk_ids.len(), 1);
+        assert_eq!(second.accepted_chunk_ids.len(), 1);
+
+        let draft = handle_get_draft_policy(
+            &state,
+            Request::new(GetDraftPolicyRequest {
+                name: sandbox_name,
+                status_filter: String::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(
+            draft.chunks.len(),
+            1,
+            "two mechanistic submits for the same host|port|binary must dedup; got {} chunks",
+            draft.chunks.len()
+        );
+        // Both submits must report the same effective id — the id of the
+        // one row that actually exists in the DB. Before the dedup fix the
+        // second submit would return a freshly-generated UUID that was
+        // never persisted; this assertion locks the contract down.
+        let stored_id = &draft.chunks[0].id;
+        assert_eq!(
+            &first.accepted_chunk_ids[0], stored_id,
+            "first submit's reported id must match the stored chunk"
+        );
+        assert_eq!(
+            &second.accepted_chunk_ids[0], stored_id,
+            "second submit must report the same id as the first (dedup fold-in), not a fresh UUID"
+        );
+    }
+
+    /// Undo of an approve must clear any `rejection_reason` left over from a
+    /// prior reject. Without this, the in-sandbox agent reading chunks via
+    /// `policy.local` cannot tell "pending and never rejected" from "pending
+    /// but previously rejected with this stale guidance." The only path that
+    /// lands a non-empty reason on a pending chunk is reject → re-approve →
+    /// undo, so the test walks that sequence.
+    #[tokio::test]
+    async fn undo_after_reject_clears_stale_rejection_reason() {
+        use openshell_core::proto::{NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxSpec};
+
+        let state = test_server_state().await;
+        let sandbox_name = "undo-clears-reason".to_string();
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-undo-clears".to_string(),
+                name: sandbox_name.clone(),
+                created_at_ms: 1_000_000,
+                labels: std::collections::HashMap::new(),
+                resource_version: 0,
+            }),
+            spec: Some(SandboxSpec {
+                policy: None,
+                ..Default::default()
+            }),
+            phase: SandboxPhase::Ready as i32,
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let proposed_rule = NetworkPolicyRule {
+            name: "allow_example".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "api.example.com".to_string(),
+                port: 443,
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        let submit = handle_submit_policy_analysis(
+            &state,
+            Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.clone(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "allow_example".to_string(),
+                    proposed_rule: Some(proposed_rule),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let chunk_id = submit.accepted_chunk_ids[0].clone();
+
+        handle_reject_draft_chunk(
+            &state,
+            Request::new(RejectDraftChunkRequest {
+                name: sandbox_name.clone(),
+                chunk_id: chunk_id.clone(),
+                reason: "scope too broad".to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        handle_approve_draft_chunk(
+            &state,
+            Request::new(ApproveDraftChunkRequest {
+                name: sandbox_name.clone(),
+                chunk_id: chunk_id.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        handle_undo_draft_chunk(
+            &state,
+            Request::new(UndoDraftChunkRequest {
+                name: sandbox_name.clone(),
+                chunk_id: chunk_id.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        let draft = handle_get_draft_policy(
+            &state,
+            Request::new(GetDraftPolicyRequest {
+                name: sandbox_name,
+                status_filter: String::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let restored = draft
+            .chunks
+            .iter()
+            .find(|c| c.id == chunk_id)
+            .expect("chunk should still be present after undo");
+        assert_eq!(restored.status, "pending");
+        assert!(
+            restored.rejection_reason.is_empty(),
+            "undo must clear stale rejection_reason; got: {:?}",
+            restored.rejection_reason
+        );
+    }
+
     #[tokio::test]
     async fn draft_chunk_handlers_reject_cross_sandbox_chunk_ids() {
         use openshell_core::proto::{NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxSpec};
@@ -4121,6 +4604,7 @@ mod tests {
                 name: "draft-owner".to_string(),
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
+                resource_version: 0,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -4135,6 +4619,7 @@ mod tests {
                 name: "draft-other".to_string(),
                 created_at_ms: 1_000_001,
                 labels: std::collections::HashMap::new(),
+                resource_version: 0,
             }),
             spec: Some(SandboxSpec {
                 policy: None,
@@ -4318,6 +4803,62 @@ mod tests {
         );
     }
 
+    #[test]
+    fn summarize_cli_policy_merge_op_formats_websocket_credential_rewrite() {
+        let operation = PolicyMergeOp::AddRule {
+            rule_name: "realtime_api".to_string(),
+            rule: NetworkPolicyRule {
+                name: "realtime_api".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "realtime.example.com".to_string(),
+                    port: 443,
+                    protocol: "websocket".to_string(),
+                    access: "read-write".to_string(),
+                    enforcement: "enforce".to_string(),
+                    websocket_credential_rewrite: true,
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/node".to_string(),
+                    ..Default::default()
+                }],
+            },
+        };
+
+        assert_eq!(
+            summarize_cli_policy_merge_op(&operation),
+            "add-endpoint realtime_api endpoints=[realtime.example.com:443 protocol=websocket access=read-write enforcement=enforce websocket_credential_rewrite=true] binaries=[/usr/bin/node]"
+        );
+    }
+
+    #[test]
+    fn summarize_cli_policy_merge_op_formats_request_body_credential_rewrite() {
+        let operation = PolicyMergeOp::AddRule {
+            rule_name: "slack_api".to_string(),
+            rule: NetworkPolicyRule {
+                name: "slack_api".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "slack.com".to_string(),
+                    port: 443,
+                    protocol: "rest".to_string(),
+                    access: "read-write".to_string(),
+                    enforcement: "enforce".to_string(),
+                    request_body_credential_rewrite: true,
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/node".to_string(),
+                    ..Default::default()
+                }],
+            },
+        };
+
+        assert_eq!(
+            summarize_cli_policy_merge_op(&operation),
+            "add-endpoint slack_api endpoints=[slack.com:443 protocol=rest access=read-write enforcement=enforce request_body_credential_rewrite=true] binaries=[/usr/bin/node]"
+        );
+    }
+
     // ---- merge_chunk_into_policy ----
 
     #[tokio::test]
@@ -4355,6 +4896,8 @@ mod tests {
             hit_count: 1,
             first_seen_ms: 0,
             last_seen_ms: 0,
+            validation_result: String::new(),
+            rejection_reason: String::new(),
         };
 
         let (version, _) = merge_chunk_into_policy(&store, &chunk.sandbox_id, &chunk)
@@ -4449,6 +4992,8 @@ mod tests {
             hit_count: 1,
             first_seen_ms: 0,
             last_seen_ms: 0,
+            validation_result: String::new(),
+            rejection_reason: String::new(),
         };
 
         let (version, _) = merge_chunk_into_policy(&store, sandbox_id, &chunk)
@@ -4548,6 +5093,8 @@ mod tests {
             hit_count: 1,
             first_seen_ms: 0,
             last_seen_ms: 0,
+            validation_result: String::new(),
+            rejection_reason: String::new(),
         };
 
         let (version, _) = merge_chunk_into_policy(&store, sandbox_id, &chunk)
@@ -4808,6 +5355,7 @@ mod tests {
             revision: 1,
             settings: std::iter::once(("policy".to_string(), StoredSettingValue::Bytes(encoded)))
                 .collect(),
+            ..Default::default()
         };
 
         let decoded = decode_policy_from_global_settings(&global)
@@ -4890,6 +5438,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            ..Default::default()
         };
         let sandbox = StoredSettings {
             revision: 1,
@@ -4902,6 +5451,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            ..Default::default()
         };
 
         let merged = merge_effective_settings(&global, &sandbox).unwrap();
@@ -4931,6 +5481,7 @@ mod tests {
             )]
             .into_iter()
             .collect(),
+            ..Default::default()
         };
 
         let merged = merge_effective_settings(&global, &sandbox).unwrap();
@@ -4960,6 +5511,7 @@ mod tests {
                 StoredSettingValue::Bytes("deadbeef".to_string()),
             ))
             .collect(),
+            ..Default::default()
         };
         let sandbox = StoredSettings {
             revision: 1,
@@ -4968,6 +5520,7 @@ mod tests {
                 StoredSettingValue::Bytes("cafebabe".to_string()),
             ))
             .collect(),
+            ..Default::default()
         };
 
         let merged = merge_effective_settings(&global, &sandbox).unwrap();
@@ -5260,24 +5813,53 @@ mod tests {
                     .settings
                     .insert(format!("key_{i}"), StoredSettingValue::Int(i as i64));
                 settings.revision = settings.revision.wrapping_add(1);
-                save_global_settings(&store, &settings).await.unwrap();
+                save_global_settings(&store, &settings).await
             }));
         }
 
+        let mut succeeded = 0;
+        let mut cas_conflicts = 0;
         for h in handles {
-            h.await.unwrap();
+            match h.await.unwrap() {
+                Ok(()) => succeeded += 1,
+                Err(e) if e.code() == Code::Aborted => cas_conflicts += 1,
+                Err(e) => panic!("unexpected error: {e}"),
+            }
         }
 
         let final_settings = load_global_settings(&store).await.unwrap();
-        let lost = (n as u64).saturating_sub(final_settings.revision);
-        if lost == 0 {
-            eprintln!(
-                "note: no lost writes detected in unlocked test (sequential scheduling); \
-                 the locked test is the authoritative correctness check"
-            );
-        } else {
-            eprintln!("unlocked test: {lost} lost writes out of {n} (expected behavior)");
-        }
+
+        // With single-attempt CAS (no retry), concurrent modifications are properly detected:
+        // - All tasks read initial state (revision=0, resource_version=0)
+        // - First write succeeds with resource_version=1
+        // - Subsequent writes fail with ABORTED (CAS conflict) because they all have stale resource_version=0
+        // - Only the first write succeeds; all others are rejected
+        //
+        // This demonstrates that single-attempt CAS prevents lost writes by rejecting stale updates.
+        // The caller must retry from a fresh read to incorporate concurrent changes.
+        assert!(
+            cas_conflicts > 0,
+            "most concurrent writes should fail with CAS conflict (succeeded={succeeded}, conflicts={cas_conflicts})"
+        );
+        assert!(
+            succeeded < n,
+            "not all writes should succeed due to conflicts (succeeded={succeeded}, total={n})"
+        );
+        assert_eq!(
+            final_settings.revision as usize, succeeded,
+            "final revision should match number of successful writes"
+        );
+        assert_eq!(
+            final_settings.settings.len(),
+            succeeded,
+            "final settings should contain exactly the keys from successful writes"
+        );
+
+        eprintln!(
+            "unlocked CAS test: {succeeded} succeeded, {cas_conflicts} CAS conflicts, \
+             final revision={} (matches succeeded count, demonstrating proper conflict detection)",
+            final_settings.revision
+        );
     }
 
     // ---- Conflict guard tests ----
@@ -5324,6 +5906,7 @@ mod tests {
             .await
             .unwrap();
 
+        // Create initial global settings
         let mut global = StoredSettings::default();
         global.settings.insert(
             "log_level".to_string(),
@@ -5335,6 +5918,8 @@ mod tests {
         let loaded = load_global_settings(&store).await.unwrap();
         assert!(loaded.settings.contains_key("log_level"));
 
+        // Load fresh to get current resource_version before updating
+        let mut global = load_global_settings(&store).await.unwrap();
         global.settings.remove("log_level");
         global.revision = 2;
         save_global_settings(&store, &global).await.unwrap();
@@ -5377,5 +5962,331 @@ mod tests {
         let err = proto_setting_to_stored("policy", &value).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("unknown setting key"));
+    }
+
+    #[tokio::test]
+    async fn save_settings_detects_concurrent_modification() {
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+
+        // Create initial settings
+        let mut settings = StoredSettings {
+            revision: 1,
+            settings: std::iter::once((
+                "initial_key".to_string(),
+                StoredSettingValue::String("initial_value".to_string()),
+            ))
+            .collect(),
+            ..Default::default()
+        };
+        save_global_settings(&store, &settings).await.unwrap();
+
+        // Load settings (simulating first client read)
+        let loaded = load_global_settings(&store).await.unwrap();
+        assert_eq!(loaded.revision, 1);
+
+        // Simulate concurrent modification: another client updates the settings
+        let mut concurrent_update = loaded.clone();
+        concurrent_update.settings.insert(
+            "concurrent_key".to_string(),
+            StoredSettingValue::String("concurrent_value".to_string()),
+        );
+        concurrent_update.revision = 2;
+        save_global_settings(&store, &concurrent_update)
+            .await
+            .unwrap();
+
+        // Now attempt to save our original modification (which is based on stale revision 1)
+        settings.settings.insert(
+            "our_key".to_string(),
+            StoredSettingValue::String("our_value".to_string()),
+        );
+        settings.revision = 2; // We think we're updating to revision 2
+
+        let result = save_global_settings(&store, &settings).await;
+
+        // Should fail with ABORTED due to concurrent modification
+        assert!(result.is_err(), "save with stale revision should fail");
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.code(),
+            Code::Aborted,
+            "should fail with ABORTED due to version mismatch"
+        );
+        assert!(
+            err.message().contains("concurrently"),
+            "error should mention concurrent modification: {}",
+            err.message()
+        );
+
+        // Verify the database contains the concurrent update, not our stale update
+        let final_settings = load_global_settings(&store).await.unwrap();
+        assert_eq!(final_settings.revision, 2);
+        assert!(
+            final_settings.settings.contains_key("concurrent_key"),
+            "concurrent update should be preserved"
+        );
+        assert!(
+            !final_settings.settings.contains_key("our_key"),
+            "stale update should NOT be in database"
+        );
+    }
+
+    // ---- CAS (Client-driven optimistic concurrency) tests for UpdateConfig ----
+    // These test the policy backfill path where spec.policy is None and UpdateConfig
+    // uses update_message_cas to atomically set it.
+
+    #[tokio::test]
+    async fn update_config_policy_backfill_cas_succeeds_with_correct_version() {
+        use openshell_core::proto::{SandboxPhase, SandboxSpec};
+
+        let state = test_server_state().await;
+
+        // Create a sandbox WITHOUT a policy (spec.policy = None)
+        // This simulates a sandbox before the supervisor has discovered and synced a policy
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-1".to_string(),
+                name: "test-sandbox".to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+                resource_version: 0,
+            }),
+            spec: Some(SandboxSpec {
+                policy: None, // No policy yet - will be backfilled
+                providers: Vec::new(),
+                ..Default::default()
+            }),
+            phase: SandboxPhase::Provisioning as i32,
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+
+        // Fetch the sandbox to get its current resource_version
+        let current = state
+            .store
+            .get_message_by_name::<Sandbox>("test-sandbox")
+            .await
+            .unwrap()
+            .unwrap();
+        let current_version = current.metadata.as_ref().unwrap().resource_version;
+
+        // Backfill the policy with correct expected_resource_version
+        let new_policy = ProtoSandboxPolicy::default();
+
+        let response = handle_update_config(
+            &state,
+            Request::new(UpdateConfigRequest {
+                name: "test-sandbox".to_string(),
+                policy: Some(new_policy),
+                setting_key: String::new(),
+                setting_value: None,
+                delete_setting: false,
+                global: false,
+                merge_operations: vec![],
+                expected_resource_version: current_version,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        // UpdateConfigResponse contains the policy version
+        assert_eq!(response.version, 1);
+
+        // Verify the resource_version incremented and policy was backfilled
+        let updated_sandbox = state
+            .store
+            .get_message_by_name::<Sandbox>("test-sandbox")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            updated_sandbox.metadata.as_ref().unwrap().resource_version,
+            current_version + 1,
+            "resource_version should increment during CAS backfill"
+        );
+        assert!(
+            updated_sandbox.spec.as_ref().unwrap().policy.is_some(),
+            "policy should be backfilled"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_config_policy_backfill_cas_rejects_stale_version() {
+        use openshell_core::proto::{SandboxPhase, SandboxSpec};
+
+        let state = test_server_state().await;
+
+        // Create a sandbox WITHOUT a policy
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-1".to_string(),
+                name: "test-sandbox".to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+                resource_version: 0,
+            }),
+            spec: Some(SandboxSpec {
+                policy: None,
+                providers: Vec::new(),
+                ..Default::default()
+            }),
+            phase: SandboxPhase::Provisioning as i32,
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+
+        // Get current version
+        let current = state
+            .store
+            .get_message_by_name::<Sandbox>("test-sandbox")
+            .await
+            .unwrap()
+            .unwrap();
+        let current_version = current.metadata.as_ref().unwrap().resource_version;
+
+        // Try to backfill with a stale version
+        let new_policy = ProtoSandboxPolicy::default();
+
+        let err = handle_update_config(
+            &state,
+            Request::new(UpdateConfigRequest {
+                name: "test-sandbox".to_string(),
+                policy: Some(new_policy),
+                setting_key: String::new(),
+                setting_value: None,
+                delete_setting: false,
+                global: false,
+                merge_operations: vec![],
+                expected_resource_version: 99, // stale version
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        // Should get ABORTED status for CAS conflict
+        assert_eq!(err.code(), Code::Aborted);
+        assert!(
+            err.message().contains("modified concurrently")
+                || err.message().contains("resource_version"),
+            "error message should mention concurrency conflict: {}",
+            err.message()
+        );
+
+        // Verify the sandbox was not modified (policy still None)
+        let unchanged = state
+            .store
+            .get_message_by_name::<Sandbox>("test-sandbox")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            unchanged.metadata.as_ref().unwrap().resource_version,
+            current_version,
+            "resource_version should not change when CAS fails"
+        );
+        assert!(
+            unchanged.spec.as_ref().unwrap().policy.is_none(),
+            "policy should still be None after failed backfill"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_config_policy_backfill_concurrent_with_stale_versions() {
+        use openshell_core::proto::{SandboxPhase, SandboxSpec};
+        use std::sync::Arc;
+
+        let state = Arc::new(test_server_state().await);
+
+        // Create a sandbox WITHOUT a policy
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-1".to_string(),
+                name: "test-sandbox".to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+                resource_version: 0,
+            }),
+            spec: Some(SandboxSpec {
+                policy: None,
+                providers: Vec::new(),
+                ..Default::default()
+            }),
+            phase: SandboxPhase::Provisioning as i32,
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+
+        // All three clients fetch the sandbox and see the same version
+        let initial = state
+            .store
+            .get_message_by_name::<Sandbox>("test-sandbox")
+            .await
+            .unwrap()
+            .unwrap();
+        let initial_version = initial.metadata.as_ref().unwrap().resource_version;
+
+        // Launch 3 concurrent policy backfill attempts, all using the same initial version
+        let mut handles = vec![];
+        for _i in 0..3 {
+            let state_clone = Arc::clone(&state);
+            let new_policy = ProtoSandboxPolicy::default();
+
+            let handle = tokio::spawn(async move {
+                handle_update_config(
+                    &state_clone,
+                    Request::new(UpdateConfigRequest {
+                        name: "test-sandbox".to_string(),
+                        policy: Some(new_policy),
+                        setting_key: String::new(),
+                        setting_value: None,
+                        delete_setting: false,
+                        global: false,
+                        merge_operations: vec![],
+                        expected_resource_version: initial_version,
+                    }),
+                )
+                .await
+            });
+            handles.push(handle);
+        }
+
+        let results: Vec<_> = futures::future::join_all(handles)
+            .await
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+
+        // Only one should succeed; others should get ABORTED
+        let successes = results.iter().filter(|r| r.is_ok()).count();
+        let aborted_conflicts = results
+            .iter()
+            .filter(|r| r.as_ref().err().is_some_and(|e| e.code() == Code::Aborted))
+            .count();
+
+        assert_eq!(
+            successes, 1,
+            "exactly one backfill should succeed with client-driven CAS"
+        );
+        assert_eq!(
+            aborted_conflicts, 2,
+            "two backfills should fail with ABORTED due to stale version"
+        );
+
+        // Final sandbox should have resource_version = initial_version + 1 and policy backfilled
+        let final_sandbox = state
+            .store
+            .get_message_by_name::<Sandbox>("test-sandbox")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            final_sandbox.metadata.as_ref().unwrap().resource_version,
+            initial_version + 1
+        );
+        assert!(
+            final_sandbox.spec.as_ref().unwrap().policy.is_some(),
+            "policy should be backfilled after one success"
+        );
     }
 }

@@ -15,7 +15,7 @@ The LM Studio server provides easy setup with both OpenAI and Anthropic compatib
 
 </Note>
 
-This tutorial will cover:
+This tutorial covers:
 
 - Expose a local inference server to OpenShell sandboxes.
 - Verify end-to-end inference from inside a sandbox.
@@ -54,11 +54,11 @@ lms daemon up
 
 Start the LM Studio local server from the Developer tab, and verify the OpenAI-compatible endpoint is enabled.
 
-LM Studio will listen to `127.0.0.1:1234` by default. For use with OpenShell, you'll need to configure LM Studio to listen on all interfaces (`0.0.0.0`).
+LM Studio listens to `127.0.0.1:1234` by default. For use with OpenShell, configure LM Studio to listen on all interfaces (`0.0.0.0`).
 
-If you're using the GUI, go to the Developer Tab, select Server Settings, then enable Serve on Local Network.
+If you use the GUI, go to the Developer Tab, select Server Settings, then enable Serve on Local Network.
 
-If you're using llmster in headless mode, run `lms server start --bind 0.0.0.0`.
+If you use llmster in headless mode, run `lms server start --bind 0.0.0.0`.
 
 ## Test with a small model
 

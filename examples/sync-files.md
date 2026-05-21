@@ -39,20 +39,19 @@ openshell sandbox download my-sandbox /sandbox/results
 
 ## Sync on create
 
-Push all git-tracked files into a new sandbox automatically:
+Push all files in the current directory into a new sandbox automatically:
 
 ```bash
-openshell sandbox create --sync -- python main.py
+openshell sandbox create --upload . -- python main.py
 ```
 
-This collects tracked and untracked (non-ignored) files via
-`git ls-files` and streams them into `/sandbox` before the command runs.
+This uploads the current directory into `/sandbox` before the command runs.
 
 ## Workflow: iterate on code in a sandbox
 
 ```bash
-# Create a sandbox and sync your repo
-openshell sandbox create --name dev --sync
+# Create a sandbox and upload your repo
+openshell sandbox create --name dev --upload .
 
 # Make local changes, then push them
 openshell sandbox upload dev ./src /sandbox/src

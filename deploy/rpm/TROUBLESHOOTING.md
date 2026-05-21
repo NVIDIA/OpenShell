@@ -5,10 +5,11 @@ and upgrade procedures for the RPM deployment.
 
 ## CLI compatibility
 
-The RPM installs the gateway as a systemd user service with the Podman
-compute driver. The published online docs and some CLI commands assume
-a Docker/K3s deployment model. This section clarifies which commands
-work, which do not, and what to use instead.
+The RPM installs the gateway as a systemd user service. On a standard RPM
+install the gateway auto-detects Podman because the package depends on it.
+The published online docs and some CLI commands assume a Docker/K3s
+deployment model. This section clarifies which commands work, which do not,
+and what to use instead.
 
 ### Commands that work normally
 
@@ -67,14 +68,14 @@ Forward the gateway port over SSH and connect via localhost:
 
 ```shell
 # On the remote CLI machine:
-ssh -L 8080:127.0.0.1:8080 user@gateway-host
+ssh -L 17670:127.0.0.1:17670 user@gateway-host
 
 # In another terminal on the same machine:
 # Copy the client certs from the gateway host first:
 scp -r user@gateway-host:~/.config/openshell/gateways/openshell/mtls/ \
     ~/.config/openshell/gateways/openshell/mtls/
 
-openshell gateway add --local https://127.0.0.1:8080
+openshell gateway add --local https://127.0.0.1:17670
 openshell status
 ```
 
@@ -82,6 +83,9 @@ openshell status
 
 Generate certificates that include the server's hostname or IP in the
 SANs. See "Using externally-managed certificates" in CONFIGURATION.md.
+Then change `bind_address` in
+`~/.config/openshell/gateway.toml` to the interface the remote CLI
+can reach, for example `0.0.0.0:17670`, and restart the gateway.
 
 After placing the server and client certs, register from the remote
 CLI:
@@ -91,7 +95,7 @@ CLI:
 mkdir -p ~/.config/openshell/gateways/openshell/mtls/
 cp ca.crt tls.crt tls.key ~/.config/openshell/gateways/openshell/mtls/
 
-openshell gateway add --local https://<gateway-hostname>:8080
+openshell gateway add --local https://<gateway-hostname>:17670
 ```
 
 ### Firewall
@@ -99,7 +103,7 @@ openshell gateway add --local https://<gateway-hostname>:8080
 For remote access, open the gateway port in firewalld:
 
 ```shell
-sudo firewall-cmd --add-port=8080/tcp --permanent
+sudo firewall-cmd --add-port=17670/tcp --permanent
 sudo firewall-cmd --reload
 ```
 
@@ -117,7 +121,7 @@ The CLI cannot find a registered gateway. This happens when the
 gateway is running but has not been registered with the CLI.
 
 ```shell
-openshell gateway add --local https://127.0.0.1:8080
+openshell gateway add --local https://127.0.0.1:17670
 ```
 
 ### Gateway fails to start
@@ -186,8 +190,8 @@ podman pull ghcr.io/nvidia/openshell-community/sandboxes/base:latest
 podman pull ghcr.io/nvidia/openshell/supervisor:latest
 ```
 
-Or set `OPENSHELL_SANDBOX_IMAGE_PULL_POLICY=always` in
-`~/.config/openshell/gateway.env` and restart the gateway.
+Or set `image_pull_policy = "always"` in
+`~/.config/openshell/gateway.toml` and restart the gateway.
 
 ### Gateway stops on logout
 
@@ -216,11 +220,9 @@ systemctl --user restart openshell-gateway
 The SQLite database schema is auto-migrated on startup. Running
 sandboxes are stopped during the restart.
 
-The `gateway.env` file is not overwritten during upgrades. The
-`init-gateway-env.sh` script is idempotent and only generates the file
-on first start. New configuration options from newer versions can be
-added manually by referencing CONFIGURATION.md or running
-`openshell-gateway --help`.
+Package upgrades do not overwrite `~/.config/openshell/gateway.toml` when you
+create one. New gateway process options can be added manually by referencing
+CONFIGURATION.md or running `openshell-gateway --help`.
 
 To pick up new container images after an upgrade:
 

@@ -34,6 +34,22 @@ e2e_pick_port() {
   python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()'
 }
 
+e2e_generate_pki() {
+  local gateway_bin=$1
+  local pki_dir=$2
+  shift 2
+  # Remaining args are extra --server-san values (e.g. host.containers.internal).
+  # host.docker.internal and localhost are already in the default SAN list.
+
+  local san_args=()
+  san_args+=(--server-san host.openshell.internal)
+  for san in "$@"; do
+    san_args+=(--server-san "${san}")
+  done
+
+  "${gateway_bin}" generate-certs --output-dir "${pki_dir}" "${san_args[@]}"
+}
+
 e2e_register_plaintext_gateway() {
   local config_home=$1
   local name=$2
@@ -63,9 +79,9 @@ e2e_register_mtls_gateway() {
   local gateway_config_dir="${config_home}/openshell/gateways/${name}"
 
   mkdir -p "${gateway_config_dir}/mtls"
-  cp "${pki_dir}/ca.crt"     "${gateway_config_dir}/mtls/ca.crt"
-  cp "${pki_dir}/client.crt" "${gateway_config_dir}/mtls/tls.crt"
-  cp "${pki_dir}/client.key" "${gateway_config_dir}/mtls/tls.key"
+  cp "${pki_dir}/ca.crt"         "${gateway_config_dir}/mtls/ca.crt"
+  cp "${pki_dir}/client/tls.crt" "${gateway_config_dir}/mtls/tls.crt"
+  cp "${pki_dir}/client/tls.key" "${gateway_config_dir}/mtls/tls.key"
   cat >"${gateway_config_dir}/metadata.json" <<EOF
 {
   "name": "${name}",

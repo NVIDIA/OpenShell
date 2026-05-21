@@ -70,7 +70,7 @@ message NetworkEndpoint {
   // Single port (backwards compat). Use `ports` for multiple ports.
   // Mutually exclusive with `ports` — if both are set, `ports` takes precedence.
   uint32 port = 2;
-  // Application protocol for L7 inspection: "rest", "graphql", "sql", or "" (L4-only).
+  // Application protocol for L7 inspection: "rest", "websocket", "graphql", "sql", or "" (L4-only).
   string protocol = 3;
   // TLS handling: "terminate" or "passthrough" (default).
   string tls = 4;
@@ -116,6 +116,14 @@ message NetworkEndpoint {
   // protocol "rest" when both surfaces live under api.example.com:443.
   // Empty means all paths.
   string path = 15;
+  // When true on a "rest" endpoint, OpenShell rewrites credential placeholders
+  // inside client-to-server WebSocket text messages after an allowed HTTP 101
+  // upgrade. Defaults to false.
+  bool websocket_credential_rewrite = 16;
+  // When true on a "rest" endpoint, OpenShell rewrites credential placeholders
+  // inside supported textual HTTP request bodies before forwarding upstream.
+  // Defaults to false.
+  bool request_body_credential_rewrite = 17;
 }
 
 // Trusted GraphQL operation classification.

@@ -291,8 +291,6 @@ pub async fn run_sandbox(
     policy_rules: Option<String>,
     policy_data: Option<String>,
     ssh_socket_path: Option<String>,
-    ssh_handshake_secret: Option<String>,
-    ssh_handshake_skew_secs: u64,
     _health_check: bool,
     _health_port: u16,
     inference_routes: Option<String>,
@@ -353,7 +351,7 @@ pub async fn run_sandbox(
     // Fetch provider environment variables from the server.
     // This is done after loading the policy so the sandbox can still start
     // even if provider env fetch fails (graceful degradation).
-    let (provider_env_revision, provider_env) =
+    let (provider_env_revision, provider_env, provider_credential_expires_at_ms) =
         if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
             match grpc_client::fetch_provider_environment(endpoint, id).await {
                 Ok(result) => {
@@ -368,7 +366,11 @@ pub async fn run_sandbox(
                             ))
                             .build()
                     );
-                    (result.provider_env_revision, result.environment)
+                    (
+                        result.provider_env_revision,
+                        result.environment,
+                        result.credential_expires_at_ms,
+                    )
                 }
                 Err(e) => {
                     ocsf_emit!(
@@ -381,16 +383,25 @@ pub async fn run_sandbox(
                             ))
                             .build()
                     );
-                    (0, std::collections::HashMap::new())
+                    (
+                        0,
+                        std::collections::HashMap::new(),
+                        std::collections::HashMap::new(),
+                    )
                 }
             }
         } else {
-            (0, std::collections::HashMap::new())
+            (
+                0,
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+            )
         };
 
     let provider_credentials = provider_credentials::ProviderCredentialState::from_environment(
         provider_env_revision,
         provider_env,
+        provider_credential_expires_at_ms,
     );
     let provider_env = provider_credentials.snapshot().child_env.clone();
 
@@ -511,7 +522,7 @@ pub async fn run_sandbox(
     let netns = if matches!(policy.network.mode, NetworkMode::Proxy) {
         match NetworkNamespace::create() {
             Ok(ns) => {
-                // Install bypass detection rules (iptables LOG + REJECT).
+                // Install bypass detection rules (nftables log + reject).
                 // This provides fast-fail UX and diagnostic logging for direct
                 // connection attempts that bypass the HTTP CONNECT proxy.
                 let proxy_port = policy
@@ -552,7 +563,7 @@ pub async fn run_sandbox(
     let _netns: Option<()> = None;
 
     // Install the supervisor seccomp prelude after privileged startup helpers
-    // (network namespace setup, iptables probes) complete, but before the SSH
+    // (network namespace setup, nftables probes) complete, but before the SSH
     // listener and workload process are exposed.
     apply_supervisor_startup_hardening()?;
 
@@ -622,7 +633,7 @@ pub async fn run_sandbox(
     };
 
     // Spawn bypass detection monitor (Linux only, proxy mode only).
-    // Reads /dev/kmsg for iptables LOG entries and emits structured
+    // Reads /dev/kmsg for nftables log entries and emits structured
     // tracing events for direct connection attempts that bypass the proxy.
     #[cfg(target_os = "linux")]
     let _bypass_monitor = netns.as_ref().and_then(|ns| {
@@ -746,8 +757,6 @@ pub async fn run_sandbox(
     if let Some(listen_path) = ssh_socket_path.clone() {
         let policy_clone = policy.clone();
         let workdir_clone = workdir.clone();
-        let _ = ssh_handshake_secret; // retained in the signature for compat; unused
-        let _ = ssh_handshake_skew_secs;
         let proxy_url = ssh_proxy_url;
         let netns_fd = ssh_netns_fd;
         let ca_paths = ca_file_paths.clone();
@@ -817,7 +826,7 @@ pub async fn run_sandbox(
         sandbox_id.as_ref(),
         ssh_socket_path.as_ref(),
     ) {
-        supervisor_session::spawn(endpoint.clone(), id.clone(), socket.clone());
+        supervisor_session::spawn(endpoint.clone(), id.clone(), socket.clone(), ssh_netns_fd);
         info!("supervisor session task spawned");
     }
 
@@ -2259,7 +2268,7 @@ async fn flush_proposals_to_gateway(
     // Run the mechanistic mapper sandbox-side to generate proposals.
     // The gateway is a thin persistence + validation layer — it never
     // generates proposals itself.
-    let proposals = mechanistic_mapper::generate_proposals(&proto_summaries).await;
+    let proposals = mechanistic_mapper::generate_proposals(&proto_summaries);
 
     info!(
         sandbox_name = %sandbox_name,
@@ -2363,6 +2372,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
                     let env_count = ctx.provider_credentials.install_environment(
                         env_result.provider_env_revision,
                         env_result.environment,
+                        env_result.credential_expires_at_ms,
                     );
                     current_provider_env_revision = env_result.provider_env_revision;
                     ocsf_emit!(

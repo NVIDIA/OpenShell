@@ -27,8 +27,14 @@ struct Args {
     #[arg(long, hide = true, default_value_t = false)]
     internal_run_vm: bool,
 
-    #[arg(long, hide = true)]
-    vm_rootfs: Option<PathBuf>,
+    #[arg(long = "vm-root-disk", hide = true, alias = "vm-rootfs")]
+    vm_root_disk: Option<PathBuf>,
+
+    #[arg(long = "vm-overlay-disk", hide = true)]
+    vm_overlay_disk: Option<PathBuf>,
+
+    #[arg(long = "vm-image-disk", hide = true)]
+    vm_image_disk: Option<PathBuf>,
 
     #[arg(long, hide = true)]
     vm_exec: Option<String>,
@@ -83,18 +89,15 @@ struct Args {
     #[arg(long, env = "OPENSHELL_SANDBOX_IMAGE", default_value = "")]
     default_image: String,
 
+    #[arg(long, env = "OPENSHELL_VM_BOOTSTRAP_IMAGE", default_value = "")]
+    bootstrap_image: String,
+
     #[arg(
         long,
         env = "OPENSHELL_VM_DRIVER_STATE_DIR",
         default_value = "target/openshell-vm-driver"
     )]
     state_dir: PathBuf,
-
-    #[arg(long, env = "OPENSHELL_SSH_HANDSHAKE_SECRET")]
-    ssh_handshake_secret: Option<String>,
-
-    #[arg(long, env = "OPENSHELL_SSH_HANDSHAKE_SKEW_SECS", default_value_t = 300)]
-    ssh_handshake_skew_secs: u64,
 
     #[arg(long = "guest-tls-ca", env = "OPENSHELL_VM_TLS_CA")]
     guest_tls_ca: Option<PathBuf>,
@@ -113,6 +116,9 @@ struct Args {
 
     #[arg(long, env = "OPENSHELL_VM_DRIVER_MEM_MIB", default_value_t = 2048)]
     mem_mib: u32,
+
+    #[arg(long, env = "OPENSHELL_VM_OVERLAY_DISK_MIB", default_value_t = 4096)]
+    overlay_disk_mib: u64,
 
     #[arg(long, env = "OPENSHELL_VM_GPU")]
     gpu: bool,
@@ -193,12 +199,12 @@ async fn main() -> Result<()> {
         state_dir: args.state_dir.clone(),
         launcher_bin: None,
         default_image: args.default_image.clone(),
-        ssh_handshake_secret: args.ssh_handshake_secret.clone().unwrap_or_default(),
-        ssh_handshake_skew_secs: args.ssh_handshake_skew_secs,
+        bootstrap_image: args.bootstrap_image.clone(),
         log_level: args.log_level.clone(),
         krun_log_level: args.krun_log_level,
         vcpus: args.vcpus,
         mem_mib: args.mem_mib,
+        overlay_disk_mib: args.overlay_disk_mib,
         guest_tls_ca: args.guest_tls_ca.clone(),
         guest_tls_cert: args.guest_tls_cert.clone(),
         guest_tls_key: args.guest_tls_key.clone(),
@@ -448,10 +454,15 @@ impl Stream for AuthenticatedUnixIncoming {
 }
 
 fn build_vm_launch_config(args: &Args) -> std::result::Result<VmLaunchConfig, String> {
-    let rootfs = args
-        .vm_rootfs
+    let root_disk = args
+        .vm_root_disk
         .clone()
-        .ok_or_else(|| "--vm-rootfs is required in internal VM mode".to_string())?;
+        .ok_or_else(|| "--vm-root-disk is required in internal VM mode".to_string())?;
+    let overlay_disk = args
+        .vm_overlay_disk
+        .clone()
+        .ok_or_else(|| "--vm-overlay-disk is required in internal VM mode".to_string())?;
+    let image_disk = args.vm_image_disk.clone();
     let exec_path = args
         .vm_exec
         .clone()
@@ -468,7 +479,9 @@ fn build_vm_launch_config(args: &Args) -> std::result::Result<VmLaunchConfig, St
     };
 
     Ok(VmLaunchConfig {
-        rootfs,
+        root_disk,
+        overlay_disk,
+        image_disk,
         vcpus: args.vm_vcpus,
         mem_mib: args.vm_mem_mib,
         exec_path,

@@ -5,9 +5,25 @@
 
 # Agent-driven policy management demo.
 #
-# Runs the full loop: a Codex agent inside a sandbox hits an OpenShell policy
-# block, reads the policy advisor skill, drafts a narrow rule via policy.local,
-# the developer approves from the host, and the agent retries successfully.
+# Runs the full loop end-to-end:
+#
+#   1. A Codex agent inside an OpenShell sandbox attempts a PUT that the L7
+#      proxy denies with a structured policy_denied 403.
+#   2. The agent reads /etc/openshell/skills/policy_advisor.md.
+#   3. The agent submits a narrow proposal (exact host, port, method, path)
+#      to policy.local and saves the returned chunk_id.
+#   4. The agent blocks on `GET /v1/proposals/{chunk_id}/wait` — one HTTP
+#      call that sleeps on a socket. THE AGENT BURNS ZERO LLM TOKENS WHILE
+#      IT WAITS; this is the load-bearing UX win over polling.
+#   5. The developer (this script, simulating the host side) sees the pending
+#      proposal in `openshell rule get` and approves it.
+#   6. The agent's /wait returns approved within ~1 second of the approval,
+#      retries the original PUT once against the hot-reloaded policy, and
+#      exits.
+#
+# The whole loop is feature-flagged behind agent_policy_proposals_enabled and
+# requires no GitHub credentials beyond the repo write token already used by
+# the existing demo flow.
 
 set -euo pipefail
 
@@ -35,7 +51,15 @@ DEMO_FILE_PATH="${DEMO_FILE_DIR}/${DEMO_RUN_ID}.md"
 DEMO_SANDBOX_NAME="${DEMO_SANDBOX_NAME:-policy-demo-${DEMO_RUN_ID}}"
 DEMO_CODEX_PROVIDER_NAME="${DEMO_CODEX_PROVIDER_NAME:-codex-policy-demo-${DEMO_RUN_ID}}"
 DEMO_GITHUB_PROVIDER_NAME="${DEMO_GITHUB_PROVIDER_NAME:-github-policy-demo-${DEMO_RUN_ID}}"
-DEMO_APPROVAL_TIMEOUT_SECS="${DEMO_APPROVAL_TIMEOUT_SECS:-240}"
+DEMO_MANUAL_APPROVE="${DEMO_MANUAL_APPROVE:-0}"
+# Manual approvals need more headroom than the auto-approve loop — a human
+# reads the proposal, thinks, and decides. Bump the default to 30 min when
+# the developer is in the loop. Explicit overrides still win.
+if [[ "$DEMO_MANUAL_APPROVE" == "1" ]]; then
+    DEMO_APPROVAL_TIMEOUT_SECS="${DEMO_APPROVAL_TIMEOUT_SECS:-1800}"
+else
+    DEMO_APPROVAL_TIMEOUT_SECS="${DEMO_APPROVAL_TIMEOUT_SECS:-240}"
+fi
 DEMO_KEEP_SANDBOX="${DEMO_KEEP_SANDBOX:-0}"
 
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/openshell-policy-demo.XXXXXX")"
@@ -57,19 +81,72 @@ RESET=$'\033[0m'
 
 AGENT_PID=""
 
-step() { printf "\n${BOLD}${CYAN}==> %s${RESET}\n\n" "$1"; }
+# Wall-clock anchor so each step header can carry a "[t+1.2s]" tag and the
+# reader sees where time is going. `date +%s.%N` works on macOS bash where
+# `${EPOCHREALTIME}` may be unavailable in older bashes.
+DEMO_START_EPOCH="$(date +%s.%N)"
+
+elapsed() {
+    awk -v s="$DEMO_START_EPOCH" -v now="$(date +%s.%N)" \
+        'BEGIN { printf "%.1fs", now - s }'
+}
+
+step() {
+    printf "\n${BOLD}${CYAN}==> [t+%s] %s${RESET}\n\n" "$(elapsed)" "$1"
+}
 info() { printf "  %b\n" "$*"; }
+
+# ASCII spinner for the watch-for-pending loop. Renders only on a TTY so
+# piped runs (CI, tee, etc.) stay clean. spin_wait pairs a message with a
+# bounded sleep so the spinner animates smoothly without polling faster
+# than necessary.
+SPINNER_CHARS=( '⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏' )
+SPINNER_IDX=0
+
+spin_wait() {
+    local message="$1"
+    local duration_secs="${2:-2}"
+    if [[ ! -t 1 ]]; then
+        sleep "$duration_secs"
+        return
+    fi
+    local end=$(( SECONDS + duration_secs ))
+    while (( SECONDS < end )); do
+        printf "\r  ${DIM}%s${RESET} %s  " \
+            "${SPINNER_CHARS[SPINNER_IDX]}" "$message"
+        SPINNER_IDX=$(( (SPINNER_IDX + 1) % ${#SPINNER_CHARS[@]} ))
+        sleep 0.1
+    done
+}
+
+spin_clear() {
+    if [[ -t 1 ]]; then
+        printf "\r%*s\r" "${COLUMNS:-100}" ''
+    fi
+}
 
 # Redact host-side credentials from the agent log tail before printing on
 # failure. Codex shouldn't echo the token, but a misbehaving tool call (e.g.,
 # `curl -v`) could leak it; sanitize before showing the log.
+#
+# Uses python's literal `str.replace` rather than sed because tokens
+# (especially JWTs) can contain characters that break sed's pattern parser
+# — a sed delimiter collision in one of the substitutions blanks the entire
+# log tail, hiding the very failure context we're trying to surface.
 redact_log() {
-    local replacement='[redacted]'
-    sed \
-        -e "s|${DEMO_GITHUB_TOKEN:-__no_github_token__}|${replacement}|g" \
-        -e "s|${CODEX_AUTH_ACCESS_TOKEN:-__no_codex_access__}|${replacement}|g" \
-        -e "s|${CODEX_AUTH_REFRESH_TOKEN:-__no_codex_refresh__}|${replacement}|g" \
-        -e "s|${CODEX_AUTH_ACCOUNT_ID:-__no_codex_account__}|${replacement}|g"
+    python3 - \
+        "${DEMO_GITHUB_TOKEN:-}" \
+        "${CODEX_AUTH_ACCESS_TOKEN:-}" \
+        "${CODEX_AUTH_REFRESH_TOKEN:-}" \
+        "${CODEX_AUTH_ACCOUNT_ID:-}" \
+        <<'PY'
+import sys
+tokens = [t for t in sys.argv[1:] if t]
+for line in sys.stdin:
+    for t in tokens:
+        line = line.replace(t, "[redacted]")
+    sys.stdout.write(line)
+PY
 }
 
 fail() {
@@ -101,11 +178,11 @@ cleanup() {
     # before this run.
     if [[ -n "${PRIOR_PROPOSALS_FLAG:-}" ]]; then
         if [[ "$PRIOR_PROPOSALS_FLAG" == "(unset)" ]]; then
-            "$OPENSHELL_BIN" settings delete --global --key agent_policy_proposals_enabled \
+            "$OPENSHELL_BIN" settings delete --global --key agent_policy_proposals_enabled --yes \
                 >/dev/null 2>&1 || true
         else
             "$OPENSHELL_BIN" settings set --global --key agent_policy_proposals_enabled \
-                --value "$PRIOR_PROPOSALS_FLAG" >/dev/null 2>&1 || true
+                --value "$PRIOR_PROPOSALS_FLAG" --yes >/dev/null 2>&1 || true
         fi
     fi
 
@@ -188,9 +265,19 @@ check_gateway() {
     local raw version
     # `openshell status` colorizes labels with ANSI even when piped, so strip
     # escapes before parsing. Use NO_COLOR as a belt-and-suspenders hint for
-    # libraries that respect it.
-    raw="$(NO_COLOR=1 "$OPENSHELL_BIN" status 2>/dev/null \
-        | sed 's/\x1b\[[0-9;]*m//g')"
+    # libraries that respect it. Capture stderr explicitly so a connection
+    # failure (gateway down, port-forward died after a redeploy) surfaces a
+    # real error message instead of `set -euo pipefail` silently exiting.
+    if ! raw="$(NO_COLOR=1 "$OPENSHELL_BIN" status 2>&1)"; then
+        fail "openshell could not reach the gateway. CLI output:
+${raw}
+
+If you just redeployed, the kubectl port-forward you backgrounded earlier
+probably died with the old pod. Restart it (silenced so its noise doesn't
+bleed into the demo):
+  KUBECONFIG=kubeconfig kubectl -n openshell port-forward svc/openshell 8090:8080 >/dev/null 2>&1 &"
+    fi
+    raw="$(sed 's/\x1b\[[0-9;]*m//g' <<<"$raw")"
     version="$(awk -F': *' '/Version:/ { print $2; exit }' <<<"$raw")"
     [[ -n "$version" ]] \
         || fail "active OpenShell gateway is not reachable; start one with: openshell gateway start"
@@ -315,9 +402,9 @@ summarize_pending() {
 narrate_sandbox_workflow() {
     info "Inside the sandbox right now:"
     info ""
-    info "  ${BOLD}[1]${RESET} agent: ${DIM}curl -X PUT https://api.github.com/repos/${DEMO_GITHUB_OWNER}/${DEMO_GITHUB_REPO}/contents/...${RESET}"
-    info "  ${BOLD}[2]${RESET} L7 proxy denies the write and returns a structured 403 the"
-    info "      agent can parse and act on:"
+    info "  • agent: ${DIM}curl -X PUT https://api.github.com/repos/${DEMO_GITHUB_OWNER}/${DEMO_GITHUB_REPO}/contents/...${RESET}"
+    info "  • L7 proxy denies the write and returns a structured 403 the"
+    info "    agent can parse and act on:"
     cat <<EOF
 ${DIM}        {
           "error":      "policy_denied",
@@ -331,55 +418,108 @@ ${DIM}        {
           ]
         }${RESET}
 EOF
-    info "  ${BOLD}[3]${RESET} agent reads the skill, drafts a narrow ${DIM}addRule${RESET} for exactly that path"
-    info "  ${BOLD}[4]${RESET} agent POSTs the proposal to ${DIM}http://policy.local/v1/proposals${RESET}"
-    info "  ${BOLD}[5]${RESET} supervisor forwards it to the gateway as a pending draft"
+    info "  • agent reads the skill, drafts a narrow ${DIM}addRule${RESET} for exactly that path"
+    info "  • agent POSTs to ${DIM}http://policy.local/v1/proposals${RESET}, saves the"
+    info "    returned ${DIM}accepted_chunk_ids[0]${RESET}"
+    info "  • agent calls ${DIM}GET /v1/proposals/{chunk_id}/wait?timeout=300${RESET}"
+    info "    — one HTTP call that sleeps on a socket until the developer decides."
+    info "    ${BOLD}Zero LLM tokens burn during this wait.${RESET}"
     info ""
-    info "${DIM}Polling for the pending draft...${RESET}"
+    info "${DIM}Watching for the pending draft on the gateway...${RESET}"
 }
 
-approve_when_pending() {
+# In DEMO_MANUAL_APPROVE mode, swap auto-approve for a human-in-the-loop pause.
+# The agent's /wait is already parked on a socket — we just stop driving the
+# decision from this script and tell the user the exact commands to run from
+# their other terminal. We poll `rule get --status pending` because that's the
+# durable signal: a chunk leaving the pending bucket means a decision landed,
+# whether approve or reject. The outer loop handles whichever path comes next
+# (agent exits cleanly after approve; agent redrafts and we see a fresh
+# pending chunk after reject --reason).
+approve_manually() {
+    local pending="$1"
+    local chunk_id
+    chunk_id="$(sed 's/\x1b\[[0-9;]*m//g' "$pending" \
+        | awk '/^[[:space:]]*Chunk:/ { print $2; exit }')"
+    [[ -n "$chunk_id" ]] || fail "could not extract chunk_id from pending output"
+    local short_id="${chunk_id:0:8}"
+
+    step "Decide from your other terminal — the agent's /wait is parked"
+    info "Run ONE on the host:"
+    info ""
+    info "  ${BOLD}${GREEN}approve:${RESET} ${DIM}${OPENSHELL_BIN} rule approve ${DEMO_SANDBOX_NAME} --chunk-id ${chunk_id}${RESET}"
+    info "  ${BOLD}reject:${RESET}  ${DIM}${OPENSHELL_BIN} rule reject ${DEMO_SANDBOX_NAME} --chunk-id ${chunk_id} --reason \"scope this to ...\"${RESET}"
+    info ""
+    info "  ${DIM}reject --reason sends free-form guidance back to the agent; it will${RESET}"
+    info "  ${DIM}read rejection_reason, draft a revised proposal, and we'll pause again.${RESET}"
+    info ""
+
+    while true; do
+        if ! "$OPENSHELL_BIN" rule get "$DEMO_SANDBOX_NAME" --status pending 2>/dev/null \
+            | grep -q "$chunk_id"; then
+            spin_clear
+            info "  ${GREEN}✓${RESET} decision recorded for chunk ${short_id}"
+            return
+        fi
+        spin_wait "awaiting your decision on chunk ${short_id}" 2
+    done
+}
+
+approve_pending_until_agent_exits() {
     step "Waiting for the agent to draft a policy proposal"
     narrate_sandbox_workflow
 
-    local start now pending
+    local start now pending approval_count
     start="$(date +%s)"
     pending="${TMP_DIR}/pending.txt"
+    approval_count=0
 
     while true; do
+        # Agent finished? Drain its exit status and we're done.
         if ! kill -0 "$AGENT_PID" >/dev/null 2>&1; then
-            wait "$AGENT_PID" || true
+            spin_clear
+            if ! wait "$AGENT_PID"; then
+                AGENT_PID=""
+                fail "agent run failed"
+            fi
             AGENT_PID=""
-            fail "agent exited before a pending proposal appeared"
+            if (( approval_count == 0 )); then
+                fail "agent exited before any pending proposal appeared"
+            fi
+            info "agent exited after ${approval_count} approval(s)"
+            return
         fi
 
+        # Anything pending? Approve and keep watching — the agent may
+        # redraft if a previous proposal didn't yield the access it needed.
         if "$OPENSHELL_BIN" rule get "$DEMO_SANDBOX_NAME" --status pending >"$pending" 2>/dev/null \
             && grep -q "Chunk:" "$pending" && grep -q "pending" "$pending"; then
+            spin_clear
             info ""
             info "${GREEN}proposal received:${RESET}"
             summarize_pending "$pending"
 
-            step "Approving and waiting for the agent to retry"
-            "$OPENSHELL_BIN" rule approve-all "$DEMO_SANDBOX_NAME" \
-                | awk '/approved/ { print "  " $0 }'
-            return
+            if [[ "$DEMO_MANUAL_APPROVE" == "1" ]]; then
+                approve_manually "$pending"
+            else
+                step "Approving — the agent's /wait will return within ~1s"
+                "$OPENSHELL_BIN" rule approve-all "$DEMO_SANDBOX_NAME" \
+                    | awk '/approved/ { print "  " $0 }'
+            fi
+            approval_count=$((approval_count + 1))
         fi
 
         now="$(date +%s)"
         if (( now - start >= DEMO_APPROVAL_TIMEOUT_SECS )); then
-            fail "timed out waiting for the agent to submit a policy proposal"
+            spin_clear
+            if (( approval_count == 0 )); then
+                fail "timed out waiting for the agent to submit a policy proposal"
+            fi
+            fail "agent did not exit within ${DEMO_APPROVAL_TIMEOUT_SECS}s after ${approval_count} approval(s)"
         fi
-        sleep 2
-    done
-}
 
-wait_for_agent() {
-    if ! wait "$AGENT_PID"; then
-        AGENT_PID=""
-        fail "agent run failed"
-    fi
-    AGENT_PID=""
-    info "agent retried after policy hot-reload — write succeeded"
+        spin_wait "watching for pending proposals (approved ${approval_count} so far)" 2
+    done
 }
 
 verify_github_write() {
@@ -398,8 +538,15 @@ verify_github_write() {
 # OpenShell's logging — keep it as-is rather than re-formatting.
 show_logs() {
     step "Policy decision trace (OCSF)"
+    # Filter to the events that tell the loop's story end-to-end, ordered by
+    # the trace's own timestamps:
+    #   HTTP:PUT DENIED          — initial proxy enforcement
+    #   CONFIG:PROPOSED          — agent submitted a chunk to the gateway
+    #   CONFIG:APPROVED/REJECTED — developer decided; agent's /wait woke up
+    #   CONFIG:LOADED            — supervisor hot-reloaded the merged policy
+    #   HTTP:PUT ALLOWED         — agent's retry succeeded
     "$OPENSHELL_BIN" logs "$DEMO_SANDBOX_NAME" --since 10m -n 200 2>&1 \
-        | grep -E 'HTTP:PUT.*(DENIED|ALLOWED)|CONFIG:LOADED.*Policy reloaded' \
+        | grep -E 'HTTP:PUT.*(DENIED|ALLOWED)|CONFIG:(PROPOSED|APPROVED|REJECTED|LOADED)' \
         | sed 's/^/  /' || true
 }
 
@@ -414,7 +561,7 @@ enable_agent_proposals() {
         | grep -o 'true\|false' | head -1)"
     PRIOR_PROPOSALS_FLAG="${prior:-(unset)}"
     "$OPENSHELL_BIN" settings set --global \
-        --key agent_policy_proposals_enabled --value true >/dev/null \
+        --key agent_policy_proposals_enabled --value true --yes >/dev/null \
         || fail "could not enable agent_policy_proposals_enabled globally"
 }
 
@@ -431,8 +578,7 @@ main() {
     show_run_summary
 
     start_agent_sandbox
-    approve_when_pending
-    wait_for_agent
+    approve_pending_until_agent_exits
     verify_github_write
     show_logs
 

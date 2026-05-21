@@ -5,6 +5,5 @@
 # Typical when a reverse proxy or tunnel terminates TLS at the edge.
 server:
   disableTls: true
-  disableGatewayAuth: true
 pkiInitJob:
   enabled: false

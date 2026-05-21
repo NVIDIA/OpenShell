@@ -21,29 +21,20 @@ use std::str::FromStr;
 /// Default SSH port inside sandbox containers.
 pub const DEFAULT_SSH_PORT: u16 = 2222;
 
-/// Default server / SSH gateway port.
-pub const DEFAULT_SERVER_PORT: u16 = 8080;
+/// Default gateway server port.
+pub const DEFAULT_SERVER_PORT: u16 = 17670;
 
 /// Default container stop timeout in seconds (SIGTERM → SIGKILL).
 pub const DEFAULT_STOP_TIMEOUT_SECS: u32 = 10;
 
-/// Default allowed clock skew for SSH handshake validation, in seconds.
-pub const DEFAULT_SSH_HANDSHAKE_SKEW_SECS: u64 = 300;
-
-/// Default Podman bridge network name.
-pub const DEFAULT_NETWORK_NAME: &str = "openshell";
-
 /// Default Docker bridge network name for local sandboxes.
 pub const DEFAULT_DOCKER_NETWORK_NAME: &str = "openshell-docker";
 
+/// Default domain used for browser-facing sandbox service URLs.
+pub const DEFAULT_SERVICE_ROUTING_DOMAIN: &str = "openshell.localhost";
+
 /// Default OCI image for the openshell-sandbox supervisor binary.
-pub const DEFAULT_SUPERVISOR_IMAGE: &str = "openshell/supervisor:latest";
-
-/// Default image pull policy for sandbox images.
-pub const DEFAULT_IMAGE_PULL_POLICY: &str = "missing";
-
-/// Default Kubernetes namespace for sandbox resources.
-pub const DEFAULT_K8S_NAMESPACE: &str = "openshell";
+pub const DEFAULT_SUPERVISOR_IMAGE: &str = "ghcr.io/nvidia/openshell/supervisor:latest";
 
 /// CDI device identifier for requesting all NVIDIA GPUs.
 pub const CDI_GPU_DEVICE_ALL: &str = "nvidia.com/gpu=all";
@@ -225,94 +216,40 @@ pub struct Config {
     #[serde(default)]
     pub compute_drivers: Vec<ComputeDriverKind>,
 
-    /// Kubernetes namespace for sandboxes.
-    #[serde(default = "default_sandbox_namespace")]
-    pub sandbox_namespace: String,
-
-    /// Default container image for sandboxes.
-    #[serde(default = "default_sandbox_image")]
-    pub sandbox_image: String,
-
-    /// Kubernetes `imagePullPolicy` for sandbox pods (e.g. `Always`,
-    /// `IfNotPresent`, `Never`).  Defaults to empty, which lets Kubernetes
-    /// apply its own default (`:latest` → `Always`, anything else →
-    /// `IfNotPresent`).
-    #[serde(default)]
-    pub sandbox_image_pull_policy: String,
-
-    /// gRPC endpoint for sandboxes to connect back to `OpenShell`.
-    /// Used by sandbox pods to fetch their policy at startup.
-    #[serde(default)]
-    pub grpc_endpoint: String,
-
-    /// Public gateway host for SSH proxy connections.
-    #[serde(default = "default_ssh_gateway_host")]
-    pub ssh_gateway_host: String,
-
-    /// Public gateway port for SSH proxy connections.
-    #[serde(default = "default_ssh_gateway_port")]
-    pub ssh_gateway_port: u16,
-
-    /// Path for SSH CONNECT/upgrade requests.
-    #[serde(default = "default_ssh_connect_path")]
-    pub ssh_connect_path: String,
-
-    /// SSH listen port inside sandbox containers that expose a TCP endpoint.
-    #[serde(default = "default_sandbox_ssh_port")]
-    pub sandbox_ssh_port: u16,
-
-    /// Filesystem path where the sandbox supervisor binds its SSH Unix
-    /// socket. The supervisor is passed this path via
-    /// `OPENSHELL_SSH_SOCKET_PATH` / `--ssh-socket-path` and connects its
-    /// relay bridge to the same path.
-    ///
-    /// When the gateway orchestrates sandboxes that each live in their own
-    /// filesystem (K8s pod, libkrun VM, etc.), the default is safe. For
-    /// local dev where multiple supervisors share `/run`, override this to
-    /// something unique per sandbox.
-    #[serde(default = "default_sandbox_ssh_socket_path")]
-    pub sandbox_ssh_socket_path: String,
-
-    /// Shared secret for gateway-to-sandbox SSH handshake.
-    #[serde(default)]
-    pub ssh_handshake_secret: String,
-
-    /// Allowed clock skew for SSH handshake validation, in seconds.
-    #[serde(default = "default_ssh_handshake_skew_secs")]
-    pub ssh_handshake_skew_secs: u64,
-
     /// TTL for SSH session tokens, in seconds. 0 disables expiry.
     #[serde(default = "default_ssh_session_ttl_secs")]
     pub ssh_session_ttl_secs: u64,
 
-    /// Kubernetes secret name containing client TLS materials for sandbox pods.
-    /// When set, sandbox pods get this secret mounted so they can connect to
-    /// the server over mTLS.
+    /// Browser-facing sandbox service routing configuration.
     #[serde(default)]
-    pub client_tls_secret_name: String,
+    pub service_routing: ServiceRoutingConfig,
+}
 
-    /// Host gateway IP for sandbox pod hostAliases.
-    /// When set, sandbox pods get hostAliases entries mapping
-    /// `host.docker.internal` and `host.openshell.internal` to this IP,
-    /// allowing them to reach services running on the Docker host.
-    #[serde(default)]
-    pub host_gateway_ip: String,
+/// Browser-facing sandbox service routing configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceRoutingConfig {
+    /// Base domains accepted for `sandbox--service.<domain>` routes.
+    /// The first domain is used when the gateway prints endpoint URLs.
+    #[serde(default = "default_service_routing_domains")]
+    pub base_domains: Vec<String>,
 
-    /// Enable Kubernetes user namespace isolation (`hostUsers: false`) for
-    /// sandbox pods.  When enabled, container UID 0 maps to an unprivileged
-    /// host UID and capabilities become namespaced. Requires Kubernetes 1.33+
-    /// with user namespace support available (beta through 1.35, GA in 1.36+),
-    /// plus a supporting container runtime and Linux 5.12+.
-    #[serde(default)]
-    pub enable_user_namespaces: bool,
+    /// Enable TLS-enabled loopback gateway listeners to also accept plaintext
+    /// HTTP for sandbox service hostnames.
+    #[serde(default = "default_enable_loopback_service_http")]
+    pub enable_loopback_service_http: bool,
 }
 
 /// TLS configuration.
 ///
-/// By default mTLS is enforced — all clients must present a certificate
-/// signed by the given CA.  When `allow_unauthenticated` is `true`, the
-/// TLS handshake also accepts connections without a client certificate
-/// (needed for reverse-proxy deployments like Cloudflare Tunnel).
+/// Two modes are supported:
+/// - **HTTPS with optional mTLS** (`client_ca_path = Some`):
+///   Client certificates are validated against the given CA when presented,
+///   but never required.  Clients may connect with or without a certificate.
+/// - **HTTPS-only** (`client_ca_path = None`):
+///   Server-side TLS only; no client certificates are requested.
+///
+/// In both modes, authentication is handled at the application layer
+/// (e.g. OIDC bearer tokens).  mTLS is an additional mechanism.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TlsConfig {
     /// Path to the TLS certificate file.
@@ -321,16 +258,17 @@ pub struct TlsConfig {
     /// Path to the TLS private key file.
     pub key_path: PathBuf,
 
-    /// Path to the CA certificate file for client certificate verification (mTLS).
-    /// The server requires all clients to present a valid certificate signed by
-    /// this CA.
-    pub client_ca_path: PathBuf,
-
-    /// When `true`, the TLS handshake succeeds even without a client
-    /// certificate.  Application-layer middleware must then enforce auth
-    /// (e.g. via a CF JWT header).
+    /// Path to the CA certificate file for client certificate verification.
+    /// When `Some`, client certs signed by this CA are validated.
+    /// When `None`, the server does not request client certs.
     #[serde(default)]
-    pub allow_unauthenticated: bool,
+    pub client_ca_path: Option<PathBuf>,
+
+    /// When `true` and `client_ca_path` is `Some`, the TLS handshake rejects
+    /// connections that do not present a valid client certificate.
+    /// When `false`, client certificates are accepted but not required.
+    #[serde(default)]
+    pub require_client_auth: bool,
 }
 
 /// OIDC (`OpenID` Connect) configuration for JWT-based authentication.
@@ -404,21 +342,8 @@ impl Config {
             oidc: None,
             database_url: String::new(),
             compute_drivers: vec![],
-            sandbox_namespace: default_sandbox_namespace(),
-            sandbox_image: default_sandbox_image(),
-            sandbox_image_pull_policy: String::new(),
-            grpc_endpoint: String::new(),
-            ssh_gateway_host: default_ssh_gateway_host(),
-            ssh_gateway_port: default_ssh_gateway_port(),
-            ssh_connect_path: default_ssh_connect_path(),
-            sandbox_ssh_port: default_sandbox_ssh_port(),
-            sandbox_ssh_socket_path: default_sandbox_ssh_socket_path(),
-            ssh_handshake_secret: String::new(),
-            ssh_handshake_skew_secs: default_ssh_handshake_skew_secs(),
             ssh_session_ttl_secs: default_ssh_session_ttl_secs(),
-            client_tls_secret_name: String::new(),
-            host_gateway_ip: String::new(),
-            enable_user_namespaces: false,
+            service_routing: ServiceRoutingConfig::default(),
         }
     }
 
@@ -478,94 +403,10 @@ impl Config {
         self
     }
 
-    /// Create a new configuration with a sandbox namespace.
-    #[must_use]
-    pub fn with_sandbox_namespace(mut self, namespace: impl Into<String>) -> Self {
-        self.sandbox_namespace = namespace.into();
-        self
-    }
-
-    /// Create a new configuration with a default sandbox image.
-    #[must_use]
-    pub fn with_sandbox_image(mut self, image: impl Into<String>) -> Self {
-        self.sandbox_image = image.into();
-        self
-    }
-
-    /// Create a new configuration with a sandbox image pull policy.
-    #[must_use]
-    pub fn with_sandbox_image_pull_policy(mut self, policy: impl Into<String>) -> Self {
-        self.sandbox_image_pull_policy = policy.into();
-        self
-    }
-
-    /// Create a new configuration with a gRPC endpoint for sandbox callback.
-    #[must_use]
-    pub fn with_grpc_endpoint(mut self, endpoint: impl Into<String>) -> Self {
-        self.grpc_endpoint = endpoint.into();
-        self
-    }
-
-    /// Create a new configuration with the SSH gateway host.
-    #[must_use]
-    pub fn with_ssh_gateway_host(mut self, host: impl Into<String>) -> Self {
-        self.ssh_gateway_host = host.into();
-        self
-    }
-
-    /// Create a new configuration with the SSH gateway port.
-    #[must_use]
-    pub const fn with_ssh_gateway_port(mut self, port: u16) -> Self {
-        self.ssh_gateway_port = port;
-        self
-    }
-
-    /// Create a new configuration with the SSH connect path.
-    #[must_use]
-    pub fn with_ssh_connect_path(mut self, path: impl Into<String>) -> Self {
-        self.ssh_connect_path = path.into();
-        self
-    }
-
-    /// Create a new configuration with the sandbox SSH port.
-    #[must_use]
-    pub const fn with_sandbox_ssh_port(mut self, port: u16) -> Self {
-        self.sandbox_ssh_port = port;
-        self
-    }
-
-    /// Create a new configuration with the SSH handshake secret.
-    #[must_use]
-    pub fn with_ssh_handshake_secret(mut self, secret: impl Into<String>) -> Self {
-        self.ssh_handshake_secret = secret.into();
-        self
-    }
-
-    /// Create a new configuration with SSH handshake skew allowance.
-    #[must_use]
-    pub const fn with_ssh_handshake_skew_secs(mut self, secs: u64) -> Self {
-        self.ssh_handshake_skew_secs = secs;
-        self
-    }
-
     /// Create a new configuration with the SSH session TTL.
     #[must_use]
     pub const fn with_ssh_session_ttl_secs(mut self, secs: u64) -> Self {
         self.ssh_session_ttl_secs = secs;
-        self
-    }
-
-    /// Set the Kubernetes secret name for sandbox client TLS materials.
-    #[must_use]
-    pub fn with_client_tls_secret_name(mut self, name: impl Into<String>) -> Self {
-        self.client_tls_secret_name = name.into();
-        self
-    }
-
-    /// Set the host gateway IP for sandbox pod hostAliases.
-    #[must_use]
-    pub fn with_host_gateway_ip(mut self, ip: impl Into<String>) -> Self {
-        self.host_gateway_ip = ip.into();
         self
     }
 
@@ -575,46 +416,102 @@ impl Config {
         self.oidc = Some(oidc);
         self
     }
+
+    /// Derive browser-facing sandbox service domains from gateway server SANs.
+    ///
+    /// Wildcard DNS SANs such as `*.apps.example.com` enable service URLs
+    /// under `apps.example.com`. Non-wildcard DNS names and IP SANs do not
+    /// enable service subdomains.
+    #[must_use]
+    pub fn with_server_sans<I, S>(mut self, sans: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.service_routing.base_domains = service_routing_domains_from_server_sans(sans);
+        self
+    }
+
+    /// Enable or disable plaintext HTTP routing for loopback sandbox service
+    /// hostnames on TLS-enabled gateway listeners.
+    #[must_use]
+    pub const fn with_loopback_service_http(mut self, enabled: bool) -> Self {
+        self.service_routing.enable_loopback_service_http = enabled;
+        self
+    }
+}
+
+impl Default for ServiceRoutingConfig {
+    fn default() -> Self {
+        Self {
+            base_domains: default_service_routing_domains(),
+            enable_loopback_service_http: default_enable_loopback_service_http(),
+        }
+    }
 }
 
 fn default_bind_address() -> SocketAddr {
-    "127.0.0.1:8080".parse().expect("valid default address")
+    "127.0.0.1:17670".parse().expect("valid default address")
+}
+
+fn default_service_routing_domains() -> Vec<String> {
+    vec![DEFAULT_SERVICE_ROUTING_DOMAIN.to_string()]
+}
+
+const fn default_enable_loopback_service_http() -> bool {
+    true
+}
+
+fn service_routing_domains_from_server_sans<I, S>(sans: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let mut domains = Vec::new();
+    for san in sans {
+        if let Some(domain) = service_routing_domain_from_server_san(&san.into())
+            && !domains.contains(&domain)
+        {
+            domains.push(domain);
+        }
+    }
+    for domain in default_service_routing_domains() {
+        if !domains.contains(&domain) {
+            domains.push(domain);
+        }
+    }
+    domains
+}
+
+fn service_routing_domain_from_server_san(san: &str) -> Option<String> {
+    let san = san.trim().trim_matches('.').to_ascii_lowercase();
+    let domain = san.strip_prefix("*.")?;
+    normalize_service_routing_domain(domain)
+}
+
+fn normalize_service_routing_domain(domain: &str) -> Option<String> {
+    let domain = domain.trim().trim_matches('.');
+    if domain.is_empty() || domain.len() > 253 {
+        return None;
+    }
+    let labels = domain.split('.');
+    if labels.clone().any(|label| !is_dns_label(label)) {
+        return None;
+    }
+    Some(domain.to_string())
+}
+
+fn is_dns_label(label: &str) -> bool {
+    if label.is_empty() || label.len() > 63 || label.starts_with('-') || label.ends_with('-') {
+        return false;
+    }
+    label
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
 fn default_log_level() -> String {
     "info".to_string()
-}
-
-fn default_sandbox_namespace() -> String {
-    "default".to_string()
-}
-
-fn default_sandbox_image() -> String {
-    format!("{}/base:latest", crate::image::DEFAULT_COMMUNITY_REGISTRY)
-}
-
-fn default_ssh_gateway_host() -> String {
-    "127.0.0.1".to_string()
-}
-
-const fn default_ssh_gateway_port() -> u16 {
-    DEFAULT_SERVER_PORT
-}
-
-fn default_ssh_connect_path() -> String {
-    "/connect/ssh".to_string()
-}
-
-fn default_sandbox_ssh_socket_path() -> String {
-    "/run/openshell/ssh.sock".to_string()
-}
-
-const fn default_sandbox_ssh_port() -> u16 {
-    DEFAULT_SSH_PORT
-}
-
-const fn default_ssh_handshake_skew_secs() -> u64 {
-    DEFAULT_SSH_HANDSHAKE_SKEW_SECS
 }
 
 const fn default_ssh_session_ttl_secs() -> u64 {
@@ -624,7 +521,8 @@ const fn default_ssh_session_ttl_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ComputeDriverKind, Config, detect_driver, docker_host_unix_socket_path, is_unix_socket,
+        ComputeDriverKind, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, detect_driver,
+        docker_host_unix_socket_path, is_unix_socket,
     };
     use std::net::SocketAddr;
     #[cfg(unix)]
@@ -659,7 +557,7 @@ mod tests {
 
     #[test]
     fn config_defaults_to_loopback_bind_address() {
-        let expected: SocketAddr = "127.0.0.1:8080".parse().expect("valid address");
+        let expected: SocketAddr = "127.0.0.1:17670".parse().expect("valid address");
         assert_eq!(Config::new(None).bind_address, expected);
     }
 
@@ -667,6 +565,52 @@ mod tests {
     fn config_new_disables_health_bind_by_default() {
         let cfg = Config::new(None);
         assert!(cfg.health_bind_address.is_none());
+    }
+
+    #[test]
+    fn service_routing_allows_loopback_plaintext_http_by_default() {
+        let cfg = Config::new(None);
+        assert_eq!(
+            cfg.service_routing.base_domains,
+            vec![DEFAULT_SERVICE_ROUTING_DOMAIN.to_string()]
+        );
+        assert!(cfg.service_routing.enable_loopback_service_http);
+    }
+
+    #[test]
+    fn server_sans_update_preserves_loopback_plaintext_http_flag() {
+        let cfg = Config::new(None)
+            .with_loopback_service_http(false)
+            .with_server_sans(["*.dev.openshell.localhost"]);
+
+        assert_eq!(
+            cfg.service_routing.base_domains,
+            vec![
+                "dev.openshell.localhost".to_string(),
+                DEFAULT_SERVICE_ROUTING_DOMAIN.to_string()
+            ]
+        );
+        assert!(!cfg.service_routing.enable_loopback_service_http);
+    }
+
+    #[test]
+    fn service_routing_domains_are_derived_from_wildcard_server_sans() {
+        let cfg = Config::new(None).with_server_sans([
+            "gateway.example.com",
+            "*.apps.example.com",
+            "127.0.0.1",
+            "*.apps.example.com",
+            "*.dev.example.com.",
+        ]);
+
+        assert_eq!(
+            cfg.service_routing.base_domains,
+            vec![
+                "apps.example.com".to_string(),
+                "dev.example.com".to_string(),
+                DEFAULT_SERVICE_ROUTING_DOMAIN.to_string(),
+            ]
+        );
     }
 
     #[test]

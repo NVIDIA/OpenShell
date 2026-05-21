@@ -60,7 +60,8 @@ const COMPUTE_DRIVER_SOCKET_RUN_DIR: &str = "run";
 const COMPUTE_DRIVER_SOCKET_NAME: &str = "compute-driver.sock";
 
 /// Configuration for launching and talking to the VM compute driver.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct VmComputeConfig {
     /// Working directory for VM driver sandbox state.
     pub state_dir: PathBuf,
@@ -72,6 +73,12 @@ pub struct VmComputeConfig {
     /// Default sandbox image the driver should use when a request omits one.
     pub default_image: String,
 
+    /// Gateway gRPC endpoint the sandbox guest connects back to.
+    pub grpc_endpoint: String,
+
+    /// Bootstrap image used to boot and prepare VM sandbox target images.
+    pub bootstrap_image: String,
+
     /// libkrun log level used by the VM driver helper.
     pub krun_log_level: u32,
 
@@ -80,6 +87,9 @@ pub struct VmComputeConfig {
 
     /// Default memory allocation for VM sandboxes, in MiB.
     pub mem_mib: u32,
+
+    /// Writable overlay disk size for each VM sandbox, in MiB.
+    pub overlay_disk_mib: u64,
 
     /// Host-side CA certificate for the guest's mTLS client bundle.
     pub guest_tls_ca: Option<PathBuf>,
@@ -95,7 +105,10 @@ impl VmComputeConfig {
     /// Default working directory for VM driver state.
     #[must_use]
     pub fn default_state_dir() -> PathBuf {
-        PathBuf::from("target/openshell-vm-driver")
+        openshell_core::paths::openshell_state_dir().map_or_else(
+            |_| PathBuf::from("target/openshell-vm-driver"),
+            |dir| dir.join("vm-driver"),
+        )
     }
 
     /// Default libkrun log level.
@@ -116,6 +129,12 @@ impl VmComputeConfig {
         2048
     }
 
+    /// Default writable overlay disk size, in MiB.
+    #[must_use]
+    pub const fn default_overlay_disk_mib() -> u64 {
+        4096
+    }
+
     #[must_use]
     fn default_driver_search_dirs(home: Option<PathBuf>) -> Vec<PathBuf> {
         let mut dirs = Vec::new();
@@ -134,10 +153,13 @@ impl Default for VmComputeConfig {
         Self {
             state_dir: Self::default_state_dir(),
             driver_dir: None,
-            default_image: String::new(),
+            default_image: openshell_core::image::default_sandbox_image(),
+            grpc_endpoint: String::new(),
+            bootstrap_image: String::new(),
             krun_log_level: Self::default_krun_log_level(),
             vcpus: Self::default_vcpus(),
             mem_mib: Self::default_mem_mib(),
+            overlay_disk_mib: Self::default_overlay_disk_mib(),
             guest_tls_ca: None,
             guest_tls_cert: None,
             guest_tls_key: None,
@@ -157,7 +179,7 @@ pub struct VmGuestTlsPaths {
 ///
 /// Resolution order:
 /// 1. `{driver_dir}/openshell-driver-vm`, where `driver_dir` comes from
-///    `--driver-dir` / `OPENSHELL_DRIVER_DIR`.
+///    `[openshell.drivers.vm].driver_dir`.
 /// 2. Conventional install directories:
 ///    `~/.local/libexec/openshell`, `/usr/libexec/openshell`,
 ///    `/usr/local/libexec/openshell`, `/usr/local/libexec`.
@@ -197,13 +219,27 @@ pub fn resolve_compute_driver_bin(vm_config: &VmComputeConfig) -> Result<PathBuf
         .collect::<Vec<_>>()
         .join(", ");
     Err(Error::config(format!(
-        "vm compute driver binary not found (searched {searched_display}); install it under --driver-dir / OPENSHELL_DRIVER_DIR, a conventional libexec path such as ~/.local/libexec/openshell, /usr/libexec/openshell, or /usr/local/libexec{{,/openshell}}, or place it next to the gateway binary"
+        "vm compute driver binary not found (searched {searched_display}); install it under [openshell.drivers.vm].driver_dir, a conventional libexec path such as ~/.local/libexec/openshell, /usr/libexec/openshell, or /usr/local/libexec{{,/openshell}}, or place it next to the gateway binary"
     )))
 }
 
 fn resolve_driver_search_dirs(vm_config: &VmComputeConfig) -> Vec<PathBuf> {
     vm_config.driver_dir.clone().map_or_else(
-        || VmComputeConfig::default_driver_search_dirs(std::env::var_os("HOME").map(PathBuf::from)),
+        || {
+            let mut dirs = Vec::new();
+            if let Ok(current_exe) = std::env::current_exe()
+                && let Some(prefix) = current_exe.parent().and_then(Path::parent)
+            {
+                push_unique_path(&mut dirs, prefix.join("libexec"));
+                push_unique_path(&mut dirs, prefix.join("libexec").join("openshell"));
+            }
+            for dir in VmComputeConfig::default_driver_search_dirs(
+                std::env::var_os("HOME").map(PathBuf::from),
+            ) {
+                push_unique_path(&mut dirs, dir);
+            }
+            dirs
+        },
         |dir| vec![dir],
     )
 }
@@ -254,11 +290,15 @@ fn prepare_vm_state_dir(state_dir: &Path, expected_uid: u32) -> Result<()> {
     })?;
     let metadata = checked_directory_metadata(state_dir, expected_uid, "vm driver state dir")?;
     let mode = metadata.permissions().mode() & 0o777;
-    if mode & 0o022 != 0 {
-        return Err(Error::execution(format!(
-            "vm driver state dir '{}' must not be group/world-writable (mode {mode:03o})",
-            state_dir.display()
-        )));
+    if mode != 0o700 {
+        std::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700)).map_err(
+            |err| {
+                Error::execution(format!(
+                    "failed to restrict vm driver state dir '{}': {err}",
+                    state_dir.display()
+                ))
+            },
+        )?;
     }
     Ok(())
 }
@@ -359,10 +399,9 @@ fn remove_stale_socket(socket_path: &Path, expected_uid: u32) -> Result<()> {
 
 #[cfg(unix)]
 pub fn compute_driver_guest_tls_paths(
-    config: &Config,
     vm_config: &VmComputeConfig,
 ) -> Result<Option<VmGuestTlsPaths>> {
-    if !config.grpc_endpoint.starts_with("https://") {
+    if !vm_config.grpc_endpoint.starts_with("https://") {
         return Ok(None);
     }
 
@@ -373,23 +412,23 @@ pub fn compute_driver_guest_tls_paths(
     ];
     if provided.iter().all(Option::is_none) {
         return Err(Error::config(
-            "vm compute driver requires --vm-tls-ca, --vm-tls-cert, and --vm-tls-key when OPENSHELL_GRPC_ENDPOINT uses https://",
+            "vm compute driver requires guest_tls_ca, guest_tls_cert, and guest_tls_key when grpc_endpoint uses https://",
         ));
     }
 
     let Some(ca) = vm_config.guest_tls_ca.clone() else {
         return Err(Error::config(
-            "--vm-tls-ca is required when VM guest TLS materials are configured",
+            "guest_tls_ca is required when VM guest TLS materials are configured",
         ));
     };
     let Some(cert) = vm_config.guest_tls_cert.clone() else {
         return Err(Error::config(
-            "--vm-tls-cert is required when VM guest TLS materials are configured",
+            "guest_tls_cert is required when VM guest TLS materials are configured",
         ));
     };
     let Some(key) = vm_config.guest_tls_key.clone() else {
         return Err(Error::config(
-            "--vm-tls-key is required when VM guest TLS materials are configured",
+            "guest_tls_key is required when VM guest TLS materials are configured",
         ));
     };
 
@@ -413,7 +452,7 @@ pub async fn spawn(
     config: &Config,
     vm_config: &VmComputeConfig,
 ) -> Result<(Channel, Arc<ManagedDriverProcess>)> {
-    if config.grpc_endpoint.trim().is_empty() {
+    if vm_config.grpc_endpoint.trim().is_empty() {
         return Err(Error::config(
             "grpc_endpoint is required when using the vm compute driver",
         ));
@@ -421,7 +460,7 @@ pub async fn spawn(
 
     let driver_bin = resolve_compute_driver_bin(vm_config)?;
     let socket_path = compute_driver_socket_path(vm_config);
-    let guest_tls_paths = compute_driver_guest_tls_paths(config, vm_config)?;
+    let guest_tls_paths = compute_driver_guest_tls_paths(vm_config)?;
     prepare_compute_driver_socket_path(vm_config, &socket_path)?;
 
     let mut command = Command::new(&driver_bin);
@@ -436,27 +475,24 @@ pub async fn spawn(
     command.arg("--log-level").arg(&config.log_level);
     command
         .arg("--openshell-endpoint")
-        .arg(&config.grpc_endpoint);
+        .arg(&vm_config.grpc_endpoint);
     command.arg("--state-dir").arg(&vm_config.state_dir);
     if !vm_config.default_image.trim().is_empty() {
         command.arg("--default-image").arg(&vm_config.default_image);
     }
-    // Only forward the handshake secret when one is configured. The VM
-    // driver does not consume it, but accepts it for parity with the
-    // Kubernetes/Podman drivers; passing an empty value is noise.
-    if !config.ssh_handshake_secret.is_empty() {
+    if !vm_config.bootstrap_image.trim().is_empty() {
         command
-            .arg("--ssh-handshake-secret")
-            .arg(&config.ssh_handshake_secret);
+            .arg("--bootstrap-image")
+            .arg(&vm_config.bootstrap_image);
     }
-    command
-        .arg("--ssh-handshake-skew-secs")
-        .arg(config.ssh_handshake_skew_secs.to_string());
     command
         .arg("--krun-log-level")
         .arg(vm_config.krun_log_level.to_string());
     command.arg("--vcpus").arg(vm_config.vcpus.to_string());
     command.arg("--mem-mib").arg(vm_config.mem_mib.to_string());
+    command
+        .arg("--overlay-disk-mib")
+        .arg(vm_config.overlay_disk_mib.to_string());
     if let Some(tls) = guest_tls_paths {
         command.arg("--guest-tls-ca").arg(tls.ca);
         command.arg("--guest-tls-cert").arg(tls.cert);
@@ -549,7 +585,6 @@ mod tests {
         prepare_compute_driver_socket_path, prepare_vm_state_dir, resolve_compute_driver_bin,
         resolve_driver_search_dirs,
     };
-    use openshell_core::{Config, TlsConfig};
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener as StdUnixListener;
     use std::path::PathBuf;
@@ -580,8 +615,7 @@ mod tests {
         let err = resolve_compute_driver_bin(&vm_config)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("--driver-dir"));
-        assert!(err.contains("OPENSHELL_DRIVER_DIR"));
+        assert!(err.contains("[openshell.drivers.vm].driver_dir"));
         assert!(err.contains("openshell-driver-vm"));
     }
 
@@ -599,27 +633,16 @@ mod tests {
 
     #[test]
     fn vm_compute_driver_tls_requires_explicit_guest_bundle() {
-        let dir = tempdir().unwrap();
-        let server_cert = dir.path().join("server.crt");
-        let server_key = dir.path().join("server.key");
-        let server_ca = dir.path().join("client-ca.crt");
-        std::fs::write(&server_cert, "server-cert").unwrap();
-        std::fs::write(&server_key, "server-key").unwrap();
-        std::fs::write(&server_ca, "client-ca").unwrap();
+        let vm_config = VmComputeConfig {
+            grpc_endpoint: "https://gateway.internal:8443".to_string(),
+            ..Default::default()
+        };
 
-        let config = Config::new(Some(TlsConfig {
-            cert_path: server_cert,
-            key_path: server_key,
-            client_ca_path: server_ca,
-            allow_unauthenticated: false,
-        }))
-        .with_grpc_endpoint("https://gateway.internal:8443");
-
-        let err = compute_driver_guest_tls_paths(&config, &VmComputeConfig::default())
+        let err = compute_driver_guest_tls_paths(&vm_config)
             .expect_err("https vm endpoints should require an explicit guest client bundle");
         assert!(
             err.to_string()
-                .contains("--vm-tls-ca, --vm-tls-cert, and --vm-tls-key")
+                .contains("guest_tls_ca, guest_tls_cert, and guest_tls_key")
         );
     }
 
@@ -628,14 +651,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let server_cert = dir.path().join("server.crt");
         let server_key = dir.path().join("server.key");
-        let server_ca = dir.path().join("client-ca.crt");
         let guest_ca = dir.path().join("guest-ca.crt");
         let guest_cert = dir.path().join("guest.crt");
         let guest_key = dir.path().join("guest.key");
         for path in [
             &server_cert,
             &server_key,
-            &server_ca,
             &guest_ca,
             &guest_cert,
             &guest_key,
@@ -643,21 +664,15 @@ mod tests {
             std::fs::write(path, path.display().to_string()).unwrap();
         }
 
-        let config = Config::new(Some(TlsConfig {
-            cert_path: server_cert.clone(),
-            key_path: server_key.clone(),
-            client_ca_path: server_ca,
-            allow_unauthenticated: false,
-        }))
-        .with_grpc_endpoint("https://gateway.internal:8443");
         let vm_config = VmComputeConfig {
+            grpc_endpoint: "https://gateway.internal:8443".to_string(),
             guest_tls_ca: Some(guest_ca.clone()),
             guest_tls_cert: Some(guest_cert.clone()),
             guest_tls_key: Some(guest_key.clone()),
             ..Default::default()
         };
 
-        let guest_paths = compute_driver_guest_tls_paths(&config, &vm_config)
+        let guest_paths = compute_driver_guest_tls_paths(&vm_config)
             .unwrap()
             .expect("https vm endpoints should pass an explicit guest client bundle");
         assert_eq!(guest_paths.ca, guest_ca);
@@ -719,7 +734,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_compute_driver_socket_path_rejects_writable_state_dir() {
+    fn prepare_compute_driver_socket_path_restricts_existing_state_dir() {
         let dir = tempdir().unwrap();
         let vm_config = VmComputeConfig {
             state_dir: dir.path().join("state"),
@@ -730,10 +745,14 @@ mod tests {
             .unwrap();
         let socket_path = compute_driver_socket_path(&vm_config);
 
-        let err = prepare_compute_driver_socket_path(&vm_config, &socket_path)
-            .expect_err("world-writable state dir should be rejected")
-            .to_string();
-        assert!(err.contains("must not be group/world-writable"));
+        prepare_compute_driver_socket_path(&vm_config, &socket_path).unwrap();
+
+        let mode = std::fs::metadata(vm_config.state_dir)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700);
     }
 
     #[test]

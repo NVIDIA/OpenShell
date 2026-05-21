@@ -3,7 +3,9 @@
 
 //! Kubernetes compute driver.
 
-use crate::config::KubernetesComputeConfig;
+use crate::config::{
+    DEFAULT_WORKSPACE_STORAGE_SIZE, KubernetesComputeConfig, SupervisorSideloadMethod,
+};
 use futures::{Stream, StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::{Event as KubeEventObj, Node};
 use kube::api::{Api, ApiResource, DeleteParams, ListParams, PostParams};
@@ -11,6 +13,11 @@ use kube::core::gvk::GroupVersionKind;
 use kube::core::{DynamicObject, ObjectMeta};
 use kube::runtime::watcher::{self, Event};
 use kube::{Client, Error as KubeError};
+use openshell_core::driver_utils::SUPERVISOR_IMAGE_BINARY_PATH;
+use openshell_core::progress::{
+    PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX, PROGRESS_STEP_STARTING_SANDBOX,
+    mark_progress_active, mark_progress_complete, mark_progress_detail,
+};
 use openshell_core::proto::compute::v1::{
     DriverCondition as SandboxCondition, DriverPlatformEvent as PlatformEvent,
     DriverSandbox as Sandbox, DriverSandboxSpec as SandboxSpec,
@@ -43,6 +50,16 @@ impl KubernetesDriverError {
         match err {
             KubeError::Api(api) if api.code == 409 => Self::AlreadyExists,
             other => Self::Message(other.to_string()),
+        }
+    }
+}
+
+impl From<KubernetesDriverError> for openshell_core::ComputeDriverError {
+    fn from(err: KubernetesDriverError) -> Self {
+        match err {
+            KubernetesDriverError::AlreadyExists => Self::AlreadyExists,
+            KubernetesDriverError::Precondition(m) => Self::Precondition(m),
+            KubernetesDriverError::Message(m) => Self::Message(m),
         }
     }
 }
@@ -91,9 +108,6 @@ const WORKSPACE_INIT_MOUNT_PATH: &str = "/workspace-pvc";
 
 /// Name of the init container that seeds the workspace PVC.
 const WORKSPACE_INIT_CONTAINER_NAME: &str = "workspace-init";
-
-/// Default storage request for the workspace PVC.
-const WORKSPACE_DEFAULT_STORAGE: &str = "2Gi";
 
 /// Sentinel file written by the init container after copying the image's
 /// `/sandbox` contents.  Subsequent pod starts skip the copy.
@@ -164,10 +178,6 @@ impl KubernetesComputeDriver {
 
     pub fn ssh_socket_path(&self) -> &str {
         &self.config.ssh_socket_path
-    }
-
-    pub const fn ssh_handshake_skew_secs(&self) -> u64 {
-        self.config.ssh_handshake_skew_secs
     }
 
     fn watch_api(&self) -> Api<DynamicObject> {
@@ -286,10 +296,6 @@ impl KubernetesComputeDriver {
         }
     }
 
-    fn ssh_handshake_secret(&self) -> &str {
-        &self.config.ssh_handshake_secret
-    }
-
     pub async fn create_sandbox(&self, sandbox: &Sandbox) -> Result<(), KubernetesDriverError> {
         let name = sandbox.name.as_str();
         info!(
@@ -313,15 +319,15 @@ impl KubernetesComputeDriver {
             image_pull_policy: &self.config.image_pull_policy,
             supervisor_image: &self.config.supervisor_image,
             supervisor_image_pull_policy: &self.config.supervisor_image_pull_policy,
+            supervisor_sideload_method: self.config.supervisor_sideload_method,
             sandbox_id: &sandbox.id,
             sandbox_name: &sandbox.name,
             grpc_endpoint: &self.config.grpc_endpoint,
             ssh_socket_path: self.ssh_socket_path(),
-            ssh_handshake_secret: self.ssh_handshake_secret(),
-            ssh_handshake_skew_secs: self.ssh_handshake_skew_secs(),
             client_tls_secret_name: &self.config.client_tls_secret_name,
             host_gateway_ip: &self.config.host_gateway_ip,
             enable_user_namespaces: self.config.enable_user_namespaces,
+            workspace_default_storage_size: &self.config.workspace_default_storage_size,
         };
         obj.data = sandbox_to_k8s_spec(sandbox.spec.as_ref(), &params);
         let api = self.api();
@@ -645,6 +651,11 @@ fn map_kube_event_to_platform(
     if let Some(count) = obj.count {
         metadata.insert("count".to_string(), count.to_string());
     }
+    attach_kube_progress_metadata(
+        &mut metadata,
+        obj.reason.as_deref().unwrap_or_default(),
+        obj.message.as_deref().unwrap_or_default(),
+    );
 
     Some((
         sandbox_id,
@@ -657,6 +668,76 @@ fn map_kube_event_to_platform(
             metadata,
         },
     ))
+}
+
+fn attach_kube_progress_metadata(
+    metadata: &mut std::collections::HashMap<String, String>,
+    reason: &str,
+    message: &str,
+) {
+    match reason {
+        "Scheduled" => {
+            mark_progress_complete(
+                metadata,
+                PROGRESS_STEP_REQUESTING_SANDBOX,
+                "Sandbox allocated",
+            );
+            mark_progress_active(metadata, PROGRESS_STEP_PULLING_IMAGE);
+        }
+        "Pulling" => {
+            mark_progress_active(metadata, PROGRESS_STEP_PULLING_IMAGE);
+            if let Some(image) = pulling_image_from_kube_message(message) {
+                mark_progress_detail(metadata, image);
+            }
+        }
+        "Pulled" => {
+            let label = pulled_image_label(message);
+            mark_progress_complete(metadata, PROGRESS_STEP_PULLING_IMAGE, label);
+            mark_progress_active(metadata, PROGRESS_STEP_STARTING_SANDBOX);
+        }
+        _ => {}
+    }
+}
+
+fn pulling_image_from_kube_message(message: &str) -> Option<String> {
+    let image = message
+        .strip_prefix("Pulling image ")
+        .map(str::trim)
+        .map(|value| value.trim_matches('"'))?;
+    (!image.is_empty()).then(|| image.to_string())
+}
+
+fn pulled_image_label(message: &str) -> String {
+    extract_image_size(message).map_or_else(
+        || "Image pulled".to_string(),
+        |bytes| format!("Image pulled ({})", format_bytes(bytes)),
+    )
+}
+
+fn extract_image_size(message: &str) -> Option<u64> {
+    let size_prefix = "Image size: ";
+    let start = message.find(size_prefix)? + size_prefix.len();
+    let rest = &message[start..];
+    let end = rest.find(' ')?;
+    rest[..end].parse().ok()
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+
+    if bytes >= GB {
+        #[allow(clippy::cast_precision_loss)]
+        let gb = bytes as f64 / GB as f64;
+        format!("{gb:.1} GB")
+    } else if bytes >= MB {
+        format!("{} MB", bytes / MB)
+    } else if bytes >= KB {
+        format!("{} KB", bytes / KB)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 /// Path where the supervisor binary is mounted inside the agent container.
@@ -687,12 +768,26 @@ fn supervisor_volume_mount() -> serde_json::Value {
     })
 }
 
-/// Path of the supervisor binary inside the supervisor image.
+/// Build an image volume that mounts the supervisor OCI image directly.
 ///
-/// The supervisor image places the binary at the filesystem root. We invoke
-/// it directly so the init path does not depend on shell utilities or PATH
-/// resolution inside the image.
-const SUPERVISOR_IMAGE_BINARY_PATH: &str = "/openshell-sandbox";
+/// Requires Kubernetes >= v1.33 (`ImageVolume` beta) or >= v1.36 (GA).
+/// The entire image filesystem is mounted read-only, making the binary
+/// available at `{SUPERVISOR_MOUNT_PATH}/openshell-sandbox`.
+fn supervisor_image_volume(
+    supervisor_image: &str,
+    supervisor_image_pull_policy: &str,
+) -> serde_json::Value {
+    let mut image_spec = serde_json::json!({
+        "reference": supervisor_image,
+    });
+    if !supervisor_image_pull_policy.is_empty() {
+        image_spec["pullPolicy"] = serde_json::json!(supervisor_image_pull_policy);
+    }
+    serde_json::json!({
+        "name": SUPERVISOR_VOLUME_NAME,
+        "image": image_spec
+    })
+}
 
 /// Build the init container that copies the supervisor binary into the emptyDir.
 ///
@@ -730,43 +825,56 @@ fn supervisor_init_container(
 
 /// Apply supervisor side-load transforms to an already-built pod template JSON.
 ///
-/// Injects an emptyDir volume, an init container that copies the supervisor
-/// binary from the supervisor image into that volume, and a read-only volume
-/// mount + command override on the agent container.
+/// Depending on the sideload method:
+/// - **`ImageVolume`**: mounts the supervisor OCI image directly as a read-only
+///   volume (no init container needed, requires K8s >= v1.33).
+/// - **`InitContainer`**: injects an emptyDir volume and an init container that
+///   copies the supervisor binary from the supervisor image into that volume.
 ///
-/// The `runAsUser: 0` override ensures the supervisor binary runs as root
-/// regardless of the image's `USER` directive. The supervisor needs root for
-/// network namespace creation, proxy setup, and Landlock/seccomp configuration.
-/// It drops to the appropriate non-root user for child processes via the
-/// policy's `run_as_user`/`run_as_group`.
+/// In both cases, the agent container gets a command override to run the
+/// side-loaded binary and `runAsUser: 0` so it can create network namespaces,
+/// set up the proxy, and configure Landlock/seccomp.
 fn apply_supervisor_sideload(
     pod_template: &mut serde_json::Value,
     supervisor_image: &str,
     supervisor_image_pull_policy: &str,
+    method: SupervisorSideloadMethod,
 ) {
     let Some(spec) = pod_template.get_mut("spec").and_then(|v| v.as_object_mut()) else {
         return;
     };
 
-    // 1. Add the emptyDir volume to spec.volumes
+    // 1. Add the volume (image source or emptyDir depending on method)
     let volumes = spec
         .entry("volumes")
         .or_insert_with(|| serde_json::json!([]))
         .as_array_mut();
     if let Some(volumes) = volumes {
-        volumes.push(supervisor_volume());
+        match method {
+            SupervisorSideloadMethod::ImageVolume => {
+                volumes.push(supervisor_image_volume(
+                    supervisor_image,
+                    supervisor_image_pull_policy,
+                ));
+            }
+            SupervisorSideloadMethod::InitContainer => {
+                volumes.push(supervisor_volume());
+            }
+        }
     }
 
-    // 2. Add the init container that copies the binary into the emptyDir
-    let init_containers = spec
-        .entry("initContainers")
-        .or_insert_with(|| serde_json::json!([]))
-        .as_array_mut();
-    if let Some(init_containers) = init_containers {
-        init_containers.push(supervisor_init_container(
-            supervisor_image,
-            supervisor_image_pull_policy,
-        ));
+    // 2. Add the init container only for the init-container method
+    if method == SupervisorSideloadMethod::InitContainer {
+        let init_containers = spec
+            .entry("initContainers")
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut();
+        if let Some(init_containers) = init_containers {
+            init_containers.push(supervisor_init_container(
+                supervisor_image,
+                supervisor_image_pull_policy,
+            ));
+        }
     }
 
     // 3. Find the agent container and add volume mount + command override
@@ -911,7 +1019,12 @@ fn apply_workspace_persistence(
 ///
 /// Provides a single PVC named "workspace" that backs the `/sandbox`
 /// directory.  The init container seeds it from the image on first use.
-fn default_workspace_volume_claim_templates() -> serde_json::Value {
+fn default_workspace_volume_claim_templates(storage_size: &str) -> serde_json::Value {
+    let size = if storage_size.is_empty() {
+        DEFAULT_WORKSPACE_STORAGE_SIZE
+    } else {
+        storage_size
+    };
     serde_json::json!([{
         "metadata": {
             "name": WORKSPACE_VOLUME_NAME
@@ -920,7 +1033,7 @@ fn default_workspace_volume_claim_templates() -> serde_json::Value {
             "accessModes": ["ReadWriteOnce"],
             "resources": {
                 "requests": {
-                    "storage": WORKSPACE_DEFAULT_STORAGE
+                    "storage": size
                 }
             }
         }
@@ -934,15 +1047,26 @@ struct SandboxPodParams<'a> {
     image_pull_policy: &'a str,
     supervisor_image: &'a str,
     supervisor_image_pull_policy: &'a str,
+    supervisor_sideload_method: SupervisorSideloadMethod,
     sandbox_id: &'a str,
     sandbox_name: &'a str,
     grpc_endpoint: &'a str,
     ssh_socket_path: &'a str,
-    ssh_handshake_secret: &'a str,
-    ssh_handshake_skew_secs: u64,
     client_tls_secret_name: &'a str,
     host_gateway_ip: &'a str,
     enable_user_namespaces: bool,
+    workspace_default_storage_size: &'a str,
+}
+
+fn spec_pod_env(spec: Option<&SandboxSpec>) -> std::collections::HashMap<String, String> {
+    let mut env = spec.map_or_else(Default::default, |s| s.environment.clone());
+    if let Some(s) = spec.filter(|s| !s.log_level.is_empty()) {
+        env.insert(
+            openshell_core::sandbox_env::LOG_LEVEL.to_string(),
+            s.log_level.clone(),
+        );
+    }
+    env
 }
 
 fn sandbox_to_k8s_spec(
@@ -963,25 +1087,11 @@ fn sandbox_to_k8s_spec(
     let inject_workspace = !user_has_vct;
 
     if let Some(spec) = spec {
-        if !spec.log_level.is_empty() {
-            root.insert("logLevel".to_string(), serde_json::json!(spec.log_level));
-        }
-        if !spec.environment.is_empty() {
-            root.insert(
-                "environment".to_string(),
-                serde_json::json!(spec.environment),
-            );
-        }
+        let pod_env = spec_pod_env(Some(spec));
         if let Some(template) = spec.template.as_ref() {
             root.insert(
                 "podTemplate".to_string(),
-                sandbox_template_to_k8s(
-                    template,
-                    spec.gpu,
-                    &spec.environment,
-                    inject_workspace,
-                    params,
-                ),
+                sandbox_template_to_k8s(template, spec.gpu, &pod_env, inject_workspace, params),
             );
             if !template.agent_socket_path.is_empty() {
                 root.insert(
@@ -1002,20 +1112,19 @@ fn sandbox_to_k8s_spec(
     if inject_workspace {
         root.insert(
             "volumeClaimTemplates".to_string(),
-            default_workspace_volume_claim_templates(),
+            default_workspace_volume_claim_templates(params.workspace_default_storage_size),
         );
     }
 
     // podTemplate is required by the Kubernetes CRD - ensure it's always present
     if !root.contains_key("podTemplate") {
-        let empty_env = std::collections::HashMap::new();
-        let spec_env = spec.as_ref().map_or(&empty_env, |s| &s.environment);
+        let pod_env = spec_pod_env(spec);
         root.insert(
             "podTemplate".to_string(),
             sandbox_template_to_k8s(
                 &SandboxTemplate::default(),
-                spec.as_ref().is_some_and(|s| s.gpu),
-                spec_env,
+                spec.is_some_and(|s| s.gpu),
+                &pod_env,
                 inject_workspace,
                 params,
             ),
@@ -1048,6 +1157,12 @@ fn sandbox_template_to_k8s(
             "runtimeClassName".to_string(),
             serde_json::json!(runtime_class),
         );
+    }
+    if let Some(node_selector) = platform_config_struct(template, "node_selector") {
+        spec.insert("nodeSelector".to_string(), node_selector);
+    }
+    if let Some(tolerations) = platform_config_struct(template, "tolerations") {
+        spec.insert("tolerations".to_string(), tolerations);
     }
 
     // Per-sandbox platform_config.host_users overrides the cluster-wide default.
@@ -1098,8 +1213,6 @@ fn sandbox_template_to_k8s(
         params.sandbox_name,
         params.grpc_endpoint,
         params.ssh_socket_path,
-        params.ssh_handshake_secret,
-        params.ssh_handshake_skew_secs,
         !params.client_tls_secret_name.is_empty(),
     );
 
@@ -1173,12 +1286,11 @@ fn sandbox_template_to_k8s(
 
     let mut result = serde_json::Value::Object(template_value);
 
-    // Side-load the supervisor binary via an init container that copies it
-    // from the supervisor image into a shared emptyDir volume.
     apply_supervisor_sideload(
         &mut result,
         params.supervisor_image,
         params.supervisor_image_pull_policy,
+        params.supervisor_sideload_method,
     );
 
     // Inject workspace persistence (init container + PVC volume mount) so
@@ -1207,10 +1319,21 @@ fn container_resources(template: &SandboxTemplate, gpu: bool) -> Option<serde_js
                 sec[key] = serde_json::json!(value);
             }
         };
-        apply("requests", "cpu", &req.cpu_request);
-        apply("requests", "memory", &req.memory_request);
         apply("limits", "cpu", &req.cpu_limit);
         apply("limits", "memory", &req.memory_limit);
+
+        let cpu_request = if req.cpu_request.is_empty() {
+            &req.cpu_limit
+        } else {
+            &req.cpu_request
+        };
+        let memory_request = if req.memory_request.is_empty() {
+            &req.memory_limit
+        } else {
+            &req.memory_request
+        };
+        apply("requests", "cpu", cpu_request);
+        apply("requests", "memory", memory_request);
     }
 
     if gpu {
@@ -1252,8 +1375,6 @@ fn build_env_list(
     sandbox_name: &str,
     grpc_endpoint: &str,
     ssh_socket_path: &str,
-    ssh_handshake_secret: &str,
-    ssh_handshake_skew_secs: u64,
     tls_enabled: bool,
 ) -> Vec<serde_json::Value> {
     let mut env = existing_env.cloned().unwrap_or_default();
@@ -1265,8 +1386,6 @@ fn build_env_list(
         sandbox_name,
         grpc_endpoint,
         ssh_socket_path,
-        ssh_handshake_secret,
-        ssh_handshake_skew_secs,
         tls_enabled,
     );
     env
@@ -1283,42 +1402,45 @@ fn apply_env_map(
 
 // Required env vars are passed individually for clarity at call sites; grouping into a struct
 // would not improve readability for this internal helper.
-#[allow(clippy::too_many_arguments)]
 fn apply_required_env(
     env: &mut Vec<serde_json::Value>,
     sandbox_id: &str,
     sandbox_name: &str,
     grpc_endpoint: &str,
     ssh_socket_path: &str,
-    ssh_handshake_secret: &str,
-    ssh_handshake_skew_secs: u64,
     tls_enabled: bool,
 ) {
-    upsert_env(env, "OPENSHELL_SANDBOX_ID", sandbox_id);
-    upsert_env(env, "OPENSHELL_SANDBOX", sandbox_name);
-    upsert_env(env, "OPENSHELL_ENDPOINT", grpc_endpoint);
-    upsert_env(env, "OPENSHELL_SANDBOX_COMMAND", "sleep infinity");
-    if !ssh_socket_path.is_empty() {
-        upsert_env(env, "OPENSHELL_SSH_SOCKET_PATH", ssh_socket_path);
-    }
-    upsert_env(env, "OPENSHELL_SSH_HANDSHAKE_SECRET", ssh_handshake_secret);
+    upsert_env(env, openshell_core::sandbox_env::SANDBOX_ID, sandbox_id);
+    upsert_env(env, openshell_core::sandbox_env::SANDBOX, sandbox_name);
+    upsert_env(env, openshell_core::sandbox_env::ENDPOINT, grpc_endpoint);
     upsert_env(
         env,
-        "OPENSHELL_SSH_HANDSHAKE_SKEW_SECS",
-        &ssh_handshake_skew_secs.to_string(),
+        openshell_core::sandbox_env::SANDBOX_COMMAND,
+        "sleep infinity",
     );
+    if !ssh_socket_path.is_empty() {
+        upsert_env(
+            env,
+            openshell_core::sandbox_env::SSH_SOCKET_PATH,
+            ssh_socket_path,
+        );
+    }
     // TLS cert paths for sandbox-to-server mTLS. Only set when TLS is enabled
     // and the client TLS secret is mounted into the sandbox pod.
     if tls_enabled {
-        upsert_env(env, "OPENSHELL_TLS_CA", "/etc/openshell-tls/client/ca.crt");
         upsert_env(
             env,
-            "OPENSHELL_TLS_CERT",
+            openshell_core::sandbox_env::TLS_CA,
+            "/etc/openshell-tls/client/ca.crt",
+        );
+        upsert_env(
+            env,
+            openshell_core::sandbox_env::TLS_CERT,
             "/etc/openshell-tls/client/tls.crt",
         );
         upsert_env(
             env,
-            "OPENSHELL_TLS_KEY",
+            openshell_core::sandbox_env::TLS_KEY,
             "/etc/openshell-tls/client/tls.key",
         );
     }
@@ -1458,31 +1580,55 @@ fn condition_from_value(value: &serde_json::Value) -> Option<SandboxCondition> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openshell_core::progress::{
+        PROGRESS_ACTIVE_DETAIL_KEY, PROGRESS_ACTIVE_STEP_KEY, PROGRESS_COMPLETE_LABEL_KEY,
+        PROGRESS_COMPLETE_STEP_KEY,
+    };
     use prost_types::{Struct, Value, value::Kind};
 
     #[test]
-    fn apply_required_env_always_injects_ssh_handshake_secret() {
-        let mut env = Vec::new();
-        apply_required_env(
-            &mut env,
-            "sandbox-1",
-            "my-sandbox",
-            "https://endpoint:8080",
-            "0.0.0.0:2222",
-            "my-secret-value",
-            300,
-            true,
+    fn kube_pulling_event_adds_image_progress_metadata() {
+        let mut metadata = std::collections::HashMap::new();
+
+        attach_kube_progress_metadata(
+            &mut metadata,
+            "Pulling",
+            "Pulling image \"ghcr.io/acme/sandbox:latest\"",
         );
 
-        let secret_entry = env
-            .iter()
-            .find(|e| {
-                e.get("name").and_then(|v| v.as_str()) == Some("OPENSHELL_SSH_HANDSHAKE_SECRET")
-            })
-            .expect("OPENSHELL_SSH_HANDSHAKE_SECRET must be present in env");
         assert_eq!(
-            secret_entry.get("value").and_then(|v| v.as_str()),
-            Some("my-secret-value")
+            metadata.get(PROGRESS_ACTIVE_STEP_KEY).map(String::as_str),
+            Some(PROGRESS_STEP_PULLING_IMAGE)
+        );
+        assert_eq!(
+            metadata.get(PROGRESS_ACTIVE_DETAIL_KEY).map(String::as_str),
+            Some("ghcr.io/acme/sandbox:latest")
+        );
+    }
+
+    #[test]
+    fn kube_pulled_event_adds_completed_image_progress_metadata() {
+        let mut metadata = std::collections::HashMap::new();
+
+        attach_kube_progress_metadata(
+            &mut metadata,
+            "Pulled",
+            "Successfully pulled image \"ghcr.io/acme/sandbox:latest\". Image size: 44040192 bytes.",
+        );
+
+        assert_eq!(
+            metadata.get(PROGRESS_COMPLETE_STEP_KEY).map(String::as_str),
+            Some(PROGRESS_STEP_PULLING_IMAGE)
+        );
+        assert_eq!(
+            metadata
+                .get(PROGRESS_COMPLETE_LABEL_KEY)
+                .map(String::as_str),
+            Some("Image pulled (42 MB)")
+        );
+        assert_eq!(
+            metadata.get(PROGRESS_ACTIVE_STEP_KEY).map(String::as_str),
+            Some(PROGRESS_STEP_STARTING_SANDBOX)
         );
     }
 
@@ -1502,7 +1648,12 @@ mod tests {
             }
         });
 
-        apply_supervisor_sideload(&mut pod_template, "custom-image:latest", "IfNotPresent");
+        apply_supervisor_sideload(
+            &mut pod_template,
+            "custom-image:latest",
+            "IfNotPresent",
+            SupervisorSideloadMethod::InitContainer,
+        );
 
         let sc = &pod_template["spec"]["containers"][0]["securityContext"];
         assert_eq!(sc["runAsUser"], 0, "runAsUser must be 0 for supervisor");
@@ -1526,7 +1677,12 @@ mod tests {
             }
         });
 
-        apply_supervisor_sideload(&mut pod_template, "supervisor-image:latest", "IfNotPresent");
+        apply_supervisor_sideload(
+            &mut pod_template,
+            "supervisor-image:latest",
+            "IfNotPresent",
+            SupervisorSideloadMethod::InitContainer,
+        );
 
         let sc = &pod_template["spec"]["containers"][0]["securityContext"];
         assert_eq!(
@@ -1546,7 +1702,12 @@ mod tests {
             }
         });
 
-        apply_supervisor_sideload(&mut pod_template, "supervisor-image:latest", "IfNotPresent");
+        apply_supervisor_sideload(
+            &mut pod_template,
+            "supervisor-image:latest",
+            "IfNotPresent",
+            SupervisorSideloadMethod::InitContainer,
+        );
 
         // Volume should be an emptyDir
         let volumes = pod_template["spec"]["volumes"]
@@ -1604,6 +1765,86 @@ mod tests {
         assert_eq!(mounts[0]["readOnly"], true);
     }
 
+    #[test]
+    fn supervisor_sideload_image_volume_injects_image_source_without_init_container() {
+        let mut pod_template = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "agent",
+                    "image": "custom-image:latest"
+                }]
+            }
+        });
+
+        apply_supervisor_sideload(
+            &mut pod_template,
+            "supervisor-image:latest",
+            "IfNotPresent",
+            SupervisorSideloadMethod::ImageVolume,
+        );
+
+        let volumes = pod_template["spec"]["volumes"]
+            .as_array()
+            .expect("volumes should exist");
+        assert_eq!(volumes.len(), 1);
+        assert_eq!(volumes[0]["name"], SUPERVISOR_VOLUME_NAME);
+        assert_eq!(volumes[0]["image"]["reference"], "supervisor-image:latest");
+        assert_eq!(volumes[0]["image"]["pullPolicy"], "IfNotPresent");
+        assert!(
+            volumes[0]["emptyDir"].is_null(),
+            "image volume method must not use emptyDir"
+        );
+
+        assert!(
+            pod_template["spec"]["initContainers"].is_null(),
+            "image volume method must not inject init containers"
+        );
+
+        let command = pod_template["spec"]["containers"][0]["command"]
+            .as_array()
+            .expect("command should be set");
+        assert_eq!(
+            command[0].as_str().unwrap(),
+            format!("{SUPERVISOR_MOUNT_PATH}/openshell-sandbox")
+        );
+
+        let sc = &pod_template["spec"]["containers"][0]["securityContext"];
+        assert_eq!(sc["runAsUser"], 0);
+
+        let mounts = pod_template["spec"]["containers"][0]["volumeMounts"]
+            .as_array()
+            .expect("volumeMounts should exist");
+        assert_eq!(mounts[0]["name"], SUPERVISOR_VOLUME_NAME);
+        assert_eq!(mounts[0]["mountPath"], SUPERVISOR_MOUNT_PATH);
+        assert_eq!(mounts[0]["readOnly"], true);
+    }
+
+    #[test]
+    fn supervisor_image_volume_omits_pull_policy_when_empty() {
+        let mut pod_template = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "agent",
+                    "image": "custom-image:latest"
+                }]
+            }
+        });
+
+        apply_supervisor_sideload(
+            &mut pod_template,
+            "supervisor-image:latest",
+            "",
+            SupervisorSideloadMethod::ImageVolume,
+        );
+
+        let volume = &pod_template["spec"]["volumes"][0];
+        assert_eq!(volume["image"]["reference"], "supervisor-image:latest");
+        assert!(
+            volume["image"].get("pullPolicy").is_none(),
+            "pullPolicy should be omitted when empty"
+        );
+    }
+
     /// Regression test: TLS mount path must match env var paths.
     /// The volume is mounted at a specific path and the env vars must point to
     /// files within that same path, otherwise the sandbox will fail to start
@@ -1621,8 +1862,6 @@ mod tests {
             "my-sandbox",
             "https://endpoint:8080",
             "0.0.0.0:2222",
-            "secret",
-            300,
             true, // tls_enabled
         );
 
@@ -1767,6 +2006,36 @@ mod tests {
             limits[GPU_RESOURCE_NAME],
             serde_json::json!(GPU_RESOURCE_QUANTITY)
         );
+    }
+
+    #[test]
+    fn cpu_and_memory_limits_are_mirrored_to_requests() {
+        use openshell_core::proto::compute::v1::DriverResourceRequirements;
+        let template = SandboxTemplate {
+            resources: Some(DriverResourceRequirements {
+                cpu_limit: "500m".to_string(),
+                memory_limit: "2Gi".to_string(),
+                ..Default::default()
+            }),
+            ..SandboxTemplate::default()
+        };
+
+        let pod_template = {
+            let params = SandboxPodParams::default();
+            sandbox_template_to_k8s(
+                &template,
+                false,
+                &std::collections::HashMap::new(),
+                true,
+                &params,
+            )
+        };
+
+        let resources = &pod_template["spec"]["containers"][0]["resources"];
+        assert_eq!(resources["limits"]["cpu"], serde_json::json!("500m"));
+        assert_eq!(resources["limits"]["memory"], serde_json::json!("2Gi"));
+        assert_eq!(resources["requests"]["cpu"], serde_json::json!("500m"));
+        assert_eq!(resources["requests"]["memory"], serde_json::json!("2Gi"));
     }
 
     #[test]
@@ -1959,7 +2228,10 @@ mod tests {
 
     #[test]
     fn workspace_persistence_skipped_when_inject_workspace_false() {
-        let params = SandboxPodParams::default();
+        let params = SandboxPodParams {
+            supervisor_sideload_method: SupervisorSideloadMethod::InitContainer,
+            ..SandboxPodParams::default()
+        };
         let pod_template = sandbox_template_to_k8s(
             &SandboxTemplate::default(),
             false,
@@ -2178,5 +2450,140 @@ mod tests {
         };
 
         assert_eq!(platform_config_bool(&template, "a_string"), None);
+    }
+
+    #[test]
+    fn log_level_propagates_as_env_var_to_sandbox_pod() {
+        let spec = SandboxSpec {
+            log_level: "debug".to_string(),
+            ..SandboxSpec::default()
+        };
+        let cr = sandbox_to_k8s_spec(Some(&spec), &SandboxPodParams::default());
+        let env = cr["spec"]["podTemplate"]["spec"]["containers"][0]["env"]
+            .as_array()
+            .unwrap();
+        assert!(
+            env.iter()
+                .any(|e| e["name"] == "OPENSHELL_LOG_LEVEL" && e["value"] == "debug")
+        );
+        assert!(cr["spec"].get("logLevel").is_none());
+    }
+
+    #[test]
+    fn node_selector_from_platform_config() {
+        let template = SandboxTemplate {
+            platform_config: Some(Struct {
+                fields: std::iter::once((
+                    "node_selector".to_string(),
+                    Value {
+                        kind: Some(Kind::StructValue(Struct {
+                            fields: std::iter::once((
+                                "gpu-pool".to_string(),
+                                Value {
+                                    kind: Some(Kind::StringValue("true".to_string())),
+                                },
+                            ))
+                            .collect(),
+                        })),
+                    },
+                ))
+                .collect(),
+            }),
+            ..SandboxTemplate::default()
+        };
+
+        let pod_template = {
+            let params = SandboxPodParams::default();
+            sandbox_template_to_k8s(
+                &template,
+                false,
+                &std::collections::HashMap::new(),
+                false,
+                &params,
+            )
+        };
+
+        assert_eq!(
+            pod_template["spec"]["nodeSelector"]["gpu-pool"],
+            serde_json::json!("true")
+        );
+    }
+
+    #[test]
+    fn tolerations_from_platform_config() {
+        let toleration = Struct {
+            fields: [
+                (
+                    "key".to_string(),
+                    Value {
+                        kind: Some(Kind::StringValue("nvidia.com/gpu".to_string())),
+                    },
+                ),
+                (
+                    "operator".to_string(),
+                    Value {
+                        kind: Some(Kind::StringValue("Exists".to_string())),
+                    },
+                ),
+                (
+                    "effect".to_string(),
+                    Value {
+                        kind: Some(Kind::StringValue("NoSchedule".to_string())),
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        };
+
+        let template = SandboxTemplate {
+            platform_config: Some(Struct {
+                fields: std::iter::once((
+                    "tolerations".to_string(),
+                    Value {
+                        kind: Some(Kind::ListValue(prost_types::ListValue {
+                            values: vec![Value {
+                                kind: Some(Kind::StructValue(toleration)),
+                            }],
+                        })),
+                    },
+                ))
+                .collect(),
+            }),
+            ..SandboxTemplate::default()
+        };
+
+        let pod_template = {
+            let params = SandboxPodParams::default();
+            sandbox_template_to_k8s(
+                &template,
+                false,
+                &std::collections::HashMap::new(),
+                false,
+                &params,
+            )
+        };
+
+        let tolerations = pod_template["spec"]["tolerations"]
+            .as_array()
+            .expect("tolerations should be an array");
+        assert_eq!(tolerations.len(), 1);
+        assert_eq!(tolerations[0]["key"], "nvidia.com/gpu");
+        assert_eq!(tolerations[0]["operator"], "Exists");
+        assert_eq!(tolerations[0]["effect"], "NoSchedule");
+    }
+
+    #[test]
+    fn default_workspace_vct_uses_provided_storage_size() {
+        let vct = default_workspace_volume_claim_templates("5Gi");
+        let storage = &vct[0]["spec"]["resources"]["requests"]["storage"];
+        assert_eq!(storage, "5Gi");
+    }
+
+    #[test]
+    fn default_workspace_vct_falls_back_to_const_when_empty() {
+        let vct = default_workspace_volume_claim_templates("");
+        let storage = &vct[0]["spec"]["resources"]["requests"]["storage"];
+        assert_eq!(storage, DEFAULT_WORKSPACE_STORAGE_SIZE);
     }
 }

@@ -1,0 +1,189 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Refresh Microsoft Graph Credentials with Providers v2"
+sidebar-title: "Microsoft Graph Provider Refresh"
+slug: "get-started/tutorials/microsoft-graph-provider-refresh"
+description: "Configure a Providers v2 Microsoft Graph profile with gateway-managed OAuth2 refresh-token rotation."
+keywords: "Generative AI, Cybersecurity, Tutorial, Providers, Microsoft Graph, OAuth2, Credential Refresh, Sandbox"
+---
+
+Use Providers v2 to keep Microsoft Graph access tokens short lived while sandboxes receive a stable `MS_GRAPH_ACCESS_TOKEN` placeholder. OpenShell stores the non-injectable refresh material at the gateway, refreshes the Microsoft Graph access token before it expires, updates the provider record, and injects the current credential into newly launched sandbox processes.
+
+After completing this tutorial, you have:
+
+- A custom Microsoft Graph mail provider profile.
+- A provider instance configured with `oauth2-refresh-token`.
+- A sandbox that can use `curl` to read Microsoft Graph mail through provider-owned policy.
+
+<Note>
+This tutorial starts after your OAuth client has already completed the initial Microsoft sign-in flow. It does not publish a token bootstrap script. Use the Microsoft identity platform documentation for the [device authorization grant flow](https://learn.microsoft.com/en-ie/entra/identity-platform/v2-oauth2-device-code) or [authorization code flow](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-auth-code-flow), and use any standards-compliant client that returns an access token, refresh token, and expiry.
+</Note>
+
+## Prerequisites
+
+- A working OpenShell installation with an active gateway. Complete the [Quickstart](/get-started/quickstart) before proceeding.
+- A Microsoft Entra app registration that can acquire delegated Microsoft Graph mail access.
+- Delegated Microsoft Graph mail permission for the signed-in user. `Mail.Read` allows reading the signed-in user's mailbox; see the [Microsoft Graph permissions reference](https://learn.microsoft.com/en-us/graph/permissions-reference).
+OAuth material from your initial Microsoft sign-in flow:
+
+| Variable | Value |
+|---|---|
+| `MS_TENANT_ID` | Microsoft Entra tenant ID, domain, or `common`. |
+| `MS_CLIENT_ID` | Microsoft Entra application client ID. |
+| `MS_GRAPH_ACCESS_TOKEN` | Current delegated Microsoft Graph access token. |
+| `MS_GRAPH_REFRESH_TOKEN` | Delegated OAuth refresh token. |
+| `MS_GRAPH_ACCESS_TOKEN_EXPIRES_AT` | Absolute expiry for the current access token. |
+
+`MS_GRAPH_ACCESS_TOKEN_EXPIRES_AT` can be an RFC3339 timestamp such as `2026-01-01T00:00:00Z` or a Unix epoch millisecond timestamp.
+
+<Warning>
+Do not commit access tokens, refresh tokens, or local `.env` files. The commands below pass token material to the gateway; they are not examples of values to store in source control.
+</Warning>
+
+<Steps toc={true}>
+
+## Enable Providers v2
+
+Enable provider profile policy composition on the active gateway:
+
+```shell
+openshell settings set --global --key providers_v2_enabled --value true --yes
+```
+
+## Create a Microsoft Graph Provider Profile
+
+Create `microsoft-graph-mail.yaml` with this profile:
+
+```yaml showLineNumbers={false}
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+id: microsoft-graph-mail
+display_name: Microsoft Graph Mail
+description: Delegated Microsoft Graph mail read access
+category: messaging
+credentials:
+  - name: graph_access_token
+    description: Microsoft Graph delegated access token
+    env_vars: [MS_GRAPH_ACCESS_TOKEN]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+    refresh:
+      strategy: oauth2_refresh_token
+      token_url: https://login.microsoftonline.com/common/oauth2/v2.0/token
+      scopes: [https://graph.microsoft.com/.default]
+      refresh_before_seconds: 600
+      max_lifetime_seconds: 3600
+      material:
+        - name: tenant_id
+          description: Microsoft Entra tenant ID
+          required: true
+        - name: client_id
+          description: Microsoft Entra application client ID
+          required: true
+        - name: refresh_token
+          description: Delegated OAuth refresh token
+          required: true
+          secret: true
+endpoints:
+  - host: graph.microsoft.com
+    port: 443
+    protocol: rest
+    access: read-only
+    enforcement: enforce
+binaries:
+  - /usr/bin/curl
+  - /usr/local/bin/curl
+```
+
+Lint and import the profile:
+
+```shell
+openshell provider profile lint -f microsoft-graph-mail.yaml
+openshell provider profile import -f microsoft-graph-mail.yaml
+```
+
+The profile defines the refresh strategy and Graph network policy. The `tenant_id` refresh material selects the Microsoft token endpoint during gateway-managed refresh.
+
+## Create the Provider
+
+Create the provider with the current Microsoft Graph access token:
+
+```shell
+openshell provider create \
+  --name microsoft-mail \
+  --type microsoft-graph-mail \
+  --credential MS_GRAPH_ACCESS_TOKEN="$MS_GRAPH_ACCESS_TOKEN"
+```
+
+The current CLI requires an initial credential at provider creation time. Refresh material is configured separately and is not injected into the sandbox.
+
+## Configure Refresh
+
+Configure gateway-managed OAuth2 refresh-token rotation:
+
+```shell
+openshell provider refresh configure microsoft-mail \
+  --credential-key MS_GRAPH_ACCESS_TOKEN \
+  --strategy oauth2-refresh-token \
+  --material tenant_id="$MS_TENANT_ID" \
+  --material client_id="$MS_CLIENT_ID" \
+  --material refresh_token="$MS_GRAPH_REFRESH_TOKEN" \
+  --secret-material-key refresh_token \
+  --credential-expires-at "$MS_GRAPH_ACCESS_TOKEN_EXPIRES_AT"
+```
+
+`--secret-material-key refresh_token` names the material key to mark as sensitive. It is not the refresh-token value. If Microsoft returns a rotated refresh token during refresh, OpenShell stores the new `refresh_token` material and marks it secret automatically.
+
+Force the first refresh immediately:
+
+```shell
+openshell provider refresh rotate microsoft-mail \
+  --credential-key MS_GRAPH_ACCESS_TOKEN
+```
+
+Check refresh status:
+
+```shell
+openshell provider refresh status microsoft-mail \
+  --credential-key MS_GRAPH_ACCESS_TOKEN
+```
+
+The status output shows refresh state, expiry, next refresh, and last refresh timing. It does not print access-token values or refresh material.
+
+## Launch a Sandbox
+
+Launch a sandbox with the Microsoft Graph provider attached:
+
+```shell
+openshell sandbox create \
+  --name microsoft-graph-mail \
+  --keep \
+  --provider microsoft-mail \
+  --no-auto-providers \
+  -- /bin/sh
+```
+
+Provider policy allows `curl` to reach `graph.microsoft.com:443`. The sandbox process receives `MS_GRAPH_ACCESS_TOKEN` as an OpenShell placeholder, and the proxy resolves that placeholder to the current gateway-managed access token when `curl` sends it in the authorization header.
+
+## Verify Microsoft Graph Access
+
+Inside the sandbox, list a small page of mailbox messages:
+
+```shell
+curl -sS \
+  -H "Authorization: Bearer $MS_GRAPH_ACCESS_TOKEN" \
+  'https://graph.microsoft.com/v1.0/me/messages?$select=sender,subject&$top=5'
+```
+
+The request uses the [Microsoft Graph list messages API](https://learn.microsoft.com/en-us/graph/api/user-list-messages?view=graph-rest-1.0). If the token has delegated mail read permission, Microsoft Graph returns message metadata for the signed-in user's mailbox.
+
+## Update Running Sandboxes
+
+Provider refresh updates the provider record at the gateway. Running sandboxes poll for provider environment revisions, but already-running processes keep the environment they started with.
+
+If you attach this provider to an existing sandbox or update provider credentials after a process has already started, launch a new process inside the sandbox before expecting `MS_GRAPH_ACCESS_TOKEN` to appear in that process environment.
+
+</Steps>

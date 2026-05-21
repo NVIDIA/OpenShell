@@ -35,12 +35,10 @@ actions:
     - 'bash -c "echo openshell-${PACKIT_PROJECT_VERSION}.tar.gz"'
 
   fix-spec-file:
-    # Update Source0 to the generated tarball name
-    - 'bash -c "sed -i \"s|^Source0:.*|Source0: openshell-${PACKIT_PROJECT_VERSION}.tar.gz|\" openshell.spec"'
-    # Update Source1 to the generated vendor tarball name
-    - 'bash -c "sed -i \"s|^Source1:.*|Source1: openshell-${PACKIT_PROJECT_VERSION}-vendor.tar.xz|\" openshell.spec"'
-    # Update Version
-    - 'bash -c "sed -i -r \"s/^Version:(\\s*)\\S+/Version:\\1${PACKIT_RPMSPEC_VERSION}/\" openshell.spec"'
+    # Update the canonical version macro. Version:, Source0:, Source1:, and all
+    # other version references expand from %{openshell_version} so only this
+    # one line needs updating.
+    - 'bash -c "sed -i -r \"s/^%global openshell_version .*/%global openshell_version ${PACKIT_RPMSPEC_VERSION}/\" openshell.spec"'
     # Update Release
     - 'bash -c "RELEASE=${OPENSHELL_RPM_RELEASE:-${PACKIT_RPMSPEC_RELEASE}} && sed -i -r \"s/^Release:(\\s*)\\S+/Release:\\1${RELEASE}%{?dist}/\" openshell.spec"'
     # Keep embedded binary metadata aligned with the release workflow. Python

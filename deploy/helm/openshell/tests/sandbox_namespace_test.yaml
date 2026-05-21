@@ -3,32 +3,28 @@
 
 suite: sandboxNamespace defaulting
 templates:
-  - templates/statefulset.yaml
+  - templates/gateway-config.yaml
   - templates/networkpolicy.yaml
 release:
   name: openshell
   namespace: my-namespace
 
 tests:
-  - it: defaults OPENSHELL_SANDBOX_NAMESPACE to release namespace
-    template: templates/statefulset.yaml
+  - it: defaults sandbox_namespace to release namespace in the TOML config
+    template: templates/gateway-config.yaml
     asserts:
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: OPENSHELL_SANDBOX_NAMESPACE
-            value: "my-namespace"
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'sandbox_namespace\s*=\s*"my-namespace"'
 
   - it: uses explicit sandboxNamespace when set
-    template: templates/statefulset.yaml
+    template: templates/gateway-config.yaml
     set:
       server.sandboxNamespace: other-ns
     asserts:
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: OPENSHELL_SANDBOX_NAMESPACE
-            value: "other-ns"
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'sandbox_namespace\s*=\s*"other-ns"'
 
   - it: defaults NetworkPolicy namespace to release namespace
     template: templates/networkpolicy.yaml

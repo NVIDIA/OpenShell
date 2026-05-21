@@ -22,12 +22,13 @@ network and filesystem policies to sandboxes, routes inference
 requests, and provides the SSH tunnel endpoint for CLI-to-sandbox
 connections.
 
-When installed via RPM, the gateway runs as a systemd user service
-with the Podman compute driver. Sandboxes are rootless Podman
-containers on the host.
+When installed via a Linux package, the gateway runs as a systemd user
+service. The packaged service starts from built-in defaults and reads
+the default gateway TOML path only when that file exists.
 
-The gateway exposes a single port (default 8080) with multiplexed
-gRPC and HTTP, secured by mutual TLS (mTLS) by default.
+The gateway exposes a single port with multiplexed gRPC and HTTP,
+secured by mutual TLS (mTLS) by default unless the TOML config disables
+TLS.
 
 # OPTIONS
 
@@ -36,7 +37,7 @@ gRPC and HTTP, secured by mutual TLS (mTLS) by default.
     Environment: **OPENSHELL_BIND_ADDRESS**.
 
 **--port** *PORT*
-:   Port for the gRPC/HTTP API. Default: **8080**.
+:   Port for the gRPC/HTTP API. Default: **17670**.
     Environment: **OPENSHELL_SERVER_PORT**.
 
 **--health-port** *PORT*
@@ -53,26 +54,34 @@ gRPC and HTTP, secured by mutual TLS (mTLS) by default.
     Environment: **OPENSHELL_LOG_LEVEL**.
 
 **--db-url** *URL*
-:   SQLite database URL for state persistence. Required.
+:   SQLite database URL for state persistence. When unset, the gateway
+    stores SQLite state under *~/.local/state/openshell/gateway/*.
     Environment: **OPENSHELL_DB_URL**.
 
 **--drivers** *DRIVER*\[,*DRIVER*\]
 :   Compute driver. Accepts a comma-delimited list. The gateway
     currently requires exactly one driver. Options: **podman**,
-    **docker**, **kubernetes**. Default: **kubernetes**.
+    **docker**, **kubernetes**, **vm**. When unset, the gateway
+    auto-detects Kubernetes, then Podman, then Docker. VM is opt-in.
     Environment: **OPENSHELL_DRIVERS**.
 
 **--tls-cert** *PATH*
-:   Path to server TLS certificate file. Required unless
-    **--disable-tls** is set. Environment: **OPENSHELL_TLS_CERT**.
+:   Path to server TLS certificate file. Defaults to the local generated
+    TLS bundle when present. Required unless **--disable-tls** is set.
+    Environment: **OPENSHELL_TLS_CERT**.
 
 **--tls-key** *PATH*
-:   Path to server TLS private key file. Required unless
-    **--disable-tls** is set. Environment: **OPENSHELL_TLS_KEY**.
+:   Path to server TLS private key file. Defaults to the local generated
+    TLS bundle when present. Required unless **--disable-tls** is set.
+    Environment: **OPENSHELL_TLS_KEY**.
 
 **--tls-client-ca** *PATH*
 :   Path to CA certificate for client certificate verification (mTLS).
-    Required unless **--disable-tls** is set.
+    When set without **--oidc-issuer**, client certificates are required
+    and the TLS handshake rejects unauthenticated connections. When set
+    together with **--oidc-issuer**, client certificates are accepted
+    but not required — callers may authenticate with either a Bearer
+    token or a client certificate.
     Environment: **OPENSHELL_TLS_CLIENT_CA**.
 
 **--disable-tls**
@@ -83,44 +92,20 @@ gRPC and HTTP, secured by mutual TLS (mTLS) by default.
     **--bind-address** to **127.0.0.1**.
     Environment: **OPENSHELL_DISABLE_TLS**.
 
-**--disable-gateway-auth**
-:   Disable mTLS client certificate requirement. The TLS handshake
-    accepts connections without a client certificate. Ignored when
-    **--disable-tls** is set.
-    Environment: **OPENSHELL_DISABLE_GATEWAY_AUTH**.
+**--server-san** *SAN*
+:   Subject Alternative Name configured on the gateway server
+    certificate. Repeat or pass a comma-separated value through
+    **OPENSHELL_SERVER_SAN**. Wildcard DNS SANs also enable sandbox
+    service URLs under that domain.
+    Environment: **OPENSHELL_SERVER_SAN**.
 
-**--sandbox-image** *IMAGE*
-:   Default container image for sandboxes.
-    Environment: **OPENSHELL_SANDBOX_IMAGE**.
-
-**--sandbox-image-pull-policy** *POLICY*
-:   Image pull policy: Always, IfNotPresent, Never.
-    Environment: **OPENSHELL_SANDBOX_IMAGE_PULL_POLICY**.
-
-**--ssh-handshake-secret** *SECRET*
-:   Shared secret for gateway-to-sandbox SSH handshake.
-    Environment: **OPENSHELL_SSH_HANDSHAKE_SECRET**.
-
-**--ssh-handshake-skew-secs** *SECONDS*
-:   Allowed clock skew in seconds for SSH handshake. Default: **30**.
-    Environment: **OPENSHELL_SSH_HANDSHAKE_SKEW_SECS**.
-
-**--ssh-gateway-host** *HOST*
-:   Public host for the SSH gateway endpoint. Default: **127.0.0.1**.
-    Environment: **OPENSHELL_SSH_GATEWAY_HOST**.
-
-**--ssh-gateway-port** *PORT*
-:   Public port for the SSH gateway endpoint. Default: **8080**.
-    Environment: **OPENSHELL_SSH_GATEWAY_PORT**.
-
-**--grpc-endpoint** *URL*
-:   gRPC endpoint for sandbox callbacks. Should be reachable from
-    within sandbox containers.
-    Environment: **OPENSHELL_GRPC_ENDPOINT**.
+Compute driver settings such as sandbox image, callback endpoint, image
+pull policy, network name, VM state directory, and guest TLS material are
+configured in the TOML file passed with **--config**.
 
 # SYSTEMD INTEGRATION
 
-The RPM installs a systemd user unit at
+The package installs a systemd user unit at
 */usr/lib/systemd/user/openshell-gateway.service*. Manage the gateway
 with standard systemd commands:
 
@@ -134,14 +119,12 @@ View logs:
     journalctl --user -u openshell-gateway
     journalctl --user -u openshell-gateway -f
 
-The unit runs two **ExecStartPre** scripts on first start:
+The unit runs **openshell-gateway generate-certs** as an **ExecStartPre**
+step on first start. This generates a self-signed PKI bundle for mTLS
+and skips generation when the bundle already exists.
 
-1. **init-pki.sh** generates a self-signed PKI bundle for mTLS.
-2. **init-gateway-env.sh** generates the environment configuration
-   file with an auto-generated SSH handshake secret.
-
-Both scripts are idempotent and skip generation if their output files
-already exist.
+The gateway then starts from built-in defaults and reads
+*~/.config/openshell/gateway.toml* when that file exists.
 
 To persist the service across logouts:
 
@@ -149,11 +132,16 @@ To persist the service across logouts:
 
 # CONFIGURATION
 
-The systemd user unit reads configuration from
-*~/.config/openshell/gateway.env*. See **openshell-gateway.env**(5)
-for the full variable reference.
+The systemd user unit launches the gateway with:
 
-To override individual settings without modifying gateway.env:
+    openshell-gateway
+
+Gateway listener, TLS, database, and compute driver settings have local
+defaults. Create *~/.config/openshell/gateway.toml* when you need to
+override them. The gateway rejects `database_url` in TOML; set
+**OPENSHELL_DB_URL** when you need a different database.
+
+To override individual settings without creating TOML:
 
     systemctl --user edit openshell-gateway
 
@@ -167,19 +155,13 @@ This creates a drop-in override that persists across package upgrades.
 */usr/lib/systemd/user/openshell-gateway.service*
 :   Systemd user unit file.
 
-*/usr/libexec/openshell/init-pki.sh*
-:   PKI bootstrap script.
-
-*/usr/libexec/openshell/init-gateway-env.sh*
-:   Gateway environment file generator.
-
-*~/.config/openshell/gateway.env*
-:   Gateway environment configuration (generated on first start).
+*~/.config/openshell/gateway.toml*
+:   Optional gateway TOML configuration.
 
 *~/.local/state/openshell/tls/*
 :   Auto-generated TLS certificates.
 
-*~/.local/state/openshell/gateway.db*
+*~/.local/state/openshell/gateway/openshell.db*
 :   SQLite database for gateway state.
 
 *~/.config/openshell/gateways/openshell/mtls/*
@@ -193,18 +175,17 @@ Start the gateway as a systemd user service:
 
 Check gateway health from the CLI:
 
-    openshell gateway add --local https://127.0.0.1:8080
+    openshell gateway add --local https://127.0.0.1:17670
     openshell status
 
-Override the API port via a systemd drop-in:
+Override the API port in TOML:
 
-    systemctl --user edit openshell-gateway
-    # Add: [Service]
-    # Add: Environment=OPENSHELL_SERVER_PORT=9090
+    $EDITOR ~/.config/openshell/gateway.toml
+    systemctl --user restart openshell-gateway
 
 # SEE ALSO
 
-**openshell**(1), **openshell-gateway.env**(5), **systemctl**(1),
-**journalctl**(1), **loginctl**(1), **podman**(1)
+**openshell**(1), **systemctl**(1), **journalctl**(1), **loginctl**(1),
+**podman**(1)
 
 Full documentation: *https://docs.nvidia.com/openshell/*

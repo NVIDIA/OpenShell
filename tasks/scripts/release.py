@@ -22,6 +22,7 @@ class Versions:
     cargo: str
     docker: str
     deb: str
+    snap: str
     rpm_version: str
     rpm_release: str
     git_tag: str
@@ -108,6 +109,11 @@ def _versions_from_parts(
     # Docker tags can't contain '+'.
     docker_version = cargo_version.replace("+", "-")
 
+    # Snap versions cannot contain '+' and are limited to 32 characters.
+    snap_version = re.sub(r"\.d\d{8}$", "", docker_version)
+    if len(snap_version) > 32:
+        raise ValueError(f"snap version must be at most 32 characters: {snap_version}")
+
     # Debian versions use '~' so prereleases sort before the eventual release.
     deb_version = cargo_version
     deb_version = deb_version[1:] if deb_version.startswith("v") else deb_version
@@ -119,6 +125,7 @@ def _versions_from_parts(
         cargo=cargo_version,
         docker=docker_version,
         deb=deb_version,
+        snap=snap_version,
         rpm_version=rpm_version,
         rpm_release=rpm_release,
         git_tag=git_tag,
@@ -149,6 +156,7 @@ def _print_env(versions: Versions) -> None:
     print(f"VERSION_CARGO={versions.cargo}")
     print(f"VERSION_DOCKER={versions.docker}")
     print(f"VERSION_DEB={versions.deb}")
+    print(f"VERSION_SNAP={versions.snap}")
     print(f"VERSION_RPM={versions.rpm_version}")
     print(f"VERSION_RPM_RELEASE={versions.rpm_release}")
     print(f"GIT_TAG={versions.git_tag}")
@@ -166,6 +174,8 @@ def get_version(format: str) -> None:
         print(versions.docker)
     elif format == "deb":
         print(versions.deb)
+    elif format == "snap":
+        print(versions.snap)
     elif format == "rpm-version":
         print(versions.rpm_version)
     elif format == "rpm-release":
@@ -214,11 +224,6 @@ def _asset_url(release_tag: str, filename: str) -> str:
     return f"{GITHUB_RELEASE_DOWNLOADS}/{release_tag}/{filename}"
 
 
-def _homebrew_supervisor_image(release_tag: str) -> str:
-    image_tag = "dev" if release_tag == "dev" else release_tag.removeprefix("v")
-    return f"ghcr.io/nvidia/openshell/supervisor:{image_tag}"
-
-
 def render_homebrew_formula(
     *,
     release_tag: str,
@@ -230,7 +235,6 @@ def render_homebrew_formula(
         raise ValueError(f"release tag contains unsupported characters: {release_tag}")
 
     version = release_tag.removeprefix("v")
-    docker_supervisor_image = _homebrew_supervisor_image(release_tag)
     return f"""# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -279,16 +283,36 @@ class Openshell < Formula
         exit 1
       fi
 
-      docker_tls_dir="${{OPENSHELL_DOCKER_TLS_DIR:-${{HOME}}/.local/state/openshell/homebrew/tls}}"
+      xdg_config_home="${{XDG_CONFIG_HOME:-${{HOME}}/.config}}"
+      xdg_gateway_env="${{xdg_config_home}}/openshell/gateway.env"
+      prefix_gateway_env="#{{var}}/openshell/gateway.env"
+      if [ -f "${{xdg_gateway_env}}" ]; then
+        set -a
+        . "${{xdg_gateway_env}}"
+        set +a
+      elif [ -f "${{prefix_gateway_env}}" ]; then
+        set -a
+        . "${{prefix_gateway_env}}"
+        set +a
+      fi
+
+      docker_tls_dir="${{HOME}}/.local/state/openshell/homebrew/tls"
+      mkdir -p "${{docker_tls_dir}}/server"
       mkdir -p "${{docker_tls_dir}}/client"
-      chmod 700 "${{docker_tls_dir}}" "${{docker_tls_dir}}/client"
+      chmod 700 "${{docker_tls_dir}}" "${{docker_tls_dir}}/server" "${{docker_tls_dir}}/client"
       /usr/bin/install -m 0644 "#{{var}}/openshell/tls/ca.crt" "${{docker_tls_dir}}/ca.crt"
+      /usr/bin/install -m 0644 "#{{var}}/openshell/tls/server/tls.crt" "${{docker_tls_dir}}/server/tls.crt"
+      /usr/bin/install -m 0600 "#{{var}}/openshell/tls/server/tls.key" "${{docker_tls_dir}}/server/tls.key"
       /usr/bin/install -m 0644 "#{{var}}/openshell/tls/client/tls.crt" "${{docker_tls_dir}}/client/tls.crt"
       /usr/bin/install -m 0600 "#{{var}}/openshell/tls/client/tls.key" "${{docker_tls_dir}}/client/tls.key"
+      export OPENSHELL_LOCAL_TLS_DIR="${{OPENSHELL_LOCAL_TLS_DIR:-${{docker_tls_dir}}}}"
 
-      export OPENSHELL_DOCKER_TLS_CA="${{docker_tls_dir}}/ca.crt"
-      export OPENSHELL_DOCKER_TLS_CERT="${{docker_tls_dir}}/client/tls.crt"
-      export OPENSHELL_DOCKER_TLS_KEY="${{docker_tls_dir}}/client/tls.key"
+      xdg_gateway_config="${{xdg_config_home}}/openshell/gateway.toml"
+      prefix_gateway_config="#{{var}}/openshell/gateway.toml"
+
+      if [ -z "${{OPENSHELL_GATEWAY_CONFIG:-}}" ] && [ ! -f "${{xdg_gateway_config}}" ] && [ -f "${{prefix_gateway_config}}" ]; then
+        exec "#{{opt_bin}}/openshell-gateway" --config "${{prefix_gateway_config}}"
+      fi
 
       exec "#{{opt_bin}}/openshell-gateway"
     SH
@@ -318,26 +342,6 @@ class Openshell < Formula
 
   service do
     run opt_libexec/"openshell-gateway-homebrew-service"
-    environment_variables(
-      OPENSHELL_BIND_ADDRESS: "127.0.0.1",
-      OPENSHELL_SERVER_PORT: "{LOCAL_GATEWAY_PORT}",
-      OPENSHELL_TLS_CERT: "#{{var}}/openshell/tls/server/tls.crt",
-      OPENSHELL_TLS_KEY: "#{{var}}/openshell/tls/server/tls.key",
-      OPENSHELL_TLS_CLIENT_CA: "#{{var}}/openshell/tls/ca.crt",
-      OPENSHELL_DB_URL: "sqlite:#{{var}}/openshell/gateway/openshell.db",
-      OPENSHELL_GRPC_ENDPOINT: "https://127.0.0.1:{LOCAL_GATEWAY_PORT}",
-      OPENSHELL_SSH_GATEWAY_HOST: "127.0.0.1",
-      OPENSHELL_SSH_GATEWAY_PORT: "{LOCAL_GATEWAY_PORT}",
-      OPENSHELL_VM_DRIVER_STATE_DIR: "#{{var}}/openshell/vm-driver",
-      OPENSHELL_VM_TLS_CA: "#{{var}}/openshell/tls/ca.crt",
-      OPENSHELL_VM_TLS_CERT: "#{{var}}/openshell/tls/client/tls.crt",
-      OPENSHELL_VM_TLS_KEY: "#{{var}}/openshell/tls/client/tls.key",
-      OPENSHELL_DOCKER_SUPERVISOR_IMAGE: "{docker_supervisor_image}",
-      OPENSHELL_PODMAN_TLS_CA: "#{{var}}/openshell/tls/ca.crt",
-      OPENSHELL_PODMAN_TLS_CERT: "#{{var}}/openshell/tls/client/tls.crt",
-      OPENSHELL_PODMAN_TLS_KEY: "#{{var}}/openshell/tls/client/tls.key",
-      OPENSHELL_DRIVER_DIR: "#{{opt_libexec}}",
-    )
     keep_alive successful_exit: false
     log_path var/"log/openshell/openshell-gateway.out.log"
     error_log_path var/"log/openshell/openshell-gateway.err.log"
@@ -407,6 +411,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--deb", action="store_true", help="Print Debian package version only."
     )
     get_version_parser.add_argument(
+        "--snap", action="store_true", help="Print Snap package version only."
+    )
+    get_version_parser.add_argument(
         "--rpm-version", action="store_true", help="Print RPM Version only."
     )
     get_version_parser.add_argument(
@@ -454,6 +461,8 @@ def main() -> None:
             get_version("docker")
         elif args.deb:
             get_version("deb")
+        elif args.snap:
+            get_version("snap")
         elif args.rpm_version:
             get_version("rpm-version")
         elif args.rpm_release:

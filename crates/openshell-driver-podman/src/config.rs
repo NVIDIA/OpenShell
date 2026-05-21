@@ -1,12 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use openshell_core::config::{
-    DEFAULT_NETWORK_NAME, DEFAULT_SSH_HANDSHAKE_SKEW_SECS, DEFAULT_SSH_PORT,
-    DEFAULT_STOP_TIMEOUT_SECS, DEFAULT_SUPERVISOR_IMAGE,
-};
+use openshell_core::config::{DEFAULT_STOP_TIMEOUT_SECS, DEFAULT_SUPERVISOR_IMAGE};
 use std::path::PathBuf;
 use std::str::FromStr;
+
+/// Default Podman bridge network name.
+pub const DEFAULT_NETWORK_NAME: &str = "openshell";
 
 /// Image pull policy for sandbox and supervisor images.
 ///
@@ -61,7 +61,8 @@ impl FromStr for ImagePullPolicy {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct PodmanComputeConfig {
     /// Path to the Podman API Unix socket.
     /// Default: `$XDG_RUNTIME_DIR/podman/podman.sock` (Linux),
@@ -88,12 +89,6 @@ pub struct PodmanComputeConfig {
     /// Name of the Podman bridge network.
     /// Created automatically if it does not exist.
     pub network_name: String,
-    /// SSH port inside the container.
-    pub ssh_port: u16,
-    /// Shared secret for the NSSH1 SSH handshake.
-    pub ssh_handshake_secret: String,
-    /// Maximum clock skew in seconds for SSH handshake timestamps.
-    pub ssh_handshake_skew_secs: u64,
     /// Container stop timeout in seconds (SIGTERM → SIGKILL).
     pub stop_timeout_secs: u32,
     /// OCI image containing the openshell-sandbox supervisor binary.
@@ -185,15 +180,12 @@ impl Default for PodmanComputeConfig {
     fn default() -> Self {
         Self {
             socket_path: Self::default_socket_path(),
-            default_image: String::new(),
+            default_image: openshell_core::image::default_sandbox_image(),
             image_pull_policy: ImagePullPolicy::default(),
             grpc_endpoint: String::new(),
             gateway_port: openshell_core::config::DEFAULT_SERVER_PORT,
             sandbox_ssh_socket_path: "/run/openshell/ssh.sock".to_string(),
             network_name: DEFAULT_NETWORK_NAME.to_string(),
-            ssh_port: DEFAULT_SSH_PORT,
-            ssh_handshake_secret: String::new(),
-            ssh_handshake_skew_secs: DEFAULT_SSH_HANDSHAKE_SKEW_SECS,
             stop_timeout_secs: DEFAULT_STOP_TIMEOUT_SECS,
             supervisor_image: DEFAULT_SUPERVISOR_IMAGE.to_string(),
             guest_tls_ca: None,
@@ -213,9 +205,6 @@ impl std::fmt::Debug for PodmanComputeConfig {
             .field("gateway_port", &self.gateway_port)
             .field("sandbox_ssh_socket_path", &self.sandbox_ssh_socket_path)
             .field("network_name", &self.network_name)
-            .field("ssh_port", &self.ssh_port)
-            .field("ssh_handshake_secret", &"[REDACTED]")
-            .field("ssh_handshake_skew_secs", &self.ssh_handshake_skew_secs)
             .field("stop_timeout_secs", &self.stop_timeout_secs)
             .field("supervisor_image", &self.supervisor_image)
             .field("guest_tls_ca", &self.guest_tls_ca)

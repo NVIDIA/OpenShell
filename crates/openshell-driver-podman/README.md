@@ -46,6 +46,7 @@ The container spec in `container.rs` sets these security-critical fields:
 | `no_new_privileges` | `true` | Prevents privilege escalation after exec. |
 | `seccomp_profile_path` | `unconfined` | The supervisor installs its own policy-aware BPF filter. A container-level profile can block Landlock/seccomp syscalls during setup. |
 | `mounts` | Private tmpfs at `/run/netns` | Lets the supervisor create named network namespaces in rootless Podman. |
+| CDI GPU devices | Sandbox `gpu_device` value when set, otherwise all NVIDIA GPUs | Exposes requested GPUs to GPU-enabled sandbox containers. |
 
 The restricted agent child does not retain these supervisor privileges.
 
@@ -54,7 +55,7 @@ The restricted agent child does not retain these supervisor privileges.
 | Capability | Purpose |
 |---|---|
 | `SYS_ADMIN` | seccomp filter installation, namespace creation, and Landlock setup. |
-| `NET_ADMIN` | Network namespace veth setup, IP address assignment, routes, and iptables. |
+| `NET_ADMIN` | Network namespace veth setup, IP address assignment, routes, and nftables. |
 | `SYS_PTRACE` | Reading `/proc/<pid>/exe` and walking process ancestry for binary identity. |
 | `SYSLOG` | Reading `/dev/kmsg` for bypass-detection diagnostics. |
 | `DAC_READ_SEARCH` | Reading `/proc/<pid>/fd/` across UIDs so the proxy can resolve the binary responsible for a connection. |
@@ -85,8 +86,8 @@ sequenceDiagram
     C->>C: entrypoint: /opt/openshell/bin/openshell-sandbox
 ```
 
-The `supervisor` target in `deploy/docker/Dockerfile.images` copies the
-`openshell-sandbox` binary to `/openshell-sandbox` in the supervisor image.
+The supervisor image from `deploy/docker/Dockerfile.supervisor` copies the static
+`openshell-sandbox` binary to `/openshell-sandbox`.
 Mounting that image at `/opt/openshell/bin` makes the binary available as
 `/opt/openshell/bin/openshell-sandbox`.
 
@@ -119,10 +120,10 @@ connection back to the gateway. On SELinux systems, the bind mounts include
 Podman's shared relabel option so the container process can read the files.
 
 The RPM packaging auto-generates a self-signed PKI on first start via
-`init-pki.sh`. Client certs are placed in the CLI auto-discovery directory
-(`~/.config/openshell/gateways/openshell/mtls/`) so the CLI connects with mTLS
-without manual configuration. See `deploy/rpm/CONFIGURATION.md` for the full
-RPM configuration reference.
+`openshell-gateway generate-certs`. Client certs are placed in the CLI
+auto-discovery directory (`~/.config/openshell/gateways/openshell/mtls/`) so
+the CLI connects with mTLS without manual configuration. See
+`deploy/rpm/CONFIGURATION.md` for the full RPM configuration reference.
 
 ## Network Model
 
@@ -133,7 +134,7 @@ the supervisor for sandbox process isolation.
 ```mermaid
 graph TB
     subgraph Host
-        GW["Gateway Server<br/>127.0.0.1:8080"]
+        GW["Gateway Server<br/>127.0.0.1:17670"]
         PS["Podman Socket"]
     end
 
@@ -196,12 +197,13 @@ The standalone `openshell-driver-podman` binary sets the same struct field from
 
 ## Credential Injection
 
-The SSH handshake secret is injected via Podman's `secret_env` API rather than
-a plaintext environment variable.
+Sandboxes authenticate to the gateway via mTLS using client materials bind-
+mounted into the container from a Podman secret. No shared per-request secret
+is injected as an environment variable.
 
 | Credential | Mechanism | Visible in `inspect`? | Visible in `/proc/<pid>/environ`? |
 |---|---|---|---|
-| SSH handshake secret | Podman `secret_env`, created via secrets API and referenced by name | No | Yes, supervisor only, scrubbed from children |
+| mTLS client cert/key | Bind-mounted file paths (`OPENSHELL_TLS_*` env vars point at them) | Yes (paths only) | Yes (paths only) |
 | Sandbox identity | Plaintext env var | Yes | Yes |
 | gRPC endpoint | Plaintext env var, override-protected | Yes | Yes |
 | Supervisor relay socket path | Plaintext env var, override-protected | Yes | Yes |
@@ -214,12 +216,8 @@ via sandbox templates:
 - `OPENSHELL_SANDBOX_ID`
 - `OPENSHELL_ENDPOINT`
 - `OPENSHELL_SSH_SOCKET_PATH`
-- `OPENSHELL_SSH_HANDSHAKE_SKEW_SECS`
 - `OPENSHELL_CONTAINER_IMAGE`
 - `OPENSHELL_SANDBOX_COMMAND`
-
-The `PodmanComputeConfig::Debug` implementation redacts the handshake secret as
-`[REDACTED]`.
 
 ## Sandbox Lifecycle
 
@@ -238,26 +236,23 @@ sequenceDiagram
     D->>P: pull_image(supervisor, "missing")
     D->>P: pull_image(sandbox_image, policy)
 
-    D->>P: create_secret(handshake)
-    Note over D: On failure below, rollback secret
-
     D->>P: create_volume(workspace)
-    Note over D: On failure below, rollback volume + secret
+    Note over D: On failure below, rollback volume
 
     D->>P: create_container(spec)
     alt Conflict (409)
-        D->>P: remove_volume + remove_secret
+        D->>P: remove_volume
         D-->>GW: AlreadyExists
     end
-    Note over D: On failure below, rollback container + volume + secret
+    Note over D: On failure below, rollback container + volume
 
     D->>P: start_container
     D-->>GW: Ok
 ```
 
 Each step rolls back previously-created resources on failure. The Conflict path
-cleans up the volume and secret because they are keyed by the new sandbox's ID,
-not the conflicting container's ID.
+cleans up the volume because it is keyed by the new sandbox's ID, not the
+conflicting container's ID.
 
 ### Readiness and Health
 
@@ -280,11 +275,9 @@ the socket without the old marker or published-port signal.
 4. Force-remove the container.
 5. Remove workspace volume derived from the request `sandbox_id`, warning on
    failure and continuing.
-6. Remove handshake secret derived from the request `sandbox_id`, warning on
-   failure and continuing.
 
 If the container is already gone during inspect or remove, the driver still
-performs idempotent volume and secret cleanup using the request `sandbox_id` and
+performs idempotent volume cleanup using the request `sandbox_id` and
 returns `Ok(false)` for the container-delete result. This prevents leaked
 Podman resources after out-of-band container removal or label drift.
 
@@ -296,14 +289,11 @@ Podman resources after out-of-band container removal or label drift.
 | `OPENSHELL_SANDBOX_IMAGE` | `--sandbox-image` | From gateway config | Default OCI image for sandboxes. |
 | `OPENSHELL_SANDBOX_IMAGE_PULL_POLICY` | `--sandbox-image-pull-policy` | `missing` | Pull policy: `always`, `missing`, `never`, or `newer`. |
 | `OPENSHELL_GRPC_ENDPOINT` | `--grpc-endpoint` | Auto-detected via `host.containers.internal` | Gateway gRPC endpoint for sandbox callbacks. |
-| `OPENSHELL_GATEWAY_PORT` | `--gateway-port` | `8080` | Gateway port used for endpoint auto-detection by the standalone binary. |
+| `OPENSHELL_GATEWAY_PORT` | `--gateway-port` | `17670` | Gateway port used for endpoint auto-detection by the standalone binary. |
 | `OPENSHELL_NETWORK_NAME` | `--network-name` | `openshell` | Podman bridge network name. |
-| `OPENSHELL_SANDBOX_SSH_PORT` | `--sandbox-ssh-port` | `2222` | SSH compatibility port inside the container. |
-| `OPENSHELL_SSH_HANDSHAKE_SECRET` | `--ssh-handshake-secret` | Required standalone, gateway-generated in-process | Shared secret for the NSSH1 handshake. |
-| `OPENSHELL_SSH_HANDSHAKE_SKEW_SECS` | `--ssh-handshake-skew-secs` | `300` | Allowed timestamp skew for SSH handshake validation. |
-| `OPENSHELL_SANDBOX_SSH_SOCKET_PATH` | `--sandbox-ssh-socket-path` | `/run/openshell/ssh.sock` | Standalone driver only: supervisor Unix socket path in `PodmanComputeConfig`. In-gateway Podman uses server `config.sandbox_ssh_socket_path`. |
+| `OPENSHELL_SANDBOX_SSH_SOCKET_PATH` | `--sandbox-ssh-socket-path` | `/run/openshell/ssh.sock` | Supervisor Unix socket path in `PodmanComputeConfig`. |
 | `OPENSHELL_STOP_TIMEOUT` | `--stop-timeout` | `10` | Container stop timeout in seconds. |
-| `OPENSHELL_SUPERVISOR_IMAGE` | `--supervisor-image` | `openshell/supervisor:latest` through the gateway, required standalone | OCI image containing the supervisor binary. |
+| `OPENSHELL_SUPERVISOR_IMAGE` | `--supervisor-image` | `ghcr.io/nvidia/openshell/supervisor:latest` through the gateway, required standalone | OCI image containing the supervisor binary. |
 | `OPENSHELL_PODMAN_TLS_CA` | `--podman-tls-ca` | unset | Host path to the CA certificate mounted for sandbox mTLS. |
 | `OPENSHELL_PODMAN_TLS_CERT` | `--podman-tls-cert` | unset | Host path to the client certificate mounted for sandbox mTLS. |
 | `OPENSHELL_PODMAN_TLS_KEY` | `--podman-tls-key` | unset | Host path to the client private key mounted for sandbox mTLS. |
@@ -351,4 +341,4 @@ matter compared to cluster or rootful runtimes:
   netns, proxy, and relay behavior shared by all drivers.
 - Container engine abstraction: `tasks/scripts/container-engine.sh` for
   build/deploy support across Docker and Podman.
-- Supervisor image build: `deploy/docker/Dockerfile.images`.
+- Supervisor image build: `deploy/docker/Dockerfile.supervisor`.

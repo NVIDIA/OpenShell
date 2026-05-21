@@ -10,9 +10,7 @@ position: 1
 
 A sandbox is the OpenShell data plane: a safe, private execution environment where an AI agent runs. Each sandbox combines runtime isolation with OpenShell policy controls that prevent unauthorized data access, credential exposure, and network exfiltration.
 
-<Info>
-You need an active gateway before creating a sandbox.
-</Info>
+<Info>You need an active gateway before creating a sandbox.</Info>
 
 ## Create a Sandbox
 
@@ -28,6 +26,22 @@ Every sandbox requires a gateway. Register or select one before running sandbox 
 openshell gateway add http://127.0.0.1:18080 --local --name local
 openshell gateway select local
 ```
+
+### CPU and Memory
+
+Set per-sandbox CPU and memory amounts with `--cpu` and `--memory`:
+
+```shell
+openshell sandbox create --cpu 2 --memory 4Gi -- claude
+```
+
+CPU values use Kubernetes-style quantities such as `500m`, `1`, or `2.5`.
+Memory values use byte quantities such as `512Mi`, `4Gi`, or `8G`.
+
+Docker and Podman apply these values as runtime limits. Kubernetes applies each
+value as both the request and the limit so the scheduler reserves the same
+amount the sandbox can use. The VM driver currently accepts these flags but
+does not change VM allocation.
 
 ### GPU Resources
 
@@ -114,13 +128,13 @@ openshell sandbox exec -n my-sandbox --tty -- /bin/bash
 
 OpenShell allocates a TTY automatically when both stdin and stdout are terminals. Force the behavior with `--tty` or disable it with `--no-tty`.
 
-| Flag | Purpose |
-|---|---|
-| `-n`, `--name` | Sandbox to target. |
-| `--workdir` | Working directory for the command inside the sandbox. |
-| `--timeout` | Command timeout in seconds. `0` disables the timeout. |
-| `--tty` | Force TTY allocation. |
-| `--no-tty` | Disable TTY allocation even when attached to a terminal. |
+| Flag           | Purpose                                                  |
+| -------------- | -------------------------------------------------------- |
+| `-n`, `--name` | Sandbox to target.                                       |
+| `--workdir`    | Working directory for the command inside the sandbox.    |
+| `--timeout`    | Command timeout in seconds. `0` disables the timeout.    |
+| `--tty`        | Force TTY allocation.                                    |
+| `--no-tty`     | Disable TTY allocation even when attached to a terminal. |
 
 ## Label a Sandbox
 
@@ -137,6 +151,52 @@ openshell sandbox list --selector env=dev
 openshell sandbox list --selector env=dev,team=platform
 ```
 
+## Expose Long Running Services
+
+Service forwarding makes a long-running process inside a sandbox reachable through a gateway-managed URL. Use it for development servers, notebooks, dashboards, or other services that keep listening after the sandbox starts. Run the service on loopback inside the sandbox, expose its port, then open the URL printed by OpenShell.
+
+Expose a service that listens on loopback inside the sandbox:
+
+```shell
+openshell service expose my-sandbox 8080
+```
+
+Pass an optional service name to create a named service URL:
+
+```shell
+openshell service expose my-sandbox 8080 web
+```
+
+List exposed endpoints:
+
+```shell
+openshell service list
+```
+
+List endpoints for one sandbox:
+
+```shell
+openshell service list my-sandbox
+```
+
+Show or delete one endpoint:
+
+```shell
+openshell service get my-sandbox web
+openshell service delete my-sandbox web
+```
+
+Omit the service name to manage the unnamed endpoint:
+
+```shell
+openshell service get my-sandbox
+openshell service delete my-sandbox
+```
+
+<Note>
+Loopback gateways return local `openshell.localhost` URLs. Remote gateways return HTTPS URLs that require normal gateway authentication. For gateway service-domain configuration, refer to [Manage Gateways](/sandboxes/manage-gateways#configure-service-forwarding).
+</Note>
+
 ## Monitor and Debug
 
 List all sandboxes:
@@ -149,6 +209,13 @@ Filter the list by labels when you want a narrower view:
 
 ```shell
 openshell sandbox list --selector team=platform
+```
+
+Use `-o json` or `-o yaml` for machine-readable output:
+
+```shell
+openshell sandbox list -o json
+openshell sandbox list -o yaml
 ```
 
 Get detailed information about a specific sandbox. The output lists **Policy source** (`sandbox` or `global`), **Revision** (the active policy’s row version for that source), and the formatted active policy YAML:
@@ -169,12 +236,12 @@ Stream sandbox logs to monitor agent activity and diagnose policy decisions:
 openshell logs my-sandbox
 ```
 
-| Flag | Purpose | Example |
-|---|---|---|
-| `--tail` | Stream logs in real time | `openshell logs my-sandbox --tail` |
-| `--source` | Filter by log source | `--source sandbox` |
-| `--level` | Filter by severity | `--level warn` |
-| `--since` | Show logs from a time window | `--since 5m` |
+| Flag       | Purpose                      | Example                            |
+| ---------- | ---------------------------- | ---------------------------------- |
+| `--tail`   | Stream logs in real time     | `openshell logs my-sandbox --tail` |
+| `--source` | Filter by log source         | `--source sandbox`                 |
+| `--level`  | Filter by severity           | `--level warn`                     |
+| `--since`  | Show logs from a time window | `--since 5m`                       |
 
 OpenShell Terminal combines sandbox status and live logs in a single real-time dashboard:
 
@@ -235,6 +302,10 @@ Download files from the sandbox to your host:
 openshell sandbox download my-sandbox /sandbox/output ./local
 ```
 
+When the sandbox-side source is a single file, the destination follows `cp`-style placement: if the destination already exists as a directory or ends with `/`, the file lands inside it as `<dest>/<basename>`; otherwise the file is written at the exact destination path.
+
+The CLI only allows sandbox-side sources that resolve inside the writable workspace (`/sandbox`). Paths that escape lexically (`/etc/passwd`, `/sandbox/../etc/passwd`) and paths that escape through a symlink (`/sandbox/etc-link` pointing at `/etc`) are both refused before any data is transferred.
+
 <Note>
 You can also upload files at creation time with the `--upload` flag on
 `openshell sandbox create`.
@@ -253,12 +324,12 @@ openshell sandbox delete my-sandbox
 
 Every sandbox moves through a defined set of phases:
 
-| Phase | Description |
-|---|---|
-| Provisioning | The runtime is setting up the sandbox environment, injecting credentials, and applying your policy. |
-| Ready | The sandbox is running. The agent process is active and all isolation layers are enforced. You can connect, sync files, and view logs. |
-| Error | Something went wrong during provisioning or execution. Check logs with `openshell logs` for details. |
-| Deleting | The sandbox is being torn down. The system releases resources and purges credentials. |
+| Phase        | Description                                                                                                                            |
+| ------------ | -------------------------------------------------------------------------------------------------------------------------------------- |
+| Provisioning | The runtime is setting up the sandbox environment, injecting credentials, and applying your policy.                                    |
+| Ready        | The sandbox is running. The agent process is active and all isolation layers are enforced. You can connect, sync files, and view logs. |
+| Error        | Something went wrong during provisioning or execution. Check logs with `openshell logs` for details.                                   |
+| Deleting     | The sandbox is being torn down. The system releases resources and purges credentials.                                                  |
 
 ## Sandbox Compute Drivers
 

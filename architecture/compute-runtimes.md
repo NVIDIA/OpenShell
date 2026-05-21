@@ -16,6 +16,12 @@ Each runtime receives a sandbox spec from the gateway and is responsible for:
 - Reporting lifecycle and platform events back to the gateway.
 - Cleaning up runtime-owned resources.
 
+Drivers own runtime-specific platform event interpretation. When an event should
+drive client provisioning UI, the driver attaches the shared
+`openshell.progress.*` metadata defined in `openshell-core` instead of requiring
+clients to parse Kubernetes reasons, VM cache states, or other driver-local
+reason strings.
+
 ## Runtime Summary
 
 | Runtime | Best fit | Sandbox boundary | Notes |
@@ -23,7 +29,12 @@ Each runtime receives a sandbox spec from the gateway and is responsible for:
 | Docker | Local development with Docker available. | Container plus nested sandbox namespace. | Uses host networking so loopback gateway endpoints work from the supervisor. |
 | Podman | Rootless or single-machine deployments. | Container plus nested sandbox namespace. | Uses the Podman REST API, OCI image volumes, and CDI GPU devices when available. |
 | Kubernetes | Cluster deployment through Helm. | Pod plus nested sandbox namespace. | Uses Kubernetes API objects, service accounts, secrets, PVC-backed workspace storage, and GPU resources. |
-| VM | Experimental microVM isolation. | Per-sandbox libkrun VM. | Gateway spawns `openshell-driver-vm` as a subprocess over a private, state-local Unix socket. |
+| VM | Experimental microVM isolation. | Per-sandbox libkrun VM. | Gateway spawns `openshell-driver-vm` as a subprocess over a private, state-local Unix socket. The VM driver boots a cached bootstrap `rootfs.ext4`, prepares requested OCI images inside a bootstrap VM with `umoci`, attaches the prepared image disk read-only, and gives each sandbox a writable `overlay.ext4` for merged-root changes and runtime material. The driver persists each accepted launch request beside the overlay and restarts those VMs on driver startup without recreating the overlay. |
+
+Per-sandbox CPU and memory values currently enter the driver layer through
+template resource limits. Docker and Podman apply them as runtime limits.
+Kubernetes mirrors each limit into the matching request. VM accepts the fields
+but currently ignores them.
 
 VM runtime state paths are derived only from driver-validated sandbox IDs
 matching `[A-Za-z0-9._-]{1,128}`. The gateway-owned VM driver socket uses a

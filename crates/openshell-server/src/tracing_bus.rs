@@ -5,7 +5,6 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use openshell_core::proto::{SandboxLogLine, SandboxStreamEvent};
 use openshell_ocsf::OCSF_TARGET;
@@ -150,7 +149,7 @@ where
         let msg = visitor.message.unwrap_or_else(|| meta.name().to_string());
         let level = display_level(meta.target(), &meta.level().to_string());
 
-        let ts = current_time_ms().unwrap_or(0);
+        let ts = openshell_core::time::now_ms();
         let log = SandboxLogLine {
             sandbox_id: sandbox_id.clone(),
             timestamp_ms: ts,
@@ -191,11 +190,6 @@ impl tracing::field::Visit for LogVisitor {
             _ => {}
         }
     }
-}
-
-fn current_time_ms() -> Option<i64> {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?;
-    i64::try_from(now.as_millis()).ok()
 }
 
 fn display_level(target: &str, level: &str) -> String {
