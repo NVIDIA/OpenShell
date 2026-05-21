@@ -104,58 +104,44 @@ jobs:
           - arch: amd64
             runner: linux-amd64-cpu8
             artifact: linux-amd64
-            task: python:build:linux:amd64
-            output_path: target/wheels/linux-amd64/*.whl
+            target: x86_64-unknown-linux-gnu
           - arch: arm64
             runner: linux-arm64-cpu8
             artifact: linux-arm64
-            task: python:build:linux:arm64
-            output_path: target/wheels/linux-arm64/*.whl
+            target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
-    container:
-      image: ghcr.io/nvidia/openshell/ci:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-      options: --privileged
-      volumes:
-        - /var/run/docker.sock:/var/run/docker.sock
-    env:
-      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      OPENSHELL_IMAGE_TAG: dev
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           fetch-depth: 0
 
-      - name: Set up Docker Buildx
-        uses: ./.github/actions/setup-buildx
+      - name: Set up mise
+        uses: jdx/mise-action@v2
 
-      - name: Mark workspace safe for git
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - name: Generate Python protobuf stubs
+        run: uv sync --group dev && mise run python:proto
 
-      - name: Sync Python dependencies
-        run: uv sync
-
-      - name: Cache Rust target and registry
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
-        with:
-          shared-key: python-wheel-linux-${{ matrix.arch }}
-          cache-directories: .cache/sccache
-          cache-targets: "true"
-
-      - name: Build Python wheels
+      - name: Patch workspace version
+        if: needs.compute-versions.outputs.cargo_version != ''
         run: |
-          set -euo pipefail
-          OPENSHELL_CARGO_VERSION="${{ needs.compute-versions.outputs.cargo_version }}" mise run ${{ matrix.task }}
-          ls -la ${{ matrix.output_path }}
+          sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "${{ needs.compute-versions.outputs.cargo_version }}"/}' Cargo.toml
+
+      - name: Build Python wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: 2_28
+          args: --release --features bundled-z3 --compatibility manylinux_2_28 --out dist
+          before-script-linux: |
+            dnf install -y --setopt=install_weak_deps=False \
+              clang llvm-devel openssl-devel perl-core perl-IPC-Cmd
 
       - name: Upload wheel artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: python-wheels-${{ matrix.artifact }}
-          path: ${{ matrix.output_path }}
+          path: dist/*.whl
           retention-days: 5
 
   build-python-wheel-macos:
