@@ -3,62 +3,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-<<<<<<< HEAD
-# Aible fork of the OpenShell gateway image.
-#
-# Compiles the gateway binary from source using the public Rust image, then
-# layers it into the upstream gateway image (already pulled locally) instead
-# of using the NVIDIA base image from nvcr.io (which requires auth).
-#
-# Build:
-#   IMAGE_TAG=20260512 tasks/scripts/docker-build-local.sh gateway
-
-# ARG at global scope so it can be used in FROM instructions.
-# Pinned to a specific upstream digest for reproducible builds. To bump the
-# upstream base, see deploy/docker/UPSTREAM-BASE-UPGRADE.md.
-# Current pin: ghcr.io/nvidia/openshell/gateway:latest as of 2026-05-13
-ARG BASE_IMAGE=ghcr.io/nvidia/openshell/gateway@sha256:343de518b016b179a9e38395031ba53cb56e78fc1ec72df2143d259859fdfe0f
-
-# ---------------------------------------------------------------------------
-# Stage 1: Compile gateway binary from source
-# ---------------------------------------------------------------------------
-FROM rust:1.95.0-slim-bookworm AS builder
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    cmake \
-    pkg-config \
-    libssl-dev \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /build
-
-COPY Cargo.toml Cargo.lock ./
-COPY crates/ crates/
-COPY proto/ proto/
-COPY providers/ providers/
-
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/build/target \
-    cargo build --release \
-        --features "openshell-core/dev-settings" \
-        --bin openshell-gateway \
-    && mkdir -p /out \
-    && install -m 0755 target/release/openshell-gateway /out/openshell-gateway
-
-# ---------------------------------------------------------------------------
-# Stage 2: Layer compiled binary and updated migrations into the base image
-# ---------------------------------------------------------------------------
-FROM ${BASE_IMAGE}
-
-COPY --from=builder /out/openshell-gateway /usr/local/bin/openshell-gateway
-# Also overwrite openshell-server so the base image's ENTRYPOINT (which invokes
-# `openshell-server`) picks up our updated binary.
-COPY --from=builder /out/openshell-gateway /usr/local/bin/openshell-server
-COPY --chmod=755 crates/openshell-server/migrations /build/crates/openshell-server/migrations
-ENTRYPOINT ["openshell-gateway"]
-=======
 # Gateway image build.
 #
 # The Rust binary is built natively before this image build runs and staged at:
@@ -90,4 +34,3 @@ EXPOSE 8080
 
 ENTRYPOINT ["/usr/local/bin/openshell-gateway"]
 CMD ["--bind-address", "0.0.0.0", "--port", "8080"]
->>>>>>> main

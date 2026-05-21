@@ -3,70 +3,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-<<<<<<< HEAD
-# Aible fork of the OpenShell supervisor image.
-#
-# The supervisor image carries the `openshell-sandbox` binary, which the
-# agent-sandbox-controller copies into every sandbox pod via an init container.
-# Inside the sandbox, the binary acts as PID 1: process supervision, policy
-# enforcement, SSH server, and gRPC callback to the gateway.
-#
-# Critically, openshell-sandbox uses the same protobuf as the gateway. If the
-# gateway is rebuilt from our local OpenShell sources, the supervisor must be
-# too — otherwise the sandbox-to-gateway gRPC link can hit field-rename or
-# message-shape skew (the same failure mode we hit with the control plane).
-#
-# Build:
-#   IMAGE_TAG=20260512 tasks/scripts/docker-build-local.sh supervisor
-
-# ARG at global scope so it can be used in FROM instructions.
-# Unlike the gateway, the upstream supervisor image is FROM scratch (just a
-# statically-linked binary). Our cargo build produces a *dynamically* linked
-# binary that needs glibc + ld-linux at runtime, so we use debian-slim (which
-# matches the rust:1.95.0-slim-bookworm builder ABI) instead of layering on
-# the upstream scratch image. The agent-sandbox-controller invokes the binary
-# as an init container during sandbox pod startup, so the loader must exist.
-ARG BASE_IMAGE=debian:trixie-slim
-
-# ---------------------------------------------------------------------------
-# Stage 1: Compile sandbox binary from source
-# ---------------------------------------------------------------------------
-FROM rust:1.95.0-slim-bookworm AS builder
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    cmake \
-    pkg-config \
-    libssl-dev \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /build
-
-COPY Cargo.toml Cargo.lock ./
-COPY crates/ crates/
-COPY proto/ proto/
-COPY providers/ providers/
-
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/build/target \
-    cargo build --release \
-        --features "openshell-core/dev-settings" \
-        --bin openshell-sandbox \
-    && mkdir -p /out \
-    && install -m 0755 target/release/openshell-sandbox /out/openshell-sandbox
-
-# ---------------------------------------------------------------------------
-# Stage 2: Layer compiled binary onto the base image
-# ---------------------------------------------------------------------------
-FROM ${BASE_IMAGE}
-
-# Match the upstream image's binary path and entrypoint so the inner chart's
-# `supervisor.image` reference works without changes — the agent-sandbox-
-# controller's init container invokes `/openshell-sandbox` to copy itself
-# into the sandbox pod's emptyDir.
-COPY --from=builder /out/openshell-sandbox /openshell-sandbox
-=======
 # Supervisor image build.
 #
 # The final image is `scratch`: it only carries the static `openshell-sandbox`
@@ -95,6 +31,5 @@ ARG TARGETARCH
 # (r-xr-x---) is the security win; the chown to a non-root UID was breaking
 # Podman without buying anything since the container is always UID 0.
 COPY --chmod=0550 deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-sandbox /openshell-sandbox
->>>>>>> main
 
 ENTRYPOINT ["/openshell-sandbox"]
