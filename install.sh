@@ -19,6 +19,7 @@ LOCAL_GATEWAY_PORT="17670"
 HOMEBREW_TAP="nvidia/openshell"
 HOMEBREW_FORMULA_NAME="openshell"
 BREAKING_RELEASE_VERSION="0.0.37"
+LINUX_PACKAGE_GLIBC_MIN_VERSION="2.31"
 UPGRADE_NOTICE_ACK="${OPENSHELL_ACK_BREAKING_UPGRADE:-}"
 
 info() {
@@ -116,6 +117,112 @@ semver_at_least() {
   [ "$_minor" -gt "$_min_minor" ] && return 0
   [ "$_minor" -lt "$_min_minor" ] && return 1
   [ "$_patch" -ge "$_min_patch" ]
+}
+
+version_at_least_major_minor() {
+  _version="$1"
+  _minimum="$2"
+
+  _major="${_version%%.*}"
+  _minor="${_version#*.}"
+  _minor="${_minor%%.*}"
+
+  _min_major="${_minimum%%.*}"
+  _min_minor="${_minimum#*.}"
+  _min_minor="${_min_minor%%.*}"
+
+  case "$_major:$_minor:$_min_major:$_min_minor" in
+    *[!0-9:]* | *::*)
+      return 1
+      ;;
+  esac
+
+  [ "$_major" -gt "$_min_major" ] && return 0
+  [ "$_major" -lt "$_min_major" ] && return 1
+  [ "$_minor" -ge "$_min_minor" ]
+}
+
+getconf_gnu_libc_version() {
+  if [ "${OPENSHELL_INSTALL_SH_TEST:-0}" = "1" ] && [ "${OPENSHELL_TEST_GETCONF_UNAVAILABLE:-0}" = "1" ]; then
+    return 127
+  fi
+
+  if [ "${OPENSHELL_INSTALL_SH_TEST:-0}" = "1" ] && [ "${OPENSHELL_TEST_GETCONF_OUTPUT+x}" = "x" ]; then
+    printf '%s\n' "$OPENSHELL_TEST_GETCONF_OUTPUT"
+    return 0
+  fi
+
+  getconf GNU_LIBC_VERSION 2>/dev/null
+}
+
+ldd_version_output() {
+  if [ "${OPENSHELL_INSTALL_SH_TEST:-0}" = "1" ] && [ "${OPENSHELL_TEST_LDD_UNAVAILABLE:-0}" = "1" ]; then
+    return 127
+  fi
+
+  if [ "${OPENSHELL_INSTALL_SH_TEST:-0}" = "1" ] && [ "${OPENSHELL_TEST_LDD_OUTPUT+x}" = "x" ]; then
+    printf '%s\n' "$OPENSHELL_TEST_LDD_OUTPUT"
+    return 0
+  fi
+
+  ldd --version 2>&1
+}
+
+detect_glibc_version() {
+  _getconf_output="$(getconf_gnu_libc_version 2>/dev/null || true)"
+  case "$_getconf_output" in
+    glibc\ [0-9]*.[0-9]*)
+      printf '%s\n' "${_getconf_output#glibc }"
+      return 0
+      ;;
+    *[Mm][Uu][Ss][Ll]* | *[Aa][Ll][Pp][Ii][Nn][Ee]*)
+      return 2
+      ;;
+  esac
+
+  _ldd_output="$(ldd_version_output 2>&1 || true)"
+  case "$_ldd_output" in
+    *[Mm][Uu][Ss][Ll]* | *[Aa][Ll][Pp][Ii][Nn][Ee]*)
+      return 2
+      ;;
+  esac
+
+  # uv's installer parses the glibc version from the first ldd line's final field.
+  _ldd_version="$(printf '%s\n' "$_ldd_output" | awk 'FNR == 1 { print $NF; exit }')"
+  case "$_ldd_version" in
+    [0-9]*.[0-9]*)
+      ;;
+    *)
+      _ldd_version=""
+      ;;
+  esac
+  if [ -n "$_ldd_version" ]; then
+    printf '%s\n' "$_ldd_version"
+    return 0
+  fi
+
+  return 1
+}
+
+require_linux_package_glibc() {
+  _glibc_status=0
+  _glibc_version="$(detect_glibc_version)" || _glibc_status=$?
+
+  case "$_glibc_status" in
+    0)
+      ;;
+    2)
+      error "OpenShell Linux packages require glibc >= ${LINUX_PACKAGE_GLIBC_MIN_VERSION}; detected musl or unsupported libc."
+      ;;
+    *)
+      error "OpenShell Linux packages require glibc >= ${LINUX_PACKAGE_GLIBC_MIN_VERSION}; could not detect glibc."
+      ;;
+  esac
+
+  if ! version_at_least_major_minor "$_glibc_version" "$LINUX_PACKAGE_GLIBC_MIN_VERSION"; then
+    error "OpenShell Linux packages require glibc >= ${LINUX_PACKAGE_GLIBC_MIN_VERSION}; detected glibc ${_glibc_version}.
+Please use a newer distribution or container environment."
+  fi
 }
 
 target_uses_breaking_gateway_model() {
@@ -934,6 +1041,7 @@ main() {
 
   case "$PLATFORM" in
     linux)
+      require_linux_package_glibc
       case "$(linux_package_method)" in
         deb)
           install_linux_deb
@@ -955,4 +1063,6 @@ main() {
   esac
 }
 
-main "$@"
+if [ "${OPENSHELL_INSTALL_SH_TEST:-0}" != "1" ]; then
+  main "$@"
+fi

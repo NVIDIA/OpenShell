@@ -37,9 +37,15 @@ jobs:
       matrix:
         include:
           - arch: x86_64
+            artifact_arch: amd64
             runner: linux-amd64-cpu8
+            cli_target: x86_64-unknown-linux-musl
+            host_target: x86_64-unknown-linux-gnu
           - arch: aarch64
+            artifact_arch: arm64
             runner: linux-arm64-cpu8
+            cli_target: aarch64-unknown-linux-musl
+            host_target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     container:
@@ -59,6 +65,26 @@ jobs:
           ref: ${{ inputs.checkout-ref }}
           fetch-depth: 0
 
+      - name: Download CLI artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: cli-linux-${{ matrix.artifact_arch }}
+          path: package-input/
+
+      - name: Download gateway artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: gateway-binary-linux-${{ matrix.artifact_arch }}
+          path: package-input/
+
+      - name: Extract package inputs
+        run: |
+          set -euo pipefail
+          mkdir -p package-binaries
+          tar -xzf "package-input/openshell-${{ matrix.cli_target }}.tar.gz" -C package-binaries
+          tar -xzf "package-input/openshell-gateway-${{ matrix.host_target }}.tar.gz" -C package-binaries
+          ls -lah package-binaries
+
       - name: Mark workspace safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
@@ -70,6 +96,7 @@ jobs:
           OPENSHELL_RPM_VERSION: ${{ inputs['rpm-version'] }}
           OPENSHELL_RPM_RELEASE: ${{ inputs['rpm-release'] }}
           OPENSHELL_CARGO_VERSION: ${{ inputs['cargo-version'] }}
+          OPENSHELL_PREBUILT_BINARIES_DIR: ${{ github.workspace }}/package-binaries
         run: packit build locally
 
       - name: Collect RPM artifacts
