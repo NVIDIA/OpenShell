@@ -802,7 +802,7 @@ where
 
     let gateways = list_gateways()?;
     if gateways.is_empty() || !interactive {
-        gateway_list(gateway_flag)?;
+        gateway_list(gateway_flag, "table")?;
         if !gateways.is_empty() {
             eprintln!();
             eprintln!(
@@ -1256,9 +1256,33 @@ pub fn gateway_logout(name: &str) -> Result<()> {
 }
 
 /// List all registered gateways.
-pub fn gateway_list(gateway_flag: &Option<String>) -> Result<()> {
+pub fn gateway_list(gateway_flag: &Option<String>, output: &str) -> Result<()> {
     let gateways = list_gateways()?;
     let active = gateway_flag.clone().or_else(load_active_gateway);
+
+    match output {
+        "json" => {
+            let items: Vec<serde_json::Value> = gateways
+                .iter()
+                .map(|g| gateway_to_json(g, &active))
+                .collect();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&items).into_diagnostic()?
+            );
+            return Ok(());
+        }
+        "yaml" => {
+            let items: Vec<serde_json::Value> = gateways
+                .iter()
+                .map(|g| gateway_to_json(g, &active))
+                .collect();
+            print!("{}", serde_yml::to_string(&items).into_diagnostic()?);
+            return Ok(());
+        }
+        "table" => {}
+        _ => return Err(miette!("unsupported output format: {output}")),
+    }
 
     if gateways.is_empty() {
         println!("No gateways found.");
@@ -1317,6 +1341,16 @@ pub fn gateway_list(gateway_flag: &Option<String>) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn gateway_to_json(gateway: &GatewayMetadata, active: &Option<String>) -> serde_json::Value {
+    serde_json::json!({
+        "name": gateway.name,
+        "endpoint": gateway.gateway_endpoint,
+        "type": gateway_type_label(gateway),
+        "auth": gateway_auth_label(gateway),
+        "active": active.as_deref() == Some(&gateway.name),
+    })
 }
 
 async fn http_health_check(server: &str, tls: &TlsOptions) -> Result<Option<StatusCode>> {

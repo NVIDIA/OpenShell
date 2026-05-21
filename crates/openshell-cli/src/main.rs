@@ -1039,7 +1039,11 @@ enum GatewayCommands {
     /// Prints a table of all registered gateways with their endpoint, type,
     /// and authentication mode. The active gateway is marked with `*`.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
-    List,
+    List {
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
 }
 
 // -----------------------------------------------------------------------
@@ -1942,8 +1946,8 @@ async fn main() -> Result<()> {
                     .unwrap_or_else(|| "openshell".to_string());
                 run::gateway_admin_info(&name)?;
             }
-            GatewayCommands::List => {
-                run::gateway_list(&cli.gateway)?;
+            GatewayCommands::List { output } => {
+                run::gateway_list(&cli.gateway, output.as_str())?;
             }
         },
 
@@ -3684,6 +3688,51 @@ mod tests {
     fn sandbox_list_json_conflicts_with_names() {
         let result = Cli::try_parse_from(["openshell", "sandbox", "list", "-o", "json", "--names"]);
         assert!(result.is_err(), "--names and -o json should conflict");
+    }
+
+    #[test]
+    fn gateway_list_default_output_is_table() {
+        let cli = Cli::try_parse_from(["openshell", "gateway", "list"])
+            .expect("gateway list should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Gateway {
+                command: Some(GatewayCommands::List {
+                    output: OutputFormat::Table,
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn gateway_list_accepts_output_json() {
+        let cli = Cli::try_parse_from(["openshell", "gateway", "list", "-o", "json"])
+            .expect("gateway list -o json should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Gateway {
+                command: Some(GatewayCommands::List {
+                    output: OutputFormat::Json,
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn gateway_list_accepts_output_yaml() {
+        let cli = Cli::try_parse_from(["openshell", "gateway", "list", "-o", "yaml"])
+            .expect("gateway list -o yaml should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Gateway {
+                command: Some(GatewayCommands::List {
+                    output: OutputFormat::Yaml,
+                })
+            })
+        ));
     }
 
     #[test]
