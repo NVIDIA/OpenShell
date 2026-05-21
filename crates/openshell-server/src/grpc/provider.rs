@@ -299,12 +299,17 @@ pub(super) async fn delete_provider_record(store: &Store, name: &str) -> Result<
         .map_err(|e| Status::internal(format!("delete provider failed: {e}")))
 }
 
-async fn sandboxes_using_provider(
-    store: &Store,
-    provider_name: &str,
-) -> Result<Vec<String>, Status> {
-    let mut blocking = Vec::new();
-    let mut offset = 0;
+/// Iterate over every `Sandbox` in the store and collect items produced by
+/// `f`.  `f` receives each decoded sandbox; returning `Some(T)` includes the
+/// value in the output, `None` skips it.
+///
+/// This is the shared pagination kernel used by all sandbox-scan helpers.
+async fn scan_sandboxes<T, F>(store: &Store, mut f: F) -> Result<Vec<T>, Status>
+where
+    F: FnMut(Sandbox) -> Option<T>,
+{
+    let mut out = Vec::new();
+    let mut offset = 0u32;
     loop {
         let records = store
             .list(Sandbox::object_type(), 1000, offset)
@@ -319,56 +324,50 @@ async fn sandboxes_using_provider(
                     .map_err(|_| Status::internal("sandbox page size exceeded u32"))?,
             )
             .ok_or_else(|| Status::internal("sandbox pagination offset overflow"))?;
-
         for record in records {
             let sandbox = Sandbox::decode(record.payload.as_slice())
                 .map_err(|e| Status::internal(format!("decode sandbox failed: {e}")))?;
-            let Some(spec) = sandbox.spec.as_ref() else {
-                continue;
-            };
-            if spec.providers.iter().any(|name| name == provider_name) {
-                blocking.push(sandbox.object_name().to_string());
+            if let Some(item) = f(sandbox) {
+                out.push(item);
             }
         }
     }
-    blocking.sort();
-    blocking.dedup();
-    Ok(blocking)
+    Ok(out)
+}
+
+async fn sandboxes_using_provider(
+    store: &Store,
+    provider_name: &str,
+) -> Result<Vec<String>, Status> {
+    let provider_name = provider_name.to_string();
+    let mut names = scan_sandboxes(store, |sandbox| {
+        let spec = sandbox.spec.as_ref()?;
+        if spec.providers.iter().any(|n| n == &provider_name) {
+            Some(sandbox.object_name().to_string())
+        } else {
+            None
+        }
+    })
+    .await?;
+    names.sort();
+    names.dedup();
+    Ok(names)
 }
 
 async fn sandboxes_using_provider_records(
     store: &Store,
     provider_name: &str,
 ) -> Result<Vec<Sandbox>, Status> {
-    let mut sandboxes = Vec::new();
-    let mut offset = 0;
-    loop {
-        let records = store
-            .list(Sandbox::object_type(), 1000, offset)
-            .await
-            .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?;
-        if records.is_empty() {
-            break;
+    let provider_name = provider_name.to_string();
+    scan_sandboxes(store, |sandbox| {
+        let spec = sandbox.spec.as_ref()?;
+        if spec.providers.iter().any(|n| n == &provider_name) {
+            Some(sandbox)
+        } else {
+            None
         }
-        offset = offset
-            .checked_add(
-                u32::try_from(records.len())
-                    .map_err(|_| Status::internal("sandbox page size exceeded u32"))?,
-            )
-            .ok_or_else(|| Status::internal("sandbox pagination offset overflow"))?;
-
-        for record in records {
-            let sandbox = Sandbox::decode(record.payload.as_slice())
-                .map_err(|e| Status::internal(format!("decode sandbox failed: {e}")))?;
-            let Some(spec) = sandbox.spec.as_ref() else {
-                continue;
-            };
-            if spec.providers.iter().any(|name| name == provider_name) {
-                sandboxes.push(sandbox);
-            }
-        }
-    }
-    Ok(sandboxes)
+    })
+    .await
 }
 
 /// Merge an incoming map into an existing map.
@@ -1045,41 +1044,31 @@ fn has_errors(diagnostics: &[ProfileValidationDiagnostic]) -> bool {
 }
 
 async fn sandboxes_using_profile(store: &Store, profile_id: &str) -> Result<Vec<String>, Status> {
-    let mut blocking = Vec::new();
-    let mut offset = 0;
-    loop {
-        let records = store
-            .list(Sandbox::object_type(), 1000, offset)
-            .await
-            .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?;
-        if records.is_empty() {
-            break;
-        }
-        offset = offset
-            .checked_add(
-                u32::try_from(records.len())
-                    .map_err(|_| Status::internal("sandbox page size exceeded u32"))?,
-            )
-            .ok_or_else(|| Status::internal("sandbox pagination offset overflow"))?;
+    // Collect all sandboxes that reference at least one provider — pagination
+    // is handled by `scan_sandboxes`; the async provider lookup happens below.
+    let candidates = scan_sandboxes(store, |sandbox| {
+        let has_providers = sandbox
+            .spec
+            .as_ref()
+            .is_some_and(|s| !s.providers.is_empty());
+        has_providers.then_some(sandbox)
+    })
+    .await?;
 
-        for record in records {
-            let sandbox = Sandbox::decode(record.payload.as_slice())
-                .map_err(|e| Status::internal(format!("decode sandbox failed: {e}")))?;
-            let Some(spec) = sandbox.spec.as_ref() else {
+    let mut blocking = Vec::new();
+    for sandbox in candidates {
+        let spec = sandbox.spec.as_ref().expect("filtered by scan_sandboxes");
+        for provider_name in &spec.providers {
+            let Some(provider) = store
+                .get_message_by_name::<Provider>(provider_name)
+                .await
+                .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
+            else {
                 continue;
             };
-            for provider_name in &spec.providers {
-                let Some(provider) = store
-                    .get_message_by_name::<Provider>(provider_name)
-                    .await
-                    .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
-                else {
-                    continue;
-                };
-                if normalize_profile_id(&provider.r#type).as_deref() == Some(profile_id) {
-                    blocking.push(sandbox.object_name().to_string());
-                    break;
-                }
+            if normalize_profile_id(&provider.r#type).as_deref() == Some(profile_id) {
+                blocking.push(sandbox.object_name().to_string());
+                break;
             }
         }
     }
