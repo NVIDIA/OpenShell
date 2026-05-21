@@ -33,17 +33,6 @@ These artifacts are attached to GitHub releases. Kubernetes deployments should u
 
 Linux package installs and standalone GNU gateway artifacts require glibc 2.31 or newer. This supports Ubuntu 20.04 and later, Ubuntu 22.04, RHEL 9-compatible distributions, and Amazon Linux 2023.
 
-## Artifact Compatibility
-
-OpenShell uses different libc targets for host-executed artifacts:
-
-| Artifact | Linux libc target | Role |
-|---|---|---|
-| `openshell` | Static musl | Standalone CLI and package-managed CLI. |
-| `openshell-gateway` | GNU/glibc 2.31 | Host gateway daemon and gateway container image binary. |
-| `openshell-driver-vm` | GNU/glibc 2.31 | Host subprocess for VM-backed sandboxes. |
-| `openshell-sandbox` | Runtime-specific | Supervisor that usually runs inside controlled containers, pods, or VM guests. |
-
 ## Compute Drivers
 
 The gateway can manage sandboxes through several compute drivers.
