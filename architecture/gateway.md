@@ -62,6 +62,15 @@ JWTs in memory before expiry only while the sandbox record still exists. Older
 tokens are not server-revoked; deployments bound replay exposure with short
 `gateway_jwt.ttl_secs` lifetimes.
 
+Gateway JWT signing-key rotation is currently an offline operator action. The
+runtime loads one active signing key and one matching public verification key
+from the configured secret at startup. To rotate that key material today,
+operators must delete or replace the JWT key secret, let certgen recreate it,
+and restart the gateway pods. This invalidates outstanding supervisor tokens;
+running supervisors recover by re-running their bootstrap path where available
+or by reconnecting after sandbox restart. Online rotation with multiple
+verification keys keyed by `kid` is tracked separately.
+
 Sandbox JWTs are not user credentials. The gRPC router accepts
 `Principal::Sandbox` only on the supervisor-to-gateway RPC allowlist
 (`ConnectSupervisor`, `RelayStream`, token renewal, config sync, policy status,

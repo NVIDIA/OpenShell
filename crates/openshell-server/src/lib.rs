@@ -300,16 +300,8 @@ pub async fn run_server(
     // and without the issuer there's nothing to exchange the SA token for.
     if state.sandbox_jwt_issuer.is_some() && std::env::var_os("KUBERNETES_SERVICE_HOST").is_some() {
         // Pod lookups and TokenReview identity checks must match the sandbox
-        // namespace and service account used by the Kubernetes driver. Fall
-        // back to the historical "default" namespace only if driver config
-        // cannot be parsed while bootstrapping the authenticator.
-        let kubernetes_config =
-            kubernetes_config_from_file(config_file.as_ref()).unwrap_or_else(|_| {
-                KubernetesComputeConfig {
-                    namespace: "default".to_string(),
-                    ..Default::default()
-                }
-            });
+        // namespace and service account used by the Kubernetes driver.
+        let kubernetes_config = kubernetes_config_for_k8s_sa_bootstrap(config_file.as_ref())?;
         let sandbox_namespace = kubernetes_config.namespace;
         let sandbox_service_account = kubernetes_config.service_account_name;
         match kube::Client::try_default().await {
@@ -788,6 +780,22 @@ fn kubernetes_config_from_file(
         .map_err(|e| Error::config(format!("invalid [openshell.drivers.kubernetes] table: {e}")))
 }
 
+fn kubernetes_config_for_k8s_sa_bootstrap(
+    file: Option<&config_file::ConfigFile>,
+) -> Result<KubernetesComputeConfig> {
+    let Some(file) = file else {
+        return Err(Error::config(
+            "K8s ServiceAccount bootstrap requires [openshell.drivers.kubernetes] when sandbox JWT issuing is enabled in-cluster",
+        ));
+    };
+    if !file.openshell.drivers.contains_key("kubernetes") {
+        return Err(Error::config(
+            "K8s ServiceAccount bootstrap requires [openshell.drivers.kubernetes] when sandbox JWT issuing is enabled in-cluster",
+        ));
+    }
+    kubernetes_config_from_file(Some(file))
+}
+
 /// Same pattern as [`kubernetes_config_from_file`] but for Podman.
 fn podman_config_from_file(
     file: Option<&config_file::ConfigFile>,
@@ -863,6 +871,7 @@ mod tests {
         ConnectionProtocol, MultiplexService, ServerState, TlsAcceptor,
         allow_plaintext_service_http, classify_initial_bytes, configured_compute_driver,
         gateway_listener_addresses, is_benign_tls_handshake_failure, serve_gateway_listener,
+        kubernetes_config_for_k8s_sa_bootstrap,
     };
     use openshell_core::{
         ComputeDriverKind, Config,
@@ -1264,6 +1273,35 @@ mod tests {
             configured_compute_driver(&config).unwrap(),
             ComputeDriverKind::Docker
         );
+    }
+
+    #[test]
+    fn k8s_sa_bootstrap_rejects_missing_kubernetes_driver_config() {
+        let err = kubernetes_config_for_k8s_sa_bootstrap(None).unwrap_err();
+        assert!(err.to_string().contains("[openshell.drivers.kubernetes]"));
+
+        let file: crate::config_file::ConfigFile =
+            toml::from_str("[openshell.gateway]\n").expect("valid config");
+        let err = kubernetes_config_for_k8s_sa_bootstrap(Some(&file)).unwrap_err();
+        assert!(err.to_string().contains("[openshell.drivers.kubernetes]"));
+    }
+
+    #[test]
+    fn k8s_sa_bootstrap_uses_configured_namespace_and_service_account() {
+        let file: crate::config_file::ConfigFile = toml::from_str(
+            r#"
+[openshell.gateway]
+
+[openshell.drivers.kubernetes]
+namespace = "sandboxes"
+service_account_name = "sandbox-sa"
+"#,
+        )
+        .expect("valid config");
+
+        let cfg = kubernetes_config_for_k8s_sa_bootstrap(Some(&file)).unwrap();
+        assert_eq!(cfg.namespace, "sandboxes");
+        assert_eq!(cfg.service_account_name, "sandbox-sa");
     }
 
     #[test]

@@ -192,15 +192,15 @@ server:
   # generates an Ed25519 keypair and writes it to a secret containing
   # signing.pem (PKCS#8), public.pem (SPKI), and kid (plain text).
   sandboxJwt:
-    # Name of the Opaque Secret holding the signing key material. Empty
-    # falls back to "<release>-jwt-keys".
+    # -- Name of the Opaque Secret holding the signing key material. Empty
+    # falls back to the chart fullname with "-jwt-keys" appended.
     signingSecretName: ""
-    # Stable gateway identity embedded in iss/aud of every minted token.
+    # -- Stable gateway identity embedded in iss/aud of every minted token.
     # Defaults to the release name so HA replicas share identity.
     gatewayId: ""
-    # Token TTL in seconds. Defaults to 3600 (1h).
+    # -- Token TTL in seconds. Defaults to 3600 (1h).
     ttlSecs: 3600
-    # Lifetime (seconds) of the projected ServiceAccount token kubelet
+    # -- Lifetime (seconds) of the projected ServiceAccount token kubelet
     # writes into each sandbox pod for the IssueSandboxToken bootstrap
     # exchange. Kubelet enforces a minimum of 600s; the driver clamps
     # values outside [600, 86400]. Default 3600 — generous, since the

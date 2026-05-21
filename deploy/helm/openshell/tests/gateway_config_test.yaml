@@ -18,6 +18,25 @@ tests:
       - exists:
           path: spec.template.metadata.annotations["checksum/gateway-config"]
 
+  - it: mounts the OIDC CA bundle when TLS is disabled
+    template: templates/statefulset.yaml
+    set:
+      server.disableTls: true
+      server.oidc.issuer: https://issuer.example.com
+      server.oidc.caConfigMapName: openshell-oidc-ca
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].volumeMounts[3].name
+          value: oidc-ca
+      - equal:
+          path: spec.template.spec.containers[0].volumeMounts[3].mountPath
+          value: /etc/openshell-tls/oidc-ca
+      - equal:
+          path: spec.template.spec.volumes[2].name
+          value: oidc-ca
+      - equal:
+          path: spec.template.spec.volumes[2].configMap.name
+          value: openshell-oidc-ca
 
   # Regression for the P1 bug Drew flagged: grpc_endpoint MUST live in the
   # Kubernetes driver table, not in [openshell.gateway]. The gateway-side

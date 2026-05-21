@@ -39,6 +39,6 @@ pub enum IdentityProvider {
     Mtls,
     /// Cloudflare Access JWT.
     CloudflareAccess,
-    /// Internal (skip-listed methods, sandbox supervisor RPCs).
-    Internal,
+    /// Explicit unauthenticated local-development user principal.
+    LocalDev,
 }

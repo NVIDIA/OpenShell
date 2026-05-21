@@ -61,23 +61,11 @@ impl Inference for InferenceService {
         &self,
         request: Request<GetInferenceBundleRequest>,
     ) -> Result<Response<GetInferenceBundleResponse>, Status> {
-        // GetInferenceBundle is gateway-wide (no per-sandbox routes yet),
-        // so it has no `sandbox_id` to compare against. Just reject
-        // anonymous callers; both user and sandbox principals are allowed.
-        match request
-            .extensions()
-            .get::<crate::auth::principal::Principal>()
-        {
-            Some(
-                crate::auth::principal::Principal::User(_)
-                | crate::auth::principal::Principal::Sandbox(_),
-            ) => {}
-            Some(crate::auth::principal::Principal::Anonymous) | None => {
-                return Err(Status::unauthenticated(
-                    "GetInferenceBundle requires an authenticated caller",
-                ));
-            }
-        }
+        authorize_inference_bundle(
+            request
+                .extensions()
+                .get::<crate::auth::principal::Principal>(),
+        )?;
         resolve_inference_bundle(self.state.store.as_ref())
             .await
             .map(Response::new)
@@ -418,6 +406,20 @@ fn find_provider_config_value(provider: &Provider, preferred_keys: &[&str]) -> O
     None
 }
 
+fn authorize_inference_bundle(
+    principal: Option<&crate::auth::principal::Principal>,
+) -> Result<(), Status> {
+    match principal {
+        Some(crate::auth::principal::Principal::Sandbox(_)) => Ok(()),
+        Some(crate::auth::principal::Principal::User(_)) => Err(Status::permission_denied(
+            "GetInferenceBundle requires a sandbox principal",
+        )),
+        Some(crate::auth::principal::Principal::Anonymous) | None => Err(Status::unauthenticated(
+            "GetInferenceBundle requires an authenticated sandbox principal",
+        )),
+    }
+}
+
 /// Resolve the inference bundle (all managed routes + revision hash).
 async fn resolve_inference_bundle(store: &Store) -> Result<GetInferenceBundleResponse, Status> {
     let mut routes = Vec::new();
@@ -515,6 +517,10 @@ async fn resolve_route_by_name(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::identity::{Identity, IdentityProvider};
+    use crate::auth::principal::{
+        Principal, SandboxIdentitySource, SandboxPrincipal, UserPrincipal,
+    };
     use openshell_core::ObjectId;
     use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -523,6 +529,28 @@ mod tests {
         Store::connect("sqlite::memory:?cache=shared")
             .await
             .expect("in-memory SQLite store should connect")
+    }
+
+    fn test_user_principal() -> Principal {
+        Principal::User(UserPrincipal {
+            identity: Identity {
+                subject: "user-a".to_string(),
+                display_name: None,
+                roles: vec!["openshell-user".to_string()],
+                scopes: vec![],
+                provider: IdentityProvider::Oidc,
+            },
+        })
+    }
+
+    fn test_sandbox_principal() -> Principal {
+        Principal::Sandbox(SandboxPrincipal {
+            sandbox_id: "sandbox-a".to_string(),
+            source: SandboxIdentitySource::BootstrapJwt {
+                issuer: "openshell-gateway:test".to_string(),
+            },
+            trust_domain: Some("openshell".to_string()),
+        })
     }
 
     fn make_route(name: &str, provider_name: &str, model_id: &str) -> InferenceRoute {
@@ -571,6 +599,19 @@ mod tests {
             config: std::iter::once((base_url_key.to_string(), base_url.to_string())).collect(),
             ..make_provider(name, provider_type, key_name, key_value)
         }
+    }
+
+    #[test]
+    fn inference_bundle_requires_sandbox_principal() {
+        let sandbox = test_sandbox_principal();
+        assert!(authorize_inference_bundle(Some(&sandbox)).is_ok());
+
+        let user = test_user_principal();
+        let err = authorize_inference_bundle(Some(&user)).expect_err("users cannot fetch bundle");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+        let err = authorize_inference_bundle(None).expect_err("missing principal rejected");
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
     }
 
     #[tokio::test]

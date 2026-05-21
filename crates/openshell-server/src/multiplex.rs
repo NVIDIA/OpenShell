@@ -363,7 +363,7 @@ fn unauthenticated_dev_user_principal() -> Principal {
             display_name: Some("Unauthenticated Local Dev".to_string()),
             roles: vec!["openshell-user".to_string(), "openshell-admin".to_string()],
             scopes: vec!["openshell:all".to_string()],
-            provider: crate::auth::identity::IdentityProvider::Internal,
+            provider: crate::auth::identity::IdentityProvider::LocalDev,
         },
     })
 }
@@ -1092,7 +1092,7 @@ mod tests {
             match principal {
                 Principal::User(u) => {
                     assert_eq!(u.identity.subject, "unauthenticated-local-dev");
-                    assert_eq!(u.identity.provider, IdentityProvider::Internal);
+                    assert_eq!(u.identity.provider, IdentityProvider::LocalDev);
                 }
                 other => panic!("expected dev user principal, got {other:?}"),
             }

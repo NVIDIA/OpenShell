@@ -349,6 +349,41 @@ fn validate_sandbox_caller_update(req: &UpdateConfigRequest) -> Result<(), Statu
     Ok(())
 }
 
+async fn resolve_sandbox_by_name_for_principal(
+    store: &Store,
+    principal: &Principal,
+    name: &str,
+) -> Result<Sandbox, Status> {
+    let sandbox = store
+        .get_message_by_name::<Sandbox>(name)
+        .await
+        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?;
+
+    match principal {
+        Principal::Sandbox(_) => {
+            let Some(sandbox) = sandbox else {
+                return Err(Status::permission_denied(
+                    "sandbox not found or not owned by caller",
+                ));
+            };
+            crate::auth::guard::ensure_sandbox_scope(principal, sandbox.object_id()).map_err(
+                |status| {
+                    if status.code() == tonic::Code::PermissionDenied {
+                        Status::permission_denied("sandbox not found or not owned by caller")
+                    } else {
+                        status
+                    }
+                },
+            )?;
+            Ok(sandbox)
+        }
+        Principal::User(_) => sandbox.ok_or_else(|| Status::not_found("sandbox not found")),
+        Principal::Anonymous => Err(Status::unauthenticated(
+            "sandbox-scoped methods require an authenticated caller",
+        )),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Config handlers
 // ---------------------------------------------------------------------------
@@ -672,21 +707,14 @@ pub(super) async fn handle_update_config(
     let req = request.into_inner();
     if sandbox_caller {
         validate_sandbox_caller_update(&req)?;
-        // Resolve req.name to a sandbox UUID and verify the calling
-        // sandbox principal owns it. User callers (CLI / TUI) bypass
-        // this check because RBAC was their gate.
-        let sandbox = state
-            .store
-            .get_message_by_name::<Sandbox>(&req.name)
-            .await
-            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-            .ok_or_else(|| Status::not_found("sandbox not found"))?;
-        crate::auth::guard::ensure_sandbox_scope(
+        resolve_sandbox_by_name_for_principal(
+            state.store.as_ref(),
             principal
                 .as_ref()
                 .expect("sandbox_caller implies principal"),
-            sandbox.object_id(),
-        )?;
+            &req.name,
+        )
+        .await?;
     }
     let key = req.setting_key.trim();
     let has_policy = req.policy.is_some();
@@ -1413,16 +1441,9 @@ pub(super) async fn handle_submit_policy_analysis(
         return Err(Status::invalid_argument("name is required"));
     }
 
-    let sandbox = state
-        .store
-        .get_message_by_name::<Sandbox>(&req.name)
-        .await
-        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    let sandbox =
+        resolve_sandbox_by_name_for_principal(state.store.as_ref(), &principal, &req.name).await?;
     let sandbox_id = sandbox.object_id().to_string();
-    // Name → id resolved; now enforce that a sandbox principal only acts
-    // on its own sandbox. User principals are unaffected.
-    crate::auth::guard::ensure_sandbox_scope(&principal, &sandbox_id)?;
 
     let current_version = state
         .store
@@ -1549,14 +1570,9 @@ pub(super) async fn handle_get_draft_policy(
         return Err(Status::invalid_argument("name is required"));
     }
 
-    let sandbox = state
-        .store
-        .get_message_by_name::<Sandbox>(&req.name)
-        .await
-        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-        .ok_or_else(|| Status::not_found("sandbox not found"))?;
+    let sandbox =
+        resolve_sandbox_by_name_for_principal(state.store.as_ref(), &principal, &req.name).await?;
     let sandbox_id = sandbox.object_id().to_string();
-    crate::auth::guard::ensure_sandbox_scope(&principal, &sandbox_id)?;
 
     let status_filter = if req.status_filter.is_empty() {
         None
@@ -3148,6 +3164,58 @@ mod tests {
         let err = handle_get_draft_policy(&state, req)
             .await
             .expect_err("cross-sandbox draft read must be denied");
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn sandbox_update_config_missing_name_returns_permission_denied() {
+        let state = test_server_state().await;
+        let req = with_sandbox(
+            Request::new(UpdateConfigRequest {
+                name: "missing-sandbox".to_string(),
+                policy: Some(ProtoSandboxPolicy::default()),
+                ..Default::default()
+            }),
+            "sb-a",
+        );
+
+        let err = handle_update_config(&state, req)
+            .await
+            .expect_err("missing name must not leak existence to sandbox callers");
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn sandbox_submit_policy_analysis_missing_name_returns_permission_denied() {
+        let state = test_server_state().await;
+        let req = with_sandbox(
+            Request::new(SubmitPolicyAnalysisRequest {
+                name: "missing-sandbox".to_string(),
+                ..Default::default()
+            }),
+            "sb-a",
+        );
+
+        let err = handle_submit_policy_analysis(&state, req)
+            .await
+            .expect_err("missing name must not leak existence to sandbox callers");
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn sandbox_get_draft_policy_missing_name_returns_permission_denied() {
+        let state = test_server_state().await;
+        let req = with_sandbox(
+            Request::new(GetDraftPolicyRequest {
+                name: "missing-sandbox".to_string(),
+                status_filter: String::new(),
+            }),
+            "sb-a",
+        );
+
+        let err = handle_get_draft_policy(&state, req)
+            .await
+            .expect_err("missing name must not leak existence to sandbox callers");
         assert_eq!(err.code(), Code::PermissionDenied);
     }
 
