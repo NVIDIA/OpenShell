@@ -9,7 +9,7 @@ use openshell_core::proto::{
     GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule, NetworkBinary, NetworkEndpoint,
     NetworkPolicyRule, ProviderCredentialRefresh, ProviderCredentialRefreshMaterial,
     ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileCategory,
-    ProviderProfileCredential,
+    ProviderProfileCredential, ProviderProfileDiscovery,
 };
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
@@ -112,6 +112,12 @@ pub struct CredentialRefreshMaterialProfile {
     pub required: bool,
     #[serde(default)]
     pub secret: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DiscoveryProfile {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credentials: Vec<String>,
 }
 
 // These YAML/JSON DTOs mirror the network policy protos intentionally. Keep
@@ -242,6 +248,8 @@ pub struct ProviderTypeProfile {
     pub binaries: Vec<BinaryProfile>,
     #[serde(default)]
     pub inference_capable: bool,
+    #[serde(default, skip_serializing_if = "discovery_is_empty")]
+    pub discovery: DiscoveryProfile,
 }
 
 // Provider profile import/export is expected to be lossless for the network
@@ -277,6 +285,11 @@ impl ProviderTypeProfile {
             endpoints: profile.endpoints.iter().map(endpoint_from_proto).collect(),
             binaries: profile.binaries.iter().map(binary_from_proto).collect(),
             inference_capable: profile.inference_capable,
+            discovery: profile
+                .discovery
+                .as_ref()
+                .map(discovery_from_proto)
+                .unwrap_or_default(),
         }
     }
 
@@ -317,6 +330,8 @@ impl ProviderTypeProfile {
             endpoints: self.endpoints.iter().map(endpoint_to_proto).collect(),
             binaries: self.binaries.iter().map(binary_to_proto).collect(),
             inference_capable: self.inference_capable,
+            discovery: (!discovery_is_empty(&self.discovery))
+                .then(|| discovery_to_proto(&self.discovery)),
         }
     }
 
@@ -328,6 +343,10 @@ impl ProviderTypeProfile {
             binaries: self.binaries.iter().map(binary_to_proto).collect(),
         }
     }
+}
+
+fn discovery_is_empty(discovery: &DiscoveryProfile) -> bool {
+    discovery.credentials.is_empty()
 }
 
 impl Serialize for BinaryProfile {
@@ -538,6 +557,18 @@ fn credential_refresh_to_proto(refresh: &CredentialRefreshProfile) -> ProviderCr
                 secret: material.secret,
             })
             .collect(),
+    }
+}
+
+fn discovery_from_proto(discovery: &ProviderProfileDiscovery) -> DiscoveryProfile {
+    DiscoveryProfile {
+        credentials: discovery.credentials.clone(),
+    }
+}
+
+fn discovery_to_proto(discovery: &DiscoveryProfile) -> ProviderProfileDiscovery {
+    ProviderProfileDiscovery {
+        credentials: discovery.credentials.clone(),
     }
 }
 
@@ -875,6 +906,33 @@ pub fn validate_profile_set(
             }
         }
 
+        let mut discovery_credentials = HashSet::new();
+        for (index, credential_name) in profile.discovery.credentials.iter().enumerate() {
+            let credential_name = credential_name.trim();
+            if credential_name.is_empty() {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    format!("discovery.credentials[{index}]"),
+                    "discovery credential name must not be empty",
+                ));
+            } else if !discovery_credentials.insert(credential_name.to_string()) {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    format!("discovery.credentials[{index}]"),
+                    format!("duplicate discovery credential: {credential_name}"),
+                ));
+            } else if !credential_names.contains(credential_name) {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    format!("discovery.credentials[{index}]"),
+                    format!("unknown discovery credential: {credential_name}"),
+                ));
+            }
+        }
+
         let mut env_vars = HashSet::new();
         for credential in &profile.credentials {
             for env_var in &credential.env_vars {
@@ -1035,7 +1093,7 @@ mod tests {
     use openshell_core::proto::ProviderProfileCategory;
 
     use super::{
-        ProfileError, ProviderTypeProfile, default_profiles, get_default_profile,
+        DiscoveryProfile, ProfileError, ProviderTypeProfile, default_profiles, get_default_profile,
         normalize_profile_id, parse_profile_catalog_yamls, parse_profile_json, parse_profile_yaml,
         profile_to_json, profile_to_yaml, validate_profile_set,
     };
@@ -1090,6 +1148,29 @@ credentials:
         assert_eq!(profile.id, "example");
         assert_eq!(profile.category, ProviderProfileCategory::Other);
         assert_eq!(profile.credential_env_vars(), vec!["EXAMPLE_API_KEY"]);
+    }
+
+    #[test]
+    fn profile_discovery_metadata_round_trips_through_proto_and_yaml() {
+        let profile = parse_profile_yaml(
+            r"
+id: example
+display_name: Example
+credentials:
+  - name: api_key
+    env_vars: [EXAMPLE_API_KEY]
+discovery:
+  credentials: [api_key]
+",
+        )
+        .expect("profile should parse");
+
+        assert_eq!(profile.discovery.credentials, vec!["api_key"]);
+        let from_proto = ProviderTypeProfile::from_proto(&profile.to_proto());
+        assert_eq!(from_proto.discovery.credentials, vec!["api_key"]);
+        let exported = profile_to_yaml(&from_proto).expect("yaml");
+        assert!(exported.contains("discovery:"));
+        assert!(exported.contains("api_key"));
     }
 
     #[test]
@@ -1241,6 +1322,8 @@ credentials:
   - name: api_key
     env_vars: [BROKEN_TOKEN, ""]
     auth_style: unknown
+discovery:
+  credentials: [api_key, missing_key]
 endpoints:
   - host: ""
     port: 0
@@ -1260,6 +1343,7 @@ binaries: ["", /usr/bin/broken]
         assert!(messages.contains(&"credential env var must not be empty"));
         assert!(messages.contains(&"query_param is required for query auth"));
         assert!(messages.contains(&"unsupported auth_style: unknown"));
+        assert!(messages.contains(&"unknown discovery credential: missing_key"));
         assert!(
             messages
                 .iter()
@@ -1282,6 +1366,7 @@ binaries: ["", /usr/bin/broken]
                     endpoints: Vec::new(),
                     binaries: Vec::new(),
                     inference_capable: false,
+                    discovery: DiscoveryProfile::default(),
                 },
             ),
             (
@@ -1295,6 +1380,7 @@ binaries: ["", /usr/bin/broken]
                     endpoints: Vec::new(),
                     binaries: Vec::new(),
                     inference_capable: false,
+                    discovery: DiscoveryProfile::default(),
                 },
             ),
             (
@@ -1308,6 +1394,7 @@ binaries: ["", /usr/bin/broken]
                     endpoints: Vec::new(),
                     binaries: Vec::new(),
                     inference_capable: false,
+                    discovery: DiscoveryProfile::default(),
                 },
             ),
         ];

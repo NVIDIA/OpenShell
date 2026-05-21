@@ -12,6 +12,8 @@ credentials:
     required: true
     auth_style: bearer
     header_name: authorization
+discovery:
+  credentials: [api_token]
 endpoints:
   - host: api.github.com
     port: 443

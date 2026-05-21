@@ -16,7 +16,7 @@ use std::path::Path;
 pub use openshell_core::proto::Provider;
 
 pub use context::{DiscoveryContext, RealDiscoveryContext};
-pub use discovery::discover_with_spec;
+pub use discovery::{discover_from_profile, discover_with_spec};
 pub use profiles::{
     CredentialRefreshProfile, ProfileError, ProfileValidationDiagnostic, ProviderTypeProfile,
     default_profiles, get_default_profile, normalize_profile_id, parse_profile_json,
@@ -28,6 +28,13 @@ pub use profiles::{
 pub enum ProviderError {
     #[error("unsupported provider type: {0}")]
     UnsupportedProvider(String),
+    #[error(
+        "provider profile '{profile_id}' discovery references unknown credential '{credential_name}'"
+    )]
+    UnknownDiscoveryCredential {
+        profile_id: String,
+        credential_name: String,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

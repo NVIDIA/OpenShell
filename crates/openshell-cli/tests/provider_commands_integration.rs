@@ -23,10 +23,10 @@ use openshell_core::proto::{
     ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
     ListSandboxesResponse, Provider, ProviderCredentialRefresh, ProviderCredentialRefreshStatus,
     ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileCredential,
-    ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse,
+    ProviderProfileDiscovery, ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse,
     RotateProviderCredentialRequest, RotateProviderCredentialResponse, Sandbox, SandboxResponse,
-    SandboxStreamEvent, ServiceStatus, SupervisorMessage, UpdateProviderRequest,
-    WatchSandboxRequest,
+    SandboxStreamEvent, ServiceStatus, SettingValue, SupervisorMessage, UpdateProviderRequest,
+    WatchSandboxRequest, setting_value,
 };
 use openshell_core::{ObjectId, ObjectName};
 use std::collections::HashMap;
@@ -46,6 +46,7 @@ struct ProviderState {
     refresh_requests: Arc<Mutex<Vec<ProviderRefreshRequestLog>>>,
     sandbox_providers: Arc<Mutex<HashMap<String, Vec<String>>>>,
     sandbox_provider_requests: Arc<Mutex<Vec<SandboxProviderRequestLog>>>,
+    global_settings: Arc<Mutex<HashMap<String, SettingValue>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -270,7 +271,10 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<GetGatewayConfigRequest>,
     ) -> Result<Response<GetGatewayConfigResponse>, Status> {
-        Ok(Response::new(GetGatewayConfigResponse::default()))
+        Ok(Response::new(GetGatewayConfigResponse {
+            settings: self.state.global_settings.lock().await.clone(),
+            settings_revision: 1,
+        }))
     }
 
     async fn get_sandbox_provider_environment(
@@ -901,6 +905,15 @@ async fn run_server() -> TestServer {
     }
 }
 
+async fn enable_providers_v2(ts: &TestServer) {
+    ts.state.global_settings.lock().await.insert(
+        openshell_core::settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
+        SettingValue {
+            value: Some(setting_value::Value::BoolValue(true)),
+        },
+    );
+}
+
 #[tokio::test]
 async fn provider_cli_run_functions_support_full_crud_flow() {
     let ts = run_server().await;
@@ -1159,6 +1172,8 @@ credentials:
     env_vars: [CUSTOM_API_KEY]
     auth_style: bearer
     header_name: authorization
+discovery:
+  credentials: [api_key]
 endpoints:
   - host: api.custom.example
     port: 443
@@ -1207,6 +1222,159 @@ binaries: [/usr/bin/custom]
     run::provider_profile_delete(&ts.endpoint, "custom-api", &ts.tls)
         .await
         .expect("profile delete");
+}
+
+#[tokio::test]
+async fn provider_create_from_existing_uses_profile_discovery_when_v2_enabled() {
+    let ts = run_server().await;
+    enable_providers_v2(&ts).await;
+    ts.state.profiles.lock().await.insert(
+        "custom-discovery".to_string(),
+        ProviderProfile {
+            id: "custom-discovery".to_string(),
+            display_name: "Custom Discovery".to_string(),
+            credentials: vec![ProviderProfileCredential {
+                name: "api_key".to_string(),
+                env_vars: vec!["CUSTOM_DISCOVERY_API_KEY".to_string()],
+                required: true,
+                ..Default::default()
+            }],
+            discovery: Some(ProviderProfileDiscovery {
+                credentials: vec!["api_key".to_string()],
+            }),
+            ..Default::default()
+        },
+    );
+    let _env = EnvVarGuard::set(&[("CUSTOM_DISCOVERY_API_KEY", "profile-secret")]);
+
+    run::provider_create(
+        &ts.endpoint,
+        "custom-discovered",
+        "custom-discovery",
+        true,
+        &[],
+        &[],
+        &ts.tls,
+    )
+    .await
+    .expect("profile-backed provider create --from-existing");
+
+    let provider = ts
+        .state
+        .providers
+        .lock()
+        .await
+        .get("custom-discovered")
+        .cloned()
+        .expect("custom provider should be stored");
+    assert_eq!(provider.r#type, "custom-discovery");
+    assert_eq!(
+        provider.credentials.get("CUSTOM_DISCOVERY_API_KEY"),
+        Some(&"profile-secret".to_string())
+    );
+}
+
+#[tokio::test]
+async fn provider_create_from_existing_fails_when_profile_discovery_finds_nothing() {
+    let ts = run_server().await;
+    enable_providers_v2(&ts).await;
+    ts.state.profiles.lock().await.insert(
+        "empty-discovery".to_string(),
+        ProviderProfile {
+            id: "empty-discovery".to_string(),
+            display_name: "Empty Discovery".to_string(),
+            credentials: vec![ProviderProfileCredential {
+                name: "api_key".to_string(),
+                env_vars: vec!["CUSTOM_DISCOVERY_TOKEN_NOT_SET_1460".to_string()],
+                required: false,
+                ..Default::default()
+            }],
+            discovery: Some(ProviderProfileDiscovery {
+                credentials: vec!["api_key".to_string()],
+            }),
+            ..Default::default()
+        },
+    );
+
+    let err = run::provider_create(
+        &ts.endpoint,
+        "empty-discovered",
+        "empty-discovery",
+        true,
+        &[],
+        &[],
+        &ts.tls,
+    )
+    .await
+    .expect_err("empty profile-backed discovery should fail");
+
+    assert!(
+        err.to_string()
+            .contains("no existing local credentials/config found"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        !ts.state
+            .providers
+            .lock()
+            .await
+            .contains_key("empty-discovered")
+    );
+}
+
+#[tokio::test]
+async fn provider_update_from_existing_uses_profile_discovery_when_v2_enabled() {
+    let ts = run_server().await;
+    enable_providers_v2(&ts).await;
+    ts.state.profiles.lock().await.insert(
+        "custom-update-discovery".to_string(),
+        ProviderProfile {
+            id: "custom-update-discovery".to_string(),
+            display_name: "Custom Update Discovery".to_string(),
+            credentials: vec![ProviderProfileCredential {
+                name: "api_key".to_string(),
+                env_vars: vec!["CUSTOM_UPDATE_DISCOVERY_API_KEY".to_string()],
+                required: true,
+                ..Default::default()
+            }],
+            discovery: Some(ProviderProfileDiscovery {
+                credentials: vec!["api_key".to_string()],
+            }),
+            ..Default::default()
+        },
+    );
+    ts.state.providers.lock().await.insert(
+        "custom-update".to_string(),
+        Provider {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "id-custom-update".to_string(),
+                name: "custom-update".to_string(),
+                ..Default::default()
+            }),
+            r#type: "custom-update-discovery".to_string(),
+            credentials: HashMap::new(),
+            config: HashMap::new(),
+            credential_expires_at_ms: HashMap::new(),
+        },
+    );
+    let _env = EnvVarGuard::set(&[("CUSTOM_UPDATE_DISCOVERY_API_KEY", "updated-profile-secret")]);
+
+    run::provider_update(&ts.endpoint, "custom-update", true, &[], &[], &[], &ts.tls)
+        .await
+        .expect("profile-backed provider update --from-existing");
+
+    let provider = ts
+        .state
+        .providers
+        .lock()
+        .await
+        .get("custom-update")
+        .cloned()
+        .expect("custom provider should still be stored");
+    assert_eq!(
+        provider.credentials.get("CUSTOM_UPDATE_DISCOVERY_API_KEY"),
+        Some(&"updated-profile-secret".to_string())
+    );
 }
 
 #[tokio::test]

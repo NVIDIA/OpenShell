@@ -3451,6 +3451,7 @@ mod tests {
                     }],
                     binaries: Vec::new(),
                     inference_capable: false,
+                    discovery: None,
                 }),
             })
             .await
@@ -3507,6 +3508,7 @@ mod tests {
                         harness: true,
                     }],
                     inference_capable: false,
+                    discovery: None,
                 }),
             })
             .await
@@ -3556,6 +3558,7 @@ mod tests {
                     }],
                     binaries: Vec::new(),
                     inference_capable: false,
+                    discovery: None,
                 }),
             })
             .await
@@ -4085,6 +4088,7 @@ mod tests {
                             harness: true,
                         }],
                         inference_capable: false,
+                        discovery: None,
                     }),
                 }],
             }),
