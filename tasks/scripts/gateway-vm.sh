@@ -58,7 +58,9 @@ normalize_arch() {
 }
 
 normalize_bool() {
-  case "${1,,}" in
+  local val
+  val="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "${val}" in
     1|true|yes|on) echo "true" ;;
     0|false|no|off) echo "false" ;;
     *)
