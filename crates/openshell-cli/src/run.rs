@@ -6128,8 +6128,8 @@ pub async fn sandbox_policy_get(
     output: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
-    let mut stdout = std::io::stdout().lock();
-    let mut stderr = std::io::stderr().lock();
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
     sandbox_policy_get_to_writer(
         server,
         name,
@@ -6137,23 +6137,37 @@ pub async fn sandbox_policy_get(
         full,
         output,
         tls,
-        &mut stdout,
-        &mut stderr,
+        (&mut stdout, &mut stderr),
     )
-    .await
+    .await?;
+
+    {
+        let mut terminal_stdout = std::io::stdout().lock();
+        terminal_stdout.write_all(&stdout).into_diagnostic()?;
+    }
+    {
+        let mut terminal_stderr = std::io::stderr().lock();
+        terminal_stderr.write_all(&stderr).into_diagnostic()?;
+    }
+
+    Ok(())
 }
 
 #[doc(hidden)]
-pub async fn sandbox_policy_get_to_writer<W: Write, E: Write>(
+pub async fn sandbox_policy_get_to_writer<W, E>(
     server: &str,
     name: &str,
     version: u32,
     full: bool,
     output: &str,
     tls: &TlsOptions,
-    stdout: &mut W,
-    stderr: &mut E,
-) -> Result<()> {
+    writers: (&mut W, &mut E),
+) -> Result<()>
+where
+    W: Write + Send,
+    E: Write + Send,
+{
+    let (stdout, stderr) = writers;
     let mut client = grpc_client(server, tls).await?;
 
     let status_resp = client

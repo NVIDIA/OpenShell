@@ -351,7 +351,7 @@ impl OpenShell for TestOpenShell {
 
         let policy = SandboxPolicy {
             version: 7,
-            network_policies: [(
+            network_policies: std::iter::once((
                 "api".to_string(),
                 NetworkPolicyRule {
                     name: "api".to_string(),
@@ -365,8 +365,7 @@ impl OpenShell for TestOpenShell {
                     }],
                     ..Default::default()
                 },
-            )]
-            .into_iter()
+            ))
             .collect(),
             ..Default::default()
         };
@@ -652,8 +651,7 @@ async fn policy_get_full_json_cli_prints_policy_payload() {
         true,
         "json",
         &ts.tls,
-        &mut stdout,
-        &mut stderr,
+        (&mut stdout, &mut stderr),
     )
     .await
     .expect("policy get should succeed");
