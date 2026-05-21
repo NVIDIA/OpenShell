@@ -10,7 +10,6 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-  SCCACHE_GHA_ENABLED: "true"
 
 permissions:
   contents: read
@@ -88,6 +87,7 @@ jobs:
         runner: [linux-amd64-cpu8, linux-arm64-cpu8]
     runs-on: ${{ matrix.runner }}
     env:
+      SCCACHE_GHA_ENABLED: "true"
       SCCACHE_GHA_VERSION: branch-checks-rust-${{ matrix.runner }}
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
