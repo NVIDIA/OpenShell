@@ -59,8 +59,17 @@ for binary in "$@"; do
   fi
 
   echo "==> Inspecting $binary"
-  file "$binary" || true
-  ldd "$binary" || true
+  if command -v file >/dev/null 2>&1; then
+    file "$binary" || true
+  else
+    echo "file: not available"
+  fi
+
+  if command -v ldd >/dev/null 2>&1; then
+    ldd "$binary" || true
+  else
+    echo "ldd: not available"
+  fi
 
   highest=
   found=0
