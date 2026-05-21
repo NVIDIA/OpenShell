@@ -390,7 +390,10 @@ start_agent_sandbox() {
     AGENT_PID="$!"
 }
 
-# Strip `rule get` down to the approval contract: chunk, binary, access, risk.
+# Strip `rule get` down to the approval contract: chunk, binary, access,
+# and the prover's categorical findings (no severity grade — the prover
+# emits category names like `credential_reach_expansion` and
+# `capability_expansion`).
 summarize_pending() {
     local pending="$1"
     sed 's/\x1b\[[0-9;]*m//g' "$pending" \
@@ -399,13 +402,11 @@ summarize_pending() {
                 in_validation = 0
                 chunk_count = 0
                 validation_printed = 0
-                severity_printed = 0
             }
             /^[[:space:]]*Chunk:/ {
                 in_validation = 0
                 chunk_count++
                 validation_printed = 0
-                severity_printed = 0
                 if (chunk_count > 1) print ""
                 sub(/^[[:space:]]*/, "")
                 chunk_id = $2
@@ -446,16 +447,12 @@ summarize_pending() {
                 print "    " $0
                 next
             }
-            in_validation && /\[(LOW|MEDIUM|HIGH|CRITICAL)\]/ {
-                if (!severity_printed) {
-                    severity = "UNKNOWN"
-                    if ($0 ~ /\[LOW\]/) severity = "LOW"
-                    if ($0 ~ /\[MEDIUM\]/) severity = "MEDIUM"
-                    if ($0 ~ /\[HIGH\]/) severity = "HIGH"
-                    if ($0 ~ /\[CRITICAL\]/) severity = "CRITICAL"
-                    print "    Severity:  " severity
-                    severity_printed = 1
-                }
+            # Indented continuation lines of the validation block are
+            # category-named finding rows (e.g.,
+            # `capability_expansion: PUT on api.github.com:443 via /usr/bin/curl`).
+            in_validation && /^[[:space:]]+(credential_reach_expansion|capability_expansion|l7_bypass_credentialed|link_local_reach):/ {
+                sub(/^[[:space:]]*/, "")
+                print "    Finding:   " $0
                 next
             }
             { in_validation = 0 }
@@ -469,7 +466,7 @@ pending_requires_review() {
     # gateway records auto-approval. Keep the demo focused on actual review
     # work: findings, merge failures, or policy validation failures.
     clean="$(sed 's/\x1b\[[0-9;]*m//g' "$pending")"
-    if grep -Eq 'Validation: (prover: [1-9][0-9]* new finding|merge failed|policy invalid)|\[(LOW|MEDIUM|HIGH|CRITICAL)\]' <<<"$clean"; then
+    if grep -Eq 'Validation: (prover: [1-9][0-9]* new finding|merge failed|policy invalid)|^[[:space:]]+(credential_reach_expansion|capability_expansion|l7_bypass_credentialed|link_local_reach):' <<<"$clean"; then
         return 0
     fi
     if grep -q 'Validation:' <<<"$clean"; then

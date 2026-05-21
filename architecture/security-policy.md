@@ -116,30 +116,23 @@ agent-authored via `policy.local`); the gateway is the single referee.
    L7) without an explicit `supersedes_chunk_id` field.
 5. **Escalation.** Anything else lands in `pending` for human review.
 
-The v1 prover calibration emits two severities, both blocking auto-approval:
+## What the prover decides
 
-**`HIGH`** (cases the prover cannot bound):
+The prover answers four formal questions about each proposed policy
+change. Each "yes" answer becomes its own categorical finding — there is
+no severity grade. Any finding (of any category) blocks auto-approval.
+The categories are intended to be (mostly) mutually exclusive per
+underlying change: the gateway suppresses `capability_expansion` paths
+whose `(binary, host, port)` is also in the `credential_reach_expansion`
+delta, so a brand-new credentialed reach surfaces as one finding rather
+than one reach + N method findings.
 
-- **Link-local endpoints** (`169.254.0.0/16`, `fe80::/10`), unconditionally
-  — covers cloud metadata endpoints (AWS IMDS, GCP metadata) which serve
-  credentials and so are dangerous even with no sandbox credential present.
-- **L4 grants** to a host where a sandbox credential is in scope.
-- **Bypass-L7 binaries** (`git-remote-http`, `ssh`, `nc`) bound to a host
-  where a sandbox credential is in scope.
-
-**`MEDIUM`** (bounded but authenticated; deserves human eyes for the
-*action*, not the *reach*):
-
-- **Narrow L7 rule** (`protocol: rest`, allow list with specific
-  method/path) bound to a host where a sandbox credential is in scope.
-  The L7 proxy bounds *what* the binary can do, but the bounded action
-  is still authenticated and potentially destructive (PUT, DELETE,
-  POST that mutates). v1 defers semantic judgment to the human
-  reviewer; future calibration may distinguish read methods from
-  mutating ones.
-
-Severity does not change the auto-approval gate — any finding blocks
-auto-approval. MEDIUM exists for audit/UI triage signal.
+| Category | The prover detects… |
+|---|---|
+| `link_local_reach` | The proposal grants reach to a host in `169.254.0.0/16` or `fe80::/10`. Unconditional — cloud-metadata endpoints serve credentials regardless of sandbox state. |
+| `l7_bypass_credentialed` | The proposal lets a binary using a non-HTTP wire protocol (`git-remote-https`, `ssh`, `nc`) reach a host where a sandbox credential is in scope. The L7 proxy cannot inspect the wire protocol; the reviewer decides whether to trust the binary with the credential. |
+| `credential_reach_expansion` | A binary gained credentialed reach to a (host, port) it could not reach before. New authenticated reach is a stated intent change; the reviewer confirms the binary should authenticate to the host at all. |
+| `capability_expansion` | On a (binary, host, port) that already had credentialed reach, the policy adds a new HTTP method. The reviewer sees exactly which method was added (e.g., PUT) and decides if it's part of the agent's task. |
 
 "Credential in scope" is sandbox-coarse, not binary-fine: a credential is
 considered in scope if the sandbox has a provider attached whose

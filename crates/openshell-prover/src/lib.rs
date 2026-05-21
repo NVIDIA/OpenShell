@@ -158,12 +158,12 @@ filesystem_policy:
     }
 
     // 6. End-to-end: testdata policy with a github credential in scope and a
-    // bypass-L7 binary (git) emits a calibrated data_exfiltration finding.
-    // Under the v1 calibration, all emissions consolidate into the
-    // data_exfiltration query at RiskLevel::High; the legacy write_bypass
-    // query is a no-op pending a future intent-aware redesign.
+    // bypass-L7 binary (git) emits an `l7_bypass_credentialed` finding.
+    // The prover output is categorical, not severity-graded.
     #[test]
-    fn test_calibrated_findings_for_github_policy() {
+    fn test_findings_for_github_policy() {
+        use finding::category;
+
         let policy_path = testdata_dir().join("policy.yaml");
         let creds_path = testdata_dir().join("credentials.yaml");
 
@@ -174,26 +174,28 @@ filesystem_policy:
         let z3_model = build_model(pol, cred_set, bin_reg);
         let findings = run_all_queries(&z3_model);
 
-        let query_types: std::collections::HashSet<&str> =
+        let categories: std::collections::HashSet<&str> =
             findings.iter().map(|f| f.query.as_str()).collect();
         assert!(
-            query_types.contains("data_exfiltration"),
-            "expected data_exfiltration finding for bypass-L7 binary with credential in scope, \
-             got query types: {query_types:?}"
+            categories.contains(category::L7_BYPASS_CREDENTIALED),
+            "expected l7_bypass_credentialed finding for bypass-L7 binary with credential in scope; \
+             got categories: {categories:?}"
         );
-        // v1 emits only data_exfiltration; write_bypass is reserved.
-        assert!(
-            !query_types.contains("write_bypass"),
-            "write_bypass is a no-op in v1; got: {findings:?}"
-        );
-        // v1 emits HIGH and MEDIUM; Critical is reserved for future use.
-        assert!(
-            findings.iter().all(|f| matches!(
-                f.risk,
-                finding::RiskLevel::High | finding::RiskLevel::Medium
-            )),
-            "v1 emits HIGH and MEDIUM only; got: {findings:?}"
-        );
+        // Every emitted category must be one of the four v1 categories.
+        let allowed: std::collections::HashSet<&str> = [
+            category::LINK_LOCAL_REACH,
+            category::L7_BYPASS_CREDENTIALED,
+            category::CREDENTIAL_REACH_EXPANSION,
+            category::CAPABILITY_EXPANSION,
+        ]
+        .into_iter()
+        .collect();
+        for c in &categories {
+            assert!(
+                allowed.contains(*c),
+                "unexpected category {c} emitted by the prover"
+            );
+        }
     }
 
     // 7. Empty policy produces no findings.

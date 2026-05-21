@@ -116,7 +116,7 @@ Validation: prover: no new findings
 
 ```text
 Validation: prover: 1 new finding
-              [HIGH] data_exfiltration: L4-only: api.github.com:443
+              capability_expansion: PUT on api.github.com:443 via /usr/bin/curl
 ```
 
 Other possible verdicts: `validation unavailable` (gateway-side prover infra

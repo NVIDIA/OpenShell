@@ -363,8 +363,8 @@ fn summarize_draft_chunk_rule(chunk: &DraftChunkRecord) -> Result<String, Status
 /// reviewer reads it like an OCSF shorthand line. One of:
 ///
 /// - `prover: no new findings`
-/// - `prover: N new finding(s)` followed by one `  [HIGH] <query>: <detail>`
-///   line per finding (shorthand from `openshell-prover`)
+/// - `prover: N new finding(s)` followed by one `  <category>: <detail>`
+///   line per finding path (categorical shorthand from `openshell-prover`)
 /// - `merge failed: <one-line error>` — proposal won't merge into the current
 ///   policy
 /// - `policy invalid: <one-line error>` — merged policy fails the cheap
@@ -527,23 +527,29 @@ async fn build_credential_set_for_sandbox(
 /// keeps the delta from spuriously surfacing baseline gaps just because the
 /// proposal added a new rule name that produces the same gap shape.
 fn finding_path_key(path: &FindingPath) -> String {
-    match path {
-        FindingPath::Exfil(p) => format!(
-            "exfil|{}|{}:{}|{}",
-            p.binary, p.endpoint_host, p.endpoint_port, p.l7_status
-        ),
-        FindingPath::WriteBypass(p) => format!(
-            "writebypass|{}|{}:{}|{}",
-            p.binary, p.endpoint_host, p.endpoint_port, p.bypass_reason
-        ),
-    }
+    let FindingPath::Exfil(p) = path;
+    // Include the category and (for capability_expansion) the method so
+    // adding a new method on an already-reached host surfaces as a new
+    // path; reuse of an existing method does not.
+    format!(
+        "exfil|{}|{}:{}|{}|{}",
+        p.binary, p.endpoint_host, p.endpoint_port, p.category, p.method
+    )
 }
 
 /// Return the merged-policy findings that aren't already present in the
 /// baseline. Comparison is per-(query, path) so that a single finding whose
-/// evidence grew (e.g. a new endpoint added to an existing `data_exfiltration`
-/// finding) surfaces only the new evidence paths.
+/// evidence grew (e.g. a new method allowed on an already-reached host)
+/// surfaces only the new evidence paths.
+///
+/// **Category suppression:** `capability_expansion` paths whose (binary,
+/// host, port) tuple appears in the `credential_reach_expansion` delta
+/// are suppressed. A brand-new credentialed reach is described by the
+/// reach-expansion finding alone; we don't double-report by also
+/// flagging every method as a separate `capability_expansion`.
 fn finding_delta(base: &[Finding], merged: &[Finding]) -> Vec<Finding> {
+    use openshell_prover::finding::category;
+
     let base_keys: HashSet<(String, String)> = base
         .iter()
         .flat_map(|f| {
@@ -553,7 +559,7 @@ fn finding_delta(base: &[Finding], merged: &[Finding]) -> Vec<Finding> {
                 .map(move |p| (query.clone(), finding_path_key(p)))
         })
         .collect();
-    let mut delta = Vec::new();
+    let mut delta: Vec<Finding> = Vec::new();
     for finding in merged {
         let new_paths: Vec<FindingPath> = finding
             .paths
@@ -569,6 +575,32 @@ fn finding_delta(base: &[Finding], merged: &[Finding]) -> Vec<Finding> {
             ..finding.clone()
         });
     }
+
+    // Suppress capability_expansion paths whose (binary, host, port)
+    // appears in the credential_reach_expansion delta — a new reach is
+    // described once, by the reach-expansion category, not also by per-
+    // method capability findings.
+    let reach_tuples: HashSet<(String, String, u16)> = delta
+        .iter()
+        .filter(|f| f.query == category::CREDENTIAL_REACH_EXPANSION)
+        .flat_map(|f| {
+            f.paths.iter().map(|p| {
+                let FindingPath::Exfil(e) = p;
+                (e.binary.clone(), e.endpoint_host.clone(), e.endpoint_port)
+            })
+        })
+        .collect();
+    delta.retain_mut(|f| {
+        if f.query != category::CAPABILITY_EXPANSION {
+            return true;
+        }
+        f.paths.retain(|p| {
+            let FindingPath::Exfil(e) = p;
+            !reach_tuples.contains(&(e.binary.clone(), e.endpoint_host.clone(), e.endpoint_port))
+        });
+        !f.paths.is_empty()
+    });
+
     delta
 }
 
@@ -5582,11 +5614,21 @@ mod tests {
             .find(|c| c.id == mechanistic_chunk_id)
             .expect("mechanistic chunk present");
         assert_eq!(mech.status, "pending");
-        assert!(mech.validation_result.contains("[HIGH]"));
+        // Mechanistic L4 with credential in scope flags as new credentialed
+        // reach for the binary on the host.
+        assert!(
+            mech.validation_result
+                .contains("credential_reach_expansion"),
+            "mechanistic L4 with credential in scope should emit \
+             credential_reach_expansion; got: {}",
+            mech.validation_result
+        );
 
         // Step 2: the agent refines into a narrow L7 proposal for the SAME
-        // (host, port, binary). Under v1 calibration, L7 with a credential
-        // in scope flags MEDIUM (bounded but authenticated), so the agent
+        // (host, port, binary). Under the v1 calibration, an L7 PUT on a
+        // host where the binary already had credentialed reach (read-only)
+        // emits a capability_expansion finding (new method on already-
+        // reached host) rather than a fresh reach expansion. The agent
         // chunk stays pending for human review. The mechanistic chunk gets
         // auto-rejected as superseded regardless of the agent chunk's own
         // validation verdict — supersede is unconditional on `(host, port,
@@ -5655,14 +5697,17 @@ mod tests {
 
         assert_eq!(
             agent.status, "pending",
-            "agent-authored narrow L7 with credential in scope flags MEDIUM under v1 \
-             calibration; it should land in pending for human review, not auto-approve; \
-             got: {}",
+            "agent-authored L7 PUT with credential in scope must land in pending; \
+             the baseline policy has no pre-existing rule for curl on api.github.com \
+             so the agent's chunk grants brand-new credentialed reach. got: {}",
             agent.status
         );
         assert!(
-            agent.validation_result.contains("[MEDIUM]"),
-            "agent chunk should carry the MEDIUM L7+credential verdict; got: {}",
+            agent
+                .validation_result
+                .contains("credential_reach_expansion"),
+            "agent chunk should carry credential_reach_expansion (new credentialed reach \
+             on api.github.com); got: {}",
             agent.validation_result
         );
         assert_eq!(
@@ -5772,14 +5817,13 @@ mod tests {
         );
     }
 
-    /// `protocol: rest, access: full` is L7-annotated but L4-equivalent in
-    /// reach — the L7 protocol doesn't actually bound what the binary can
-    /// do. With a credential in scope, this must emit HIGH (not MEDIUM),
-    /// because the agent has done no meaningful narrowing despite the L7
-    /// dressing. Regression test for the narrowness classifier in
-    /// `openshell-prover::queries::endpoint_is_narrowly_bounded`.
+    /// `protocol: rest, access: full` on a host where the binary had no
+    /// prior credentialed reach: the prover emits
+    /// `credential_reach_expansion`. (The per-method `capability_expansion`
+    /// paths are suppressed by the gateway delta because the reach is
+    /// new; one finding describes the change, not eight.)
     #[tokio::test]
-    async fn agent_authored_l7_full_with_credential_records_high_finding() {
+    async fn agent_authored_l7_full_with_credential_emits_reach_expansion() {
         use openshell_core::proto::{
             FilesystemPolicy, NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxPolicy,
             SandboxSpec,
@@ -5864,17 +5908,19 @@ mod tests {
         .into_inner();
         let verdict = &draft.chunks[0].validation_result;
         assert!(
-            verdict.contains("[HIGH]"),
-            "L7 `access: full` with credential in scope must emit HIGH (not MEDIUM) — \
-             the L7 annotation doesn't actually narrow reach. got: {verdict}"
+            verdict.contains("credential_reach_expansion"),
+            "L7 `access: full` on a host the binary did not previously reach must emit \
+             credential_reach_expansion; got: {verdict}"
         );
+        // Capability_expansion paths for the same (binary, host:port) are
+        // suppressed when the reach itself is new — one finding, not many.
         assert!(
-            !verdict.contains("[MEDIUM]"),
-            "MEDIUM must NOT fire when the L7 scope is effectively all-methods; got: {verdict}"
+            !verdict.contains("capability_expansion"),
+            "capability_expansion must be suppressed when reach itself is new; got: {verdict}"
         );
         assert_eq!(
             draft.chunks[0].status, "pending",
-            "HIGH finding must keep the chunk in pending despite auto mode; got: {}",
+            "any prover finding must keep the chunk in pending despite auto mode; got: {}",
             draft.chunks[0].status
         );
     }
@@ -6232,8 +6278,9 @@ mod tests {
             "expected first line like `prover: N new finding(s)`, got: {verdict}"
         );
         assert!(
-            verdict.contains("[HIGH]"),
-            "v1 emits HIGH for L4 + credential in scope; got: {verdict}"
+            verdict.contains("credential_reach_expansion"),
+            "L4 + credential in scope emits credential_reach_expansion (the binary gains \
+             credentialed reach to a new host:port); got: {verdict}"
         );
         assert!(
             verdict.contains("api.github.com:443"),
@@ -6405,8 +6452,9 @@ mod tests {
         .into_inner();
         let verdict = &draft.chunks[0].validation_result;
         assert!(
-            verdict.contains("[HIGH]"),
-            "link-local proposal must emit HIGH regardless of credentials; got: {verdict}"
+            verdict.contains("link_local_reach"),
+            "link-local proposal must emit link_local_reach regardless of credentials; \
+             got: {verdict}"
         );
         assert!(
             verdict.contains("169.254.169.254"),
@@ -6730,12 +6778,30 @@ mod tests {
 
         assert_eq!(
             step2_chunk.status, "pending",
-            "credentialed L7 proposal under v2 + auto mode must stay pending (MEDIUM); got: {}",
+            "credentialed L7 PUT under v2 + auto mode must stay pending; got: {}",
             step2_chunk.status
         );
+        // This test's spec policy has no pre-existing rule for curl on
+        // api.github.com, so the agent's chunk grants brand-new
+        // credentialed reach: the finding is credential_reach_expansion,
+        // not capability_expansion. (The capability_expansion path is
+        // suppressed by the delta because the reach is new — one finding
+        // per change, not two.) The demo's policy.template.yaml has
+        // github_api_readonly which exercises the capability_expansion
+        // path; that's covered by the supersede test above.
         assert!(
-            step2_chunk.validation_result.contains("[MEDIUM]"),
-            "credentialed L7 must carry MEDIUM verdict; got: {}",
+            step2_chunk
+                .validation_result
+                .contains("credential_reach_expansion"),
+            "credentialed PUT on a host the binary did not previously reach must carry \
+             credential_reach_expansion; got: {}",
+            step2_chunk.validation_result
+        );
+        assert!(
+            !step2_chunk
+                .validation_result
+                .contains("capability_expansion"),
+            "capability_expansion must be suppressed when reach itself is new; got: {}",
             step2_chunk.validation_result
         );
     }
