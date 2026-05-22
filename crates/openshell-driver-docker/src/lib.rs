@@ -1869,10 +1869,27 @@ fn linux_supervisor_candidates(daemon_arch: &str) -> Vec<PathBuf> {
 /// inside the digest-keyed directory and renamed into place, so concurrent
 /// gateway starts don't observe a partial file.
 async fn extract_supervisor_bin_from_image(docker: &Docker, image: &str) -> CoreResult<PathBuf> {
+    let refresh_attempted = if supervisor_image_should_refresh(image) {
+        info!(image = image, "Refreshing mutable docker supervisor image");
+        match pull_supervisor_image(docker, image).await {
+            Ok(()) => true,
+            Err(err) => {
+                warn!(
+                    image = image,
+                    error = %err,
+                    "failed to refresh mutable docker supervisor image; falling back to local image if present",
+                );
+                true
+            }
+        }
+    } else {
+        false
+    };
+
     // Inspect first to see if the image is already present; only pull on miss.
     let inspect = match docker.inspect_image(image).await {
         Ok(inspect) => inspect,
-        Err(err) if is_not_found_error(&err) => {
+        Err(err) if is_not_found_error(&err) && !refresh_attempted => {
             info!(image = image, "Pulling docker supervisor image");
             pull_supervisor_image(docker, image).await?;
             docker.inspect_image(image).await.map_err(|err| {
@@ -1880,6 +1897,11 @@ async fn extract_supervisor_bin_from_image(docker: &Docker, image: &str) -> Core
                     "failed to inspect docker supervisor image '{image}' after pull: {err}",
                 ))
             })?
+        }
+        Err(err) if is_not_found_error(&err) => {
+            return Err(Error::config(format!(
+                "docker supervisor image '{image}' is not present locally after refresh attempt",
+            )));
         }
         Err(err) => {
             return Err(Error::config(format!(
@@ -1924,6 +1946,23 @@ async fn extract_supervisor_bin_from_image(docker: &Docker, image: &str) -> Core
     write_cache_binary_atomic(&cache_path, &binary_bytes)?;
     validate_linux_elf_binary(&cache_path)?;
     Ok(cache_path)
+}
+
+fn supervisor_image_should_refresh(image: &str) -> bool {
+    matches!(supervisor_image_tag(image), Some("dev" | "latest"))
+}
+
+fn supervisor_image_tag(image: &str) -> Option<&str> {
+    if image.contains('@') {
+        return None;
+    }
+
+    let image_name = image.rsplit('/').next().unwrap_or(image);
+    image_name
+        .rsplit_once(':')
+        .map_or(Some("latest"), |(_, tag)| {
+            if tag.is_empty() { None } else { Some(tag) }
+        })
 }
 
 async fn pull_supervisor_image(docker: &Docker, image: &str) -> CoreResult<()> {

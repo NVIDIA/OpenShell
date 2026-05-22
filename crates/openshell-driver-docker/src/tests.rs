@@ -904,6 +904,25 @@ fn docker_supervisor_image_tag_sanitizes_build_metadata_for_docker() {
 }
 
 #[test]
+fn docker_supervisor_image_refreshes_mutable_tags_only() {
+    assert!(supervisor_image_should_refresh(
+        "ghcr.io/nvidia/openshell/supervisor:dev"
+    ));
+    assert!(supervisor_image_should_refresh(
+        "ghcr.io/nvidia/openshell/supervisor:latest"
+    ));
+    assert!(supervisor_image_should_refresh(
+        "ghcr.io/nvidia/openshell/supervisor"
+    ));
+    assert!(!supervisor_image_should_refresh(
+        "ghcr.io/nvidia/openshell/supervisor:0.0.47-dev.13-g57b71c68f"
+    ));
+    assert!(!supervisor_image_should_refresh(
+        "ghcr.io/nvidia/openshell/supervisor@sha256:abc123"
+    ));
+}
+
+#[test]
 fn supervisor_cache_path_namespaces_by_digest_under_openshell_data_dir() {
     let base = PathBuf::from("/var/cache/share");
     let path =
