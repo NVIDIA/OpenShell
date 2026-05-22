@@ -1229,6 +1229,7 @@ fn sandbox_template_to_k8s(
     container.insert(
         "securityContext".to_string(),
         serde_json::json!({
+            "privileged": true,
             "capabilities": {
                 "add": capabilities
             }
