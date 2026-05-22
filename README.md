@@ -191,7 +191,7 @@ The TUI gives you a live, keyboard-driven view of your gateway and sandboxes. Na
 Use `--from` to create sandboxes from the [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community) catalog, a local directory, or a container image:
 
 ```bash
-openshell sandbox create --from ollama             # community catalog
+openshell sandbox create --from gemini             # community catalog
 openshell sandbox create --from ./my-sandbox-dir   # local Dockerfile
 openshell sandbox create --from registry.io/img:v1 # container image
 ```
