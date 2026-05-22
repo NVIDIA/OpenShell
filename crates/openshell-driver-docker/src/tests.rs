@@ -268,11 +268,12 @@ fn docker_gateway_route_uses_bridge_gateway_for_linux_docker() {
         ..Default::default()
     };
 
-    let route = docker_gateway_route(
+    let route = docker_gateway_route_for_host(
         &info,
         IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
         DEFAULT_SERVER_PORT,
         None,
+        false,
     );
 
     assert_eq!(
@@ -288,6 +289,25 @@ fn docker_gateway_route_uses_bridge_gateway_for_linux_docker() {
             "host.docker.internal:172.18.0.1".to_string(),
             "host.openshell.internal:172.18.0.1".to_string()
         ]
+    );
+}
+
+#[test]
+fn docker_gateway_route_uses_host_gateway_when_host_runtime_requires_it() {
+    let info = SystemInfo {
+        operating_system: Some("Ubuntu 24.04 LTS".to_string()),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        docker_gateway_route_for_host(
+            &info,
+            IpAddr::V4(Ipv4Addr::new(10, 89, 10, 1)),
+            DEFAULT_SERVER_PORT,
+            None,
+            true,
+        ),
+        DockerGatewayRoute::HostGateway
     );
 }
 

@@ -1252,6 +1252,22 @@ fn docker_gateway_route(
     port: u16,
     host_gateway_ip: Option<IpAddr>,
 ) -> DockerGatewayRoute {
+    docker_gateway_route_for_host(
+        info,
+        bridge_gateway_ip,
+        port,
+        host_gateway_ip,
+        host_runtime_requires_host_gateway_alias(),
+    )
+}
+
+fn docker_gateway_route_for_host(
+    info: &SystemInfo,
+    bridge_gateway_ip: IpAddr,
+    port: u16,
+    host_gateway_ip: Option<IpAddr>,
+    host_requires_host_gateway_alias: bool,
+) -> DockerGatewayRoute {
     if let Some(host_alias_ip) = host_gateway_ip {
         return DockerGatewayRoute::Bridge {
             bind_address: SocketAddr::new(host_alias_ip, port),
@@ -1259,7 +1275,7 @@ fn docker_gateway_route(
         };
     }
 
-    if uses_host_gateway_alias(info) {
+    if host_requires_host_gateway_alias || uses_host_gateway_alias(info) {
         DockerGatewayRoute::HostGateway
     } else {
         DockerGatewayRoute::Bridge {
@@ -1267,6 +1283,10 @@ fn docker_gateway_route(
             host_alias_ip: bridge_gateway_ip,
         }
     }
+}
+
+fn host_runtime_requires_host_gateway_alias() -> bool {
+    cfg!(target_os = "macos")
 }
 
 /// Detect Docker Desktop and behaviourally compatible runtimes - Colima,

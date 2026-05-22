@@ -358,6 +358,9 @@ table.
   by the operator or packaging layer.
 - Compute runtimes own the mechanics of starting workloads and injecting
   callback configuration.
+- Docker-backed local gateways use Docker's `host-gateway` callback alias on
+  macOS and Docker Desktop-style runtimes. Native Linux Docker may expose an
+  additional bridge-gateway listener because the host can bind that bridge IP.
 - Gateway restarts recover persisted objects from storage, but live relay
   streams must be re-established by supervisors.
 - User-facing behavior changes must update published docs in `docs/`; this file
