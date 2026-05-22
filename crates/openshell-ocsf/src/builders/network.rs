@@ -78,16 +78,6 @@ impl<'a> NetworkActivityBuilder<'a> {
         self
     }
     #[must_use]
-    pub fn severity(mut self, id: SeverityId) -> Self {
-        self.severity = id;
-        self
-    }
-    #[must_use]
-    pub fn status(mut self, id: StatusId) -> Self {
-        self.status = Some(id);
-        self
-    }
-    #[must_use]
     pub fn src_endpoint_addr(mut self, ip: IpAddr, port: u16) -> Self {
         self.src_endpoint = Some(Endpoint::from_ip(ip, port));
         self
@@ -115,11 +105,6 @@ impl<'a> NetworkActivityBuilder<'a> {
     #[must_use]
     pub fn observation_point(mut self, id: u8) -> Self {
         self.observation_point_id = Some(id);
-        self
-    }
-    #[must_use]
-    pub fn message(mut self, msg: impl Into<String>) -> Self {
-        self.message = Some(msg.into());
         self
     }
     #[must_use]
@@ -166,20 +151,14 @@ impl<'a> NetworkActivityBuilder<'a> {
             metadata,
         );
 
-        if let Some(status) = self.status {
-            base.set_status(status);
-        }
-        if let Some(msg) = self.message {
-            base.set_message(msg);
-        }
         if let Some(detail) = self.status_detail {
             base.set_status_detail(detail);
         }
-        base.set_device(self.ctx.device());
-        base.set_container(self.ctx.container());
         if let Some(unmapped) = self.unmapped {
             base.unmapped = Some(serde_json::Value::Object(unmapped));
         }
+        self.ctx
+            .apply_common_fields(&mut base, self.status, self.message);
 
         OcsfEvent::NetworkActivity(NetworkActivityEvent {
             base,
@@ -196,6 +175,8 @@ impl<'a> NetworkActivityBuilder<'a> {
         })
     }
 }
+
+impl_builder_setters!(NetworkActivityBuilder);
 
 #[cfg(test)]
 mod tests {

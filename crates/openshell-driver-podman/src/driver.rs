@@ -57,13 +57,8 @@ fn validated_container_name(sandbox_name: &str) -> Result<String, ComputeDriverE
 }
 
 fn sandbox_token_host_path(sandbox_id: &str) -> Result<PathBuf, ComputeDriverError> {
-    let base = openshell_core::paths::xdg_state_dir()
-        .map_err(|err| ComputeDriverError::Message(format!("resolve state dir failed: {err}")))?;
-    Ok(base
-        .join("openshell")
-        .join("podman-sandbox-tokens")
-        .join(sandbox_id)
-        .join("sandbox.jwt"))
+    openshell_core::driver_utils::sandbox_token_path("podman-sandbox-tokens", None, sandbox_id)
+        .map_err(|err| ComputeDriverError::Message(format!("resolve state dir failed: {err}")))
 }
 
 async fn write_sandbox_token_file(
@@ -257,14 +252,12 @@ impl PodmanComputeDriver {
 
     /// Report driver capabilities.
     pub fn capabilities(&self) -> Result<GetCapabilitiesResponse, ComputeDriverError> {
-        let supports_gpu = Self::has_gpu_capacity();
-        Ok(GetCapabilitiesResponse {
-            driver_name: "podman".to_string(),
-            driver_version: openshell_core::VERSION.to_string(),
-            default_image: self.config.default_image.clone(),
-            supports_gpu,
-            gpu_count: 0,
-        })
+        Ok(openshell_core::driver_utils::build_capabilities_response(
+            "podman",
+            openshell_core::VERSION,
+            &self.config.default_image,
+            Self::has_gpu_capacity(),
+        ))
     }
 
     #[must_use]

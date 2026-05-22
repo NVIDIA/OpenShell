@@ -54,11 +54,6 @@ impl<'a> DetectionFindingBuilder<'a> {
         self
     }
     #[must_use]
-    pub fn severity(mut self, id: SeverityId) -> Self {
-        self.severity = id;
-        self
-    }
-    #[must_use]
     pub fn action(mut self, id: ActionId) -> Self {
         self.action = Some(id);
         self
@@ -86,11 +81,6 @@ impl<'a> DetectionFindingBuilder<'a> {
     #[must_use]
     pub fn risk_level(mut self, id: RiskLevelId) -> Self {
         self.risk_level = Some(id);
-        self
-    }
-    #[must_use]
-    pub fn message(mut self, msg: impl Into<String>) -> Self {
-        self.message = Some(msg.into());
         self
     }
     #[must_use]
@@ -147,11 +137,7 @@ impl<'a> DetectionFindingBuilder<'a> {
             self.severity,
             metadata,
         );
-        if let Some(msg) = self.message {
-            base.set_message(msg);
-        }
-        base.set_device(self.ctx.device());
-        base.set_container(self.ctx.container());
+        self.ctx.apply_common_fields(&mut base, None, self.message);
 
         OcsfEvent::DetectionFinding(DetectionFindingEvent {
             base,
@@ -177,6 +163,8 @@ impl<'a> DetectionFindingBuilder<'a> {
         })
     }
 }
+
+impl_builder_setters!(DetectionFindingBuilder, no_status);
 
 #[cfg(test)]
 mod tests {

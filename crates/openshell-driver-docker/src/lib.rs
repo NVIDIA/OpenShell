@@ -320,13 +320,12 @@ impl DockerComputeDriver {
     }
 
     fn capabilities(&self) -> GetCapabilitiesResponse {
-        GetCapabilitiesResponse {
-            driver_name: "docker".to_string(),
-            driver_version: self.config.daemon_version.clone(),
-            default_image: self.config.default_image.clone(),
-            supports_gpu: self.config.supports_gpu,
-            gpu_count: 0,
-        }
+        openshell_core::driver_utils::build_capabilities_response(
+            "docker",
+            &self.config.daemon_version,
+            &self.config.default_image,
+            self.config.supports_gpu,
+        )
     }
 
     fn validate_sandbox(
@@ -962,17 +961,16 @@ fn sandbox_token_host_path_by_id(
     sandbox_id: &str,
     config: &DockerDriverRuntimeConfig,
 ) -> Result<PathBuf, Status> {
-    let base = openshell_core::paths::xdg_state_dir().map_err(|err| {
+    openshell_core::driver_utils::sandbox_token_path(
+        "docker-sandbox-tokens",
+        Some(&config.sandbox_namespace),
+        sandbox_id,
+    )
+    .map_err(|err| {
         Status::internal(format!(
             "resolve sandbox token state directory failed: {err}"
         ))
-    })?;
-    Ok(base
-        .join("openshell")
-        .join("docker-sandbox-tokens")
-        .join(config.sandbox_namespace.replace(['/', '\\'], "-"))
-        .join(sandbox_id)
-        .join("sandbox.jwt"))
+    })
 }
 
 async fn write_sandbox_token_file(

@@ -160,13 +160,12 @@ impl KubernetesComputeDriver {
     }
 
     pub async fn capabilities(&self) -> Result<GetCapabilitiesResponse, String> {
-        Ok(GetCapabilitiesResponse {
-            driver_name: "kubernetes".to_string(),
-            driver_version: openshell_core::VERSION.to_string(),
-            default_image: self.config.default_image.clone(),
-            supports_gpu: self.has_gpu_capacity().await.unwrap_or(false),
-            gpu_count: 0,
-        })
+        Ok(openshell_core::driver_utils::build_capabilities_response(
+            "kubernetes",
+            openshell_core::VERSION,
+            &self.config.default_image,
+            self.has_gpu_capacity().await.unwrap_or(false),
+        ))
     }
 
     pub fn default_image(&self) -> &str {

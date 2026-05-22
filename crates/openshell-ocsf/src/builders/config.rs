@@ -37,22 +37,6 @@ impl<'a> ConfigStateChangeBuilder<'a> {
         }
     }
 
-    #[must_use]
-    pub fn severity(mut self, id: SeverityId) -> Self {
-        self.severity = id;
-        self
-    }
-    #[must_use]
-    pub fn status(mut self, id: StatusId) -> Self {
-        self.status = Some(id);
-        self
-    }
-    #[must_use]
-    pub fn message(mut self, msg: impl Into<String>) -> Self {
-        self.message = Some(msg.into());
-        self
-    }
-
     /// Set state with a custom label (OCSF `state_id` + display label).
     #[must_use]
     pub fn state(mut self, id: StateId, label: &str) -> Self {
@@ -92,17 +76,11 @@ impl<'a> ConfigStateChangeBuilder<'a> {
             self.ctx
                 .metadata(&["security_control", "container", "host"]),
         );
-        if let Some(status) = self.status {
-            base.set_status(status);
-        }
-        if let Some(msg) = self.message {
-            base.set_message(msg);
-        }
-        base.set_device(self.ctx.device());
-        base.set_container(self.ctx.container());
         if !self.unmapped.is_empty() {
             base.unmapped = Some(serde_json::Value::Object(self.unmapped));
         }
+        self.ctx
+            .apply_common_fields(&mut base, self.status, self.message);
 
         OcsfEvent::DeviceConfigStateChange(DeviceConfigStateChangeEvent {
             base,
@@ -113,6 +91,8 @@ impl<'a> ConfigStateChangeBuilder<'a> {
         })
     }
 }
+
+impl_builder_setters!(ConfigStateChangeBuilder);
 
 #[cfg(test)]
 mod tests {
