@@ -167,8 +167,17 @@ class SandboxClient:
                 cert_path=mtls_dir / "tls.crt",
                 key_path=mtls_dir / "tls.key",
             )
-            return cls(endpoint, tls=tls, timeout=timeout, cluster_name=cluster_name)
-        return cls(endpoint, timeout=timeout, cluster_name=cluster_name)
+            return cls(
+                endpoint,
+                tls=tls,
+                timeout=timeout,
+                cluster_name=cluster_name,
+            )
+        return cls(
+            endpoint,
+            timeout=timeout,
+            cluster_name=cluster_name,
+        )
 
     def close(self) -> None:
         self._channel.close()

@@ -42,7 +42,7 @@ openshell status
 ```
 
 <Warning>
-Disabling TLS removes authentication. Binding to `127.0.0.1` limits access to the local machine. If you expose the port on `0.0.0.0`, enable mTLS to prevent unauthenticated access.
+Disabling TLS removes authentication. Binding to `127.0.0.1` limits access to the local machine. If you expose the port on `0.0.0.0`, enable TLS and local mTLS user authentication, or put the gateway behind a trusted proxy with its own authentication.
 </Warning>
 
 ## Full mTLS Setup
@@ -61,7 +61,7 @@ docker run --rm \
   generate-certs --output-dir /home/openshell/.local/state/openshell/tls
 ```
 
-This writes the server and client certificates under `~/.local/state/openshell/tls/` and copies the client bundle to `~/.config/openshell/gateways/openshell/mtls/` so the CLI picks it up automatically.
+This writes the server and client certificates under `~/.local/state/openshell/tls/`, writes sandbox JWT signing keys under `~/.local/state/openshell/tls/jwt/`, and copies the client bundle to `~/.config/openshell/gateways/openshell/mtls/` so the CLI picks it up automatically.
 
 Start the gateway with mTLS enabled:
 
@@ -74,9 +74,11 @@ docker run -d \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -e OPENSHELL_DRIVERS=docker \
   -e OPENSHELL_DB_URL=sqlite:/home/openshell/.local/state/openshell/openshell.db \
+  -e OPENSHELL_LOCAL_TLS_DIR=/home/openshell/.local/state/openshell/tls \
   -e OPENSHELL_TLS_CERT=/home/openshell/.local/state/openshell/tls/server/tls.crt \
   -e OPENSHELL_TLS_KEY=/home/openshell/.local/state/openshell/tls/server/tls.key \
   -e OPENSHELL_TLS_CLIENT_CA=/home/openshell/.local/state/openshell/tls/ca.crt \
+  -e OPENSHELL_ENABLE_MTLS_AUTH=true \
   -e OPENSHELL_DOCKER_TLS_CA=/home/openshell/.local/state/openshell/tls/ca.crt \
   -e OPENSHELL_DOCKER_TLS_CERT=/home/openshell/.local/state/openshell/tls/client/tls.crt \
   -e OPENSHELL_DOCKER_TLS_KEY=/home/openshell/.local/state/openshell/tls/client/tls.key \

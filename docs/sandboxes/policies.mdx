@@ -448,6 +448,8 @@ openshell settings get <name>
 
 Check `openshell logs <name> --tail --source sandbox` for the denied host, path, and binary.
 
+For agent-authored draft updates on running sandboxes, enable [Policy Advisor](/sandboxes/policy-advisor). Policy advisor lets the sandboxed agent submit a narrow proposal through `policy.local` while a developer still approves or rejects the structured rule from outside the sandbox.
+
 When triaging denied requests, check:
 
 - Destination host and port to confirm which endpoint is missing.

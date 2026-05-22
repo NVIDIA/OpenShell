@@ -4,7 +4,8 @@
 //! Kubernetes compute driver.
 
 use crate::config::{
-    DEFAULT_WORKSPACE_STORAGE_SIZE, KubernetesComputeConfig, SupervisorSideloadMethod,
+    DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_WORKSPACE_STORAGE_SIZE, KubernetesComputeConfig,
+    SupervisorSideloadMethod,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::{Event as KubeEventObj, Node};
@@ -320,6 +321,7 @@ impl KubernetesComputeDriver {
             supervisor_image: &self.config.supervisor_image,
             supervisor_image_pull_policy: &self.config.supervisor_image_pull_policy,
             supervisor_sideload_method: self.config.supervisor_sideload_method,
+            service_account_name: &self.config.service_account_name,
             sandbox_id: &sandbox.id,
             sandbox_name: &sandbox.name,
             grpc_endpoint: &self.config.grpc_endpoint,
@@ -328,6 +330,7 @@ impl KubernetesComputeDriver {
             host_gateway_ip: &self.config.host_gateway_ip,
             enable_user_namespaces: self.config.enable_user_namespaces,
             workspace_default_storage_size: &self.config.workspace_default_storage_size,
+            sa_token_ttl_secs: self.config.effective_sa_token_ttl_secs(),
         };
         obj.data = sandbox_to_k8s_spec(sandbox.spec.as_ref(), &params);
         let api = self.api();
@@ -1041,13 +1044,13 @@ fn default_workspace_volume_claim_templates(storage_size: &str) -> serde_json::V
 }
 
 /// Parameters shared by `sandbox_to_k8s_spec` and `sandbox_template_to_k8s`.
-#[derive(Default)]
 struct SandboxPodParams<'a> {
     default_image: &'a str,
     image_pull_policy: &'a str,
     supervisor_image: &'a str,
     supervisor_image_pull_policy: &'a str,
     supervisor_sideload_method: SupervisorSideloadMethod,
+    service_account_name: &'a str,
     sandbox_id: &'a str,
     sandbox_name: &'a str,
     grpc_endpoint: &'a str,
@@ -1056,6 +1059,31 @@ struct SandboxPodParams<'a> {
     host_gateway_ip: &'a str,
     enable_user_namespaces: bool,
     workspace_default_storage_size: &'a str,
+    /// Lifetime (seconds) of the projected `ServiceAccount` token used
+    /// for the bootstrap `IssueSandboxToken` exchange.
+    sa_token_ttl_secs: i64,
+}
+
+impl Default for SandboxPodParams<'_> {
+    fn default() -> Self {
+        Self {
+            default_image: "",
+            image_pull_policy: "",
+            supervisor_image: "",
+            supervisor_image_pull_policy: "",
+            supervisor_sideload_method: SupervisorSideloadMethod::default(),
+            service_account_name: DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
+            sandbox_id: "",
+            sandbox_name: "",
+            grpc_endpoint: "",
+            ssh_socket_path: "",
+            client_tls_secret_name: "",
+            host_gateway_ip: "",
+            enable_user_namespaces: false,
+            workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE,
+            sa_token_ttl_secs: 3600,
+        }
+    }
 }
 
 fn spec_pod_env(spec: Option<&SandboxSpec>) -> std::collections::HashMap<String, String> {
@@ -1147,8 +1175,29 @@ fn sandbox_template_to_k8s(
     if !template.labels.is_empty() {
         metadata.insert("labels".to_string(), serde_json::json!(template.labels));
     }
-    if let Some(annotations) = platform_config_struct(template, "annotations") {
-        metadata.insert("annotations".to_string(), annotations);
+    // Carry the sandbox UUID as a pod annotation so the gateway can resolve
+    // a projected SA token claim (pod name + uid) back to a sandbox identity
+    // when the supervisor calls `IssueSandboxToken` at startup. The gateway
+    // also verifies the pod's controlling Sandbox ownerReference against the
+    // live CR before accepting this annotation. Its K8s Role does NOT grant
+    // `patch pods`, so this annotation is effectively immutable post-create.
+    let mut pod_annotations = platform_config_struct(template, "annotations")
+        .and_then(|v| match v {
+            serde_json::Value::Object(map) => Some(map),
+            _ => None,
+        })
+        .unwrap_or_default();
+    if !params.sandbox_id.is_empty() {
+        pod_annotations.insert(
+            "openshell.io/sandbox-id".to_string(),
+            serde_json::Value::String(params.sandbox_id.to_string()),
+        );
+    }
+    if !pod_annotations.is_empty() {
+        metadata.insert(
+            "annotations".to_string(),
+            serde_json::Value::Object(pod_annotations),
+        );
     }
 
     let mut spec = serde_json::Map::new();
@@ -1177,6 +1226,13 @@ fn sandbox_template_to_k8s(
                  NVIDIA device plugin compatibility is unverified"
             );
         }
+    }
+
+    if !params.service_account_name.is_empty() {
+        spec.insert(
+            "serviceAccountName".to_string(),
+            serde_json::json!(params.service_account_name),
+        );
     }
 
     // Disable service account token auto-mounting for security hardening.
@@ -1235,17 +1291,26 @@ fn sandbox_template_to_k8s(
         }),
     );
 
-    // Mount client TLS secret for mTLS to the server.
+    // Mount client TLS secret for mTLS to the server, plus the projected
+    // ServiceAccount token used to bootstrap the sandbox's gateway JWT
+    // via `IssueSandboxToken`.
+    let mut volume_mounts: Vec<serde_json::Value> = Vec::new();
     if !params.client_tls_secret_name.is_empty() {
-        container.insert(
-            "volumeMounts".to_string(),
-            serde_json::json!([{
-                "name": "openshell-client-tls",
-                "mountPath": "/etc/openshell-tls/client",
-                "readOnly": true
-            }]),
-        );
+        volume_mounts.push(serde_json::json!({
+            "name": "openshell-client-tls",
+            "mountPath": "/etc/openshell-tls/client",
+            "readOnly": true
+        }));
     }
+    volume_mounts.push(serde_json::json!({
+        "name": "openshell-sa-token",
+        "mountPath": "/var/run/secrets/openshell",
+        "readOnly": true,
+    }));
+    container.insert(
+        "volumeMounts".to_string(),
+        serde_json::Value::Array(volume_mounts),
+    );
 
     if let Some(resources) = container_resources(template, gpu) {
         container.insert("resources".to_string(), resources);
@@ -1257,15 +1322,31 @@ fn sandbox_template_to_k8s(
 
     // Add TLS secret volume.  Mode 0400 (owner-read) prevents the
     // unprivileged sandbox user from reading the mTLS private key.
+    let mut volumes: Vec<serde_json::Value> = Vec::new();
     if !params.client_tls_secret_name.is_empty() {
-        spec.insert(
-            "volumes".to_string(),
-            serde_json::json!([{
-                "name": "openshell-client-tls",
-                "secret": { "secretName": params.client_tls_secret_name, "defaultMode": 256 }
-            }]),
-        );
+        volumes.push(serde_json::json!({
+            "name": "openshell-client-tls",
+            "secret": { "secretName": params.client_tls_secret_name, "defaultMode": 256 }
+        }));
     }
+    // Projected ServiceAccountToken volume — kubelet writes a short-lived
+    // audience-bound JWT into /var/run/secrets/openshell/token and rotates
+    // it automatically. The supervisor exchanges this for a gateway-minted
+    // JWT via `IssueSandboxToken` once at startup.
+    volumes.push(serde_json::json!({
+        "name": "openshell-sa-token",
+        "projected": {
+            "sources": [{
+                "serviceAccountToken": {
+                    "audience": "openshell-gateway",
+                    "expirationSeconds": params.sa_token_ttl_secs,
+                    "path": "token"
+                }
+            }],
+            "defaultMode": 256
+        }
+    }));
+    spec.insert("volumes".to_string(), serde_json::Value::Array(volumes));
 
     // Add hostAliases so sandbox pods can reach the Docker host.
     if !params.host_gateway_ip.is_empty() {
@@ -1444,6 +1525,14 @@ fn apply_required_env(
             "/etc/openshell-tls/client/tls.key",
         );
     }
+    // Projected ServiceAccount token written by kubelet (see the volume
+    // definition in `sandbox_template_to_k8s`). The supervisor reads this
+    // and exchanges it for a gateway-minted JWT via `IssueSandboxToken`.
+    upsert_env(
+        env,
+        openshell_core::sandbox_env::K8S_SA_TOKEN_FILE,
+        "/var/run/secrets/openshell/token",
+    );
 }
 
 fn upsert_env(env: &mut Vec<serde_json::Value>, name: &str, value: &str) {
@@ -2412,6 +2501,32 @@ mod tests {
             pod_template["spec"]["automountServiceAccountToken"],
             serde_json::json!(false),
             "service account token auto-mounting must be disabled for security hardening"
+        );
+    }
+
+    #[test]
+    fn sandbox_template_sets_configured_service_account_name() {
+        let params = SandboxPodParams {
+            service_account_name: "openshell-sandbox",
+            ..Default::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+
+        assert_eq!(
+            pod_template["spec"]["serviceAccountName"],
+            serde_json::json!("openshell-sandbox"),
+            "sandbox pods must run under the configured service account"
+        );
+        assert_eq!(
+            pod_template["spec"]["automountServiceAccountToken"],
+            serde_json::json!(false),
+            "explicit service account selection must not re-enable default token automounting"
         );
     }
 

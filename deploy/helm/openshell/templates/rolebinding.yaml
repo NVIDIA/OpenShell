@@ -5,6 +5,7 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: {{ include "openshell.fullname" . }}-sandbox
+  namespace: {{ include "openshell.sandboxNamespace" . }}
   labels:
     {{- include "openshell.labels" . | nindent 4 }}
 roleRef:

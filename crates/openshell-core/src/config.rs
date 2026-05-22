@@ -205,6 +205,24 @@ pub struct Config {
     #[serde(default)]
     pub oidc: Option<OidcConfig>,
 
+    /// Gateway user authentication behavior.
+    #[serde(default)]
+    pub auth: GatewayAuthConfig,
+
+    /// mTLS user authentication configuration. When enabled, a verified TLS
+    /// client certificate can authenticate CLI/SDK callers as a
+    /// `Principal::User`. This is for local single-user gateways only;
+    /// sandbox identity is always carried by gateway-minted sandbox JWTs.
+    #[serde(default)]
+    pub mtls_auth: MtlsAuthConfig,
+
+    /// Gateway-minted sandbox JWT configuration. When `Some`, the gateway
+    /// loads the signing key from disk and accepts gateway-issued sandbox
+    /// JWTs as `Principal::Sandbox`. Required for the per-sandbox identity
+    /// flow (issue #1354).
+    #[serde(default)]
+    pub gateway_jwt: Option<GatewayJwtConfig>,
+
     /// Database URL for persistence.
     pub database_url: String,
 
@@ -313,8 +331,60 @@ pub struct OidcConfig {
     pub scopes_claim: String,
 }
 
+/// mTLS user authentication for local, single-user gateways.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MtlsAuthConfig {
+    /// When true, the gateway maps a verified TLS client certificate into a
+    /// user principal. Keep disabled for Kubernetes deployments because
+    /// Kubernetes sandbox pods and external users must not share user auth.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+/// Gateway user authentication settings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GatewayAuthConfig {
+    /// When true, unauthenticated user/CLI calls are accepted as a local
+    /// developer principal. This is an unsafe local-development escape hatch
+    /// for trusted, non-shared gateways. Sandbox supervisor calls still use
+    /// gateway-minted sandbox JWTs.
+    #[serde(default)]
+    pub allow_unauthenticated_users: bool,
+}
+
 const fn default_jwks_ttl_secs() -> u64 {
     3600
+}
+
+/// Gateway-minted sandbox JWT configuration.
+///
+/// Points the gateway at the Ed25519 signing key (produced by `certgen`)
+/// and identifies the issuer string embedded in every minted token. The
+/// signing key never leaves the gateway process; the public key is loaded
+/// by the same gateway so it can validate its own tokens.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatewayJwtConfig {
+    /// Path to the Ed25519 signing key (PKCS#8 PEM).
+    pub signing_key_path: PathBuf,
+    /// Path to the matching public key (SPKI PEM).
+    pub public_key_path: PathBuf,
+    /// Path to the `kid` value (plain text, one line).
+    pub kid_path: PathBuf,
+    /// Stable gateway identity embedded in `iss`/`aud`. Defaults to the
+    /// hostname-or-`openshell` placeholder if unset.
+    #[serde(default = "default_gateway_id")]
+    pub gateway_id: String,
+    /// Token lifetime in seconds. Defaults to 1 hour.
+    #[serde(default = "default_sandbox_token_ttl_secs")]
+    pub ttl_secs: u64,
+}
+
+fn default_gateway_id() -> String {
+    "openshell".to_string()
+}
+
+const fn default_sandbox_token_ttl_secs() -> u64 {
+    3_600
 }
 
 fn default_roles_claim() -> String {
@@ -340,6 +410,9 @@ impl Config {
             log_level: default_log_level(),
             tls,
             oidc: None,
+            auth: GatewayAuthConfig::default(),
+            mtls_auth: MtlsAuthConfig::default(),
+            gateway_jwt: None,
             database_url: String::new(),
             compute_drivers: vec![],
             ssh_session_ttl_secs: default_ssh_session_ttl_secs(),
@@ -565,6 +638,12 @@ mod tests {
     fn config_new_disables_health_bind_by_default() {
         let cfg = Config::new(None);
         assert!(cfg.health_bind_address.is_none());
+    }
+
+    #[test]
+    fn config_disables_unauthenticated_users_by_default() {
+        let cfg = Config::new(None);
+        assert!(!cfg.auth.allow_unauthenticated_users);
     }
 
     #[test]

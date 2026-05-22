@@ -1515,6 +1515,7 @@ mod tests {
             endpoints: Vec::new(),
             binaries: Vec::new(),
             inference_capable: false,
+            discovery: None,
         }
     }
 
@@ -1925,6 +1926,7 @@ mod tests {
                             harness: true,
                         }],
                         inference_capable: false,
+                        discovery: None,
                     }),
                     source: "advanced-api.yaml".to_string(),
                 }],
@@ -2951,6 +2953,7 @@ mod tests {
                         endpoints: vec![],
                         binaries: vec![],
                         inference_capable: false,
+                        discovery: None,
                     }),
                     source: "delegated-refresh-api.yaml".to_string(),
                 }],

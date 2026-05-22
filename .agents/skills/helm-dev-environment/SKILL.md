@@ -26,8 +26,9 @@ mise run helm:k3s:create
 ```
 
 Creates a k3d cluster and merges its kubeconfig into the worktree-local `kubeconfig` file.
-Also applies base manifests (`deploy/kube/manifests/agent-sandbox.yaml`). Traefik is
-disabled at cluster creation time.
+Also applies base manifests (`deploy/kube/manifests/agent-sandbox.yaml`) and preloads the
+default community sandbox image into k3d so the first sandbox create does not wait on a
+large registry pull. Traefik is disabled at cluster creation time.
 
 **Multi-worktree support:** the cluster name is derived from the last component of the
 current git branch (e.g. branch `kube-support/local-dev/tmutch` → cluster
@@ -43,6 +44,8 @@ Port mappings created at cluster time (cannot be changed without recreating):
 
 Override with env vars before running `helm:k3s:create`:
 - `HELM_K3S_LB_HOST_PORT` (default: `8080`)
+- `HELM_K3S_PRELOAD_SANDBOX_IMAGE` (default:
+  `ghcr.io/nvidia/openshell-community/sandboxes/base:latest`; set to an empty value to skip)
 
 ### 2. Deploy OpenShell
 

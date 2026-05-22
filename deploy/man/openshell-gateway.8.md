@@ -80,9 +80,17 @@ TLS.
     When set without **--oidc-issuer**, client certificates are required
     and the TLS handshake rejects unauthenticated connections. When set
     together with **--oidc-issuer**, client certificates are accepted
-    but not required — callers may authenticate with either a Bearer
-    token or a client certificate.
+    but not required. Client certificates can authenticate local
+    single-user CLI callers when mTLS auth is enabled; sandbox
+    supervisors still authenticate with gateway-minted bearer tokens.
     Environment: **OPENSHELL_TLS_CLIENT_CA**.
+
+**--enable-mtls-auth** *BOOL*
+:   Enable mTLS client certificate authentication for local single-user
+    Docker, Podman, and VM gateways. Defaults on for local gateways with
+    client certificate verification and no OIDC issuer. Not supported with
+    the Kubernetes compute driver.
+    Environment: **OPENSHELL_ENABLE_MTLS_AUTH**.
 
 **--disable-tls**
 :   Disable TLS entirely and listen on plaintext HTTP. When the bind
@@ -121,7 +129,8 @@ View logs:
 
 The unit runs **openshell-gateway generate-certs** as an **ExecStartPre**
 step on first start. This generates a self-signed PKI bundle for mTLS
-and skips generation when the bundle already exists.
+and sandbox JWT signing material, adding missing JWT files to older
+TLS-only installs when needed.
 
 The gateway then starts from built-in defaults and reads
 *~/.config/openshell/gateway.toml* when that file exists.
@@ -159,7 +168,7 @@ This creates a drop-in override that persists across package upgrades.
 :   Optional gateway TOML configuration.
 
 *~/.local/state/openshell/tls/*
-:   Auto-generated TLS certificates.
+:   Auto-generated TLS certificates and sandbox JWT signing keys.
 
 *~/.local/state/openshell/gateway/openshell.db*
 :   SQLite database for gateway state.

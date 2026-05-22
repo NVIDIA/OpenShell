@@ -117,12 +117,17 @@ s.close()')"
 # basename short — see the SUN_LEN comment above.
 RUN_STATE_DIR="${STATE_DIR_ROOT}/os-vm-e2e-${HOST_PORT}-$$"
 mkdir -p "${RUN_STATE_DIR}"
+export XDG_CONFIG_HOME="${RUN_STATE_DIR}/config"
+export XDG_DATA_HOME="${RUN_STATE_DIR}/data"
 
 GATEWAY_LOG="$(mktemp /tmp/openshell-gateway-e2e.XXXXXX)"
 GATEWAY_PID_FILE="${RUN_STATE_DIR}/gateway.pid"
 GATEWAY_ARGS_FILE="${RUN_STATE_DIR}/gateway.args"
 GATEWAY_CONFIG="${RUN_STATE_DIR}/gateway.toml"
 GATEWAY_DB="${RUN_STATE_DIR}/gateway.db"
+JWT_DIR="${RUN_STATE_DIR}/jwt"
+PKI_DIR="${RUN_STATE_DIR}/pki"
+GATEWAY_NAME="openshell-e2e-vm-${HOST_PORT}"
 
 # ── Cleanup (trap) ───────────────────────────────────────────────────
 
@@ -190,6 +195,9 @@ echo "==> Starting openshell-gateway on 127.0.0.1:${HOST_PORT} (state: ${RUN_STA
 # host-loopback proxy carries the connection while keeping the endpoint aligned
 # with package-managed gateway certificates. gvproxy's bare gateway IP
 # (192.168.127.1) does NOT forward arbitrary host ports.
+e2e_generate_gateway_jwt "${JWT_DIR}"
+e2e_generate_pki "${GATEWAY_BIN}" "${PKI_DIR}"
+
 cat >"${GATEWAY_CONFIG}" <<EOF
 [openshell]
 version = 1
@@ -197,12 +205,29 @@ version = 1
 [openshell.gateway]
 bind_address = "127.0.0.1:${HOST_PORT}"
 compute_drivers = ["vm"]
-disable_tls = true
+
+[openshell.gateway.tls]
+cert_path = "${PKI_DIR}/server/tls.crt"
+key_path = "${PKI_DIR}/server/tls.key"
+client_ca_path = "${PKI_DIR}/ca.crt"
+
+[openshell.gateway.mtls_auth]
+enabled = true
+
+[openshell.gateway.gateway_jwt]
+signing_key_path = "${JWT_DIR}/signing.pem"
+public_key_path = "${JWT_DIR}/public.pem"
+kid_path = "${JWT_DIR}/kid"
+gateway_id = "${GATEWAY_NAME}"
+ttl_secs = 3600
 
 [openshell.drivers.vm]
-grpc_endpoint = "http://host.openshell.internal:${HOST_PORT}"
+grpc_endpoint = "https://host.openshell.internal:${HOST_PORT}"
 driver_dir = "${ROOT}/target/debug"
 state_dir = "${RUN_STATE_DIR}"
+guest_tls_ca = "${PKI_DIR}/ca.crt"
+guest_tls_cert = "${PKI_DIR}/client/tls.crt"
+guest_tls_key = "${PKI_DIR}/client/tls.key"
 EOF
 
 GATEWAY_ARGS=(
@@ -243,10 +268,18 @@ echo "==> Gateway ready after ${elapsed}s"
 
 # ── Run the smoke test ───────────────────────────────────────────────
 #
-# The CLI takes OPENSHELL_GATEWAY_ENDPOINT directly; no gateway
-# metadata lookup needed when TLS is disabled.
+# The CLI uses the raw endpoint but still resolves matching metadata so it
+# can find the mTLS client bundle.
 
-export OPENSHELL_GATEWAY_ENDPOINT="http://127.0.0.1:${HOST_PORT}"
+CLI_GATEWAY_ENDPOINT="https://127.0.0.1:${HOST_PORT}"
+e2e_register_mtls_gateway \
+  "${XDG_CONFIG_HOME}" \
+  "${GATEWAY_NAME}" \
+  "${CLI_GATEWAY_ENDPOINT}" \
+  "${HOST_PORT}" \
+  "${PKI_DIR}"
+
+export OPENSHELL_GATEWAY_ENDPOINT="${CLI_GATEWAY_ENDPOINT}"
 export OPENSHELL_E2E_EXPECT_VM_OVERLAY=1
 export OPENSHELL_E2E_DRIVER="vm"
 e2e_export_gateway_restart_metadata \

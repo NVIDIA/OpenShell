@@ -9,7 +9,8 @@
 //! identity verification.
 //!
 //! This separation follows RFC 0001's control-plane identity design:
-//! authentication is a driver concern, authorization is a gateway concern.
+//! authentication is handled by explicit application-layer authenticators,
+//! authorization is a gateway concern.
 
 use super::identity::Identity;
 use tonic::Status;

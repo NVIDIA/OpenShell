@@ -47,11 +47,16 @@ use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::LazyLock;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
+
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 use compute::{ComputeRuntime, DockerComputeConfig, VmComputeConfig};
 pub use grpc::OpenShellService;
@@ -106,6 +111,22 @@ pub struct ServerState {
 
     /// OIDC JWKS cache for JWT validation. `None` when OIDC is not configured.
     pub oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
+
+    /// Gateway-minted sandbox JWT issuer. `None` when `config.gateway_jwt`
+    /// is not configured; in that mode `IssueSandboxToken` returns
+    /// `Status::unavailable`. Populated at startup from the on-disk key
+    /// material that `certgen` writes.
+    pub sandbox_jwt_issuer: Option<Arc<auth::sandbox_jwt::SandboxJwtIssuer>>,
+
+    /// Authenticator that validates gateway-minted sandbox JWTs on every
+    /// inbound request. Always set when `sandbox_jwt_issuer` is, so callers
+    /// presenting a freshly minted token are recognized.
+    pub sandbox_jwt_authenticator: Option<Arc<auth::sandbox_jwt::SandboxJwtAuthenticator>>,
+
+    /// Optional K8s `ServiceAccount` authenticator that backs the
+    /// `IssueSandboxToken` bootstrap path. Only present when the gateway
+    /// runs in-cluster.
+    pub k8s_sa_authenticator: Option<Arc<auth::k8s_sa::K8sServiceAccountAuthenticator>>,
 }
 
 fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
@@ -150,6 +171,9 @@ impl ServerState {
             settings_mutex: tokio::sync::Mutex::new(()),
             supervisor_sessions,
             oidc_cache,
+            sandbox_jwt_issuer: None,
+            sandbox_jwt_authenticator: None,
+            k8s_sa_authenticator: None,
         }
     }
 }
@@ -207,7 +231,7 @@ pub async fn run_server(
         supervisor_sessions.clone(),
     )
     .await?;
-    let state = Arc::new(ServerState::new(
+    let mut state = ServerState::new(
         config.clone(),
         store.clone(),
         compute,
@@ -216,7 +240,95 @@ pub async fn run_server(
         tracing_log_bus,
         supervisor_sessions,
         oidc_cache,
-    ));
+    );
+
+    // Load the gateway-minted sandbox JWT signing key when configured.
+    // Optional so single-driver dev deployments without certgen continue
+    // to start. The helm-deployed gateway and the RPM init script populate
+    // `gateway_jwt` once `certgen` has produced the on-disk material.
+    if let Some(ref jwt) = config.gateway_jwt {
+        let signing_pem = std::fs::read(&jwt.signing_key_path).map_err(|e| {
+            Error::config(format!(
+                "failed to read sandbox JWT signing key from {}: {e}",
+                jwt.signing_key_path.display()
+            ))
+        })?;
+        let public_pem = std::fs::read(&jwt.public_key_path).map_err(|e| {
+            Error::config(format!(
+                "failed to read sandbox JWT public key from {}: {e}",
+                jwt.public_key_path.display()
+            ))
+        })?;
+        let kid = std::fs::read_to_string(&jwt.kid_path)
+            .map_err(|e| {
+                Error::config(format!(
+                    "failed to read sandbox JWT kid from {}: {e}",
+                    jwt.kid_path.display()
+                ))
+            })?
+            .trim()
+            .to_string();
+        if kid.is_empty() {
+            return Err(Error::config(format!(
+                "sandbox JWT kid file {} is empty",
+                jwt.kid_path.display()
+            )));
+        }
+        let issuer = auth::sandbox_jwt::SandboxJwtIssuer::from_pem(
+            &signing_pem,
+            kid.clone(),
+            &jwt.gateway_id,
+            Duration::from_secs(jwt.ttl_secs),
+        )
+        .map_err(Error::config)?;
+        let authenticator =
+            auth::sandbox_jwt::SandboxJwtAuthenticator::from_pem(&public_pem, kid, &jwt.gateway_id)
+                .map_err(Error::config)?;
+        info!(
+            gateway_id = %jwt.gateway_id,
+            ttl_secs = jwt.ttl_secs,
+            "gateway-minted sandbox JWT enabled"
+        );
+        state.sandbox_jwt_issuer = Some(Arc::new(issuer));
+        state.sandbox_jwt_authenticator = Some(Arc::new(authenticator));
+    }
+
+    // K8s ServiceAccount bootstrap authenticator. Only constructed when
+    // the gateway is running in-cluster (kubelet provides the API host
+    // env var) and has a sandbox JWT issuer to mint replacements against;
+    // outside the cluster we can't call the apiserver's TokenReview API,
+    // and without the issuer there's nothing to exchange the SA token for.
+    if state.sandbox_jwt_issuer.is_some() && std::env::var_os("KUBERNETES_SERVICE_HOST").is_some() {
+        // Pod lookups and TokenReview identity checks must match the sandbox
+        // namespace and service account used by the Kubernetes driver.
+        let kubernetes_config = kubernetes_config_for_k8s_sa_bootstrap(config_file.as_ref())?;
+        let sandbox_namespace = kubernetes_config.namespace;
+        let sandbox_service_account = kubernetes_config.service_account_name;
+        match kube::Client::try_default().await {
+            Ok(client) => {
+                let resolver = Arc::new(auth::k8s_sa::LiveK8sResolver::new(
+                    client,
+                    &sandbox_namespace,
+                    "openshell-gateway".to_string(),
+                    sandbox_service_account.clone(),
+                ));
+                let authenticator = auth::k8s_sa::K8sServiceAccountAuthenticator::new(resolver);
+                state.k8s_sa_authenticator = Some(Arc::new(authenticator));
+                info!(
+                    namespace = %sandbox_namespace,
+                    service_account = %sandbox_service_account,
+                    "K8s ServiceAccount bootstrap authenticator enabled"
+                );
+            }
+            Err(e) => warn!(
+                error = %e,
+                "in-cluster K8s client construction failed; \
+                 K8s ServiceAccount bootstrap is disabled"
+            ),
+        }
+    }
+
+    let state = Arc::new(state);
 
     // Resume sandboxes that were stopped during the previous gateway
     // shutdown so the running compute state matches the persisted store.
@@ -668,6 +780,22 @@ fn kubernetes_config_from_file(
         .map_err(|e| Error::config(format!("invalid [openshell.drivers.kubernetes] table: {e}")))
 }
 
+fn kubernetes_config_for_k8s_sa_bootstrap(
+    file: Option<&config_file::ConfigFile>,
+) -> Result<KubernetesComputeConfig> {
+    let Some(file) = file else {
+        return Err(Error::config(
+            "K8s ServiceAccount bootstrap requires [openshell.drivers.kubernetes] when sandbox JWT issuing is enabled in-cluster",
+        ));
+    };
+    if !file.openshell.drivers.contains_key("kubernetes") {
+        return Err(Error::config(
+            "K8s ServiceAccount bootstrap requires [openshell.drivers.kubernetes] when sandbox JWT issuing is enabled in-cluster",
+        ));
+    }
+    kubernetes_config_from_file(Some(file))
+}
+
 /// Same pattern as [`kubernetes_config_from_file`] but for Podman.
 fn podman_config_from_file(
     file: Option<&config_file::ConfigFile>,
@@ -742,7 +870,8 @@ mod tests {
     use super::{
         ConnectionProtocol, MultiplexService, ServerState, TlsAcceptor,
         allow_plaintext_service_http, classify_initial_bytes, configured_compute_driver,
-        gateway_listener_addresses, is_benign_tls_handshake_failure, serve_gateway_listener,
+        gateway_listener_addresses, is_benign_tls_handshake_failure,
+        kubernetes_config_for_k8s_sa_bootstrap, serve_gateway_listener,
     };
     use openshell_core::{
         ComputeDriverKind, Config,
@@ -1144,6 +1273,35 @@ mod tests {
             configured_compute_driver(&config).unwrap(),
             ComputeDriverKind::Docker
         );
+    }
+
+    #[test]
+    fn k8s_sa_bootstrap_rejects_missing_kubernetes_driver_config() {
+        let err = kubernetes_config_for_k8s_sa_bootstrap(None).unwrap_err();
+        assert!(err.to_string().contains("[openshell.drivers.kubernetes]"));
+
+        let file: crate::config_file::ConfigFile =
+            toml::from_str("[openshell.gateway]\n").expect("valid config");
+        let err = kubernetes_config_for_k8s_sa_bootstrap(Some(&file)).unwrap_err();
+        assert!(err.to_string().contains("[openshell.drivers.kubernetes]"));
+    }
+
+    #[test]
+    fn k8s_sa_bootstrap_uses_configured_namespace_and_service_account() {
+        let file: crate::config_file::ConfigFile = toml::from_str(
+            r#"
+[openshell.gateway]
+
+[openshell.drivers.kubernetes]
+namespace = "sandboxes"
+service_account_name = "sandbox-sa"
+"#,
+        )
+        .expect("valid config");
+
+        let cfg = kubernetes_config_for_k8s_sa_bootstrap(Some(&file)).unwrap();
+        assert_eq!(cfg.namespace, "sandboxes");
+        assert_eq!(cfg.service_account_name, "sandbox-sa");
     }
 
     #[test]

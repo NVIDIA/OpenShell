@@ -55,6 +55,7 @@ const SUPERVISOR_MOUNT_PATH: &str = "/opt/openshell/bin/openshell-sandbox";
 const TLS_CA_MOUNT_PATH: &str = "/etc/openshell/tls/client/ca.crt";
 const TLS_CERT_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.crt";
 const TLS_KEY_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.key";
+const SANDBOX_TOKEN_MOUNT_PATH: &str = "/etc/openshell/auth/sandbox.jwt";
 const SANDBOX_COMMAND: &str = "sleep infinity";
 const SUPERVISOR_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const HOST_OPENSHELL_INTERNAL: &str = "host.openshell.internal";
@@ -417,6 +418,7 @@ impl DockerComputeDriver {
             .and_then(|spec| spec.template.as_ref())
             .expect("validated sandbox has template");
         self.ensure_image_available(&template.image).await?;
+        let token_file_created = write_sandbox_token_file(sandbox, &self.config).await?;
 
         let container_name = container_name_for_sandbox(sandbox);
         let create_body = build_container_create_body(sandbox, &self.config)?;
@@ -431,6 +433,9 @@ impl DockerComputeDriver {
             )
             .await
             .map_err(|err| {
+                if token_file_created {
+                    cleanup_sandbox_token_file(sandbox, &self.config);
+                }
                 create_status_from_docker_error("create docker sandbox container", err)
             })?;
 
@@ -449,6 +454,9 @@ impl DockerComputeDriver {
                     error = %cleanup_err,
                     "Failed to clean up Docker container after start failure"
                 );
+            }
+            if token_file_created {
+                cleanup_sandbox_token_file(sandbox, &self.config);
             }
             return Err(create_status_from_docker_error(
                 "start docker sandbox container",
@@ -482,8 +490,14 @@ impl DockerComputeDriver {
             )
             .await
         {
-            Ok(()) => Ok(true),
-            Err(err) if is_not_found_error(&err) => Ok(false),
+            Ok(()) => {
+                cleanup_sandbox_token_file_by_id(sandbox_id, &self.config);
+                Ok(true)
+            }
+            Err(err) if is_not_found_error(&err) => {
+                cleanup_sandbox_token_file_by_id(sandbox_id, &self.config);
+                Ok(false)
+            }
             Err(err) => Err(internal_status("delete docker sandbox container", err)),
         }
     }
@@ -905,7 +919,10 @@ impl ComputeDriver for DockerComputeDriver {
     }
 }
 
-fn build_binds(config: &DockerDriverRuntimeConfig) -> Vec<String> {
+fn build_binds(
+    sandbox: &DriverSandbox,
+    config: &DockerDriverRuntimeConfig,
+) -> Result<Vec<String>, Status> {
     let mut binds = vec![format!(
         "{}:{}:ro,z",
         config.supervisor_bin.display(),
@@ -920,7 +937,101 @@ fn build_binds(config: &DockerDriverRuntimeConfig) -> Vec<String> {
         ));
         binds.push(format!("{}:{}:ro,z", tls.key.display(), TLS_KEY_MOUNT_PATH));
     }
-    binds
+    if sandbox
+        .spec
+        .as_ref()
+        .is_some_and(|spec| !spec.sandbox_token.is_empty())
+    {
+        binds.push(format!(
+            "{}:{}:ro,z",
+            sandbox_token_host_path(sandbox, config)?.display(),
+            SANDBOX_TOKEN_MOUNT_PATH
+        ));
+    }
+    Ok(binds)
+}
+
+fn sandbox_token_host_path(
+    sandbox: &DriverSandbox,
+    config: &DockerDriverRuntimeConfig,
+) -> Result<PathBuf, Status> {
+    sandbox_token_host_path_by_id(&sandbox.id, config)
+}
+
+fn sandbox_token_host_path_by_id(
+    sandbox_id: &str,
+    config: &DockerDriverRuntimeConfig,
+) -> Result<PathBuf, Status> {
+    let base = openshell_core::paths::xdg_state_dir().map_err(|err| {
+        Status::internal(format!(
+            "resolve sandbox token state directory failed: {err}"
+        ))
+    })?;
+    Ok(base
+        .join("openshell")
+        .join("docker-sandbox-tokens")
+        .join(config.sandbox_namespace.replace(['/', '\\'], "-"))
+        .join(sandbox_id)
+        .join("sandbox.jwt"))
+}
+
+async fn write_sandbox_token_file(
+    sandbox: &DriverSandbox,
+    config: &DockerDriverRuntimeConfig,
+) -> Result<bool, Status> {
+    let Some(spec) = sandbox.spec.as_ref() else {
+        return Ok(false);
+    };
+    if spec.sandbox_token.is_empty() {
+        return Ok(false);
+    }
+    let path = sandbox_token_host_path(sandbox, config)?;
+    if let Some(parent) = path.parent() {
+        openshell_core::paths::create_dir_restricted(parent).map_err(|err| {
+            Status::internal(format!(
+                "create sandbox token directory {} failed: {err}",
+                parent.display()
+            ))
+        })?;
+    }
+    tokio::fs::write(&path, format!("{}\n", spec.sandbox_token))
+        .await
+        .map_err(|err| {
+            Status::internal(format!(
+                "write sandbox token file {} failed: {err}",
+                path.display()
+            ))
+        })?;
+    openshell_core::paths::set_file_owner_only(&path).map_err(|err| {
+        Status::internal(format!(
+            "restrict sandbox token file {} failed: {err}",
+            path.display()
+        ))
+    })?;
+    Ok(true)
+}
+
+fn cleanup_sandbox_token_file(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig) {
+    cleanup_sandbox_token_file_by_id(&sandbox.id, config);
+}
+
+fn cleanup_sandbox_token_file_by_id(sandbox_id: &str, config: &DockerDriverRuntimeConfig) {
+    let Ok(path) = sandbox_token_host_path_by_id(sandbox_id, config) else {
+        return;
+    };
+    if let Err(err) = std::fs::remove_file(&path)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(
+            sandbox_id = %sandbox_id,
+            path = %path.display(),
+            error = %err,
+            "Failed to remove Docker sandbox token file"
+        );
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::remove_dir(dir);
+    }
 }
 
 fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig) -> Vec<String> {
@@ -976,6 +1087,20 @@ fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig
         environment.insert(
             openshell_core::sandbox_env::TLS_KEY.to_string(),
             TLS_KEY_MOUNT_PATH.to_string(),
+        );
+    }
+
+    environment.remove(openshell_core::sandbox_env::SANDBOX_TOKEN);
+    environment.remove(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE);
+
+    // Gateway-minted sandbox JWT. Keep the raw bearer out of container
+    // metadata; the supervisor reads it from this driver-owned bind mount.
+    if let Some(spec) = sandbox.spec.as_ref()
+        && !spec.sandbox_token.is_empty()
+    {
+        environment.insert(
+            openshell_core::sandbox_env::SANDBOX_TOKEN_FILE.to_string(),
+            SANDBOX_TOKEN_MOUNT_PATH.to_string(),
         );
     }
 
@@ -1039,7 +1164,7 @@ fn build_container_create_body(
             nano_cpus: resource_limits.nano_cpus,
             memory: resource_limits.memory_bytes,
             device_requests: docker_gpu_device_requests(spec.gpu, &spec.gpu_device),
-            binds: Some(build_binds(config)),
+            binds: Some(build_binds(sandbox, config)?),
             restart_policy: Some(RestartPolicy {
                 name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
                 maximum_retry_count: None,
@@ -1127,6 +1252,22 @@ fn docker_gateway_route(
     port: u16,
     host_gateway_ip: Option<IpAddr>,
 ) -> DockerGatewayRoute {
+    docker_gateway_route_for_host(
+        info,
+        bridge_gateway_ip,
+        port,
+        host_gateway_ip,
+        host_runtime_requires_host_gateway_alias(),
+    )
+}
+
+fn docker_gateway_route_for_host(
+    info: &SystemInfo,
+    bridge_gateway_ip: IpAddr,
+    port: u16,
+    host_gateway_ip: Option<IpAddr>,
+    host_requires_host_gateway_alias: bool,
+) -> DockerGatewayRoute {
     if let Some(host_alias_ip) = host_gateway_ip {
         return DockerGatewayRoute::Bridge {
             bind_address: SocketAddr::new(host_alias_ip, port),
@@ -1134,7 +1275,7 @@ fn docker_gateway_route(
         };
     }
 
-    if uses_host_gateway_alias(info) {
+    if host_requires_host_gateway_alias || uses_host_gateway_alias(info) {
         DockerGatewayRoute::HostGateway
     } else {
         DockerGatewayRoute::Bridge {
@@ -1142,6 +1283,10 @@ fn docker_gateway_route(
             host_alias_ip: bridge_gateway_ip,
         }
     }
+}
+
+fn host_runtime_requires_host_gateway_alias() -> bool {
+    cfg!(target_os = "macos")
 }
 
 /// Detect Docker Desktop and behaviourally compatible runtimes - Colima,

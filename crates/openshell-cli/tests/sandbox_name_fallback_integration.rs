@@ -17,12 +17,13 @@ use openshell_core::proto::{
     DetachSandboxProviderRequest, DetachSandboxProviderResponse, ExecSandboxEvent,
     ExecSandboxInput, ExecSandboxRequest, GatewayMessage, GetGatewayConfigRequest,
     GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
-    GetSandboxConfigResponse, GetSandboxProviderEnvironmentRequest,
-    GetSandboxProviderEnvironmentResponse, GetSandboxRequest, HealthRequest, HealthResponse,
-    ListProvidersRequest, ListProvidersResponse, ListSandboxProvidersRequest,
-    ListSandboxProvidersResponse, ListSandboxesRequest, ListSandboxesResponse, ProviderResponse,
-    Sandbox, SandboxPolicy, SandboxResponse, SandboxStreamEvent, ServiceStatus, SupervisorMessage,
-    UpdateProviderRequest, WatchSandboxRequest,
+    GetSandboxConfigResponse, GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
+    GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
+    HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
+    ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
+    ListSandboxesResponse, NetworkEndpoint, NetworkPolicyRule, PolicyStatus, ProviderResponse,
+    Sandbox, SandboxPolicy, SandboxPolicyRevision, SandboxResponse, SandboxStreamEvent,
+    ServiceStatus, SupervisorMessage, UpdateProviderRequest, WatchSandboxRequest,
 };
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -341,9 +342,46 @@ impl OpenShell for TestOpenShell {
 
     async fn get_sandbox_policy_status(
         &self,
-        _request: tonic::Request<openshell_core::proto::GetSandboxPolicyStatusRequest>,
-    ) -> Result<Response<openshell_core::proto::GetSandboxPolicyStatusResponse>, Status> {
-        Err(Status::unimplemented("not implemented in test"))
+        request: tonic::Request<GetSandboxPolicyStatusRequest>,
+    ) -> Result<Response<GetSandboxPolicyStatusResponse>, Status> {
+        let req = request.into_inner();
+        assert_eq!(req.name, "my-sandbox");
+        assert_eq!(req.version, 0);
+        assert!(!req.global);
+
+        let policy = SandboxPolicy {
+            version: 7,
+            network_policies: std::iter::once((
+                "api".to_string(),
+                NetworkPolicyRule {
+                    name: "api".to_string(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: "api.example.com".to_string(),
+                        port: 443,
+                        protocol: "rest".to_string(),
+                        enforcement: "enforce".to_string(),
+                        access: "read-only".to_string(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ))
+            .collect(),
+            ..Default::default()
+        };
+
+        Ok(Response::new(GetSandboxPolicyStatusResponse {
+            revision: Some(SandboxPolicyRevision {
+                version: 7,
+                policy_hash: "sha256:test-policy".to_string(),
+                status: PolicyStatus::Loaded.into(),
+                created_at_ms: 1_700_000_000_000,
+                loaded_at_ms: 1_700_000_000_500,
+                policy: Some(policy),
+                ..Default::default()
+            }),
+            active_version: 7,
+        }))
     }
 
     async fn list_sandbox_policies(
@@ -434,6 +472,20 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<openshell_core::proto::GetDraftHistoryRequest>,
     ) -> Result<Response<openshell_core::proto::GetDraftHistoryResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn issue_sandbox_token(
+        &self,
+        _request: tonic::Request<openshell_core::proto::IssueSandboxTokenRequest>,
+    ) -> Result<Response<openshell_core::proto::IssueSandboxTokenResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn refresh_sandbox_token(
+        &self,
+        _request: tonic::Request<openshell_core::proto::RefreshSandboxTokenRequest>,
+    ) -> Result<Response<openshell_core::proto::RefreshSandboxTokenResponse>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
 
@@ -583,6 +635,45 @@ async fn sandbox_get_with_persisted_last_sandbox() {
         recorded.as_deref(),
         Some("persisted-sb"),
         "the persisted sandbox name should flow through to the gRPC request"
+    );
+}
+
+#[tokio::test]
+async fn policy_get_full_json_cli_prints_policy_payload() {
+    let ts = run_server().await;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    run::sandbox_policy_get_to_writer(
+        &ts.endpoint,
+        "my-sandbox",
+        0,
+        true,
+        "json",
+        &ts.tls,
+        (&mut stdout, &mut stderr),
+    )
+    .await
+    .expect("policy get should succeed");
+
+    assert!(
+        stderr.is_empty(),
+        "policy get should not print stderr: {}",
+        String::from_utf8_lossy(&stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&stdout).expect("stdout should be valid JSON");
+    assert_eq!(json["scope"], "sandbox");
+    assert_eq!(json["sandbox"], "my-sandbox");
+    assert_eq!(json["version"], 7);
+    assert_eq!(json["active_version"], 7);
+    assert_eq!(json["hash"], "sha256:test-policy");
+    assert_eq!(json["status"], "loaded");
+    assert_eq!(json["policy"]["network_policies"]["api"]["name"], "api");
+    assert_eq!(
+        json["policy"]["network_policies"]["api"]["endpoints"][0]["host"],
+        "api.example.com"
     );
 }
 

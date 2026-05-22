@@ -10,7 +10,10 @@
 //! This module owns authentication (verifying who the caller is).
 //! Authorization (deciding what the caller can do) is in `authz.rs`.
 
+use super::authenticator::Authenticator;
 use super::identity::{Identity, IdentityProvider};
+use super::principal::{Principal, UserPrincipal};
+use async_trait::async_trait;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use openshell_core::OidcConfig;
 use reqwest::Client;
@@ -22,15 +25,6 @@ use tokio::sync::RwLock;
 use tonic::Status;
 use tracing::{debug, info, warn};
 
-/// Internal metadata header set by the auth middleware to mark a request as
-/// originating from a sandbox. This is stripped from all incoming requests
-/// first so external callers cannot spoof it.
-pub const INTERNAL_AUTH_SOURCE_HEADER: &str = "x-openshell-auth-source";
-/// Internal auth-source marker for requests originating from a sandbox
-/// (no OIDC Bearer; trust derives from the mTLS channel or operator's
-/// fronting proxy).
-pub const AUTH_SOURCE_SANDBOX: &str = "sandbox";
-
 /// Truly unauthenticated methods — health probes and infrastructure.
 const UNAUTHENTICATED_METHODS: &[&str] = &[
     "/openshell.v1.OpenShell/Health",
@@ -40,76 +34,12 @@ const UNAUTHENTICATED_METHODS: &[&str] = &[
 /// Path prefixes that bypass OIDC validation (gRPC reflection, health probes).
 const UNAUTHENTICATED_PREFIXES: &[&str] = &["/grpc.reflection.", "/grpc.health."];
 
-/// Sandbox-to-server RPCs that are called by sandboxes instead of CLI
-/// users. These do not require an OIDC Bearer token; the gRPC channel's
-/// mTLS handshake (or the operator's fronting proxy when
-/// `--disable-gateway-auth` is set) is the trust boundary.
-const SANDBOX_METHODS: &[&str] = &[
-    "/openshell.v1.OpenShell/ReportPolicyStatus",
-    "/openshell.v1.OpenShell/PushSandboxLogs",
-    "/openshell.v1.OpenShell/GetSandboxProviderEnvironment",
-    "/openshell.v1.OpenShell/SubmitPolicyAnalysis",
-    "/openshell.sandbox.v1.SandboxService/GetSandboxConfig",
-    "/openshell.inference.v1.Inference/GetInferenceBundle",
-    "/openshell.v1.OpenShell/ConnectSupervisor",
-    "/openshell.v1.OpenShell/RelayStream",
-];
-
-/// Methods that accept either an OIDC Bearer token (CLI users, full scope)
-/// or no Bearer (sandbox supervisor, sandbox-restricted scope).
-/// `UpdateConfig` is called by both CLI (policy/settings mutations) and the
-/// sandbox supervisor (policy sync on startup).
-/// `OpenShell/GetSandboxConfig` serves CLI settings reads while remaining
-/// compatible with sandbox callers.
-/// `GetDraftPolicy` serves CLI reviewer surfaces (`openshell rule get`,
-/// TUI inbox) AND the sandbox-side `policy.local /wait` long-poll that
-/// blocks on the agent's proposal until the developer decides.
-const DUAL_AUTH_METHODS: &[&str] = &[
-    "/openshell.v1.OpenShell/UpdateConfig",
-    "/openshell.v1.OpenShell/GetSandboxConfig",
-    "/openshell.v1.OpenShell/GetDraftPolicy",
-];
-
-/// Returns `true` if the method accepts either an OIDC Bearer token or a
-/// sandbox-class caller (no Bearer).
-pub fn is_dual_auth_method(path: &str) -> bool {
-    DUAL_AUTH_METHODS.contains(&path)
-}
-
 /// Returns `true` if the method needs no authentication at all.
 pub fn is_unauthenticated_method(path: &str) -> bool {
     UNAUTHENTICATED_METHODS.contains(&path)
         || UNAUTHENTICATED_PREFIXES
             .iter()
             .any(|prefix| path.starts_with(prefix))
-}
-
-/// Returns `true` if the method is an exclusively sandbox-class call (does
-/// not accept OIDC Bearer).
-pub fn is_sandbox_method(path: &str) -> bool {
-    SANDBOX_METHODS.contains(&path)
-}
-
-/// Remove internal auth-source markers from the request before any auth
-/// decision is made so external callers cannot spoof them.
-pub fn clear_internal_auth_markers(headers: &mut http::HeaderMap) {
-    headers.remove(INTERNAL_AUTH_SOURCE_HEADER);
-}
-
-/// Mark the request as originating from a sandbox caller.
-pub fn mark_sandbox_caller(headers: &mut http::HeaderMap) {
-    headers.insert(
-        INTERNAL_AUTH_SOURCE_HEADER,
-        http::HeaderValue::from_static(AUTH_SOURCE_SANDBOX),
-    );
-}
-
-/// Returns `true` if the request metadata indicates a sandbox caller.
-pub fn is_sandbox_caller(metadata: &tonic::metadata::MetadataMap) -> bool {
-    metadata
-        .get(INTERNAL_AUTH_SOURCE_HEADER)
-        .and_then(|v| v.to_str().ok())
-        == Some(AUTH_SOURCE_SANDBOX)
 }
 
 /// Cached JWKS key set fetched from the OIDC issuer.
@@ -421,6 +351,42 @@ impl JwksCache {
     }
 }
 
+/// Authenticator that validates `Authorization: Bearer <jwt>` headers against
+/// the configured OIDC issuer.
+///
+/// Returns `Ok(None)` when no Bearer header is present, so the chain can fall
+/// through to other authenticators (e.g. the gateway-minted sandbox JWT
+/// authenticator).
+pub struct OidcAuthenticator {
+    cache: Arc<JwksCache>,
+}
+
+impl OidcAuthenticator {
+    pub fn new(cache: Arc<JwksCache>) -> Self {
+        Self { cache }
+    }
+}
+
+#[async_trait]
+impl Authenticator for OidcAuthenticator {
+    async fn authenticate(
+        &self,
+        headers: &http::HeaderMap,
+        _path: &str,
+    ) -> Result<Option<Principal>, Status> {
+        let Some(token) = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+        else {
+            return Ok(None);
+        };
+
+        let identity = self.cache.validate_token(token).await?;
+        Ok(Some(Principal::User(UserPrincipal { identity })))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,7 +401,6 @@ mod tests {
         assert!(!is_unauthenticated_method(
             "/openshell.v1.OpenShell/CreateSandbox"
         ));
-        assert!(!is_sandbox_method("/openshell.v1.OpenShell/CreateSandbox"));
     }
 
     #[test]
@@ -451,78 +416,6 @@ mod tests {
     #[test]
     fn grpc_health_is_unauthenticated() {
         assert!(is_unauthenticated_method("/grpc.health.v1.Health/Check"));
-    }
-
-    #[test]
-    fn sandbox_rpcs_are_sandbox_methods() {
-        assert!(is_sandbox_method(
-            "/openshell.sandbox.v1.SandboxService/GetSandboxConfig"
-        ));
-        assert!(is_sandbox_method(
-            "/openshell.v1.OpenShell/GetSandboxProviderEnvironment"
-        ));
-        assert!(is_sandbox_method(
-            "/openshell.v1.OpenShell/ReportPolicyStatus"
-        ));
-        assert!(is_sandbox_method("/openshell.v1.OpenShell/PushSandboxLogs"));
-        assert!(is_sandbox_method(
-            "/openshell.v1.OpenShell/SubmitPolicyAnalysis"
-        ));
-        assert!(is_sandbox_method(
-            "/openshell.inference.v1.Inference/GetInferenceBundle"
-        ));
-        assert!(is_sandbox_method(
-            "/openshell.v1.OpenShell/ConnectSupervisor"
-        ));
-        assert!(is_sandbox_method("/openshell.v1.OpenShell/RelayStream"));
-    }
-
-    #[test]
-    fn openshell_get_sandbox_config_is_dual_auth() {
-        assert!(!is_sandbox_method(
-            "/openshell.v1.OpenShell/GetSandboxConfig"
-        ));
-        assert!(is_dual_auth_method(
-            "/openshell.v1.OpenShell/GetSandboxConfig"
-        ));
-    }
-
-    #[test]
-    fn openshell_get_draft_policy_is_dual_auth() {
-        // policy.local calls GetDraftPolicy from inside the sandbox
-        // supervisor (no Bearer, authenticated via mTLS), and the CLI/TUI
-        // reviewer surfaces call it with an OIDC Bearer. Sandbox-only
-        // would lock CLI out; Bearer-only would 401 the /wait long-poll
-        // in OIDC-enabled deployments.
-        assert!(!is_sandbox_method("/openshell.v1.OpenShell/GetDraftPolicy"));
-        assert!(is_dual_auth_method(
-            "/openshell.v1.OpenShell/GetDraftPolicy"
-        ));
-    }
-
-    #[test]
-    fn sandbox_caller_marker_round_trips_through_metadata() {
-        let mut headers = http::HeaderMap::new();
-        mark_sandbox_caller(&mut headers);
-        let metadata = tonic::metadata::MetadataMap::from_headers(headers);
-        assert!(is_sandbox_caller(&metadata));
-    }
-
-    #[test]
-    fn unmarked_request_is_not_sandbox_caller() {
-        let metadata = tonic::metadata::MetadataMap::new();
-        assert!(!is_sandbox_caller(&metadata));
-    }
-
-    #[test]
-    fn clear_internal_markers_strips_spoofed_header() {
-        let mut headers = http::HeaderMap::new();
-        headers.insert(
-            INTERNAL_AUTH_SOURCE_HEADER,
-            http::HeaderValue::from_static(AUTH_SOURCE_SANDBOX),
-        );
-        clear_internal_auth_markers(&mut headers);
-        assert!(headers.get(INTERNAL_AUTH_SOURCE_HEADER).is_none());
     }
 
     #[test]

@@ -25,6 +25,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=e2e/support/gateway-common.sh
 source "${ROOT}/e2e/support/gateway-common.sh"
 
+e2e_preserve_mise_dirs
+
 github_actions_host_docker_tmpdir() {
   if [ "${GITHUB_ACTIONS:-}" != "true" ] \
      || [ ! -S /var/run/docker.sock ] \
@@ -55,6 +57,9 @@ else
   fi
   WORKDIR_PARENT="${TMPDIR:-/tmp}"
 fi
+
+e2e_align_docker_host_with_cli_context
+
 WORKDIR_PARENT="${WORKDIR_PARENT%/}"
 WORKDIR="$(mktemp -d "${WORKDIR_PARENT}/openshell-e2e-gateway.XXXXXX")"
 GATEWAY_BIN=""
@@ -73,6 +78,10 @@ DOCKER_SUPERVISOR_ARGS=()
 # Isolate CLI/SDK gateway metadata from the developer's real config.
 export XDG_CONFIG_HOME="${WORKDIR}/config"
 export XDG_DATA_HOME="${WORKDIR}/data"
+# Docker e2e runs in a GitHub Actions container while talking to the host
+# Docker daemon. Keep gateway state in the host-visible workdir so driver-owned
+# bind mounts, including sandbox JWT files, resolve on both sides.
+export XDG_STATE_HOME="${WORKDIR}/state"
 
 cleanup() {
   local exit_code=$?
@@ -389,8 +398,9 @@ PKI_DIR="${WORKDIR}/pki"
 e2e_generate_pki "${GATEWAY_BIN}" "${PKI_DIR}"
 
 HOST_PORT=$(e2e_pick_port)
-STATE_DIR="${WORKDIR}/state"
+STATE_DIR="${XDG_STATE_HOME}"
 mkdir -p "${STATE_DIR}"
+JWT_DIR="${STATE_DIR}/jwt"
 
 GATEWAY_ENDPOINT="https://host.openshell.internal:${HOST_PORT}"
 E2E_NAMESPACE="e2e-docker-$$-${HOST_PORT}"
@@ -410,6 +420,7 @@ else
 fi
 
 echo "Starting openshell-gateway on port ${HOST_PORT} (namespace: ${E2E_NAMESPACE})..."
+e2e_generate_gateway_jwt "${JWT_DIR}"
 
 # Driver-specific options moved from CLI flags into a TOML config table
 # (commit 560550d2). Synthesize a minimal config here and pass --config.
@@ -428,6 +439,8 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
 {
   printf '[openshell]\nversion = 1\n\n'
   printf '[openshell.gateway]\nlog_level = "info"\n\n'
+  e2e_write_gateway_jwt_config "${JWT_DIR}" "openshell-e2e-docker-${HOST_PORT}"
+  e2e_write_gateway_mtls_auth_config
   printf '[openshell.drivers.docker]\n'
   printf 'sandbox_namespace = %s\n'    "$(toml_string "${E2E_NAMESPACE}")"
   printf 'network_name = %s\n'         "$(toml_string "${DOCKER_NETWORK_NAME}")"

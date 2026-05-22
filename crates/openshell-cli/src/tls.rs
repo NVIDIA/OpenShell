@@ -100,7 +100,7 @@ impl TlsOptions {
         }
     }
 
-    /// Returns `true` when using bearer token auth (edge or OIDC).
+    /// Returns `true` when using bearer token auth.
     pub fn is_bearer_auth(&self) -> bool {
         self.edge_token.is_some() || self.oidc_token.is_some()
     }
@@ -397,9 +397,9 @@ pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
         .keep_alive_while_idle(true);
 
     let tls_config = if tls.oidc_token.is_some() {
-        // OIDC bearer auth over HTTPS: use mTLS certs for the transport layer
-        // when available (server may still require client certs), and layer
-        // the Bearer token on top via the interceptor.
+        // Bearer auth over HTTPS: use mTLS certs for the transport layer when
+        // available (server may still require client certs), and layer the
+        // Bearer token on top via the interceptor.
         require_tls_materials(server, tls).map_or_else(
             |_| {
                 let resolved = tls.with_default_paths(server);

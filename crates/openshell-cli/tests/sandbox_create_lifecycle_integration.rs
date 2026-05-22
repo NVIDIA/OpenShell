@@ -23,8 +23,8 @@ use openshell_core::proto::{
     ListSandboxProvidersResponse, ListSandboxesRequest, ListSandboxesResponse, PlatformEvent,
     ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, Sandbox, SandboxCondition,
     SandboxLogLine, SandboxPhase, SandboxResponse, SandboxStatus, SandboxStreamEvent,
-    ServiceStatus, SupervisorMessage, UpdateProviderRequest, WatchSandboxRequest,
-    sandbox_stream_event,
+    ServiceStatus, SettingValue, SupervisorMessage, UpdateProviderRequest, WatchSandboxRequest,
+    sandbox_stream_event, setting_value,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -46,6 +46,7 @@ struct SandboxState {
     vm_error_after_started: Arc<AtomicBool>,
     vm_slow_progress_before_ready: Arc<AtomicBool>,
     vm_log_churn_before_ready: Arc<AtomicBool>,
+    global_settings: Arc<Mutex<HashMap<String, SettingValue>>>,
 }
 
 #[derive(Clone, Default)]
@@ -165,7 +166,10 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<GetGatewayConfigRequest>,
     ) -> Result<Response<GetGatewayConfigResponse>, Status> {
-        Ok(Response::new(GetGatewayConfigResponse::default()))
+        Ok(Response::new(GetGatewayConfigResponse {
+            settings: self.state.global_settings.lock().await.clone(),
+            settings_revision: 1,
+        }))
     }
 
     async fn get_sandbox_provider_environment(
@@ -604,6 +608,20 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("not implemented in test"))
     }
 
+    async fn issue_sandbox_token(
+        &self,
+        _request: tonic::Request<openshell_core::proto::IssueSandboxTokenRequest>,
+    ) -> Result<Response<openshell_core::proto::IssueSandboxTokenResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn refresh_sandbox_token(
+        &self,
+        _request: tonic::Request<openshell_core::proto::RefreshSandboxTokenRequest>,
+    ) -> Result<Response<openshell_core::proto::RefreshSandboxTokenResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
     async fn connect_supervisor(
         &self,
         _request: tonic::Request<tonic::Streaming<SupervisorMessage>>,
@@ -737,6 +755,15 @@ async fn create_requests(server: &TestServer) -> Vec<CreateSandboxRequest> {
     server.openshell.state.create_requests.lock().await.clone()
 }
 
+async fn enable_providers_v2(server: &TestServer) {
+    server.openshell.state.global_settings.lock().await.insert(
+        openshell_core::settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
+        SettingValue {
+            value: Some(setting_value::Value::BoolValue(true)),
+        },
+    );
+}
+
 fn test_tls(server: &TestServer) -> TlsOptions {
     server.tls.with_gateway_name("openshell")
 }
@@ -855,6 +882,53 @@ async fn sandbox_create_sends_cpu_and_memory_limits_only() {
         Some("2Gi")
     );
     assert!(!resources.fields.contains_key("requests"));
+}
+
+#[tokio::test]
+async fn sandbox_create_does_not_infer_command_providers_when_v2_enabled() {
+    let server = run_server().await;
+    enable_providers_v2(&server).await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+
+    run::sandbox_create(
+        &server.endpoint,
+        Some("v2-no-inferred-provider"),
+        None,
+        "openshell",
+        None,
+        true,
+        false,
+        None,
+        None,
+        None,
+        None,
+        &[],
+        None,
+        None,
+        &["claude".to_string(), "--version".to_string()],
+        Some(true),
+        Some(false),
+        &HashMap::new(),
+        &tls,
+    )
+    .await
+    .expect("sandbox create should succeed without inferred provider");
+
+    let requests = create_requests(&server).await;
+    let providers = requests[0]
+        .spec
+        .as_ref()
+        .expect("sandbox spec should be sent")
+        .providers
+        .clone();
+    assert!(
+        providers.is_empty(),
+        "providers v2 should not infer command providers, got {providers:?}"
+    );
 }
 
 #[tokio::test]

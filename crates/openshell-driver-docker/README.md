@@ -12,11 +12,12 @@ The gateway runs as a host process. The Docker driver creates one container per
 sandbox and starts the `openshell-sandbox` supervisor inside that container. The
 supervisor then creates the nested sandbox namespace for the agent process.
 
-Docker containers currently use host networking. This lets a supervisor reach a
-gateway bound to `127.0.0.1` without requiring a separate bridge listener, NAT
-rule, or userland proxy. The container also receives
-`host.openshell.internal -> 127.0.0.1` so local host services have a stable
-OpenShell-owned name.
+Docker containers join an OpenShell-managed bridge network. The driver injects
+`host.openshell.internal` and `host.docker.internal` so supervisors have stable
+names for reaching the gateway host. On Docker Desktop, Colima, Rancher
+Desktop, OrbStack, and macOS-hosted gateways, those names use Docker's
+`host-gateway` alias. On native Linux Docker, the gateway also binds the bridge
+gateway IP so containers can call back to the host process.
 
 ## Container Contract
 
@@ -26,7 +27,7 @@ contract:
 | Setting | Purpose |
 |---|---|
 | `user = "0"` | The supervisor needs root inside the container to prepare namespaces, mounts, Landlock, and seccomp. |
-| `network_mode = "host"` | Lets the supervisor call back to loopback gateway endpoints. |
+| `network_mode = openshell` | Places the supervisor on the managed Docker bridge network. |
 | `cap_add` | Grants supervisor-only capabilities required for namespace setup and process inspection. |
 | `apparmor=unconfined` | Avoids Docker's default profile blocking required mount operations. |
 | `restart_policy = unless-stopped` | Keeps managed sandboxes resumable across daemon or gateway restarts. |
@@ -51,9 +52,12 @@ into the binary at compile time. The default Docker supervisor image is not
 
 ## Callback and TLS
 
-`OPENSHELL_ENDPOINT` is injected from the gateway's configured gRPC endpoint
-without rewriting. Because the container uses host networking, loopback
-endpoints such as `http://127.0.0.1:8080` resolve to the host gateway.
+`OPENSHELL_ENDPOINT` is injected from the gateway's configured gRPC endpoint.
+When no endpoint is configured, the driver uses
+`host.openshell.internal:<gateway-port>` with the appropriate HTTP or HTTPS
+scheme. Set `host_gateway_ip` only when the host has an explicit, locally
+assigned address that containers should use for callbacks; package-managed
+macOS gateways should leave it unset.
 
 For HTTPS endpoints, the server certificate must include the endpoint host as a
 subject alternative name. Docker sandboxes also need the client TLS bundle

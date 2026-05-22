@@ -59,10 +59,20 @@ data:
     cert_path             = "/etc/openshell-tls/server/tls.crt"
     key_path              = "/etc/openshell-tls/server/tls.key"
     client_ca_path        = "/etc/openshell-tls/client-ca/ca.crt"
-    {{- if .Values.server.disableGatewayAuth }}
-    allow_unauthenticated = true
     {{- end }}
+
+    {{- if .Values.server.auth.allowUnauthenticatedUsers }}
+
+    [openshell.gateway.auth]
+    allow_unauthenticated_users = true
     {{- end }}
+
+    [openshell.gateway.gateway_jwt]
+    signing_key_path = "/etc/openshell-jwt/signing.pem"
+    public_key_path  = "/etc/openshell-jwt/public.pem"
+    kid_path         = "/etc/openshell-jwt/kid"
+    gateway_id       = {{ .Values.server.sandboxJwt.gatewayId | default (include "openshell.fullname" .) | quote }}
+    ttl_secs         = {{ .Values.server.sandboxJwt.ttlSecs | default 3600 }}
 
     {{- if .Values.server.oidc.issuer }}
 
@@ -86,7 +96,9 @@ data:
 
     [openshell.drivers.kubernetes]
     grpc_endpoint                = {{ include "openshell.grpcEndpoint" . | quote }}
+    service_account_name         = {{ include "openshell.sandboxServiceAccountName" . | quote }}
     supervisor_sideload_method   = {{ include "openshell.supervisorSideloadMethod" . | quote }}
+    sa_token_ttl_secs            = {{ .Values.server.sandboxJwt.k8sSaTokenTtlSecs | default 3600 }}
     {{- if .Values.server.sandboxImagePullPolicy }}
     image_pull_policy            = {{ .Values.server.sandboxImagePullPolicy | quote }}
     {{- end }}

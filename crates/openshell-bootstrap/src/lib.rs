@@ -3,6 +3,7 @@
 
 pub mod build;
 pub mod edge_token;
+pub mod jwt;
 pub mod oidc_token;
 
 mod metadata;

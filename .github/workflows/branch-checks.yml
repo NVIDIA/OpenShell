@@ -106,10 +106,12 @@ jobs:
       - name: Cache Rust target and registry
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
         with:
-          # Separate caches for clippy (check-like) vs test (full build)
-          # so they don't thrash each other's artifacts
+          # Keep branch-check caches partitioned by runner architecture; lint
+          # and test intentionally share the same job-local target directory.
           shared-key: rust-checks-${{ matrix.runner }}
-          cache-on-failure: true
+          # Preserve compiled artifacts from failed lint/test runs so the next
+          # push to the same PR branch does not start from a cold cache.
+          cache-on-failure: "true"
 
       - name: Format
         run: mise run rust:format:check

@@ -37,6 +37,7 @@ fn test_sandbox() -> DriverSandbox {
             }),
             gpu: false,
             gpu_device: String::new(),
+            sandbox_token: String::new(),
         }),
         status: None,
     }
@@ -267,11 +268,12 @@ fn docker_gateway_route_uses_bridge_gateway_for_linux_docker() {
         ..Default::default()
     };
 
-    let route = docker_gateway_route(
+    let route = docker_gateway_route_for_host(
         &info,
         IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
         DEFAULT_SERVER_PORT,
         None,
+        false,
     );
 
     assert_eq!(
@@ -287,6 +289,25 @@ fn docker_gateway_route_uses_bridge_gateway_for_linux_docker() {
             "host.docker.internal:172.18.0.1".to_string(),
             "host.openshell.internal:172.18.0.1".to_string()
         ]
+    );
+}
+
+#[test]
+fn docker_gateway_route_uses_host_gateway_when_host_runtime_requires_it() {
+    let info = SystemInfo {
+        operating_system: Some("Ubuntu 24.04 LTS".to_string()),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        docker_gateway_route_for_host(
+            &info,
+            IpAddr::V4(Ipv4Addr::new(10, 89, 10, 1)),
+            DEFAULT_SERVER_PORT,
+            None,
+            true,
+        ),
+        DockerGatewayRoute::HostGateway
     );
 }
 
@@ -426,7 +447,7 @@ fn build_environment_keeps_path_driver_controlled() {
 
 #[test]
 fn build_binds_uses_docker_tls_directory() {
-    let binds = build_binds(&runtime_config());
+    let binds = build_binds(&test_sandbox(), &runtime_config()).unwrap();
     let targets = binds
         .iter()
         .filter_map(|bind| bind.split(':').nth(1).map(String::from))
@@ -440,6 +461,27 @@ fn build_binds_uses_docker_tls_directory() {
             .iter()
             .all(|target| target.starts_with(TLS_MOUNT_DIR) || target == SUPERVISOR_MOUNT_PATH)
     );
+}
+
+#[test]
+fn build_environment_uses_token_file_without_raw_token_env() {
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    spec.sandbox_token = "secret.jwt.value".to_string();
+    spec.environment.insert(
+        openshell_core::sandbox_env::SANDBOX_TOKEN.to_string(),
+        "user-provided-token".to_string(),
+    );
+
+    let env = build_environment(&sandbox, &runtime_config());
+
+    assert!(!env.iter().any(|entry| {
+        entry.starts_with(&format!("{}=", openshell_core::sandbox_env::SANDBOX_TOKEN))
+    }));
+    assert!(env.contains(&format!(
+        "{}={SANDBOX_TOKEN_MOUNT_PATH}",
+        openshell_core::sandbox_env::SANDBOX_TOKEN_FILE
+    )));
 }
 
 #[test]

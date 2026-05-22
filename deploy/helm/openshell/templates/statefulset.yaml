@@ -75,6 +75,9 @@ spec:
             - name: gateway-config
               mountPath: /etc/openshell
               readOnly: true
+            - name: sandbox-jwt
+              mountPath: /etc/openshell-jwt
+              readOnly: true
             {{- if not .Values.server.disableTls }}
             - name: tls-cert
               mountPath: /etc/openshell-tls/server
@@ -84,11 +87,11 @@ spec:
               mountPath: /etc/openshell-tls/client-ca
               readOnly: true
             {{- end }}
+            {{- end }}
             {{- if and .Values.server.oidc.issuer .Values.server.oidc.caConfigMapName }}
             - name: oidc-ca
               mountPath: /etc/openshell-tls/oidc-ca
               readOnly: true
-            {{- end }}
             {{- end }}
           ports:
             - name: grpc
@@ -131,6 +134,10 @@ spec:
         - name: gateway-config
           configMap:
             name: {{ include "openshell.fullname" . }}-config
+        - name: sandbox-jwt
+          secret:
+            secretName: {{ .Values.server.sandboxJwt.signingSecretName | default (printf "%s-jwt-keys" (include "openshell.fullname" .)) }}
+            defaultMode: 0400
         {{- if not .Values.server.disableTls }}
         - name: tls-cert
           secret:
@@ -147,11 +154,11 @@ spec:
             secretName: {{ .Values.server.tls.clientCaSecretName }}
             {{- end }}
         {{- end }}
+        {{- end }}
         {{- if and .Values.server.oidc.issuer .Values.server.oidc.caConfigMapName }}
         - name: oidc-ca
           configMap:
             name: {{ .Values.server.oidc.caConfigMapName }}
-        {{- end }}
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

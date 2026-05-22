@@ -54,9 +54,9 @@ use openshell_core::proto::{
 use openshell_core::settings::{self, SettingValueKind};
 use openshell_core::{ObjectId, ObjectName};
 use openshell_providers::{
-    ProviderRegistry, ProviderTypeProfile, detect_provider_from_command, normalize_provider_type,
-    parse_profile_json, parse_profile_yaml, profile_to_json, profile_to_yaml, profiles_to_json,
-    profiles_to_yaml,
+    ProviderRegistry, ProviderTypeProfile, RealDiscoveryContext, detect_provider_from_command,
+    discover_from_profile, normalize_provider_type, parse_profile_json, parse_profile_yaml,
+    profile_to_json, profile_to_yaml, profiles_to_json, profiles_to_yaml,
 };
 use owo_colors::OwoColorize;
 use std::collections::{HashMap, HashSet};
@@ -743,6 +743,11 @@ fn import_local_package_mtls_bundle(name: &str) -> Result<Option<PathBuf>> {
             client_key_pem: std::fs::read_to_string(&key)
                 .into_diagnostic()
                 .wrap_err_with(|| format!("failed to read {}", key.display()))?,
+            // CLI never holds the gateway's JWT signing material — only the
+            // gateway needs it. Fill the JWT fields with placeholders.
+            jwt_signing_key_pem: String::new(),
+            jwt_public_key_pem: String::new(),
+            jwt_key_id: String::new(),
         };
         openshell_bootstrap::mtls::store_pki_bundle(name, &bundle)
             .wrap_err_with(|| format!("failed to store mTLS bundle for gateway '{name}'"))?;
@@ -1704,7 +1709,12 @@ pub async fn sandbox_create(
     };
     let requested_gpu = gpu || image.as_deref().is_some_and(image_requests_gpu);
 
-    let inferred_types: Vec<String> = inferred_provider_type(command).into_iter().collect();
+    let providers_v2_enabled = gateway_providers_v2_enabled(&mut client).await?;
+    let inferred_types: Vec<String> = if providers_v2_enabled {
+        Vec::new()
+    } else {
+        inferred_provider_type(command).into_iter().collect()
+    };
     let configured_providers = ensure_required_providers(
         &mut client,
         providers,
@@ -2008,7 +2018,7 @@ pub async fn sandbox_create(
 
             // If --forward was requested, start the background port forward
             // *before* running the command so that long-running processes
-            // (e.g. `openclaw gateway`) are reachable immediately.
+            // (e.g. a web gateway) are reachable immediately.
             if let Some(ref spec) = forward {
                 sandbox_forward(
                     &effective_server,
@@ -3626,9 +3636,8 @@ async fn auto_create_provider(
         return Ok(());
     }
 
-    let registry = ProviderRegistry::new();
-    let discovered = registry
-        .discover_existing(provider_type)
+    let discovered = discover_existing_provider_data(client, provider_type)
+        .await
         .map_err(|err| miette::miette!("failed to discover provider '{provider_type}': {err}"))?;
     let Some(discovered) = discovered else {
         eprintln!(
@@ -4089,6 +4098,68 @@ fn service_url_for_gateway(service_url: &str, gateway_endpoint: &str) -> String 
     service_url.to_string()
 }
 
+async fn gateway_providers_v2_enabled(client: &mut crate::tls::GrpcClient) -> Result<bool> {
+    let response = client
+        .get_gateway_config(GetGatewayConfigRequest {})
+        .await
+        .into_diagnostic()?
+        .into_inner();
+    let Some(setting) = response.settings.get(settings::PROVIDERS_V2_ENABLED_KEY) else {
+        return Ok(false);
+    };
+    match setting.value.as_ref() {
+        Some(setting_value::Value::BoolValue(enabled)) => Ok(*enabled),
+        None => Ok(false),
+        Some(_) => Err(miette::miette!(
+            "gateway setting '{}' has invalid value type; expected bool",
+            settings::PROVIDERS_V2_ENABLED_KEY
+        )),
+    }
+}
+
+async fn fetch_provider_profile(
+    client: &mut crate::tls::GrpcClient,
+    provider_type: &str,
+) -> Result<ProviderProfile> {
+    let response = client
+        .get_provider_profile(GetProviderProfileRequest {
+            id: provider_type.to_string(),
+        })
+        .await
+        .map_err(|status| {
+            if status.code() == Code::NotFound {
+                miette::miette!(
+                    "provider profile '{provider_type}' not found; providers v2 discovery requires a provider profile"
+                )
+            } else {
+                miette::miette!(status.to_string())
+            }
+        })?;
+
+    response
+        .into_inner()
+        .profile
+        .ok_or_else(|| miette::miette!("provider profile '{provider_type}' missing from response"))
+}
+
+async fn discover_existing_provider_data(
+    client: &mut crate::tls::GrpcClient,
+    provider_type: &str,
+) -> Result<Option<openshell_providers::DiscoveredProvider>> {
+    if gateway_providers_v2_enabled(client).await? {
+        let profile = fetch_provider_profile(client, provider_type).await?;
+        let profile = ProviderTypeProfile::from_proto(&profile);
+        discover_from_profile(&profile, &RealDiscoveryContext).map_err(|err| {
+            miette::miette!("failed to discover existing provider data from profile: {err}")
+        })
+    } else {
+        let registry = ProviderRegistry::new();
+        registry
+            .discover_existing(provider_type)
+            .map_err(|err| miette::miette!("failed to discover existing provider data: {err}"))
+    }
+}
+
 pub async fn provider_create(
     server: &str,
     name: &str,
@@ -4138,10 +4209,7 @@ pub async fn provider_create(
     let mut config_map = parse_key_value_pairs(config, "--config")?;
 
     if from_existing {
-        let registry = ProviderRegistry::new();
-        let discovered = registry
-            .discover_existing(&provider_type)
-            .map_err(|err| miette::miette!("failed to discover existing provider data: {err}"))?;
+        let discovered = discover_existing_provider_data(&mut client, &provider_type).await?;
         let Some(discovered) = discovered else {
             return Err(miette::miette!(
                 "no existing local credentials/config found for provider type '{provider_type}'"
@@ -4157,13 +4225,9 @@ pub async fn provider_create(
     }
 
     if credential_map.is_empty() {
-        let allows_refresh_bootstrap = client
-            .get_provider_profile(GetProviderProfileRequest {
-                id: provider_type.clone(),
-            })
+        let allows_refresh_bootstrap = fetch_provider_profile(&mut client, &provider_type)
             .await
             .ok()
-            .and_then(|response| response.into_inner().profile)
             .is_some_and(|profile| provider_profile_allows_refresh_bootstrap(&profile));
         if !allows_refresh_bootstrap {
             return Err(miette::miette!(
@@ -4906,10 +4970,7 @@ pub async fn provider_update(
             .ok_or_else(|| miette::miette!("provider '{name}' not found"))?;
 
         let provider_type = existing.r#type;
-        let registry = ProviderRegistry::new();
-        let discovered = registry
-            .discover_existing(&provider_type)
-            .map_err(|err| miette::miette!("failed to discover existing provider data: {err}"))?;
+        let discovered = discover_existing_provider_data(&mut client, &provider_type).await?;
         let Some(discovered) = discovered else {
             return Err(miette::miette!(
                 "no existing local credentials/config found for provider type '{provider_type}'"
@@ -6120,8 +6181,49 @@ pub async fn sandbox_policy_get(
     name: &str,
     version: u32,
     full: bool,
+    output: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    sandbox_policy_get_to_writer(
+        server,
+        name,
+        version,
+        full,
+        output,
+        tls,
+        (&mut stdout, &mut stderr),
+    )
+    .await?;
+
+    {
+        let mut terminal_stdout = std::io::stdout().lock();
+        terminal_stdout.write_all(&stdout).into_diagnostic()?;
+    }
+    {
+        let mut terminal_stderr = std::io::stderr().lock();
+        terminal_stderr.write_all(&stderr).into_diagnostic()?;
+    }
+
+    Ok(())
+}
+
+#[doc(hidden)]
+pub async fn sandbox_policy_get_to_writer<W, E>(
+    server: &str,
+    name: &str,
+    version: u32,
+    full: bool,
+    output: &str,
+    tls: &TlsOptions,
+    writers: (&mut W, &mut E),
+) -> Result<()>
+where
+    W: Write + Send,
+    E: Write + Send,
+{
+    let (stdout, stderr) = writers;
     let mut client = grpc_client(server, tls).await?;
 
     let status_resp = client
@@ -6136,32 +6238,55 @@ pub async fn sandbox_policy_get(
     let inner = status_resp.into_inner();
     if let Some(rev) = inner.revision {
         let status = PolicyStatus::try_from(rev.status).unwrap_or(PolicyStatus::Unspecified);
-        println!("Version:      {}", rev.version);
-        println!("Hash:         {}", rev.policy_hash);
-        println!("Status:       {status:?}");
-        println!("Active:       {}", inner.active_version);
+        match output {
+            "json" => {
+                let obj = policy_revision_to_json(
+                    "sandbox",
+                    Some(name),
+                    Some(inner.active_version),
+                    &rev,
+                    status,
+                    full,
+                )?;
+                writeln!(
+                    stdout,
+                    "{}",
+                    serde_json::to_string_pretty(&obj).into_diagnostic()?
+                )
+                .into_diagnostic()?;
+                return Ok(());
+            }
+            "table" => {}
+            _ => return Err(miette!("unsupported output format: {output}")),
+        }
+
+        writeln!(stdout, "Version:      {}", rev.version).into_diagnostic()?;
+        writeln!(stdout, "Hash:         {}", rev.policy_hash).into_diagnostic()?;
+        writeln!(stdout, "Status:       {status:?}").into_diagnostic()?;
+        writeln!(stdout, "Active:       {}", inner.active_version).into_diagnostic()?;
         if rev.created_at_ms > 0 {
-            println!("Created:      {} ms", rev.created_at_ms);
+            writeln!(stdout, "Created:      {} ms", rev.created_at_ms).into_diagnostic()?;
         }
         if rev.loaded_at_ms > 0 {
-            println!("Loaded:       {} ms", rev.loaded_at_ms);
+            writeln!(stdout, "Loaded:       {} ms", rev.loaded_at_ms).into_diagnostic()?;
         }
         if !rev.load_error.is_empty() {
-            println!("Error:        {}", rev.load_error);
+            writeln!(stdout, "Error:        {}", rev.load_error).into_diagnostic()?;
         }
 
         if full {
             if let Some(ref policy) = rev.policy {
-                println!("---");
+                writeln!(stdout, "---").into_diagnostic()?;
                 let yaml_str = openshell_policy::serialize_sandbox_policy(policy)
                     .wrap_err("failed to serialize policy to YAML")?;
-                print!("{yaml_str}");
+                write!(stdout, "{yaml_str}").into_diagnostic()?;
             } else {
-                eprintln!("Policy payload not available for this version");
+                writeln!(stderr, "Policy payload not available for this version")
+                    .into_diagnostic()?;
             }
         }
     } else {
-        eprintln!("No policy history found for sandbox '{name}'");
+        writeln!(stderr, "No policy history found for sandbox '{name}'").into_diagnostic()?;
     }
 
     Ok(())
@@ -6171,6 +6296,7 @@ pub async fn sandbox_policy_get_global(
     server: &str,
     version: u32,
     full: bool,
+    output: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
@@ -6187,6 +6313,16 @@ pub async fn sandbox_policy_get_global(
     let inner = status_resp.into_inner();
     if let Some(rev) = inner.revision {
         let status = PolicyStatus::try_from(rev.status).unwrap_or(PolicyStatus::Unspecified);
+        match output {
+            "json" => {
+                let obj = policy_revision_to_json("global", None, None, &rev, status, full)?;
+                println!("{}", serde_json::to_string_pretty(&obj).into_diagnostic()?);
+                return Ok(());
+            }
+            "table" => {}
+            _ => return Err(miette!("unsupported output format: {output}")),
+        }
+
         println!("Scope:        global");
         println!("Version:      {}", rev.version);
         println!("Hash:         {}", rev.policy_hash);
@@ -6213,6 +6349,66 @@ pub async fn sandbox_policy_get_global(
     }
 
     Ok(())
+}
+
+fn policy_status_json_name(status: PolicyStatus) -> &'static str {
+    match status {
+        PolicyStatus::Unspecified => "unspecified",
+        PolicyStatus::Pending => "pending",
+        PolicyStatus::Loaded => "loaded",
+        PolicyStatus::Failed => "failed",
+        PolicyStatus::Superseded => "superseded",
+    }
+}
+
+fn policy_revision_to_json(
+    scope: &str,
+    sandbox: Option<&str>,
+    active_version: Option<u32>,
+    rev: &openshell_core::proto::SandboxPolicyRevision,
+    status: PolicyStatus,
+    full: bool,
+) -> Result<serde_json::Value> {
+    let mut obj = serde_json::Map::new();
+    obj.insert("scope".to_string(), serde_json::json!(scope));
+    if let Some(sandbox) = sandbox {
+        obj.insert("sandbox".to_string(), serde_json::json!(sandbox));
+    }
+    obj.insert("version".to_string(), serde_json::json!(rev.version));
+    obj.insert("hash".to_string(), serde_json::json!(rev.policy_hash));
+    obj.insert(
+        "status".to_string(),
+        serde_json::json!(policy_status_json_name(status)),
+    );
+    if let Some(active_version) = active_version {
+        obj.insert(
+            "active_version".to_string(),
+            serde_json::json!(active_version),
+        );
+    }
+    if rev.created_at_ms > 0 {
+        obj.insert(
+            "created_at_ms".to_string(),
+            serde_json::json!(rev.created_at_ms),
+        );
+    }
+    if rev.loaded_at_ms > 0 {
+        obj.insert(
+            "loaded_at_ms".to_string(),
+            serde_json::json!(rev.loaded_at_ms),
+        );
+    }
+    if !rev.load_error.is_empty() {
+        obj.insert("load_error".to_string(), serde_json::json!(rev.load_error));
+    }
+    if full {
+        let policy = match rev.policy.as_ref() {
+            Some(policy) => openshell_policy::sandbox_policy_to_json_value(policy)?,
+            None => serde_json::Value::Null,
+        };
+        obj.insert("policy".to_string(), policy);
+    }
+    Ok(serde_json::Value::Object(obj))
 }
 
 pub async fn sandbox_policy_list(
@@ -7216,7 +7412,7 @@ mod tests {
         for image in [
             "ghcr.io/nvidia/openshell-community/sandboxes/base:latest",
             "registry.example.com/gpu/team/base:latest",
-            "registry.example.com/team/openclaw:latest",
+            "registry.example.com/team/notebook:latest",
             "cuda-toolkit:latest",
             "registry.example.com/team/graphics:latest",
         ] {
@@ -7328,10 +7524,10 @@ mod tests {
     fn service_url_for_gateway_uses_external_gateway_port() {
         assert_eq!(
             service_url_for_gateway(
-                "https://quiet-flamingo--openclaw.navigator.openshell.localhost:8080/",
+                "https://quiet-flamingo--notebook.navigator.openshell.localhost:8080/",
                 "https://127.0.0.1:31886"
             ),
-            "https://quiet-flamingo--openclaw.navigator.openshell.localhost:31886/"
+            "https://quiet-flamingo--notebook.navigator.openshell.localhost:31886/"
         );
     }
 
@@ -7339,10 +7535,10 @@ mod tests {
     fn service_url_for_gateway_omits_default_external_port() {
         assert_eq!(
             service_url_for_gateway(
-                "https://quiet-flamingo--openclaw.navigator.openshell.localhost:8080/",
+                "https://quiet-flamingo--notebook.navigator.openshell.localhost:8080/",
                 "https://gateway.example.com"
             ),
-            "https://quiet-flamingo--openclaw.navigator.openshell.localhost/"
+            "https://quiet-flamingo--notebook.navigator.openshell.localhost/"
         );
     }
 
@@ -7350,10 +7546,10 @@ mod tests {
     fn service_url_for_gateway_preserves_service_scheme() {
         assert_eq!(
             service_url_for_gateway(
-                "http://quiet-flamingo--openclaw.navigator.openshell.localhost:8080/",
+                "http://quiet-flamingo--notebook.navigator.openshell.localhost:8080/",
                 "https://127.0.0.1:31886"
             ),
-            "http://quiet-flamingo--openclaw.navigator.openshell.localhost:31886/"
+            "http://quiet-flamingo--notebook.navigator.openshell.localhost:31886/"
         );
     }
 
@@ -7361,10 +7557,10 @@ mod tests {
     fn service_url_for_gateway_uses_gateway_default_port() {
         assert_eq!(
             service_url_for_gateway(
-                "http://quiet-flamingo--openclaw.navigator.openshell.localhost:8080/",
+                "http://quiet-flamingo--notebook.navigator.openshell.localhost:8080/",
                 "https://gateway.example.com"
             ),
-            "http://quiet-flamingo--openclaw.navigator.openshell.localhost:443/"
+            "http://quiet-flamingo--notebook.navigator.openshell.localhost:443/"
         );
     }
 

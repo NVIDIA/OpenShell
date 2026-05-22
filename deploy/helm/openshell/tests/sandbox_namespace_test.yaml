@@ -5,6 +5,9 @@ suite: sandboxNamespace defaulting
 templates:
   - templates/gateway-config.yaml
   - templates/networkpolicy.yaml
+  - templates/role.yaml
+  - templates/rolebinding.yaml
+  - templates/serviceaccount.yaml
 release:
   name: openshell
   namespace: my-namespace
@@ -44,3 +47,31 @@ tests:
       - equal:
           path: metadata.namespace
           value: other-ns
+
+  - it: uses explicit sandboxNamespace for sandbox RBAC
+    template: templates/role.yaml
+    set:
+      server.sandboxNamespace: other-ns
+    asserts:
+      - equal:
+          path: metadata.namespace
+          value: other-ns
+
+  - it: uses explicit sandboxNamespace for sandbox RoleBinding
+    template: templates/rolebinding.yaml
+    set:
+      server.sandboxNamespace: other-ns
+    asserts:
+      - equal:
+          path: metadata.namespace
+          value: other-ns
+
+  - it: uses explicit sandboxNamespace for sandbox ServiceAccount
+    template: templates/serviceaccount.yaml
+    set:
+      server.sandboxNamespace: other-ns
+    asserts:
+      - equal:
+          path: metadata.namespace
+          value: other-ns
+        documentIndex: 1

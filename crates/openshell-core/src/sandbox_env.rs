@@ -34,3 +34,22 @@ pub const TLS_CERT: &str = "OPENSHELL_TLS_CERT";
 
 /// Path to the private key for mTLS communication with the gateway.
 pub const TLS_KEY: &str = "OPENSHELL_TLS_KEY";
+
+/// Raw gateway-minted JWT identifying this sandbox. Mutually exclusive with
+/// [`SANDBOX_TOKEN_FILE`] / [`K8S_SA_TOKEN_FILE`]; used only by test harnesses
+/// that bypass the file-mount path.
+pub const SANDBOX_TOKEN: &str = "OPENSHELL_SANDBOX_TOKEN";
+
+/// Path to the file holding a gateway-minted sandbox JWT.
+///
+/// Set by the Docker, Podman, and VM drivers, which write the token to a
+/// bundle file at sandbox-create time. Read once at supervisor startup;
+/// the token is held in process memory thereafter.
+pub const SANDBOX_TOKEN_FILE: &str = "OPENSHELL_SANDBOX_TOKEN_FILE";
+
+/// Path to the projected `ServiceAccount` JWT (Kubernetes driver).
+///
+/// Used to bootstrap a gateway-minted JWT via `IssueSandboxToken`. Kubelet
+/// writes and rotates this file; the supervisor exchanges its contents
+/// for a gateway JWT at startup and on refresh.
+pub const K8S_SA_TOKEN_FILE: &str = "OPENSHELL_K8S_SA_TOKEN_FILE";

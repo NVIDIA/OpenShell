@@ -122,9 +122,9 @@ fn resolve_gateway_name(gateway_flag: &Option<String>) -> Option<String> {
 
 /// Apply authentication token from local storage based on gateway auth mode.
 ///
-/// Handles both Cloudflare Access (`edge_token`) and OIDC (`oidc_token`)
-/// auth modes by loading the stored token and setting it on `TlsOptions`.
-/// For OIDC, automatically refreshes the token if it's near expiry.
+/// Handles Cloudflare Access and OIDC auth modes by loading the stored token
+/// and setting it on `TlsOptions`. For OIDC, automatically refreshes the token
+/// if it's near expiry.
 fn apply_auth(tls: &mut TlsOptions, gateway_name: &str) {
     let Some(meta) = get_gateway_metadata(gateway_name) else {
         return;
@@ -681,6 +681,21 @@ impl OutputFormat {
 }
 
 #[derive(Clone, Debug, ValueEnum)]
+enum PolicyGetOutput {
+    Table,
+    Json,
+}
+
+impl PolicyGetOutput {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Table => "table",
+            Self::Json => "json",
+        }
+    }
+}
+
+#[derive(Clone, Debug, ValueEnum)]
 enum CliEditor {
     Vscode,
     Cursor,
@@ -1138,7 +1153,7 @@ enum SandboxCommands {
         #[arg(long, add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
 
-        /// Sandbox source: a community sandbox name (e.g., `openclaw`), a path
+        /// Sandbox source: a community sandbox name (e.g., `ollama`), a path
         /// to a Dockerfile or directory containing one, or a full container
         /// image reference (e.g., `myregistry.com/img:tag`).
         ///
@@ -1591,9 +1606,13 @@ enum PolicyCommands {
         #[arg(long = "rev", default_value_t = 0)]
         rev: u32,
 
-        /// Print the full policy as YAML.
+        /// Include the full policy payload.
         #[arg(long)]
         full: bool,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = PolicyGetOutput::Table)]
+        output: PolicyGetOutput,
 
         /// Show the global policy revision.
         #[arg(long)]
@@ -2271,13 +2290,29 @@ async fn main() -> Result<()> {
                     name,
                     rev,
                     full,
+                    output,
                     global,
                 } => {
                     if global {
-                        run::sandbox_policy_get_global(&ctx.endpoint, rev, full, &tls).await?;
+                        run::sandbox_policy_get_global(
+                            &ctx.endpoint,
+                            rev,
+                            full,
+                            output.as_str(),
+                            &tls,
+                        )
+                        .await?;
                     } else {
                         let name = resolve_sandbox_name(name, &ctx.name)?;
-                        run::sandbox_policy_get(&ctx.endpoint, &name, rev, full, &tls).await?;
+                        run::sandbox_policy_get(
+                            &ctx.endpoint,
+                            &name,
+                            rev,
+                            full,
+                            output.as_str(),
+                            &tls,
+                        )
+                        .await?;
                     }
                 }
                 PolicyCommands::List {
@@ -3965,6 +4000,34 @@ mod tests {
                 assert!(name.is_none());
             }
             other => panic!("expected settings get command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn policy_get_json_output_parses() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "policy",
+            "get",
+            "my-sandbox",
+            "--full",
+            "-o",
+            "json",
+        ])
+        .expect("policy get -o json should parse");
+
+        match cli.command {
+            Some(Commands::Policy {
+                command:
+                    Some(PolicyCommands::Get {
+                        name, full, output, ..
+                    }),
+            }) => {
+                assert_eq!(name.as_deref(), Some("my-sandbox"));
+                assert!(full);
+                assert!(matches!(output, PolicyGetOutput::Json));
+            }
+            other => panic!("expected policy get command, got: {other:?}"),
         }
     }
 

@@ -29,8 +29,8 @@ helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <vers
 # Precreate the openshell namespace so we can create the SCC cluster role
 oc create ns openshell
 
-# Sandboxes are deployed into the openshell namespace and use the default service account for now
-oc adm policy add-scc-to-user privileged -z default -n openshell
+# Sandboxes are deployed into the openshell namespace and use the openshell-sandbox service account
+oc adm policy add-scc-to-user privileged -z openshell-sandbox -n openshell
 
 # Deploy openshell with overrides to allow SCC assignment of fsGroup and runAsUser for the gateway
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> -n openshell \

@@ -13,6 +13,8 @@ credentials:
     required: true
     auth_style: header
     header_name: x-api-key
+discovery:
+  credentials: [api_key]
 endpoints:
   - host: api.anthropic.com
     port: 443

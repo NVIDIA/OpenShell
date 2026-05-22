@@ -144,8 +144,15 @@ Check required Helm deployment secrets:
 kubectl -n openshell get secret \
   openshell-server-tls \
   openshell-server-client-ca \
-  openshell-client-tls
+  openshell-client-tls \
+  openshell-jwt-keys
 ```
+
+If the gateway exits with `failed to read sandbox JWT signing key from
+/etc/openshell-jwt/signing.pem`, verify that `openshell-jwt-keys` contains
+`signing.pem`, `public.pem`, and `kid`, and that the StatefulSet mounts the
+`sandbox-jwt` secret at `/etc/openshell-jwt`. The sandbox JWT mount is required
+even when local Helm values disable TLS.
 
 Check the image references currently used by the gateway deployment:
 
@@ -204,6 +211,18 @@ helm -n openshell get values openshell | grep sandboxNamespace
 ```
 
 Then inspect sandbox resources in that namespace.
+
+Check the configured sandbox service account when TokenReview bootstrap or
+sandbox registration fails. Helm creates a dedicated sandbox service account by
+default and writes it to `[openshell.drivers.kubernetes].service_account_name`;
+the gateway rejects projected tokens from other service accounts.
+
+```bash
+helm -n openshell get values openshell | grep -A3 sandboxServiceAccount
+kubectl -n <sandbox-namespace> get serviceaccount openshell-sandbox
+kubectl -n openshell get configmap openshell-config -o jsonpath='{.data.gateway\.toml}'
+kubectl -n <sandbox-namespace> get sandbox <sandbox-name> -o jsonpath='{.spec.template.spec.serviceAccountName}{"\n"}'
+```
 
 ### Step 6: Check VM-Backed Gateways
 

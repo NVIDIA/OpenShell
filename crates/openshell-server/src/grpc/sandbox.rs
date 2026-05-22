@@ -133,7 +133,27 @@ pub(super) async fn handle_create_sandbox(
             status
         })?;
 
-    let sandbox = state.compute.create_sandbox(sandbox).await?;
+    // Mint the gateway JWT for singleplayer drivers. K8s sandboxes skip
+    // this mint and bootstrap via `IssueSandboxToken` at supervisor
+    // startup; identifying "is this K8s?" lives in the compute layer, so
+    // we mint unconditionally here when the issuer is configured and let
+    // the K8s driver simply ignore the field.
+    let sandbox_token = state.sandbox_jwt_issuer.as_ref().map(|issuer| {
+        issuer.mint(&id).map(|minted| {
+            tracing::info!(
+                sandbox_id = %id,
+                "minted sandbox JWT"
+            );
+            minted.token
+        })
+    });
+    let sandbox_token = match sandbox_token {
+        Some(Ok(token)) => Some(token),
+        Some(Err(status)) => return Err(status),
+        None => None,
+    };
+
+    let sandbox = state.compute.create_sandbox(sandbox, sandbox_token).await?;
 
     info!(
         sandbox_id = %id,

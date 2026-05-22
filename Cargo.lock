@@ -3395,6 +3395,7 @@ dependencies = [
  "rcgen",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tar",
  "tempfile",
  "tokio",
@@ -3586,6 +3587,7 @@ dependencies = [
  "miette",
  "openshell-core",
  "serde",
+ "serde_json",
  "serde_yml",
 ]
 
@@ -3687,6 +3689,7 @@ name = "openshell-server"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum 0.8.9",
  "bytes",
  "clap",
@@ -3743,6 +3746,7 @@ dependencies = [
  "tower-http 0.6.8",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
  "wiremock",
  "x509-parser",

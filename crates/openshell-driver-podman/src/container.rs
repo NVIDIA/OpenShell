@@ -50,6 +50,7 @@ const VOLUME_PREFIX: &str = "openshell-sandbox-";
 const TLS_CA_MOUNT_PATH: &str = "/etc/openshell/tls/client/ca.crt";
 const TLS_CERT_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.crt";
 const TLS_KEY_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.key";
+const SANDBOX_TOKEN_MOUNT_PATH: &str = "/etc/openshell/auth/sandbox.jwt";
 
 /// Build a Podman container name from the sandbox name.
 #[must_use]
@@ -299,6 +300,20 @@ fn build_env(
         );
     }
 
+    env.remove(openshell_core::sandbox_env::SANDBOX_TOKEN);
+    env.remove(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE);
+
+    // 4. Gateway-minted sandbox JWT. Keep the raw bearer out of container
+    //    metadata; the supervisor reads it from a driver-owned bind mount.
+    if let Some(s) = spec
+        && !s.sandbox_token.is_empty()
+    {
+        env.insert(
+            openshell_core::sandbox_env::SANDBOX_TOKEN_FILE.into(),
+            SANDBOX_TOKEN_MOUNT_PATH.into(),
+        );
+    }
+
     env
 }
 
@@ -363,8 +378,18 @@ fn build_devices(sandbox: &DriverSandbox) -> Option<Vec<LinuxDevice>> {
 }
 
 /// Build the Podman container creation JSON spec.
+#[cfg(test)]
 #[must_use]
 pub fn build_container_spec(sandbox: &DriverSandbox, config: &PodmanComputeConfig) -> Value {
+    build_container_spec_with_token(sandbox, config, None)
+}
+
+#[must_use]
+pub fn build_container_spec_with_token(
+    sandbox: &DriverSandbox,
+    config: &PodmanComputeConfig,
+    token_host_path: Option<&std::path::Path>,
+) -> Value {
     let image = resolve_image(sandbox, config);
     let name = container_name(&sandbox.name);
     let vol = volume_name(&sandbox.id);
@@ -560,6 +585,18 @@ pub fn build_container_spec(sandbox: &DriverSandbox, config: &PodmanComputeConfi
                     kind: "bind".into(),
                     source: key.display().to_string(),
                     destination: TLS_KEY_MOUNT_PATH.into(),
+                    options: ro,
+                });
+            }
+            if let Some(path) = token_host_path {
+                let mut ro = vec!["ro".into(), "rbind".into()];
+                if is_selinux_enabled() {
+                    ro.push("z".into());
+                }
+                m.push(Mount {
+                    kind: "bind".into(),
+                    source: path.display().to_string(),
+                    destination: SANDBOX_TOKEN_MOUNT_PATH.into(),
                     options: ro,
                 });
             }
@@ -1113,6 +1150,43 @@ mod tests {
             is_selinux_enabled(),
             "TLS bind mounts should include 'z' option iff SELinux is enabled"
         );
+    }
+
+    #[test]
+    fn container_spec_uses_token_file_mount_without_raw_token_env() {
+        use openshell_core::proto::compute::v1::DriverSandboxSpec;
+
+        let mut sandbox = test_sandbox("token-id", "token-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            sandbox_token: "secret.jwt.value".to_string(),
+            ..Default::default()
+        });
+        let config = test_config();
+        let token_path = std::path::Path::new("/host/token.jwt");
+
+        let spec = build_container_spec_with_token(&sandbox, &config, Some(token_path));
+
+        let env_map = spec["env"].as_object().expect("env should be an object");
+        assert_eq!(
+            env_map
+                .get(openshell_core::sandbox_env::SANDBOX_TOKEN)
+                .and_then(|v| v.as_str()),
+            None
+        );
+        assert_eq!(
+            env_map
+                .get(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE)
+                .and_then(|v| v.as_str()),
+            Some("/etc/openshell/auth/sandbox.jwt")
+        );
+        let mounts = spec["mounts"]
+            .as_array()
+            .expect("mounts should be an array");
+        assert!(mounts.iter().any(|m| {
+            m["type"].as_str() == Some("bind")
+                && m["source"].as_str() == Some("/host/token.jwt")
+                && m["destination"].as_str() == Some("/etc/openshell/auth/sandbox.jwt")
+        }));
     }
 
     #[test]

@@ -421,7 +421,11 @@ impl ComputeRuntime {
             .map(|_| ())
     }
 
-    pub async fn create_sandbox(&self, sandbox: Sandbox) -> Result<Sandbox, Status> {
+    pub async fn create_sandbox(
+        &self,
+        sandbox: Sandbox,
+        sandbox_token: Option<String>,
+    ) -> Result<Sandbox, Status> {
         let sandbox_id = sandbox.object_id().to_string();
 
         // Create with MustCreate condition to prevent duplicate creation race
@@ -452,7 +456,12 @@ impl ComputeRuntime {
                 }
             })?;
 
-        let driver_sandbox = driver_sandbox_from_public(&sandbox);
+        let mut driver_sandbox = driver_sandbox_from_public(&sandbox);
+        if let Some(token) = sandbox_token
+            && let Some(spec) = driver_sandbox.spec.as_mut()
+        {
+            spec.sandbox_token = token;
+        }
         match self
             .driver
             .create_sandbox(Request::new(CreateSandboxRequest {
@@ -1229,6 +1238,7 @@ fn driver_sandbox_spec_from_public(spec: &SandboxSpec) -> DriverSandboxSpec {
             .map(driver_sandbox_template_from_public),
         gpu: spec.gpu,
         gpu_device: spec.gpu_device.clone(),
+        sandbox_token: String::new(),
     }
 }
 
@@ -1614,6 +1624,7 @@ fn is_terminal_failure_reason(reason: &str) -> bool {
         "dependenciesnotready",
         "starting",
         "containerstarting",
+        "containercreated",
         "healthcheckstarting",
         "inspectfailed",
     ];
@@ -1996,6 +2007,10 @@ mod tests {
             ),
             ("dependenciesnotready", "lowercase also works"),
             ("Starting", "VM is starting"),
+            (
+                "ContainerCreated",
+                "Podman created the container before starting it",
+            ),
         ];
 
         for (reason, message) in transient_cases {
@@ -2033,6 +2048,10 @@ mod tests {
                 "Pod exists with phase: Pending; Service Exists",
             ),
             ("Starting", "VM is starting"),
+            (
+                "ContainerCreated",
+                "Container exists but has not started yet",
+            ),
         ];
 
         for (reason, message) in transient_conditions {
@@ -2862,7 +2881,7 @@ mod tests {
             resource_version: 0,
         });
 
-        let created = runtime.create_sandbox(sandbox).await.unwrap();
+        let created = runtime.create_sandbox(sandbox, None).await.unwrap();
 
         assert_eq!(
             created.metadata.as_ref().unwrap().resource_version,
@@ -2898,11 +2917,11 @@ mod tests {
         // Spawn two concurrent creation attempts for the same sandbox
         let runtime1 = runtime.clone();
         let sandbox1 = sandbox.clone();
-        let handle1 = tokio::spawn(async move { runtime1.create_sandbox(sandbox1).await });
+        let handle1 = tokio::spawn(async move { runtime1.create_sandbox(sandbox1, None).await });
 
         let runtime2 = runtime.clone();
         let sandbox2 = sandbox.clone();
-        let handle2 = tokio::spawn(async move { runtime2.create_sandbox(sandbox2).await });
+        let handle2 = tokio::spawn(async move { runtime2.create_sandbox(sandbox2, None).await });
 
         // Wait for both to complete
         let result1 = handle1.await.unwrap();
