@@ -24,8 +24,9 @@ pub struct PkiBundle {
     pub jwt_key_id: String,
 }
 
-/// Default SANs always included on the server certificate. Covers the host
-/// aliases used by every supported runtime: Kubernetes service DNS,
+/// Default SANs always included on the server certificate.
+///
+/// Covers the host aliases used by every supported runtime: Kubernetes service DNS,
 /// `host.docker.internal` for Docker Desktop and rootless Docker on Linux,
 /// and `host.containers.internal` for Podman containers reaching their host.
 pub const DEFAULT_SERVER_SANS: &[&str] = &[
