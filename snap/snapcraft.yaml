@@ -31,6 +31,8 @@ platforms:
 apps:
   openshell:
     command: bin/openshell
+    environment:
+      OPENSHELL_SYSTEM_GATEWAY_DIR: "$SNAP_COMMON/system-gateways"
     plugs:
       - home
       - network
@@ -40,11 +42,9 @@ apps:
     command: bin/openshell-gateway-wrapper
     daemon: simple
     refresh-mode: endure
-    environment:
-      XDG_DATA_HOME: "$SNAP_COMMON"
-      XDG_RUNTIME_DIR: "$SNAP_COMMON"
     plugs:
       - docker
+      - kvm
       - log-observe
       - network
       - network-bind
@@ -61,21 +61,40 @@ parts:
       - ca-certificates
       - clang
       - cmake
+      - bc
+      - bison
+      - cpio
+      - curl
+      - flex
       - git
       - libclang-dev
+      - jq
+      - libcap-ng-dev
       - libssl-dev
+      - libelf-dev
       - libz3-dev
       - pkg-config
       - python3
+      - python3-pyelftools
+      - zstd
+    stage-packages:
+      - e2fsprogs
+      - iproute2
+      - nftables
     override-pull: |
       craftctl default
       craftctl set version="$(python3 "$CRAFT_PROJECT_DIR/tasks/scripts/release.py" get-version --snap)"
     override-build: |
       set -euo pipefail
 
+      export OPENSHELL_VM_RUNTIME_COMPRESSED_DIR="$CRAFT_PART_BUILD/target/vm-runtime-compressed"
+      FROM_SOURCE=1 "$CRAFT_PART_BUILD/tasks/scripts/vm/vm-setup.sh"
+      "$CRAFT_PART_BUILD/tasks/scripts/vm/build-supervisor-bundle.sh"
+
       cargo build --release --locked -p openshell-cli --features bundled-z3
       cargo build --release --locked -p openshell-server --bin openshell-gateway
       cargo build --release --locked -p openshell-sandbox --bin openshell-sandbox
+      cargo build --release --locked -p openshell-driver-vm --bin openshell-driver-vm
 
       install -D -m 0755 "$CRAFT_PART_BUILD/target/release/openshell" \
         "$CRAFT_PART_INSTALL/bin/openshell"
@@ -83,6 +102,8 @@ parts:
         "$CRAFT_PART_INSTALL/bin/openshell-gateway"
       install -D -m 0755 "$CRAFT_PART_BUILD/target/release/openshell-sandbox" \
         "$CRAFT_PART_INSTALL/bin/openshell-sandbox"
+      install -D -m 0755 "$CRAFT_PART_BUILD/target/release/openshell-driver-vm" \
+        "$CRAFT_PART_INSTALL/libexec/openshell/openshell-driver-vm"
       install -D -m 0755 "$CRAFT_PROJECT_DIR/deploy/snap/bin/openshell-gateway-wrapper" \
         "$CRAFT_PART_INSTALL/bin/openshell-gateway-wrapper"
       install -D -m 0644 "$CRAFT_PROJECT_DIR/LICENSE" \

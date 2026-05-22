@@ -11,7 +11,7 @@ binaries when you want to inspect the snap root or produce local artifacts.
 - Linux on `amd64` or `arm64`
 - `snap` from `snapd`
 - `snapcraft`
-- Docker from the Docker snap (`sudo snap install docker`)
+- KVM access for the VM driver — `/dev/kvm` reachable from your user
 
 ## Build with Snapcraft
 
@@ -22,8 +22,8 @@ snapcraft pack
 ```
 
 The manifest builds the Rust binaries inside Snapcraft, installs the CLI,
-gateway, and sandbox supervisor into the snap, and keeps the same runtime
-environment as the current deployment logic.
+gateway, sandbox supervisor, and VM driver into the snap, and keeps the same
+runtime environment as the current deployment logic.
 
 ## Staged helper flow
 
@@ -45,7 +45,8 @@ mise run build:rust:snap
 ```
 
 This convenience target builds the CLI with `bundled-z3`, the gateway, and
-`openshell-sandbox` for the Docker driver to bind-mount into sandbox containers.
+`openshell-sandbox` for the supervisor binary the VM driver injects into
+sandbox guests.
 
 ## Pack the snap
 
@@ -88,7 +89,7 @@ The snap exposes the CLI:
 
 - `openshell`
 
-It also defines a system service with packaged Docker driver settings.
+It also defines a system service.
 
 - `openshell.gateway`
 
@@ -96,10 +97,12 @@ The gateway service uses `refresh-mode: endure` so snap refreshes do not restart
 it while sandboxes are active. Restart the service manually when you are ready
 to move the gateway to the refreshed snap revision.
 
-`openshell-sandbox` is staged next to `openshell-gateway` as the Docker
-supervisor binary. The gateway app starts through a small wrapper that sets
-Snap-specific defaults and reads `$SNAP_COMMON/gateway.toml` when that file
-exists. The service stores its gateway database under `$SNAP_COMMON`.
+The gateway app starts through a small wrapper that pins snap-specific
+defaults: an on-disk SQLite database, a loopback HTTP listener at
+`http://127.0.0.1:17670`, plaintext (no TLS), trusted-local user access for
+that loopback endpoint, and the `vm` compute driver. Before the gateway starts,
+it also ensures the local sandbox JWT bundle exists under snap state so
+sandbox supervisors can authenticate back to the gateway.
 
 ## Interfaces
 
@@ -113,65 +116,44 @@ The `openshell` CLI app plugs:
 The `openshell.gateway` service plugs:
 
 - `docker`
+- `kvm`
 - `log-observe`
 - `network`
 - `network-bind`
 - `ssh-keys`
 - `system-observe`
 
-## Start a Docker gateway from the snap
+## Connecting after install
 
-The snapped gateway talks to Docker through the Docker snap's
-`docker:docker-daemon` slot. The snap declares `default-provider: docker` on
-its Docker plug so snapd can install the Docker snap when OpenShell is
-installed. Connect the interface before using the Docker driver:
-
-```shell
-sudo snap connect openshell:docker docker:docker-daemon
-sudo snap connect openshell:log-observe
-sudo snap connect openshell:system-observe
-sudo snap connect openshell:ssh-keys
-```
-
-The gateway uses Docker's default Unix socket location. The Docker snap exposes
-that socket through the connected `docker` interface, so no `DOCKER_HOST`
-override is required. The OpenShell snap still requires the Docker snap because
-it relies on the `docker:docker-daemon` slot; it does not work with Docker
-installed from a Debian package or Docker's upstream packages.
-
-The service runs the gateway with Snap-specific environment defaults:
+On first install, the snap's install hook seeds a system-level gateway entry
+named `local-vm` pointing at the snap-managed loopback HTTP endpoint, and
+marks it active. The CLI discovers this through `OPENSHELL_SYSTEM_GATEWAY_DIR`,
+so a fresh snap is usable without any manual `openshell gateway add`.
 
 ```shell
-OPENSHELL_DISABLE_TLS=true \
-OPENSHELL_DB_URL="sqlite:$SNAP_COMMON/gateway.db?mode=rwc" \
-openshell.gateway
-```
-
-This stores the gateway SQLite database at
-`/var/snap/openshell/common/gateway.db`. Create
-`/var/snap/openshell/common/gateway.toml` when you need to override gateway or
-Docker driver settings.
-
-## Connect with the OpenShell CLI
-
-Register the snap-run gateway as a local plaintext gateway:
-
-```shell
-openshell gateway add http://127.0.0.1:17670 --local --name snap-docker
-openshell gateway select snap-docker
 openshell status
-```
-
-Then use normal sandbox commands:
-
-```shell
 openshell sandbox create --name demo
 openshell sandbox connect demo
 ```
 
-To avoid changing the default gateway, pass the gateway name per command:
+`openshell gateway list` will show the `local-vm` entry. Per-user gateway
+registrations (made with `openshell gateway add`) shadow the system entry on
+name collision, so an operator wanting a different default does not need to
+remove anything.
+
+## Connecting Docker (optional)
+
+The snap also declares the Docker interface. Connecting it lets the gateway
+talk to a host Docker daemon if you want to switch the compute driver from
+`vm` to `docker`:
 
 ```shell
-openshell --gateway snap-docker status
-openshell --gateway snap-docker sandbox create --name demo
+sudo snap connect openshell:docker docker:docker-daemon
+sudo snap set openshell drivers=docker
 ```
+
+The Docker snap exposes the Docker daemon through the connected `docker`
+so no `DOCKER_HOST` override is required. The OpenShell snap requires the
+Docker snap because it relies on the `docker:docker-daemon` slot; it does not
+work with Docker installed from a Debian package or Docker's upstream
+packages.

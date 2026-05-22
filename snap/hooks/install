@@ -1,0 +1,23 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+set -eu
+
+SYSTEM_GATEWAY_DIR="${SNAP_COMMON}/system-gateways"
+DEFAULT_GATEWAY="local-vm"
+
+if [ ! -f "${SYSTEM_GATEWAY_DIR}/active_gateway" ]; then
+    mkdir -p "$SYSTEM_GATEWAY_DIR"
+    printf '%s' "$DEFAULT_GATEWAY" > "${SYSTEM_GATEWAY_DIR}/active_gateway"
+    chmod 644 "${SYSTEM_GATEWAY_DIR}/active_gateway"
+fi
+chmod 755 "$SYSTEM_GATEWAY_DIR"
+
+if [ ! -f "${SYSTEM_GATEWAY_DIR}/${DEFAULT_GATEWAY}/metadata.json" ]; then
+    mkdir -p "${SYSTEM_GATEWAY_DIR}/${DEFAULT_GATEWAY}"
+    printf '{\n  "name": "%s",\n  "gateway_endpoint": "http://127.0.0.1:17670",\n  "is_remote": false,\n  "gateway_port": 0,\n  "auth_mode": "plaintext"\n}\n' \
+        "$DEFAULT_GATEWAY" > "${SYSTEM_GATEWAY_DIR}/${DEFAULT_GATEWAY}/metadata.json"
+    chmod 644 "${SYSTEM_GATEWAY_DIR}/${DEFAULT_GATEWAY}/metadata.json"
+fi
+chmod 755 "${SYSTEM_GATEWAY_DIR}/${DEFAULT_GATEWAY}"

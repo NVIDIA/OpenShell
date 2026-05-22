@@ -4,12 +4,31 @@
 
 set -eu
 
-CANONICAL_CONFIG_FILE="${SNAP_COMMON}/gateway.toml"
+export XDG_DATA_HOME="${XDG_DATA_HOME:-${SNAP_COMMON}}"
+export PATH="${SNAP}/usr/sbin:${SNAP}/usr/bin:${SNAP}/sbin:${SNAP}/bin:${PATH}"
+export XDG_STATE_HOME="${XDG_STATE_HOME:-${SNAP_COMMON}/state}"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-${SNAP_COMMON}/run}"
+mkdir -p "${XDG_RUNTIME_DIR}"
+export OPENSHELL_GATEWAY_CONFIG="${OPENSHELL_GATEWAY_CONFIG:-${SNAP_COMMON}/gateway.toml}"
 export OPENSHELL_DB_URL="${OPENSHELL_DB_URL:-sqlite:${SNAP_COMMON}/gateway.db?mode=rwc}"
+export OPENSHELL_BIND_ADDRESS="${OPENSHELL_BIND_ADDRESS:-127.0.0.1}"
+export OPENSHELL_SERVER_PORT="${OPENSHELL_SERVER_PORT:-17670}"
 export OPENSHELL_DISABLE_TLS="${OPENSHELL_DISABLE_TLS:-true}"
+DRIVERS="$(snapctl get drivers 2>/dev/null || true)"
+export OPENSHELL_DRIVERS="${OPENSHELL_DRIVERS:-${DRIVERS:-vm}}"
 
-if [ -z "${OPENSHELL_GATEWAY_CONFIG:-}" ] && [ -f "$CANONICAL_CONFIG_FILE" ]; then
-    exec "${SNAP}/bin/openshell-gateway" --config "$CANONICAL_CONFIG_FILE" "$@"
+if [ ! -f "${OPENSHELL_GATEWAY_CONFIG}" ]; then
+    printf '%s\n' \
+        '[openshell]' \
+        'version = 1' \
+        '' \
+        '[openshell.gateway.auth]' \
+        'allow_unauthenticated_users = true' \
+        > "${OPENSHELL_GATEWAY_CONFIG}"
 fi
+
+"${SNAP}/bin/openshell-gateway" generate-certs \
+    --output-dir "${XDG_STATE_HOME}/openshell/tls" \
+    --server-san host.openshell.internal
 
 exec "${SNAP}/bin/openshell-gateway" "$@"

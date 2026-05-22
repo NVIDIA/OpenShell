@@ -94,23 +94,55 @@ def test_generate_homebrew_formula_uses_tagged_macos_driver_asset_without_defaul
     assert "brew services restart openshell" in formula
 
 
-def test_snap_wrapper_uses_optional_gateway_config_without_generating_toml() -> None:
+def test_snap_wrapper_configures_gateway_via_env_vars() -> None:
     repo_root = Path(__file__).resolve().parents[2]
     wrapper = (repo_root / "deploy/snap/bin/openshell-gateway-wrapper").read_text(
         encoding="utf-8"
     )
 
     assert "init-gateway-config.sh" not in wrapper
+    assert "--config" not in wrapper
+    assert "CANONICAL_CONFIG_FILE" not in wrapper
+
+    expected_exports = [
+        'export XDG_DATA_HOME="${XDG_DATA_HOME:-${SNAP_COMMON}}"',
+        'export PATH="${SNAP}/usr/sbin:${SNAP}/usr/bin:${SNAP}/sbin:${SNAP}/bin:${PATH}"',
+        'export XDG_STATE_HOME="${XDG_STATE_HOME:-${SNAP_COMMON}/state}"',
+        'export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-${SNAP_COMMON}/run}"',
+        'export OPENSHELL_GATEWAY_CONFIG="${OPENSHELL_GATEWAY_CONFIG:-${SNAP_COMMON}/gateway.toml}"',
+        'export OPENSHELL_DB_URL="${OPENSHELL_DB_URL:-sqlite:${SNAP_COMMON}/gateway.db?mode=rwc}"',
+        'export OPENSHELL_BIND_ADDRESS="${OPENSHELL_BIND_ADDRESS:-127.0.0.1}"',
+        'export OPENSHELL_SERVER_PORT="${OPENSHELL_SERVER_PORT:-17670}"',
+        'export OPENSHELL_DISABLE_TLS="${OPENSHELL_DISABLE_TLS:-true}"',
+        'export OPENSHELL_DRIVERS="${OPENSHELL_DRIVERS:-${DRIVERS:-vm}}"',
+    ]
+    for export in expected_exports:
+        assert export in wrapper, f"missing export: {export}"
+    assert 'mkdir -p "${XDG_RUNTIME_DIR}"' in wrapper
+    assert 'DRIVERS="$(snapctl get drivers 2>/dev/null || true)"' in wrapper
+    assert "allow_unauthenticated_users = true" in wrapper
     assert (
-        'export OPENSHELL_DB_URL="${OPENSHELL_DB_URL:-sqlite:${SNAP_COMMON}/gateway.db?mode=rwc}"'
+        'generate-certs \\\n    --output-dir "${XDG_STATE_HOME}/openshell/tls" \\\n    --server-san host.openshell.internal'
         in wrapper
     )
-    assert 'export OPENSHELL_DISABLE_TLS="${OPENSHELL_DISABLE_TLS:-true}"' in wrapper
-    assert (
-        'exec "${SNAP}/bin/openshell-gateway" --config "$CANONICAL_CONFIG_FILE" "$@"'
-        in wrapper
-    )
+
     assert 'exec "${SNAP}/bin/openshell-gateway" "$@"' in wrapper
+
+
+def test_snap_install_hook_seeds_localhost_gateway_metadata() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    install_hook = (repo_root / "snap/hooks/install").read_text(encoding="utf-8")
+
+    assert '"gateway_endpoint": "http://127.0.0.1:17670"' in install_hook
+    assert '"auth_mode": "plaintext"' in install_hook
+
+
+def test_snap_cli_sets_system_gateway_dir_via_app_env() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    snapcraft = (repo_root / "snap/snapcraft.yaml").read_text(encoding="utf-8")
+
+    assert "command: bin/openshell" in snapcraft
+    assert 'OPENSHELL_SYSTEM_GATEWAY_DIR: "$SNAP_COMMON/system-gateways"' in snapcraft
 
 
 def test_rpm_spec_uses_gateway_defaults_without_config_helper() -> None:
