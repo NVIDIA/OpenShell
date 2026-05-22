@@ -368,7 +368,10 @@ the same layout (`<dir>/<name>/metadata.json` plus an optional top-level
 `active_gateway` file). The CLI falls back to this directory when no per-user
 entry exists; per-user entries shadow system entries on name collision. System
 entries are read-only from the CLI, so `gateway remove` rejects a pure system
-entry instead of pretending to delete installer-owned state.
+entry instead of pretending to delete installer-owned state. The snap gateway
+service keeps its service-owned state and runtime files in `$SNAP_COMMON`,
+while the snap CLI uses `~/.config/openshell/` for user-managed registrations
+via the `dot-config-openshell` personal-files interface.
 
 ## Operational Constraints
 

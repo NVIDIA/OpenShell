@@ -25,6 +25,8 @@ architectures:
 apps:
   openshell:
     command: bin/openshell
+    environment:
+      OPENSHELL_SYSTEM_GATEWAY_DIR: "$SNAP_COMMON/system-gateways"
     plugs:
       - home
       - network
@@ -34,11 +36,6 @@ apps:
     command: bin/openshell-gateway-wrapper
     daemon: simple
     refresh-mode: endure
-    environment:
-      XDG_DATA_HOME: "$SNAP_COMMON"
-      # Used for creating and locating certain sockets.
-      XDG_RUNTIME_DIR: "$SNAP_COMMON"
-
     plugs:
       - docker
       - log-observe
