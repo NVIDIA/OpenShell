@@ -115,6 +115,9 @@ fn emit_gateway_policy_audit_log(
 /// class as a human approval, with extra unmapped fields carrying the
 /// safety reasoning so the audit is reconstructable. `source` records the
 /// proposer (`mechanistic` or `agent_authored`) for provenance.
+/// `resolved_from` records the scope that supplied the `auto` mode setting
+/// (`gateway`, `sandbox`, or `default`) so operators can see why a given
+/// approval was auto vs manual.
 fn emit_gateway_policy_auto_approve_audit_log(
     sandbox_id: &str,
     sandbox_name: &str,
@@ -122,11 +125,13 @@ fn emit_gateway_policy_auto_approve_audit_log(
     version: i64,
     policy_hash: &str,
     source: &str,
+    resolved_from: &str,
 ) {
     let extra = [
         ("auto", "true".to_string()),
         ("source", source.to_string()),
         ("prover_delta", "empty".to_string()),
+        ("resolved_from", resolved_from.to_string()),
     ];
     let message = build_gateway_policy_audit_message(
         sandbox_id,
@@ -785,12 +790,45 @@ async fn self_reject_mechanistic_if_already_covered(
 /// (`mechanistic` or `agent_authored`). The audit copy says "auto-approved:
 /// no new prover findings" — never "safe" — because the claim is about the
 /// prover's reasoning, not the world.
+/// Resolve the effective proposal-approval mode for a sandbox.
+///
+/// Precedence (matches the rest of the settings model): gateway scope wins
+/// over sandbox scope. A reviewer can pin manual mode fleet-wide by setting
+/// it globally; per-sandbox overrides only apply when no global is set.
+///
+/// Returns `(auto_approve_enabled, resolved_from)` where `resolved_from`
+/// is `"gateway"`, `"sandbox"`, or `"default"`. Only an exact `"auto"`
+/// value enables auto-approval; any other string (including future-
+/// reserved modes like `"auto_on_low_risk"`) is conservatively treated as
+/// manual.
+async fn resolve_proposal_approval_mode(
+    store: &Store,
+    sandbox_name: &str,
+) -> Result<(bool, &'static str), Status> {
+    let global = load_global_settings(store).await?;
+    if let Some(StoredSettingValue::String(value)) =
+        global.settings.get(settings::PROPOSAL_APPROVAL_MODE_KEY)
+    {
+        return Ok((value == "auto", "gateway"));
+    }
+
+    let sandbox = load_sandbox_settings(store, sandbox_name).await?;
+    if let Some(StoredSettingValue::String(value)) =
+        sandbox.settings.get(settings::PROPOSAL_APPROVAL_MODE_KEY)
+    {
+        return Ok((value == "auto", "sandbox"));
+    }
+
+    Ok((false, "default"))
+}
+
 async fn auto_approve_chunk(
     state: &Arc<ServerState>,
     sandbox_id: &str,
     sandbox_name: &str,
     chunk_id: &str,
     source: &str,
+    resolved_from: &str,
 ) -> Result<(), Status> {
     // Same gate the human-driven approve paths apply: if a global policy is
     // active, sandbox-scoped chunk approvals are meaningless because
@@ -835,11 +873,12 @@ async fn auto_approve_chunk(
         sandbox_id,
         sandbox_name,
         format!(
-            "auto-approved: no new prover findings (source={source_label}) — chunk {chunk_id}: {chunk_summary}"
+            "auto-approved: no new prover findings (source={source_label}, resolved_from={resolved_from}) — chunk {chunk_id}: {chunk_summary}"
         ),
         version,
         &hash,
         source_label,
+        resolved_from,
     );
 
     info!(
@@ -849,6 +888,7 @@ async fn auto_approve_chunk(
         version = version,
         policy_hash = %hash,
         source = %source_label,
+        resolved_from = %resolved_from,
         "Auto-approved chunk: no new prover findings"
     );
 
@@ -2056,15 +2096,13 @@ pub(super) async fn handle_submit_policy_analysis(
     // fix is to recompute baseline after each successful auto-approve.
     let current_policy = current_effective_policy_for_sandbox(state, &sandbox, &sandbox_id).await?;
 
-    // Auto-approval is an opt-in per-sandbox behavior. Default (empty or
-    // explicit "manual") preserves OpenShell's default-deny posture: every
-    // proposal lands in `pending` for a human reviewer. Only sandboxes that
-    // explicitly set `proposal_approval_mode = "auto"` get prover-gated
-    // auto-approval for empty-delta proposals.
-    let auto_approve_enabled = sandbox
-        .spec
-        .as_ref()
-        .is_some_and(|spec| spec.proposal_approval_mode == "auto");
+    // Auto-approval is an opt-in behavior, sourced from the settings model
+    // (sandbox or gateway scope) so it can be flipped on a running sandbox
+    // and managed fleet-wide. Default (no setting, or any value other than
+    // exact "auto") preserves OpenShell's default-deny posture: every
+    // proposal lands in `pending` for a human reviewer.
+    let (auto_approve_enabled, resolved_from) =
+        resolve_proposal_approval_mode(state.store.as_ref(), sandbox.object_name()).await?;
 
     // The credential set is stable across all chunks in this batch, so build
     // it once. v1 captures presence only — no scope modeling — so the prover
@@ -2094,6 +2132,21 @@ pub(super) async fn handle_submit_policy_analysis(
         if chunk.rule_name.is_empty() {
             rejected += 1;
             rejection_reasons.push("chunk missing rule_name".to_string());
+            continue;
+        }
+        // `_provider_*` is the reserved namespace for rules synthesized from
+        // provider profiles during composition. Agent submissions that target
+        // those keys would merge directly into the provider rule and bypass
+        // the merge.rs guard that splits agent-authored chunks into their
+        // own rule so the prover sees their contribution honestly. Reject at
+        // the entry boundary — the agent never has reason to address a
+        // provider rule by name.
+        if chunk.rule_name.starts_with("_provider_") {
+            rejected += 1;
+            rejection_reasons.push(format!(
+                "chunk '{}' uses reserved '_provider_' rule-name prefix",
+                chunk.rule_name
+            ));
             continue;
         }
         if chunk.proposed_rule.is_none() {
@@ -2216,12 +2269,13 @@ pub(super) async fn handle_submit_policy_analysis(
 
         // Auto-approval gate (proposer-agnostic, opt-in): only fire when
         // BOTH the prover found nothing new in this proposal's delta AND
-        // the sandbox owner opted in via `proposal_approval_mode = "auto"`.
-        // On any failure (merge conflict, status update error), the chunk
-        // stays pending so a human can review — never silently lose a
-        // proposal. The `validation_result` literal here is the canonical
-        // empty-delta verdict; any other string means findings or
-        // infrastructure error, both of which require human attention.
+        // the reviewer opted in via the `proposal_approval_mode` setting
+        // (gateway or sandbox scope). On any failure (merge conflict,
+        // status update error), the chunk stays pending so a human can
+        // review — never silently lose a proposal. The `validation_result`
+        // literal here is the canonical empty-delta verdict; any other
+        // string means findings or infrastructure error, both of which
+        // require human attention.
         if auto_approve_enabled
             && validation_result == "prover: no new findings"
             && let Err(err) = auto_approve_chunk(
@@ -2230,6 +2284,7 @@ pub(super) async fn handle_submit_policy_analysis(
                 sandbox.object_name(),
                 &effective_id,
                 &req.analysis_mode,
+                resolved_from,
             )
             .await
         {
@@ -5097,6 +5152,56 @@ mod tests {
         assert_eq!(policy.process.unwrap().run_as_user, "sandbox");
     }
 
+    /// Test helper: pin the proposal approval mode for a sandbox via the
+    /// settings model, mirroring what `openshell settings set <name>
+    /// proposal_approval_mode <mode>` would do at runtime.
+    async fn seed_sandbox_approval_mode(state: &Arc<ServerState>, sandbox_name: &str, mode: &str) {
+        let mut settings = load_sandbox_settings(state.store.as_ref(), sandbox_name)
+            .await
+            .unwrap();
+        settings.settings.insert(
+            settings::PROPOSAL_APPROVAL_MODE_KEY.to_string(),
+            StoredSettingValue::String(mode.to_string()),
+        );
+        settings.revision = settings.revision.wrapping_add(1);
+        save_sandbox_settings(state.store.as_ref(), sandbox_name, &settings)
+            .await
+            .unwrap();
+    }
+
+    /// Test helper: pin the gateway-wide proposal approval mode, mirroring
+    /// `openshell settings set --global proposal_approval_mode <mode>`.
+    async fn seed_global_approval_mode(state: &Arc<ServerState>, mode: &str) {
+        let mut settings = load_global_settings(state.store.as_ref()).await.unwrap();
+        settings.settings.insert(
+            settings::PROPOSAL_APPROVAL_MODE_KEY.to_string(),
+            StoredSettingValue::String(mode.to_string()),
+        );
+        settings.revision = settings.revision.wrapping_add(1);
+        save_global_settings(state.store.as_ref(), &settings)
+            .await
+            .unwrap();
+    }
+
+    async fn test_server_state() -> Arc<ServerState> {
+        let store = Arc::new(
+            Store::connect("sqlite::memory:?cache=shared")
+                .await
+                .unwrap(),
+        );
+        let compute = new_test_runtime(store.clone()).await;
+        Arc::new(ServerState::new(
+            Config::new(None).with_database_url("sqlite::memory:?cache=shared"),
+            store,
+            compute,
+            SandboxIndex::new(),
+            SandboxWatchBus::new(),
+            TracingLogBus::new(),
+            Arc::new(SupervisorSessionRegistry::new()),
+            None,
+        ))
+    }
+
     #[tokio::test]
     async fn draft_chunk_handler_lifecycle_round_trip() {
         use openshell_core::proto::{
@@ -5442,15 +5547,16 @@ mod tests {
                     }),
                     ..Default::default()
                 }),
-                // Opt this sandbox into auto-approval to exercise the
-                // empty-delta → approved path.
-                proposal_approval_mode: "auto".to_string(),
                 ..Default::default()
             }),
             phase: SandboxPhase::Ready as i32,
             ..Default::default()
         };
         state.store.put_message(&sandbox).await.unwrap();
+        // Opt this sandbox into auto-approval via the settings model — same
+        // path the CLI's `--approval-mode auto` exercises — to test the
+        // empty-delta → approved path.
+        seed_sandbox_approval_mode(&state, &sandbox_name, "auto").await;
 
         let proposed_rule = NetworkPolicyRule {
             name: "github_contents_write".to_string(),
@@ -5758,14 +5864,15 @@ mod tests {
                     ..Default::default()
                 }),
                 // No providers → no credential in scope for the proposed host.
-                // Opt into auto mode to test the proposer-agnostic gate.
-                proposal_approval_mode: "auto".to_string(),
                 ..Default::default()
             }),
             phase: SandboxPhase::Ready as i32,
             ..Default::default()
         };
         state.store.put_message(&sandbox).await.unwrap();
+        // Opt into auto mode via the settings model to test the
+        // proposer-agnostic gate.
+        seed_sandbox_approval_mode(&state, &sandbox_name, "auto").await;
 
         let proposed_rule = NetworkPolicyRule {
             name: "anon_l4".to_string(),
@@ -5853,13 +5960,13 @@ mod tests {
                     ..Default::default()
                 }),
                 providers: vec!["github-pat".to_string()],
-                proposal_approval_mode: "auto".to_string(),
                 ..Default::default()
             }),
             phase: SandboxPhase::Ready as i32,
             ..Default::default()
         };
         state.store.put_message(&sandbox).await.unwrap();
+        seed_sandbox_approval_mode(&state, &sandbox_name, "auto").await;
 
         // L7-annotated (protocol: rest, enforce) but access: full — no
         // method/path bound. Credential in scope.
@@ -5926,11 +6033,11 @@ mod tests {
     }
 
     /// Acceptance criterion #7: default approval mode is manual. A sandbox
-    /// with `proposal_approval_mode` unset (the proto3 default of `""`)
-    /// must NOT auto-approve empty-delta proposals; the chunk lands in
-    /// `pending` for human review. This is the default-deny safeguard:
-    /// auto-approval is an explicit per-sandbox opt-in, not a global
-    /// behavior change shipped under a feature.
+    /// with no `proposal_approval_mode` setting at either scope must NOT
+    /// auto-approve empty-delta proposals; the chunk lands in `pending` for
+    /// human review. This is the default-deny safeguard: auto-approval is
+    /// an explicit opt-in, not a global behavior change shipped under a
+    /// feature.
     #[tokio::test]
     async fn empty_delta_does_not_auto_approve_when_mode_unset() {
         use openshell_core::proto::{
@@ -5956,8 +6063,8 @@ mod tests {
                     }),
                     ..Default::default()
                 }),
-                // proposal_approval_mode left as proto3 default ("") — must
-                // be treated as "manual".
+                // No approval-mode setting seeded at sandbox or gateway
+                // scope — the resolver must treat absence as "manual".
                 ..Default::default()
             }),
             phase: SandboxPhase::Ready as i32,
@@ -6048,14 +6155,14 @@ mod tests {
                     }),
                     ..Default::default()
                 }),
-                // A future-CLI value the current gateway doesn't recognize.
-                proposal_approval_mode: "auto_on_low_risk".to_string(),
                 ..Default::default()
             }),
             phase: SandboxPhase::Ready as i32,
             ..Default::default()
         };
         state.store.put_message(&sandbox).await.unwrap();
+        // A future-CLI value the current gateway doesn't recognize.
+        seed_sandbox_approval_mode(&state, &sandbox_name, "auto_on_low_risk").await;
 
         let proposed_rule = NetworkPolicyRule {
             name: "anon_l4".to_string(),
@@ -6132,13 +6239,13 @@ mod tests {
                     }),
                     ..Default::default()
                 }),
-                proposal_approval_mode: "manual".to_string(),
                 ..Default::default()
             }),
             phase: SandboxPhase::Ready as i32,
             ..Default::default()
         };
         state.store.put_message(&sandbox).await.unwrap();
+        seed_sandbox_approval_mode(&state, &sandbox_name, "manual").await;
 
         let proposed_rule = NetworkPolicyRule {
             name: "anon_l4".to_string(),
@@ -6185,6 +6292,263 @@ mod tests {
             "explicit manual mode must equal default mode — no auto-approval; \
              got: {}",
             draft.chunks[0].status
+        );
+    }
+
+    /// Gateway-scope `proposal_approval_mode = "auto"` enables auto-approval
+    /// for any sandbox under that gateway, with no per-sandbox setting
+    /// required. This is the fleet-wide opt-in path — a reviewer flips the
+    /// gateway setting once and every sandbox without an explicit override
+    /// gets prover-gated auto-approval.
+    #[tokio::test]
+    async fn empty_delta_auto_approves_from_gateway_scope_setting() {
+        use openshell_core::proto::{
+            FilesystemPolicy, NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxPolicy,
+            SandboxSpec,
+        };
+
+        let state = test_server_state().await;
+        let sandbox_name = "gateway-auto-mode".to_string();
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-gateway-auto-mode".to_string(),
+                name: sandbox_name.clone(),
+                created_at_ms: 1_000_000,
+                labels: std::collections::HashMap::new(),
+            }),
+            spec: Some(SandboxSpec {
+                policy: Some(SandboxPolicy {
+                    version: 1,
+                    filesystem: Some(FilesystemPolicy {
+                        read_write: vec!["/sandbox".to_string()],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            phase: SandboxPhase::Ready as i32,
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+        // Fleet-wide opt-in — no sandbox-scope setting.
+        seed_global_approval_mode(&state, "auto").await;
+
+        let proposed_rule = NetworkPolicyRule {
+            name: "anon_l4".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "example.com".to_string(),
+                port: 443,
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        handle_submit_policy_analysis(
+            &state,
+            Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.clone(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "anon_l4".to_string(),
+                    proposed_rule: Some(proposed_rule),
+                    rationale: "un-credentialed L4 — empty delta".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let draft = handle_get_draft_policy(
+            &state,
+            Request::new(GetDraftPolicyRequest {
+                name: sandbox_name,
+                status_filter: String::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(
+            draft.chunks[0].status, "approved",
+            "empty-delta proposal must auto-approve when the gateway-scope \
+             setting is \"auto\" and no sandbox-scope override exists. got: {}",
+            draft.chunks[0].status
+        );
+    }
+
+    /// Gateway scope wins over sandbox scope. A reviewer can pin manual mode
+    /// fleet-wide; a per-sandbox `"auto"` value is silently ignored. Matches
+    /// the existing settings precedence convention (global wins, sandbox is
+    /// the per-sandbox override only when no global is set).
+    #[tokio::test]
+    async fn gateway_manual_overrides_sandbox_auto() {
+        use openshell_core::proto::{
+            FilesystemPolicy, NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxPolicy,
+            SandboxSpec,
+        };
+
+        let state = test_server_state().await;
+        let sandbox_name = "gateway-pinned-manual".to_string();
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-gateway-pinned-manual".to_string(),
+                name: sandbox_name.clone(),
+                created_at_ms: 1_000_000,
+                labels: std::collections::HashMap::new(),
+            }),
+            spec: Some(SandboxSpec {
+                policy: Some(SandboxPolicy {
+                    version: 1,
+                    filesystem: Some(FilesystemPolicy {
+                        read_write: vec!["/sandbox".to_string()],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            phase: SandboxPhase::Ready as i32,
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+        // Gateway pins manual; the sandbox-scope override is supplied (test
+        // helper bypasses the UpdateConfig precondition, simulating the
+        // before-pin state) to prove the resolver still picks the gateway
+        // value.
+        seed_global_approval_mode(&state, "manual").await;
+        seed_sandbox_approval_mode(&state, &sandbox_name, "auto").await;
+
+        let proposed_rule = NetworkPolicyRule {
+            name: "anon_l4".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "example.com".to_string(),
+                port: 443,
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        handle_submit_policy_analysis(
+            &state,
+            Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.clone(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "anon_l4".to_string(),
+                    proposed_rule: Some(proposed_rule),
+                    rationale: "un-credentialed L4 — empty delta".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let draft = handle_get_draft_policy(
+            &state,
+            Request::new(GetDraftPolicyRequest {
+                name: sandbox_name,
+                status_filter: String::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(
+            draft.chunks[0].status, "pending",
+            "gateway-scope \"manual\" must win over sandbox-scope \"auto\"; \
+             got: {}",
+            draft.chunks[0].status
+        );
+    }
+
+    /// Agent submissions targeting a `_provider_*` rule name are rejected at
+    /// the submit boundary. Provider-synthesized rules are a reserved
+    /// namespace; an agent that addresses one by name could otherwise
+    /// circumvent the merge guard that splits agent contributions into their
+    /// own rule (so the prover sees them honestly).
+    #[tokio::test]
+    async fn submit_rejects_reserved_provider_rule_name_prefix() {
+        use openshell_core::proto::{
+            FilesystemPolicy, NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxPolicy,
+            SandboxSpec,
+        };
+
+        let state = test_server_state().await;
+        let sandbox_name = "reject-provider-prefix".to_string();
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-reject-provider-prefix".to_string(),
+                name: sandbox_name.clone(),
+                created_at_ms: 1_000_000,
+                labels: std::collections::HashMap::new(),
+            }),
+            spec: Some(SandboxSpec {
+                policy: Some(SandboxPolicy {
+                    version: 1,
+                    filesystem: Some(FilesystemPolicy {
+                        read_write: vec!["/sandbox".to_string()],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            phase: SandboxPhase::Ready as i32,
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let proposed_rule = NetworkPolicyRule {
+            name: "github".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "api.github.com".to_string(),
+                port: 443,
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        let response = handle_submit_policy_analysis(
+            &state,
+            Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.clone(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "_provider_work_github".to_string(),
+                    proposed_rule: Some(proposed_rule),
+                    rationale: "should be rejected — addresses provider rule by name".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(response.accepted_chunks, 0, "chunk must be rejected");
+        assert_eq!(response.rejected_chunks, 1);
+        assert!(
+            response
+                .rejection_reasons
+                .iter()
+                .any(|r| r.contains("_provider_")),
+            "rejection reason must cite the reserved-prefix rule. got: {:?}",
+            response.rejection_reasons,
         );
     }
 
@@ -6652,13 +7016,13 @@ mod tests {
                     ..Default::default()
                 }),
                 providers: vec!["github-pat".to_string()],
-                proposal_approval_mode: "auto".to_string(),
                 ..Default::default()
             }),
             phase: SandboxPhase::Ready as i32,
             ..Default::default()
         };
         state.store.put_message(&sandbox).await.unwrap();
+        seed_sandbox_approval_mode(&state, &sandbox_name, "auto").await;
 
         // ── Step 1: un-credentialed GET → expected auto-approve ──
         let uncredentialed_rule = NetworkPolicyRule {

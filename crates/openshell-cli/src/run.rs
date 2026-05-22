@@ -1772,7 +1772,6 @@ pub async fn sandbox_create(
             policy,
             providers: configured_providers,
             template,
-            proposal_approval_mode: approval_mode.to_string(),
             ..SandboxSpec::default()
         }),
         name: name.unwrap_or_default().to_string(),
@@ -1806,6 +1805,37 @@ pub async fn sandbox_create(
     // is expected to persist beyond the initial session.
     if persist && let Some(gateway) = effective_tls.gateway_name() {
         let _ = save_last_sandbox(gateway, &sandbox_name);
+    }
+
+    // Persist `--approval-mode` as a sandbox-scoped setting now that the
+    // sandbox exists. `manual` is the implicit default (no setting needed);
+    // any other value is written so it survives sandbox restarts and can be
+    // flipped later via `openshell settings set <name> proposal_approval_mode`.
+    // If the write fails the sandbox still runs in default `manual` — surface
+    // the recovery command so the user can retry.
+    if approval_mode != "manual" {
+        let setting = parse_cli_setting_value(settings::PROPOSAL_APPROVAL_MODE_KEY, approval_mode)?;
+        match client
+            .update_config(UpdateConfigRequest {
+                name: sandbox_name.clone(),
+                policy: None,
+                setting_key: settings::PROPOSAL_APPROVAL_MODE_KEY.to_string(),
+                setting_value: Some(setting),
+                delete_setting: false,
+                global: false,
+                merge_operations: vec![],
+            })
+            .await
+        {
+            Ok(_) => {}
+            Err(status) => {
+                eprintln!(
+                    "{} failed to set approval mode '{approval_mode}' on sandbox '{sandbox_name}': {}\n  retry with: openshell settings set {sandbox_name} proposal_approval_mode {approval_mode}",
+                    "warning:".yellow().bold(),
+                    status.message(),
+                );
+            }
+        }
     }
 
     // Set up display — interactive terminals get a step-based checklist with

@@ -98,17 +98,18 @@ agent-authored via `policy.local`); the gateway is the single referee.
    chunk regardless of mode. The prover builds a Z3 model from the merged
    policy plus the sandbox's attached-provider credential set, then computes
    the delta of findings between the current baseline and the merged policy.
-3. **Auto-approval gate (proposer-agnostic, opt-in per sandbox).** Auto-approval
-   fires when *both* (a) the prover delta is empty (`prover: no new findings`)
-   AND (b) the sandbox sets `spec.proposal_approval_mode = "auto"`. When both
-   hold, the gateway internally invokes the approve path with actor identity
-   `system:auto`. The audit event uses `CONFIG:APPROVED` and carries `auto=true`,
-   `source=<mode>`, `prover_delta=empty` as unmapped fields, with message text
-   `"auto-approved: no new prover findings"` — never `safe`. The opt-in gate
-   preserves OpenShell's default-deny posture: sandboxes that leave
-   `proposal_approval_mode` unset (proto3 default of `""`, treated as
-   `"manual"`) keep every proposal in `pending` for human review, even when
-   the prover sees no findings.
+3. **Auto-approval gate (proposer-agnostic, opt-in).** Auto-approval fires
+   when *both* (a) the prover delta is empty (`prover: no new findings`) AND
+   (b) the `proposal_approval_mode` setting resolves to `"auto"` — gateway
+   scope wins, sandbox scope is the per-sandbox override, default is
+   `"manual"`. When both hold, the gateway internally invokes the approve
+   path with actor identity `system:auto`. The audit event uses
+   `CONFIG:APPROVED` and carries `auto=true`, `source=<mode>`,
+   `prover_delta=empty`, and `resolved_from=<gateway|sandbox>` as unmapped
+   fields, with message text `"auto-approved: no new prover findings"` —
+   never `safe`. The opt-in gate preserves OpenShell's default-deny
+   posture: with no setting at either scope, every proposal lands in
+   `pending` for human review, even when the prover sees no findings.
 4. **Implicit supersede.** On any successful submission, the gateway scans
    the sandbox's pending chunks for matches on `(host, port, binary)` and
    auto-rejects the older ones with reason `"superseded by chunk X"`. This

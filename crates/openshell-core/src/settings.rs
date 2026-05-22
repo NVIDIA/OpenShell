@@ -59,6 +59,21 @@ pub const PROVIDERS_V2_ENABLED_KEY: &str = "providers_v2_enabled";
 /// still applies when this flag is on.
 pub const AGENT_POLICY_PROPOSALS_ENABLED_KEY: &str = "agent_policy_proposals_enabled";
 
+/// Approval mode for agent-authored policy proposals.
+///
+/// `"manual"` (the default when unset): every proposal lands in the draft
+/// inbox for human review, regardless of the prover verdict. `"auto"`:
+/// proposals whose prover delta is empty are approved automatically;
+/// proposals with findings still require human approval. Any other value
+/// (typos, future-reserved modes like `"auto_on_low_risk"`) falls back to
+/// manual — auto mode is an explicit, exact opt-in.
+///
+/// Resolution precedence (matches the rest of the settings model): gateway
+/// scope wins over sandbox scope. A reviewer can pin manual mode for a
+/// fleet by setting it globally; per-sandbox overrides only apply when no
+/// global is set.
+pub const PROPOSAL_APPROVAL_MODE_KEY: &str = "proposal_approval_mode";
+
 pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
     // Gateway-level opt-in for provider profile policy composition. Defaults
     // to false when unset.
@@ -78,6 +93,12 @@ pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
     RegisteredSetting {
         key: AGENT_POLICY_PROPOSALS_ENABLED_KEY,
         kind: SettingValueKind::Bool,
+    },
+    // Approval mode for agent-authored proposals. See
+    // PROPOSAL_APPROVAL_MODE_KEY for details. Defaults to manual.
+    RegisteredSetting {
+        key: PROPOSAL_APPROVAL_MODE_KEY,
+        kind: SettingValueKind::String,
     },
     // Test-only keys live behind the `dev-settings` feature flag so they
     // don't appear in production builds.

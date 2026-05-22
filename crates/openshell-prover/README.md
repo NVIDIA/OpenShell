@@ -10,8 +10,8 @@ capability changes a reviewer should be aware of.
 
 Used by the gateway to gate auto-approval of agent-authored policy
 proposals: any finding blocks auto-approval, an empty delta lets the
-chunk pass through (when the sandbox opts in via
-`spec.proposal_approval_mode = "auto"`).
+chunk pass through (when the reviewer opts in via the
+`proposal_approval_mode` setting at either gateway or sandbox scope).
 
 ## What it decides
 

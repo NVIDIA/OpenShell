@@ -67,7 +67,8 @@ network_policies:
     # any additional GET paths it actually needs. Each new proposal is
     # un-credentialed (no provider declares this host), so the prover
     # sees no findings and the gateway auto-approves narrow scoped reads
-    # under sandboxes opted into `proposal_approval_mode: auto`.
+    # when `proposal_approval_mode = auto` (set via `--approval-mode auto`
+    # at create or via `openshell settings set` at runtime).
     name: github-raw-scoped
     endpoints:
       - host: raw.githubusercontent.com

@@ -127,17 +127,22 @@ A complete narrow REST-inspected rule looks like this:
 
 ## Auto-approval
 
-Auto-approval is opt-in per sandbox. A sandbox set to
-`proposal_approval_mode = "auto"` will auto-approve any proposal the
-prover sees as empty-delta; sandboxes left in `"manual"` (the default)
-route every proposal to human review regardless of the prover verdict.
+Auto-approval is opt-in via the `proposal_approval_mode` setting,
+managed through the standard settings model. Reviewers set it at the
+gateway scope (fleet-wide) with `openshell settings set --global
+proposal_approval_mode auto` or at the sandbox scope with `openshell
+settings set <name> proposal_approval_mode auto`. The CLI's `openshell
+sandbox create --approval-mode auto` is a shorthand that writes the
+sandbox-scoped setting at create time. Gateway scope wins when both are
+set; the default (no setting) is `"manual"`.
 
-When the sandbox is in `"auto"` mode and the prover finds nothing new,
-the gateway approves the chunk with actor `system:auto` and the
-`CONFIG:APPROVED` audit event carries `auto=true`, `source=<mode>`, and
-`prover_delta=empty`. The agent's `/wait` returns approved in ~1
-second. When the prover does find something — or the sandbox is in
-`"manual"` mode — the chunk lands in `pending` for human review.
+When auto-approval is enabled and the prover finds nothing new, the
+gateway approves the chunk with actor `system:auto` and the
+`CONFIG:APPROVED` audit event carries `auto=true`, `source=<mode>`,
+`prover_delta=empty`, and `resolved_from=<gateway|sandbox>`. The
+agent's `/wait` returns approved in ~1 second. When the prover does
+find something — or the setting is `"manual"`/unset — the chunk lands
+in `pending` for human review.
 
 The prover answers four formal questions about each proposed change.
 Each "yes" answer is its own categorical finding — there is no
