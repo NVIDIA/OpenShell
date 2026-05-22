@@ -3422,6 +3422,7 @@ mod tests {
                 name: name.to_string(),
                 created_at_ms: 1_000_000,
                 labels: HashMap::new(),
+                resource_version: 0,
             }),
             r#type: "microsoft-agent-s2s".to_string(),
             credentials: std::iter::once((
@@ -3444,6 +3445,7 @@ mod tests {
                     "api://allowed".to_string(),
                 ),
             ]),
+            credential_expires_at_ms: HashMap::new(),
         }
     }
 

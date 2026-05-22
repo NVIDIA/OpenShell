@@ -400,12 +400,7 @@ pub async fn run_sandbox(
             )
         };
 
-    let provider_credentials = provider_credentials::ProviderCredentialState::from_environment(
-        provider_env_revision,
-        provider_env,
-        provider_credential_expires_at_ms,
-    );
-    let provider_env = provider_credentials.snapshot().child_env.clone();
+    let mut provider_env = provider_env;
     let provider_token_resolver_port =
         provider_tokens::microsoft_agent_s2s_resolver_port(&provider_env);
 
