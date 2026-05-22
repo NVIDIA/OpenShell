@@ -1153,7 +1153,7 @@ enum SandboxCommands {
         #[arg(long, add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
 
-        /// Sandbox source: a community sandbox name (e.g., `openclaw`), a path
+        /// Sandbox source: a community sandbox name (e.g., `ollama`), a path
         /// to a Dockerfile or directory containing one, or a full container
         /// image reference (e.g., `myregistry.com/img:tag`).
         ///

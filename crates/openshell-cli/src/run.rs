@@ -2013,7 +2013,7 @@ pub async fn sandbox_create(
 
             // If --forward was requested, start the background port forward
             // *before* running the command so that long-running processes
-            // (e.g. `openclaw gateway`) are reachable immediately.
+            // (e.g. a web gateway) are reachable immediately.
             if let Some(ref spec) = forward {
                 sandbox_forward(
                     &effective_server,
@@ -7356,7 +7356,7 @@ mod tests {
         for image in [
             "ghcr.io/nvidia/openshell-community/sandboxes/base:latest",
             "registry.example.com/gpu/team/base:latest",
-            "registry.example.com/team/openclaw:latest",
+            "registry.example.com/team/notebook:latest",
             "cuda-toolkit:latest",
             "registry.example.com/team/graphics:latest",
         ] {
@@ -7468,10 +7468,10 @@ mod tests {
     fn service_url_for_gateway_uses_external_gateway_port() {
         assert_eq!(
             service_url_for_gateway(
-                "https://quiet-flamingo--openclaw.navigator.openshell.localhost:8080/",
+                "https://quiet-flamingo--notebook.navigator.openshell.localhost:8080/",
                 "https://127.0.0.1:31886"
             ),
-            "https://quiet-flamingo--openclaw.navigator.openshell.localhost:31886/"
+            "https://quiet-flamingo--notebook.navigator.openshell.localhost:31886/"
         );
     }
 
@@ -7479,10 +7479,10 @@ mod tests {
     fn service_url_for_gateway_omits_default_external_port() {
         assert_eq!(
             service_url_for_gateway(
-                "https://quiet-flamingo--openclaw.navigator.openshell.localhost:8080/",
+                "https://quiet-flamingo--notebook.navigator.openshell.localhost:8080/",
                 "https://gateway.example.com"
             ),
-            "https://quiet-flamingo--openclaw.navigator.openshell.localhost/"
+            "https://quiet-flamingo--notebook.navigator.openshell.localhost/"
         );
     }
 
@@ -7490,10 +7490,10 @@ mod tests {
     fn service_url_for_gateway_preserves_service_scheme() {
         assert_eq!(
             service_url_for_gateway(
-                "http://quiet-flamingo--openclaw.navigator.openshell.localhost:8080/",
+                "http://quiet-flamingo--notebook.navigator.openshell.localhost:8080/",
                 "https://127.0.0.1:31886"
             ),
-            "http://quiet-flamingo--openclaw.navigator.openshell.localhost:31886/"
+            "http://quiet-flamingo--notebook.navigator.openshell.localhost:31886/"
         );
     }
 
@@ -7501,10 +7501,10 @@ mod tests {
     fn service_url_for_gateway_uses_gateway_default_port() {
         assert_eq!(
             service_url_for_gateway(
-                "http://quiet-flamingo--openclaw.navigator.openshell.localhost:8080/",
+                "http://quiet-flamingo--notebook.navigator.openshell.localhost:8080/",
                 "https://gateway.example.com"
             ),
-            "http://quiet-flamingo--openclaw.navigator.openshell.localhost:443/"
+            "http://quiet-flamingo--notebook.navigator.openshell.localhost:443/"
         );
     }
 

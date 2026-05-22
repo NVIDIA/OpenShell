@@ -606,7 +606,7 @@ Deliverables:
 - Structured deny messages that point agents to the local policy workflow.
 - Feedback path so agents can read operator rejection guidance and iterate on a proposal.
 
-This is the point where the feature becomes broadly useful to OpenClaw, Claude Code, Cursor, and other agents.
+This is the point where the feature becomes broadly useful to NemoClaw, Claude Code, Cursor, and other agents.
 
 ### Phase 3: Validation and simulation
 

@@ -394,7 +394,7 @@ def generate_homebrew_formula(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="OpenClaw release tooling.")
+    parser = argparse.ArgumentParser(description="OpenShell release tooling.")
     sub = parser.add_subparsers(dest="command", required=True)
 
     get_version_parser = sub.add_parser("get-version", help="Print computed version.")
