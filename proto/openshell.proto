@@ -322,6 +322,20 @@ message SandboxSpec {
   // (e.g. "0", "1"). When empty with gpu=true, the driver assigns the
   // first available GPU.
   string gpu_device = 10;
+  // Approval mode for agent-authored policy proposals.
+  //
+  // When unset or "manual" (the default), every proposal lands in the
+  // draft inbox for human review, regardless of the prover verdict.
+  //
+  // When "auto", proposals whose prover delta is empty are approved
+  // automatically without human action; proposals with findings still
+  // require human approval. The opt-in preserves OpenShell's
+  // default-deny posture: auto-approval is a deliberate per-sandbox
+  // choice, not a global behavior change.
+  //
+  // Empty string defaults to "manual". String (not enum) so future
+  // modes ("auto_on_low_risk", etc.) extend without a proto migration.
+  string proposal_approval_mode = 11;
 }
 
 // Public sandbox template mapped onto compute-driver template inputs.

@@ -2024,6 +2024,16 @@ pub(super) async fn handle_submit_policy_analysis(
     // fix is to recompute baseline after each successful auto-approve.
     let current_policy = current_effective_policy_for_sandbox(state, &sandbox, &sandbox_id).await?;
 
+    // Auto-approval is an opt-in per-sandbox behavior. Default (empty or
+    // explicit "manual") preserves OpenShell's default-deny posture: every
+    // proposal lands in `pending` for a human reviewer. Only sandboxes that
+    // explicitly set `proposal_approval_mode = "auto"` get prover-gated
+    // auto-approval for empty-delta proposals.
+    let auto_approve_enabled = sandbox
+        .spec
+        .as_ref()
+        .is_some_and(|spec| spec.proposal_approval_mode == "auto");
+
     // The credential set is stable across all chunks in this batch, so build
     // it once. v1 captures presence only — no scope modeling — so the prover
     // can answer "is there a credential in scope for this host?" but not
@@ -2172,14 +2182,16 @@ pub(super) async fn handle_submit_policy_analysis(
             .await;
         }
 
-        // Auto-approval gate (proposer-agnostic): if the prover found nothing
-        // new in this proposal's delta, internally invoke the approve path.
+        // Auto-approval gate (proposer-agnostic, opt-in): only fire when
+        // BOTH the prover found nothing new in this proposal's delta AND
+        // the sandbox owner opted in via `proposal_approval_mode = "auto"`.
         // On any failure (merge conflict, status update error), the chunk
         // stays pending so a human can review — never silently lose a
         // proposal. The `validation_result` literal here is the canonical
         // empty-delta verdict; any other string means findings or
         // infrastructure error, both of which require human attention.
-        if validation_result == "prover: no new findings"
+        if auto_approve_enabled
+            && validation_result == "prover: no new findings"
             && let Err(err) = auto_approve_chunk(
                 state,
                 &sandbox_id,
@@ -5398,6 +5410,9 @@ mod tests {
                     }),
                     ..Default::default()
                 }),
+                // Opt this sandbox into auto-approval to exercise the
+                // empty-delta → approved path.
+                proposal_approval_mode: "auto".to_string(),
                 ..Default::default()
             }),
             phase: SandboxPhase::Ready as i32,
@@ -5460,11 +5475,13 @@ mod tests {
             "exact L7 PUT against an inspected endpoint should not introduce \
              any new findings over baseline; got: {verdict}"
         );
-        // Auto-approval gate: empty delta → status flips to approved without
-        // human action. This is the canonical happy path for agent speed.
+        // Auto-approval gate: empty delta + sandbox opted into auto mode →
+        // status flips to approved without human action. The canonical
+        // happy path for agent speed.
         assert_eq!(
             draft.chunks[0].status, "approved",
-            "empty-delta agent-authored proposal must auto-approve; got status: {}",
+            "empty-delta agent-authored proposal under auto mode must auto-approve; \
+             got status: {}",
             draft.chunks[0].status
         );
     }
@@ -5568,8 +5585,12 @@ mod tests {
         assert!(mech.validation_result.contains("[HIGH]"));
 
         // Step 2: the agent refines into a narrow L7 proposal for the SAME
-        // (host, port, binary). The new chunk auto-approves (empty delta)
-        // AND the older mechanistic one gets auto-rejected as superseded.
+        // (host, port, binary). Under v1 calibration, L7 with a credential
+        // in scope flags MEDIUM (bounded but authenticated), so the agent
+        // chunk stays pending for human review. The mechanistic chunk gets
+        // auto-rejected as superseded regardless of the agent chunk's own
+        // validation verdict — supersede is unconditional on `(host, port,
+        // binary)` overlap.
         let agent_rule = NetworkPolicyRule {
             name: "github_contents_put".to_string(),
             endpoints: vec![NetworkEndpoint {
@@ -5633,9 +5654,16 @@ mod tests {
             .expect("mechanistic chunk should still be visible (with new status)");
 
         assert_eq!(
-            agent.status, "approved",
-            "agent-authored narrow L7 should auto-approve; got: {}",
+            agent.status, "pending",
+            "agent-authored narrow L7 with credential in scope flags MEDIUM under v1 \
+             calibration; it should land in pending for human review, not auto-approve; \
+             got: {}",
             agent.status
+        );
+        assert!(
+            agent.validation_result.contains("[MEDIUM]"),
+            "agent chunk should carry the MEDIUM L7+credential verdict; got: {}",
+            agent.validation_result
         );
         assert_eq!(
             mech_after.status, "rejected",
@@ -5685,6 +5713,8 @@ mod tests {
                     ..Default::default()
                 }),
                 // No providers → no credential in scope for the proposed host.
+                // Opt into auto mode to test the proposer-agnostic gate.
+                proposal_approval_mode: "auto".to_string(),
                 ..Default::default()
             }),
             phase: SandboxPhase::Ready as i32,
@@ -5736,8 +5766,378 @@ mod tests {
         assert_eq!(verdict, "prover: no new findings");
         assert_eq!(
             draft.chunks[0].status, "approved",
-            "empty-delta mechanistic proposal must auto-approve (proposer-agnostic); \
-             got status: {}",
+            "empty-delta mechanistic proposal under auto mode must auto-approve \
+             (proposer-agnostic); got status: {}",
+            draft.chunks[0].status
+        );
+    }
+
+    /// `protocol: rest, access: full` is L7-annotated but L4-equivalent in
+    /// reach — the L7 protocol doesn't actually bound what the binary can
+    /// do. With a credential in scope, this must emit HIGH (not MEDIUM),
+    /// because the agent has done no meaningful narrowing despite the L7
+    /// dressing. Regression test for the narrowness classifier in
+    /// `openshell-prover::queries::endpoint_is_narrowly_bounded`.
+    #[tokio::test]
+    async fn agent_authored_l7_full_with_credential_records_high_finding() {
+        use openshell_core::proto::{
+            FilesystemPolicy, NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxPolicy,
+            SandboxSpec,
+        };
+
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("github-pat", "github"))
+            .await
+            .unwrap();
+        let sandbox_name = "l7-full-with-cred".to_string();
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-l7-full-with-cred".to_string(),
+                name: sandbox_name.clone(),
+                created_at_ms: 1_000_000,
+                labels: std::collections::HashMap::new(),
+            }),
+            spec: Some(SandboxSpec {
+                policy: Some(SandboxPolicy {
+                    version: 1,
+                    filesystem: Some(FilesystemPolicy {
+                        read_write: vec!["/sandbox".to_string()],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                providers: vec!["github-pat".to_string()],
+                proposal_approval_mode: "auto".to_string(),
+                ..Default::default()
+            }),
+            phase: SandboxPhase::Ready as i32,
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+
+        // L7-annotated (protocol: rest, enforce) but access: full — no
+        // method/path bound. Credential in scope.
+        let proposed_rule = NetworkPolicyRule {
+            name: "github_l7_full".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "api.github.com".to_string(),
+                port: 443,
+                protocol: "rest".to_string(),
+                enforcement: "enforce".to_string(),
+                access: "full".to_string(),
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        handle_submit_policy_analysis(
+            &state,
+            Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.clone(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "github_l7_full".to_string(),
+                    proposed_rule: Some(proposed_rule),
+                    rationale: "broad L7 dressing".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let draft = handle_get_draft_policy(
+            &state,
+            Request::new(GetDraftPolicyRequest {
+                name: sandbox_name,
+                status_filter: String::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let verdict = &draft.chunks[0].validation_result;
+        assert!(
+            verdict.contains("[HIGH]"),
+            "L7 `access: full` with credential in scope must emit HIGH (not MEDIUM) — \
+             the L7 annotation doesn't actually narrow reach. got: {verdict}"
+        );
+        assert!(
+            !verdict.contains("[MEDIUM]"),
+            "MEDIUM must NOT fire when the L7 scope is effectively all-methods; got: {verdict}"
+        );
+        assert_eq!(
+            draft.chunks[0].status, "pending",
+            "HIGH finding must keep the chunk in pending despite auto mode; got: {}",
+            draft.chunks[0].status
+        );
+    }
+
+    /// Acceptance criterion #7: default approval mode is manual. A sandbox
+    /// with `proposal_approval_mode` unset (the proto3 default of `""`)
+    /// must NOT auto-approve empty-delta proposals; the chunk lands in
+    /// `pending` for human review. This is the default-deny safeguard:
+    /// auto-approval is an explicit per-sandbox opt-in, not a global
+    /// behavior change shipped under a feature.
+    #[tokio::test]
+    async fn empty_delta_does_not_auto_approve_when_mode_unset() {
+        use openshell_core::proto::{
+            FilesystemPolicy, NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxPolicy,
+            SandboxSpec,
+        };
+
+        let state = test_server_state().await;
+        let sandbox_name = "default-manual-mode".to_string();
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-default-manual-mode".to_string(),
+                name: sandbox_name.clone(),
+                created_at_ms: 1_000_000,
+                labels: std::collections::HashMap::new(),
+            }),
+            spec: Some(SandboxSpec {
+                policy: Some(SandboxPolicy {
+                    version: 1,
+                    filesystem: Some(FilesystemPolicy {
+                        read_write: vec!["/sandbox".to_string()],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                // proposal_approval_mode left as proto3 default ("") — must
+                // be treated as "manual".
+                ..Default::default()
+            }),
+            phase: SandboxPhase::Ready as i32,
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let proposed_rule = NetworkPolicyRule {
+            name: "anon_l4".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "example.com".to_string(),
+                port: 443,
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        handle_submit_policy_analysis(
+            &state,
+            Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.clone(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "anon_l4".to_string(),
+                    proposed_rule: Some(proposed_rule),
+                    rationale: "un-credentialed L4 — prover sees no finding".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let draft = handle_get_draft_policy(
+            &state,
+            Request::new(GetDraftPolicyRequest {
+                name: sandbox_name,
+                status_filter: String::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let verdict = &draft.chunks[0].validation_result;
+        assert_eq!(
+            verdict, "prover: no new findings",
+            "prover should still emit no findings; gate is downstream",
+        );
+        assert_eq!(
+            draft.chunks[0].status, "pending",
+            "default (unset) proposal_approval_mode must not auto-approve; \
+             chunk should wait for human review. got status: {}",
+            draft.chunks[0].status
+        );
+    }
+
+    /// Unknown `proposal_approval_mode` strings (typos, future-mode values
+    /// the gateway doesn't yet know about) fall back to manual. This locks
+    /// in forward-compat: a future CLI that learns about `"auto_on_low_risk"`
+    /// can never accidentally bypass an older gateway's review gate just by
+    /// virtue of an unrecognized value defaulting to "auto."
+    #[tokio::test]
+    async fn empty_delta_does_not_auto_approve_when_mode_unknown_string() {
+        use openshell_core::proto::{
+            FilesystemPolicy, NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxPolicy,
+            SandboxSpec,
+        };
+
+        let state = test_server_state().await;
+        let sandbox_name = "unknown-mode".to_string();
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-unknown-mode".to_string(),
+                name: sandbox_name.clone(),
+                created_at_ms: 1_000_000,
+                labels: std::collections::HashMap::new(),
+            }),
+            spec: Some(SandboxSpec {
+                policy: Some(SandboxPolicy {
+                    version: 1,
+                    filesystem: Some(FilesystemPolicy {
+                        read_write: vec!["/sandbox".to_string()],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                // A future-CLI value the current gateway doesn't recognize.
+                proposal_approval_mode: "auto_on_low_risk".to_string(),
+                ..Default::default()
+            }),
+            phase: SandboxPhase::Ready as i32,
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let proposed_rule = NetworkPolicyRule {
+            name: "anon_l4".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "example.com".to_string(),
+                port: 443,
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        handle_submit_policy_analysis(
+            &state,
+            Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.clone(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "anon_l4".to_string(),
+                    proposed_rule: Some(proposed_rule),
+                    rationale: "un-credentialed L4".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let draft = handle_get_draft_policy(
+            &state,
+            Request::new(GetDraftPolicyRequest {
+                name: sandbox_name,
+                status_filter: String::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(
+            draft.chunks[0].status, "pending",
+            "unknown approval-mode strings must fall back to manual; \
+             only the literal \"auto\" opts in. got: {}",
+            draft.chunks[0].status
+        );
+    }
+
+    /// Explicit `"manual"` is equivalent to the unset default — chunk lands
+    /// in pending even with empty delta.
+    #[tokio::test]
+    async fn empty_delta_does_not_auto_approve_when_mode_explicit_manual() {
+        use openshell_core::proto::{
+            FilesystemPolicy, NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxPolicy,
+            SandboxSpec,
+        };
+
+        let state = test_server_state().await;
+        let sandbox_name = "explicit-manual-mode".to_string();
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-explicit-manual-mode".to_string(),
+                name: sandbox_name.clone(),
+                created_at_ms: 1_000_000,
+                labels: std::collections::HashMap::new(),
+            }),
+            spec: Some(SandboxSpec {
+                policy: Some(SandboxPolicy {
+                    version: 1,
+                    filesystem: Some(FilesystemPolicy {
+                        read_write: vec!["/sandbox".to_string()],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                proposal_approval_mode: "manual".to_string(),
+                ..Default::default()
+            }),
+            phase: SandboxPhase::Ready as i32,
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let proposed_rule = NetworkPolicyRule {
+            name: "anon_l4".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "example.com".to_string(),
+                port: 443,
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        handle_submit_policy_analysis(
+            &state,
+            Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.clone(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "anon_l4".to_string(),
+                    proposed_rule: Some(proposed_rule),
+                    rationale: "un-credentialed L4 — prover sees no finding".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let draft = handle_get_draft_policy(
+            &state,
+            Request::new(GetDraftPolicyRequest {
+                name: sandbox_name,
+                status_filter: String::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(
+            draft.chunks[0].status, "pending",
+            "explicit manual mode must equal default mode — no auto-approval; \
+             got: {}",
             draft.chunks[0].status
         );
     }
@@ -6150,6 +6550,193 @@ mod tests {
             !verdict.contains("validation unavailable"),
             "providers-v2 composition must not break the prover pipeline; \
              got: {verdict}"
+        );
+    }
+
+    /// End-to-end loop test against the v1 calibration and the auto-approval
+    /// gate. Mirrors the two-path flow in `examples/agent-driven-policy-management`:
+    ///
+    /// 1. Un-credentialed L7 proposal (raw.githubusercontent.com GET) →
+    ///    prover sees no findings → sandbox in `auto` mode → chunk
+    ///    auto-approves without human action.
+    ///
+    /// 2. Credentialed L7 proposal (api.github.com PUT) → prover sees
+    ///    `github_token` in scope, emits MEDIUM → chunk lands in pending
+    ///    for human review even under `auto` mode.
+    ///
+    /// This is the deterministic counterpart of the demo's product UX
+    /// claim: "narrow safe = free, narrow credentialed = one approval."
+    #[tokio::test]
+    async fn full_loop_under_v2_auto_mode_splits_credentialed_and_uncredentialed() {
+        use openshell_core::proto::{
+            FilesystemPolicy, L7Allow, L7Rule, NetworkBinary, NetworkEndpoint, SandboxPhase,
+            SandboxPolicy, SandboxSpec,
+        };
+
+        let state = test_server_state().await;
+        enable_providers_v2(&state).await;
+
+        // Github provider attached: a credential ends up in scope for
+        // api.github.com (PUT proposal flags MEDIUM). raw.githubusercontent.com
+        // is not declared by any provider, so the bootstrap fetch is
+        // un-credentialed and auto-approves.
+        state
+            .store
+            .put_message(&test_provider("github-pat", "github"))
+            .await
+            .unwrap();
+
+        let sandbox_name = "full-loop-v2".to_string();
+        let sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-full-loop-v2".to_string(),
+                name: sandbox_name.clone(),
+                created_at_ms: 1_000_000,
+                labels: std::collections::HashMap::new(),
+            }),
+            spec: Some(SandboxSpec {
+                policy: Some(SandboxPolicy {
+                    version: 1,
+                    filesystem: Some(FilesystemPolicy {
+                        read_write: vec!["/sandbox".to_string()],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                providers: vec!["github-pat".to_string()],
+                proposal_approval_mode: "auto".to_string(),
+                ..Default::default()
+            }),
+            phase: SandboxPhase::Ready as i32,
+            ..Default::default()
+        };
+        state.store.put_message(&sandbox).await.unwrap();
+
+        // ── Step 1: un-credentialed GET → expected auto-approve ──
+        let uncredentialed_rule = NetworkPolicyRule {
+            name: "github_raw_openapi_get".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "raw.githubusercontent.com".to_string(),
+                port: 443,
+                protocol: "rest".to_string(),
+                enforcement: "enforce".to_string(),
+                rules: vec![L7Rule {
+                    allow: Some(L7Allow {
+                        method: "GET".to_string(),
+                        path: "/github/rest-api-description/main/descriptions/api.github.com/api.github.com.json"
+                            .to_string(),
+                        ..Default::default()
+                    }),
+                }],
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+        let step1 = handle_submit_policy_analysis(
+            &state,
+            Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.clone(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "github_raw_openapi_get".to_string(),
+                    proposed_rule: Some(uncredentialed_rule),
+                    rationale: "fetch the public github openapi description".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let step1_chunk_id = step1.accepted_chunk_ids[0].clone();
+
+        // ── Step 2: credentialed PUT → expected MEDIUM, pending ──
+        let credentialed_rule = NetworkPolicyRule {
+            name: "github_contents_put".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "api.github.com".to_string(),
+                port: 443,
+                protocol: "rest".to_string(),
+                enforcement: "enforce".to_string(),
+                rules: vec![L7Rule {
+                    allow: Some(L7Allow {
+                        method: "PUT".to_string(),
+                        path: "/repos/owner/name/contents/path/file.md".to_string(),
+                        ..Default::default()
+                    }),
+                }],
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+        let step2 = handle_submit_policy_analysis(
+            &state,
+            Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.clone(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "github_contents_put".to_string(),
+                    proposed_rule: Some(credentialed_rule),
+                    rationale: "write the demo file via the GitHub Contents API".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let step2_chunk_id = step2.accepted_chunk_ids[0].clone();
+
+        let draft = handle_get_draft_policy(
+            &state,
+            Request::new(GetDraftPolicyRequest {
+                name: sandbox_name,
+                status_filter: String::new(),
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        let step1_chunk = draft
+            .chunks
+            .iter()
+            .find(|c| c.id == step1_chunk_id)
+            .expect("step1 chunk present");
+        let step2_chunk = draft
+            .chunks
+            .iter()
+            .find(|c| c.id == step2_chunk_id)
+            .expect("step2 chunk present");
+
+        assert_eq!(
+            step1_chunk.status, "approved",
+            "un-credentialed L7 proposal under v2 + auto mode must auto-approve; got: {}",
+            step1_chunk.status
+        );
+        assert_eq!(
+            step1_chunk.validation_result, "prover: no new findings",
+            "un-credentialed L7 verdict should be `no new findings`; got: {}",
+            step1_chunk.validation_result
+        );
+
+        assert_eq!(
+            step2_chunk.status, "pending",
+            "credentialed L7 proposal under v2 + auto mode must stay pending (MEDIUM); got: {}",
+            step2_chunk.status
+        );
+        assert!(
+            step2_chunk.validation_result.contains("[MEDIUM]"),
+            "credentialed L7 must carry MEDIUM verdict; got: {}",
+            step2_chunk.validation_result
         );
     }
 

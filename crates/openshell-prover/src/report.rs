@@ -87,6 +87,18 @@ fn compact_detail(finding: &Finding) -> String {
                         .join(", ")
                 ));
             }
+            if let Some(eps) = by_status.get("l7_credentialed") {
+                let mut sorted: Vec<&String> = eps.iter().collect();
+                sorted.sort();
+                parts.push(format!(
+                    "L7 + credential in scope: {}",
+                    sorted
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
             parts.join("; ")
         }
         "write_bypass" => {
@@ -146,6 +158,7 @@ fn risk_label(risk: RiskLevel) -> String {
     match risk {
         RiskLevel::Critical => "CRITICAL".to_owned(),
         RiskLevel::High => "HIGH".to_owned(),
+        RiskLevel::Medium => "MEDIUM".to_owned(),
     }
 }
 
@@ -153,6 +166,7 @@ fn print_risk_label(risk: RiskLevel) {
     match risk {
         RiskLevel::Critical => print!("{}", "CRITICAL".bold().red()),
         RiskLevel::High => print!("{}", "    HIGH".red()),
+        RiskLevel::Medium => print!("{}", "  MEDIUM".yellow()),
     }
 }
 
@@ -195,6 +209,7 @@ pub fn render_compact(findings: &[Finding], _policy_path: &str, _credentials_pat
     }
     let has_critical = counts.contains_key(&RiskLevel::Critical);
     let has_high = counts.contains_key(&RiskLevel::High);
+    let has_medium = counts.contains_key(&RiskLevel::Medium);
     let accepted_note = if accepted.is_empty() {
         String::new()
     } else {
@@ -207,6 +222,13 @@ pub fn render_compact(findings: &[Finding], _policy_path: &str, _credentials_pat
         println!(
             "   {}  {n} critical/high gaps{accepted_note}",
             " FAIL ".white().bold().on_red()
+        );
+        1
+    } else if has_medium {
+        let n = counts.get(&RiskLevel::Medium).unwrap_or(&0);
+        println!(
+            "   {}  {n} medium-risk gap(s){accepted_note}",
+            " REVIEW ".black().bold().on_yellow()
         );
         1
     } else if !active.is_empty() {
@@ -259,13 +281,14 @@ pub fn render_report(findings: &[Finding], policy_path: &str, credentials_path: 
     }
 
     println!("{}", "Finding Summary".bold().underline());
-    for level in [RiskLevel::Critical, RiskLevel::High] {
+    for level in [RiskLevel::Critical, RiskLevel::High, RiskLevel::Medium] {
         if let Some(&count) = counts.get(&level) {
             match level {
                 RiskLevel::Critical => {
                     println!("  {:>10}  {count}", "CRITICAL".bold().red());
                 }
                 RiskLevel::High => println!("  {:>10}  {count}", "HIGH".red()),
+                RiskLevel::Medium => println!("  {:>10}  {count}", "MEDIUM".yellow()),
             }
         }
     }
@@ -285,6 +308,7 @@ pub fn render_report(findings: &[Finding], policy_path: &str, credentials_path: 
         let border = match finding.risk {
             RiskLevel::Critical => format!("{}", format!("[{label}]").bold().red()),
             RiskLevel::High => format!("{}", format!("[{label}]").red()),
+            RiskLevel::Medium => format!("{}", format!("[{label}]").yellow()),
         };
 
         println!("--- Finding #{} {border} ---", i + 1);
@@ -325,6 +349,7 @@ pub fn render_report(findings: &[Finding], policy_path: &str, credentials_path: 
     // Verdict
     let has_critical = counts.contains_key(&RiskLevel::Critical);
     let has_high = counts.contains_key(&RiskLevel::High);
+    let has_medium = counts.contains_key(&RiskLevel::Medium);
     let accepted_note = if accepted.is_empty() {
         String::new()
     } else {
@@ -341,6 +366,14 @@ pub fn render_report(findings: &[Finding], policy_path: &str, credentials_path: 
         println!(
             "{}{accepted_note}",
             "FAIL \u{2014} High-risk gaps found.".bold().red()
+        );
+        1
+    } else if has_medium {
+        println!(
+            "{}{accepted_note}",
+            "REVIEW \u{2014} Medium-risk gaps require human attention."
+                .bold()
+                .yellow()
         );
         1
     } else if !active.is_empty() {
@@ -384,6 +417,7 @@ fn render_exfil_paths(paths: &[FindingPath]) {
                 "l4_only" => format!("{}", "L4-only".red()),
                 "l7_bypassed" => format!("{}", "bypassed".red()),
                 "l7_allows_write" => format!("{}", "L7 write".yellow()),
+                "l7_credentialed" => format!("{}", "L7+cred".yellow()),
                 _ => p.l7_status.clone(),
             };
             let ep = format!("{}:{}", p.endpoint_host, p.endpoint_port);

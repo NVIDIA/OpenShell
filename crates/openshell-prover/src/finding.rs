@@ -6,8 +6,13 @@
 use std::fmt;
 
 /// Severity level for a finding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// Ordering reflects risk magnitude: `Critical > High > Medium`. v1 emits
+/// `High` and `Medium`; `Critical` is retained for future use without a
+/// behavioral distinction yet attached to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum RiskLevel {
+    Medium,
     High,
     Critical,
 }
@@ -15,6 +20,7 @@ pub enum RiskLevel {
 impl fmt::Display for RiskLevel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Medium => write!(f, "MEDIUM"),
             Self::High => write!(f, "HIGH"),
             Self::Critical => write!(f, "CRITICAL"),
         }

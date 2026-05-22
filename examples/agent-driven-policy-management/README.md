@@ -82,7 +82,7 @@ reject with `--reason "scope to docs/ paths only"` and the agent reads
 | `DEMO_KEEP_SANDBOX` | `0` (set `1` to inspect the sandbox after the demo) |
 | `DEMO_MANUAL_APPROVE` | `0` (set `1` to pause for host-side `rule approve` / `rule reject --reason`) |
 | `DEMO_APPROVAL_TIMEOUT_SECS` | `240` (auto), `1800` (manual mode) |
-| `DEMO_CODEX_MODEL` | `gpt-5` (pinned for ChatGPT-account compatibility; override if your account supports a different model) |
+| `DEMO_CODEX_MODEL` | `gpt-5.4-mini` (pinned for ChatGPT-account compatibility; override if your account supports a different model) |
 | `DEMO_CODEX_REASONING` | `low` (the demo task is mechanical; `medium`/`high` slow it down without changing outcomes) |
 | `OPENSHELL_BIN` | `target/debug/openshell` if present, else `openshell` on `PATH` |
 

@@ -46,12 +46,14 @@ operations. Each `addRule` carries a complete narrow `NetworkPolicyRule`.
    `port`, `binary`, `rule_missing`, and `detail` as evidence.
 2. Fetch the current policy from `/v1/policy/current`.
 3. Fetch recent denials from `/v1/denials` if the response body is incomplete.
-4. Prefer L7 REST rules for REST APIs. **Narrow L7 proposals against
-   inspectable hosts auto-approve without human review** (see Auto-approval
-   below). L4 grants for the same host with a credential in scope always
-   require human approval, so L7 is the agent-speed path. Use L4 only when
-   the binary's wire protocol is opaque to L7 inspection (`ssh`, `nc`,
-   `git-remote-http`) or the host has no documented REST surface.
+4. Prefer L7 REST rules for REST APIs. **Narrow L7 proposals against hosts
+   with no credential in scope auto-approve without human review** (see
+   Auto-approval below). L7 to a host where a credential is in scope flags
+   MEDIUM and still goes to human review. L4 grants with a credential in
+   scope always require human approval, so L7 is the agent-speed path
+   wherever L7 inspection is possible. Use L4 only when the binary's wire
+   protocol is opaque to L7 inspection (`ssh`, `nc`, `git-remote-http`) or
+   the host has no documented REST surface.
 5. Draft the narrowest rule: exact host, exact port, exact binary when known,
    exact method, and the smallest safe path.
 6. Submit the proposal, save `accepted_chunk_ids` from the response, and
@@ -125,31 +127,54 @@ A complete narrow REST-inspected rule looks like this:
 
 ## Auto-approval
 
-The gateway runs a deterministic prover on every proposal and auto-approves
-when the proposal introduces no new findings. You get agent speed for
-proposals the prover can bound; everything else escalates to a human.
+Auto-approval is opt-in per sandbox. A sandbox set to
+`proposal_approval_mode = "auto"` will auto-approve any proposal the
+prover sees as empty-delta; sandboxes left in `"manual"` (the default)
+route every proposal to human review regardless of the prover verdict.
 
-What the prover flags (and therefore keeps in human review):
+When the sandbox is in `"auto"` mode and the prover finds nothing new,
+the gateway approves the chunk with actor `system:auto` and the
+`CONFIG:APPROVED` audit event carries `auto=true`, `source=<mode>`, and
+`prover_delta=empty`. The agent's `/wait` returns approved in ~1
+second. When the prover does find something — or the sandbox is in
+`"manual"` mode — the chunk lands in `pending` for human review.
 
-- **Link-local hosts** (`169.254.0.0/16`, `fe80::/10`). Cloud metadata
-  endpoints like `169.254.169.254` live here. **Never** propose access to
-  these — the proposal will always escalate, regardless of credentials.
-- **L4 grants** (no `protocol: rest`) to a host where a sandbox credential
-  is in scope. The L4 layer has no inspection; combined with a privileged
-  credential, this is unbounded reachability.
-- **Bypass-L7 binaries** (`/usr/bin/git`, `/usr/lib/git-core/git-remote-http`,
-  `/usr/bin/ssh`, `/usr/bin/nc`) bound to any host where a credential is in
-  scope. Wire protocols opaque to L7 inspection are unbounded by L7 scoping.
+What the prover flags:
 
-What auto-approves:
+- **`HIGH` — Link-local hosts** (`169.254.0.0/16`, `fe80::/10`). Cloud
+  metadata endpoints like `169.254.169.254` live here. **Never**
+  propose access to these — the proposal will always require human
+  review, regardless of credential state.
+- **`HIGH` — L4 grants** (no `protocol: rest`) to a host where a
+  sandbox credential is in scope. The L4 layer has no inspection;
+  combined with a privileged credential, this is unbounded
+  reachability.
+- **`HIGH` — Bypass-L7 binaries** (`/usr/bin/git`,
+  `/usr/lib/git-core/git-remote-http`, `/usr/bin/ssh`, `/usr/bin/nc`)
+  bound to any host where a credential is in scope. Wire protocols
+  opaque to L7 inspection are unbounded by L7 scoping.
+- **`MEDIUM` — Narrow L7 rules to a host where a credential is in
+  scope.** The L7 proxy bounds *what* you can do, but the bounded
+  action is still authenticated. PUT, POST, PATCH, DELETE can mutate
+  state. v1 defers to a human reviewer for any credentialed action;
+  there's no way to "narrow" further to make this auto-approve. The
+  L7 + credential row is the smallest amount of escalation v1 demands
+  — one human approval per credentialed action, and you're done.
 
-- L7 (REST) rules with explicit `method` + exact `path` against
-  inspectable hosts.
-- Any proposal that adds no path the prover can reach with a privileged
-  binary against a credentialed host.
+What auto-approves (under `auto` mode):
 
-If your proposal escalates and you need it sooner, narrow it: an L7 method/path
-scope often turns an "L4 with credential" finding into "no new findings."
+- L7 (REST) rules against hosts where **no credential is in scope**
+  (no attached provider declares the host). Public-content fetches
+  from CDNs, schema URLs, public API discovery — these go through.
+- Any proposal that adds no path the prover can reach with a
+  privileged binary against a credentialed host.
+
+If your proposal escalates and you'd like it to auto-approve, look
+first at whether the host actually needs a credentialed binary. A
+public-content GET often doesn't, and changing the binary or scope can
+turn a MEDIUM into "no new findings." Credentialed mutations are
+*supposed* to escalate; don't try to bypass that — propose the narrow
+rule and wait for review.
 
 ## Refining an earlier auto-suggested rule
 

@@ -186,12 +186,13 @@ filesystem_policy:
             !query_types.contains("write_bypass"),
             "write_bypass is a no-op in v1; got: {findings:?}"
         );
-        // Every v1 finding is HIGH.
+        // v1 emits HIGH and MEDIUM; Critical is reserved for future use.
         assert!(
-            findings
-                .iter()
-                .all(|f| matches!(f.risk, finding::RiskLevel::High)),
-            "v1 emits only HIGH; got: {findings:?}"
+            findings.iter().all(|f| matches!(
+                f.risk,
+                finding::RiskLevel::High | finding::RiskLevel::Medium
+            )),
+            "v1 emits HIGH and MEDIUM only; got: {findings:?}"
         );
     }
 

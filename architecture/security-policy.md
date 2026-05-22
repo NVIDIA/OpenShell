@@ -98,12 +98,17 @@ agent-authored via `policy.local`); the gateway is the single referee.
    chunk regardless of mode. The prover builds a Z3 model from the merged
    policy plus the sandbox's attached-provider credential set, then computes
    the delta of findings between the current baseline and the merged policy.
-3. **Auto-approval gate (proposer-agnostic).** If the delta is empty
-   (`prover: no new findings`), the gateway internally invokes the approve
-   path with actor identity `system:auto`. The audit event uses
-   `CONFIG:APPROVED` and carries `auto=true`, `source=<mode>`,
-   `prover_delta=empty` as unmapped fields, with message text
-   `"auto-approved: no new prover findings"` — never `safe`.
+3. **Auto-approval gate (proposer-agnostic, opt-in per sandbox).** Auto-approval
+   fires when *both* (a) the prover delta is empty (`prover: no new findings`)
+   AND (b) the sandbox sets `spec.proposal_approval_mode = "auto"`. When both
+   hold, the gateway internally invokes the approve path with actor identity
+   `system:auto`. The audit event uses `CONFIG:APPROVED` and carries `auto=true`,
+   `source=<mode>`, `prover_delta=empty` as unmapped fields, with message text
+   `"auto-approved: no new prover findings"` — never `safe`. The opt-in gate
+   preserves OpenShell's default-deny posture: sandboxes that leave
+   `proposal_approval_mode` unset (proto3 default of `""`, treated as
+   `"manual"`) keep every proposal in `pending` for human review, even when
+   the prover sees no findings.
 4. **Implicit supersede.** On any successful submission, the gateway scans
    the sandbox's pending chunks for matches on `(host, port, binary)` and
    auto-rejects the older ones with reason `"superseded by chunk X"`. This
@@ -111,7 +116,9 @@ agent-authored via `policy.local`); the gateway is the single referee.
    L7) without an explicit `supersedes_chunk_id` field.
 5. **Escalation.** Anything else lands in `pending` for human review.
 
-The v1 prover calibration emits `HIGH` findings (the only severity used) on:
+The v1 prover calibration emits two severities, both blocking auto-approval:
+
+**`HIGH`** (cases the prover cannot bound):
 
 - **Link-local endpoints** (`169.254.0.0/16`, `fe80::/10`), unconditionally
   — covers cloud metadata endpoints (AWS IMDS, GCP metadata) which serve
@@ -119,6 +126,20 @@ The v1 prover calibration emits `HIGH` findings (the only severity used) on:
 - **L4 grants** to a host where a sandbox credential is in scope.
 - **Bypass-L7 binaries** (`git-remote-http`, `ssh`, `nc`) bound to a host
   where a sandbox credential is in scope.
+
+**`MEDIUM`** (bounded but authenticated; deserves human eyes for the
+*action*, not the *reach*):
+
+- **Narrow L7 rule** (`protocol: rest`, allow list with specific
+  method/path) bound to a host where a sandbox credential is in scope.
+  The L7 proxy bounds *what* the binary can do, but the bounded action
+  is still authenticated and potentially destructive (PUT, DELETE,
+  POST that mutates). v1 defers semantic judgment to the human
+  reviewer; future calibration may distinguish read methods from
+  mutating ones.
+
+Severity does not change the auto-approval gate — any finding blocks
+auto-approval. MEDIUM exists for audit/UI triage signal.
 
 "Credential in scope" is sandbox-coarse, not binary-fine: a credential is
 considered in scope if the sandbox has a provider attached whose
