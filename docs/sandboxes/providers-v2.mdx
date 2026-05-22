@@ -55,6 +55,7 @@ Providers v2 currently includes these user-facing features:
 - `openshell provider list-profiles` with table, YAML, and JSON output.
 - `openshell provider profile export`, `import`, `lint`, and `delete` for custom profiles.
 - Provider instances created from built-in or imported profile IDs with `openshell provider create --type <id>`.
+- Profile-backed credential discovery for explicit `openshell provider create --from-existing` and `openshell provider update --from-existing` flows.
 - Just-in-time effective policy composition from sandbox policy plus attached provider profiles.
 - Runtime sandbox provider lifecycle commands under `openshell sandbox provider list|attach|detach`.
 - Credential refresh configuration with `openshell provider refresh status|configure|rotate|delete`.
@@ -86,6 +87,14 @@ List available profiles:
 ```shell
 openshell provider list-profiles
 ```
+
+Built-in Providers v2 profiles currently include:
+
+| Profile ID | Category | Credential environment variables |
+|---|---|---|
+| `claude-code` | `agent` | `ANTHROPIC_API_KEY`, `CLAUDE_API_KEY` |
+| `github` | `source_control` | `GITHUB_TOKEN`, `GH_TOKEN` |
+| `nvidia` | `inference` | `NVIDIA_API_KEY` |
 
 Export a built-in profile as YAML:
 
@@ -170,6 +179,9 @@ credentials:
           required: true
           secret: true
 
+discovery:
+  credentials: [api_token]
+
 endpoints:
   - host: api.example.com
     port: 443
@@ -224,6 +236,12 @@ binaries:
 
 `credentials` declares the credential names, environment variables, auth metadata, and optional refresh metadata for the provider type. The current runtime still exposes configured credential keys as placeholder environment variables and resolves placeholders in outbound HTTP requests.
 
+`discovery` controls what `--from-existing` scans when
+`providers_v2_enabled=true`. Each entry in `discovery.credentials` must name a
+credential declared under `credentials`. OpenShell scans the referenced
+credential's `env_vars` in order and stores the first non-empty local
+environment value under the actual environment variable key.
+
 `endpoints` contains the same endpoint object shape as sandbox network policy. A profile can use access presets, protocol-specific allow rules, deny rules, WebSocket credential rewriting, request body credential rewriting, GraphQL fields, and SSRF IP allowlists.
 
 `binaries` contains the executable paths allowed to reach the profile endpoints when the profile contributes policy to a sandbox.
@@ -269,14 +287,24 @@ openshell provider create \
   --credential GITHUB_TOKEN
 ```
 
-Create a provider from local credentials discovered by the provider implementation:
+Create a provider from local credentials discovered through the provider profile:
 
 ```shell
 openshell provider create \
   --name work-claude \
-  --type claude \
+  --type claude-code \
   --from-existing
 ```
+
+When `providers_v2_enabled=true`, `--from-existing` uses the provider profile's
+`discovery` section. If no profile exists for the requested type, the command
+fails instead of falling back to the legacy provider registry. When
+`providers_v2_enabled=false`, `--from-existing` uses the legacy provider
+registry and ignores profile `discovery` metadata.
+
+For example, with Providers v2 enabled, `--type openai --from-existing`
+requires an imported `openai` profile with a `discovery` section. Setting
+`OPENAI_API_KEY` alone is not enough for v2 profile discovery.
 
 Create a provider from an imported custom profile:
 
@@ -330,9 +358,13 @@ Create the provider instance first:
 ```shell
 openshell provider create \
   --name my-graph \
-  --type outlook \
+  --type microsoft-graph-mail \
   --credential MS_GRAPH_ACCESS_TOKEN
 ```
+
+This example assumes you imported a custom profile with
+`id: microsoft-graph-mail`. Provider refresh can be configured only for provider
+types whose profile declares compatible credential refresh metadata.
 
 Configure OAuth2 client credentials refresh:
 
@@ -375,6 +407,8 @@ openshell provider refresh configure drive-work \
   --material private_key="$GOOGLE_PRIVATE_KEY" \
   --secret-material-key private_key
 ```
+
+This example assumes you imported a custom profile with `id: google-drive`.
 
 <Note>
 `--secret-material-key` takes the name of a `--material` key, not the secret value. For example, use `--material client_secret="$MS_CLIENT_SECRET"` with `--secret-material-key client_secret`. The key should match a material entry so OpenShell can record that material field as sensitive when it stores refresh state. The gateway uses the material values to mint future access tokens, but only the `--credential-key` value, such as `MS_GRAPH_ACCESS_TOKEN`, becomes the injectable provider credential. If a refresh response rotates an OAuth refresh token, OpenShell stores the new `refresh_token` material and marks `refresh_token` as secret automatically.
@@ -446,6 +480,10 @@ openshell sandbox create \
 ```
 
 When `providers_v2_enabled=true`, each attached provider with a matching profile contributes a provider policy layer to the sandbox effective policy. When the setting is disabled, the sandbox receives provider credentials but not provider-derived policy entries.
+
+Providers v2 does not infer or auto-attach providers from the sandbox command.
+Attach providers explicitly with `--provider` during sandbox creation, or use
+`openshell sandbox provider attach` after creation.
 
 List providers attached to a sandbox:
 
