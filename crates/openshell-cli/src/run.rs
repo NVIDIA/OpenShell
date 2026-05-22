@@ -858,6 +858,7 @@ pub async fn gateway_add(
     oidc_client_id: &str,
     oidc_audience: Option<&str>,
     oidc_scopes: Option<&str>,
+    gateway_insecure: bool,
 ) -> Result<()> {
     // If the endpoint starts with ssh://, parse it into an SSH destination
     // and a gateway endpoint automatically.  The host is resolved via
@@ -971,6 +972,7 @@ pub async fn gateway_add(
                 oidc_client_id,
                 oidc_audience,
                 oidc_scopes,
+                gateway_insecure,
             )
             .await
             {
@@ -991,6 +993,7 @@ pub async fn gateway_add(
                 oidc_client_id,
                 oidc_audience,
                 oidc_scopes,
+                gateway_insecure,
             )
             .await
             {
@@ -1164,7 +1167,7 @@ pub async fn gateway_add(
 /// Re-authenticate with an edge-authenticated or OIDC gateway.
 ///
 /// Dispatches to the appropriate auth flow based on `auth_mode`.
-pub async fn gateway_login(name: &str) -> Result<()> {
+pub async fn gateway_login(name: &str, gateway_insecure: bool) -> Result<()> {
     let metadata = openshell_bootstrap::load_gateway_metadata(name).map_err(|_| {
         miette::miette!(
             "Unknown gateway '{name}'.\n\
@@ -1190,11 +1193,23 @@ pub async fn gateway_login(name: &str) -> Result<()> {
             let scopes = metadata.oidc_scopes.as_deref();
 
             let bundle = if std::env::var("OPENSHELL_OIDC_CLIENT_SECRET").is_ok() {
-                crate::oidc_auth::oidc_client_credentials_flow(issuer, client_id, audience, scopes)
-                    .await?
+                crate::oidc_auth::oidc_client_credentials_flow(
+                    issuer,
+                    client_id,
+                    audience,
+                    scopes,
+                    gateway_insecure,
+                )
+                .await?
             } else {
-                crate::oidc_auth::oidc_browser_auth_flow(issuer, client_id, audience, scopes)
-                    .await?
+                crate::oidc_auth::oidc_browser_auth_flow(
+                    issuer,
+                    client_id,
+                    audience,
+                    scopes,
+                    gateway_insecure,
+                )
+                .await?
             };
 
             let username = jwt_preferred_username(&bundle.access_token);
@@ -7927,6 +7942,7 @@ mod tests {
                     "openshell-cli",
                     None,
                     None,
+                    false,
                 )
                 .await
                 .expect("register plaintext gateway");
@@ -7958,6 +7974,7 @@ mod tests {
                     "openshell-cli",
                     None,
                     None,
+                    false,
                 )
                 .await
                 .expect("register plaintext gateway");

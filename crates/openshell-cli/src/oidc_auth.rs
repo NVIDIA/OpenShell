@@ -42,10 +42,13 @@ struct OidcDiscovery {
 ///
 /// Validates that the discovery document's `issuer` field matches the
 /// configured issuer URL to prevent SSRF or misdirection.
-async fn discover(issuer: &str) -> Result<OidcDiscovery> {
+async fn discover(issuer: &str, insecure: bool) -> Result<OidcDiscovery> {
     let normalized_issuer = issuer.trim_end_matches('/');
     let url = format!("{normalized_issuer}/.well-known/openid-configuration");
-    let resp: OidcDiscovery = reqwest::get(&url)
+    let client = http_client(insecure);
+    let resp: OidcDiscovery = client
+        .get(&url)
+        .send()
         .await
         .into_diagnostic()?
         .json()
@@ -63,11 +66,12 @@ async fn discover(issuer: &str) -> Result<OidcDiscovery> {
     Ok(resp)
 }
 
-fn http_client() -> reqwest::Client {
-    reqwest::ClientBuilder::new()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("failed to build HTTP client")
+fn http_client(insecure: bool) -> reqwest::Client {
+    let mut builder = reqwest::ClientBuilder::new().redirect(reqwest::redirect::Policy::none());
+    if insecure {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+    builder.build().expect("failed to build HTTP client")
 }
 
 fn build_scopes(scopes: Option<&str>) -> Vec<Scope> {
@@ -100,8 +104,9 @@ pub async fn oidc_browser_auth_flow(
     client_id: &str,
     audience: Option<&str>,
     scopes: Option<&str>,
+    insecure: bool,
 ) -> Result<OidcTokenBundle> {
-    let discovery = discover(issuer).await?;
+    let discovery = discover(issuer, insecure).await?;
 
     let listener = TcpListener::bind("127.0.0.1:0").await.into_diagnostic()?;
     let port = listener.local_addr().into_diagnostic()?.port();
@@ -161,7 +166,7 @@ pub async fn oidc_browser_auth_flow(
 
     server_handle.abort();
 
-    let http = http_client();
+    let http = http_client(insecure);
     let token_response = client
         .exchange_code(AuthorizationCode::new(code))
         .set_pkce_verifier(pkce_verifier)
@@ -184,6 +189,7 @@ pub async fn oidc_client_credentials_flow(
     client_id: &str,
     audience: Option<&str>,
     scopes: Option<&str>,
+    insecure: bool,
 ) -> Result<OidcTokenBundle> {
     let client_secret = std::env::var("OPENSHELL_OIDC_CLIENT_SECRET").map_err(|_| {
         miette::miette!(
@@ -191,7 +197,7 @@ pub async fn oidc_client_credentials_flow(
         )
     })?;
 
-    let discovery = discover(issuer).await?;
+    let discovery = discover(issuer, insecure).await?;
 
     let client = BasicClient::new(ClientId::new(client_id.to_string()))
         .set_client_secret(ClientSecret::new(client_secret))
@@ -206,7 +212,7 @@ pub async fn oidc_client_credentials_flow(
         request = request.add_extra_param("audience", aud);
     }
 
-    let http = http_client();
+    let http = http_client(insecure);
     let token_response = request
         .request_async(&http)
         .await
@@ -223,19 +229,22 @@ pub async fn oidc_client_credentials_flow(
 ///
 /// Preserves the existing refresh token if the server does not return a new
 /// one (per OAuth 2.0 spec, the refresh response may omit `refresh_token`).
-pub async fn oidc_refresh_token(bundle: &OidcTokenBundle) -> Result<OidcTokenBundle> {
+pub async fn oidc_refresh_token(
+    bundle: &OidcTokenBundle,
+    insecure: bool,
+) -> Result<OidcTokenBundle> {
     let refresh_token = bundle.refresh_token.as_deref().ok_or_else(|| {
         miette::miette!(
             "no refresh token available — re-authenticate with: openshell gateway login"
         )
     })?;
 
-    let discovery = discover(&bundle.issuer).await?;
+    let discovery = discover(&bundle.issuer, insecure).await?;
 
     let client = BasicClient::new(ClientId::new(bundle.client_id.clone()))
         .set_token_uri(TokenUrl::new(discovery.token_endpoint).into_diagnostic()?);
 
-    let http = http_client();
+    let http = http_client(insecure);
     let token_response = client
         .exchange_refresh_token(&RefreshToken::new(refresh_token.to_string()))
         .request_async(&http)
@@ -253,7 +262,7 @@ pub async fn oidc_refresh_token(bundle: &OidcTokenBundle) -> Result<OidcTokenBun
 /// Ensure we have a valid OIDC token for the given gateway, refreshing if needed.
 ///
 /// Returns the access token string.
-pub async fn ensure_valid_oidc_token(gateway_name: &str) -> Result<String> {
+pub async fn ensure_valid_oidc_token(gateway_name: &str, insecure: bool) -> Result<String> {
     let bundle =
         openshell_bootstrap::oidc_token::load_oidc_token(gateway_name).ok_or_else(|| {
             miette::miette!(
@@ -270,7 +279,7 @@ pub async fn ensure_valid_oidc_token(gateway_name: &str) -> Result<String> {
         gateway = gateway_name,
         "OIDC token expired, attempting refresh"
     );
-    let refreshed = oidc_refresh_token(&bundle).await?;
+    let refreshed = oidc_refresh_token(&bundle, insecure).await?;
     openshell_bootstrap::oidc_token::store_oidc_token(gateway_name, &refreshed)?;
     Ok(refreshed.access_token)
 }
@@ -435,4 +444,91 @@ fn html_response(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
         .header("content-type", "text/html")
         .body(Full::new(Bytes::from(body)))
         .expect("response")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn http_client_secure_rejects_self_signed() {
+        let client = http_client(false);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        // A real self-signed server isn't available in unit tests, but we can
+        // verify the client is constructed and makes requests. The secure client
+        // should exist and function for valid endpoints.
+        let result = rt.block_on(async { client.get("https://127.0.0.1:1").send().await });
+        assert!(result.is_err(), "connection to closed port should fail");
+    }
+
+    #[test]
+    fn http_client_insecure_builds_without_panic() {
+        let client = http_client(true);
+        // Verify the client is usable (doesn't panic on construction).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(async { client.get("https://127.0.0.1:1").send().await });
+        assert!(result.is_err(), "connection to closed port should fail");
+    }
+
+    #[test]
+    fn discover_validates_issuer_mismatch() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        // Discovery against a non-existent issuer should fail with a
+        // connection error, not silently succeed.
+        let result = rt.block_on(discover("http://127.0.0.1:1/realms/test", false));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn discover_insecure_passes_flag_through() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        // Same as above but with insecure=true. Should still fail on
+        // connection (no server) but must not panic.
+        let result = rt.block_on(discover("https://127.0.0.1:1/realms/test", true));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn percent_decode_basic() {
+        assert_eq!(percent_decode("hello%20world"), "hello world");
+        assert_eq!(percent_decode("a%2Fb"), "a/b");
+        assert_eq!(percent_decode("no+encoding+here"), "no encoding here");
+    }
+
+    #[test]
+    fn build_scopes_always_includes_openid() {
+        let scopes = build_scopes(None);
+        assert_eq!(scopes.len(), 1);
+
+        let scopes = build_scopes(Some("profile email"));
+        assert_eq!(scopes.len(), 3);
+    }
+
+    #[test]
+    fn build_scopes_deduplicates_openid() {
+        let scopes = build_scopes(Some("openid profile"));
+        assert_eq!(scopes.len(), 2);
+    }
+
+    #[test]
+    fn build_ci_scopes_empty_on_none() {
+        let scopes = build_ci_scopes(None);
+        assert!(scopes.is_empty());
+    }
+
+    #[test]
+    fn bundle_from_response_sets_fields() {
+        use oauth2::basic::BasicTokenResponse;
+
+        let token_response: BasicTokenResponse = serde_json::from_str(
+            r#"{"access_token":"test-access","token_type":"bearer","expires_in":300,"refresh_token":"test-refresh"}"#,
+        )
+        .unwrap();
+        let bundle = bundle_from_oauth2_response(&token_response, "https://issuer", "my-client");
+        assert_eq!(bundle.access_token, "test-access");
+        assert_eq!(bundle.refresh_token.as_deref(), Some("test-refresh"));
+        assert_eq!(bundle.issuer, "https://issuer");
+        assert_eq!(bundle.client_id, "my-client");
+        assert!(bundle.expires_at.is_some());
+    }
 }

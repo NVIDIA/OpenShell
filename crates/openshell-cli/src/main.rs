@@ -141,11 +141,14 @@ fn apply_auth(tls: &mut TlsOptions, gateway_name: &str) {
                 return;
             };
             if openshell_bootstrap::oidc_token::is_token_expired(&bundle) {
+                let insecure = std::env::var("OPENSHELL_GATEWAY_INSECURE")
+                    .is_ok_and(|v| !v.is_empty() && v != "0" && v != "false");
                 // Try to refresh the token in-place using block_in_place
                 // so the async refresh can run within the sync apply_auth call.
                 match tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current()
-                        .block_on(openshell_cli::oidc_auth::oidc_refresh_token(&bundle))
+                    tokio::runtime::Handle::current().block_on(
+                        openshell_cli::oidc_auth::oidc_refresh_token(&bundle, insecure),
+                    )
                 }) {
                     Ok(refreshed) => {
                         let _ = openshell_bootstrap::oidc_token::store_oidc_token(
@@ -1917,6 +1920,7 @@ async fn main() -> Result<()> {
                     &oidc_client_id,
                     oidc_audience.as_deref(),
                     oidc_scopes.as_deref(),
+                    cli.gateway_insecure,
                 )
                 .await?;
             }
@@ -1942,7 +1946,7 @@ async fn main() -> Result<()> {
                              Or set one with: openshell gateway select <name>"
                         )
                     })?;
-                run::gateway_login(&name).await?;
+                run::gateway_login(&name, cli.gateway_insecure).await?;
             }
             GatewayCommands::Logout { name } => {
                 let name = name
