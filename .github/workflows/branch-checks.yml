@@ -109,8 +109,7 @@ jobs:
           # Separate caches for clippy (check-like) vs test (full build)
           # so they don't thrash each other's artifacts
           shared-key: rust-checks-${{ matrix.runner }}
-          # Cache the sccache directory too
-          cache-directories: .cache/sccache
+          cache-on-failure: true
 
       - name: Format
         run: mise run rust:format:check
