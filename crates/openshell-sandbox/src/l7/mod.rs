@@ -8,8 +8,10 @@
 //! doing a raw `copy_bidirectional`. Each request within the tunnel is parsed,
 //! evaluated against OPA policy, and either forwarded or denied.
 
+pub mod content;
 pub mod inference;
 pub mod path;
+pub mod privacy_scan;
 pub mod provider;
 pub mod relay;
 pub mod rest;
@@ -64,6 +66,8 @@ pub struct L7EndpointConfig {
     /// rather than rejected at the parser. Needed by upstreams like GitLab
     /// that embed `%2F` in namespaced project paths. Defaults to false.
     pub allow_encoded_slash: bool,
+    /// Outbound content scanning config. `None` if content scanning is disabled.
+    pub content_policy: Option<content::ContentScanConfig>,
 }
 
 /// Result of an L7 policy decision for a single request.
@@ -129,11 +133,14 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
 
     let allow_encoded_slash = get_object_bool(val, "allow_encoded_slash").unwrap_or(false);
 
+    let content_policy = content::ContentScanConfig::from_regorus(val);
+
     Some(L7EndpointConfig {
         protocol,
         tls,
         enforcement,
         allow_encoded_slash,
+        content_policy,
     })
 }
 
@@ -328,6 +335,29 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                 warnings.push(format!(
                     "{loc}: 'tls: skip' with L7 rules on port 443 — L7 inspection cannot work on encrypted traffic"
                 ));
+            }
+
+            // content_policy validation
+            let has_content_policy = ep
+                .get("content_policy")
+                .and_then(|v| v.get("enabled"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if has_content_policy {
+                if protocol.is_empty() {
+                    errors.push(format!(
+                        "{loc}: content_policy requires protocol: rest (proxy must see plaintext HTTP)"
+                    ));
+                } else if protocol != "rest" {
+                    errors.push(format!(
+                        "{loc}: content_policy is only supported with protocol: rest, got '{protocol}'"
+                    ));
+                }
+                if tls == "skip" {
+                    warnings.push(format!(
+                        "{loc}: content_policy with tls: skip — content scanning cannot inspect encrypted bodies"
+                    ));
+                }
             }
 
             // sql + enforce blocked in v1

@@ -24,7 +24,8 @@ fi
 ENV_FILE=.env
 PUBLISHED_IMAGE_REPO_BASE_DEFAULT=ghcr.io/nvidia/openshell
 LOCAL_REGISTRY_CONTAINER=openshell-local-registry
-LOCAL_REGISTRY_ADDR=127.0.0.1:5000
+LOCAL_REGISTRY_PORT=${OPENSHELL_REGISTRY_PORT:-5050}
+LOCAL_REGISTRY_ADDR=127.0.0.1:${LOCAL_REGISTRY_PORT}
 
 if [ -n "${CI:-}" ] && [ -n "${CI_REGISTRY_IMAGE:-}" ]; then
   IMAGE_REPO_BASE_DEFAULT=${CI_REGISTRY_IMAGE}
@@ -118,12 +119,14 @@ export GATEWAY_PORT
 export OPENSHELL_GATEWAY
 
 is_local_registry_host() {
-  [ "${REGISTRY_HOST}" = "127.0.0.1:5000" ] || [ "${REGISTRY_HOST}" = "localhost:5000" ]
+  case "${REGISTRY_HOST}" in
+    127.0.0.1:*|localhost:*) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 registry_reachable() {
-  curl -4 -fsS --max-time 2 "http://127.0.0.1:5000/v2/" >/dev/null 2>&1 || \
-    curl -4 -fsS --max-time 2 "http://localhost:5000/v2/" >/dev/null 2>&1
+  curl -4 -fsS --max-time 2 "http://${LOCAL_REGISTRY_ADDR}/v2/" >/dev/null 2>&1
 }
 
 wait_for_registry_ready() {
@@ -151,7 +154,7 @@ ensure_local_registry() {
   fi
 
   if ! docker inspect "${LOCAL_REGISTRY_CONTAINER}" >/dev/null 2>&1; then
-    docker run -d --restart=always --name "${LOCAL_REGISTRY_CONTAINER}" -p 5000:5000 registry:2 >/dev/null
+    docker run -d --restart=always --name "${LOCAL_REGISTRY_CONTAINER}" -p "${LOCAL_REGISTRY_PORT}:5000" registry:2 >/dev/null
   else
     if ! docker ps --filter "name=^${LOCAL_REGISTRY_CONTAINER}$" --filter "status=running" -q | grep -q .; then
       docker start "${LOCAL_REGISTRY_CONTAINER}" >/dev/null
@@ -159,11 +162,11 @@ ensure_local_registry() {
 
     port_map=$(docker port "${LOCAL_REGISTRY_CONTAINER}" 5000/tcp 2>/dev/null || true)
     case "${port_map}" in
-      *:5000*)
+      *:"${LOCAL_REGISTRY_PORT}"*)
         ;;
       *)
         docker rm -f "${LOCAL_REGISTRY_CONTAINER}" >/dev/null 2>&1 || true
-        docker run -d --restart=always --name "${LOCAL_REGISTRY_CONTAINER}" -p 5000:5000 registry:2 >/dev/null
+        docker run -d --restart=always --name "${LOCAL_REGISTRY_CONTAINER}" -p "${LOCAL_REGISTRY_PORT}:5000" registry:2 >/dev/null
         ;;
     esac
   fi
@@ -176,8 +179,8 @@ ensure_local_registry() {
     return
   fi
 
-  echo "Error: local registry is not reachable at ${REGISTRY_HOST}." >&2
-  echo "       Ensure a registry is running on port 5000 (e.g. docker run -d --name openshell-local-registry -p 5000:5000 registry:2)." >&2
+  echo "Error: local registry is not reachable at ${LOCAL_REGISTRY_ADDR}." >&2
+  echo "       Ensure a registry is running on port ${LOCAL_REGISTRY_PORT} (e.g. docker run -d --name ${LOCAL_REGISTRY_CONTAINER} -p ${LOCAL_REGISTRY_PORT}:5000 registry:2)." >&2
   docker ps -a >&2 || true
   docker logs "${LOCAL_REGISTRY_CONTAINER}" >&2 || true
   exit 1
@@ -185,7 +188,8 @@ ensure_local_registry() {
 
 REGISTRY_ENDPOINT_DEFAULT=${REGISTRY_HOST}
 if is_local_registry_host; then
-  REGISTRY_ENDPOINT_DEFAULT=host.docker.internal:5000
+  local_port=${REGISTRY_HOST##*:}
+  REGISTRY_ENDPOINT_DEFAULT=host.docker.internal:${local_port}
 fi
 
 REGISTRY_INSECURE_DEFAULT=false

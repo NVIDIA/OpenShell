@@ -2986,7 +2986,7 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "openshell-bootstrap"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "async-stream",
  "base64 0.22.1",
@@ -3006,7 +3006,7 @@ dependencies = [
 
 [[package]]
 name = "openshell-cli"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "bytes",
@@ -3052,7 +3052,7 @@ dependencies = [
 
 [[package]]
 name = "openshell-core"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "ipnet",
  "miette",
@@ -3070,7 +3070,7 @@ dependencies = [
 
 [[package]]
 name = "openshell-driver-kubernetes"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "clap",
  "futures",
@@ -3092,7 +3092,7 @@ dependencies = [
 
 [[package]]
 name = "openshell-driver-vm"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "clap",
  "futures",
@@ -3114,7 +3114,7 @@ dependencies = [
 
 [[package]]
 name = "openshell-ocsf"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "chrono",
  "serde",
@@ -3126,7 +3126,7 @@ dependencies = [
 
 [[package]]
 name = "openshell-policy"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "miette",
  "openshell-core",
@@ -3136,7 +3136,7 @@ dependencies = [
 
 [[package]]
 name = "openshell-prover"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "glob",
  "include_dir",
@@ -3149,7 +3149,7 @@ dependencies = [
 
 [[package]]
 name = "openshell-providers"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "openshell-core",
  "thiserror 2.0.18",
@@ -3157,7 +3157,7 @@ dependencies = [
 
 [[package]]
 name = "openshell-router"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "bytes",
  "openshell-core",
@@ -3175,7 +3175,7 @@ dependencies = [
 
 [[package]]
 name = "openshell-sandbox"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3195,7 +3195,9 @@ dependencies = [
  "openshell-router",
  "rand_core 0.6.4",
  "rcgen",
+ "regex",
  "regorus",
+ "reqwest",
  "russh",
  "rustls",
  "rustls-pemfile",
@@ -3220,7 +3222,7 @@ dependencies = [
 
 [[package]]
 name = "openshell-server"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "axum 0.8.8",
@@ -3275,7 +3277,7 @@ dependencies = [
 
 [[package]]
 name = "openshell-tui"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "base64 0.22.1",
  "crossterm 0.28.1",
@@ -3296,7 +3298,7 @@ dependencies = [
 
 [[package]]
 name = "openshell-vm"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = [
  "base64 0.22.1",
  "clap",

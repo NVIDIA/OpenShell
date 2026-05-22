@@ -121,9 +121,8 @@ where
     }
 
     fn call(&mut self, req: Request<B>) -> Self::Future {
-        let is_inference = req.uri().path().starts_with(INFERENCE_PATH_PREFIX);
-
-        if is_inference {
+        let path = req.uri().path();
+        if path.starts_with(INFERENCE_PATH_PREFIX) {
             let mut svc = self.inference.clone();
             Box::pin(async move { svc.ready().await?.call(req).await })
         } else {

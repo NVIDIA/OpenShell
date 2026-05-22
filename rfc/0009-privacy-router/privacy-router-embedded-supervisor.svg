@@ -1,0 +1,248 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1080" viewBox="0 0 1920 1080" role="img" aria-labelledby="title desc">
+  <title id="title">OpenShell Privacy Router Architecture</title>
+  <desc id="desc">AWS-style architecture diagram for OpenShell Privacy Router showing the gateway control plane, sandbox supervisor proxy, built-in scanner provider, optional remote scanner service, and upstream services.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#1f2937"/>
+    </marker>
+    <marker id="green-arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#047857"/>
+    </marker>
+    <marker id="orange-arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2,2 L10,6 L2,10 Z" fill="#b45309"/>
+    </marker>
+    <style>
+      .page { fill: #ffffff; }
+      .cloud { fill: #ffffff; stroke: #111827; stroke-width: 3; }
+      .zone { fill: #f8fafc; stroke: #64748b; stroke-width: 2.4; stroke-dasharray: 10 8; }
+      .vpc { fill: #f0fdf4; stroke: #15803d; stroke-width: 3; }
+      .subnet { fill: #ecfdf5; stroke: #16a34a; stroke-width: 2.4; stroke-dasharray: 10 8; }
+      .tile { fill: #ffffff; stroke: #cbd5e1; stroke-width: 2; }
+      .gatewayIcon { fill: #2563eb; }
+      .settingsIcon { fill: #9333ea; }
+      .policyIcon { fill: #7c3aed; }
+      .runtimeIcon { fill: #16a34a; }
+      .proxyIcon { fill: #0891b2; }
+      .scannerIcon { fill: #d97706; }
+      .remoteIcon { fill: #f97316; }
+      .externalIcon { fill: #dc2626; }
+      .logIcon { fill: #475569; }
+      .note { fill: #f8fafc; stroke: #94a3b8; stroke-width: 1.8; }
+      .title { font: 700 34px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #111827; }
+      .subtitle { font: 17px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #475569; }
+      .groupTitle { font: 700 23px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #334155; }
+      .label { font: 700 18px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+      .small { font: 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #475569; }
+      .tiny { font: 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #64748b; }
+      .whiteIconText { font: 700 22px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #ffffff; text-anchor: middle; dominant-baseline: central; }
+      .arrow { stroke: #1f2937; stroke-width: 2.7; fill: none; marker-end: url(#arrow); }
+      .greenArrow { stroke: #047857; stroke-width: 3.1; fill: none; marker-end: url(#green-arrow); }
+      .orangeArrow { stroke: #b45309; stroke-width: 3.1; fill: none; marker-end: url(#orange-arrow); }
+      .dashedArrow { stroke: #64748b; stroke-width: 2.4; fill: none; stroke-dasharray: 8 8; marker-end: url(#arrow); }
+      .num { fill: #020617; }
+      .numText { font: 700 15px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #ffffff; text-anchor: middle; dominant-baseline: central; }
+      .legendText { font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #334155; }
+    </style>
+  </defs>
+
+  <rect class="page" width="1920" height="1080"/>
+  <rect class="cloud" x="56" y="56" width="1808" height="968" rx="4"/>
+  <text class="title" x="92" y="112">OpenShell Privacy Router</text>
+  <text class="subtitle" x="92" y="142">Outbound HTTP(S) requests are scanned at the sandbox network boundary before they reach upstream services.</text>
+
+  <!-- Gateway control plane component -->
+  <rect class="zone" x="96" y="202" width="356" height="576" rx="6"/>
+  <text class="groupTitle" x="124" y="242">Gateway control plane</text>
+
+  <g id="gateway-api">
+    <rect class="tile" x="148" y="292" width="252" height="84" rx="4"/>
+    <rect class="gatewayIcon" x="170" y="312" width="48" height="48" rx="4"/>
+    <text class="whiteIconText" x="194" y="337">G</text>
+    <text class="label" x="238" y="326">Gateway API</text>
+    <text class="small" x="238" y="350">sandbox lifecycle</text>
+  </g>
+
+  <g id="settings">
+    <rect class="tile" x="148" y="418" width="252" height="84" rx="4"/>
+    <rect class="settingsIcon" x="170" y="438" width="48" height="48" rx="4"/>
+    <text class="whiteIconText" x="194" y="463">S</text>
+    <text class="label" x="238" y="452">Global settings</text>
+    <text class="small" x="238" y="476">privacy_scanner_config</text>
+  </g>
+
+  <g id="policy-store">
+    <rect class="tile" x="148" y="544" width="252" height="84" rx="4"/>
+    <rect class="policyIcon" x="170" y="564" width="48" height="48" rx="4"/>
+    <text class="whiteIconText" x="194" y="589">P</text>
+    <text class="label" x="238" y="578">Policy store</text>
+    <text class="small" x="238" y="602">network and L7 rules</text>
+  </g>
+
+  <g id="audit-logs">
+    <rect class="tile" x="148" y="670" width="252" height="64" rx="4"/>
+    <rect class="logIcon" x="170" y="684" width="40" height="40" rx="4"/>
+    <text class="whiteIconText" x="190" y="705">L</text>
+    <text class="label" x="230" y="698">Audit logs</text>
+    <text class="small" x="230" y="719">CONTENT_SCAN_*</text>
+  </g>
+
+  <!-- Sandbox VPC / runtime component -->
+  <rect class="vpc" x="516" y="202" width="846" height="682" rx="6"/>
+  <text class="groupTitle" x="548" y="242">Sandbox runtime boundary</text>
+  <text class="small" x="548" y="268">Request enforcement runs here, inside each sandbox supervisor.</text>
+
+  <rect class="subnet" x="560" y="304" width="758" height="522" rx="6"/>
+  <text class="groupTitle" x="592" y="342">Sandbox supervisor process</text>
+
+  <g id="workload">
+    <rect class="tile" x="610" y="392" width="180" height="92" rx="4"/>
+    <rect class="runtimeIcon" x="632" y="414" width="48" height="48" rx="4"/>
+    <text class="whiteIconText" x="656" y="439">A</text>
+    <text class="label" x="700" y="427">Agent</text>
+    <text class="small" x="700" y="451">SDKs, curl, tools</text>
+  </g>
+
+  <g id="proxy">
+    <rect class="tile" x="870" y="392" width="180" height="92" rx="4"/>
+    <rect class="proxyIcon" x="892" y="414" width="48" height="48" rx="4"/>
+    <text class="whiteIconText" x="916" y="439">PX</text>
+    <text class="label" x="960" y="427">Proxy</text>
+    <text class="small" x="960" y="451">HTTP(S) intercept</text>
+  </g>
+
+  <g id="policy-check">
+    <rect class="tile" x="1108" y="392" width="160" height="92" rx="4"/>
+    <rect class="policyIcon" x="1130" y="414" width="48" height="48" rx="4"/>
+    <text class="whiteIconText" x="1154" y="439">O</text>
+    <text class="label" x="1198" y="427">OPA</text>
+    <text class="small" x="1198" y="451">allow / deny</text>
+  </g>
+
+  <g id="parser-buffer">
+    <rect class="tile" x="690" y="570" width="204" height="92" rx="4"/>
+    <rect class="proxyIcon" x="712" y="592" width="48" height="48" rx="4"/>
+    <text class="whiteIconText" x="736" y="617">B</text>
+    <text class="label" x="780" y="605">Body buffer</text>
+    <text class="small" x="780" y="629">bounded Content-Length</text>
+  </g>
+
+  <g id="scanner-provider">
+    <rect class="tile" x="952" y="570" width="238" height="92" rx="4"/>
+    <rect class="scannerIcon" x="974" y="592" width="48" height="48" rx="4"/>
+    <text class="whiteIconText" x="998" y="617">SC</text>
+    <text class="label" x="1042" y="605">Scanner provider</text>
+    <text class="small" x="1042" y="629">built-in or remote</text>
+  </g>
+
+  <g id="builtin-scanner">
+    <rect class="tile" x="952" y="706" width="238" height="74" rx="4"/>
+    <rect class="scannerIcon" x="974" y="721" width="44" height="44" rx="4"/>
+    <text class="whiteIconText" x="996" y="744">R</text>
+    <text class="label" x="1038" y="735">Built-in scanner</text>
+    <text class="small" x="1038" y="758">Rust regex in supervisor</text>
+  </g>
+
+  <g id="rewrite">
+    <rect class="tile" x="690" y="706" width="204" height="74" rx="4"/>
+    <rect class="runtimeIcon" x="712" y="721" width="44" height="44" rx="4"/>
+    <text class="whiteIconText" x="734" y="744">RW</text>
+    <text class="label" x="774" y="735">Rewrite</text>
+    <text class="small" x="774" y="758">redact and length</text>
+  </g>
+
+  <!-- Optional remote scanner component -->
+  <rect class="zone" x="1418" y="202" width="360" height="280" rx="6"/>
+  <text class="groupTitle" x="1446" y="242">Remote scanner component</text>
+  <text class="small" x="1446" y="268">Optional customer-owned service</text>
+
+  <g id="remote-scanner">
+    <rect class="tile" x="1470" y="314" width="256" height="92" rx="4"/>
+    <rect class="remoteIcon" x="1492" y="336" width="48" height="48" rx="4"/>
+    <text class="whiteIconText" x="1516" y="361">RS</text>
+    <text class="label" x="1560" y="349">Scanner API</text>
+    <text class="small" x="1560" y="373">HTTP JSON contract</text>
+  </g>
+
+  <rect class="note" x="1470" y="426" width="256" height="32" rx="4"/>
+  <text class="tiny" x="1598" y="447" text-anchor="middle">Fallback: built-in regex or fail-open</text>
+
+  <!-- External services component -->
+  <rect class="zone" x="1418" y="558" width="360" height="320" rx="6"/>
+  <text class="groupTitle" x="1446" y="598">External services</text>
+
+  <g id="upstream-api">
+    <rect class="tile" x="1470" y="650" width="256" height="92" rx="4"/>
+    <rect class="externalIcon" x="1492" y="672" width="48" height="48" rx="4"/>
+    <text class="whiteIconText" x="1516" y="697">API</text>
+    <text class="label" x="1560" y="685">Upstream API</text>
+    <text class="small" x="1560" y="709">receives final body</text>
+  </g>
+
+  <g id="response-service">
+    <rect class="tile" x="1470" y="774" width="256" height="66" rx="4"/>
+    <rect class="externalIcon" x="1492" y="787" width="40" height="40" rx="4"/>
+    <text class="whiteIconText" x="1512" y="808">R</text>
+    <text class="label" x="1552" y="801">Response path</text>
+    <text class="small" x="1552" y="822">unchanged relay</text>
+  </g>
+
+  <!-- Data flow arrows and numbered markers -->
+  <path class="arrow" d="M790,438 L870,438"/>
+  <circle class="num" cx="830" cy="408" r="18"/><text class="numText" x="830" y="408">1</text>
+  <text class="tiny" x="808" y="388">outbound request</text>
+
+  <path class="arrow" d="M1050,438 L1108,438"/>
+  <circle class="num" cx="1078" cy="408" r="18"/><text class="numText" x="1078" y="408">2</text>
+
+  <path class="arrow" d="M1188,484 C1188,536 1012,542 1012,570"/>
+  <circle class="num" cx="1218" cy="514" r="18"/><text class="numText" x="1218" y="514">3</text>
+  <text class="tiny" x="1228" y="519">allowed</text>
+
+  <path class="arrow" d="M870,484 C820,520 792,536 792,570"/>
+  <circle class="num" cx="830" cy="530" r="18"/><text class="numText" x="830" y="530">4</text>
+  <text class="tiny" x="744" y="526">parse and buffer</text>
+
+  <path class="greenArrow" d="M894,616 L952,616"/>
+  <circle class="num" cx="924" cy="586" r="18"/><text class="numText" x="924" y="586">5</text>
+
+  <path class="orangeArrow" d="M1190,616 C1300,616 1360,360 1470,360"/>
+  <circle class="num" cx="1330" cy="490" r="18"/><text class="numText" x="1330" y="490">6</text>
+  <text class="tiny" x="1320" y="472">optional remote call</text>
+
+  <path class="greenArrow" d="M1071,662 L1071,706"/>
+  <circle class="num" cx="1102" cy="684" r="18"/><text class="numText" x="1102" y="684">7</text>
+  <text class="tiny" x="1124" y="688">default / fallback</text>
+
+  <path class="greenArrow" d="M952,743 L894,743"/>
+  <circle class="num" cx="922" cy="773" r="18"/><text class="numText" x="922" y="773">8</text>
+
+  <path class="arrow" d="M894,743 C1118,836 1268,696 1470,696"/>
+  <circle class="num" cx="1284" cy="758" r="18"/><text class="numText" x="1284" y="758">9</text>
+  <text class="tiny" x="1264" y="738">final body only</text>
+
+  <path class="arrow" d="M1470,807 C1288,908 884,862 746,780"/>
+  <circle class="num" cx="1214" cy="900" r="18"/><text class="numText" x="1214" y="900">10</text>
+  <text class="tiny" x="1238" y="904">response relay</text>
+
+  <path class="dashedArrow" d="M400,334 C474,334 484,420 610,420"/>
+  <circle class="num" cx="492" cy="334" r="18"/><text class="numText" x="492" y="334">11</text>
+  <text class="tiny" x="426" y="314">config and policy</text>
+
+  <path class="dashedArrow" d="M400,702 C500,702 510,742 690,742"/>
+  <circle class="num" cx="512" cy="702" r="18"/><text class="numText" x="512" y="702">12</text>
+  <text class="tiny" x="430" y="682">redaction audit</text>
+
+  <!-- Legend and notes -->
+  <rect class="note" x="96" y="914" width="1682" height="62" rx="6"/>
+  <rect class="gatewayIcon" x="126" y="934" width="22" height="22" rx="3"/>
+  <text class="legendText" x="158" y="951">Control plane config</text>
+  <rect class="runtimeIcon" x="320" y="934" width="22" height="22" rx="3"/>
+  <text class="legendText" x="352" y="951">Sandbox enforcement path</text>
+  <rect class="scannerIcon" x="560" y="934" width="22" height="22" rx="3"/>
+  <text class="legendText" x="592" y="951">Built-in scanner provider</text>
+  <rect class="remoteIcon" x="804" y="934" width="22" height="22" rx="3"/>
+  <text class="legendText" x="836" y="951">Optional customer scanner service</text>
+  <rect class="externalIcon" x="1130" y="934" width="22" height="22" rx="3"/>
+  <text class="legendText" x="1162" y="951">External upstream</text>
+  <text class="legendText" x="1398" y="951">Chunked or oversized bodies: forwarded unchanged and logged as CONTENT_SCAN_SKIP.</text>
+</svg>

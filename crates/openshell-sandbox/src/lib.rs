@@ -250,7 +250,7 @@ pub async fn run_sandbox(
     // Load policy and initialize OPA engine
     let openshell_endpoint_for_proxy = openshell_endpoint.clone();
     let sandbox_name_for_agg = sandbox.clone();
-    let (policy, opa_engine, retained_proto) = load_policy(
+    let (policy, opa_engine, retained_proto, initial_settings) = load_policy(
         sandbox_id.clone(),
         sandbox,
         openshell_endpoint.clone(),
@@ -258,6 +258,7 @@ pub async fn run_sandbox(
         policy_data,
     )
     .await?;
+    apply_privacy_scan_settings(&initial_settings);
 
     // Validate that the required "sandbox" user exists in this image.
     // All sandbox images must include this user for privilege dropping.
@@ -1506,6 +1507,8 @@ mod baseline_tests {
 /// Returns the policy, the OPA engine, and (for gRPC mode) the original proto
 /// policy. The proto is retained so the OPA engine can be rebuilt with symlink
 /// resolution after the container entrypoint starts.
+type EffectiveSettings = std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>;
+
 async fn load_policy(
     sandbox_id: Option<String>,
     sandbox: Option<String>,
@@ -1516,6 +1519,7 @@ async fn load_policy(
     SandboxPolicy,
     Option<Arc<OpaEngine>>,
     Option<openshell_core::proto::SandboxPolicy>,
+    EffectiveSettings,
 )> {
     // File mode: load OPA engine from rego rules + YAML data (dev override)
     if let (Some(policy_file), Some(data_file)) = (&policy_rules, &policy_data) {
@@ -1545,7 +1549,7 @@ async fn load_policy(
             process: config.process,
         };
         enrich_sandbox_baseline_paths(&mut policy);
-        return Ok((policy, Some(Arc::new(engine)), None));
+        return Ok((policy, Some(Arc::new(engine)), None, Default::default()));
     }
 
     // gRPC mode: fetch typed proto policy, construct OPA engine from baked rules + proto data
@@ -1555,9 +1559,10 @@ async fn load_policy(
             endpoint = %endpoint,
             "Fetching sandbox policy via gRPC"
         );
-        let proto_policy = grpc_client::fetch_policy(endpoint, id).await?;
+        let config_result = grpc_client::fetch_config(endpoint, id).await?;
+        let initial_settings = config_result.settings;
 
-        let mut proto_policy = match proto_policy {
+        let mut proto_policy = match config_result.policy {
             Some(p) => p,
             None => {
                 // No policy configured on the server. Discover from disk or
@@ -1615,7 +1620,7 @@ async fn load_policy(
         let opa_engine = Some(Arc::new(OpaEngine::from_proto(&proto_policy)?));
 
         let policy = SandboxPolicy::try_from(proto_policy.clone())?;
-        return Ok((policy, opa_engine, Some(proto_policy)));
+        return Ok((policy, opa_engine, Some(proto_policy), initial_settings));
     }
 
     // No policy source available
@@ -2104,6 +2109,18 @@ async fn run_policy_poll_loop(
             info!(ocsf_json_enabled = new_ocsf, "OCSF JSONL logging toggled");
         }
 
+        if string_setting_changed(
+            &current_settings,
+            &result.settings,
+            openshell_core::settings::PRIVACY_SCAN_CUSTOM_PATTERNS_KEY,
+        ) || string_setting_changed(
+            &current_settings,
+            &result.settings,
+            openshell_core::settings::PRIVACY_SCANNER_CONFIG_KEY,
+        ) {
+            apply_privacy_scan_settings(&result.settings);
+        }
+
         current_config_revision = result.config_revision;
         current_policy_hash = result.policy_hash;
         current_settings = result.settings;
@@ -2126,16 +2143,84 @@ fn extract_bool_setting(
         })
 }
 
+/// Extract a string value from an effective setting, if present.
+fn extract_string_setting(
+    settings: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
+    key: &str,
+) -> Option<String> {
+    use openshell_core::proto::setting_value;
+    settings
+        .get(key)
+        .and_then(|es| es.value.as_ref())
+        .and_then(|sv| sv.value.as_ref())
+        .and_then(|v| match v {
+            setting_value::Value::StringValue(value) => Some(value.clone()),
+            _ => None,
+        })
+}
+
+fn string_setting_changed(
+    old: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
+    new: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
+    key: &str,
+) -> bool {
+    extract_string_setting(old, key) != extract_string_setting(new, key)
+}
+
+fn apply_privacy_scan_settings(
+    settings: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
+) {
+    let raw = extract_string_setting(
+        settings,
+        openshell_core::settings::PRIVACY_SCAN_CUSTOM_PATTERNS_KEY,
+    );
+    match l7::privacy_scan::set_custom_patterns_from_json(raw.as_deref()) {
+        Ok(count) => {
+            info!(
+                custom_patterns = count,
+                "Privacy scanner custom regex patterns updated"
+            );
+        }
+        Err(error) => {
+            warn!(
+                error = %error,
+                "Invalid privacy scanner custom regex config; keeping last-known-good custom patterns"
+            );
+        }
+    }
+
+    let raw = extract_string_setting(
+        settings,
+        openshell_core::settings::PRIVACY_SCANNER_CONFIG_KEY,
+    );
+    match l7::privacy_scan::set_scanner_config_from_json(raw.as_deref()) {
+        Ok(summary) => {
+            info!(
+                backend = %summary.backend,
+                remote_url = summary.remote_url.as_deref().unwrap_or(""),
+                fallback = %summary.fallback,
+                "Privacy scanner provider config updated"
+            );
+        }
+        Err(error) => {
+            warn!(
+                error = %error,
+                "Invalid privacy scanner provider config; keeping last-known-good provider config"
+            );
+        }
+    }
+}
+
 /// Log individual setting changes between two snapshots.
 fn log_setting_changes(
     old: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
     new: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
 ) {
     for (key, new_es) in new {
-        let new_val = format_setting_value(new_es);
+        let new_val = format_setting_value(key, new_es);
         match old.get(key) {
             Some(old_es) => {
-                let old_val = format_setting_value(old_es);
+                let old_val = format_setting_value(key, old_es);
                 if old_val != new_val {
                     ocsf_emit!(
                         ConfigStateChangeBuilder::new(ocsf_ctx())
@@ -2182,8 +2267,24 @@ fn log_setting_changes(
 }
 
 /// Format an `EffectiveSetting` value for log display.
-fn format_setting_value(es: &openshell_core::proto::EffectiveSetting) -> String {
+fn format_setting_value(key: &str, es: &openshell_core::proto::EffectiveSetting) -> String {
     use openshell_core::proto::setting_value;
+    if key == openshell_core::settings::PRIVACY_SCAN_CUSTOM_PATTERNS_KEY {
+        return match es.value.as_ref().and_then(|sv| sv.value.as_ref()) {
+            Some(setting_value::Value::StringValue(value)) if !value.trim().is_empty() => {
+                "<custom privacy scan patterns configured>".to_string()
+            }
+            _ => "<unset>".to_string(),
+        };
+    }
+    if key == openshell_core::settings::PRIVACY_SCANNER_CONFIG_KEY {
+        return match es.value.as_ref().and_then(|sv| sv.value.as_ref()) {
+            Some(setting_value::Value::StringValue(value)) if !value.trim().is_empty() => {
+                "<privacy scanner provider configured>".to_string()
+            }
+            _ => "<unset>".to_string(),
+        };
+    }
     match es.value.as_ref().and_then(|sv| sv.value.as_ref()) {
         None => "<unset>".to_string(),
         Some(setting_value::Value::StringValue(v)) => v.clone(),

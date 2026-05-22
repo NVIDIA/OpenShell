@@ -645,6 +645,41 @@ fn find_crlf(buf: &[u8], start: usize) -> Option<usize> {
         .map(|offset| start + offset)
 }
 
+/// Relay exactly `len` bytes from reader to writer (crate-public wrapper).
+pub(crate) async fn relay_fixed_public<R, W>(reader: &mut R, writer: &mut W, len: u64) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    relay_fixed(reader, writer, len).await
+}
+
+/// Relay chunked transfer encoding from reader to writer (crate-public wrapper).
+pub(crate) async fn relay_chunked_public<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    already_forwarded: &[u8],
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    relay_chunked(reader, writer, already_forwarded).await
+}
+
+/// Read and relay a full HTTP response (headers + body) from upstream to client (crate-public wrapper).
+pub(crate) async fn relay_response_public<U, C>(
+    request_method: &str,
+    upstream: &mut U,
+    client: &mut C,
+) -> Result<RelayOutcome>
+where
+    U: AsyncRead + Unpin,
+    C: AsyncWrite + Unpin,
+{
+    relay_response(request_method, upstream, client).await
+}
+
 /// Read and relay a full HTTP response (headers + body) from upstream to client.
 ///
 /// Returns a [`RelayOutcome`] indicating whether the connection is reusable,

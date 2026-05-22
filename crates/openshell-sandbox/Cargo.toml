@@ -34,8 +34,8 @@ clap = { workspace = true }
 miette = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
-hmac = "0.12"
 sha2 = "0.10"
+hmac = "0.12"
 hex = "0.4"
 russh = "0.57"
 rand_core = "0.6"
@@ -52,6 +52,7 @@ webpki-roots = { workspace = true }
 
 # HTTP
 bytes = { workspace = true }
+reqwest = { workspace = true }
 
 # UUID
 uuid = { workspace = true }
@@ -65,6 +66,9 @@ ipnet = "2"
 # Serialization
 serde_json = { workspace = true }
 serde_yml = { workspace = true }
+
+# Regex (content scanning)
+regex = { workspace = true }
 
 # Logging
 tracing = { workspace = true }

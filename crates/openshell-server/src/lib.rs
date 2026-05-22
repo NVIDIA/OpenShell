@@ -147,6 +147,7 @@ pub async fn run_server(
     }
 
     let store = Arc::new(Store::connect(database_url).await?);
+    seed_privacy_scanner_config(store.as_ref(), &config.privacy_scanner_config).await?;
 
     let sandbox_index = SandboxIndex::new();
     let sandbox_watch_bus = SandboxWatchBus::new();
@@ -233,6 +234,30 @@ pub async fn run_server(
             });
         }
     }
+}
+
+async fn seed_privacy_scanner_config(store: &Store, raw: &str) -> Result<()> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(());
+    }
+
+    let changed = grpc::policy::upsert_global_string_setting(
+        store,
+        openshell_core::settings::PRIVACY_SCANNER_CONFIG_KEY,
+        raw.to_string(),
+    )
+    .await
+    .map_err(|status| {
+        Error::config(format!(
+            "failed to seed privacy scanner config from gateway startup config: {status}"
+        ))
+    })?;
+
+    if changed {
+        info!("Seeded privacy scanner config from gateway startup config");
+    }
+    Ok(())
 }
 
 async fn build_compute_runtime(

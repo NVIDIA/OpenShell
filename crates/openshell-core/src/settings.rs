@@ -30,6 +30,12 @@ pub struct RegisteredSetting {
     pub kind: SettingValueKind,
 }
 
+/// Gateway/global setting that adds customer regex rules to Privacy Router.
+pub const PRIVACY_SCAN_CUSTOM_PATTERNS_KEY: &str = "privacy_scan_custom_patterns";
+
+/// Gateway/global setting that selects the active Privacy Scanner provider.
+pub const PRIVACY_SCANNER_CONFIG_KEY: &str = "privacy_scanner_config";
+
 /// Static registry of currently-supported runtime settings.
 ///
 /// `policy` is intentionally excluded because it is a reserved key handled by
@@ -55,6 +61,14 @@ pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
     RegisteredSetting {
         key: "ocsf_json_enabled",
         kind: SettingValueKind::Bool,
+    },
+    RegisteredSetting {
+        key: PRIVACY_SCAN_CUSTOM_PATTERNS_KEY,
+        kind: SettingValueKind::String,
+    },
+    RegisteredSetting {
+        key: PRIVACY_SCANNER_CONFIG_KEY,
+        kind: SettingValueKind::String,
     },
     // Test-only keys live behind the `dev-settings` feature flag so they
     // don't appear in production builds.
@@ -99,8 +113,8 @@ pub fn parse_bool_like(raw: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::{
-        REGISTERED_SETTINGS, RegisteredSetting, SettingValueKind, parse_bool_like,
-        registered_keys_csv, setting_for_key,
+        PRIVACY_SCAN_CUSTOM_PATTERNS_KEY, PRIVACY_SCANNER_CONFIG_KEY, REGISTERED_SETTINGS,
+        RegisteredSetting, SettingValueKind, parse_bool_like, registered_keys_csv, setting_for_key,
     };
 
     #[cfg(feature = "dev-settings")]
@@ -115,6 +129,20 @@ mod tests {
     #[test]
     fn setting_for_key_returns_none_for_unknown() {
         assert!(setting_for_key("nonexistent_key").is_none());
+    }
+
+    #[test]
+    fn privacy_scan_custom_patterns_is_registered_as_string() {
+        let setting = setting_for_key(PRIVACY_SCAN_CUSTOM_PATTERNS_KEY)
+            .expect("privacy scan custom patterns should be registered");
+        assert_eq!(setting.kind, SettingValueKind::String);
+    }
+
+    #[test]
+    fn privacy_scanner_config_is_registered_as_string() {
+        let setting = setting_for_key(PRIVACY_SCANNER_CONFIG_KEY)
+            .expect("privacy scanner config should be registered");
+        assert_eq!(setting.kind, SettingValueKind::String);
     }
 
     #[test]

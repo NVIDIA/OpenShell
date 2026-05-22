@@ -109,6 +109,16 @@ server:
     # K8s secret mounted into sandbox pods for mTLS to the server
     clientTlsSecretName: openshell-client-tls
 
+# Optional remote Privacy Scanner provider. When disabled, sandboxes use the
+# built-in regex scanner in the supervisor.
+privacyScanner:
+  enabled: false
+  # URL reachable from sandbox supervisor pods, for example:
+  # http://privacy-scanner.privacy.svc.cluster.local:8080/scan
+  url: ""
+  timeoutMs: 2000
+  fallback: "builtin_regex"
+
 # NetworkPolicy restricting SSH ingress on sandbox pods to the gateway only.
 networkPolicy:
   enabled: true

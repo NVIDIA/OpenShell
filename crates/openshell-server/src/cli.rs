@@ -109,6 +109,10 @@ struct Args {
     #[arg(long, env = "OPENSHELL_HOST_GATEWAY_IP")]
     host_gateway_ip: Option<String>,
 
+    /// Gateway-global Privacy Scanner provider config JSON.
+    #[arg(long, env = "OPENSHELL_PRIVACY_SCANNER_CONFIG")]
+    privacy_scanner_config: Option<String>,
+
     /// Working directory for VM driver sandbox state.
     #[arg(
         long,
@@ -257,6 +261,10 @@ async fn run_from_args(args: Args) -> Result<()> {
 
     if let Some(ip) = args.host_gateway_ip {
         config = config.with_host_gateway_ip(ip);
+    }
+
+    if let Some(scanner_config) = args.privacy_scanner_config {
+        config = config.with_privacy_scanner_config(scanner_config);
     }
 
     let vm_config = VmComputeConfig {

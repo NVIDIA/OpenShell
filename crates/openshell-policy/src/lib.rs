@@ -17,8 +17,8 @@ use std::path::Path;
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::proto::{
-    FilesystemPolicy, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule, LandlockPolicy, NetworkBinary,
-    NetworkEndpoint, NetworkPolicyRule, ProcessPolicy, SandboxPolicy,
+    ContentPolicy, FilesystemPolicy, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule, LandlockPolicy,
+    NetworkBinary, NetworkEndpoint, NetworkPolicyRule, ProcessPolicy, SandboxPolicy,
 };
 use serde::{Deserialize, Serialize};
 
@@ -115,9 +115,26 @@ struct NetworkEndpointDef {
     /// Defaults to false (strict).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     allow_encoded_slash: bool,
+    /// Outbound content scanning policy for request bodies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content_policy: Option<ContentPolicyDef>,
 }
 
 fn is_zero(v: &u16) -> bool {
+    *v == 0
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ContentPolicyDef {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    max_scan_bytes: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    action: String,
+}
+
+fn is_zero_u32(v: &u32) -> bool {
     *v == 0
 }
 
@@ -268,6 +285,12 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                                 })
                                 .collect(),
                             allow_encoded_slash: e.allow_encoded_slash,
+                            content_policy: e.content_policy.map(|cp| ContentPolicy {
+                                enabled: cp.enabled,
+                                max_scan_bytes: cp.max_scan_bytes,
+                                action: cp.action,
+                                ..Default::default()
+                            }),
                         }
                     })
                     .collect(),
@@ -408,6 +431,11 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                                 })
                                 .collect(),
                             allow_encoded_slash: e.allow_encoded_slash,
+                            content_policy: e.content_policy.as_ref().map(|cp| ContentPolicyDef {
+                                enabled: cp.enabled,
+                                max_scan_bytes: cp.max_scan_bytes,
+                                action: cp.action.clone(),
+                            }),
                         }
                     })
                     .collect(),

@@ -102,6 +102,26 @@ message NetworkEndpoint {
   // upstreams like GitLab that embed %2F in namespaced resource paths.
   // Defaults to false (strict).
   bool allow_encoded_slash = 11;
+  // Outbound content scanning policy for request bodies.
+  // Requires protocol: "rest" (proxy must see plaintext HTTP bodies).
+  ContentPolicy content_policy = 12;
+}
+
+// Outbound content scanning policy for HTTP request bodies.
+//
+// When enabled, this endpoint uses max_scan_bytes as its scan cap. The
+// sandbox supervisor's embedded scanner still scans bounded HTTP request
+// bodies for endpoints without this policy using the default 1 MiB cap.
+message ContentPolicy {
+  // Enable content scanning for this endpoint.
+  bool enabled = 1;
+  // Maximum request body bytes to buffer for scanning.
+  // Bodies exceeding this limit stream through unscanned.
+  // Default: 1048576 (1 MiB).
+  uint32 max_scan_bytes = 4;
+  // Legacy action field retained for config compatibility.
+  // The embedded scanner always applies [LABEL] redaction.
+  string action = 7;
 }
 
 // An L7 deny rule that blocks specific requests.

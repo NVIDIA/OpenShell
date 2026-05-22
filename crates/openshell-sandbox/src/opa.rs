@@ -911,6 +911,20 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                             .collect();
                         ep["deny_rules"] = deny_rules.into();
                     }
+                    if let Some(ref cp) = e.content_policy {
+                        if cp.enabled {
+                            let mut cpj = serde_json::json!({
+                                "enabled": true,
+                            });
+                            if cp.max_scan_bytes > 0 {
+                                cpj["max_scan_bytes"] = cp.max_scan_bytes.into();
+                            }
+                            if !cp.action.is_empty() {
+                                cpj["action"] = cp.action.clone().into();
+                            }
+                            ep["content_policy"] = cpj;
+                        }
+                    }
                     ep
                 })
                 .collect();
@@ -1937,6 +1951,96 @@ process:
         let l7 = crate::l7::parse_l7_config(&config).unwrap();
         assert_eq!(l7.protocol, crate::l7::L7Protocol::Rest);
         assert_eq!(l7.enforcement, crate::l7::EnforcementMode::Enforce);
+    }
+
+    #[test]
+    fn content_policy_action_round_trips_through_opa() {
+        let data = r#"
+network_policies:
+  content_scan:
+    name: content-scan-test
+    endpoints:
+      - host: httpbin.org
+        port: 443
+        protocol: rest
+        enforcement: audit
+        access: full
+        content_policy:
+          enabled: true
+          action: synthesize
+    binaries:
+      - { path: /usr/bin/curl }
+filesystem_policy:
+  include_workdir: true
+  read_only: []
+  read_write: []
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data)
+            .expect("failed to load content_policy test data");
+        let input = NetworkInput {
+            host: "httpbin.org".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let config = engine
+            .query_endpoint_config(&input)
+            .expect("query failed")
+            .expect("endpoint config should be present");
+        let l7 = crate::l7::parse_l7_config(&config).expect("parse_l7_config failed");
+        let cp = l7
+            .content_policy
+            .as_ref()
+            .expect("content_policy should be Some");
+        assert!(cp.enabled);
+        assert_eq!(
+            cp.action, "synthesize",
+            "action must survive YAML → OPA → ContentScanConfig round-trip"
+        );
+    }
+
+    #[test]
+    fn content_policy_without_protocol_is_rejected_by_validation() {
+        // content_policy requires REST parsing; endpoints without protocol:
+        // rest are rejected before OPA data is used.
+        let data = r#"
+network_policies:
+  content_only:
+    name: content-only
+    endpoints:
+      - host: scan.example.com
+        port: 80
+        content_policy:
+          enabled: true
+          action: redact
+    binaries:
+      - { path: /usr/bin/curl }
+filesystem_policy:
+  include_workdir: true
+  read_only: []
+  read_write: []
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+"#;
+        let err = match OpaEngine::from_strings(TEST_POLICY, data) {
+            Ok(_) => panic!("content_policy without protocol should fail validation"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("content_policy requires protocol: rest"),
+            "unexpected validation error: {message}"
+        );
     }
 
     #[test]

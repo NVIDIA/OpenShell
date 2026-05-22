@@ -89,26 +89,39 @@ async fn connect(endpoint: &str) -> Result<OpenShellClient<Channel>> {
     Ok(OpenShellClient::new(channel))
 }
 
+/// Result of fetching the initial sandbox config from the gateway.
+pub struct FetchConfigResult {
+    pub policy: Option<ProtoSandboxPolicy>,
+    pub settings: std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
+}
+
+/// Fetch sandbox config (policy + settings) from OpenShell server via gRPC.
+///
+/// Returns the policy (if configured) and the effective settings map.
+pub async fn fetch_config(endpoint: &str, sandbox_id: &str) -> Result<FetchConfigResult> {
+    debug!(endpoint = %endpoint, sandbox_id = %sandbox_id, "Connecting to OpenShell server");
+
+    let mut client = connect(endpoint).await?;
+
+    debug!("Connected, fetching sandbox config");
+
+    fetch_config_with_client(&mut client, sandbox_id).await
+}
+
 /// Fetch sandbox policy from OpenShell server via gRPC.
 ///
 /// Returns `Ok(Some(policy))` when the server has a policy configured,
 /// or `Ok(None)` when the sandbox was created without a policy (the sandbox
 /// should discover one from disk or use the restrictive default).
 pub async fn fetch_policy(endpoint: &str, sandbox_id: &str) -> Result<Option<ProtoSandboxPolicy>> {
-    debug!(endpoint = %endpoint, sandbox_id = %sandbox_id, "Connecting to OpenShell server");
-
-    let mut client = connect(endpoint).await?;
-
-    debug!("Connected, fetching sandbox policy");
-
-    fetch_policy_with_client(&mut client, sandbox_id).await
+    Ok(fetch_config(endpoint, sandbox_id).await?.policy)
 }
 
-/// Fetch sandbox policy using an existing client connection.
-async fn fetch_policy_with_client(
+/// Fetch sandbox config using an existing client connection.
+async fn fetch_config_with_client(
     client: &mut OpenShellClient<Channel>,
     sandbox_id: &str,
-) -> Result<Option<ProtoSandboxPolicy>> {
+) -> Result<FetchConfigResult> {
     let response = client
         .get_sandbox_config(GetSandboxConfigRequest {
             sandbox_id: sandbox_id.to_string(),
@@ -120,12 +133,20 @@ async fn fetch_policy_with_client(
 
     // version 0 with no policy means the sandbox was created without one.
     if inner.version == 0 && inner.policy.is_none() {
-        return Ok(None);
+        return Ok(FetchConfigResult {
+            policy: None,
+            settings: inner.settings,
+        });
     }
 
-    Ok(Some(inner.policy.ok_or_else(|| {
-        miette::miette!("Server returned non-zero version but empty policy")
-    })?))
+    Ok(FetchConfigResult {
+        policy: Some(
+            inner.policy.ok_or_else(|| {
+                miette::miette!("Server returned non-zero version but empty policy")
+            })?,
+        ),
+        settings: inner.settings,
+    })
 }
 
 /// Sync a locally-discovered policy using an existing client connection.
@@ -174,8 +195,9 @@ pub async fn discover_and_sync_policy(
     sync_policy_with_client(&mut client, sandbox, discovered_policy).await?;
 
     // Re-fetch from the gateway to get the canonical version/hash.
-    fetch_policy_with_client(&mut client, sandbox_id)
+    fetch_config_with_client(&mut client, sandbox_id)
         .await?
+        .policy
         .ok_or_else(|| {
             miette::miette!("Server still returned no policy after sync — this is a bug")
         })

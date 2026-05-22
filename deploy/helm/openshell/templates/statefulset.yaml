@@ -76,6 +76,13 @@ spec:
             - name: OPENSHELL_HOST_GATEWAY_IP
               value: {{ .Values.server.hostGatewayIP | quote }}
             {{- end }}
+            {{- if and .Values.privacyScanner.enabled .Values.privacyScanner.url }}
+            - name: OPENSHELL_PRIVACY_SCANNER_CONFIG
+              value: {{ dict "backend" "remote_http" "remote_http" (dict "url" .Values.privacyScanner.url "timeout_ms" (int .Values.privacyScanner.timeoutMs)) "fallback" .Values.privacyScanner.fallback | toJson | quote }}
+            {{- else }}
+            - name: OPENSHELL_PRIVACY_SCANNER_CONFIG
+              value: {{ dict "backend" "builtin_regex" | toJson | quote }}
+            {{- end }}
             - name: OPENSHELL_SSH_HANDSHAKE_SECRET
               valueFrom:
                 secretKeyRef:

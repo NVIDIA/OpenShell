@@ -13,8 +13,11 @@ normalize_name() {
 CLUSTER_NAME=${CLUSTER_NAME:-$(basename "$PWD")}
 CLUSTER_NAME=$(normalize_name "${CLUSTER_NAME}")
 CONTAINER_NAME="openshell-cluster-${CLUSTER_NAME}"
-IMAGE_REPO_BASE=${IMAGE_REPO_BASE:-${OPENSHELL_REGISTRY:-127.0.0.1:5000/openshell}}
+LOCAL_REGISTRY_PORT=${OPENSHELL_REGISTRY_PORT:-5050}
+LOCAL_REGISTRY_ADDR=127.0.0.1:${LOCAL_REGISTRY_PORT}
+IMAGE_REPO_BASE=${IMAGE_REPO_BASE:-${OPENSHELL_REGISTRY:-${LOCAL_REGISTRY_ADDR}/openshell}}
 IMAGE_TAG=${IMAGE_TAG:-dev}
+LOCAL_REGISTRY_CONTAINER=${LOCAL_REGISTRY_CONTAINER:-openshell-local-registry}
 RUST_BUILD_PROFILE=${RUST_BUILD_PROFILE:-debug}
 DEPLOY_FAST_MODE=${DEPLOY_FAST_MODE:-auto}
 FORCE_HELM_UPGRADE=${FORCE_HELM_UPGRADE:-0}
@@ -366,6 +369,46 @@ fi
 build_end=$(date +%s)
 log_duration "Builds" "${build_start}" "${build_end}"
 
+is_local_registry() {
+  local repo_host=${IMAGE_REPO_BASE%%/*}
+  [[ "${repo_host}" == 127.0.0.1:* || "${repo_host}" == localhost:* ]]
+}
+
+registry_reachable() {
+  curl -4 -fsS --max-time 2 "http://${LOCAL_REGISTRY_ADDR}/v2/" >/dev/null 2>&1
+}
+
+ensure_local_registry() {
+  if registry_reachable; then
+    return 0
+  fi
+
+  echo "Local registry at ${LOCAL_REGISTRY_ADDR} is not reachable. Recovering..."
+
+  if docker inspect "${LOCAL_REGISTRY_CONTAINER}" >/dev/null 2>&1; then
+    if ! docker ps --filter "name=^${LOCAL_REGISTRY_CONTAINER}$" --filter "status=running" -q | grep -q .; then
+      docker start "${LOCAL_REGISTRY_CONTAINER}" >/dev/null
+    fi
+  else
+    docker run -d --restart=always --name "${LOCAL_REGISTRY_CONTAINER}" -p "${LOCAL_REGISTRY_PORT}:5000" registry:2 >/dev/null
+  fi
+
+  local attempts=10
+  local i
+  for i in $(seq 1 "${attempts}"); do
+    if registry_reachable; then
+      echo "Local registry recovered."
+      return 0
+    fi
+    sleep 1
+  done
+
+  echo "Error: local registry is not reachable at ${LOCAL_REGISTRY_ADDR}." >&2
+  echo "       The bootstrap creates this automatically, but it appears to have stopped." >&2
+  echo "       Try: docker run -d --restart=always --name ${LOCAL_REGISTRY_CONTAINER} -p ${LOCAL_REGISTRY_PORT}:5000 registry:2" >&2
+  exit 1
+}
+
 # Push rebuilt gateway image to local registry.
 declare -a pushed_images=()
 
@@ -376,6 +419,10 @@ if [[ "${build_gateway}" == "1" ]]; then
 fi
 
 if [[ "${#pushed_images[@]}" -gt 0 ]]; then
+  if is_local_registry; then
+    ensure_local_registry
+  fi
+
   push_start=$(date +%s)
   echo "Pushing updated images to local registry..."
   for image_ref in "${pushed_images[@]}"; do

@@ -705,6 +705,7 @@ async fn handle_tcp_connection(
             .map(|p| p.to_string_lossy().into_owned())
             .collect(),
         secret_resolver: secret_resolver.clone(),
+        denial_tx: denial_tx.clone(),
     };
 
     if effective_tls_skip {
@@ -736,41 +737,79 @@ async fn handle_tcp_connection(
             let tls_result = async {
                 let mut tls_client =
                     crate::l7::tls::tls_terminate_client(client, tls, &host_lc).await?;
-                let mut tls_upstream =
-                    crate::l7::tls::tls_connect_upstream(upstream, &host_lc, tls.upstream_config())
-                        .await?;
 
-                if let Some(ref l7_config) = l7_config {
-                    // L7 inspection on terminated TLS traffic.
-                    let tunnel_engine = opa_engine.clone_engine_for_tunnel().unwrap_or_else(|e| {
-                        let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
-                            .activity(ActivityId::Fail)
-                            .severity(SeverityId::Low)
-                            .status(StatusId::Failure)
-                            .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                            .message(format!(
-                                "Failed to clone OPA engine for L7, falling back to relay-only: {e}"
-                            ))
-                            .build();
-                        ocsf_emit!(event);
-                        regorus::Engine::new()
-                    });
-                    crate::l7::relay::relay_with_inspection(
-                        l7_config,
-                        std::sync::Mutex::new(tunnel_engine),
-                        &mut tls_client,
-                        &mut tls_upstream,
-                        &ctx,
-                    )
-                    .await
+                // For L7 endpoints, defer the upstream TLS connection until
+                // the first request body has either been scanned or explicitly
+                // skipped. This keeps body buffering local to the sandbox.
+                let should_defer_scan = l7_config.is_some();
+
+                if should_defer_scan {
+                    if let Some(ref l7_config) = l7_config {
+                        let tunnel_engine = opa_engine.clone_engine_for_tunnel().unwrap_or_else(|e| {
+                            let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                                .activity(ActivityId::Fail)
+                                .severity(SeverityId::Low)
+                                .status(StatusId::Failure)
+                                .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                                .message(format!(
+                                    "Failed to clone OPA engine for L7, falling back to relay-only: {e}"
+                                ))
+                                .build();
+                            ocsf_emit!(event);
+                            regorus::Engine::new()
+                        });
+                        let tunnel_engine = std::sync::Mutex::new(tunnel_engine);
+                        crate::l7::relay::relay_rest_deferred_upstream(
+                            l7_config,
+                            &tunnel_engine,
+                            &mut tls_client,
+                            upstream,
+                            &host_lc,
+                            tls.upstream_config(),
+                            &ctx,
+                        )
+                        .await
+                    } else {
+                        unreachable!("should_defer_scan requires l7_config")
+                    }
                 } else {
-                    // No L7 config — relay with credential injection only.
-                    crate::l7::relay::relay_passthrough_with_credentials(
-                        &mut tls_client,
-                        &mut tls_upstream,
-                        &ctx,
+                    let mut tls_upstream = crate::l7::tls::tls_connect_upstream(
+                        upstream,
+                        &host_lc,
+                        tls.upstream_config(),
                     )
-                    .await
+                    .await?;
+
+                    if let Some(ref l7_config) = l7_config {
+                        let tunnel_engine = opa_engine.clone_engine_for_tunnel().unwrap_or_else(|e| {
+                            let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                                .activity(ActivityId::Fail)
+                                .severity(SeverityId::Low)
+                                .status(StatusId::Failure)
+                                .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                                .message(format!(
+                                    "Failed to clone OPA engine for L7, falling back to relay-only: {e}"
+                                ))
+                                .build();
+                            ocsf_emit!(event);
+                            regorus::Engine::new()
+                        });
+                        crate::l7::relay::relay_with_inspection(
+                            l7_config,
+                            std::sync::Mutex::new(tunnel_engine),
+                            &mut tls_client,
+                            &mut tls_upstream,
+                            &ctx,
+                        )
+                        .await
+                    } else {
+                        crate::l7::relay::relay_passthrough_with_credentials(
+                            &mut tls_client,
+                            &mut tls_upstream,
+                            &ctx,
+                        )
+                        .await
+                    }
                 }
             };
             if let Err(e) = tls_result.await {
@@ -2224,6 +2263,7 @@ async fn handle_forward_proxy(
                 .map(|p| p.to_string_lossy().into_owned())
                 .collect(),
             secret_resolver: secret_resolver.clone(),
+            denial_tx: None,
         };
 
         // Canonicalize the request-target. The canonical form is fed to OPA

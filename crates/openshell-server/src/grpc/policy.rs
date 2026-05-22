@@ -2417,6 +2417,37 @@ pub(super) async fn save_global_settings(
     .await
 }
 
+pub(crate) async fn upsert_global_string_setting(
+    store: &Store,
+    key: &str,
+    value: String,
+) -> Result<bool, Status> {
+    let Some(registered) = settings::setting_for_key(key) else {
+        return Err(Status::invalid_argument(format!(
+            "unknown setting key '{key}'. registered keys: {}",
+            settings::registered_keys_csv()
+        )));
+    };
+    if registered.kind != SettingValueKind::String {
+        return Err(Status::invalid_argument(format!(
+            "setting '{key}' expects {}, got string",
+            registered.kind.as_str()
+        )));
+    }
+
+    let mut global_settings = load_global_settings(store).await?;
+    let changed = upsert_setting_value(
+        &mut global_settings.settings,
+        key,
+        StoredSettingValue::String(value),
+    );
+    if changed {
+        global_settings.revision = global_settings.revision.wrapping_add(1);
+        save_global_settings(store, &global_settings).await?;
+    }
+    Ok(changed)
+}
+
 /// Derive a distinct settings record ID from a sandbox UUID.
 pub(crate) fn sandbox_settings_id(sandbox_id: &str) -> String {
     format!("settings:{sandbox_id}")
@@ -3268,6 +3299,29 @@ mod tests {
         let err = proto_setting_to_stored("unknown_key", &value).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("unknown setting key"));
+    }
+
+    #[test]
+    fn proto_setting_to_stored_accepts_privacy_scan_custom_patterns() {
+        let raw = r#"{"patterns":[{"label":"employee_id","regex":"\\bEMP-[0-9]{6}\\b"}]}"#;
+        let value = SettingValue {
+            value: Some(setting_value::Value::StringValue(raw.to_string())),
+        };
+        let stored =
+            proto_setting_to_stored(settings::PRIVACY_SCAN_CUSTOM_PATTERNS_KEY, &value).unwrap();
+
+        assert_eq!(stored, StoredSettingValue::String(raw.to_string()));
+    }
+
+    #[test]
+    fn proto_setting_to_stored_accepts_privacy_scanner_config() {
+        let raw = r#"{"backend":"remote_http","remote_http":{"url":"http://scanner.default.svc.cluster.local:8080/scan","timeout_ms":2000},"fallback":"builtin_regex"}"#;
+        let value = SettingValue {
+            value: Some(setting_value::Value::StringValue(raw.to_string())),
+        };
+        let stored = proto_setting_to_stored(settings::PRIVACY_SCANNER_CONFIG_KEY, &value).unwrap();
+
+        assert_eq!(stored, StoredSettingValue::String(raw.to_string()));
     }
 
     #[cfg(feature = "dev-settings")]

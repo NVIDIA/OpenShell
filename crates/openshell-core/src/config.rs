@@ -143,6 +143,13 @@ pub struct Config {
     /// allowing them to reach services running on the Docker host.
     #[serde(default)]
     pub host_gateway_ip: String,
+
+    /// Gateway-global Privacy Scanner provider config JSON.
+    ///
+    /// When set, the gateway stores this as a global runtime setting so
+    /// sandbox supervisors use the same scanner provider.
+    #[serde(default)]
+    pub privacy_scanner_config: String,
 }
 
 /// TLS configuration.
@@ -193,6 +200,7 @@ impl Config {
             ssh_session_ttl_secs: default_ssh_session_ttl_secs(),
             client_tls_secret_name: String::new(),
             host_gateway_ip: String::new(),
+            privacy_scanner_config: String::new(),
         }
     }
 
@@ -310,6 +318,13 @@ impl Config {
         self.host_gateway_ip = ip.into();
         self
     }
+
+    /// Set the gateway-global Privacy Scanner provider config JSON.
+    #[must_use]
+    pub fn with_privacy_scanner_config(mut self, config: impl Into<String>) -> Self {
+        self.privacy_scanner_config = config.into();
+        self
+    }
 }
 
 fn default_bind_address() -> SocketAddr {
@@ -383,6 +398,18 @@ mod tests {
         assert_eq!(
             Config::new(None).compute_drivers,
             vec![ComputeDriverKind::Kubernetes]
+        );
+    }
+
+    #[test]
+    fn privacy_scanner_config_defaults_empty_and_can_be_set() {
+        let config = Config::new(None);
+        assert!(config.privacy_scanner_config.is_empty());
+
+        let config = config.with_privacy_scanner_config(r#"{"backend":"builtin_regex"}"#);
+        assert_eq!(
+            config.privacy_scanner_config,
+            r#"{"backend":"builtin_regex"}"#
         );
     }
 }

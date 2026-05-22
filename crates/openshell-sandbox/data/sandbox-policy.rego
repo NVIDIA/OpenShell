@@ -448,7 +448,7 @@ endpoint_matches_request(ep, network) if {
 }
 
 # An endpoint has extended config if it specifies L7 protocol, allowed_ips,
-# or an explicit tls mode (e.g. tls: skip).
+# an explicit tls mode (e.g. tls: skip), or a content_policy.
 endpoint_has_extended_config(ep) if {
 	ep.protocol
 }
@@ -459,4 +459,8 @@ endpoint_has_extended_config(ep) if {
 
 endpoint_has_extended_config(ep) if {
 	ep.tls
+}
+
+endpoint_has_extended_config(ep) if {
+	object.get(ep, "content_policy", null) != null
 }
