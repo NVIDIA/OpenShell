@@ -99,7 +99,6 @@ jobs:
             --version 0.0.0-dev \
             --namespace "$RELEASE_NAMESPACE" --create-namespace \
             --set server.disableTls=true \
-            --set pkiInitJob.enabled=false \
             --wait --timeout 5m
 
       - name: Verify gateway pod is Ready

@@ -83,7 +83,6 @@ helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
   --version 0.0.0-dev \
   --namespace openshell --create-namespace \
   --set server.disableTls=true \
-  --set pkiInitJob.enabled=false \
   --wait --timeout 5m
 
 kubectl wait --namespace openshell \
@@ -95,6 +94,10 @@ kubectl port-forward --namespace openshell svc/openshell 8080:8080 &
 openshell gateway add http://127.0.0.1:8080 --local --name kind
 openshell status
 ```
+
+Keep `pkiInitJob.enabled=true` (the chart default), even when
+`server.disableTls=true`. The hook also generates the sandbox JWT signing
+secret that the gateway pod always mounts.
 
 Swap `0.0.0-dev` for `0.0.0-dev.<sha>` to pin to a specific dev build. Tear down with `kind delete cluster --name release-canary-local`.
 
