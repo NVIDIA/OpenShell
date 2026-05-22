@@ -84,8 +84,10 @@ jobs:
           set -euo pipefail
           for component in gateway supervisor; do
             image="ghcr.io/nvidia/openshell/${component}:${{ inputs.image-tag }}"
+            archive="${RUNNER_TEMP:-/tmp}/openshell-${component}-linux-amd64.tar"
             docker pull --platform linux/amd64 "$image"
-            kind load docker-image "$image" --name "$KIND_CLUSTER_NAME"
+            docker image save --platform linux/amd64 --output "$archive" "$image"
+            kind load image-archive "$archive" --name "$KIND_CLUSTER_NAME"
           done
 
       - name: Run Kubernetes E2E (Rust smoke)
