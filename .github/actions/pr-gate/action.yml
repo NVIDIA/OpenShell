@@ -16,6 +16,9 @@ outputs:
   should_run:
     description: "true if the workflow should proceed, false otherwise"
     value: ${{ steps.gate.outputs.should_run }}
+  labels_json:
+    description: "JSON array of PR label names for push-triggered mirror runs, or [] otherwise"
+    value: ${{ steps.gate.outputs.labels_json }}
 
 runs:
   using: composite
@@ -35,20 +38,23 @@ runs:
         REQUIRED_LABEL: ${{ inputs.required_label }}
       run: |
         if [ "$EVENT_NAME" != "push" ]; then
+          echo "labels_json=[]" >> "$GITHUB_OUTPUT"
           echo "should_run=true" >> "$GITHUB_OUTPUT"
           exit 0
         fi
 
         if [ "$GET_PR_INFO_OUTCOME" != "success" ]; then
+          echo "labels_json=[]" >> "$GITHUB_OUTPUT"
           echo "should_run=false" >> "$GITHUB_OUTPUT"
           exit 0
         fi
 
         head_sha="$(jq -r '.head.sha' <<< "$PR_INFO")"
+        labels_json="$(jq -c '[.labels[].name]' <<< "$PR_INFO")"
         if [ -z "$REQUIRED_LABEL" ]; then
           has_label=true
         else
-          has_label="$(jq -r --arg L "$REQUIRED_LABEL" '[.labels[].name] | index($L) != null' <<< "$PR_INFO")"
+          has_label="$(jq -r --arg L "$REQUIRED_LABEL" 'index($L) != null' <<< "$labels_json")"
         fi
 
         # Only trust copied pull-request/* pushes that still match the PR head
@@ -59,4 +65,5 @@ runs:
           should_run=false
         fi
 
+        echo "labels_json=$labels_json" >> "$GITHUB_OUTPUT"
         echo "should_run=$should_run" >> "$GITHUB_OUTPUT"
