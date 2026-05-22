@@ -1,6 +1,6 @@
 # Building a snap package
 
-OpenShell snap packages are defined by the root `snapcraft.yaml` and built with
+OpenShell snap packages are defined by `snap/snapcraft.yaml` and built with
 Snapcraft from source.
 
 The helper task under `tasks/` still stages the same payload from pre-built
@@ -15,7 +15,7 @@ binaries when you want to inspect the snap root or produce local artifacts.
 
 ## Build with Snapcraft
 
-Build the snap from source with the root manifest:
+Build the snap from source with the project manifest:
 
 ```shell
 snapcraft pack
