@@ -1,10 +1,12 @@
 ---
 authors:
   - "@elezar"
-state: draft
+state: accepted
 links:
   - https://github.com/NVIDIA/OpenShell/issues/1338
   - https://github.com/NVIDIA/OpenShell/pull/1340
+  - https://github.com/NVIDIA/OpenShell/pull/1360
+  - https://github.com/NVIDIA/OpenShell/issues/1492
 ---
 
 # RFC 0004 - Sandbox Resource Requirements
@@ -54,6 +56,8 @@ configuration rather than portable resources.
 The proposal is inspired by Kubernetes Dynamic Resource Allocation structured
 parameters: scheduler-visible selection is structured, while driver-specific
 configuration remains separate and is interpreted by the resource driver.
+Exposing a general-purpose driver-specific configuration surface is related, but
+tracked separately in issue #1492.
 
 ## Non-goals
 
@@ -62,6 +66,8 @@ configuration remains separate and is interpreted by the resource driver.
 - Building a gateway-level scheduler or reservation system.
 - Exposing detailed per-device inventory from drivers.
 - Exposing JSON-formatted portable resource requests in the CLI.
+- Defining the general driver-specific configuration passthrough API. Issue
+  #1492 tracks that related API surface.
 - Publishing allocated resource identities in sandbox status.
 - Preserving long-term compatibility for `gpu`, `gpu_device`, or a
   GPU-specific `gpu_count` request field.
@@ -97,33 +103,10 @@ resource requests and limits, but it is not the portable resource contract.
 The CLI should not expose a JSON flag for `resource_requirements`. Common
 portable requests should use typed flags such as CPU, memory, and GPU-count
 flags, and SDK/API callers should use the typed protobuf messages directly.
-JSON-formatted CLI input is reserved for driver-specific configuration.
-
-The long-term public API should expose one opaque driver configuration field on
-the template instead of adding more JSON-shaped resource inputs:
-
-```proto
-message SandboxTemplate {
-  string image = 1;
-  string runtime_class_name = 2;
-  string agent_socket = 3;
-  map<string, string> labels = 4;
-  map<string, string> annotations = 5;
-  map<string, string> environment = 6;
-
-  // Driver/platform-native configuration. Top-level keys are DNS-style
-  // namespaces such as kubernetes.openshell.ai, docker.openshell.ai, or
-  // vm.openshell.ai. The gateway validates shape and size but does not
-  // interpret the values for portable resource matching.
-  map<string, google.protobuf.Struct> driver_config = 11;
-}
-```
-
-Existing JSON passthrough such as PR #1340's `--resources-json` should be
-renamed to `--driver-config-json` before it becomes a stable CLI contract, or
-treated as transitional if it has already shipped. The flag writes the provided
-object into `SandboxTemplate.driver_config`; it does not populate
-`SandboxSpec.resource_requirements`.
+JSON-formatted driver-specific configuration is a related but separate API
+topic. Issue #1492 tracks exposing an opaque driver-owned configuration surface,
+potentially named `driver_config`. This RFC only requires that driver-native
+configuration remains separate from portable resource requirements.
 
 ### Resource requirements
 
@@ -218,6 +201,14 @@ Compute requirements are fungible CPU and memory requirements. They differ from
 devices because they usually do not need exact identity or driver-specific
 selection.
 
+This RFC standardizes only CPU and memory as initial portable compute
+requirements. Other compute-shaped constraints such as ephemeral storage, huge
+pages, PID limits, shared memory, or similar cgroup-backed limits may be added
+later, but only once their request/limit semantics are clear and they can map to
+multiple drivers. Driver-specific support for such constraints should stay in
+driver-specific configuration until it is portable enough for the first-party
+API.
+
 Example request:
 
 ```yaml
@@ -237,6 +228,13 @@ Example realizations:
 | Docker | Apply supported runtime limits such as CPU quota/NanoCPUs and memory limit. Requests are capacity checks when the driver can evaluate host capacity. |
 | Podman | Apply supported runtime limits such as CPU quota and memory limit. Requests are capacity checks when the driver can evaluate host capacity. |
 | VM | Map CPU and memory limits to VM vCPU count and guest memory allocation. The driver may require request and limit to be equal when it cannot represent separate request/limit semantics. |
+
+Compute requirements describe the sandbox workload that the driver provisions,
+not every runtime-managed helper process. If a driver later runs the proxy,
+supervisor, or other control-plane helpers in separate containers, sidecars, or
+pods, it may apply fixed overhead or expose helper-specific settings through
+driver-specific configuration. Those helper resources are driver implementation
+details unless a later RFC promotes them into portable resource requirements.
 
 Drivers must reject compute requirements they cannot honor. They must not
 silently accept a limit or request that has no effect.
@@ -504,38 +502,20 @@ validation failure: portable GPU count conflicts with template GPU limit
 The request must fail rather than letting either source silently override the
 other.
 
-### Driver-specific JSON configuration
+### Related driver-specific configuration
 
-The only JSON-formatted CLI escape hatch proposed by this RFC is
-`--driver-config-json`. It is for driver/platform-specific configuration, not
-portable resource requests.
-
-Example:
-
-```shell
-openshell sandbox create \
-  --driver-config-json '{"kubernetes.openshell.ai":{"nodeSelector":{"accelerator":"nvidia"}}}'
-```
-
-Request shape:
-
-```yaml
-template:
-  driverConfig:
-    kubernetes.openshell.ai:
-      nodeSelector:
-        accelerator: nvidia
-```
-
-The gateway may use the presence of a driver-config namespace as a compatibility
-prefilter, but it must not inspect driver-config values as portable resource
-requirements. CPU, memory, GPU count, and exact GPU selection should use typed
-resource fields or typed CLI flags.
+Driver-specific configuration is intentionally separate from portable resource
+requirements. Issue #1492 tracks an opaque driver-owned configuration surface
+for backend-native settings such as Kubernetes node selectors, tolerations,
+image pull secrets, Docker network mode, or VM disk shape. A future design may
+place that surface on `SandboxTemplate.driver_config` and may use a namespaced
+map-of-maps shape, but this RFC does not standardize that API or its CLI flags.
 
 This RFC does not introduce `--resources-json`, `--resource-requirements-json`,
-or `--template-resources-json`. If a driver needs backend-native resource
-settings that are not modeled by `resource_requirements`, they belong under
-that driver's `--driver-config-json` namespace and remain driver-specific.
+or `--template-resources-json`. CPU, memory, GPU count, and exact GPU selection
+should use typed resource fields or typed CLI flags. Backend-native settings
+that are not modeled by `resource_requirements` should remain driver-specific
+and should not be presented as portable resource requests.
 
 ### Template realization and conflicts
 
@@ -555,13 +535,10 @@ not silently override portable resource intent with template passthrough values,
 or template passthrough values with portable resource intent.
 
 Requests with only `SandboxTemplate.resources` are valid platform-native
-passthrough, but they do not participate in portable driver matching.
-
-In the breaking API proposed by this RFC, new driver-native JSON should use
-`SandboxTemplate.driver_config`. Existing `SandboxTemplate.resources` behavior
-can be preserved during migration, but should not gain a stable CLI flag named
-`--resources-json` because that name conflicts with portable resource
-requirements.
+passthrough, but they do not participate in portable driver matching. Existing
+`SandboxTemplate.resources` behavior can be preserved during migration, but
+should not gain a stable CLI flag named `--resources-json` because that name
+conflicts with portable resource requirements.
 
 ### Driver request model
 
@@ -677,9 +654,7 @@ default behavior and use the configured default driver.
    namespaces.
 7. Update CLI/API request construction so CPU, memory, GPU count, and exact GPU
    selection use resource requirements instead of GPU-specific request fields.
-8. Rename JSON passthrough to `--driver-config-json` and map it to
-   `SandboxTemplate.driver_config`; do not expose JSON-formatted portable
-   resource request flags.
+8. Do not expose JSON-formatted portable resource request flags.
 9. Update user-facing docs and driver README files once behavior is
    implemented.
 
@@ -709,8 +684,7 @@ The implementation should include:
   index with `vm.openshell.ai`.
 - tests showing that template-only resources are treated as platform-native
   passthrough and are not used for portable driver matching.
-- CLI request-shape tests showing that `--driver-config-json` populates
-  `SandboxTemplate.driver_config` and that there is no JSON-formatted portable
+- CLI request-shape tests showing that there is no JSON-formatted portable
   resource request flag.
 - error-message tests for no matching driver and validation failure across all
   candidates.
@@ -742,8 +716,8 @@ The implementation should include:
   passthrough surface.
 - Expose `--resources-json` as a CLI shortcut for `SandboxTemplate.resources`.
   This matches PR #1340's immediate implementation direction, but the name
-  implies portable resource semantics. `--driver-config-json` is more explicit
-  about the backend-native nature of the data.
+  implies portable resource semantics. Backend-native configuration needs a
+  separate driver-specific design, tracked by issue #1492.
 - Use a repeated `kind`-based requirement for all resources. This keeps gateway
   matching generic, but makes common resources such as CPU, memory, and GPU more
   stringly typed than necessary.
