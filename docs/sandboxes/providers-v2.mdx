@@ -513,7 +513,13 @@ endpoints:
   - host: api.github.com
     port: 443
     protocol: rest
-    access: read-write
+    access: read-only
+    enforcement: enforce
+  - host: api.github.com
+    port: 443
+    path: /graphql
+    protocol: graphql
+    access: read-only
     enforcement: enforce
   - host: github.com
     port: 443
@@ -544,7 +550,13 @@ network_policies:
       - host: api.github.com
         port: 443
         protocol: rest
-        access: read-write
+        access: read-only
+        enforcement: enforce
+      - host: api.github.com
+        port: 443
+        path: /graphql
+        protocol: graphql
+        access: read-only
         enforcement: enforce
       - host: github.com
         port: 443

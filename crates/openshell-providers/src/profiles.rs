@@ -1119,7 +1119,23 @@ mod tests {
             proto.category,
             ProviderProfileCategory::SourceControl as i32
         );
-        assert_eq!(proto.endpoints.len(), 2);
+        assert_eq!(proto.endpoints.len(), 3);
+        assert!(
+            proto.endpoints.iter().any(|endpoint| {
+                endpoint.host == "api.github.com"
+                    && endpoint.protocol == "graphql"
+                    && endpoint.path == "/graphql"
+                    && endpoint.access == "read-only"
+            }),
+            "github profile should include read-only GraphQL endpoint"
+        );
+        assert!(
+            proto
+                .endpoints
+                .iter()
+                .all(|endpoint| endpoint.access == "read-only"),
+            "github profile endpoints should all be read-only"
+        );
         assert_eq!(proto.binaries.len(), 4);
     }
 

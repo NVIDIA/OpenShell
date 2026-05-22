@@ -3586,13 +3586,30 @@ mod tests {
 
         assert_eq!(layers.len(), 1);
         assert_eq!(layers[0].rule_name, "_provider_work_github");
-        assert_eq!(layers[0].rule.endpoints.len(), 2);
+        assert_eq!(layers[0].rule.endpoints.len(), 3);
         assert!(
             layers[0]
                 .rule
                 .endpoints
                 .iter()
                 .any(|endpoint| endpoint.host == "api.github.com")
+        );
+        assert!(
+            layers[0].rule.endpoints.iter().any(|endpoint| {
+                endpoint.host == "api.github.com"
+                    && endpoint.protocol == "graphql"
+                    && endpoint.path == "/graphql"
+                    && endpoint.access == "read-only"
+            }),
+            "github provider policy should include read-only GraphQL endpoint"
+        );
+        assert!(
+            layers[0]
+                .rule
+                .endpoints
+                .iter()
+                .all(|endpoint| endpoint.access == "read-only"),
+            "github provider policy should be read-only by default"
         );
     }
 
