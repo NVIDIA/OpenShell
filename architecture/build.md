@@ -20,6 +20,15 @@ OpenShell builds these main artifacts:
 
 Sandbox community images are built outside this repository.
 
+## Linux Runtime Environments
+
+OpenShell uses different Linux libc environments for different host artifacts.
+The standalone `openshell` CLI is built as a static musl binary so it can run on
+a wide range of Linux distributions without depending on the host's glibc. Host
+runtime binaries that use the GNU/Linux runtime environment, including
+`openshell-gateway` and `openshell-driver-vm`, are GNU-linked and built with a
+glibc 2.31 floor.
+
 ## Container Builds
 
 The Docker image pipeline is a two-step flow: build the Rust binary natively

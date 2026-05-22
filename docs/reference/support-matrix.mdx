@@ -19,6 +19,8 @@ OpenShell publishes multi-architecture gateway images for `linux/amd64` and `lin
 | macOS (Docker Desktop)           | Apple Silicon (arm64) | Supported |
 | Windows (WSL 2 + Docker Desktop) | x86_64                | Experimental  |
 
+On Linux, the `openshell` CLI is a static musl binary and does not require glibc at runtime.
+
 ## Standalone Gateway Binary
 
 OpenShell publishes standalone `openshell-gateway` release assets for manual download on these platforms:
@@ -31,7 +33,7 @@ OpenShell publishes standalone `openshell-gateway` release assets for manual dow
 
 These artifacts are attached to GitHub releases. Kubernetes deployments should use the Helm chart and the published gateway image.
 
-Linux package installs and standalone GNU gateway artifacts require glibc 2.31 or newer. This supports Ubuntu 20.04 and later, Ubuntu 22.04, RHEL 9-compatible distributions, and Amazon Linux 2023.
+On Linux, `openshell-gateway` requires glibc 2.31 or newer. Compatible systems include, for example, Ubuntu 20.04+, RHEL 9+, Amazon Linux 2023+, and Fedora 32+.
 
 ## Compute Drivers
 
