@@ -4121,12 +4121,22 @@ async fn fetch_provider_profile(
     client: &mut crate::tls::GrpcClient,
     provider_type: &str,
 ) -> Result<ProviderProfile> {
-    client
+    let response = client
         .get_provider_profile(GetProviderProfileRequest {
             id: provider_type.to_string(),
         })
         .await
-        .into_diagnostic()?
+        .map_err(|status| {
+            if status.code() == Code::NotFound {
+                miette::miette!(
+                    "provider profile '{provider_type}' not found; providers v2 discovery requires a provider profile"
+                )
+            } else {
+                miette::miette!(status.to_string())
+            }
+        })?;
+
+    response
         .into_inner()
         .profile
         .ok_or_else(|| miette::miette!("provider profile '{provider_type}' missing from response"))

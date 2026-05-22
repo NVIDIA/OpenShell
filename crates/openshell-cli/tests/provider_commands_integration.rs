@@ -1275,6 +1275,56 @@ async fn provider_create_from_existing_uses_profile_discovery_when_v2_enabled() 
 }
 
 #[tokio::test]
+async fn provider_create_from_existing_uses_registry_discovery_when_v2_disabled() {
+    let ts = run_server().await;
+    let _env = EnvVarGuard::set(&[("OPENAI_API_KEY", "legacy-openai-secret")]);
+
+    run::provider_create(
+        &ts.endpoint,
+        "legacy-openai",
+        "openai",
+        true,
+        &[],
+        &[],
+        &ts.tls,
+    )
+    .await
+    .expect("legacy provider create --from-existing");
+
+    let provider = ts
+        .state
+        .providers
+        .lock()
+        .await
+        .get("legacy-openai")
+        .cloned()
+        .expect("legacy provider should be stored");
+    assert_eq!(provider.r#type, "openai");
+    assert_eq!(
+        provider.credentials.get("OPENAI_API_KEY"),
+        Some(&"legacy-openai-secret".to_string())
+    );
+}
+
+#[tokio::test]
+async fn provider_create_from_existing_requires_profile_when_v2_enabled() {
+    let ts = run_server().await;
+    enable_providers_v2(&ts).await;
+    let _env = EnvVarGuard::set(&[("OPENAI_API_KEY", "legacy-openai-secret")]);
+
+    let err = run::provider_create(&ts.endpoint, "v2-openai", "openai", true, &[], &[], &ts.tls)
+        .await
+        .expect_err("v2 discovery without a profile should fail");
+
+    assert!(
+        err.to_string()
+            .contains("providers v2 discovery requires a provider profile"),
+        "unexpected error: {err}"
+    );
+    assert!(!ts.state.providers.lock().await.contains_key("v2-openai"));
+}
+
+#[tokio::test]
 async fn provider_create_from_existing_fails_when_profile_discovery_finds_nothing() {
     let ts = run_server().await;
     enable_providers_v2(&ts).await;
