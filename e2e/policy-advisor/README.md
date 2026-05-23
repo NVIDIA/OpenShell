@@ -52,3 +52,18 @@ bash e2e/policy-advisor/test.sh
 Requires Docker, `agent_policy_proposals_enabled=true`, and a GitHub token with
 contents write on the repository. The test auto-resolves the token from
 `DEMO_GITHUB_TOKEN`, `GITHUB_TOKEN`, `GH_TOKEN`, or `gh auth token`.
+
+## Mechanistic smoke
+
+Lightweight regression for the L4 CONNECT deny → mechanistic chunk pipeline.
+No GitHub token or LLM required.
+
+```bash
+mise run e2e:mechanistic-smoke
+```
+
+Or manually against a running gateway with `agent_policy_proposals_enabled=true`:
+
+```bash
+OPENSHELL_BIN=target/debug/openshell bash e2e/policy-advisor/mechanistic-smoke.sh
+```

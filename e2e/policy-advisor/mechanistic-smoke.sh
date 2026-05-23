@@ -43,6 +43,8 @@ step() { printf "\n${BOLD}${CYAN}==> %s${RESET}\n\n" "$1"; }
 ok()   { printf "  ${GREEN}✓${RESET} %s\n" "$*"; }
 fail() { printf "\n${RED}FAIL:${RESET} %s\n" "$*" >&2; exit 1; }
 
+TMP_DIR=""
+
 cleanup() {
     if [[ "$KEEP_SANDBOX" != "1" ]]; then
         "$OPENSHELL_BIN" sandbox delete "$SANDBOX" >/dev/null 2>&1 || true
