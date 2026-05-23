@@ -23,6 +23,9 @@
 #   - Existing-context mode pulls from ${OPENSHELL_REGISTRY}/{gateway,supervisor}:${IMAGE_TAG}
 #     (defaults: ghcr.io/nvidia/openshell, latest). CI sets IMAGE_TAG to the
 #     commit SHA and preloads or publishes the images before running this script.
+#
+# Set OPENSHELL_E2E_KUBE_SPIFFE=1 to install SPIRE and configure the chart to
+# use SPIFFE JWT-SVIDs for sandbox supervisor authentication.
 
 set -euo pipefail
 
@@ -47,9 +50,11 @@ CLUSTER_NAME=""
 KUBE_CONTEXT=""
 NAMESPACE="openshell"
 RELEASE_NAME="openshell"
+SPIRE_NAMESPACE="spire"
 PORTFORWARD_PID=""
 PORTFORWARD_LOG="${WORKDIR}/portforward.log"
 HELM_INSTALLED=0
+SPIRE_INSTALLED=0
 
 # Isolate CLI/SDK gateway metadata from the developer's real config.
 export XDG_CONFIG_HOME="${WORKDIR}/config"
@@ -101,6 +106,19 @@ cleanup() {
       # Wait for the namespace to fully delete so back-to-back runs don't hit
       # "namespace is being terminated" when helm install creates it again.
       kctl delete namespace "${NAMESPACE}" --wait=true --timeout=60s \
+        --ignore-not-found >/dev/null 2>&1 || true
+    fi
+  fi
+
+  if [ "${SPIRE_INSTALLED}" = "1" ] && [ -n "${KUBE_CONTEXT}" ]; then
+    if command -v helm >/dev/null 2>&1; then
+      helmctl uninstall spire --namespace "${SPIRE_NAMESPACE}" --wait \
+        --timeout 60s >/dev/null 2>&1 || true
+      helmctl uninstall spire-crds --namespace "${SPIRE_NAMESPACE}" --wait \
+        --timeout 60s >/dev/null 2>&1 || true
+    fi
+    if command -v kubectl >/dev/null 2>&1; then
+      kctl delete namespace "${SPIRE_NAMESPACE}" --wait=true --timeout=60s \
         --ignore-not-found >/dev/null 2>&1 || true
     fi
   fi
@@ -289,15 +307,36 @@ kctl apply -f "${ROOT}/deploy/kube/manifests/agent-sandbox.yaml"
 kctl wait --for=condition=Established crd/sandboxes.agents.x-k8s.io --timeout=120s
 kctl -n agent-sandbox-system rollout status statefulset/agent-sandbox-controller --timeout=300s
 
+if [ "${OPENSHELL_E2E_KUBE_SPIFFE:-0}" = "1" ]; then
+  echo "Installing SPIRE for Kubernetes SPIFFE e2e..."
+  helmctl install spire-crds spire-crds \
+    --repo https://spiffe.github.io/helm-charts-hardened/ \
+    --namespace "${SPIRE_NAMESPACE}" --create-namespace \
+    --wait --timeout 5m
+  helmctl install spire spire \
+    --repo https://spiffe.github.io/helm-charts-hardened/ \
+    --namespace "${SPIRE_NAMESPACE}" --create-namespace \
+    --values "${ROOT}/deploy/helm/openshell/ci/values-spire-stack.yaml" \
+    --wait --timeout 5m
+  SPIRE_INSTALLED=1
+fi
+
 helm_extra_args=()
 if [ -n "${HOST_GATEWAY_IP}" ]; then
   helm_extra_args+=(--set "server.hostGatewayIP=${HOST_GATEWAY_IP}")
 fi
 
+helm_values_args=(
+  --values "${ROOT}/deploy/helm/openshell/ci/values-skaffold.yaml"
+)
+if [ "${OPENSHELL_E2E_KUBE_SPIFFE:-0}" = "1" ]; then
+  helm_values_args+=(--values "${ROOT}/deploy/helm/openshell/ci/values-spire.yaml")
+fi
+
 echo "Installing Helm chart (release=${RELEASE_NAME}, namespace=${NAMESPACE}, tag=${IMAGE_TAG_VALUE})..."
 helmctl install "${RELEASE_NAME}" "${ROOT}/deploy/helm/openshell" \
   --namespace "${NAMESPACE}" --create-namespace \
-  --values "${ROOT}/deploy/helm/openshell/ci/values-skaffold.yaml" \
+  "${helm_values_args[@]}" \
   --set "fullnameOverride=openshell" \
   --set "image.repository=${REGISTRY_VALUE}/gateway" \
   --set "image.tag=${IMAGE_TAG_VALUE}" \
@@ -343,6 +382,8 @@ e2e_register_plaintext_gateway \
 
 export OPENSHELL_GATEWAY="${GATEWAY_NAME}"
 export OPENSHELL_E2E_DRIVER="kubernetes"
+export OPENSHELL_E2E_KUBE_CONTEXT="${KUBE_CONTEXT}"
+export OPENSHELL_E2E_KUBE_NAMESPACE="${NAMESPACE}"
 export OPENSHELL_E2E_SANDBOX_NAMESPACE="${NAMESPACE}"
 export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-300}"
 
