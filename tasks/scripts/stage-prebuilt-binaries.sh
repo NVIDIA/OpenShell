@@ -121,7 +121,7 @@ patch_workspace_version() {
   fi
 
   cargo_toml="${ROOT}/Cargo.toml"
-  cargo_toml_backup="$(mktemp)"
+  cargo_toml_backup="$(mktemp "${TMPDIR:-/tmp}/openshell-cargo.XXXXXX")"
   cp "$cargo_toml" "$cargo_toml_backup"
   restore_cargo_toml=1
   sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${OPENSHELL_CARGO_VERSION}"'"/}' "$cargo_toml"

@@ -117,7 +117,7 @@ k3d_cluster_exists() {
 merge_kubeconfig() {
   require_kubectl
   local tmp k3d_cfg merged_dir
-  tmp="$(mktemp)"
+  tmp="$(mktemp "${TMPDIR:-/tmp}/openshell-kubeconfig.XXXXXX")"
   k3d kubeconfig get "${CLUSTER_NAME}" >"${tmp}"
 
   if [[ -s "${KUBECONFIG_TARGET}" ]]; then
