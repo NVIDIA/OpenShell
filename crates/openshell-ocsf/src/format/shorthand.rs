@@ -319,6 +319,7 @@ impl OcsfEvent {
                         push("auto");
                         push("source");
                         push("prover_delta");
+                        push("resolved_from");
                         if let Some(ver) = u.get("policy_version").and_then(|v| v.as_str()) {
                             parts.push(format!("version:{ver}"));
                         }
@@ -844,6 +845,37 @@ mod tests {
         assert_eq!(
             shorthand,
             "CONFIG:LOADED [INFO] policy reloaded [version:v3 hash:sha256:abc123def456]"
+        );
+    }
+
+    /// Auto-approval audit events carry `auto`, `source`, `prover_delta`, and
+    /// `resolved_from` as unmapped fields. Lock the suffix order so operators
+    /// (and the demo's grep) can rely on it.
+    #[test]
+    fn test_config_state_change_shorthand_includes_auto_approve_fields() {
+        let mut b = base(5019, "Device Config State Change", 5, "Discovery", 1, "Log");
+        b.set_message("auto-approved: no new prover findings (source=agent_authored)");
+        b.add_unmapped("auto", serde_json::json!("true"));
+        b.add_unmapped("source", serde_json::json!("agent_authored"));
+        b.add_unmapped("prover_delta", serde_json::json!("empty"));
+        b.add_unmapped("resolved_from", serde_json::json!("sandbox"));
+        b.add_unmapped("policy_version", serde_json::json!("v4"));
+        b.add_unmapped("policy_hash", serde_json::json!("sha256:cafe"));
+
+        let event = OcsfEvent::DeviceConfigStateChange(DeviceConfigStateChangeEvent {
+            base: b,
+            state: Some(StateId::Other),
+            state_custom_label: Some("APPROVED".to_string()),
+            security_level: None,
+            prev_security_level: None,
+        });
+
+        let shorthand = event.format_shorthand();
+        assert_eq!(
+            shorthand,
+            "CONFIG:APPROVED [INFO] auto-approved: no new prover findings (source=agent_authored) \
+             [auto:true source:agent_authored prover_delta:empty resolved_from:sandbox \
+             version:v4 hash:sha256:cafe]"
         );
     }
 

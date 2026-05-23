@@ -873,7 +873,7 @@ async fn auto_approve_chunk(
         sandbox_id,
         sandbox_name,
         format!(
-            "auto-approved: no new prover findings (source={source_label}, resolved_from={resolved_from}) — chunk {chunk_id}: {chunk_summary}"
+            "auto-approved: no new prover findings (source={source_label}) — chunk {chunk_id}: {chunk_summary}"
         ),
         version,
         &hash,
