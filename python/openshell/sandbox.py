@@ -156,7 +156,7 @@ class SandboxClient:
         try:
             metadata = json.loads(metadata_path.read_text())
         except FileNotFoundError:
-            raise SandboxError(f"gateway '{cluster_name}' not found")
+            raise SandboxError(f"gateway '{cluster_name}' not found") from None
         if "gateway_endpoint" not in metadata:
             raise SandboxError(f"gateway '{cluster_name}' metadata missing endpoint")
         parsed = urlparse(metadata["gateway_endpoint"])
@@ -621,7 +621,7 @@ def _resolve_active_cluster() -> str:
     try:
         value = active_file.read_text().strip()
     except FileNotFoundError:
-        raise SandboxError("no active gateway configured")
+        raise SandboxError("no active gateway configured") from None
     if value == "":
         raise SandboxError("no active gateway configured")
     return value
