@@ -950,6 +950,7 @@ pub async fn gateway_add(
     // OIDC takes precedence over plaintext/mTLS/edge detection — the user
     // explicitly opted in with --oidc-issuer regardless of scheme.
     if let Some(issuer) = oidc_issuer {
+        let previous_active = load_active_gateway();
         let metadata = GatewayMetadata {
             name: name.to_string(),
             gateway_endpoint: endpoint.clone(),
@@ -974,8 +975,10 @@ pub async fn gateway_add(
         eprintln!("  {} oidc", "Auth:".dimmed());
         eprintln!();
 
+        let auth_skipped = is_browser_suppressed();
+
         // Check for client_credentials env var (CI mode).
-        if std::env::var("OPENSHELL_OIDC_CLIENT_SECRET").is_ok() {
+        let auth_ok = if std::env::var("OPENSHELL_OIDC_CLIENT_SECRET").is_ok() {
             match crate::oidc_auth::oidc_client_credentials_flow(
                 issuer,
                 oidc_client_id,
@@ -991,9 +994,11 @@ pub async fn gateway_add(
                         "{} Authenticated via client credentials",
                         "✓".green().bold()
                     );
+                    true
                 }
                 Err(e) => {
                     eprintln!("{} Authentication failed: {e}", "!".yellow());
+                    false
                 }
             }
         } else {
@@ -1009,15 +1014,17 @@ pub async fn gateway_add(
                 Ok(bundle) => {
                     openshell_bootstrap::oidc_token::store_oidc_token(name, &bundle)?;
                     eprintln!("{} Authenticated successfully", "✓".green().bold());
+                    true
                 }
                 Err(e) => {
-                    eprintln!("{} Authentication skipped: {e}", "!".yellow());
-                    eprintln!(
-                        "  Authenticate later with: {}",
-                        "openshell gateway login".dimmed(),
-                    );
+                    eprintln!("{} Authentication failed: {e}", "!".yellow());
+                    false
                 }
             }
+        };
+
+        if !auth_ok && !auth_skipped {
+            rollback_gateway_registration(name, previous_active.as_deref());
         }
 
         return Ok(());
@@ -1135,6 +1142,7 @@ pub async fn gateway_add(
         eprintln!("{} TLS certificates present", "✓".green().bold());
     } else {
         // Cloud (edge-authenticated) gateway.
+        let previous_active = load_active_gateway();
         let metadata = GatewayMetadata {
             name: name.to_string(),
             gateway_endpoint: endpoint.clone(),
@@ -1155,18 +1163,22 @@ pub async fn gateway_add(
         eprintln!("  {} cloud", "Type:".dimmed());
         eprintln!();
 
-        match crate::auth::browser_auth_flow(&endpoint).await {
+        let auth_skipped = is_browser_suppressed();
+
+        let auth_ok = match crate::auth::browser_auth_flow(&endpoint).await {
             Ok(token) => {
                 openshell_bootstrap::edge_token::store_edge_token(name, &token)?;
                 eprintln!("{} Authenticated successfully", "✓".green().bold());
+                true
             }
             Err(e) => {
-                eprintln!("{} Authentication skipped: {e}", "!".yellow());
-                eprintln!(
-                    "  Authenticate later with: {}",
-                    "openshell gateway login".dimmed(),
-                );
+                eprintln!("{} Authentication failed: {e}", "!".yellow());
+                false
             }
+        };
+
+        if !auth_ok && !auth_skipped {
+            rollback_gateway_registration(name, previous_active.as_deref());
         }
     }
 
@@ -1433,6 +1445,29 @@ async fn gateway_reachable(server: &str, tls: &TlsOptions) -> bool {
     }
 
     matches!(http_health_check(server, tls).await, Ok(Some(status)) if status.is_success())
+}
+
+fn is_browser_suppressed() -> bool {
+    std::env::var("OPENSHELL_NO_BROWSER").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+fn rollback_gateway_registration(name: &str, previous_active: Option<&str>) {
+    remove_gateway_registration(name);
+    if let Some(prev) = previous_active
+        && let Err(e) = save_active_gateway(prev)
+    {
+        tracing::warn!("failed to restore previous active gateway '{prev}': {e}");
+        eprintln!(
+            "{} Failed to restore previous active gateway '{}': {e}",
+            "!".yellow(),
+            prev,
+        );
+    }
+    eprintln!(
+        "{} Registration for '{}' removed. Fix the issue and retry gateway add.",
+        "!".yellow(),
+        name,
+    );
 }
 
 fn remove_gateway_registration(name: &str) {
@@ -8764,5 +8799,123 @@ mod tests {
             provider_profile_allows_refresh_bootstrap(&profile),
             "Oauth2RefreshToken should be allowed for refresh bootstrap"
         );
+    }
+
+    #[test]
+    fn gateway_add_oidc_rolls_back_on_auth_failure() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        with_tmp_xdg(tmpdir.path(), || {
+            let runtime = tokio::runtime::Runtime::new().expect("create runtime");
+
+            // Register a working plaintext gateway first so we can verify
+            // the active gateway is restored after rollback.
+            runtime.block_on(async {
+                gateway_add(
+                    "http://127.0.0.1:9999",
+                    Some("existing-gw"),
+                    None,
+                    false,
+                    None,
+                    "openshell-cli",
+                    None,
+                    None,
+                    false,
+                )
+                .await
+                .expect("register seed gateway");
+            });
+            assert_eq!(load_active_gateway().as_deref(), Some("existing-gw"));
+
+            // Attempt OIDC gateway add against an unreachable issuer.
+            // Auth will fail (connection refused), triggering rollback.
+            runtime.block_on(async {
+                gateway_add(
+                    "https://gateway.example.com",
+                    Some("oidc-fail"),
+                    None,
+                    false,
+                    Some("http://127.0.0.1:1/realms/nonexistent"),
+                    "openshell-cli",
+                    None,
+                    None,
+                    false,
+                )
+                .await
+                .expect("gateway_add should not return Err on auth failure");
+            });
+
+            // The failed registration should have been rolled back.
+            assert!(
+                load_gateway_metadata("oidc-fail").is_err(),
+                "failed OIDC gateway should be removed after auth failure"
+            );
+            // The previously active gateway should be restored.
+            assert_eq!(
+                load_active_gateway().as_deref(),
+                Some("existing-gw"),
+                "active gateway should be restored after rollback"
+            );
+        });
+    }
+
+    #[test]
+    fn gateway_add_cloud_rolls_back_on_auth_failure() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        with_tmp_xdg(tmpdir.path(), || {
+            let runtime = tokio::runtime::Runtime::new().expect("create runtime");
+
+            // Register a working plaintext gateway first.
+            runtime.block_on(async {
+                gateway_add(
+                    "http://127.0.0.1:9999",
+                    Some("existing-gw"),
+                    None,
+                    false,
+                    None,
+                    "openshell-cli",
+                    None,
+                    None,
+                    false,
+                )
+                .await
+                .expect("register seed gateway");
+            });
+            assert_eq!(load_active_gateway().as_deref(), Some("existing-gw"));
+
+            // Attempt cloud gateway add. The browser flow will fail because
+            // OPENSHELL_NO_BROWSER is NOT set but the /auth/connect endpoint
+            // is unreachable (connection refused), so the 120s timeout would
+            // kick in. To keep the test fast, set OPENSHELL_NO_BROWSER=0
+            // (explicitly not suppressed) and use a port that refuses connections.
+            // The CF auth flow will fail quickly on connection refused.
+            runtime.block_on(async {
+                gateway_add(
+                    "https://127.0.0.1:1",
+                    Some("cloud-fail"),
+                    None,
+                    false,
+                    None,
+                    "openshell-cli",
+                    None,
+                    None,
+                    false,
+                )
+                .await
+                .expect("gateway_add should not return Err on auth failure");
+            });
+
+            // The failed registration should have been rolled back.
+            assert!(
+                load_gateway_metadata("cloud-fail").is_err(),
+                "failed cloud gateway should be removed after auth failure"
+            );
+            assert_eq!(
+                load_active_gateway().as_deref(),
+                Some("existing-gw"),
+                "active gateway should be restored after rollback"
+            );
+        });
     }
 }
