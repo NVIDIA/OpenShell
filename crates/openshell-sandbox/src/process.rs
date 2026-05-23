@@ -477,6 +477,13 @@ pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
             .ok_or_else(|| miette::miette!("Failed to resolve user primary group"))?
     };
 
+    // Idempotent fast-path: if euid/egid already match the target (e.g. a
+    // container entrypoint pre-dropped before exec'ing the sandbox), skip
+    // initgroups(3), which would otherwise fail without CAP_SETGID.
+    if nix::unistd::geteuid() == user.uid && nix::unistd::getegid() == group.gid {
+        return Ok(());
+    }
+
     if user_name.is_some() {
         let user_cstr =
             CString::new(user.name.clone()).map_err(|_| miette::miette!("Invalid user name"))?;
