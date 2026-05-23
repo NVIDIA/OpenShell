@@ -61,6 +61,7 @@ const SUPERVISOR_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 const HOST_OPENSHELL_INTERNAL: &str = "host.openshell.internal";
 const HOST_DOCKER_INTERNAL: &str = "host.docker.internal";
 const DOCKER_NETWORK_DRIVER: &str = "bridge";
+const DEFAULT_SANDBOX_PIDS_LIMIT: i64 = 2048;
 
 /// Default image holding the Linux `openshell-sandbox` binary. The gateway
 /// pulls this image and extracts the binary to a host-side cache when no
@@ -163,6 +164,11 @@ pub struct DockerComputeConfig {
 
     /// Unix socket path the in-container supervisor bridges relay traffic to.
     pub ssh_socket_path: String,
+
+    /// Container cgroup PID limit for Docker-managed sandboxes.
+    ///
+    /// Set to `0` to leave Docker's runtime/default PID limit unchanged.
+    pub sandbox_pids_limit: i64,
 }
 
 impl Default for DockerComputeConfig {
@@ -180,6 +186,7 @@ impl Default for DockerComputeConfig {
             network_name: DEFAULT_DOCKER_NETWORK_NAME.to_string(),
             host_gateway_ip: String::new(),
             ssh_socket_path: "/run/openshell/ssh.sock".to_string(),
+            sandbox_pids_limit: DEFAULT_SANDBOX_PIDS_LIMIT,
         }
     }
 }
@@ -206,6 +213,7 @@ struct DockerDriverRuntimeConfig {
     guest_tls: Option<DockerGuestTlsPaths>,
     daemon_version: String,
     supports_gpu: bool,
+    sandbox_pids_limit: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -252,6 +260,7 @@ impl DockerComputeDriver {
             .cdi_spec_dirs
             .as_ref()
             .is_some_and(|dirs| !dirs.is_empty());
+        validate_sandbox_pids_limit(docker_config.sandbox_pids_limit)?;
         let gateway_port = config.bind_address.port();
         if gateway_port == 0 {
             return Err(Error::config(
@@ -298,6 +307,7 @@ impl DockerComputeDriver {
                 guest_tls,
                 daemon_version: version.version.unwrap_or_else(|| "unknown".to_string()),
                 supports_gpu,
+                sandbox_pids_limit: docker_config.sandbox_pids_limit,
             },
             events: broadcast::channel(WATCH_BUFFER).0,
             supervisor_readiness,
@@ -1161,6 +1171,7 @@ fn build_container_create_body(
         host_config: Some(HostConfig {
             nano_cpus: resource_limits.nano_cpus,
             memory: resource_limits.memory_bytes,
+            pids_limit: docker_pids_limit(config.sandbox_pids_limit)?,
             device_requests: docker_gpu_device_requests(spec.gpu, &spec.gpu_device),
             binds: Some(build_binds(sandbox, config)?),
             restart_policy: Some(RestartPolicy {
@@ -1450,6 +1461,28 @@ fn docker_resource_limits(
         nano_cpus: parse_cpu_limit(&resources.cpu_limit)?,
         memory_bytes: parse_memory_limit(&resources.memory_limit)?,
     })
+}
+
+fn validate_sandbox_pids_limit(value: i64) -> CoreResult<()> {
+    if value < 0 {
+        return Err(Error::config(
+            "docker sandbox_pids_limit must be zero or greater",
+        ));
+    }
+    Ok(())
+}
+
+fn docker_pids_limit(value: i64) -> Result<Option<i64>, Status> {
+    if value < 0 {
+        return Err(Status::failed_precondition(
+            "docker sandbox_pids_limit must be zero or greater",
+        ));
+    }
+    if value == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(value))
+    }
 }
 
 #[allow(clippy::cast_possible_truncation)]

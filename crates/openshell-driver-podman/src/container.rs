@@ -183,6 +183,8 @@ struct HealthConfig {
 struct ResourceLimits {
     cpu: CpuLimits,
     memory: MemoryLimits,
+    #[serde(rename = "PidsLimit", skip_serializing_if = "Option::is_none")]
+    pids_limit: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -340,7 +342,7 @@ fn build_labels(sandbox: &DriverSandbox) -> BTreeMap<String, String> {
 }
 
 /// Parse resource limits from the sandbox template, falling back to defaults.
-fn build_resource_limits(sandbox: &DriverSandbox) -> ResourceLimits {
+fn build_resource_limits(sandbox: &DriverSandbox, config: &PodmanComputeConfig) -> ResourceLimits {
     let resources = sandbox
         .spec
         .as_ref()
@@ -363,7 +365,12 @@ fn build_resource_limits(sandbox: &DriverSandbox) -> ResourceLimits {
             period: DEFAULT_CPU_PERIOD,
         },
         memory: MemoryLimits { limit: mem_bytes },
+        pids_limit: podman_pids_limit(config.sandbox_pids_limit),
     }
+}
+
+fn podman_pids_limit(value: i64) -> Option<i64> {
+    if value > 0 { Some(value) } else { None }
 }
 
 /// Build CDI GPU device list if GPU is requested.
@@ -396,7 +403,7 @@ pub fn build_container_spec_with_token(
 
     let env = build_env(sandbox, config, image);
     let labels = build_labels(sandbox);
-    let resource_limits = build_resource_limits(sandbox);
+    let resource_limits = build_resource_limits(sandbox, config);
     let devices = build_devices(sandbox);
 
     // Network configuration -- always bridge mode.
@@ -735,6 +742,20 @@ mod tests {
             spec["resource_limits"]["memory"]["limit"].as_u64(),
             Some(2 * 1024 * 1024 * 1024)
         );
+        assert_eq!(
+            spec["resource_limits"]["PidsLimit"].as_i64(),
+            Some(crate::config::DEFAULT_SANDBOX_PIDS_LIMIT)
+        );
+    }
+
+    #[test]
+    fn container_spec_can_inherit_runtime_pids_limit() {
+        let sandbox = test_sandbox("test-id", "test-name");
+        let mut config = test_config();
+        config.sandbox_pids_limit = 0;
+        let spec = build_container_spec(&sandbox, &config);
+
+        assert!(spec["resource_limits"].get("PidsLimit").is_none());
     }
 
     #[test]

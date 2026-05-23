@@ -68,6 +68,7 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         }),
         daemon_version: "28.0.0".to_string(),
         supports_gpu: false,
+        sandbox_pids_limit: DEFAULT_SANDBOX_PIDS_LIMIT,
     }
 }
 
@@ -409,6 +410,23 @@ fn docker_resource_limits_applies_cpu_and_memory_limits() {
     let limits = docker_resource_limits(&template).unwrap();
     assert_eq!(limits.nano_cpus, Some(500_000_000));
     assert_eq!(limits.memory_bytes, Some(2_147_483_648));
+}
+
+#[test]
+fn docker_pids_limit_uses_driver_default_and_allows_runtime_inherit() {
+    assert_eq!(
+        docker_pids_limit(DEFAULT_SANDBOX_PIDS_LIMIT).unwrap(),
+        Some(DEFAULT_SANDBOX_PIDS_LIMIT)
+    );
+    assert_eq!(docker_pids_limit(0).unwrap(), None);
+    assert!(docker_pids_limit(-1).is_err());
+}
+
+#[test]
+fn container_create_body_sets_driver_owned_pids_limit() {
+    let body = build_container_create_body(&test_sandbox(), &runtime_config()).unwrap();
+    let host_config = body.host_config.expect("host config");
+    assert_eq!(host_config.pids_limit, Some(DEFAULT_SANDBOX_PIDS_LIMIT));
 }
 
 #[test]

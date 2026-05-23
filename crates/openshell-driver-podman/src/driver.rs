@@ -141,6 +141,7 @@ impl PodmanComputeDriver {
         // (e.g. CA set but cert/key missing) are rejected early so operators
         // get a clear error instead of a silent fallback to plaintext HTTP.
         config.validate_tls_config()?;
+        config.validate_runtime_limits()?;
 
         let client = PodmanClient::new(config.socket_path.clone());
 
