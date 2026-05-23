@@ -152,6 +152,45 @@ helm upgrade --install openshell \
   --values my-values.yaml
 ```
 
+## RBAC
+
+The chart creates the following RBAC resources in the release namespace:
+
+| Resource | Scope | Name |
+|---|---|---|
+| ServiceAccount | Namespace | `openshell` |
+| ServiceAccount | Namespace | `openshell-sandbox` (for sandbox pods) |
+| Role + RoleBinding | Namespace | `openshell-sandbox` |
+| ClusterRole + ClusterRoleBinding | Cluster | `openshell-node-reader` |
+
+The namespaced Role covers sandbox lifecycle and identity:
+
+| API Group | Resource | Verbs |
+|---|---|---|
+| `agents.x-k8s.io` | `sandboxes`, `sandboxes/status` | create, delete, get, list, patch, update, watch |
+| `""` | `events` | get, list, watch |
+| `""` | `pods` | get |
+
+The ClusterRole grants node inspection and token validation:
+
+| API Group | Resource | Verbs |
+|---|---|---|
+| `authentication.k8s.io` | `tokenreviews` | create |
+| `""` | `nodes` | get, list, watch |
+
+To use an existing ServiceAccount instead of creating one, set `serviceAccount.create=false` and supply its name:
+
+```shell
+helm upgrade --install openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  --set serviceAccount.create=false \
+  --set serviceAccount.name=my-existing-sa
+```
+
+The ServiceAccount must already have the Role and ClusterRole bindings described above.
+
 ## Next Steps
 
 - To enable automatic certificate rotation with cert-manager, refer to [Managing Certificates](/kubernetes/managing-certificates).
