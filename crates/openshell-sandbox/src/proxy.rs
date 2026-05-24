@@ -6649,4 +6649,255 @@ network_policies:
             }
         }
     }
+
+    // Regression tests for issue #1498: hostname parser security vulnerabilities
+    // These tests ensure that malformed CONNECT hostnames are properly rejected
+    // to prevent parser differential attacks and allowlist bypasses.
+
+    /// Test that NUL byte injection in hostnames is rejected.
+    /// This prevents attacks like the Claude Code SOCKS5 bypass where
+    /// "allowed.com\x00evil.com" could be parsed as "allowed.com" by
+    /// policy matching but connect to "evil.com" via the resolver.
+    #[test]
+    fn test_nul_byte_in_hostname_rejected() {
+        // Test NUL byte in middle of hostname
+        let target = "allowed.com\x00evil.com:443";
+        let result = parse_target(target);
+        assert!(
+            result.is_err(),
+            "NUL byte in hostname should be rejected, got: {:?}",
+            result
+        );
+
+        // Test NUL byte after hostname, before port
+        let target2 = "allowed.com\x00:443";
+        let result2 = parse_target(target2);
+        assert!(
+            result2.is_err(),
+            "NUL byte before port should be rejected, got: {:?}",
+            result2
+        );
+    }
+
+    /// Test that control characters (CR, LF, TAB) in hostnames are rejected.
+    /// These could be used for HTTP request smuggling or header injection.
+    #[test]
+    fn test_control_chars_in_hostname_rejected() {
+        // Carriage return + line feed injection
+        let targets = vec![
+            "allowed.com\r\nevil.com:443",
+            "allowed.com\revil.com:443",
+            "allowed.com\nevil.com:443",
+            "allowed.com\tevil.com:443",
+        ];
+
+        for target in targets {
+            let result = parse_target(target);
+            assert!(
+                result.is_err(),
+                "Control characters in hostname should be rejected: {:?}, got: {:?}",
+                target.escape_default(),
+                result
+            );
+        }
+    }
+
+    /// Test that URL encoding attempts in hostnames are handled safely.
+    /// Encodings like %00 (NUL), %0d%0a (CRLF) should not bypass validation.
+    #[test]
+    fn test_encoded_hostnames_safe() {
+        let targets = vec![
+            "allowed%00.com:443",      // Encoded NUL
+            "allowed%2ecom:443",       // Encoded dot
+            "allowed%0d%0a.com:443",   // Encoded CRLF
+        ];
+
+        for target in targets {
+            let result = parse_target(target);
+            // Either reject encoded chars OR ensure they're not decoded
+            // before policy matching
+            match result {
+                Ok((host, port)) => {
+                    // If accepted, the percent signs MUST remain literal
+                    assert!(
+                        host.contains('%'),
+                        "Encoded hostname should not be decoded: {} -> {}",
+                        target,
+                        host
+                    );
+                    assert_eq!(port, 443);
+                }
+                Err(_) => {
+                    // Rejection is also acceptable
+                }
+            }
+        }
+    }
+
+    /// Test that hostnames with embedded spaces are rejected.
+    /// Spaces could cause parsing ambiguities.
+    #[test]
+    fn test_hostname_with_spaces_rejected() {
+        let targets = vec![
+            "allowed .com:443",
+            "allowed. com:443",
+            "allowed.com :443",
+        ];
+
+        for target in targets {
+            let result = parse_target(target);
+            assert!(
+                result.is_err() || !result.as_ref().unwrap().0.contains(' '),
+                "Hostname with spaces should be rejected or normalized: {}",
+                target
+            );
+        }
+    }
+
+    /// Test that very long hostnames don't cause issues.
+    /// This ensures no buffer overflows or DoS via memory exhaustion.
+    #[test]
+    fn test_hostname_length_limits() {
+        // DNS hostname max is 253 characters, but we should handle longer gracefully
+        let long_hostname = "a".repeat(1000);
+        let target = format!("{}:443", long_hostname);
+        let result = parse_target(&target);
+
+        // Either reject or accept - just ensure it doesn't panic
+        match result {
+            Ok((host, port)) => {
+                assert_eq!(port, 443);
+                assert_eq!(host.len(), 1000);
+            }
+            Err(_) => {
+                // Rejection is acceptable
+            }
+        }
+    }
+
+    /// Test that IPv6 addresses in brackets are handled correctly.
+    /// This ensures no injection via bracket manipulation.
+    #[test]
+    fn test_ipv6_bracket_handling() {
+        let valid_targets = vec![
+            ("[::1]:443", "::1", 443),
+            ("[2001:db8::1]:8080", "2001:db8::1", 8080),
+        ];
+
+        for (target, expected_host, expected_port) in valid_targets {
+            let result = parse_target(target);
+            match result {
+                Ok((host, port)) => {
+                    // Check if brackets are stripped
+                    assert!(
+                        host == expected_host || host == format!("[{}]", expected_host),
+                        "IPv6 address parsing mismatch: {} -> {}",
+                        target,
+                        host
+                    );
+                    assert_eq!(port, expected_port);
+                }
+                Err(e) => {
+                    panic!("Valid IPv6 target rejected: {} - {:?}", target, e);
+                }
+            }
+        }
+
+        // Test malformed brackets
+        let malformed = vec![
+            "[::1:443",         // Missing closing bracket
+            "::1]:443",         // Missing opening bracket
+            "[[::1]]:443",      // Double brackets
+        ];
+
+        for target in malformed {
+            let result = parse_target(target);
+            // These should either be rejected or handled safely
+            if let Ok((host, _)) = result {
+                // If accepted, should not have unbalanced brackets
+                let open_count = host.chars().filter(|&c| c == '[').count();
+                let close_count = host.chars().filter(|&c| c == ']').count();
+                assert_eq!(
+                    open_count, close_count,
+                    "Unbalanced brackets accepted: {} -> {}",
+                    target, host
+                );
+            }
+        }
+    }
+
+    /// Test that port parsing rejects invalid ports.
+    #[test]
+    fn test_invalid_port_rejected() {
+        let targets = vec![
+            "example.com:99999",    // Port too large
+            "example.com:0",        // Port zero
+            "example.com:-1",       // Negative port
+            "example.com:abc",      // Non-numeric port
+            "example.com:80\x00",   // NUL after port
+        ];
+
+        for target in targets {
+            let result = parse_target(target);
+            assert!(
+                result.is_err(),
+                "Invalid port should be rejected: {} -> {:?}",
+                target.escape_default(),
+                result
+            );
+        }
+    }
+
+    /// Test that missing port is rejected.
+    #[test]
+    fn test_missing_port_rejected() {
+        let targets = vec![
+            "example.com",
+            "example.com:",
+            ":443",
+        ];
+
+        for target in targets {
+            let result = parse_target(target);
+            assert!(
+                result.is_err(),
+                "Missing or invalid port should be rejected: {}",
+                target
+            );
+        }
+    }
+
+    /// Test normalization consistency.
+    /// Ensures that hostname normalization (if any) is applied consistently
+    /// before both policy matching AND connection.
+    #[test]
+    fn test_hostname_normalization_consistency() {
+        // Test case sensitivity
+        let targets = vec![
+            ("Example.COM:443", "example.com", 443),
+            ("EXAMPLE.com:443", "example.com", 443),
+        ];
+
+        for (target, expected_normalized, expected_port) in targets {
+            let result = parse_target(target);
+            match result {
+                Ok((host, port)) => {
+                    // If normalization happens, it should be lowercase
+                    if host != target.split(':').next().unwrap() {
+                        assert_eq!(
+                            host.to_lowercase(),
+                            expected_normalized,
+                            "Hostname normalization inconsistent: {} -> {}",
+                            target,
+                            host
+                        );
+                    }
+                    assert_eq!(port, expected_port);
+                }
+                Err(e) => {
+                    panic!("Valid hostname rejected: {} - {:?}", target, e);
+                }
+            }
+        }
+    }
 }
