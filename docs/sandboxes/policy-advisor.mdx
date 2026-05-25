@@ -116,7 +116,7 @@ For REST APIs, prefer L7 rules over broad L4 access. A good proposal allows one 
 
 The current `policy.local` JSON shape covers L4 endpoints and REST method or path rules. Use [Customize Sandbox Policies](/sandboxes/policies) or [Policy Schema Reference](/reference/policy-schema) for policy fields that are not part of the agent-authored proposal surface, such as WebSocket credential rewrite, GraphQL operation matching, endpoint path scoping, and provider-owned policy bundles.
 
-Policy advisor proposals do not add `allowed_ips` automatically. If a hostname resolves to an internal or private address, OpenShell's SSRF protections still block the connection until a developer explicitly adds the required `allowed_ips` entry.
+Policy advisor proposals do not add `allowed_ips` automatically. If an advisor-proposed hostname resolves to an internal or private address, OpenShell's SSRF protections still block the connection until a developer explicitly adds the required `allowed_ips` entry. Exact hostname trust for user-declared policy endpoints does not apply to advisor-generated proposal binaries.
 
 ## Review Proposals
 
