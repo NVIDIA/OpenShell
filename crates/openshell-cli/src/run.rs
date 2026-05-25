@@ -1824,6 +1824,7 @@ pub async fn sandbox_create(
                 delete_setting: false,
                 global: false,
                 merge_operations: vec![],
+                expected_resource_version: 0,
             })
             .await
         {

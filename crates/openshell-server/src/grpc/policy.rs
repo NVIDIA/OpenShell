@@ -5183,25 +5183,6 @@ mod tests {
             .unwrap();
     }
 
-    async fn test_server_state() -> Arc<ServerState> {
-        let store = Arc::new(
-            Store::connect("sqlite::memory:?cache=shared")
-                .await
-                .unwrap(),
-        );
-        let compute = new_test_runtime(store.clone()).await;
-        Arc::new(ServerState::new(
-            Config::new(None).with_database_url("sqlite::memory:?cache=shared"),
-            store,
-            compute,
-            SandboxIndex::new(),
-            SandboxWatchBus::new(),
-            TracingLogBus::new(),
-            Arc::new(SupervisorSessionRegistry::new()),
-            None,
-        ))
-    }
-
     #[tokio::test]
     async fn draft_chunk_handler_lifecycle_round_trip() {
         use openshell_core::proto::{
@@ -5537,6 +5518,7 @@ mod tests {
                 name: sandbox_name.clone(),
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
+                resource_version: 0,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -5582,7 +5564,7 @@ mod tests {
 
         handle_submit_policy_analysis(
             &state,
-            Request::new(SubmitPolicyAnalysisRequest {
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
@@ -5592,17 +5574,17 @@ mod tests {
                     ..Default::default()
                 }],
                 ..Default::default()
-            }),
+            })),
         )
         .await
         .unwrap();
 
         let draft = handle_get_draft_policy(
             &state,
-            Request::new(GetDraftPolicyRequest {
+            with_user(Request::new(GetDraftPolicyRequest {
                 name: sandbox_name,
                 status_filter: String::new(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -5651,6 +5633,7 @@ mod tests {
                 name: sandbox_name.clone(),
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
+                resource_version: 0,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -5685,7 +5668,7 @@ mod tests {
         };
         let mechanistic_submit = handle_submit_policy_analysis(
             &state,
-            Request::new(SubmitPolicyAnalysisRequest {
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
                 name: sandbox_name.clone(),
                 analysis_mode: "mechanistic".to_string(),
                 proposed_chunks: vec![PolicyChunk {
@@ -5695,7 +5678,7 @@ mod tests {
                     ..Default::default()
                 }],
                 ..Default::default()
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -5706,10 +5689,10 @@ mod tests {
         // finding.
         let draft = handle_get_draft_policy(
             &state,
-            Request::new(GetDraftPolicyRequest {
+            with_user(Request::new(GetDraftPolicyRequest {
                 name: sandbox_name.clone(),
                 status_filter: String::new(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -5762,7 +5745,7 @@ mod tests {
         };
         let agent_submit = handle_submit_policy_analysis(
             &state,
-            Request::new(SubmitPolicyAnalysisRequest {
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
@@ -5772,7 +5755,7 @@ mod tests {
                     ..Default::default()
                 }],
                 ..Default::default()
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -5781,10 +5764,10 @@ mod tests {
 
         let draft_after = handle_get_draft_policy(
             &state,
-            Request::new(GetDraftPolicyRequest {
+            with_user(Request::new(GetDraftPolicyRequest {
                 name: sandbox_name,
                 status_filter: String::new(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -5853,6 +5836,7 @@ mod tests {
                 name: sandbox_name.clone(),
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
+                resource_version: 0,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -5889,7 +5873,7 @@ mod tests {
 
         handle_submit_policy_analysis(
             &state,
-            Request::new(SubmitPolicyAnalysisRequest {
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
                 name: sandbox_name.clone(),
                 analysis_mode: "mechanistic".to_string(),
                 proposed_chunks: vec![PolicyChunk {
@@ -5899,17 +5883,17 @@ mod tests {
                     ..Default::default()
                 }],
                 ..Default::default()
-            }),
+            })),
         )
         .await
         .unwrap();
 
         let draft = handle_get_draft_policy(
             &state,
-            Request::new(GetDraftPolicyRequest {
+            with_user(Request::new(GetDraftPolicyRequest {
                 name: sandbox_name,
                 status_filter: String::new(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -5949,6 +5933,7 @@ mod tests {
                 name: sandbox_name.clone(),
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
+                resource_version: 0,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -5988,7 +5973,7 @@ mod tests {
 
         handle_submit_policy_analysis(
             &state,
-            Request::new(SubmitPolicyAnalysisRequest {
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
@@ -5998,17 +5983,17 @@ mod tests {
                     ..Default::default()
                 }],
                 ..Default::default()
-            }),
+            })),
         )
         .await
         .unwrap();
 
         let draft = handle_get_draft_policy(
             &state,
-            Request::new(GetDraftPolicyRequest {
+            with_user(Request::new(GetDraftPolicyRequest {
                 name: sandbox_name,
                 status_filter: String::new(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -6053,6 +6038,7 @@ mod tests {
                 name: sandbox_name.clone(),
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
+                resource_version: 0,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -6087,7 +6073,7 @@ mod tests {
 
         handle_submit_policy_analysis(
             &state,
-            Request::new(SubmitPolicyAnalysisRequest {
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
@@ -6097,17 +6083,17 @@ mod tests {
                     ..Default::default()
                 }],
                 ..Default::default()
-            }),
+            })),
         )
         .await
         .unwrap();
 
         let draft = handle_get_draft_policy(
             &state,
-            Request::new(GetDraftPolicyRequest {
+            with_user(Request::new(GetDraftPolicyRequest {
                 name: sandbox_name,
                 status_filter: String::new(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -6145,6 +6131,7 @@ mod tests {
                 name: sandbox_name.clone(),
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
+                resource_version: 0,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -6179,7 +6166,7 @@ mod tests {
 
         handle_submit_policy_analysis(
             &state,
-            Request::new(SubmitPolicyAnalysisRequest {
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
@@ -6189,17 +6176,17 @@ mod tests {
                     ..Default::default()
                 }],
                 ..Default::default()
-            }),
+            })),
         )
         .await
         .unwrap();
 
         let draft = handle_get_draft_policy(
             &state,
-            Request::new(GetDraftPolicyRequest {
+            with_user(Request::new(GetDraftPolicyRequest {
                 name: sandbox_name,
                 status_filter: String::new(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -6229,6 +6216,7 @@ mod tests {
                 name: sandbox_name.clone(),
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
+                resource_version: 0,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -6262,7 +6250,7 @@ mod tests {
 
         handle_submit_policy_analysis(
             &state,
-            Request::new(SubmitPolicyAnalysisRequest {
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
@@ -6272,17 +6260,17 @@ mod tests {
                     ..Default::default()
                 }],
                 ..Default::default()
-            }),
+            })),
         )
         .await
         .unwrap();
 
         let draft = handle_get_draft_policy(
             &state,
-            Request::new(GetDraftPolicyRequest {
+            with_user(Request::new(GetDraftPolicyRequest {
                 name: sandbox_name,
                 status_filter: String::new(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -6315,6 +6303,7 @@ mod tests {
                 name: sandbox_name.clone(),
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
+                resource_version: 0,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -6349,7 +6338,7 @@ mod tests {
 
         handle_submit_policy_analysis(
             &state,
-            Request::new(SubmitPolicyAnalysisRequest {
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
@@ -6359,17 +6348,17 @@ mod tests {
                     ..Default::default()
                 }],
                 ..Default::default()
-            }),
+            })),
         )
         .await
         .unwrap();
 
         let draft = handle_get_draft_policy(
             &state,
-            Request::new(GetDraftPolicyRequest {
+            with_user(Request::new(GetDraftPolicyRequest {
                 name: sandbox_name,
                 status_filter: String::new(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -6401,6 +6390,7 @@ mod tests {
                 name: sandbox_name.clone(),
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
+                resource_version: 0,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -6439,7 +6429,7 @@ mod tests {
 
         handle_submit_policy_analysis(
             &state,
-            Request::new(SubmitPolicyAnalysisRequest {
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
@@ -6449,17 +6439,17 @@ mod tests {
                     ..Default::default()
                 }],
                 ..Default::default()
-            }),
+            })),
         )
         .await
         .unwrap();
 
         let draft = handle_get_draft_policy(
             &state,
-            Request::new(GetDraftPolicyRequest {
+            with_user(Request::new(GetDraftPolicyRequest {
                 name: sandbox_name,
                 status_filter: String::new(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -6492,6 +6482,7 @@ mod tests {
                 name: sandbox_name.clone(),
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
+                resource_version: 0,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -6524,7 +6515,7 @@ mod tests {
 
         let response = handle_submit_policy_analysis(
             &state,
-            Request::new(SubmitPolicyAnalysisRequest {
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
@@ -6534,7 +6525,7 @@ mod tests {
                     ..Default::default()
                 }],
                 ..Default::default()
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -6577,6 +6568,7 @@ mod tests {
                 name: sandbox_name.clone(),
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
+                resource_version: 0,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -6610,7 +6602,7 @@ mod tests {
 
         handle_submit_policy_analysis(
             &state,
-            Request::new(SubmitPolicyAnalysisRequest {
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
@@ -6620,17 +6612,17 @@ mod tests {
                     ..Default::default()
                 }],
                 ..Default::default()
-            }),
+            })),
         )
         .await
         .unwrap();
 
         let draft = handle_get_draft_policy(
             &state,
-            Request::new(GetDraftPolicyRequest {
+            with_user(Request::new(GetDraftPolicyRequest {
                 name: sandbox_name,
                 status_filter: String::new(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -6672,6 +6664,7 @@ mod tests {
                 name: sandbox_name.clone(),
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
+                resource_version: 0,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -6705,7 +6698,7 @@ mod tests {
 
         handle_submit_policy_analysis(
             &state,
-            Request::new(SubmitPolicyAnalysisRequest {
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
@@ -6715,17 +6708,17 @@ mod tests {
                     ..Default::default()
                 }],
                 ..Default::default()
-            }),
+            })),
         )
         .await
         .unwrap();
 
         let draft = handle_get_draft_policy(
             &state,
-            Request::new(GetDraftPolicyRequest {
+            with_user(Request::new(GetDraftPolicyRequest {
                 name: sandbox_name,
                 status_filter: String::new(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -6756,6 +6749,7 @@ mod tests {
                 name: sandbox_name.clone(),
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
+                resource_version: 0,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -6789,7 +6783,7 @@ mod tests {
 
         handle_submit_policy_analysis(
             &state,
-            Request::new(SubmitPolicyAnalysisRequest {
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
@@ -6799,17 +6793,17 @@ mod tests {
                     ..Default::default()
                 }],
                 ..Default::default()
-            }),
+            })),
         )
         .await
         .unwrap();
 
         let draft = handle_get_draft_policy(
             &state,
-            Request::new(GetDraftPolicyRequest {
+            with_user(Request::new(GetDraftPolicyRequest {
                 name: sandbox_name,
                 status_filter: String::new(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -6849,6 +6843,7 @@ mod tests {
                     name: "custom-api".to_string(),
                     created_at_ms: 1_000_000,
                     labels: HashMap::new(),
+                    resource_version: 0,
                 }),
                 profile: Some(ProviderProfile {
                     id: "custom-api".to_string(),
@@ -6872,6 +6867,7 @@ mod tests {
                         ..Default::default()
                     }],
                     inference_capable: false,
+                    discovery: None,
                 }),
             })
             .await
@@ -6884,6 +6880,7 @@ mod tests {
                 name: sandbox_name.clone(),
                 created_at_ms: 1_000_000,
                 labels: HashMap::new(),
+                resource_version: 0,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -6926,7 +6923,7 @@ mod tests {
 
         handle_submit_policy_analysis(
             &state,
-            Request::new(SubmitPolicyAnalysisRequest {
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
@@ -6936,17 +6933,17 @@ mod tests {
                     ..Default::default()
                 }],
                 ..Default::default()
-            }),
+            })),
         )
         .await
         .unwrap();
 
         let draft = handle_get_draft_policy(
             &state,
-            Request::new(GetDraftPolicyRequest {
+            with_user(Request::new(GetDraftPolicyRequest {
                 name: sandbox_name,
                 status_filter: String::new(),
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -7005,6 +7002,7 @@ mod tests {
                 name: sandbox_name.clone(),
                 created_at_ms: 1_000_000,
                 labels: std::collections::HashMap::new(),
+                resource_version: 0,
             }),
             spec: Some(SandboxSpec {
                 policy: Some(SandboxPolicy {
@@ -7049,7 +7047,7 @@ mod tests {
         };
         let step1 = handle_submit_policy_analysis(
             &state,
-            Request::new(SubmitPolicyAnalysisRequest {
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
@@ -7059,7 +7057,7 @@ mod tests {
                     ..Default::default()
                 }],
                 ..Default::default()
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -7090,7 +7088,7 @@ mod tests {
         };
         let step2 = handle_submit_policy_analysis(
             &state,
-            Request::new(SubmitPolicyAnalysisRequest {
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
                 name: sandbox_name.clone(),
                 analysis_mode: "agent_authored".to_string(),
                 proposed_chunks: vec![PolicyChunk {
@@ -7100,7 +7098,7 @@ mod tests {
                     ..Default::default()
                 }],
                 ..Default::default()
-            }),
+            })),
         )
         .await
         .unwrap()
@@ -7109,10 +7107,10 @@ mod tests {
 
         let draft = handle_get_draft_policy(
             &state,
-            Request::new(GetDraftPolicyRequest {
+            with_user(Request::new(GetDraftPolicyRequest {
                 name: sandbox_name,
                 status_filter: String::new(),
-            }),
+            })),
         )
         .await
         .unwrap()

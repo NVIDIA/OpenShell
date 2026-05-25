@@ -915,6 +915,7 @@ async fn sandbox_create_does_not_infer_command_providers_when_v2_enabled() {
         Some(true),
         Some(false),
         &HashMap::new(),
+        "manual",
         &tls,
     )
     .await
