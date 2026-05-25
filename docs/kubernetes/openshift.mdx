@@ -40,6 +40,24 @@ Sandbox pods run under the `openshell-sandbox` service account in the `openshell
 oc adm policy add-scc-to-user privileged -z openshell-sandbox -n openshell
 ```
 
+## Create the JWT signing secret
+
+The PKI init job is disabled (see next step), so the JWT signing keys it would normally create must be provisioned manually:
+
+```shell
+openssl genpkey -algorithm Ed25519 -out /tmp/signing.pem
+openssl pkey -in /tmp/signing.pem -pubout -out /tmp/public.pem
+openssl rand -hex 16 > /tmp/kid
+
+oc create secret generic openshell-jwt-keys \
+  -n openshell \
+  --from-file=signing.pem=/tmp/signing.pem \
+  --from-file=public.pem=/tmp/public.pem \
+  --from-file=kid=/tmp/kid
+
+rm /tmp/signing.pem /tmp/public.pem /tmp/kid
+```
+
 ## Install the chart with OpenShift overrides
 
 ```shell
