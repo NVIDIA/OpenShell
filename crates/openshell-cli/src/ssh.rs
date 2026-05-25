@@ -484,20 +484,7 @@ fn write_upload_archive<W: Write>(writer: W, source: UploadSource) -> Result<()>
             local_path,
             tar_name,
         } => {
-            if local_path.is_file() {
-                archive
-                    .append_path_with_name(&local_path, &tar_name)
-                    .into_diagnostic()?;
-            } else if local_path.is_dir() {
-                archive
-                    .append_dir_all(&tar_name, &local_path)
-                    .into_diagnostic()?;
-            } else {
-                return Err(miette::miette!(
-                    "local path does not exist: {}",
-                    local_path.display()
-                ));
-            }
+            append_upload_path(&mut archive, &local_path, Path::new(&tar_name), false)?;
         }
         UploadSource::FileList {
             base_dir,
@@ -509,29 +496,125 @@ fn write_upload_archive<W: Write>(writer: W, source: UploadSource) -> Result<()>
                 let archive_path = archive_prefix
                     .as_ref()
                     .map_or_else(|| PathBuf::from(file), |prefix| prefix.join(file));
-                if full_path.is_file() {
-                    archive
-                        .append_path_with_name(&full_path, &archive_path)
-                        .into_diagnostic()
-                        .wrap_err_with(|| {
-                            format!("failed to add {} to tar archive", archive_path.display())
-                        })?;
-                } else if full_path.is_dir() {
-                    archive
-                        .append_dir_all(&archive_path, &full_path)
-                        .into_diagnostic()
-                        .wrap_err_with(|| {
-                            format!(
-                                "failed to add directory {} to tar archive",
-                                archive_path.display()
-                            )
-                        })?;
-                }
+                append_upload_path(&mut archive, &full_path, &archive_path, true)?;
             }
         }
     }
     archive.finish().into_diagnostic()?;
     Ok(())
+}
+
+fn append_upload_path<W: Write>(
+    archive: &mut tar::Builder<W>,
+    local_path: &Path,
+    archive_path: &Path,
+    skip_missing: bool,
+) -> Result<()> {
+    let metadata = match fs::symlink_metadata(local_path) {
+        Ok(metadata) => metadata,
+        Err(err) if skip_missing && err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(err)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("failed to stat {}", local_path.display()));
+        }
+    };
+    let file_type = metadata.file_type();
+
+    if file_type.is_file() {
+        archive
+            .append_path_with_name(local_path, archive_path)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to add {} to tar archive", archive_path.display()))?;
+        return Ok(());
+    }
+
+    if file_type.is_dir() {
+        let dir_archive_path = upload_archive_dir_entry_path(archive_path);
+        archive
+            .append_dir(&dir_archive_path, local_path)
+            .into_diagnostic()
+            .wrap_err_with(|| {
+                format!(
+                    "failed to add directory {} to tar archive",
+                    archive_path.display()
+                )
+            })?;
+        append_upload_dir_contents(archive, local_path, archive_path)?;
+        return Ok(());
+    }
+
+    if file_type.is_symlink() {
+        append_upload_symlink(archive, local_path, archive_path, &metadata)?;
+        return Ok(());
+    }
+
+    Err(miette::miette!(
+        "unsupported file type for upload: {}",
+        local_path.display()
+    ))
+}
+
+fn upload_archive_dir_entry_path(archive_path: &Path) -> PathBuf {
+    let mut path = archive_path.as_os_str().to_os_string();
+    path.push("/");
+    PathBuf::from(path)
+}
+
+fn append_upload_dir_contents<W: Write>(
+    archive: &mut tar::Builder<W>,
+    local_path: &Path,
+    archive_path: &Path,
+) -> Result<()> {
+    let mut entries = fs::read_dir(local_path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read directory {}", local_path.display()))?
+        .collect::<std::io::Result<Vec<_>>>()
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read directory {}", local_path.display()))?;
+    entries.sort_by_key(fs::DirEntry::file_name);
+
+    for entry in entries {
+        let entry_name = entry.file_name();
+        let child_local_path = entry.path();
+        let child_archive_path = archive_path.join(entry_name);
+        append_upload_path(archive, &child_local_path, &child_archive_path, false)?;
+    }
+
+    Ok(())
+}
+
+fn append_upload_symlink<W: Write>(
+    archive: &mut tar::Builder<W>,
+    local_path: &Path,
+    archive_path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<()> {
+    let target = fs::read_link(local_path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read symlink {}", local_path.display()))?;
+    let mut header = tar::Header::new_gnu();
+    header.set_metadata(metadata);
+    header.set_entry_type(tar::EntryType::Symlink);
+    header.set_size(0);
+    header.set_cksum();
+    archive
+        .append_link(&mut header, archive_path, target)
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!(
+                "failed to add symlink {} to tar archive",
+                archive_path.display()
+            )
+        })?;
+    Ok(())
+}
+
+fn local_upload_path_is_file_like(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| {
+        let file_type = metadata.file_type();
+        file_type.is_file() || file_type.is_symlink()
+    })
 }
 
 /// Core tar-over-SSH upload: streams a tar archive into `dest_dir` on the
@@ -782,8 +865,9 @@ pub async fn sandbox_sync_up(
     // passed "/sandbox"), fall through to directory semantics instead.  The
     // sandbox user cannot write to "/" and the intent is almost certainly
     // "put the file inside /sandbox", not "create a file named sandbox in /".
+    let local_path_is_file_like = local_upload_path_is_file_like(local_path);
     if let Some(path) = sandbox_path
-        && local_path.is_file()
+        && local_path_is_file_like
         && !path.ends_with('/')
     {
         let (parent, target_name) = split_sandbox_path(path);
@@ -802,7 +886,7 @@ pub async fn sandbox_sync_up(
         }
     }
 
-    let tar_name = if local_path.is_file() {
+    let tar_name = if local_path_is_file_like {
         local_path
             .file_name()
             .ok_or_else(|| miette::miette!("path has no file name"))?
@@ -1831,20 +1915,46 @@ mod tests {
         assert_eq!(file_list_archive_prefix(&file), None);
     }
 
-    fn upload_archive_paths(source: UploadSource) -> Vec<String> {
+    #[derive(Debug)]
+    struct UploadArchiveEntry {
+        path: String,
+        entry_type: tar::EntryType,
+        link_name: Option<String>,
+    }
+
+    fn upload_archive_entries(source: UploadSource) -> Vec<UploadArchiveEntry> {
         let mut bytes = Vec::new();
         write_upload_archive(&mut bytes, source).expect("write upload archive");
         let mut archive = tar::Archive::new(std::io::Cursor::new(bytes));
         let entries = archive.entries().expect("read archive entries");
-        let mut paths = entries
+        let mut entries = entries
             .map(|entry| {
-                entry
-                    .expect("read archive entry")
+                let entry = entry.expect("read archive entry");
+                let path = entry
                     .path()
                     .expect("read archive path")
                     .to_string_lossy()
-                    .into_owned()
+                    .into_owned();
+                let entry_type = entry.header().entry_type();
+                let link_name = entry
+                    .link_name()
+                    .expect("read archive link")
+                    .map(|link| link.to_string_lossy().into_owned());
+                UploadArchiveEntry {
+                    path,
+                    entry_type,
+                    link_name,
+                }
             })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.path.cmp(&right.path));
+        entries
+    }
+
+    fn upload_archive_paths(source: UploadSource) -> Vec<String> {
+        let mut paths = upload_archive_entries(source)
+            .into_iter()
+            .map(|entry| entry.path)
             .collect::<Vec<_>>();
         paths.sort();
         paths
@@ -1900,6 +2010,56 @@ mod tests {
         assert!(paths.contains(&"source-dir/file.txt".to_string()));
         assert!(paths.contains(&"source-dir/inner/child.txt".to_string()));
         assert!(paths.iter().all(|path| path.starts_with("source-dir/")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn single_directory_archive_preserves_symlink_entries() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let source = tmpdir.path().join("source-dir");
+        fs::create_dir_all(source.join("real-dir")).expect("create dirs");
+        fs::write(source.join("real-dir/file.txt"), "file").expect("write file");
+        std::os::unix::fs::symlink("real-dir", source.join("link-dir")).expect("create symlink");
+
+        let entries = upload_archive_entries(UploadSource::SinglePath {
+            local_path: source,
+            tar_name: "source-dir".into(),
+        });
+
+        let symlink = entries
+            .iter()
+            .find(|entry| entry.path == "source-dir/link-dir")
+            .expect("symlink archive entry");
+        assert_eq!(symlink.entry_type, tar::EntryType::Symlink);
+        assert_eq!(symlink.link_name.as_deref(), Some("real-dir"));
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry.path != "source-dir/link-dir/file.txt"),
+            "symlink target should not be expanded into the archive: {entries:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_list_archive_preserves_symlink_entries() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let base_dir = tmpdir.path().join("nested");
+        fs::create_dir_all(base_dir.join("real-dir")).expect("create dirs");
+        fs::write(base_dir.join("real-dir/file.txt"), "file").expect("write file");
+        std::os::unix::fs::symlink("real-dir", base_dir.join("link-dir")).expect("create symlink");
+
+        let entries = upload_archive_entries(UploadSource::FileList {
+            base_dir,
+            files: vec!["link-dir".into()],
+            archive_prefix: Some(PathBuf::from("nested")),
+        });
+
+        assert_eq!(entries.len(), 1, "unexpected archive entries: {entries:?}");
+        let symlink = &entries[0];
+        assert_eq!(symlink.path, "nested/link-dir");
+        assert_eq!(symlink.entry_type, tar::EntryType::Symlink);
+        assert_eq!(symlink.link_name.as_deref(), Some("real-dir"));
     }
 
     #[test]
