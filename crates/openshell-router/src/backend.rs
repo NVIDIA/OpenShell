@@ -5,6 +5,7 @@ use crate::RouterError;
 use crate::config::{AuthHeader, ResolvedRoute};
 use crate::mock;
 use std::collections::HashSet;
+use tracing::warn;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedEndpoint {
@@ -190,9 +191,22 @@ fn prepare_backend_request(
 
     // Set the "model" field in the JSON body to the route's configured model so the
     // backend receives the correct model ID regardless of what the client sent.
+    // When the caller supplied a non-empty model that differs from the configured
+    // route, emit a warning so the rewrite is visible to operators and silent
+    // model-typo / stale-reference bugs do not get masked by the rewrite.
     let body = match serde_json::from_slice::<serde_json::Value>(&body) {
         Ok(mut json) => {
             if let Some(obj) = json.as_object_mut() {
+                if let Some(serde_json::Value::String(client_model)) = obj.get("model") {
+                    if !client_model.is_empty() && client_model != &route.model {
+                        warn!(
+                            client_model = %client_model,
+                            route_model = %route.model,
+                            endpoint = %route.endpoint,
+                            "router is rewriting client-supplied model to the configured route model",
+                        );
+                    }
+                }
                 obj.insert(
                     "model".to_string(),
                     serde_json::Value::String(route.model.clone()),
