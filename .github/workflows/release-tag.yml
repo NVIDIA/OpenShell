@@ -799,7 +799,7 @@ jobs:
         if: matrix.kind == 'rpm'
         run: |
           set -euo pipefail
-          dnf install -y ./package-input/*.rpm
+          dnf install -y ./package-input/openshell-[0-9]*.rpm ./package-input/openshell-gateway-*.rpm
           openshell-gateway --version
 
   # ---------------------------------------------------------------------------
