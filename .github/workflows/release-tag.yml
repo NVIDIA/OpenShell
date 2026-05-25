@@ -730,16 +730,16 @@ jobs:
             artifact_arch: arm64
             rpm_arch: aarch64
             target: aarch64-unknown-linux-gnu
-          - name: rhel9-rpm
+          - name: fedora-rpm
             runner: linux-amd64-cpu8
-            image: rockylinux:9
+            image: fedora:latest
             kind: rpm
             artifact_arch: amd64
             rpm_arch: x86_64
             target: x86_64-unknown-linux-gnu
-          - name: rhel9-rpm-aarch64
+          - name: fedora-rpm-aarch64
             runner: linux-arm64-cpu8
-            image: rockylinux:9
+            image: fedora:latest
             kind: rpm
             artifact_arch: arm64
             rpm_arch: aarch64
