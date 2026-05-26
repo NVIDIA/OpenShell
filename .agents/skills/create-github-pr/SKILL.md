@@ -137,7 +137,7 @@ gh pr create --base "release-1.0"
 
 ## PR Description Format
 
-PR descriptions must follow the project's [PR template](.github/PULL_REQUEST_TEMPLATE.md) structure:
+PR descriptions must follow the project's [PR template](../../../.github/PULL_REQUEST_TEMPLATE.md) structure:
 
 ```markdown
 ## Summary
