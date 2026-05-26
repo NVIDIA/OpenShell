@@ -211,7 +211,7 @@ image_pull_policy = "missing"   # Podman vocabulary: always | missing | never | 
 
 ### MicroVM
 
-Each sandbox runs inside its own libkrun microVM managed by one `openshell-driver-vm` subprocess spawned by the gateway. Configure VM driver settings through the gateway TOML file; `openshell-driver-vm` does not read a separate `--config` file.
+Each sandbox runs inside its own libkrun microVM managed by one `openshell-driver-vm` subprocess spawned by the gateway. Configure VM driver settings in this gateway TOML file under `[openshell.drivers.vm]`.
 
 ```toml
 [openshell]
