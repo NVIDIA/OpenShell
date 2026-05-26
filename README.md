@@ -157,7 +157,6 @@ Docker-backed GPU sandboxes auto-select CDI when available and otherwise fall ba
 | [Ollama](https://ollama.com/)                                 | [Community](https://github.com/NVIDIA/OpenShell-Community)                       | Launch with `openshell sandbox create --from ollama`.                         |
 | [Pi](https://pi.dev/)                                 | [Community](https://github.com/NVIDIA/OpenShell-Community)                       | Launch with `openshell sandbox create --from pi`.                         |
 
-
 ## Key Commands
 
 | Command                                                    | Description                                     |
