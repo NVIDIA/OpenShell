@@ -1474,4 +1474,50 @@ default_image = "k8s-specific:1.0"
             .expect("deserializes");
         assert_eq!(parsed.default_image, "k8s-specific:1.0");
     }
+
+    #[test]
+    fn vm_config_parses_driver_specific_gpu_fields() {
+        let file = config_file_from_toml(
+            r#"
+[openshell.gateway]
+default_image = "gateway-default:1.0"
+guest_tls_ca = "/tls/ca.pem"
+guest_tls_cert = "/tls/client.pem"
+guest_tls_key = "/tls/client-key.pem"
+
+[openshell.drivers.vm]
+grpc_endpoint = "http://127.0.0.1:17670"
+gpu_enabled = true
+gpu_mem_mib = 12288
+gpu_vcpus = 6
+"#,
+        );
+
+        let cfg = super::build_vm_config(Some(&file), None, true, 17670).unwrap();
+
+        assert_eq!(cfg.default_image, "gateway-default:1.0");
+        assert_eq!(cfg.guest_tls_ca, Some("/tls/ca.pem".into()));
+        assert_eq!(cfg.guest_tls_cert, Some("/tls/client.pem".into()));
+        assert_eq!(cfg.guest_tls_key, Some("/tls/client-key.pem".into()));
+        assert!(cfg.gpu_enabled);
+        assert_eq!(cfg.gpu_mem_mib, 12288);
+        assert_eq!(cfg.gpu_vcpus, 6);
+    }
+
+    #[test]
+    fn vm_config_rejects_unknown_driver_field() {
+        let file = config_file_from_toml(
+            r"
+[openshell.drivers.vm]
+unknown_vm_field = true
+",
+        );
+
+        let err = super::build_vm_config(Some(&file), None, true, 17670).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("invalid [openshell.drivers.vm] table")
+        );
+    }
 }

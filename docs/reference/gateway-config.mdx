@@ -211,7 +211,7 @@ image_pull_policy = "missing"   # Podman vocabulary: always | missing | never | 
 
 ### MicroVM
 
-Each sandbox runs inside its own libkrun microVM managed by the standalone `openshell-driver-vm` subprocess. Use this driver when you want stronger isolation than container namespaces alone.
+Each sandbox runs inside its own libkrun microVM managed by one `openshell-driver-vm` subprocess spawned by the gateway. Configure VM driver settings through the gateway TOML file; `openshell-driver-vm` does not read a separate `--config` file.
 
 ```toml
 [openshell]
@@ -233,7 +233,14 @@ grpc_endpoint = "https://host.containers.internal:17670"
 state_dir      = "/var/lib/openshell/vm"
 # Where the gateway looks for the openshell-driver-vm subprocess binary.
 driver_dir     = "/usr/local/libexec/openshell"
-vcpus          = 2
-mem_mib        = 2048
-krun_log_level = 1
+bootstrap_image  = ""
+krun_log_level   = 1
+vcpus            = 2
+mem_mib          = 2048
+overlay_disk_mib = 4096
+
+# GPU passthrough support. Leave disabled unless the host is prepared for VFIO.
+gpu_enabled = false
+gpu_mem_mib = 8192
+gpu_vcpus   = 4
 ```
