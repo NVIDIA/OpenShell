@@ -6446,19 +6446,31 @@ network_policies:
 
     #[test]
     fn test_emit_denial_enqueues_denial_event() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::denial_aggregator::DenialEvent>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<DenialEvent>();
         let decision = ConnectDecision {
-            action: NetworkAction::Deny { reason: "no matching policy".into() },
+            action: NetworkAction::Deny {
+                reason: "no matching policy".into(),
+            },
             generation: 0,
-            binary: Some(std::path::PathBuf::from("/usr/bin/curl")),
+            binary: Some(PathBuf::from("/usr/bin/curl")),
             binary_pid: Some(1234),
             ancestors: vec![],
             cmdline_paths: vec![],
         };
 
-        emit_denial(&Some(tx), "blocked.invalid", 443, "/usr/bin/curl", &decision, "no matching policy", "connect");
+        emit_denial(
+            &Some(tx),
+            "blocked.invalid",
+            443,
+            "/usr/bin/curl",
+            &decision,
+            "no matching policy",
+            "connect",
+        );
 
-        let event = rx.try_recv().expect("DenialEvent should be enqueued after L4 deny");
+        let event = rx
+            .try_recv()
+            .expect("DenialEvent should be enqueued after L4 deny");
         assert_eq!(event.host, "blocked.invalid");
         assert_eq!(event.port, 443);
         assert_eq!(event.binary, "/usr/bin/curl");
