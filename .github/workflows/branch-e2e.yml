@@ -90,7 +90,6 @@ jobs:
     with:
       component: cli
       platform: linux/amd64
-    secrets: inherit
 
   e2e:
     needs: [pr_metadata, build-gateway, build-supervisor]
