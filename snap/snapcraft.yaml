@@ -89,6 +89,7 @@ parts:
       - e2fsprogs
       - iproute2
       - nftables
+      - openssh-client
     override-pull: |
       craftctl default
       craftctl set version="$(python3 "$CRAFT_PROJECT_DIR/tasks/scripts/release.py" get-version --snap)"
