@@ -1333,7 +1333,7 @@ fn apply_gateway_readiness_init(template: &mut serde_json::Value, grpc_endpoint:
 
     let init_container = serde_json::json!({
         "name": "wait-for-gateway",
-        "image": "busybox:1.36",
+        "image": "busybox:1.37",
         "command": ["sh", "-c", check_cmd]
     });
 
