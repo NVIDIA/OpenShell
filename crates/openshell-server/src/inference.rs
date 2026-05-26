@@ -12,6 +12,8 @@ use openshell_core::proto::{
 };
 use openshell_router::config::ResolvedRoute as RouterResolvedRoute;
 use openshell_router::{ValidationFailureKind, verify_backend_endpoint};
+#[allow(unused_imports)]
+use openshell_server_macros::{rpc_auth, rpc_authz};
 use prost::Message as _;
 use std::sync::Arc;
 use std::time::Duration;
@@ -55,8 +57,10 @@ impl ObjectType for InferenceRoute {
     }
 }
 
+#[rpc_authz(service = "openshell.inference.v1.Inference")]
 #[tonic::async_trait]
 impl Inference for InferenceService {
+    #[rpc_auth(auth = "sandbox-secret")]
     async fn get_inference_bundle(
         &self,
         request: Request<GetInferenceBundleRequest>,
@@ -71,6 +75,7 @@ impl Inference for InferenceService {
             .map(Response::new)
     }
 
+    #[rpc_auth(auth = "bearer", scope = "inference:write", role = "admin")]
     async fn set_cluster_inference(
         &self,
         request: Request<SetClusterInferenceRequest>,
@@ -105,6 +110,7 @@ impl Inference for InferenceService {
         }))
     }
 
+    #[rpc_auth(auth = "bearer", scope = "inference:read", role = "user")]
     async fn get_cluster_inference(
         &self,
         request: Request<GetClusterInferenceRequest>,

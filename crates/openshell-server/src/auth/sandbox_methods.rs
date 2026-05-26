@@ -7,25 +7,13 @@
 //! must not authorize user-facing or admin APIs. The router rejects sandbox
 //! principals for every method outside this supervisor-to-gateway allowlist;
 //! handlers still perform same-sandbox checks on request bodies.
-
-/// Methods a `Principal::Sandbox` may invoke.
-const ALLOWED_SANDBOX_METHODS: &[&str] = &[
-    "/openshell.v1.OpenShell/IssueSandboxToken",
-    "/openshell.v1.OpenShell/RefreshSandboxToken",
-    "/openshell.v1.OpenShell/ConnectSupervisor",
-    "/openshell.v1.OpenShell/RelayStream",
-    "/openshell.v1.OpenShell/GetSandboxConfig",
-    "/openshell.v1.OpenShell/GetSandboxProviderEnvironment",
-    "/openshell.v1.OpenShell/UpdateConfig",
-    "/openshell.v1.OpenShell/ReportPolicyStatus",
-    "/openshell.v1.OpenShell/PushSandboxLogs",
-    "/openshell.v1.OpenShell/SubmitPolicyAnalysis",
-    "/openshell.v1.OpenShell/GetDraftPolicy",
-    "/openshell.inference.v1.Inference/GetInferenceBundle",
-];
+//!
+//! The allowlist is derived from per-handler `#[rpc_auth(...)]` annotations:
+//! a method is callable by a sandbox principal when its declared auth mode is
+//! `sandbox-secret` or `dual`.
 
 pub fn is_sandbox_callable(path: &str) -> bool {
-    ALLOWED_SANDBOX_METHODS.contains(&path)
+    super::method_authz::is_sandbox_callable(path)
 }
 
 #[cfg(test)]

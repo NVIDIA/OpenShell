@@ -24,6 +24,7 @@ openshell-ocsf = { path = "../openshell-ocsf" }
 openshell-policy = { path = "../openshell-policy" }
 openshell-providers = { path = "../openshell-providers" }
 openshell-router = { path = "../openshell-router" }
+openshell-server-macros = { path = "../openshell-server-macros" }
 
 # Kubernetes client (used by the `generate-certs` subcommand)
 kube = { workspace = true }

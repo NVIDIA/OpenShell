@@ -3719,6 +3719,7 @@ dependencies = [
  "openshell-policy",
  "openshell-providers",
  "openshell-router",
+ "openshell-server-macros",
  "petname",
  "pin-project-lite",
  "prost",
@@ -3750,6 +3751,15 @@ dependencies = [
  "uuid",
  "wiremock",
  "x509-parser",
+]
+
+[[package]]
+name = "openshell-server-macros"
+version = "0.0.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
