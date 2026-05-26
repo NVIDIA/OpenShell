@@ -305,6 +305,21 @@ pub struct Config {
     #[serde(default)]
     pub enable_user_namespaces: bool,
 
+    /// Run sandbox pods with `securityContext.privileged: true`.
+    ///
+    /// UNSAFE: this grants the sandbox container full access to the host
+    /// kernel (all capabilities, no seccomp/AppArmor confinement, host
+    /// devices visible). Only enable on dedicated single-tenant clusters
+    /// where you trust everything the sandbox might run.
+    ///
+    /// The setting exists to support managed Kubernetes runtimes (notably
+    /// AKS) whose containerd policy blocks `mount --make-shared /run/netns`
+    /// even with `CAP_SYS_ADMIN`, which prevents the supervisor from
+    /// creating its network namespace. Prefer `enable_user_namespaces` on
+    /// any runtime that supports it.
+    #[serde(default)]
+    pub sandbox_privileged: bool,
+
     /// Browser-facing sandbox service routing configuration.
     #[serde(default)]
     pub service_routing: ServiceRoutingConfig,
@@ -435,6 +450,7 @@ impl Config {
             client_tls_secret_name: String::new(),
             host_gateway_ip: String::new(),
             enable_user_namespaces: false,
+            sandbox_privileged: false,
             service_routing: ServiceRoutingConfig::default(),
         }
     }

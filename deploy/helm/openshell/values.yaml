@@ -123,6 +123,14 @@ server:
   # Linux 5.12+. When enabled, container UID 0 maps to an unprivileged host
   # UID and capabilities become namespaced.
   enableUserNamespaces: false
+  # Run sandbox pods with `securityContext.privileged: true`.
+  # UNSAFE: this grants the sandbox container full host access (all
+  # capabilities, no seccomp/AppArmor confinement, host devices visible).
+  # Only enable on dedicated single-tenant clusters whose container runtime
+  # blocks operations the supervisor needs (notably AKS containerd, which
+  # denies `mount --make-shared /run/netns` even with `CAP_SYS_ADMIN`).
+  # Prefer `enableUserNamespaces` on any runtime that supports it.
+  sandboxPrivileged: false
   # Disable gateway authentication (mTLS client certificate requirement).
   # Set to true when the gateway sits behind a reverse proxy (e.g.
   # Cloudflare Tunnel) that terminates TLS.

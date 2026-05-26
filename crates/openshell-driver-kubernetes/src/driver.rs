@@ -323,6 +323,7 @@ impl KubernetesComputeDriver {
             client_tls_secret_name: &self.config.client_tls_secret_name,
             host_gateway_ip: &self.config.host_gateway_ip,
             enable_user_namespaces: self.config.enable_user_namespaces,
+            sandbox_privileged: self.config.sandbox_privileged,
         };
         obj.data = sandbox_to_k8s_spec(sandbox.spec.as_ref(), &params);
         let api = self.api();
@@ -979,6 +980,7 @@ struct SandboxPodParams<'a> {
     client_tls_secret_name: &'a str,
     host_gateway_ip: &'a str,
     enable_user_namespaces: bool,
+    sandbox_privileged: bool,
 }
 
 fn spec_pod_env(spec: Option<&SandboxSpec>) -> std::collections::HashMap<String, String> {
@@ -1088,6 +1090,9 @@ fn sandbox_template_to_k8s(
     // Per-sandbox platform_config.host_users overrides the cluster-wide default.
     let use_user_namespaces = platform_config_bool(template, "host_users")
         .map_or(params.enable_user_namespaces, |host_users| !host_users);
+    // Per-sandbox platform_config.privileged overrides the cluster-wide default.
+    let use_privileged =
+        platform_config_bool(template, "privileged").unwrap_or(params.sandbox_privileged);
 
     if use_user_namespaces {
         spec.insert("hostUsers".to_string(), serde_json::json!(false));
@@ -1148,13 +1153,17 @@ fn sandbox_template_to_k8s(
         // for process identity resolution in network policy enforcement.
         capabilities.extend(["SETUID", "SETGID", "DAC_READ_SEARCH"]);
     }
+    let mut security_context = serde_json::Map::new();
+    security_context.insert(
+        "capabilities".to_string(),
+        serde_json::json!({ "add": capabilities }),
+    );
+    if use_privileged {
+        security_context.insert("privileged".to_string(), serde_json::json!(true));
+    }
     container.insert(
         "securityContext".to_string(),
-        serde_json::json!({
-            "capabilities": {
-                "add": capabilities
-            }
-        }),
+        serde_json::Value::Object(security_context),
     );
 
     // Mount client TLS secret for mTLS to the server.
@@ -1328,7 +1337,7 @@ fn apply_required_env(
     ssh_handshake_skew_secs: u64,
     tls_enabled: bool,
 ) {
-    upsert_env(env, "OPENSHELL_SANDBOX_ID", sandbox_id);
+                                                                                                                            upsert_env(env, "OPENSHELL_SANDBOX_ID", sandbox_id);
     upsert_env(env, "OPENSHELL_SANDBOX", sandbox_name);
     upsert_env(env, "OPENSHELL_ENDPOINT", grpc_endpoint);
     upsert_env(env, "OPENSHELL_SANDBOX_COMMAND", "sleep infinity");
@@ -2252,6 +2261,104 @@ mod tests {
             caps.len(),
             4,
             "extra capabilities must not be added when user namespaces are disabled"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Privileged tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn privileged_disabled_by_default() {
+        let pod_template = default_template_to_k8s(false);
+        let sc = &pod_template["spec"]["containers"][0]["securityContext"];
+        assert!(
+            sc["privileged"].is_null(),
+            "privileged must not be set when sandbox_privileged is false"
+        );
+    }
+
+    #[test]
+    fn privileged_enabled_by_cluster_default() {
+        let params = SandboxPodParams {
+            sandbox_privileged: true,
+            ..Default::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+        assert_eq!(
+            pod_template["spec"]["containers"][0]["securityContext"]["privileged"],
+            serde_json::json!(true),
+            "privileged must be true when sandbox_privileged is on"
+        );
+    }
+
+    #[test]
+    fn privileged_per_sandbox_override_enables() {
+        let template = SandboxTemplate {
+            platform_config: Some(Struct {
+                fields: std::iter::once((
+                    "privileged".to_string(),
+                    Value {
+                        kind: Some(Kind::BoolValue(true)),
+                    },
+                ))
+                .collect(),
+            }),
+            ..SandboxTemplate::default()
+        };
+
+        let params = SandboxPodParams::default(); // cluster default is off
+        let pod_template = sandbox_template_to_k8s(
+            &template,
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+
+        assert_eq!(
+            pod_template["spec"]["containers"][0]["securityContext"]["privileged"],
+            serde_json::json!(true),
+            "per-sandbox privileged: true must enable privileged"
+        );
+    }
+
+    #[test]
+    fn privileged_per_sandbox_override_disables() {
+        let template = SandboxTemplate {
+            platform_config: Some(Struct {
+                fields: std::iter::once((
+                    "privileged".to_string(),
+                    Value {
+                        kind: Some(Kind::BoolValue(false)),
+                    },
+                ))
+                .collect(),
+            }),
+            ..SandboxTemplate::default()
+        };
+
+        let params = SandboxPodParams {
+            sandbox_privileged: true, // cluster default is on
+            ..Default::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &template,
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+
+        assert!(
+            pod_template["spec"]["containers"][0]["securityContext"]["privileged"].is_null(),
+            "per-sandbox privileged: false must disable privileged even when cluster default is on"
         );
     }
 

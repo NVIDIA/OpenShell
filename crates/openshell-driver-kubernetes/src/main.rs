@@ -74,6 +74,14 @@ struct Args {
 
     #[arg(long, env = "OPENSHELL_ENABLE_USER_NAMESPACES")]
     enable_user_namespaces: bool,
+
+    /// Run sandbox pods with `securityContext.privileged: true`.
+    /// UNSAFE: grants the sandbox container full host access. Only enable
+    /// on dedicated single-tenant clusters where the container runtime
+    /// blocks operations the supervisor needs (e.g. AKS containerd's
+    /// `mount --make-shared` denial). Prefer `--enable-user-namespaces`.
+    #[arg(long, env = "OPENSHELL_SANDBOX_PRIVILEGED")]
+    sandbox_privileged: bool,
 }
 
 #[tokio::main]
@@ -101,6 +109,7 @@ async fn main() -> Result<()> {
         client_tls_secret_name: args.client_tls_secret_name.unwrap_or_default(),
         host_gateway_ip: args.host_gateway_ip.unwrap_or_default(),
         enable_user_namespaces: args.enable_user_namespaces,
+        sandbox_privileged: args.sandbox_privileged,
     })
     .await
     .into_diagnostic()?;

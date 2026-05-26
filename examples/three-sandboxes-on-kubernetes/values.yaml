@@ -1,0 +1,84 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Helm values for the "three sandboxes on Kubernetes" example.
+#
+# Optimized for local evaluation against any cluster:
+#   - TLS off and gateway auth disabled, so the CLI can talk to the gateway
+#     over plaintext through `kubectl port-forward` without minting client
+#     certs.
+#   - ClusterIP service (the default) so nothing is exposed externally.
+#
+# This file targets the HEAD chart in this checkout (`deploy/helm/openshell`)
+# and a HEAD-built gateway/supervisor image pair. The HEAD chart drives the
+# gateway via environment variables (`OPENSHELL_*`), so the chart and image
+# must be from the same revision. Released v0.0.x charts read a TOML file
+# instead and are not compatible with this values file.
+#
+# For production deployments keep TLS enabled and place the gateway behind
+# a trusted ingress or load balancer.
+
+# Gateway + supervisor images. Override to your own registry when you build
+# locally (e.g. `image.repository=ryanclaw.azurecr.io/openshell/gateway`).
+# The defaults below match a build pushed by:
+#   IMAGE_REGISTRY=ryanclaw.azurecr.io IMAGE_TAG=dev DOCKER_PUSH=1 \
+#     mise run build:docker:gateway
+#   IMAGE_REGISTRY=ryanclaw.azurecr.io IMAGE_TAG=dev DOCKER_PUSH=1 \
+#     mise run build:docker:supervisor
+image:
+  repository: ryanclaw.azurecr.io/gateway
+  tag: "dev-privileged-1779820809"
+  pullPolicy: Always
+
+supervisor:
+  image:
+    repository: ryanclaw.azurecr.io/supervisor
+    tag: "dev-privileged-1779820809"
+    pullPolicy: Always
+  # Auto-detect sideload method based on K8s version. On v1.35+ this picks
+  # `image-volume`. On AKS that combo works only when the sandbox container
+  # does NOT run with `hostUsers: false` (idmap mounts on the AKS root
+  # filesystem fail) — which is fine here because we use the privileged
+  # path below instead of user namespaces.
+  sideloadMethod: ""
+
+service:
+  type: ClusterIP
+  port: 8080
+
+server:
+  # Plaintext gateway. Combined with disableGatewayAuth below this means the
+  # CLI can connect directly through `kubectl port-forward` with no auth.
+  disableTls: true
+  # UNSAFE: accept unauthenticated CLI requests. Required for this example so
+  # the CLI can talk to the gateway over plaintext through `kubectl
+  # port-forward`. Do NOT use in production — front the gateway with OIDC
+  # or mTLS instead.
+  disableGatewayAuth: true
+  # Explicit gRPC endpoint sandbox pods dial back into. The chart auto-derives
+  # this from the service name when left empty; we set it explicitly so the
+  # example is easy to copy-paste into any namespace/release.
+  grpcEndpoint: "http://openshell.openshell.svc.cluster.local:8080"
+  # UNSAFE: run sandbox pods with `securityContext.privileged: true`. Required
+  # on AKS because containerd 2.1 rejects `mount --make-shared /run/netns`
+  # from inside the sandbox container even when `hostUsers: false` is set
+  # (the kernel mount-propagation lockdown ignores namespaced CAP_SYS_ADMIN
+  # when the underlying mount is owned by the host init userns). Privileged
+  # mode bypasses that guard by dropping the seccomp + capability + locked-
+  # mount restrictions entirely.
+  #
+  # Only enable on dedicated single-tenant clusters. On runtimes that
+  # support user namespaces (kind, k3d, GKE-Ubuntu, EKS-AL2023), prefer
+  # `enableUserNamespaces: true` and leave this off.
+  sandboxPrivileged: true
+  # Sandbox pods are created in the gateway's release namespace by default.
+  # Uncomment and set to isolate sandbox pods in a separate namespace.
+  # sandboxNamespace: openshell-sandboxes
+
+# Pre-install hook that creates the JWT signing-key Secret (and PKI certs
+# when TLS is enabled). Keep enabled: even with `disableTls: true` and
+# `disableGatewayAuth: true`, the gateway StatefulSet mounts the
+# `openshell-jwt-keys` Secret and stays in `ContainerCreating` if it
+# does not exist.
+pkiInitJob:
+  enabled: true

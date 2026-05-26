@@ -242,6 +242,14 @@ struct RunArgs {
     #[arg(long, env = "OPENSHELL_ENABLE_USER_NAMESPACES")]
     enable_user_namespaces: bool,
 
+    /// Run sandbox pods with `securityContext.privileged: true`.
+    /// UNSAFE: grants the sandbox container full host access. Only enable
+    /// on dedicated single-tenant clusters where the container runtime
+    /// blocks operations the supervisor needs (e.g. AKS containerd's
+    /// `mount --make-shared` denial). Prefer `--enable-user-namespaces`.
+    #[arg(long, env = "OPENSHELL_SANDBOX_PRIVILEGED")]
+    sandbox_privileged: bool,
+
     /// Disable TLS entirely — listen on plaintext HTTP.
     /// Use this when the gateway sits behind a reverse proxy or tunnel
     /// (e.g. Cloudflare Tunnel) that terminates TLS at the edge.
@@ -453,6 +461,7 @@ async fn run_from_args(args: RunArgs) -> Result<()> {
     }
 
     config.enable_user_namespaces = args.enable_user_namespaces;
+    config.sandbox_privileged = args.sandbox_privileged;
 
     let vm_config = VmComputeConfig {
         state_dir: args.vm_driver_state_dir,

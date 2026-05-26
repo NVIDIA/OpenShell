@@ -58,4 +58,11 @@ pub struct KubernetesComputeConfig {
     pub client_tls_secret_name: String,
     pub host_gateway_ip: String,
     pub enable_user_namespaces: bool,
+    /// Run sandbox pods with `securityContext.privileged: true`.
+    /// UNSAFE: grants the sandbox container full host access. Only enable
+    /// on dedicated single-tenant clusters where the cluster's container
+    /// runtime blocks operations the supervisor needs (e.g. AKS's
+    /// containerd policy denies `mount --make-shared /run/netns` even with
+    /// `CAP_SYS_ADMIN`). Prefer `enable_user_namespaces` when possible.
+    pub sandbox_privileged: bool,
 }
