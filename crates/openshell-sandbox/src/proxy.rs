@@ -167,6 +167,7 @@ pub struct ProxyHandle {
     #[allow(dead_code)]
     http_addr: Option<SocketAddr>,
     join: JoinHandle<()>,
+    inference_join: Option<JoinHandle<()>>,
 }
 
 impl ProxyHandle {
@@ -226,6 +227,11 @@ impl ProxyHandle {
             );
         }
 
+        // Clone before move into main proxy closure so inference listener
+        // can also reference them.
+        let tls_state_for_inference = tls_state.clone();
+        let inference_ctx_for_inference = inference_ctx.clone();
+
         let join = tokio::spawn(async move {
             loop {
                 match listener.accept().await {
@@ -280,9 +286,123 @@ impl ProxyHandle {
             }
         });
 
+        // Inject `inference.local → host_ip` into /etc/hosts so libc
+        // getaddrinfo (used by Node 22 built-in fetch) can resolve the hostname
+        // without needing HTTPS_PROXY support.
+        if let Some(addr) = bind_addr {
+            let host_ip = addr.ip();
+            let entry = format!("{host_ip} {INFERENCE_LOCAL_HOST}\n");
+            match std::fs::read_to_string("/etc/hosts") {
+                Ok(contents) if !contents.contains(INFERENCE_LOCAL_HOST) => {
+                    if let Err(e) = std::fs::OpenOptions::new()
+                        .append(true)
+                        .open("/etc/hosts")
+                        .and_then(|mut f| {
+                            use std::io::Write as _;
+                            f.write_all(entry.as_bytes())
+                        })
+                    {
+                        warn!("Failed to inject {INFERENCE_LOCAL_HOST} into /etc/hosts: {e}");
+                    } else {
+                        tracing::info!(
+                            "{INFERENCE_LOCAL_HOST} → {host_ip} injected into /etc/hosts"
+                        );
+                    }
+                }
+                Ok(_) => {} // already present
+                Err(e) => warn!("Failed to read /etc/hosts: {e}"),
+            }
+        }
+
+        // Start a direct TLS listener on host_ip:443 for processes that do not
+        // honor HTTPS_PROXY (e.g. Node 22 built-in fetch).  Connections here go
+        // straight to handle_inference_interception without a CONNECT handshake.
+        let inference_join = if let (Some(tls), Some(inf), Some(addr)) = (
+            &tls_state_for_inference,
+            &inference_ctx_for_inference,
+            bind_addr,
+        ) {
+                let tls_addr = SocketAddr::new(addr.ip(), INFERENCE_LOCAL_PORT);
+                match TcpListener::bind(tls_addr).await {
+                    Ok(inference_listener) => {
+                        {
+                            let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                                .activity(ActivityId::Listen)
+                                .severity(SeverityId::Informational)
+                                .status(StatusId::Success)
+                                .dst_endpoint(Endpoint::from_ip(tls_addr.ip(), tls_addr.port()))
+                                .message(format!(
+                                    "Inference TLS listener on {tls_addr}"
+                                ))
+                                .build();
+                            ocsf_emit!(event);
+                        }
+                        let tls_c = tls.clone();
+                        let inf_c = inf.clone();
+                        Some(tokio::spawn(async move {
+                            loop {
+                                match inference_listener.accept().await {
+                                    Ok((stream, _peer)) => {
+                                        let tls2 = tls_c.clone();
+                                        let inf2 = inf_c.clone();
+                                        tokio::spawn(async move {
+                                            match handle_inference_interception(
+                                                stream,
+                                                INFERENCE_LOCAL_HOST,
+                                                INFERENCE_LOCAL_PORT,
+                                                Some(&tls2),
+                                                Some(&inf2),
+                                            )
+                                            .await
+                                            {
+                                                Ok(InferenceOutcome::Denied { reason }) => {
+                                                    let event =
+                                                        NetworkActivityBuilder::new(crate::ocsf_ctx())
+                                                            .activity(ActivityId::Open)
+                                                            .action(ActionId::Denied)
+                                                            .disposition(DispositionId::Blocked)
+                                                            .severity(SeverityId::Medium)
+                                                            .status(StatusId::Failure)
+                                                            .dst_endpoint(Endpoint::from_domain(
+                                                                INFERENCE_LOCAL_HOST,
+                                                                INFERENCE_LOCAL_PORT,
+                                                            ))
+                                                            .message(format!(
+                                                                "Direct inference denied: {reason}"
+                                                            ))
+                                                            .status_detail(&reason)
+                                                            .build();
+                                                    ocsf_emit!(event);
+                                                }
+                                                Ok(InferenceOutcome::Routed) | Err(_) => {}
+                                            }
+                                        });
+                                    }
+                                    Err(err) => {
+                                        warn!(
+                                            "Inference TLS listener accept error: {err}"
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
+                        }))
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to bind inference TLS listener on {tls_addr}: {e}"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
         Ok(Self {
             http_addr: Some(local_addr),
             join,
+            inference_join,
         })
     }
 
@@ -295,6 +415,9 @@ impl ProxyHandle {
 impl Drop for ProxyHandle {
     fn drop(&mut self) {
         self.join.abort();
+        if let Some(j) = &self.inference_join {
+            j.abort();
+        }
     }
 }
 

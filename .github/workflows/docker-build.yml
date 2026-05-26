@@ -42,6 +42,11 @@ on:
         required: false
         type: string
         default: ""
+      image-registry:
+        description: "Docker registry and org prefix (e.g. docker.io/aible, ghcr.io/nvidia/openshell)"
+        required: false
+        type: string
+        default: "ghcr.io/nvidia/openshell"
 
 env:
   MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -182,7 +187,7 @@ jobs:
         - /etc/buildkit:/etc/buildkit:ro
     env:
       IMAGE_TAG: ${{ needs.resolve.outputs.platform_count == '1' && needs.resolve.outputs.image_tag_base || format('{0}-{1}', needs.resolve.outputs.image_tag_base, matrix.arch) }}
-      IMAGE_REGISTRY: ghcr.io/nvidia/openshell
+      IMAGE_REGISTRY: ${{ inputs['image-registry'] }}
       DOCKER_PUSH: ${{ inputs.push && '1' || '0' }}
       DOCKER_PLATFORM: ${{ matrix.platform }}
     steps:
@@ -197,9 +202,16 @@ jobs:
       - name: Install tools
         run: mise install --locked
 
-      - name: Log in to GHCR
+      - name: Log in to registry
         if: ${{ inputs.push }}
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+        run: |
+          set -euo pipefail
+          registry=$(echo "${{ inputs['image-registry'] }}" | cut -d/ -f1)
+          if [[ "$registry" == "ghcr.io" ]]; then
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          else
+            echo "${{ secrets.REGISTRY_TOKEN }}" | docker login "$registry" -u "${{ secrets.REGISTRY_USER }}" --password-stdin
+          fi
 
       - name: Set up buildx (local driver)
         uses: ./.github/actions/setup-buildx
@@ -268,13 +280,20 @@ jobs:
       volumes:
         - /var/run/docker.sock:/var/run/docker.sock
     steps:
-      - name: Log in to GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Log in to registry
+        run: |
+          set -euo pipefail
+          registry=$(echo "${{ inputs['image-registry'] }}" | cut -d/ -f1)
+          if [[ "$registry" == "ghcr.io" ]]; then
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          else
+            echo "${{ secrets.REGISTRY_TOKEN }}" | docker login "$registry" -u "${{ secrets.REGISTRY_USER }}" --password-stdin
+          fi
 
       - name: Create multi-arch manifest
         run: |
           set -euo pipefail
-          image="ghcr.io/nvidia/openshell/${{ inputs.component }}"
+          image="${{ inputs['image-registry'] }}/${{ inputs.component }}"
           refs=()
           for arch in ${{ needs.resolve.outputs.arches }}; do
             refs+=("${image}:${{ needs.resolve.outputs.image_tag_base }}-${arch}")

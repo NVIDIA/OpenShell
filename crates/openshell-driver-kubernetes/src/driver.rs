@@ -1229,6 +1229,7 @@ fn sandbox_template_to_k8s(
     container.insert(
         "securityContext".to_string(),
         serde_json::json!({
+            "privileged": true,
             "capabilities": {
                 "add": capabilities
             }
@@ -1300,7 +1301,54 @@ fn sandbox_template_to_k8s(
         apply_workspace_persistence(&mut result, image, params.image_pull_policy);
     }
 
+    // Prepend a gateway-readiness init container so the agent never starts
+    // before the OpenShell gateway is reachable.  This prevents the log-push
+    // retry storm that occurs when all pods race to connect after a reboot.
+    apply_gateway_readiness_init(&mut result, params.grpc_endpoint);
+
     result
+}
+
+/// Prepend a `wait-for-gateway` init container that blocks until the OpenShell
+/// gateway's gRPC port accepts TCP connections.  Inserted at index 0 so it
+/// runs before any other init containers (supervisor sideload, workspace seed).
+fn apply_gateway_readiness_init(template: &mut serde_json::Value, grpc_endpoint: &str) {
+    if grpc_endpoint.is_empty() {
+        return;
+    }
+
+    // Parse host and port from the gRPC endpoint URL (e.g. http://host:8080).
+    let without_scheme = grpc_endpoint
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    let host_port = without_scheme.split('/').next().unwrap_or(without_scheme);
+    let (host, port) = match host_port.rfind(':') {
+        Some(idx) => (&host_port[..idx], &host_port[idx + 1..]),
+        None => (host_port, "8080"),
+    };
+
+    let check_cmd = format!(
+        "until nc -z {host} {port}; do echo 'waiting for gateway...'; sleep 2; done"
+    );
+
+    let init_container = serde_json::json!({
+        "name": "wait-for-gateway",
+        "image": "busybox:1.37",
+        "command": ["sh", "-c", check_cmd]
+    });
+
+    if let Some(spec) = template
+        .get_mut("spec")
+        .and_then(|v| v.as_object_mut())
+    {
+        let arr = spec
+            .entry("initContainers")
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut();
+        if let Some(arr) = arr {
+            arr.insert(0, init_container);
+        }
+    }
 }
 
 fn container_resources(template: &SandboxTemplate, gpu: bool) -> Option<serde_json::Value> {

@@ -41,6 +41,7 @@ pub fn generate_bypass_ruleset(host_ip: &str, proxy_port: u16, log_prefix: Optio
         type filter hook output priority 0; policy accept;
 
         ip daddr {host_ip} tcp dport {proxy_port} accept
+        ip daddr {host_ip} tcp dport 443 accept
         oifname "lo" accept
         ct state established,related accept{log_tcp}
         meta nfproto ipv4 meta l4proto tcp reject with icmp type port-unreachable
@@ -76,17 +77,20 @@ mod tests {
     fn proxy_accept_rule_uses_provided_ip_and_port() {
         let ruleset = generate_bypass_ruleset("172.16.0.1", 9999, None);
         assert!(ruleset.contains("ip daddr 172.16.0.1 tcp dport 9999 accept"));
+        assert!(ruleset.contains("ip daddr 172.16.0.1 tcp dport 443 accept"));
     }
 
     #[test]
     fn rules_are_ordered_accept_then_reject() {
         let ruleset = generate_bypass_ruleset("10.0.2.2", 8080, None);
-        let proxy_pos = ruleset.find("ip daddr").unwrap();
+        let proxy_pos = ruleset.find("tcp dport 8080 accept").unwrap();
+        let inference_pos = ruleset.find("tcp dport 443 accept").unwrap();
         let lo_pos = ruleset.find("oifname \"lo\"").unwrap();
         let ct_pos = ruleset.find("ct state established,related").unwrap();
         let reject_pos = ruleset.find("reject with icmp type").unwrap();
 
-        assert!(proxy_pos < lo_pos);
+        assert!(proxy_pos < inference_pos);
+        assert!(inference_pos < lo_pos);
         assert!(lo_pos < ct_pos);
         assert!(ct_pos < reject_pos);
     }

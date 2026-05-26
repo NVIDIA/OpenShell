@@ -34,6 +34,7 @@ backend = "github:anchore/syft"
 checksum = "sha256:6f6cdcdc695721d91ce756e3b5bc3e3416599c464101f5e32e9c3f33054ee6d9"
 url = "https://github.com/anchore/syft/releases/download/v1.44.0/syft_1.44.0_linux_arm64.tar.gz"
 url_api = "https://api.github.com/repos/anchore/syft/releases/assets/410001182"
+provenance = "github-attestations"
 
 [tools."github:anchore/syft"."platforms.linux-x64"]
 checksum = "sha256:0e91737aee2b5baf1d255b959630194a302335d848ff97bb07921eb6205b5f5a"
@@ -248,6 +249,7 @@ version = "2.20.0"
 backend = "aqua:GoogleContainerTools/skaffold"
 
 [tools.skaffold."platforms.linux-arm64"]
+checksum = "blake3:00bb199c82f320879741621d35ac356e8146a3b965c1f857163d96afb5825deb"
 url = "https://storage.googleapis.com/skaffold/releases/v2.20.0/skaffold-linux-arm64"
 
 [tools.skaffold."platforms.linux-x64"]
@@ -303,6 +305,7 @@ backend = "core:zig"
 [tools.zig."platforms.linux-arm64"]
 checksum = "sha256:f7a654acc967864f7a050ddacfaa778c7504a0eca8d2b678839c21eea47c992b"
 url = "https://ziglang.org/download/0.14.1/zig-aarch64-linux-0.14.1.tar.xz"
+provenance = "minisign"
 
 [tools.zig."platforms.linux-x64"]
 checksum = "sha256:24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c"

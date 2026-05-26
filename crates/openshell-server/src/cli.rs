@@ -53,7 +53,7 @@ struct RunArgs {
     config: Option<PathBuf>,
 
     /// IP address to bind the server, health, and metrics listeners to.
-    #[arg(long, default_value = "127.0.0.1", env = "OPENSHELL_BIND_ADDRESS")]
+    #[arg(long, default_value = "0.0.0.0", env = "OPENSHELL_BIND_ADDRESS")]
     bind_address: IpAddr,
 
     /// Port to bind the server to.
@@ -682,7 +682,7 @@ mod tests {
     }
 
     #[test]
-    fn command_defaults_bind_address_to_loopback() {
+    fn command_defaults_bind_address_to_unspecified() {
         let _lock = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);

@@ -227,8 +227,12 @@ async fn run_push_loop(
 
         if stream_broken {
             eprintln!("openshell: log push stream lost, reconnecting...");
-            backoff = INITIAL_BACKOFF;
-            // Loop back to reconnect.
+            // Apply backoff before reconnecting — if the stream breaks immediately
+            // (e.g. Envoy returns "no healthy upstream" during gateway startup)
+            // this prevents a tight retry storm.  Backoff doubles on each
+            // consecutive failure and resets only when a connection succeeds.
+            drain_during_backoff(&mut rx, &mut batch, backoff).await;
+            backoff = (backoff * 2).min(MAX_BACKOFF);
         }
     }
 }

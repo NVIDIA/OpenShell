@@ -8,11 +8,11 @@ replicaCount: 1
 
 image:
   # -- Gateway image repository.
-  repository: ghcr.io/nvidia/openshell/gateway
+  repository: docker.io/aible/openshell-gateway
   # -- Gateway image pull policy.
   pullPolicy: IfNotPresent
   # -- Gateway image tag. Defaults to the chart appVersion when empty.
-  tag: ""
+  tag: "20260512"
 
 # Supervisor image - provides the openshell-sandbox binary injected into sandbox
 # pods. tag defaults to appVersion (same as the gateway image) so both stay in

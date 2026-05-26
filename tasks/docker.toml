@@ -41,6 +41,16 @@ description = "Alias for build:docker:supervisor"
 depends = ["build:docker:supervisor"]
 hide = true
 
+["build:docker:cluster"]
+description = "Build the cluster image (k3s + inner Helm chart + entrypoint scripts)"
+run = "tasks/scripts/docker-build-cluster.sh"
+hide = true
+
+["docker:build:cluster"]
+description = "Alias for build:docker:cluster"
+depends = ["build:docker:cluster"]
+hide = true
+
 ["build:docker:multiarch"]
 description = "Build multi-arch gateway and supervisor images and push to a registry"
 run = "tasks/scripts/docker-publish-multiarch.sh"

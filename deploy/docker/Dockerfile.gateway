@@ -3,34 +3,56 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Gateway image build.
+# Aible fork of the OpenShell gateway image.
 #
-# The Rust binary is built natively before this image build runs and staged at:
-#   deploy/docker/.build/prebuilt-binaries/<arch>/openshell-gateway
+# Compiles the gateway binary from source using the public Rust image, then
+# layers it into the upstream gateway image instead of using the NVIDIA base
+# image from nvcr.io (which requires auth).
 #
-# Use tasks/scripts/docker-build-image.sh gateway (or `mise run build:docker:gateway`)
-# to stage the binary and build the image in one step. CI builds the binary
-# per-architecture via the `rust-native-build.yml` workflow and uploads it as
-# an artifact, which is downloaded into the same staging directory before the
-# image build job runs.
+# Build:
+#   IMAGE_TAG=20260521 tasks/scripts/docker-build-local.sh gateway
 #
-# The runtime is distroless Debian 13, which provides glibc and the dynamic
-# loader needed by the GNU-linked gateway binary while keeping the attack
-# surface small. The default digest currently carries Debian glibc
-# 2.41-12+deb13u3.
+# The upstream base is pinned by digest for reproducible builds.
+# To bump, see deploy/docker/UPSTREAM-BASE-UPGRADE.md.
+# Current pin: ghcr.io/nvidia/openshell/gateway:latest as of 2026-05-13
+ARG BASE_IMAGE=ghcr.io/nvidia/openshell/gateway@sha256:343de518b016b179a9e38395031ba53cb56e78fc1ec72df2143d259859fdfe0f
 
-ARG GATEWAY_BASE_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:e1fd250ce83d94603e9887ec991156a6c26905a6b0001039b7a43699018c0733
+# ---------------------------------------------------------------------------
+# Stage 1: Compile gateway binary from source
+# ---------------------------------------------------------------------------
+FROM rust:1.95.0-slim-trixie AS builder
 
-FROM ${GATEWAY_BASE_IMAGE} AS gateway
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    pkg-config \
+    libssl-dev \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
-ARG TARGETARCH
+WORKDIR /build
 
-WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+COPY proto/ proto/
+COPY providers/ providers/
 
-COPY deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-gateway /usr/local/bin/openshell-gateway
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    cargo build --release \
+        --features "openshell-core/dev-settings" \
+        --bin openshell-gateway \
+    && mkdir -p /out \
+    && install -m 0755 target/release/openshell-gateway /out/openshell-gateway
 
-USER 1000:1000
-EXPOSE 8080
+# ---------------------------------------------------------------------------
+# Stage 2: Layer compiled binary and updated migrations into the base image
+# ---------------------------------------------------------------------------
+FROM ${BASE_IMAGE}
 
-ENTRYPOINT ["/usr/local/bin/openshell-gateway"]
-CMD ["--bind-address", "0.0.0.0", "--port", "8080"]
+COPY --from=builder /out/openshell-gateway /usr/local/bin/openshell-gateway
+# Also overwrite openshell-server so the base image's ENTRYPOINT (which may
+# invoke `openshell-server`) picks up our updated binary.
+COPY --from=builder /out/openshell-gateway /usr/local/bin/openshell-server
+COPY --chmod=755 crates/openshell-server/migrations /build/crates/openshell-server/migrations
+ENTRYPOINT ["openshell-gateway"]
