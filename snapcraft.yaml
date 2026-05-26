@@ -12,8 +12,7 @@ description: |
   LLM inference routing.
 
 base: core24
-# TODO: this prevents publishing a snap to latest/stable.
-grade: devel
+grade: stable
 confinement: strict
 license: Apache-2.0
 website: https://docs.nvidia.com/openshell/latest/index.html
