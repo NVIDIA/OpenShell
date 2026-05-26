@@ -2328,11 +2328,19 @@ impl VmDriver {
                 }
             };
 
+            let console_output = {
+                let registry = self.registry.lock().await;
+                registry
+                    .get(&sandbox_id)
+                    .map(|record| record.state_dir.join("rootfs-console.log"))
+            };
+
             if let Some(status) = exit_status {
-                let message = status.code().map_or_else(
-                    || "VM process exited".to_string(),
-                    |code| format!("VM process exited with status {code}"),
-                );
+                let console_excerpt = match console_output {
+                    Some(path) => read_vm_console_excerpt(&path).await,
+                    None => None,
+                };
+                let message = vm_process_exit_message(status.code(), console_excerpt.as_deref());
                 if let Some(snapshot) = self
                     .set_snapshot_condition(
                         &sandbox_id,
@@ -2347,6 +2355,7 @@ impl VmDriver {
                     sandbox_id.clone(),
                     platform_event("vm", "Warning", "ProcessExited", message),
                 );
+
                 let has_gpu = {
                     let registry = self.registry.lock().await;
                     registry
@@ -4321,6 +4330,32 @@ fn platform_event(source: &str, event_type: &str, reason: &str, message: String)
     event
 }
 
+async fn read_vm_console_excerpt(path: &Path) -> Option<String> {
+    let console = tokio::fs::read_to_string(path).await.ok()?;
+    let mut lines: Vec<&str> = console
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    let keep_from = lines.len().saturating_sub(8);
+    lines.drain(..keep_from);
+    Some(lines.join("\n"))
+}
+
+fn vm_process_exit_message(code: Option<i32>, console_excerpt: Option<&str>) -> String {
+    match (code, console_excerpt) {
+        (Some(code), Some(console)) => {
+            format!("VM process exited with status {code}. Last console output:\n{console}")
+        }
+        (Some(code), None) => format!("VM process exited with status {code}"),
+        (None, Some(console)) => format!("VM process exited. Last console output:\n{console}"),
+        (None, None) => "VM process exited".to_string(),
+    }
+}
+
 fn attach_vm_progress_metadata(event: &mut PlatformEvent) {
     if event.source != "vm" {
         return;
@@ -4442,6 +4477,36 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use tonic::Code;
 
+    #[test]
+    fn vm_process_exit_message_includes_console_excerpt() {
+        let message = vm_process_exit_message(Some(0), Some("line one\nline two"));
+        assert!(message.contains("VM process exited with status 0"));
+        assert!(message.contains("line one\nline two"));
+    }
+
+    #[tokio::test]
+    async fn read_vm_console_excerpt_returns_tail_lines() {
+        let base = unique_temp_dir();
+        std::fs::create_dir_all(&base).unwrap();
+        let console = base.join("rootfs-console.log");
+        fs::write(
+            &console,
+            [
+                "line 1", "line 2", "line 3", "line 4", "line 5", "line 6", "line 7", "line 8",
+                "line 9", "line 10",
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let excerpt = read_vm_console_excerpt(&console).await.unwrap();
+        assert_eq!(
+            excerpt,
+            "line 3\nline 4\nline 5\nline 6\nline 7\nline 8\nline 9\nline 10"
+        );
+
+        let _ = std::fs::remove_dir_all(base);
+    }
     #[test]
     fn vm_pulling_layer_event_adds_progress_detail_metadata() {
         let mut event = platform_event(
