@@ -55,6 +55,10 @@ required-features = ["e2e-podman"]
 name = "vm_gateway_resume"
 path = "tests/vm_gateway_resume.rs"
 required-features = ["e2e-vm"]
+[[test]]
+name = "vm_custom_image"
+path = "tests/vm_custom_image.rs"
+required-features = ["e2e-vm"]
 
 [[test]]
 name = "websocket_conformance"

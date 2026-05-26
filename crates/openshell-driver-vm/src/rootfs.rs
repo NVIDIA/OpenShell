@@ -947,6 +947,21 @@ mod tests {
         assert!(rootfs.join("overlay").is_dir());
         assert!(rootfs.join("newroot").is_dir());
         assert!(
+            fs::read_to_string(rootfs.join("srv/openshell-vm-sandbox-init.sh"))
+                .expect("read init script")
+                .contains("mount -t ext4 -o ro,noload /dev/vdc /image-cache")
+        );
+        assert!(
+            fs::read_to_string(rootfs.join("srv/openshell-vm-sandbox-init.sh"))
+                .expect("read init script")
+                .contains("umoci unpack")
+        );
+        assert!(
+            fs::read_to_string(rootfs.join("srv/openshell-vm-sandbox-init.sh"))
+                .expect("read init script")
+                .contains("if [ ! -d \"$partial_root/rootfs\" ]; then")
+        );
+        assert!(
             fs::read_dir(rootfs.join("sandbox"))
                 .expect("read sandbox")
                 .next()

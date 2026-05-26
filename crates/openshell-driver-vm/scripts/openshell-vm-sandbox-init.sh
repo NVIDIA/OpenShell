@@ -165,7 +165,7 @@ prepare_guest_image_rootfs() {
                 ts "FATAL: umoci not found in VM bootstrap image"
                 exit 1
             fi
-            /opt/openshell/bin/umoci raw unpack \
+            /opt/openshell/bin/umoci unpack \
                 --image "$payload_dir/oci:openshell" \
                 "$partial_root"
             if [ ! -d "$partial_root/rootfs" ]; then
@@ -252,7 +252,7 @@ setup_overlay_root() {
 
     local lower_root="/lower"
     if [ -b /dev/vdc ]; then
-        mount -t ext4 -o ro /dev/vdc /image-cache
+        mount -t ext4 -o ro,noload /dev/vdc /image-cache
         if [ -d /image-cache/image-rootfs ]; then
             lower_root="/image-cache/image-rootfs"
             ts "using prepared image rootfs lowerdir"
