@@ -195,6 +195,17 @@ server:
   # -- Enable plaintext HTTP routing for loopback sandbox service URLs on
   # TLS-enabled gateways.
   enableLoopbackServiceHttp: true
+  # Optional gateway-wide gRPC request rate limit. Applies only to gRPC API
+  # traffic after protocol multiplexing; health, metrics, and loopback service
+  # HTTP routes are not rate limited. Both values must be positive to enable the
+  # limit, otherwise it is omitted from the rendered config and stays disabled.
+  grpcRateLimit:
+    # -- Maximum gRPC requests allowed per window. Must be positive (alongside
+    # windowSeconds) to enable rate limiting; 0 (default) disables it.
+    requests: 0
+    # -- gRPC rate-limit window length in seconds. Must be positive (alongside
+    # requests) to enable rate limiting; 0 (default) disables it.
+    windowSeconds: 0
   auth:
     # -- UNSAFE: accept unauthenticated CLI/user requests as a local developer
     # principal. Intended only for trusted local Skaffold/k3d development or a

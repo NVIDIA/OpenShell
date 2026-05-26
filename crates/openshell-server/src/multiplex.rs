@@ -17,12 +17,13 @@ use hyper_util::{
     service::TowerToHyperService,
 };
 use metrics::{counter, histogram};
+use openshell_core::Config;
 use openshell_core::proto::{
     inference_server::InferenceServer, open_shell_server::OpenShellServer,
 };
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -174,6 +175,8 @@ impl MultiplexService {
             self.state.config.mtls_auth.enabled,
             self.state.config.auth.allow_unauthenticated_users,
         );
+        let grpc_service =
+            GrpcRateLimitService::new(grpc_service, self.state.grpc_rate_limiter.clone());
         let http_service = http_router(self.state.clone());
 
         let grpc_service = request_id_middleware!(grpc_service);
@@ -208,6 +211,153 @@ impl MultiplexService {
             .await?;
 
         Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct GrpcRateLimiter {
+    requests: u64,
+    window: Duration,
+    state: Arc<Mutex<GrpcRateLimitState>>,
+}
+
+#[derive(Debug)]
+struct GrpcRateLimitState {
+    window_started: Instant,
+    remaining: u64,
+}
+
+impl GrpcRateLimiter {
+    pub fn from_config(config: &Config) -> Option<Self> {
+        let (requests, window) = config.grpc_rate_limit()?;
+        Some(Self {
+            requests,
+            window,
+            state: Arc::new(Mutex::new(GrpcRateLimitState {
+                window_started: Instant::now(),
+                remaining: requests,
+            })),
+        })
+    }
+
+    fn allow(&self) -> bool {
+        let now = Instant::now();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if now.duration_since(state.window_started) >= self.window {
+            state.window_started = now;
+            state.remaining = self.requests;
+        }
+        if state.remaining == 0 {
+            false
+        } else {
+            state.remaining -= 1;
+            true
+        }
+    }
+
+    /// Report whether the limiter currently has capacity without consuming a
+    /// token, rolling the window over first so an elapsed window reports
+    /// capacity again.
+    ///
+    /// Used by `poll_ready` so an exhausted limiter reports readiness instead
+    /// of blocking on inner-service backpressure: `call` can then return
+    /// `RESOURCE_EXHAUSTED` immediately rather than waiting for the inner gRPC
+    /// service to become ready.
+    fn has_capacity(&self) -> bool {
+        let now = Instant::now();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if now.duration_since(state.window_started) >= self.window {
+            state.window_started = now;
+            state.remaining = self.requests;
+        }
+        state.remaining > 0
+    }
+}
+
+#[derive(Clone)]
+struct GrpcRateLimitService<S> {
+    inner: S,
+    limiter: Option<GrpcRateLimiter>,
+    /// Set by `poll_ready` when it reports synthetic readiness for an
+    /// exhausted limiter without polling the inner service. The paired `call`
+    /// must then reject with `RESOURCE_EXHAUSTED` instead of forwarding to an
+    /// inner service that never reported readiness — even if the rate-limit
+    /// window rolls over in between. Reset whenever `poll_ready` defers to the
+    /// inner service.
+    rate_limited: bool,
+}
+
+impl<S> GrpcRateLimitService<S> {
+    fn new(inner: S, limiter: Option<GrpcRateLimiter>) -> Self {
+        Self {
+            inner,
+            limiter,
+            rate_limited: false,
+        }
+    }
+}
+
+impl<S, B> tower::Service<Request<B>> for GrpcRateLimitService<S>
+where
+    S: tower::Service<Request<B>, Response = Response<tonic::body::BoxBody>>,
+    S::Future: Send + 'static,
+    B: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        // When the limiter is exhausted, report ready so `call` can return
+        // RESOURCE_EXHAUSTED immediately. Delegating to the inner service here
+        // would make rate-limited requests wait on inner backpressure (a
+        // pending inner `poll_ready`) before they are rejected. The check is
+        // non-consuming: the token is only consumed in `call` via `allow`.
+        //
+        // Crucially, this path does NOT poll the inner service, so the inner
+        // service has not reported readiness. Record that decision so the
+        // paired `call` rejects rather than forwarding to a service that never
+        // became ready — even if the rate-limit window rolls over in between.
+        if self
+            .limiter
+            .as_ref()
+            .is_some_and(|limiter| !limiter.has_capacity())
+        {
+            self.rate_limited = true;
+            return Poll::Ready(Ok(()));
+        }
+        self.rate_limited = false;
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: Request<B>) -> Self::Future {
+        // If `poll_ready` short-circuited an exhausted limiter, it never polled
+        // the inner service to readiness. Honor that decision regardless of the
+        // limiter's current state (the window may have rolled over since): the
+        // Tower contract forbids forwarding to an inner service that did not
+        // report readiness.
+        if std::mem::take(&mut self.rate_limited) {
+            let response =
+                tonic::Status::resource_exhausted("gRPC rate limit exceeded").into_http();
+            return Box::pin(async move { Ok(response) });
+        }
+        if self
+            .limiter
+            .as_ref()
+            .is_some_and(|limiter| !limiter.allow())
+        {
+            let response =
+                tonic::Status::resource_exhausted("gRPC rate limit exceeded").into_http();
+            return Box::pin(async move { Ok(response) });
+        }
+        let future = self.inner.call(req);
+        Box::pin(future)
     }
 }
 
@@ -654,6 +804,8 @@ mod tests {
     use bytes::Bytes;
     use http_body_util::Empty;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tower::Service;
 
     #[test]
     fn uuid_request_id_generates_valid_uuid() {
@@ -799,6 +951,275 @@ mod tests {
             .get("x-request-id")
             .expect("gRPC-routed response should include x-request-id header");
         assert_eq!(request_id.to_str().unwrap(), "grpc-corr-id");
+    }
+
+    #[derive(Clone)]
+    struct CountingGrpcService {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Service<Request<()>> for CountingGrpcService {
+        type Response = Response<tonic::body::BoxBody>;
+        type Error = std::convert::Infallible;
+        type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: Request<()>) -> Self::Future {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            std::future::ready(Ok(Response::new(tonic::body::empty_body())))
+        }
+    }
+
+    /// Inner service that is never ready, used to prove the rate limiter does
+    /// not wait on inner-service backpressure when it is already exhausted.
+    /// Counts `call` invocations so tests can assert the limiter never forwards
+    /// to an inner service that did not report readiness.
+    #[derive(Clone)]
+    struct PendingInnerService {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl PendingInnerService {
+        fn new() -> Self {
+            Self {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl Service<Request<()>> for PendingInnerService {
+        type Response = Response<tonic::body::BoxBody>;
+        type Error = std::convert::Infallible;
+        type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Pending
+        }
+
+        fn call(&mut self, _req: Request<()>) -> Self::Future {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            std::future::ready(Ok(Response::new(tonic::body::empty_body())))
+        }
+    }
+
+    #[tokio::test]
+    async fn grpc_rate_limit_poll_ready_short_circuits_exhausted_limiter() {
+        // An exhausted limiter must report ready even when the inner service is
+        // pending, so `call` returns RESOURCE_EXHAUSTED instead of waiting on
+        // inner backpressure.
+        let config = Config::new(None).with_grpc_rate_limit(Some(1), Some(60));
+        let limiter = GrpcRateLimiter::from_config(&config).expect("limiter should be enabled");
+        // Consume the single token so the limiter is exhausted.
+        assert!(limiter.allow());
+
+        let mut exhausted = GrpcRateLimitService::new(PendingInnerService::new(), Some(limiter));
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(
+            matches!(exhausted.poll_ready(&mut cx), Poll::Ready(Ok(()))),
+            "exhausted limiter should report ready despite a pending inner service",
+        );
+        let response = exhausted.call(Request::new(())).await.unwrap();
+        assert_eq!(grpc_status_from_response(&response), "8");
+
+        // A limiter with capacity must still respect inner backpressure.
+        let config = Config::new(None).with_grpc_rate_limit(Some(1), Some(60));
+        let limiter = GrpcRateLimiter::from_config(&config);
+        let mut with_capacity = GrpcRateLimitService::new(PendingInnerService::new(), limiter);
+        assert!(
+            with_capacity.poll_ready(&mut cx).is_pending(),
+            "limiter with capacity should defer to the pending inner service",
+        );
+    }
+
+    #[tokio::test]
+    async fn grpc_rate_limit_call_rejects_after_poll_ready_short_circuit_despite_window_rollover() {
+        // Regression: when `poll_ready` reports synthetic readiness for an
+        // exhausted limiter, it does NOT poll the inner service. If the
+        // rate-limit window then rolls over before `call`, the request must
+        // still be rejected rather than forwarded to an inner service that
+        // never reported readiness (a Tower contract violation).
+        let config = Config::new(None).with_grpc_rate_limit(Some(1), Some(60));
+        let limiter = GrpcRateLimiter::from_config(&config).expect("limiter should be enabled");
+        // Exhaust the single token.
+        assert!(limiter.allow());
+
+        // Pending inner service: its `poll_ready` never reports ready and its
+        // `call` increments a counter. A ready result from the wrapper
+        // therefore proves the limiter short-circuited rather than delegating,
+        // and `calls == 0` proves the wrapper never forwarded.
+        let inner = PendingInnerService::new();
+        let calls = inner.calls.clone();
+        let mut service = GrpcRateLimitService::new(inner, Some(limiter.clone()));
+
+        // poll_ready short-circuits the exhausted limiter and records synthetic
+        // readiness without polling the inner service.
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(
+            matches!(service.poll_ready(&mut cx), Poll::Ready(Ok(()))),
+            "exhausted limiter should report ready despite a pending inner service",
+        );
+
+        // The window rolls over between poll_ready and call: the limiter now
+        // has capacity again.
+        {
+            let mut state = limiter
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.window_started = state
+                .window_started
+                .checked_sub(Duration::from_secs(61))
+                .expect("test window rewind should be valid");
+        }
+
+        let response = service.call(Request::new(())).await.unwrap();
+        assert_eq!(grpc_status_from_response(&response), "8");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            0,
+            "inner service must not be called when poll_ready short-circuited the limiter",
+        );
+    }
+
+    #[tokio::test]
+    async fn grpc_rate_limit_returns_resource_exhausted_after_limit() {
+        let config = Config::new(None).with_grpc_rate_limit(Some(1), Some(60));
+        let limiter = GrpcRateLimiter::from_config(&config);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut service = GrpcRateLimitService::new(
+            CountingGrpcService {
+                calls: calls.clone(),
+            },
+            limiter,
+        );
+
+        let first = service
+            .ready()
+            .await
+            .unwrap()
+            .call(Request::new(()))
+            .await
+            .unwrap();
+        assert_eq!(grpc_status_from_response(&first), "0");
+
+        let second = service
+            .ready()
+            .await
+            .unwrap()
+            .call(Request::new(()))
+            .await
+            .unwrap();
+        assert_eq!(grpc_status_from_response(&second), "8");
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn grpc_rate_limit_disabled_passes_requests_through() {
+        let config = Config::new(None).with_grpc_rate_limit(Some(0), Some(60));
+        let limiter = GrpcRateLimiter::from_config(&config);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut service = GrpcRateLimitService::new(
+            CountingGrpcService {
+                calls: calls.clone(),
+            },
+            limiter,
+        );
+
+        for _ in 0..3 {
+            let response = service
+                .ready()
+                .await
+                .unwrap()
+                .call(Request::new(()))
+                .await
+                .unwrap();
+            assert_eq!(grpc_status_from_response(&response), "0");
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn grpc_rate_limit_resets_after_window() {
+        let config = Config::new(None).with_grpc_rate_limit(Some(1), Some(60));
+        let limiter = GrpcRateLimiter::from_config(&config).expect("limiter should be enabled");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut service = GrpcRateLimitService::new(
+            CountingGrpcService {
+                calls: calls.clone(),
+            },
+            Some(limiter.clone()),
+        );
+
+        let first = service
+            .ready()
+            .await
+            .unwrap()
+            .call(Request::new(()))
+            .await
+            .unwrap();
+        assert_eq!(grpc_status_from_response(&first), "0");
+
+        {
+            let mut state = limiter
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.window_started = state
+                .window_started
+                .checked_sub(Duration::from_secs(61))
+                .expect("test window rewind should be valid");
+        }
+
+        let second = service
+            .ready()
+            .await
+            .unwrap()
+            .call(Request::new(()))
+            .await
+            .unwrap();
+        assert_eq!(grpc_status_from_response(&second), "0");
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn grpc_rate_limit_state_is_shared_across_service_clones() {
+        let config = Config::new(None).with_grpc_rate_limit(Some(1), Some(60));
+        let limiter = GrpcRateLimiter::from_config(&config);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut first_service = GrpcRateLimitService::new(
+            CountingGrpcService {
+                calls: calls.clone(),
+            },
+            limiter.clone(),
+        );
+        let mut second_service = GrpcRateLimitService::new(
+            CountingGrpcService {
+                calls: calls.clone(),
+            },
+            limiter,
+        );
+
+        let first = first_service
+            .ready()
+            .await
+            .unwrap()
+            .call(Request::new(()))
+            .await
+            .unwrap();
+        assert_eq!(grpc_status_from_response(&first), "0");
+
+        let second = second_service
+            .ready()
+            .await
+            .unwrap()
+            .call(Request::new(()))
+            .await
+            .unwrap();
+        assert_eq!(grpc_status_from_response(&second), "8");
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 
     #[derive(Clone)]

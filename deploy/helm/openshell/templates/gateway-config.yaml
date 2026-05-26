@@ -56,6 +56,17 @@ data:
     {{- if $sans }}
     server_sans = [{{- range $i, $san := $sans }}{{ if $i }}, {{ end }}{{ $san | quote }}{{- end }}]
     {{- end }}
+    {{- $rlRequests := int .Values.server.grpcRateLimit.requests }}
+    {{- $rlWindowSeconds := int .Values.server.grpcRateLimit.windowSeconds }}
+    {{- if or (lt $rlRequests 0) (lt $rlWindowSeconds 0) }}
+    {{- fail "server.grpcRateLimit.requests and server.grpcRateLimit.windowSeconds must not be negative; they map to unsigned gateway settings" }}
+    {{- end }}
+    {{- if and (gt $rlRequests 0) (gt $rlWindowSeconds 0) }}
+    grpc_rate_limit_requests       = {{ $rlRequests }}
+    grpc_rate_limit_window_seconds = {{ $rlWindowSeconds }}
+    {{- else if or (gt $rlRequests 0) (gt $rlWindowSeconds 0) }}
+    {{- fail "server.grpcRateLimit requires both requests and windowSeconds to be positive to enable rate limiting, or both 0/unset to disable it" }}
+    {{- end }}
 
     {{- if not .Values.server.disableTls }}
 

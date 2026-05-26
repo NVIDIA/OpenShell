@@ -13,7 +13,6 @@ use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
-#[cfg(unix)]
 use std::time::Duration;
 
 // ── Public default constants ────────────────────────────────────────────
@@ -364,6 +363,20 @@ pub struct Config {
     /// TTL for SSH session tokens, in seconds. 0 disables expiry.
     pub ssh_session_ttl_secs: u64,
 
+    /// Maximum gRPC requests allowed per rate-limit window.
+    ///
+    /// When paired with [`Self::grpc_rate_limit_window_secs`], positive values
+    /// enable gateway-wide gRPC request rate limiting. `None` or `0` disables
+    /// the limit.
+    pub grpc_rate_limit_requests: Option<u64>,
+
+    /// gRPC rate-limit window length in seconds.
+    ///
+    /// When paired with [`Self::grpc_rate_limit_requests`], positive values
+    /// enable gateway-wide gRPC request rate limiting. `None` or `0` disables
+    /// the limit.
+    pub grpc_rate_limit_window_secs: Option<u64>,
+
     /// Browser-facing sandbox service routing configuration.
     pub service_routing: ServiceRoutingConfig,
 }
@@ -547,6 +560,8 @@ impl Config {
             database_url: String::new(),
             compute_drivers: vec![],
             ssh_session_ttl_secs: default_ssh_session_ttl_secs(),
+            grpc_rate_limit_requests: None,
+            grpc_rate_limit_window_secs: None,
             service_routing: ServiceRoutingConfig::default(),
         }
     }
@@ -614,6 +629,29 @@ impl Config {
         self
     }
 
+    /// Set the gateway-wide gRPC request rate limit.
+    #[must_use]
+    pub const fn with_grpc_rate_limit(
+        mut self,
+        requests: Option<u64>,
+        window_secs: Option<u64>,
+    ) -> Self {
+        self.grpc_rate_limit_requests = requests;
+        self.grpc_rate_limit_window_secs = window_secs;
+        self
+    }
+
+    /// Return the effective gRPC rate limit, if fully configured and enabled.
+    #[must_use]
+    pub fn grpc_rate_limit(&self) -> Option<(u64, Duration)> {
+        let requests = self.grpc_rate_limit_requests?;
+        let window_secs = self.grpc_rate_limit_window_secs?;
+        if requests == 0 || window_secs == 0 {
+            None
+        } else {
+            Some((requests, Duration::from_secs(window_secs)))
+        }
+    }
     /// Set the OIDC configuration for JWT-based authentication.
     #[must_use]
     pub fn with_oidc(mut self, oidc: OidcConfig) -> Self {
@@ -737,6 +775,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
+    use std::time::Duration;
 
     #[test]
     fn compute_driver_kind_parses_supported_values() {
@@ -792,6 +831,29 @@ mod tests {
         .expect("gateway JWT config should deserialize with default ttl");
 
         assert_eq!(cfg.ttl_secs, 0);
+    }
+
+    #[test]
+    fn grpc_rate_limit_requires_positive_pair() {
+        assert!(Config::new(None).grpc_rate_limit().is_none());
+        assert!(
+            Config::new(None)
+                .with_grpc_rate_limit(Some(10), None)
+                .grpc_rate_limit()
+                .is_none()
+        );
+        assert!(
+            Config::new(None)
+                .with_grpc_rate_limit(Some(0), Some(60))
+                .grpc_rate_limit()
+                .is_none()
+        );
+        assert_eq!(
+            Config::new(None)
+                .with_grpc_rate_limit(Some(10), Some(60))
+                .grpc_rate_limit(),
+            Some((10, Duration::from_secs(60)))
+        );
     }
 
     #[test]

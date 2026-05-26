@@ -94,6 +94,10 @@ pub struct GatewayFileSection {
     pub sandbox_namespace: Option<String>,
     #[serde(default)]
     pub ssh_session_ttl_secs: Option<u64>,
+    #[serde(default)]
+    pub grpc_rate_limit_requests: Option<u64>,
+    #[serde(default)]
+    pub grpc_rate_limit_window_seconds: Option<u64>,
 
     // ── Service routing ──────────────────────────────────────────────────
     /// Subject Alternative Names configured on the gateway server certificate.
@@ -349,6 +353,8 @@ health_bind_address = "0.0.0.0:8081"
 log_level = "info"
 compute_drivers = ["kubernetes"]
 sandbox_namespace = "agents"
+grpc_rate_limit_requests = 120
+grpc_rate_limit_window_seconds = 60
 default_image = "ghcr.io/nvidia/openshell/sandbox:latest"
 supervisor_image = "ghcr.io/nvidia/openshell/supervisor:latest"
 client_tls_secret_name = "openshell-sandbox-tls"
@@ -375,6 +381,8 @@ grpc_endpoint = "https://openshell-gateway.agents.svc:8080"
             gw.default_image.as_deref(),
             Some("ghcr.io/nvidia/openshell/sandbox:latest")
         );
+        assert_eq!(gw.grpc_rate_limit_requests, Some(120));
+        assert_eq!(gw.grpc_rate_limit_window_seconds, Some(60));
         assert!(gw.tls.is_some());
         assert!(gw.oidc.is_some());
         assert!(file.openshell.drivers.contains_key("kubernetes"));

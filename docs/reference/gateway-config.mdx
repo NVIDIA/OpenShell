@@ -98,6 +98,11 @@ guest_tls_ca            = "/etc/openshell/certs/ca.pem"
 guest_tls_cert          = "/etc/openshell/certs/client.pem"
 guest_tls_key           = "/etc/openshell/certs/client-key.pem"
 
+# Optional gRPC rate limit. Both values must be positive to enable the limit.
+# Set either value to 0, or omit both, to disable rate limiting.
+grpc_rate_limit_requests       = 120
+grpc_rate_limit_window_seconds = 60
+
 # Gateway listener TLS (distinct from the per-driver guest_tls_*).
 [openshell.gateway.tls]
 cert_path             = "/etc/openshell/certs/gateway.pem"

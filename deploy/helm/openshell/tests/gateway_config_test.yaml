@@ -119,6 +119,64 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.gateway\.auth\].*?allow_unauthenticated_users\s*=\s*true'
 
+  - it: omits the gRPC rate limit by default
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'grpc_rate_limit_requests\s*='
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'grpc_rate_limit_window_seconds\s*='
+
+  - it: renders the gRPC rate limit under [openshell.gateway] when both values are positive
+    template: templates/gateway-config.yaml
+    set:
+      server.grpcRateLimit.requests: 120
+      server.grpcRateLimit.windowSeconds: 60
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\].*?grpc_rate_limit_requests\s*=\s*120'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\].*?grpc_rate_limit_window_seconds\s*=\s*60'
+
+  # The validation lives in gateway-config.yaml but surfaces through the
+  # statefulset checksum include, so the failure is asserted against that
+  # template (mirrors the postgres serviceBindings failure test below).
+  - it: fails to render when only requests is positive
+    template: templates/statefulset.yaml
+    set:
+      server.grpcRateLimit.requests: 120
+    asserts:
+      - failedTemplate:
+          errorMessage: "server.grpcRateLimit requires both requests and windowSeconds to be positive to enable rate limiting, or both 0/unset to disable it"
+
+  - it: fails to render when only windowSeconds is positive
+    template: templates/statefulset.yaml
+    set:
+      server.grpcRateLimit.windowSeconds: 60
+    asserts:
+      - failedTemplate:
+          errorMessage: "server.grpcRateLimit requires both requests and windowSeconds to be positive to enable rate limiting, or both 0/unset to disable it"
+
+  - it: fails to render when requests is negative
+    template: templates/statefulset.yaml
+    set:
+      server.grpcRateLimit.requests: -1
+    asserts:
+      - failedTemplate:
+          errorMessage: "server.grpcRateLimit.requests and server.grpcRateLimit.windowSeconds must not be negative; they map to unsigned gateway settings"
+
+  - it: fails to render when windowSeconds is negative
+    template: templates/statefulset.yaml
+    set:
+      server.grpcRateLimit.windowSeconds: -5
+    asserts:
+      - failedTemplate:
+          errorMessage: "server.grpcRateLimit.requests and server.grpcRateLimit.windowSeconds must not be negative; they map to unsigned gateway settings"
+
   - it: uses the configured existing sandbox service account name
     template: templates/gateway-config.yaml
     set:

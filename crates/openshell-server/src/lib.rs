@@ -132,6 +132,9 @@ pub struct ServerState {
     /// `IssueSandboxToken` bootstrap path. Only present when the gateway
     /// runs in-cluster.
     pub k8s_sa_authenticator: Option<Arc<auth::k8s_sa::K8sServiceAccountAuthenticator>>,
+
+    /// Gateway-wide gRPC request rate limiter shared by every multiplex path.
+    pub(crate) grpc_rate_limiter: Option<multiplex::GrpcRateLimiter>,
 }
 
 fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
@@ -164,6 +167,7 @@ impl ServerState {
         supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
         oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
     ) -> Self {
+        let grpc_rate_limiter = multiplex::GrpcRateLimiter::from_config(&config);
         Self {
             config,
             store,
@@ -180,6 +184,7 @@ impl ServerState {
             sandbox_jwt_issuer: None,
             sandbox_jwt_authenticator: None,
             k8s_sa_authenticator: None,
+            grpc_rate_limiter,
         }
     }
 }
