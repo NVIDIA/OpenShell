@@ -7,6 +7,11 @@ use openshell_core::driver_utils::{
     LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
     LABEL_SANDBOX_NAMESPACE,
 };
+use openshell_core::progress::{
+    PROGRESS_ACTIVE_DETAIL_KEY, PROGRESS_ACTIVE_STEP_KEY, PROGRESS_COMPLETE_LABEL_KEY,
+    PROGRESS_COMPLETE_STEP_KEY, PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX,
+    PROGRESS_STEP_STARTING_SANDBOX,
+};
 use openshell_core::proto::compute::v1::{
     DriverResourceRequirements, DriverSandboxSpec, DriverSandboxTemplate,
 };
@@ -554,6 +559,28 @@ fn validate_sandbox_rejects_gpu_when_cdi_unavailable() {
 }
 
 #[test]
+fn validate_sandbox_auth_requires_gateway_token() {
+    let mut sandbox = test_sandbox();
+    sandbox.spec.as_mut().unwrap().sandbox_token.clear();
+
+    let err = DockerComputeDriver::validate_sandbox_auth(&sandbox).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        err.message(),
+        "docker sandboxes require gateway JWT auth; configure [openshell.gateway.gateway_jwt]"
+    );
+}
+
+#[test]
+fn validate_sandbox_auth_accepts_gateway_token() {
+    let mut sandbox = test_sandbox();
+    sandbox.spec.as_mut().unwrap().sandbox_token = "secret.jwt.value".to_string();
+
+    DockerComputeDriver::validate_sandbox_auth(&sandbox).unwrap();
+}
+
+#[test]
 fn build_container_create_body_maps_gpu_to_all_cdi_device() {
     let mut config = runtime_config();
     config.supports_gpu = true;
@@ -734,6 +761,123 @@ fn driver_status_marks_restarting_sandboxes_as_error() {
         status.conditions[0].message,
         "Container is restarting after a failure"
     );
+}
+
+#[test]
+fn docker_scheduled_event_adds_progress_metadata() {
+    let mut metadata = HashMap::from([(
+        "image_ref".to_string(),
+        "ghcr.io/acme/sandbox:latest".to_string(),
+    )]);
+
+    attach_docker_progress_metadata(
+        &mut metadata,
+        "Scheduled",
+        "Docker sandbox accepted for image \"ghcr.io/acme/sandbox:latest\"",
+    );
+
+    assert_eq!(
+        metadata.get(PROGRESS_COMPLETE_STEP_KEY).map(String::as_str),
+        Some(PROGRESS_STEP_REQUESTING_SANDBOX)
+    );
+    assert_eq!(
+        metadata
+            .get(PROGRESS_COMPLETE_LABEL_KEY)
+            .map(String::as_str),
+        Some("Sandbox allocated")
+    );
+    assert_eq!(
+        metadata.get(PROGRESS_ACTIVE_STEP_KEY).map(String::as_str),
+        Some(PROGRESS_STEP_PULLING_IMAGE)
+    );
+    assert_eq!(
+        metadata.get(PROGRESS_ACTIVE_DETAIL_KEY).map(String::as_str),
+        Some("ghcr.io/acme/sandbox:latest")
+    );
+}
+
+#[test]
+fn docker_pulled_event_advances_to_starting_progress() {
+    let mut metadata = HashMap::new();
+
+    attach_docker_progress_metadata(
+        &mut metadata,
+        "Pulled",
+        "Pulled Docker image \"ghcr.io/acme/sandbox:latest\"",
+    );
+
+    assert_eq!(
+        metadata.get(PROGRESS_COMPLETE_STEP_KEY).map(String::as_str),
+        Some(PROGRESS_STEP_PULLING_IMAGE)
+    );
+    assert_eq!(
+        metadata
+            .get(PROGRESS_COMPLETE_LABEL_KEY)
+            .map(String::as_str),
+        Some("Image pulled")
+    );
+    assert_eq!(
+        metadata.get(PROGRESS_ACTIVE_STEP_KEY).map(String::as_str),
+        Some(PROGRESS_STEP_STARTING_SANDBOX)
+    );
+}
+
+#[test]
+fn docker_pull_progress_event_adds_layer_detail_metadata() {
+    let event = docker_pull_progress_event(
+        "ghcr.io/acme/sandbox:latest",
+        &CreateImageInfo {
+            id: Some("layer-1".to_string()),
+            status: Some("Downloading".to_string()),
+            progress_detail: Some(ProgressDetail {
+                current: Some(42 * 1024 * 1024),
+                total: Some(84 * 1024 * 1024),
+            }),
+            ..Default::default()
+        },
+    )
+    .expect("pull progress event");
+
+    assert_eq!(event.source, "docker");
+    assert_eq!(event.reason, "PullingLayer");
+    assert_eq!(
+        event
+            .metadata
+            .get(PROGRESS_ACTIVE_STEP_KEY)
+            .map(String::as_str),
+        Some(PROGRESS_STEP_PULLING_IMAGE)
+    );
+    assert_eq!(
+        event
+            .metadata
+            .get(PROGRESS_ACTIVE_DETAIL_KEY)
+            .map(String::as_str),
+        Some("Downloading layer-1 (42 MB/84 MB)")
+    );
+}
+
+#[test]
+fn pending_sandbox_snapshot_uses_docker_namespace_and_starting_condition() {
+    let sandbox = test_sandbox();
+
+    let snapshot =
+        pending_sandbox_snapshot(&sandbox, "docker-dev", provisioning_condition(), false);
+
+    assert_eq!(snapshot.id, "sbx-123");
+    assert_eq!(snapshot.name, "demo");
+    assert_eq!(snapshot.namespace, "docker-dev");
+    assert!(snapshot.spec.is_none());
+    assert!(pending_sandbox_matches(&snapshot, "sbx-123", ""));
+    assert!(pending_sandbox_matches(&snapshot, "", "demo"));
+
+    let status = snapshot.status.expect("status");
+    assert!(!status.deleting);
+    assert_eq!(status.sandbox_name, "demo");
+    assert_eq!(status.conditions.len(), 1);
+    assert_eq!(status.conditions[0].r#type, "Ready");
+    assert_eq!(status.conditions[0].status, "False");
+    assert_eq!(status.conditions[0].reason, "Starting");
+    assert_eq!(status.conditions[0].message, "Docker container is starting");
 }
 
 #[test]

@@ -219,6 +219,8 @@ struct ProvisioningDisplay {
     completed_steps: Vec<ProvisioningStep>,
     /// Progress bars for completed steps (so they can be cleared).
     completed_bars: Vec<ProgressBar>,
+    /// The currently active provisioning step.
+    active_step: Option<ProvisioningStep>,
     /// The currently active step label (shown on the spinner).
     active_label: String,
     /// Detail text shown next to the active step (e.g. image name).
@@ -253,6 +255,7 @@ impl ProvisioningDisplay {
             spacer,
             completed_steps: Vec::new(),
             completed_bars: Vec::new(),
+            active_step: None,
             active_label: ProvisioningStep::RequestingSandbox
                 .active_label()
                 .to_string(),
@@ -290,11 +293,15 @@ impl ProvisioningDisplay {
         self.step_start = Instant::now();
         self.spinner.reset_elapsed();
         self.active_detail.clear();
+        if self.active_step == Some(step) {
+            self.active_step = None;
+        }
     }
 
     /// Set the active (in-progress) step shown on the spinner.
-    fn set_active(&mut self, label: &str) {
-        self.active_label = label.to_string();
+    fn set_active(&mut self, step: ProvisioningStep) {
+        self.active_step = Some(step);
+        self.active_label = step.active_label().to_string();
         self.active_detail.clear();
         // Reset the spinner's elapsed time for the new step.
         self.spinner.reset_elapsed();
@@ -304,11 +311,17 @@ impl ProvisioningDisplay {
 
     /// Set the active step from a known provisioning step enum.
     fn set_active_step(&mut self, step: ProvisioningStep) {
-        self.set_active(step.active_label());
+        if self.active_step == Some(step) {
+            return;
+        }
+        self.set_active(step);
     }
 
     /// Set detail text shown alongside the active step (e.g. image name).
     fn set_active_detail(&mut self, detail: &str) {
+        if self.active_detail == detail {
+            return;
+        }
         self.active_detail = detail.to_string();
         self.update_spinner();
     }
@@ -6949,7 +6962,7 @@ fn format_timestamp_ms(ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ProvisioningStep, TlsOptions, build_sandbox_resource_limits,
+        ProvisioningDisplay, ProvisioningStep, TlsOptions, build_sandbox_resource_limits,
         dockerfile_sources_supported_for_gateway, format_endpoint, format_gateway_select_header,
         format_gateway_select_items, format_provider_attachment_table, gateway_add,
         gateway_auth_label, gateway_env_override_warning, gateway_select_with, gateway_type_label,
@@ -6970,6 +6983,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::thread;
+    use std::time::{Duration, Instant};
     use tonic::Status;
 
     use openshell_bootstrap::GatewayMetadata;
@@ -7176,6 +7190,48 @@ mod tests {
             Some(ProvisioningStep::StartingSandbox)
         );
         assert_eq!(progress_step_from_metadata("driver-private-step"), None);
+    }
+
+    #[test]
+    fn provisioning_display_ignores_repeated_active_step_updates() {
+        let mut display = ProvisioningDisplay::new();
+        display.set_active_step(ProvisioningStep::PullingSandboxImage);
+        display.set_active_detail("Downloading layer-1 (1 MB/2 MB)");
+
+        let original_step_start = Instant::now()
+            .checked_sub(Duration::from_secs(5))
+            .expect("test duration should be representable");
+        display.step_start = original_step_start;
+
+        display.set_active_step(ProvisioningStep::PullingSandboxImage);
+        display.set_active_detail("Downloading layer-1 (1 MB/2 MB)");
+
+        assert_eq!(
+            display.active_step,
+            Some(ProvisioningStep::PullingSandboxImage)
+        );
+        assert_eq!(display.active_detail, "Downloading layer-1 (1 MB/2 MB)");
+        assert_eq!(display.step_start, original_step_start);
+        display.clear();
+    }
+
+    #[test]
+    fn provisioning_display_resets_detail_on_active_step_transition() {
+        let mut display = ProvisioningDisplay::new();
+        display.set_active_step(ProvisioningStep::PullingSandboxImage);
+        display.set_active_detail("Downloading layer-1 (1 MB/2 MB)");
+
+        let original_step_start = Instant::now()
+            .checked_sub(Duration::from_secs(5))
+            .expect("test duration should be representable");
+        display.step_start = original_step_start;
+
+        display.set_active_step(ProvisioningStep::StartingSandbox);
+
+        assert_eq!(display.active_step, Some(ProvisioningStep::StartingSandbox));
+        assert!(display.active_detail.is_empty());
+        assert!(display.step_start > original_step_start);
+        display.clear();
     }
 
     #[test]
