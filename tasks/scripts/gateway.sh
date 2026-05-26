@@ -291,6 +291,14 @@ if [[ ! -x "${GATEWAY_BIN}" ]]; then
   exit 1
 fi
 
+TLS_DIR="${STATE_DIR}/tls"
+echo "Generating local gateway credentials..."
+"${GATEWAY_BIN}" generate-certs \
+  --output-dir "${TLS_DIR}" \
+  --server-san "127.0.0.1" \
+  --server-san "localhost" \
+  --server-san "host.openshell.internal"
+
 mkdir -p "${STATE_DIR}"
 CONFIG_PATH="${STATE_DIR}/gateway.toml"
 cat >"${CONFIG_PATH}" <<EOF
@@ -301,6 +309,16 @@ version = 1
 compute_drivers = ["${DRIVER}"]
 default_image = "${SANDBOX_IMAGE}"
 disable_tls = true
+
+[openshell.gateway.auth]
+allow_unauthenticated_users = true
+
+[openshell.gateway.gateway_jwt]
+signing_key_path = "${TLS_DIR}/jwt/signing.pem"
+public_key_path = "${TLS_DIR}/jwt/public.pem"
+kid_path = "${TLS_DIR}/jwt/kid"
+gateway_id = "${GATEWAY_NAME}"
+ttl_secs = 3600
 EOF
 
 case "${DRIVER}" in
