@@ -22,10 +22,10 @@ pub struct MethodAuth {
     /// Authentication mode for the method.
     pub mode: AuthMode,
     /// Required OIDC scope on the Bearer path. `None` when the method
-    /// is unauthenticated or sandbox-secret-only.
+    /// is `unauthenticated` or `sandbox`-only.
     pub scope: Option<&'static str>,
     /// Required role on the Bearer path. `None` when the method is
-    /// unauthenticated or sandbox-secret-only.
+    /// `unauthenticated` or `sandbox`-only.
     pub role: Option<Role>,
 }
 
@@ -75,7 +75,7 @@ pub fn all_paths() -> impl Iterator<Item = &'static str> {
 }
 
 /// Required Bearer scope for the method, or `None` if scopes don't
-/// apply (unauthenticated, sandbox-secret).
+/// apply (`unauthenticated`, `sandbox`).
 #[must_use]
 pub fn required_scope(method: &str) -> Option<&'static str> {
     lookup(method).and_then(|m| m.scope)
