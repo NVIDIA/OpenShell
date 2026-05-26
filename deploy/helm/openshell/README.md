@@ -58,6 +58,47 @@ See [`values.yaml`](values.yaml) for source defaults. Selected overlays:
 - [`ci/values-cert-manager.yaml`](ci/values-cert-manager.yaml) - cert-manager integration
 - [`ci/values-keycloak.yaml`](ci/values-keycloak.yaml) - Keycloak OIDC integration
 
+### Database backend
+
+By default, OpenShell uses SQLite:
+
+```yaml
+server:
+  dbUrl: "sqlite:/var/openshell/openshell.db"
+postgres:
+  enabled: false
+```
+
+Enable bundled PostgreSQL:
+
+```bash
+helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
+  --set postgres.enabled=true \
+  --set postgres.auth.password=my-secret-password
+```
+
+Use external PostgreSQL:
+
+```bash
+helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
+  --set postgres.enabled=true \
+  --set postgres.mode=external \
+  --set postgres.external.host=my-postgres.example.com \
+  --set postgres.external.port=5432 \
+  --set postgres.external.database=openshell \
+  --set postgres.external.username=openshell \
+  --set postgres.external.password=my-password
+```
+
+Or provide a full connection URL directly:
+
+```bash
+helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
+  --set postgres.enabled=true \
+  --set postgres.mode=external \
+  --set postgres.external.url="postgres://user:pass@host:5432/db?sslmode=require"
+```
+
 ## PKI bootstrap
 
 By default, a pre-install/pre-upgrade hook Job runs `openshell-gateway generate-certs`

@@ -103,6 +103,32 @@ Namespace where sandbox pods are created. An explicit
 {{- end }}
 
 {{/*
+Gateway database URL.
+- postgres.enabled=false: use .Values.server.dbUrl (default sqlite)
+- postgres.enabled=true + mode=internal: derive URL from bundled postgres service
+- postgres.enabled=true + mode=external: use external.url or compose external fields
+*/}}
+{{- define "openshell.dbUrl" -}}
+{{- if .Values.postgres.enabled -}}
+{{- if eq (default "internal" .Values.postgres.mode) "external" -}}
+{{- if .Values.postgres.external.url -}}
+{{- .Values.postgres.external.url -}}
+{{- else -}}
+{{- $host := required "postgres.external.host is required when postgres.mode=external and no postgres.external.url is provided" .Values.postgres.external.host -}}
+{{- $pw := required "postgres.external.password is required when postgres.mode=external and no postgres.external.url is provided" .Values.postgres.external.password -}}
+{{- printf "postgres://%s:%s@%s:%d/%s" (.Values.postgres.external.username | urlquery) ($pw | urlquery) $host (int (default 5432 .Values.postgres.external.port)) .Values.postgres.external.database -}}
+{{- end -}}
+{{- else -}}
+{{- $pw := required "postgres.auth.password must be set when postgres.enabled=true" .Values.postgres.auth.password -}}
+{{- $host := .Values.postgres.host | default (printf "%s-postgres.%s.svc.cluster.local" .Release.Name .Release.Namespace) -}}
+{{- printf "postgres://%s:%s@%s:%d/%s" (.Values.postgres.auth.username | urlquery) ($pw | urlquery) $host (int .Values.postgres.port) .Values.postgres.auth.database -}}
+{{- end -}}
+{{- else -}}
+{{- .Values.server.dbUrl -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 gRPC endpoint sandbox pods use to call back into the gateway. An explicit
 .Values.server.grpcEndpoint is used verbatim. Otherwise it is derived from
 the in-cluster Service DNS, release namespace, service port, and disableTls
