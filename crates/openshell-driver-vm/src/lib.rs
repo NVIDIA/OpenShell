@@ -3,6 +3,7 @@
 
 pub mod driver;
 mod embedded_runtime;
+pub mod extension;
 mod ffi;
 pub mod gpu;
 mod nft_ruleset;
@@ -11,6 +12,10 @@ mod rootfs;
 mod runtime;
 
 pub use driver::{VmDriver, VmDriverConfig};
+pub use extension::{
+    LaunchAbortReason, VmLaunchPlan, VmLifecycleError, VmLifecycleExtension, VmLifecycleExtensions,
+    VmLifecycleResult,
+};
 pub use runtime::{
     VM_RUNTIME_DIR_ENV, VmBackend, VmLaunchConfig, cleanup_stale_tap_interfaces,
     configured_runtime_dir, run_vm,
