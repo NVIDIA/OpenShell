@@ -212,12 +212,6 @@ jobs:
           echo "CARGO_TARGET_${TARGET_ENV_UPPER}_RUSTFLAGS=-Clink-self-contained=no" >> "$GITHUB_ENV"
 
       - name: Build ${{ steps.target.outputs.binary }} (${{ steps.target.outputs.zig_target || steps.target.outputs.target }})
-          # z3 built with zig c++ uses libc++ symbols (std::__1::*).
-          # Override z3-sys default (stdc++) so Rust links the matching runtime.
-          if [[ "$COMPONENT" == "cli" ]]; then
-            echo "CXXSTDLIB=c++" >> "$GITHUB_ENV"
-          fi
-
         env:
           # Preserve the release-codegen setting used by the old Dockerfile
           # Rust build path so image artifacts keep the same release profile.
@@ -225,6 +219,12 @@ jobs:
           OPENSHELL_IMAGE_TAG: ${{ inputs['image-tag'] }}
         run: |
           set -euo pipefail
+          # z3 built with zig c++ uses libc++ symbols (std::__1::*).
+          # Override z3-sys default (stdc++) so Rust links the matching runtime.
+          if [[ ""${{ inputs.component }}" == "cli" ]]; then
+            echo "CXXSTDLIB=c++" >> "$GITHUB_ENV"
+          fi
+
           mise x -- rustup target add "${{ steps.target.outputs.target }}"
           cargo_cmd=(cargo build)
           build_target="${{ steps.target.outputs.target }}"
