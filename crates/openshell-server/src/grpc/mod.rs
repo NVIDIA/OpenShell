@@ -495,7 +495,7 @@ impl OpenShell for OpenShellService {
         policy::handle_get_gateway_config(&self.state, request).await
     }
 
-    #[rpc_auth(auth = "sandbox-secret")]
+    #[rpc_auth(auth = "sandbox")]
     async fn get_sandbox_provider_environment(
         &self,
         request: Request<GetSandboxProviderEnvironmentRequest>,
@@ -527,7 +527,7 @@ impl OpenShell for OpenShellService {
         policy::handle_list_sandbox_policies(&self.state, request).await
     }
 
-    #[rpc_auth(auth = "sandbox-secret")]
+    #[rpc_auth(auth = "sandbox")]
     async fn report_policy_status(
         &self,
         request: Request<ReportPolicyStatusRequest>,
@@ -545,7 +545,7 @@ impl OpenShell for OpenShellService {
         policy::handle_get_sandbox_logs(&self.state, request).await
     }
 
-    #[rpc_auth(auth = "sandbox-secret")]
+    #[rpc_auth(auth = "sandbox")]
     async fn push_sandbox_logs(
         &self,
         request: Request<tonic::Streaming<PushSandboxLogsRequest>>,
@@ -555,7 +555,7 @@ impl OpenShell for OpenShellService {
 
     // --- Draft policy recommendations ---
 
-    #[rpc_auth(auth = "sandbox-secret")]
+    #[rpc_auth(auth = "sandbox")]
     async fn submit_policy_analysis(
         &self,
         request: Request<SubmitPolicyAnalysisRequest>,
@@ -629,7 +629,7 @@ impl OpenShell for OpenShellService {
 
     // --- Sandbox identity ---
 
-    #[rpc_auth(auth = "sandbox-secret")]
+    #[rpc_auth(auth = "sandbox")]
     async fn issue_sandbox_token(
         &self,
         request: Request<IssueSandboxTokenRequest>,
@@ -637,7 +637,7 @@ impl OpenShell for OpenShellService {
         auth_rpc::handle_issue_sandbox_token(&self.state, request).await
     }
 
-    #[rpc_auth(auth = "sandbox-secret")]
+    #[rpc_auth(auth = "sandbox")]
     async fn refresh_sandbox_token(
         &self,
         request: Request<RefreshSandboxTokenRequest>,
@@ -650,7 +650,7 @@ impl OpenShell for OpenShellService {
     type ConnectSupervisorStream =
         Pin<Box<dyn tokio_stream::Stream<Item = Result<GatewayMessage, Status>> + Send + 'static>>;
 
-    #[rpc_auth(auth = "sandbox-secret")]
+    #[rpc_auth(auth = "sandbox")]
     async fn connect_supervisor(
         &self,
         request: Request<tonic::Streaming<SupervisorMessage>>,
@@ -661,7 +661,7 @@ impl OpenShell for OpenShellService {
     type RelayStreamStream =
         Pin<Box<dyn tokio_stream::Stream<Item = Result<RelayFrame, Status>> + Send + 'static>>;
 
-    #[rpc_auth(auth = "sandbox-secret")]
+    #[rpc_auth(auth = "sandbox")]
     async fn relay_stream(
         &self,
         request: Request<tonic::Streaming<RelayFrame>>,

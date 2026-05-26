@@ -60,7 +60,7 @@ impl ObjectType for InferenceRoute {
 #[rpc_authz(service = "openshell.inference.v1.Inference")]
 #[tonic::async_trait]
 impl Inference for InferenceService {
-    #[rpc_auth(auth = "sandbox-secret")]
+    #[rpc_auth(auth = "sandbox")]
     async fn get_inference_bundle(
         &self,
         request: Request<GetInferenceBundleRequest>,

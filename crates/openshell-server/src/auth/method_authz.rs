@@ -34,8 +34,9 @@ pub struct MethodAuth {
 pub enum AuthMode {
     /// No authentication required (e.g. health probes).
     Unauthenticated,
-    /// Only callable by a sandbox principal (sandbox-minted JWT).
-    SandboxSecret,
+    /// Only callable by a `Principal::Sandbox` (gateway-minted sandbox JWT).
+    /// See `auth/sandbox_jwt.rs`.
+    Sandbox,
     /// Bearer (OIDC) authentication required.
     Bearer,
     /// Either sandbox principal or Bearer; scope and role apply on
@@ -99,13 +100,13 @@ pub fn is_unauthenticated(method: &str) -> bool {
     )
 }
 
-/// `true` if the method is callable by a sandbox principal
-/// (sandbox-secret or dual-auth).
+/// `true` if the method is callable by a `Principal::Sandbox`
+/// (`sandbox` or `dual` auth mode).
 #[must_use]
 pub fn is_sandbox_callable(method: &str) -> bool {
     matches!(
         lookup(method).map(|m| m.mode),
-        Some(AuthMode::SandboxSecret | AuthMode::Dual)
+        Some(AuthMode::Sandbox | AuthMode::Dual)
     )
 }
 

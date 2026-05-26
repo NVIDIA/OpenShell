@@ -10,7 +10,7 @@
 //!
 //! The allowlist is derived from per-handler `#[rpc_auth(...)]` annotations:
 //! a method is callable by a sandbox principal when its declared auth mode is
-//! `sandbox-secret` or `dual`.
+//! `sandbox` or `dual`.
 
 pub fn is_sandbox_callable(path: &str) -> bool {
     super::method_authz::is_sandbox_callable(path)
