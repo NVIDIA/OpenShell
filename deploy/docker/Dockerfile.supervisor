@@ -24,7 +24,7 @@ ARG BASE_IMAGE=debian:trixie-slim
 # ---------------------------------------------------------------------------
 # Stage 1: Compile sandbox binary from source
 # ---------------------------------------------------------------------------
-FROM rust:1.95.0-slim-bookworm AS builder
+FROM rust:1.95.0-slim-trixie AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \

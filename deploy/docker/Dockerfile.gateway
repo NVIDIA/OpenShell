@@ -20,7 +20,7 @@ ARG BASE_IMAGE=ghcr.io/nvidia/openshell/gateway@sha256:343de518b016b179a9e383950
 # ---------------------------------------------------------------------------
 # Stage 1: Compile gateway binary from source
 # ---------------------------------------------------------------------------
-FROM rust:1.95.0-slim-bookworm AS builder
+FROM rust:1.95.0-slim-trixie AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
