@@ -143,6 +143,7 @@ def test_snap_cli_sets_system_gateway_dir_via_app_env() -> None:
 
     assert "command: bin/openshell" in snapcraft
     assert 'OPENSHELL_SYSTEM_GATEWAY_DIR: "$SNAP_COMMON/system-gateways"' in snapcraft
+    assert "- openssh-client" in snapcraft
 
 
 def test_rpm_spec_uses_gateway_defaults_without_config_helper() -> None:
