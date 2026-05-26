@@ -149,7 +149,7 @@ spec:
         - name: sandbox-jwt
           secret:
             secretName: {{ .Values.server.sandboxJwt.signingSecretName | default (printf "%s-jwt-keys" (include "openshell.fullname" .)) }}
-            defaultMode: 0444
+            defaultMode: {{ .Values.server.sandboxJwt.secretDefaultMode | default (ternary "0440" "0444" (not (empty .Values.podSecurityContext.fsGroup))) }}
         {{- if not .Values.server.disableTls }}
         - name: tls-cert
           secret:
