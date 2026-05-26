@@ -3,6 +3,7 @@
 
 //! Gateway-owned compute orchestration over a pluggable compute backend.
 
+pub mod lease;
 pub mod vm;
 
 pub use openshell_driver_docker::DockerComputeConfig;
@@ -40,10 +41,10 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 use tonic::transport::Channel;
 use tonic::{Code, Request, Status};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 type DriverWatchStream = Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, Status>> + Send>>;
 type SharedComputeDriver =
@@ -555,15 +556,22 @@ impl ComputeRuntime {
         Ok(deleted)
     }
 
-    pub fn spawn_watchers(&self) {
+    pub fn spawn_watchers(&self, shutdown_rx: watch::Receiver<bool>) {
         let runtime = Arc::new(self.clone());
-        let watch_runtime = runtime.clone();
-        tokio::spawn(async move {
-            watch_runtime.watch_loop().await;
-        });
-        tokio::spawn(async move {
-            runtime.reconcile_loop().await;
-        });
+        if self.store.is_single_replica() {
+            let watch_runtime = runtime.clone();
+            let watch_shutdown = shutdown_rx.clone();
+            tokio::spawn(async move {
+                watch_runtime.watch_loop(watch_shutdown).await;
+            });
+            tokio::spawn(async move {
+                runtime.reconcile_loop(shutdown_rx).await;
+            });
+        } else {
+            tokio::spawn(async move {
+                runtime.lease_coordinator(shutdown_rx).await;
+            });
+        }
     }
 
     pub async fn cleanup_on_shutdown(&self) -> Result<(), String> {
@@ -712,7 +720,103 @@ impl ComputeRuntime {
         }
     }
 
-    async fn watch_loop(self: Arc<Self>) {
+    async fn lease_coordinator(self: Arc<Self>, mut shutdown_rx: watch::Receiver<bool>) {
+        use lease::{ReconcilerLease, replica_id, LEASE_ACQUIRE_INTERVAL, LEASE_TTL};
+
+        let lease = ReconcilerLease::new(self.store.clone(), replica_id(), LEASE_TTL);
+        info!(replica = %lease.replica_id(), "reconciler lease coordinator started");
+
+        loop {
+            if *shutdown_rx.borrow() {
+                break;
+            }
+
+            match lease.acquire_or_steal().await {
+                Ok(guard) => {
+                    info!(replica = %lease.replica_id(), "acquired reconciler lease");
+                    self.run_as_holder(&lease, guard, &mut shutdown_rx).await;
+                }
+                Err(e) => {
+                    debug!(
+                        replica = %lease.replica_id(),
+                        error = %e,
+                        "reconciler lease acquisition attempt failed"
+                    );
+                    tokio::select! {
+                        _ = tokio::time::sleep(LEASE_ACQUIRE_INTERVAL) => {}
+                        _ = shutdown_rx.changed() => {
+                            if *shutdown_rx.borrow() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        info!(replica = %lease.replica_id(), "reconciler lease coordinator stopped");
+    }
+
+    async fn run_as_holder(
+        self: &Arc<Self>,
+        lease: &lease::ReconcilerLease,
+        mut guard: lease::LeaseGuard,
+        shutdown_rx: &mut watch::Receiver<bool>,
+    ) {
+        use lease::LEASE_RENEWAL_INTERVAL;
+
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+
+        let runtime = self.clone();
+        let watch_cancel = cancel_rx.clone();
+        let watch_handle = tokio::spawn(async move {
+            runtime.watch_loop(watch_cancel).await;
+        });
+
+        let runtime = self.clone();
+        let reconcile_handle = tokio::spawn(async move {
+            runtime.reconcile_loop(cancel_rx).await;
+        });
+
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(LEASE_RENEWAL_INTERVAL) => {
+                    match lease.renew(&mut guard).await {
+                        Ok(()) => {
+                            debug!(replica = %lease.replica_id(), "renewed reconciler lease");
+                        }
+                        Err(e) => {
+                            warn!(
+                                replica = %lease.replica_id(),
+                                error = %e,
+                                "reconciler lease renewal failed — releasing holder role"
+                            );
+                            break;
+                        }
+                    }
+                }
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        info!(replica = %lease.replica_id(), "shutdown — releasing reconciler lease");
+                        if let Err(e) = lease.release(guard).await {
+                            warn!(error = %e, "failed to release reconciler lease on shutdown");
+                        }
+                        let _ = cancel_tx.send(true);
+                        let _ = watch_handle.await;
+                        let _ = reconcile_handle.await;
+                        return;
+                    }
+                }
+            }
+        }
+
+        let _ = cancel_tx.send(true);
+        let _ = watch_handle.await;
+        let _ = reconcile_handle.await;
+        info!(replica = %lease.replica_id(), "reconciler lease lost — returning to standby");
+    }
+
+    async fn watch_loop(self: Arc<Self>, mut cancel: watch::Receiver<bool>) {
         loop {
             let mut stream = match self
                 .driver
@@ -722,40 +826,55 @@ impl ComputeRuntime {
                 Ok(response) => response.into_inner(),
                 Err(err) => {
                     warn!(error = %err, "Compute driver watch stream failed to start");
-                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                        _ = cancel.changed() => return,
+                    }
                     continue;
                 }
             };
 
             let mut restart = false;
-            while let Some(item) = stream.next().await {
-                match item {
-                    Ok(event) => {
-                        if let Err(err) = self.apply_watch_event(event).await {
-                            warn!(error = %err, "Failed to apply compute driver event");
+            loop {
+                tokio::select! {
+                    item = stream.next() => {
+                        match item {
+                            Some(Ok(event)) => {
+                                if let Err(err) = self.apply_watch_event(event).await {
+                                    warn!(error = %err, "Failed to apply compute driver event");
+                                }
+                            }
+                            Some(Err(err)) => {
+                                warn!(error = %err, "Compute driver watch stream errored");
+                                restart = true;
+                                break;
+                            }
+                            None => break,
                         }
                     }
-                    Err(err) => {
-                        warn!(error = %err, "Compute driver watch stream errored");
-                        restart = true;
-                        break;
-                    }
+                    _ = cancel.changed() => return,
                 }
             }
 
             if !restart {
                 warn!("Compute driver watch stream ended unexpectedly");
             }
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                _ = cancel.changed() => return,
+            }
         }
     }
 
-    async fn reconcile_loop(self: Arc<Self>) {
+    async fn reconcile_loop(self: Arc<Self>, mut cancel: watch::Receiver<bool>) {
         loop {
             if let Err(err) = self.reconcile_store_with_backend(ORPHAN_GRACE_PERIOD).await {
                 warn!(error = %err, "Store reconciliation sweep failed");
             }
-            tokio::time::sleep(RECONCILE_INTERVAL).await;
+            tokio::select! {
+                _ = tokio::time::sleep(RECONCILE_INTERVAL) => {}
+                _ = cancel.changed() => return,
+            }
         }
     }
 
