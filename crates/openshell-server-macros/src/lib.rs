@@ -89,12 +89,21 @@ impl RpcAuth {
                 .ok_or_else(|| m.error("expected `auth`, `scope`, or `role`"))?;
 
             if ident == "auth" {
+                if mode.is_some() {
+                    return Err(m.error("`auth` specified more than once"));
+                }
                 let value: LitStr = m.value()?.parse()?;
                 mode = Some(parse_auth_mode(&value)?);
             } else if ident == "scope" {
+                if scope.is_some() {
+                    return Err(m.error("`scope` specified more than once"));
+                }
                 let value: LitStr = m.value()?.parse()?;
                 scope = Some(value);
             } else if ident == "role" {
+                if role.is_some() {
+                    return Err(m.error("`role` specified more than once"));
+                }
                 let value: LitStr = m.value()?.parse()?;
                 role = Some(parse_role(&value)?);
             } else {

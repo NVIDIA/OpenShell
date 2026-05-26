@@ -110,6 +110,21 @@ pub fn is_sandbox_callable(method: &str) -> bool {
     )
 }
 
+/// `true` if the method is callable by a `Principal::User` (`bearer` or
+/// `dual` auth mode).
+///
+/// Unknown methods return `true` so [`AuthzPolicy::check`] still gets a
+/// chance to evaluate role/scope and apply the `openshell:all` fallback —
+/// the exhaustiveness test prevents this branch from ever firing for real
+/// RPCs, but it remains as defense-in-depth.
+#[must_use]
+pub fn is_user_callable(method: &str) -> bool {
+    match lookup(method).map(|m| m.mode) {
+        Some(AuthMode::Sandbox | AuthMode::Unauthenticated) => false,
+        Some(AuthMode::Bearer | AuthMode::Dual) | None => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,5 +212,40 @@ mod tests {
             );
             seen.push(path);
         }
+    }
+
+    /// User principals must be rejected for `sandbox` and `unauthenticated`
+    /// methods; the auth-mode check at the router enforces this regardless
+    /// of role/scope, closing the gap where a token with `openshell:all`
+    /// could otherwise reach sandbox-only handlers.
+    #[test]
+    fn user_callable_matches_auth_mode() {
+        // Bearer
+        assert!(is_user_callable("/openshell.v1.OpenShell/ListSandboxes"));
+        // Dual
+        assert!(is_user_callable("/openshell.v1.OpenShell/GetSandboxConfig"));
+        // Sandbox-only
+        assert!(!is_user_callable(
+            "/openshell.v1.OpenShell/ReportPolicyStatus"
+        ));
+        assert!(!is_user_callable("/openshell.v1.OpenShell/PushSandboxLogs"));
+        assert!(!is_user_callable(
+            "/openshell.v1.OpenShell/GetSandboxProviderEnvironment"
+        ));
+        assert!(!is_user_callable(
+            "/openshell.v1.OpenShell/SubmitPolicyAnalysis"
+        ));
+        assert!(!is_user_callable(
+            "/openshell.v1.OpenShell/ConnectSupervisor"
+        ));
+        assert!(!is_user_callable("/openshell.v1.OpenShell/RelayStream"));
+        assert!(!is_user_callable(
+            "/openshell.inference.v1.Inference/GetInferenceBundle"
+        ));
+        // Unauthenticated methods are not "user callable" — they're
+        // intercepted before principal evaluation.
+        assert!(!is_user_callable("/openshell.v1.OpenShell/Health"));
+        // Unknown method falls through to AuthzPolicy::check.
+        assert!(is_user_callable("/openshell.v1.OpenShell/FutureMethod"));
     }
 }
