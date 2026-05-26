@@ -52,6 +52,57 @@ impl PciBindGuard {
         self.disarmed = true;
     }
 
+    /// Adopt ownership of a `PCIe` device that is already bound to `vfio-pci`.
+    ///
+    /// This is the restart-reconciliation counterpart to
+    /// [`prepare_pci_for_passthrough`]. It validates that the device exists,
+    /// that all IOMMU peers are already on `vfio-pci`, and that the primary BDF
+    /// is currently bound to `vfio-pci`, then returns a guard that will restore
+    /// the device on drop. It does not write `driver_override`, `new_id`, or
+    /// `drivers_probe`.
+    pub fn adopt(sysfs: &SysfsRoot, bdf: &str) -> Result<Self, VfioError> {
+        validate_pci_for_passthrough(sysfs, bdf)?;
+        ensure_bound_to_vfio(sysfs, bdf)?;
+
+        let vfio_id = crate::bind::vfio_id_string(sysfs, bdf);
+
+        Ok(Self::new_armed(
+            bdf.to_string(),
+            Vec::new(),
+            sysfs.clone(),
+            vfio_id,
+        ))
+    }
+
+    /// Adopt ownership of a complete IOMMU group already bound to `vfio-pci`.
+    ///
+    /// This is the restart-reconciliation counterpart to
+    /// [`prepare_pci_group_for_passthrough`]. It validates that `bdfs` is the
+    /// complete IOMMU group, that every declared device is already bound to
+    /// `vfio-pci`, and then returns a guard that restores every declared device
+    /// on drop. It does not write `driver_override`, `new_id`, or
+    /// `drivers_probe`.
+    pub fn adopt_group(sysfs: &SysfsRoot, bdfs: &[&str]) -> Result<Self, VfioError> {
+        validate_pci_group_for_passthrough(sysfs, bdfs)?;
+
+        for bdf in bdfs {
+            ensure_bound_to_vfio(sysfs, bdf)?;
+        }
+
+        let (primary, companions) = bdfs
+            .split_first()
+            .expect("validate_pci_group_for_passthrough rejects empty slices");
+        let vfio_id = crate::bind::vfio_id_string(sysfs, primary);
+        let companion_bdfs: Vec<String> = companions.iter().map(|s| (*s).to_string()).collect();
+
+        Ok(Self::new_armed(
+            (*primary).to_string(),
+            companion_bdfs,
+            sysfs.clone(),
+            vfio_id,
+        ))
+    }
+
     pub(crate) fn new_armed(
         bdf: String,
         companion_bdfs: Vec<String>,
@@ -89,6 +140,18 @@ impl PciBindGuard {
             tracing::error!(bdf = %self.bdf, error = %err, "failed to restore PCI device to host driver");
         }
     }
+}
+
+fn ensure_bound_to_vfio(sysfs: &SysfsRoot, bdf: &str) -> Result<(), VfioError> {
+    let driver = crate::bind::current_driver_name(sysfs, bdf);
+    if driver.as_deref() == Some("vfio-pci") {
+        return Ok(());
+    }
+
+    Err(VfioError::NotBoundToVfio {
+        bdf: bdf.to_string(),
+        driver: driver.unwrap_or_else(|| "<none>".to_string()),
+    })
 }
 
 impl Drop for PciBindGuard {
@@ -157,10 +220,7 @@ impl PciBindState {
 /// Class-based filtering (GPU vs NIC vs other) is intentionally left to
 /// the caller because portable device-class definitions are a driver-layer
 /// concern (see RFC 0004's `DeviceResourceRequirement.class_name`).
-pub fn probe_host_vfio_candidates(
-    sysfs: &SysfsRoot,
-    vendor_filter: Option<&str>,
-) -> Vec<PciInfo> {
+pub fn probe_host_vfio_candidates(sysfs: &SysfsRoot, vendor_filter: Option<&str>) -> Vec<PciInfo> {
     let devices_dir = sysfs.pci_devices_dir();
     let entries = match fs::read_dir(&devices_dir) {
         Ok(e) => e,
@@ -407,9 +467,7 @@ pub fn prepare_pci_group_for_passthrough(
             }
             Err(err) => {
                 for already in newly_bound.iter().rev() {
-                    if let Err(restore_err) =
-                        crate::bind::restore_to_host_driver(sysfs, already)
-                    {
+                    if let Err(restore_err) = crate::bind::restore_to_host_driver(sysfs, already) {
                         tracing::error!(
                             bdf = %already,
                             error = %restore_err,
@@ -601,6 +659,148 @@ mod tests {
         let override_val =
             fs::read_to_string(sysfs.pci_device("0000:2d:00.0").join("driver_override")).unwrap();
         assert_eq!(override_val, "vfio-pci");
+    }
+
+    #[test]
+    fn test_adopt_single_already_bound_device() {
+        let _refcount_guard = test_refcounts::guard();
+        test_refcounts::clear("15b3 101e");
+        let (tmp, sysfs) = setup_mock_sysfs();
+        create_pci_device(
+            &sysfs,
+            tmp.path(),
+            "0000:81:00.2",
+            "0x15b3",
+            "0x101e",
+            "0x020000",
+            7,
+        );
+        create_probe_file(&sysfs);
+        create_remove_id_file(&sysfs);
+        set_mock_driver(&sysfs, "0000:81:00.2", "vfio-pci");
+        fs::write(
+            sysfs.pci_device("0000:81:00.2").join("driver_override"),
+            "vfio-pci",
+        )
+        .unwrap();
+
+        {
+            let guard = PciBindGuard::adopt(&sysfs, "0000:81:00.2").unwrap();
+            assert_eq!(guard.bdf(), "0000:81:00.2");
+            assert!(guard.companion_bdfs().is_empty());
+        }
+
+        let override_val =
+            fs::read_to_string(sysfs.pci_device("0000:81:00.2").join("driver_override")).unwrap();
+        assert_eq!(override_val.trim(), "");
+    }
+
+    #[test]
+    fn test_adopt_rejects_device_not_bound_to_vfio() {
+        let (tmp, sysfs) = setup_mock_sysfs();
+        create_pci_device(
+            &sysfs,
+            tmp.path(),
+            "0000:81:00.2",
+            "0x15b3",
+            "0x101e",
+            "0x020000",
+            7,
+        );
+        set_mock_driver(&sysfs, "0000:81:00.2", "mlx5_core");
+
+        let err = PciBindGuard::adopt(&sysfs, "0000:81:00.2").unwrap_err();
+        match err {
+            VfioError::NotBoundToVfio { bdf, driver } => {
+                assert_eq!(bdf, "0000:81:00.2");
+                assert_eq!(driver, "mlx5_core");
+            }
+            other => panic!("expected NotBoundToVfio, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_adopt_group_already_bound_devices() {
+        let _refcount_guard = test_refcounts::guard();
+        test_refcounts::clear("15b3 101e");
+        test_refcounts::clear("15b3 101f");
+        let (tmp, sysfs) = setup_mock_sysfs();
+        create_pci_device(
+            &sysfs,
+            tmp.path(),
+            "0000:81:00.2",
+            "0x15b3",
+            "0x101e",
+            "0x020000",
+            7,
+        );
+        create_pci_device(
+            &sysfs,
+            tmp.path(),
+            "0000:81:00.3",
+            "0x15b3",
+            "0x101f",
+            "0x020000",
+            7,
+        );
+        create_probe_file(&sysfs);
+        create_remove_id_file(&sysfs);
+        set_mock_driver(&sysfs, "0000:81:00.2", "vfio-pci");
+        set_mock_driver(&sysfs, "0000:81:00.3", "vfio-pci");
+        for bdf in ["0000:81:00.2", "0000:81:00.3"] {
+            fs::write(sysfs.pci_device(bdf).join("driver_override"), "vfio-pci").unwrap();
+        }
+
+        {
+            let guard =
+                PciBindGuard::adopt_group(&sysfs, &["0000:81:00.2", "0000:81:00.3"]).unwrap();
+            assert_eq!(guard.bdf(), "0000:81:00.2");
+            assert_eq!(guard.companion_bdfs(), &["0000:81:00.3".to_string()]);
+        }
+
+        for bdf in ["0000:81:00.2", "0000:81:00.3"] {
+            let override_val =
+                fs::read_to_string(sysfs.pci_device(bdf).join("driver_override")).unwrap();
+            assert_eq!(
+                override_val.trim(),
+                "",
+                "{bdf}: driver_override should be cleared after adopted group drops"
+            );
+        }
+    }
+
+    #[test]
+    fn test_adopt_group_rejects_member_not_bound_to_vfio() {
+        let (tmp, sysfs) = setup_mock_sysfs();
+        create_pci_device(
+            &sysfs,
+            tmp.path(),
+            "0000:81:00.2",
+            "0x15b3",
+            "0x101e",
+            "0x020000",
+            7,
+        );
+        create_pci_device(
+            &sysfs,
+            tmp.path(),
+            "0000:81:00.3",
+            "0x15b3",
+            "0x101f",
+            "0x020000",
+            7,
+        );
+        set_mock_driver(&sysfs, "0000:81:00.2", "vfio-pci");
+        set_mock_driver(&sysfs, "0000:81:00.3", "mlx5_core");
+
+        let err = PciBindGuard::adopt_group(&sysfs, &["0000:81:00.2", "0000:81:00.3"]).unwrap_err();
+        match err {
+            VfioError::NotBoundToVfio { bdf, driver } => {
+                assert_eq!(bdf, "0000:81:00.3");
+                assert_eq!(driver, "mlx5_core");
+            }
+            other => panic!("expected NotBoundToVfio, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1114,9 +1314,8 @@ mod tests {
             9,
         );
 
-        let err =
-            prepare_pci_group_for_passthrough(&sysfs, &["0000:81:00.2", "0000:82:00.0"])
-                .unwrap_err();
+        let err = prepare_pci_group_for_passthrough(&sysfs, &["0000:81:00.2", "0000:82:00.0"])
+            .unwrap_err();
         match err {
             VfioError::GroupMismatch {
                 bdf,
@@ -1144,9 +1343,8 @@ mod tests {
             7,
         );
 
-        let err =
-            prepare_pci_group_for_passthrough(&sysfs, &["0000:81:00.2", "0000:81:00.2"])
-                .unwrap_err();
+        let err = prepare_pci_group_for_passthrough(&sysfs, &["0000:81:00.2", "0000:81:00.2"])
+            .unwrap_err();
         assert!(matches!(err, VfioError::InvalidBdf { .. }));
     }
 
@@ -1199,9 +1397,8 @@ mod tests {
         )
         .unwrap();
 
-        let err =
-            prepare_pci_group_for_passthrough(&sysfs, &["0000:81:00.2", "0000:81:00.3"])
-                .unwrap_err();
+        let err = prepare_pci_group_for_passthrough(&sysfs, &["0000:81:00.2", "0000:81:00.3"])
+            .unwrap_err();
         assert!(matches!(err, VfioError::BindFailed { .. }));
 
         // First device was already on vfio-pci (not newly bound), so it
@@ -1285,8 +1482,8 @@ mod tests {
 
         // The first BDF is invalid; the second is valid and must still be
         // restored even though the first call returns an error.
-        let err = release_pci_group_from_passthrough(&sysfs, &["bad-bdf", "0000:81:00.2"])
-            .unwrap_err();
+        let err =
+            release_pci_group_from_passthrough(&sysfs, &["bad-bdf", "0000:81:00.2"]).unwrap_err();
         assert!(matches!(err, VfioError::InvalidBdf { .. }));
 
         let override_val =

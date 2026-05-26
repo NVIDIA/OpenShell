@@ -29,9 +29,9 @@ pub use error::VfioError;
 pub use gpu::{prepare_gpu_for_passthrough, probe_host_nvidia_vfio_readiness};
 pub use pci::{
     PciBindGuard, PciBindState, PciBinding, PciInfo, prepare_pci_for_passthrough,
-    prepare_pci_group_for_passthrough, probe_host_vfio_candidates,
-    release_pci_from_passthrough, release_pci_group_from_passthrough,
-    validate_pci_for_passthrough, validate_pci_group_for_passthrough,
+    prepare_pci_group_for_passthrough, probe_host_vfio_candidates, release_pci_from_passthrough,
+    release_pci_group_from_passthrough, validate_pci_for_passthrough,
+    validate_pci_group_for_passthrough,
 };
 pub use reconcile::reconcile_stale_bindings;
 pub use sysfs::{SysfsRoot, validate_bdf, validate_sysfs_data};

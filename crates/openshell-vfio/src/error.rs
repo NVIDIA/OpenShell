@@ -29,6 +29,9 @@ pub enum VfioError {
         actual_group: u32,
     },
 
+    #[error("PCI device {bdf} is not bound to vfio-pci (driver={driver})")]
+    NotBoundToVfio { bdf: String, driver: String },
+
     #[error("empty PCI group passed to prepare_pci_group_for_passthrough")]
     EmptyGroup,
 
