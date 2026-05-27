@@ -42,18 +42,16 @@ const MICROSOFT_AGENT_S2S_MARKER_KEYS: &[&str] = &[
     PROVIDER_NAME_ENV,
 ];
 
-pub(crate) struct PreparedProviderTokenResolver {
+pub struct PreparedProviderTokenResolver {
     pub environment: HashMap<String, String>,
     pub handle: Option<ProviderTokenResolverHandle>,
 }
 
-pub(crate) fn microsoft_agent_s2s_resolver_port(
-    provider_env: &HashMap<String, String>,
-) -> Option<u16> {
+pub fn microsoft_agent_s2s_resolver_port(provider_env: &HashMap<String, String>) -> Option<u16> {
     contains_microsoft_agent_s2s_inputs(provider_env).then_some(MICROSOFT_AGENT_S2S_RESOLVER_PORT)
 }
 
-pub(crate) fn strip_microsoft_agent_s2s_inputs(
+pub fn strip_microsoft_agent_s2s_inputs(
     provider_env: &mut HashMap<String, String>,
 ) -> Option<String> {
     if !contains_microsoft_agent_s2s_inputs(provider_env) {
@@ -68,7 +66,7 @@ pub(crate) fn strip_microsoft_agent_s2s_inputs(
 }
 
 #[derive(Debug)]
-pub(crate) struct ProviderTokenResolverHandle {
+pub struct ProviderTokenResolverHandle {
     local_addr: SocketAddr,
     token_path: String,
     join: JoinHandle<()>,
@@ -86,7 +84,7 @@ impl Drop for ProviderTokenResolverHandle {
     }
 }
 
-pub(crate) async fn prepare_microsoft_agent_s2s(
+pub async fn prepare_microsoft_agent_s2s(
     raw_provider_env: &mut HashMap<String, String>,
     bind_addr: SocketAddr,
     endpoint: &str,
@@ -380,14 +378,14 @@ fn audience_from_json_body(body: &str) -> std::result::Result<Option<String>, Ht
         return Ok(None);
     }
 
-    #[derive(Deserialize)]
-    struct TokenRequestBody {
-        audience: Option<String>,
-    }
-
     serde_json::from_str::<TokenRequestBody>(body)
         .map(|payload| payload.audience)
         .map_err(|_| HttpError::new(400, "Bad Request", "invalid JSON request body"))
+}
+
+#[derive(Deserialize)]
+struct TokenRequestBody {
+    audience: Option<String>,
 }
 
 struct ParsedHttpRequest<'a> {

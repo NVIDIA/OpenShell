@@ -1694,7 +1694,10 @@ mod tests {
             .iter()
             .map(|profile| profile.id.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(ids, vec!["claude-code", "github", "nvidia"]);
+        assert_eq!(
+            ids,
+            vec!["claude-code", "github", "microsoft-agent-s2s", "nvidia"]
+        );
 
         let github = response
             .profiles

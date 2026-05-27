@@ -401,7 +401,7 @@ fn provider_fingerprint(provider: &Provider) -> String {
     hasher.update(provider.r#type.as_bytes());
 
     let mut credential_items: Vec<_> = provider.credentials.iter().collect();
-    credential_items.sort_by(|(left, _), (right, _)| left.cmp(right));
+    credential_items.sort_by_key(|(left, _)| *left);
     for (key, value) in credential_items {
         hasher.update(key.as_bytes());
         hasher.update([0]);
@@ -410,7 +410,7 @@ fn provider_fingerprint(provider: &Provider) -> String {
     }
 
     let mut config_items: Vec<_> = provider.config.iter().collect();
-    config_items.sort_by(|(left, _), (right, _)| left.cmp(right));
+    config_items.sort_by_key(|(left, _)| *left);
     for (key, value) in config_items {
         hasher.update(key.as_bytes());
         hasher.update([0]);

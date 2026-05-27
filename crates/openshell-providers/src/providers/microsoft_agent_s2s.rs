@@ -22,7 +22,7 @@ impl ProviderPlugin for MicrosoftAgentS2sProvider {
     }
 
     fn discover_existing(&self) -> Result<Option<DiscoveredProvider>, ProviderError> {
-        discover_microsoft_agent_s2s(&RealDiscoveryContext)
+        Ok(discover_microsoft_agent_s2s(&RealDiscoveryContext))
     }
 
     fn credential_env_vars(&self) -> &'static [&'static str] {
@@ -30,9 +30,7 @@ impl ProviderPlugin for MicrosoftAgentS2sProvider {
     }
 }
 
-fn discover_microsoft_agent_s2s(
-    context: &dyn DiscoveryContext,
-) -> Result<Option<DiscoveredProvider>, ProviderError> {
+fn discover_microsoft_agent_s2s(context: &dyn DiscoveryContext) -> Option<DiscoveredProvider> {
     let mut discovered = DiscoveredProvider::default();
 
     for key in CREDENTIAL_ENV_VARS {
@@ -55,9 +53,9 @@ fn discover_microsoft_agent_s2s(
     }
 
     if discovered.is_empty() {
-        Ok(None)
+        None
     } else {
-        Ok(Some(discovered))
+        Some(discovered)
     }
 }
 
@@ -76,9 +74,7 @@ mod tests {
             .with_env("A365_ALLOWED_AUDIENCES", "api://aud-a,api://aud-b")
             .with_env("A365_OBSERVABILITY_RESOURCE", "observability-resource")
             .with_env("A365_REQUIRED_ROLES", "Agent365.Observability.OtelWrite");
-        let discovered = discover_microsoft_agent_s2s(&ctx)
-            .expect("discovery")
-            .expect("provider");
+        let discovered = discover_microsoft_agent_s2s(&ctx).expect("provider");
         assert_eq!(
             discovered.credentials.get("A365_BLUEPRINT_CLIENT_SECRET"),
             Some(&"blueprint-secret".to_string())
