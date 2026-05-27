@@ -387,6 +387,12 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
     } else if let Some(jwt) = local_jwt {
         config.gateway_jwt = Some(jwt);
     }
+    if let Some(spiffe) = file
+        .as_ref()
+        .and_then(|f| f.openshell.gateway.spiffe.clone())
+    {
+        config.spiffe = Some(spiffe);
+    }
 
     let vm_config = build_vm_config(
         file.as_ref(),
@@ -411,6 +417,10 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
     if has_oidc {
         info!("OIDC authentication enabled");
     }
+    if config.spiffe.is_some() {
+        info!("SPIFFE sandbox authentication enabled");
+    }
+
     if config.auth.allow_unauthenticated_users {
         warn!(
             "Unauthenticated user access enabled — only use this for trusted local development or a fully trusted fronting proxy"
@@ -421,9 +431,10 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
         && !config.mtls_auth.enabled
         && !has_oidc
         && config.gateway_jwt.is_none()
+        && config.spiffe.is_none()
     {
         warn!(
-            "Neither mTLS user auth nor OIDC nor sandbox JWT auth is configured — \
+            "Neither mTLS user auth nor OIDC nor sandbox JWT nor SPIFFE auth is configured — \
              the gateway has no authentication mechanism"
         );
     }

@@ -33,7 +33,7 @@ k8s-openapi = { workspace = true }
 tokio = { workspace = true }
 
 # gRPC
-tonic = { workspace = true, features = ["channel", "tls"] }
+tonic = { workspace = true, features = ["channel", "tls-native-roots"] }
 prost = { workspace = true }
 prost-types = { workspace = true }
 
@@ -82,6 +82,7 @@ uuid = { workspace = true }
 hmac = "0.12"
 sha2 = { workspace = true }
 jsonwebtoken = { workspace = true }
+spiffe = { workspace = true }
 async-trait = "0.1"
 url = { workspace = true }
 hex = "0.4"

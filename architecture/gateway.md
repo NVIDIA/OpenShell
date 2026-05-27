@@ -46,10 +46,16 @@ Supported auth modes:
 | Unauthenticated local users | Trusted Kubernetes dev or fully trusted proxy deployments only. |
 | Cloudflare JWT | Edge-authenticated deployments where Cloudflare Access supplies identity. |
 | OIDC | Bearer-token auth for users, with browser PKCE or client credentials login. |
+| SPIFFE JWT-SVID | Sandbox supervisor authentication through a local SPIFFE Workload API implementation such as SPIRE. |
 
-Sandbox supervisor RPCs authenticate with gateway-minted sandbox JWTs when that
-authenticator is configured; mTLS does not grant sandbox identity. User-facing
-mutations are authorized by role policy when OIDC or edge identity is enabled.
+Sandbox supervisor RPCs authenticate with explicit sandbox credentials; mTLS
+does not grant sandbox identity. Kubernetes deployments can use either the
+gateway-minted JWT bootstrap path or SPIFFE JWT-SVIDs. In SPIFFE mode, the
+supervisor fetches a JWT-SVID from the SPIFFE Workload API and the gateway
+validates it through its own local Workload API socket, then maps
+`spiffe://<trust-domain>/openshell/sandbox/<id>` to `Principal::Sandbox`.
+User-facing mutations are authorized by role policy when OIDC or edge identity
+is enabled.
 
 Sandbox secrets are gateway-signed JWTs bound to a single sandbox ID. Docker,
 Podman, and VM drivers deliver the initial token through supervisor-only

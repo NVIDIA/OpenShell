@@ -70,6 +70,10 @@ agent process and SSH child processes. Driver-controlled environment variables
 override template values so sandbox images cannot spoof identity, callback, or
 relay settings.
 
+Supervisor bootstrap identity is not inherited by agent child processes. In
+Kubernetes SPIFFE mode, children also enter a private mount namespace where the
+Workload API socket directory is hidden before privilege drop.
+
 Credential placeholders in proxied HTTP requests can be resolved by the proxy
 when policy allows the target endpoint. Secrets must not be logged in OCSF or
 plain tracing output.

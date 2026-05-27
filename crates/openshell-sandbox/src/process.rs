@@ -16,14 +16,42 @@ use nix::unistd::{Group, Pid, User};
 use std::collections::HashMap;
 use std::ffi::CString;
 #[cfg(target_os = "linux")]
-use std::os::unix::io::RawFd;
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(any(test, target_os = "linux"))]
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::Stdio;
+#[cfg(target_os = "linux")]
+use std::sync::OnceLock;
 use tokio::process::{Child, Command};
 use tracing::debug;
 
+const SUPERVISOR_ONLY_ENV_VARS: &[&str] = &[
+    openshell_core::sandbox_env::SANDBOX_TOKEN,
+    openshell_core::sandbox_env::SANDBOX_TOKEN_FILE,
+    openshell_core::sandbox_env::K8S_SA_TOKEN_FILE,
+    openshell_core::sandbox_env::SPIFFE_WORKLOAD_API_SOCKET,
+    openshell_core::sandbox_env::SPIFFE_AUDIENCE,
+    openshell_core::sandbox_env::SPIFFE_ID,
+];
+
+pub fn is_supervisor_only_env_var(key: &str) -> bool {
+    SUPERVISOR_ONLY_ENV_VARS.contains(&key)
+}
+
+fn strip_supervisor_only_env(cmd: &mut Command) {
+    for key in SUPERVISOR_ONLY_ENV_VARS {
+        cmd.env_remove(key);
+    }
+}
+
 fn inject_provider_env(cmd: &mut Command, provider_env: &HashMap<String, String>) {
     for (key, value) in provider_env {
+        if is_supervisor_only_env_var(key) {
+            continue;
+        }
         cmd.env(key, value);
     }
 }
@@ -61,6 +89,209 @@ pub fn harden_child_process() -> Result<()> {
             .map_err(|e| miette::miette!("Failed to set PR_SET_DUMPABLE=0: {e}"))?;
     }
 
+    Ok(())
+}
+
+// Pins the pre-seccomp child mount namespace where supervisor identity sockets
+// are shadowed. Children enter it with setns before dropping privileges.
+#[cfg(target_os = "linux")]
+static SUPERVISOR_IDENTITY_MOUNT_NS: OnceLock<Option<SupervisorIdentityMountNamespace>> =
+    OnceLock::new();
+
+#[cfg(target_os = "linux")]
+pub(crate) struct SupervisorIdentityMountNamespace {
+    fd: OwnedFd,
+}
+
+#[cfg(target_os = "linux")]
+type SupervisorIdentityNsRef = &'static SupervisorIdentityMountNamespace;
+
+#[cfg(target_os = "linux")]
+impl SupervisorIdentityMountNamespace {
+    fn from_socket_path(socket_path: &str) -> Result<Option<Self>> {
+        let Some(target) = supervisor_identity_mount_target(socket_path)? else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            fd: create_supervisor_identity_mount_namespace(&target)?,
+        }))
+    }
+
+    pub(crate) fn enter_for_child(&self) -> std::io::Result<()> {
+        set_mount_namespace(self.fd.as_raw_fd())
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn prepare_supervisor_identity_mount_namespace_from_env() -> Result<()> {
+    if SUPERVISOR_IDENTITY_MOUNT_NS.get().is_some() {
+        return Ok(());
+    }
+
+    let Ok(socket_path) = std::env::var(openshell_core::sandbox_env::SPIFFE_WORKLOAD_API_SOCKET)
+    else {
+        let _ = SUPERVISOR_IDENTITY_MOUNT_NS.set(None);
+        return Ok(());
+    };
+    let namespace = SupervisorIdentityMountNamespace::from_socket_path(&socket_path)?;
+    let _ = SUPERVISOR_IDENTITY_MOUNT_NS.set(namespace);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn supervisor_identity_mount_from_env() -> Result<Option<SupervisorIdentityNsRef>> {
+    let Some(namespace) = SUPERVISOR_IDENTITY_MOUNT_NS.get() else {
+        if std::env::var(openshell_core::sandbox_env::SPIFFE_WORKLOAD_API_SOCKET)
+            .is_ok_and(|socket_path| !socket_path.trim().is_empty())
+        {
+            return Err(miette::miette!(
+                "supervisor identity mount namespace was not prepared before startup hardening"
+            ));
+        }
+        return Ok(None);
+    };
+    Ok(namespace.as_ref())
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn supervisor_identity_mount_target(socket_path: &str) -> Result<Option<PathBuf>> {
+    let trimmed = socket_path.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.starts_with("tcp:") {
+        return Err(miette::miette!(
+            "{} must be a UNIX socket path so sandbox child processes can hide it",
+            openshell_core::sandbox_env::SPIFFE_WORKLOAD_API_SOCKET
+        ));
+    }
+    let path = trimmed.strip_prefix("unix:").unwrap_or(trimmed);
+    let path = Path::new(path);
+    if !path.is_absolute() {
+        return Err(miette::miette!(
+            "{} must be an absolute UNIX socket path",
+            openshell_core::sandbox_env::SPIFFE_WORKLOAD_API_SOCKET
+        ));
+    }
+    let Some(parent) = path.parent() else {
+        return Err(miette::miette!(
+            "{} has no parent directory",
+            openshell_core::sandbox_env::SPIFFE_WORKLOAD_API_SOCKET
+        ));
+    };
+    if parent == Path::new("/") {
+        return Err(miette::miette!(
+            "{} must live below a dedicated directory, not directly under /",
+            openshell_core::sandbox_env::SPIFFE_WORKLOAD_API_SOCKET
+        ));
+    }
+    Ok(Some(parent.to_path_buf()))
+}
+
+#[cfg(target_os = "linux")]
+fn cstring_path(path: &Path) -> Result<CString> {
+    CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| miette::miette!("path contains an interior NUL byte: {}", path.display()))
+}
+
+#[cfg(target_os = "linux")]
+fn create_supervisor_identity_mount_namespace(target: &Path) -> Result<OwnedFd> {
+    let original_ns = open_current_mount_namespace()
+        .map_err(|err| miette::miette!("failed to open original mount namespace: {err}"))?;
+
+    private_mount_namespace()
+        .map_err(|err| miette::miette!("failed to create supervisor identity namespace: {err}"))?;
+
+    let target = cstring_path(target)?;
+    let result = (|| -> Result<OwnedFd> {
+        mount_empty_tmpfs(&target).map_err(|err| {
+            miette::miette!("failed to hide supervisor identity mount from child namespace: {err}")
+        })?;
+        open_current_mount_namespace()
+            .map_err(|err| miette::miette!("failed to open sanitized mount namespace: {err}"))
+    })();
+
+    set_mount_namespace(original_ns.as_raw_fd()).map_err(|restore_err| {
+        let result_msg = result.as_ref().err().map_or_else(
+            || "sanitized namespace was created".to_string(),
+            ToString::to_string,
+        );
+        miette::miette!(
+            "failed to restore original mount namespace after supervisor identity isolation setup: \
+             {restore_err}; setup result: {result_msg}"
+        )
+    })?;
+
+    result
+}
+
+#[cfg(target_os = "linux")]
+fn open_current_mount_namespace() -> std::io::Result<OwnedFd> {
+    let file = std::fs::File::open("/proc/self/ns/mnt")?;
+    Ok(file.into())
+}
+
+#[cfg(target_os = "linux")]
+fn private_mount_namespace() -> std::io::Result<()> {
+    #[allow(unsafe_code)]
+    let rc = unsafe { libc::unshare(libc::CLONE_NEWNS) };
+    if rc != 0 {
+        return Err(std::io::Error::other(format!(
+            "failed to create private mount namespace: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    #[allow(unsafe_code)]
+    let rc = unsafe {
+        libc::mount(
+            std::ptr::null(),
+            c"/".as_ptr(),
+            std::ptr::null(),
+            (libc::MS_REC | libc::MS_PRIVATE) as libc::c_ulong,
+            std::ptr::null(),
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::other(format!(
+            "failed to mark mount namespace private: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn set_mount_namespace(fd: RawFd) -> std::io::Result<()> {
+    #[allow(unsafe_code)]
+    let rc = unsafe { libc::setns(fd, libc::CLONE_NEWNS) };
+    if rc != 0 {
+        return Err(std::io::Error::other(format!(
+            "failed to enter mount namespace: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn mount_empty_tmpfs(target: &CString) -> std::io::Result<()> {
+    #[allow(unsafe_code)]
+    let rc = unsafe {
+        libc::mount(
+            c"tmpfs".as_ptr(),
+            target.as_ptr(),
+            c"tmpfs".as_ptr(),
+            (libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC | libc::MS_RDONLY) as libc::c_ulong,
+            c"mode=0555,size=4k".as_ptr().cast(),
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::other(format!(
+            "failed to hide supervisor identity mount from child process: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
     Ok(())
 }
 
@@ -146,14 +377,11 @@ impl ProcessHandle {
             .kill_on_drop(true)
             .env(openshell_core::sandbox_env::SANDBOX, "1");
 
-        // Strip supervisor-only credentials from the entrypoint's inherited
-        // environment. The entrypoint drops to the sandbox user before
-        // `exec`; without this strip, anything running as the sandbox user
-        // (e.g. an SSH-spawned shell) could read /proc/<entrypoint_pid>/environ
-        // and recover the gateway-minted JWT. Issue #1354.
-        cmd.env_remove(openshell_core::sandbox_env::SANDBOX_TOKEN)
-            .env_remove(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE)
-            .env_remove(openshell_core::sandbox_env::K8S_SA_TOKEN_FILE);
+        // Strip supervisor-only identity material from the entrypoint's
+        // inherited environment. The entrypoint drops to the sandbox user
+        // before `exec`; without this strip, sandbox code could recover
+        // supervisor credentials from its inherited environment.
+        strip_supervisor_only_env(&mut cmd);
 
         inject_provider_env(&mut cmd, provider_env);
 
@@ -204,6 +432,10 @@ impl ProcessHandle {
         #[cfg(target_os = "linux")]
         let prepared_sandbox = sandbox::linux::prepare(policy, workdir)
             .map_err(|err| miette::miette!("Failed to prepare sandbox: {err}"))?;
+        #[cfg(target_os = "linux")]
+        let supervisor_identity_mount = supervisor_identity_mount_from_env().map_err(|err| {
+            miette::miette!("Failed to prepare supervisor identity isolation: {err}")
+        })?;
 
         // Set up process group for signal handling (non-interactive mode only).
         // In interactive mode, we inherit the parent's process group to maintain
@@ -216,6 +448,8 @@ impl ProcessHandle {
             // pre_exec is only called once (after fork, before exec).
             #[cfg(target_os = "linux")]
             let mut prepared_sandbox = Some(prepared_sandbox);
+            #[cfg(target_os = "linux")]
+            let supervisor_identity_mount = supervisor_identity_mount;
             #[allow(unsafe_code)]
             unsafe {
                 cmd.pre_exec(move || {
@@ -230,6 +464,11 @@ impl ProcessHandle {
                         if result != 0 {
                             return Err(std::io::Error::last_os_error());
                         }
+                    }
+
+                    #[cfg(target_os = "linux")]
+                    if let Some(mount) = supervisor_identity_mount {
+                        mount.enter_for_child()?;
                     }
 
                     // Drop privileges. initgroups/setgid/setuid need access to
@@ -281,14 +520,9 @@ impl ProcessHandle {
             .kill_on_drop(true)
             .env(openshell_core::sandbox_env::SANDBOX, "1");
 
-        // Strip supervisor-only credentials from the entrypoint's inherited
-        // environment. The entrypoint drops to the sandbox user before
-        // `exec`; without this strip, anything running as the sandbox user
-        // (e.g. an SSH-spawned shell) could read /proc/<entrypoint_pid>/environ
-        // and recover the gateway-minted JWT. Issue #1354.
-        cmd.env_remove(openshell_core::sandbox_env::SANDBOX_TOKEN)
-            .env_remove(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE)
-            .env_remove(openshell_core::sandbox_env::K8S_SA_TOKEN_FILE);
+        // Strip supervisor-only identity material from the entrypoint's
+        // inherited environment.
+        strip_supervisor_only_env(&mut cmd);
 
         inject_provider_env(&mut cmd, provider_env);
 
@@ -823,5 +1057,96 @@ mod tests {
         let output = cmd.output().await.expect("spawn env");
         let stdout = String::from_utf8(output.stdout).expect("utf8");
         assert!(stdout.contains("ANTHROPIC_API_KEY=openshell:resolve:env:ANTHROPIC_API_KEY"));
+    }
+
+    #[tokio::test]
+    async fn inject_provider_env_skips_supervisor_identity_material() {
+        let mut cmd = Command::new("/usr/bin/env");
+        cmd.env_clear()
+            .stdin(StdStdio::null())
+            .stdout(StdStdio::piped())
+            .stderr(StdStdio::null());
+
+        let provider_env = HashMap::from([
+            (
+                "ANTHROPIC_API_KEY".to_string(),
+                "openshell:resolve:env:ANTHROPIC_API_KEY".to_string(),
+            ),
+            (
+                openshell_core::sandbox_env::SANDBOX_TOKEN.to_string(),
+                "provider-token".to_string(),
+            ),
+            (
+                openshell_core::sandbox_env::SPIFFE_WORKLOAD_API_SOCKET.to_string(),
+                "/spiffe-workload-api/spire-agent.sock".to_string(),
+            ),
+        ]);
+
+        inject_provider_env(&mut cmd, &provider_env);
+
+        let output = cmd.output().await.expect("spawn env");
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).expect("utf8");
+        assert!(stdout.contains("ANTHROPIC_API_KEY=openshell:resolve:env:ANTHROPIC_API_KEY"));
+        assert!(!stdout.contains(openshell_core::sandbox_env::SANDBOX_TOKEN));
+        assert!(!stdout.contains(openshell_core::sandbox_env::SPIFFE_WORKLOAD_API_SOCKET));
+    }
+
+    #[tokio::test]
+    async fn strip_supervisor_only_env_removes_identity_material() {
+        let mut cmd = Command::new("/usr/bin/env");
+        cmd.stdin(StdStdio::null())
+            .stdout(StdStdio::piped())
+            .stderr(StdStdio::null())
+            .env("OPENSHELL_ENDPOINT", "https://gateway.example.test");
+
+        for key in SUPERVISOR_ONLY_ENV_VARS {
+            cmd.env(key, format!("{key}-secret"));
+        }
+
+        strip_supervisor_only_env(&mut cmd);
+
+        let output = cmd.output().await.expect("spawn env");
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).expect("utf8");
+
+        for key in SUPERVISOR_ONLY_ENV_VARS {
+            assert!(
+                !stdout
+                    .lines()
+                    .any(|line| line.starts_with(&format!("{key}="))),
+                "{key} must not be inherited by sandbox child processes"
+            );
+        }
+        assert!(stdout.contains("OPENSHELL_ENDPOINT=https://gateway.example.test"));
+    }
+
+    #[test]
+    fn supervisor_identity_mount_target_uses_socket_parent() {
+        assert_eq!(
+            supervisor_identity_mount_target("/spiffe-workload-api/spire-agent.sock")
+                .expect("plain path should parse"),
+            Some(PathBuf::from("/spiffe-workload-api"))
+        );
+        assert_eq!(
+            supervisor_identity_mount_target("unix:/spiffe-workload-api/spire-agent.sock")
+                .expect("unix path should parse"),
+            Some(PathBuf::from("/spiffe-workload-api"))
+        );
+    }
+
+    #[test]
+    fn supervisor_identity_mount_target_ignores_empty_socket_path() {
+        assert_eq!(
+            supervisor_identity_mount_target("   ").expect("empty path should be ignored"),
+            None
+        );
+    }
+
+    #[test]
+    fn supervisor_identity_mount_target_rejects_unhideable_endpoints() {
+        assert!(supervisor_identity_mount_target("tcp:127.0.0.1:8081").is_err());
+        assert!(supervisor_identity_mount_target("spiffe-workload-api/spire-agent.sock").is_err());
+        assert!(supervisor_identity_mount_target("/spire-agent.sock").is_err());
     }
 }

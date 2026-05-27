@@ -136,3 +136,11 @@ init-container
 {{- printf "%s://%s.%s.svc.cluster.local:%d" $scheme (include "openshell.fullname" .) .Release.Namespace (int .Values.service.port) -}}
 {{- end -}}
 {{- end }}
+
+{{/*
+Directory mounted for the SPIFFE Workload API CSI volume. The socket itself
+lives at server.spiffe.workloadApiSocketPath.
+*/}}
+{{- define "openshell.spiffeWorkloadApiMountPath" -}}
+{{- dir .Values.server.spiffe.workloadApiSocketPath -}}
+{{- end }}

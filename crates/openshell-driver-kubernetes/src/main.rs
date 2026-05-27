@@ -82,6 +82,26 @@ struct Args {
     /// gateway clamps values outside `[600, 86400]`. Default 3600.
     #[arg(long, env = "OPENSHELL_K8S_SA_TOKEN_TTL_SECS", default_value_t = 3600)]
     sa_token_ttl_secs: i64,
+
+    #[arg(long, env = "OPENSHELL_SPIFFE_WORKLOAD_API_SOCKET")]
+    spiffe_workload_api_socket_path: Option<String>,
+
+    #[arg(long, env = "OPENSHELL_SPIFFE_TRUST_DOMAIN")]
+    spiffe_trust_domain: Option<String>,
+
+    #[arg(
+        long,
+        env = "OPENSHELL_SPIFFE_AUDIENCE",
+        default_value = "openshell-gateway"
+    )]
+    spiffe_audience: String,
+
+    #[arg(
+        long,
+        env = "OPENSHELL_SPIFFE_SANDBOX_ID_PREFIX",
+        default_value = "/openshell/sandbox/"
+    )]
+    spiffe_sandbox_id_prefix: String,
 }
 
 #[tokio::main]
@@ -115,6 +135,10 @@ async fn main() -> Result<()> {
             openshell_driver_kubernetes::DEFAULT_WORKSPACE_STORAGE_SIZE.to_string()
         }),
         sa_token_ttl_secs: args.sa_token_ttl_secs,
+        spiffe_workload_api_socket_path: args.spiffe_workload_api_socket_path.unwrap_or_default(),
+        spiffe_trust_domain: args.spiffe_trust_domain.unwrap_or_default(),
+        spiffe_audience: args.spiffe_audience,
+        spiffe_sandbox_id_prefix: args.spiffe_sandbox_id_prefix,
     })
     .await
     .into_diagnostic()?;

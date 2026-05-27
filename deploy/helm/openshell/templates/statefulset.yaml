@@ -75,9 +75,15 @@ spec:
             - name: gateway-config
               mountPath: /etc/openshell
               readOnly: true
+            {{- if .Values.server.spiffe.enabled }}
+            - name: spiffe-workload-api
+              mountPath: {{ include "openshell.spiffeWorkloadApiMountPath" . | quote }}
+              readOnly: true
+            {{- else }}
             - name: sandbox-jwt
               mountPath: /etc/openshell-jwt
               readOnly: true
+            {{- end }}
             {{- if not .Values.server.disableTls }}
             - name: tls-cert
               mountPath: /etc/openshell-tls/server
@@ -134,10 +140,17 @@ spec:
         - name: gateway-config
           configMap:
             name: {{ include "openshell.fullname" . }}-config
+        {{- if .Values.server.spiffe.enabled }}
+        - name: spiffe-workload-api
+          csi:
+            driver: csi.spiffe.io
+            readOnly: true
+        {{- else }}
         - name: sandbox-jwt
           secret:
             secretName: {{ .Values.server.sandboxJwt.signingSecretName | default (printf "%s-jwt-keys" (include "openshell.fullname" .)) }}
             defaultMode: 0400
+        {{- end }}
         {{- if not .Values.server.disableTls }}
         - name: tls-cert
           secret:

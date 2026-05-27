@@ -57,6 +57,8 @@ See [`values.yaml`](values.yaml) for source defaults. Selected overlays:
 - [`ci/values-gateway.yaml`](ci/values-gateway.yaml) - gateway-only configuration
 - [`ci/values-cert-manager.yaml`](ci/values-cert-manager.yaml) - cert-manager integration
 - [`ci/values-keycloak.yaml`](ci/values-keycloak.yaml) - Keycloak OIDC integration
+- [`ci/values-spire.yaml`](ci/values-spire.yaml) - SPIFFE/SPIRE sandbox supervisor authentication
+- [`ci/values-spire-stack.yaml`](ci/values-spire-stack.yaml) - SPIRE hardened chart values for local development
 
 ## PKI bootstrap
 
@@ -74,6 +76,16 @@ The Job is idempotent:
 Disable with `--set pkiInitJob.enabled=false` when bringing your own PKI (cert-manager,
 external CA, or pre-created Secrets). See `certManager.*` in `values.yaml` for the
 cert-manager alternative.
+
+## SPIFFE/SPIRE sandbox identity
+
+Set `server.spiffe.enabled=true` to use SPIFFE JWT-SVIDs for sandbox supervisor
+authentication instead of gateway-minted sandbox JWTs. The chart mounts the
+SPIFFE CSI Workload API socket into the gateway pod and configures sandbox pods
+to request `spiffe://<trust-domain>/openshell/sandbox/<sandbox-id>` JWT-SVIDs.
+
+For local development, uncomment the SPIRE Helm releases in `skaffold.yaml` and
+add `ci/values-spire.yaml` to the OpenShell release values files.
 
 ## Values
 
@@ -154,6 +166,11 @@ cert-manager alternative.
 | server.sandboxJwt.signingSecretName | string | `""` | Name of the Opaque Secret holding the signing key material. Empty falls back to the chart fullname with "-jwt-keys" appended. |
 | server.sandboxJwt.ttlSecs | int | `3600` | Token TTL in seconds. Defaults to 3600 (1h). |
 | server.sandboxNamespace | string | `""` | Namespace where sandbox pods are created. Defaults to the Helm release namespace (.Release.Namespace) when left empty. |
+| server.spiffe.audience | string | `"openshell-gateway"` |  |
+| server.spiffe.enabled | bool | `false` |  |
+| server.spiffe.sandboxIdPrefix | string | `"/openshell/sandbox/"` |  |
+| server.spiffe.trustDomain | string | `"openshell.local"` |  |
+| server.spiffe.workloadApiSocketPath | string | `"/spiffe-workload-api/spire-agent.sock"` |  |
 | server.tls.certSecretName | string | `"openshell-server-tls"` | K8s secret (type kubernetes.io/tls) with tls.crt and tls.key for the server. |
 | server.tls.clientCaSecretName | string | `"openshell-server-client-ca"` | K8s secret with ca.crt for client certificate verification (mTLS). Set to "" to disable mTLS and run HTTPS-only (use OIDC for auth instead). |
 | server.tls.clientTlsSecretName | string | `"openshell-client-tls"` | K8s secret mounted into sandbox pods for mTLS to the server. |

@@ -40,11 +40,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     collect_proto_files(&proto_root, &mut proto_files)?;
     proto_files.sort();
 
-    // Configure tonic-build
-    tonic_build::configure()
+    // Configure tonic/prost protobuf code generation.
+    let include_paths = [proto_root];
+    tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
-        .compile_protos(&proto_files, &[proto_root.as_path()])?;
+        .compile_protos(&proto_files, &include_paths)?;
 
     Ok(())
 }

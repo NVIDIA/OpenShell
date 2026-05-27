@@ -57,6 +57,8 @@ See [`values.yaml`](values.yaml) for source defaults. Selected overlays:
 - [`ci/values-gateway.yaml`](ci/values-gateway.yaml) - gateway-only configuration
 - [`ci/values-cert-manager.yaml`](ci/values-cert-manager.yaml) - cert-manager integration
 - [`ci/values-keycloak.yaml`](ci/values-keycloak.yaml) - Keycloak OIDC integration
+- [`ci/values-spire.yaml`](ci/values-spire.yaml) - SPIFFE/SPIRE sandbox supervisor authentication
+- [`ci/values-spire-stack.yaml`](ci/values-spire-stack.yaml) - SPIRE hardened chart values for local development
 
 ## PKI bootstrap
 
@@ -74,6 +76,16 @@ The Job is idempotent:
 Disable with `--set pkiInitJob.enabled=false` when bringing your own PKI (cert-manager,
 external CA, or pre-created Secrets). See `certManager.*` in `values.yaml` for the
 cert-manager alternative.
+
+## SPIFFE/SPIRE sandbox identity
+
+Set `server.spiffe.enabled=true` to use SPIFFE JWT-SVIDs for sandbox supervisor
+authentication instead of gateway-minted sandbox JWTs. The chart mounts the
+SPIFFE CSI Workload API socket into the gateway pod and configures sandbox pods
+to request `spiffe://<trust-domain>/openshell/sandbox/<sandbox-id>` JWT-SVIDs.
+
+For local development, uncomment the SPIRE Helm releases in `skaffold.yaml` and
+add `ci/values-spire.yaml` to the OpenShell release values files.
 
 {{ template "chart.valuesSection" . }}
 {{ template "helm-docs.versionFooter" . }}

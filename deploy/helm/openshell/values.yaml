@@ -206,6 +206,15 @@ server:
     # values outside [600, 86400]. Default 3600 — generous, since the
     # supervisor consumes the token within seconds of pod start.
     k8sSaTokenTtlSecs: 3600
+  # SPIFFE/SPIRE sandbox identity. When enabled, sandbox supervisors fetch a
+  # JWT-SVID from the SPIFFE Workload API and present it directly to the
+  # gateway instead of bootstrapping a gateway-minted sandbox JWT.
+  spiffe:
+    enabled: false
+    trustDomain: openshell.local
+    audience: openshell-gateway
+    workloadApiSocketPath: /spiffe-workload-api/spire-agent.sock
+    sandboxIdPrefix: /openshell/sandbox/
   # OIDC (OpenID Connect) configuration for JWT-based authentication.
   # When issuer is set, the server validates Bearer tokens on gRPC requests.
   oidc:

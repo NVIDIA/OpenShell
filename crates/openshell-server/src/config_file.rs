@@ -25,7 +25,9 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use openshell_core::config::ComputeDriverKind;
-use openshell_core::{GatewayAuthConfig, GatewayJwtConfig, MtlsAuthConfig, OidcConfig, TlsConfig};
+use openshell_core::{
+    GatewayAuthConfig, GatewayJwtConfig, MtlsAuthConfig, OidcConfig, SpiffeConfig, TlsConfig,
+};
 use serde::{Deserialize, Serialize};
 
 /// Latest schema version this build understands.
@@ -146,6 +148,8 @@ pub struct GatewayFileSection {
     pub mtls_auth: Option<MtlsAuthConfig>,
     #[serde(default)]
     pub gateway_jwt: Option<GatewayJwtConfig>,
+    #[serde(default)]
+    pub spiffe: Option<SpiffeConfig>,
 
     // ── Disallowed-in-file fields ────────────────────────────────────────
     //
@@ -262,6 +266,10 @@ fn inheritable_keys(driver: ComputeDriverKind) -> &'static [&'static str] {
             "host_gateway_ip",
             "enable_user_namespaces",
             "sa_token_ttl_secs",
+            "spiffe_workload_api_socket_path",
+            "spiffe_trust_domain",
+            "spiffe_audience",
+            "spiffe_sandbox_id_prefix",
         ],
         ComputeDriverKind::Docker => &[
             "sandbox_namespace",
@@ -298,6 +306,22 @@ fn gateway_inherited_value(g: &GatewayFileSection, key: &str) -> Option<toml::Va
         "host_gateway_ip" => g.host_gateway_ip.as_deref().map(string_value),
         "enable_user_namespaces" => g.enable_user_namespaces.map(toml::Value::Boolean),
         "sa_token_ttl_secs" => g.sa_token_ttl_secs.map(toml::Value::Integer),
+        "spiffe_workload_api_socket_path" => g
+            .spiffe
+            .as_ref()
+            .map(|spiffe| path_value(&spiffe.workload_api_socket_path)),
+        "spiffe_trust_domain" => g
+            .spiffe
+            .as_ref()
+            .map(|spiffe| string_value(&spiffe.trust_domain)),
+        "spiffe_audience" => g
+            .spiffe
+            .as_ref()
+            .map(|spiffe| string_value(&spiffe.audience)),
+        "spiffe_sandbox_id_prefix" => g
+            .spiffe
+            .as_ref()
+            .map(|spiffe| string_value(&spiffe.sandbox_id_prefix)),
         "guest_tls_ca" => g.guest_tls_ca.as_deref().map(path_value),
         "guest_tls_cert" => g.guest_tls_cert.as_deref().map(path_value),
         "guest_tls_key" => g.guest_tls_key.as_deref().map(path_value),

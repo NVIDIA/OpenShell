@@ -563,6 +563,13 @@ pub async fn run_sandbox(
     #[allow(clippy::no_effect_underscore_binding)]
     let _netns: Option<()> = None;
 
+    // Prepare the child-only mount namespace before the supervisor seccomp
+    // prelude blocks mount operations. Children enter this namespace with
+    // `setns` in pre_exec so supervisor identity sockets stay hidden from
+    // untrusted code while remaining available to the supervisor for refresh.
+    #[cfg(target_os = "linux")]
+    process::prepare_supervisor_identity_mount_namespace_from_env()?;
+
     // Install the supervisor seccomp prelude after privileged startup helpers
     // (network namespace setup, nftables probes) complete, but before the SSH
     // listener and workload process are exposed.

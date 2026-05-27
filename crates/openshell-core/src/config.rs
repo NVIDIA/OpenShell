@@ -223,6 +223,12 @@ pub struct Config {
     #[serde(default)]
     pub gateway_jwt: Option<GatewayJwtConfig>,
 
+    /// SPIFFE Workload API configuration. When `Some`, the gateway validates
+    /// sandbox JWT-SVIDs through the local SPIFFE implementation and maps
+    /// matching SPIFFE IDs to sandbox principals.
+    #[serde(default)]
+    pub spiffe: Option<SpiffeConfig>,
+
     /// Database URL for persistence.
     pub database_url: String,
 
@@ -379,12 +385,40 @@ pub struct GatewayJwtConfig {
     pub ttl_secs: u64,
 }
 
+/// SPIFFE-based sandbox identity configuration.
+///
+/// The gateway uses the local SPIFFE Workload API to validate JWT-SVIDs
+/// presented by sandbox supervisors. Supervisors request those JWT-SVIDs
+/// for the configured audience and use SPIFFE IDs shaped as
+/// `spiffe://<trust_domain>/<sandbox_id_prefix><sandbox-id>`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpiffeConfig {
+    /// Path to the SPIFFE Workload API UNIX socket.
+    pub workload_api_socket_path: PathBuf,
+    /// Trust domain accepted for sandbox SPIFFE IDs.
+    pub trust_domain: String,
+    /// Audience expected in sandbox JWT-SVIDs.
+    #[serde(default = "default_spiffe_audience")]
+    pub audience: String,
+    /// Path prefix, below the trust domain, that precedes the sandbox UUID.
+    #[serde(default = "default_spiffe_sandbox_id_prefix")]
+    pub sandbox_id_prefix: String,
+}
+
 fn default_gateway_id() -> String {
     "openshell".to_string()
 }
 
 const fn default_sandbox_token_ttl_secs() -> u64 {
     3_600
+}
+
+fn default_spiffe_audience() -> String {
+    "openshell-gateway".to_string()
+}
+
+fn default_spiffe_sandbox_id_prefix() -> String {
+    "/openshell/sandbox/".to_string()
 }
 
 fn default_roles_claim() -> String {
@@ -413,6 +447,7 @@ impl Config {
             auth: GatewayAuthConfig::default(),
             mtls_auth: MtlsAuthConfig::default(),
             gateway_jwt: None,
+            spiffe: None,
             database_url: String::new(),
             compute_drivers: vec![],
             ssh_session_ttl_secs: default_ssh_session_ttl_secs(),

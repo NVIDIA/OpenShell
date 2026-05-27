@@ -78,6 +78,7 @@ pub const SANDBOX_KIND: &str = "Sandbox";
 
 const GPU_RESOURCE_NAME: &str = "nvidia.com/gpu";
 const GPU_RESOURCE_QUANTITY: &str = "1";
+const SPIFFE_WORKLOAD_API_VOLUME_NAME: &str = "spiffe-workload-api";
 
 // ---------------------------------------------------------------------------
 // Default workspace persistence (temporary — will be replaced by snapshotting)
@@ -330,6 +331,11 @@ impl KubernetesComputeDriver {
             enable_user_namespaces: self.config.enable_user_namespaces,
             workspace_default_storage_size: &self.config.workspace_default_storage_size,
             sa_token_ttl_secs: self.config.effective_sa_token_ttl_secs(),
+            spiffe_enabled: self.config.spiffe_enabled(),
+            spiffe_workload_api_socket_path: &self.config.spiffe_workload_api_socket_path,
+            spiffe_trust_domain: &self.config.spiffe_trust_domain,
+            spiffe_audience: &self.config.spiffe_audience,
+            spiffe_sandbox_id_prefix: &self.config.spiffe_sandbox_id_prefix,
         };
         obj.data = sandbox_to_k8s_spec(sandbox.spec.as_ref(), &params);
         let api = self.api();
@@ -1061,6 +1067,11 @@ struct SandboxPodParams<'a> {
     /// Lifetime (seconds) of the projected `ServiceAccount` token used
     /// for the bootstrap `IssueSandboxToken` exchange.
     sa_token_ttl_secs: i64,
+    spiffe_enabled: bool,
+    spiffe_workload_api_socket_path: &'a str,
+    spiffe_trust_domain: &'a str,
+    spiffe_audience: &'a str,
+    spiffe_sandbox_id_prefix: &'a str,
 }
 
 impl Default for SandboxPodParams<'_> {
@@ -1081,6 +1092,11 @@ impl Default for SandboxPodParams<'_> {
             enable_user_namespaces: false,
             workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE,
             sa_token_ttl_secs: 3600,
+            spiffe_enabled: false,
+            spiffe_workload_api_socket_path: "",
+            spiffe_trust_domain: "",
+            spiffe_audience: "openshell-gateway",
+            spiffe_sandbox_id_prefix: "/openshell/sandbox/",
         }
     }
 }
@@ -1171,8 +1187,25 @@ fn sandbox_template_to_k8s(
     params: &SandboxPodParams<'_>,
 ) -> serde_json::Value {
     let mut metadata = serde_json::Map::new();
-    if !template.labels.is_empty() {
-        metadata.insert("labels".to_string(), serde_json::json!(template.labels));
+    let mut pod_labels = template
+        .labels
+        .iter()
+        .map(|(key, value)| (key.clone(), serde_json::Value::String(value.clone())))
+        .collect::<serde_json::Map<String, serde_json::Value>>();
+    if params.spiffe_enabled {
+        pod_labels.insert(
+            LABEL_MANAGED_BY.to_string(),
+            serde_json::Value::String(LABEL_MANAGED_BY_VALUE.to_string()),
+        );
+        if !params.sandbox_id.is_empty() {
+            pod_labels.insert(
+                LABEL_SANDBOX_ID.to_string(),
+                serde_json::Value::String(params.sandbox_id.to_string()),
+            );
+        }
+    }
+    if !pod_labels.is_empty() {
+        metadata.insert("labels".to_string(), serde_json::Value::Object(pod_labels));
     }
     // Carry the sandbox UUID as a pod annotation so the gateway can resolve
     // a projected SA token claim (pod name + uid) back to a sandbox identity
@@ -1190,6 +1223,12 @@ fn sandbox_template_to_k8s(
         pod_annotations.insert(
             "openshell.io/sandbox-id".to_string(),
             serde_json::Value::String(params.sandbox_id.to_string()),
+        );
+    }
+    if params.spiffe_enabled {
+        pod_annotations.insert(
+            "openshell.io/spiffe-id".to_string(),
+            serde_json::Value::String(sandbox_spiffe_id(params)),
         );
     }
     if !pod_annotations.is_empty() {
@@ -1269,6 +1308,7 @@ fn sandbox_template_to_k8s(
         params.grpc_endpoint,
         params.ssh_socket_path,
         !params.client_tls_secret_name.is_empty(),
+        spiffe_env(params),
     );
 
     container.insert("env".to_string(), serde_json::Value::Array(env));
@@ -1290,9 +1330,10 @@ fn sandbox_template_to_k8s(
         }),
     );
 
-    // Mount client TLS secret for mTLS to the server, plus the projected
-    // ServiceAccount token used to bootstrap the sandbox's gateway JWT
-    // via `IssueSandboxToken`.
+    // Mount client TLS secret for mTLS to the server, plus exactly one
+    // sandbox identity source: SPIFFE Workload API socket when configured,
+    // otherwise a projected ServiceAccount token for the gateway-JWT
+    // bootstrap path.
     let mut volume_mounts: Vec<serde_json::Value> = Vec::new();
     if !params.client_tls_secret_name.is_empty() {
         volume_mounts.push(serde_json::json!({
@@ -1301,11 +1342,19 @@ fn sandbox_template_to_k8s(
             "readOnly": true
         }));
     }
-    volume_mounts.push(serde_json::json!({
-        "name": "openshell-sa-token",
-        "mountPath": "/var/run/secrets/openshell",
-        "readOnly": true,
-    }));
+    if params.spiffe_enabled {
+        volume_mounts.push(serde_json::json!({
+            "name": SPIFFE_WORKLOAD_API_VOLUME_NAME,
+            "mountPath": spiffe_socket_mount_path(params.spiffe_workload_api_socket_path),
+            "readOnly": true,
+        }));
+    } else {
+        volume_mounts.push(serde_json::json!({
+            "name": "openshell-sa-token",
+            "mountPath": "/var/run/secrets/openshell",
+            "readOnly": true,
+        }));
+    }
     container.insert(
         "volumeMounts".to_string(),
         serde_json::Value::Array(volume_mounts),
@@ -1328,23 +1377,33 @@ fn sandbox_template_to_k8s(
             "secret": { "secretName": params.client_tls_secret_name, "defaultMode": 256 }
         }));
     }
-    // Projected ServiceAccountToken volume — kubelet writes a short-lived
-    // audience-bound JWT into /var/run/secrets/openshell/token and rotates
-    // it automatically. The supervisor exchanges this for a gateway-minted
-    // JWT via `IssueSandboxToken` once at startup.
-    volumes.push(serde_json::json!({
-        "name": "openshell-sa-token",
-        "projected": {
-            "sources": [{
-                "serviceAccountToken": {
-                    "audience": "openshell-gateway",
-                    "expirationSeconds": params.sa_token_ttl_secs,
-                    "path": "token"
-                }
-            }],
-            "defaultMode": 256
-        }
-    }));
+    if params.spiffe_enabled {
+        volumes.push(serde_json::json!({
+            "name": SPIFFE_WORKLOAD_API_VOLUME_NAME,
+            "csi": {
+                "driver": "csi.spiffe.io",
+                "readOnly": true
+            }
+        }));
+    } else {
+        // Projected ServiceAccountToken volume — kubelet writes a short-lived
+        // audience-bound JWT into /var/run/secrets/openshell/token and rotates
+        // it automatically. The supervisor exchanges this for a gateway-minted
+        // JWT via `IssueSandboxToken` once at startup.
+        volumes.push(serde_json::json!({
+            "name": "openshell-sa-token",
+            "projected": {
+                "sources": [{
+                    "serviceAccountToken": {
+                        "audience": "openshell-gateway",
+                        "expirationSeconds": params.sa_token_ttl_secs,
+                        "path": "token"
+                    }
+                }],
+                "defaultMode": 256
+            }
+        }));
+    }
     spec.insert("volumes".to_string(), serde_json::Value::Array(volumes));
 
     // Add hostAliases so sandbox pods can reach the Docker host.
@@ -1456,6 +1515,7 @@ fn build_env_list(
     grpc_endpoint: &str,
     ssh_socket_path: &str,
     tls_enabled: bool,
+    spiffe_env: Option<SpiffeEnv>,
 ) -> Vec<serde_json::Value> {
     let mut env = existing_env.cloned().unwrap_or_default();
     apply_env_map(&mut env, template_environment);
@@ -1467,6 +1527,7 @@ fn build_env_list(
         grpc_endpoint,
         ssh_socket_path,
         tls_enabled,
+        spiffe_env,
     );
     env
 }
@@ -1489,6 +1550,7 @@ fn apply_required_env(
     grpc_endpoint: &str,
     ssh_socket_path: &str,
     tls_enabled: bool,
+    spiffe_env: Option<SpiffeEnv>,
 ) {
     upsert_env(env, openshell_core::sandbox_env::SANDBOX_ID, sandbox_id);
     upsert_env(env, openshell_core::sandbox_env::SANDBOX, sandbox_name);
@@ -1524,14 +1586,79 @@ fn apply_required_env(
             "/etc/openshell-tls/client/tls.key",
         );
     }
-    // Projected ServiceAccount token written by kubelet (see the volume
-    // definition in `sandbox_template_to_k8s`). The supervisor reads this
-    // and exchanges it for a gateway-minted JWT via `IssueSandboxToken`.
-    upsert_env(
-        env,
-        openshell_core::sandbox_env::K8S_SA_TOKEN_FILE,
-        "/var/run/secrets/openshell/token",
-    );
+    if let Some(spiffe) = spiffe_env {
+        upsert_env(
+            env,
+            openshell_core::sandbox_env::SPIFFE_WORKLOAD_API_SOCKET,
+            &spiffe.socket_path,
+        );
+        upsert_env(
+            env,
+            openshell_core::sandbox_env::SPIFFE_AUDIENCE,
+            &spiffe.audience,
+        );
+        upsert_env(env, openshell_core::sandbox_env::SPIFFE_ID, &spiffe.id);
+    } else {
+        // Projected ServiceAccount token written by kubelet (see the volume
+        // definition in `sandbox_template_to_k8s`). The supervisor reads this
+        // and exchanges it for a gateway-minted JWT via `IssueSandboxToken`.
+        upsert_env(
+            env,
+            openshell_core::sandbox_env::K8S_SA_TOKEN_FILE,
+            "/var/run/secrets/openshell/token",
+        );
+    }
+}
+
+#[derive(Clone)]
+struct SpiffeEnv {
+    socket_path: String,
+    audience: String,
+    id: String,
+}
+
+fn spiffe_env(params: &SandboxPodParams<'_>) -> Option<SpiffeEnv> {
+    params.spiffe_enabled.then(|| SpiffeEnv {
+        socket_path: params.spiffe_workload_api_socket_path.to_string(),
+        audience: params.spiffe_audience.to_string(),
+        id: sandbox_spiffe_id(params),
+    })
+}
+
+fn sandbox_spiffe_id(params: &SandboxPodParams<'_>) -> String {
+    format!(
+        "spiffe://{}{}{}",
+        params
+            .spiffe_trust_domain
+            .trim()
+            .trim_start_matches("spiffe://")
+            .trim_end_matches('/'),
+        normalize_spiffe_path_prefix(params.spiffe_sandbox_id_prefix),
+        params.sandbox_id,
+    )
+}
+
+fn normalize_spiffe_path_prefix(prefix: &str) -> String {
+    let trimmed = prefix.trim();
+    let with_leading = if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    };
+    if with_leading.ends_with('/') {
+        with_leading
+    } else {
+        format!("{with_leading}/")
+    }
+}
+
+fn spiffe_socket_mount_path(socket_path: &str) -> String {
+    std::path::Path::new(socket_path)
+        .parent()
+        .and_then(std::path::Path::to_str)
+        .filter(|path| !path.is_empty())
+        .unwrap_or("/spiffe-workload-api")
+        .to_string()
 }
 
 fn upsert_env(env: &mut Vec<serde_json::Value>, name: &str, value: &str) {
@@ -1951,6 +2078,7 @@ mod tests {
             "https://endpoint:8080",
             "0.0.0.0:2222",
             true, // tls_enabled
+            None,
         );
 
         // Extract the TLS-related env vars
@@ -2526,6 +2654,65 @@ mod tests {
             pod_template["spec"]["automountServiceAccountToken"],
             serde_json::json!(false),
             "explicit service account selection must not re-enable default token automounting"
+        );
+    }
+
+    #[test]
+    fn spiffe_mode_mounts_csi_socket_and_sets_identity_env() {
+        let params = SandboxPodParams {
+            sandbox_id: "sandbox-123",
+            sandbox_name: "sandbox",
+            spiffe_enabled: true,
+            spiffe_workload_api_socket_path: "/spiffe-workload-api/spire-agent.sock",
+            spiffe_trust_domain: "openshell.local",
+            spiffe_audience: "openshell-gateway",
+            spiffe_sandbox_id_prefix: "/openshell/sandbox/",
+            ..SandboxPodParams::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+
+        let env = pod_template["spec"]["containers"][0]["env"]
+            .as_array()
+            .expect("env");
+        assert!(env.iter().any(|e| {
+            e["name"] == openshell_core::sandbox_env::SPIFFE_WORKLOAD_API_SOCKET
+                && e["value"] == "/spiffe-workload-api/spire-agent.sock"
+        }));
+        assert!(env.iter().any(|e| {
+            e["name"] == openshell_core::sandbox_env::SPIFFE_ID
+                && e["value"] == "spiffe://openshell.local/openshell/sandbox/sandbox-123"
+        }));
+        assert!(
+            !env.iter()
+                .any(|e| e["name"] == openshell_core::sandbox_env::K8S_SA_TOKEN_FILE),
+            "SPIFFE mode must not expose the ServiceAccount bootstrap token"
+        );
+
+        let volumes = pod_template["spec"]["volumes"].as_array().expect("volumes");
+        assert!(volumes.iter().any(|volume| {
+            volume["name"] == SPIFFE_WORKLOAD_API_VOLUME_NAME
+                && volume["csi"]["driver"] == "csi.spiffe.io"
+        }));
+        assert!(
+            !volumes
+                .iter()
+                .any(|volume| volume["name"] == "openshell-sa-token"),
+            "SPIFFE mode must not mount the ServiceAccount token volume"
+        );
+
+        assert_eq!(
+            pod_template["metadata"]["annotations"]["openshell.io/spiffe-id"],
+            serde_json::json!("spiffe://openshell.local/openshell/sandbox/sandbox-123")
+        );
+        assert_eq!(
+            pod_template["metadata"]["labels"][LABEL_MANAGED_BY],
+            serde_json::json!(LABEL_MANAGED_BY_VALUE)
         );
     }
 

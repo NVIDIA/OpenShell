@@ -21,7 +21,7 @@ ratatui = { workspace = true }
 crossterm = { workspace = true }
 terminal-colorsaurus = { workspace = true }
 tokio = { workspace = true }
-tonic = { workspace = true, features = ["tls"] }
+tonic = { workspace = true, features = ["tls-native-roots"] }
 miette = { workspace = true }
 owo-colors = { workspace = true }
 serde = { workspace = true }

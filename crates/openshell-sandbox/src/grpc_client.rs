@@ -4,21 +4,24 @@
 //! gRPC client for fetching sandbox policy, provider environment, and inference
 //! route bundles from `OpenShell` server.
 //!
-//! Every request carries a gateway-minted JWT in the `Authorization` header.
-//! The token is resolved at startup from one of three sources:
+//! Every request carries a sandbox bearer credential in the `Authorization`
+//! header. The token is resolved at startup from one of four sources:
 //!
 //! 1. `OPENSHELL_SANDBOX_TOKEN` — raw JWT in the env (test harness path).
 //! 2. `OPENSHELL_SANDBOX_TOKEN_FILE` — file containing the JWT (Docker /
 //!    Podman / VM drivers write this to a bundle file at sandbox-create
 //!    time).
-//! 3. `OPENSHELL_K8S_SA_TOKEN_FILE` — projected `ServiceAccount` JWT; the
+//! 3. `OPENSHELL_SPIFFE_WORKLOAD_API_SOCKET` — local SPIFFE Workload API
+//!    socket; the supervisor fetches a JWT-SVID and presents it directly.
+//! 4. `OPENSHELL_K8S_SA_TOKEN_FILE` — projected `ServiceAccount` JWT; the
 //!    supervisor exchanges it for a gateway JWT via `IssueSandboxToken`
 //!    once at startup.
 //!
-//! The resolved gateway JWT is held in process memory thereafter and
+//! The resolved bearer credential is held in process memory thereafter and
 //! injected on every outbound call by [`AuthInterceptor`].
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -31,6 +34,7 @@ use openshell_core::proto::{
     UpdateConfigRequest, inference_client::InferenceClient, open_shell_client::OpenShellClient,
 };
 use openshell_core::sandbox_env;
+use spiffe::{SpiffeId, WorkloadApiClient};
 use tonic::Status;
 use tonic::metadata::AsciiMetadataValue;
 use tonic::service::interceptor::InterceptedService;
@@ -53,18 +57,12 @@ enum TokenSource {
     K8sServiceAccount,
 }
 
-#[derive(Debug)]
-struct AcquiredToken {
-    token: String,
-    source: TokenSource,
-}
-
 /// Process-wide token slot. Initialized by the first [`connect_channel`]
 /// call and shared with every subsequent client and the renewal loop.
 static TOKEN_SLOT: OnceLock<TokenSlot> = OnceLock::new();
 
-/// Source used to acquire the process-wide token slot.
-static TOKEN_SOURCE: OnceLock<TokenSource> = OnceLock::new();
+/// Refresh strategy used by the process-wide token slot.
+static TOKEN_REFRESH_MODE: OnceLock<RefreshMode> = OnceLock::new();
 
 /// Serializes the first token acquisition. Several supervisor subsystems
 /// connect during startup; without this guard they can all observe an empty
@@ -73,6 +71,25 @@ static TOKEN_INIT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new((
 
 /// One-shot guard so the renewal loop spawns at most once per process.
 static REFRESH_SPAWNED: OnceLock<()> = OnceLock::new();
+
+#[derive(Clone, Debug)]
+enum RefreshMode {
+    GatewayJwt(TokenSource),
+    Spiffe(SpiffeTokenSource),
+}
+
+#[derive(Clone, Debug)]
+struct SpiffeTokenSource {
+    socket_path: PathBuf,
+    audience: String,
+    spiffe_id: Option<String>,
+}
+
+#[derive(Debug)]
+struct AcquiredToken {
+    token: String,
+    refresh_mode: RefreshMode,
+}
 
 fn install_token_slot(token: &str) -> Result<TokenSlot> {
     let bearer = AsciiMetadataValue::try_from(format!("Bearer {token}"))
@@ -188,36 +205,52 @@ async fn build_plain_channel(endpoint: &str) -> Result<Channel> {
 /// spawned once per process via [`REFRESH_SPAWNED`].
 async fn connect_channel(endpoint: &str) -> Result<AuthedChannel> {
     let channel = build_plain_channel(endpoint).await?;
-    let (slot, source) = token_slot(endpoint, &channel).await?;
+    let (slot, refresh_mode) = token_slot(endpoint, &channel).await?;
     let plain_channel = channel.clone();
     let intercepted = InterceptedService::new(channel, AuthInterceptor::new(slot.clone()));
     if REFRESH_SPAWNED.set(()).is_ok() {
-        let refresh_channel = intercepted.clone();
-        let endpoint = endpoint.to_string();
-        tokio::spawn(async move {
-            refresh_token_loop(refresh_channel, slot, source, endpoint, plain_channel).await;
-        });
+        match refresh_mode {
+            RefreshMode::GatewayJwt(source) => {
+                let refresh_channel = intercepted.clone();
+                let endpoint = endpoint.to_string();
+                tokio::spawn(async move {
+                    refresh_token_loop(refresh_channel, slot, source, endpoint, plain_channel)
+                        .await;
+                });
+            }
+            RefreshMode::Spiffe(source) => {
+                tokio::spawn(async move {
+                    refresh_spiffe_token_loop(source, slot).await;
+                });
+            }
+        }
     }
     Ok(intercepted)
 }
 
-async fn token_slot(endpoint: &str, plain_channel: &Channel) -> Result<(TokenSlot, TokenSource)> {
+async fn token_slot(endpoint: &str, plain_channel: &Channel) -> Result<(TokenSlot, RefreshMode)> {
     if let Some(existing) = TOKEN_SLOT.get() {
-        let source = TOKEN_SOURCE.get().copied().unwrap_or(TokenSource::Env);
-        return Ok((existing.clone(), source));
+        let refresh_mode = TOKEN_REFRESH_MODE
+            .get()
+            .cloned()
+            .unwrap_or(RefreshMode::GatewayJwt(TokenSource::Env));
+        return Ok((existing.clone(), refresh_mode));
     }
 
     let _guard = TOKEN_INIT_LOCK.lock().await;
 
     if let Some(existing) = TOKEN_SLOT.get() {
-        let source = TOKEN_SOURCE.get().copied().unwrap_or(TokenSource::Env);
-        return Ok((existing.clone(), source));
+        let refresh_mode = TOKEN_REFRESH_MODE
+            .get()
+            .cloned()
+            .unwrap_or(RefreshMode::GatewayJwt(TokenSource::Env));
+        return Ok((existing.clone(), refresh_mode));
     }
 
     let acquired = acquire_sandbox_token(endpoint, plain_channel).await?;
     let slot = install_token_slot(&acquired.token)?;
-    let _ = TOKEN_SOURCE.set(acquired.source);
-    Ok((slot, acquired.source))
+    let _ = TOKEN_REFRESH_MODE.set(acquired.refresh_mode.clone());
+    Ok((slot, acquired.refresh_mode))
 }
 
 /// Resolve the sandbox JWT used to authenticate every outbound RPC.
@@ -233,7 +266,7 @@ async fn acquire_sandbox_token(endpoint: &str, plain_channel: &Channel) -> Resul
         debug!(source = "env", "loaded sandbox token");
         return Ok(AcquiredToken {
             token: t,
-            source: TokenSource::Env,
+            refresh_mode: RefreshMode::GatewayJwt(TokenSource::Env),
         });
     }
 
@@ -246,7 +279,21 @@ async fn acquire_sandbox_token(endpoint: &str, plain_channel: &Channel) -> Resul
         debug!(source = "file", path = %path, "loaded sandbox token");
         return Ok(AcquiredToken {
             token: contents.trim().to_string(),
-            source: TokenSource::File,
+            refresh_mode: RefreshMode::GatewayJwt(TokenSource::File),
+        });
+    }
+
+    if let Some(source) = spiffe_token_source_from_env()? {
+        info!(
+            socket = %source.socket_path.display(),
+            audience = %source.audience,
+            spiffe_id = source.spiffe_id.as_deref().unwrap_or(""),
+            "fetching SPIFFE JWT-SVID for sandbox gateway authentication"
+        );
+        let token = fetch_spiffe_jwt_svid(&source).await?;
+        return Ok(AcquiredToken {
+            token,
+            refresh_mode: RefreshMode::Spiffe(source),
         });
     }
 
@@ -255,14 +302,15 @@ async fn acquire_sandbox_token(endpoint: &str, plain_channel: &Channel) -> Resul
     {
         return Ok(AcquiredToken {
             token: acquire_k8s_sandbox_token(endpoint, plain_channel, &sa_path).await?,
-            source: TokenSource::K8sServiceAccount,
+            refresh_mode: RefreshMode::GatewayJwt(TokenSource::K8sServiceAccount),
         });
     }
 
     Err(miette::miette!(
-        "no sandbox token source available — set one of {}, {}, or {}",
+        "no sandbox token source available — set one of {}, {}, {}, or {}",
         sandbox_env::SANDBOX_TOKEN,
         sandbox_env::SANDBOX_TOKEN_FILE,
+        sandbox_env::SPIFFE_WORKLOAD_API_SOCKET,
         sandbox_env::K8S_SA_TOKEN_FILE,
     ))
 }
@@ -295,6 +343,64 @@ async fn acquire_k8s_sandbox_token(
         .into_diagnostic()
         .wrap_err("IssueSandboxToken bootstrap exchange failed")?;
     Ok(resp.into_inner().token)
+}
+
+fn spiffe_token_source_from_env() -> Result<Option<SpiffeTokenSource>> {
+    let Ok(socket_path) = std::env::var(sandbox_env::SPIFFE_WORKLOAD_API_SOCKET) else {
+        return Ok(None);
+    };
+    if socket_path.trim().is_empty() {
+        return Ok(None);
+    }
+    let audience = std::env::var(sandbox_env::SPIFFE_AUDIENCE)
+        .unwrap_or_else(|_| "openshell-gateway".to_string());
+    if audience.trim().is_empty() {
+        return Err(miette::miette!(
+            "{} must not be empty when {} is set",
+            sandbox_env::SPIFFE_AUDIENCE,
+            sandbox_env::SPIFFE_WORKLOAD_API_SOCKET,
+        ));
+    }
+    let spiffe_id = std::env::var(sandbox_env::SPIFFE_ID)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    Ok(Some(SpiffeTokenSource {
+        socket_path: PathBuf::from(socket_path),
+        audience,
+        spiffe_id,
+    }))
+}
+
+async fn fetch_spiffe_jwt_svid(source: &SpiffeTokenSource) -> Result<String> {
+    let endpoint = spiffe_workload_api_endpoint(&source.socket_path);
+    let client = WorkloadApiClient::connect_to(&endpoint)
+        .await
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!("failed to connect to SPIFFE Workload API endpoint {endpoint}")
+        })?;
+    let requested_spiffe_id = source
+        .spiffe_id
+        .as_deref()
+        .map(SpiffeId::try_from)
+        .transpose()
+        .into_diagnostic()
+        .wrap_err("invalid SPIFFE ID requested for JWT-SVID")?;
+    client
+        .fetch_jwt_token([source.audience.as_str()], requested_spiffe_id.as_ref())
+        .await
+        .into_diagnostic()
+        .wrap_err("SPIFFE FetchJWTSVID failed")
+}
+
+fn spiffe_workload_api_endpoint(path: &std::path::Path) -> String {
+    let path = path.to_string_lossy();
+    if path.starts_with("unix:") || path.starts_with("tcp:") {
+        path.into_owned()
+    } else {
+        format!("unix:{path}")
+    }
 }
 
 /// Build an authenticated channel for direct external use (e.g. the
@@ -380,6 +486,30 @@ async fn refresh_token_loop(
                 warn!(error = %status, "RefreshSandboxToken failed; will retry");
                 // Backoff so we don't spin against a sustained failure.
                 tokio::time::sleep(Duration::from_secs(10)).await;
+            }
+        }
+    }
+}
+
+async fn refresh_spiffe_token_loop(source: SpiffeTokenSource, slot: TokenSlot) {
+    loop {
+        let sleep = compute_refresh_delay(&slot);
+        tokio::time::sleep(sleep).await;
+        match fetch_spiffe_jwt_svid(&source).await {
+            Ok(new_token) => match AsciiMetadataValue::try_from(format!("Bearer {new_token}")) {
+                Ok(value) => {
+                    if let Ok(mut guard) = slot.write() {
+                        *guard = value;
+                        info!("rotated SPIFFE JWT-SVID in-place");
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "refreshed SPIFFE JWT-SVID contained invalid header bytes");
+                }
+            },
+            Err(err) => {
+                warn!(error = %err, "SPIFFE FetchJWTSVID failed; will retry");
+                tokio::time::sleep(Duration::from_secs(60)).await;
             }
         }
     }

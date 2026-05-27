@@ -125,3 +125,30 @@ tests:
       - matchRegex:
           path: data["gateway.toml"]
           pattern: 'server_sans\s*=\s*\["openshell", "\*\.dev\.openshell\.localhost"\]'
+
+  - it: renders SPIFFE sandbox auth instead of gateway JWT when enabled
+    set:
+      server.spiffe.enabled: true
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.gateway\.spiffe\]'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'spiffe_workload_api_socket_path\s*=\s*"/spiffe-workload-api/spire-agent\.sock"'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.gateway\.gateway_jwt\]'
+
+  - it: mounts the SPIFFE Workload API socket when SPIFFE is enabled
+    set:
+      server.spiffe.enabled: true
+    template: templates/statefulset.yaml
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.volumes[1].name
+          pattern: '^spiffe-workload-api$'
+      - matchRegex:
+          path: spec.template.spec.volumes[1].csi.driver
+          pattern: '^csi\.spiffe\.io$'

@@ -83,6 +83,16 @@ pub struct KubernetesComputeConfig {
     /// this token within a few seconds of pod start, so any value at
     /// the floor is sufficient. Default 3600.
     pub sa_token_ttl_secs: i64,
+    /// SPIFFE Workload API socket path mounted into sandbox pods. Empty
+    /// disables SPIFFE identity material and keeps the `ServiceAccount`
+    /// bootstrap path active.
+    pub spiffe_workload_api_socket_path: String,
+    /// SPIFFE trust domain used for sandbox identities.
+    pub spiffe_trust_domain: String,
+    /// Audience requested by sandbox supervisors for JWT-SVIDs.
+    pub spiffe_audience: String,
+    /// Path prefix under the trust domain before the sandbox UUID.
+    pub spiffe_sandbox_id_prefix: String,
 }
 
 /// Lower bound enforced by kubelet for projected SA tokens.
@@ -114,6 +124,10 @@ impl Default for KubernetesComputeConfig {
             enable_user_namespaces: false,
             workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE.to_string(),
             sa_token_ttl_secs: 3600,
+            spiffe_workload_api_socket_path: String::new(),
+            spiffe_trust_domain: String::new(),
+            spiffe_audience: "openshell-gateway".to_string(),
+            spiffe_sandbox_id_prefix: "/openshell/sandbox/".to_string(),
         }
     }
 }
@@ -130,6 +144,13 @@ impl KubernetesComputeConfig {
             self.sa_token_ttl_secs
                 .clamp(MIN_SA_TOKEN_TTL_SECS, MAX_SA_TOKEN_TTL_SECS)
         }
+    }
+
+    #[must_use]
+    pub fn spiffe_enabled(&self) -> bool {
+        !self.spiffe_workload_api_socket_path.trim().is_empty()
+            && !self.spiffe_trust_domain.trim().is_empty()
+            && !self.spiffe_audience.trim().is_empty()
     }
 }
 

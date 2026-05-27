@@ -19,6 +19,14 @@ The Helm chart always generates mTLS certificates at install time. The gateway u
 
 For how the CLI resolves gateways and stores credentials, refer to [Gateway Authentication](/reference/gateway-auth).
 
+## Sandbox Supervisor Identity
+
+Kubernetes sandbox supervisors authenticate back to the gateway as sandbox workloads. By default, the gateway mints its own sandbox JWTs and Kubernetes sandboxes bootstrap them with a projected ServiceAccount token.
+
+Set `server.spiffe.enabled=true` to use SPIFFE JWT-SVIDs instead. In this mode, sandbox pods mount the SPIFFE CSI Workload API socket, request a JWT-SVID for `server.spiffe.audience`, and present that token directly to the gateway. The gateway validates the token through its local SPIFFE Workload API socket and accepts SPIFFE IDs under `spiffe://<trust-domain>/openshell/sandbox/`.
+
+SPIFFE mode requires a SPIFFE implementation such as SPIRE and a `ClusterSPIFFEID` that assigns per-sandbox IDs from the pod's `openshell.io/sandbox-id` annotation.
+
 ## OIDC User Authentication
 
 Set `server.oidc.issuer` to enable OIDC. The gateway validates the `Authorization: Bearer <token>` header on every request against the issuer's JWKS endpoint.

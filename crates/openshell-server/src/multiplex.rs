@@ -273,7 +273,10 @@ where
 ///    other path; only present when the gateway runs in-cluster.
 /// 2. `SandboxJwtAuthenticator` — validates gateway-minted JWTs. Recognized
 ///    via a distinctive `kid` so non-matching Bearer tokens fall through.
-/// 3. `OidcAuthenticator` — validates user Bearer tokens against the
+/// 3. `SpiffeAuthenticator` — validates SPIFFE JWT-SVIDs through the
+///    local SPIFFE Workload API and maps sandbox SPIFFE IDs to
+///    `Principal::Sandbox`.
+/// 4. `OidcAuthenticator` — validates user Bearer tokens against the
 ///    configured OIDC issuer. Returns `Unauthenticated` for missing
 ///    Bearer headers so non-OIDC clients can't sneak through.
 ///
@@ -283,9 +286,9 @@ where
 /// for local single-user gateways, or to an unsafe local developer user when
 /// `auth.allow_unauthenticated_users` is explicitly enabled.
 ///
-/// When neither OIDC nor gateway-minted JWTs are configured (a barebones
+/// When neither OIDC nor sandbox credentials are configured (a barebones
 /// dev gateway), the chain is left as `None` so the router short-circuits
-/// to pass-through.
+/// to pass-through unless mTLS or local unauthenticated users are enabled.
 fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> {
     let mut authenticators: Vec<Arc<dyn crate::auth::authenticator::Authenticator>> = Vec::new();
     if let Some(k8s) = state.k8s_sa_authenticator.clone() {
@@ -293,6 +296,9 @@ fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> 
     }
     if let Some(jwt) = state.sandbox_jwt_authenticator.clone() {
         authenticators.push(jwt);
+    }
+    if let Some(spiffe) = state.spiffe_authenticator.clone() {
+        authenticators.push(spiffe);
     }
     if let Some(cache) = state.oidc_cache.clone() {
         authenticators.push(Arc::new(OidcAuthenticator::new(cache)));
@@ -368,19 +374,13 @@ fn unauthenticated_dev_user_principal() -> Principal {
     })
 }
 
-fn status_response(status: tonic::Status) -> Response<tonic::body::BoxBody> {
-    let response = status.into_http();
-    let (parts, body) = response.into_parts();
-    let body = tonic::body::BoxBody::new(body);
-    Response::from_parts(parts, body)
+fn status_response(status: tonic::Status) -> Response<tonic::body::Body> {
+    status.into_http()
 }
 
 impl<S, B> tower::Service<Request<B>> for AuthGrpcRouter<S>
 where
-    S: tower::Service<Request<B>, Response = Response<tonic::body::BoxBody>>
-        + Clone
-        + Send
-        + 'static,
+    S: tower::Service<Request<B>, Response = Response<tonic::body::Body>> + Clone + Send + 'static,
     S::Future: Send,
     S::Error: Send + Into<Box<dyn std::error::Error + Send + Sync>>,
     B: Send + 'static,
@@ -938,7 +938,7 @@ mod tests {
         }
 
         impl<B: Send + 'static> Service<Request<B>> for PrincipalRecorder {
-            type Response = Response<tonic::body::BoxBody>;
+            type Response = Response<tonic::body::Body>;
             type Error = std::convert::Infallible;
             type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
@@ -949,14 +949,7 @@ mod tests {
             fn call(&mut self, req: Request<B>) -> Self::Future {
                 let principal = req.extensions().get::<Principal>().cloned();
                 *self.recorded.lock().unwrap() = principal;
-                Box::pin(async move {
-                    let body = tonic::body::BoxBody::new(
-                        Full::new(Bytes::new())
-                            .map_err(|never| match never {})
-                            .boxed_unsync(),
-                    );
-                    Ok(Response::new(body))
-                })
+                Box::pin(async move { Ok(Response::new(tonic::body::Body::empty())) })
             }
         }
 

@@ -30,7 +30,7 @@ prost-types = { workspace = true }
 tokio = { workspace = true }
 
 # gRPC client
-tonic = { workspace = true, features = ["tls", "tls-native-roots"] }
+tonic = { workspace = true, features = ["tls-native-roots"] }
 
 # CLI
 chrono = "0.4"

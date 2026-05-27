@@ -53,3 +53,15 @@ pub const SANDBOX_TOKEN_FILE: &str = "OPENSHELL_SANDBOX_TOKEN_FILE";
 /// writes and rotates this file; the supervisor exchanges its contents
 /// for a gateway JWT at startup and on refresh.
 pub const K8S_SA_TOKEN_FILE: &str = "OPENSHELL_K8S_SA_TOKEN_FILE";
+
+/// Filesystem path to the SPIFFE Workload API UNIX socket.
+///
+/// When set, the supervisor fetches a JWT-SVID from the local Workload API
+/// and presents that token directly to the gateway.
+pub const SPIFFE_WORKLOAD_API_SOCKET: &str = "OPENSHELL_SPIFFE_WORKLOAD_API_SOCKET";
+
+/// Audience requested when fetching a SPIFFE JWT-SVID.
+pub const SPIFFE_AUDIENCE: &str = "OPENSHELL_SPIFFE_AUDIENCE";
+
+/// Optional exact SPIFFE ID requested from the Workload API.
+pub const SPIFFE_ID: &str = "OPENSHELL_SPIFFE_ID";

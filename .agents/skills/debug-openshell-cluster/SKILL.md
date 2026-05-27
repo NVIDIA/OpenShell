@@ -154,6 +154,22 @@ If the gateway exits with `failed to read sandbox JWT signing key from
 `sandbox-jwt` secret at `/etc/openshell-jwt`. The sandbox JWT mount is required
 even when local Helm values disable TLS.
 
+If `server.spiffe.enabled=true`, the sandbox JWT ConfigMap block and
+`sandbox-jwt` StatefulSet mount are intentionally omitted. Instead verify that
+SPIRE is installed, the CSI driver is available, and the gateway pod mounts the
+SPIFFE Workload API socket:
+
+```bash
+helm -n openshell get values openshell | grep -E 'spiffe|trustDomain|workloadApiSocketPath'
+kubectl get pods -A | grep -E 'spire|spiffe'
+kubectl -n openshell get statefulset openshell -o yaml | grep -E 'spiffe-workload-api|csi.spiffe.io'
+```
+
+Sandbox pods in SPIFFE mode should have `openshell.io/sandbox-id` and
+`openshell.io/spiffe-id` annotations, an `openshell.ai/managed-by=openshell`
+label, and supervisor env vars `OPENSHELL_SPIFFE_WORKLOAD_API_SOCKET`,
+`OPENSHELL_SPIFFE_AUDIENCE`, and `OPENSHELL_SPIFFE_ID`.
+
 Check the image references currently used by the gateway deployment:
 
 ```bash

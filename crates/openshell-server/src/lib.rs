@@ -123,6 +123,10 @@ pub struct ServerState {
     /// presenting a freshly minted token are recognized.
     pub sandbox_jwt_authenticator: Option<Arc<auth::sandbox_jwt::SandboxJwtAuthenticator>>,
 
+    /// Authenticator that validates SPIFFE JWT-SVIDs through the local SPIFFE
+    /// Workload API and maps authorized SPIFFE IDs to sandbox principals.
+    pub spiffe_authenticator: Option<Arc<auth::spiffe::SpiffeAuthenticator>>,
+
     /// Optional K8s `ServiceAccount` authenticator that backs the
     /// `IssueSandboxToken` bootstrap path. Only present when the gateway
     /// runs in-cluster.
@@ -173,6 +177,7 @@ impl ServerState {
             oidc_cache,
             sandbox_jwt_issuer: None,
             sandbox_jwt_authenticator: None,
+            spiffe_authenticator: None,
             k8s_sa_authenticator: None,
         }
     }
@@ -291,6 +296,13 @@ pub async fn run_server(
         );
         state.sandbox_jwt_issuer = Some(Arc::new(issuer));
         state.sandbox_jwt_authenticator = Some(Arc::new(authenticator));
+    }
+
+    if let Some(ref spiffe) = config.spiffe {
+        let authenticator = auth::spiffe::SpiffeAuthenticator::new(spiffe.clone())
+            .await
+            .map_err(|e| Error::config(format!("SPIFFE initialization failed: {e}")))?;
+        state.spiffe_authenticator = Some(Arc::new(authenticator));
     }
 
     // K8s ServiceAccount bootstrap authenticator. Only constructed when

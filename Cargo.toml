@@ -17,10 +17,11 @@ repository = "https://github.com/NVIDIA/OpenShell"
 tokio = { version = "1.43", features = ["full"] }
 
 # gRPC/Protobuf
-tonic = "0.12"
-tonic-build = "0.12"
-prost = "0.13"
-prost-types = "0.13"
+tonic = "0.14"
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+prost = "0.14"
+prost-types = "0.14"
 
 # HTTP server
 axum = { version = "0.8", features = ["ws"] }
@@ -87,6 +88,7 @@ sha2 = "0.10"
 rand = "0.9"
 jsonwebtoken = "9"
 getrandom = "0.3"
+spiffe = { version = "0.15", default-features = false, features = ["workload-api-jwt", "tracing"] }
 
 # Filesystem embedding
 include_dir = "0.7"
