@@ -708,10 +708,7 @@ async fn build_compute_runtime(
 
     match driver {
         ComputeDriverKind::Kubernetes => {
-            let mut k8s = kubernetes_config_from_file(file)?;
-            if let Ok(size) = std::env::var("OPENSHELL_K8S_WORKSPACE_DEFAULT_STORAGE_SIZE") {
-                k8s.workspace_default_storage_size = size;
-            }
+            let k8s = kubernetes_config_from_file(file)?;
             ComputeRuntime::new_kubernetes(
                 k8s,
                 store,
@@ -770,6 +767,77 @@ async fn build_compute_runtime(
     }
 }
 
+fn apply_kubernetes_env_overrides(config: &mut KubernetesComputeConfig) {
+    if let Ok(namespace) = std::env::var("OPENSHELL_SANDBOX_NAMESPACE")
+        && !namespace.is_empty()
+    {
+        config.namespace = namespace;
+    }
+    if let Ok(service_account) = std::env::var("OPENSHELL_K8S_SANDBOX_SERVICE_ACCOUNT")
+        && !service_account.is_empty()
+    {
+        config.service_account_name = service_account;
+    }
+    if let Ok(image) = std::env::var("OPENSHELL_SANDBOX_IMAGE")
+        && !image.is_empty()
+    {
+        config.default_image = image;
+    }
+    if let Ok(pull_policy) = std::env::var("OPENSHELL_SANDBOX_IMAGE_PULL_POLICY") {
+        config.image_pull_policy = pull_policy;
+    }
+    if let Ok(image) = std::env::var("OPENSHELL_SUPERVISOR_IMAGE")
+        && !image.is_empty()
+    {
+        config.supervisor_image = image;
+    }
+    if let Ok(pull_policy) = std::env::var("OPENSHELL_SUPERVISOR_IMAGE_PULL_POLICY") {
+        config.supervisor_image_pull_policy = pull_policy;
+    }
+    if let Ok(method) = std::env::var("OPENSHELL_SUPERVISOR_SIDELOAD_METHOD")
+        && !method.is_empty()
+        && let Ok(parsed) = method.parse()
+    {
+        config.supervisor_sideload_method = parsed;
+    }
+    if let Ok(endpoint) = std::env::var("OPENSHELL_GRPC_ENDPOINT")
+        && !endpoint.is_empty()
+    {
+        config.grpc_endpoint = endpoint;
+    }
+    if let Ok(path) = std::env::var("OPENSHELL_SANDBOX_SSH_SOCKET_PATH")
+        && !path.is_empty()
+    {
+        config.ssh_socket_path = path;
+    }
+    if let Ok(secret_name) = std::env::var("OPENSHELL_CLIENT_TLS_SECRET_NAME")
+        && !secret_name.is_empty()
+    {
+        config.client_tls_secret_name = secret_name;
+    }
+    if let Ok(host_gateway_ip) = std::env::var("OPENSHELL_HOST_GATEWAY_IP")
+        && !host_gateway_ip.is_empty()
+    {
+        config.host_gateway_ip = host_gateway_ip;
+    }
+    if let Ok(enable_user_namespaces) = std::env::var("OPENSHELL_ENABLE_USER_NAMESPACES") {
+        config.enable_user_namespaces = matches!(
+            enable_user_namespaces.as_str(),
+            "1" | "true" | "TRUE" | "True"
+        );
+    }
+    if let Ok(ttl) = std::env::var("OPENSHELL_K8S_SA_TOKEN_TTL_SECS")
+        && let Ok(ttl) = ttl.parse()
+    {
+        config.sa_token_ttl_secs = ttl;
+    }
+    if let Ok(size) = std::env::var("OPENSHELL_K8S_WORKSPACE_DEFAULT_STORAGE_SIZE")
+        && !size.is_empty()
+    {
+        config.workspace_default_storage_size = size;
+    }
+}
+
 /// Build a [`KubernetesComputeConfig`] from the file's
 /// `[openshell.drivers.kubernetes]` table merged with inheritable
 /// `[openshell.gateway]` defaults. Falls back to the driver's `Default`
@@ -777,33 +845,26 @@ async fn build_compute_runtime(
 fn kubernetes_config_from_file(
     file: Option<&config_file::ConfigFile>,
 ) -> Result<KubernetesComputeConfig> {
-    let Some(file) = file else {
-        return Ok(KubernetesComputeConfig::default());
+    let mut config = if let Some(file) = file {
+        let merged = config_file::driver_table(
+            ComputeDriverKind::Kubernetes,
+            &file.openshell.gateway,
+            file.openshell.drivers.get("kubernetes"),
+        );
+        merged.try_into().map_err(|e| {
+            Error::config(format!("invalid [openshell.drivers.kubernetes] table: {e}"))
+        })?
+    } else {
+        KubernetesComputeConfig::default()
     };
-    let merged = config_file::driver_table(
-        ComputeDriverKind::Kubernetes,
-        &file.openshell.gateway,
-        file.openshell.drivers.get("kubernetes"),
-    );
-    merged
-        .try_into()
-        .map_err(|e| Error::config(format!("invalid [openshell.drivers.kubernetes] table: {e}")))
+    apply_kubernetes_env_overrides(&mut config);
+    Ok(config)
 }
 
 fn kubernetes_config_for_k8s_sa_bootstrap(
     file: Option<&config_file::ConfigFile>,
 ) -> Result<KubernetesComputeConfig> {
-    let Some(file) = file else {
-        return Err(Error::config(
-            "K8s ServiceAccount bootstrap requires [openshell.drivers.kubernetes] when sandbox JWT issuing is enabled in-cluster",
-        ));
-    };
-    if !file.openshell.drivers.contains_key("kubernetes") {
-        return Err(Error::config(
-            "K8s ServiceAccount bootstrap requires [openshell.drivers.kubernetes] when sandbox JWT issuing is enabled in-cluster",
-        ));
-    }
-    kubernetes_config_from_file(Some(file))
+    kubernetes_config_from_file(file)
 }
 
 /// Same pattern as [`kubernetes_config_from_file`] but for Podman.
@@ -883,6 +944,7 @@ mod tests {
         gateway_listener_addresses, is_benign_tls_handshake_failure,
         kubernetes_config_for_k8s_sa_bootstrap, serve_gateway_listener,
     };
+    use crate::TEST_ENV_LOCK as ENV_LOCK;
     use openshell_core::{
         ComputeDriverKind, Config,
         proto::{HealthRequest, open_shell_client::OpenShellClient},
@@ -896,6 +958,41 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::watch;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        #[allow(unsafe_code)]
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var(key).ok();
+            // SAFETY: tests serialize environment mutation with ENV_LOCK.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, original }
+        }
+
+        #[allow(unsafe_code)]
+        fn remove(key: &'static str) -> Self {
+            let original = std::env::var(key).ok();
+            // SAFETY: tests serialize environment mutation with ENV_LOCK.
+            unsafe { std::env::remove_var(key) };
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        #[allow(unsafe_code)]
+        fn drop(&mut self) {
+            match self.original.as_deref() {
+                // SAFETY: tests serialize environment mutation with ENV_LOCK.
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                // SAFETY: tests serialize environment mutation with ENV_LOCK.
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
 
     fn install_rustls_provider() {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -1286,18 +1383,34 @@ mod tests {
     }
 
     #[test]
-    fn k8s_sa_bootstrap_rejects_missing_kubernetes_driver_config() {
-        let err = kubernetes_config_for_k8s_sa_bootstrap(None).unwrap_err();
-        assert!(err.to_string().contains("[openshell.drivers.kubernetes]"));
+    fn k8s_sa_bootstrap_falls_back_to_defaults_without_driver_config() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _namespace = EnvVarGuard::remove("OPENSHELL_SANDBOX_NAMESPACE");
+        let _service_account = EnvVarGuard::remove("OPENSHELL_K8S_SANDBOX_SERVICE_ACCOUNT");
+        let _supervisor = EnvVarGuard::remove("OPENSHELL_SUPERVISOR_IMAGE");
+
+        let cfg = kubernetes_config_for_k8s_sa_bootstrap(None).unwrap();
+        assert!(!cfg.namespace.is_empty());
+        assert!(!cfg.service_account_name.is_empty());
 
         let file: crate::config_file::ConfigFile =
             toml::from_str("[openshell.gateway]\n").expect("valid config");
-        let err = kubernetes_config_for_k8s_sa_bootstrap(Some(&file)).unwrap_err();
-        assert!(err.to_string().contains("[openshell.drivers.kubernetes]"));
+        let cfg = kubernetes_config_for_k8s_sa_bootstrap(Some(&file)).unwrap();
+        assert!(!cfg.namespace.is_empty());
+        assert!(!cfg.service_account_name.is_empty());
     }
 
     #[test]
     fn k8s_sa_bootstrap_uses_configured_namespace_and_service_account() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _namespace = EnvVarGuard::remove("OPENSHELL_SANDBOX_NAMESPACE");
+        let _service_account = EnvVarGuard::remove("OPENSHELL_K8S_SANDBOX_SERVICE_ACCOUNT");
+        let _supervisor = EnvVarGuard::remove("OPENSHELL_SUPERVISOR_IMAGE");
+
         let file: crate::config_file::ConfigFile = toml::from_str(
             r#"
 [openshell.gateway]
@@ -1312,6 +1425,28 @@ service_account_name = "sandbox-sa"
         let cfg = kubernetes_config_for_k8s_sa_bootstrap(Some(&file)).unwrap();
         assert_eq!(cfg.namespace, "sandboxes");
         assert_eq!(cfg.service_account_name, "sandbox-sa");
+    }
+
+    #[test]
+    fn k8s_sa_bootstrap_accepts_env_only_kubernetes_config() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _namespace = EnvVarGuard::set("OPENSHELL_SANDBOX_NAMESPACE", "sandboxes");
+        let _service_account =
+            EnvVarGuard::set("OPENSHELL_K8S_SANDBOX_SERVICE_ACCOUNT", "sandbox-sa");
+        let _supervisor = EnvVarGuard::set(
+            "OPENSHELL_SUPERVISOR_IMAGE",
+            "example.com/openshell/supervisor:test",
+        );
+
+        let cfg = kubernetes_config_for_k8s_sa_bootstrap(None).unwrap();
+        assert_eq!(cfg.namespace, "sandboxes");
+        assert_eq!(cfg.service_account_name, "sandbox-sa");
+        assert_eq!(
+            cfg.supervisor_image,
+            "example.com/openshell/supervisor:test"
+        );
     }
 
     #[test]
