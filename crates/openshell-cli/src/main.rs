@@ -1621,14 +1621,14 @@ enum PolicyCommands {
         timeout: u64,
     },
 
-    /// Show current active policy for a sandbox or the global policy.
+    /// Show current effective policy for a sandbox or a stored global policy.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Get {
         /// Sandbox name (defaults to last-used sandbox). Ignored with --global.
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
 
-        /// Show a specific policy revision (default: latest).
+        /// Show a specific stored policy revision. Default shows the current effective policy.
         #[arg(long = "rev", default_value_t = 0)]
         rev: u32,
 

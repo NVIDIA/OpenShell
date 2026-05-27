@@ -74,9 +74,12 @@ protocols remain raw passthrough.
 
 ## Live Updates
 
-The gateway stores policy revisions and exposes effective sandbox configuration.
-The supervisor polls for config revisions and attempts to load new dynamic
-policy into the in-process OPA engine.
+The gateway stores sandbox-authored policy revisions separately from derived
+effective sandbox configuration. Effective configuration can include
+gateway-global policy overrides and provider-profile policy layers. The
+supervisor polls for config revisions and attempts to load new dynamic policy
+into the in-process OPA engine; CLI reads of the latest sandbox policy use the
+same effective configuration path.
 
 If a new policy fails validation or loading, the supervisor reports the failure
 and keeps the last-known-good policy. Static controls, such as filesystem

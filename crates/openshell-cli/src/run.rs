@@ -6599,6 +6599,11 @@ where
     W: Write + Send,
     E: Write + Send,
 {
+    if version == 0 {
+        return sandbox_policy_get_effective_to_writer(server, name, full, output, tls, writers)
+            .await;
+    }
+
     let (stdout, stderr) = writers;
     let mut client = grpc_client(server, tls).await?;
 
@@ -6663,6 +6668,118 @@ where
         }
     } else {
         writeln!(stderr, "No policy history found for sandbox '{name}'").into_diagnostic()?;
+    }
+
+    Ok(())
+}
+
+async fn sandbox_policy_get_effective_to_writer<W, E>(
+    server: &str,
+    name: &str,
+    full: bool,
+    output: &str,
+    tls: &TlsOptions,
+    writers: (&mut W, &mut E),
+) -> Result<()>
+where
+    W: Write + Send,
+    E: Write + Send,
+{
+    let (stdout, _stderr) = writers;
+    let mut client = grpc_client(server, tls).await?;
+
+    let sandbox = client
+        .get_sandbox(GetSandboxRequest {
+            name: name.to_string(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner()
+        .sandbox
+        .ok_or_else(|| miette!("sandbox missing from response"))?;
+    let sandbox_id = sandbox.object_id();
+    if sandbox_id.is_empty() {
+        return Err(miette!("sandbox missing metadata"));
+    }
+
+    let config = client
+        .get_sandbox_config(GetSandboxConfigRequest {
+            sandbox_id: sandbox_id.to_string(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner();
+    let policy = config
+        .policy
+        .as_ref()
+        .ok_or_else(|| miette!("no active policy configured for sandbox '{name}'"))?;
+    let policy_source =
+        PolicySource::try_from(config.policy_source).unwrap_or(PolicySource::Sandbox);
+    let policy_source_label = match policy_source {
+        PolicySource::Global => "global",
+        PolicySource::Sandbox => "sandbox",
+        PolicySource::Unspecified => "unspecified",
+    };
+    let version = if policy_source == PolicySource::Global && config.global_policy_version > 0 {
+        config.global_policy_version
+    } else {
+        config.version
+    };
+
+    match output {
+        "json" => {
+            let mut obj = serde_json::Map::new();
+            obj.insert("scope".to_string(), serde_json::json!("sandbox"));
+            obj.insert("sandbox".to_string(), serde_json::json!(name));
+            obj.insert("version".to_string(), serde_json::json!(version));
+            obj.insert("active_version".to_string(), serde_json::json!(version));
+            obj.insert("hash".to_string(), serde_json::json!(config.policy_hash));
+            obj.insert("status".to_string(), serde_json::json!("effective"));
+            obj.insert(
+                "config_revision".to_string(),
+                serde_json::json!(config.config_revision),
+            );
+            obj.insert(
+                "policy_source".to_string(),
+                serde_json::json!(policy_source_label),
+            );
+            if config.global_policy_version > 0 {
+                obj.insert(
+                    "global_policy_version".to_string(),
+                    serde_json::json!(config.global_policy_version),
+                );
+            }
+            if full {
+                obj.insert(
+                    "policy".to_string(),
+                    openshell_policy::sandbox_policy_to_json_value(policy)?,
+                );
+            }
+            writeln!(
+                stdout,
+                "{}",
+                serde_json::to_string_pretty(&serde_json::Value::Object(obj)).into_diagnostic()?
+            )
+            .into_diagnostic()?;
+        }
+        "table" => {
+            writeln!(stdout, "Version:      {version}").into_diagnostic()?;
+            writeln!(stdout, "Hash:         {}", config.policy_hash).into_diagnostic()?;
+            writeln!(stdout, "Status:       Effective").into_diagnostic()?;
+            writeln!(stdout, "Source:       {policy_source_label}").into_diagnostic()?;
+            writeln!(stdout, "Config rev:   {}", config.config_revision).into_diagnostic()?;
+            if config.global_policy_version > 0 {
+                writeln!(stdout, "Global:       {}", config.global_policy_version)
+                    .into_diagnostic()?;
+            }
+            if full {
+                writeln!(stdout, "---").into_diagnostic()?;
+                let yaml_str = openshell_policy::serialize_sandbox_policy(policy)
+                    .wrap_err("failed to serialize policy to YAML")?;
+                write!(stdout, "{yaml_str}").into_diagnostic()?;
+            }
+        }
+        _ => return Err(miette!("unsupported output format: {output}")),
     }
 
     Ok(())
