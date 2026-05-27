@@ -196,19 +196,12 @@ fn snake_to_pascal(ident: &str) -> String {
     out
 }
 
-/// `OpenShell` → `OPEN_SHELL_AUTH_METADATA`.
-fn const_ident_from_trait(trait_ident: &Ident) -> Ident {
-    let name = trait_ident.to_string();
-    let mut buf = String::with_capacity(name.len() * 2);
-    for (i, c) in name.chars().enumerate() {
-        if c.is_ascii_uppercase() && i != 0 {
-            buf.push('_');
-        }
-        buf.extend(c.to_uppercase());
-    }
-    buf.push_str("_AUTH_METADATA");
-    Ident::new(&buf, trait_ident.span())
-}
+/// Name of the per-service const emitted alongside the impl block. The
+/// service module is what disambiguates between services — every impl
+/// lives in its own module (`crate::grpc::AUTH_METADATA`,
+/// `crate::inference::AUTH_METADATA`), so a fixed name reads more
+/// naturally than `OPEN_SHELL_AUTH_METADATA` / `INFERENCE_AUTH_METADATA`.
+const AUTH_METADATA_CONST: &str = "AUTH_METADATA";
 
 fn trait_ident(item: &ItemImpl) -> Result<Ident> {
     let (_, path, _) = item.trait_.as_ref().ok_or_else(|| {
@@ -235,8 +228,10 @@ pub fn rpc_authz(args: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 fn expand(args: &AuthzArgs, item: &mut ItemImpl) -> Result<proc_macro2::TokenStream> {
+    // `trait_ident` is still called for its validation side effect: the
+    // macro must be applied to a trait impl (`impl Trait for Type`).
     let trait_ident = trait_ident(item)?;
-    let const_name = const_ident_from_trait(&trait_ident);
+    let const_name = Ident::new(AUTH_METADATA_CONST, trait_ident.span());
     let service = args.service.value();
 
     let mut entries: Vec<proc_macro2::TokenStream> = Vec::new();

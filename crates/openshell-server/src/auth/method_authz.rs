@@ -9,9 +9,6 @@
 //! consumed by `authz.rs` (role/scope), `oidc.rs` (unauthenticated
 //! check), and `sandbox_methods.rs` (sandbox principal allowlist).
 
-use crate::grpc::OPEN_SHELL_AUTH_METADATA;
-use crate::inference::INFERENCE_AUTH_METADATA;
-
 /// Per-method auth metadata emitted by `#[rpc_authz]`.
 ///
 /// Built at compile time and looked up at request-dispatch time.
@@ -54,8 +51,10 @@ pub enum Role {
 
 /// All per-service auth tables in one flat list.
 ///
-/// Add a new service by appending its generated const here.
-const SERVICES: &[&[MethodAuth]] = &[OPEN_SHELL_AUTH_METADATA, INFERENCE_AUTH_METADATA];
+/// Add a new service by appending its module's `AUTH_METADATA` const here.
+/// The constant name is fixed by `#[rpc_authz]`; service disambiguation
+/// comes from the module path.
+const SERVICES: &[&[MethodAuth]] = &[crate::grpc::AUTH_METADATA, crate::inference::AUTH_METADATA];
 
 /// Find the auth metadata for `method`, if any.
 #[must_use]
