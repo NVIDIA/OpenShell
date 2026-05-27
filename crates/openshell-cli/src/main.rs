@@ -827,7 +827,7 @@ enum ProviderCommands {
         /// Revoke passthrough for every credential by replacing the
         /// passthrough list with the empty list. Mutually exclusive with
         /// `--passthrough` because passing both would be ambiguous (the
-        /// server cannot honour "clear and then set" in one request).
+        /// server cannot apply "clear and then set" in one request).
         #[arg(long = "clear-passthrough", conflicts_with = "passthrough")]
         clear_passthrough: bool,
 

@@ -90,8 +90,11 @@ that key, so the L7 proxy performs no substitution for it. Each entry must be
 a valid env-var name, present in `Provider.credentials`, and unique. On update,
 an empty incoming list preserves the existing list while auto-pruning entries
 whose credential was deleted in the same update; a non-empty list replaces the
-stored list verbatim. When two providers declare the same credential key, the
-first provider's value wins and the passthrough flag follows the winning value.
+stored list verbatim; setting `UpdateProviderRequest.clear_passthrough_credentials = true`
+revokes passthrough for every credential by replacing the list with the empty
+list (mutually exclusive with a non-empty incoming list). When two providers
+declare the same credential key, the first provider's value wins and the
+passthrough flag follows the winning value.
 
 Passthrough drops the "agent never sees the real secret" invariant for the
 listed keys: the real value is at rest in `/proc/<agent-pid>/environ` and any

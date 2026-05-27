@@ -982,6 +982,7 @@ async fn provider_refresh_cli_run_functions_wire_requests() {
         false,
         &["MS_GRAPH_ACCESS_TOKEN=token".to_string()],
         &[],
+        &[],
         &ts.tls,
     )
     .await
@@ -1067,6 +1068,7 @@ async fn provider_create_allows_empty_credentials_for_gateway_refresh_profiles()
         "custom-refresh-provider",
         "custom-refresh",
         false,
+        &[],
         &[],
         &[],
         &ts.tls,
@@ -1264,6 +1266,7 @@ async fn provider_create_from_existing_uses_profile_discovery_when_v2_enabled() 
         true,
         &[],
         &[],
+        &[],
         &ts.tls,
     )
     .await
@@ -1296,6 +1299,7 @@ async fn provider_create_from_existing_uses_registry_discovery_when_v2_disabled(
         true,
         &[],
         &[],
+        &[],
         &ts.tls,
     )
     .await
@@ -1322,9 +1326,18 @@ async fn provider_create_from_existing_requires_profile_when_v2_enabled() {
     enable_providers_v2(&ts).await;
     let _env = EnvVarGuard::set(&[("OPENAI_API_KEY", "legacy-openai-secret")]);
 
-    let err = run::provider_create(&ts.endpoint, "v2-openai", "openai", true, &[], &[], &ts.tls)
-        .await
-        .expect_err("v2 discovery without a profile should fail");
+    let err = run::provider_create(
+        &ts.endpoint,
+        "v2-openai",
+        "openai",
+        true,
+        &[],
+        &[],
+        &[],
+        &ts.tls,
+    )
+    .await
+    .expect_err("v2 discovery without a profile should fail");
 
     assert!(
         err.to_string()
@@ -1361,6 +1374,7 @@ async fn provider_create_from_existing_fails_when_profile_discovery_finds_nothin
         "empty-discovered",
         "empty-discovery",
         true,
+        &[],
         &[],
         &[],
         &ts.tls,
@@ -1415,13 +1429,24 @@ async fn provider_update_from_existing_uses_profile_discovery_when_v2_enabled() 
             credentials: HashMap::new(),
             config: HashMap::new(),
             credential_expires_at_ms: HashMap::new(),
+            passthrough_credentials: Vec::new(),
         },
     );
     let _env = EnvVarGuard::set(&[("CUSTOM_UPDATE_DISCOVERY_API_KEY", "updated-profile-secret")]);
 
-    run::provider_update(&ts.endpoint, "custom-update", true, &[], &[], &[], false, &[], &ts.tls)
-        .await
-        .expect("profile-backed provider update --from-existing");
+    run::provider_update(
+        &ts.endpoint,
+        "custom-update",
+        true,
+        &[],
+        &[],
+        &[],
+        false,
+        &[],
+        &ts.tls,
+    )
+    .await
+    .expect("profile-backed provider update --from-existing");
 
     let provider = ts
         .state

@@ -199,7 +199,7 @@ provider instance, and pass `--provider <name>` explicitly.
 
 ## How Credential Injection Works
 
-The agent process inside the sandbox never sees real credential values. At startup, the proxy replaces each credential with an opaque placeholder token in the agent's environment. When the agent sends an HTTP request containing a placeholder, the proxy resolves it to the real credential before forwarding upstream.
+By default, the agent process inside the sandbox never sees real credential values. At startup, the proxy replaces each credential with an opaque placeholder token in the agent's environment. When the agent sends an HTTP request containing a placeholder, the proxy resolves it to the real credential before forwarding upstream. This default is intentionally narrowed by the [selective passthrough](#selective-passthrough) opt-in below, which is required for credentials that an SDK validates in-process or sends over transports the proxy cannot rewrite.
 
 This resolution requires the proxy to see plaintext HTTP. Endpoints must use `protocol: rest` in the policy (which auto-terminates TLS) or explicit `tls: terminate`. Endpoints without TLS termination pass traffic through as an opaque stream, and credential placeholders are forwarded unresolved.
 
@@ -268,7 +268,7 @@ To revoke passthrough for every credential on a provider in one operation, use `
 openshell provider update --name slack --clear-passthrough
 ```
 
-`--clear-passthrough` is mutually exclusive with `--passthrough` because passing both would be ambiguous (the server cannot honour "clear and then set" in one request — issue two updates instead). After the update the agent process receives canonical placeholders for every credential again, and any new sandbox launched against the provider picks up the revoked status on the next environment refresh.
+`--clear-passthrough` is mutually exclusive with `--passthrough` because passing both would be ambiguous (the server cannot apply "clear and then set" in one request — issue two updates instead). After the update, any sandbox launched (or relaunched) against the provider receives canonical placeholders for every credential. Agent processes that are already running keep the real values that were injected into their environment at launch until they are restarted; the gateway does not mutate the env of a live process.
 
 `openshell provider get <name>` annotates passthrough keys in its output, and `openshell provider list` shows a `PASSTHROUGH` column with the per-provider count.
 
