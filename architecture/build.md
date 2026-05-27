@@ -20,6 +20,15 @@ OpenShell builds these main artifacts:
 
 Sandbox community images are built outside this repository.
 
+## Linux Runtime Environments
+
+OpenShell uses different Linux libc environments for different host artifacts.
+The standalone `openshell` CLI is built as a static musl binary so it can run on
+a wide range of Linux distributions without depending on the host's glibc. Host
+runtime binaries that use the GNU/Linux runtime environment, including
+`openshell-gateway` and `openshell-driver-vm`, are GNU-linked and built with a
+glibc 2.31 floor.
+
 ## Container Builds
 
 The Docker image pipeline is a two-step flow: build the Rust binary natively
@@ -29,9 +38,11 @@ and the supervisor image from `deploy/docker/Dockerfile.supervisor`. Neither
 Dockerfile compiles Rust — both copy a staged binary out of
 `deploy/docker/.build/prebuilt-binaries/<arch>/` into the final image.
 
-Binary staging is driven by `tasks/scripts/stage-prebuilt-binaries.sh`, which
-runs `cargo build` natively on a matching host or `cargo zigbuild` when
-cross-compiling. Local Docker image tasks infer the target architecture from
+Binary staging is driven by `tasks/scripts/stage-prebuilt-binaries.sh`. Gateway
+binaries use `cargo zigbuild` with GNU targets pinned to glibc 2.31, including
+native-architecture builds, so the gateway image, standalone tarballs, and Linux
+packages share the same host portability floor. Supervisor binaries remain
+static musl. Local Docker image tasks infer the target architecture from
 `DOCKER_PLATFORM` when set, otherwise from the container engine host metadata
 with the kernel architecture as the fallback. CI invokes the same staging step
 via the `rust-native-build.yml` workflow (per-architecture, per-component) and
@@ -41,7 +52,9 @@ the staging directory before running Buildx.
 Runtime layout:
 
 - **Gateway**: `gcr.io/distroless/cc-debian13:nonroot` base, GNU-linked binary at
-  `/usr/local/bin/openshell-gateway`, runs as UID/GID `1000:1000`.
+  `/usr/local/bin/openshell-gateway`, runs as UID/GID `1000:1000`. Linux GNU
+  gateway and VM driver binaries must not reference `GLIBC_*` symbols newer than
+  `GLIBC_2.31`; release workflows verify this before publishing artifacts.
 - **Supervisor**: `scratch` base, static musl binary at `/openshell-sandbox`.
   Static linkage is required because the image is mounted/extracted into
   sandbox environments (Docker extraction, Podman image volumes, Kubernetes

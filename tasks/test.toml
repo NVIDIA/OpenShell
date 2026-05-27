@@ -5,7 +5,12 @@
 
 [test]
 description = "Run all tests (Rust + Python)"
-depends = ["test:rust", "test:python"]
+depends = ["test:rust", "test:python", "test:install-sh"]
+
+["test:install-sh"]
+description = "Run focused install.sh shell tests"
+run = "tasks/scripts/test-install-sh.sh"
+hide = true
 
 [e2e]
 description = "Run all end-to-end tests (Rust + Python)"
@@ -21,7 +26,12 @@ depends = ["e2e:python:gpu"]
 
 ["test:rust"]
 description = "Run Rust tests"
-run = "cargo test --workspace"
+run = [
+  # Run the workspace once without openshell-server so we can run that crate
+  # with test-only helpers enabled.
+  "cargo test --workspace --exclude openshell-server",
+  "cargo test -p openshell-server --features test-support",
+]
 hide = true
 
 ["test:python"]
@@ -77,6 +87,13 @@ run = "e2e/rust/e2e-vm.sh"
 ["e2e:docker"]
 description = "Run smoke e2e against a standalone gateway with the Docker compute driver"
 run = "e2e/rust/e2e-docker.sh"
+
+["e2e:mechanistic-smoke"]
+description = "Run mechanistic L4 smoke against a Docker-backed gateway"
+run = [
+  "cargo build -p openshell-cli --features openshell-core/dev-settings",
+  "e2e/with-docker-gateway.sh bash -lc 'target/debug/openshell settings set --global --key agent_policy_proposals_enabled --value true --yes && OPENSHELL_BIN=$PWD/target/debug/openshell bash e2e/policy-advisor/mechanistic-smoke.sh'",
+]
 
 ["e2e:docker:gpu"]
 description = "Run GPU e2e against a standalone gateway with the Docker compute driver"

@@ -55,6 +55,8 @@ On Fedora and RHEL, the install script uses RPM packages. The RPM installs the `
 
 On Debian and Ubuntu, the install script uses a Debian package. The Debian package installs the `openshell` CLI, the `openshell-gateway` daemon, VM sandbox support, and a systemd user service.
 
+Linux packages require glibc 2.31 or newer. The installer checks libc before downloading packages and exits with an error on older glibc versions, Alpine, musl-based distributions, or unknown libc environments.
+
 The Linux user service listens on `https://127.0.0.1:17670`, starts from built-in defaults, and generates a local mTLS bundle before the gateway starts. Create `~/.config/openshell/gateway.toml` only when you need to override those defaults.
 
 The CLI reads the client bundle from `~/.config/openshell/gateways/openshell/mtls/`.

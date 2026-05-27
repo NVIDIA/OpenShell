@@ -307,6 +307,14 @@ if [ "$(uname -s)" = "Darwin" ]; then
     "${DRIVER_DIR}/openshell-driver-vm"
 fi
 
+TLS_DIR="${STATE_DIR}/tls"
+echo "==> Generating local gateway credentials"
+"${GATEWAY_BIN}" generate-certs \
+  --output-dir "${TLS_DIR}" \
+  --server-san "127.0.0.1" \
+  --server-san "localhost" \
+  --server-san "host.openshell.internal"
+
 mkdir -p "${STATE_DIR}"
 mkdir -p "${VM_DRIVER_STATE_DIR}"
 chmod 700 "${VM_DRIVER_STATE_DIR}"
@@ -318,6 +326,16 @@ version = 1
 [openshell.gateway]
 compute_drivers = ["vm"]
 disable_tls = ${DISABLE_TLS}
+
+[openshell.gateway.auth]
+allow_unauthenticated_users = true
+
+[openshell.gateway.gateway_jwt]
+signing_key_path = "${TLS_DIR}/jwt/signing.pem"
+public_key_path = "${TLS_DIR}/jwt/public.pem"
+kid_path = "${TLS_DIR}/jwt/kid"
+gateway_id = "${GATEWAY_NAME}"
+ttl_secs = 3600
 
 [openshell.drivers.vm]
 default_image = "${SANDBOX_IMAGE}"

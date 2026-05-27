@@ -64,16 +64,6 @@ impl<'a> SshActivityBuilder<'a> {
         self
     }
     #[must_use]
-    pub fn severity(mut self, id: SeverityId) -> Self {
-        self.severity = id;
-        self
-    }
-    #[must_use]
-    pub fn status(mut self, id: StatusId) -> Self {
-        self.status = Some(id);
-        self
-    }
-    #[must_use]
     pub fn src_endpoint_addr(mut self, ip: IpAddr, port: u16) -> Self {
         self.src_endpoint = Some(Endpoint::from_ip(ip, port));
         self
@@ -86,11 +76,6 @@ impl<'a> SshActivityBuilder<'a> {
     #[must_use]
     pub fn actor_process(mut self, process: Process) -> Self {
         self.actor = Some(Actor { process });
-        self
-    }
-    #[must_use]
-    pub fn message(mut self, msg: impl Into<String>) -> Self {
-        self.message = Some(msg.into());
         self
     }
 
@@ -122,14 +107,8 @@ impl<'a> SshActivityBuilder<'a> {
             self.ctx
                 .metadata(&["security_control", "container", "host"]),
         );
-        if let Some(status) = self.status {
-            base.set_status(status);
-        }
-        if let Some(msg) = self.message {
-            base.set_message(msg);
-        }
-        base.set_device(self.ctx.device());
-        base.set_container(self.ctx.container());
+        self.ctx
+            .apply_common_fields(&mut base, self.status, self.message);
 
         OcsfEvent::SshActivity(SshActivityEvent {
             base,
@@ -144,6 +123,8 @@ impl<'a> SshActivityBuilder<'a> {
         })
     }
 }
+
+impl_builder_setters!(SshActivityBuilder);
 
 #[cfg(test)]
 mod tests {

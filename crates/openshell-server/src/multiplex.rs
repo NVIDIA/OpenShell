@@ -668,11 +668,19 @@ mod tests {
         assert_ne!(id1.header_value(), id2.header_value());
     }
 
+    async fn test_health_store() -> Arc<crate::Store> {
+        Arc::new(
+            crate::Store::connect("sqlite::memory:")
+                .await
+                .expect("connect in-memory sqlite store for tests"),
+        )
+    }
+
     async fn start_http_server_with_middleware() -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let http_service = crate::http::health_router();
+        let http_service = crate::http::health_router(test_health_store().await);
         let http_service = request_id_middleware!(http_service);
 
         let service = MultiplexedService::new(http_service.clone(), http_service);

@@ -64,16 +64,6 @@ impl<'a> HttpActivityBuilder<'a> {
         self
     }
     #[must_use]
-    pub fn severity(mut self, id: SeverityId) -> Self {
-        self.severity = id;
-        self
-    }
-    #[must_use]
-    pub fn status(mut self, id: StatusId) -> Self {
-        self.status = Some(id);
-        self
-    }
-    #[must_use]
     pub fn http_request(mut self, req: HttpRequest) -> Self {
         self.http_request = Some(req);
         self
@@ -104,11 +94,6 @@ impl<'a> HttpActivityBuilder<'a> {
         self
     }
     #[must_use]
-    pub fn message(mut self, msg: impl Into<String>) -> Self {
-        self.message = Some(msg.into());
-        self
-    }
-    #[must_use]
     pub fn status_detail(mut self, detail: impl Into<String>) -> Self {
         self.status_detail = Some(detail.into());
         self
@@ -128,17 +113,11 @@ impl<'a> HttpActivityBuilder<'a> {
             self.ctx
                 .metadata(&["security_control", "network_proxy", "container", "host"]),
         );
-        if let Some(status) = self.status {
-            base.set_status(status);
-        }
-        if let Some(msg) = self.message {
-            base.set_message(msg);
-        }
         if let Some(detail) = self.status_detail {
             base.set_status_detail(detail);
         }
-        base.set_device(self.ctx.device());
-        base.set_container(self.ctx.container());
+        self.ctx
+            .apply_common_fields(&mut base, self.status, self.message);
 
         OcsfEvent::HttpActivity(HttpActivityEvent {
             base,
@@ -156,6 +135,8 @@ impl<'a> HttpActivityBuilder<'a> {
         })
     }
 }
+
+impl_builder_setters!(HttpActivityBuilder);
 
 #[cfg(test)]
 mod tests {

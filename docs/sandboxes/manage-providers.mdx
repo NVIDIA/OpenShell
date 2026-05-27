@@ -67,6 +67,12 @@ openshell settings set --global --key providers_v2_enabled --value true
 
 Without `providers_v2_enabled=true`, provider behavior remains credential-only.
 
+When `providers_v2_enabled=true`, `--from-existing` uses profile-backed
+discovery instead of the legacy provider registry. The requested `--type` must
+have a built-in or imported provider profile with a `discovery` section. If no
+matching profile exists, the CLI returns an error instead of falling back to
+legacy discovery.
+
 ## Manage Providers
 
 List, inspect, update, and delete providers from the active gateway.
@@ -102,9 +108,10 @@ Use `0` as the timestamp to clear expiry for a credential key.
 ## Credential Refresh
 
 Provider refresh stores non-injectable refresh material separately from the
-provider's current credential values. The gateway can mint OAuth2 client
-credentials tokens and Google service account JWT tokens, then write the current
-access token back to the provider record for sandbox injection.
+provider's current credential values. The gateway can mint OAuth2 refresh-token
+tokens, OAuth2 client credentials tokens, and Google service account JWT tokens,
+then write the current access token back to the provider record for sandbox
+injection.
 
 Configure refresh metadata for one injectable credential key:
 
@@ -164,17 +171,20 @@ also contribute provider-generated network policy entries when
 providers keep the previous behavior and only provide credentials.
 
 <Warning>
-Providers cannot be added to a running sandbox. If you need to attach an
-additional provider, delete the sandbox and recreate it with all required
-providers specified.
+Legacy provider attachment is fixed at sandbox creation time. Providers v2 adds
+`openshell sandbox provider attach` and `openshell sandbox provider detach` for
+running sandboxes. See [Providers v2](/sandboxes/providers-v2#attach-and-detach-providers)
+for runtime attach and detach behavior.
 
 </Warning>
 
 ### Auto-Discovery Shortcut
 
-When the trailing command in `openshell sandbox create` is a recognized tool name (`claude`, `codex`, or `opencode`), the CLI auto-creates the required
-provider from your local credentials if one does not already exist. You do not
-need to create the provider separately:
+When `providers_v2_enabled=false` and the trailing command in
+`openshell sandbox create` is a recognized tool name (`claude`, `codex`, or
+`opencode`), the CLI auto-creates the required provider from your local
+credentials if one does not already exist. You do not need to create the
+provider separately:
 
 ```shell
 openshell sandbox create -- claude
@@ -182,6 +192,10 @@ openshell sandbox create -- claude
 
 This detects `claude` as a known tool, finds your `ANTHROPIC_API_KEY`, creates
 a provider, attaches it to the sandbox, and launches Claude Code.
+
+Providers v2 disables command-derived provider inference. When
+`providers_v2_enabled=true`, create or import the provider profile, create the
+provider instance, and pass `--provider <name>` explicitly.
 
 ## How Credential Injection Works
 

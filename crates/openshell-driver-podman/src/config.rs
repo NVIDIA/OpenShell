@@ -7,6 +7,7 @@ use std::str::FromStr;
 
 /// Default Podman bridge network name.
 pub const DEFAULT_NETWORK_NAME: &str = "openshell";
+pub const DEFAULT_SANDBOX_PIDS_LIMIT: i64 = 2048;
 
 /// Image pull policy for sandbox and supervisor images.
 ///
@@ -106,6 +107,10 @@ pub struct PodmanComputeConfig {
     pub guest_tls_cert: Option<PathBuf>,
     /// Host path to the client private key for sandbox mTLS.
     pub guest_tls_key: Option<PathBuf>,
+    /// Container cgroup PID limit for Podman-managed sandboxes.
+    ///
+    /// Set to `0` to leave Podman's runtime/default PID limit unchanged.
+    pub sandbox_pids_limit: i64,
 }
 
 impl PodmanComputeConfig {
@@ -147,6 +152,16 @@ impl PodmanComputeConfig {
              Missing: {}",
             missing.join(", ")
         )))
+    }
+
+    /// Validate runtime resource-limit configuration.
+    pub fn validate_runtime_limits(&self) -> Result<(), crate::client::PodmanApiError> {
+        if self.sandbox_pids_limit < 0 {
+            return Err(crate::client::PodmanApiError::InvalidInput(
+                "sandbox_pids_limit must be zero or greater".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Resolve the default socket path from the environment.
@@ -191,6 +206,7 @@ impl Default for PodmanComputeConfig {
             guest_tls_ca: None,
             guest_tls_cert: None,
             guest_tls_key: None,
+            sandbox_pids_limit: DEFAULT_SANDBOX_PIDS_LIMIT,
         }
     }
 }
@@ -210,6 +226,7 @@ impl std::fmt::Debug for PodmanComputeConfig {
             .field("guest_tls_ca", &self.guest_tls_ca)
             .field("guest_tls_cert", &self.guest_tls_cert)
             .field("guest_tls_key", &self.guest_tls_key)
+            .field("sandbox_pids_limit", &self.sandbox_pids_limit)
             .finish()
     }
 }
@@ -249,6 +266,23 @@ mod tests {
                 PathBuf::from(format!("/run/user/{uid}/podman/podman.sock"))
             );
         });
+    }
+
+    #[test]
+    fn default_config_sets_driver_owned_pids_limit() {
+        let cfg = PodmanComputeConfig::default();
+        assert_eq!(cfg.sandbox_pids_limit, DEFAULT_SANDBOX_PIDS_LIMIT);
+        assert!(cfg.validate_runtime_limits().is_ok());
+    }
+
+    #[test]
+    fn runtime_limit_validation_rejects_negative_pids_limit() {
+        let cfg = PodmanComputeConfig {
+            sandbox_pids_limit: -1,
+            ..PodmanComputeConfig::default()
+        };
+        let err = cfg.validate_runtime_limits().unwrap_err();
+        assert!(err.to_string().contains("sandbox_pids_limit"));
     }
 
     #[test]

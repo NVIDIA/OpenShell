@@ -24,9 +24,11 @@ use k8s_openapi::api::core::v1::Secret;
 use kube::Client;
 use kube::api::{Api, ObjectMeta, PostParams};
 use miette::{IntoDiagnostic, Result, WrapErr};
-use openshell_bootstrap::pki::{PkiBundle, generate_pki};
+use openshell_bootstrap::pki::{DEFAULT_SERVER_SANS, PkiBundle, generate_pki};
 use openshell_core::paths::{create_dir_restricted, set_file_owner_only};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -290,6 +292,21 @@ enum LocalAction {
     CreateAll,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum CertSan {
+    Dns(String),
+    Ip(IpAddr),
+}
+
+impl fmt::Display for CertSan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Dns(name) => write!(f, "{name}"),
+            Self::Ip(addr) => write!(f, "{addr}"),
+        }
+    }
+}
+
 /// Layout under `<dir>`:
 ///
 /// ```text
@@ -389,13 +406,34 @@ fn run_local(dir: &Path, server_sans: &[String]) -> Result<()> {
 
     let bundle = match decide_local(paths.tls_existence_count(), paths.jwt_existence_count()) {
         LocalAction::Skip => {
-            info!(dir = %dir.display(), "PKI files already exist, skipping.");
+            let missing_sans = missing_required_server_sans(&paths, server_sans)?;
+            if missing_sans.is_empty() {
+                info!(dir = %dir.display(), "PKI files already exist, skipping.");
+            } else {
+                let bundle = generate_pki(server_sans)?;
+                write_local_tls_bundle(&bundle, &paths)?;
+                info!(
+                    dir = %dir.display(),
+                    missing_sans = %format_cert_sans(&missing_sans),
+                    "server TLS certificate refreshed for current SAN set.",
+                );
+            }
             read_local_bundle(&paths)?
         }
         LocalAction::CreateJwtOnly => {
             let bundle = generate_pki(server_sans)?;
-            write_local_jwt_bundle(&bundle, &paths)?;
-            info!(dir = %dir.display(), "JWT signing files created for existing TLS install.");
+            let missing_sans = missing_required_server_sans(&paths, server_sans)?;
+            if missing_sans.is_empty() {
+                write_local_jwt_bundle(&bundle, &paths)?;
+                info!(dir = %dir.display(), "JWT signing files created for existing TLS install.");
+            } else {
+                write_local_bundle(dir, &bundle, &paths)?;
+                info!(
+                    dir = %dir.display(),
+                    missing_sans = %format_cert_sans(&missing_sans),
+                    "PKI files refreshed for current SAN set and JWT signing material.",
+                );
+            }
             read_local_bundle(&paths)?
         }
         LocalAction::PartialState => {
@@ -421,6 +459,90 @@ fn run_local(dir: &Path, server_sans: &[String]) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn required_server_sans(server_sans: &[String]) -> BTreeSet<CertSan> {
+    DEFAULT_SERVER_SANS
+        .iter()
+        .copied()
+        .chain(server_sans.iter().map(String::as_str))
+        .filter_map(|san| {
+            san.parse::<IpAddr>()
+                .map(CertSan::Ip)
+                .ok()
+                .or_else(|| san.is_ascii().then(|| CertSan::Dns(san.to_string())))
+        })
+        .collect()
+}
+
+fn missing_required_server_sans(
+    paths: &LocalPaths,
+    server_sans: &[String],
+) -> Result<Vec<CertSan>> {
+    let required = required_server_sans(server_sans);
+    let actual = server_cert_sans(&paths.server_crt)?;
+    Ok(required.difference(&actual).cloned().collect())
+}
+
+fn server_cert_sans(path: &Path) -> Result<BTreeSet<CertSan>> {
+    use x509_parser::pem::parse_x509_pem;
+    use x509_parser::prelude::{FromDer, GeneralName, X509Certificate};
+
+    let pem = std::fs::read(path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read {}", path.display()))?;
+    let (_, pem) = parse_x509_pem(&pem).map_err(|e| {
+        miette::miette!(
+            "failed to parse server certificate PEM {}: {e:?}",
+            path.display()
+        )
+    })?;
+    let (_, cert) = X509Certificate::from_der(&pem.contents).map_err(|e| {
+        miette::miette!(
+            "failed to parse server certificate {}: {e:?}",
+            path.display()
+        )
+    })?;
+
+    let Some(ext) = cert.subject_alternative_name().map_err(|e| {
+        miette::miette!(
+            "failed to read server certificate SANs {}: {e:?}",
+            path.display()
+        )
+    })?
+    else {
+        return Ok(BTreeSet::new());
+    };
+
+    let mut sans = BTreeSet::new();
+    for name in &ext.value.general_names {
+        match name {
+            GeneralName::DNSName(name) => {
+                sans.insert(CertSan::Dns((*name).to_string()));
+            }
+            GeneralName::IPAddress(raw) => match raw.len() {
+                4 => {
+                    sans.insert(CertSan::Ip(IpAddr::V4(Ipv4Addr::new(
+                        raw[0], raw[1], raw[2], raw[3],
+                    ))));
+                }
+                16 => {
+                    let octets: [u8; 16] = (*raw).try_into().expect("checked IPv6 SAN length");
+                    sans.insert(CertSan::Ip(IpAddr::V6(Ipv6Addr::from(octets))));
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    Ok(sans)
+}
+
+fn format_cert_sans(sans: &[CertSan]) -> String {
+    sans.iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn read_local_bundle(paths: &LocalPaths) -> Result<PkiBundle> {
@@ -506,6 +628,47 @@ fn write_local_bundle(dir: &Path, bundle: &PkiBundle, paths: &LocalPaths) -> Res
     Ok(())
 }
 
+fn write_local_tls_bundle(bundle: &PkiBundle, paths: &LocalPaths) -> Result<()> {
+    let temp = sibling_temp_dir(&paths.server_dir);
+    if temp.exists() {
+        std::fs::remove_dir_all(&temp)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to remove stale {}", temp.display()))?;
+    }
+
+    let temp_server = temp.join("server");
+    let temp_client = temp.join("client");
+    create_dir_restricted(&temp)?;
+    create_dir_restricted(&temp_server)?;
+    create_dir_restricted(&temp_client)?;
+
+    write_pem(&temp.join("ca.crt"), &bundle.ca_cert_pem, false)?;
+    write_pem(&temp.join("ca.key"), &bundle.ca_key_pem, true)?;
+    write_pem(&temp_server.join("tls.crt"), &bundle.server_cert_pem, false)?;
+    write_pem(&temp_server.join("tls.key"), &bundle.server_key_pem, true)?;
+    write_pem(&temp_client.join("tls.crt"), &bundle.client_cert_pem, false)?;
+    write_pem(&temp_client.join("tls.key"), &bundle.client_key_pem, true)?;
+
+    create_dir_restricted(&paths.server_dir)?;
+    create_dir_restricted(&paths.client_dir)?;
+    let renames: [(PathBuf, &Path); 6] = [
+        (temp.join("ca.crt"), paths.ca_crt.as_path()),
+        (temp.join("ca.key"), paths.ca_key.as_path()),
+        (temp_server.join("tls.crt"), paths.server_crt.as_path()),
+        (temp_server.join("tls.key"), paths.server_key.as_path()),
+        (temp_client.join("tls.crt"), paths.client_crt.as_path()),
+        (temp_client.join("tls.key"), paths.client_key.as_path()),
+    ];
+    for (from, to) in &renames {
+        std::fs::rename(from, to)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to move {} -> {}", from.display(), to.display()))?;
+    }
+
+    let _ = std::fs::remove_dir_all(&temp);
+    Ok(())
+}
+
 fn write_local_jwt_bundle(bundle: &PkiBundle, paths: &LocalPaths) -> Result<()> {
     let temp = sibling_temp_dir(&paths.jwt_dir);
     if temp.exists() {
@@ -568,9 +731,9 @@ fn print_bundle(bundle: &PkiBundle) {
 #[cfg(test)]
 mod tests {
     use super::{
-        K8sAction, LocalAction, LocalPaths, decide_k8s, decide_local, jwt_signing_secret,
-        read_local_bundle, sibling_temp_dir, tls_secret, write_local_bundle,
-        write_local_jwt_bundle,
+        CertSan, K8sAction, LocalAction, LocalPaths, decide_k8s, decide_local, jwt_signing_secret,
+        missing_required_server_sans, read_local_bundle, sibling_temp_dir, tls_secret,
+        write_local_bundle, write_local_jwt_bundle, write_local_tls_bundle,
     };
     use openshell_bootstrap::pki::generate_pki;
     use std::path::Path;
@@ -731,6 +894,48 @@ mod tests {
         assert_eq!(read.client_cert_pem, old_bundle.client_cert_pem);
         assert_eq!(read.jwt_key_id, new_bundle.jwt_key_id);
         assert_eq!(read.jwt_public_key_pem, new_bundle.jwt_public_key_pem);
+    }
+
+    #[test]
+    fn write_local_tls_bundle_preserves_existing_jwt_files() {
+        let parent = tempfile::tempdir().expect("tempdir");
+        let dir = parent.path().join("tls");
+        let old_bundle = generate_pki(&[]).expect("generate_pki");
+        let new_bundle = generate_pki(&["extra.example.test".to_string()]).expect("generate_pki");
+        let paths = LocalPaths::resolve(&dir);
+
+        write_local_bundle(&dir, &old_bundle, &paths).expect("write_local_bundle");
+        write_local_tls_bundle(&new_bundle, &paths).expect("write_local_tls_bundle");
+
+        let read = read_local_bundle(&paths).expect("read_local_bundle");
+        assert_eq!(read.ca_cert_pem, new_bundle.ca_cert_pem);
+        assert_eq!(read.server_cert_pem, new_bundle.server_cert_pem);
+        assert_eq!(read.client_cert_pem, new_bundle.client_cert_pem);
+        assert_eq!(read.jwt_key_id, old_bundle.jwt_key_id);
+        assert_eq!(read.jwt_public_key_pem, old_bundle.jwt_public_key_pem);
+    }
+
+    #[test]
+    fn missing_required_server_sans_detects_new_required_name() {
+        let parent = tempfile::tempdir().expect("tempdir");
+        let dir = parent.path().join("tls");
+        let bundle = generate_pki(&[]).expect("generate_pki");
+        let paths = LocalPaths::resolve(&dir);
+
+        write_local_bundle(&dir, &bundle, &paths).expect("write_local_bundle");
+
+        assert!(
+            missing_required_server_sans(&paths, &[])
+                .unwrap()
+                .is_empty()
+        );
+
+        let missing =
+            missing_required_server_sans(&paths, &["future.example.test".to_string()]).unwrap();
+        assert_eq!(
+            missing,
+            vec![CertSan::Dns("future.example.test".to_string())]
+        );
     }
 
     #[test]

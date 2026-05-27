@@ -34,12 +34,16 @@ deny_reason := reason if {
 	input.network
 	input.exec
 	not network_policy_for_request
-	endpoint_misses := [r |
-		some name
-		policy := data.network_policies[name]
-		not endpoint_allowed(policy, input.network)
-		r := sprintf("endpoint %s:%d not in policy '%s'", [input.network.host, input.network.port, name])
-	]
+	not endpoint_policy_for_request
+	count(data.network_policies) > 0
+	reason := sprintf("endpoint %s:%d is not allowed by any policy", [input.network.host, input.network.port])
+}
+
+deny_reason := reason if {
+	input.network
+	input.exec
+	not network_policy_for_request
+	endpoint_policy_for_request
 	ancestors_str := concat(" -> ", input.exec.ancestors)
 	cmdline_str := concat(", ", input.exec.cmdline_paths)
 	binary_misses := [r |
@@ -49,9 +53,8 @@ deny_reason := reason if {
 		not binary_allowed(policy, input.exec)
 		r := sprintf("binary '%s' not allowed in policy '%s' (ancestors: [%s], cmdline: [%s]). SYMLINK HINT: the binary path is the kernel-resolved target from /proc/<pid>/exe, not the symlink. If your policy specifies a symlink (e.g., /usr/bin/python3) but the actual binary is /usr/bin/python3.11, either: (1) use the canonical path in your policy (run 'readlink -f /usr/bin/python3' inside the sandbox), or (2) ensure symlink resolution is working (check sandbox logs for 'Cannot access container filesystem')", [input.exec.path, name, ancestors_str, cmdline_str])
 	]
-	all_reasons := array.concat(endpoint_misses, binary_misses)
-	count(all_reasons) > 0
-	reason := concat("; ", all_reasons)
+	count(binary_misses) > 0
+	reason := concat("; ", binary_misses)
 }
 
 deny_reason := "network connections not allowed by policy" if {
@@ -89,6 +92,12 @@ network_policy_for_request if {
 	data.network_policies[name]
 	endpoint_allowed(data.network_policies[name], input.network)
 	binary_allowed(data.network_policies[name], input.exec)
+}
+
+endpoint_policy_for_request if {
+	some name
+	data.network_policies[name]
+	endpoint_allowed(data.network_policies[name], input.network)
 }
 
 # Endpoint matching: exact host (case-insensitive) + port in ports list.

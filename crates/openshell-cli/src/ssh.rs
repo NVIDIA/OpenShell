@@ -1574,8 +1574,8 @@ mod tests {
             "/sandbox/file.txt"
         );
         assert_eq!(
-            validate_sandbox_source_path("/sandbox/.openclaw/workspace/hello.txt").unwrap(),
-            "/sandbox/.openclaw/workspace/hello.txt"
+            validate_sandbox_source_path("/sandbox/.agent/workspace/hello.txt").unwrap(),
+            "/sandbox/.agent/workspace/hello.txt"
         );
         assert_eq!(
             validate_sandbox_source_path("/sandbox").unwrap(),

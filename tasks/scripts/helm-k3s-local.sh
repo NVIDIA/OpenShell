@@ -149,8 +149,8 @@ configure_ghcr_credentials() {
   registries_content="$(printf 'configs:\n  "ghcr.io":\n    auth:\n      username: %s\n      password: %s\n' \
     "${GITHUB_USERNAME}" "${GITHUB_PAT}")"
 
-  local -a nodes
-  mapfile -t nodes < <(docker ps --format '{{.Names}}' \
+  local -a nodes=()
+  while IFS= read -r _node; do nodes+=("$_node"); done < <(docker ps --format '{{.Names}}' \
     --filter "name=k3d-${CLUSTER_NAME}-server-" 2>/dev/null || true)
 
   if [[ ${#nodes[@]} -eq 0 ]]; then
@@ -168,8 +168,8 @@ configure_ghcr_credentials() {
 
 cluster_has_image() {
   local image="$1"
-  local -a nodes
-  mapfile -t nodes < <(docker ps --format '{{.Names}}' \
+  local -a nodes=()
+  while IFS= read -r _node; do nodes+=("$_node"); done < <(docker ps --format '{{.Names}}' \
     --filter "name=k3d-${CLUSTER_NAME}-server-" 2>/dev/null || true)
 
   for node in "${nodes[@]}"; do
@@ -182,8 +182,8 @@ cluster_has_image() {
 }
 
 cluster_image_platform() {
-  local -a nodes
-  mapfile -t nodes < <(docker ps --format '{{.Names}}' \
+  local -a nodes=()
+  while IFS= read -r _node; do nodes+=("$_node"); done < <(docker ps --format '{{.Names}}' \
     --filter "name=k3d-${CLUSTER_NAME}-server-" 2>/dev/null || true)
 
   if [[ ${#nodes[@]} -gt 0 ]]; then

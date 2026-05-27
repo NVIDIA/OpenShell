@@ -180,6 +180,9 @@ Linux-owned ext4 storage. The resulting disk is cached under
 sandboxes. Local Docker images are still exported as rootfs tar archives and
 prepared inside the bootstrap VM. Set `OPENSHELL_VM_IMAGE_PULL_CONCURRENCY` to
 tune registry layer download parallelism (default `4`, maximum `16`).
+Both caches are scoped by source image identity and OpenShell version, so an
+OpenShell upgrade builds a fresh guest rootfs instead of reusing one with an old
+embedded supervisor.
 
 Each sandbox gets its own sparse writable
 `<state-dir>/sandboxes/<id>/overlay.ext4`. Guest init mounts overlayfs as `/`

@@ -11,7 +11,9 @@ use tracing_subscriber::EnvFilter;
 use openshell_core::VERSION;
 use openshell_core::config::DEFAULT_STOP_TIMEOUT_SECS;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
-use openshell_driver_podman::config::{DEFAULT_NETWORK_NAME, ImagePullPolicy};
+use openshell_driver_podman::config::{
+    DEFAULT_NETWORK_NAME, DEFAULT_SANDBOX_PIDS_LIMIT, ImagePullPolicy,
+};
 use openshell_driver_podman::{ComputeDriverService, PodmanComputeConfig, PodmanComputeDriver};
 
 #[derive(Parser)]
@@ -71,6 +73,15 @@ struct Args {
     #[arg(long, env = "OPENSHELL_STOP_TIMEOUT", default_value_t = DEFAULT_STOP_TIMEOUT_SECS)]
     stop_timeout: u32,
 
+    /// Container cgroup PID limit for sandbox containers. Set 0 to inherit
+    /// Podman's runtime/default PID limit.
+    #[arg(
+        long,
+        env = "OPENSHELL_SANDBOX_PIDS_LIMIT",
+        default_value_t = DEFAULT_SANDBOX_PIDS_LIMIT
+    )]
+    sandbox_pids_limit: i64,
+
     /// OCI image containing the openshell-sandbox supervisor binary.
     #[arg(long, env = "OPENSHELL_SUPERVISOR_IMAGE")]
     supervisor_image: String,
@@ -114,6 +125,7 @@ async fn main() -> Result<()> {
         guest_tls_ca: args.podman_tls_ca,
         guest_tls_cert: args.podman_tls_cert,
         guest_tls_key: args.podman_tls_key,
+        sandbox_pids_limit: args.sandbox_pids_limit,
     })
     .await
     .into_diagnostic()?;

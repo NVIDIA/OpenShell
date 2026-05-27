@@ -89,6 +89,21 @@ Sandbox logs are emitted locally and can also be pushed back to the gateway.
 Security-relevant sandbox behavior uses OCSF structured events; internal
 diagnostics use ordinary tracing.
 
+## Policy Proposals
+
+When an L4 CONNECT is denied, the proxy emits a `DenialEvent`. The denial
+aggregator batches these events and flushes summaries to the gateway every 10
+seconds (configurable via `OPENSHELL_DENIAL_FLUSH_INTERVAL_SECS`). The gateway
+runs them through the mechanistic mapper, which generates a pending
+`NetworkPolicyRule` proposal visible under `openshell rule get --status pending`.
+
+L7 denials (HTTP 403 from method/path rules) are intentionally excluded from
+mechanistic mapping. L4 denials carry only `host:port`, which a deterministic mapper can handle.
+L7 denials carry method, path, query, and body context. The agent loop reads
+the structured 403 and authors the narrowest rule. Mechanistically mapping L7
+would either over-broaden rules or require path-templating logic that rots
+quickly.
+
 ## Failure Behavior
 
 - If gateway config polling fails, the sandbox keeps its last-known-good policy.

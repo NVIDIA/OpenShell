@@ -6,7 +6,7 @@ description: "AI agent frameworks and runtimes compatible with OpenShell sandbox
 keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Claude, Codex, Cursor"
 position: 5
 ---
-The following table summarizes the agents that run in OpenShell sandboxes. All agent sandbox images are maintained in the [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community) repository. Agents in the base image are auto-configured when passed as the trailing command to `openshell sandbox create`.
+The following table summarizes the agents that run in OpenShell sandboxes. Most agent sandbox images are maintained in the [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community) repository. Agents in the base image are auto-configured when passed as the trailing command to `openshell sandbox create`.
 
 | Agent | Source | Default Policy | Notes |
 |---|---|---|---|
@@ -14,8 +14,9 @@ The following table summarizes the agents that run in OpenShell sandboxes. All a
 | [OpenCode](https://opencode.ai/) | [`base`](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base) | Partial coverage | Pre-installed. Add `opencode.ai` endpoint and OpenCode binary paths to the policy for full functionality. |
 | [Codex](https://developers.openai.com/codex) | [`base`](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base) | No coverage | Pre-installed. Requires a custom policy with OpenAI endpoints and Codex binary paths. Requires `OPENAI_API_KEY`. |
 | [GitHub Copilot CLI](https://docs.github.com/en/copilot/github-copilot-in-the-cli) | [`base`](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base) | Full coverage | Pre-installed. Works out of the box. Requires `GITHUB_TOKEN` or `COPILOT_GITHUB_TOKEN`. |
-| [OpenClaw](https://openclaw.ai/) | [`openclaw`](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/openclaw) | Bundled | Agent orchestration layer. Launch with `openshell sandbox create --from openclaw`. |
+| [OpenClaw](https://openclaw.ai/) | [NemoClaw](https://github.com/NVIDIA/NemoClaw) | Blueprint-managed | Run OpenClaw more securely inside NVIDIA OpenShell with managed inference using NemoClaw. |
 | [Ollama](https://ollama.com/) | [`ollama`](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/ollama) | Bundled | Run cloud and local models. Includes Claude Code, Codex, and OpenCode. Launch with `openshell sandbox create --from ollama`. |
+| [Pi](https://pi.dev/) | [`pi`](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/pi) | Bundled | Comes with Pi pre-installed. Launch with `openshell sandbox create --from pi`. |
 
 For base image details and `--from` usage, refer to [Sandboxes](/sandboxes/manage-sandboxes#base-sandbox-container).
 

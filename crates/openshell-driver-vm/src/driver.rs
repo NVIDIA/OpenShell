@@ -111,8 +111,8 @@ const GUEST_IMAGE_CONFIG_DIR: &str = "openshell-image";
 const GUEST_IMAGE_OCI_LAYOUT_DIR: &str = "oci";
 const GUEST_IMAGE_OCI_REF: &str = "openshell";
 const IMAGE_EXPORT_ROOTFS_ARCHIVE: &str = "source-rootfs.tar";
-const BOOTSTRAP_IMAGE_CACHE_LAYOUT_VERSION: &str = "sandbox-bootstrap-rootfs-ext4-v2";
-const PREPARED_IMAGE_CACHE_LAYOUT_VERSION: &str = "sandbox-prepared-rootfs-ext4-umoci-v2";
+const BOOTSTRAP_IMAGE_CACHE_LAYOUT_VERSION: &str = "sandbox-bootstrap-rootfs-ext4-v3";
+const PREPARED_IMAGE_CACHE_LAYOUT_VERSION: &str = "sandbox-prepared-rootfs-ext4-umoci-v3";
 const IMAGE_IDENTITY_FILE: &str = "image-identity";
 const IMAGE_REFERENCE_FILE: &str = "image-reference";
 const IMAGE_PREP_INIT_MODE: &str = "image-prep";
@@ -3725,11 +3725,17 @@ fn write_oci_layout_for_manifest(
 }
 
 fn bootstrap_image_cache_identity(image_identity: &str) -> String {
-    format!("{BOOTSTRAP_IMAGE_CACHE_LAYOUT_VERSION}:{image_identity}")
+    format!(
+        "{BOOTSTRAP_IMAGE_CACHE_LAYOUT_VERSION}:openshell-{}:{image_identity}",
+        openshell_core::VERSION
+    )
 }
 
 fn prepared_image_cache_identity(image_identity: &str) -> String {
-    format!("{PREPARED_IMAGE_CACHE_LAYOUT_VERSION}:{image_identity}")
+    format!(
+        "{PREPARED_IMAGE_CACHE_LAYOUT_VERSION}:openshell-{}:{image_identity}",
+        openshell_core::VERSION
+    )
 }
 
 fn registry_layer_download_concurrency() -> usize {
@@ -5517,18 +5523,24 @@ mod tests {
     }
 
     #[test]
-    fn prepared_image_cache_identity_includes_rootfs_layout_version() {
+    fn prepared_image_cache_identity_includes_rootfs_layout_and_openshell_version() {
         assert_eq!(
             prepared_image_cache_identity("sha256:local-image"),
-            "sandbox-prepared-rootfs-ext4-umoci-v2:sha256:local-image"
+            format!(
+                "sandbox-prepared-rootfs-ext4-umoci-v3:openshell-{}:sha256:local-image",
+                openshell_core::VERSION
+            )
         );
     }
 
     #[test]
-    fn bootstrap_image_cache_identity_includes_rootfs_layout_version() {
+    fn bootstrap_image_cache_identity_includes_rootfs_layout_and_openshell_version() {
         assert_eq!(
             bootstrap_image_cache_identity("sha256:bootstrap-image"),
-            "sandbox-bootstrap-rootfs-ext4-v2:sha256:bootstrap-image"
+            format!(
+                "sandbox-bootstrap-rootfs-ext4-v3:openshell-{}:sha256:bootstrap-image",
+                openshell_core::VERSION
+            )
         );
     }
 

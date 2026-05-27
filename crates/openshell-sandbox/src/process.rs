@@ -20,7 +20,7 @@ use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::process::{Child, Command};
-use tracing::debug;
+use tracing::{debug, warn};
 
 fn inject_provider_env(cmd: &mut Command, provider_env: &HashMap<String, String>) {
     for (key, value) in provider_env {
@@ -41,19 +41,6 @@ pub fn harden_child_process() -> Result<()> {
     )
     .map_err(|e| miette::miette!("Failed to disable core dumps: {e}"))?;
 
-    // Limit process creation to prevent fork bombs. 512 processes per UID is
-    // sufficient for typical agent workloads (shell, compilers, language servers)
-    // while preventing runaway forking. Set as a hard limit so the sandbox user
-    // cannot raise it after privilege drop.
-    setrlimit(
-        Resource::Nproc,
-        Rlimit {
-            current: Some(512),
-            maximum: Some(512),
-        },
-    )
-    .map_err(|e| miette::miette!("Failed to set RLIMIT_NPROC: {e}"))?;
-
     #[cfg(target_os = "linux")]
     {
         use rustix::process::{DumpableBehavior, set_dumpable_behavior};
@@ -62,6 +49,84 @@ pub fn harden_child_process() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+const CGROUP_PIDS_MAX_PATH: &str = "/sys/fs/cgroup/pids.max";
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimePidLimitStatus {
+    Limited(u64),
+    Unlimited,
+    Unavailable(String),
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimePidLimitMode {
+    Warn,
+    Require,
+}
+
+#[cfg(target_os = "linux")]
+pub fn check_runtime_pid_limit(mode: RuntimePidLimitMode) -> Result<()> {
+    check_runtime_pid_limit_status(runtime_pid_limit_status(), mode)
+}
+
+#[cfg(target_os = "linux")]
+fn check_runtime_pid_limit_status(
+    status: RuntimePidLimitStatus,
+    mode: RuntimePidLimitMode,
+) -> Result<()> {
+    match status {
+        RuntimePidLimitStatus::Limited(limit) => {
+            debug!(pids_max = limit, "runtime PID limit detected");
+            Ok(())
+        }
+        RuntimePidLimitStatus::Unlimited => {
+            let message = "runtime cgroup pids.max is unlimited; configure the compute driver or container runtime to enforce a PID limit";
+            if matches!(mode, RuntimePidLimitMode::Require) {
+                Err(miette::miette!(message))
+            } else {
+                warn!("{message}");
+                Ok(())
+            }
+        }
+        RuntimePidLimitStatus::Unavailable(reason) => {
+            let message = format!(
+                "runtime cgroup pids.max is unavailable ({reason}); configure the compute driver or container runtime to enforce a PID limit"
+            );
+            if matches!(mode, RuntimePidLimitMode::Require) {
+                Err(miette::miette!(message))
+            } else {
+                warn!("{message}");
+                Ok(())
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn runtime_pid_limit_status() -> RuntimePidLimitStatus {
+    match std::fs::read_to_string(CGROUP_PIDS_MAX_PATH) {
+        Ok(contents) => parse_pids_max(&contents),
+        Err(err) => RuntimePidLimitStatus::Unavailable(err.to_string()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_pids_max(contents: &str) -> RuntimePidLimitStatus {
+    let raw = contents.trim();
+    if raw.eq_ignore_ascii_case("max") {
+        return RuntimePidLimitStatus::Unlimited;
+    }
+    match raw.parse::<u64>() {
+        Ok(limit) => RuntimePidLimitStatus::Limited(limit),
+        Err(err) => {
+            RuntimePidLimitStatus::Unavailable(format!("invalid pids.max value {raw:?}: {err}"))
+        }
+    }
 }
 
 /// Handle to a running process.
@@ -803,6 +868,52 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn harden_child_process_marks_process_nondumpable() {
         assert_eq!(probe_hardened_child(dumpable_flag_probe), 0);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn parse_pids_max_detects_limited_runtime() {
+        assert_eq!(
+            parse_pids_max("2048\n"),
+            RuntimePidLimitStatus::Limited(2048)
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn parse_pids_max_detects_unlimited_runtime() {
+        assert_eq!(parse_pids_max("max\n"), RuntimePidLimitStatus::Unlimited);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn parse_pids_max_reports_invalid_values() {
+        let status = parse_pids_max("not-a-number\n");
+        assert!(matches!(status, RuntimePidLimitStatus::Unavailable(_)));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn pid_limit_require_mode_rejects_missing_guardrail_statuses() {
+        for status in [
+            RuntimePidLimitStatus::Unlimited,
+            RuntimePidLimitStatus::Unavailable("missing".to_string()),
+        ] {
+            let result = check_runtime_pid_limit_status(status, RuntimePidLimitMode::Require);
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn pid_limit_warn_mode_accepts_missing_guardrail_statuses() {
+        for status in [
+            RuntimePidLimitStatus::Unlimited,
+            RuntimePidLimitStatus::Unavailable("missing".to_string()),
+        ] {
+            let result = check_runtime_pid_limit_status(status, RuntimePidLimitMode::Warn);
+            assert!(result.is_ok());
+        }
     }
 
     #[tokio::test]

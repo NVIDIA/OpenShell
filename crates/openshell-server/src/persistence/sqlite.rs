@@ -11,7 +11,7 @@ use crate::policy_store::{
 };
 use openshell_core::paths::set_file_owner_only;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::{Row, SqlitePool};
+use sqlx::{Connection, Row, SqlitePool};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -63,6 +63,21 @@ impl SqliteStore {
             .run(&self.pool)
             .await
             .map_err(|e| map_migrate_error(&e))
+    }
+
+    /// Verify the database is reachable by acquiring a pooled connection
+    /// and issuing a ping.
+    pub async fn ping(&self) -> PersistenceResult<()> {
+        let mut conn = self.pool.acquire().await.map_err(|e| map_db_error(&e))?;
+        conn.ping().await.map_err(|e| map_db_error(&e))
+    }
+
+    /// Test support only: close the underlying connection pool.
+    ///
+    /// Do not call from runtime code; this tears down the active pool.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn close(&self) {
+        self.pool.close().await;
     }
 
     pub async fn put(

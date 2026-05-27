@@ -141,6 +141,7 @@ build_component_for_arch() {
   local stage
   local features
   local cargo_subcommand
+  local build_target
   local current_host_os
   local current_host_arch
 
@@ -152,7 +153,17 @@ build_component_for_arch() {
   current_host_arch="$(host_arch)"
 
   cargo_subcommand=(cargo build)
-  if [[ "$current_host_os" != "Linux" || "$current_host_arch" != "$arch" ]]; then
+  build_target="$target"
+
+  if [[ "$component" == "gateway" ]]; then
+    if command -v cargo-zigbuild >/dev/null 2>&1 || mise which cargo-zigbuild >/dev/null 2>&1; then
+      cargo_subcommand=(cargo zigbuild)
+      build_target="${target}.2.31"
+    else
+      echo "Error: cargo-zigbuild + zig are required to build ${binary} with the glibc 2.31 floor." >&2
+      exit 1
+    fi
+  elif [[ "$current_host_os" != "Linux" || "$current_host_arch" != "$arch" ]]; then
     if command -v cargo-zigbuild >/dev/null 2>&1 || mise which cargo-zigbuild >/dev/null 2>&1; then
       cargo_subcommand=(cargo zigbuild)
     else
@@ -163,12 +174,12 @@ build_component_for_arch() {
     fi
   fi
 
-  echo "Building ${binary} for linux/${arch} (${target})..."
+  echo "Building ${binary} for linux/${arch} (${build_target})..."
   mise x -- rustup target add "$target" >/dev/null 2>&1 || true
 
   args=(
     --release
-    --target "$target"
+    --target "$build_target"
     -p "$crate"
     --bin "$binary"
   )

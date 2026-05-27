@@ -55,7 +55,6 @@ EXCLUDE_DIRS: set[str] = {
     ".git",
     ".cache",
     "python/openshell/_proto",
-    "deploy/helm/openshell/templates",
 }
 
 # Individual filenames to skip.

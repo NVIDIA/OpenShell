@@ -119,6 +119,45 @@ pub fn prepare(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<Option<P
         return Ok(None);
     }
 
+    let compatibility = &policy.landlock.compatibility;
+
+    // Probe first: kernels without Landlock (e.g. gVisor's sentry returns
+    // ENOSYS) would otherwise log misleading "Applying"+"Built" events.
+    let availability = probe_availability();
+    if !matches!(availability, LandlockAvailability::Available { .. }) {
+        match compatibility {
+            LandlockCompatibility::BestEffort => {
+                openshell_ocsf::ocsf_emit!(
+                    openshell_ocsf::DetectionFindingBuilder::new(crate::ocsf_ctx())
+                        .activity(openshell_ocsf::ActivityId::Open)
+                        .severity(openshell_ocsf::SeverityId::High)
+                        .confidence(openshell_ocsf::ConfidenceId::High)
+                        .is_alert(true)
+                        .finding_info(
+                            openshell_ocsf::FindingInfo::new(
+                                "landlock-unavailable",
+                                "Landlock Filesystem Sandbox Unavailable",
+                            )
+                            .with_desc(&format!(
+                                "Running WITHOUT filesystem restrictions: Landlock is {availability}. \
+                                 Set landlock.compatibility to 'hard_requirement' to make this fatal."
+                            )),
+                        )
+                        .message(format!(
+                            "Landlock filesystem sandbox unavailable: {availability}"
+                        ))
+                        .build()
+                );
+                return Ok(None);
+            }
+            LandlockCompatibility::HardRequirement => {
+                return Err(miette::miette!(
+                    "Landlock unavailable in hard_requirement mode: {availability}"
+                ));
+            }
+        }
+    }
+
     let total_paths = read_only.len() + read_write.len();
     let abi = ABI::V2;
     openshell_ocsf::ocsf_emit!(
@@ -134,8 +173,6 @@ pub fn prepare(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<Option<P
             ))
             .build()
     );
-
-    let compatibility = &policy.landlock.compatibility;
 
     let result: Result<PreparedRuleset> = (|| {
         let access_all = AccessFs::from_all(abi);

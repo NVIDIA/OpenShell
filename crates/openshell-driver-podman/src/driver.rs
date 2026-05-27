@@ -57,13 +57,8 @@ fn validated_container_name(sandbox_name: &str) -> Result<String, ComputeDriverE
 }
 
 fn sandbox_token_host_path(sandbox_id: &str) -> Result<PathBuf, ComputeDriverError> {
-    let base = openshell_core::paths::xdg_state_dir()
-        .map_err(|err| ComputeDriverError::Message(format!("resolve state dir failed: {err}")))?;
-    Ok(base
-        .join("openshell")
-        .join("podman-sandbox-tokens")
-        .join(sandbox_id)
-        .join("sandbox.jwt"))
+    openshell_core::driver_utils::sandbox_token_path("podman-sandbox-tokens", None, sandbox_id)
+        .map_err(|err| ComputeDriverError::Message(format!("resolve state dir failed: {err}")))
 }
 
 async fn write_sandbox_token_file(
@@ -146,6 +141,7 @@ impl PodmanComputeDriver {
         // (e.g. CA set but cert/key missing) are rejected early so operators
         // get a clear error instead of a silent fallback to plaintext HTTP.
         config.validate_tls_config()?;
+        config.validate_runtime_limits()?;
 
         let client = PodmanClient::new(config.socket_path.clone());
 
@@ -257,14 +253,12 @@ impl PodmanComputeDriver {
 
     /// Report driver capabilities.
     pub fn capabilities(&self) -> Result<GetCapabilitiesResponse, ComputeDriverError> {
-        let supports_gpu = Self::has_gpu_capacity();
-        Ok(GetCapabilitiesResponse {
-            driver_name: "podman".to_string(),
-            driver_version: openshell_core::VERSION.to_string(),
-            default_image: self.config.default_image.clone(),
-            supports_gpu,
-            gpu_count: 0,
-        })
+        Ok(openshell_core::driver_utils::build_capabilities_response(
+            "podman",
+            openshell_core::VERSION,
+            &self.config.default_image,
+            Self::has_gpu_capacity(),
+        ))
     }
 
     #[must_use]
@@ -328,15 +322,16 @@ impl PodmanComputeDriver {
 
         // 1a. Pull the supervisor image if needed. The supervisor binary
         //     is shipped in a standalone OCI image and mounted into sandbox
-        //     containers via Podman's type=image mount. Using "missing"
-        //     policy so the image is only pulled once and then cached.
+        //     containers via Podman's type=image mount. Refresh mutable tags
+        //     like latest/dev, but avoid registry checks for pinned images.
+        let supervisor_pull_policy = supervisor_image_pull_policy(&self.config.supervisor_image);
         info!(
             image = %self.config.supervisor_image,
-            policy = "missing",
+            policy = supervisor_pull_policy,
             "Ensuring supervisor image"
         );
         self.client
-            .pull_image(&self.config.supervisor_image, "missing")
+            .pull_image(&self.config.supervisor_image, supervisor_pull_policy)
             .await
             .map_err(ComputeDriverError::from)?;
 
@@ -589,6 +584,31 @@ impl PodmanComputeDriver {
     }
 }
 
+fn supervisor_image_pull_policy(image: &str) -> &'static str {
+    if supervisor_image_should_refresh(image) {
+        "newer"
+    } else {
+        "missing"
+    }
+}
+
+fn supervisor_image_should_refresh(image: &str) -> bool {
+    matches!(supervisor_image_tag(image), Some("dev" | "latest"))
+}
+
+fn supervisor_image_tag(image: &str) -> Option<&str> {
+    if image.contains('@') {
+        return None;
+    }
+
+    let image_name = image.rsplit('/').next().unwrap_or(image);
+    image_name
+        .rsplit_once(':')
+        .map_or(Some("latest"), |(_, tag)| {
+            if tag.is_empty() { None } else { Some(tag) }
+        })
+}
+
 /// Check whether the current user has subuid/subgid ranges configured.
 ///
 /// Rootless Podman requires entries in `/etc/subuid` and `/etc/subgid` for
@@ -717,6 +737,32 @@ mod tests {
             cfg.grpc_endpoint = format!("{scheme}://host.containers.internal:{}", cfg.gateway_port);
         }
         assert_eq!(cfg.grpc_endpoint, "https://gateway.internal:9000");
+    }
+
+    #[test]
+    fn supervisor_pull_policy_refreshes_mutable_tags_only() {
+        assert_eq!(
+            supervisor_image_pull_policy("ghcr.io/nvidia/openshell/supervisor:dev"),
+            "newer"
+        );
+        assert_eq!(
+            supervisor_image_pull_policy("ghcr.io/nvidia/openshell/supervisor:latest"),
+            "newer"
+        );
+        assert_eq!(
+            supervisor_image_pull_policy("ghcr.io/nvidia/openshell/supervisor"),
+            "newer"
+        );
+        assert_eq!(
+            supervisor_image_pull_policy(
+                "ghcr.io/nvidia/openshell/supervisor:0.0.47-dev.13-g57b71c68f"
+            ),
+            "missing"
+        );
+        assert_eq!(
+            supervisor_image_pull_policy("ghcr.io/nvidia/openshell/supervisor@sha256:abc123"),
+            "missing"
+        );
     }
 
     fn test_driver(socket_path: PathBuf) -> PodmanComputeDriver {

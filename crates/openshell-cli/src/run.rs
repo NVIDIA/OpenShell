@@ -54,9 +54,9 @@ use openshell_core::proto::{
 use openshell_core::settings::{self, SettingValueKind};
 use openshell_core::{ObjectId, ObjectName};
 use openshell_providers::{
-    ProviderRegistry, ProviderTypeProfile, detect_provider_from_command, normalize_provider_type,
-    parse_profile_json, parse_profile_yaml, profile_to_json, profile_to_yaml, profiles_to_json,
-    profiles_to_yaml,
+    ProviderRegistry, ProviderTypeProfile, RealDiscoveryContext, detect_provider_from_command,
+    discover_from_profile, normalize_provider_type, parse_profile_json, parse_profile_yaml,
+    profile_to_json, profile_to_yaml, profiles_to_json, profiles_to_yaml,
 };
 use owo_colors::OwoColorize;
 use std::collections::{HashMap, HashSet};
@@ -219,6 +219,8 @@ struct ProvisioningDisplay {
     completed_steps: Vec<ProvisioningStep>,
     /// Progress bars for completed steps (so they can be cleared).
     completed_bars: Vec<ProgressBar>,
+    /// The currently active provisioning step.
+    active_step: Option<ProvisioningStep>,
     /// The currently active step label (shown on the spinner).
     active_label: String,
     /// Detail text shown next to the active step (e.g. image name).
@@ -253,6 +255,7 @@ impl ProvisioningDisplay {
             spacer,
             completed_steps: Vec::new(),
             completed_bars: Vec::new(),
+            active_step: None,
             active_label: ProvisioningStep::RequestingSandbox
                 .active_label()
                 .to_string(),
@@ -290,11 +293,15 @@ impl ProvisioningDisplay {
         self.step_start = Instant::now();
         self.spinner.reset_elapsed();
         self.active_detail.clear();
+        if self.active_step == Some(step) {
+            self.active_step = None;
+        }
     }
 
     /// Set the active (in-progress) step shown on the spinner.
-    fn set_active(&mut self, label: &str) {
-        self.active_label = label.to_string();
+    fn set_active(&mut self, step: ProvisioningStep) {
+        self.active_step = Some(step);
+        self.active_label = step.active_label().to_string();
         self.active_detail.clear();
         // Reset the spinner's elapsed time for the new step.
         self.spinner.reset_elapsed();
@@ -304,11 +311,17 @@ impl ProvisioningDisplay {
 
     /// Set the active step from a known provisioning step enum.
     fn set_active_step(&mut self, step: ProvisioningStep) {
-        self.set_active(step.active_label());
+        if self.active_step == Some(step) {
+            return;
+        }
+        self.set_active(step);
     }
 
     /// Set detail text shown alongside the active step (e.g. image name).
     fn set_active_detail(&mut self, detail: &str) {
+        if self.active_detail == detail {
+            return;
+        }
         self.active_detail = detail.to_string();
         self.update_spinner();
     }
@@ -858,6 +871,7 @@ pub async fn gateway_add(
     oidc_client_id: &str,
     oidc_audience: Option<&str>,
     oidc_scopes: Option<&str>,
+    gateway_insecure: bool,
 ) -> Result<()> {
     // If the endpoint starts with ssh://, parse it into an SSH destination
     // and a gateway endpoint automatically.  The host is resolved via
@@ -971,6 +985,7 @@ pub async fn gateway_add(
                 oidc_client_id,
                 oidc_audience,
                 oidc_scopes,
+                gateway_insecure,
             )
             .await
             {
@@ -991,6 +1006,7 @@ pub async fn gateway_add(
                 oidc_client_id,
                 oidc_audience,
                 oidc_scopes,
+                gateway_insecure,
             )
             .await
             {
@@ -1164,7 +1180,7 @@ pub async fn gateway_add(
 /// Re-authenticate with an edge-authenticated or OIDC gateway.
 ///
 /// Dispatches to the appropriate auth flow based on `auth_mode`.
-pub async fn gateway_login(name: &str) -> Result<()> {
+pub async fn gateway_login(name: &str, gateway_insecure: bool) -> Result<()> {
     let metadata = openshell_bootstrap::load_gateway_metadata(name).map_err(|_| {
         miette::miette!(
             "Unknown gateway '{name}'.\n\
@@ -1190,11 +1206,23 @@ pub async fn gateway_login(name: &str) -> Result<()> {
             let scopes = metadata.oidc_scopes.as_deref();
 
             let bundle = if std::env::var("OPENSHELL_OIDC_CLIENT_SECRET").is_ok() {
-                crate::oidc_auth::oidc_client_credentials_flow(issuer, client_id, audience, scopes)
-                    .await?
+                crate::oidc_auth::oidc_client_credentials_flow(
+                    issuer,
+                    client_id,
+                    audience,
+                    scopes,
+                    gateway_insecure,
+                )
+                .await?
             } else {
-                crate::oidc_auth::oidc_browser_auth_flow(issuer, client_id, audience, scopes)
-                    .await?
+                crate::oidc_auth::oidc_browser_auth_flow(
+                    issuer,
+                    client_id,
+                    audience,
+                    scopes,
+                    gateway_insecure,
+                )
+                .await?
             };
 
             let username = jwt_preferred_username(&bundle.access_token);
@@ -1709,7 +1737,12 @@ pub async fn sandbox_create(
     };
     let requested_gpu = gpu || image.as_deref().is_some_and(image_requests_gpu);
 
-    let inferred_types: Vec<String> = inferred_provider_type(command).into_iter().collect();
+    let providers_v2_enabled = gateway_providers_v2_enabled(&mut client).await?;
+    let inferred_types: Vec<String> = if providers_v2_enabled {
+        Vec::new()
+    } else {
+        inferred_provider_type(command).into_iter().collect()
+    };
     let configured_providers = ensure_required_providers(
         &mut client,
         providers,
@@ -2013,7 +2046,7 @@ pub async fn sandbox_create(
 
             // If --forward was requested, start the background port forward
             // *before* running the command so that long-running processes
-            // (e.g. `openclaw gateway`) are reachable immediately.
+            // (e.g. a web gateway) are reachable immediately.
             if let Some(ref spec) = forward {
                 sandbox_forward(
                     &effective_server,
@@ -3631,9 +3664,8 @@ async fn auto_create_provider(
         return Ok(());
     }
 
-    let registry = ProviderRegistry::new();
-    let discovered = registry
-        .discover_existing(provider_type)
+    let discovered = discover_existing_provider_data(client, provider_type)
+        .await
         .map_err(|err| miette::miette!("failed to discover provider '{provider_type}': {err}"))?;
     let Some(discovered) = discovered else {
         eprintln!(
@@ -4094,6 +4126,68 @@ fn service_url_for_gateway(service_url: &str, gateway_endpoint: &str) -> String 
     service_url.to_string()
 }
 
+async fn gateway_providers_v2_enabled(client: &mut crate::tls::GrpcClient) -> Result<bool> {
+    let response = client
+        .get_gateway_config(GetGatewayConfigRequest {})
+        .await
+        .into_diagnostic()?
+        .into_inner();
+    let Some(setting) = response.settings.get(settings::PROVIDERS_V2_ENABLED_KEY) else {
+        return Ok(false);
+    };
+    match setting.value.as_ref() {
+        Some(setting_value::Value::BoolValue(enabled)) => Ok(*enabled),
+        None => Ok(false),
+        Some(_) => Err(miette::miette!(
+            "gateway setting '{}' has invalid value type; expected bool",
+            settings::PROVIDERS_V2_ENABLED_KEY
+        )),
+    }
+}
+
+async fn fetch_provider_profile(
+    client: &mut crate::tls::GrpcClient,
+    provider_type: &str,
+) -> Result<ProviderProfile> {
+    let response = client
+        .get_provider_profile(GetProviderProfileRequest {
+            id: provider_type.to_string(),
+        })
+        .await
+        .map_err(|status| {
+            if status.code() == Code::NotFound {
+                miette::miette!(
+                    "provider profile '{provider_type}' not found; providers v2 discovery requires a provider profile"
+                )
+            } else {
+                miette::miette!(status.to_string())
+            }
+        })?;
+
+    response
+        .into_inner()
+        .profile
+        .ok_or_else(|| miette::miette!("provider profile '{provider_type}' missing from response"))
+}
+
+async fn discover_existing_provider_data(
+    client: &mut crate::tls::GrpcClient,
+    provider_type: &str,
+) -> Result<Option<openshell_providers::DiscoveredProvider>> {
+    if gateway_providers_v2_enabled(client).await? {
+        let profile = fetch_provider_profile(client, provider_type).await?;
+        let profile = ProviderTypeProfile::from_proto(&profile);
+        discover_from_profile(&profile, &RealDiscoveryContext).map_err(|err| {
+            miette::miette!("failed to discover existing provider data from profile: {err}")
+        })
+    } else {
+        let registry = ProviderRegistry::new();
+        registry
+            .discover_existing(provider_type)
+            .map_err(|err| miette::miette!("failed to discover existing provider data: {err}"))
+    }
+}
+
 pub async fn provider_create(
     server: &str,
     name: &str,
@@ -4143,10 +4237,7 @@ pub async fn provider_create(
     let mut config_map = parse_key_value_pairs(config, "--config")?;
 
     if from_existing {
-        let registry = ProviderRegistry::new();
-        let discovered = registry
-            .discover_existing(&provider_type)
-            .map_err(|err| miette::miette!("failed to discover existing provider data: {err}"))?;
+        let discovered = discover_existing_provider_data(&mut client, &provider_type).await?;
         let Some(discovered) = discovered else {
             return Err(miette::miette!(
                 "no existing local credentials/config found for provider type '{provider_type}'"
@@ -4162,13 +4253,9 @@ pub async fn provider_create(
     }
 
     if credential_map.is_empty() {
-        let allows_refresh_bootstrap = client
-            .get_provider_profile(GetProviderProfileRequest {
-                id: provider_type.clone(),
-            })
+        let allows_refresh_bootstrap = fetch_provider_profile(&mut client, &provider_type)
             .await
             .ok()
-            .and_then(|response| response.into_inner().profile)
             .is_some_and(|profile| provider_profile_allows_refresh_bootstrap(&profile));
         if !allows_refresh_bootstrap {
             return Err(miette::miette!(
@@ -4911,10 +4998,7 @@ pub async fn provider_update(
             .ok_or_else(|| miette::miette!("provider '{name}' not found"))?;
 
         let provider_type = existing.r#type;
-        let registry = ProviderRegistry::new();
-        let discovered = registry
-            .discover_existing(&provider_type)
-            .map_err(|err| miette::miette!("failed to discover existing provider data: {err}"))?;
+        let discovered = discover_existing_provider_data(&mut client, &provider_type).await?;
         let Some(discovered) = discovered else {
             return Err(miette::miette!(
                 "no existing local credentials/config found for provider type '{provider_type}'"
@@ -6878,7 +6962,7 @@ fn format_timestamp_ms(ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ProvisioningStep, TlsOptions, build_sandbox_resource_limits,
+        ProvisioningDisplay, ProvisioningStep, TlsOptions, build_sandbox_resource_limits,
         dockerfile_sources_supported_for_gateway, format_endpoint, format_gateway_select_header,
         format_gateway_select_items, format_provider_attachment_table, gateway_add,
         gateway_auth_label, gateway_env_override_warning, gateway_select_with, gateway_type_label,
@@ -6899,6 +6983,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::thread;
+    use std::time::{Duration, Instant};
     use tonic::Status;
 
     use openshell_bootstrap::GatewayMetadata;
@@ -7105,6 +7190,48 @@ mod tests {
             Some(ProvisioningStep::StartingSandbox)
         );
         assert_eq!(progress_step_from_metadata("driver-private-step"), None);
+    }
+
+    #[test]
+    fn provisioning_display_ignores_repeated_active_step_updates() {
+        let mut display = ProvisioningDisplay::new();
+        display.set_active_step(ProvisioningStep::PullingSandboxImage);
+        display.set_active_detail("Downloading layer-1 (1 MB/2 MB)");
+
+        let original_step_start = Instant::now()
+            .checked_sub(Duration::from_secs(5))
+            .expect("test duration should be representable");
+        display.step_start = original_step_start;
+
+        display.set_active_step(ProvisioningStep::PullingSandboxImage);
+        display.set_active_detail("Downloading layer-1 (1 MB/2 MB)");
+
+        assert_eq!(
+            display.active_step,
+            Some(ProvisioningStep::PullingSandboxImage)
+        );
+        assert_eq!(display.active_detail, "Downloading layer-1 (1 MB/2 MB)");
+        assert_eq!(display.step_start, original_step_start);
+        display.clear();
+    }
+
+    #[test]
+    fn provisioning_display_resets_detail_on_active_step_transition() {
+        let mut display = ProvisioningDisplay::new();
+        display.set_active_step(ProvisioningStep::PullingSandboxImage);
+        display.set_active_detail("Downloading layer-1 (1 MB/2 MB)");
+
+        let original_step_start = Instant::now()
+            .checked_sub(Duration::from_secs(5))
+            .expect("test duration should be representable");
+        display.step_start = original_step_start;
+
+        display.set_active_step(ProvisioningStep::StartingSandbox);
+
+        assert_eq!(display.active_step, Some(ProvisioningStep::StartingSandbox));
+        assert!(display.active_detail.is_empty());
+        assert!(display.step_start > original_step_start);
+        display.clear();
     }
 
     #[test]
@@ -7356,7 +7483,7 @@ mod tests {
         for image in [
             "ghcr.io/nvidia/openshell-community/sandboxes/base:latest",
             "registry.example.com/gpu/team/base:latest",
-            "registry.example.com/team/openclaw:latest",
+            "registry.example.com/team/notebook:latest",
             "cuda-toolkit:latest",
             "registry.example.com/team/graphics:latest",
         ] {
@@ -7468,10 +7595,10 @@ mod tests {
     fn service_url_for_gateway_uses_external_gateway_port() {
         assert_eq!(
             service_url_for_gateway(
-                "https://quiet-flamingo--openclaw.navigator.openshell.localhost:8080/",
+                "https://quiet-flamingo--notebook.navigator.openshell.localhost:8080/",
                 "https://127.0.0.1:31886"
             ),
-            "https://quiet-flamingo--openclaw.navigator.openshell.localhost:31886/"
+            "https://quiet-flamingo--notebook.navigator.openshell.localhost:31886/"
         );
     }
 
@@ -7479,10 +7606,10 @@ mod tests {
     fn service_url_for_gateway_omits_default_external_port() {
         assert_eq!(
             service_url_for_gateway(
-                "https://quiet-flamingo--openclaw.navigator.openshell.localhost:8080/",
+                "https://quiet-flamingo--notebook.navigator.openshell.localhost:8080/",
                 "https://gateway.example.com"
             ),
-            "https://quiet-flamingo--openclaw.navigator.openshell.localhost/"
+            "https://quiet-flamingo--notebook.navigator.openshell.localhost/"
         );
     }
 
@@ -7490,10 +7617,10 @@ mod tests {
     fn service_url_for_gateway_preserves_service_scheme() {
         assert_eq!(
             service_url_for_gateway(
-                "http://quiet-flamingo--openclaw.navigator.openshell.localhost:8080/",
+                "http://quiet-flamingo--notebook.navigator.openshell.localhost:8080/",
                 "https://127.0.0.1:31886"
             ),
-            "http://quiet-flamingo--openclaw.navigator.openshell.localhost:31886/"
+            "http://quiet-flamingo--notebook.navigator.openshell.localhost:31886/"
         );
     }
 
@@ -7501,10 +7628,10 @@ mod tests {
     fn service_url_for_gateway_uses_gateway_default_port() {
         assert_eq!(
             service_url_for_gateway(
-                "http://quiet-flamingo--openclaw.navigator.openshell.localhost:8080/",
+                "http://quiet-flamingo--notebook.navigator.openshell.localhost:8080/",
                 "https://gateway.example.com"
             ),
-            "http://quiet-flamingo--openclaw.navigator.openshell.localhost:443/"
+            "http://quiet-flamingo--notebook.navigator.openshell.localhost:443/"
         );
     }
 
@@ -7871,6 +7998,7 @@ mod tests {
                     "openshell-cli",
                     None,
                     None,
+                    false,
                 )
                 .await
                 .expect("register plaintext gateway");
@@ -7902,6 +8030,7 @@ mod tests {
                     "openshell-cli",
                     None,
                     None,
+                    false,
                 )
                 .await
                 .expect("register plaintext gateway");

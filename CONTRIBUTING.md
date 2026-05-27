@@ -126,6 +126,25 @@ Project requirements:
 - Docker (running)
 - Z3 solver library (for the policy prover crate)
 
+### macOS build tools
+
+Install Apple Command Line Tools before building locally:
+
+```bash
+xcode-select --install
+```
+
+If Cargo fails while building `protobuf-src` with an error such as
+`fatal error: 'utility' file not found`, `fatal error: 'cstdlib' file not
+found`, or `A compiler with support for C++11 language features is required`,
+your Command Line Tools install may not expose the libc++ headers on the
+compiler's default include path. Reinstall Command Line Tools to correct the error:
+
+```bash
+sudo rm -rf /Library/Developer/CommandLineTools
+xcode-select --install
+```
+
 ### Z3 installation
 
 The `openshell-prover` crate links against the system Z3 library via pkg-config.

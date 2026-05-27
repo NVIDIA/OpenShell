@@ -10,7 +10,6 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-  SCCACHE_GHA_ENABLED: "true"
 
 permissions:
   contents: read
@@ -88,6 +87,7 @@ jobs:
         runner: [linux-amd64-cpu8, linux-arm64-cpu8]
     runs-on: ${{ matrix.runner }}
     env:
+      SCCACHE_GHA_ENABLED: "true"
       SCCACHE_GHA_VERSION: branch-checks-rust-${{ matrix.runner }}
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
@@ -97,11 +97,11 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-      - name: Install tools
-        run: mise install --locked
-
       - name: Configure GHA sccache backend
         uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+
+      - name: Install tools
+        run: mise install --locked
 
       - name: Cache Rust target and registry
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
@@ -109,8 +109,6 @@ jobs:
           # Keep branch-check caches partitioned by runner architecture; lint
           # and test intentionally share the same job-local target directory.
           shared-key: rust-checks-${{ matrix.runner }}
-          # Cache the sccache directory too
-          cache-directories: .cache/sccache
           # Preserve compiled artifacts from failed lint/test runs so the next
           # push to the same PR branch does not start from a cold cache.
           cache-on-failure: "true"

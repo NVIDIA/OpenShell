@@ -4585,6 +4585,25 @@ network_policies:
         );
     }
 
+    #[test]
+    fn deny_reason_collapses_endpoint_misses() {
+        let engine = test_engine();
+        let input = NetworkInput {
+            host: "not-configured.example.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/local/bin/claude"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let decision = engine.evaluate_network(&input).unwrap();
+        assert!(!decision.allowed);
+        assert_eq!(
+            decision.reason,
+            "endpoint not-configured.example.com:443 is not allowed by any policy"
+        );
+    }
+
     /// Check if symlink resolution through `/proc/<pid>/root/` actually works.
     /// Creates a real symlink in a tempdir and attempts to resolve it via
     /// the procfs root path. This catches environments where the probe path
