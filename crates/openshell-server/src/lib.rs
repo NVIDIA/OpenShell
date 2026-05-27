@@ -127,6 +127,9 @@ pub struct ServerState {
     /// `IssueSandboxToken` bootstrap path. Only present when the gateway
     /// runs in-cluster.
     pub k8s_sa_authenticator: Option<Arc<auth::k8s_sa::K8sServiceAccountAuthenticator>>,
+
+    /// Gateway-wide gRPC request rate limiter shared by every multiplex path.
+    pub(crate) grpc_rate_limiter: Option<multiplex::GrpcRateLimiter>,
 }
 
 fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
@@ -159,6 +162,7 @@ impl ServerState {
         supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
         oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
     ) -> Self {
+        let grpc_rate_limiter = multiplex::GrpcRateLimiter::from_config(&config);
         Self {
             config,
             store,
@@ -174,6 +178,7 @@ impl ServerState {
             sandbox_jwt_issuer: None,
             sandbox_jwt_authenticator: None,
             k8s_sa_authenticator: None,
+            grpc_rate_limiter,
         }
     }
 }
@@ -219,7 +224,10 @@ pub async fn run_server(
     let sandbox_index = SandboxIndex::new();
     let sandbox_watch_bus = SandboxWatchBus::new();
     let supervisor_sessions = Arc::new(supervisor_session::SupervisorSessionRegistry::new());
+    let driver = configured_compute_driver(&config)?;
+    let config = config.with_compute_drivers([driver]);
     let compute = build_compute_runtime(
+        driver,
         &config,
         &vm_config,
         &docker_config,
@@ -683,6 +691,7 @@ async fn terminate_signal() {
 // that must be passed through, so the count is justified.
 #[allow(clippy::too_many_arguments)]
 async fn build_compute_runtime(
+    driver: ComputeDriverKind,
     config: &Config,
     vm_config: &VmComputeConfig,
     docker_config: &DockerComputeConfig,
@@ -693,7 +702,6 @@ async fn build_compute_runtime(
     tracing_log_bus: TracingLogBus,
     supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
 ) -> Result<ComputeRuntime> {
-    let driver = configured_compute_driver(config)?;
     info!(driver = %driver, "Using compute driver");
 
     match driver {

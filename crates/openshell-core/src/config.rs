@@ -11,6 +11,7 @@ use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
+use std::time::Duration;
 
 // ── Public default constants ────────────────────────────────────────────
 //
@@ -38,6 +39,14 @@ pub const DEFAULT_SUPERVISOR_IMAGE: &str = "ghcr.io/nvidia/openshell/supervisor:
 
 /// CDI device identifier for requesting all NVIDIA GPUs.
 pub const CDI_GPU_DEVICE_ALL: &str = "nvidia.com/gpu=all";
+
+/// Default per-sandbox CPU limit applied when the user omits
+/// `template.resources.limits.cpu`. Uses Kubernetes-style quantity strings.
+pub const DEFAULT_SANDBOX_CPU_LIMIT: &str = "2";
+
+/// Default per-sandbox memory limit applied when the user omits
+/// `template.resources.limits.memory`. Uses Kubernetes-style quantity strings.
+pub const DEFAULT_SANDBOX_MEMORY_LIMIT: &str = "4Gi";
 
 /// Compute backends the gateway can orchestrate sandboxes through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -238,9 +247,57 @@ pub struct Config {
     #[serde(default = "default_ssh_session_ttl_secs")]
     pub ssh_session_ttl_secs: u64,
 
+    /// Maximum gRPC requests allowed per rate-limit window.
+    ///
+    /// When paired with [`Self::grpc_rate_limit_window_secs`], positive values
+    /// enable gateway-wide gRPC request rate limiting. `None` or `0` disables
+    /// the limit.
+    #[serde(default)]
+    pub grpc_rate_limit_requests: Option<u64>,
+
+    /// gRPC rate-limit window length in seconds.
+    ///
+    /// When paired with [`Self::grpc_rate_limit_requests`], positive values
+    /// enable gateway-wide gRPC request rate limiting. `None` or `0` disables
+    /// the limit.
+    #[serde(default)]
+    pub grpc_rate_limit_window_secs: Option<u64>,
+
     /// Browser-facing sandbox service routing configuration.
     #[serde(default)]
     pub service_routing: ServiceRoutingConfig,
+
+    /// Default CPU limit overlaid onto `template.resources.limits.cpu` when
+    /// a `CreateSandbox` request omits the field.
+    ///
+    /// - `Some(value)`: a Kubernetes-style quantity string (e.g. `"2"`,
+    ///   `"500m"`) injected into the sandbox template before persistence.
+    ///   User-supplied `limits.cpu` always wins (overlay semantics).
+    /// - `None`: gateway opts out of imposing a CPU bound for sandboxes
+    ///   that omit the field. The container runs without a CPU cgroup cap
+    ///   unless a driver-level fallback applies.
+    ///
+    /// The TOML loader resolves `default_sandbox_cpu_limit = "0"`, `""`, or
+    /// whitespace-only values to `None`. Negative quantities are rejected
+    /// rather than silently treated as an opt-out. An absent key falls back to
+    /// [`DEFAULT_SANDBOX_CPU_LIMIT`]. See
+    /// `openshell_server::config_file::resolve_sandbox_quantity_default`
+    /// for the full resolution table.
+    ///
+    /// [`Config::new`] seeds this with `Some(DEFAULT_SANDBOX_CPU_LIMIT)` so
+    /// embedded callers inherit the secure default automatically.
+    #[serde(default)]
+    pub default_sandbox_cpu_limit: Option<String>,
+
+    /// Default memory limit overlaid onto `template.resources.limits.memory`
+    /// when a `CreateSandbox` request omits the field. Same
+    /// `Some`/`None` semantics as [`Self::default_sandbox_cpu_limit`].
+    ///
+    /// TOML opt-out: `default_sandbox_memory_limit = "0"`, `""`, or
+    /// whitespace-only -> `None`. Negative quantities are rejected. An absent
+    /// key falls back to [`DEFAULT_SANDBOX_MEMORY_LIMIT`].
+    #[serde(default)]
+    pub default_sandbox_memory_limit: Option<String>,
 }
 
 /// Browser-facing sandbox service routing configuration.
@@ -416,7 +473,11 @@ impl Config {
             database_url: String::new(),
             compute_drivers: vec![],
             ssh_session_ttl_secs: default_ssh_session_ttl_secs(),
+            grpc_rate_limit_requests: None,
+            grpc_rate_limit_window_secs: None,
             service_routing: ServiceRoutingConfig::default(),
+            default_sandbox_cpu_limit: Some(DEFAULT_SANDBOX_CPU_LIMIT.to_string()),
+            default_sandbox_memory_limit: Some(DEFAULT_SANDBOX_MEMORY_LIMIT.to_string()),
         }
     }
 
@@ -480,6 +541,56 @@ impl Config {
     #[must_use]
     pub const fn with_ssh_session_ttl_secs(mut self, secs: u64) -> Self {
         self.ssh_session_ttl_secs = secs;
+        self
+    }
+
+    /// Set the gateway-wide gRPC request rate limit.
+    #[must_use]
+    pub const fn with_grpc_rate_limit(
+        mut self,
+        requests: Option<u64>,
+        window_secs: Option<u64>,
+    ) -> Self {
+        self.grpc_rate_limit_requests = requests;
+        self.grpc_rate_limit_window_secs = window_secs;
+        self
+    }
+
+    /// Return the effective gRPC rate limit, if fully configured and enabled.
+    #[must_use]
+    pub fn grpc_rate_limit(&self) -> Option<(u64, Duration)> {
+        let requests = self.grpc_rate_limit_requests?;
+        let window_secs = self.grpc_rate_limit_window_secs?;
+        if requests == 0 || window_secs == 0 {
+            None
+        } else {
+            Some((requests, Duration::from_secs(window_secs)))
+        }
+    }
+
+    /// Override the default sandbox CPU limit.
+    ///
+    /// - `Some(value)`: applied as the gateway-wide default when a
+    ///   `CreateSandbox` request omits `template.resources.limits.cpu`.
+    /// - `None`: gateway-wide opt-out — sandboxes that omit the field run
+    ///   without a CPU cap from the gateway. Equivalent to setting
+    ///   `default_sandbox_cpu_limit = "0"` (or `""`) in the gateway TOML.
+    ///
+    /// See [`Self::default_sandbox_cpu_limit`] for the overlay semantics.
+    #[must_use]
+    pub fn with_default_sandbox_cpu_limit(mut self, value: Option<String>) -> Self {
+        self.default_sandbox_cpu_limit = value;
+        self
+    }
+
+    /// Override the default sandbox memory limit.
+    ///
+    /// `None` opts out of the gateway-wide memory default, mirroring
+    /// `default_sandbox_memory_limit = "0"` in TOML. See
+    /// [`Self::default_sandbox_memory_limit`].
+    #[must_use]
+    pub fn with_default_sandbox_memory_limit(mut self, value: Option<String>) -> Self {
+        self.default_sandbox_memory_limit = value;
         self
     }
 
@@ -601,6 +712,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
+    use std::time::Duration;
 
     #[test]
     fn compute_driver_kind_parses_supported_values() {
@@ -644,6 +756,29 @@ mod tests {
     fn config_disables_unauthenticated_users_by_default() {
         let cfg = Config::new(None);
         assert!(!cfg.auth.allow_unauthenticated_users);
+    }
+
+    #[test]
+    fn grpc_rate_limit_requires_positive_pair() {
+        assert!(Config::new(None).grpc_rate_limit().is_none());
+        assert!(
+            Config::new(None)
+                .with_grpc_rate_limit(Some(10), None)
+                .grpc_rate_limit()
+                .is_none()
+        );
+        assert!(
+            Config::new(None)
+                .with_grpc_rate_limit(Some(0), Some(60))
+                .grpc_rate_limit()
+                .is_none()
+        );
+        assert_eq!(
+            Config::new(None)
+                .with_grpc_rate_limit(Some(10), Some(60))
+                .grpc_rate_limit(),
+            Some((10, Duration::from_secs(60)))
+        );
     }
 
     #[test]

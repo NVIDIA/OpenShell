@@ -1362,7 +1362,9 @@ fn build_platform_config(template: &SandboxTemplate) -> Option<prost_types::Stru
 
     // Pass through any resource fields that do not map to the typed
     // DriverResourceRequirements so platform-specific drivers can still see
-    // custom resources such as GPU limits.
+    // custom resources such as GPU limits. `pids` has no typed driver field
+    // today and is not a valid Kubernetes container resource, so ignore it
+    // rather than turning it into platform_config that strict drivers reject.
     if let Some(res) = build_platform_resources_config(&template.resources) {
         fields.insert(
             "resources_raw".to_string(),
@@ -1404,7 +1406,7 @@ fn build_platform_resources_config(
             .filter_map(|(resource_name, resource_value)| {
                 let is_typed_quantity = matches!(resource_name.as_str(), "cpu" | "memory")
                     && matches!(resource_value.kind.as_ref(), Some(Kind::StringValue(_)));
-                if is_typed_quantity {
+                if is_typed_quantity || resource_name == "pids" {
                     None
                 } else {
                     Some((resource_name.clone(), resource_value.clone()))
@@ -2097,7 +2099,11 @@ mod tests {
                 fields: [
                     (
                         "limits",
-                        struct_value([("cpu", string_value("2")), ("memory", string_value("1Gi"))]),
+                        struct_value([
+                            ("cpu", string_value("2")),
+                            ("memory", string_value("1Gi")),
+                            ("pids", number_value(256.0)),
+                        ]),
                     ),
                     (
                         "requests",
@@ -2127,6 +2133,7 @@ mod tests {
                         struct_value([
                             ("cpu", string_value("2")),
                             ("memory", string_value("1Gi")),
+                            ("pids", number_value(256.0)),
                             ("nvidia.com/gpu", string_value("1")),
                         ]),
                     ),
@@ -2169,6 +2176,7 @@ mod tests {
             .unwrap();
         assert!(!limits.fields.contains_key("cpu"));
         assert!(!limits.fields.contains_key("memory"));
+        assert!(!limits.fields.contains_key("pids"));
         assert_eq!(
             limits
                 .fields

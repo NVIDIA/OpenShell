@@ -37,6 +37,10 @@ health, metrics, or tunnel routes. The plaintext service router also rejects
 browser requests whose Fetch Metadata, Origin, or Referer headers indicate a
 cross-origin or sibling-subdomain request.
 
+Operators can configure a gateway-wide gRPC request rate limit. The limit is
+applied only to gRPC API traffic after protocol multiplexing; health, metrics,
+and local sandbox-service HTTP routes are not rate limited by this control.
+
 Supported auth modes:
 
 | Mode | Use |

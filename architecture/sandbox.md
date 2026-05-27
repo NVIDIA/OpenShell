@@ -40,9 +40,29 @@ OpenShell uses overlapping controls rather than a single sandbox primitive:
 | Seccomp | Blocks dangerous syscalls, including raw socket paths that bypass the proxy. |
 | Network namespace | Forces ordinary agent egress through the local CONNECT proxy. |
 | Policy proxy | Evaluates destination, binary identity, TLS/L7 rules, SSRF checks, and inference interception. |
+| Cgroup limits | Caps per-sandbox CPU, memory, and supported PID limits to prevent runaway resource consumption. |
 
 The supervisor may enrich baseline filesystem allowances for runtime-required
 paths, such as proxy support files or GPU device paths when a GPU is present.
+
+### Cgroup Resource Defaults
+
+The gateway overlays `template.resources.limits.{cpu,memory}` on every
+`CreateSandbox` request that omits the field. User-supplied values are
+preserved verbatim; the defaults are persisted, so subsequent `GetSandbox`
+calls observe the effective limits. The defaults live on the public Struct and
+propagate through typed driver resource fields.
+
+| Dimension | Default | Driver support |
+|---|---|---|
+| CPU | `"2"` | Kubernetes, Docker, Podman (defense-in-depth fallback). VM ignores. |
+| Memory | `"4Gi"` | Kubernetes, Docker, Podman (defense-in-depth fallback). VM ignores. |
+
+Operators tune the values in `[openshell.gateway]` via
+`default_sandbox_cpu_limit` and `default_sandbox_memory_limit`. Setting `"0"`
+(or an empty value) disables the corresponding default — the sandbox runs
+without a gateway-imposed bound on that dimension. Omitting a key uses the
+built-in default above. Negative values are rejected during config load.
 
 ## Network and Inference
 

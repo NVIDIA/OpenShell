@@ -53,6 +53,66 @@ const TCP_FORWARD_CHUNK_SIZE: usize = 64 * 1024;
 // Sandbox lifecycle handlers
 // ---------------------------------------------------------------------------
 
+/// Overlay gateway-wide cgroup defaults onto `template.resources.limits`.
+///
+/// For CPU and memory, the function:
+///
+/// 1. Skips the field entirely when the corresponding default is `None`
+///    (operator opt-out via `"0"` in `[openshell.gateway]`).
+/// 2. Leaves user-supplied values untouched (overlay semantics — never
+///    overwrites an existing `limits.<field>`).
+/// 3. Inserts the configured default otherwise.
+///
+/// The defaults live on the public `template.resources` Struct, so CPU/memory
+/// flow through `extract_typed_resources` to drivers that support them.
+/// Persisting the post-overlay template makes the applied defaults observable
+/// via `GetSandbox`.
+///
+/// All sandboxes receive CPU and memory caps unless the operator explicitly
+/// disables them. PID caps are not overlaid today.
+fn apply_sandbox_template_defaults(
+    template: &mut SandboxTemplate,
+    cpu_limit: Option<&str>,
+    memory_limit: Option<&str>,
+) {
+    use prost_types::{Struct, Value, value::Kind};
+
+    if cpu_limit.is_none() && memory_limit.is_none() {
+        return;
+    }
+
+    let resources = template.resources.get_or_insert_with(Struct::default);
+    let limits_value = resources
+        .fields
+        .entry("limits".to_string())
+        .or_insert_with(|| Value {
+            kind: Some(Kind::StructValue(Struct::default())),
+        });
+
+    // If the caller put something other than a Struct at `limits` we leave
+    // it alone — the driver layer will surface the type error.
+    let Some(Kind::StructValue(limits)) = limits_value.kind.as_mut() else {
+        return;
+    };
+
+    if let Some(value) = cpu_limit {
+        limits
+            .fields
+            .entry("cpu".to_string())
+            .or_insert_with(|| Value {
+                kind: Some(Kind::StringValue(value.to_string())),
+            });
+    }
+    if let Some(value) = memory_limit {
+        limits
+            .fields
+            .entry("memory".to_string())
+            .or_insert_with(|| Value {
+                kind: Some(Kind::StringValue(value.to_string())),
+            });
+    }
+}
+
 pub(super) async fn handle_create_sandbox(
     state: &Arc<ServerState>,
     request: Request<CreateSandboxRequest>,
@@ -90,6 +150,16 @@ pub(super) async fn handle_create_sandbox(
     if template.image.is_empty() {
         template.image = state.compute.default_image().to_string();
     }
+
+    // Overlay gateway-wide cgroup defaults onto the template's
+    // resource limits. User-supplied values win; absent fields are filled
+    // from the runtime `Config`. Persisting after the overlay makes the
+    // applied defaults visible to subsequent `GetSandbox` calls.
+    apply_sandbox_template_defaults(
+        template,
+        state.config.default_sandbox_cpu_limit.as_deref(),
+        state.config.default_sandbox_memory_limit.as_deref(),
+    );
 
     // Ensure process identity defaults to "sandbox" when missing or
     // empty, then validate policy safety before persisting.
@@ -1852,7 +1922,14 @@ async fn run_exec_with_russh(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compute::new_test_runtime;
     use crate::grpc::test_support::test_server_state;
+    use crate::persistence::Store;
+    use crate::sandbox_index::SandboxIndex;
+    use crate::sandbox_watch::SandboxWatchBus;
+    use crate::supervisor_session::SupervisorSessionRegistry;
+    use crate::tracing_bus::TracingLogBus;
+    use openshell_core::Config;
     use openshell_core::proto::datamodel::v1::ObjectMeta;
     use std::collections::HashMap;
 
@@ -3127,6 +3204,269 @@ mod tests {
         assert_eq!(
             final_sandbox.metadata.as_ref().unwrap().resource_version,
             initial_version + 1
+        );
+    }
+
+    // ---- apply_sandbox_template_defaults ----
+
+    fn template_with_limits(fields: &[(&str, prost_types::Value)]) -> SandboxTemplate {
+        use prost_types::{Struct, Value, value::Kind};
+        let mut limits = Struct::default();
+        for (k, v) in fields {
+            limits.fields.insert((*k).to_string(), v.clone());
+        }
+        let mut resources = Struct::default();
+        resources.fields.insert(
+            "limits".to_string(),
+            Value {
+                kind: Some(Kind::StructValue(limits)),
+            },
+        );
+        SandboxTemplate {
+            resources: Some(resources),
+            ..Default::default()
+        }
+    }
+
+    fn string_value(s: &str) -> prost_types::Value {
+        prost_types::Value {
+            kind: Some(prost_types::value::Kind::StringValue(s.to_string())),
+        }
+    }
+
+    fn number_value(n: f64) -> prost_types::Value {
+        prost_types::Value {
+            kind: Some(prost_types::value::Kind::NumberValue(n)),
+        }
+    }
+
+    fn limits(template: &SandboxTemplate) -> &prost_types::Struct {
+        let res = template.resources.as_ref().expect("resources missing");
+        match res.fields.get("limits").and_then(|v| v.kind.as_ref()) {
+            Some(prost_types::value::Kind::StructValue(s)) => s,
+            other => panic!("expected limits struct, got {other:?}"),
+        }
+    }
+
+    fn limit_string(template: &SandboxTemplate, key: &str) -> Option<String> {
+        match limits(template).fields.get(key)?.kind.as_ref()? {
+            prost_types::value::Kind::StringValue(s) => Some(s.clone()),
+            _ => None,
+        }
+    }
+
+    fn limit_number(template: &SandboxTemplate, key: &str) -> Option<f64> {
+        match limits(template).fields.get(key)?.kind.as_ref()? {
+            prost_types::value::Kind::NumberValue(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn apply_sandbox_template_defaults_when_resources_is_none() {
+        let mut template = SandboxTemplate::default();
+        apply_sandbox_template_defaults(&mut template, Some("2"), Some("4Gi"));
+        assert_eq!(limit_string(&template, "cpu").as_deref(), Some("2"));
+        assert_eq!(limit_string(&template, "memory").as_deref(), Some("4Gi"));
+        let l = limits(&template);
+        assert!(!l.fields.contains_key("pids"));
+    }
+
+    #[test]
+    fn apply_sandbox_template_defaults_preserves_user_cpu_overlay_others() {
+        let mut template = template_with_limits(&[("cpu", string_value("1"))]);
+        apply_sandbox_template_defaults(&mut template, Some("2"), Some("4Gi"));
+        // User-supplied CPU is preserved.
+        assert_eq!(limit_string(&template, "cpu").as_deref(), Some("1"));
+        // Memory is overlaid from the defaults.
+        assert_eq!(limit_string(&template, "memory").as_deref(), Some("4Gi"));
+        let l = limits(&template);
+        assert!(!l.fields.contains_key("pids"));
+    }
+
+    #[test]
+    fn apply_sandbox_template_defaults_noop_when_all_set() {
+        let mut template = template_with_limits(&[
+            ("cpu", string_value("1")),
+            ("memory", string_value("1Gi")),
+            ("pids", number_value(64.0)),
+        ]);
+        apply_sandbox_template_defaults(&mut template, Some("2"), Some("4Gi"));
+        assert_eq!(limit_string(&template, "cpu").as_deref(), Some("1"));
+        assert_eq!(limit_string(&template, "memory").as_deref(), Some("1Gi"));
+        assert_eq!(limit_number(&template, "pids"), Some(64.0));
+    }
+
+    #[test]
+    fn apply_sandbox_template_defaults_skips_when_limits_is_non_struct() {
+        // A caller put a string in place of the limits struct — leave it
+        // alone; downstream validation will surface the type mismatch.
+        use prost_types::{Struct, Value, value::Kind};
+        let mut resources = Struct::default();
+        resources.fields.insert(
+            "limits".to_string(),
+            Value {
+                kind: Some(Kind::StringValue("bogus".to_string())),
+            },
+        );
+        let mut template = SandboxTemplate {
+            resources: Some(resources),
+            ..Default::default()
+        };
+        apply_sandbox_template_defaults(&mut template, Some("2"), Some("4Gi"));
+        let res = template.resources.as_ref().unwrap();
+        match res.fields.get("limits").and_then(|v| v.kind.as_ref()) {
+            Some(Kind::StringValue(s)) => assert_eq!(s, "bogus"),
+            other => panic!("expected unchanged string, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_sandbox_template_defaults_skips_when_all_config_disabled() {
+        let mut template = SandboxTemplate::default();
+        apply_sandbox_template_defaults(&mut template, None, None);
+        assert!(template.resources.is_none());
+    }
+
+    #[test]
+    fn apply_sandbox_template_defaults_partial_config_only_injects_provided() {
+        let mut template = SandboxTemplate::default();
+        // CPU disabled, memory enabled.
+        apply_sandbox_template_defaults(&mut template, None, Some("4Gi"));
+        let l = limits(&template);
+        assert!(!l.fields.contains_key("cpu"));
+        assert_eq!(limit_string(&template, "memory").as_deref(), Some("4Gi"));
+        assert!(!l.fields.contains_key("pids"));
+    }
+
+    // ---- handle_create_sandbox integration ----
+
+    #[tokio::test]
+    async fn handle_create_sandbox_persists_default_resource_limits() {
+        use openshell_core::proto::{CreateSandboxRequest, SandboxSpec};
+        let state = test_server_state().await;
+
+        let response = handle_create_sandbox(
+            &state,
+            Request::new(CreateSandboxRequest {
+                name: "default-limits".to_string(),
+                spec: Some(SandboxSpec {
+                    log_level: "info".to_string(),
+                    policy: Some(openshell_core::proto::SandboxPolicy::default()),
+                    ..Default::default()
+                }),
+                labels: HashMap::new(),
+            }),
+        )
+        .await
+        .expect("create sandbox")
+        .into_inner();
+
+        let template = response
+            .sandbox
+            .expect("sandbox in response")
+            .spec
+            .expect("spec")
+            .template
+            .expect("template");
+        assert_eq!(limit_string(&template, "cpu").as_deref(), Some("2"));
+        assert_eq!(limit_string(&template, "memory").as_deref(), Some("4Gi"));
+        let l = limits(&template);
+        assert!(
+            !l.fields.contains_key("pids"),
+            "Kubernetes does not enforce template.resources.limits.pids; got {:?}",
+            l.fields.get("pids")
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_create_sandbox_preserves_user_resource_limits() {
+        use openshell_core::proto::{CreateSandboxRequest, SandboxSpec};
+        let state = test_server_state().await;
+
+        // User supplies a partial `limits.cpu` only. The gateway must keep
+        // it, then fill memory from the defaults.
+        let user_template = template_with_limits(&[("cpu", string_value("500m"))]);
+
+        let response = handle_create_sandbox(
+            &state,
+            Request::new(CreateSandboxRequest {
+                name: "user-cpu".to_string(),
+                spec: Some(SandboxSpec {
+                    log_level: "info".to_string(),
+                    policy: Some(openshell_core::proto::SandboxPolicy::default()),
+                    template: Some(user_template),
+                    ..Default::default()
+                }),
+                labels: HashMap::new(),
+            }),
+        )
+        .await
+        .expect("create sandbox")
+        .into_inner();
+
+        let template = response
+            .sandbox
+            .expect("sandbox in response")
+            .spec
+            .expect("spec")
+            .template
+            .expect("template");
+        assert_eq!(limit_string(&template, "cpu").as_deref(), Some("500m"));
+        assert_eq!(limit_string(&template, "memory").as_deref(), Some("4Gi"));
+        let l = limits(&template);
+        assert!(!l.fields.contains_key("pids"));
+    }
+
+    #[tokio::test]
+    async fn handle_create_sandbox_skips_defaults_when_disabled() {
+        use openshell_core::proto::{CreateSandboxRequest, SandboxSpec};
+        let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
+        let compute = new_test_runtime(store.clone()).await;
+        // Build a Config with all sandbox defaults disabled (admin opt-out).
+        let config = Config::new(None)
+            .with_database_url("sqlite::memory:")
+            .with_default_sandbox_cpu_limit(None)
+            .with_default_sandbox_memory_limit(None);
+        let state = Arc::new(ServerState::new(
+            config,
+            store,
+            compute,
+            SandboxIndex::new(),
+            SandboxWatchBus::new(),
+            TracingLogBus::new(),
+            Arc::new(SupervisorSessionRegistry::new()),
+            None,
+        ));
+
+        let response = handle_create_sandbox(
+            &state,
+            Request::new(CreateSandboxRequest {
+                name: "no-defaults".to_string(),
+                spec: Some(SandboxSpec {
+                    log_level: "info".to_string(),
+                    policy: Some(openshell_core::proto::SandboxPolicy::default()),
+                    ..Default::default()
+                }),
+                labels: HashMap::new(),
+            }),
+        )
+        .await
+        .expect("create sandbox")
+        .into_inner();
+
+        let template = response
+            .sandbox
+            .expect("sandbox in response")
+            .spec
+            .expect("spec")
+            .template
+            .expect("template");
+        // With all defaults disabled, the gateway must not touch resources.
+        assert!(
+            template.resources.is_none(),
+            "expected no resources when defaults are disabled, got {:?}",
+            template.resources
         );
     }
 }

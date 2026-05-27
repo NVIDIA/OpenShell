@@ -175,6 +175,14 @@ struct RunArgs {
     #[arg(long, env = "OPENSHELL_OIDC_SCOPES_CLAIM", default_value = "")]
     oidc_scopes_claim: String,
 
+    /// Maximum gRPC requests allowed per rate-limit window. Set to 0 to disable.
+    #[arg(long, env = "OPENSHELL_GRPC_RATE_LIMIT_REQUESTS")]
+    grpc_rate_limit_requests: Option<u64>,
+
+    /// gRPC rate-limit window length in seconds. Set to 0 to disable.
+    #[arg(long, env = "OPENSHELL_GRPC_RATE_LIMIT_WINDOW_SECONDS")]
+    grpc_rate_limit_window_seconds: Option<u64>,
+
     /// Subject Alternative Names configured on the gateway server certificate.
     /// Wildcard DNS SANs also enable sandbox service URLs under that domain.
     #[arg(
@@ -353,14 +361,42 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
     config = config
         .with_database_url(db_url)
         .with_compute_drivers(args.drivers.clone())
+        .with_grpc_rate_limit(
+            args.grpc_rate_limit_requests,
+            args.grpc_rate_limit_window_seconds,
+        )
         .with_server_sans(args.server_sans.clone())
         .with_loopback_service_http(args.enable_loopback_service_http);
+    validate_grpc_rate_limit_args(
+        args.grpc_rate_limit_requests,
+        args.grpc_rate_limit_window_seconds,
+    )?;
 
     if let Some(ttl) = file
         .as_ref()
         .and_then(|f| f.openshell.gateway.ssh_session_ttl_secs)
     {
         config = config.with_ssh_session_ttl_secs(ttl);
+    }
+
+    // Sandbox resource defaults. The gateway always applies these unless the
+    // operator explicitly opts out by setting `"0"` in `[openshell.gateway]`.
+    {
+        let cpu = config_file::resolve_sandbox_quantity_default(
+            "default_sandbox_cpu_limit",
+            file_gateway.and_then(|g| g.default_sandbox_cpu_limit.as_deref()),
+            openshell_core::config::DEFAULT_SANDBOX_CPU_LIMIT,
+        )
+        .map_err(|e| miette::miette!("{e}"))?;
+        let memory = config_file::resolve_sandbox_quantity_default(
+            "default_sandbox_memory_limit",
+            file_gateway.and_then(|g| g.default_sandbox_memory_limit.as_deref()),
+            openshell_core::config::DEFAULT_SANDBOX_MEMORY_LIMIT,
+        )
+        .map_err(|e| miette::miette!("{e}"))?;
+        config = config
+            .with_default_sandbox_cpu_limit(cpu)
+            .with_default_sandbox_memory_limit(memory);
     }
 
     if let Some(issuer) = args.oidc_issuer.clone() {
@@ -608,6 +644,37 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
             args.oidc_scopes_claim.clone_from(&oidc.scopes_claim);
         }
     }
+    if let Some(requests) = file.grpc_rate_limit_requests
+        && args.grpc_rate_limit_requests.is_none()
+        && arg_defaulted(matches, "grpc_rate_limit_requests")
+    {
+        args.grpc_rate_limit_requests = Some(requests);
+    }
+    if let Some(window) = file.grpc_rate_limit_window_seconds
+        && args.grpc_rate_limit_window_seconds.is_none()
+        && arg_defaulted(matches, "grpc_rate_limit_window_seconds")
+    {
+        args.grpc_rate_limit_window_seconds = Some(window);
+    }
+}
+
+fn validate_grpc_rate_limit_args(requests: Option<u64>, window_seconds: Option<u64>) -> Result<()> {
+    let disabled = matches!(requests, Some(0)) || matches!(window_seconds, Some(0));
+    if disabled {
+        return Ok(());
+    }
+    if matches!(
+        (requests, window_seconds),
+        (Some(requests), None) if requests > 0
+    ) || matches!(
+        (requests, window_seconds),
+        (None, Some(window_seconds)) if window_seconds > 0
+    ) {
+        return Err(miette::miette!(
+            "gRPC rate limiting requires both --grpc-rate-limit-requests and --grpc-rate-limit-window-seconds to be positive; set either value to 0 to disable"
+        ));
+    }
+    Ok(())
 }
 
 fn effective_single_driver(args: &RunArgs) -> Option<ComputeDriverKind> {
@@ -887,6 +954,41 @@ mod tests {
             Cli::try_parse_from(["openshell-gateway", "--db-url", "sqlite::memory:"]).unwrap();
 
         assert!(cli.run.enable_mtls_auth);
+    }
+
+    #[test]
+    fn command_parses_grpc_rate_limit_flags() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g1 = EnvVarGuard::remove("OPENSHELL_GRPC_RATE_LIMIT_REQUESTS");
+        let _g2 = EnvVarGuard::remove("OPENSHELL_GRPC_RATE_LIMIT_WINDOW_SECONDS");
+
+        let cli = Cli::try_parse_from([
+            "openshell-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--grpc-rate-limit-requests",
+            "120",
+            "--grpc-rate-limit-window-seconds",
+            "60",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.run.grpc_rate_limit_requests, Some(120));
+        assert_eq!(cli.run.grpc_rate_limit_window_seconds, Some(60));
+    }
+
+    #[test]
+    fn validate_grpc_rate_limit_args_requires_positive_pair() {
+        assert!(super::validate_grpc_rate_limit_args(None, None).is_ok());
+        assert!(super::validate_grpc_rate_limit_args(Some(0), None).is_ok());
+        assert!(super::validate_grpc_rate_limit_args(None, Some(0)).is_ok());
+        assert!(super::validate_grpc_rate_limit_args(Some(0), Some(60)).is_ok());
+        assert!(super::validate_grpc_rate_limit_args(Some(120), Some(0)).is_ok());
+        assert!(super::validate_grpc_rate_limit_args(Some(120), Some(60)).is_ok());
+        assert!(super::validate_grpc_rate_limit_args(Some(120), None).is_err());
+        assert!(super::validate_grpc_rate_limit_args(None, Some(60)).is_err());
     }
 
     #[test]
@@ -1285,6 +1387,45 @@ audience = "openshell-cli"
 
         assert_eq!(args.oidc_issuer.as_deref(), Some("https://idp.example.com"));
         assert_eq!(args.oidc_audience, "openshell-cli");
+    }
+
+    #[test]
+    fn file_grpc_rate_limit_populates_args_when_cli_omits() {
+        let (mut args, matches) =
+            parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
+        let file = config_file_from_toml(
+            r"
+[openshell.gateway]
+grpc_rate_limit_requests = 100
+grpc_rate_limit_window_seconds = 30
+",
+        );
+        merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+
+        assert_eq!(args.grpc_rate_limit_requests, Some(100));
+        assert_eq!(args.grpc_rate_limit_window_seconds, Some(30));
+    }
+
+    #[test]
+    fn cli_grpc_rate_limit_overrides_file_value() {
+        let (mut args, matches) = parse_with_args(&[
+            "openshell-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--grpc-rate-limit-requests",
+            "20",
+        ]);
+        let file = config_file_from_toml(
+            r"
+[openshell.gateway]
+grpc_rate_limit_requests = 100
+grpc_rate_limit_window_seconds = 30
+",
+        );
+        merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+
+        assert_eq!(args.grpc_rate_limit_requests, Some(20));
+        assert_eq!(args.grpc_rate_limit_window_seconds, Some(30));
     }
 
     #[test]
