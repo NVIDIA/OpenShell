@@ -18,7 +18,6 @@
 //! See `architecture/plans/scope-annotations.md` for the design.
 
 use proc_macro::TokenStream;
-use proc_macro2::Span;
 use quote::quote;
 use syn::parse::{Parse, ParseStream};
 use syn::{
@@ -233,24 +232,6 @@ pub fn rpc_authz(args: TokenStream, item: TokenStream) -> TokenStream {
         Ok(tokens) => tokens.into(),
         Err(err) => err.to_compile_error().into(),
     }
-}
-
-/// Standalone use of `#[rpc_auth]` is a hard error so that a method
-/// missing the impl-level `#[rpc_authz]` macro fails to compile rather
-/// than silently dropping its auth declaration.
-#[proc_macro_attribute]
-pub fn rpc_auth(_args: TokenStream, item: TokenStream) -> TokenStream {
-    let span = proc_macro2::TokenStream::from(item.clone())
-        .into_iter()
-        .next()
-        .map_or_else(Span::call_site, |t| t.span());
-    let err = Error::new(
-        span,
-        "`#[rpc_auth]` only has meaning inside an `#[rpc_authz]` impl block",
-    )
-    .to_compile_error();
-    let original: proc_macro2::TokenStream = item.into();
-    quote! { #err #original }.into()
 }
 
 fn expand(args: &AuthzArgs, item: &mut ItemImpl) -> Result<proc_macro2::TokenStream> {

@@ -51,12 +51,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
 use crate::ServerState;
-// `rpc_auth` is consumed by `#[rpc_authz]` and so looks unused to the
-// import-checker. Keep it imported so a missing `#[rpc_authz]` produces a
-// "macro misuse" error from the standalone-rpc_auth fallback rather than
-// "cannot find attribute `rpc_auth` in this scope".
-#[allow(unused_imports)]
-use openshell_server_macros::{rpc_auth, rpc_authz};
+use openshell_server_macros::rpc_authz;
 
 // ---------------------------------------------------------------------------
 // Public re-exports

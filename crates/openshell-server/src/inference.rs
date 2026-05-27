@@ -12,8 +12,7 @@ use openshell_core::proto::{
 };
 use openshell_router::config::ResolvedRoute as RouterResolvedRoute;
 use openshell_router::{ValidationFailureKind, verify_backend_endpoint};
-#[allow(unused_imports)]
-use openshell_server_macros::{rpc_auth, rpc_authz};
+use openshell_server_macros::rpc_authz;
 use prost::Message as _;
 use std::sync::Arc;
 use std::time::Duration;
