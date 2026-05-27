@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# CI/dev overlay for exercising the gateway with more than one replica.
+# SQLite is not suitable for HA because each replica has its own pod volume, so
+# this overlay enables the bundled PostgreSQL dependency added by the chart.
+replicaCount: 2
+
+postgres:
+  enabled: true
+  auth:
+    password: openshell-ha-ci

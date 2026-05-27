@@ -138,6 +138,15 @@ kubectl -n openshell rollout status statefulset/openshell
 
 Look for failed installs, unexpected values, missing namespace, wrong image tag, TLS settings that do not match the registered endpoint, and scheduling failures.
 
+For HA or PostgreSQL-backed installs, also check the service-binding Secret and
+bundled PostgreSQL workload:
+
+```bash
+kubectl -n openshell get secret -l app.kubernetes.io/instance=openshell
+kubectl -n openshell get statefulset,pod,pvc -l app.kubernetes.io/instance=openshell
+kubectl -n openshell logs statefulset/openshell-postgres --tail=200
+```
+
 Check required Helm deployment secrets:
 
 ```bash

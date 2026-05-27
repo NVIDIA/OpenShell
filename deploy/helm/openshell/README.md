@@ -56,6 +56,7 @@ See [`values.yaml`](values.yaml) for source defaults. Selected overlays:
 - [`ci/values-gateway.yaml`](ci/values-gateway.yaml) - gateway-only configuration
 - [`ci/values-cert-manager.yaml`](ci/values-cert-manager.yaml) - cert-manager integration
 - [`ci/values-keycloak.yaml`](ci/values-keycloak.yaml) - Keycloak OIDC integration
+- [`ci/values-high-availability.yaml`](ci/values-high-availability.yaml) - HA gateway test overlay with bundled PostgreSQL
 
 ### Database backend
 

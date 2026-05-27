@@ -1,0 +1,37 @@
+name: Kubernetes HA E2E Test
+
+on:
+  workflow_call:
+    inputs:
+      image-tag:
+        description: "Image tag to test (typically the commit SHA)"
+        required: true
+        type: string
+      runner:
+        description: "GitHub Actions runner label"
+        required: false
+        type: string
+        default: "linux-amd64-cpu8"
+      checkout-ref:
+        description: "Git ref to check out for test inputs (defaults to the workflow SHA)"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  e2e-kubernetes-ha:
+    name: Kubernetes HA E2E
+    permissions:
+      contents: read
+      packages: read
+    uses: ./.github/workflows/e2e-kubernetes-test.yml
+    secrets: inherit
+    with:
+      image-tag: ${{ inputs.image-tag }}
+      runner: ${{ inputs.runner }}
+      checkout-ref: ${{ inputs.checkout-ref }}
+      extra-helm-values: deploy/helm/openshell/ci/values-high-availability.yaml
