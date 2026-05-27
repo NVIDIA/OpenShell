@@ -25,7 +25,7 @@
 //! generalized compute-driver interface, the CLI-arg plumbing below should
 //! be replaced with a driver-agnostic launcher that speaks gRPC to
 //! configure the driver — and this file should collapse to the types that
-//! are genuinely VM-specific (libkrun log level, vCPU / memory shape) plus a
+//! are genuinely VM-specific (hypervisor helper log level, vCPU / memory shape) plus a
 //! trait implementation registering the VM driver against the generic
 //! interface.
 
@@ -66,6 +66,7 @@ const VM_DRIVER_CONFIG_ENV_VARS: &[&str] = &[
     "OPENSHELL_SANDBOX_IMAGE",
     "OPENSHELL_VM_BOOTSTRAP_IMAGE",
     "OPENSHELL_VM_DRIVER_STATE_DIR",
+    "OPENSHELL_VM_HYPERVISOR_LOG_LEVEL",
     "OPENSHELL_VM_KRUN_LOG_LEVEL",
     "OPENSHELL_VM_DRIVER_VCPUS",
     "OPENSHELL_VM_DRIVER_MEM_MIB",
@@ -98,8 +99,9 @@ pub struct VmComputeConfig {
     /// Bootstrap image used to boot and prepare VM sandbox target images.
     pub bootstrap_image: String,
 
-    /// libkrun log level used by the VM driver helper.
-    pub krun_log_level: u32,
+    /// Hypervisor helper log level used by the VM driver.
+    #[serde(alias = "krun_log_level")]
+    pub hypervisor_log_level: u32,
 
     /// Default vCPU count for VM sandboxes.
     pub vcpus: u8,
@@ -139,9 +141,9 @@ impl VmComputeConfig {
         )
     }
 
-    /// Default libkrun log level.
+    /// Default hypervisor helper log level.
     #[must_use]
-    pub const fn default_krun_log_level() -> u32 {
+    pub const fn default_hypervisor_log_level() -> u32 {
         1
     }
 
@@ -196,7 +198,7 @@ impl Default for VmComputeConfig {
             default_image: openshell_core::image::default_sandbox_image(),
             grpc_endpoint: String::new(),
             bootstrap_image: String::new(),
-            krun_log_level: Self::default_krun_log_level(),
+            hypervisor_log_level: Self::default_hypervisor_log_level(),
             vcpus: Self::default_vcpus(),
             mem_mib: Self::default_mem_mib(),
             overlay_disk_mib: Self::default_overlay_disk_mib(),
@@ -503,8 +505,10 @@ fn vm_config_with_env_overrides(vm_config: &VmComputeConfig) -> Result<VmCompute
     if let Some(path) = std::env::var_os("OPENSHELL_VM_DRIVER_STATE_DIR") {
         cfg.state_dir = PathBuf::from(path);
     }
-    if let Some(value) = env_parse("OPENSHELL_VM_KRUN_LOG_LEVEL")? {
-        cfg.krun_log_level = value;
+    if let Some(value) = env_parse("OPENSHELL_VM_HYPERVISOR_LOG_LEVEL")? {
+        cfg.hypervisor_log_level = value;
+    } else if let Some(value) = env_parse("OPENSHELL_VM_KRUN_LOG_LEVEL")? {
+        cfg.hypervisor_log_level = value;
     }
     if let Some(value) = env_parse("OPENSHELL_VM_DRIVER_VCPUS")? {
         cfg.vcpus = value;
@@ -612,7 +616,7 @@ fn compute_driver_args(
     }
 
     args.push(OsString::from("--krun-log-level"));
-    args.push(OsString::from(vm_config.krun_log_level.to_string()));
+    args.push(OsString::from(vm_config.hypervisor_log_level.to_string()));
     args.push(OsString::from("--vcpus"));
     args.push(OsString::from(vm_config.vcpus.to_string()));
     args.push(OsString::from("--mem-mib"));
@@ -885,6 +889,15 @@ gpu_vcpus = 6
     }
 
     #[test]
+    fn vm_compute_config_deserializes_hypervisor_log_level_aliases() {
+        let cfg: VmComputeConfig = toml::from_str("hypervisor_log_level = 4").unwrap();
+        assert_eq!(cfg.hypervisor_log_level, 4);
+
+        let legacy: VmComputeConfig = toml::from_str("krun_log_level = 2").unwrap();
+        assert_eq!(legacy.hypervisor_log_level, 2);
+    }
+
+    #[test]
     fn vm_compute_config_rejects_unknown_fields() {
         let err = toml::from_str::<VmComputeConfig>(
             r"
@@ -906,7 +919,7 @@ unknown_vm_field = true
         let _g2 = EnvVarGuard::set("OPENSHELL_SANDBOX_IMAGE", "env-sandbox:latest");
         let _g3 = EnvVarGuard::set("OPENSHELL_VM_BOOTSTRAP_IMAGE", "env-bootstrap:latest");
         let _g4 = EnvVarGuard::set("OPENSHELL_VM_DRIVER_STATE_DIR", "/tmp/env-vm-state");
-        let _g5 = EnvVarGuard::set("OPENSHELL_VM_KRUN_LOG_LEVEL", "3");
+        let _g5 = EnvVarGuard::set("OPENSHELL_VM_HYPERVISOR_LOG_LEVEL", "3");
         let _g6 = EnvVarGuard::set("OPENSHELL_VM_DRIVER_VCPUS", "5");
         let _g7 = EnvVarGuard::set("OPENSHELL_VM_DRIVER_MEM_MIB", "5120");
         let _g8 = EnvVarGuard::set("OPENSHELL_VM_OVERLAY_DISK_MIB", "8192");
@@ -918,7 +931,7 @@ unknown_vm_field = true
             default_image: "file-sandbox:latest".to_string(),
             bootstrap_image: "file-bootstrap:latest".to_string(),
             state_dir: PathBuf::from("/tmp/file-vm-state"),
-            krun_log_level: 1,
+            hypervisor_log_level: 1,
             vcpus: 2,
             mem_mib: 2048,
             overlay_disk_mib: 4096,
@@ -934,13 +947,48 @@ unknown_vm_field = true
         assert_eq!(cfg.default_image, "env-sandbox:latest");
         assert_eq!(cfg.bootstrap_image, "env-bootstrap:latest");
         assert_eq!(cfg.state_dir, PathBuf::from("/tmp/env-vm-state"));
-        assert_eq!(cfg.krun_log_level, 3);
+        assert_eq!(cfg.hypervisor_log_level, 3);
         assert_eq!(cfg.vcpus, 5);
         assert_eq!(cfg.mem_mib, 5120);
         assert_eq!(cfg.overlay_disk_mib, 8192);
         assert!(cfg.gpu_enabled);
         assert_eq!(cfg.gpu_mem_mib, 24576);
         assert_eq!(cfg.gpu_vcpus, 10);
+    }
+
+    #[test]
+    fn vm_config_env_overrides_accept_legacy_krun_log_level() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = remove_vm_env_overrides();
+        let _legacy = EnvVarGuard::set("OPENSHELL_VM_KRUN_LOG_LEVEL", "4");
+        let base = VmComputeConfig {
+            hypervisor_log_level: 1,
+            ..Default::default()
+        };
+
+        let cfg = vm_config_with_env_overrides(&base).unwrap();
+
+        assert_eq!(cfg.hypervisor_log_level, 4);
+    }
+
+    #[test]
+    fn vm_config_env_prefers_hypervisor_log_level_over_legacy_krun() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = remove_vm_env_overrides();
+        let _preferred = EnvVarGuard::set("OPENSHELL_VM_HYPERVISOR_LOG_LEVEL", "5");
+        let _legacy = EnvVarGuard::set("OPENSHELL_VM_KRUN_LOG_LEVEL", "4");
+        let base = VmComputeConfig {
+            hypervisor_log_level: 1,
+            ..Default::default()
+        };
+
+        let cfg = vm_config_with_env_overrides(&base).unwrap();
+
+        assert_eq!(cfg.hypervisor_log_level, 5);
     }
 
     #[test]

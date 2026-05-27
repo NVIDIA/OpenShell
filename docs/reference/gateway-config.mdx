@@ -224,6 +224,7 @@ log_level       = "info"
 compute_drivers = ["vm"]
 
 default_image  = "ghcr.io/nvidia/openshell/sandbox:latest"
+# Guest mTLS material is gateway-level input inherited by local compute drivers.
 guest_tls_ca   = "/var/lib/openshell/guest-tls/ca.pem"
 guest_tls_cert = "/var/lib/openshell/guest-tls/client.pem"
 guest_tls_key  = "/var/lib/openshell/guest-tls/client-key.pem"
@@ -233,11 +234,19 @@ grpc_endpoint = "https://host.containers.internal:17670"
 state_dir      = "/var/lib/openshell/vm"
 # Where the gateway looks for the openshell-driver-vm subprocess binary.
 driver_dir     = "/usr/local/libexec/openshell"
-bootstrap_image  = ""
-krun_log_level   = 1
+
+# Optional bootstrap image. When unset, the VM driver uses default_image, then
+# the requested sandbox image.
+# bootstrap_image = "ghcr.io/nvidia/openshell/sandbox-bootstrap:latest"
+
+# Default VM shape.
 vcpus            = 2
 mem_mib          = 2048
 overlay_disk_mib = 4096
+
+# Hypervisor helper verbosity. Distinct from [openshell.gateway].log_level,
+# which controls gateway and driver process logs.
+hypervisor_log_level = 1
 
 # GPU passthrough support. Leave disabled unless the host is prepared for VFIO.
 gpu_enabled = false
