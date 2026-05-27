@@ -119,6 +119,78 @@ impl Default for KubernetesComputeConfig {
 }
 
 impl KubernetesComputeConfig {
+    /// Apply supported environment-variable overrides in place.
+    pub fn apply_env_overrides(&mut self) {
+        if let Ok(namespace) = std::env::var("OPENSHELL_SANDBOX_NAMESPACE")
+            && !namespace.is_empty()
+        {
+            self.namespace = namespace;
+        }
+        if let Ok(service_account) = std::env::var("OPENSHELL_K8S_SANDBOX_SERVICE_ACCOUNT")
+            && !service_account.is_empty()
+        {
+            self.service_account_name = service_account;
+        }
+        if let Ok(image) = std::env::var("OPENSHELL_SANDBOX_IMAGE")
+            && !image.is_empty()
+        {
+            self.default_image = image;
+        }
+        if let Ok(pull_policy) = std::env::var("OPENSHELL_SANDBOX_IMAGE_PULL_POLICY") {
+            self.image_pull_policy = pull_policy;
+        }
+        if let Ok(image) = std::env::var("OPENSHELL_SUPERVISOR_IMAGE")
+            && !image.is_empty()
+        {
+            self.supervisor_image = image;
+        }
+        if let Ok(pull_policy) = std::env::var("OPENSHELL_SUPERVISOR_IMAGE_PULL_POLICY") {
+            self.supervisor_image_pull_policy = pull_policy;
+        }
+        if let Ok(method) = std::env::var("OPENSHELL_SUPERVISOR_SIDELOAD_METHOD")
+            && !method.is_empty()
+            && let Ok(parsed) = method.parse()
+        {
+            self.supervisor_sideload_method = parsed;
+        }
+        if let Ok(endpoint) = std::env::var("OPENSHELL_GRPC_ENDPOINT")
+            && !endpoint.is_empty()
+        {
+            self.grpc_endpoint = endpoint;
+        }
+        if let Ok(path) = std::env::var("OPENSHELL_SANDBOX_SSH_SOCKET_PATH")
+            && !path.is_empty()
+        {
+            self.ssh_socket_path = path;
+        }
+        if let Ok(secret_name) = std::env::var("OPENSHELL_CLIENT_TLS_SECRET_NAME")
+            && !secret_name.is_empty()
+        {
+            self.client_tls_secret_name = secret_name;
+        }
+        if let Ok(host_gateway_ip) = std::env::var("OPENSHELL_HOST_GATEWAY_IP")
+            && !host_gateway_ip.is_empty()
+        {
+            self.host_gateway_ip = host_gateway_ip;
+        }
+        if let Ok(enable_user_namespaces) = std::env::var("OPENSHELL_ENABLE_USER_NAMESPACES") {
+            self.enable_user_namespaces = matches!(
+                enable_user_namespaces.as_str(),
+                "1" | "true" | "TRUE" | "True"
+            );
+        }
+        if let Ok(ttl) = std::env::var("OPENSHELL_K8S_SA_TOKEN_TTL_SECS")
+            && let Ok(ttl) = ttl.parse()
+        {
+            self.sa_token_ttl_secs = ttl;
+        }
+        if let Ok(size) = std::env::var("OPENSHELL_K8S_WORKSPACE_DEFAULT_STORAGE_SIZE")
+            && !size.is_empty()
+        {
+            self.workspace_default_storage_size = size;
+        }
+    }
+
     /// Clamp `sa_token_ttl_secs` into the `[MIN_SA_TOKEN_TTL_SECS,
     /// MAX_SA_TOKEN_TTL_SECS]` range used by the projected-volume spec.
     /// Invalid (≤0) values fall back to the default 3600.

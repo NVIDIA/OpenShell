@@ -767,77 +767,6 @@ async fn build_compute_runtime(
     }
 }
 
-fn apply_kubernetes_env_overrides(config: &mut KubernetesComputeConfig) {
-    if let Ok(namespace) = std::env::var("OPENSHELL_SANDBOX_NAMESPACE")
-        && !namespace.is_empty()
-    {
-        config.namespace = namespace;
-    }
-    if let Ok(service_account) = std::env::var("OPENSHELL_K8S_SANDBOX_SERVICE_ACCOUNT")
-        && !service_account.is_empty()
-    {
-        config.service_account_name = service_account;
-    }
-    if let Ok(image) = std::env::var("OPENSHELL_SANDBOX_IMAGE")
-        && !image.is_empty()
-    {
-        config.default_image = image;
-    }
-    if let Ok(pull_policy) = std::env::var("OPENSHELL_SANDBOX_IMAGE_PULL_POLICY") {
-        config.image_pull_policy = pull_policy;
-    }
-    if let Ok(image) = std::env::var("OPENSHELL_SUPERVISOR_IMAGE")
-        && !image.is_empty()
-    {
-        config.supervisor_image = image;
-    }
-    if let Ok(pull_policy) = std::env::var("OPENSHELL_SUPERVISOR_IMAGE_PULL_POLICY") {
-        config.supervisor_image_pull_policy = pull_policy;
-    }
-    if let Ok(method) = std::env::var("OPENSHELL_SUPERVISOR_SIDELOAD_METHOD")
-        && !method.is_empty()
-        && let Ok(parsed) = method.parse()
-    {
-        config.supervisor_sideload_method = parsed;
-    }
-    if let Ok(endpoint) = std::env::var("OPENSHELL_GRPC_ENDPOINT")
-        && !endpoint.is_empty()
-    {
-        config.grpc_endpoint = endpoint;
-    }
-    if let Ok(path) = std::env::var("OPENSHELL_SANDBOX_SSH_SOCKET_PATH")
-        && !path.is_empty()
-    {
-        config.ssh_socket_path = path;
-    }
-    if let Ok(secret_name) = std::env::var("OPENSHELL_CLIENT_TLS_SECRET_NAME")
-        && !secret_name.is_empty()
-    {
-        config.client_tls_secret_name = secret_name;
-    }
-    if let Ok(host_gateway_ip) = std::env::var("OPENSHELL_HOST_GATEWAY_IP")
-        && !host_gateway_ip.is_empty()
-    {
-        config.host_gateway_ip = host_gateway_ip;
-    }
-    if let Ok(enable_user_namespaces) = std::env::var("OPENSHELL_ENABLE_USER_NAMESPACES") {
-        config.enable_user_namespaces = matches!(
-            enable_user_namespaces.as_str(),
-            "1" | "true" | "TRUE" | "True"
-        );
-    }
-    if let Ok(ttl) = std::env::var("OPENSHELL_K8S_SA_TOKEN_TTL_SECS")
-        && let Ok(ttl) = ttl.parse()
-    {
-        config.sa_token_ttl_secs = ttl;
-    }
-    if let Ok(size) = std::env::var("OPENSHELL_K8S_WORKSPACE_DEFAULT_STORAGE_SIZE")
-        && !size.is_empty()
-    {
-        config.workspace_default_storage_size = size;
-    }
-}
-
 /// Build a [`KubernetesComputeConfig`] from the file's
 /// `[openshell.drivers.kubernetes]` table merged with inheritable
 /// `[openshell.gateway]` defaults. Falls back to the driver's `Default`
@@ -857,7 +786,7 @@ fn kubernetes_config_from_file(
     } else {
         KubernetesComputeConfig::default()
     };
-    apply_kubernetes_env_overrides(&mut config);
+    config.apply_env_overrides();
     Ok(config)
 }
 
