@@ -2,9 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::VfioError;
-use crate::sysfs::{SysfsRoot, read_sysfs_trimmed, write_sysfs};
+use crate::sysfs::{SysfsRoot, write_sysfs};
 use std::collections::HashMap;
-use std::fs;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
@@ -19,20 +18,12 @@ static VFIO_ID_REFCOUNTS: LazyLock<Mutex<HashMap<String, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub(crate) fn current_driver_name(sysfs: &SysfsRoot, bdf: &str) -> Option<String> {
-    let driver_link = sysfs.pci_device(bdf).join("driver");
-    fs::read_link(&driver_link)
-        .ok()
-        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+    sysfs.pci_device_ref(bdf).driver_name()
 }
 
 /// Read vendor and device IDs from sysfs and format as `"VVVV DDDD"` (no `0x` prefix).
 pub(crate) fn vfio_id_string(sysfs: &SysfsRoot, bdf: &str) -> Option<String> {
-    let dev_dir = sysfs.pci_device(bdf);
-    let vendor = read_sysfs_trimmed(&dev_dir.join("vendor")).ok()?;
-    let device = read_sysfs_trimmed(&dev_dir.join("device")).ok()?;
-    let vendor_hex = vendor.strip_prefix("0x").unwrap_or(&vendor);
-    let device_hex = device.strip_prefix("0x").unwrap_or(&device);
-    Some(format!("{vendor_hex} {device_hex}"))
+    sysfs.pci_device_ref(bdf).vfio_id_string()
 }
 
 /// Best-effort registration of a device's vendor:device ID with `vfio-pci`.
@@ -159,9 +150,9 @@ pub(crate) fn clear_vfio_id_refcounts() {
 /// with `driver_override=vfio-pci` and would silently re-bind to vfio-pci on
 /// the next probe event.
 fn cleanup_partial_bind(sysfs: &SysfsRoot, bdf: &str) {
-    let override_path = sysfs.pci_device(bdf).join("driver_override");
-    if override_path.exists()
-        && let Err(err) = write_sysfs(&override_path, "\n")
+    let device = sysfs.pci_device_ref(bdf);
+    if device.driver_override_path().exists()
+        && let Err(err) = device.clear_driver_override()
     {
         tracing::warn!(bdf, %err, "failed to clear driver_override during bind rollback");
     }
@@ -179,7 +170,7 @@ pub(crate) fn bind_device_to_vfio(sysfs: &SysfsRoot, bdf: &str) -> Result<bool, 
         if drv == "vfio-pci" {
             return Ok(false);
         }
-        let unbind_path = sysfs.pci_device(bdf).join("driver/unbind");
+        let unbind_path = sysfs.pci_device_ref(bdf).driver_unbind_path();
         write_sysfs(&unbind_path, bdf).map_err(|e| VfioError::BindFailed {
             bdf: bdf.to_string(),
             reason: format!("unbind from {drv}: {e}"),
@@ -189,7 +180,7 @@ pub(crate) fn bind_device_to_vfio(sysfs: &SysfsRoot, bdf: &str) -> Result<bool, 
 
     register_vfio_new_id(sysfs, bdf);
 
-    let override_path = sysfs.pci_device(bdf).join("driver_override");
+    let override_path = sysfs.pci_device_ref(bdf).driver_override_path();
     if let Err(e) = write_sysfs(&override_path, "vfio-pci") {
         deregister_vfio_new_id(sysfs, bdf);
         return Err(VfioError::BindFailed {
@@ -251,7 +242,7 @@ pub(crate) fn restore_to_host_driver_ex(
     bdf: &str,
     skip_deregister: bool,
 ) -> Result<(), VfioError> {
-    let dev_dir = sysfs.pci_device(bdf);
+    let device = sysfs.pci_device_ref(bdf);
 
     if !skip_deregister {
         // Deregister the device ID from vfio-pci's match table before
@@ -260,7 +251,7 @@ pub(crate) fn restore_to_host_driver_ex(
         deregister_vfio_new_id(sysfs, bdf);
     }
 
-    let unbind_path = dev_dir.join("driver/unbind");
+    let unbind_path = device.driver_unbind_path();
     if unbind_path.exists() {
         write_sysfs(&unbind_path, bdf).map_err(|e| VfioError::UnbindFailed {
             bdf: bdf.to_string(),
@@ -268,12 +259,13 @@ pub(crate) fn restore_to_host_driver_ex(
         })?;
     }
 
-    let override_path = dev_dir.join("driver_override");
-    if override_path.exists() {
-        write_sysfs(&override_path, "\n").map_err(|e| VfioError::UnbindFailed {
-            bdf: bdf.to_string(),
-            reason: format!("clear driver_override: {e}"),
-        })?;
+    if device.driver_override_path().exists() {
+        device
+            .clear_driver_override()
+            .map_err(|e| VfioError::UnbindFailed {
+                bdf: bdf.to_string(),
+                reason: format!("clear driver_override: {e}"),
+            })?;
     }
 
     let probe = sysfs.drivers_probe();

@@ -11,6 +11,12 @@ pub struct SysfsRoot {
     base: PathBuf,
 }
 
+/// View of a single PCI device under a [`SysfsRoot`].
+pub(crate) struct SysfsPciDevice<'a> {
+    sysfs: &'a SysfsRoot,
+    bdf: &'a str,
+}
+
 impl SysfsRoot {
     /// Production root pointing at the real `/sys` filesystem.
     pub fn system() -> Self {
@@ -35,6 +41,10 @@ impl SysfsRoot {
 
     pub fn pci_device(&self, bdf: &str) -> PathBuf {
         self.pci_devices_dir().join(bdf)
+    }
+
+    pub(crate) fn pci_device_ref<'a>(&'a self, bdf: &'a str) -> SysfsPciDevice<'a> {
+        SysfsPciDevice { sysfs: self, bdf }
     }
 
     pub fn drivers_probe(&self) -> PathBuf {
@@ -83,6 +93,71 @@ impl SysfsRoot {
         }
         devices.sort();
         Ok(devices)
+    }
+}
+
+impl SysfsPciDevice<'_> {
+    pub(crate) fn path(&self) -> PathBuf {
+        self.sysfs.pci_device(self.bdf)
+    }
+
+    pub(crate) fn exists(&self) -> bool {
+        self.path().exists()
+    }
+
+    pub(crate) fn file(&self, name: &str) -> PathBuf {
+        self.path().join(name)
+    }
+
+    pub(crate) fn read_trimmed(&self, name: &str) -> Result<String, VfioError> {
+        read_sysfs_trimmed(&self.file(name))
+    }
+
+    pub(crate) fn vendor(&self) -> Result<String, VfioError> {
+        self.read_trimmed("vendor")
+    }
+
+    pub(crate) fn device_id(&self) -> Result<String, VfioError> {
+        self.read_trimmed("device")
+    }
+
+    pub(crate) fn class(&self) -> Result<String, VfioError> {
+        self.read_trimmed("class")
+    }
+
+    pub(crate) fn driver_name(&self) -> Option<String> {
+        fs::read_link(self.file("driver"))
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+    }
+
+    pub(crate) fn driver_override_path(&self) -> PathBuf {
+        self.file("driver_override")
+    }
+
+    pub(crate) fn driver_override(&self) -> Result<String, VfioError> {
+        self.read_trimmed("driver_override")
+    }
+
+    pub(crate) fn clear_driver_override(&self) -> Result<(), VfioError> {
+        write_sysfs(&self.driver_override_path(), "\n")
+    }
+
+    pub(crate) fn driver_unbind_path(&self) -> PathBuf {
+        self.file("driver/unbind")
+    }
+
+    pub(crate) fn iommu_group(&self) -> Result<u32, VfioError> {
+        self.sysfs.iommu_group(self.bdf)
+    }
+
+    /// Read vendor and device IDs from sysfs and format as `"VVVV DDDD"` (no `0x` prefix).
+    pub(crate) fn vfio_id_string(&self) -> Option<String> {
+        let vendor = self.vendor().ok()?;
+        let device = self.device_id().ok()?;
+        let vendor_hex = vendor.strip_prefix("0x").unwrap_or(&vendor);
+        let device_hex = device.strip_prefix("0x").unwrap_or(&device);
+        Some(format!("{vendor_hex} {device_hex}"))
     }
 }
 

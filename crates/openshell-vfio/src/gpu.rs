@@ -3,7 +3,7 @@
 
 use crate::VfioError;
 use crate::pci::{PciBindGuard, PciInfo};
-use crate::sysfs::{SysfsRoot, read_sysfs_trimmed, validate_bdf};
+use crate::sysfs::{SysfsRoot, validate_bdf};
 use std::fs;
 
 const NVIDIA_VENDOR_ID: &str = "0x10de";
@@ -38,26 +38,27 @@ pub fn probe_host_nvidia_vfio_readiness(sysfs: &SysfsRoot) -> Vec<PciInfo> {
 
     for entry in entries.filter_map(Result::ok) {
         let bdf = entry.file_name().to_string_lossy().into_owned();
-        let dev_dir = sysfs.pci_device(&bdf);
+        let device = sysfs.pci_device_ref(&bdf);
 
-        let Ok(vendor) = read_sysfs_trimmed(&dev_dir.join("vendor")) else {
+        let Ok(vendor) = device.vendor() else {
             continue;
         };
         if vendor != NVIDIA_VENDOR_ID {
             continue;
         }
 
-        let Ok(class) = read_sysfs_trimmed(&dev_dir.join("class")) else {
+        let Ok(class) = device.class() else {
             continue;
         };
         if !is_gpu_class(&class) {
             continue;
         }
 
-        let device = read_sysfs_trimmed(&dev_dir.join("device")).unwrap_or_default();
+        let device_id = device.device_id().unwrap_or_default();
 
-        let name = read_sysfs_trimmed(&dev_dir.join("label"))
-            .unwrap_or_else(|_| format!("NVIDIA {device}"));
+        let name = device
+            .read_trimmed("label")
+            .unwrap_or_else(|_| format!("NVIDIA {device_id}"));
 
         let Ok(iommu_group) = sysfs.iommu_group(&bdf) else {
             continue;
@@ -67,7 +68,7 @@ pub fn probe_host_nvidia_vfio_readiness(sysfs: &SysfsRoot) -> Vec<PciInfo> {
             bdf,
             name,
             vendor,
-            device,
+            device: device_id,
             iommu_group,
         });
     }
@@ -86,28 +87,28 @@ pub fn prepare_gpu_for_passthrough(
 ) -> Result<PciBindGuard, VfioError> {
     validate_bdf(bdf)?;
 
-    let dev_dir = sysfs.pci_device(bdf);
-    if !dev_dir.exists() {
+    let device = sysfs.pci_device_ref(bdf);
+    if !device.exists() {
         return Err(VfioError::GpuNotFound {
             bdf: bdf.to_string(),
         });
     }
 
-    let vendor = read_sysfs_trimmed(&dev_dir.join("vendor"))?;
-    if vendor != NVIDIA_VENDOR_ID {
-        return Err(VfioError::NotNvidia {
+    let class = device.class()?;
+    if !is_gpu_class(&class) {
+        return Err(VfioError::NotGpu {
             bdf: bdf.to_string(),
-            vendor,
+            class,
         });
     }
 
-    let iommu_group = sysfs.iommu_group(bdf)?;
+    let iommu_group = device.iommu_group()?;
     let group_devices = sysfs.iommu_group_devices(iommu_group)?;
     let peers: Vec<String> = group_devices.into_iter().filter(|d| d != bdf).collect();
 
     let mut bound_companions = Vec::new();
     for peer in &peers {
-        if !sysfs.pci_device(peer).exists() {
+        if !sysfs.pci_device_ref(peer).exists() {
             continue;
         }
         match crate::bind::bind_device_to_vfio(sysfs, peer) {
@@ -265,6 +266,53 @@ mod tests {
 
         assert!(guard.companion_bdfs.is_empty());
         assert_eq!(guard.bdf, "0000:2d:00.0");
+    }
+
+    #[test]
+    fn test_prepare_gpu_accepts_non_nvidia_gpu() {
+        let _refcount_guard = test_refcounts::guard();
+        test_refcounts::clear("8086 56a0");
+        let (tmp, sysfs) = setup_mock_sysfs();
+        create_pci_device(
+            &sysfs,
+            tmp.path(),
+            "0000:03:00.0",
+            "0x8086",
+            "0x56a0",
+            "0x030200",
+            11,
+        );
+        create_probe_file(&sysfs);
+        set_mock_driver(&sysfs, "0000:03:00.0", "vfio-pci");
+
+        let guard = prepare_gpu_for_passthrough(&sysfs, "0000:03:00.0").unwrap();
+
+        assert!(guard.companion_bdfs.is_empty());
+        assert_eq!(guard.bdf, "0000:03:00.0");
+    }
+
+    #[test]
+    fn test_prepare_gpu_rejects_non_gpu_device() {
+        let (tmp, sysfs) = setup_mock_sysfs();
+        create_pci_device(
+            &sysfs,
+            tmp.path(),
+            "0000:04:00.0",
+            "0x8086",
+            "0x1234",
+            "0x020000",
+            12,
+        );
+
+        let err = prepare_gpu_for_passthrough(&sysfs, "0000:04:00.0").unwrap_err();
+
+        assert!(matches!(
+            err,
+            VfioError::NotGpu {
+                bdf,
+                class
+            } if bdf == "0000:04:00.0" && class == "0x020000"
+        ));
     }
 
     #[test]

@@ -13,7 +13,7 @@
 //! - [`bind`] - generic bind/unbind/probe mechanics
 //! - [`pci`] - generic device types and the public passthrough API
 //! - [`reconcile`] - crash-recovery for stale bindings
-//! - [`gpu`] - NVIDIA-specific helpers consumed by the VM driver's GPU inventory
+//! - [`gpu`] - GPU passthrough helpers plus NVIDIA-specific inventory probing
 
 pub mod bind;
 pub mod error;

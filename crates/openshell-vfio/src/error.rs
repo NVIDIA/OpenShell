@@ -12,6 +12,9 @@ pub enum VfioError {
     #[error("GPU {bdf} is not an NVIDIA device (vendor={vendor})")]
     NotNvidia { bdf: String, vendor: String },
 
+    #[error("PCI device {bdf} is not a GPU display controller (class={class})")]
+    NotGpu { bdf: String, class: String },
+
     #[error("PCI device {bdf} has no IOMMU group - is IOMMU enabled?")]
     NoIommuGroup { bdf: String },
 

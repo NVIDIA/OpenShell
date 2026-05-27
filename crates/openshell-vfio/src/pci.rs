@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::VfioError;
-use crate::sysfs::{SysfsRoot, read_sysfs_trimmed, validate_bdf};
+use crate::sysfs::{SysfsRoot, validate_bdf};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
@@ -234,9 +234,9 @@ pub fn probe_host_vfio_candidates(sysfs: &SysfsRoot, vendor_filter: Option<&str>
 
     for entry in entries.filter_map(Result::ok) {
         let bdf = entry.file_name().to_string_lossy().into_owned();
-        let dev_dir = sysfs.pci_device(&bdf);
+        let device = sysfs.pci_device_ref(&bdf);
 
-        let Ok(vendor) = read_sysfs_trimmed(&dev_dir.join("vendor")) else {
+        let Ok(vendor) = device.vendor() else {
             continue;
         };
         if let Some(filter) = vendor_filter
@@ -245,12 +245,13 @@ pub fn probe_host_vfio_candidates(sysfs: &SysfsRoot, vendor_filter: Option<&str>
             continue;
         }
 
-        let device = read_sysfs_trimmed(&dev_dir.join("device")).unwrap_or_default();
+        let device_id = device.device_id().unwrap_or_default();
 
-        let name = read_sysfs_trimmed(&dev_dir.join("label"))
-            .unwrap_or_else(|_| format!("{vendor} {device}"));
+        let name = device
+            .read_trimmed("label")
+            .unwrap_or_else(|_| format!("{vendor} {device_id}"));
 
-        let Ok(iommu_group) = sysfs.iommu_group(&bdf) else {
+        let Ok(iommu_group) = device.iommu_group() else {
             tracing::debug!(bdf, "skipping PCI device without IOMMU group");
             continue;
         };
@@ -259,7 +260,7 @@ pub fn probe_host_vfio_candidates(sysfs: &SysfsRoot, vendor_filter: Option<&str>
             bdf,
             name,
             vendor,
-            device,
+            device: device_id,
             iommu_group,
         });
     }
@@ -281,14 +282,14 @@ pub fn probe_host_vfio_candidates(sysfs: &SysfsRoot, vendor_filter: Option<&str>
 pub fn validate_pci_for_passthrough(sysfs: &SysfsRoot, bdf: &str) -> Result<(), VfioError> {
     validate_bdf(bdf)?;
 
-    let dev_dir = sysfs.pci_device(bdf);
-    if !dev_dir.exists() {
+    let device = sysfs.pci_device_ref(bdf);
+    if !device.exists() {
         return Err(VfioError::DeviceNotFound {
             bdf: bdf.to_string(),
         });
     }
 
-    let iommu_group = sysfs.iommu_group(bdf)?;
+    let iommu_group = device.iommu_group()?;
     let group_devices = sysfs.iommu_group_devices(iommu_group)?;
     let peers: Vec<String> = group_devices.into_iter().filter(|d| d != bdf).collect();
 
@@ -374,7 +375,7 @@ pub fn validate_pci_group_for_passthrough(
 
     for bdf in bdfs {
         validate_bdf(bdf)?;
-        if !sysfs.pci_device(bdf).exists() {
+        if !sysfs.pci_device_ref(bdf).exists() {
             return Err(VfioError::DeviceNotFound {
                 bdf: (*bdf).to_string(),
             });
@@ -390,9 +391,9 @@ pub fn validate_pci_group_for_passthrough(
         });
     }
 
-    let expected_group = sysfs.iommu_group(primary)?;
+    let expected_group = sysfs.pci_device_ref(primary).iommu_group()?;
     for bdf in companions {
-        let g = sysfs.iommu_group(bdf)?;
+        let g = sysfs.pci_device_ref(bdf).iommu_group()?;
         if g != expected_group {
             return Err(VfioError::GroupMismatch {
                 bdf: (*bdf).to_string(),

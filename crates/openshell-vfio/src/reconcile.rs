@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::pci::PciBindState;
-use crate::sysfs::{SysfsRoot, read_sysfs_trimmed, write_sysfs};
+use crate::sysfs::{SysfsRoot, write_sysfs};
 use std::fs;
 use std::path::Path;
 
@@ -45,8 +45,8 @@ pub fn reconcile_stale_bindings(sysfs: &SysfsRoot, state_path: &Path) -> Vec<Str
                 restored.push(binding.bdf.clone());
             }
             _ => {
-                let override_path = sysfs.pci_device(&binding.bdf).join("driver_override");
-                if let Ok(val) = read_sysfs_trimmed(&override_path)
+                let device = sysfs.pci_device_ref(&binding.bdf);
+                if let Ok(val) = device.driver_override()
                     && val == "vfio-pci"
                 {
                     tracing::warn!(
@@ -55,7 +55,7 @@ pub fn reconcile_stale_bindings(sysfs: &SysfsRoot, state_path: &Path) -> Vec<Str
                         "stale driver_override detected, clearing and re-probing"
                     );
                     crate::bind::deregister_vfio_new_id(sysfs, &binding.bdf);
-                    if let Err(err) = write_sysfs(&override_path, "\n") {
+                    if let Err(err) = device.clear_driver_override() {
                         tracing::error!(bdf = %binding.bdf, %err, "failed to clear stale driver_override");
                         failed_bindings.push(binding.clone());
                         continue;
