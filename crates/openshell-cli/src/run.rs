@@ -4514,6 +4514,8 @@ pub async fn provider_list_profiles(server: &str, output: &str, tls: &TlsOptions
     }
 
     println!("{}", "Available Provider Profiles:".cyan().bold());
+    let id_width = provider_profile_id_width(&profiles);
+    let display_width = provider_profile_display_width(&profiles);
     let mut current_category = i32::MIN;
     for profile in profiles {
         if profile.category != current_category {
@@ -4521,7 +4523,7 @@ pub async fn provider_list_profiles(server: &str, output: &str, tls: &TlsOptions
             println!();
             println!("  {}", display_provider_category(current_category).bold());
         }
-        print_provider_type_row(&profile);
+        print_provider_type_row(&profile, id_width, display_width);
     }
 
     Ok(())
@@ -4992,19 +4994,63 @@ fn display_provider_category(category: i32) -> &'static str {
     }
 }
 
-fn print_provider_type_row(profile: &ProviderProfile) {
+const PROVIDER_PROFILE_ID_MAX_WIDTH: usize = 32;
+const PROVIDER_PROFILE_DISPLAY_MAX_WIDTH: usize = 40;
+
+fn provider_profile_id_width(profiles: &[ProviderProfile]) -> usize {
+    profiles
+        .iter()
+        .map(|profile| {
+            profile
+                .id
+                .chars()
+                .count()
+                .min(PROVIDER_PROFILE_ID_MAX_WIDTH)
+        })
+        .max()
+        .unwrap_or(2)
+        .max(2)
+}
+
+fn provider_profile_display_width(profiles: &[ProviderProfile]) -> usize {
+    profiles
+        .iter()
+        .map(|profile| {
+            profile
+                .display_name
+                .chars()
+                .count()
+                .min(PROVIDER_PROFILE_DISPLAY_MAX_WIDTH)
+        })
+        .max()
+        .unwrap_or(4)
+        .max(4)
+}
+
+fn print_provider_type_row(profile: &ProviderProfile, id_width: usize, display_width: usize) {
     let inference = if profile.inference_capable {
         " inference"
     } else {
         ""
     };
+    let id = truncate_display(&profile.id, PROVIDER_PROFILE_ID_MAX_WIDTH);
+    let display_name = truncate_display(&profile.display_name, PROVIDER_PROFILE_DISPLAY_MAX_WIDTH);
     println!(
-        "    {:<12} {:<42} endpoints: {:<2}{}",
-        profile.id,
-        profile.display_name,
+        "    {id:<id_width$}  {display_name:<display_width$}  endpoints: {:<2}{}",
         profile.endpoints.len(),
         inference
     );
+}
+
+fn truncate_display(value: &str, max_width: usize) -> String {
+    if value.chars().count() <= max_width {
+        return value.to_string();
+    }
+
+    let keep = max_width.saturating_sub(3);
+    let mut truncated = value.chars().take(keep).collect::<String>();
+    truncated.push_str("...");
+    truncated
 }
 
 pub async fn provider_update(

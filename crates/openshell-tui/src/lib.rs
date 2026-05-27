@@ -186,23 +186,7 @@ pub async fn run(
             }
             Some(Event::ProviderDetailFetched(result)) => match result {
                 Ok(provider) => {
-                    let cred_key = provider
-                        .credentials
-                        .keys()
-                        .next()
-                        .cloned()
-                        .unwrap_or_default();
-                    let masked = provider
-                        .credentials
-                        .values()
-                        .next()
-                        .map_or_else(|| "-".to_string(), |val| mask_secret(val));
-                    app.provider_detail = Some(app::ProviderDetailView {
-                        name: provider.object_name().to_string(),
-                        provider_type: provider.r#type.clone(),
-                        credential_key: cred_key,
-                        masked_value: masked,
-                    });
+                    app.provider_detail = Some(app.provider_detail_from_provider(&provider));
                 }
                 Err(msg) => {
                     app.status_text = format!("get provider failed: {msg}");
@@ -1911,30 +1895,48 @@ fn spawn_draft_approve_all(
     });
 }
 
-/// Mask a secret value, showing only the first and last 2 chars.
-fn mask_secret(value: &str) -> String {
-    let len = value.len();
-    if len <= 6 {
-        "*".repeat(len)
-    } else {
-        let start: String = value.chars().take(2).collect();
-        let end: String = value.chars().skip(len - 2).collect();
-        format!("{start}{}…{end}", "*".repeat(len.saturating_sub(4).min(20)))
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Data refresh
 // ---------------------------------------------------------------------------
 
 async fn refresh_data(app: &mut App) {
     refresh_health(app).await;
-    refresh_providers(app).await;
     refresh_global_settings(app).await;
+    refresh_providers(app).await;
     refresh_sandboxes(app).await;
 }
 
 async fn refresh_providers(app: &mut App) {
+    let profiles = if app.providers_v2_enabled {
+        let req = openshell_core::proto::ListProviderProfilesRequest {
+            limit: 100,
+            offset: 0,
+        };
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            app.client.list_provider_profiles(req),
+        )
+        .await
+        {
+            Ok(Ok(resp)) => resp
+                .into_inner()
+                .profiles
+                .into_iter()
+                .map(|profile| (profile.id.clone(), profile))
+                .collect::<HashMap<_, _>>(),
+            Ok(Err(e)) => {
+                tracing::warn!("failed to list provider profiles: {}", e.message());
+                HashMap::new()
+            }
+            Err(_) => {
+                tracing::warn!("list provider profiles timed out");
+                HashMap::new()
+            }
+        }
+    } else {
+        HashMap::new()
+    };
+
     let req = openshell_core::proto::ListProvidersRequest {
         limit: 100,
         offset: 0,
@@ -1950,9 +1952,21 @@ async fn refresh_providers(app: &mut App) {
         Ok(Ok(resp)) => {
             let providers = resp.into_inner().providers;
             app.provider_count = providers.len();
+            app.provider_entries = if app.providers_v2_enabled {
+                providers
+                    .iter()
+                    .cloned()
+                    .map(|provider| app::ProviderV2Entry {
+                        profile: profiles.get(&provider.r#type).cloned(),
+                        provider,
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
             app.provider_names = providers
                 .iter()
-                .map(|p| p.object_name().to_string())
+                .map(|p| app::provider_name(p).to_string())
                 .collect();
             app.provider_types = providers.iter().map(|p| p.r#type.clone()).collect();
             app.provider_cred_keys = providers
