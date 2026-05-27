@@ -119,8 +119,13 @@ def test_rpm_spec_uses_gateway_defaults_without_config_helper() -> None:
 
     assert "init-gateway-config.sh" not in spec
     assert "init-pki.sh" not in spec
-    assert "openshell-gateway generate-certs --output-dir %%S/openshell/tls" in spec
+    assert "Environment=OPENSHELL_LOCAL_TLS_DIR=%%h/.local/state/openshell/tls" in spec
+    assert (
+        "openshell-gateway generate-certs --output-dir ${OPENSHELL_LOCAL_TLS_DIR}"
+        in spec
+    )
     assert "EnvironmentFile=-%%E/openshell/gateway.env" in spec
+    assert "%%S/openshell/tls" not in spec
     assert "Environment=OPENSHELL_DRIVERS" not in spec
     assert "Environment=OPENSHELL_BIND_ADDRESS" not in spec
     assert "Environment=OPENSHELL_PODMAN_TLS_CA" not in spec
@@ -136,7 +141,12 @@ def test_deb_user_service_uses_gateway_defaults_without_config_helper() -> None:
     )
 
     assert "EnvironmentFile=-%E/openshell/gateway.env" in unit
-    assert "openshell-gateway generate-certs --output-dir %S/openshell/tls" in unit
+    assert "Environment=OPENSHELL_LOCAL_TLS_DIR=%h/.local/state/openshell/tls" in unit
+    assert (
+        "openshell-gateway generate-certs --output-dir ${OPENSHELL_LOCAL_TLS_DIR}"
+        in unit
+    )
+    assert "%S/openshell/tls" not in unit
     assert "init-gateway-config.sh" not in unit
     assert "ExecStart=/usr/bin/openshell-gateway" in unit
     assert "--config" not in unit

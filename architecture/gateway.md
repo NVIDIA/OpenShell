@@ -306,9 +306,12 @@ created. Both deployment paths use it:
 
 On Kubernetes, the Helm chart runs the command via a pre-install/pre-upgrade
 hook Job using the gateway image itself -- no separate cert-generation image,
-no extra mirror burden in air-gapped environments. On the RPM gateway, the
-same command runs from the systemd unit's `ExecStartPre` to bootstrap PKI
-into the user's state directory on first start.
+no extra mirror burden in air-gapped environments. On package-managed local
+gateways, the same command runs from the systemd unit's `ExecStartPre` to
+bootstrap PKI into the configured local TLS directory on first start. The
+Linux package unit defaults that directory to `~/.local/state/openshell/tls`
+through `OPENSHELL_LOCAL_TLS_DIR` so certificate generation and runtime
+auto-detection use the same path across systemd versions.
 
 Both modes share the same idempotency contract: all targets present -> skip;
 partial state -> fail with a recovery hint; nothing present -> generate and
