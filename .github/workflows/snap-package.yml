@@ -64,6 +64,8 @@ jobs:
         run: |
           set -euo pipefail
           sudo snap install lxd
+          sudo iptables -P FORWARD ACCEPT
+          sudo chmod 666 /var/snap/lxd/common/lxd/unix.socket
           sudo usermod -aG lxd $USER
           sudo lxd init --auto
 
