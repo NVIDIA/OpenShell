@@ -9,6 +9,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
 source "${SCRIPT_DIR}/container-engine.sh"
 
 OUTPUT_ARGS=(--load)
@@ -20,12 +21,12 @@ fi
 
 SECRET_ARGS=()
 if [[ -n "${MISE_GITHUB_TOKEN:-}" ]]; then
-  SECRET_ARGS=(--secret id=MISE_GITHUB_TOKEN,env=MISE_GITHUB_TOKEN)
+  SECRET_ARGS=(--secret "id=MISE_GITHUB_TOKEN,env=MISE_GITHUB_TOKEN")
 elif [[ -n "${GITHUB_TOKEN:-}" ]]; then
-  SECRET_ARGS=(--secret id=MISE_GITHUB_TOKEN,env=GITHUB_TOKEN)
+  SECRET_ARGS=(--secret "id=MISE_GITHUB_TOKEN,env=GITHUB_TOKEN")
 fi
 
-exec ce_build \
+ce_build \
   ${DOCKER_BUILDER:+--builder ${DOCKER_BUILDER}} \
   ${DOCKER_PLATFORM:+--platform ${DOCKER_PLATFORM}} \
   ${SECRET_ARGS[@]+"${SECRET_ARGS[@]}"} \

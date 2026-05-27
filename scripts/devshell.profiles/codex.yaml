@@ -1,0 +1,43 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+id: codex
+display_name: Codex
+description: Codex CLI access for OpenShell development sandboxes
+category: agent
+inference_capable: true
+credentials:
+  - name: api_key
+    description: OpenAI API key used by Codex
+    env_vars: [OPENAI_API_KEY]
+    required: false
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: api.openai.com
+    port: 443
+    protocol: rest
+    access: full
+    enforcement: enforce
+  - host: auth.openai.com
+    port: 443
+    protocol: rest
+    access: full
+    enforcement: enforce
+  - host: chatgpt.com
+    port: 443
+    protocol: rest
+    access: full
+    enforcement: enforce
+  - host: ab.chatgpt.com
+    port: 443
+    protocol: rest
+    access: full
+    enforcement: enforce
+binaries:
+  - /usr/bin/codex
+  - /usr/local/bin/codex
+  - /usr/bin/node
+  - /usr/local/bin/node

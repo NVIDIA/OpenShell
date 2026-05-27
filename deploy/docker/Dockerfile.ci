@@ -14,9 +14,9 @@ ARG NPM_VERSION=11.13.0
 ARG TARGETARCH
 
 ENV DEBIAN_FRONTEND=noninteractive
-ENV MISE_DATA_DIR=/opt/mise
-ENV MISE_CACHE_DIR=/opt/mise/cache
-ENV PATH="/opt/mise/shims:/root/.cargo/bin:/root/.local/bin:$PATH"
+ENV MISE_DATA_DIR=/usr/local/share/openshell/mise
+ENV RUSTUP_HOME=/usr/local/share/openshell/mise/rustup
+ENV PATH="/usr/local/share/openshell/mise/shims:/usr/local/bin:/usr/local/share/openshell/mise/cargo/bin:/root/.local/bin:$PATH"
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -26,6 +26,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     clang \
     libclang-dev \
+    libnss-wrapper \
     libz3-dev \
     pkg-config \
     libssl-dev \
@@ -38,7 +39,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     unzip \
     xz-utils \
     jq \
+    iptables \
+    iproute2 \
+    nftables \
     rsync \
+    util-linux \
     zstd \
     && apt-get install -y --only-upgrade gpgv python3 \
     && rm -rf /var/lib/apt/lists/*
@@ -68,22 +73,42 @@ RUN case "$TARGETARCH" in \
 
 # Install mise (NOTE: keep this version in sync with mise.toml)
 ARG MISE_VERSION=v2026.4.25
-RUN curl https://mise.run | MISE_VERSION=$MISE_VERSION sh
+RUN curl https://mise.run | MISE_VERSION=$MISE_VERSION sh \
+    && install -D -m 0755 /root/.local/bin/mise /usr/local/bin/mise
+
+# The VM sandbox runs as the unprivileged `sandbox` user and does not preserve
+# Docker image ENV metadata, so expose mise through system paths and profiles.
+RUN printf '%s\n' \
+      'export MISE_DATA_DIR="${MISE_DATA_DIR:-/usr/local/share/openshell/mise}"' \
+      'export MISE_CACHE_DIR="${MISE_CACHE_DIR:-${HOME:-/tmp}/.cache/mise}"' \
+      'export CARGO_HOME="${CARGO_HOME:-${HOME:-/tmp}/.cargo}"' \
+      'export RUSTUP_HOME="${RUSTUP_HOME:-/usr/local/share/openshell/mise/rustup}"' \
+      'case ":${PATH}:" in *:/usr/local/share/openshell/mise/shims:*) ;; *) export PATH="/usr/local/share/openshell/mise/shims:${PATH}" ;; esac' \
+      'case ":${PATH}:" in *:/usr/local/share/openshell/mise/cargo/bin:*) ;; *) export PATH="/usr/local/share/openshell/mise/cargo/bin:${PATH}" ;; esac' \
+      'case ":${PATH}:" in *:/usr/local/bin:*) ;; *) export PATH="/usr/local/bin:${PATH}" ;; esac' \
+      > /etc/profile.d/openshell-mise.sh \
+    && printf '%s\n' '' '[ -r /etc/profile.d/openshell-mise.sh ] && . /etc/profile.d/openshell-mise.sh' >> /etc/bash.bashrc
+
+COPY deploy/docker/devshell-bootstrap.sh /usr/local/bin/openshell-devshell-bootstrap
+RUN chmod 0755 /usr/local/bin/openshell-devshell-bootstrap
 
 # Copy mise.toml and task includes, then install all tools via mise
-COPY mise.toml /opt/mise/mise.toml
-COPY mise.lock /opt/mise/mise.lock
-COPY tasks/ /opt/mise/tasks/
-WORKDIR /opt/mise
+COPY mise.toml /usr/local/share/openshell/mise/mise.toml
+COPY mise.lock /usr/local/share/openshell/mise/mise.lock
+COPY tasks/ /usr/local/share/openshell/mise/tasks/
+WORKDIR /usr/local/share/openshell/mise
 RUN --mount=type=secret,id=MISE_GITHUB_TOKEN \
     export MISE_GITHUB_TOKEN="$(cat /run/secrets/MISE_GITHUB_TOKEN 2>/dev/null || true)" && \
-    mise trust /opt/mise/mise.toml && \
-    env -u RUSTC_WRAPPER mise install --locked && \
-    mise reshim && \
+    export CARGO_HOME=/usr/local/share/openshell/mise/cargo && \
+    export RUSTUP_HOME=/usr/local/share/openshell/mise/rustup && \
+    /usr/local/bin/mise trust /usr/local/share/openshell/mise/mise.toml && \
+    env -u RUSTC_WRAPPER /usr/local/bin/mise install --locked && \
+    /usr/local/bin/mise reshim && \
     npm install -g "npm@${NPM_VERSION}" && \
-    mise reshim && \
-    (/root/.cargo/bin/rustup component remove rust-docs || true) && \
-    rm -rf /root/.rustup/toolchains/*/share/doc /root/.rustup/toolchains/*/share/man && \
+    /usr/local/bin/mise reshim && \
+    find /usr/local/share/openshell/mise/shims -type l -exec ln -sfn /usr/local/bin/mise {} \; && \
+    (/usr/local/share/openshell/mise/cargo/bin/rustup component remove rust-docs || true) && \
+    rm -rf /usr/local/share/openshell/mise/rustup/toolchains/*/share/doc /usr/local/share/openshell/mise/rustup/toolchains/*/share/man && \
     helm plugin install https://github.com/helm-unittest/helm-unittest --verify=false
 
 # Set working directory for CI jobs

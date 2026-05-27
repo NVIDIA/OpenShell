@@ -43,6 +43,7 @@ By default `mise run gateway:vm`:
 - Registers the CLI gateway `vm-dev` by writing `~/.config/openshell/gateways/vm-dev/metadata.json`. It does not modify the workspace `.env`.
 - Persists the gateway SQLite DB under `.cache/gateway-vm/gateway.db`.
 - Places the VM driver state (per-sandbox `overlay.ext4`, image cache, and `run/compute-driver.sock`) under `/tmp/openshell-vm-driver-$USER-vm-dev/` so the AF_UNIX socket path stays under macOS `SUN_LEN`.
+- Starts development sandboxes with 4 vCPUs, 8192 MiB RAM, and a 32768 MiB sparse writable overlay disk.
 - Writes `.cache/gateway-vm/gateway.toml` with `[openshell.drivers.vm].driver_dir = "$PWD/target/debug"` so the freshly built `openshell-driver-vm` is used instead of an older installed copy from `~/.local/libexec/openshell`, `/usr/libexec/openshell`, or `/usr/local/libexec`.
 
 For GPU passthrough (VFIO), pass `-- --gpu` and run with root privileges:
@@ -75,6 +76,12 @@ mise run gateway:vm
 
 # custom sandbox image
 OPENSHELL_SANDBOX_IMAGE=ghcr.io/example/sandbox:latest mise run gateway:vm
+
+# custom sandbox VM size
+OPENSHELL_VM_DRIVER_VCPUS=6 \
+OPENSHELL_VM_DRIVER_MEM_MIB=12288 \
+OPENSHELL_VM_OVERLAY_DISK_MIB=32768 \
+mise run gateway:vm
 
 # custom bootstrap image for the VM runtime used to prepare/boot target images
 OPENSHELL_VM_BOOTSTRAP_IMAGE=ghcr.io/example/bootstrap:latest mise run gateway:vm

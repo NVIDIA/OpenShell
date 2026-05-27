@@ -1,0 +1,77 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+id: openshell-dev-toolchains
+display_name: OpenShell Dev Toolchains
+description: Network access for OpenShell development toolchain bootstrap
+category: other
+credentials:
+  - name: activation
+    description: Non-secret marker credential used to attach this policy bundle
+    env_vars: [OPENSHELL_DEVSHELL_ACCESS]
+    required: false
+discovery:
+  credentials: [activation]
+endpoints:
+  - { host: github.com, port: 443 }
+  - { host: api.github.com, port: 443 }
+  - { host: raw.githubusercontent.com, port: 443 }
+  - { host: objects.githubusercontent.com, port: 443 }
+  - { host: codeload.github.com, port: 443 }
+  - { host: release-assets.githubusercontent.com, port: 443 }
+  - { host: crates.io, port: 443 }
+  - { host: index.crates.io, port: 443 }
+  - { host: static.crates.io, port: 443 }
+  - { host: static.rust-lang.org, port: 443 }
+  - { host: sh.rustup.rs, port: 443 }
+  - { host: pypi.org, port: 443 }
+  - { host: files.pythonhosted.org, port: 443 }
+  - { host: astral.sh, port: 443 }
+  - host: registry.npmjs.org
+    port: 443
+    protocol: rest
+    enforcement: enforce
+    access: read-only
+    allow_encoded_slash: true
+  - { host: nodejs.org, port: 443 }
+  - { host: dl.k8s.io, port: 443 }
+  - { host: get.helm.sh, port: 443 }
+  - { host: storage.googleapis.com, port: 443 }
+  - { host: ziglang.org, port: 443 }
+  - { host: zig.linus.dev, port: 443 }
+  - { host: zig.tilok.dev, port: 443 }
+  - { host: zig.chainsafe.dev, port: 443 }
+  - { host: mise.run, port: 443 }
+  - { host: mise.en.dev, port: 443 }
+  - { host: mise.jdx.dev, port: 443 }
+  - { host: mise-versions.jdx.dev, port: 443 }
+  - { host: fulcio.sigstore.dev, port: 443 }
+  - { host: rekor.sigstore.dev, port: 443 }
+  - { host: tuf-repo-cdn.sigstore.dev, port: 443 }
+  - { host: oauth2.sigstore.dev, port: 443 }
+  - { host: ports.ubuntu.com, port: 80 }
+  - { host: ports.ubuntu.com, port: 443 }
+  - { host: archive.ubuntu.com, port: 80 }
+  - { host: archive.ubuntu.com, port: 443 }
+  - { host: security.ubuntu.com, port: 80 }
+  - { host: security.ubuntu.com, port: 443 }
+binaries:
+  - /usr/local/bin/mise
+  - /usr/local/share/openshell/mise/**
+  - /sandbox/.local/bin/mise
+  - /sandbox/.local/share/mise/**
+  - /sandbox/.cargo/**
+  - /usr/bin/git
+  - /usr/local/bin/git
+  - /usr/lib/git-core/git-remote-http
+  - /usr/bin/curl
+  - /usr/local/bin/curl
+  - /usr/bin/python3
+  - /usr/local/bin/python3
+  - /usr/bin/node
+  - /usr/local/bin/node
+  - /usr/bin/npm
+  - /usr/local/bin/npm
+  - /usr/bin/apt-get
+  - /usr/bin/apt-cache
+  - /usr/lib/apt/**

@@ -18,6 +18,8 @@ use openshell_ocsf::{
     NetworkActivityBuilder, Process, SeverityId, StatusId, Url as OcsfUrl, ocsf_emit,
 };
 use std::net::{IpAddr, SocketAddr};
+#[cfg(target_os = "linux")]
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -1137,20 +1139,7 @@ fn resolve_owner_identity(
         })?;
 
     let ancestors = crate::procfs::collect_ancestor_binaries(owner_pid, entrypoint_pid);
-
-    for ancestor in &ancestors {
-        identity_cache
-            .verify_or_cache(ancestor)
-            .map_err(|e| IdentityError {
-                reason: format!(
-                    "ancestor integrity check failed for {}: {e}",
-                    ancestor.display()
-                ),
-                binary: Some(bin_path.clone()),
-                binary_pid: Some(owner_pid),
-                ancestors: ancestors.clone(),
-            })?;
-    }
+    let ancestors = verify_existing_ancestors(ancestors, identity_cache, &bin_path, owner_pid)?;
 
     let mut exclude = ancestors.clone();
     exclude.push(bin_path.clone());
@@ -1163,6 +1152,56 @@ fn resolve_owner_identity(
         cmdline_paths,
         bin_hash,
     })
+}
+
+#[cfg(target_os = "linux")]
+fn verify_existing_ancestors(
+    ancestors: Vec<PathBuf>,
+    identity_cache: &BinaryIdentityCache,
+    bin_path: &Path,
+    owner_pid: u32,
+) -> std::result::Result<Vec<PathBuf>, IdentityError> {
+    let mut verified = Vec::with_capacity(ancestors.len());
+
+    for ancestor in ancestors {
+        match std::fs::metadata(&ancestor) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                debug!(
+                    ancestor = %ancestor.display(),
+                    "Skipping missing process ancestor during identity verification"
+                );
+                continue;
+            }
+            Err(error) => {
+                return Err(IdentityError {
+                    reason: format!(
+                        "ancestor integrity check failed for {}: Failed to stat {}: {error}",
+                        ancestor.display(),
+                        ancestor.display()
+                    ),
+                    binary: Some(bin_path.to_path_buf()),
+                    binary_pid: Some(owner_pid),
+                    ancestors: verified,
+                });
+            }
+        }
+
+        identity_cache
+            .verify_or_cache(&ancestor)
+            .map_err(|e| IdentityError {
+                reason: format!(
+                    "ancestor integrity check failed for {}: {e}",
+                    ancestor.display()
+                ),
+                binary: Some(bin_path.to_path_buf()),
+                binary_pid: Some(owner_pid),
+                ancestors: verified.clone(),
+            })?;
+        verified.push(ancestor);
+    }
+
+    Ok(verified)
 }
 
 /// Resolve the identity of the process owning a TCP peer connection.
@@ -6349,6 +6388,30 @@ network_policies:
         // Verify body length matches
         let body_start = resp_str.find("\r\n\r\n").unwrap() + 4;
         assert_eq!(resp_str[body_start..].len(), cl);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verify_existing_ancestors_skips_missing_paths() {
+        use crate::identity::BinaryIdentityCache;
+        use std::io::Write;
+
+        let mut existing = tempfile::NamedTempFile::new().unwrap();
+        existing.write_all(b"ancestor").unwrap();
+        existing.flush().unwrap();
+
+        let missing = existing.path().with_file_name("missing-ancestor");
+        let cache = BinaryIdentityCache::new();
+
+        let verified = verify_existing_ancestors(
+            vec![existing.path().to_path_buf(), missing],
+            &cache,
+            Path::new("/usr/bin/curl"),
+            123,
+        )
+        .expect("missing ancestors should be ignored");
+
+        assert_eq!(verified, vec![existing.path().to_path_buf()]);
     }
 
     /// End-to-end regression for the `docker cp` hot-swap hazard that

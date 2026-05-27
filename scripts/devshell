@@ -1,0 +1,277 @@
+#!/usr/bin/env bash
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Create or reconnect to an OpenShell development sandbox on the active gateway.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+OPENSHELL_BIN="${OPENSHELL_BIN:-${ROOT}/scripts/bin/openshell}"
+SANDBOX_NAME="${OPENSHELL_DEVSHELL_SANDBOX:-openshell-dev}"
+SANDBOX_IMAGE="${OPENSHELL_DEVSHELL_IMAGE:-openshell/ci:dev}"
+BOOTSTRAP_FILE="${OPENSHELL_DEVSHELL_BOOTSTRAP:-${ROOT}/deploy/docker/devshell-bootstrap.sh}"
+PROFILE_DIR="${OPENSHELL_DEVSHELL_PROFILE_DIR:-${ROOT}/scripts/devshell.profiles}"
+POLICY_FILE="${OPENSHELL_DEVSHELL_POLICY:-}"
+DEVSHELL_PROVIDER="${OPENSHELL_DEVSHELL_TOOLCHAIN_PROVIDER:-openshell-dev-toolchains}"
+PROVIDERS="${OPENSHELL_DEVSHELL_PROVIDERS-github codex claude ${DEVSHELL_PROVIDER}}"
+REPO="${OPENSHELL_DEVSHELL_REPO:-}"
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  scripts/devshell                  Create or connect to the dev sandbox
+  scripts/devshell -- <command...>  Run a command in the dev sandbox
+  scripts/devshell recreate         Delete and recreate the dev sandbox
+  scripts/devshell delete           Delete the dev sandbox
+  scripts/devshell policy           Print the optional policy override path
+  scripts/devshell profiles         Print the dev provider profile directory
+
+Environment:
+  OPENSHELL_DEVSHELL_IMAGE       Sandbox image (default: openshell/ci:dev)
+  OPENSHELL_DEVSHELL_REPO        GitHub repo slug or URL (default: origin remote)
+  OPENSHELL_DEVSHELL_PROVIDERS   Provider names/types to attach
+                                  (default: github codex claude openshell-dev-toolchains)
+  OPENSHELL_DEVSHELL_POLICY      Optional policy file override (default: none)
+  OPENSHELL_DEVSHELL_PROFILE_DIR Provider profiles to import for Providers v2
+  OPENSHELL_DEVSHELL_BOOTSTRAP   Fallback bootstrap helper for images that do not include one
+USAGE
+}
+
+fail() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+openshell() {
+  "$OPENSHELL_BIN" "$@"
+}
+
+normalize_repo() {
+  local input=$1
+  input="${input%.git}"
+  case "$input" in
+    https://github.com/*/*) input="${input#https://github.com/}" ;;
+    http://github.com/*/*) input="${input#http://github.com/}" ;;
+    git@github.com:*) input="${input#git@github.com:}" ;;
+    ssh://git@github.com/*/*) input="${input#ssh://git@github.com/}" ;;
+  esac
+  printf '%s\n' "$input"
+}
+
+repo_slug() {
+  local repo=$REPO
+  if [[ -z "$repo" ]]; then
+    repo="$(git -C "$ROOT" config --get remote.origin.url 2>/dev/null || true)"
+  fi
+  repo="$(normalize_repo "$repo")"
+  [[ -n "$repo" ]] || repo="NVIDIA/OpenShell"
+  [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] \
+    || fail "OPENSHELL_DEVSHELL_REPO must be a GitHub owner/repo slug or URL, got '$repo'"
+  printf '%s\n' "$repo"
+}
+
+provider_args() {
+  local provider
+  for provider in $PROVIDERS; do
+    printf '%s\n' "--provider"
+    printf '%s\n' "$provider"
+  done
+}
+
+policy_args() {
+  if [[ -n "$POLICY_FILE" ]]; then
+    printf '%s\n' "--policy"
+    printf '%s\n' "$POLICY_FILE"
+  fi
+}
+
+profile_id_from_file() {
+  sed -n -E 's/^id:[[:space:]]*"?([^"#]+)"?[[:space:]]*$/\1/p' "$1" | head -n 1
+}
+
+ensure_provider_profile() {
+  local file=$1
+  local id
+  id="$(profile_id_from_file "$file")"
+  [[ -n "$id" ]] || fail "provider profile '$file' is missing an id"
+  if openshell provider profile export "$id" -o json >/dev/null 2>&1; then
+    return
+  fi
+  openshell provider profile import -f "$file" >/dev/null
+}
+
+ensure_provider_profiles_v2() {
+  local file
+  for file in "$PROFILE_DIR"/*.yaml "$PROFILE_DIR"/*.yml "$PROFILE_DIR"/*.json; do
+    [[ -f "$file" ]] || continue
+    ensure_provider_profile "$file"
+  done
+  openshell settings set --global --key providers_v2_enabled --value true --yes >/dev/null
+}
+
+ensure_devshell_provider() {
+  if openshell provider get "$DEVSHELL_PROVIDER" >/dev/null 2>&1; then
+    return
+  fi
+  openshell provider create \
+    --name "$DEVSHELL_PROVIDER" \
+    --type "$DEVSHELL_PROVIDER" \
+    --credential OPENSHELL_DEVSHELL_ACCESS=1 \
+    >/dev/null
+}
+
+attach_devshell_provider() {
+  openshell sandbox provider attach "$SANDBOX_NAME" "$DEVSHELL_PROVIDER" >/dev/null
+}
+
+quote_command() {
+  local quoted=()
+  local item q
+  for item in "$@"; do
+    printf -v q '%q' "$item"
+    quoted+=("$q")
+  done
+  printf '%s\n' "${quoted[*]}"
+}
+
+base64_file() {
+  base64 < "$1" | tr -d '\n'
+}
+
+bootstrap_command() {
+  local repo=$1
+  local command_string=$2
+  local bootstrap_b64
+  bootstrap_b64="$(base64_file "$BOOTSTRAP_FILE")"
+  {
+    printf 'set -euo pipefail\n'
+    printf 'export OPENSHELL_DEVSHELL_REPO_SLUG=%q\n' "$repo"
+    printf 'set -- %s\n' "$command_string"
+    cat <<'EOF'
+if command -v openshell-devshell-bootstrap >/dev/null 2>&1; then
+  exec openshell-devshell-bootstrap "$@"
+fi
+mkdir -p /sandbox
+EOF
+    printf 'printf %%s %q | base64 -d > /sandbox/.openshell-devshell-bootstrap\n' "$bootstrap_b64"
+    cat <<'EOF'
+chmod +x /sandbox/.openshell-devshell-bootstrap
+exec /sandbox/.openshell-devshell-bootstrap "$@"
+EOF
+  }
+}
+
+bash_script_arg() {
+  local script=$1
+  local encoded
+  encoded="$(printf '%s' "$script" | base64 | tr -d '\n')"
+  # shellcheck disable=SC2016
+  printf 'eval "$(printf %%s %q | base64 -d)"\n' "$encoded"
+}
+
+run_in_sandbox() {
+  local repo command_string script
+  repo="$(repo_slug)"
+  command_string="$(quote_command "$@")"
+  script="$(bootstrap_command "$repo" "$command_string")"
+  script="$(bash_script_arg "$script")"
+  openshell sandbox exec -n "$SANDBOX_NAME" --workdir /sandbox --tty -- /bin/bash -lc "$script"
+}
+
+main() {
+  [[ -x "$OPENSHELL_BIN" ]] || command -v "$OPENSHELL_BIN" >/dev/null 2>&1 \
+    || fail "openshell binary not found: $OPENSHELL_BIN"
+  [[ -z "$POLICY_FILE" || -f "$POLICY_FILE" ]] || fail "policy file not found: $POLICY_FILE"
+  [[ -f "$BOOTSTRAP_FILE" ]] || fail "bootstrap helper not found: $BOOTSTRAP_FILE"
+  [[ -d "$PROFILE_DIR" ]] || fail "provider profile directory not found: $PROFILE_DIR"
+
+  local subcommand=connect
+  if [[ $# -gt 0 ]]; then
+    case "$1" in
+      -h|--help|help)
+        usage
+        exit 0
+        ;;
+      connect|recreate|delete|policy|profiles)
+        subcommand=$1
+        shift
+        ;;
+      --)
+        shift
+        ;;
+    esac
+  fi
+  if [[ $# -gt 0 && "$1" == "--" ]]; then
+    shift
+  fi
+
+  case "$subcommand" in
+    policy)
+      if [[ -n "$POLICY_FILE" ]]; then
+        printf '%s\n' "$POLICY_FILE"
+      else
+        printf 'no policy override configured; using Providers v2 profiles from %s\n' "$PROFILE_DIR"
+      fi
+      exit 0
+      ;;
+    profiles)
+      printf '%s\n' "$PROFILE_DIR"
+      exit 0
+      ;;
+    delete)
+      openshell sandbox delete "$SANDBOX_NAME"
+      exit $?
+      ;;
+  esac
+
+  local command=(/bin/bash -l)
+  if [[ $# -gt 0 ]]; then
+    command=("$@")
+  fi
+
+  ensure_provider_profiles_v2
+  ensure_devshell_provider
+
+  if openshell sandbox get "$SANDBOX_NAME" >/dev/null 2>&1; then
+    if [[ "$subcommand" == recreate ]]; then
+      openshell sandbox delete "$SANDBOX_NAME"
+    else
+      attach_devshell_provider
+      run_in_sandbox "${command[@]}"
+      exit $?
+    fi
+  fi
+
+  if [[ -z "${GITHUB_TOKEN:-}" && -z "${GH_TOKEN:-}" ]] && command -v gh >/dev/null 2>&1; then
+    GH_TOKEN="$(gh auth token 2>/dev/null || true)"
+    export GH_TOKEN
+  fi
+
+  local providers=()
+  while IFS= read -r arg; do
+    providers+=("$arg")
+  done < <(provider_args)
+  local policy=()
+  while IFS= read -r arg; do
+    policy+=("$arg")
+  done < <(policy_args)
+
+  local repo command_string script
+  repo="$(repo_slug)"
+  command_string="$(quote_command "${command[@]}")"
+  script="$(bootstrap_command "$repo" "$command_string")"
+  script="$(bash_script_arg "$script")"
+
+  openshell sandbox create \
+    --name "$SANDBOX_NAME" \
+    --from "$SANDBOX_IMAGE" \
+    "${policy[@]}" \
+    "${providers[@]}" \
+    --auto-providers \
+    --tty \
+    -- /bin/bash -lc "$script"
+}
+
+main "$@"

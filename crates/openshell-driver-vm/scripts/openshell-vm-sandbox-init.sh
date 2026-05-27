@@ -243,6 +243,10 @@ setup_overlay_root() {
     if [ "${OPENSHELL_VM_INIT_MODE:-sandbox}" = "image-prep" ]; then
         prepare_guest_image_rootfs
         sync
+        if ! umount /overlay 2>/dev/null; then
+            ts "WARNING: failed to unmount image-prep disk cleanly"
+        fi
+        sync
         ts "image-prep complete"
         exit 0
     fi

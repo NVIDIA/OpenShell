@@ -22,6 +22,8 @@
 #   OPENSHELL_VM_GATEWAY_NAME=my-vm-gateway mise run gateway:vm
 #   OPENSHELL_SANDBOX_NAMESPACE=my-ns mise run gateway:vm
 #   OPENSHELL_SANDBOX_IMAGE=ghcr.io/... mise run gateway:vm
+#   OPENSHELL_VM_DRIVER_VCPUS=6 OPENSHELL_VM_DRIVER_MEM_MIB=12288 \
+#     OPENSHELL_VM_OVERLAY_DISK_MIB=32768 mise run gateway:vm
 #   mise run gateway:vm -- --gpu
 #
 # This script also writes ~/.config/openshell/active_gateway so the
@@ -39,7 +41,6 @@ STATE_DIR="${OPENSHELL_VM_GATEWAY_STATE_DIR:-${ROOT}/.cache/gateway-vm}"
 SANDBOX_NAMESPACE="${OPENSHELL_SANDBOX_NAMESPACE:-vm-dev}"
 SANDBOX_IMAGE="${OPENSHELL_SANDBOX_IMAGE:-${COMMUNITY_SANDBOX_IMAGE:-ghcr.io/nvidia/openshell-community/sandboxes/base:latest}}"
 VM_BOOTSTRAP_IMAGE="${OPENSHELL_VM_BOOTSTRAP_IMAGE:-}"
-SANDBOX_IMAGE_PULL_POLICY="${OPENSHELL_SANDBOX_IMAGE_PULL_POLICY:-IfNotPresent}"
 LOG_LEVEL="${OPENSHELL_LOG_LEVEL:-info}"
 GATEWAY_BIN="${ROOT}/target/debug/openshell-gateway"
 DRIVER_DIR_DEFAULT="${ROOT}/target/debug"
@@ -68,6 +69,16 @@ normalize_bool() {
       exit 2
       ;;
   esac
+}
+
+positive_int() {
+  local name=$1
+  local val=$2
+  if [[ ! "${val}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: ${name} must be a positive integer, got '${val}'" >&2
+    exit 2
+  fi
+  printf '%s\n' "${val}"
 }
 
 port_is_in_use() {
@@ -209,6 +220,9 @@ check_supervisor_cross_toolchain() {
 }
 
 VM_GPU="$(normalize_bool "${OPENSHELL_VM_GPU:-false}")"
+VM_DRIVER_VCPUS="$(positive_int OPENSHELL_VM_DRIVER_VCPUS "${OPENSHELL_VM_DRIVER_VCPUS:-4}")"
+VM_DRIVER_MEM_MIB="$(positive_int OPENSHELL_VM_DRIVER_MEM_MIB "${OPENSHELL_VM_DRIVER_MEM_MIB:-8192}")"
+VM_OVERLAY_DISK_MIB="$(positive_int OPENSHELL_VM_OVERLAY_DISK_MIB "${OPENSHELL_VM_OVERLAY_DISK_MIB:-32768}")"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -343,6 +357,9 @@ bootstrap_image = "${VM_BOOTSTRAP_IMAGE}"
 grpc_endpoint = "${GRPC_ENDPOINT}"
 driver_dir = "${DRIVER_DIR}"
 state_dir = "${VM_DRIVER_STATE_DIR}"
+vcpus = ${VM_DRIVER_VCPUS}
+mem_mib = ${VM_DRIVER_MEM_MIB}
+overlay_disk_mib = ${VM_OVERLAY_DISK_MIB}
 EOF
 
 GATEWAY_ENDPOINT="http://127.0.0.1:${PORT}"
@@ -356,6 +373,7 @@ echo "  namespace:  ${SANDBOX_NAMESPACE}"
 echo "  state dir:  ${STATE_DIR}"
 echo "  driver:     ${DRIVER_DIR}/openshell-driver-vm"
 echo "  driver dir: ${VM_DRIVER_STATE_DIR}"
+echo "  vm size:    ${VM_DRIVER_VCPUS} vCPU / ${VM_DRIVER_MEM_MIB} MiB RAM / ${VM_OVERLAY_DISK_MIB} MiB overlay"
 echo "  gpu:        ${VM_GPU}"
 echo "  image:      ${SANDBOX_IMAGE}"
 echo

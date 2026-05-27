@@ -10,8 +10,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use sha2::{Digest, Sha256};
+
 const SUPERVISOR: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/openshell-sandbox.zst"));
 const UMOCI: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/umoci.zst"));
+const GUEST_INIT_SCRIPT: &str = include_str!("../scripts/openshell-vm-sandbox-init.sh");
 const ROOTFS_VARIANT_MARKER: &str = ".openshell-rootfs-variant";
 const SANDBOX_GUEST_INIT_PATH: &str = "/srv/openshell-vm-sandbox-init.sh";
 const SANDBOX_SUPERVISOR_PATH: &str = "/opt/openshell/bin/openshell-sandbox";
@@ -24,6 +27,18 @@ static INJECTION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub const fn sandbox_guest_init_path() -> &'static str {
     SANDBOX_GUEST_INIT_PATH
+}
+
+pub fn embedded_rootfs_payload_identity() -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"openshell-vm-rootfs-payload-v1\0");
+    hasher.update(b"init\0");
+    hasher.update(GUEST_INIT_SCRIPT.as_bytes());
+    hasher.update(b"supervisor\0");
+    hasher.update(SUPERVISOR);
+    hasher.update(b"umoci\0");
+    hasher.update(UMOCI);
+    format!("runtime-sha256:{:x}", hasher.finalize())
 }
 
 pub fn prepare_sandbox_rootfs_from_image_root(
@@ -123,6 +138,44 @@ pub fn create_ext4_image_from_dir_with_size(
     }
 
     Ok(())
+}
+
+pub fn repair_ext4_image(image_path: &Path) -> Result<(), String> {
+    let mut last_error = None;
+    for tool in ["e2fsck", "fsck.ext4"] {
+        for candidate in e2fs_tool_candidates(tool) {
+            let label = candidate.display().to_string();
+            let output = Command::new(&candidate)
+                .arg("-f")
+                .arg("-p")
+                .arg(image_path)
+                .output();
+            match output {
+                Ok(output) if e2fsck_status_is_successful(output.status.code()) => {
+                    return Ok(());
+                }
+                Ok(output) => {
+                    last_error = Some(format!(
+                        "{label} failed with status {}\nstdout: {}\nstderr: {}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    ));
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    last_error = Some(format!("{label} not found"));
+                }
+                Err(err) => {
+                    last_error = Some(format!("run {label}: {err}"));
+                }
+            }
+        }
+    }
+    Err(format!(
+        "failed to repair ext4 image {}: {}. Install e2fsprogs (e2fsck/fsck.ext4) and retry",
+        image_path.display(),
+        last_error.unwrap_or_else(|| "e2fsck not found".to_string())
+    ))
 }
 
 pub fn clone_or_copy_sparse_file(source: &Path, dest: &Path) -> Result<(), String> {
@@ -357,11 +410,8 @@ fn prepare_sandbox_rootfs(rootfs: &Path) -> Result<(), String> {
     if let Some(parent) = init_path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
-    fs::write(
-        &init_path,
-        include_str!("../scripts/openshell-vm-sandbox-init.sh"),
-    )
-    .map_err(|e| format!("write {}: {e}", init_path.display()))?;
+    fs::write(&init_path, GUEST_INIT_SCRIPT)
+        .map_err(|e| format!("write {}: {e}", init_path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -427,6 +477,13 @@ fn rootfs_image_size_bytes(source: &Path) -> Result<u64, String> {
     let headroom = (used / 4).max(ROOTFS_IMAGE_MIN_HEADROOM_BYTES);
     let size = (used + headroom).max(ROOTFS_IMAGE_MIN_SIZE_BYTES);
     Ok(round_up_to_mib(size))
+}
+
+fn e2fsck_status_is_successful(code: Option<i32>) -> bool {
+    // e2fsck uses a bitmask exit status. 0 means clean, 1 means filesystem
+    // errors were corrected, and 2 requests a reboot for mounted filesystems.
+    // For offline image files, any combination of those bits is usable.
+    matches!(code, Some(code) if code >= 0 && (code & !0b11) == 0)
 }
 
 fn ext4_image_min_size_bytes(source: &Path) -> Result<u64, String> {
@@ -1119,6 +1176,17 @@ mod tests {
             Some("\"/tmp/path/with\\\\backslash/and\\\"quote\"".to_string())
         );
         assert_eq!(debugfs_quote_argument("/tmp/bad\npath"), None);
+    }
+
+    #[test]
+    fn e2fsck_status_accepts_clean_and_corrected_images() {
+        for code in [0, 1, 2, 3] {
+            assert!(e2fsck_status_is_successful(Some(code)));
+        }
+        for code in [4, 8, 16, 32, 128] {
+            assert!(!e2fsck_status_is_successful(Some(code)));
+        }
+        assert!(!e2fsck_status_is_successful(None));
     }
 
     fn unique_temp_dir() -> PathBuf {

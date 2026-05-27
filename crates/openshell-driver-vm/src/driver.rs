@@ -6,7 +6,8 @@ use crate::gpu::{
 };
 use crate::rootfs::{
     clone_or_copy_sparse_file, create_ext4_image_from_dir_with_size, create_rootfs_image_from_dir,
-    extract_rootfs_archive_to, prepare_sandbox_rootfs_from_image_root, sandbox_guest_init_path,
+    embedded_rootfs_payload_identity, extract_rootfs_archive_to,
+    prepare_sandbox_rootfs_from_image_root, repair_ext4_image, sandbox_guest_init_path,
     set_rootfs_image_file_mode, write_rootfs_image_file,
 };
 use bollard::Docker;
@@ -1317,7 +1318,10 @@ impl VmDriver {
             image_identity = %source_image_identity,
             "vm driver: manifest digest resolved"
         );
-        let image_identity = bootstrap_image_cache_identity(&source_image_identity);
+        let image_identity = bootstrap_image_cache_identity(
+            &source_image_identity,
+            &embedded_rootfs_payload_identity(),
+        );
         let image_path = image_cache_rootfs_image(&self.config.state_dir, &image_identity);
 
         // Emit a driver progress hint for cache hits too and immediately
@@ -1498,7 +1502,8 @@ impl VmDriver {
         docker: &Docker,
         image_identity: &str,
     ) -> Result<String, Status> {
-        let cache_identity = bootstrap_image_cache_identity(image_identity);
+        let cache_identity =
+            bootstrap_image_cache_identity(image_identity, &embedded_rootfs_payload_identity());
         let image_path = image_cache_rootfs_image(&self.config.state_dir, &cache_identity);
 
         self.publish_platform_event(
@@ -1605,7 +1610,8 @@ impl VmDriver {
         image_identity: &str,
         bootstrap_root_disk: &Path,
     ) -> Result<PreparedImageDisk, Status> {
-        let cache_identity = prepared_image_cache_identity(image_identity);
+        let cache_identity =
+            prepared_image_cache_identity(image_identity, &embedded_rootfs_payload_identity());
         let image_path = image_cache_rootfs_image(&self.config.state_dir, &cache_identity);
 
         if tokio::fs::metadata(&image_path).await.is_ok() {
@@ -1714,7 +1720,10 @@ impl VmDriver {
                     "failed to resolve vm sandbox image '{image_ref}': {err}"
                 ))
             })?;
-        let cache_identity = prepared_image_cache_identity(&source_image_identity);
+        let cache_identity = prepared_image_cache_identity(
+            &source_image_identity,
+            &embedded_rootfs_payload_identity(),
+        );
         let image_path = image_cache_rootfs_image(&self.config.state_dir, &cache_identity);
 
         if tokio::fs::metadata(&image_path).await.is_ok() {
@@ -1904,6 +1913,11 @@ impl VmDriver {
             let _ = tokio::fs::remove_dir_all(staging_dir).await;
             return Err(err);
         }
+        let prepared_image_for_repair = prepared_image.clone();
+        tokio::task::spawn_blocking(move || repair_ext4_image(&prepared_image_for_repair))
+            .await
+            .map_err(|err| Status::internal(format!("prepared image repair panicked: {err}")))?
+            .map_err(Status::failed_precondition)?;
 
         if tokio::fs::metadata(&image_path).await.is_ok() {
             let _ = tokio::fs::remove_dir_all(staging_dir).await;
@@ -3724,12 +3738,12 @@ fn write_oci_layout_for_manifest(
     Ok(())
 }
 
-fn bootstrap_image_cache_identity(image_identity: &str) -> String {
-    format!("{BOOTSTRAP_IMAGE_CACHE_LAYOUT_VERSION}:{image_identity}")
+fn bootstrap_image_cache_identity(image_identity: &str, rootfs_payload_identity: &str) -> String {
+    format!("{BOOTSTRAP_IMAGE_CACHE_LAYOUT_VERSION}:{rootfs_payload_identity}:{image_identity}")
 }
 
-fn prepared_image_cache_identity(image_identity: &str) -> String {
-    format!("{PREPARED_IMAGE_CACHE_LAYOUT_VERSION}:{image_identity}")
+fn prepared_image_cache_identity(image_identity: &str, rootfs_payload_identity: &str) -> String {
+    format!("{PREPARED_IMAGE_CACHE_LAYOUT_VERSION}:{rootfs_payload_identity}:{image_identity}")
 }
 
 fn registry_layer_download_concurrency() -> usize {
@@ -5517,18 +5531,18 @@ mod tests {
     }
 
     #[test]
-    fn prepared_image_cache_identity_includes_rootfs_layout_version() {
+    fn prepared_image_cache_identity_includes_rootfs_layout_and_payload_version() {
         assert_eq!(
-            prepared_image_cache_identity("sha256:local-image"),
-            "sandbox-prepared-rootfs-ext4-umoci-v2:sha256:local-image"
+            prepared_image_cache_identity("sha256:local-image", "runtime-sha256:abc"),
+            "sandbox-prepared-rootfs-ext4-umoci-v2:runtime-sha256:abc:sha256:local-image"
         );
     }
 
     #[test]
-    fn bootstrap_image_cache_identity_includes_rootfs_layout_version() {
+    fn bootstrap_image_cache_identity_includes_rootfs_layout_and_payload_version() {
         assert_eq!(
-            bootstrap_image_cache_identity("sha256:bootstrap-image"),
-            "sandbox-bootstrap-rootfs-ext4-v2:sha256:bootstrap-image"
+            bootstrap_image_cache_identity("sha256:bootstrap-image", "runtime-sha256:def"),
+            "sandbox-bootstrap-rootfs-ext4-v2:runtime-sha256:def:sha256:bootstrap-image"
         );
     }
 
@@ -5551,7 +5565,10 @@ mod tests {
             &staging_dir,
             &GuestImagePayload {
                 image_ref: "ghcr.io/example/app:latest".to_string(),
-                image_identity: prepared_image_cache_identity("sha256:abc"),
+                image_identity: prepared_image_cache_identity(
+                    "sha256:abc",
+                    "runtime-sha256:payload",
+                ),
                 source: GuestImagePayloadSource::RegistryOciLayout { layout_dir },
             },
         )
