@@ -2609,7 +2609,7 @@ async fn main() -> Result<()> {
                     apply_auth(&mut tls, &ctx.name);
                     let sandbox_dest = dest.as_deref();
                     let local = std::path::Path::new(&local_path);
-                    if !local.exists() {
+                    if !run::local_upload_path_exists(local) {
                         return Err(miette::miette!(
                             "local path does not exist: {}",
                             local.display()
@@ -2617,7 +2617,10 @@ async fn main() -> Result<()> {
                     }
                     let dest_display = sandbox_dest.unwrap_or("~");
                     eprintln!("Uploading {} -> sandbox:{}", local.display(), dest_display);
-                    if !no_git_ignore && let Ok((base_dir, files)) = run::git_sync_files(local) {
+                    if !no_git_ignore
+                        && !run::local_upload_path_is_symlink(local)
+                        && let Ok((base_dir, files)) = run::git_sync_files(local)
+                    {
                         run::sandbox_sync_up_files(
                             &ctx.endpoint,
                             &name,

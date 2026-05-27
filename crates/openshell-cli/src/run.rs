@@ -2020,7 +2020,17 @@ pub async fn sandbox_create(
                     "\u{2022}".dimmed(),
                 );
                 let local = Path::new(local_path);
-                if *git_ignore && let Ok((base_dir, files)) = git_sync_files(local) {
+                if !local_upload_path_exists(local) {
+                    return Err(miette::miette!(
+                        "local path does not exist: {}",
+                        local.display()
+                    ));
+                }
+
+                if *git_ignore
+                    && !local_upload_path_is_symlink(local)
+                    && let Ok((base_dir, files)) = git_sync_files(local)
+                {
                     sandbox_sync_up_files(
                         &effective_server,
                         &sandbox_name,
@@ -2031,7 +2041,7 @@ pub async fn sandbox_create(
                         &effective_tls,
                     )
                     .await?;
-                } else if local.exists() {
+                } else {
                     sandbox_sync_up(
                         &effective_server,
                         &sandbox_name,
@@ -2376,7 +2386,7 @@ pub async fn sandbox_sync_command(
     match (up, down) {
         (Some(local_path), None) => {
             let local = Path::new(local_path);
-            if !local.exists() {
+            if !local_upload_path_exists(local) {
                 return Err(miette::miette!(
                     "local path does not exist: {}",
                     local.display()
@@ -5412,6 +5422,14 @@ pub fn git_sync_files(local_path: &Path) -> Result<(PathBuf, Vec<String>)> {
     Ok((base_dir, files))
 }
 
+pub fn local_upload_path_exists(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+pub fn local_upload_path_is_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+}
+
 // ---------------------------------------------------------------------------
 // Sandbox policy commands
 // ---------------------------------------------------------------------------
@@ -6967,12 +6985,13 @@ mod tests {
         format_gateway_select_items, format_provider_attachment_table, gateway_add,
         gateway_auth_label, gateway_env_override_warning, gateway_select_with, gateway_type_label,
         git_sync_files, http_health_check, image_requests_gpu, import_local_package_mtls_bundle,
-        inferred_provider_type, package_managed_tls_dirs, parse_cli_setting_value,
-        parse_credential_expiry_cli_value, parse_credential_expiry_pairs, parse_credential_pairs,
-        plaintext_gateway_is_remote, progress_step_from_metadata,
-        provider_profile_allows_refresh_bootstrap, provisioning_timeout_message,
-        ready_false_condition_message, refresh_status_header, refresh_status_row, resolve_from,
-        sandbox_should_persist, service_expose_status_error, service_url_for_gateway,
+        inferred_provider_type, local_upload_path_exists, local_upload_path_is_symlink,
+        package_managed_tls_dirs, parse_cli_setting_value, parse_credential_expiry_cli_value,
+        parse_credential_expiry_pairs, parse_credential_pairs, plaintext_gateway_is_remote,
+        progress_step_from_metadata, provider_profile_allows_refresh_bootstrap,
+        provisioning_timeout_message, ready_false_condition_message, refresh_status_header,
+        refresh_status_row, resolve_from, sandbox_should_persist, service_expose_status_error,
+        service_url_for_gateway,
     };
     use crate::TEST_ENV_LOCK;
     use hyper::StatusCode;
@@ -7756,6 +7775,31 @@ mod tests {
             fs::canonicalize(repo.join("nested")).expect("canonicalize nested path")
         );
         assert_eq!(files, vec!["file.txt", "inner/child.txt"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_upload_path_helpers_accept_symlinks() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let target = tmpdir.path().join("target.txt");
+        let link = tmpdir.path().join("link.txt");
+        fs::write(&target, "target").expect("write target");
+        std::os::unix::fs::symlink("target.txt", &link).expect("create symlink");
+
+        assert!(local_upload_path_exists(&link));
+        assert!(local_upload_path_is_symlink(&link));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_upload_path_helpers_accept_dangling_symlinks() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let link = tmpdir.path().join("dangling-link.txt");
+        std::os::unix::fs::symlink("missing.txt", &link).expect("create symlink");
+
+        assert!(local_upload_path_exists(&link));
+        assert!(local_upload_path_is_symlink(&link));
+        assert!(!link.exists(), "std::path::Path::exists follows symlinks");
     }
 
     #[test]
