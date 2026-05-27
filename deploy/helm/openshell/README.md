@@ -57,6 +57,7 @@ See [`values.yaml`](values.yaml) for source defaults. Selected overlays:
 - [`ci/values-gateway.yaml`](ci/values-gateway.yaml) - gateway-only configuration
 - [`ci/values-cert-manager.yaml`](ci/values-cert-manager.yaml) - cert-manager integration
 - [`ci/values-keycloak.yaml`](ci/values-keycloak.yaml) - Keycloak OIDC integration
+- [`ci/values-high-availability.yaml`](ci/values-high-availability.yaml) - HA gateway test overlay with bundled PostgreSQL
 
 ### Database backend
 
@@ -152,6 +153,20 @@ cert-manager alternative.
 | podLabels | object | `{}` | Extra labels to add to the gateway pod. |
 | podLifecycle.terminationGracePeriodSeconds | int | `5` | Grace period, in seconds, before Kubernetes terminates the gateway pod. |
 | podSecurityContext.fsGroup | int | `1000` | fsGroup assigned to the gateway pod. |
+| postgres.auth.database | string | `"openshell"` |  |
+| postgres.auth.password | string | `""` |  |
+| postgres.auth.username | string | `"openshell"` |  |
+| postgres.enabled | bool | `false` |  |
+| postgres.external.database | string | `"openshell"` |  |
+| postgres.external.host | string | `""` |  |
+| postgres.external.password | string | `""` |  |
+| postgres.external.port | int | `5432` |  |
+| postgres.external.url | string | `""` |  |
+| postgres.external.username | string | `"openshell"` |  |
+| postgres.host | string | `""` |  |
+| postgres.mode | string | `"internal"` |  |
+| postgres.port | int | `5432` |  |
+| postgres.primary.persistence.enabled | bool | `true` |  |
 | probes.liveness.failureThreshold | int | `3` | Liveness probe failure threshold before the container is restarted. |
 | probes.liveness.initialDelaySeconds | int | `2` | Liveness probe initial delay, in seconds. |
 | probes.liveness.periodSeconds | int | `5` | Liveness probe period, in seconds. |
@@ -192,6 +207,7 @@ cert-manager alternative.
 | server.sandboxImagePullPolicy | string | `""` | Kubernetes imagePullPolicy for sandbox pods. Empty = Kubernetes default (Always for :latest, IfNotPresent otherwise). Set to "Always" for dev clusters so new images are picked up without manual eviction. |
 | server.sandboxJwt.gatewayId | string | `""` | Stable gateway identity embedded in iss/aud of every minted token. Defaults to the release name so HA replicas share identity. |
 | server.sandboxJwt.k8sSaTokenTtlSecs | int | `3600` | Lifetime (seconds) of the projected ServiceAccount token kubelet writes into each sandbox pod for the IssueSandboxToken bootstrap exchange. Kubelet enforces a minimum of 600s; the driver clamps values outside [600, 86400]. Default 3600 — generous, since the supervisor consumes the token within seconds of pod start. |
+| server.sandboxJwt.secretDefaultMode | string | `""` | File mode for the mounted JWT signing key Secret. Empty (default) auto-selects: 0440 when podSecurityContext.fsGroup is set (process reads via group ownership), 0444 when fsGroup is null (OpenShift random-UID environments where group ownership cannot be relied on). Override to e.g. "0400" if your security policy requires owner-only and you guarantee the container UID matches the volume file owner. |
 | server.sandboxJwt.signingSecretName | string | `""` | Name of the Opaque Secret holding the signing key material. Empty falls back to the chart fullname with "-jwt-keys" appended. |
 | server.sandboxJwt.ttlSecs | int | `3600` | Token TTL in seconds. Defaults to 3600 (1h). |
 | server.sandboxNamespace | string | `""` | Namespace where sandbox pods are created. Defaults to the Helm release namespace (.Release.Namespace) when left empty. |
