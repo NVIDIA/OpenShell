@@ -27,9 +27,9 @@ use openshell_core::proto::{
     DenialSummary, GetDraftPolicyRequest, GetInferenceBundleRequest, GetInferenceBundleResponse,
     GetSandboxConfigRequest, GetSandboxProviderEnvironmentRequest, IssueSandboxTokenRequest,
     NetworkActivitySummary, PolicyChunk, PolicySource, PolicyStatus, RefreshSandboxTokenRequest,
-    ReportPolicyStatusRequest,
-    SandboxPolicy as ProtoSandboxPolicy, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse,
-    UpdateConfigRequest, inference_client::InferenceClient, open_shell_client::OpenShellClient,
+    ReportPolicyStatusRequest, SandboxPolicy as ProtoSandboxPolicy, SubmitPolicyAnalysisRequest,
+    SubmitPolicyAnalysisResponse, UpdateConfigRequest, inference_client::InferenceClient,
+    open_shell_client::OpenShellClient,
 };
 use openshell_core::sandbox_env;
 use tonic::Status;

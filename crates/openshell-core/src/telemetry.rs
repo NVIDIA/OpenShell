@@ -14,7 +14,7 @@ use std::time::Duration;
 const TELEMETRY_EVENT_QUEUE_CAPACITY: usize = 1024;
 const MAX_TELEMETRY_INTEGER: u64 = 9_223_372_036_854_775_807;
 const CLIENT_ID: &str = "415437562476676";
-const DEFAULT_ENDPOINT: &str = "https://events.telemetry.data-uat.nvidia.com/v1.1/events/json";
+const DEFAULT_ENDPOINT: &str = "https://events.telemetry.data.nvidia.com/v1.1/events/json";
 const EVENT_SCHEMA_VERSION: &str = "4.0";
 const EVENT_PROTOCOL_VERSION: &str = "1.6";
 const EVENT_SYSTEM_VERSION: &str = "openshell-telemetry/1.0";
