@@ -4,6 +4,7 @@ authors:
 state: review
 links:
   - https://github.com/NVIDIA/OpenShell/issues/1492
+  - https://github.com/NVIDIA/OpenShell/pull/1589
 ---
 
 # RFC 0005 - Driver Config Passthrough
