@@ -1818,7 +1818,13 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             ids,
-            vec!["claude-code", "github", "google-vertex-ai", "nvidia",]
+            vec![
+                "claude-code",
+                "codex",
+                "github",
+                "google-vertex-ai",
+                "nvidia",
+            ]
         );
 
         let github = response
