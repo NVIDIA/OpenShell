@@ -64,11 +64,12 @@ jobs:
         run: |
           set -euo pipefail
           sudo snap install lxd
-          sudo iptables -P FORWARD ACCEPT
-          sudo chmod 666 /var/snap/lxd/common/lxd/unix.socket
-          sudo usermod -aG lxd $USER
-          sudo lxd init --auto
+          sudo usermod -aG lxd "$USER"
           sudo lxd waitready
+          sudo lxd init --auto
+          sudo iptables -P FORWARD ACCEPT
+          sudo chgrp lxd /var/snap/lxd/common/lxd/unix.socket
+          sudo chmod 660 /var/snap/lxd/common/lxd/unix.socket
 
       - name: Install snapcraft
         run: |
@@ -78,7 +79,10 @@ jobs:
       - name: Build snap
         run: |
           set -euo pipefail
-          snapcraft pack -v
+          runtime_dir="/run/user/$(id -u)"
+          sudo install -d -m 0700 -o "$(id -u)" -g "$(id -g)" "$runtime_dir"
+          export XDG_RUNTIME_DIR="$runtime_dir"
+          sg lxd -c "XDG_RUNTIME_DIR=${runtime_dir} snapcraft pack -v"
 
       - name: Upload snapcraft logs on failure
         if: failure()
