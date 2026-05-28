@@ -23,7 +23,7 @@ spec:
         # without this annotation a `helm upgrade` that only mutates the
         # ConfigMap would leave pods running with stale config.
         checksum/gateway-config: {{ include (print $.Template.BasePath "/gateway-config.yaml") . | sha256sum }}
-        {{- if .Values.postgres.enabled }}
+        {{- if and .Values.postgres.enabled (not .Values.postgres.deploy) (not .Values.postgres.external.existingSecret) }}
         checksum/db-secret: {{ include (print $.Template.BasePath "/db-secret.yaml") . | sha256sum }}
         {{- end }}
         {{- with .Values.podAnnotations }}
@@ -68,8 +68,8 @@ spec:
             - name: OPENSHELL_DB_URL
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "openshell.fullname" . }}-db
-                  key: db-url
+                  name: {{ include "openshell.dbSecretName" . }}
+                  key: uri
             {{- end }}
             # All gateway settings live in the ConfigMap-backed TOML file
             # mounted at /etc/openshell/gateway.toml. The only env var below

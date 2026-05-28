@@ -103,28 +103,34 @@ Namespace where sandbox pods are created. An explicit
 {{- end }}
 
 {{/*
-Gateway database URL.
-- postgres.enabled=false: use .Values.server.dbUrl (default sqlite)
-- postgres.enabled=true + deploy=true: derive URL from bundled postgres subchart
-- postgres.enabled=true + deploy=false: use external.url or compose external fields
+Fully qualified name of the PostgreSQL subchart, mirroring the Bitnami
+common.names.fullname template so we stay in sync when users set
+postgres.fullnameOverride or postgres.nameOverride.
 */}}
-{{- define "openshell.dbUrl" -}}
-{{- if .Values.postgres.enabled -}}
-{{- if not .Values.postgres.deploy -}}
-{{- if .Values.postgres.external.url -}}
-{{- .Values.postgres.external.url -}}
+{{- define "openshell.postgresFullname" -}}
+{{- if .Values.postgres.fullnameOverride -}}
+{{- .Values.postgres.fullnameOverride | trunc 63 | trimSuffix "-" -}}
 {{- else -}}
-{{- $host := required "postgres.external.host is required when postgres.deploy=false and no postgres.external.url is provided" .Values.postgres.external.host -}}
-{{- $pw := required "postgres.external.password is required when postgres.deploy=false and no postgres.external.url is provided" .Values.postgres.external.password -}}
-{{- printf "postgres://%s:%s@%s:%d/%s" (.Values.postgres.external.username | urlquery) ($pw | urlquery) $host (int (default 5432 .Values.postgres.external.port)) .Values.postgres.external.database -}}
+{{- $name := default "postgres" .Values.postgres.nameOverride -}}
+{{- if contains $name .Release.Name -}}
+{{- .Release.Name | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
-{{- else -}}
-{{- $pw := required "postgres.auth.password must be set when postgres.enabled=true" .Values.postgres.auth.password -}}
-{{- $host := .Values.postgres.host | default (printf "%s-postgres.%s.svc.cluster.local" .Release.Name .Release.Namespace) -}}
-{{- printf "postgres://%s:%s@%s:%d/%s" (.Values.postgres.auth.username | urlquery) ($pw | urlquery) $host (int .Values.postgres.port) .Values.postgres.auth.database -}}
 {{- end -}}
+{{- end }}
+
+{{/*
+Name of the Secret holding the PostgreSQL connection URI.
+- deploy=true: derive from Bitnami service-binding naming convention
+- deploy=false + existingSecret set: use it verbatim
+- deploy=false + no existingSecret: use chart-generated "<fullname>-db"
+*/}}
+{{- define "openshell.dbSecretName" -}}
+{{- if .Values.postgres.deploy -}}
+{{- printf "%s-svcbind-custom-user" (include "openshell.postgresFullname" .) -}}
 {{- else -}}
-{{- .Values.server.dbUrl -}}
+{{- .Values.postgres.external.existingSecret | default (printf "%s-db" (include "openshell.fullname" .)) -}}
 {{- end -}}
 {{- end }}
 

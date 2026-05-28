@@ -238,21 +238,22 @@ server:
 # Optional PostgreSQL backing store.
 # - enabled=false (default): gateway uses server.dbUrl (SQLite by default).
 # - enabled=true + deploy=true: deploy bundled PostgreSQL subchart and derive dbUrl.
-# - enabled=true + deploy=false: derive dbUrl from postgres.external.* (or external.url).
+# - enabled=true + deploy=false: use postgres.external.existingSecret or compose
+#   from postgres.external.* fields.
 postgres:
   enabled: false
   # -- Deploy the bundled Bitnami PostgreSQL subchart. Set to true to
   # run PostgreSQL alongside the gateway. Leave false when using an
   # external PostgreSQL instance.
   deploy: false
-  # Internal host override. Leave empty to use:
-  # <release-name>-postgres.<namespace>.svc.cluster.local
-  host: ""
-  port: 5432
-  # External mode connection settings.
+  # External mode connection settings (used when deploy=false).
   external:
-    # Full URL override, e.g. postgres://user:pass@host:5432/db
-    url: ""
+    # -- Name of a pre-existing Opaque Secret containing PostgreSQL
+    # credentials. When set, the chart does not create its own db Secret
+    # and reads directly from this one. The Secret must contain a `uri`
+    # key with the full connection string, e.g.
+    # postgresql://user:pass@host:5432/dbname.
+    existingSecret: ""
     host: ""
     port: 5432
     database: openshell
@@ -266,6 +267,10 @@ postgres:
     username: openshell
     password: ""
     database: openshell
+  # Enable Bitnami service-binding Secrets so the gateway can read the
+  # connection URI directly from the subchart-managed Secret.
+  serviceBindings:
+    enabled: true
   primary:
     persistence:
       enabled: true
