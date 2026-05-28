@@ -2673,6 +2673,7 @@ where
             websocket_extensions: options.websocket_extensions,
             request_body_credential_rewrite: options.request_body_credential_rewrite,
             credential_signing: crate::l7::CredentialSigning::None,
+            signing_service: String::new(),
             host: String::new(),
         },
     )
@@ -3703,6 +3704,7 @@ mod tests {
             request_body_credential_rewrite: false,
             websocket_graphql_policy: false,
             credential_signing: crate::l7::CredentialSigning::None,
+            signing_service: String::new(),
         }
     }
 
@@ -4170,6 +4172,7 @@ network_policies:
                     request_body_credential_rewrite: false,
                     websocket_graphql_policy: false,
                     credential_signing: crate::l7::CredentialSigning::None,
+                    signing_service: String::new(),
                 },
             },
             L7ConfigSnapshot {
@@ -4184,6 +4187,7 @@ network_policies:
                     request_body_credential_rewrite: false,
                     websocket_graphql_policy: false,
                     credential_signing: crate::l7::CredentialSigning::None,
+                    signing_service: String::new(),
                 },
             },
         ];

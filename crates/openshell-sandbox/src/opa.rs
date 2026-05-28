@@ -1070,6 +1070,9 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                     if !e.credential_signing.is_empty() {
                         ep["credential_signing"] = e.credential_signing.clone().into();
                     }
+                    if !e.signing_service.is_empty() {
+                        ep["signing_service"] = e.signing_service.clone().into();
+                    }
                     if !e.persisted_queries.is_empty() {
                         ep["persisted_queries"] = e.persisted_queries.clone().into();
                     }
@@ -2675,6 +2678,7 @@ network_policies:
                     enforcement: "enforce".to_string(),
                     access: "read-write".to_string(),
                     credential_signing: "sigv4".to_string(),
+                    signing_service: "bedrock".to_string(),
                     ..Default::default()
                 }],
                 binaries: vec![NetworkBinary {
@@ -2716,6 +2720,7 @@ network_policies:
             .expect("endpoint config");
         let l7 = crate::l7::parse_l7_config(&config).unwrap();
         assert_eq!(l7.credential_signing, crate::l7::CredentialSigning::SigV4);
+        assert_eq!(l7.signing_service, "bedrock");
     }
 
     #[test]

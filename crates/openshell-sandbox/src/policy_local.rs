@@ -1098,6 +1098,7 @@ fn network_endpoint_from_json(
         graphql_max_body_bytes: 0,
         path: String::new(),
         credential_signing: String::new(),
+        signing_service: String::new(),
     })
 }
 

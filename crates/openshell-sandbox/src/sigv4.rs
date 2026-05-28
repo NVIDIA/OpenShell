@@ -7,28 +7,15 @@ use aws_sigv4::sign::v4;
 use aws_smithy_runtime_api::client::identity::Identity;
 use std::time::SystemTime;
 
-pub fn extract_aws_region_and_service(host: &str) -> Option<(String, String)> {
-    // Pattern: <service>.<region>.amazonaws.com
+/// Extract the AWS region from a standard AWS hostname.
+/// Pattern: `<service>.<region>.amazonaws.com` → `<region>`.
+pub fn extract_aws_region(host: &str) -> Option<String> {
     let parts: Vec<&str> = host.split('.').collect();
     if parts.len() >= 4 && parts[parts.len() - 2] == "amazonaws" && parts[parts.len() - 1] == "com"
     {
-        let raw_service = parts[0];
-        let region = parts[1].to_string();
-        let service = normalize_aws_signing_name(raw_service).to_string();
-        Some((region, service))
+        Some(parts[1].to_string())
     } else {
         None
-    }
-}
-
-// AWS services have signing name overrides that differ from hostname
-// prefixes. The full SDK embeds these per-service (e.g.
-// aws-sdk-bedrockruntime hardcodes SigningName("bedrock")). There is
-// no lightweight crate for this mapping, so we maintain our own table.
-fn normalize_aws_signing_name(hostname_prefix: &str) -> &str {
-    match hostname_prefix {
-        "bedrock-runtime" | "bedrock-agent" | "bedrock-agent-runtime" => "bedrock",
-        other => other,
     }
 }
 
@@ -202,24 +189,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extract_region_and_service_from_hostname() {
-        let (region, service) =
-            extract_aws_region_and_service("bedrock-runtime.us-east-2.amazonaws.com").unwrap();
+    fn extract_region_from_hostname() {
+        let region =
+            extract_aws_region("bedrock-runtime.us-east-2.amazonaws.com").unwrap();
         assert_eq!(region, "us-east-2");
-        assert_eq!(service, "bedrock");
     }
 
     #[test]
-    fn extract_sts_from_hostname() {
-        let (region, service) =
-            extract_aws_region_and_service("sts.us-east-1.amazonaws.com").unwrap();
+    fn extract_region_from_sts_hostname() {
+        let region = extract_aws_region("sts.us-east-1.amazonaws.com").unwrap();
         assert_eq!(region, "us-east-1");
-        assert_eq!(service, "sts");
     }
 
     #[test]
     fn non_aws_hostname_returns_none() {
-        assert!(extract_aws_region_and_service("api.anthropic.com").is_none());
+        assert!(extract_aws_region("api.anthropic.com").is_none());
     }
 
     #[test]

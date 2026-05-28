@@ -378,6 +378,7 @@ where
             websocket_extensions: WebSocketExtensionMode::Preserve,
             request_body_credential_rewrite: false,
             credential_signing: crate::l7::CredentialSigning::None,
+            signing_service: String::new(),
             host: String::new(),
         },
     )
@@ -398,6 +399,7 @@ pub(crate) struct RelayRequestOptions<'a> {
     pub(crate) websocket_extensions: WebSocketExtensionMode,
     pub(crate) request_body_credential_rewrite: bool,
     pub(crate) credential_signing: crate::l7::CredentialSigning,
+    pub(crate) signing_service: String,
     pub(crate) host: String,
 }
 
@@ -471,11 +473,14 @@ where
                 resolver.resolve_placeholder(&secret_key_placeholder),
             ) {
                 (Some(access_key), Some(secret_key)) => {
-                    let (region, service) =
-                        crate::sigv4::extract_aws_region_and_service(&options.host)
-                            .unwrap_or_else(|| {
-                                ("us-east-1".to_string(), "execute-api".to_string())
-                            });
+                    let region = crate::sigv4::extract_aws_region(&options.host)
+                        .unwrap_or_else(|| "us-east-1".to_string());
+                    let service = &options.signing_service;
+                    if service.is_empty() {
+                        return Err(miette!(
+                            "SigV4 signing configured but signing_service not set in policy"
+                        ));
+                    }
                     tracing::warn!(
                         host = %options.host,
                         region = %region,
