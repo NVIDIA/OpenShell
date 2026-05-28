@@ -633,6 +633,89 @@ def test_refresher_picks_up_disk_rotation_before_refreshing(
     assert r.current_access_token() == "cli-rotated"
 
 
+def test_refresher_adopts_stale_disk_refresh_token_before_refreshing(
+    tmp_path: Path,
+) -> None:
+    """Regression: when both the in-memory and on-disk access tokens are
+    stale but another process rotated the on-disk refresh_token, refresh
+    with the disk refresh_token (r2), not the invalidated in-memory one (r1).
+
+    Without this, a rotating IdP (Keycloak with rotation, Entra strict) would
+    invalid_grant because process A still holds the pre-rotation r1.
+    """
+    # Disk holds a rotated-but-stale bundle (r2) written by another process.
+    # Its access token was minted more recently than ours (later expiry,
+    # though still inside the grace window), so disk carries the newer
+    # refresh_token even though both are due for refresh.
+    disk_exp = int(time.time()) + 5
+    _write_bundle(
+        tmp_path, access_token="disk-old", expires_at=disk_exp, refresh_token="r2"
+    )
+    seen: list[Any] = []
+    transport = _make_mock_transport(
+        refresh_responses=[
+            {"access_token": "a-new", "refresh_token": "r3", "expires_in": 3600},
+        ],
+        seen_refresh=seen,
+    )
+    r = _OidcRefresher(tmp_path, "g", write_back=False)
+    _install_mock_transport(r, transport)
+    # Seed older stale in-memory state holding the pre-rotation token r1.
+    r._bundle = {
+        "access_token": "mem-old",
+        "expires_at": 1,
+        "refresh_token": "r1",
+        "issuer": DEFAULT_ISSUER,
+    }
+
+    assert r.current_access_token() == "a-new"
+    # The refresh POST must carry the disk's r2, never the stale r1.
+    _, body = seen[-1]
+    assert b"refresh_token=r2" in body
+    assert b"refresh_token=r1" not in body
+
+
+def test_refresher_resets_token_endpoint_when_disk_issuer_changes(
+    tmp_path: Path,
+) -> None:
+    """When the adopted disk bundle has a different issuer than the cached
+    one, the previously discovered token endpoint must be re-discovered
+    against the new issuer rather than reused."""
+    new_issuer = "https://other-idp.example/realms/openshell"
+    # Disk is newer than the in-memory bundle (later expiry) so it is
+    # adopted, but still stale so a refresh — and thus re-discovery — runs.
+    _write_bundle(
+        tmp_path,
+        access_token="disk-old",
+        expires_at=int(time.time()) + 5,
+        refresh_token="r2",
+        issuer=new_issuer,
+    )
+    seen_discovery: list[Any] = []
+    transport = _make_mock_transport(
+        discovery={
+            "issuer": new_issuer,
+            "token_endpoint": f"{new_issuer}/protocol/openid-connect/token",
+        },
+        seen_discovery=seen_discovery,
+    )
+    r = _OidcRefresher(tmp_path, "g", write_back=False)
+    _install_mock_transport(r, transport)
+    # Pretend we already discovered an endpoint for the OLD issuer.
+    r._token_endpoint = f"{DEFAULT_ISSUER}/protocol/openid-connect/token"
+    r._bundle = {
+        "access_token": "mem-old",
+        "expires_at": 1,
+        "refresh_token": "r1",
+        "issuer": DEFAULT_ISSUER,
+    }
+
+    r.current_access_token()
+    # Re-discovery happened against the new issuer.
+    assert len(seen_discovery) == 1
+    assert new_issuer in seen_discovery[0]
+
+
 def test_refresher_exchanges_refresh_token_when_stale(tmp_path: Path) -> None:
     """When both memory and disk are stale, do the OAuth2 refresh exchange."""
     _write_bundle(tmp_path, access_token="old", expires_at=1)

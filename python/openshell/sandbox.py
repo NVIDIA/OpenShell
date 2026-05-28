@@ -812,6 +812,18 @@ def _read_oidc_token_bundle(gateway_dir: pathlib.Path) -> dict | None:
         return None
 
 
+def _normalize_issuer(bundle: dict) -> str | None:
+    """Return the bundle's issuer with a trailing slash stripped.
+
+    Used to detect whether the issuer changed when adopting a bundle
+    re-read from disk, so a cached token endpoint computed for the old
+    issuer can be invalidated. Trailing-slash differences are treated as
+    equal, matching `_discover_token_endpoint`'s normalization.
+    """
+    issuer = bundle.get("issuer")
+    return issuer.rstrip("/") if isinstance(issuer, str) else None
+
+
 def _load_cluster_bearer_token(gateway_dir: pathlib.Path) -> str | None:
     """Read a single (possibly expired) access token from disk.
 
@@ -971,12 +983,32 @@ class _OidcRefresher:
             if self._is_fresh(self._bundle):
                 return self._bundle["access_token"]
             # Cached bundle is stale. Before refreshing, re-read disk —
-            # the CLI may have rotated the token while we were idle.
+            # another process (CLI, TUI, another SDK client) may have
+            # rotated the bundle while we were idle. Adopt the disk
+            # bundle when it was refreshed more recently than ours, EVEN
+            # WHEN its access token is also stale: otherwise we'd refresh
+            # with our in-memory refresh_token, which a rotating IdP may
+            # have already invalidated when the other process refreshed
+            # (Keycloak with rotation, Entra in strict mode).
+            #
+            # "More recently" is judged by `expires_at`: a refresh issues
+            # a new access token with a forward expiry alongside the
+            # (possibly rotated) refresh_token, so the bundle with the
+            # later expiry carries the newest refresh_token. This also
+            # preserves the write_back=False case, where our in-memory
+            # bundle has already rotated past the on-disk one and must
+            # NOT be clobbered by the older disk copy.
             disk = _read_oidc_token_bundle(self._gateway_dir)
-            if disk is not None and self._is_fresh(disk):
+            if disk is not None and self._expiry(disk) > self._expiry(self._bundle):
+                # If the issuer changed under us, the cached token
+                # endpoint no longer applies — force re-discovery.
+                if _normalize_issuer(disk) != _normalize_issuer(self._bundle):
+                    self._token_endpoint = None
                 self._bundle = disk
-                return disk["access_token"]
-            # Truly stale; refresh against the IdP.
+                if self._is_fresh(disk):
+                    return disk["access_token"]
+            # Truly stale; refresh against the IdP using the freshest
+            # bundle we have (disk if it was newer, else in-memory).
             self._bundle = self._refresh(self._bundle)
             if self._write_back:
                 self._write_to_disk(self._bundle)
@@ -993,6 +1025,19 @@ class _OidcRefresher:
             # `is_token_expired` semantics in the Rust CLI).
             return True
         return int(time.time()) + _OIDC_TOKEN_EXPIRY_GRACE_SECONDS < exp
+
+    @staticmethod
+    def _expiry(bundle: dict) -> float:
+        """Access-token expiry as a comparable number.
+
+        A bundle without an `expires_at` is treated as non-expiring
+        (`+inf`) — consistent with `_is_fresh`, which treats a missing
+        expiry as always fresh. Used to decide which of two stale
+        bundles (in-memory vs. on-disk) was refreshed more recently and
+        therefore holds the newest refresh_token.
+        """
+        exp = bundle.get("expires_at")
+        return float(exp) if isinstance(exp, int) else float("inf")
 
     def _discover_token_endpoint(self, bundle: dict) -> str:
         if self._token_endpoint is not None:
