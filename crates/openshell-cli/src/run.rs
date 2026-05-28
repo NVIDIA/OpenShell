@@ -60,7 +60,7 @@ use openshell_providers::{
 };
 use owo_colors::OwoColorize;
 use std::collections::{HashMap, HashSet};
-use std::io::{IsTerminal, Read, Write};
+use std::io::{ErrorKind, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -75,6 +75,15 @@ pub use crate::ssh::{
 pub use openshell_core::forward::{
     find_forward_by_port, list_forwards, stop_forward, stop_forwards_for_sandbox,
 };
+
+#[derive(Debug, PartialEq, Eq)]
+enum SandboxUploadPlan {
+    GitAware {
+        base_dir: PathBuf,
+        files: Vec<String>,
+    },
+    Regular,
+}
 
 /// Convert a sandbox phase integer to a human-readable string.
 fn phase_name(phase: i32) -> &'static str {
@@ -2040,26 +2049,29 @@ pub async fn sandbox_create(
                     "\u{2022}".dimmed(),
                 );
                 let local = Path::new(local_path);
-                if *git_ignore && let Ok((base_dir, files)) = git_sync_files(local) {
-                    sandbox_sync_up_files(
-                        &effective_server,
-                        &sandbox_name,
-                        &base_dir,
-                        &files,
-                        local,
-                        dest,
-                        &effective_tls,
-                    )
-                    .await?;
-                } else if local.exists() {
-                    sandbox_sync_up(
-                        &effective_server,
-                        &sandbox_name,
-                        local,
-                        dest,
-                        &effective_tls,
-                    )
-                    .await?;
+                match sandbox_upload_plan(local, *git_ignore)? {
+                    SandboxUploadPlan::GitAware { base_dir, files } => {
+                        sandbox_sync_up_files(
+                            &effective_server,
+                            &sandbox_name,
+                            &base_dir,
+                            &files,
+                            local,
+                            dest,
+                            &effective_tls,
+                        )
+                        .await?;
+                    }
+                    SandboxUploadPlan::Regular => {
+                        sandbox_sync_up(
+                            &effective_server,
+                            &sandbox_name,
+                            local,
+                            dest,
+                            &effective_tls,
+                        )
+                        .await?;
+                    }
                 }
                 eprintln!("  {} Files uploaded", "\u{2713}".green().bold());
             }
@@ -5649,6 +5661,28 @@ pub fn git_sync_files(local_path: &Path) -> Result<(PathBuf, Vec<String>)> {
     Ok((base_dir, files))
 }
 
+fn sandbox_upload_plan(local_path: &Path, git_ignore: bool) -> Result<SandboxUploadPlan> {
+    let metadata = std::fs::symlink_metadata(local_path).map_err(|err| {
+        if err.kind() == ErrorKind::NotFound {
+            miette::miette!("local path does not exist: {}", local_path.display())
+        } else {
+            miette::miette!(
+                "failed to inspect local upload path: {}",
+                local_path.display()
+            )
+        }
+    })?;
+
+    if git_ignore
+        && !metadata.file_type().is_symlink()
+        && let Ok((base_dir, files)) = git_sync_files(local_path)
+    {
+        return Ok(SandboxUploadPlan::GitAware { base_dir, files });
+    }
+
+    Ok(SandboxUploadPlan::Regular)
+}
+
 fn scrub_git_env(command: &mut Command) -> &mut Command {
     for key in [
         "GIT_DIR",
@@ -7247,7 +7281,8 @@ mod tests {
         plaintext_gateway_is_remote, progress_step_from_metadata,
         provider_profile_allows_refresh_bootstrap, provisioning_timeout_message,
         ready_false_condition_message, refresh_status_header, refresh_status_row, resolve_from,
-        sandbox_should_persist, service_expose_status_error, service_url_for_gateway,
+        sandbox_should_persist, sandbox_upload_plan, service_expose_status_error,
+        service_url_for_gateway,
     };
     use crate::TEST_ENV_LOCK;
     use hyper::StatusCode;
@@ -7988,6 +8023,51 @@ mod tests {
             fs::canonicalize(repo.join("nested")).expect("canonicalize nested path")
         );
         assert_eq!(files, vec!["file.txt", "inner/child.txt"]);
+    }
+
+    #[test]
+    fn sandbox_upload_plan_errors_for_missing_local_path() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let missing = tmpdir.path().join("missing");
+
+        let err = sandbox_upload_plan(&missing, false).expect_err("missing path should error");
+
+        assert!(
+            err.to_string().contains("local path does not exist"),
+            "expected missing-path error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn sandbox_upload_plan_errors_for_missing_local_path_with_git_ignore() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let repo = tmpdir.path().join("repo");
+        fs::create_dir_all(&repo).expect("create repo");
+        init_git_repo(&repo);
+        let missing = repo.join("missing");
+
+        let err = sandbox_upload_plan(&missing, true).expect_err("missing path should error");
+
+        assert!(
+            err.to_string().contains("local path does not exist"),
+            "expected missing-path error, got: {err}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sandbox_upload_plan_uses_regular_upload_for_symlinks() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let repo = tmpdir.path().join("repo");
+        fs::create_dir_all(repo.join("real-dir")).expect("create repo");
+        init_git_repo(&repo);
+        fs::write(repo.join("real-dir/file.txt"), "file").expect("write file.txt");
+        std::os::unix::fs::symlink("real-dir", repo.join("link-dir")).expect("create symlink");
+
+        let plan = sandbox_upload_plan(&repo.join("link-dir"), true)
+            .expect("symlink upload should be planned");
+
+        assert_eq!(plan, super::SandboxUploadPlan::Regular);
     }
 
     #[test]

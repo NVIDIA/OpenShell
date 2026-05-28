@@ -213,38 +213,43 @@ fn prepare_backend_request(
     //   path) and inject "anthropic_version" (required in the body, not a header).
     // Non-JSON bodies pass through unchanged; model rewrite and version injection
     // are silently skipped. Such bodies would be rejected by the upstream anyway.
-    let body = serde_json::from_slice::<serde_json::Value>(&body).map_or(body, |mut json| {
-        if let Some(obj) = json.as_object_mut() {
-            // Vertex AI Anthropic endpoints require anthropic_version in the body.
-            // Standard Anthropic SDK sends it as a header; Vertex AI needs it as a body field.
-            // We inject it only for the Vertex rawPredict-style route contract used for
-            // Anthropic publisher endpoints, not for arbitrary model-in-path routes.
-            let needs_vertex_anthropic_version = is_vertex_anthropic_rawpredict_route(route);
-            if needs_vertex_anthropic_version {
-                // Vertex AI rawPredict encodes the model in the URL path, not
-                // the request body. Clients using the standard Anthropic API
-                // (e.g. Claude Code via inference.local) always send "model"
-                // in the body; strip it so Vertex AI does not reject the
-                // request with "Extra inputs are not permitted".
-                obj.remove("model");
-            } else {
-                obj.insert(
-                    "model".to_string(),
-                    serde_json::Value::String(route.model.clone()),
-                );
+    let body = match serde_json::from_slice::<serde_json::Value>(&body) {
+        Ok(mut json) => {
+            if let Some(obj) = json.as_object_mut() {
+                // Vertex AI Anthropic endpoints require anthropic_version in the body.
+                // Standard Anthropic SDK sends it as a header; Vertex AI needs it as a body field.
+                // We inject it only for the Vertex rawPredict-style route contract used for
+                // Anthropic publisher endpoints, not for arbitrary model-in-path routes.
+                let needs_vertex_anthropic_version = is_vertex_anthropic_rawpredict_route(route);
+                if needs_vertex_anthropic_version {
+                    // Vertex AI rawPredict encodes the model in the URL path, not
+                    // the request body. Clients using the standard Anthropic API
+                    // (e.g. Claude Code via inference.local) always send "model"
+                    // in the body; strip it so Vertex AI does not reject the
+                    // request with "Extra inputs are not permitted".
+                    obj.remove("model");
+                } else {
+                    obj.insert(
+                        "model".to_string(),
+                        serde_json::Value::String(route.model.clone()),
+                    );
+                }
+                if needs_vertex_anthropic_version && !obj.contains_key("anthropic_version") {
+                    obj.insert(
+                        "anthropic_version".to_string(),
+                        serde_json::Value::String(VERTEX_ANTHROPIC_VERSION.to_string()),
+                    );
+                }
             }
-            if needs_vertex_anthropic_version && !obj.contains_key("anthropic_version") {
-                obj.insert(
-                    "anthropic_version".to_string(),
-                    serde_json::Value::String(VERTEX_ANTHROPIC_VERSION.to_string()),
-                );
-            }
+
+            bytes::Bytes::from(serde_json::to_vec(&json).map_err(|err| {
+                RouterError::Internal(format!(
+                    "failed to serialize rewritten inference request body: {err}"
+                ))
+            })?)
         }
-        bytes::Bytes::from(
-            serde_json::to_vec(&json)
-                .expect("re-serializing a valid serde_json::Value cannot fail"),
-        )
-    });
+        Err(_) => body,
+    };
     builder = builder.body(body);
 
     Ok((builder, url))

@@ -184,7 +184,7 @@ fn resolve_sandbox_name(name: Option<String>, gateway: &str) -> Result<String> {
     let last = load_last_sandbox(gateway).ok_or_else(|| {
         miette::miette!(
             "No sandbox name provided and no last-used sandbox.\n\
-             Specify a sandbox name or connect to one first: nav sandbox connect <name>"
+             Specify a sandbox name or connect to one first: openshell sandbox connect <name>"
         )
     })?;
     eprintln!("{} Using sandbox '{}' (last used)", "→".bold(), last.bold());
@@ -3509,7 +3509,7 @@ mod tests {
             let err = resolve_sandbox_name(None, "unknown-gateway").unwrap_err();
             let msg = err.to_string();
             assert!(
-                msg.contains("nav sandbox connect"),
+                msg.contains("openshell sandbox connect"),
                 "expected helpful hint in error, got: {msg}"
             );
         });
