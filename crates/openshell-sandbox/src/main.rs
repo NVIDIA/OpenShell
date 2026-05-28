@@ -221,7 +221,10 @@ fn main() -> Result<()> {
         // Shared flag: the sandbox poll loop toggles this when the
         // `ocsf_json_enabled` setting changes. The JSONL layer checks it
         // on each event and short-circuits when false.
-        let ocsf_enabled = Arc::new(AtomicBool::new(false));
+        let ocsf_enabled = Arc::new(AtomicBool::new(
+            std::env::var(openshell_core::sandbox_env::OCSF_JSONL_ENABLED)
+                .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
+        ));
 
         // Keep guards alive for the entire process. When a guard is dropped the
         // non-blocking writer flushes remaining logs.

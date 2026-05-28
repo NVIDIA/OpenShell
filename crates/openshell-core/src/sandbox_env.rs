@@ -53,3 +53,6 @@ pub const SANDBOX_TOKEN_FILE: &str = "OPENSHELL_SANDBOX_TOKEN_FILE";
 /// writes and rotates this file; the supervisor exchanges its contents
 /// for a gateway JWT at startup and on refresh.
 pub const K8S_SA_TOKEN_FILE: &str = "OPENSHELL_K8S_SA_TOKEN_FILE";
+
+/// Opt-in switch for the OCSF JSONL tracing layer in standalone mode.
+pub const OCSF_JSONL_ENABLED: &str = "OPENSHELL_OCSF_JSONL";

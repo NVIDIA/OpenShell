@@ -33,6 +33,10 @@ To disable:
 openshell settings set --global --key ocsf_json_enabled --value false
 ```
 
+### Standalone mode
+
+When the supervisor runs without a gateway endpoint, the policy poll loop that toggles `ocsf_json_enabled` never starts. Set `OPENSHELL_OCSF_JSONL=1` in the supervisor's environment at startup to enable JSON export in this mode.
+
 ## Output Location
 
 When enabled, OCSF JSON records are written to `/var/log/openshell-ocsf.YYYY-MM-DD.log` inside the sandbox. The file rotates daily and retains the 3 most recent files, matching the main log file rotation.
