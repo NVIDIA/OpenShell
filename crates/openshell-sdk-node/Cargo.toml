@@ -1,0 +1,37 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "openshell-sdk-node"
+description = "napi-rs bindings for the OpenShell Rust SDK; published as @openshell/sdk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Required for napi-rs: produces a dynamic library Node.js loads via N-API.
+# `rlib` is kept so the crate can also be exercised by `cargo test --workspace`.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+openshell-sdk = { path = "../openshell-sdk" }
+async-trait = "0.1"
+napi = { version = "3", default-features = false, features = [
+  "async",
+  "napi6",
+  "tokio_rt",
+  "error_anyhow",
+] }
+napi-derive = "3"
+tokio = { workspace = true }
+
+[build-dependencies]
+napi-build = "2"
+
+# Lints are disabled for this crate because napi-derive expands into patterns
+# (raw FFI signatures, Unsafe blocks for N-API, generated TypeScript shim
+# functions) that trigger several pedantic lints. The wrapped Rust SDK already
+# enforces the workspace lint policy.
+[lints]
