@@ -19,10 +19,10 @@ use crossterm::terminal::{
 };
 use miette::{IntoDiagnostic, Result};
 use openshell_bootstrap::list_gateways_with_source;
-use openshell_core::auth::EdgeAuthInterceptor;
 use openshell_core::metadata::{ObjectId, ObjectLabels, ObjectName};
 use openshell_core::proto::SandboxPhase;
 use openshell_core::proto::open_shell_client::OpenShellClient;
+use openshell_sdk::EdgeAuthInterceptor;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
