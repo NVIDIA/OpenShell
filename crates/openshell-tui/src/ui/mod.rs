@@ -132,13 +132,21 @@ fn draw_title_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
         _ => Span::styled(&app.status_text, t.muted),
     };
 
+    let active_gateway_source = app
+        .gateways
+        .iter()
+        .find(|gateway| gateway.name == app.gateway_name)
+        .map_or("unknown", app::GatewayEntry::source_label);
+
     let mut parts: Vec<Span<'_>> = vec![
         Span::styled(" >_ OpenShell ", t.accent_bold),
         Span::styled(" ALPHA ", t.badge),
         Span::styled(" | ", t.muted),
         Span::styled("Current Gateway: ", t.text),
         Span::styled(&app.gateway_name, t.heading),
-        Span::styled(" (", t.muted),
+        Span::styled(" [", t.muted),
+        Span::styled(active_gateway_source, t.muted),
+        Span::styled("] (", t.muted),
         status_span,
         Span::styled(")", t.muted),
         Span::styled(" | ", t.muted),

@@ -18,6 +18,7 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use miette::{IntoDiagnostic, Result};
+use openshell_bootstrap::list_gateways_with_source;
 use openshell_core::auth::EdgeAuthInterceptor;
 use openshell_core::metadata::{ObjectId, ObjectLabels, ObjectName};
 use openshell_core::proto::SandboxPhase;
@@ -440,13 +441,14 @@ pub async fn run(
 
 /// Refresh the list of known gateways from disk.
 fn refresh_gateway_list(app: &mut App) {
-    if let Ok(gateways) = openshell_bootstrap::list_gateways() {
+    if let Ok(gateways) = list_gateways_with_source() {
         app.gateways = gateways
             .into_iter()
             .map(|m| GatewayEntry {
-                name: m.name,
-                endpoint: m.gateway_endpoint,
-                is_remote: m.is_remote,
+                source: Some(m.source),
+                name: m.metadata.name,
+                endpoint: m.metadata.gateway_endpoint,
+                is_remote: m.metadata.is_remote,
             })
             .collect();
 

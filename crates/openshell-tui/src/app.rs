@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use openshell_bootstrap::GatewayMetadataSource;
 use openshell_core::auth::EdgeAuthInterceptor;
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::setting_value;
@@ -214,10 +215,21 @@ pub fn display_setting_value(value: &Option<setting_value::Value>) -> String {
 // Gateway entry
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayEntry {
     pub name: String,
     pub endpoint: String,
     pub is_remote: bool,
+    pub source: Option<GatewayMetadataSource>,
+}
+
+impl GatewayEntry {
+    pub const fn source_label(&self) -> &'static str {
+        match self.source {
+            Some(source) => source.label(),
+            None => "unknown",
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2819,6 +2831,7 @@ fn clamped_scroll(current: usize, delta: isize, total: usize, viewport: usize) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openshell_bootstrap::GatewayMetadataSource;
 
     // -- clamped_scroll -------------------------------------------------
 
@@ -2886,5 +2899,36 @@ mod tests {
     #[test]
     fn scroll_up_one() {
         assert_eq!(clamped_scroll(10, -1, 100, 20), 9);
+    }
+
+    #[test]
+    fn gateway_entry_source_label_formats_known_sources() {
+        let user_gateway = GatewayEntry {
+            name: "user-gw".to_string(),
+            endpoint: "https://user.example.com".to_string(),
+            is_remote: true,
+            source: Some(GatewayMetadataSource::User),
+        };
+        let system_gateway = GatewayEntry {
+            name: "system-gw".to_string(),
+            endpoint: "http://127.0.0.1:17670".to_string(),
+            is_remote: false,
+            source: Some(GatewayMetadataSource::System),
+        };
+
+        assert_eq!(user_gateway.source_label(), "user");
+        assert_eq!(system_gateway.source_label(), "system");
+    }
+
+    #[test]
+    fn gateway_entry_source_label_handles_unknown_source() {
+        let gateway = GatewayEntry {
+            name: "mystery".to_string(),
+            endpoint: "https://mystery.example.com".to_string(),
+            is_remote: true,
+            source: None,
+        };
+
+        assert_eq!(gateway.source_label(), "unknown");
     }
 }
