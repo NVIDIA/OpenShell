@@ -80,6 +80,11 @@ run = "e2e/rust/e2e-podman.sh"
 description = "Run Rust CLI e2e tests against an OpenShell gateway deployed on Kubernetes via Helm (set OPENSHELL_E2E_KUBE_CONTEXT to reuse a cluster; otherwise creates a local k3d cluster when k3d is installed; set OPENSHELL_E2E_KUBE_TEST=<name> to scope to one test)"
 run = "e2e/rust/e2e-kubernetes.sh"
 
+["e2e:kubernetes:db"]
+description = "Run Kubernetes e2e with all database backend scenarios (SQLite, bundled PostgreSQL, external PostgreSQL with existingSecret)"
+env = { OPENSHELL_E2E_KUBE_DB_SCENARIOS = "1" }
+run = "e2e/rust/e2e-kubernetes.sh"
+
 ["e2e:vm"]
 description = "Start openshell-gateway with the VM compute driver and run the cluster-agnostic smoke e2e"
 run = "e2e/rust/e2e-vm.sh"
