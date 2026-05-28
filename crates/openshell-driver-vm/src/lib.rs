@@ -13,8 +13,9 @@ mod runtime;
 
 pub use driver::{VmDriver, VmDriverConfig};
 pub use extension::{
-    LaunchAbortReason, VmLaunchPlan, VmLifecycleError, VmLifecycleExtension, VmLifecycleExtensions,
-    VmLifecycleResult,
+    LaunchAbortReason, VmBackendFeature, VmExtensionProvides, VmGuestInitDropIn, VmLaunchPlan,
+    VmLifecycleError, VmLifecycleExtension, VmLifecycleExtensionDescriptor, VmLifecycleExtensions,
+    VmLifecycleResult, VmPersistedSandbox,
 };
 pub use runtime::{
     VM_RUNTIME_DIR_ENV, VmBackend, VmLaunchConfig, cleanup_stale_tap_interfaces,

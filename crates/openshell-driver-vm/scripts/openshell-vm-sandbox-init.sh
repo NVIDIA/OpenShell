@@ -570,6 +570,37 @@ configure_hostname() {
     ts "hostname=${sandbox_hostname}"
 }
 
+run_openshell_init_dropins() {
+    # Run executable drop-ins from /opt/openshell/init.d in deterministic
+    # ASCII-sorted order. Drop-ins are *executed* in a child shell rather
+    # than sourced, so they cannot mutate parent shell state or exit the
+    # caller. They inherit `OPENSHELL_VM_INIT_PHASE`, `ROOT_PREFIX`, and
+    # any `OPENSHELL_VM_DATA_*` env vars set by lifecycle extensions.
+    local init_dir
+    init_dir="$(root_path /opt/openshell/init.d)"
+    [ -d "$init_dir" ] || return 0
+
+    export OPENSHELL_VM_INIT_PHASE="before-supervisor"
+    export ROOT_PREFIX="${ROOT_PREFIX:-}"
+
+    local dropin rc
+    while IFS= read -r dropin; do
+        [ -n "$dropin" ] || continue
+        [ -f "$dropin" ] || continue
+        [ -x "$dropin" ] || continue
+
+        ts "running OpenShell VM init drop-in ${dropin##*/}"
+        rc=0
+        set +e
+        "$dropin"
+        rc=$?
+        set -e
+        if [ "$rc" -ne 0 ]; then
+            ts "WARNING: OpenShell VM init drop-in ${dropin##*/} failed with exit code ${rc}"
+        fi
+    done < <(LC_ALL=C find "$init_dir" -mindepth 1 -maxdepth 1 -type f -print | LC_ALL=C sort)
+}
+
 run_post_overlay_setup() {
     # Source QEMU-injected environment variables if present. The file lives in
     # the overlay upperdir so the cached bootstrap rootfs remains immutable.
@@ -728,6 +759,8 @@ if [ -d /sandbox ]; then
         fi
     fi
 fi
+
+run_openshell_init_dropins
 
 rewrite_openshell_endpoint_if_needed
 
