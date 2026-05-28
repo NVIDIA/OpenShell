@@ -219,8 +219,6 @@ struct ProvisioningDisplay {
     completed_steps: Vec<ProvisioningStep>,
     /// Progress bars for completed steps (so they can be cleared).
     completed_bars: Vec<ProgressBar>,
-    /// The currently active provisioning step.
-    active_step: Option<ProvisioningStep>,
     /// The currently active step label (shown on the spinner).
     active_label: String,
     /// Detail text shown next to the active step (e.g. image name).
@@ -255,7 +253,6 @@ impl ProvisioningDisplay {
             spacer,
             completed_steps: Vec::new(),
             completed_bars: Vec::new(),
-            active_step: None,
             active_label: ProvisioningStep::RequestingSandbox
                 .active_label()
                 .to_string(),
@@ -293,15 +290,11 @@ impl ProvisioningDisplay {
         self.step_start = Instant::now();
         self.spinner.reset_elapsed();
         self.active_detail.clear();
-        if self.active_step == Some(step) {
-            self.active_step = None;
-        }
     }
 
     /// Set the active (in-progress) step shown on the spinner.
-    fn set_active(&mut self, step: ProvisioningStep) {
-        self.active_step = Some(step);
-        self.active_label = step.active_label().to_string();
+    fn set_active(&mut self, label: &str) {
+        self.active_label = label.to_string();
         self.active_detail.clear();
         // Reset the spinner's elapsed time for the new step.
         self.spinner.reset_elapsed();
@@ -311,17 +304,11 @@ impl ProvisioningDisplay {
 
     /// Set the active step from a known provisioning step enum.
     fn set_active_step(&mut self, step: ProvisioningStep) {
-        if self.active_step == Some(step) {
-            return;
-        }
-        self.set_active(step);
+        self.set_active(step.active_label());
     }
 
     /// Set detail text shown alongside the active step (e.g. image name).
     fn set_active_detail(&mut self, detail: &str) {
-        if self.active_detail == detail {
-            return;
-        }
         self.active_detail = detail.to_string();
         self.update_spinner();
     }
@@ -2020,17 +2007,7 @@ pub async fn sandbox_create(
                     "\u{2022}".dimmed(),
                 );
                 let local = Path::new(local_path);
-                if !local_upload_path_exists(local) {
-                    return Err(miette::miette!(
-                        "local path does not exist: {}",
-                        local.display()
-                    ));
-                }
-
-                if *git_ignore
-                    && !local_upload_path_is_symlink(local)
-                    && let Ok((base_dir, files)) = git_sync_files(local)
-                {
+                if *git_ignore && let Ok((base_dir, files)) = git_sync_files(local) {
                     sandbox_sync_up_files(
                         &effective_server,
                         &sandbox_name,
@@ -2041,7 +2018,7 @@ pub async fn sandbox_create(
                         &effective_tls,
                     )
                     .await?;
-                } else {
+                } else if local.exists() {
                     sandbox_sync_up(
                         &effective_server,
                         &sandbox_name,
@@ -2386,7 +2363,7 @@ pub async fn sandbox_sync_command(
     match (up, down) {
         (Some(local_path), None) => {
             let local = Path::new(local_path);
-            if !local_upload_path_exists(local) {
+            if !local.exists() {
                 return Err(miette::miette!(
                     "local path does not exist: {}",
                     local.display()
@@ -4118,6 +4095,131 @@ fn service_display_name(service: &str) -> &str {
     if service.is_empty() { "-" } else { service }
 }
 
+/// Read gcloud Application Default Credentials from disk.
+///
+/// Returns `(client_id, client_secret, refresh_token)`.
+///
+/// Checks `GOOGLE_APPLICATION_CREDENTIALS` first; falls back to
+/// `$CLOUDSDK_CONFIG/application_default_credentials.json` when set, then to
+/// `~/.config/gcloud/application_default_credentials.json`.
+fn read_gcloud_adc() -> Result<(String, String, String)> {
+    let path = if let Some(env_path) = std::env::var("GOOGLE_APPLICATION_CREDENTIALS")
+        .ok()
+        .filter(|v| !v.is_empty())
+    {
+        PathBuf::from(env_path)
+    } else if let Some(config_dir) = std::env::var("CLOUDSDK_CONFIG")
+        .ok()
+        .filter(|v| !v.is_empty())
+    {
+        PathBuf::from(config_dir).join("application_default_credentials.json")
+    } else {
+        let home = std::env::var("HOME")
+            .map_err(|_| miette::miette!("HOME is not set; cannot locate gcloud ADC file"))?;
+        PathBuf::from(home)
+            .join(".config")
+            .join("gcloud")
+            .join("application_default_credentials.json")
+    };
+
+    let content = std::fs::read_to_string(&path).map_err(|err| {
+        miette::miette!(
+            "failed to read gcloud ADC file at {}: {}. \
+             Run: gcloud auth application-default login",
+            path.display(),
+            err
+        )
+    })?;
+
+    let json: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|err| miette::miette!("failed to parse gcloud ADC file: {err}"))?;
+
+    let cred_type = json.get("type").and_then(|v| v.as_str());
+    match cred_type {
+        Some("service_account") => {
+            return Err(miette::miette!(
+                "Application Default Credentials are a service account key, not user credentials. \
+                 To use a service account, create the provider with the service account JSON key \
+                 and configure gateway-managed refresh for 'GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN'. \
+                 See: openshell provider create --help"
+            ));
+        }
+        Some("authorized_user") => {}
+        Some(other) => {
+            return Err(miette::miette!(
+                "Application Default Credentials have unsupported type '{other}' \
+                 (expected 'authorized_user'). \
+                 Run: gcloud auth application-default login"
+            ));
+        }
+        None => {
+            return Err(miette::miette!(
+                "gcloud ADC file is missing the 'type' field. \
+                 The file may be malformed. \
+                 Run: gcloud auth application-default login"
+            ));
+        }
+    }
+
+    let client_id = json
+        .get("client_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| miette::miette!("gcloud ADC file is missing 'client_id'"))?
+        .to_string();
+
+    let client_secret = json
+        .get("client_secret")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| miette::miette!("gcloud ADC file is missing 'client_secret'"))?
+        .to_string();
+
+    let refresh_token = json
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| miette::miette!("gcloud ADC file is missing 'refresh_token'"))?
+        .to_string();
+
+    Ok((client_id, client_secret, refresh_token))
+}
+
+async fn rollback_provider_create_after_vertex_adc_failure(
+    client: &mut crate::tls::GrpcClient,
+    provider_name: &str,
+    stage: &str,
+    source: &Status,
+) -> Result<()> {
+    match client
+        .delete_provider(DeleteProviderRequest {
+            name: provider_name.to_string(),
+        })
+        .await
+    {
+        Ok(_) => Err(miette!(
+            "failed to {stage} Vertex AI credentials from gcloud ADC for provider '{provider_name}': {source}. \
+             The provider was rolled back successfully."
+        )),
+        Err(cleanup_err) => {
+            eprintln!(
+                "{} Failed to clean up provider '{}' after {} failed: {}. \
+                 Run 'openshell provider delete {}' to remove it manually.",
+                "⚠".yellow(),
+                provider_name,
+                stage,
+                cleanup_err,
+                provider_name
+            );
+            Err(miette!(
+                "failed to {stage} Vertex AI credentials from gcloud ADC for provider '{provider_name}': {source}. \
+                 Cleanup also failed, so the provider may still exist. \
+                 Run 'openshell provider delete {provider_name}' to remove it manually."
+            ))
+        }
+    }
+}
+
 fn service_url_for_gateway(service_url: &str, gateway_endpoint: &str) -> String {
     let (Ok(mut service_url), Ok(gateway_endpoint)) = (
         url::Url::parse(service_url),
@@ -4187,9 +4289,27 @@ async fn discover_existing_provider_data(
     if gateway_providers_v2_enabled(client).await? {
         let profile = fetch_provider_profile(client, provider_type).await?;
         let profile = ProviderTypeProfile::from_proto(&profile);
-        discover_from_profile(&profile, &RealDiscoveryContext).map_err(|err| {
-            miette::miette!("failed to discover existing provider data from profile: {err}")
-        })
+        let mut discovered =
+            discover_from_profile(&profile, &RealDiscoveryContext).map_err(|err| {
+                miette::miette!("failed to discover existing provider data from profile: {err}")
+            })?;
+
+        // Vertex AI config keys (project ID, region, base URL, publisher) are not
+        // declared in the profile's discovery.credentials list, so discover_from_profile
+        // does not scan them. Scan them directly here so --from-existing captures them.
+        if provider_type == VERTEX_AI_PROVIDER_TYPE {
+            let discovered = discovered.get_or_insert_with(Default::default);
+            for key in openshell_core::inference::VERTEX_AI_CONFIG_KEY_NAMES {
+                if let Ok(val) = std::env::var(key) {
+                    let val = val.trim().to_string();
+                    if !val.is_empty() {
+                        discovered.config.entry(key.to_string()).or_insert(val);
+                    }
+                }
+            }
+        }
+
+        Ok(discovered)
     } else {
         let registry = ProviderRegistry::new();
         registry
@@ -4198,15 +4318,41 @@ async fn discover_existing_provider_data(
     }
 }
 
+/// Canonical provider type string for Google Vertex AI.
+const VERTEX_AI_PROVIDER_TYPE: &str = "google-vertex-ai";
+
+fn missing_credentials_error(provider_type: &str) -> miette::Report {
+    if provider_type == VERTEX_AI_PROVIDER_TYPE {
+        return miette::miette!(
+            "no credentials resolved for provider type '{provider_type}'. \
+             Set GOOGLE_VERTEX_AI_TOKEN, VERTEX_AI_TOKEN, \
+             GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN, or VERTEX_AI_SERVICE_ACCOUNT_TOKEN; \
+             or use --from-gcloud-adc / --from-existing with those env vars set."
+        );
+    }
+
+    miette::miette!(
+        "no credentials resolved for provider type '{provider_type}'. \
+         Use --credential KEY[=VALUE] or --from-existing with the appropriate env vars set."
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn provider_create(
     server: &str,
     name: &str,
     provider_type: &str,
     from_existing: bool,
     credentials: &[String],
+    from_gcloud_adc: bool,
     config: &[String],
     tls: &TlsOptions,
 ) -> Result<()> {
+    if from_gcloud_adc && (from_existing || !credentials.is_empty()) {
+        return Err(miette::miette!(
+            "--from-gcloud-adc cannot be combined with --from-existing or --credential"
+        ));
+    }
     if from_existing && !credentials.is_empty() {
         return Err(miette::miette!(
             "--from-existing cannot be combined with --credential"
@@ -4243,6 +4389,12 @@ pub async fn provider_create(
         }
     };
 
+    if from_gcloud_adc && provider_type != VERTEX_AI_PROVIDER_TYPE {
+        return Err(miette::miette!(
+            "--from-gcloud-adc is only valid for google-vertex-ai providers"
+        ));
+    }
+
     let mut credential_map = parse_credential_pairs(credentials)?;
     let mut config_map = parse_key_value_pairs(config, "--config")?;
 
@@ -4263,17 +4415,26 @@ pub async fn provider_create(
     }
 
     if credential_map.is_empty() {
+        if from_existing {
+            return Err(missing_credentials_error(&provider_type));
+        }
         let allows_refresh_bootstrap = fetch_provider_profile(&mut client, &provider_type)
             .await
             .ok()
             .is_some_and(|profile| provider_profile_allows_refresh_bootstrap(&profile));
         if !allows_refresh_bootstrap {
-            return Err(miette::miette!(
-                "no credentials resolved for provider type '{provider_type}'. \
-                 Use --credential KEY[=VALUE] or --from-existing with the appropriate env vars set."
-            ));
+            return Err(missing_credentials_error(&provider_type));
         }
     }
+
+    // Validate and read the ADC file BEFORE creating the provider so that
+    // a bad/missing ADC does not leave an orphan provider behind.
+    let gcloud_adc_material = if from_gcloud_adc {
+        let (client_id, client_secret, refresh_token) = read_gcloud_adc()?;
+        Some((client_id, client_secret, refresh_token))
+    } else {
+        None
+    };
 
     let response = client
         .create_provider(CreateProviderRequest {
@@ -4298,37 +4459,66 @@ pub async fn provider_create(
         .into_inner()
         .provider
         .ok_or_else(|| miette::miette!("provider missing from response"))?;
+    let provider_name = provider.object_name().to_string();
 
-    println!(
-        "{} Created provider {}",
-        "✓".green().bold(),
-        provider.object_name()
-    );
+    if let Some((client_id, client_secret, refresh_token)) = gcloud_adc_material {
+        let mut material = HashMap::new();
+        material.insert("client_id".to_string(), client_id);
+        material.insert("client_secret".to_string(), client_secret);
+        material.insert("refresh_token".to_string(), refresh_token);
+
+        if let Err(configure_err) = client
+            .configure_provider_refresh(ConfigureProviderRefreshRequest {
+                provider: provider_name.clone(),
+                credential_key: openshell_core::inference::VERTEX_AI_ADC_TOKEN_KEY.to_string(),
+                strategy: ProviderCredentialRefreshStrategy::Oauth2RefreshToken as i32,
+                material,
+                secret_material_keys: vec![
+                    "client_secret".to_string(),
+                    "refresh_token".to_string(),
+                ],
+                expires_at_ms: None,
+            })
+            .await
+        {
+            return rollback_provider_create_after_vertex_adc_failure(
+                &mut client,
+                &provider_name,
+                "configure",
+                &configure_err,
+            )
+            .await;
+        }
+
+        if let Err(rotate_err) = client
+            .rotate_provider_credential(RotateProviderCredentialRequest {
+                provider: provider_name.clone(),
+                credential_key: openshell_core::inference::VERTEX_AI_ADC_TOKEN_KEY.to_string(),
+            })
+            .await
+        {
+            return rollback_provider_create_after_vertex_adc_failure(
+                &mut client,
+                &provider_name,
+                "mint the initial access token for",
+                &rotate_err,
+            )
+            .await;
+        }
+
+        println!("{} Created provider {}", "✓".green().bold(), provider_name);
+        println!(
+            "Configured Vertex AI credentials from gcloud ADC and minted the initial access token"
+        );
+        return Ok(());
+    }
+
+    println!("{} Created provider {}", "✓".green().bold(), provider_name);
     Ok(())
 }
 
 fn provider_profile_allows_refresh_bootstrap(profile: &ProviderProfile) -> bool {
-    let required_credentials = profile
-        .credentials
-        .iter()
-        .filter(|credential| credential.required)
-        .collect::<Vec<_>>();
-    !required_credentials.is_empty()
-        && required_credentials.iter().all(|credential| {
-            credential
-                .refresh
-                .as_ref()
-                .is_some_and(|refresh| is_gateway_mintable_refresh_strategy(refresh.strategy))
-        })
-}
-
-fn is_gateway_mintable_refresh_strategy(strategy: i32) -> bool {
-    matches!(
-        ProviderCredentialRefreshStrategy::try_from(strategy),
-        Ok(ProviderCredentialRefreshStrategy::Oauth2RefreshToken
-            | ProviderCredentialRefreshStrategy::Oauth2ClientCredentials
-            | ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt)
-    )
+    ProviderTypeProfile::from_proto(profile).allows_gateway_refresh_bootstrap()
 }
 
 pub async fn provider_get(server: &str, name: &str, tls: &TlsOptions) -> Result<()> {
@@ -5312,7 +5502,9 @@ pub fn git_repo_root(local_path: &Path) -> Result<PathBuf> {
             .parent()
             .ok_or_else(|| miette::miette!("path has no parent: {}", local_path.display()))?
     };
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    scrub_git_env(&mut command);
+    let output = command
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(git_dir)
         .output()
@@ -5377,7 +5569,9 @@ pub fn git_sync_files(local_path: &Path) -> Result<(PathBuf, Vec<String>)> {
         Some(relative_path.to_string_lossy().into_owned())
     };
 
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    scrub_git_env(&mut command);
+    let output = command
         .args(["ls-files", "-co", "--exclude-standard", "-z"])
         .args(pathspec.as_deref())
         .current_dir(&repo_root)
@@ -5422,12 +5616,19 @@ pub fn git_sync_files(local_path: &Path) -> Result<(PathBuf, Vec<String>)> {
     Ok((base_dir, files))
 }
 
-pub fn local_upload_path_exists(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok()
-}
-
-pub fn local_upload_path_is_symlink(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+fn scrub_git_env(command: &mut Command) -> &mut Command {
+    for key in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_PREFIX",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    ] {
+        command.env_remove(key);
+    }
+    command
 }
 
 // ---------------------------------------------------------------------------
@@ -6980,18 +7181,17 @@ fn format_timestamp_ms(ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ProvisioningDisplay, ProvisioningStep, TlsOptions, build_sandbox_resource_limits,
+        ProvisioningStep, TlsOptions, build_sandbox_resource_limits,
         dockerfile_sources_supported_for_gateway, format_endpoint, format_gateway_select_header,
         format_gateway_select_items, format_provider_attachment_table, gateway_add,
         gateway_auth_label, gateway_env_override_warning, gateway_select_with, gateway_type_label,
         git_sync_files, http_health_check, image_requests_gpu, import_local_package_mtls_bundle,
-        inferred_provider_type, local_upload_path_exists, local_upload_path_is_symlink,
-        package_managed_tls_dirs, parse_cli_setting_value, parse_credential_expiry_cli_value,
-        parse_credential_expiry_pairs, parse_credential_pairs, plaintext_gateway_is_remote,
-        progress_step_from_metadata, provider_profile_allows_refresh_bootstrap,
-        provisioning_timeout_message, ready_false_condition_message, refresh_status_header,
-        refresh_status_row, resolve_from, sandbox_should_persist, service_expose_status_error,
-        service_url_for_gateway,
+        inferred_provider_type, package_managed_tls_dirs, parse_cli_setting_value,
+        parse_credential_expiry_cli_value, parse_credential_expiry_pairs, parse_credential_pairs,
+        plaintext_gateway_is_remote, progress_step_from_metadata,
+        provider_profile_allows_refresh_bootstrap, provisioning_timeout_message,
+        ready_false_condition_message, refresh_status_header, refresh_status_row, resolve_from,
+        sandbox_should_persist, service_expose_status_error, service_url_for_gateway,
     };
     use crate::TEST_ENV_LOCK;
     use hyper::StatusCode;
@@ -7002,7 +7202,6 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::thread;
-    use std::time::{Duration, Instant};
     use tonic::Status;
 
     use openshell_bootstrap::GatewayMetadata;
@@ -7212,48 +7411,6 @@ mod tests {
     }
 
     #[test]
-    fn provisioning_display_ignores_repeated_active_step_updates() {
-        let mut display = ProvisioningDisplay::new();
-        display.set_active_step(ProvisioningStep::PullingSandboxImage);
-        display.set_active_detail("Downloading layer-1 (1 MB/2 MB)");
-
-        let original_step_start = Instant::now()
-            .checked_sub(Duration::from_secs(5))
-            .expect("test duration should be representable");
-        display.step_start = original_step_start;
-
-        display.set_active_step(ProvisioningStep::PullingSandboxImage);
-        display.set_active_detail("Downloading layer-1 (1 MB/2 MB)");
-
-        assert_eq!(
-            display.active_step,
-            Some(ProvisioningStep::PullingSandboxImage)
-        );
-        assert_eq!(display.active_detail, "Downloading layer-1 (1 MB/2 MB)");
-        assert_eq!(display.step_start, original_step_start);
-        display.clear();
-    }
-
-    #[test]
-    fn provisioning_display_resets_detail_on_active_step_transition() {
-        let mut display = ProvisioningDisplay::new();
-        display.set_active_step(ProvisioningStep::PullingSandboxImage);
-        display.set_active_detail("Downloading layer-1 (1 MB/2 MB)");
-
-        let original_step_start = Instant::now()
-            .checked_sub(Duration::from_secs(5))
-            .expect("test duration should be representable");
-        display.step_start = original_step_start;
-
-        display.set_active_step(ProvisioningStep::StartingSandbox);
-
-        assert_eq!(display.active_step, Some(ProvisioningStep::StartingSandbox));
-        assert!(display.active_detail.is_empty());
-        assert!(display.step_start > original_step_start);
-        display.clear();
-    }
-
-    #[test]
     fn refresh_status_table_includes_operational_fields() {
         let header = refresh_status_header();
         assert!(header.contains("NEXT_REFRESH"));
@@ -7335,7 +7492,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(!provider_profile_allows_refresh_bootstrap(
+        assert!(provider_profile_allows_refresh_bootstrap(
             &optional_refresh_profile
         ));
     }
@@ -7728,7 +7885,9 @@ mod tests {
     }
 
     fn init_git_repo(path: &Path) {
-        let status = Command::new("git")
+        let mut command = Command::new("git");
+        super::scrub_git_env(&mut command);
+        let status = command
             .args(["init"])
             .current_dir(path)
             .status()
@@ -7777,29 +7936,30 @@ mod tests {
         assert_eq!(files, vec!["file.txt", "inner/child.txt"]);
     }
 
-    #[cfg(unix)]
     #[test]
-    fn local_upload_path_helpers_accept_symlinks() {
+    fn git_sync_files_ignores_inherited_git_env() {
+        let _lock = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmpdir = tempfile::tempdir().expect("create tmpdir");
-        let target = tmpdir.path().join("target.txt");
-        let link = tmpdir.path().join("link.txt");
-        fs::write(&target, "target").expect("write target");
-        std::os::unix::fs::symlink("target.txt", &link).expect("create symlink");
+        let repo = tmpdir.path().join("repo");
+        fs::create_dir_all(repo.join("nested")).expect("create repo");
+        init_git_repo(&repo);
 
-        assert!(local_upload_path_exists(&link));
-        assert!(local_upload_path_is_symlink(&link));
-    }
+        fs::write(repo.join("nested/file.txt"), "file").expect("write file.txt");
+        fs::write(repo.join("top.txt"), "top").expect("write top.txt");
 
-    #[cfg(unix)]
-    #[test]
-    fn local_upload_path_helpers_accept_dangling_symlinks() {
-        let tmpdir = tempfile::tempdir().expect("create tmpdir");
-        let link = tmpdir.path().join("dangling-link.txt");
-        std::os::unix::fs::symlink("missing.txt", &link).expect("create symlink");
+        let _git_dir = EnvVarGuard::set("GIT_DIR", "/tmp/not-the-test-repo/.git");
+        let _git_work_tree = EnvVarGuard::set("GIT_WORK_TREE", "/tmp/not-the-test-repo");
 
-        assert!(local_upload_path_exists(&link));
-        assert!(local_upload_path_is_symlink(&link));
-        assert!(!link.exists(), "std::path::Path::exists follows symlinks");
+        let result = git_sync_files(&repo.join("nested"));
+        let (base_dir, files) = result.expect("git_sync_files should succeed");
+
+        assert_eq!(
+            base_dir,
+            fs::canonicalize(repo.join("nested")).expect("canonicalize nested path")
+        );
+        assert_eq!(files, vec!["file.txt"]);
     }
 
     #[test]
@@ -8160,6 +8320,152 @@ mod tests {
         assert_eq!(
             format_endpoint(&l7_scoped),
             "host.example.test:443 [L7 rest, allow PUT /v1/example/resource, deny DELETE /v1/example/resource]"
+        );
+    }
+
+    #[test]
+    fn read_gcloud_adc_missing_file_errors() {
+        let _lock = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = EnvVarGuard::set(
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "/nonexistent/path/to/adc.json",
+        );
+        let err = super::read_gcloud_adc().expect_err("missing file should error");
+        assert!(
+            err.to_string().contains("failed to read gcloud ADC file"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn read_gcloud_adc_wrong_type_errors() {
+        let _lock = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let json = serde_json::json!({
+            "type": "service_account",
+            "project_id": "my-project",
+            "private_key_id": "key123"
+        });
+        Write::write_all(&mut tmp.as_file(), json.to_string().as_bytes()).expect("write tempfile");
+        let _guard = EnvVarGuard::set(
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            tmp.path().to_str().expect("tempfile path"),
+        );
+        let err = super::read_gcloud_adc().expect_err("wrong type should error");
+        // The service_account type gets a targeted message directing the user
+        // to the real Vertex service-account credential flow instead of the
+        // generic authorized_user hint.
+        assert!(
+            err.to_string()
+                .contains("GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN"),
+            "error should mention the service-account token key, got: {err}"
+        );
+    }
+
+    #[test]
+    fn read_gcloud_adc_parses_user_creds() {
+        let _lock = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let json = serde_json::json!({
+            "type": "authorized_user",
+            "client_id": "test-client-id.apps.googleusercontent.com",
+            "client_secret": "test-client-secret",
+            "refresh_token": "test-refresh-token"
+        });
+        Write::write_all(&mut tmp.as_file(), json.to_string().as_bytes()).expect("write tempfile");
+        let _guard = EnvVarGuard::set(
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            tmp.path().to_str().expect("tempfile path"),
+        );
+        let (client_id, client_secret, refresh_token) =
+            super::read_gcloud_adc().expect("valid ADC should parse");
+        assert_eq!(client_id, "test-client-id.apps.googleusercontent.com");
+        assert_eq!(client_secret, "test-client-secret");
+        assert_eq!(refresh_token, "test-refresh-token");
+    }
+
+    #[test]
+    fn read_gcloud_adc_uses_cloudsdk_config_fallback() {
+        let _lock = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let adc_path = dir.path().join("application_default_credentials.json");
+        let json = serde_json::json!({
+            "type": "authorized_user",
+            "client_id": "cloudsdk-client-id.apps.googleusercontent.com",
+            "client_secret": "cloudsdk-client-secret",
+            "refresh_token": "cloudsdk-refresh-token"
+        });
+        fs::write(&adc_path, json.to_string()).expect("write adc file");
+        let _adc_guard = EnvVarGuard::unset("GOOGLE_APPLICATION_CREDENTIALS");
+        let _cloudsdk_guard =
+            EnvVarGuard::set("CLOUDSDK_CONFIG", dir.path().to_str().expect("config path"));
+
+        let (client_id, client_secret, refresh_token) =
+            super::read_gcloud_adc().expect("valid CLOUDSDK_CONFIG ADC should parse");
+        assert_eq!(client_id, "cloudsdk-client-id.apps.googleusercontent.com");
+        assert_eq!(client_secret, "cloudsdk-client-secret");
+        assert_eq!(refresh_token, "cloudsdk-refresh-token");
+    }
+
+    #[test]
+    fn read_gcloud_adc_malformed_json_errors() {
+        let _lock = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        Write::write_all(&mut tmp.as_file(), b"not valid json at all {{{{")
+            .expect("write tempfile");
+        let _guard = EnvVarGuard::set(
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            tmp.path().to_str().expect("tempfile path"),
+        );
+        let result = super::read_gcloud_adc();
+        assert!(
+            result.is_err(),
+            "malformed JSON should produce an error, got: {result:?}"
+        );
+        let err = result.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("parse")
+                || msg.contains("JSON")
+                || msg.contains("json")
+                || msg.contains("invalid")
+                || msg.contains("failed"),
+            "error message should mention parse/JSON failure, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn refresh_bootstrap_allows_oauth2_refresh_token() {
+        use openshell_core::proto::{
+            ProviderCredentialRefresh, ProviderCredentialRefreshStrategy, ProviderProfile,
+            ProviderProfileCredential,
+        };
+
+        let strategy = ProviderCredentialRefreshStrategy::Oauth2RefreshToken as i32;
+        let profile = ProviderProfile {
+            credentials: vec![ProviderProfileCredential {
+                required: true,
+                refresh: Some(ProviderCredentialRefresh {
+                    strategy,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(
+            provider_profile_allows_refresh_bootstrap(&profile),
+            "Oauth2RefreshToken should be allowed for refresh bootstrap"
         );
     }
 }
