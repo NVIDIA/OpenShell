@@ -67,7 +67,7 @@ The following Providers v2 design items are not part of the current behavior:
 
 | Roadmap item | Current behavior |
 |---|---|
-| Profile-driven explicit credential injection | Profile `auth_style`, `header_name`, and `query_param` fields are stored and validated, but runtime injection still depends on environment placeholders generated from provider credentials. |
+| Profile-driven explicit credential injection | Profile `auth_style`, `header_name`, `query_param`, and `path_template` fields are stored and validated, but runtime injection still depends on environment placeholders generated from provider credentials. |
 | Endpoint and binary scoped credential injection | Provider profile endpoints and binaries affect policy composition. They do not yet restrict which outbound requests can receive credential injection. |
 | Credential verification on create | `openshell provider create` does not yet probe provider verification endpoints or expose `--no-verify`. |
 | Automatic credential scope extraction | OpenShell does not yet inspect upstream provider responses to discover credential scopes. |
@@ -158,12 +158,13 @@ credentials:
     env_vars: [CUSTOM_API_TOKEN]
     required: true
 
-    # Accepted values: basic, bearer, header, query.
+    # Accepted values: basic, bearer, header, query, path.
     # These fields describe the intended credential placement.
     # Runtime injection still uses env placeholder resolution today.
     auth_style: bearer
     header_name: authorization
     query_param: api_key
+    path_template: /v1/{credential}/resources
 
     refresh:
       # Accepted values:
@@ -239,7 +240,7 @@ binaries:
 
 `category` groups profiles in `openshell provider list-profiles`. Use one of the values in the category enum.
 
-`credentials` declares the credential names, environment variables, auth metadata, and optional refresh metadata for the provider type. The current runtime still exposes configured credential keys as placeholder environment variables and resolves placeholders in outbound HTTP requests.
+`credentials` declares the credential names, environment variables, auth metadata, and optional refresh metadata for the provider type. The `auth_style` field accepts `basic`, `bearer`, `header`, `query`, or `path`. When `auth_style` is `path`, set `path_template` to a URL path containing the `{credential}` placeholder exactly once (for example, `/v1/{credential}/resources`). The current runtime still exposes configured credential keys as placeholder environment variables and resolves placeholders in outbound HTTP requests.
 
 `discovery` controls what `--from-existing` scans when
 `providers_v2_enabled=true`. Each entry in `discovery.credentials` must name a

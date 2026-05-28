@@ -897,6 +897,7 @@ message ProviderProfileCredential {
   string header_name = 6;
   string query_param = 7;
   ProviderCredentialRefresh refresh = 8;
+  string path_template = 9;
 }
 
 enum ProviderCredentialRefreshStrategy {
