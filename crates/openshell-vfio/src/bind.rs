@@ -10,12 +10,9 @@ use std::time::Duration;
 pub(crate) const VFIO_BIND_POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub(crate) const VFIO_BIND_MAX_POLL_ATTEMPTS: u32 = 20;
 
-/// Reference counter for vendor:device ID registrations in the vfio-pci
-/// match table. Multiple devices may share the same vendor:device pair. We
-/// only write to the kernel's `new_id`/`remove_id` sysfs files when the first
-/// device registers or the last device deregisters an ID.
-static VFIO_ID_REFCOUNTS: LazyLock<Mutex<HashMap<String, usize>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+// Process-local registry shared across bind guards to coordinate vfio-pci ID writes.
+static VFIO_ID_REGISTRY: LazyLock<Mutex<VfioIdRegistry>> =
+    LazyLock::new(|| Mutex::new(VfioIdRegistry::default()));
 
 pub(crate) fn current_driver_name(sysfs: &SysfsRoot, bdf: &str) -> Option<String> {
     sysfs.pci_device_ref(bdf).driver_name()
@@ -37,14 +34,9 @@ pub(crate) fn register_vfio_new_id(sysfs: &SysfsRoot, bdf: &str) {
         return;
     };
 
-    let should_write = {
-        let mut map = VFIO_ID_REFCOUNTS.lock().unwrap();
-        let count = map.entry(id_str.clone()).or_insert(0);
-        *count += 1;
-        *count == 1
-    };
+    let registration = VFIO_ID_REGISTRY.lock().unwrap().register(&id_str);
 
-    if !should_write {
+    if registration != VfioIdRegistration::FirstUser {
         tracing::debug!(
             bdf, id = %id_str,
             "vfio-pci new_id already registered by another device, refcount incremented"
@@ -80,37 +72,29 @@ pub(crate) fn deregister_vfio_new_id(sysfs: &SysfsRoot, bdf: &str) {
         return;
     };
 
-    let should_write = {
-        let mut map = VFIO_ID_REFCOUNTS.lock().unwrap();
-        match map.get_mut(&id_str) {
-            Some(count) if *count > 1 => {
-                *count -= 1;
-                false
-            }
-            Some(_) => {
-                map.remove(&id_str);
-                true
-            }
-            None => true,
-        }
-    };
+    deregister_vfio_id(sysfs, &id_str, Some(bdf));
+}
 
-    if !should_write {
+fn deregister_vfio_id(sysfs: &SysfsRoot, id_str: &str, bdf: Option<&str>) {
+    let deregistration = VFIO_ID_REGISTRY.lock().unwrap().deregister(id_str);
+
+    if deregistration == VfioIdDeregistration::StillInUse {
         tracing::debug!(
-            bdf, id = %id_str,
+            bdf = ?bdf, id = %id_str,
             "vfio-pci remove_id skipped (other devices still using this ID)"
         );
         return;
     }
 
+    // LastUser and NotTracked both require a best-effort remove_id write.
     let remove_id_path = sysfs.vfio_pci_remove_id();
-    match write_sysfs(&remove_id_path, &id_str) {
+    match write_sysfs(&remove_id_path, id_str) {
         Ok(()) => {
-            tracing::debug!(bdf, id = %id_str, "deregistered vfio-pci new_id");
+            tracing::debug!(bdf = ?bdf, id = %id_str, "deregistered vfio-pci new_id");
         }
         Err(_) => {
             tracing::debug!(
-                bdf, id = %id_str,
+                bdf = ?bdf, id = %id_str,
                 "vfio-pci remove_id write skipped (not registered or already removed)"
             );
         }
@@ -123,23 +107,12 @@ pub(crate) fn deregister_vfio_new_id(sysfs: &SysfsRoot, bdf: &str) {
 /// sysfs at call time, making it reliable even when the device has been
 /// physically removed or sysfs is otherwise inaccessible.
 pub(crate) fn deregister_vfio_id_by_value(sysfs: &SysfsRoot, id_str: &str) {
-    let remove_id_path = sysfs.vfio_pci_remove_id();
-    match write_sysfs(&remove_id_path, id_str) {
-        Ok(()) => {
-            tracing::debug!(id = %id_str, "deregistered vfio-pci new_id (by cached value)");
-        }
-        Err(_) => {
-            tracing::debug!(
-                id = %id_str,
-                "vfio-pci remove_id write skipped (not registered or already removed)"
-            );
-        }
-    }
+    deregister_vfio_id(sysfs, id_str, None);
 }
 
 pub(crate) fn clear_vfio_id_refcounts() {
-    if let Ok(mut map) = VFIO_ID_REFCOUNTS.lock() {
-        map.clear();
+    if let Ok(mut registry) = VFIO_ID_REGISTRY.lock() {
+        registry.clear();
     }
 }
 
@@ -280,9 +253,72 @@ pub(crate) fn restore_to_host_driver_ex(
     Ok(())
 }
 
+/// Process-local reference counter for vendor:device ID registrations in the
+/// vfio-pci match table. Multiple devices may share the same vendor:device
+/// pair. We only write to the kernel's `new_id`/`remove_id` sysfs files when
+/// the first device registers or the last device deregisters an ID.
+#[derive(Debug, Default)]
+struct VfioIdRegistry {
+    refcounts: HashMap<String, usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VfioIdRegistration {
+    FirstUser,
+    AlreadyTracked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VfioIdDeregistration {
+    LastUser,
+    StillInUse,
+    NotTracked,
+}
+
+impl VfioIdRegistry {
+    /// Record one active user of `id`.
+    ///
+    /// Returns the resulting process-local registration state.
+    fn register(&mut self, id: &str) -> VfioIdRegistration {
+        let count = self.refcounts.entry(id.to_string()).or_insert(0);
+        *count += 1;
+        if *count == 1 {
+            VfioIdRegistration::FirstUser
+        } else {
+            VfioIdRegistration::AlreadyTracked
+        }
+    }
+
+    /// Record one fewer active user of `id`.
+    ///
+    /// Returns the resulting process-local deregistration state.
+    fn deregister(&mut self, id: &str) -> VfioIdDeregistration {
+        match self.refcounts.get_mut(id) {
+            Some(count) if *count > 1 => {
+                *count -= 1;
+                VfioIdDeregistration::StillInUse
+            }
+            Some(_) => {
+                self.refcounts.remove(id);
+                VfioIdDeregistration::LastUser
+            }
+            None => VfioIdDeregistration::NotTracked,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.refcounts.clear();
+    }
+
+    #[cfg(test)]
+    fn remove(&mut self, id: &str) {
+        self.refcounts.remove(id);
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod test_refcounts {
-    use super::VFIO_ID_REFCOUNTS;
+    use super::VFIO_ID_REGISTRY;
     use std::sync::{Mutex, MutexGuard, PoisonError};
 
     static VFIO_ID_REFCOUNT_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -297,7 +333,7 @@ pub(crate) mod test_refcounts {
     /// Used by tests to clean up their own entries without disturbing
     /// parallel tests that hold refcounts for different device IDs.
     pub fn clear(id: &str) {
-        VFIO_ID_REFCOUNTS.lock().unwrap().remove(id);
+        VFIO_ID_REGISTRY.lock().unwrap().remove(id);
     }
 }
 
@@ -444,6 +480,51 @@ mod tests {
         assert_eq!(
             written, "10de 26b8",
             "second deregister should write to remove_id"
+        );
+    }
+
+    #[test]
+    fn test_deregister_by_cached_value_updates_refcount() {
+        let _refcount_guard = test_refcounts::guard();
+        test_refcounts::clear("10de 26ba");
+        let (tmp, sysfs) = setup_mock_sysfs();
+
+        create_pci_device(
+            &sysfs,
+            tmp.path(),
+            "0000:2d:00.0",
+            "0x10de",
+            "0x26ba",
+            "0x030000",
+            42,
+        );
+        create_pci_device(
+            &sysfs,
+            tmp.path(),
+            "0000:3b:00.0",
+            "0x10de",
+            "0x26ba",
+            "0x030200",
+            43,
+        );
+        create_new_id_file(&sysfs);
+        create_remove_id_file(&sysfs);
+
+        register_vfio_new_id(&sysfs, "0000:2d:00.0");
+        register_vfio_new_id(&sysfs, "0000:3b:00.0");
+
+        deregister_vfio_id_by_value(&sysfs, "10de 26ba");
+        let written = fs::read_to_string(sysfs.vfio_pci_remove_id()).unwrap();
+        assert_eq!(
+            written, "",
+            "cached deregister should respect remaining refcount users"
+        );
+
+        deregister_vfio_new_id(&sysfs, "0000:3b:00.0");
+        let written = fs::read_to_string(sysfs.vfio_pci_remove_id()).unwrap();
+        assert_eq!(
+            written, "10de 26ba",
+            "final deregister should write remove_id after cached release decremented refcount"
         );
     }
 
