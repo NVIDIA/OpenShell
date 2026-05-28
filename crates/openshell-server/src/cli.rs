@@ -111,6 +111,16 @@ struct RunArgs {
     )]
     drivers: Vec<ComputeDriverKind>,
 
+    /// Path to a Unix domain socket served by an external compute driver
+    /// implementing `compute_driver.proto`.
+    ///
+    /// When set, the gateway uses `ComputeDriverKind::External(<path>)` and
+    /// skips both the `--drivers` list and the auto-detection probe. This
+    /// lets out-of-tree driver binaries (Kyma, custom backends) connect to
+    /// an already-running gateway without rebuilding it.
+    #[arg(long, env = "OPENSHELL_COMPUTE_DRIVER_SOCKET")]
+    compute_driver_socket: Option<PathBuf>,
+
     /// Disable TLS entirely — listen on plaintext HTTP.
     /// Use this when the gateway sits behind a reverse proxy or tunnel
     /// (e.g. Cloudflare Tunnel) that terminates TLS at the edge.
@@ -350,9 +360,18 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
         config = config.with_metrics_bind_address(addr);
     }
 
+    // The --compute-driver-socket flag pins an external driver and overrides
+    // the --drivers list. `effective_single_driver` already mirrors this for
+    // pre-runtime checks; do the same here so `configured_compute_driver`
+    // sees the External entry when it inspects `config.compute_drivers`.
+    let configured_drivers = if let Some(socket) = args.compute_driver_socket.clone() {
+        vec![ComputeDriverKind::External(socket)]
+    } else {
+        args.drivers.clone()
+    };
     config = config
         .with_database_url(db_url)
-        .with_compute_drivers(args.drivers.clone())
+        .with_compute_drivers(configured_drivers)
         .with_server_sans(args.server_sans.clone())
         .with_loopback_service_http(args.enable_loopback_service_http);
 
@@ -611,6 +630,11 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
 }
 
 fn effective_single_driver(args: &RunArgs) -> Option<ComputeDriverKind> {
+    // The --compute-driver-socket flag pins an out-of-tree driver and
+    // therefore wins over both the explicit --drivers list and auto-detection.
+    if let Some(socket) = args.compute_driver_socket.clone() {
+        return Some(ComputeDriverKind::External(socket));
+    }
     match args.drivers.as_slice() {
         [] => openshell_core::config::detect_driver(),
         [driver] => Some(driver.clone()),
@@ -1426,6 +1450,80 @@ enable_loopback_service_http = false
             args.enable_loopback_service_http,
             "env var must win over file"
         );
+    }
+
+    #[test]
+    fn compute_driver_socket_flag_yields_external_driver() {
+        // The CLI flag pins ComputeDriverKind::External(<path>) so that
+        // out-of-tree drivers (Kyma, custom backends) can be wired without
+        // recompiling the gateway.
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g1 = EnvVarGuard::remove("OPENSHELL_COMPUTE_DRIVER_SOCKET");
+        let _g2 = EnvVarGuard::remove("OPENSHELL_DRIVERS");
+
+        let (args, _) = parse_with_args(&[
+            "openshell-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--compute-driver-socket",
+            "/tmp/openshell-driver.sock",
+        ]);
+
+        match super::effective_single_driver(&args) {
+            Some(super::ComputeDriverKind::External(p)) => {
+                assert_eq!(p, std::path::PathBuf::from("/tmp/openshell-driver.sock"));
+            }
+            other => panic!("expected External, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compute_driver_socket_flag_overrides_drivers_list() {
+        // Even when --drivers is set, --compute-driver-socket pins the
+        // external driver. This avoids forcing operators to wipe a
+        // gateway-wide --drivers list to add an out-of-tree driver.
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g1 = EnvVarGuard::remove("OPENSHELL_COMPUTE_DRIVER_SOCKET");
+        let _g2 = EnvVarGuard::remove("OPENSHELL_DRIVERS");
+
+        let (args, _) = parse_with_args(&[
+            "openshell-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--drivers",
+            "docker",
+            "--compute-driver-socket",
+            "/tmp/x.sock",
+        ]);
+
+        match super::effective_single_driver(&args) {
+            Some(super::ComputeDriverKind::External(p)) => {
+                assert_eq!(p, std::path::PathBuf::from("/tmp/x.sock"));
+            }
+            other => panic!("expected External, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compute_driver_socket_reads_from_env_var() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g1 = EnvVarGuard::set("OPENSHELL_COMPUTE_DRIVER_SOCKET", "/run/external.sock");
+        let _g2 = EnvVarGuard::remove("OPENSHELL_DRIVERS");
+
+        let (args, _) = parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
+
+        match super::effective_single_driver(&args) {
+            Some(super::ComputeDriverKind::External(p)) => {
+                assert_eq!(p, std::path::PathBuf::from("/run/external.sock"));
+            }
+            other => panic!("expected External, got {other:?}"),
+        }
     }
 
     #[test]
