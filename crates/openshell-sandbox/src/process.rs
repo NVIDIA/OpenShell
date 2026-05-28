@@ -20,7 +20,9 @@ use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::process::{Child, Command};
-use tracing::{debug, warn};
+use tracing::debug;
+#[cfg(target_os = "linux")]
+use tracing::warn;
 
 fn inject_provider_env(cmd: &mut Command, provider_env: &HashMap<String, String>) {
     for (key, value) in provider_env {
