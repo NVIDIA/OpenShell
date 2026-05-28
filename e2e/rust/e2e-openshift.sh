@@ -10,7 +10,8 @@
 #   - Chart dependencies built (helm dependency build deploy/helm/openshell)
 #
 # Usage:
-#   ./deploy/helm/openshell/ci/test-openshift-scenarios.sh [--chart-path ./deploy/helm/openshell] [--image-tag dev]
+#   mise run e2e:openshift
+#   e2e/rust/e2e-openshift.sh [--chart-path ./deploy/helm/openshell] [--image-tag dev]
 
 set -euo pipefail
 
