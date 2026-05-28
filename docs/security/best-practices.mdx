@@ -213,7 +213,7 @@ OpenShell applies seccomp in two phases. A narrow supervisor-startup prelude run
 | Aspect | Detail |
 |---|---|
 | Startup prelude | After privileged bootstrap helpers complete, the supervisor sets `PR_SET_NO_NEW_PRIVS` and synchronizes a seccomp filter across all runtime threads that blocks `mount`, the new mount API syscalls, `pivot_root`, `umount2`, `bpf`, `perf_event_open`, `userfaultfd`, module-loading syscalls, and kexec. This closes the long-lived privileged remount and kernel-surface window while leaving required setup syscalls such as `setns` available. |
-| Socket domains | The filter allows `AF_INET` and `AF_INET6` (for proxy communication) and blocks `AF_NETLINK`, `AF_PACKET`, `AF_BLUETOOTH`, and `AF_VSOCK` with `EPERM`. |
+| Socket domains | The filter allows `AF_INET` and `AF_INET6` (for proxy communication) and blocks `AF_PACKET`, `AF_BLUETOOTH`, and `AF_VSOCK` with `EPERM`. `AF_NETLINK` is partially allowed: only `NETLINK_ROUTE` (protocol 0) is permitted so that `getifaddrs(3)` works; all other netlink protocols are blocked. Write operations via `NETLINK_ROUTE` still require `CAP_NET_ADMIN`, which the sandbox does not grant. |
 | Runtime unconditional syscall blocks | `memfd_create`, `ptrace`, `bpf`, `process_vm_readv`, `process_vm_writev`, `pidfd_open`, `pidfd_getfd`, `pidfd_send_signal`, `io_uring_setup`, `mount`, `fsopen`, `fsconfig`, `fsmount`, `fspick`, `move_mount`, `open_tree`, `setns`, `umount2`, `pivot_root`, `userfaultfd`, `perf_event_open`. |
 | Conditional syscall blocks | `execveat` with `AT_EMPTY_PATH`, `unshare` and `clone` with `CLONE_NEWUSER`, and `seccomp(SECCOMP_SET_MODE_FILTER)` are denied with `EPERM`. |
 | What you can change | This is not a user-facing knob. OpenShell enforces it automatically. |

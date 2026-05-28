@@ -44,6 +44,10 @@ struct ProviderState {
     profiles: Arc<Mutex<HashMap<String, ProviderProfile>>>,
     refresh_statuses: Arc<Mutex<HashMap<(String, String), ProviderCredentialRefreshStatus>>>,
     refresh_requests: Arc<Mutex<Vec<ProviderRefreshRequestLog>>>,
+    delete_provider_requests: Arc<Mutex<Vec<String>>>,
+    fail_configure_refresh_message: Arc<Mutex<Option<String>>>,
+    fail_rotate_refresh_message: Arc<Mutex<Option<String>>>,
+    fail_delete_provider_message: Arc<Mutex<Option<String>>>,
     sandbox_providers: Arc<Mutex<HashMap<String, Vec<String>>>>,
     sandbox_provider_requests: Arc<Mutex<Vec<SandboxProviderRequestLog>>>,
     global_settings: Arc<Mutex<HashMap<String, SettingValue>>>,
@@ -336,6 +340,28 @@ impl OpenShell for TestOpenShell {
             .into_inner()
             .provider
             .ok_or_else(|| Status::invalid_argument("provider is required"))?;
+        if provider.credentials.is_empty() {
+            let bootstrap_allowed =
+                if let Some(profile) = openshell_providers::get_default_profile(&provider.r#type) {
+                    profile.allows_gateway_refresh_bootstrap()
+                } else {
+                    self.state
+                        .profiles
+                        .lock()
+                        .await
+                        .get(&provider.r#type)
+                        .cloned()
+                        .is_some_and(|profile| {
+                            openshell_providers::ProviderTypeProfile::from_proto(&profile)
+                                .allows_gateway_refresh_bootstrap()
+                        })
+                };
+            if !bootstrap_allowed {
+                return Err(Status::invalid_argument(
+                    "provider.credentials must not be empty",
+                ));
+            }
+        }
         let mut providers = self.state.providers.lock().await;
         let provider_name = provider.object_name().to_string();
         if providers.contains_key(&provider_name) {
@@ -567,6 +593,15 @@ impl OpenShell for TestOpenShell {
                 credential_key: request.credential_key.clone(),
                 expires_at_ms: request.expires_at_ms,
             });
+        let configure_failure = self
+            .state
+            .fail_configure_refresh_message
+            .lock()
+            .await
+            .take();
+        if let Some(message) = configure_failure {
+            return Err(Status::internal(message));
+        }
         let providers = self.state.providers.lock().await;
         let provider = providers
             .get(&request.provider)
@@ -600,21 +635,42 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<RotateProviderCredentialRequest>,
     ) -> Result<Response<RotateProviderCredentialResponse>, Status> {
         let request = request.into_inner();
+        let provider_name = request.provider.clone();
+        let credential_key = request.credential_key.clone();
         self.state
             .refresh_requests
             .lock()
             .await
             .push(ProviderRefreshRequestLog::Rotate {
-                provider_name: request.provider.clone(),
-                credential_key: request.credential_key.clone(),
+                provider_name: provider_name.clone(),
+                credential_key: credential_key.clone(),
             });
+        let rotate_failure = self.state.fail_rotate_refresh_message.lock().await.take();
+        if let Some(message) = rotate_failure {
+            return Err(Status::internal(message));
+        }
         let mut refresh_statuses = self.state.refresh_statuses.lock().await;
         let status = refresh_statuses
-            .get_mut(&(request.provider, request.credential_key))
+            .get_mut(&(provider_name.clone(), credential_key.clone()))
             .ok_or_else(|| Status::not_found("provider refresh state not found"))?;
-        status.status = "rotation_requested".to_string();
+        status.status = "refreshed".to_string();
+        status.last_refresh_at_ms = 1;
+        status.next_refresh_at_ms = 3_600_000;
+        status.expires_at_ms = 3_600_000;
+        let status = status.clone();
+        drop(refresh_statuses);
+        let mut providers = self.state.providers.lock().await;
+        let provider = providers
+            .get_mut(&provider_name)
+            .ok_or_else(|| Status::not_found("provider not found"))?;
+        provider
+            .credentials
+            .insert(credential_key.clone(), format!("minted-{credential_key}"));
+        provider
+            .credential_expires_at_ms
+            .insert(credential_key, 3_600_000);
         Ok(Response::new(RotateProviderCredentialResponse {
-            status: Some(status.clone()),
+            status: Some(status),
         }))
     }
 
@@ -646,6 +702,15 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<DeleteProviderRequest>,
     ) -> Result<Response<DeleteProviderResponse>, Status> {
         let name = request.into_inner().name;
+        self.state
+            .delete_provider_requests
+            .lock()
+            .await
+            .push(name.clone());
+        let delete_failure = self.state.fail_delete_provider_message.lock().await.take();
+        if let Some(message) = delete_failure {
+            return Err(Status::internal(message));
+        }
         let deleted = self.state.providers.lock().await.remove(&name).is_some();
         Ok(Response::new(DeleteProviderResponse { deleted }))
     }
@@ -922,6 +987,7 @@ async fn provider_cli_run_functions_support_full_crud_flow() {
         "claude",
         false,
         &["API_KEY=abc".to_string()],
+        false,
         &["profile=dev".to_string()],
         &ts.tls,
     )
@@ -971,6 +1037,7 @@ async fn provider_refresh_cli_run_functions_wire_requests() {
         "outlook",
         false,
         &["MS_GRAPH_ACCESS_TOKEN=token".to_string()],
+        false,
         &[],
         &ts.tls,
     )
@@ -1058,6 +1125,7 @@ async fn provider_create_allows_empty_credentials_for_gateway_refresh_profiles()
         "custom-refresh",
         false,
         &[],
+        false,
         &[],
         &ts.tls,
     )
@@ -1080,6 +1148,7 @@ async fn sandbox_provider_cli_run_functions_wire_requests_and_idempotent_results
         "github",
         false,
         &["GITHUB_TOKEN=ghp-test".to_string()],
+        false,
         &[],
         &ts.tls,
     )
@@ -1198,6 +1267,7 @@ binaries: [/usr/bin/custom]
         "custom-api",
         false,
         &["CUSTOM_API_KEY=abc".to_string()],
+        false,
         &[],
         &ts.tls,
     )
@@ -1251,6 +1321,7 @@ async fn provider_create_from_existing_uses_profile_discovery_when_v2_enabled() 
         "custom-discovery",
         true,
         &[],
+        false,
         &[],
         &ts.tls,
     )
@@ -1283,6 +1354,7 @@ async fn provider_create_from_existing_uses_registry_discovery_when_v2_disabled(
         "openai",
         true,
         &[],
+        false,
         &[],
         &ts.tls,
     )
@@ -1305,21 +1377,94 @@ async fn provider_create_from_existing_uses_registry_discovery_when_v2_disabled(
 }
 
 #[tokio::test]
+async fn provider_create_from_existing_vertex_discovers_credentials_and_config_when_v2_enabled() {
+    let ts = run_server().await;
+    enable_providers_v2(&ts).await;
+    let _env = EnvVarGuard::set(&[
+        ("VERTEX_AI_TOKEN", "ya29.vertex-v2-fallback"),
+        ("VERTEX_AI_PROJECT_ID", "vertex-v2-project"),
+        ("VERTEX_AI_REGION", "europe-west4"),
+        (
+            "GOOGLE_VERTEX_AI_BASE_URL",
+            "https://aiplatform.googleapis.com/v1beta1/projects/vertex-v2-project/locations/global/endpoints/openapi",
+        ),
+        ("VERTEX_AI_PUBLISHER", "anthropic"),
+    ]);
+
+    run::provider_create(
+        &ts.endpoint,
+        "vertex-v2-discovered",
+        "google-vertex-ai",
+        true,
+        &[],
+        false,
+        &[],
+        &ts.tls,
+    )
+    .await
+    .expect("vertex provider create --from-existing with v2 enabled");
+
+    let provider = ts
+        .state
+        .providers
+        .lock()
+        .await
+        .get("vertex-v2-discovered")
+        .cloned()
+        .expect("vertex provider should be stored");
+    assert_eq!(provider.r#type, "google-vertex-ai");
+    assert_eq!(
+        provider.credentials.get("VERTEX_AI_TOKEN"),
+        Some(&"ya29.vertex-v2-fallback".to_string())
+    );
+    assert_eq!(
+        provider.config.get("VERTEX_AI_PROJECT_ID"),
+        Some(&"vertex-v2-project".to_string())
+    );
+    assert_eq!(
+        provider.config.get("VERTEX_AI_REGION"),
+        Some(&"europe-west4".to_string())
+    );
+    assert_eq!(
+        provider.config.get("GOOGLE_VERTEX_AI_BASE_URL"),
+        Some(
+            &"https://aiplatform.googleapis.com/v1beta1/projects/vertex-v2-project/locations/global/endpoints/openapi"
+                .to_string()
+        )
+    );
+    assert_eq!(
+        provider.config.get("VERTEX_AI_PUBLISHER"),
+        Some(&"anthropic".to_string())
+    );
+}
+
+#[tokio::test]
 async fn provider_create_from_existing_requires_profile_when_v2_enabled() {
     let ts = run_server().await;
     enable_providers_v2(&ts).await;
-    let _env = EnvVarGuard::set(&[("OPENAI_API_KEY", "legacy-openai-secret")]);
+    // Use "generic" which is a normalised type but has no built-in provider
+    // profile, so v2 profile-based discovery fails with the expected message.
+    let _env = EnvVarGuard::set(&[("GENERIC_API_KEY", "some-secret")]);
 
-    let err = run::provider_create(&ts.endpoint, "v2-openai", "openai", true, &[], &[], &ts.tls)
-        .await
-        .expect_err("v2 discovery without a profile should fail");
+    let err = run::provider_create(
+        &ts.endpoint,
+        "v2-generic",
+        "generic",
+        true,
+        &[],
+        false,
+        &[],
+        &ts.tls,
+    )
+    .await
+    .expect_err("v2 discovery without a profile should fail");
 
     assert!(
         err.to_string()
             .contains("providers v2 discovery requires a provider profile"),
         "unexpected error: {err}"
     );
-    assert!(!ts.state.providers.lock().await.contains_key("v2-openai"));
+    assert!(!ts.state.providers.lock().await.contains_key("v2-generic"));
 }
 
 #[tokio::test]
@@ -1350,6 +1495,7 @@ async fn provider_create_from_existing_fails_when_profile_discovery_finds_nothin
         "empty-discovery",
         true,
         &[],
+        false,
         &[],
         &ts.tls,
     )
@@ -1603,6 +1749,7 @@ async fn provider_create_rejects_key_only_credentials_without_local_env_value() 
         "claude",
         false,
         &["INVALID_PAIR".to_string()],
+        false,
         &[],
         &ts.tls,
     )
@@ -1627,6 +1774,7 @@ async fn provider_create_supports_generic_type_and_env_lookup_credentials() {
         "generic",
         false,
         &["NAV_GENERIC_TEST_KEY".to_string()],
+        false,
         &[],
         &ts.tls,
     )
@@ -1661,6 +1809,7 @@ async fn provider_create_rejects_combined_from_existing_and_credentials() {
         "claude",
         true,
         &["API_KEY=abc".to_string()],
+        false,
         &[],
         &ts.tls,
     )
@@ -1675,6 +1824,56 @@ async fn provider_create_rejects_combined_from_existing_and_credentials() {
 }
 
 #[tokio::test]
+async fn provider_create_rejects_combined_from_gcloud_adc_and_from_existing() {
+    let ts = run_server().await;
+
+    let err = run::provider_create(
+        &ts.endpoint,
+        "bad-vertex-provider",
+        "google-vertex-ai",
+        true,
+        &[],
+        true,
+        &[],
+        &ts.tls,
+    )
+    .await
+    .expect_err("from-gcloud-adc and from-existing should be mutually exclusive");
+
+    assert!(
+        err.to_string()
+            .contains("--from-gcloud-adc cannot be combined with --from-existing or --credential"),
+        "unexpected error: {err}"
+    );
+    assert!(ts.state.providers.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn provider_create_rejects_combined_from_gcloud_adc_and_credentials() {
+    let ts = run_server().await;
+
+    let err = run::provider_create(
+        &ts.endpoint,
+        "bad-vertex-provider",
+        "google-vertex-ai",
+        false,
+        &["GOOGLE_VERTEX_AI_TOKEN=token".to_string()],
+        true,
+        &[],
+        &ts.tls,
+    )
+    .await
+    .expect_err("from-gcloud-adc and credentials should be mutually exclusive");
+
+    assert!(
+        err.to_string()
+            .contains("--from-gcloud-adc cannot be combined with --from-existing or --credential"),
+        "unexpected error: {err}"
+    );
+    assert!(ts.state.providers.lock().await.is_empty());
+}
+
+#[tokio::test]
 async fn provider_create_rejects_empty_env_var_for_key_only_credential() {
     let ts = run_server().await;
     let _guard = EnvVarGuard::set(&[("NAV_EMPTY_ENV_KEY", "")]);
@@ -1685,6 +1884,7 @@ async fn provider_create_rejects_empty_env_var_for_key_only_credential() {
         "generic",
         false,
         &["NAV_EMPTY_ENV_KEY".to_string()],
+        false,
         &[],
         &ts.tls,
     )
@@ -1709,6 +1909,7 @@ async fn provider_create_supports_nvidia_type_with_nvidia_api_key() {
         "nvidia",
         false,
         &["NVIDIA_API_KEY".to_string()],
+        false,
         &[],
         &ts.tls,
     )
@@ -1730,5 +1931,544 @@ async fn provider_create_supports_nvidia_type_with_nvidia_api_key() {
     assert_eq!(
         provider.credentials.get("NVIDIA_API_KEY"),
         Some(&"nvapi-live-test".to_string())
+    );
+}
+
+// ── --from-gcloud-adc tests ───────────────────────────────────────────────────
+
+#[tokio::test]
+async fn provider_create_from_gcloud_adc_happy_path() {
+    let ts = run_server().await;
+
+    // Write a temp ADC file simulating a valid authorized_user credential.
+    let adc_content = serde_json::json!({
+        "type": "authorized_user",
+        "client_id": "test-client-id.apps.googleusercontent.com",
+        "client_secret": "test-client-secret",
+        "refresh_token": "1//test-refresh-token"
+    });
+    let adc_file = tempfile::NamedTempFile::new().unwrap();
+    serde_json::to_writer(&adc_file, &adc_content).unwrap();
+
+    // Point GOOGLE_APPLICATION_CREDENTIALS at the temp file so read_gcloud_adc
+    // picks it up without touching the real ~/.config/gcloud/ path.
+    let adc_path = adc_file.path().to_str().unwrap().to_string();
+    let _guard = EnvVarGuard::set(&[("GOOGLE_APPLICATION_CREDENTIALS", &adc_path)]);
+
+    run::provider_create(
+        &ts.endpoint,
+        "my-vertex",
+        "google-vertex-ai",
+        false,
+        &[],  // no explicit credentials; refresh bootstrap covers it
+        true, // from_gcloud_adc
+        &[],
+        &ts.tls,
+    )
+    .await
+    .expect("provider_create with --from-gcloud-adc should succeed");
+
+    // Provider must exist in the server state.
+    let providers = ts.state.providers.lock().await;
+    let provider = providers
+        .get("my-vertex")
+        .expect("provider should be stored after create");
+    assert_eq!(provider.r#type, "google-vertex-ai");
+    assert_eq!(
+        provider
+            .credentials
+            .get("GOOGLE_VERTEX_AI_TOKEN")
+            .map(String::as_str),
+        Some("minted-GOOGLE_VERTEX_AI_TOKEN"),
+        "initial rotate should materialize a usable access token"
+    );
+    drop(providers);
+
+    // ADC bootstrap must configure refresh and immediately mint the first token.
+    let requests = ts.state.refresh_requests.lock().await.clone();
+    assert_eq!(
+        requests.len(),
+        2,
+        "expected configure + rotate refresh requests"
+    );
+    assert_eq!(
+        requests[0],
+        ProviderRefreshRequestLog::Configure {
+            provider_name: "my-vertex".to_string(),
+            credential_key: "GOOGLE_VERTEX_AI_TOKEN".to_string(),
+            expires_at_ms: None,
+        }
+    );
+    assert_eq!(
+        requests[1],
+        ProviderRefreshRequestLog::Rotate {
+            provider_name: "my-vertex".to_string(),
+            credential_key: "GOOGLE_VERTEX_AI_TOKEN".to_string(),
+        }
+    );
+
+    // The refresh status must record the ADC material keys.
+    let refresh_statuses = ts.state.refresh_statuses.lock().await;
+    let status = refresh_statuses
+        .get(&(
+            "my-vertex".to_string(),
+            "GOOGLE_VERTEX_AI_TOKEN".to_string(),
+        ))
+        .expect("refresh status should be stored");
+    assert_eq!(
+        status.strategy,
+        ProviderCredentialRefreshStrategy::Oauth2RefreshToken as i32
+    );
+}
+
+#[tokio::test]
+async fn provider_create_from_gcloud_adc_rejects_service_account() {
+    let ts = run_server().await;
+
+    // Write a temp ADC file with type=service_account.
+    let adc_content = serde_json::json!({
+        "type": "service_account",
+        "project_id": "my-project",
+        "private_key_id": "key-id",
+        "private_key": "-----BEGIN RSA PRIVATE KEY-----\n...",
+        "client_email": "sa@my-project.iam.gserviceaccount.com"
+    });
+    let adc_file = tempfile::NamedTempFile::new().unwrap();
+    serde_json::to_writer(&adc_file, &adc_content).unwrap();
+
+    let adc_path = adc_file.path().to_str().unwrap().to_string();
+    let _guard = EnvVarGuard::set(&[("GOOGLE_APPLICATION_CREDENTIALS", &adc_path)]);
+
+    let err = run::provider_create(
+        &ts.endpoint,
+        "my-vertex-sa",
+        "google-vertex-ai",
+        false,
+        &[],
+        true,
+        &[],
+        &ts.tls,
+    )
+    .await
+    .expect_err("service_account ADC should be rejected");
+
+    assert!(
+        err.to_string()
+            .contains("GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN"),
+        "error should mention the service-account token key, got: {err}"
+    );
+
+    // create_provider must NOT have been called — no provider stored.
+    let providers = ts.state.providers.lock().await;
+    assert!(
+        providers.is_empty(),
+        "no provider should have been created on pre-flight failure"
+    );
+}
+
+#[tokio::test]
+async fn provider_create_from_gcloud_adc_missing_file() {
+    let ts = run_server().await;
+
+    // Point to a path that does not exist.
+    let _guard = EnvVarGuard::set(&[(
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "/tmp/nonexistent-adc-file-openshell-test.json",
+    )]);
+
+    let err = run::provider_create(
+        &ts.endpoint,
+        "my-vertex-missing",
+        "google-vertex-ai",
+        false,
+        &[],
+        true,
+        &[],
+        &ts.tls,
+    )
+    .await
+    .expect_err("missing ADC file should produce an error");
+
+    // Error must mention the file path or the read failure.
+    let msg = err.to_string();
+    assert!(
+        msg.contains("nonexistent-adc-file-openshell-test.json")
+            || msg.contains("failed to read gcloud ADC file"),
+        "error should reference the missing file, got: {msg}"
+    );
+
+    // create_provider must NOT have been called — no provider stored.
+    let providers = ts.state.providers.lock().await;
+    assert!(
+        providers.is_empty(),
+        "no provider should have been created on pre-flight failure"
+    );
+}
+
+#[tokio::test]
+async fn provider_create_from_gcloud_adc_rejects_wrong_provider_type_before_credential_check() {
+    let ts = run_server().await;
+
+    let err = run::provider_create(
+        &ts.endpoint,
+        "my-openai-adc",
+        "openai",
+        false,
+        &[],
+        true,
+        &[],
+        &ts.tls,
+    )
+    .await
+    .expect_err("wrong provider type should fail before generic credential validation");
+
+    assert!(
+        err.to_string()
+            .contains("--from-gcloud-adc is only valid for google-vertex-ai providers"),
+        "unexpected error: {err}"
+    );
+    assert!(ts.state.providers.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn provider_create_from_gcloud_adc_rolls_back_provider_when_refresh_configure_fails() {
+    let ts = run_server().await;
+    *ts.state.fail_configure_refresh_message.lock().await =
+        Some("simulated configure failure".to_string());
+
+    let adc_content = serde_json::json!({
+        "type": "authorized_user",
+        "client_id": "test-client-id.apps.googleusercontent.com",
+        "client_secret": "test-client-secret",
+        "refresh_token": "1//test-refresh-token"
+    });
+    let adc_file = tempfile::NamedTempFile::new().unwrap();
+    serde_json::to_writer(&adc_file, &adc_content).unwrap();
+    let adc_path = adc_file.path().to_str().unwrap().to_string();
+    let _guard = EnvVarGuard::set(&[("GOOGLE_APPLICATION_CREDENTIALS", &adc_path)]);
+
+    let err = run::provider_create(
+        &ts.endpoint,
+        "vertex-rollback",
+        "google-vertex-ai",
+        false,
+        &[],
+        true,
+        &[],
+        &ts.tls,
+    )
+    .await
+    .expect_err("configure_provider_refresh failure should bubble up");
+
+    assert!(
+        err.to_string().contains("simulated configure failure"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        !ts.state
+            .providers
+            .lock()
+            .await
+            .contains_key("vertex-rollback"),
+        "provider should be deleted on rollback"
+    );
+    assert_eq!(
+        ts.state.delete_provider_requests.lock().await.clone(),
+        vec!["vertex-rollback".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn provider_create_from_gcloud_adc_warn_path_keeps_provider_when_rollback_delete_fails() {
+    let ts = run_server().await;
+    *ts.state.fail_configure_refresh_message.lock().await =
+        Some("simulated configure failure".to_string());
+    *ts.state.fail_delete_provider_message.lock().await =
+        Some("simulated delete failure".to_string());
+
+    let adc_content = serde_json::json!({
+        "type": "authorized_user",
+        "client_id": "test-client-id.apps.googleusercontent.com",
+        "client_secret": "test-client-secret",
+        "refresh_token": "1//test-refresh-token"
+    });
+    let adc_file = tempfile::NamedTempFile::new().unwrap();
+    serde_json::to_writer(&adc_file, &adc_content).unwrap();
+    let adc_path = adc_file.path().to_str().unwrap().to_string();
+    let _guard = EnvVarGuard::set(&[("GOOGLE_APPLICATION_CREDENTIALS", &adc_path)]);
+
+    let err = run::provider_create(
+        &ts.endpoint,
+        "vertex-cleanup-warning",
+        "google-vertex-ai",
+        false,
+        &[],
+        true,
+        &[],
+        &ts.tls,
+    )
+    .await
+    .expect_err("cleanup failure path should still return configure error");
+
+    assert!(
+        err.to_string().contains("simulated configure failure"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        ts.state
+            .providers
+            .lock()
+            .await
+            .contains_key("vertex-cleanup-warning"),
+        "provider should remain when rollback deletion fails"
+    );
+    assert_eq!(
+        ts.state.delete_provider_requests.lock().await.clone(),
+        vec!["vertex-cleanup-warning".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn provider_create_from_gcloud_adc_rolls_back_provider_when_initial_rotate_fails() {
+    let ts = run_server().await;
+    *ts.state.fail_rotate_refresh_message.lock().await =
+        Some("simulated rotate failure".to_string());
+
+    let adc_content = serde_json::json!({
+        "type": "authorized_user",
+        "client_id": "test-client-id.apps.googleusercontent.com",
+        "client_secret": "test-client-secret",
+        "refresh_token": "1//test-refresh-token"
+    });
+    let adc_file = tempfile::NamedTempFile::new().unwrap();
+    serde_json::to_writer(&adc_file, &adc_content).unwrap();
+    let adc_path = adc_file.path().to_str().unwrap().to_string();
+    let _guard = EnvVarGuard::set(&[("GOOGLE_APPLICATION_CREDENTIALS", &adc_path)]);
+
+    let err = run::provider_create(
+        &ts.endpoint,
+        "vertex-rotate-rollback",
+        "google-vertex-ai",
+        false,
+        &[],
+        true,
+        &[],
+        &ts.tls,
+    )
+    .await
+    .expect_err("initial rotate failure should roll back the provider");
+
+    assert!(
+        err.to_string().contains("simulated rotate failure"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        !ts.state
+            .providers
+            .lock()
+            .await
+            .contains_key("vertex-rotate-rollback"),
+        "provider should be deleted on initial-rotate rollback"
+    );
+    assert_eq!(
+        ts.state.delete_provider_requests.lock().await.clone(),
+        vec!["vertex-rotate-rollback".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn provider_create_from_existing_vertex_config_only_reports_missing_vertex_credentials() {
+    let ts = run_server().await;
+    enable_providers_v2(&ts).await;
+    let _env = EnvVarGuard::set(&[
+        ("VERTEX_AI_PROJECT_ID", "vertex-config-only-project"),
+        ("VERTEX_AI_REGION", "us-central1"),
+    ]);
+
+    let err = run::provider_create(
+        &ts.endpoint,
+        "vertex-config-only",
+        "google-vertex-ai",
+        true,
+        &[],
+        false,
+        &[],
+        &ts.tls,
+    )
+    .await
+    .expect_err("config-only discovery should surface missing credential guidance");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("GOOGLE_VERTEX_AI_TOKEN") && msg.contains("VERTEX_AI_SERVICE_ACCOUNT_TOKEN"),
+        "unexpected error: {msg}"
+    );
+    assert!(
+        !ts.state
+            .providers
+            .lock()
+            .await
+            .contains_key("vertex-config-only")
+    );
+}
+
+#[tokio::test]
+async fn provider_create_from_gcloud_adc_with_config_keys() {
+    let ts = run_server().await;
+
+    // Write a valid authorized_user ADC file.
+    let adc_content = serde_json::json!({
+        "type": "authorized_user",
+        "client_id": "test-client-id.apps.googleusercontent.com",
+        "client_secret": "test-client-secret",
+        "refresh_token": "1//test-refresh-token"
+    });
+    let adc_file = tempfile::NamedTempFile::new().unwrap();
+    serde_json::to_writer(&adc_file, &adc_content).unwrap();
+    let adc_path = adc_file.path().to_str().unwrap().to_string();
+    let _guard = EnvVarGuard::set(&[("GOOGLE_APPLICATION_CREDENTIALS", &adc_path)]);
+
+    run::provider_create(
+        &ts.endpoint,
+        "vertex-with-config",
+        "google-vertex-ai",
+        false,
+        &[],  // no explicit credentials; ADC flow
+        true, // from_gcloud_adc
+        &[
+            "VERTEX_AI_PROJECT_ID=my-gcp-project".to_string(),
+            "VERTEX_AI_REGION=us-east1".to_string(),
+        ],
+        &ts.tls,
+    )
+    .await
+    .expect("provider_create with --from-gcloud-adc and --config keys should succeed");
+
+    // Verify provider was created with the config keys.
+    let providers = ts.state.providers.lock().await;
+    let provider = providers
+        .get("vertex-with-config")
+        .expect("provider should be stored after create");
+    assert_eq!(provider.r#type, "google-vertex-ai");
+    assert_eq!(
+        provider
+            .config
+            .get("VERTEX_AI_PROJECT_ID")
+            .map(String::as_str),
+        Some("my-gcp-project"),
+        "VERTEX_AI_PROJECT_ID must be stored in provider config"
+    );
+    assert_eq!(
+        provider.config.get("VERTEX_AI_REGION").map(String::as_str),
+        Some("us-east1"),
+        "VERTEX_AI_REGION must be stored in provider config"
+    );
+    drop(providers);
+
+    // ADC flow should configure refresh and eagerly mint the initial token.
+    let refresh_requests = ts.state.refresh_requests.lock().await.clone();
+    assert_eq!(
+        refresh_requests.len(),
+        2,
+        "exactly one configure call and one rotate call expected"
+    );
+    assert_eq!(
+        refresh_requests[0],
+        ProviderRefreshRequestLog::Configure {
+            provider_name: "vertex-with-config".to_string(),
+            credential_key: "GOOGLE_VERTEX_AI_TOKEN".to_string(),
+            expires_at_ms: None,
+        }
+    );
+    assert_eq!(
+        refresh_requests[1],
+        ProviderRefreshRequestLog::Rotate {
+            provider_name: "vertex-with-config".to_string(),
+            credential_key: "GOOGLE_VERTEX_AI_TOKEN".to_string(),
+        }
+    );
+}
+
+#[tokio::test]
+async fn provider_create_from_gcloud_adc_missing_refresh_token() {
+    let ts = run_server().await;
+
+    // ADC file is valid authorized_user type but missing refresh_token.
+    let adc_content = serde_json::json!({
+        "type": "authorized_user",
+        "client_id": "test-client-id.apps.googleusercontent.com",
+        "client_secret": "test-client-secret"
+    });
+    let adc_file = tempfile::NamedTempFile::new().unwrap();
+    serde_json::to_writer(&adc_file, &adc_content).unwrap();
+    let adc_path = adc_file.path().to_str().unwrap().to_string();
+    let _guard = EnvVarGuard::set(&[("GOOGLE_APPLICATION_CREDENTIALS", &adc_path)]);
+
+    let err = run::provider_create(
+        &ts.endpoint,
+        "vertex-missing-refresh",
+        "google-vertex-ai",
+        false,
+        &[],
+        true,
+        &[],
+        &ts.tls,
+    )
+    .await
+    .expect_err("missing refresh_token should produce an error");
+
+    let err_msg = err.to_string();
+    assert!(
+        err_msg.contains("refresh_token"),
+        "error must mention 'refresh_token', got: {err_msg}"
+    );
+
+    // No provider should have been created.
+    let providers = ts.state.providers.lock().await;
+    assert!(
+        providers.is_empty(),
+        "no provider must be created when ADC validation fails"
+    );
+}
+
+#[tokio::test]
+async fn provider_create_from_gcloud_adc_missing_client_secret() {
+    let ts = run_server().await;
+
+    // ADC file is valid authorized_user type but missing client_secret.
+    let adc_content = serde_json::json!({
+        "type": "authorized_user",
+        "client_id": "test-client-id.apps.googleusercontent.com",
+        "refresh_token": "1//test-refresh-token"
+    });
+    let adc_file = tempfile::NamedTempFile::new().unwrap();
+    serde_json::to_writer(&adc_file, &adc_content).unwrap();
+    let adc_path = adc_file.path().to_str().unwrap().to_string();
+    let _guard = EnvVarGuard::set(&[("GOOGLE_APPLICATION_CREDENTIALS", &adc_path)]);
+
+    let err = run::provider_create(
+        &ts.endpoint,
+        "vertex-missing-secret",
+        "google-vertex-ai",
+        false,
+        &[],
+        true,
+        &[],
+        &ts.tls,
+    )
+    .await
+    .expect_err("missing client_secret should produce an error");
+
+    let err_msg = err.to_string();
+    assert!(
+        err_msg.contains("client_secret"),
+        "error must mention 'client_secret', got: {err_msg}"
+    );
+
+    // No provider should have been created.
+    let providers = ts.state.providers.lock().await;
+    assert!(
+        providers.is_empty(),
+        "no provider must be created when ADC validation fails"
     );
 }

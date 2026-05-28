@@ -24,9 +24,9 @@ If code calls an external inference host directly, OpenShell evaluates that traf
 | Property | Detail |
 |---|---|
 | Credentials | No sandbox API keys needed. Credentials come from the configured provider record. The router strips caller-supplied `Authorization` before forwarding the request. |
-| Header forwarding | `inference.local` forwards only a per-provider header allowlist. OpenAI routes allow `openai-organization` and `x-model-id`. Anthropic routes allow `anthropic-version` and `anthropic-beta`. NVIDIA routes allow `x-model-id`. All other caller headers are stripped. |
+| Header forwarding | `inference.local` forwards only a per-provider header allowlist. OpenAI routes allow `openai-organization` and `x-model-id`. Anthropic routes allow `anthropic-version` and `anthropic-beta`. Vertex Claude rawPredict routes strip `anthropic-beta` and do not forward `anthropic-version` as a header because the router injects `anthropic_version` into the Vertex request body. NVIDIA routes allow `x-model-id`. All other caller headers are stripped. |
 | Configuration | One provider and one model define sandbox inference for the active gateway. Every sandbox on that gateway sees the same `inference.local` backend. |
-| Provider support | NVIDIA, any OpenAI-compatible provider, and Anthropic all work through the same endpoint. |
+| Provider support | NVIDIA, Anthropic, Google Vertex AI, and any OpenAI-compatible provider all work through the same endpoint. Vertex routes Claude models through `/v1/messages` and non-Anthropic models through `/v1/chat/completions`. The gateway resolves the upstream Vertex host from the provider config, including regional, global, and supported multi-region endpoints. |
 | Streaming reliability | The router tolerates idle gaps of up to 120 seconds between streamed chunks so long reasoning responses are not cut off mid-stream. |
 | Hot refresh | OpenShell picks up provider credential changes and inference updates without recreating sandboxes. Changes propagate within about 5 seconds by default. |
 
@@ -57,6 +57,8 @@ Supported request patterns depend on the provider configured for `inference.loca
 </Tabs>
 
 Requests to `inference.local` that do not match the configured provider's supported patterns are denied.
+
+Google Vertex AI does not expose every OpenAI-compatible path through `inference.local`. Vertex routes for Gemini and other non-Anthropic models currently support Chat Completions. Vertex routes for Claude models use the Anthropic Messages pattern. Base URL overrides are only supported for non-Anthropic Vertex routes.
 
 ## Configure Inference Routing
 
@@ -98,6 +100,21 @@ openshell provider create \
 ```
 
 Replace the base URL and API key with the values from your provider. For supported providers out of the box, refer to [Supported Inference Providers](/sandboxes/manage-providers#supported-inference-providers). For other providers, refer to your provider's documentation for the correct base URL, available models, and API key setup.
+
+</Tab>
+
+<Tab title="Google Vertex AI">
+
+```shell
+openshell provider create \
+    --name vertex-local \
+    --type google-vertex-ai \
+    --from-gcloud-adc \
+    --config VERTEX_AI_PROJECT_ID=my-gcp-project \
+    --config VERTEX_AI_REGION=us-central1
+```
+
+Use [Google Vertex AI](/providers/google-vertex-ai) for the full auth flows, including the production service-account refresh path, ADC-backed providers that mint `GOOGLE_VERTEX_AI_TOKEN`, and `--from-existing` support.
 
 </Tab>
 
