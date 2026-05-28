@@ -1099,6 +1099,52 @@ async fn provider_refresh_cli_run_functions_wire_requests() {
 }
 
 #[tokio::test]
+async fn okta_provider_refresh_cli_supports_runtime_refresh_shape() {
+    let ts = run_server().await;
+
+    run::provider_create(
+        &ts.endpoint,
+        "okta-runtime",
+        "okta",
+        false,
+        &["OKTA_ACCESS_TOKEN=token".to_string()],
+        &[],
+        &ts.tls,
+    )
+    .await
+    .expect("provider create");
+
+    run::provider_refresh_config(
+        &ts.endpoint,
+        run::ProviderRefreshConfigInput {
+            name: "okta-runtime",
+            credential_key: "OKTA_ACCESS_TOKEN",
+            strategy: "oauth2_refresh_token",
+            material: &[
+                "client_id=client-123".to_string(),
+                "refresh_token=refresh-abc".to_string(),
+                "scope=okta.apps.read".to_string(),
+            ],
+            secret_material_keys: &["refresh_token".to_string()],
+            credential_expires_at_ms: Some(1_767_225_600_000),
+        },
+        &ts.tls,
+    )
+    .await
+    .expect("provider refresh configure");
+
+    let requests = ts.state.refresh_requests.lock().await.clone();
+    assert!(
+        requests.contains(&ProviderRefreshRequestLog::Configure {
+            provider_name: "okta-runtime".to_string(),
+            credential_key: "OKTA_ACCESS_TOKEN".to_string(),
+            expires_at_ms: Some(1_767_225_600_000),
+        }),
+        "expected configure request for okta runtime provider"
+    );
+}
+
+#[tokio::test]
 async fn provider_create_allows_empty_credentials_for_gateway_refresh_profiles() {
     let ts = run_server().await;
     ts.state.profiles.lock().await.insert(
@@ -1675,6 +1721,37 @@ binaries:
     assert!(endpoint.allow_encoded_slash);
     assert_eq!(endpoint.path, "/v1");
     assert!(profile.binaries[0].harness);
+}
+
+#[tokio::test]
+async fn built_in_okta_profile_is_available_via_provider_profile_api() {
+    let ts = run_server().await;
+
+    let mut client = openshell_cli::tls::grpc_client(&ts.endpoint, &ts.tls)
+        .await
+        .expect("grpc client should connect");
+    let profile = client
+        .get_provider_profile(openshell_core::proto::GetProviderProfileRequest {
+            id: "okta".to_string(),
+        })
+        .await
+        .expect("get provider profile")
+        .into_inner()
+        .profile
+        .expect("profile should exist");
+
+    assert_eq!(profile.id, "okta");
+    assert_eq!(profile.credentials.len(), 1);
+    assert_eq!(profile.credentials[0].env_vars, vec!["OKTA_ACCESS_TOKEN"]);
+    let refresh = profile.credentials[0]
+        .refresh
+        .as_ref()
+        .expect("okta profile should include refresh metadata");
+    assert_eq!(
+        refresh.strategy,
+        ProviderCredentialRefreshStrategy::Oauth2RefreshToken as i32
+    );
+    assert_eq!(refresh.token_url, "https://example.okta.com/oauth2/default/v1/token");
 }
 
 #[tokio::test]

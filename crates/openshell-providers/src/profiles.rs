@@ -21,6 +21,7 @@ const BUILT_IN_PROFILE_YAMLS: &[&str] = &[
     include_str!("../../../providers/github.yaml"),
     include_str!("../../../providers/google-vertex-ai.yaml"),
     include_str!("../../../providers/nvidia.yaml"),
+    include_str!("../../../providers/okta.yaml"),
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -1123,7 +1124,7 @@ pub fn get_default_profile(id: &str) -> Option<&'static ProviderTypeProfile> {
 
 #[cfg(test)]
 mod tests {
-    use openshell_core::proto::ProviderProfileCategory;
+    use openshell_core::proto::{ProviderCredentialRefreshStrategy, ProviderProfileCategory};
 
     use super::{
         DiscoveryProfile, ProfileError, ProviderTypeProfile, default_profiles, get_default_profile,
@@ -1170,6 +1171,38 @@ mod tests {
             "github profile endpoints should all be read-only"
         );
         assert_eq!(proto.binaries.len(), 4);
+    }
+
+    #[test]
+    fn okta_profile_exposes_refreshable_runtime_token_shape() {
+        let profile = get_default_profile("okta").expect("okta profile");
+        let proto = profile.to_proto();
+
+        assert_eq!(proto.id, "okta");
+        assert_eq!(proto.credentials.len(), 1);
+        let credential = &proto.credentials[0];
+        assert_eq!(credential.name, "access_token");
+        assert_eq!(credential.env_vars, vec!["OKTA_ACCESS_TOKEN"]);
+
+        let refresh = credential.refresh.as_ref().expect("okta refresh metadata");
+        assert_eq!(
+            refresh.strategy,
+            ProviderCredentialRefreshStrategy::Oauth2RefreshToken as i32
+        );
+        assert_eq!(
+            refresh.token_url,
+            "https://example.okta.com/oauth2/default/v1/token"
+        );
+        assert!(
+            refresh.material.iter().any(|entry| {
+                entry.name == "refresh_token" && entry.required && entry.secret
+            }),
+            "okta profile should require a secret refresh token material entry"
+        );
+        assert!(
+            refresh.material.iter().any(|entry| entry.name == "client_id" && entry.required),
+            "okta profile should require client_id refresh material"
+        );
     }
 
     #[test]

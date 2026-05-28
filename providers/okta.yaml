@@ -1,0 +1,43 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+id: okta
+display_name: Okta
+description: Okta OAuth access tokens for runtime sandbox access
+category: other
+credentials:
+  - name: access_token
+    description: Okta OAuth access token
+    env_vars: [OKTA_ACCESS_TOKEN]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+    refresh:
+      strategy: oauth2_refresh_token
+      token_url: https://example.okta.com/oauth2/default/v1/token
+      refresh_before_seconds: 300
+      max_lifetime_seconds: 3600
+      material:
+        - name: client_id
+          description: Okta OIDC application client ID
+          required: true
+        - name: refresh_token
+          description: Okta OAuth refresh token
+          required: true
+          secret: true
+        - name: client_secret
+          description: Okta client secret for confidential applications
+          required: false
+          secret: true
+        - name: scope
+          description: Space-delimited scopes requested during refresh
+          required: false
+endpoints:
+  - host: example.okta.com
+    port: 443
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+binaries:
+  - /usr/bin/curl
+  - /usr/local/bin/curl

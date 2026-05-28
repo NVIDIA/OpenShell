@@ -1,0 +1,162 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Refresh Okta Runtime Credentials with Providers v2"
+sidebar-title: "Okta Provider Refresh"
+slug: "get-started/tutorials/okta-provider-refresh"
+description: "Configure the built-in Okta provider profile with gateway-managed OAuth2 refresh-token rotation."
+keywords: "Generative AI, Cybersecurity, Tutorial, Providers, Okta, OAuth2, Credential Refresh, Sandbox"
+---
+
+Use Providers v2 to keep Okta access tokens short lived while sandboxes receive a stable `OKTA_ACCESS_TOKEN` placeholder. OpenShell stores the non-injectable refresh material at the gateway, refreshes the Okta access token before it expires, updates the provider record, and injects the current credential into newly launched sandbox processes.
+
+After completing this tutorial, you have:
+
+- The built-in `okta` provider profile available on the gateway.
+- A provider instance configured with `oauth2-refresh-token`.
+- A sandbox that can call an Okta-protected API through provider-owned policy.
+
+<Note>
+This tutorial targets the runtime credential lane. It assumes you already have an Okta OAuth refresh token from a standards-compliant sign-in flow outside OpenShell. It does not cover delegated token exchange or workforce gateway login.
+</Note>
+
+## Prerequisites
+
+- A working OpenShell installation with an active gateway. Complete the [Quickstart](/get-started/quickstart) before proceeding.
+- An Okta custom authorization server and OAuth application that can mint refresh tokens.
+- An Okta-protected API or resource server you want the sandbox to call.
+- OAuth material from your initial sign-in flow:
+
+| Variable | Value |
+|---|---|
+| `OKTA_CLIENT_ID` | Okta OAuth application client ID. |
+| `OKTA_ACCESS_TOKEN` | Current Okta access token. |
+| `OKTA_REFRESH_TOKEN` | Okta OAuth refresh token. |
+| `OKTA_ACCESS_TOKEN_EXPIRES_AT` | Absolute expiry for the current access token. |
+| `OKTA_SCOPES` | Space-delimited scopes to request during refresh. |
+
+`OKTA_ACCESS_TOKEN_EXPIRES_AT` can be an RFC3339 timestamp such as `2026-01-01T00:00:00Z` or a Unix epoch millisecond timestamp.
+
+<Warning>
+Do not commit access tokens, refresh tokens, client secrets, or local `.env` files. The commands below pass token material to the gateway; they are not examples of values to store in source control.
+</Warning>
+
+<Steps toc={true}>
+
+## Enable Providers v2
+
+Enable provider profile policy composition on the active gateway:
+
+```shell
+openshell settings set --global --key providers_v2_enabled --value true --yes
+```
+
+## Inspect the Built-in Okta Profile
+
+Export the built-in profile to inspect its credential and policy shape:
+
+```shell
+openshell provider profile export okta -o yaml
+```
+
+The built-in profile defines:
+
+- `OKTA_ACCESS_TOKEN` as the injected credential.
+- `oauth2_refresh_token` as the refresh strategy.
+- `client_id`, `refresh_token`, and optional `client_secret` / `scope` as refresh material.
+
+For live use, update the exported YAML to replace `example.okta.com` with your Okta domain and import it as a custom profile override.
+
+## Create a Tenant-Specific Okta Profile
+
+Export the built-in profile and update the token endpoint and allowed host:
+
+```shell
+openshell provider profile export okta -o yaml > okta-runtime.yaml
+```
+
+Replace:
+
+- `https://example.okta.com/oauth2/default/v1/token`
+- `example.okta.com`
+
+with your real Okta domain, then import the customized profile:
+
+```shell
+openshell provider profile lint -f okta-runtime.yaml
+openshell provider profile import -f okta-runtime.yaml
+```
+
+## Create the Provider
+
+Create the provider with the current Okta access token:
+
+```shell
+openshell provider create \
+  --name okta-runtime \
+  --type okta \
+  --credential OKTA_ACCESS_TOKEN="$OKTA_ACCESS_TOKEN"
+```
+
+The current CLI requires an initial credential at provider creation time. Refresh material is configured separately and is not injected into the sandbox.
+
+## Configure Refresh
+
+Configure gateway-managed OAuth2 refresh-token rotation:
+
+```shell
+openshell provider refresh configure okta-runtime \
+  --credential-key OKTA_ACCESS_TOKEN \
+  --strategy oauth2-refresh-token \
+  --material client_id="$OKTA_CLIENT_ID" \
+  --material refresh_token="$OKTA_REFRESH_TOKEN" \
+  --material scope="$OKTA_SCOPES" \
+  --secret-material-key refresh_token \
+  --credential-expires-at "$OKTA_ACCESS_TOKEN_EXPIRES_AT"
+```
+
+If your Okta application is confidential, include the client secret too:
+
+```shell
+openshell provider refresh configure okta-runtime \
+  --credential-key OKTA_ACCESS_TOKEN \
+  --strategy oauth2-refresh-token \
+  --material client_id="$OKTA_CLIENT_ID" \
+  --material client_secret="$OKTA_CLIENT_SECRET" \
+  --material refresh_token="$OKTA_REFRESH_TOKEN" \
+  --material scope="$OKTA_SCOPES" \
+  --secret-material-key client_secret \
+  --secret-material-key refresh_token \
+  --credential-expires-at "$OKTA_ACCESS_TOKEN_EXPIRES_AT"
+```
+
+Force the first refresh immediately:
+
+```shell
+openshell provider refresh rotate okta-runtime \
+  --credential-key OKTA_ACCESS_TOKEN
+```
+
+Check refresh status:
+
+```shell
+openshell provider refresh status okta-runtime \
+  --credential-key OKTA_ACCESS_TOKEN
+```
+
+## Launch a Sandbox
+
+Launch a sandbox with the Okta provider attached:
+
+```shell
+openshell sandbox create \
+  --name okta-runtime \
+  --keep \
+  --provider okta-runtime \
+  --no-auto-providers \
+  -- /bin/sh
+```
+
+The sandbox process receives `OKTA_ACCESS_TOKEN` as an OpenShell placeholder. If the provider policy allows the destination API, the proxy resolves that placeholder to the current gateway-managed access token when the process sends it in the authorization header.
+
+</Steps>
