@@ -3,19 +3,19 @@
 
 pub mod driver;
 mod embedded_runtime;
-pub mod extension;
 mod ffi;
 pub mod gpu;
+pub mod lifecycle;
 mod nft_ruleset;
 pub mod procguard;
 mod rootfs;
 mod runtime;
 
 pub use driver::{VmDriver, VmDriverConfig};
-pub use extension::{
-    LaunchAbortReason, VmBackendFeature, VmExtensionProvides, VmGuestInitDropIn, VmLaunchPlan,
-    VmLifecycleError, VmLifecycleExtension, VmLifecycleExtensionDescriptor, VmLifecycleExtensions,
-    VmLifecycleResult, VmPersistedSandbox,
+pub use lifecycle::{
+    BackendFeature, ExtensionCapabilities, ExtensionDescriptor, GuestInitDropin, LaunchAbortReason,
+    LaunchPlan, LifecycleError, LifecycleExtension, LifecycleExtensionRegistry, LifecycleResult,
+    RestoreContext,
 };
 pub use runtime::{
     VM_RUNTIME_DIR_ENV, VmBackend, VmLaunchConfig, cleanup_stale_tap_interfaces,

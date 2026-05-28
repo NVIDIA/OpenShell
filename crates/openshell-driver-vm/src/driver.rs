@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::extension::{
-    LaunchAbortReason, VmBackendFeature, VmGuestInitDropIn, VmLaunchPlan, VmLifecycleExtensions,
-    VmPersistedSandbox, extension_state_dir,
+use crate::lifecycle::{
+    BackendFeature, GuestInitDropin, LaunchAbortReason, LaunchPlan, LifecycleExtensionRegistry,
+    RestoreContext, extension_state_dir,
 };
 use crate::gpu::{
     GpuInventory, SubnetAllocator, allocate_vsock_cid, mac_from_sandbox_id, tap_device_name,
@@ -305,17 +305,17 @@ pub struct VmDriver {
     events: broadcast::Sender<WatchSandboxesEvent>,
     gpu_inventory: Option<Arc<std::sync::Mutex<GpuInventory>>>,
     subnet_allocator: Arc<std::sync::Mutex<SubnetAllocator>>,
-    lifecycle_extensions: Arc<VmLifecycleExtensions>,
+    lifecycle_extensions: Arc<LifecycleExtensionRegistry>,
 }
 
 impl VmDriver {
     pub async fn new(config: VmDriverConfig) -> Result<Self, String> {
-        Self::new_with_extensions(config, VmLifecycleExtensions::new()).await
+        Self::new_with_extensions(config, LifecycleExtensionRegistry::new()).await
     }
 
     pub async fn new_with_extensions(
         config: VmDriverConfig,
-        lifecycle_extensions: VmLifecycleExtensions,
+        lifecycle_extensions: LifecycleExtensionRegistry,
     ) -> Result<Self, String> {
         lifecycle_extensions
             .validate()
@@ -663,11 +663,11 @@ impl VmDriver {
 
         if let Err(err) = self
             .lifecycle_extensions
-            .configure_vm_launch(&sandbox, &state_dir, &mut plan)
+            .configure_launch(&sandbox, &state_dir, &mut plan)
             .await
         {
             self.lifecycle_extensions
-                .after_vm_launch_failed(
+                .after_launch_failed(
                     &sandbox,
                     &state_dir,
                     LaunchAbortReason::BeforeLaunchHookFailed,
@@ -686,9 +686,9 @@ impl VmDriver {
         }
 
         // Resolve and validate the backend from the requirements that
-        // `configure_vm_launch` extensions contributed. After this point the
+        // `configure_launch` extensions contributed. After this point the
         // plan's backend, sizing, and host allocations (subnet, tap, vsock)
-        // are final; the `before_vm_launch` hook below may still mutate
+        // are final; the `before_launch` hook below may still mutate
         // `plan.env` and `plan.guest_init_dropins` and may abort the launch,
         // but it MUST NOT change `plan.backend`, `plan.required_backends`,
         // or `plan.required_backend_features` -- those are enforced as a
@@ -697,7 +697,7 @@ impl VmDriver {
             self.resolve_launch_plan_backend(&sandbox.id, is_gpu, gpu_bdf.clone(), &mut plan)
         {
             self.lifecycle_extensions
-                .after_vm_launch_failed(
+                .after_launch_failed(
                     &sandbox,
                     &state_dir,
                     LaunchAbortReason::BeforeLaunchHookFailed,
@@ -709,7 +709,7 @@ impl VmDriver {
 
         if let Err(err) = Self::validate_launch_plan_backend(is_gpu, &plan) {
             self.lifecycle_extensions
-                .after_vm_launch_failed(
+                .after_launch_failed(
                     &sandbox,
                     &state_dir,
                     LaunchAbortReason::BeforeLaunchHookFailed,
@@ -728,11 +728,11 @@ impl VmDriver {
 
         if let Err(err) = self
             .lifecycle_extensions
-            .before_vm_launch(&sandbox, &state_dir, &mut plan)
+            .before_launch(&sandbox, &state_dir, &mut plan)
             .await
         {
             self.lifecycle_extensions
-                .after_vm_launch_failed(
+                .after_launch_failed(
                     &sandbox,
                     &state_dir,
                     LaunchAbortReason::BeforeLaunchHookFailed,
@@ -752,7 +752,7 @@ impl VmDriver {
 
         if let Err(err) = inject_guest_init_dropins(&overlay_disk, &plan.guest_init_dropins) {
             self.lifecycle_extensions
-                .after_vm_launch_failed(&sandbox, &state_dir, LaunchAbortReason::GuestPrepareFailed)
+                .after_launch_failed(&sandbox, &state_dir, LaunchAbortReason::GuestPrepareFailed)
                 .await;
             self.release_gpu_and_subnet(&sandbox.id);
             return Err(err);
@@ -840,7 +840,7 @@ impl VmDriver {
                     "vm driver: launcher spawn failed"
                 );
                 self.lifecycle_extensions
-                    .after_vm_launch_failed(
+                    .after_launch_failed(
                         &sandbox,
                         &state_dir,
                         LaunchAbortReason::LauncherSpawnFailed,
@@ -901,12 +901,12 @@ impl VmDriver {
             self.publish_snapshot(snapshot);
         }
         if overlay_preparation == OverlayPreparation::PreserveExisting {
-            let persisted = VmPersistedSandbox {
+            let persisted = RestoreContext {
                 sandbox: sandbox.clone(),
                 state_dir: state_dir.clone(),
             };
             self.lifecycle_extensions
-                .reconcile_after_restore(&persisted)
+                .after_restore(&persisted)
                 .await;
         }
         tokio::spawn({
@@ -988,7 +988,7 @@ impl VmDriver {
         }
 
         self.lifecycle_extensions
-            .after_sandbox_deleted(&sandbox_snapshot, &state_dir)
+            .after_delete(&sandbox_snapshot, &state_dir)
             .await;
 
         self.release_allocations(&record_id, gpu_bdf.is_some(), qemu_network_allocated);
@@ -1144,13 +1144,13 @@ impl VmDriver {
             return;
         }
 
-        let persisted = VmPersistedSandbox {
+        let persisted = RestoreContext {
             sandbox: sandbox.clone(),
             state_dir: state_dir.clone(),
         };
         if let Err(err) = self
             .lifecycle_extensions
-            .reconcile_before_restore(&persisted)
+            .before_restore(&persisted)
             .await
         {
             warn!(
@@ -1275,13 +1275,13 @@ impl VmDriver {
         sandbox_id: &str,
         is_gpu: bool,
         gpu_bdf: Option<String>,
-        plan: &mut VmLaunchPlan,
+        plan: &mut LaunchPlan,
     ) -> Result<(), Status> {
         if plan.kernel_image.is_some() {
-            plan.require_backend_feature(VmBackendFeature::ExternalKernelImage);
+            plan.require_backend_feature(BackendFeature::ExternalKernelImage);
         }
         if !plan.guest_init_dropins.is_empty() {
-            plan.require_backend_feature(VmBackendFeature::GuestInitDropins);
+            plan.require_backend_feature(BackendFeature::GuestInitDropins);
         }
 
         if plan.required_backends.contains(&VmBackend::Qemu)
@@ -1303,7 +1303,7 @@ impl VmDriver {
         sandbox_id: &str,
         is_gpu: bool,
         gpu_bdf: Option<String>,
-        plan: &mut VmLaunchPlan,
+        plan: &mut LaunchPlan,
     ) -> Result<(), Status> {
         plan.backend = VmBackend::Qemu;
         if is_gpu {
@@ -1337,7 +1337,7 @@ impl VmDriver {
     }
 
     #[allow(clippy::result_large_err)]
-    fn validate_launch_plan_backend(is_gpu: bool, plan: &VmLaunchPlan) -> Result<(), Status> {
+    fn validate_launch_plan_backend(is_gpu: bool, plan: &LaunchPlan) -> Result<(), Status> {
         // NOTE: this guard exists because the non-GPU QEMU launch path
         // (PCI device transport, VFIO root port wiring) has not landed
         // yet. Until then, even though the resolver will happily promote
@@ -1429,9 +1429,9 @@ impl VmDriver {
         needs_qemu: bool,
         is_gpu: bool,
         gpu_bdf: Option<String>,
-    ) -> Result<VmLaunchPlan, Status> {
+    ) -> Result<LaunchPlan, Status> {
         if !needs_qemu {
-            return Ok(VmLaunchPlan {
+            return Ok(LaunchPlan {
                 backend: VmBackend::Libkrun,
                 vcpus: self.config.vcpus,
                 mem_mib: self.config.mem_mib,
@@ -1472,7 +1472,7 @@ impl VmDriver {
             (self.config.vcpus, self.config.mem_mib)
         };
 
-        Ok(VmLaunchPlan {
+        Ok(LaunchPlan {
             backend: VmBackend::Qemu,
             vcpus,
             mem_mib,
@@ -3862,7 +3862,7 @@ fn gateway_port_from_endpoint(endpoint: &str) -> Option<u16> {
     Url::parse(endpoint).ok().and_then(|url| url.port())
 }
 
-fn has_complete_qemu_network(plan: &VmLaunchPlan) -> bool {
+fn has_complete_qemu_network(plan: &LaunchPlan) -> bool {
     plan.tap_device.is_some()
         && plan.guest_ip.is_some()
         && plan.host_ip.is_some()
@@ -4479,7 +4479,7 @@ fn inject_guest_sandbox_token(overlay_disk: &Path, token: &str) -> Result<(), St
 #[allow(clippy::result_large_err)]
 fn inject_guest_init_dropins(
     overlay_disk: &Path,
-    dropins: &[VmGuestInitDropIn],
+    dropins: &[GuestInitDropin],
 ) -> Result<(), Status> {
     validate_guest_init_dropins(dropins).map_err(Status::failed_precondition)?;
 
@@ -4505,7 +4505,7 @@ fn inject_guest_init_dropins(
     Ok(())
 }
 
-fn validate_guest_init_dropins(dropins: &[VmGuestInitDropIn]) -> Result<(), String> {
+fn validate_guest_init_dropins(dropins: &[GuestInitDropin]) -> Result<(), String> {
     let mut names = HashSet::new();
     for dropin in dropins {
         validate_guest_init_dropin_name(&dropin.name)?;
@@ -5280,7 +5280,7 @@ mod tests {
                 Ipv4Addr::new(10, 0, 128, 0),
                 17,
             ))),
-            lifecycle_extensions: Arc::new(VmLifecycleExtensions::new()),
+            lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
         };
 
         assert_eq!(driver.capabilities().default_image, "openshell/sandbox:dev");
@@ -5302,7 +5302,7 @@ mod tests {
                 Ipv4Addr::new(10, 0, 128, 0),
                 17,
             ))),
-            lifecycle_extensions: Arc::new(VmLifecycleExtensions::new()),
+            lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
         };
         let sandbox = Sandbox {
             spec: Some(SandboxSpec {
@@ -5337,7 +5337,7 @@ mod tests {
                 Ipv4Addr::new(10, 0, 128, 0),
                 17,
             ))),
-            lifecycle_extensions: Arc::new(VmLifecycleExtensions::new()),
+            lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
         };
         let sandbox = Sandbox {
             spec: Some(SandboxSpec {
@@ -5366,7 +5366,7 @@ mod tests {
                 Ipv4Addr::new(10, 0, 128, 0),
                 17,
             ))),
-            lifecycle_extensions: Arc::new(VmLifecycleExtensions::new()),
+            lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
         };
         let sandbox = Sandbox {
             spec: Some(SandboxSpec {
@@ -5396,7 +5396,7 @@ mod tests {
                 Ipv4Addr::new(10, 0, 128, 0),
                 17,
             ))),
-            lifecycle_extensions: Arc::new(VmLifecycleExtensions::new()),
+            lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
         };
 
         assert_eq!(
@@ -5421,7 +5421,7 @@ mod tests {
                 Ipv4Addr::new(10, 0, 128, 0),
                 17,
             ))),
-            lifecycle_extensions: Arc::new(VmLifecycleExtensions::new()),
+            lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
         };
 
         assert_eq!(
@@ -5443,7 +5443,7 @@ mod tests {
                 Ipv4Addr::new(10, 0, 128, 0),
                 17,
             ))),
-            lifecycle_extensions: Arc::new(VmLifecycleExtensions::new()),
+            lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
         };
 
         assert_eq!(
@@ -5831,7 +5831,7 @@ mod tests {
                 Ipv4Addr::new(10, 0, 128, 0),
                 17,
             ))),
-            lifecycle_extensions: Arc::new(VmLifecycleExtensions::new()),
+            lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
         };
 
         let state_file = sandbox_state_dir(&driver_state, "sandbox-123").unwrap();
@@ -5895,7 +5895,7 @@ mod tests {
                 Ipv4Addr::new(10, 0, 128, 0),
                 17,
             ))),
-            lifecycle_extensions: Arc::new(VmLifecycleExtensions::new()),
+            lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
         };
 
         let state_dir = sandbox_state_dir(&driver_state, "sandbox-123").unwrap();
@@ -5951,7 +5951,7 @@ mod tests {
                 Ipv4Addr::new(10, 0, 128, 0),
                 17,
             ))),
-            lifecycle_extensions: Arc::new(VmLifecycleExtensions::new()),
+            lifecycle_extensions: Arc::new(LifecycleExtensionRegistry::new()),
         };
 
         let state_dir = sandbox_state_dir(&driver_state, "sandbox-123").unwrap();
@@ -6305,13 +6305,13 @@ mod tests {
         );
     }
 
-    use crate::extension::{
-        VmBackendFeature, VmLaunchPlan, VmLifecycleError, VmLifecycleExtension,
-        VmLifecycleExtensions, VmLifecycleResult,
+    use crate::lifecycle::{
+        BackendFeature, LaunchPlan, LifecycleError, LifecycleExtension,
+        LifecycleExtensionRegistry, LifecycleResult,
     };
     use crate::runtime::VmBackend;
 
-    fn test_driver_with_extensions(extensions: VmLifecycleExtensions) -> VmDriver {
+    fn test_driver_with_extensions(extensions: LifecycleExtensionRegistry) -> VmDriver {
         let (events, _) = broadcast::channel(WATCH_BUFFER);
         VmDriver {
             config: VmDriverConfig {
@@ -6341,30 +6341,30 @@ mod tests {
     }
 
     #[tonic::async_trait]
-    impl VmLifecycleExtension for QemuRequiringExtension {
+    impl LifecycleExtension for QemuRequiringExtension {
         fn name(&self) -> &str {
             &self.name
         }
 
-        async fn configure_vm_launch(
+        async fn configure_launch(
             &self,
             _sandbox: &Sandbox,
             _state_dir: &Path,
-            plan: &mut VmLaunchPlan,
-        ) -> VmLifecycleResult<()> {
+            plan: &mut LaunchPlan,
+        ) -> LifecycleResult<()> {
             plan.require_backend(VmBackend::Qemu);
-            plan.require_backend_feature(VmBackendFeature::PciPassthrough);
+            plan.require_backend_feature(BackendFeature::PciPassthrough);
             Ok(())
         }
 
-        async fn before_vm_launch(
+        async fn before_launch(
             &self,
             _sandbox: &Sandbox,
             _state_dir: &Path,
-            plan: &mut VmLaunchPlan,
-        ) -> VmLifecycleResult<()> {
+            plan: &mut LaunchPlan,
+        ) -> LifecycleResult<()> {
             if plan.backend != VmBackend::Qemu {
-                return Err(VmLifecycleError::new(
+                return Err(LifecycleError::new(
                     "qemu-requiring extension demands QEMU backend",
                 ));
             }
@@ -6377,24 +6377,24 @@ mod tests {
     struct AlwaysFailsExtension;
 
     #[tonic::async_trait]
-    impl VmLifecycleExtension for AlwaysFailsExtension {
+    impl LifecycleExtension for AlwaysFailsExtension {
         fn name(&self) -> &'static str {
             "always-fails"
         }
 
-        async fn before_vm_launch(
+        async fn before_launch(
             &self,
             _sandbox: &Sandbox,
             _state_dir: &Path,
-            _plan: &mut VmLaunchPlan,
-        ) -> VmLifecycleResult<()> {
-            Err(VmLifecycleError::resource_exhausted("pool empty"))
+            _plan: &mut LaunchPlan,
+        ) -> LifecycleResult<()> {
+            Err(LifecycleError::resource_exhausted("pool empty"))
         }
     }
 
     #[test]
     fn empty_registry_keeps_non_gpu_sandbox_on_libkrun() {
-        let driver = test_driver_with_extensions(VmLifecycleExtensions::new());
+        let driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
 
         let plan = driver
             .build_vm_launch_plan("sandbox-x", false, false, None)
@@ -6414,13 +6414,13 @@ mod tests {
 
     #[test]
     fn empty_registry_has_no_extension_descriptors() {
-        let driver = test_driver_with_extensions(VmLifecycleExtensions::new());
+        let driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
         assert!(driver.lifecycle_extensions.descriptors().is_empty());
     }
 
     #[test]
     fn gpu_sandbox_uses_qemu_backend_and_gpu_sizing() {
-        let driver = test_driver_with_extensions(VmLifecycleExtensions::new());
+        let driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
 
         let plan = driver
             .build_vm_launch_plan("sandbox-gpu", true, true, Some("0000:01:00.0".to_string()))
@@ -6439,7 +6439,7 @@ mod tests {
 
     #[test]
     fn launch_plan_rejects_external_kernel_on_unsupported_backend() {
-        let mut plan = VmLaunchPlan {
+        let mut plan = LaunchPlan {
             backend: VmBackend::Libkrun,
             vcpus: 2,
             mem_mib: 2048,
@@ -6475,11 +6475,11 @@ mod tests {
 
     #[test]
     fn backend_feature_requirements_select_qemu_launch_plan() {
-        let driver = test_driver_with_extensions(VmLifecycleExtensions::new());
+        let driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
         let mut plan = driver
             .build_vm_launch_plan("sandbox-vfio", false, false, None)
             .expect("base plan should build");
-        plan.require_backend_feature(VmBackendFeature::PciPassthrough);
+        plan.require_backend_feature(BackendFeature::PciPassthrough);
 
         driver
             .resolve_launch_plan_backend("sandbox-vfio", false, None, &mut plan)
@@ -6497,7 +6497,7 @@ mod tests {
 
     #[test]
     fn explicit_backend_requirement_selects_qemu_launch_plan() {
-        let driver = test_driver_with_extensions(VmLifecycleExtensions::new());
+        let driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
         let mut plan = driver
             .build_vm_launch_plan("sandbox-qemu", false, false, None)
             .expect("base plan should build");
@@ -6517,11 +6517,11 @@ mod tests {
 
     #[test]
     fn guest_init_dropin_feature_does_not_force_qemu() {
-        let driver = test_driver_with_extensions(VmLifecycleExtensions::new());
+        let driver = test_driver_with_extensions(LifecycleExtensionRegistry::new());
         let mut plan = driver
             .build_vm_launch_plan("sandbox-init", false, false, None)
             .expect("base plan should build");
-        plan.require_backend_feature(VmBackendFeature::GuestInitDropins);
+        plan.require_backend_feature(BackendFeature::GuestInitDropins);
 
         driver
             .resolve_launch_plan_backend("sandbox-init", false, None, &mut plan)
@@ -6533,10 +6533,10 @@ mod tests {
 
     #[test]
     fn guest_init_dropin_validation_rejects_unsafe_or_duplicate_names() {
-        validate_guest_init_dropins(&[VmGuestInitDropIn::new("50-vfio.sh", b"true\n".to_vec())])
+        validate_guest_init_dropins(&[GuestInitDropin::new("50-vfio.sh", b"true\n".to_vec())])
             .expect("safe drop-in name is accepted");
 
-        let err = validate_guest_init_dropins(&[VmGuestInitDropIn::new(
+        let err = validate_guest_init_dropins(&[GuestInitDropin::new(
             "../50-vfio.sh",
             b"true\n".to_vec(),
         )])
@@ -6544,26 +6544,26 @@ mod tests {
         assert!(err.contains("must contain only ASCII"));
 
         let err = validate_guest_init_dropins(&[
-            VmGuestInitDropIn::new("50-vfio.sh", b"true\n".to_vec()),
-            VmGuestInitDropIn::new("50-vfio.sh", b"true\n".to_vec()),
+            GuestInitDropin::new("50-vfio.sh", b"true\n".to_vec()),
+            GuestInitDropin::new("50-vfio.sh", b"true\n".to_vec()),
         ])
         .expect_err("duplicate drop-ins are rejected");
         assert!(err.contains("duplicate"));
     }
 
     #[tokio::test]
-    async fn extension_can_validate_backend_in_before_vm_launch() {
+    async fn extension_can_validate_backend_in_before_launch() {
         let extension = Arc::new(QemuRequiringExtension {
             name: "validate".to_string(),
         });
-        let extensions = VmLifecycleExtensions::with(vec![extension.clone()]);
+        let extensions = LifecycleExtensionRegistry::with(vec![extension.clone()]);
         let sandbox = Sandbox {
             id: "sandbox-validate".to_string(),
             name: "sandbox-validate".to_string(),
             ..Default::default()
         };
 
-        let mut libkrun_plan = VmLaunchPlan {
+        let mut libkrun_plan = LaunchPlan {
             backend: VmBackend::Libkrun,
             vcpus: 2,
             mem_mib: 2048,
@@ -6582,12 +6582,12 @@ mod tests {
             env: Vec::new(),
         };
         let err = extensions
-            .before_vm_launch(&sandbox, Path::new("/tmp/state"), &mut libkrun_plan)
+            .before_launch(&sandbox, Path::new("/tmp/state"), &mut libkrun_plan)
             .await
             .expect_err("backend mismatch should fail validation");
         assert!(err.message().contains("demands QEMU"));
 
-        let mut qemu_plan = VmLaunchPlan {
+        let mut qemu_plan = LaunchPlan {
             backend: VmBackend::Qemu,
             vcpus: 2,
             mem_mib: 2048,
@@ -6606,7 +6606,7 @@ mod tests {
             env: Vec::new(),
         };
         extensions
-            .before_vm_launch(&sandbox, Path::new("/tmp/state"), &mut qemu_plan)
+            .before_launch(&sandbox, Path::new("/tmp/state"), &mut qemu_plan)
             .await
             .expect("QEMU backend should satisfy the extension");
         assert!(qemu_plan.env.contains(&"EXT_DECLARED_QEMU=1".to_string()));
@@ -6614,13 +6614,13 @@ mod tests {
 
     #[tokio::test]
     async fn lifecycle_error_resource_exhausted_propagates() {
-        let extensions = VmLifecycleExtensions::with(vec![Arc::new(AlwaysFailsExtension)]);
+        let extensions = LifecycleExtensionRegistry::with(vec![Arc::new(AlwaysFailsExtension)]);
         let sandbox = Sandbox {
             id: "sandbox-resource".to_string(),
             name: "sandbox-resource".to_string(),
             ..Default::default()
         };
-        let mut plan = VmLaunchPlan {
+        let mut plan = LaunchPlan {
             backend: VmBackend::Qemu,
             vcpus: 2,
             mem_mib: 2048,
@@ -6639,7 +6639,7 @@ mod tests {
             env: Vec::new(),
         };
         let err = extensions
-            .before_vm_launch(&sandbox, Path::new("/tmp/state"), &mut plan)
+            .before_launch(&sandbox, Path::new("/tmp/state"), &mut plan)
             .await
             .expect_err("scripted pool exhaustion should surface");
         assert!(err.is_resource_exhausted());

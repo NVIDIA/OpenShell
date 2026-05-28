@@ -17,12 +17,12 @@ pub enum LaunchAbortReason {
 }
 
 #[derive(Debug, Clone)]
-pub struct VmLifecycleError {
+pub struct LifecycleError {
     message: String,
     resource_exhausted: bool,
 }
 
-impl VmLifecycleError {
+impl LifecycleError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
@@ -48,22 +48,22 @@ impl VmLifecycleError {
     }
 }
 
-impl std::fmt::Display for VmLifecycleError {
+impl std::fmt::Display for LifecycleError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.message)
     }
 }
 
-impl std::error::Error for VmLifecycleError {}
+impl std::error::Error for LifecycleError {}
 
-pub type VmLifecycleResult<T> = Result<T, VmLifecycleError>;
+pub type LifecycleResult<T> = Result<T, LifecycleError>;
 
 /// A capability an extension can require from the VM backend.
 ///
 /// Extensions declare features they need (e.g. PCI passthrough or an
 /// external kernel image) and the VM driver resolves a concrete
 /// [`VmBackend`] that can satisfy them. The mapping from feature to
-/// backend lives in [`VmBackendFeature::requires_qemu`] for now; once a
+/// backend lives in [`BackendFeature::requires_qemu`] for now; once a
 /// third backend exists this should evolve into a per-backend capability
 /// table that the resolver intersects against feature requirements.
 ///
@@ -73,16 +73,16 @@ pub type VmLifecycleResult<T> = Result<T, VmLifecycleError>;
 /// port wiring) lands, the driver still rejects launches where the
 /// resolved backend is QEMU but the sandbox has no GPU. As a result,
 /// declaring [`Self::PciPassthrough`] or [`Self::ExternalKernelImage`] on
-/// a non-GPU sandbox is accepted by [`VmLifecycleExtensions::validate`]
+/// a non-GPU sandbox is accepted by [`LifecycleExtensionRegistry::validate`]
 /// at registration time but will fail provisioning with a
 /// `FailedPrecondition` status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum VmBackendFeature {
+pub enum BackendFeature {
     /// Extension supplies its own kernel image via
-    /// [`VmLaunchPlan::kernel_image`]. Currently QEMU-only.
+    /// [`LaunchPlan::kernel_image`]. Currently QEMU-only.
     ExternalKernelImage,
     /// Extension contributes guest init drop-ins via
-    /// [`VmLaunchPlan::guest_init_dropins`]. Supported by all backends.
+    /// [`LaunchPlan::guest_init_dropins`]. Supported by all backends.
     GuestInitDropins,
     /// Extension needs PCI device passthrough on the guest. Currently
     /// QEMU-only and currently rejected for non-GPU sandboxes pending the
@@ -93,7 +93,7 @@ pub enum VmBackendFeature {
     TapNetworking,
 }
 
-impl VmBackendFeature {
+impl BackendFeature {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -118,7 +118,7 @@ impl VmBackendFeature {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct VmExtensionProvides {
+pub struct ExtensionCapabilities {
     pub kernel_profiles: Vec<String>,
     pub guest_init_dropins: Vec<String>,
     pub launch_features: Vec<String>,
@@ -132,28 +132,28 @@ pub struct VmExtensionProvides {
 /// launch plan unconditionally for every sandbox. An extension that wants
 /// conditional behavior (e.g. only contribute requirements when the
 /// sandbox spec asks for it) should leave the descriptor fields empty and
-/// call [`VmLaunchPlan::require_backend`] /
-/// [`VmLaunchPlan::require_backend_feature`] inside
-/// [`VmLifecycleExtension::configure_vm_launch`] instead.
+/// call [`LaunchPlan::require_backend`] /
+/// [`LaunchPlan::require_backend_feature`] inside
+/// [`LifecycleExtension::configure_launch`] instead.
 ///
 /// A future PR will add a per-sandbox activation protocol so the driver
 /// can gate this merge on a sandbox spec field. Until that lands, the
 /// only knob is "declare in the descriptor (always merged) vs decide in
 /// the hook (per-sandbox)".
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VmLifecycleExtensionDescriptor {
+pub struct ExtensionDescriptor {
     pub name: String,
-    pub provides: VmExtensionProvides,
+    pub provides: ExtensionCapabilities,
     pub required_backends: Vec<VmBackend>,
-    pub required_backend_features: Vec<VmBackendFeature>,
+    pub required_backend_features: Vec<BackendFeature>,
 }
 
-impl VmLifecycleExtensionDescriptor {
+impl ExtensionDescriptor {
     #[must_use]
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
-            provides: VmExtensionProvides::default(),
+            provides: ExtensionCapabilities::default(),
             required_backends: Vec::new(),
             required_backend_features: Vec::new(),
         }
@@ -176,12 +176,12 @@ impl VmLifecycleExtensionDescriptor {
 /// path separators, no `.`/`..`); duplicates across a single launch plan
 /// are rejected by the driver.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VmGuestInitDropIn {
+pub struct GuestInitDropin {
     pub name: String,
     pub contents: Vec<u8>,
 }
 
-impl VmGuestInitDropIn {
+impl GuestInitDropin {
     #[must_use]
     pub fn new(name: impl Into<String>, contents: impl Into<Vec<u8>>) -> Self {
         Self {
@@ -192,12 +192,12 @@ impl VmGuestInitDropIn {
 }
 
 #[derive(Debug, Clone)]
-pub struct VmLaunchPlan {
+pub struct LaunchPlan {
     pub backend: VmBackend,
     pub vcpus: u8,
     pub mem_mib: u32,
     pub required_backends: Vec<VmBackend>,
-    pub required_backend_features: Vec<VmBackendFeature>,
+    pub required_backend_features: Vec<BackendFeature>,
     pub kernel_profile: Option<String>,
     pub kernel_image: Option<PathBuf>,
     pub gpu_bdf: Option<String>,
@@ -207,18 +207,18 @@ pub struct VmLaunchPlan {
     pub vsock_cid: Option<u32>,
     pub guest_mac: Option<String>,
     pub gateway_port: Option<u16>,
-    pub guest_init_dropins: Vec<VmGuestInitDropIn>,
+    pub guest_init_dropins: Vec<GuestInitDropin>,
     pub env: Vec<String>,
 }
 
-impl VmLaunchPlan {
+impl LaunchPlan {
     pub fn require_backend(&mut self, backend: VmBackend) {
         if !self.required_backends.contains(&backend) {
             self.required_backends.push(backend);
         }
     }
 
-    pub fn require_backend_feature(&mut self, feature: VmBackendFeature) {
+    pub fn require_backend_feature(&mut self, feature: BackendFeature) {
         if !self.required_backend_features.contains(&feature) {
             self.required_backend_features.push(feature);
         }
@@ -226,7 +226,7 @@ impl VmLaunchPlan {
 
     pub fn require_backend_features(
         &mut self,
-        features: impl IntoIterator<Item = VmBackendFeature>,
+        features: impl IntoIterator<Item = BackendFeature>,
     ) {
         for feature in features {
             self.require_backend_feature(feature);
@@ -235,7 +235,7 @@ impl VmLaunchPlan {
 }
 
 #[derive(Debug, Clone)]
-pub struct VmPersistedSandbox {
+pub struct RestoreContext {
     pub sandbox: Sandbox,
     pub state_dir: PathBuf,
 }
@@ -245,28 +245,28 @@ pub struct VmPersistedSandbox {
 ///
 /// # Hook ordering during a successful launch
 ///
-/// 1. [`configure_vm_launch`](Self::configure_vm_launch) — contribute backend
-///    requirements (via [`VmLaunchPlan::require_backend`] /
-///    [`VmLaunchPlan::require_backend_feature`]) and provisioning inputs
+/// 1. [`configure_launch`](Self::configure_launch) — contribute backend
+///    requirements (via [`LaunchPlan::require_backend`] /
+///    [`LaunchPlan::require_backend_feature`]) and provisioning inputs
 ///    (kernel profile, guest init drop-ins, etc.). Called before the driver
 ///    has resolved the final backend.
-/// 2. Driver resolves [`VmLaunchPlan::backend`] from declared requirements
+/// 2. Driver resolves [`LaunchPlan::backend`] from declared requirements
 ///    and allocates backend-specific host resources (subnet, tap, vsock).
-/// 3. [`before_vm_launch`](Self::before_vm_launch) — perform host-side
+/// 3. [`before_launch`](Self::before_launch) — perform host-side
 ///    side effects with the resolved plan in hand, optionally append
-///    additional guest env via [`VmLaunchPlan::env`].
+///    additional guest env via [`LaunchPlan::env`].
 /// 4. The driver spawns the VM launcher process.
 ///
 /// On launch failure or sandbox deletion, the driver invokes
-/// [`after_vm_launch_failed`](Self::after_vm_launch_failed) or
-/// [`after_sandbox_deleted`](Self::after_sandbox_deleted) in **reverse
+/// [`after_launch_failed`](Self::after_launch_failed) or
+/// [`after_delete`](Self::after_delete) in **reverse
 /// registration order**, so cleanup mirrors setup.
 #[tonic::async_trait]
-pub trait VmLifecycleExtension: std::fmt::Debug + Send + Sync {
+pub trait LifecycleExtension: std::fmt::Debug + Send + Sync {
     fn name(&self) -> &str;
 
-    fn descriptor(&self) -> VmLifecycleExtensionDescriptor {
-        VmLifecycleExtensionDescriptor::new(self.name())
+    fn descriptor(&self) -> ExtensionDescriptor {
+        ExtensionDescriptor::new(self.name())
     }
 
     /// Contribute backend requirements and provisioning inputs to the plan
@@ -274,71 +274,71 @@ pub trait VmLifecycleExtension: std::fmt::Debug + Send + Sync {
     ///
     /// Use this hook to:
     /// - Declare backend requirements with
-    ///   [`VmLaunchPlan::require_backend`] or
-    ///   [`VmLaunchPlan::require_backend_feature`].
-    /// - Set [`VmLaunchPlan::kernel_profile`] or
-    ///   [`VmLaunchPlan::kernel_image`].
-    /// - Append [`VmLaunchPlan::guest_init_dropins`] entries.
+    ///   [`LaunchPlan::require_backend`] or
+    ///   [`LaunchPlan::require_backend_feature`].
+    /// - Set [`LaunchPlan::kernel_profile`] or
+    ///   [`LaunchPlan::kernel_image`].
+    /// - Append [`LaunchPlan::guest_init_dropins`] entries.
     ///
-    /// At this point [`VmLaunchPlan::backend`] is the driver's tentative
+    /// At this point [`LaunchPlan::backend`] is the driver's tentative
     /// choice and may still change during backend resolution. Do not perform
     /// host-side side effects here — defer them to
-    /// [`before_vm_launch`](Self::before_vm_launch).
-    async fn configure_vm_launch(
+    /// [`before_launch`](Self::before_launch).
+    async fn configure_launch(
         &self,
         _sandbox: &Sandbox,
         _state_dir: &Path,
-        _plan: &mut VmLaunchPlan,
-    ) -> VmLifecycleResult<()> {
+        _plan: &mut LaunchPlan,
+    ) -> LifecycleResult<()> {
         Ok(())
     }
 
     /// Perform host-side preparation with the resolved launch plan.
     ///
-    /// At this point [`VmLaunchPlan::backend`],
-    /// [`VmLaunchPlan::required_backends`], and
-    /// [`VmLaunchPlan::required_backend_features`] are finalized and any
+    /// At this point [`LaunchPlan::backend`],
+    /// [`LaunchPlan::required_backends`], and
+    /// [`LaunchPlan::required_backend_features`] are finalized and any
     /// backend-specific host resources (subnet, tap, vsock) have been
     /// allocated. This hook is the right place to bind PCI devices, set
     /// up filesystem state, or otherwise prepare the host.
     ///
-    /// Implementations MAY append entries to [`VmLaunchPlan::env`] to
+    /// Implementations MAY append entries to [`LaunchPlan::env`] to
     /// inject additional guest environment variables, and MAY return an
     /// error to abort the launch. Implementations MUST NOT change
-    /// [`VmLaunchPlan::backend`], [`VmLaunchPlan::required_backends`], or
-    /// [`VmLaunchPlan::required_backend_features`]; those changes are
-    /// ignored by the driver once `before_vm_launch` is reached.
+    /// [`LaunchPlan::backend`], [`LaunchPlan::required_backends`], or
+    /// [`LaunchPlan::required_backend_features`]; those changes are
+    /// ignored by the driver once `before_launch` is reached.
     ///
     /// If this hook performs allocations that must be released on failure
     /// or delete, implement
-    /// [`after_vm_launch_failed`](Self::after_vm_launch_failed) and
-    /// [`after_sandbox_deleted`](Self::after_sandbox_deleted) accordingly.
-    async fn before_vm_launch(
+    /// [`after_launch_failed`](Self::after_launch_failed) and
+    /// [`after_delete`](Self::after_delete) accordingly.
+    async fn before_launch(
         &self,
         _sandbox: &Sandbox,
         _state_dir: &Path,
-        _plan: &mut VmLaunchPlan,
-    ) -> VmLifecycleResult<()> {
+        _plan: &mut LaunchPlan,
+    ) -> LifecycleResult<()> {
         Ok(())
     }
 
     /// Release anything this extension allocated during
-    /// [`configure_vm_launch`](Self::configure_vm_launch) or
-    /// [`before_vm_launch`](Self::before_vm_launch) when the launcher
+    /// [`configure_launch`](Self::configure_launch) or
+    /// [`before_launch`](Self::before_launch) when the launcher
     /// could not be started or aborted before it became healthy.
     ///
     /// Invoked in reverse registration order. Errors are logged but do not
     /// propagate; do best-effort cleanup and return [`Ok`] when possible.
     /// This hook is invoked on every launcher failure, including failures
     /// that happen during a persisted-sandbox restore (in that case
-    /// [`reconcile_after_restore`](Self::reconcile_after_restore) is *not*
+    /// [`after_restore`](Self::after_restore) is *not*
     /// invoked).
-    async fn after_vm_launch_failed(
+    async fn after_launch_failed(
         &self,
         _sandbox: &Sandbox,
         _state_dir: &Path,
         _reason: LaunchAbortReason,
-    ) -> VmLifecycleResult<()> {
+    ) -> LifecycleResult<()> {
         Ok(())
     }
 
@@ -346,11 +346,11 @@ pub trait VmLifecycleExtension: std::fmt::Debug + Send + Sync {
     ///
     /// Invoked in reverse registration order. Errors are logged but do not
     /// propagate.
-    async fn after_sandbox_deleted(
+    async fn after_delete(
         &self,
         _sandbox: &Sandbox,
         _state_dir: &Path,
-    ) -> VmLifecycleResult<()> {
+    ) -> LifecycleResult<()> {
         Ok(())
     }
 
@@ -360,10 +360,10 @@ pub trait VmLifecycleExtension: std::fmt::Debug + Send + Sync {
     /// Returning an error causes the driver to skip restoring this
     /// sandbox; the persisted state is left on disk for operator
     /// inspection.
-    async fn reconcile_before_restore(
+    async fn before_restore(
         &self,
-        _sandbox: &VmPersistedSandbox,
-    ) -> VmLifecycleResult<()> {
+        _sandbox: &RestoreContext,
+    ) -> LifecycleResult<()> {
         Ok(())
     }
 
@@ -371,24 +371,24 @@ pub trait VmLifecycleExtension: std::fmt::Debug + Send + Sync {
     /// successfully restored and its launcher is running again.
     ///
     /// Only invoked when restore succeeds. If the restore fails partway
-    /// through, [`after_vm_launch_failed`](Self::after_vm_launch_failed)
+    /// through, [`after_launch_failed`](Self::after_launch_failed)
     /// runs instead.
-    async fn reconcile_after_restore(
+    async fn after_restore(
         &self,
-        _sandbox: &VmPersistedSandbox,
-    ) -> VmLifecycleResult<()> {
+        _sandbox: &RestoreContext,
+    ) -> LifecycleResult<()> {
         Ok(())
     }
 }
 
 #[derive(Clone, Default)]
-pub struct VmLifecycleExtensions {
-    extensions: Vec<Arc<dyn VmLifecycleExtension>>,
+pub struct LifecycleExtensionRegistry {
+    extensions: Vec<Arc<dyn LifecycleExtension>>,
 }
 
-impl std::fmt::Debug for VmLifecycleExtensions {
+impl std::fmt::Debug for LifecycleExtensionRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("VmLifecycleExtensions")
+        f.debug_struct("LifecycleExtensionRegistry")
             .field(
                 "names",
                 &self
@@ -401,18 +401,18 @@ impl std::fmt::Debug for VmLifecycleExtensions {
     }
 }
 
-impl VmLifecycleExtensions {
+impl LifecycleExtensionRegistry {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     #[must_use]
-    pub fn with(extensions: Vec<Arc<dyn VmLifecycleExtension>>) -> Self {
+    pub fn with(extensions: Vec<Arc<dyn LifecycleExtension>>) -> Self {
         Self { extensions }
     }
 
-    pub fn push(&mut self, extension: Arc<dyn VmLifecycleExtension>) {
+    pub fn push(&mut self, extension: Arc<dyn LifecycleExtension>) {
         self.extensions.push(extension);
     }
 
@@ -435,27 +435,27 @@ impl VmLifecycleExtensions {
     }
 
     #[must_use]
-    pub fn descriptors(&self) -> Vec<VmLifecycleExtensionDescriptor> {
+    pub fn descriptors(&self) -> Vec<ExtensionDescriptor> {
         self.extensions.iter().map(|ext| ext.descriptor()).collect()
     }
 
-    pub fn validate(&self) -> VmLifecycleResult<()> {
+    pub fn validate(&self) -> LifecycleResult<()> {
         let mut names = HashSet::new();
         for ext in &self.extensions {
             let descriptor = ext.descriptor();
             validate_extension_name(ext.name())?;
             validate_extension_name(&descriptor.name)?;
             if descriptor.name != ext.name() {
-                return Err(VmLifecycleError::new(format!(
-                    "VM lifecycle extension '{}' descriptor name does not match '{}'",
+                return Err(LifecycleError::new(format!(
+                    "lifecycle extension '{}' descriptor name does not match '{}'",
                     ext.name(),
                     descriptor.name
                 )));
             }
             validate_descriptor_strings(&descriptor)?;
             if !names.insert(descriptor.name.clone()) {
-                return Err(VmLifecycleError::new(format!(
-                    "duplicate VM lifecycle extension name: {}",
+                return Err(LifecycleError::new(format!(
+                    "duplicate lifecycle extension name: {}",
                     descriptor.name
                 )));
             }
@@ -463,12 +463,12 @@ impl VmLifecycleExtensions {
         Ok(())
     }
 
-    pub async fn configure_vm_launch(
+    pub async fn configure_launch(
         &self,
         sandbox: &Sandbox,
         state_dir: &Path,
-        plan: &mut VmLaunchPlan,
-    ) -> VmLifecycleResult<()> {
+        plan: &mut LaunchPlan,
+    ) -> LifecycleResult<()> {
         for ext in &self.extensions {
             let descriptor = ext.descriptor();
             for backend in descriptor.required_backends {
@@ -480,7 +480,7 @@ impl VmLifecycleExtensions {
             // silently dropping the earlier value.
             let prev_kernel_profile = plan.kernel_profile.clone();
             let prev_kernel_image = plan.kernel_image.clone();
-            ext.configure_vm_launch(sandbox, state_dir, plan).await?;
+            ext.configure_launch(sandbox, state_dir, plan).await?;
             warn_on_singleton_overwrite(
                 ext.name(),
                 "kernel_profile",
@@ -501,19 +501,19 @@ impl VmLifecycleExtensions {
         Ok(())
     }
 
-    pub async fn before_vm_launch(
+    pub async fn before_launch(
         &self,
         sandbox: &Sandbox,
         state_dir: &Path,
-        plan: &mut VmLaunchPlan,
-    ) -> VmLifecycleResult<()> {
+        plan: &mut LaunchPlan,
+    ) -> LifecycleResult<()> {
         for ext in &self.extensions {
-            ext.before_vm_launch(sandbox, state_dir, plan).await?;
+            ext.before_launch(sandbox, state_dir, plan).await?;
         }
         Ok(())
     }
 
-    pub async fn after_vm_launch_failed(
+    pub async fn after_launch_failed(
         &self,
         sandbox: &Sandbox,
         state_dir: &Path,
@@ -521,50 +521,50 @@ impl VmLifecycleExtensions {
     ) {
         for ext in self.extensions.iter().rev() {
             if let Err(err) = ext
-                .after_vm_launch_failed(sandbox, state_dir, reason.clone())
+                .after_launch_failed(sandbox, state_dir, reason.clone())
                 .await
             {
                 tracing::warn!(
                     extension = ext.name(),
                     sandbox_id = %sandbox.id,
                     error = %err,
-                    "vm driver: lifecycle extension after_vm_launch_failed hook failed"
+                    "vm driver: lifecycle extension after_launch_failed hook failed"
                 );
             }
         }
     }
 
-    pub async fn after_sandbox_deleted(&self, sandbox: &Sandbox, state_dir: &Path) {
+    pub async fn after_delete(&self, sandbox: &Sandbox, state_dir: &Path) {
         for ext in self.extensions.iter().rev() {
-            if let Err(err) = ext.after_sandbox_deleted(sandbox, state_dir).await {
+            if let Err(err) = ext.after_delete(sandbox, state_dir).await {
                 tracing::warn!(
                     extension = ext.name(),
                     sandbox_id = %sandbox.id,
                     error = %err,
-                    "vm driver: lifecycle extension after_sandbox_deleted hook failed"
+                    "vm driver: lifecycle extension after_delete hook failed"
                 );
             }
         }
     }
 
-    pub async fn reconcile_before_restore(
+    pub async fn before_restore(
         &self,
-        sandbox: &VmPersistedSandbox,
-    ) -> VmLifecycleResult<()> {
+        sandbox: &RestoreContext,
+    ) -> LifecycleResult<()> {
         for ext in &self.extensions {
-            ext.reconcile_before_restore(sandbox).await?;
+            ext.before_restore(sandbox).await?;
         }
         Ok(())
     }
 
-    pub async fn reconcile_after_restore(&self, sandbox: &VmPersistedSandbox) {
+    pub async fn after_restore(&self, sandbox: &RestoreContext) {
         for ext in &self.extensions {
-            if let Err(err) = ext.reconcile_after_restore(sandbox).await {
+            if let Err(err) = ext.after_restore(sandbox).await {
                 tracing::warn!(
                     extension = ext.name(),
                     sandbox_id = %sandbox.sandbox.id,
                     error = %err,
-                    "vm driver: lifecycle extension reconcile_after_restore hook failed"
+                    "vm driver: lifecycle extension after_restore hook failed"
                 );
             }
         }
@@ -597,31 +597,31 @@ fn warn_on_singleton_overwrite<T>(
 pub fn extension_state_dir(
     sandbox_state_dir: &Path,
     extension_name: &str,
-) -> VmLifecycleResult<PathBuf> {
+) -> LifecycleResult<PathBuf> {
     validate_extension_name(extension_name)?;
     Ok(sandbox_state_dir.join("extensions").join(extension_name))
 }
 
-fn validate_extension_name(name: &str) -> VmLifecycleResult<()> {
+fn validate_extension_name(name: &str) -> LifecycleResult<()> {
     if name.is_empty() || name == "." || name == ".." {
-        return Err(VmLifecycleError::new(
-            "VM lifecycle extension name is empty or reserved",
+        return Err(LifecycleError::new(
+            "lifecycle extension name is empty or reserved",
         ));
     }
     if !name
         .chars()
         .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.')
     {
-        return Err(VmLifecycleError::new(format!(
-            "VM lifecycle extension name '{name}' must contain only ASCII letters, numbers, '.', '-', or '_'"
+        return Err(LifecycleError::new(format!(
+            "lifecycle extension name '{name}' must contain only ASCII letters, numbers, '.', '-', or '_'"
         )));
     }
     Ok(())
 }
 
 fn validate_descriptor_strings(
-    descriptor: &VmLifecycleExtensionDescriptor,
-) -> VmLifecycleResult<()> {
+    descriptor: &ExtensionDescriptor,
+) -> LifecycleResult<()> {
     for value in descriptor
         .provides
         .kernel_profiles
@@ -631,8 +631,8 @@ fn validate_descriptor_strings(
         .chain(descriptor.provides.host_resources.iter())
     {
         validate_extension_identifier(value).map_err(|err| {
-            VmLifecycleError::new(format!(
-                "VM lifecycle extension '{}' has invalid provided capability '{}': {err}",
+            LifecycleError::new(format!(
+                "lifecycle extension '{}' has invalid provided capability '{}': {err}",
                 descriptor.name, value
             ))
         })?;
@@ -702,62 +702,62 @@ mod tests {
     }
 
     #[tonic::async_trait]
-    impl VmLifecycleExtension for RecordingExtension {
+    impl LifecycleExtension for RecordingExtension {
         fn name(&self) -> &str {
             &self.name
         }
 
-        fn descriptor(&self) -> VmLifecycleExtensionDescriptor {
-            VmLifecycleExtensionDescriptor {
+        fn descriptor(&self) -> ExtensionDescriptor {
+            ExtensionDescriptor {
                 name: self.name.clone(),
-                provides: VmExtensionProvides {
+                provides: ExtensionCapabilities {
                     kernel_profiles: vec![format!("profile-{}", self.name)],
                     guest_init_dropins: vec![format!("50-{}.sh", self.name)],
                     launch_features: vec!["guest-init-dropins".to_string()],
                     host_resources: Vec::new(),
                 },
                 required_backends: Vec::new(),
-                required_backend_features: vec![VmBackendFeature::GuestInitDropins],
+                required_backend_features: vec![BackendFeature::GuestInitDropins],
             }
         }
 
-        async fn configure_vm_launch(
+        async fn configure_launch(
             &self,
             _sandbox: &Sandbox,
             _state_dir: &Path,
-            plan: &mut VmLaunchPlan,
-        ) -> VmLifecycleResult<()> {
+            plan: &mut LaunchPlan,
+        ) -> LifecycleResult<()> {
             self.calls
                 .lock()
                 .unwrap()
-                .push(format!("{}:configure_vm_launch", self.name));
+                .push(format!("{}:configure_launch", self.name));
             if self.configure_should_fail {
-                return Err(VmLifecycleError::new(format!(
-                    "{}: scripted configure_vm_launch failure",
+                return Err(LifecycleError::new(format!(
+                    "{}: scripted configure_launch failure",
                     self.name
                 )));
             }
             plan.kernel_profile = Some(format!("profile-{}", self.name));
-            plan.guest_init_dropins.push(VmGuestInitDropIn::new(
+            plan.guest_init_dropins.push(GuestInitDropin::new(
                 format!("50-{}.sh", self.name),
                 b"#!/bin/sh\n".to_vec(),
             ));
             Ok(())
         }
 
-        async fn before_vm_launch(
+        async fn before_launch(
             &self,
             _sandbox: &Sandbox,
             _state_dir: &Path,
-            plan: &mut VmLaunchPlan,
-        ) -> VmLifecycleResult<()> {
+            plan: &mut LaunchPlan,
+        ) -> LifecycleResult<()> {
             self.calls
                 .lock()
                 .unwrap()
-                .push(format!("{}:before_vm_launch", self.name));
+                .push(format!("{}:before_launch", self.name));
             if self.before_should_fail {
-                return Err(VmLifecycleError::new(format!(
-                    "{}: scripted before_vm_launch failure",
+                return Err(LifecycleError::new(format!(
+                    "{}: scripted before_launch failure",
                     self.name
                 )));
             }
@@ -765,34 +765,34 @@ mod tests {
             Ok(())
         }
 
-        async fn after_vm_launch_failed(
+        async fn after_launch_failed(
             &self,
             _sandbox: &Sandbox,
             _state_dir: &Path,
             reason: LaunchAbortReason,
-        ) -> VmLifecycleResult<()> {
+        ) -> LifecycleResult<()> {
             self.calls
                 .lock()
                 .unwrap()
-                .push(format!("{}:after_vm_launch_failed:{:?}", self.name, reason));
+                .push(format!("{}:after_launch_failed:{:?}", self.name, reason));
             Ok(())
         }
 
-        async fn after_sandbox_deleted(
+        async fn after_delete(
             &self,
             _sandbox: &Sandbox,
             _state_dir: &Path,
-        ) -> VmLifecycleResult<()> {
+        ) -> LifecycleResult<()> {
             self.calls
                 .lock()
                 .unwrap()
-                .push(format!("{}:after_sandbox_deleted", self.name));
+                .push(format!("{}:after_delete", self.name));
             Ok(())
         }
     }
 
-    fn sample_plan(backend: VmBackend) -> VmLaunchPlan {
-        VmLaunchPlan {
+    fn sample_plan(backend: VmBackend) -> LaunchPlan {
+        LaunchPlan {
             backend,
             vcpus: 2,
             mem_mib: 2048,
@@ -820,26 +820,26 @@ mod tests {
         }
     }
 
-    fn as_extension<T>(extension: &Arc<T>) -> Arc<dyn VmLifecycleExtension>
+    fn as_extension<T>(extension: &Arc<T>) -> Arc<dyn LifecycleExtension>
     where
-        T: VmLifecycleExtension + 'static,
+        T: LifecycleExtension + 'static,
     {
         extension.clone()
     }
 
     #[tokio::test]
-    async fn configure_vm_launch_runs_each_extension_in_order() {
+    async fn configure_launch_runs_each_extension_in_order() {
         let ext_a = RecordingExtension::new("a");
         let ext_b = RecordingExtension::new("b");
         let registry =
-            VmLifecycleExtensions::with(vec![as_extension(&ext_a), as_extension(&ext_b)]);
+            LifecycleExtensionRegistry::with(vec![as_extension(&ext_a), as_extension(&ext_b)]);
         let mut plan = sample_plan(VmBackend::Qemu);
         let sandbox = sample_sandbox();
 
         registry
-            .configure_vm_launch(&sandbox, &PathBuf::from("/tmp/state"), &mut plan)
+            .configure_launch(&sandbox, &PathBuf::from("/tmp/state"), &mut plan)
             .await
-            .expect("configure_vm_launch succeeds");
+            .expect("configure_launch succeeds");
 
         assert_eq!(plan.kernel_profile.as_deref(), Some("profile-b"));
         assert_eq!(
@@ -849,16 +849,16 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["50-a.sh", "50-b.sh"]
         );
-        assert_eq!(ext_a.calls(), vec!["a:configure_vm_launch"]);
-        assert_eq!(ext_b.calls(), vec!["b:configure_vm_launch"]);
+        assert_eq!(ext_a.calls(), vec!["a:configure_launch"]);
+        assert_eq!(ext_b.calls(), vec!["b:configure_launch"]);
     }
 
     #[tokio::test]
-    async fn configure_vm_launch_short_circuits_on_first_failure() {
+    async fn configure_launch_short_circuits_on_first_failure() {
         let ext_a = RecordingExtension::new("a");
         let ext_fail = RecordingExtension::configure_failing("boom");
         let ext_c = RecordingExtension::new("c");
-        let registry = VmLifecycleExtensions::with(vec![
+        let registry = LifecycleExtensionRegistry::with(vec![
             as_extension(&ext_a),
             as_extension(&ext_fail),
             as_extension(&ext_c),
@@ -867,16 +867,16 @@ mod tests {
         let sandbox = sample_sandbox();
 
         let err = registry
-            .configure_vm_launch(&sandbox, &PathBuf::from("/tmp/state"), &mut plan)
+            .configure_launch(&sandbox, &PathBuf::from("/tmp/state"), &mut plan)
             .await
             .expect_err("scripted failure should propagate");
         assert!(
             err.message()
-                .contains("scripted configure_vm_launch failure")
+                .contains("scripted configure_launch failure")
         );
 
-        assert_eq!(ext_a.calls(), vec!["a:configure_vm_launch"]);
-        assert_eq!(ext_fail.calls(), vec!["boom:configure_vm_launch"]);
+        assert_eq!(ext_a.calls(), vec!["a:configure_launch"]);
+        assert_eq!(ext_fail.calls(), vec!["boom:configure_launch"]);
         assert!(
             ext_c.calls().is_empty(),
             "extensions after the failure must not be invoked"
@@ -884,30 +884,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn before_vm_launch_runs_each_extension_in_order_and_collects_env() {
+    async fn before_launch_runs_each_extension_in_order_and_collects_env() {
         let ext_a = RecordingExtension::new("a");
         let ext_b = RecordingExtension::new("b");
         let registry =
-            VmLifecycleExtensions::with(vec![as_extension(&ext_a), as_extension(&ext_b)]);
+            LifecycleExtensionRegistry::with(vec![as_extension(&ext_a), as_extension(&ext_b)]);
         let mut plan = sample_plan(VmBackend::Qemu);
         let sandbox = sample_sandbox();
 
         registry
-            .before_vm_launch(&sandbox, &PathBuf::from("/tmp/state"), &mut plan)
+            .before_launch(&sandbox, &PathBuf::from("/tmp/state"), &mut plan)
             .await
-            .expect("before_vm_launch succeeds");
+            .expect("before_launch succeeds");
 
         assert_eq!(plan.env, vec!["RECORDING_a=1", "RECORDING_b=1"]);
-        assert_eq!(ext_a.calls(), vec!["a:before_vm_launch"]);
-        assert_eq!(ext_b.calls(), vec!["b:before_vm_launch"]);
+        assert_eq!(ext_a.calls(), vec!["a:before_launch"]);
+        assert_eq!(ext_b.calls(), vec!["b:before_launch"]);
     }
 
     #[tokio::test]
-    async fn before_vm_launch_short_circuits_on_first_failure() {
+    async fn before_launch_short_circuits_on_first_failure() {
         let ext_a = RecordingExtension::new("a");
         let ext_fail = RecordingExtension::failing("boom");
         let ext_c = RecordingExtension::new("c");
-        let registry = VmLifecycleExtensions::with(vec![
+        let registry = LifecycleExtensionRegistry::with(vec![
             as_extension(&ext_a),
             as_extension(&ext_fail),
             as_extension(&ext_c),
@@ -916,13 +916,13 @@ mod tests {
         let sandbox = sample_sandbox();
 
         let err = registry
-            .before_vm_launch(&sandbox, &PathBuf::from("/tmp/state"), &mut plan)
+            .before_launch(&sandbox, &PathBuf::from("/tmp/state"), &mut plan)
             .await
             .expect_err("scripted failure should propagate");
-        assert!(err.message().contains("scripted before_vm_launch failure"));
+        assert!(err.message().contains("scripted before_launch failure"));
 
-        assert_eq!(ext_a.calls(), vec!["a:before_vm_launch"]);
-        assert_eq!(ext_fail.calls(), vec!["boom:before_vm_launch"]);
+        assert_eq!(ext_a.calls(), vec!["a:before_launch"]);
+        assert_eq!(ext_fail.calls(), vec!["boom:before_launch"]);
         assert!(
             ext_c.calls().is_empty(),
             "extensions after the failure must not be invoked"
@@ -930,15 +930,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn after_vm_launch_failed_runs_every_extension_in_reverse_order() {
+    async fn after_launch_failed_runs_every_extension_in_reverse_order() {
         let ext_a = RecordingExtension::new("a");
         let ext_b = RecordingExtension::new("b");
         let registry =
-            VmLifecycleExtensions::with(vec![as_extension(&ext_a), as_extension(&ext_b)]);
+            LifecycleExtensionRegistry::with(vec![as_extension(&ext_a), as_extension(&ext_b)]);
         let sandbox = sample_sandbox();
 
         registry
-            .after_vm_launch_failed(
+            .after_launch_failed(
                 &sandbox,
                 &PathBuf::from("/tmp/state"),
                 LaunchAbortReason::LauncherSpawnFailed,
@@ -947,37 +947,37 @@ mod tests {
 
         assert_eq!(
             ext_a.calls(),
-            vec!["a:after_vm_launch_failed:LauncherSpawnFailed"]
+            vec!["a:after_launch_failed:LauncherSpawnFailed"]
         );
         assert_eq!(
             ext_b.calls(),
-            vec!["b:after_vm_launch_failed:LauncherSpawnFailed"]
+            vec!["b:after_launch_failed:LauncherSpawnFailed"]
         );
     }
 
     #[tokio::test]
-    async fn after_sandbox_deleted_runs_every_extension() {
+    async fn after_delete_runs_every_extension() {
         let ext_a = RecordingExtension::new("a");
         let ext_b = RecordingExtension::new("b");
         let registry =
-            VmLifecycleExtensions::with(vec![as_extension(&ext_a), as_extension(&ext_b)]);
+            LifecycleExtensionRegistry::with(vec![as_extension(&ext_a), as_extension(&ext_b)]);
         let sandbox = sample_sandbox();
 
         registry
-            .after_sandbox_deleted(&sandbox, &PathBuf::from("/tmp/state"))
+            .after_delete(&sandbox, &PathBuf::from("/tmp/state"))
             .await;
 
-        assert_eq!(ext_a.calls(), vec!["a:after_sandbox_deleted"]);
-        assert_eq!(ext_b.calls(), vec!["b:after_sandbox_deleted"]);
+        assert_eq!(ext_a.calls(), vec!["a:after_delete"]);
+        assert_eq!(ext_b.calls(), vec!["b:after_delete"]);
     }
 
     #[test]
     fn resource_exhausted_flag_round_trips() {
-        let err = VmLifecycleError::resource_exhausted("pool empty");
+        let err = LifecycleError::resource_exhausted("pool empty");
         assert!(err.is_resource_exhausted());
         assert_eq!(err.message(), "pool empty");
 
-        let plain = VmLifecycleError::new("internal");
+        let plain = LifecycleError::new("internal");
         assert!(!plain.is_resource_exhausted());
     }
 
@@ -994,7 +994,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_duplicate_extension_names() {
-        let registry = VmLifecycleExtensions::with(vec![
+        let registry = LifecycleExtensionRegistry::with(vec![
             RecordingExtension::new("dup"),
             RecordingExtension::new("dup"),
         ]);
@@ -1007,7 +1007,7 @@ mod tests {
     #[test]
     fn descriptor_tracks_provided_capabilities_and_requirements() {
         let ext = RecordingExtension::new("vfio");
-        let registry = VmLifecycleExtensions::with(vec![ext]);
+        let registry = LifecycleExtensionRegistry::with(vec![ext]);
 
         let descriptors = registry.descriptors();
         assert_eq!(descriptors.len(), 1);
@@ -1015,7 +1015,7 @@ mod tests {
         assert!(descriptors[0].required_backends.is_empty());
         assert_eq!(
             descriptors[0].required_backend_features,
-            vec![VmBackendFeature::GuestInitDropins]
+            vec![BackendFeature::GuestInitDropins]
         );
         assert_eq!(
             descriptors[0].provides.kernel_profiles,
