@@ -1,0 +1,28 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# openshell-sdk-node (TypeScript binding) tasks
+
+["sdk-node:install"]
+description = "Install npm dependencies for openshell-sdk-node"
+run = "cd crates/openshell-sdk-node && npm ci"
+hide = true
+
+["sdk-node:build"]
+description = "Build the napi binding and regenerate index.{js,d.ts}"
+depends = ["sdk-node:install"]
+run = "cd crates/openshell-sdk-node && npx napi build --platform --release"
+
+["sdk-node:smoke"]
+description = "Run the openshell-sdk-node smoke suite"
+depends = ["sdk-node:build"]
+run = "cd crates/openshell-sdk-node && node test/smoke.mjs"
+hide = true
+
+["sdk-node:check"]
+description = "Verify committed index.{js,d.ts} are in sync with src/lib.rs and the smoke suite passes"
+depends = ["sdk-node:build"]
+run = [
+  "git diff --exit-code crates/openshell-sdk-node/index.js crates/openshell-sdk-node/index.d.ts",
+  "cd crates/openshell-sdk-node && node test/smoke.mjs",
+]

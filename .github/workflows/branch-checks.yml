@@ -181,3 +181,34 @@ jobs:
 
       - name: Lint
         run: mise run markdown:lint
+
+  sdk-node:
+    name: TypeScript SDK (openshell-sdk-node)
+    needs: pr_metadata
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    runs-on: linux-amd64-cpu8
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_VERSION: branch-checks-sdk-node
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Configure GHA sccache backend
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+
+      - name: Install tools
+        run: mise install --locked
+
+      - name: Cache Rust target and registry
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
+        with:
+          shared-key: rust-sdk-node
+          cache-on-failure: "true"
+
+      - name: Verify SDK binding is in sync and smoke tests pass
+        run: mise run sdk-node:check
