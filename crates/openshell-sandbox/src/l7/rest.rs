@@ -471,10 +471,6 @@ where
                 resolver.resolve_placeholder(&secret_key_placeholder),
             ) {
                 (Some(access_key), Some(secret_key)) => {
-                    let creds = crate::sigv4::AwsCredentials {
-                        access_key_id: access_key.to_string(),
-                        secret_access_key: secret_key.to_string(),
-                    };
                     let (region, service) =
                         crate::sigv4::extract_aws_region_and_service(&options.host)
                             .unwrap_or_else(|| {
@@ -502,10 +498,14 @@ where
                         }
                     }
 
-                    let signed =
-                        crate::sigv4::apply_sigv4_to_request(
-                            &full_request, &options.host, &region, &service, &creds,
-                        );
+                    let signed = crate::sigv4::apply_sigv4_to_request(
+                        &full_request,
+                        &options.host,
+                        &region,
+                        &service,
+                        access_key,
+                        secret_key,
+                    );
                     upstream.write_all(&signed).await.into_diagnostic()?;
                 }
                 _ => {
