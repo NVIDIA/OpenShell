@@ -94,6 +94,12 @@ pub struct GatewayFileSection {
     pub sandbox_namespace: Option<String>,
     #[serde(default)]
     pub ssh_session_ttl_secs: Option<u64>,
+    /// Path to a sandbox policy YAML file. When set, `CreateSandbox`
+    /// requests that omit `spec.policy` use this policy instead of being
+    /// forwarded to the driver with no policy at all. Loaded and validated
+    /// once at gateway startup; restart the gateway to pick up changes.
+    #[serde(default)]
+    pub default_policy_path: Option<PathBuf>,
 
     // ── Service routing ──────────────────────────────────────────────────
     /// Subject Alternative Names configured on the gateway server certificate.

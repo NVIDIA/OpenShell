@@ -90,6 +90,31 @@ openshell sandbox create -- claude
 
 The CLI uses the policy from `OPENSHELL_SANDBOX_POLICY` whenever `--policy` is not explicitly provided.
 
+### Gateway-wide default policy
+
+Operators can configure a fallback policy on the gateway so that `CreateSandbox` requests that omit `spec.policy` are not silently provisioned without enforcement. Set `default_policy_path` in the gateway TOML:
+
+```toml
+[openshell.gateway]
+default_policy_path = "/etc/openshell/default-policy.yaml"
+```
+
+The Helm chart wires this through `server.defaultSandboxPolicy`, which inlines a policy YAML into the gateway ConfigMap:
+
+```yaml
+server:
+  defaultSandboxPolicy: |
+    version: 1
+    filesystem_policy:
+      include_workdir: true
+      read_only:
+        - /usr
+      read_write:
+        - /tmp
+```
+
+The gateway parses and validates the file once at startup; an unsafe or unreadable default fails the gateway boot. Callers that pass an explicit policy still take precedence — the default only fires when `spec.policy` is omitted.
+
 ## Iterate on a Running Sandbox
 
 To change what the sandbox can access, pull the current policy, edit the YAML, and push the update. The workflow is iterative: create the sandbox, monitor logs for denied actions, pull the policy, modify it, push, and verify.

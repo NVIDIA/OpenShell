@@ -63,6 +63,7 @@ use compute::{ComputeRuntime, DockerComputeConfig, VmComputeConfig};
 pub use grpc::OpenShellService;
 pub use http::{health_router, http_router, metrics_router, service_http_router};
 pub use multiplex::{MultiplexService, MultiplexedService};
+use openshell_core::proto::SandboxPolicy;
 use openshell_driver_kubernetes::KubernetesComputeConfig;
 pub use persistence::Store;
 use sandbox_index::SandboxIndex;
@@ -128,6 +129,13 @@ pub struct ServerState {
     /// `IssueSandboxToken` bootstrap path. Only present when the gateway
     /// runs in-cluster.
     pub k8s_sa_authenticator: Option<Arc<auth::k8s_sa::K8sServiceAccountAuthenticator>>,
+
+    /// Server-side default sandbox policy. Substituted into
+    /// `CreateSandbox` requests that omit `spec.policy` so wrapper SDKs
+    /// cannot accidentally provision a sandbox without enforcement.
+    /// Loaded and validated once at startup from
+    /// `[openshell.gateway].default_policy_path`.
+    pub default_sandbox_policy: Option<Arc<SandboxPolicy>>,
 }
 
 fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
@@ -175,8 +183,50 @@ impl ServerState {
             sandbox_jwt_issuer: None,
             sandbox_jwt_authenticator: None,
             k8s_sa_authenticator: None,
+            default_sandbox_policy: None,
         }
     }
+}
+
+/// Load the gateway-wide default sandbox policy referenced by
+/// `[openshell.gateway].default_policy_path` and validate it against the
+/// same safety rules every per-request policy must satisfy. Returns
+/// `Ok(None)` when the field is unset or no config file is present.
+fn load_default_sandbox_policy(
+    file: Option<&config_file::ConfigFile>,
+) -> Result<Option<SandboxPolicy>> {
+    let Some(path) = file
+        .and_then(|f| f.openshell.gateway.default_policy_path.as_ref())
+        .cloned()
+    else {
+        return Ok(None);
+    };
+    let contents = std::fs::read_to_string(&path).map_err(|e| {
+        Error::config(format!(
+            "failed to read default sandbox policy from {}: {e}",
+            path.display()
+        ))
+    })?;
+    let mut policy = openshell_policy::parse_sandbox_policy(&contents).map_err(|e| {
+        Error::config(format!(
+            "failed to parse default sandbox policy from {}: {e}",
+            path.display()
+        ))
+    })?;
+    openshell_policy::ensure_sandbox_process_identity(&mut policy);
+    if let Err(violations) = openshell_policy::validate_sandbox_policy(&policy) {
+        let messages: Vec<String> = violations.iter().map(ToString::to_string).collect();
+        return Err(Error::config(format!(
+            "default sandbox policy at {} is unsafe: {}",
+            path.display(),
+            messages.join("; "),
+        )));
+    }
+    info!(
+        path = %path.display(),
+        "Loaded default sandbox policy; requests without spec.policy will use it"
+    );
+    Ok(Some(policy))
 }
 
 /// Run the `OpenShell` server.
@@ -233,6 +283,8 @@ pub async fn run_server(
         supervisor_sessions.clone(),
     )
     .await?;
+    let default_sandbox_policy = load_default_sandbox_policy(config_file.as_ref())?.map(Arc::new);
+
     let mut state = ServerState::new(
         config.clone(),
         store.clone(),
@@ -243,6 +295,7 @@ pub async fn run_server(
         supervisor_sessions,
         oidc_cache,
     );
+    state.default_sandbox_policy = default_sandbox_policy;
 
     // Load the gateway-minted sandbox JWT signing key when configured.
     // Optional so single-driver dev deployments without certgen continue
@@ -876,7 +929,8 @@ mod tests {
         ConnectionProtocol, MultiplexService, ServerState, TlsAcceptor,
         allow_plaintext_service_http, classify_initial_bytes, configured_compute_driver,
         gateway_listener_addresses, is_benign_tls_handshake_failure,
-        kubernetes_config_for_k8s_sa_bootstrap, serve_gateway_listener,
+        kubernetes_config_for_k8s_sa_bootstrap, load_default_sandbox_policy,
+        serve_gateway_listener,
     };
     use openshell_core::{
         ComputeDriverKind, Config,
@@ -1328,6 +1382,83 @@ service_account_name = "sandbox-sa"
         assert_eq!(
             gateway_listener_addresses(primary, &[docker, docker]),
             vec![primary, docker]
+        );
+    }
+
+    #[test]
+    fn load_default_sandbox_policy_returns_none_when_unset() {
+        assert!(load_default_sandbox_policy(None).unwrap().is_none());
+
+        let file: crate::config_file::ConfigFile =
+            toml::from_str("[openshell.gateway]\n").expect("valid empty config");
+        assert!(load_default_sandbox_policy(Some(&file)).unwrap().is_none());
+    }
+
+    #[test]
+    fn load_default_sandbox_policy_parses_and_validates_yaml() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("default-policy.yaml");
+        std::fs::write(
+            &path,
+            "version: 1\n\
+             filesystem_policy:\n  \
+               include_workdir: true\n  \
+               read_only:\n    - /usr\n  \
+               read_write:\n    - /tmp\n",
+        )
+        .expect("write policy file");
+
+        let toml_body = format!(
+            "[openshell.gateway]\ndefault_policy_path = \"{}\"\n",
+            path.display()
+        );
+        let file: crate::config_file::ConfigFile =
+            toml::from_str(&toml_body).expect("valid config");
+        let policy = load_default_sandbox_policy(Some(&file))
+            .expect("load succeeds")
+            .expect("policy returned");
+        assert_eq!(policy.version, 1);
+        let process = policy.process.expect("process identity filled in");
+        assert_eq!(process.run_as_user, "sandbox");
+        assert_eq!(process.run_as_group, "sandbox");
+    }
+
+    #[test]
+    fn load_default_sandbox_policy_rejects_unsafe_policy() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("unsafe-policy.yaml");
+        // `/` is overly broad — validate_sandbox_policy rejects it.
+        std::fs::write(
+            &path,
+            "version: 1\n\
+             filesystem_policy:\n  \
+               include_workdir: true\n  \
+               read_only:\n    - /usr\n  \
+               read_write:\n    - /\n",
+        )
+        .expect("write policy file");
+
+        let toml_body = format!(
+            "[openshell.gateway]\ndefault_policy_path = \"{}\"\n",
+            path.display()
+        );
+        let file: crate::config_file::ConfigFile =
+            toml::from_str(&toml_body).expect("valid config");
+        let err = load_default_sandbox_policy(Some(&file)).unwrap_err();
+        assert!(
+            err.to_string().contains("unsafe"),
+            "expected unsafe-policy error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_default_sandbox_policy_reports_missing_file() {
+        let toml_body = "[openshell.gateway]\ndefault_policy_path = \"/nonexistent/policy.yaml\"\n";
+        let file: crate::config_file::ConfigFile = toml::from_str(toml_body).expect("valid config");
+        let err = load_default_sandbox_policy(Some(&file)).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("failed to read default sandbox policy")
         );
     }
 }

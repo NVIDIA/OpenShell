@@ -683,16 +683,26 @@ pub mod test_support {
     use crate::supervisor_session::SupervisorSessionRegistry;
     use crate::tracing_bus::TracingLogBus;
     use openshell_core::Config;
+    use openshell_core::proto::SandboxPolicy;
 
     /// Build an in-memory `ServerState` for unit tests.
     pub async fn test_server_state() -> Arc<ServerState> {
+        test_server_state_with_default_policy(None).await
+    }
+
+    /// Build an in-memory `ServerState` for unit tests, optionally seeding the
+    /// gateway-wide default sandbox policy applied when a `CreateSandbox`
+    /// request omits `spec.policy`.
+    pub async fn test_server_state_with_default_policy(
+        default_policy: Option<SandboxPolicy>,
+    ) -> Arc<ServerState> {
         let store = Arc::new(
             Store::connect("sqlite::memory:?cache=shared")
                 .await
                 .unwrap(),
         );
         let compute = new_test_runtime(store.clone()).await;
-        Arc::new(ServerState::new(
+        let mut state = ServerState::new(
             Config::new(None).with_database_url("sqlite::memory:?cache=shared"),
             store,
             compute,
@@ -701,7 +711,9 @@ pub mod test_support {
             TracingLogBus::new(),
             Arc::new(SupervisorSessionRegistry::new()),
             None,
-        ))
+        );
+        state.default_sandbox_policy = default_policy.map(Arc::new);
+        Arc::new(state)
     }
 }
 

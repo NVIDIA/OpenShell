@@ -45,6 +45,9 @@ data:
     client_tls_secret_name = {{ .Values.server.tls.clientTlsSecretName | quote }}
     {{- end }}
     enable_loopback_service_http = {{ .Values.server.enableLoopbackServiceHttp }}
+    {{- if .Values.server.defaultSandboxPolicy }}
+    default_policy_path   = "/etc/openshell/default-policy.yaml"
+    {{- end }}
     {{- $sans := list -}}
     {{- if and .Values.certManager.enabled .Values.certManager.serverDnsNames }}
     {{- $sans = .Values.certManager.serverDnsNames }}
@@ -110,3 +113,7 @@ data:
     {{- if .Values.supervisor.image.pullPolicy }}
     supervisor_image_pull_policy = {{ .Values.supervisor.image.pullPolicy | quote }}
     {{- end }}
+{{- if .Values.server.defaultSandboxPolicy }}
+  default-policy.yaml: |
+{{ .Values.server.defaultSandboxPolicy | indent 4 }}
+{{- end }}

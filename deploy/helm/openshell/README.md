@@ -133,6 +133,7 @@ cert-manager alternative.
 | securityContext.runAsUser | int | `1000` | UID assigned to the gateway container. |
 | server.auth.allowUnauthenticatedUsers | bool | `false` | UNSAFE: accept unauthenticated CLI/user requests as a local developer principal. Intended only for trusted local Skaffold/k3d development or a fully trusted fronting proxy. Leave false for shared or production clusters. |
 | server.dbUrl | string | `"sqlite:/var/openshell/openshell.db"` | Gateway database URL. |
+| server.defaultSandboxPolicy | string | `""` | Default sandbox policy YAML applied when CreateSandbox requests omit `spec.policy`. Paste the contents of a policy file inline; the chart mounts it into the gateway pod and points the gateway at it. Leave empty to keep the legacy behavior where omitted policies pass through unenforced. |
 | server.disableTls | bool | `false` | Disable TLS entirely - the server listens on plaintext HTTP. Set to true when a reverse proxy / tunnel terminates TLS at the edge. |
 | server.enableLoopbackServiceHttp | bool | `true` | Enable plaintext HTTP routing for loopback sandbox service URLs on TLS-enabled gateways. |
 | server.enableUserNamespaces | bool | `false` | Enable Kubernetes user namespace isolation (hostUsers: false) for sandbox pods. Requires Kubernetes 1.33+ with user namespace support available (beta through 1.35, GA in 1.36+), plus a supporting container runtime and Linux 5.12+. When enabled, container UID 0 maps to an unprivileged host UID and capabilities become namespaced. |

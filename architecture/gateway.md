@@ -245,6 +245,16 @@ config path. A gateway-global policy can override sandbox-scoped policy. The
 sandbox supervisor polls for config revisions and hot-reloads dynamic policy
 when the policy engine accepts the update.
 
+### Default sandbox policy
+
+`[openshell.gateway].default_policy_path` points at a sandbox-policy YAML file
+that the gateway substitutes into any `CreateSandbox` request that omits
+`spec.policy`. The file is parsed and validated once at startup; an unsafe or
+unreadable default fails the gateway boot instead of waiting for a request to
+trip on it. Callers that pass an explicit policy are unaffected. The Helm chart
+exposes this through `server.defaultSandboxPolicy`, which inlines the policy
+YAML into the gateway ConfigMap mounted at `/etc/openshell/default-policy.yaml`.
+
 ## Supervisor Relay
 
 Sandbox workloads maintain an outbound supervisor session to the gateway. This

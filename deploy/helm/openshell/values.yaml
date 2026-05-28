@@ -175,6 +175,12 @@ server:
   # -- Enable plaintext HTTP routing for loopback sandbox service URLs on
   # TLS-enabled gateways.
   enableLoopbackServiceHttp: true
+  # -- Default sandbox policy YAML applied when CreateSandbox requests omit
+  # `spec.policy`. Paste the contents of a policy file inline; the chart
+  # mounts it into the gateway pod and points the gateway at it. Leave
+  # empty to keep the legacy behavior where omitted policies pass through
+  # unenforced.
+  defaultSandboxPolicy: ""
   auth:
     # -- UNSAFE: accept unauthenticated CLI/user requests as a local developer
     # principal. Intended only for trusted local Skaffold/k3d development or a

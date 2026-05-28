@@ -91,6 +91,19 @@ pub(super) async fn handle_create_sandbox(
         template.image = state.compute.default_image().to_string();
     }
 
+    // Substitute the gateway-wide default policy when the caller omitted
+    // one. This is the server-side guardrail that frees wrapper SDKs from
+    // having to remember a `--policy` flag on every CreateSandbox call.
+    if spec.policy.is_none()
+        && let Some(default_policy) = state.default_sandbox_policy.as_deref()
+    {
+        spec.policy = Some(default_policy.clone());
+        info!(
+            sandbox_name = %request.name,
+            "CreateSandbox request omitted spec.policy; substituted gateway default"
+        );
+    }
+
     // Ensure process identity defaults to "sandbox" when missing or
     // empty, then validate policy safety before persisting.
     if let Some(ref mut policy) = spec.policy {
@@ -2109,6 +2122,97 @@ mod tests {
             current_policy_version: 7,
             ..Default::default()
         }
+    }
+
+    fn create_request(
+        name: &str,
+        policy: Option<openshell_core::proto::SandboxPolicy>,
+    ) -> CreateSandboxRequest {
+        CreateSandboxRequest {
+            name: name.to_string(),
+            spec: Some(openshell_core::proto::SandboxSpec {
+                policy,
+                ..Default::default()
+            }),
+            labels: HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_substitutes_default_policy_when_request_omits_one() {
+        let default_policy = openshell_policy::restrictive_default_policy();
+        let state = crate::grpc::test_support::test_server_state_with_default_policy(Some(
+            default_policy.clone(),
+        ))
+        .await;
+
+        let response =
+            handle_create_sandbox(&state, Request::new(create_request("missing-policy", None)))
+                .await
+                .expect("create succeeds");
+
+        let policy = response
+            .into_inner()
+            .sandbox
+            .expect("sandbox in response")
+            .spec
+            .expect("spec in sandbox")
+            .policy
+            .expect("default policy was substituted");
+        assert_eq!(policy, default_policy);
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_preserves_explicit_policy_when_provided() {
+        let default_policy = openshell_policy::restrictive_default_policy();
+        let mut caller_policy = openshell_policy::restrictive_default_policy();
+        // Mutate so we can tell the two apart even after process-identity defaults.
+        caller_policy.version = 2;
+        let state =
+            crate::grpc::test_support::test_server_state_with_default_policy(Some(default_policy))
+                .await;
+
+        let response = handle_create_sandbox(
+            &state,
+            Request::new(create_request(
+                "explicit-policy",
+                Some(caller_policy.clone()),
+            )),
+        )
+        .await
+        .expect("create succeeds");
+
+        let policy = response
+            .into_inner()
+            .sandbox
+            .expect("sandbox in response")
+            .spec
+            .expect("spec in sandbox")
+            .policy
+            .expect("policy present");
+        assert_eq!(policy.version, caller_policy.version);
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_without_default_policy_forwards_unset_policy() {
+        let state = crate::grpc::test_support::test_server_state_with_default_policy(None).await;
+
+        let response =
+            handle_create_sandbox(&state, Request::new(create_request("no-default", None)))
+                .await
+                .expect("create succeeds");
+
+        assert!(
+            response
+                .into_inner()
+                .sandbox
+                .expect("sandbox in response")
+                .spec
+                .expect("spec in sandbox")
+                .policy
+                .is_none(),
+            "no default policy configured, so policy must remain unset"
+        );
     }
 
     #[tokio::test]
