@@ -50,6 +50,14 @@ pub enum TlsMode {
     Skip,
 }
 
+/// Credential signing mode for proxy-side request signing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CredentialSigning {
+    #[default]
+    None,
+    SigV4,
+}
+
 /// Enforcement mode for L7 policy decisions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EnforcementMode {
@@ -88,6 +96,8 @@ pub struct L7EndpointConfig {
     /// When true, client-to-server GraphQL-over-WebSocket operation messages
     /// are classified with the same operation policy used by GraphQL-over-HTTP.
     pub websocket_graphql_policy: bool,
+    /// Proxy-side credential signing mode for this endpoint.
+    pub credential_signing: CredentialSigning,
 }
 
 /// Result of an L7 policy decision for a single request.
@@ -165,6 +175,11 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
         .filter(|v| *v > 0)
         .unwrap_or(graphql::DEFAULT_MAX_BODY_BYTES);
 
+    let credential_signing = match get_object_str(val, "credential_signing").as_deref() {
+        Some("sigv4") => CredentialSigning::SigV4,
+        _ => CredentialSigning::None,
+    };
+
     Some(L7EndpointConfig {
         protocol,
         path: get_object_str(val, "path").unwrap_or_default(),
@@ -175,6 +190,7 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
         websocket_credential_rewrite,
         request_body_credential_rewrite,
         websocket_graphql_policy,
+        credential_signing,
     })
 }
 

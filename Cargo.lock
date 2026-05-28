@@ -3647,6 +3647,7 @@ dependencies = [
  "glob",
  "hex",
  "hmac",
+ "http",
  "ipnet",
  "landlock",
  "libc",

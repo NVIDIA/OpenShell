@@ -377,6 +377,8 @@ where
             generation_guard,
             websocket_extensions: WebSocketExtensionMode::Preserve,
             request_body_credential_rewrite: false,
+            credential_signing: crate::l7::CredentialSigning::None,
+            host: String::new(),
         },
     )
     .await
@@ -389,12 +391,14 @@ pub(crate) enum WebSocketExtensionMode {
     PermessageDeflate,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct RelayRequestOptions<'a> {
     pub(crate) resolver: Option<&'a SecretResolver>,
     pub(crate) generation_guard: Option<&'a PolicyGenerationGuard>,
     pub(crate) websocket_extensions: WebSocketExtensionMode,
     pub(crate) request_body_credential_rewrite: bool,
+    pub(crate) credential_signing: crate::l7::CredentialSigning,
+    pub(crate) host: String,
 }
 
 pub(crate) async fn relay_http_request_with_options_guarded<C, U>(
@@ -421,8 +425,19 @@ where
         parse_websocket_upgrade_request(&req.raw_header[..header_end])?
     };
 
+    // When SigV4 signing is configured, strip AWS auth headers before credential
+    // rewriting so the fail-closed placeholder scan doesn't reject the SigV4
+    // Authorization header (which embeds placeholder strings).
+    let raw_for_rewrite;
+    let header_source = if options.credential_signing == crate::l7::CredentialSigning::SigV4 {
+        raw_for_rewrite = crate::sigv4::strip_aws_headers(&req.raw_header[..header_end]);
+        &raw_for_rewrite[..]
+    } else {
+        &req.raw_header[..header_end]
+    };
+
     let (header_bytes, expected_websocket_extension) = rewrite_websocket_extensions_for_mode(
-        &req.raw_header[..header_end],
+        header_source,
         options.websocket_extensions,
         websocket_request.is_some(),
     )?;
@@ -442,7 +457,69 @@ where
         guard.ensure_current()?;
     }
 
-    if options.request_body_credential_rewrite {
+    // Apply SigV4 signing if configured. We need the full request (headers + body)
+    // to compute the signature, so for SigV4 we always buffer the body first.
+    if options.credential_signing == crate::l7::CredentialSigning::SigV4 {
+        if let Some(resolver) = options.resolver {
+            let access_key_placeholder =
+                crate::secrets::placeholder_for_env_key("AWS_ACCESS_KEY_ID");
+            let secret_key_placeholder =
+                crate::secrets::placeholder_for_env_key("AWS_SECRET_ACCESS_KEY");
+
+            match (
+                resolver.resolve_placeholder(&access_key_placeholder),
+                resolver.resolve_placeholder(&secret_key_placeholder),
+            ) {
+                (Some(access_key), Some(secret_key)) => {
+                    let creds = crate::sigv4::AwsCredentials {
+                        access_key_id: access_key.to_string(),
+                        secret_access_key: secret_key.to_string(),
+                    };
+                    let (region, service) =
+                        crate::sigv4::extract_aws_region_and_service(&options.host)
+                            .unwrap_or_else(|| {
+                                ("us-east-1".to_string(), "execute-api".to_string())
+                            });
+                    tracing::warn!(
+                        host = %options.host,
+                        region = %region,
+                        service = %service,
+                        "applying SigV4 signing to CONNECT tunnel request"
+                    );
+
+                    // Collect body from overflow + stream
+                    let overflow = &req.raw_header[header_end..];
+                    let mut full_request = rewrite_result.rewritten.clone();
+                    full_request.extend_from_slice(overflow);
+                    // Read remaining body based on content-length
+                    if let BodyLength::ContentLength(body_len) = parse_body_length(header_str)? {
+                        let already_have = overflow.len() as u64;
+                        if body_len > already_have {
+                            let remaining = (body_len - already_have) as usize;
+                            let mut body_buf = vec![0u8; remaining];
+                            client.read_exact(&mut body_buf).await.into_diagnostic()?;
+                            full_request.extend_from_slice(&body_buf);
+                        }
+                    }
+
+                    let signed =
+                        crate::sigv4::apply_sigv4_to_request(
+                            &full_request, &options.host, &region, &service, &creds,
+                        );
+                    upstream.write_all(&signed).await.into_diagnostic()?;
+                }
+                _ => {
+                    return Err(miette!(
+                        "SigV4 signing configured but AWS credentials not found in provider"
+                    ));
+                }
+            }
+        } else {
+            return Err(miette!(
+                "SigV4 signing configured but no secret resolver available"
+            ));
+        }
+    } else if options.request_body_credential_rewrite {
         let body = collect_and_rewrite_request_body(
             req,
             client,
