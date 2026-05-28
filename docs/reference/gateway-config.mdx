@@ -169,6 +169,13 @@ image_pull_policy              = "IfNotPresent"
 image_pull_secrets             = ["regcred"]
 supervisor_image               = "ghcr.io/nvidia/openshell/supervisor:latest"
 supervisor_image_pull_policy   = "IfNotPresent"
+supervisor_role                = "workload"
+network_enforcement_mode       = "soft-proxy"
+# Optional for network_enforcement_mode = "external-enforcer".
+enforcer_endpoint              = "http://$(OPENSHELL_NODE_IP):17671"
+# Short-term compatibility escape hatch for trusted clusters that require
+# privileged sandbox pod admission.
+privileged                     = false
 # Use the image volume on Kubernetes >= 1.35 (GA in 1.36); switch to "init-container"
 # on older clusters or where the ImageVolume feature gate is off.
 supervisor_sideload_method     = "image-volume"
@@ -181,10 +188,26 @@ app_armor_profile              = "Unconfined"
 workspace_default_storage_size = "10Gi"
 # Kubernetes RuntimeClass applied to sandbox pods when the API request does
 # not specify one. Empty (default) = omit the field, using the cluster default.
-# default_runtime_class_name   = "kata-containers"
+default_runtime_class_name     = "gvisor"
 # Kubelet clamps projected tokens below 600 seconds. The driver caps values at 86400.
 sa_token_ttl_secs              = 3600
 ```
+
+When `default_runtime_class_name` is set, the Kubernetes driver validates that the
+RuntimeClass exists during startup. Missing RuntimeClasses fail the gateway
+early instead of surfacing later as pod sandbox creation errors. Per-sandbox
+template RuntimeClass overrides are validated during sandbox admission/create.
+
+`privileged = true` sets `securityContext.privileged` on every Kubernetes
+sandbox pod container. Use it only as a short-term compatibility escape hatch
+for trusted clusters that require privileged pod admission.
+
+`network_enforcement_mode = "soft-proxy"` lets Kubernetes sandbox pods run
+without supervisor-managed netns setup. The proxy still enforces
+proxy-aware traffic and hot-reloads `network_policies`, but direct socket egress
+is not kernel-blocked in this mode. Use `supervisor-netns` for the current hard
+netns/veth/nft path, or `external-enforcer` to use the node-enforcer topology
+for coarse pod-netns egress blocking while dynamic policy stays in the proxy.
 
 ### Docker
 

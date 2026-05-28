@@ -100,6 +100,14 @@ data:
 
     [openshell.drivers.kubernetes]
     grpc_endpoint                = {{ include "openshell.grpcEndpoint" . | quote }}
+    supervisor_role             = {{ .Values.server.supervisorRole | quote }}
+    network_enforcement_mode    = {{ .Values.server.networkEnforcementMode | quote }}
+    {{- if .Values.server.enforcerEndpoint }}
+    enforcer_endpoint           = {{ .Values.server.enforcerEndpoint | quote }}
+    {{- end }}
+    {{- if .Values.server.sandboxPrivileged }}
+    privileged                   = true
+    {{- end }}
     service_account_name         = {{ include "openshell.sandboxServiceAccountName" . | quote }}
     supervisor_sideload_method   = {{ include "openshell.supervisorSideloadMethod" . | quote }}
     sa_token_ttl_secs            = {{ .Values.server.sandboxJwt.k8sSaTokenTtlSecs | default 3600 }}

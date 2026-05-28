@@ -1,0 +1,63 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+{{- if .Values.nodeEnforcer.enabled }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "openshell.fullname" . }}-node-enforcer
+  labels:
+    {{- include "openshell.labels" . | nindent 4 }}
+    app.kubernetes.io/component: node-enforcer
+spec:
+  selector:
+    matchLabels:
+      {{- include "openshell.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: node-enforcer
+  template:
+    metadata:
+      labels:
+        {{- include "openshell.labels" . | nindent 8 }}
+        app.kubernetes.io/component: node-enforcer
+    spec:
+      hostNetwork: true
+      hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
+      serviceAccountName: {{ include "openshell.serviceAccountName" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: node-enforcer
+          image: {{ include "openshell.supervisorImage" . | quote }}
+          imagePullPolicy: {{ .Values.supervisor.image.pullPolicy | default .Values.image.pullPolicy }}
+          args:
+            - --supervisor-role
+            - enforcer
+            - --network-enforcement-mode
+            - external-enforcer
+            - --enforcer-listen-addr
+            - {{ .Values.nodeEnforcer.listenAddress | quote }}
+            - --log-level
+            - {{ .Values.nodeEnforcer.logLevel | quote }}
+          securityContext:
+            privileged: true
+            allowPrivilegeEscalation: true
+          {{- with .Values.nodeEnforcer.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      {{- with .Values.nodeEnforcer.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeEnforcer.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeEnforcer.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

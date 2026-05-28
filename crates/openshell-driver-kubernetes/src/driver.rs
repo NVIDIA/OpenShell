@@ -9,6 +9,7 @@ use crate::config::{
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::{Event as KubeEventObj, Node};
+use k8s_openapi::api::node::v1::RuntimeClass;
 use kube::api::{Api, ApiResource, DeleteParams, ListParams, PostParams};
 use kube::core::gvk::GroupVersionKind;
 use kube::core::{DynamicObject, ObjectMeta};
@@ -28,6 +29,7 @@ use openshell_core::proto::compute::v1::{
     GetCapabilitiesResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
     WatchSandboxesPlatformEvent, WatchSandboxesSandboxEvent, watch_sandboxes_event,
 };
+use openshell_core::sandbox_env::{NetworkEnforcementMode, SupervisorRole};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::pin::Pin;
@@ -174,25 +176,30 @@ impl std::fmt::Debug for KubernetesComputeDriver {
 }
 
 impl KubernetesComputeDriver {
-    pub async fn new(config: KubernetesComputeConfig) -> Result<Self, KubeError> {
+    pub async fn new(mut config: KubernetesComputeConfig) -> Result<Self, KubernetesDriverError> {
         let base_config = match kube::Config::incluster() {
             Ok(c) => c,
             Err(_) => kube::Config::infer()
                 .await
-                .map_err(kube::Error::InferConfig)?,
+                .map_err(kube::Error::InferConfig)
+                .map_err(KubernetesDriverError::from_kube)?,
         };
 
         let mut kube_config = base_config.clone();
         kube_config.connect_timeout = Some(Duration::from_secs(10));
         kube_config.read_timeout = Some(Duration::from_secs(30));
         kube_config.write_timeout = Some(Duration::from_secs(30));
-        let client = Client::try_from(kube_config)?;
+        let client = Client::try_from(kube_config).map_err(KubernetesDriverError::from_kube)?;
 
         let mut watch_kube_config = base_config;
         watch_kube_config.connect_timeout = Some(Duration::from_secs(10));
         watch_kube_config.read_timeout = None;
         watch_kube_config.write_timeout = Some(Duration::from_secs(30));
-        let watch_client = Client::try_from(watch_kube_config)?;
+        let watch_client =
+            Client::try_from(watch_kube_config).map_err(KubernetesDriverError::from_kube)?;
+
+        config.default_runtime_class_name = config.default_runtime_class_name.trim().to_string();
+        validate_runtime_class_exists(&client, &config.default_runtime_class_name).await?;
 
         Ok(Self {
             client,
@@ -244,6 +251,17 @@ impl KubernetesComputeDriver {
         }))
     }
 
+    async fn validate_sandbox_runtime_class_override(
+        &self,
+        sandbox: &Sandbox,
+    ) -> Result<(), KubernetesDriverError> {
+        let Some(runtime_class_name) = sandbox_runtime_class_override(sandbox) else {
+            return Ok(());
+        };
+
+        validate_runtime_class_exists(&self.client, &runtime_class_name).await
+    }
+
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), tonic::Status> {
         let gpu_requested = sandbox.spec.as_ref().is_some_and(|spec| spec.gpu);
         if gpu_requested
@@ -255,6 +273,17 @@ impl KubernetesComputeDriver {
                 "GPU sandbox requested, but the active gateway has no allocatable GPUs. Please refer to documentation and use `openshell doctor` commands to inspect GPU support and gateway configuration.",
             ));
         }
+        self.validate_sandbox_runtime_class_override(sandbox)
+            .await
+            .map_err(|err| match err {
+                KubernetesDriverError::Precondition(message) => {
+                    tonic::Status::failed_precondition(message)
+                }
+                KubernetesDriverError::AlreadyExists => {
+                    tonic::Status::already_exists("sandbox already exists")
+                }
+                KubernetesDriverError::Message(message) => tonic::Status::internal(message),
+            })?;
         Ok(())
     }
 
@@ -346,6 +375,9 @@ impl KubernetesComputeDriver {
             "Creating sandbox in Kubernetes"
         );
 
+        self.validate_sandbox_runtime_class_override(sandbox)
+            .await?;
+
         let gvk = GroupVersionKind::gvk(SANDBOX_GROUP, SANDBOX_VERSION, SANDBOX_KIND);
         let resource = ApiResource::from_gvk(&gvk);
         let mut obj = DynamicObject::new(name, &resource);
@@ -371,6 +403,10 @@ impl KubernetesComputeDriver {
             host_gateway_ip: &self.config.host_gateway_ip,
             enable_user_namespaces: self.config.enable_user_namespaces,
             app_armor_profile: self.config.app_armor_profile.as_ref(),
+            supervisor_role: self.config.supervisor_role,
+            network_enforcement_mode: self.config.network_enforcement_mode,
+            enforcer_endpoint: &self.config.enforcer_endpoint,
+            privileged: self.config.privileged,
             workspace_default_storage_size: &self.config.workspace_default_storage_size,
             default_runtime_class_name: &self.config.default_runtime_class_name,
             sa_token_ttl_secs: self.config.effective_sa_token_ttl_secs(),
@@ -1085,6 +1121,10 @@ struct SandboxPodParams<'a> {
     host_gateway_ip: &'a str,
     enable_user_namespaces: bool,
     app_armor_profile: Option<&'a AppArmorProfile>,
+    supervisor_role: SupervisorRole,
+    network_enforcement_mode: NetworkEnforcementMode,
+    enforcer_endpoint: &'a str,
+    privileged: bool,
     workspace_default_storage_size: &'a str,
     default_runtime_class_name: &'a str,
     /// Lifetime (seconds) of the projected `ServiceAccount` token used
@@ -1110,11 +1150,57 @@ impl Default for SandboxPodParams<'_> {
             host_gateway_ip: "",
             enable_user_namespaces: false,
             app_armor_profile: None,
+            supervisor_role: SupervisorRole::Workload,
+            network_enforcement_mode: NetworkEnforcementMode::SoftProxy,
+            enforcer_endpoint: "",
+            privileged: false,
             workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE,
             default_runtime_class_name: "",
             sa_token_ttl_secs: 3600,
         }
     }
+}
+
+async fn validate_runtime_class_exists(
+    client: &Client,
+    runtime_class_name: &str,
+) -> Result<(), KubernetesDriverError> {
+    let runtime_class_name = runtime_class_name.trim();
+    if runtime_class_name.is_empty() {
+        return Ok(());
+    }
+
+    let runtime_classes: Api<RuntimeClass> = Api::all(client.clone());
+    match tokio::time::timeout(KUBE_API_TIMEOUT, runtime_classes.get(runtime_class_name)).await {
+        Ok(Ok(_runtime_class)) => {
+            info!(
+                runtime_class_name,
+                "Validated configured Kubernetes RuntimeClass"
+            );
+            Ok(())
+        }
+        Ok(Err(KubeError::Api(err))) if err.code == 404 => {
+            Err(KubernetesDriverError::Precondition(format!(
+                "Kubernetes RuntimeClass '{runtime_class_name}' does not exist; create it before starting OpenShell or choose an existing RuntimeClass"
+            )))
+        }
+        Ok(Err(err)) => Err(KubernetesDriverError::Message(format!(
+            "failed to validate Kubernetes RuntimeClass '{runtime_class_name}': {err}"
+        ))),
+        Err(_elapsed) => Err(KubernetesDriverError::Message(format!(
+            "timed out after {}s validating Kubernetes RuntimeClass '{runtime_class_name}'",
+            KUBE_API_TIMEOUT.as_secs()
+        ))),
+    }
+}
+
+fn sandbox_runtime_class_override(sandbox: &Sandbox) -> Option<String> {
+    sandbox
+        .spec
+        .as_ref()?
+        .template
+        .as_ref()
+        .and_then(|template| platform_config_string(template, "runtime_class_name"))
 }
 
 fn spec_pod_env(spec: Option<&SandboxSpec>) -> std::collections::HashMap<String, String> {
@@ -1337,10 +1423,49 @@ fn sandbox_template_to_k8s(
         params.ssh_socket_path,
         !params.client_tls_secret_name.is_empty(),
     );
+    let mut env = env;
+    upsert_env(
+        &mut env,
+        openshell_core::sandbox_env::SUPERVISOR_ROLE,
+        params.supervisor_role.as_str(),
+    );
+    upsert_env(
+        &mut env,
+        openshell_core::sandbox_env::NETWORK_ENFORCEMENT_MODE,
+        params.network_enforcement_mode.as_str(),
+    );
+    if matches!(
+        params.network_enforcement_mode,
+        NetworkEnforcementMode::ExternalEnforcer
+    ) {
+        upsert_env_field_ref(
+            &mut env,
+            openshell_core::sandbox_env::NODE_IP,
+            "status.hostIP",
+        );
+        upsert_env_field_ref(
+            &mut env,
+            openshell_core::sandbox_env::POD_IP,
+            "status.podIP",
+        );
+        upsert_env(
+            &mut env,
+            openshell_core::sandbox_env::ENFORCER_ENDPOINT,
+            if params.enforcer_endpoint.is_empty() {
+                "http://$(OPENSHELL_NODE_IP):17671"
+            } else {
+                params.enforcer_endpoint
+            },
+        );
+    }
 
     container.insert("env".to_string(), serde_json::Value::Array(env));
 
-    let mut capabilities: Vec<&str> = vec!["SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE", "SYSLOG"];
+    let mut capabilities: Vec<&str> = if pod_uses_supervisor_netns(params) {
+        vec!["SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE", "SYSLOG"]
+    } else {
+        vec!["SYS_PTRACE"]
+    };
     if use_user_namespaces {
         // In a user namespace the bounding set is reset. SETUID/SETGID are
         // needed for the supervisor to drop privileges to the sandbox user.
@@ -1355,6 +1480,9 @@ fn sandbox_template_to_k8s(
     });
     if let Some(profile) = params.app_armor_profile {
         security_context["appArmorProfile"] = app_armor_profile_to_k8s(profile);
+    }
+    if params.privileged {
+        security_context["privileged"] = serde_json::json!(true);
     }
     container.insert("securityContext".to_string(), security_context);
 
@@ -1727,12 +1855,44 @@ fn upsert_env(env: &mut Vec<serde_json::Value>, name: &str, value: &str) {
     env.push(serde_json::json!({"name": name, "value": value}));
 }
 
+fn upsert_env_field_ref(env: &mut Vec<serde_json::Value>, name: &str, field_path: &str) {
+    let value = serde_json::json!({
+        "name": name,
+        "valueFrom": {
+            "fieldRef": {
+                "fieldPath": field_path
+            }
+        }
+    });
+    if let Some(existing) = env
+        .iter_mut()
+        .find(|item| item.get("name").and_then(|value| value.as_str()) == Some(name))
+    {
+        *existing = value;
+        return;
+    }
+
+    env.push(value);
+}
+
+fn pod_uses_supervisor_netns(params: &SandboxPodParams<'_>) -> bool {
+    matches!(
+        params.network_enforcement_mode,
+        NetworkEnforcementMode::SupervisorNetns
+    ) || (matches!(
+        params.network_enforcement_mode,
+        NetworkEnforcementMode::Auto
+    ) && matches!(params.supervisor_role, SupervisorRole::Combined))
+}
+
 /// Extract a string value from the template's `platform_config` Struct.
 fn platform_config_string(template: &SandboxTemplate, key: &str) -> Option<String> {
     let config = template.platform_config.as_ref()?;
     let value = config.fields.get(key)?;
     match value.kind.as_ref() {
-        Some(prost_types::value::Kind::StringValue(s)) if !s.is_empty() => Some(s.clone()),
+        Some(prost_types::value::Kind::StringValue(s)) if !s.trim().is_empty() => {
+            Some(s.trim().to_string())
+        }
         _ => None,
     }
 }
@@ -1917,6 +2077,51 @@ mod tests {
         assert!(config.pod.node_selector.is_empty());
         assert!(config.containers.agent.resources.requests.is_empty());
         assert!(config.containers.agent.resources.limits.is_empty());
+    }
+
+    fn pod_env_value<'a>(pod_template: &'a serde_json::Value, name: &str) -> Option<&'a str> {
+        pod_template["spec"]["containers"][0]["env"]
+            .as_array()?
+            .iter()
+            .find(|item| item.get("name").and_then(|value| value.as_str()) == Some(name))
+            .and_then(|item| item.get("value"))
+            .and_then(|value| value.as_str())
+    }
+
+    fn pod_env_field_ref<'a>(pod_template: &'a serde_json::Value, name: &str) -> Option<&'a str> {
+        pod_template["spec"]["containers"][0]["env"]
+            .as_array()?
+            .iter()
+            .find(|item| item.get("name").and_then(|value| value.as_str()) == Some(name))
+            .and_then(|item| item.pointer("/valueFrom/fieldRef/fieldPath"))
+            .and_then(|value| value.as_str())
+    }
+
+    #[test]
+    fn sandbox_runtime_class_override_reads_template_value() {
+        let sandbox = Sandbox {
+            spec: Some(SandboxSpec {
+                template: Some(SandboxTemplate {
+                    platform_config: Some(Struct {
+                        fields: std::iter::once((
+                            "runtime_class_name".to_string(),
+                            Value {
+                                kind: Some(Kind::StringValue(" kata-qemu ".to_string())),
+                            },
+                        ))
+                        .collect(),
+                    }),
+                    ..SandboxTemplate::default()
+                }),
+                ..SandboxSpec::default()
+            }),
+            ..Sandbox::default()
+        };
+
+        assert_eq!(
+            sandbox_runtime_class_override(&sandbox),
+            Some("kata-qemu".to_string())
+        );
     }
 
     #[test]
@@ -2486,6 +2691,95 @@ mod tests {
     }
 
     #[test]
+    fn template_runtime_class_name_is_trimmed() {
+        let template = SandboxTemplate {
+            platform_config: Some(Struct {
+                fields: std::iter::once((
+                    "runtime_class_name".to_string(),
+                    Value {
+                        kind: Some(Kind::StringValue(" gvisor ".to_string())),
+                    },
+                ))
+                .collect(),
+            }),
+            ..SandboxTemplate::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &template,
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &SandboxPodParams::default(),
+        );
+
+        assert_eq!(
+            pod_template["spec"]["runtimeClassName"],
+            serde_json::json!("gvisor")
+        );
+    }
+
+    #[test]
+    fn kubernetes_default_sets_workload_soft_proxy_env() {
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &SandboxPodParams::default(),
+        );
+
+        assert_eq!(
+            pod_env_value(&pod_template, openshell_core::sandbox_env::SUPERVISOR_ROLE),
+            Some("workload")
+        );
+        assert_eq!(
+            pod_env_value(
+                &pod_template,
+                openshell_core::sandbox_env::NETWORK_ENFORCEMENT_MODE
+            ),
+            Some("soft-proxy")
+        );
+    }
+
+    #[test]
+    fn external_enforcer_mode_injects_node_registration_env() {
+        let params = SandboxPodParams {
+            network_enforcement_mode: NetworkEnforcementMode::ExternalEnforcer,
+            ..Default::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+
+        assert_eq!(
+            pod_env_value(
+                &pod_template,
+                openshell_core::sandbox_env::NETWORK_ENFORCEMENT_MODE
+            ),
+            Some("external-enforcer")
+        );
+        assert_eq!(
+            pod_env_value(
+                &pod_template,
+                openshell_core::sandbox_env::ENFORCER_ENDPOINT
+            ),
+            Some("http://$(OPENSHELL_NODE_IP):17671")
+        );
+        assert_eq!(
+            pod_env_field_ref(&pod_template, openshell_core::sandbox_env::NODE_IP),
+            Some("status.hostIP")
+        );
+        assert_eq!(
+            pod_env_field_ref(&pod_template, openshell_core::sandbox_env::POD_IP),
+            Some("status.podIP")
+        );
+    }
+
+    #[test]
     fn gpu_sandbox_preserves_existing_resource_limits() {
         use openshell_core::proto::compute::v1::DriverResourceRequirements;
         let template = SandboxTemplate {
@@ -2855,7 +3149,7 @@ mod tests {
         let caps = pod_template["spec"]["containers"][0]["securityContext"]["capabilities"]["add"]
             .as_array()
             .unwrap();
-        assert_eq!(caps.len(), 4);
+        assert_eq!(caps, &[serde_json::json!("SYS_PTRACE")]);
         assert!(!caps.contains(&serde_json::json!("SETUID")));
     }
 
@@ -2875,14 +3169,34 @@ mod tests {
         let caps = pod_template["spec"]["containers"][0]["securityContext"]["capabilities"]["add"]
             .as_array()
             .unwrap();
+        assert!(caps.contains(&serde_json::json!("SYS_PTRACE")));
+        assert!(caps.contains(&serde_json::json!("SETUID")));
+        assert!(caps.contains(&serde_json::json!("SETGID")));
+        assert!(caps.contains(&serde_json::json!("DAC_READ_SEARCH")));
+        assert_eq!(caps.len(), 4);
+    }
+
+    #[test]
+    fn supervisor_netns_mode_adds_network_capabilities() {
+        let params = SandboxPodParams {
+            network_enforcement_mode: NetworkEnforcementMode::SupervisorNetns,
+            ..Default::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+        let caps = pod_template["spec"]["containers"][0]["securityContext"]["capabilities"]["add"]
+            .as_array()
+            .unwrap();
         assert!(caps.contains(&serde_json::json!("SYS_ADMIN")));
         assert!(caps.contains(&serde_json::json!("NET_ADMIN")));
         assert!(caps.contains(&serde_json::json!("SYS_PTRACE")));
         assert!(caps.contains(&serde_json::json!("SYSLOG")));
-        assert!(caps.contains(&serde_json::json!("SETUID")));
-        assert!(caps.contains(&serde_json::json!("SETGID")));
-        assert!(caps.contains(&serde_json::json!("DAC_READ_SEARCH")));
-        assert_eq!(caps.len(), 7);
+        assert_eq!(caps.len(), 4);
     }
 
     #[test]
@@ -2956,8 +3270,45 @@ mod tests {
             .unwrap();
         assert_eq!(
             caps.len(),
-            4,
+            1,
             "extra capabilities must not be added when user namespaces are disabled"
+        );
+    }
+
+    #[test]
+    fn configured_privileged_sets_container_security_context() {
+        let params = SandboxPodParams {
+            privileged: true,
+            ..SandboxPodParams::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+
+        assert_eq!(
+            pod_template["spec"]["containers"][0]["securityContext"]["privileged"],
+            serde_json::json!(true),
+            "privileged config must map to container securityContext"
+        );
+    }
+
+    #[test]
+    fn privileged_omitted_by_default() {
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &SandboxPodParams::default(),
+        );
+
+        assert!(
+            pod_template["spec"]["containers"][0]["securityContext"]["privileged"].is_null(),
+            "privileged must be omitted unless configured"
         );
     }
 

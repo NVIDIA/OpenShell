@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: runtime class RBAC
+templates:
+  - templates/clusterrole.yaml
+release:
+  name: openshell
+  namespace: my-namespace
+
+tests:
+  - it: allows the gateway to preflight configured RuntimeClasses
+    asserts:
+      - equal:
+          path: rules[2].apiGroups[0]
+          value: node.k8s.io
+      - equal:
+          path: rules[2].resources[0]
+          value: runtimeclasses
+      - equal:
+          path: rules[2].verbs[0]
+          value: get

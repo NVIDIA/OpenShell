@@ -5,10 +5,10 @@
 
 # Supervisor image build.
 #
-# The final image is `scratch`: it only carries the static `openshell-sandbox`
-# binary used by Docker extraction, Podman image volumes, and the Kubernetes
-# init container copy-self path. A static musl binary lets the image stay
-# `scratch` while still being executable as an init container.
+# The final image carries the static `openshell-sandbox` binary used by Docker
+# extraction, Podman image volumes, and the Kubernetes init container copy-self
+# path. It also includes nftables so the same image can run the Kubernetes
+# node-enforcer DaemonSet and install pod network-namespace egress rules.
 #
 # The Rust binary is built natively before this image build runs and staged at:
 #   deploy/docker/.build/prebuilt-binaries/<arch>/openshell-sandbox
@@ -19,9 +19,11 @@
 # target) and uploads it as an artifact, which is downloaded into the same
 # staging directory before the image build job runs.
 
-FROM scratch AS supervisor
+FROM alpine:3.22 AS supervisor
 
 ARG TARGETARCH
+
+RUN apk add --no-cache nftables
 
 # --chmod=0550 drops world-execute and survives the actions/upload-artifact
 # + download-artifact roundtrip (which strips exec perms). Ownership is left

@@ -139,6 +139,7 @@ The most commonly changed values are:
 | `server.sandboxNamespace` | Namespace where sandbox pods are created. Defaults to the Helm release namespace when left empty. |
 | `server.sandboxImage` | Default sandbox image used when a sandbox does not specify one. |
 | `server.sandboxImagePullSecrets` | Image pull secrets attached to sandbox pods. Referenced Secrets must exist in the sandbox namespace. |
+| `server.defaultRuntimeClassName` | Default Kubernetes RuntimeClass for sandbox pods, such as `gvisor` or a Kata RuntimeClass name. Leave empty to use the cluster default. The gateway validates this RuntimeClass at startup when configured. |
 | `server.grpcEndpoint` | Endpoint that sandbox supervisors use to call back to the gateway. Must be reachable from inside the cluster. |
 | `server.appArmorProfile` | AppArmor profile requested for sandbox agent containers. Defaults to `Unconfined`. |
 | `server.disableTls` | Run the gateway over plaintext HTTP. Use only behind a trusted transport. |
@@ -206,6 +207,7 @@ The ClusterRole grants node inspection and token validation:
 |---|---|---|
 | `authentication.k8s.io` | `tokenreviews` | create |
 | `""` | `nodes` | get, list, watch |
+| `node.k8s.io` | `runtimeclasses` | get |
 
 To use an existing ServiceAccount instead of creating one, set `serviceAccount.create=false` and supply its name:
 

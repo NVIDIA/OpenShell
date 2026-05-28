@@ -4388,6 +4388,16 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_create_rejects_privileged_flag() {
+        let err = Cli::try_parse_from(["openshell", "sandbox", "create", "--privileged"])
+            .expect_err("privileged must not be a per-sandbox CLI flag");
+        assert!(
+            err.to_string().contains("--privileged"),
+            "error should identify the rejected flag"
+        );
+    }
+
+    #[test]
     fn service_expose_accepts_positional_target_port_and_service() {
         let cli = Cli::try_parse_from([
             "openshell",

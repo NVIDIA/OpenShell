@@ -96,6 +96,64 @@ tests:
           path: data["gateway.toml"]
           pattern: 'image_pull_secrets\s*='
 
+  - it: omits default_runtime_class_name by default
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'default_runtime_class_name\s*='
+
+  - it: renders the configured default RuntimeClass under [openshell.drivers.kubernetes]
+    template: templates/gateway-config.yaml
+    set:
+      server.defaultRuntimeClassName: gvisor
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?default_runtime_class_name\s*=\s*"gvisor"'
+
+  - it: renders default supervisor workload soft-proxy mode
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?supervisor_role\s*=\s*"workload"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?network_enforcement_mode\s*=\s*"soft-proxy"'
+
+  - it: renders external enforcer endpoint when configured
+    template: templates/gateway-config.yaml
+    set:
+      server.networkEnforcementMode: external-enforcer
+      server.enforcerEndpoint: http://$(OPENSHELL_NODE_IP):17671
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?network_enforcement_mode\s*=\s*"external-enforcer"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?enforcer_endpoint\s*=\s*"http://\$\(OPENSHELL_NODE_IP\):17671"'
+
+  - it: omits privileged sandbox pods by default
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'privileged\s*='
+
+  - it: renders privileged sandbox pods under [openshell.drivers.kubernetes]
+    template: templates/gateway-config.yaml
+    set:
+      server.sandboxPrivileged: true
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?privileged\s*=\s*true'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\][^\[]*?privileged\s*='
+
   - it: does not render local mTLS user auth for Kubernetes deployments
     template: templates/gateway-config.yaml
     asserts:

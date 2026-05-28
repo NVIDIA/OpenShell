@@ -145,6 +145,11 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 | `default_image` | `server.sandboxImage` | Set the default sandbox image. |
 | `image_pull_policy` | `server.sandboxImagePullPolicy` | Set the Kubernetes image pull policy for sandbox pods. |
 | `image_pull_secrets` | `server.sandboxImagePullSecrets` | Attach Kubernetes image pull secrets to sandbox pods. Referenced Secrets must exist in the sandbox namespace. |
+| `default_runtime_class_name` | `server.defaultRuntimeClassName` | Set the default Kubernetes RuntimeClass for sandbox pods, such as `gvisor` for GKE Sandbox or a Kata RuntimeClass name. The gateway validates this class at startup when configured. Per-sandbox template runtime classes override this default and are validated during sandbox admission/create. |
+| `supervisor_role` | `server.supervisorRole` | Select the supervisor topology role for sandbox pods. Kubernetes defaults to `workload`; local non-Kubernetes supervisors keep `combined` by default. |
+| `network_enforcement_mode` | `server.networkEnforcementMode` | Select sandbox network posture. `soft-proxy` injects proxy env vars and enforces cooperative proxy traffic without kernel-blocking direct sockets. `supervisor-netns` uses the existing supervisor-managed netns/veth/nft path and requires the needed Linux capabilities. `external-enforcer` registers with a node/host enforcer that installs coarse pod-netns egress rules while dynamic policy stays in the proxy. |
+| `enforcer_endpoint` | `server.enforcerEndpoint` | Optional endpoint template for `external-enforcer` mode. Empty defaults sandbox pods to `http://$(OPENSHELL_NODE_IP):17671`. |
+| `privileged` | `server.sandboxPrivileged` | Set `securityContext.privileged` on all Kubernetes sandbox pod containers. This is a short-term compatibility escape hatch for trusted clusters that require privileged pod admission and reduces the container boundary. |
 | `grpc_endpoint` | `server.grpcEndpoint` | Set the gateway callback endpoint reachable from sandbox pods. |
 | `client_tls_secret_name` | `server.tls.clientTlsSecretName` | Mount sandbox client TLS materials from a Kubernetes secret. |
 | `supervisor_image` | `supervisor.image.repository` / `supervisor.image.tag` | Set the supervisor image that provides the `openshell-sandbox` binary. |
@@ -155,6 +160,11 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 | `sa_token_ttl_secs` | `server.sandboxJwt.k8sSaTokenTtlSecs` | Set the projected ServiceAccount token TTL used for the bootstrap token exchange. |
 
 The Kubernetes driver creates namespaced `agents.x-k8s.io/v1alpha1` `Sandbox` resources from the Kubernetes SIG Apps [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) project. The Agent Sandbox controller turns those resources into sandbox pods and related storage.
+
+`nodeEnforcer.enabled=true` deploys an optional privileged DaemonSet that runs
+the supervisor image in `enforcer` mode. This topology is experimental: the
+current enforcer acknowledges workload registrations so the deployment shape can
+be tested, but host-side rule installation is not active yet.
 
 <Note>
 `Sandbox.spec.volumeClaimTemplates` is immutable after creation. To change storage configuration, delete the sandbox and create a new one with the updated spec.

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use openshell_core::config::DEFAULT_SUPERVISOR_IMAGE;
+use openshell_core::sandbox_env::{NetworkEnforcementMode, SupervisorRole};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::str::FromStr;
 
@@ -176,6 +177,19 @@ pub struct KubernetesComputeConfig {
         deserialize_with = "deserialize_optional_app_armor_profile"
     )]
     pub app_armor_profile: Option<AppArmorProfile>,
+    /// Runtime role passed to the sandbox supervisor binary.
+    pub supervisor_role: SupervisorRole,
+    /// Network enforcement mode passed to the sandbox supervisor binary.
+    pub network_enforcement_mode: NetworkEnforcementMode,
+    /// Endpoint template for a node/host enforcer. Supports Kubernetes env
+    /// expansion such as `http://$(OPENSHELL_NODE_IP):17671`.
+    pub enforcer_endpoint: String,
+    /// Set `securityContext.privileged` on sandbox pod containers.
+    ///
+    /// This is a deployment-wide compatibility escape hatch for clusters that
+    /// require privileged pod admission. It weakens the container boundary and
+    /// should stay disabled unless the Kubernetes environment is trusted.
+    pub privileged: bool,
     pub workspace_default_storage_size: String,
     /// Default Kubernetes `runtimeClassName` for sandbox pods.
     /// Applied when a `CreateSandbox` request does not specify one.
@@ -221,6 +235,10 @@ impl Default for KubernetesComputeConfig {
             host_gateway_ip: String::new(),
             enable_user_namespaces: false,
             app_armor_profile: None,
+            supervisor_role: SupervisorRole::Workload,
+            network_enforcement_mode: NetworkEnforcementMode::SoftProxy,
+            enforcer_endpoint: String::new(),
+            privileged: false,
             workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE.to_string(),
             default_runtime_class_name: String::new(),
             sa_token_ttl_secs: 3600,
@@ -361,5 +379,40 @@ mod tests {
         });
         let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
         assert_eq!(cfg.image_pull_secrets, ["regcred", "backup-regcred"]);
+    }
+
+    #[test]
+    fn serde_override_privileged() {
+        let json = serde_json::json!({
+            "privileged": true
+        });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+        assert!(cfg.privileged);
+    }
+
+    #[test]
+    fn default_kubernetes_supervisor_mode_is_soft_workload() {
+        let cfg = KubernetesComputeConfig::default();
+        assert_eq!(cfg.supervisor_role, SupervisorRole::Workload);
+        assert_eq!(
+            cfg.network_enforcement_mode,
+            NetworkEnforcementMode::SoftProxy
+        );
+    }
+
+    #[test]
+    fn serde_override_supervisor_network_mode() {
+        let json = serde_json::json!({
+            "supervisor_role": "combined",
+            "network_enforcement_mode": "supervisor-netns",
+            "enforcer_endpoint": "http://$(OPENSHELL_NODE_IP):17671"
+        });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.supervisor_role, SupervisorRole::Combined);
+        assert_eq!(
+            cfg.network_enforcement_mode,
+            NetworkEnforcementMode::SupervisorNetns
+        );
+        assert_eq!(cfg.enforcer_endpoint, "http://$(OPENSHELL_NODE_IP):17671");
     }
 }

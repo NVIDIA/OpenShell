@@ -9,6 +9,7 @@ use tracing_subscriber::EnvFilter;
 
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
+use openshell_core::sandbox_env::{NetworkEnforcementMode, SupervisorRole};
 use openshell_driver_kubernetes::{
     AppArmorProfile, ComputeDriverService, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
     KubernetesComputeConfig, KubernetesComputeDriver, SupervisorSideloadMethod,
@@ -86,6 +87,31 @@ struct Args {
     #[arg(long, env = "OPENSHELL_K8S_APP_ARMOR_PROFILE")]
     app_armor_profile: Option<AppArmorProfile>,
 
+    /// Runtime role passed to openshell-sandbox in workload pods.
+    #[arg(
+        long,
+        env = "OPENSHELL_SUPERVISOR_ROLE",
+        default_value_t = SupervisorRole::Workload
+    )]
+    supervisor_role: SupervisorRole,
+
+    /// Network enforcement mode passed to openshell-sandbox in workload pods.
+    #[arg(
+        long,
+        env = "OPENSHELL_NETWORK_ENFORCEMENT_MODE",
+        default_value_t = NetworkEnforcementMode::SoftProxy
+    )]
+    network_enforcement_mode: NetworkEnforcementMode,
+
+    /// Endpoint template for the optional node/host enforcer.
+    #[arg(long, env = "OPENSHELL_ENFORCER_ENDPOINT")]
+    enforcer_endpoint: Option<String>,
+
+    /// Default Kubernetes `runtimeClassName` for sandbox pods.
+    /// Per-sandbox template `runtime_class_name` values override this default.
+    #[arg(long, env = "OPENSHELL_K8S_DEFAULT_RUNTIME_CLASS_NAME")]
+    default_runtime_class_name: Option<String>,
+
     /// Lifetime (seconds) of the projected `ServiceAccount` token
     /// kubelet writes into each sandbox pod for the `IssueSandboxToken`
     /// bootstrap exchange. Kubelet enforces a minimum of 600s; the
@@ -120,14 +146,17 @@ async fn main() -> Result<()> {
         host_gateway_ip: args.host_gateway_ip.unwrap_or_default(),
         enable_user_namespaces: args.enable_user_namespaces,
         app_armor_profile: args.app_armor_profile,
+        supervisor_role: args.supervisor_role,
+        network_enforcement_mode: args.network_enforcement_mode,
+        enforcer_endpoint: args.enforcer_endpoint.unwrap_or_default(),
+        privileged: false,
         workspace_default_storage_size: std::env::var(
             "OPENSHELL_K8S_WORKSPACE_DEFAULT_STORAGE_SIZE",
         )
         .unwrap_or_else(|_| {
             openshell_driver_kubernetes::DEFAULT_WORKSPACE_STORAGE_SIZE.to_string()
         }),
-        default_runtime_class_name: std::env::var("OPENSHELL_K8S_DEFAULT_RUNTIME_CLASS_NAME")
-            .unwrap_or_default(),
+        default_runtime_class_name: args.default_runtime_class_name.unwrap_or_default(),
         sa_token_ttl_secs: args.sa_token_ttl_secs,
     })
     .await

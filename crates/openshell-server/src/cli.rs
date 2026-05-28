@@ -1538,4 +1538,23 @@ default_image = "k8s-specific:1.0"
             .expect("deserializes");
         assert_eq!(parsed.default_image, "k8s-specific:1.0");
     }
+
+    #[test]
+    fn kubernetes_driver_parses_privileged_from_driver_table() {
+        let file = config_file_from_toml(
+            r#"
+[openshell.drivers.kubernetes]
+privileged = true
+"#,
+        );
+        let merged = crate::config_file::driver_table(
+            super::ComputeDriverKind::Kubernetes,
+            &file.openshell.gateway,
+            file.openshell.drivers.get("kubernetes"),
+        );
+        let parsed = merged
+            .try_into::<openshell_driver_kubernetes::KubernetesComputeConfig>()
+            .expect("deserializes");
+        assert!(parsed.privileged);
+    }
 }

@@ -24,3 +24,12 @@ rules:
       - get
       - list
       - watch
+  # Startup preflight validates the configured RuntimeClass before accepting
+  # sandbox work so missing classes fail at gateway startup instead of later
+  # as pod sandbox creation errors.
+  - apiGroups:
+      - node.k8s.io
+    resources:
+      - runtimeclasses
+    verbs:
+      - get
