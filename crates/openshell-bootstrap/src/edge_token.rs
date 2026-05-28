@@ -7,19 +7,19 @@
 //! `$XDG_CONFIG_HOME/openshell/gateways/<name>/edge_token`.
 //! The token is a plain-text JWT string with `0600` permissions.
 
-use crate::paths::gateways_dir;
+use crate::paths::user_gateways_dir;
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::paths::{ensure_parent_dir_restricted, set_file_owner_only};
 use std::path::PathBuf;
 
 /// Path to the stored edge auth token for a gateway.
 pub fn edge_token_path(gateway_name: &str) -> Result<PathBuf> {
-    Ok(gateways_dir()?.join(gateway_name).join("edge_token"))
+    Ok(user_gateways_dir()?.join(gateway_name).join("edge_token"))
 }
 
 /// Legacy path used before the rename to `edge_token`.
 fn legacy_token_path(gateway_name: &str) -> Result<PathBuf> {
-    Ok(gateways_dir()?.join(gateway_name).join("cf_token"))
+    Ok(user_gateways_dir()?.join(gateway_name).join("cf_token"))
 }
 
 /// Store an edge authentication token for a gateway.

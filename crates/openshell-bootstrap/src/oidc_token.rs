@@ -7,7 +7,7 @@
 //! `$XDG_CONFIG_HOME/openshell/gateways/<name>/oidc_token.json`.
 //! File permissions are `0600` (owner-only).
 
-use crate::paths::gateways_dir;
+use crate::paths::user_gateways_dir;
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::paths::{ensure_parent_dir_restricted, set_file_owner_only};
 use serde::{Deserialize, Serialize};
@@ -36,7 +36,7 @@ pub struct OidcTokenBundle {
 
 /// Path to the stored OIDC token bundle for a gateway.
 pub fn oidc_token_path(gateway_name: &str) -> Result<PathBuf> {
-    Ok(gateways_dir()?.join(gateway_name).join("oidc_token.json"))
+    Ok(user_gateways_dir()?.join(gateway_name).join("oidc_token.json"))
 }
 
 /// Store an OIDC token bundle for a gateway.
