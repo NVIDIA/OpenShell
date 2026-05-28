@@ -32,8 +32,9 @@ oc create ns openshell
 # Sandboxes are deployed into the openshell namespace and use the openshell-sandbox service account
 oc adm policy add-scc-to-user privileged -z openshell-sandbox -n openshell
 
-# Deploy openshell with overrides for OpenShift SCC compatibility
+# Deploy openshell with overrides to allow SCC assignment of fsGroup and runAsUser for the gateway
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> -n openshell \
+  --set pkiInitJob.enabled=false \
   --set server.disableTls=true \
   --set podSecurityContext.fsGroup=null \
   --set securityContext.runAsUser=null
@@ -77,7 +78,7 @@ helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <vers
   --set postgres.auth.password=my-secret-password
 ```
 
-Enable bundled PostgreSQL(OpenShift):
+Enable bundled PostgreSQL (OpenShift):
 
 ```bash
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
@@ -177,6 +178,20 @@ cert-manager alternative.
 | podLabels | object | `{}` | Extra labels to add to the gateway pod. |
 | podLifecycle.terminationGracePeriodSeconds | int | `5` | Grace period, in seconds, before Kubernetes terminates the gateway pod. |
 | podSecurityContext.fsGroup | int | `1000` | fsGroup assigned to the gateway pod. |
+| postgres.auth.database | string | `"openshell"` |  |
+| postgres.auth.password | string | `""` |  |
+| postgres.auth.username | string | `"openshell"` |  |
+| postgres.deploy | bool | `false` | Deploy the bundled Bitnami PostgreSQL subchart. Set to true to run PostgreSQL alongside the gateway. Leave false when using an external PostgreSQL instance. |
+| postgres.enabled | bool | `false` |  |
+| postgres.external.database | string | `"openshell"` |  |
+| postgres.external.host | string | `""` |  |
+| postgres.external.password | string | `""` |  |
+| postgres.external.port | int | `5432` |  |
+| postgres.external.url | string | `""` |  |
+| postgres.external.username | string | `"openshell"` |  |
+| postgres.host | string | `""` |  |
+| postgres.port | int | `5432` |  |
+| postgres.primary.persistence.enabled | bool | `true` |  |
 | probes.liveness.failureThreshold | int | `3` | Liveness probe failure threshold before the container is restarted. |
 | probes.liveness.initialDelaySeconds | int | `2` | Liveness probe initial delay, in seconds. |
 | probes.liveness.periodSeconds | int | `5` | Liveness probe period, in seconds. |
@@ -217,6 +232,7 @@ cert-manager alternative.
 | server.sandboxImagePullPolicy | string | `""` | Kubernetes imagePullPolicy for sandbox pods. Empty = Kubernetes default (Always for :latest, IfNotPresent otherwise). Set to "Always" for dev clusters so new images are picked up without manual eviction. |
 | server.sandboxJwt.gatewayId | string | `""` | Stable gateway identity embedded in iss/aud of every minted token. Defaults to the release name so HA replicas share identity. |
 | server.sandboxJwt.k8sSaTokenTtlSecs | int | `3600` | Lifetime (seconds) of the projected ServiceAccount token kubelet writes into each sandbox pod for the IssueSandboxToken bootstrap exchange. Kubelet enforces a minimum of 600s; the driver clamps values outside [600, 86400]. Default 3600 — generous, since the supervisor consumes the token within seconds of pod start. |
+| server.sandboxJwt.secretDefaultMode | string | `""` | File mode for the mounted JWT signing key Secret. Default 0400 (owner-read only). Override to 0440 or 0444 if the container UID does not match the volume file owner. |
 | server.sandboxJwt.signingSecretName | string | `""` | Name of the Opaque Secret holding the signing key material. Empty falls back to the chart fullname with "-jwt-keys" appended. |
 | server.sandboxJwt.ttlSecs | int | `3600` | Token TTL in seconds. Defaults to 3600 (1h). |
 | server.sandboxNamespace | string | `""` | Namespace where sandbox pods are created. Defaults to the Helm release namespace (.Release.Namespace) when left empty. |
