@@ -10,7 +10,7 @@ position: 6
 
 Policy advisor lets a running sandboxed agent ask for a narrow network policy change after OpenShell denies a request. The agent submits a draft through `policy.local`, a developer approves or rejects it from outside the sandbox, and approved network policy hot-reloads into the same sandbox.
 
-Policy advisor does not grant access automatically. The structured rule is the approval contract, and the agent's rationale is supporting context.
+Policy advisor preserves OpenShell's default-deny posture. The structured rule is the approval contract, and the agent's rationale is supporting context. By default every proposal lands in the draft inbox for human review. Opt-in [auto mode](#approval-modes) lets the gateway approve provably safe proposals — those whose [prover delta](#what-auto-approval-checks) is empty — without a reviewer in the loop; proposals with any prover finding still require human approval.
 
 ## Enable Policy Advisor
 
@@ -95,14 +95,15 @@ When policy advisor is enabled, the sandbox supervisor turns on three agent-faci
 - It serves `http://policy.local` from inside the sandbox.
 - It adds `next_steps` to L7 `policy_denied` response bodies so the agent can find the skill and local API.
 
-The loop has six steps:
+The loop has seven steps:
 
 1. A sandboxed process attempts a network request that policy denies.
 2. For inspected REST traffic, OpenShell returns a structured `403` body with fields such as `layer`, `host`, `port`, `binary`, `method`, `path`, `rule_missing`, and `next_steps`.
 3. The agent reads the policy advisor skill, inspects the current policy, and optionally reads recent denial log lines.
 4. The agent submits one or more `addRule` proposals to `http://policy.local/v1/proposals`.
-5. The gateway stores accepted proposals as pending draft chunks for the sandbox.
-6. A developer reviews the draft, approves or rejects it, and the agent waits on `/v1/proposals/{chunk_id}/wait` until a decision is available.
+5. The gateway stores accepted proposals as pending draft chunks for the sandbox and runs the [policy prover](#what-auto-approval-checks) against the proposed delta.
+6. Under `auto` mode, proposals with an empty prover delta are approved immediately and skipped past human review. Under `manual` mode (the default), every proposal — and under `auto` mode, every proposal with a prover finding — lands in the draft inbox for a developer to approve or reject.
+7. The agent waits on `/v1/proposals/{chunk_id}/wait` until a decision is available. Approved proposals hot-reload into the sandbox; rejected proposals return `rejection_reason` and `validation_result` so the agent can revise.
 
 When a proposal is approved, `/wait` reports `policy_reloaded: true` only after the local sandbox policy covers the approved rule. At that point the agent can retry the original denied action once. If a proposal is rejected, `/wait` returns `rejection_reason` and `validation_result` so the agent can revise or stop. `validation_result` carries the categorical prover findings — `link_local_reach`, `l7_bypass_credentialed`, `credential_reach_expansion`, `capability_expansion` — so the agent can narrow the next attempt to the specific concern the prover flagged.
 
@@ -180,6 +181,8 @@ Review pending chunks from the host:
 ```shell
 openshell rule get <sandbox-name> --status pending
 ```
+
+Under `auto` mode, only proposals the prover flagged appear here; empty-delta proposals are already approved and visible under `--status approved` with the auto-approval audit fields described in [Approval Modes](#approval-modes). Under `manual` mode, every proposal — regardless of prover verdict — shows up as pending.
 
 The output shows the chunk ID, status, rationale, binary, and endpoint summary. For L7 proposals, the endpoint summary includes the protocol, method, and path:
 
