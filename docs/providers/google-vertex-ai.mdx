@@ -105,15 +105,92 @@ OpenShell exposes Anthropic Vertex routes for inference only. It does not advert
 
 ## Configure Inference Routing
 
-After creating the provider, point `inference.local` at it:
+Before configuring inference routing, enable provider endpoint injection so the Vertex AI network endpoints are automatically included in sandbox policies:
+
+```shell
+openshell settings set --global --key providers_v2_enabled --value true --yes
+```
+
+Then point `inference.local` at the provider:
 
 ```shell
 openshell inference set \
   --provider vertex-prod \
-  --model claude-3-5-sonnet@20241022
+  --model claude-sonnet-4-6
+```
+
+Use `--no-verify` if the endpoint verification fails. This is common with the `global` region, where the validation probe may not match the actual rawPredict path:
+
+```shell
+openshell inference set \
+  --provider vertex-prod \
+  --model claude-sonnet-4-6 \
+  --no-verify
 ```
 
 Sandboxes on that gateway reach the model at `https://inference.local`. For full details on inference routing, refer to [Inference Routing](/sandboxes/inference-routing).
+
+## Use from a Sandbox
+
+Agents inside sandboxes should reach Vertex AI through `inference.local`, not by connecting to Vertex AI directly. The gateway manages GCP credential refresh and request translation; the agent only needs to point its SDK at the local endpoint.
+
+The complete setup from scratch:
+
+```shell
+# 1. Enable provider endpoint injection
+openshell settings set --global --key providers_v2_enabled --value true --yes
+
+# 2. Create the provider
+openshell provider create \
+  --name vertex-local \
+  --type google-vertex-ai \
+  --from-gcloud-adc \
+  --config VERTEX_AI_PROJECT_ID=my-gcp-project \
+  --config VERTEX_AI_REGION=us-central1
+
+# 3. Configure inference routing
+openshell inference set --provider vertex-local --model claude-sonnet-4-6 --no-verify
+
+# 4. Create a sandbox with the provider attached
+openshell sandbox create --name my-sandbox --provider vertex-local
+```
+
+Then inside the sandbox, launch the agent as shown below.
+
+<Tabs>
+<Tab title="Claude Code">
+
+```shell
+ANTHROPIC_BASE_URL="https://inference.local" ANTHROPIC_API_KEY=unused claude --bare
+```
+
+`--bare` skips the OAuth login flow and uses `ANTHROPIC_API_KEY` directly for authentication. The key value does not reach Vertex AI — `inference.local` strips it and injects the real GCP access token before forwarding.
+
+<Warning>
+Do not set `CLAUDE_CODE_USE_VERTEX=1` inside the sandbox. That flag makes Claude Code connect directly to Vertex AI and attempt GCP credential discovery (ADC file, metadata service), which fails because the sandbox does not expose GCP credentials. Use `inference.local` instead.
+</Warning>
+
+</Tab>
+<Tab title="OpenCode">
+
+```shell
+ANTHROPIC_BASE_URL="https://inference.local/v1" ANTHROPIC_API_KEY=unused opencode
+```
+
+OpenCode requires `/v1` in the base URL. Without it, OpenCode sends `POST /messages` instead of `POST /v1/messages`, which does not match the inference pattern and is denied.
+
+</Tab>
+</Tabs>
+
+### Policy Proposals
+
+After running an agent, the TUI (`openshell term`) may show policy proposals for denied endpoints. Common ones for Vertex AI sandboxes:
+
+| Endpoint | Action | Reason |
+|---|---|---|
+| `metadata.google.internal:80` | **Reject** | Resolves to `169.254.169.254` (GCE metadata service). Always blocked regardless of policy — the proxy blocks the resolved IP unconditionally to prevent credential exfiltration. |
+| `downloads.claude.ai:443` | Approve if desired | Claude Code update checking and asset loading. Not required for inference. |
+| `storage.googleapis.com:443` | Approve if desired | Google Cloud Storage. Used by some Claude Code features. Not required for inference. |
 
 ## From Existing Environment
 
