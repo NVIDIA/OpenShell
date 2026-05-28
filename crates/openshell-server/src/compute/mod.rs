@@ -329,7 +329,7 @@ impl ComputeRuntime {
     ) -> Result<Self, ComputeError> {
         let driver = KubernetesComputeDriver::new(config)
             .await
-            .map_err(|err| ComputeError::Message(err.to_string()))?;
+            .map_err(ComputeError::from)?;
         let driver: SharedComputeDriver = Arc::new(ComputeDriverService::new(driver));
         Self::from_driver(
             driver,

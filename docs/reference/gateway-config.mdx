@@ -149,10 +149,17 @@ namespace                  = "agents"
 grpc_endpoint              = "https://openshell-gateway.agents.svc:8080"
 service_account_name       = "openshell-sandbox"
 image_pull_policy          = "IfNotPresent"
+runtime_class_name         = "gvisor"
+runtime_class_outer_isolation = true
 # Use the image volume on K8s >= 1.35 (GA in 1.36); switch to "init-container"
 # on older clusters or where the ImageVolume feature gate is off.
 supervisor_sideload_method = "image-volume"
 ```
+
+When `runtime_class_name` is set, the Kubernetes driver validates that the
+RuntimeClass exists during startup. Missing RuntimeClasses fail the gateway
+early instead of surfacing later as pod sandbox creation errors. Per-sandbox
+template RuntimeClass overrides are validated during sandbox admission/create.
 
 ### Docker
 

@@ -13,6 +13,17 @@ this driver. Kubernetes owns scheduling and pod lifecycle. The
 `openshell-sandbox` supervisor inside each workload owns agent isolation,
 credential injection, policy polling, logs, and the gateway relay.
 
+Set `runtime_class_name` in the driver config to assign a default Kubernetes
+RuntimeClass, such as `gvisor` or a Kata Containers RuntimeClass, to sandbox
+pods. Per-sandbox template `runtime_class_name` values override the driver
+default. When that RuntimeClass is the outer isolation boundary for the
+sandbox, set `runtime_class_outer_isolation = true` explicitly; the driver does
+not infer isolation semantics from RuntimeClass names. When a default
+`runtime_class_name` is configured, the driver validates that the cluster has
+that RuntimeClass during startup so a missing runtime fails fast instead of
+surfacing later as pod sandbox creation errors. Per-sandbox RuntimeClass
+overrides are dynamic and are validated during sandbox admission/create.
+
 ## Sandbox Resource
 
 The driver works with the `agents.x-k8s.io/v1alpha1` `Sandbox` custom resource.

@@ -76,6 +76,16 @@ struct Args {
     #[arg(long, env = "OPENSHELL_ENABLE_USER_NAMESPACES")]
     enable_user_namespaces: bool,
 
+    /// Default Kubernetes `RuntimeClass` assigned to sandbox pods.
+    /// Per-sandbox template `runtime_class_name` values override this default.
+    #[arg(long, env = "OPENSHELL_RUNTIME_CLASS_NAME")]
+    runtime_class_name: Option<String>,
+
+    /// Treat the configured `RuntimeClass` as the sandbox's outer isolation
+    /// boundary. Set explicitly for runtimes such as gVisor or Kata Containers.
+    #[arg(long, env = "OPENSHELL_RUNTIME_CLASS_OUTER_ISOLATION")]
+    runtime_class_outer_isolation: bool,
+
     /// Lifetime (seconds) of the projected `ServiceAccount` token
     /// kubelet writes into each sandbox pod for the `IssueSandboxToken`
     /// bootstrap exchange. Kubelet enforces a minimum of 600s; the
@@ -105,6 +115,8 @@ async fn main() -> Result<()> {
         supervisor_sideload_method: args.supervisor_sideload_method,
         grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
         ssh_socket_path: args.sandbox_ssh_socket_path,
+        runtime_class_name: args.runtime_class_name.unwrap_or_default(),
+        runtime_class_outer_isolation: args.runtime_class_outer_isolation,
         client_tls_secret_name: args.client_tls_secret_name.unwrap_or_default(),
         host_gateway_ip: args.host_gateway_ip.unwrap_or_default(),
         enable_user_namespaces: args.enable_user_namespaces,

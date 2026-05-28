@@ -9,6 +9,7 @@ use crate::config::{
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::{Event as KubeEventObj, Node};
+use k8s_openapi::api::node::v1::RuntimeClass;
 use kube::api::{Api, ApiResource, DeleteParams, ListParams, PostParams};
 use kube::core::gvk::GroupVersionKind;
 use kube::core::{DynamicObject, ObjectMeta};
@@ -132,25 +133,30 @@ impl std::fmt::Debug for KubernetesComputeDriver {
 }
 
 impl KubernetesComputeDriver {
-    pub async fn new(config: KubernetesComputeConfig) -> Result<Self, KubeError> {
+    pub async fn new(mut config: KubernetesComputeConfig) -> Result<Self, KubernetesDriverError> {
         let base_config = match kube::Config::incluster() {
             Ok(c) => c,
             Err(_) => kube::Config::infer()
                 .await
-                .map_err(kube::Error::InferConfig)?,
+                .map_err(kube::Error::InferConfig)
+                .map_err(KubernetesDriverError::from_kube)?,
         };
 
         let mut kube_config = base_config.clone();
         kube_config.connect_timeout = Some(Duration::from_secs(10));
         kube_config.read_timeout = Some(Duration::from_secs(30));
         kube_config.write_timeout = Some(Duration::from_secs(30));
-        let client = Client::try_from(kube_config)?;
+        let client = Client::try_from(kube_config).map_err(KubernetesDriverError::from_kube)?;
 
         let mut watch_kube_config = base_config;
         watch_kube_config.connect_timeout = Some(Duration::from_secs(10));
         watch_kube_config.read_timeout = None;
         watch_kube_config.write_timeout = Some(Duration::from_secs(30));
-        let watch_client = Client::try_from(watch_kube_config)?;
+        let watch_client =
+            Client::try_from(watch_kube_config).map_err(KubernetesDriverError::from_kube)?;
+
+        config.runtime_class_name = config.runtime_class_name.trim().to_string();
+        validate_runtime_class_exists(&client, &config.runtime_class_name).await?;
 
         Ok(Self {
             client,
@@ -203,6 +209,17 @@ impl KubernetesComputeDriver {
         }))
     }
 
+    async fn validate_sandbox_runtime_class_override(
+        &self,
+        sandbox: &Sandbox,
+    ) -> Result<(), KubernetesDriverError> {
+        let Some(runtime_class_name) = sandbox_runtime_class_override(sandbox) else {
+            return Ok(());
+        };
+
+        validate_runtime_class_exists(&self.client, &runtime_class_name).await
+    }
+
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), tonic::Status> {
         let gpu_requested = sandbox.spec.as_ref().is_some_and(|spec| spec.gpu);
         if gpu_requested
@@ -214,6 +231,17 @@ impl KubernetesComputeDriver {
                 "GPU sandbox requested, but the active gateway has no allocatable GPUs. Please refer to documentation and use `openshell doctor` commands to inspect GPU support and gateway configuration.",
             ));
         }
+        self.validate_sandbox_runtime_class_override(sandbox)
+            .await
+            .map_err(|err| match err {
+                KubernetesDriverError::Precondition(message) => {
+                    tonic::Status::failed_precondition(message)
+                }
+                KubernetesDriverError::AlreadyExists => {
+                    tonic::Status::already_exists("sandbox already exists")
+                }
+                KubernetesDriverError::Message(message) => tonic::Status::internal(message),
+            })?;
         Ok(())
     }
 
@@ -305,6 +333,9 @@ impl KubernetesComputeDriver {
             "Creating sandbox in Kubernetes"
         );
 
+        self.validate_sandbox_runtime_class_override(sandbox)
+            .await?;
+
         let gvk = GroupVersionKind::gvk(SANDBOX_GROUP, SANDBOX_VERSION, SANDBOX_KIND);
         let resource = ApiResource::from_gvk(&gvk);
         let mut obj = DynamicObject::new(name, &resource);
@@ -325,6 +356,8 @@ impl KubernetesComputeDriver {
             sandbox_name: &sandbox.name,
             grpc_endpoint: &self.config.grpc_endpoint,
             ssh_socket_path: self.ssh_socket_path(),
+            runtime_class_name: &self.config.runtime_class_name,
+            runtime_class_outer_isolation: self.config.runtime_class_outer_isolation,
             client_tls_secret_name: &self.config.client_tls_secret_name,
             host_gateway_ip: &self.config.host_gateway_ip,
             enable_user_namespaces: self.config.enable_user_namespaces,
@@ -1054,6 +1087,8 @@ struct SandboxPodParams<'a> {
     sandbox_name: &'a str,
     grpc_endpoint: &'a str,
     ssh_socket_path: &'a str,
+    runtime_class_name: &'a str,
+    runtime_class_outer_isolation: bool,
     client_tls_secret_name: &'a str,
     host_gateway_ip: &'a str,
     enable_user_namespaces: bool,
@@ -1076,6 +1111,8 @@ impl Default for SandboxPodParams<'_> {
             sandbox_name: "",
             grpc_endpoint: "",
             ssh_socket_path: "",
+            runtime_class_name: "",
+            runtime_class_outer_isolation: false,
             client_tls_secret_name: "",
             host_gateway_ip: "",
             enable_user_namespaces: false,
@@ -1083,6 +1120,48 @@ impl Default for SandboxPodParams<'_> {
             sa_token_ttl_secs: 3600,
         }
     }
+}
+
+async fn validate_runtime_class_exists(
+    client: &Client,
+    runtime_class_name: &str,
+) -> Result<(), KubernetesDriverError> {
+    let runtime_class_name = runtime_class_name.trim();
+    if runtime_class_name.is_empty() {
+        return Ok(());
+    }
+
+    let runtime_classes: Api<RuntimeClass> = Api::all(client.clone());
+    match tokio::time::timeout(KUBE_API_TIMEOUT, runtime_classes.get(runtime_class_name)).await {
+        Ok(Ok(_runtime_class)) => {
+            info!(
+                runtime_class_name,
+                "Validated configured Kubernetes RuntimeClass"
+            );
+            Ok(())
+        }
+        Ok(Err(KubeError::Api(err))) if err.code == 404 => {
+            Err(KubernetesDriverError::Precondition(format!(
+                "Kubernetes RuntimeClass '{runtime_class_name}' does not exist; create it before starting OpenShell or choose an existing RuntimeClass"
+            )))
+        }
+        Ok(Err(err)) => Err(KubernetesDriverError::Message(format!(
+            "failed to validate Kubernetes RuntimeClass '{runtime_class_name}': {err}"
+        ))),
+        Err(_elapsed) => Err(KubernetesDriverError::Message(format!(
+            "timed out after {}s validating Kubernetes RuntimeClass '{runtime_class_name}'",
+            KUBE_API_TIMEOUT.as_secs()
+        ))),
+    }
+}
+
+fn sandbox_runtime_class_override(sandbox: &Sandbox) -> Option<String> {
+    sandbox
+        .spec
+        .as_ref()?
+        .template
+        .as_ref()
+        .and_then(|template| platform_config_string(template, "runtime_class_name"))
 }
 
 fn spec_pod_env(spec: Option<&SandboxSpec>) -> std::collections::HashMap<String, String> {
@@ -1200,12 +1279,22 @@ fn sandbox_template_to_k8s(
     }
 
     let mut spec = serde_json::Map::new();
-    if let Some(runtime_class) = platform_config_string(template, "runtime_class_name") {
+    let runtime_class = platform_config_string(template, "runtime_class_name").or_else(|| {
+        if params.runtime_class_name.is_empty() {
+            None
+        } else {
+            Some(params.runtime_class_name.to_string())
+        }
+    });
+    if let Some(runtime_class) = runtime_class.as_deref() {
         spec.insert(
             "runtimeClassName".to_string(),
             serde_json::json!(runtime_class),
         );
     }
+    let runtime_class_outer_isolation =
+        platform_config_bool(template, "runtime_class_outer_isolation")
+            .unwrap_or(params.runtime_class_outer_isolation);
     if let Some(node_selector) = platform_config_struct(template, "node_selector") {
         spec.insert("nodeSelector".to_string(), node_selector);
     }
@@ -1270,6 +1359,14 @@ fn sandbox_template_to_k8s(
         params.ssh_socket_path,
         !params.client_tls_secret_name.is_empty(),
     );
+    let mut env = env;
+    if runtime_class_outer_isolation {
+        upsert_env(
+            &mut env,
+            openshell_core::sandbox_env::OUTER_RUNTIME_ISOLATION,
+            "runtime-class",
+        );
+    }
 
     container.insert("env".to_string(), serde_json::Value::Array(env));
 
@@ -1551,7 +1648,9 @@ fn platform_config_string(template: &SandboxTemplate, key: &str) -> Option<Strin
     let config = template.platform_config.as_ref()?;
     let value = config.fields.get(key)?;
     match value.kind.as_ref() {
-        Some(prost_types::value::Kind::StringValue(s)) if !s.is_empty() => Some(s.clone()),
+        Some(prost_types::value::Kind::StringValue(s)) if !s.trim().is_empty() => {
+            Some(s.trim().to_string())
+        }
         _ => None,
     }
 }
@@ -1673,6 +1772,42 @@ mod tests {
         PROGRESS_COMPLETE_STEP_KEY,
     };
     use prost_types::{Struct, Value, value::Kind};
+
+    fn pod_env_value<'a>(pod_template: &'a serde_json::Value, name: &str) -> Option<&'a str> {
+        pod_template["spec"]["containers"][0]["env"]
+            .as_array()?
+            .iter()
+            .find(|item| item.get("name").and_then(|value| value.as_str()) == Some(name))
+            .and_then(|item| item.get("value"))
+            .and_then(|value| value.as_str())
+    }
+
+    #[test]
+    fn sandbox_runtime_class_override_reads_template_value() {
+        let sandbox = Sandbox {
+            spec: Some(SandboxSpec {
+                template: Some(SandboxTemplate {
+                    platform_config: Some(Struct {
+                        fields: std::iter::once((
+                            "runtime_class_name".to_string(),
+                            Value {
+                                kind: Some(Kind::StringValue(" kata-qemu ".to_string())),
+                            },
+                        ))
+                        .collect(),
+                    }),
+                    ..SandboxTemplate::default()
+                }),
+                ..SandboxSpec::default()
+            }),
+            ..Sandbox::default()
+        };
+
+        assert_eq!(
+            sandbox_runtime_class_override(&sandbox),
+            Some("kata-qemu".to_string())
+        );
+    }
 
     #[test]
     fn kube_pulling_event_adds_image_progress_metadata() {
@@ -2063,6 +2198,169 @@ mod tests {
         assert_eq!(
             pod_template["spec"]["runtimeClassName"],
             serde_json::json!("kata-containers")
+        );
+    }
+
+    #[test]
+    fn sandbox_uses_configured_runtime_class_name_when_template_omits_it() {
+        let params = SandboxPodParams {
+            runtime_class_name: "gvisor",
+            ..Default::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+
+        assert_eq!(
+            pod_template["spec"]["runtimeClassName"],
+            serde_json::json!("gvisor")
+        );
+    }
+
+    #[test]
+    fn template_runtime_class_name_overrides_configured_default() {
+        let template = SandboxTemplate {
+            platform_config: Some(Struct {
+                fields: std::iter::once((
+                    "runtime_class_name".to_string(),
+                    Value {
+                        kind: Some(Kind::StringValue("kata-containers".to_string())),
+                    },
+                ))
+                .collect(),
+            }),
+            ..SandboxTemplate::default()
+        };
+        let params = SandboxPodParams {
+            runtime_class_name: "gvisor",
+            ..Default::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &template,
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+
+        assert_eq!(
+            pod_template["spec"]["runtimeClassName"],
+            serde_json::json!("kata-containers")
+        );
+    }
+
+    #[test]
+    fn template_runtime_class_name_is_trimmed() {
+        let template = SandboxTemplate {
+            platform_config: Some(Struct {
+                fields: std::iter::once((
+                    "runtime_class_name".to_string(),
+                    Value {
+                        kind: Some(Kind::StringValue(" gvisor ".to_string())),
+                    },
+                ))
+                .collect(),
+            }),
+            ..SandboxTemplate::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &template,
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &SandboxPodParams::default(),
+        );
+
+        assert_eq!(
+            pod_template["spec"]["runtimeClassName"],
+            serde_json::json!("gvisor")
+        );
+    }
+
+    #[test]
+    fn runtime_class_name_does_not_imply_outer_runtime_isolation_env() {
+        let params = SandboxPodParams {
+            runtime_class_name: "gvisor",
+            ..Default::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+
+        assert_eq!(
+            pod_env_value(
+                &pod_template,
+                openshell_core::sandbox_env::OUTER_RUNTIME_ISOLATION
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn explicit_runtime_class_outer_isolation_sets_outer_runtime_env() {
+        let params = SandboxPodParams {
+            runtime_class_name: "gvisor",
+            runtime_class_outer_isolation: true,
+            ..Default::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+
+        assert_eq!(
+            pod_env_value(
+                &pod_template,
+                openshell_core::sandbox_env::OUTER_RUNTIME_ISOLATION
+            ),
+            Some("runtime-class")
+        );
+    }
+
+    #[test]
+    fn template_runtime_class_outer_isolation_overrides_configured_default() {
+        let template = SandboxTemplate {
+            platform_config: Some(Struct {
+                fields: std::iter::once((
+                    "runtime_class_outer_isolation".to_string(),
+                    Value {
+                        kind: Some(Kind::BoolValue(false)),
+                    },
+                ))
+                .collect(),
+            }),
+            ..SandboxTemplate::default()
+        };
+        let params = SandboxPodParams {
+            runtime_class_name: "gvisor",
+            runtime_class_outer_isolation: true,
+            ..Default::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &template,
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+
+        assert_eq!(
+            pod_env_value(
+                &pod_template,
+                openshell_core::sandbox_env::OUTER_RUNTIME_ISOLATION
+            ),
+            None
         );
     }
 

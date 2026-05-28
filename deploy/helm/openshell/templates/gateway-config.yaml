@@ -98,6 +98,12 @@ data:
 
     [openshell.drivers.kubernetes]
     grpc_endpoint                = {{ include "openshell.grpcEndpoint" . | quote }}
+    {{- if .Values.server.runtimeClassName }}
+    runtime_class_name           = {{ .Values.server.runtimeClassName | quote }}
+    {{- end }}
+    {{- if .Values.server.runtimeClassOuterIsolation }}
+    runtime_class_outer_isolation = true
+    {{- end }}
     service_account_name         = {{ include "openshell.sandboxServiceAccountName" . | quote }}
     supervisor_sideload_method   = {{ include "openshell.supervisorSideloadMethod" . | quote }}
     sa_token_ttl_secs            = {{ .Values.server.sandboxJwt.k8sSaTokenTtlSecs | default 3600 }}

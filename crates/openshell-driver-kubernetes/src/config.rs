@@ -70,6 +70,16 @@ pub struct KubernetesComputeConfig {
     pub supervisor_sideload_method: SupervisorSideloadMethod,
     pub grpc_endpoint: String,
     pub ssh_socket_path: String,
+    /// Default Kubernetes `RuntimeClass` assigned to sandbox pods.
+    /// Empty string leaves runtime selection to the cluster default. Per-sandbox
+    /// template `runtime_class_name` values override this deployment default.
+    pub runtime_class_name: String,
+    /// Whether the configured `RuntimeClass` provides the outer kernel isolation
+    /// boundary for sandbox pods. When true, the supervisor can degrade controls
+    /// such as netns/nftables/seccomp that are unavailable inside runtimes like
+    /// gVisor or Kata Containers. This is explicit operator intent and is not
+    /// inferred from the `RuntimeClass` name.
+    pub runtime_class_outer_isolation: bool,
     pub client_tls_secret_name: String,
     pub host_gateway_ip: String,
     pub enable_user_namespaces: bool,
@@ -109,6 +119,8 @@ impl Default for KubernetesComputeConfig {
             supervisor_sideload_method: SupervisorSideloadMethod::default(),
             grpc_endpoint: String::new(),
             ssh_socket_path: "/run/openshell/ssh.sock".to_string(),
+            runtime_class_name: String::new(),
+            runtime_class_outer_isolation: false,
             client_tls_secret_name: String::new(),
             host_gateway_ip: String::new(),
             enable_user_namespaces: false,
@@ -171,5 +183,23 @@ mod tests {
         });
         let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
         assert_eq!(cfg.service_account_name, "openshell-sandbox");
+    }
+
+    #[test]
+    fn serde_override_runtime_class_name() {
+        let json = serde_json::json!({
+            "runtime_class_name": "gvisor"
+        });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.runtime_class_name, "gvisor");
+    }
+
+    #[test]
+    fn serde_override_runtime_class_outer_isolation() {
+        let json = serde_json::json!({
+            "runtime_class_outer_isolation": true
+        });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+        assert!(cfg.runtime_class_outer_isolation);
     }
 }

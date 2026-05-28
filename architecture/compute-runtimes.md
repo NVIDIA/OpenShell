@@ -78,6 +78,15 @@ runtime still owns GPU device injection.
 ## Deployment Shape
 
 Kubernetes deployments use the Helm chart under `deploy/helm/openshell`.
+The Kubernetes driver can set a default `runtimeClassName` for sandbox pods,
+for example `gvisor` or a Kata Containers RuntimeClass, while preserving
+per-sandbox template overrides. If the RuntimeClass is the sandbox's outer
+kernel isolation boundary, that behavior is configured explicitly; OpenShell
+does not infer isolation semantics from RuntimeClass names. When a default
+RuntimeClass is configured, the Kubernetes driver validates its existence at
+startup so missing cluster runtime support fails before any sandbox pods are
+requested. Per-sandbox RuntimeClass overrides are validated during sandbox
+admission/create because they are not known at gateway startup.
 Standalone local deployments start the gateway with a selected runtime such as
 Docker, Podman, or VM. The CLI can register multiple gateways and switch between
 them without changing the sandbox architecture.

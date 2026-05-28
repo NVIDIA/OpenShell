@@ -59,6 +59,38 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?service_account_name\s*=\s*"openshell-sandbox"'
 
+  - it: omits runtime_class_name by default
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'runtime_class_name\s*='
+
+  - it: renders the configured default RuntimeClass under [openshell.drivers.kubernetes]
+    template: templates/gateway-config.yaml
+    set:
+      server.runtimeClassName: gvisor
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?runtime_class_name\s*=\s*"gvisor"'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'runtime_class_outer_isolation\s*='
+
+  - it: renders explicit RuntimeClass outer isolation when enabled
+    template: templates/gateway-config.yaml
+    set:
+      server.runtimeClassName: gvisor
+      server.runtimeClassOuterIsolation: true
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?runtime_class_name\s*=\s*"gvisor"'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?runtime_class_outer_isolation\s*=\s*true'
+
   - it: does not render local mTLS user auth for Kubernetes deployments
     template: templates/gateway-config.yaml
     asserts:

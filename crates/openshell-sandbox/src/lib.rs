@@ -111,6 +111,35 @@ pub(crate) fn agent_proposals_enabled() -> bool {
         .is_some_and(|flag| flag.load(Ordering::Relaxed))
 }
 
+pub(crate) fn outer_runtime_isolation_enabled() -> bool {
+    std::env::var(openshell_core::sandbox_env::OUTER_RUNTIME_ISOLATION)
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "runtime-class" | "true" | "1" | "yes"
+            )
+        })
+}
+
+fn emit_outer_runtime_degradation(control: &str, error: &dyn std::fmt::Display) {
+    warn!(
+        control = control,
+        error = %error,
+        "Continuing without supervisor-managed isolation control because outer runtime isolation is enabled"
+    );
+    ocsf_emit!(
+        ConfigStateChangeBuilder::new(ocsf_ctx())
+            .severity(SeverityId::High)
+            .status(StatusId::Failure)
+            .state(StateId::Disabled, "outer-runtime")
+            .message(format!(
+                "{control} unavailable; continuing because outer runtime isolation is enabled: {error}"
+            ))
+            .build()
+    );
+}
+
 /// Test-only helpers shared across sibling test modules.
 #[cfg(test)]
 pub(crate) mod test_helpers {
@@ -557,11 +586,16 @@ pub async fn run_sandbox(
                 Some(ns)
             }
             Err(e) => {
-                return Err(miette::miette!(
-                    "Network namespace creation failed and proxy mode requires isolation. \
-                     Ensure CAP_NET_ADMIN and CAP_SYS_ADMIN are available and iproute2 is installed. \
-                     Error: {e}"
-                ));
+                if outer_runtime_isolation_enabled() {
+                    emit_outer_runtime_degradation("network namespace creation", &e);
+                    None
+                } else {
+                    return Err(miette::miette!(
+                        "Network namespace creation failed and proxy mode requires isolation. \
+                         Ensure CAP_NET_ADMIN and CAP_SYS_ADMIN are available and iproute2 is installed. \
+                         Error: {e}"
+                    ));
+                }
             }
         }
     } else {
@@ -576,7 +610,13 @@ pub async fn run_sandbox(
     // Install the supervisor seccomp prelude after privileged startup helpers
     // (network namespace setup, nftables probes) complete, but before the SSH
     // listener and workload process are exposed.
-    apply_supervisor_startup_hardening()?;
+    if let Err(e) = apply_supervisor_startup_hardening() {
+        if outer_runtime_isolation_enabled() {
+            emit_outer_runtime_degradation("supervisor seccomp prelude", &e);
+        } else {
+            return Err(e);
+        }
+    }
 
     // Shared PID: set after process spawn so the proxy can look up
     // the entrypoint process's /proc/net/tcp for identity binding.
@@ -674,15 +714,28 @@ pub async fn run_sandbox(
     let ssh_proxy_url = if matches!(policy.network.mode, NetworkMode::Proxy) {
         #[cfg(target_os = "linux")]
         {
-            netns.as_ref().map(|ns| {
-                let port = policy
-                    .network
-                    .proxy
-                    .as_ref()
-                    .and_then(|p| p.http_addr)
-                    .map_or(3128, |addr| addr.port());
-                format!("http://{}:{port}", ns.host_ip())
-            })
+            Some(netns.as_ref().map_or_else(
+                || {
+                    policy
+                        .network
+                        .proxy
+                        .as_ref()
+                        .and_then(|p| p.http_addr)
+                        .map_or_else(
+                            || "http://127.0.0.1:3128".to_string(),
+                            |addr| format!("http://{addr}"),
+                        )
+                },
+                |ns| {
+                    let port = policy
+                        .network
+                        .proxy
+                        .as_ref()
+                        .and_then(|p| p.http_addr)
+                        .map_or(3128, |addr| addr.port());
+                    format!("http://{}:{port}", ns.host_ip())
+                },
+            ))
         }
         #[cfg(not(target_os = "linux"))]
         {
