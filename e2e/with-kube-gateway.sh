@@ -16,6 +16,10 @@
 # Helm e2e currently uses plaintext gateway traffic (ci/values-skaffold.yaml).
 # The certgen hook still runs so the gateway has sandbox JWT signing keys.
 #
+# Set OPENSHELL_E2E_KUBE_EXTRA_VALUES to one or more colon-separated Helm values
+# files, relative to the repository root or absolute, to layer additional chart
+# configuration on top of ci/values-skaffold.yaml.
+#
 # Image source:
 #   - Ephemeral k3d mode builds local `openshell/{gateway,supervisor}:${IMAGE_TAG}`
 #     images by default, imports them into k3d, then installs the chart. This
@@ -306,10 +310,23 @@ if [ -n "${HOST_GATEWAY_IP}" ]; then
   helm_extra_args+=(--set "server.hostGatewayIP=${HOST_GATEWAY_IP}")
 fi
 
+helm_values_args=(--values "${ROOT}/deploy/helm/openshell/ci/values-skaffold.yaml")
+if [ -n "${OPENSHELL_E2E_KUBE_EXTRA_VALUES:-}" ]; then
+  IFS=':' read -r -a extra_values_files <<< "${OPENSHELL_E2E_KUBE_EXTRA_VALUES}"
+  for values_file in "${extra_values_files[@]}"; do
+    [ -n "${values_file}" ] || continue
+    if [[ "${values_file}" != /* ]]; then
+      values_file="${ROOT}/${values_file}"
+    fi
+    helm_values_args+=(--values "${values_file}")
+  done
+fi
+
 echo "Installing Helm chart (release=${RELEASE_NAME}, namespace=${NAMESPACE}, tag=${IMAGE_TAG_VALUE})..."
 helmctl install "${RELEASE_NAME}" "${ROOT}/deploy/helm/openshell" \
   --namespace "${NAMESPACE}" --create-namespace \
-  --values "${ROOT}/deploy/helm/openshell/ci/values-skaffold.yaml" \
+  --dependency-update \
+  "${helm_values_args[@]}" \
   --set "fullnameOverride=openshell" \
   --set "image.repository=${REGISTRY_VALUE}/gateway" \
   --set "image.tag=${IMAGE_TAG_VALUE}" \

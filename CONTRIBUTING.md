@@ -78,6 +78,7 @@ Skills live in `.agents/skills/`. Your agent's harness can discover and load the
 | Reviewing       | `test-release-canary`     | Dispatch and iterate on the Release Canary workflow that smoke-tests published artifacts            |
 | Triage          | `triage-issue`            | Assess, classify, and route community-filed issues                                                  |
 | Platform        | `generate-sandbox-policy` | Generate YAML sandbox policies from requirements or API docs                                        |
+| Platform        | `deploy-openshell-cluster`| Deploy OpenShell gateway on Kubernetes or OpenShift with optional PostgreSQL settings               |
 | Platform        | `tui-development`         | Development guide for the ratatui-based terminal UI                                                 |
 | Documentation   | `update-docs`             | Scan recent commits and draft doc updates for user-facing changes                                   |
 | Maintenance     | `sync-agent-infra`        | Detect and fix drift across agent-first infrastructure files                                        |
@@ -302,4 +303,4 @@ DCO sign-off is separate from cryptographic commit signing. CI requires signing 
 
 ## CI
 
-How PR CI runs, the `test:e2e` / `test:e2e-gpu` labels, copy-pr-bot, and commit-signing setup are documented in [CI.md](CI.md).
+How PR CI runs, the `test:e2e`, `test:e2e-gpu`, and `test:e2e-kubernetes` labels, copy-pr-bot, and commit-signing setup are documented in [CI.md](CI.md).

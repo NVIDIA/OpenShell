@@ -21,6 +21,9 @@ spec:
         # without this annotation a `helm upgrade` that only mutates the
         # ConfigMap would leave pods running with stale config.
         checksum/gateway-config: {{ include (print $.Template.BasePath "/gateway-config.yaml") . | sha256sum }}
+        {{- if .Values.postgres.enabled }}
+        checksum/db-secret: {{ include (print $.Template.BasePath "/db-secret.yaml") . | sha256sum }}
+        {{- end }}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -54,9 +57,18 @@ spec:
           args:
             - --config
             - /etc/openshell/gateway.toml
+            {{- if not .Values.postgres.enabled }}
             - --db-url
             - {{ .Values.server.dbUrl | quote }}
+            {{- end }}
           env:
+            {{- if .Values.postgres.enabled }}
+            - name: OPENSHELL_DB_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "openshell.fullname" . }}-db
+                  key: db-url
+            {{- end }}
             # All gateway settings live in the ConfigMap-backed TOML file
             # mounted at /etc/openshell/gateway.toml. The only env var below
             # is a process-level setting consumed by libraries outside
@@ -137,7 +149,7 @@ spec:
         - name: sandbox-jwt
           secret:
             secretName: {{ .Values.server.sandboxJwt.signingSecretName | default (printf "%s-jwt-keys" (include "openshell.fullname" .)) }}
-            defaultMode: 0400
+            defaultMode: {{ .Values.server.sandboxJwt.secretDefaultMode | default (ternary "0440" "0444" (not (empty .Values.podSecurityContext.fsGroup))) }}
         {{- if not .Values.server.disableTls }}
         - name: tls-cert
           secret:
