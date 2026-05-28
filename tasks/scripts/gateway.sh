@@ -271,6 +271,15 @@ if [[ "${DRIVER}" == "podman" ]]; then
   SUPERVISOR_IMAGE="${OPENSHELL_SUPERVISOR_IMAGE:-openshell/supervisor:dev}"
   ensure_podman_supervisor_image "${SUPERVISOR_IMAGE}"
   export OPENSHELL_SUPERVISOR_IMAGE="${SUPERVISOR_IMAGE}"
+
+  # Rootless Podman containers reach the host via pasta's local connection
+  # bypass, which translates to host L4 sockets. The gateway must listen on
+  # 0.0.0.0 so pasta can reach it — 127.0.0.1 is not routable through pasta.
+  if [[ -z "${OPENSHELL_BIND_ADDRESS:-}" ]]; then
+    if podman info --format '{{.Host.Security.Rootless}}' 2>/dev/null | grep -q true; then
+      export OPENSHELL_BIND_ADDRESS="0.0.0.0"
+    fi
+  fi
 fi
 
 if [[ ! "${GATEWAY_NAME}" =~ ^[A-Za-z0-9._-]+$ ]]; then
