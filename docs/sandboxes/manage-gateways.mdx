@@ -82,6 +82,8 @@ One gateway is always the active gateway. All CLI commands target it by default.
 
 The active gateway is the persisted default. The `-g` flag and the `OPENSHELL_GATEWAY` environment variable override it when commands resolve a gateway. If `OPENSHELL_GATEWAY` is set to a different gateway, `openshell gateway select <name>` still saves the new default and warns that the current shell continues to use the environment value until you unset or update it.
 
+Installers can seed read-only gateway entries for package-managed local services. By default the CLI reads these from `/etc/openshell`, using the same `active_gateway` plus `gateways/<name>/metadata.json` layout as per-user config. Packages can override that system config root with a non-empty absolute `OPENSHELL_SYSTEM_GATEWAY_DIR` when needed; empty or relative values fall back to `/etc/openshell` and log a warning. These entries appear in `openshell gateway list` and can be selected like user registrations. `openshell gateway list` and `openshell term` label each gateway as `user` or `system` so you can see which config layer owns it. `openshell gateway remove` removes only per-user registrations. Register a per-user gateway with the same name when you need to shadow an installer-provided default.
+
 List all registered gateways:
 
 ```shell

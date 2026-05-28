@@ -446,6 +446,21 @@ Driver-specific values that are not part of the inheritance allowlist
 (e.g. Podman `socket_path`, VM `vcpus`) only come from the driver's own
 table.
 
+### Package-managed gateway registry
+
+The CLI reads its active-gateway and per-gateway metadata from
+`$XDG_CONFIG_HOME/openshell/`. It also looks for a package-manager owned
+system config root at `/etc/openshell`, using the same layout as the per-user
+config root: `active_gateway` plus `gateways/<name>/metadata.json`. Packages
+or runtimes that need a different location can override that root with a
+non-empty absolute `OPENSHELL_SYSTEM_GATEWAY_DIR`; empty or relative values
+fall back to `/etc/openshell` and emit a warning. The CLI falls back to this
+system config when no per-user `metadata.json` exists; malformed user metadata
+still shadows the system entry, but stray empty directories do not.
+
+System entries are read-only from the CLI, so `gateway remove` rejects a pure
+system entry instead of pretending to delete package-manager owned state.
+
 ## Operational Constraints
 
 - Gateway TLS and client certificate distribution are deployment concerns owned
