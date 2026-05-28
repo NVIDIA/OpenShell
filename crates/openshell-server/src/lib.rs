@@ -762,11 +762,23 @@ async fn build_compute_runtime(
             .await
             .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
         }
-        ComputeDriverKind::External(_) => Err(Error::config(
-            "external compute driver dispatch is not yet wired; \
-             tonic UDS client lands in plan task 2a.4 \
-             (st-gr/openshell-driver-kyma docs/superpowers/plans/2026-05-27-phase2a-gateway-fork.md)",
-        )),
+        ComputeDriverKind::External(socket) => {
+            info!(
+                socket = %socket.display(),
+                "Connecting to external compute driver over Unix domain socket"
+            );
+            let channel = compute::connect_external_compute_driver(socket.clone()).await?;
+            ComputeRuntime::new_remote_external(
+                channel,
+                store,
+                sandbox_index,
+                sandbox_watch_bus,
+                tracing_log_bus,
+                supervisor_sessions,
+            )
+            .await
+            .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
+        }
     }
 }
 

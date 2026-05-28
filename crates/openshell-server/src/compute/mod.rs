@@ -216,6 +216,44 @@ impl ComputeDriver for RemoteComputeDriver {
     }
 }
 
+/// Build a tonic [`Channel`] connected to a Unix domain socket served by an
+/// external compute driver. Used by the `External(PathBuf)` dispatch arm in
+/// `lib.rs::build_compute_runtime`. The dummy authority `http://[::]:50051`
+/// matches the connector convention used by the VM driver — tonic ignores it
+/// once a custom service connector is supplied.
+#[cfg(unix)]
+pub(crate) async fn connect_external_compute_driver(
+    socket_path: std::path::PathBuf,
+) -> Result<Channel, openshell_core::Error> {
+    use hyper_util::rt::TokioIo;
+    use tokio::net::UnixStream;
+    use tonic::transport::Endpoint;
+    use tower::service_fn;
+
+    let display_path = socket_path.clone();
+    Endpoint::from_static("http://[::]:50051")
+        .connect_with_connector(service_fn(move |_: tonic::transport::Uri| {
+            let socket_path = socket_path.clone();
+            async move { UnixStream::connect(socket_path).await.map(TokioIo::new) }
+        }))
+        .await
+        .map_err(|e| {
+            openshell_core::Error::execution(format!(
+                "failed to connect to external compute driver socket '{}': {e}",
+                display_path.display()
+            ))
+        })
+}
+
+#[cfg(not(unix))]
+pub(crate) async fn connect_external_compute_driver(
+    _socket_path: std::path::PathBuf,
+) -> Result<Channel, openshell_core::Error> {
+    Err(openshell_core::Error::config(
+        "the external compute driver requires unix domain socket support",
+    ))
+}
+
 #[derive(Clone)]
 pub struct ComputeRuntime {
     driver: SharedComputeDriver,
@@ -362,6 +400,38 @@ impl ComputeRuntime {
             None,
             None,
             driver_process,
+            store,
+            sandbox_index,
+            sandbox_watch_bus,
+            tracing_log_bus,
+            supervisor_sessions,
+            true,
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// Build a `ComputeRuntime` over a tonic `Channel` connected to an
+    /// already-running external compute driver process.
+    ///
+    /// Unlike [`new_remote_vm`], this constructor does not own a child
+    /// process — the external driver's lifecycle is the operator's
+    /// responsibility (systemd unit, sidecar container, etc.). The
+    /// underlying `RemoteComputeDriver` proxy is identical.
+    pub(crate) async fn new_remote_external(
+        channel: Channel,
+        store: Arc<Store>,
+        sandbox_index: SandboxIndex,
+        sandbox_watch_bus: SandboxWatchBus,
+        tracing_log_bus: TracingLogBus,
+        supervisor_sessions: Arc<SupervisorSessionRegistry>,
+    ) -> Result<Self, ComputeError> {
+        let driver: SharedComputeDriver = Arc::new(RemoteComputeDriver::new(channel));
+        Self::from_driver(
+            driver,
+            None,
+            None,
+            None,
             store,
             sandbox_index,
             sandbox_watch_bus,
