@@ -1538,6 +1538,7 @@ mod tests {
             auth_style: "bearer".to_string(),
             header_name: "authorization".to_string(),
             query_param: String::new(),
+            path_template: String::new(),
             refresh: Some(ProviderCredentialRefresh {
                 strategy: ProviderCredentialRefreshStrategy::Oauth2ClientCredentials as i32,
                 token_url: "https://auth.example.com/token".to_string(),
@@ -1595,6 +1596,7 @@ mod tests {
             header_name: "authorization".to_string(),
             query_param: String::new(),
             refresh: None,
+            path_template: String::new(),
         }
     }
 
@@ -2927,6 +2929,7 @@ mod tests {
                             auth_style: "bearer".to_string(),
                             header_name: "authorization".to_string(),
                             query_param: String::new(),
+                            path_template: String::new(),
                             refresh: Some(ProviderCredentialRefresh {
                                 strategy: ProviderCredentialRefreshStrategy::Oauth2RefreshToken
                                     as i32,
