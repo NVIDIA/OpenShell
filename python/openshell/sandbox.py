@@ -877,6 +877,17 @@ def _make_fail_closed_bearer_provider(
     return provider
 
 
+class _InvalidGrantError(SandboxError):
+    """Refresh failed with OAuth2 `invalid_grant` (RFC 6749 §5.2).
+
+    The refresh_token was rejected — expired, revoked, or rotated out by
+    a concurrent refresh in another process. Subclass of `SandboxError`
+    so an uncaught instance still surfaces the standard re-authenticate
+    hint; `current_access_token` catches it to retry once with a
+    peer-rotated bundle before giving up.
+    """
+
+
 class _OidcRefresher:
     """Thread-safe in-process OAuth2 refresh for a gateway's `oidc_token.json`.
 
@@ -1009,10 +1020,46 @@ class _OidcRefresher:
                     return disk["access_token"]
             # Truly stale; refresh against the IdP using the freshest
             # bundle we have (disk if it was newer, else in-memory).
-            self._bundle = self._refresh(self._bundle)
+            try:
+                self._bundle = self._refresh(self._bundle)
+            except _InvalidGrantError as exc:
+                # We lost a cross-process rotation race: between our disk
+                # re-read above and our refresh POST, a peer (CLI, TUI,
+                # another SDK client) rotated the refresh_token and the
+                # IdP invalidated ours. This is the residual window that
+                # neither google-auth nor botocore close without an OS
+                # file lock. Rather than lock, recover: re-read disk once
+                # and, if a peer wrote a *different* refresh_token, retry
+                # with it before surfacing a re-authenticate error.
+                self._bundle = self._recover_from_invalid_grant(self._bundle, exc)
             if self._write_back:
                 self._write_to_disk(self._bundle)
             return self._bundle["access_token"]
+
+    def _recover_from_invalid_grant(
+        self, attempted: dict, exc: _InvalidGrantError
+    ) -> dict:
+        """Re-read disk after an `invalid_grant` and retry once if a peer
+        rotated the refresh_token.
+
+        `attempted` is the bundle whose refresh_token the IdP just
+        rejected. If disk now holds a different refresh_token, a
+        concurrent process won the rotation race — adopt and reuse it
+        (returning early if it is already fresh, otherwise refreshing
+        with it). If disk offers nothing new, the rejection is genuine:
+        re-raise so the caller sees the re-authenticate hint.
+        """
+        disk = _read_oidc_token_bundle(self._gateway_dir)
+        if disk is None or disk.get("refresh_token") == attempted.get("refresh_token"):
+            # No peer rotation — the refresh_token really is dead.
+            raise exc
+        if _normalize_issuer(disk) != _normalize_issuer(attempted):
+            self._token_endpoint = None
+        if self._is_fresh(disk):
+            return disk
+        # Single retry with the peer's rotated token; a second
+        # _InvalidGrantError here propagates (no further retry).
+        return self._refresh(disk)
 
     @staticmethod
     def _is_fresh(bundle: dict) -> bool:
@@ -1131,15 +1178,27 @@ class _OidcRefresher:
             # Include the IdP's error body for diagnostics — RFC 6749
             # mandates a JSON body like {"error":"invalid_grant", ...}
             # on failure, which is the most useful signal to surface.
+            error_code = None
+            with contextlib.suppress(Exception):
+                body = resp.json()
+                if isinstance(body, dict):
+                    error_code = body.get("error")
             detail = ""
             with contextlib.suppress(Exception):
                 detail = f": {resp.text[:200]}"
-            raise SandboxError(
+            message = (
                 f"OIDC token refresh failed for gateway "
                 f"'{self._cluster_name}': HTTP {resp.status_code}"
                 f"{detail}. Re-authenticate with: openshell gateway "
                 f"login"
             )
+            # `invalid_grant` specifically means the refresh_token was
+            # rejected — distinguished from transport/5xx errors so the
+            # caller can retry once with a peer-rotated bundle (a lost
+            # cross-process rotation race) before surfacing the failure.
+            if error_code == "invalid_grant":
+                raise _InvalidGrantError(message)
+            raise SandboxError(message)
         try:
             token = resp.json()
         except ValueError as e:

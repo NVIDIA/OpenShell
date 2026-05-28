@@ -716,6 +716,87 @@ def test_refresher_resets_token_endpoint_when_disk_issuer_changes(
     assert new_issuer in seen_discovery[0]
 
 
+def test_refresher_recovers_from_invalid_grant_after_peer_rotation(
+    tmp_path: Path,
+) -> None:
+    """If our refresh POST loses a rotation race (peer already rotated r1→r2
+    and the IdP rejects our r1 with invalid_grant), re-read disk, pick up the
+    peer's r2, and retry — succeeding without forcing a re-authenticate."""
+    import httpx as _httpx
+
+    _write_bundle(tmp_path, access_token="old", expires_at=1, refresh_token="r1")
+    posts: list[bytes] = []
+
+    def handler(request: _httpx.Request) -> _httpx.Response:
+        if request.url.path.endswith("/.well-known/openid-configuration"):
+            return _httpx.Response(
+                200,
+                json={
+                    "issuer": DEFAULT_ISSUER,
+                    "token_endpoint": DEFAULT_TOKEN_ENDPOINT,
+                },
+            )
+        body = bytes(request.content)
+        posts.append(body)
+        if b"refresh_token=r1" in body:
+            # Simulate the peer: it already rotated r1→r2 and wrote r2 to
+            # disk, so the IdP rejects our now-stale r1.
+            _write_bundle(
+                tmp_path,
+                access_token="peer",
+                expires_at=int(time.time()) + 5,
+                refresh_token="r2",
+            )
+            return _httpx.Response(400, json={"error": "invalid_grant"})
+        # The retry carries the peer's r2 and succeeds.
+        return _httpx.Response(
+            200,
+            json={"access_token": "a-final", "refresh_token": "r3", "expires_in": 3600},
+        )
+
+    r = _OidcRefresher(tmp_path, "g", write_back=False)
+    _install_mock_transport(r, _httpx.MockTransport(handler))
+
+    assert r.current_access_token() == "a-final"
+    # Exactly two refresh POSTs: the failed r1 then the recovered r2.
+    assert any(b"refresh_token=r1" in p for p in posts)
+    assert any(b"refresh_token=r2" in p for p in posts)
+    assert len(posts) == 2
+
+
+def test_refresher_reraises_invalid_grant_without_peer_rotation(
+    tmp_path: Path,
+) -> None:
+    """invalid_grant with no peer rotation (disk still holds our refresh_token)
+    is a genuine dead token — surface the re-authenticate hint and do NOT loop
+    on the retry path."""
+    import httpx as _httpx
+    import pytest as _pytest
+
+    _write_bundle(tmp_path, access_token="old", expires_at=1, refresh_token="r1")
+    posts: list[bytes] = []
+
+    def handler(request: _httpx.Request) -> _httpx.Response:
+        if request.url.path.endswith("/.well-known/openid-configuration"):
+            return _httpx.Response(
+                200,
+                json={
+                    "issuer": DEFAULT_ISSUER,
+                    "token_endpoint": DEFAULT_TOKEN_ENDPOINT,
+                },
+            )
+        posts.append(bytes(request.content))
+        return _httpx.Response(400, json={"error": "invalid_grant"})
+
+    r = _OidcRefresher(tmp_path, "g", write_back=False)
+    _install_mock_transport(r, _httpx.MockTransport(handler))
+
+    with _pytest.raises(SandboxError, match="Re-authenticate"):
+        r.current_access_token()
+    # Only one POST — disk offered no new refresh_token, so no retry.
+    assert len(posts) == 1
+
+
 def test_refresher_exchanges_refresh_token_when_stale(tmp_path: Path) -> None:
     """When both memory and disk are stale, do the OAuth2 refresh exchange."""
     _write_bundle(tmp_path, access_token="old", expires_at=1)
