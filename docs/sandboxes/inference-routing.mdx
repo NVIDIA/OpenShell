@@ -195,7 +195,34 @@ openshell inference update --timeout 120
 
 ## Use the Local Endpoint from a Sandbox
 
-After inference is configured, code inside any sandbox can call `https://inference.local` directly:
+After inference is configured, code inside any sandbox can call `https://inference.local` directly. The client-supplied `model` and `api_key` values are not sent upstream — the privacy router injects the real credentials from the configured provider and rewrites the model before forwarding. Some SDKs require a non-empty API key even though `inference.local` does not use the sandbox-provided value; pass any placeholder such as `unused`.
+
+<Tabs>
+<Tab title="Claude Code">
+
+```shell
+ANTHROPIC_BASE_URL="https://inference.local" ANTHROPIC_API_KEY=unused claude --bare
+```
+
+`--bare` skips the OAuth login flow and uses `ANTHROPIC_API_KEY` directly. The key is stripped by the proxy and never reaches the upstream provider.
+
+<Note>
+Claude Code appends `/v1/messages` to `ANTHROPIC_BASE_URL`, so omit the `/v1` suffix from the base URL.
+</Note>
+
+</Tab>
+<Tab title="OpenCode">
+
+```shell
+ANTHROPIC_BASE_URL="https://inference.local/v1" ANTHROPIC_API_KEY=unused opencode
+```
+
+<Note>
+OpenCode appends `/messages` directly to `ANTHROPIC_BASE_URL`. Include the `/v1` suffix so the full path becomes `/v1/messages`, which matches the inference pattern.
+</Note>
+
+</Tab>
+<Tab title="Python (OpenAI SDK)">
 
 ```python
 from openai import OpenAI
@@ -208,9 +235,28 @@ response = client.chat.completions.create(
 )
 ```
 
-The client-supplied `model` and `api_key` values are not sent upstream. The privacy router injects the real credentials from the configured provider and rewrites the model before forwarding. Some SDKs require a non-empty API key even though `inference.local` does not use the sandbox-provided value. In those cases, pass any placeholder such as `test` or `unused`.
+</Tab>
+<Tab title="Python (Anthropic SDK)">
 
-Use this endpoint when inference should stay local to the host for privacy and security reasons. External providers that should be reached directly belong in `network_policies` instead.
+```python
+import anthropic
+
+client = anthropic.Anthropic(
+    base_url="https://inference.local",
+    api_key="unused",
+)
+
+message = client.messages.create(
+    model="anything",
+    max_tokens=1024,
+    messages=[{"role": "user", "content": "Hello"}],
+)
+```
+
+</Tab>
+</Tabs>
+
+Use `inference.local` when inference should stay private and credentials should not be exposed inside the sandbox. External providers reached directly belong in `network_policies` instead.
 
 When the upstream runs on the same machine as the gateway, bind it to `0.0.0.0` and point the provider at `host.openshell.internal` or the host's LAN IP. `127.0.0.1` and `localhost` usually fail because the request originates from the gateway or sandbox runtime, not from your shell.
 
