@@ -32,9 +32,8 @@ oc create ns openshell
 # Sandboxes are deployed into the openshell namespace and use the openshell-sandbox service account
 oc adm policy add-scc-to-user privileged -z openshell-sandbox -n openshell
 
-# Deploy openshell with overrides to allow SCC assignment of fsGroup and runAsUser for the gateway
+# Deploy openshell with overrides for OpenShift SCC compatibility
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> -n openshell \
-  --set pkiInitJob.enabled=false \
   --set server.disableTls=true \
   --set podSecurityContext.fsGroup=null \
   --set securityContext.runAsUser=null
@@ -57,6 +56,73 @@ See [`values.yaml`](values.yaml) for source defaults. Selected overlays:
 - [`ci/values-gateway.yaml`](ci/values-gateway.yaml) - gateway-only configuration
 - [`ci/values-cert-manager.yaml`](ci/values-cert-manager.yaml) - cert-manager integration
 - [`ci/values-keycloak.yaml`](ci/values-keycloak.yaml) - Keycloak OIDC integration
+
+### Database backend
+
+By default, OpenShell uses SQLite:
+
+```yaml
+server:
+  dbUrl: "sqlite:/var/openshell/openshell.db"
+postgres:
+  enabled: false
+```
+
+Enable bundled PostgreSQL:
+
+```bash
+helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
+  --set postgres.enabled=true \
+  --set postgres.deploy=true \
+  --set postgres.auth.password=my-secret-password
+```
+
+Enable bundled PostgreSQL(OpenShift):
+
+```bash
+helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
+  --set postgres.enabled=true \
+  --set postgres.deploy=true \
+  --set postgres.auth.password=my-secret-password \
+  --set server.disableTls=true \
+  --set podSecurityContext.fsGroup=null \
+  --set securityContext.runAsUser=null
+```
+
+Use external PostgreSQL:
+
+```bash
+helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
+  --set postgres.enabled=true \
+  --set postgres.external.host=my-postgres.example.com \
+  --set postgres.external.port=5432 \
+  --set postgres.external.database=openshell \
+  --set postgres.external.username=openshell \
+  --set postgres.external.password=my-password
+```
+
+Use external PostgreSQL (OpenShift):
+
+```bash
+helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
+  --set postgres.enabled=true \
+  --set postgres.external.host=my-postgres.example.com \
+  --set postgres.external.port=5432 \
+  --set postgres.external.database=openshell \
+  --set postgres.external.username=openshell \
+  --set postgres.external.password=my-password \
+  --set server.disableTls=true \
+  --set podSecurityContext.fsGroup=null \
+  --set securityContext.runAsUser=null
+```
+
+Or provide a full connection URL directly:
+
+```bash
+helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
+  --set postgres.enabled=true \
+  --set postgres.external.url="postgres://user:pass@host:5432/db?sslmode=require"
+```
 
 ## PKI bootstrap
 

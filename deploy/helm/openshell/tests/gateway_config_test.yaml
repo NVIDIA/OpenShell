@@ -5,6 +5,7 @@ suite: gateway TOML config shape
 templates:
   - templates/gateway-config.yaml
   - templates/statefulset.yaml
+  - templates/db-secret.yaml
 release:
   name: openshell
   namespace: my-namespace
@@ -125,3 +126,124 @@ tests:
       - matchRegex:
           path: data["gateway.toml"]
           pattern: 'server_sans\s*=\s*\["openshell", "\*\.dev\.openshell\.localhost"\]'
+
+  - it: passes sqlite db-url via --db-url arg by default
+    template: templates/statefulset.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: "sqlite:/var/openshell/openshell.db"
+
+  - it: does not create a db Secret when postgres is disabled
+    template: templates/db-secret.yaml
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: does not pass --db-url in args when postgres is enabled
+    template: templates/statefulset.yaml
+    set:
+      postgres.enabled: true
+      postgres.deploy: true
+      postgres.auth.password: test-pw
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: "--db-url"
+
+  - it: injects OPENSHELL_DB_URL from Secret when postgres is enabled
+    template: templates/statefulset.yaml
+    set:
+      postgres.enabled: true
+      postgres.deploy: true
+      postgres.auth.password: test-pw
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_DB_URL
+            valueFrom:
+              secretKeyRef:
+                name: openshell-db
+                key: db-url
+
+  - it: creates db Secret with internal postgres URL
+    template: templates/db-secret.yaml
+    set:
+      postgres.enabled: true
+      postgres.deploy: true
+      postgres.auth.password: test-pw
+    asserts:
+      - isKind:
+          of: Secret
+      - equal:
+          path: stringData["db-url"]
+          value: "postgres://openshell:test-pw@openshell-postgres.my-namespace.svc.cluster.local:5432/openshell"
+
+  - it: creates db Secret with external postgres URL fields
+    template: templates/db-secret.yaml
+    set:
+      postgres.enabled: true
+      postgres.deploy: false
+      postgres.external.host: external-postgres.example.com
+      postgres.external.port: 5432
+      postgres.external.database: openshell_ext
+      postgres.external.username: ext_user
+      postgres.external.password: ext_pass
+    asserts:
+      - isKind:
+          of: Secret
+      - equal:
+          path: stringData["db-url"]
+          value: "postgres://ext_user:ext_pass@external-postgres.example.com:5432/openshell_ext"
+
+  - it: uses external.url verbatim when provided
+    template: templates/db-secret.yaml
+    set:
+      postgres.enabled: true
+      postgres.deploy: false
+      postgres.external.url: "postgres://custom:secret@my-host:5433/mydb?sslmode=require"
+    asserts:
+      - isKind:
+          of: Secret
+      - equal:
+          path: stringData["db-url"]
+          value: "postgres://custom:secret@my-host:5433/mydb?sslmode=require"
+
+  - it: URL-encodes special characters in credentials
+    template: templates/db-secret.yaml
+    set:
+      postgres.enabled: true
+      postgres.deploy: true
+      postgres.auth.password: "p@ss:word"
+    asserts:
+      - equal:
+          path: stringData["db-url"]
+          value: "postgres://openshell:p%40ss%3Aword@openshell-postgres.my-namespace.svc.cluster.local:5432/openshell"
+
+  - it: fails when postgres is enabled but no password is set
+    template: templates/statefulset.yaml
+    set:
+      postgres.enabled: true
+      postgres.deploy: true
+    asserts:
+      - failedTemplate:
+          errorMessage: "postgres.auth.password must be set when postgres.enabled=true"
+
+  - it: fails when postgres.deploy=true but postgres.enabled=false
+    template: templates/statefulset.yaml
+    set:
+      postgres.deploy: true
+    asserts:
+      - failedTemplate:
+          errorMessage: "postgres.deploy=true requires postgres.enabled=true"
+
+  - it: fails when external postgres has no password
+    template: templates/statefulset.yaml
+    set:
+      postgres.enabled: true
+      postgres.deploy: false
+      postgres.external.host: my-host.example.com
+    asserts:
+      - failedTemplate:
+          errorMessage: "postgres.external.password is required when postgres.deploy=false and no postgres.external.url is provided"

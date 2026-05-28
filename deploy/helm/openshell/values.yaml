@@ -206,6 +206,10 @@ server:
     # values outside [600, 86400]. Default 3600 — generous, since the
     # supervisor consumes the token within seconds of pod start.
     k8sSaTokenTtlSecs: 3600
+    # -- File mode for the mounted JWT signing key Secret. Default 0400
+    # (owner-read only). Override to 0440 or 0444 if the container UID
+    # does not match the volume file owner.
+    secretDefaultMode: ""
   # OIDC (OpenID Connect) configuration for JWT-based authentication.
   # When issuer is set, the server validates Bearer tokens on gRPC requests.
   oidc:
@@ -230,6 +234,41 @@ server:
     # for verifying the OIDC issuer's TLS certificate. Required when the
     # issuer uses a non-public CA (e.g. OpenShift ingress, private PKI).
     caConfigMapName: ""
+
+# Optional PostgreSQL backing store.
+# - enabled=false (default): gateway uses server.dbUrl (SQLite by default).
+# - enabled=true + deploy=true: deploy bundled PostgreSQL subchart and derive dbUrl.
+# - enabled=true + deploy=false: derive dbUrl from postgres.external.* (or external.url).
+postgres:
+  enabled: false
+  # -- Deploy the bundled Bitnami PostgreSQL subchart. Set to true to
+  # run PostgreSQL alongside the gateway. Leave false when using an
+  # external PostgreSQL instance.
+  deploy: false
+  # Internal host override. Leave empty to use:
+  # <release-name>-postgres.<namespace>.svc.cluster.local
+  host: ""
+  port: 5432
+  # External mode connection settings.
+  external:
+    # Full URL override, e.g. postgres://user:pass@host:5432/db
+    url: ""
+    host: ""
+    port: 5432
+    database: openshell
+    username: openshell
+    password: ""
+  # Values below also configure the bundled Bitnami PostgreSQL subchart
+  # (aliased as "postgres" in Chart.yaml). The subchart uses these to
+  # initialise the PostgreSQL instance; the gateway uses them to compose
+  # the connection URL. They must stay in sync.
+  auth:
+    username: openshell
+    password: ""
+    database: openshell
+  primary:
+    persistence:
+      enabled: true
 
 # NetworkPolicy restricting SSH ingress on sandbox pods to the gateway only.
 networkPolicy:
