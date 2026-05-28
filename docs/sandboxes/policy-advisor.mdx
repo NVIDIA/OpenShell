@@ -47,6 +47,46 @@ openshell settings delete --global \
 
 Set the value before creating a sandbox when you want the first denied request to include policy advisor guidance. Running sandboxes poll settings and can enable the surface after startup, but startup enablement gives the agent the clearest first-denial path.
 
+## Approval Modes
+
+Every proposal — mechanistic or agent-authored — is routed through the [policy prover](#what-auto-approval-checks). The `proposal_approval_mode` setting decides what happens when the prover finds nothing to flag.
+
+| Mode | When unset / `manual` | `auto` |
+|---|---|---|
+| Empty prover delta | Lands in the draft inbox for human review. | Approved automatically; the sandbox hot-reloads the new rule and the agent retries. |
+| Any prover finding | Lands in the draft inbox. | Lands in the draft inbox — auto-approval is gated on an empty delta. |
+
+`manual` is the default. Auto mode is an explicit opt-in; OpenShell's default-deny posture is preserved unless you choose otherwise.
+
+Enable auto mode at gateway scope when you want every sandbox on this gateway to auto-approve safe proposals:
+
+```shell
+openshell settings set --global \
+  --key proposal_approval_mode \
+  --value auto \
+  --yes
+```
+
+Enable it for one sandbox when no global value is set:
+
+```shell
+openshell settings set <sandbox-name> \
+  --key proposal_approval_mode \
+  --value auto
+```
+
+The shorthand at create time writes the sandbox-scoped setting for you:
+
+```shell
+openshell sandbox create --approval-mode auto <name>
+```
+
+Only `manual` and `auto` are accepted; typos like `autom` are rejected at configure time. Stale or unknown values found in storage are still treated as `manual` at runtime as a defense-in-depth measure.
+
+**Precedence.** Gateway scope wins over sandbox scope. A reviewer can pin `manual` for a fleet by setting it globally; per-sandbox overrides only apply when no global value is set.
+
+**Audit trail.** Every auto-approval emits a `CONFIG:APPROVED` event with `auto=true`, `source=<mechanistic|agent_authored>`, `prover_delta=empty`, and `resolved_from=<gateway|sandbox|default>` so operators can reconstruct why a given approval ran without human review.
+
 ## How It Works
 
 When policy advisor is enabled, the sandbox supervisor turns on three agent-facing surfaces:
@@ -64,7 +104,7 @@ The loop has six steps:
 5. The gateway stores accepted proposals as pending draft chunks for the sandbox.
 6. A developer reviews the draft, approves or rejects it, and the agent waits on `/v1/proposals/{chunk_id}/wait` until a decision is available.
 
-When a proposal is approved, `/wait` reports `policy_reloaded: true` only after the local sandbox policy covers the approved rule. At that point the agent can retry the original denied action once. If a proposal is rejected, `/wait` returns `rejection_reason` and `validation_result` so the agent can revise or stop.
+When a proposal is approved, `/wait` reports `policy_reloaded: true` only after the local sandbox policy covers the approved rule. At that point the agent can retry the original denied action once. If a proposal is rejected, `/wait` returns `rejection_reason` and `validation_result` so the agent can revise or stop. `validation_result` carries the categorical prover findings — `link_local_reach`, `l7_bypass_credentialed`, `credential_reach_expansion`, `capability_expansion` — so the agent can narrow the next attempt to the specific concern the prover flagged.
 
 ## What Gets Proposed
 
@@ -117,6 +157,21 @@ For REST APIs, prefer L7 rules over broad L4 access. A good proposal allows one 
 The current `policy.local` JSON shape covers L4 endpoints and REST method or path rules. Use [Customize Sandbox Policies](/sandboxes/policies) or [Policy Schema Reference](/reference/policy-schema) for policy fields that are not part of the agent-authored proposal surface, such as WebSocket credential rewrite, GraphQL operation matching, endpoint path scoping, and provider-owned policy bundles.
 
 Policy advisor proposals do not add `allowed_ips` automatically. If a hostname resolves to an internal or private address, OpenShell's SSRF protections still block the connection until a developer explicitly adds the required `allowed_ips` entry.
+
+## What Auto-Approval Checks
+
+The policy prover runs against every proposal — mechanistic and agent-authored alike — and asks four formal questions about the proposed change. Each "yes" is one categorical finding. Any finding blocks auto-approval; only an empty delta is eligible.
+
+| Category | Triggered when |
+|---|---|
+| `link_local_reach` | The proposal reaches a host in `169.254.0.0/16` or `fe80::/10` (the cloud-metadata range, which serves credentials regardless of sandbox state). Unconditional. |
+| `l7_bypass_credentialed` | A binary using a wire protocol the L7 proxy cannot inspect (`git-remote-https`, `ssh`, `nc`) gains reach to a host where a credential is in scope. |
+| `credential_reach_expansion` | A binary gains credentialed reach to a `(host, port)` it could not reach before. |
+| `capability_expansion` | On a `(binary, host, port)` that already had credentialed reach, the proposal adds a new HTTP method. The finding cites the specific method. |
+
+Findings are categorical — there is no severity tier. The reviewer reads the category and the structured evidence to decide. When the prover delta is empty, the proposal is provably safe under the model and auto-approval (if enabled) can fire.
+
+The full reasoning model lives in [`crates/openshell-prover/README.md`](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-prover/README.md). Provider profiles composed in via [Providers v2](/sandboxes/providers-v2) are part of the effective policy the prover reasons over.
 
 ## Review Proposals
 
@@ -172,7 +227,7 @@ Policy advisor emits audit events into the sandbox log. Use these lines to trace
 openshell logs <sandbox-name> --since 10m
 ```
 
-Look for `HTTP:* DENIED`, `CONFIG:PROPOSED`, `CONFIG:APPROVED` or `CONFIG:REJECTED`, `CONFIG:LOADED`, and the final allowed request if the agent retries successfully.
+Look for `HTTP:* DENIED`, `CONFIG:PROPOSED`, `CONFIG:APPROVED` or `CONFIG:REJECTED`, `CONFIG:LOADED`, and the final allowed request if the agent retries successfully. Auto-approved chunks emit `CONFIG:APPROVED` with `auto=true`, `source=<mechanistic|agent_authored>`, `prover_delta=empty`, and `resolved_from=<gateway|sandbox|default>`.
 
 ## Next Steps
 

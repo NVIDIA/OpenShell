@@ -3408,25 +3408,36 @@ async fn remove_chunk_from_policy(
 // Settings helpers
 // ---------------------------------------------------------------------------
 
-fn validate_registered_setting_key(key: &str) -> Result<SettingValueKind, Status> {
-    settings::setting_for_key(key)
-        .map(|entry| entry.kind)
-        .ok_or_else(|| {
-            Status::invalid_argument(format!(
-                "unknown setting key '{key}'. Allowed keys: {}",
-                settings::registered_keys_csv()
-            ))
-        })
+fn validate_registered_setting_key(
+    key: &str,
+) -> Result<&'static settings::RegisteredSetting, Status> {
+    settings::setting_for_key(key).ok_or_else(|| {
+        Status::invalid_argument(format!(
+            "unknown setting key '{key}'. Allowed keys: {}",
+            settings::registered_keys_csv()
+        ))
+    })
 }
 
 fn proto_setting_to_stored(key: &str, value: &SettingValue) -> Result<StoredSettingValue, Status> {
-    let expected = validate_registered_setting_key(key)?;
+    let setting = validate_registered_setting_key(key)?;
+    let expected = setting.kind;
     let inner = value
         .value
         .as_ref()
         .ok_or_else(|| Status::invalid_argument("setting_value.value is required"))?;
     let stored = match (expected, inner) {
         (SettingValueKind::String, setting_value::Value::StringValue(v)) => {
+            // Enforce per-key string whitelist at configure time so typos
+            // (e.g. `proposal_approval_mode=autom`) get rejected here instead
+            // of silently falling back to the default at runtime.
+            if let Err(allowed) = setting.validate_string_value(v) {
+                return Err(Status::invalid_argument(format!(
+                    "setting '{key}' expects one of [{}]; got '{}'",
+                    allowed.join(", "),
+                    v
+                )));
+            }
             StoredSettingValue::String(v.clone())
         }
         (SettingValueKind::Bool, setting_value::Value::BoolValue(v)) => {
@@ -8380,6 +8391,84 @@ mod tests {
         };
         let stored = proto_setting_to_stored("dummy_bool", &value).unwrap();
         assert_eq!(stored, StoredSettingValue::Bool(true));
+    }
+
+    #[test]
+    fn proto_setting_to_stored_accepts_allowed_proposal_approval_mode_values() {
+        for raw in ["manual", "auto"] {
+            let value = SettingValue {
+                value: Some(setting_value::Value::StringValue(raw.to_string())),
+            };
+            let stored = proto_setting_to_stored(
+                settings::PROPOSAL_APPROVAL_MODE_KEY,
+                &value,
+            )
+            .unwrap_or_else(|e| panic!("expected '{raw}' to be accepted, got: {e}"));
+            assert_eq!(stored, StoredSettingValue::String(raw.to_string()));
+        }
+    }
+
+    #[test]
+    fn proto_setting_to_stored_rejects_invalid_proposal_approval_mode_value() {
+        // Typos and future-reserved modes must be rejected at configure time
+        // — without this, the value silently resolves to manual at runtime
+        // (fail-closed) and the operator never finds out they fat-fingered
+        // the setting.
+        for raw in ["autom", "AUTO", "Manual", "auto_on_low_risk", "", " auto"] {
+            let value = SettingValue {
+                value: Some(setting_value::Value::StringValue(raw.to_string())),
+            };
+            let res = proto_setting_to_stored(
+                settings::PROPOSAL_APPROVAL_MODE_KEY,
+                &value,
+            );
+            assert!(res.is_err(), "expected '{raw}' to be rejected, got: {res:?}");
+            let err = res.unwrap_err();
+            assert_eq!(err.code(), Code::InvalidArgument);
+        }
+    }
+
+    #[test]
+    fn proto_setting_to_stored_rejection_message_lists_allowed_proposal_approval_mode_values() {
+        let value = SettingValue {
+            value: Some(setting_value::Value::StringValue("autom".to_string())),
+        };
+        let err = proto_setting_to_stored(
+            settings::PROPOSAL_APPROVAL_MODE_KEY,
+            &value,
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        let msg = err.message();
+        assert!(msg.contains("manual"), "missing 'manual' in {msg}");
+        assert!(msg.contains("auto"), "missing 'auto' in {msg}");
+        assert!(msg.contains("autom"), "missing offending value in {msg}");
+    }
+
+    /// Locks in that invalid `proposal_approval_mode` is rejected at the
+    /// `UpdateConfig` RPC boundary — not just in the `proto_setting_to_stored`
+    /// helper. Prevents a future refactor from accidentally routing setting
+    /// writes around the validation chokepoint.
+    #[tokio::test]
+    async fn update_config_global_rejects_invalid_proposal_approval_mode() {
+        let state = test_server_state().await;
+        let req = with_user(Request::new(UpdateConfigRequest {
+            global: true,
+            setting_key: settings::PROPOSAL_APPROVAL_MODE_KEY.to_string(),
+            setting_value: Some(SettingValue {
+                value: Some(setting_value::Value::StringValue("autom".to_string())),
+            }),
+            ..Default::default()
+        }));
+        let err = handle_update_config(&state, req)
+            .await
+            .expect_err("invalid proposal_approval_mode must be rejected at UpdateConfig");
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(
+            err.message().contains("autom") && err.message().contains("manual"),
+            "expected rejection message to echo the bad value and list allowed values; got: {}",
+            err.message()
+        );
     }
 
     #[cfg(feature = "dev-settings")]
