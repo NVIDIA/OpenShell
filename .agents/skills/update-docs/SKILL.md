@@ -34,7 +34,7 @@ git log -50 --oneline --no-merges
 Filter to commits that are likely to affect docs. Look for these signals:
 
 1. **Commit type**: `feat`, `fix`, `refactor`, `perf` commits often change behavior. `docs` commits are already doc changes. `chore`, `ci`, `test` commits rarely need doc updates.
-2. **Files changed**: Changes to `crates/openshell-cli/`, `python/`, `proto/`, `deploy/`, or policy-related code are high-signal.
+2. **Files changed**: Changes to `crates/openshell-cli/`, `python/`, `proto/`, `deploy/`, gateway config parsing, driver config structs, or policy-related code are high-signal.
 3. **Ignore**: Changes limited to `tests/`, `e2e/`, `.github/`, `tasks/`, or internal-only modules.
 
 ```bash
@@ -52,6 +52,10 @@ For each relevant commit, determine which doc page(s) it affects. Use this mappi
 | `crates/openshell-cli/` (sandbox commands) | `docs/sandboxes/manage-sandboxes.mdx` |
 | `crates/openshell-cli/` (provider commands) | `docs/sandboxes/manage-providers.mdx` |
 | `crates/openshell-cli/` (new top-level command) | May need a new page or `docs/reference/` entry |
+| `crates/openshell-server/src/config_file.rs` or gateway TOML parsing | `docs/reference/gateway-config.mdx` |
+| `crates/openshell-server/src/cli.rs` gateway config merge/default behavior | `docs/reference/gateway-config.mdx` |
+| `crates/openshell-driver-*/` config structs or driver defaults | `docs/reference/gateway-config.mdx`, `docs/reference/sandbox-compute-drivers.mdx` |
+| `deploy/helm/openshell/templates/gateway-config.yaml` | `docs/reference/gateway-config.mdx`, `docs/reference/sandbox-compute-drivers.mdx`, Helm docs if values change |
 | Proxy or policy code | `docs/sandboxes/policies.mdx`, `docs/reference/policy-schema.mdx` |
 | Inference code | `docs/inference/configure.mdx` |
 | `python/` (SDK changes) | `docs/reference/` or `docs/get-started/quickstart.mdx` |
