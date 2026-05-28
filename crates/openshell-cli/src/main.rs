@@ -1148,6 +1148,7 @@ enum DoctorCommands {
 }
 
 #[derive(Subcommand, Debug)]
+#[allow(clippy::large_enum_variant)]
 enum SandboxCommands {
     /// Create a sandbox.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
@@ -1215,6 +1216,15 @@ enum SandboxCommands {
         /// Memory limit for the sandbox (for example: 512Mi, 4Gi, 8G).
         #[arg(long)]
         memory: Option<String>,
+
+        /// Request a Kubernetes `RuntimeClass` for the sandbox pod (for example:
+        /// `kata`, `kata-containers`, `gvisor`).
+        ///
+        /// Only honored by the Kubernetes driver. On GPU sandboxes the driver
+        /// defaults to `nvidia` when this flag is omitted; passing this flag
+        /// overrides that default.
+        #[arg(long, value_name = "NAME")]
+        runtime_class: Option<String>,
 
         /// Provider names to attach to this sandbox.
         #[arg(long = "provider")]
@@ -2518,6 +2528,7 @@ async fn main() -> Result<()> {
                     gpu_device,
                     cpu,
                     memory,
+                    runtime_class,
                     providers,
                     policy,
                     forward,
@@ -2586,6 +2597,7 @@ async fn main() -> Result<()> {
                         gpu_device.as_deref(),
                         cpu.as_deref(),
                         memory.as_deref(),
+                        runtime_class.as_deref(),
                         editor,
                         &providers,
                         policy.as_deref(),
@@ -4163,6 +4175,23 @@ mod tests {
                 assert_eq!(cpu.as_deref(), Some("500m"));
                 assert_eq!(memory.as_deref(), Some("2Gi"));
                 assert_eq!(command, vec!["claude".to_string()]);
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_runtime_class_flag_parses() {
+        let cli =
+            Cli::try_parse_from(["openshell", "sandbox", "create", "--runtime-class", "kata"])
+                .expect("sandbox create --runtime-class should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { runtime_class, .. }),
+                ..
+            }) => {
+                assert_eq!(runtime_class.as_deref(), Some("kata"));
             }
             other => panic!("expected SandboxCommands::Create, got: {other:?}"),
         }

@@ -36,6 +36,12 @@ template resource limits. Docker and Podman apply them as runtime limits.
 Kubernetes mirrors each limit into the matching request. VM accepts the fields
 but currently ignores them.
 
+The CLI `--runtime-class` flag sets `SandboxTemplate.runtime_class_name`. The
+Kubernetes driver maps this onto pod `spec.runtimeClassName` (used to request
+sandboxed runtimes such as Kata Containers or gVisor); other drivers ignore it.
+When omitted on GPU sandboxes, the Kubernetes driver still falls back to
+`nvidia`.
+
 VM runtime state paths are derived only from driver-validated sandbox IDs
 matching `[A-Za-z0-9._-]{1,128}`. The gateway-owned VM driver socket uses a
 private `run/` directory plus Unix peer UID/PID checks. Standalone

@@ -1685,6 +1685,7 @@ pub async fn sandbox_create(
     gpu_device: Option<&str>,
     cpu: Option<&str>,
     memory: Option<&str>,
+    runtime_class: Option<&str>,
     editor: Option<Editor>,
     providers: &[String],
     policy: Option<&str>,
@@ -1754,10 +1755,11 @@ pub async fn sandbox_create(
     let policy = load_sandbox_policy(policy)?;
     let resource_limits = build_sandbox_resource_limits(cpu, memory)?;
 
-    let template = if image.is_some() || resource_limits.is_some() {
+    let template = if image.is_some() || resource_limits.is_some() || runtime_class.is_some() {
         Some(SandboxTemplate {
             image: image.unwrap_or_default(),
             resources: resource_limits,
+            runtime_class_name: runtime_class.unwrap_or_default().to_string(),
             ..SandboxTemplate::default()
         })
     } else {
