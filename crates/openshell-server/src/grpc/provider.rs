@@ -502,8 +502,6 @@ pub(super) async fn resolve_provider_environment(
                 .trim();
 
             // Static flags -- always present for Vertex AI providers.
-            env.entry("CLAUDE_CODE_USE_VERTEX".to_string())
-                .or_insert_with(|| "1".to_string());
             env.entry("GOOSE_PROVIDER".to_string())
                 .or_insert_with(|| "gcp_vertex_ai".to_string());
 
@@ -3835,7 +3833,7 @@ mod tests {
             Some(&"ya29.token".to_string())
         );
         // Static flags.
-        assert_eq!(result.get("CLAUDE_CODE_USE_VERTEX"), Some(&"1".to_string()));
+        assert!(!result.contains_key("CLAUDE_CODE_USE_VERTEX"));
         assert_eq!(
             result.get("GOOSE_PROVIDER"),
             Some(&"gcp_vertex_ai".to_string())
@@ -3940,7 +3938,7 @@ mod tests {
             .unwrap();
 
         // Static flags still present.
-        assert_eq!(result.get("CLAUDE_CODE_USE_VERTEX"), Some(&"1".to_string()));
+        assert!(!result.contains_key("CLAUDE_CODE_USE_VERTEX"));
         assert_eq!(
             result.get("GOOSE_PROVIDER"),
             Some(&"gcp_vertex_ai".to_string())
@@ -3976,11 +3974,8 @@ mod tests {
                         "GOOGLE_VERTEX_AI_TOKEN".to_string(),
                         "ya29.token".to_string(),
                     ),
-                    // Same key as the injected static flag.
-                    (
-                        "CLAUDE_CODE_USE_VERTEX".to_string(),
-                        "custom-value".to_string(),
-                    ),
+                    // Same key as an injected static flag.
+                    ("GOOSE_PROVIDER".to_string(), "custom-value".to_string()),
                 ]
                 .into_iter()
                 .collect(),
@@ -4000,15 +3995,10 @@ mod tests {
             .await
             .unwrap();
 
-        // Credential value wins over the injected "1".
-        assert_eq!(
-            result.get("CLAUDE_CODE_USE_VERTEX"),
-            Some(&"custom-value".to_string())
-        );
-        // Other injected vars are still present.
+        // Credential value wins over the injected static value.
         assert_eq!(
             result.get("GOOSE_PROVIDER"),
-            Some(&"gcp_vertex_ai".to_string())
+            Some(&"custom-value".to_string())
         );
     }
 
