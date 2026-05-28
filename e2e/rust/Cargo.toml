@@ -72,6 +72,11 @@ path = "tests/user_namespaces.rs"
 required-features = ["e2e-kubernetes"]
 
 [[test]]
+name = "runtime_class"
+path = "tests/runtime_class.rs"
+required-features = ["e2e-kubernetes"]
+
+[[test]]
 name = "host_gateway_alias"
 path = "tests/host_gateway_alias.rs"
 required-features = ["e2e-host-gateway"]
