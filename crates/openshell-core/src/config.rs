@@ -40,30 +40,38 @@ pub const DEFAULT_SUPERVISOR_IMAGE: &str = "ghcr.io/nvidia/openshell/supervisor:
 pub const CDI_GPU_DEVICE_ALL: &str = "nvidia.com/gpu=all";
 
 /// Compute backends the gateway can orchestrate sandboxes through.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ComputeDriverKind {
     Kubernetes,
     Vm,
     Docker,
     Podman,
+    /// Out-of-process compute driver speaking the gRPC compute_driver.proto contract over a Unix domain socket. The path is supplied by --compute-driver-socket or OPENSHELL_COMPUTE_DRIVER_SOCKET.
+    External(PathBuf),
 }
 
 impl ComputeDriverKind {
     #[must_use]
-    pub const fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Self::Kubernetes => "kubernetes",
             Self::Vm => "vm",
             Self::Docker => "docker",
             Self::Podman => "podman",
+            Self::External(_) => "external",
         }
     }
 }
 
 impl fmt::Display for ComputeDriverKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+        match self {
+            Self::Kubernetes | Self::Vm | Self::Docker | Self::Podman => {
+                f.write_str(self.as_str())
+            }
+            Self::External(path) => write!(f, "external:{}", path.display()),
+        }
     }
 }
 
@@ -71,13 +79,31 @@ impl FromStr for ComputeDriverKind {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.trim().to_ascii_lowercase().as_str() {
+        let trimmed = value.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if let Some(suffix_lower) = lower.strip_prefix("external:") {
+            // Use the case-preserving suffix for the path.
+            let suffix = &trimmed[trimmed.len() - suffix_lower.len()..];
+            if suffix.is_empty() {
+                return Err(
+                    "compute driver 'external:' requires a non-empty socket path \
+                     (e.g. 'external:/var/run/openshell-driver.sock')"
+                        .to_string(),
+                );
+            }
+            return Ok(Self::External(PathBuf::from(suffix)));
+        }
+        match lower.as_str() {
             "kubernetes" => Ok(Self::Kubernetes),
             "vm" => Ok(Self::Vm),
             "docker" => Ok(Self::Docker),
             "podman" => Ok(Self::Podman),
+            "external" => Err(
+                "compute driver 'external' requires a socket path: 'external:/path/to/driver.sock' (or set --compute-driver-socket)"
+                    .to_string(),
+            ),
             other => Err(format!(
-                "unsupported compute driver '{other}'. expected one of: kubernetes, vm, docker, podman"
+                "unsupported compute driver '{other}'. expected one of: kubernetes, vm, docker, podman, external:<path>"
             )),
         }
     }
@@ -629,6 +655,42 @@ mod tests {
     }
 
     #[test]
+    fn compute_driver_kind_external_displays_with_path() {
+        let kind = ComputeDriverKind::External(PathBuf::from("/x/y"));
+        assert_eq!(kind.to_string(), "external:/x/y");
+    }
+
+    #[test]
+    fn compute_driver_kind_parses_external_with_socket_path() {
+        let parsed: ComputeDriverKind =
+            "external:/var/run/openshell-driver.sock".parse().unwrap();
+        match parsed {
+            ComputeDriverKind::External(path) => {
+                assert_eq!(path, PathBuf::from("/var/run/openshell-driver.sock"));
+            }
+            other => panic!("expected External(_), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compute_driver_kind_rejects_bare_external_without_path() {
+        let err = "external".parse::<ComputeDriverKind>().unwrap_err();
+        assert!(
+            err.contains("requires a socket path"),
+            "missing socket-path hint in error: {err}"
+        );
+    }
+
+    #[test]
+    fn compute_driver_kind_unknown_error_lists_external_in_supported() {
+        let err = "unknown".parse::<ComputeDriverKind>().unwrap_err();
+        assert!(
+            err.contains("external:<path>"),
+            "expected supported list to mention external:<path>, got: {err}"
+        );
+    }
+
+    #[test]
     fn config_defaults_to_loopback_bind_address() {
         let expected: SocketAddr = "127.0.0.1:17670".parse().expect("valid address");
         assert_eq!(Config::new(None).bind_address, expected);
@@ -752,6 +814,41 @@ mod tests {
                 Some(val) => std::env::set_var("KUBERNETES_SERVICE_HOST", val),
                 None => std::env::remove_var("KUBERNETES_SERVICE_HOST"),
             }
+        }
+    }
+
+    #[test]
+    fn compute_driver_kind_display_roundtrips_through_from_str() {
+        use std::path::PathBuf;
+        for kind in [
+            ComputeDriverKind::Kubernetes,
+            ComputeDriverKind::Vm,
+            ComputeDriverKind::Docker,
+            ComputeDriverKind::Podman,
+            ComputeDriverKind::External(PathBuf::from("/var/run/openshell-driver.sock")),
+        ] {
+            let s = kind.to_string();
+            let parsed: ComputeDriverKind = s.parse().expect("round-trip parse");
+            assert_eq!(parsed, kind, "round-trip mismatch for {s}");
+        }
+    }
+
+    #[test]
+    fn compute_driver_kind_rejects_external_with_empty_path() {
+        let err = "external:".parse::<ComputeDriverKind>().unwrap_err();
+        assert!(err.contains("non-empty socket path"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn compute_driver_kind_external_is_case_insensitive_on_prefix() {
+        let parsed: ComputeDriverKind = "External:/var/run/openshell-driver.sock"
+            .parse()
+            .expect("case-insensitive prefix should be accepted");
+        match parsed {
+            ComputeDriverKind::External(p) => {
+                assert_eq!(p, PathBuf::from("/var/run/openshell-driver.sock"));
+            }
+            other => panic!("expected External, got {other:?}"),
         }
     }
 }

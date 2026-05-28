@@ -285,6 +285,10 @@ fn inheritable_keys(driver: ComputeDriverKind) -> &'static [&'static str] {
             "guest_tls_cert",
             "guest_tls_key",
         ],
+        // The external driver is configured via the --compute-driver-socket
+        // CLI flag, not a TOML driver table, so no gateway-section keys are
+        // inheritable.
+        ComputeDriverKind::External(_) => &[],
     }
 }
 
