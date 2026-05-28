@@ -467,6 +467,19 @@ where
                 }
             }
 
+            let raw_oidc_bearer = if let Principal::User(ref user) = principal {
+                if user.identity.provider == crate::auth::identity::IdentityProvider::Oidc {
+                    oidc::extract_bearer_token(req.headers()).map(str::to_owned)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(token) = raw_oidc_bearer {
+                req.extensions_mut().insert(oidc::RawBearerToken(token));
+            }
+
             req.extensions_mut().insert(principal);
             inner.ready().await?.call(req).await
         })

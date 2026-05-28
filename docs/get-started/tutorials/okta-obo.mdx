@@ -1,0 +1,145 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Delegate Okta Access On Behalf of the Logged-in User"
+sidebar-title: "Okta OBO Token Exchange"
+slug: "get-started/tutorials/okta-obo"
+description: "Configure the built-in Okta OBO provider profile so OpenShell can exchange a logged-in user's token for a delegated downstream token."
+keywords: "Generative AI, Cybersecurity, Tutorial, Providers, Okta, OBO, RFC 8693, Token Exchange, Delegation"
+---
+
+Use the built-in `okta-obo` profile when a sandboxed workload must call a downstream API on behalf of the human who logged into OpenShell. The gateway keeps the inbound user token server-side, binds it to sandbox creation, and exchanges it for a short-lived delegated token using Okta token exchange.
+
+After completing this tutorial, you have:
+
+- A token-exchange service app in Okta for delegated access.
+- A customized `okta-obo` provider profile that points at your Okta tenant.
+- A sandbox whose attached provider can mint `OKTA_OBO_ACCESS_TOKEN` from the logged-in user's identity.
+
+<Note>
+This tutorial covers the delegation lane. It assumes you already completed the gateway login lane and can log into the gateway with Okta before you create the sandbox.
+</Note>
+
+## Prerequisites
+
+- A working OpenShell installation with an active gateway.
+- Okta CLI login already working against your OpenShell gateway.
+- An Okta custom authorization server.
+- An Okta service app with the `Token Exchange` grant enabled.
+- A downstream audience and scope that the delegated token should target.
+
+For the example commands below, set:
+
+| Variable | Value |
+|---|---|
+| `OKTA_OBO_CLIENT_ID` | Token-exchange service app client ID. |
+| `OKTA_OBO_CLIENT_SECRET` | Token-exchange service app client secret. |
+| `OKTA_OBO_AUDIENCE` | Downstream audience, such as `api://default`. |
+| `OKTA_OBO_SCOPE` | Delegated scope, such as `api:access:read`. |
+
+<Warning>
+Treat the token-exchange service app secret like any other production credential. Do not commit it, paste it into source control, or leave it in shell history longer than needed.
+</Warning>
+
+<Steps toc={true}>
+
+## Create the Downstream Scope and Rule in Okta
+
+In your Okta custom authorization server:
+
+- create the downstream scope that the delegated token should carry
+- create an access-policy rule for the service app with the `Token Exchange` grant enabled
+
+For a smoke test, a broad rule with `Any scopes` is fine.
+
+## Create a Tenant-Specific OBO Profile
+
+Export the built-in profile and update the token endpoint:
+
+```shell
+openshell provider profile export okta-obo -o yaml > okta-obo.yaml
+```
+
+Replace:
+
+- `https://example.okta.com/oauth2/default/v1/token`
+
+with your real Okta token endpoint, then import the customized profile:
+
+```shell
+openshell provider profile lint -f okta-obo.yaml
+openshell provider profile import -f okta-obo.yaml
+```
+
+## Log In and Create the Sandbox
+
+Log into the gateway as the human user whose identity should be delegated:
+
+```shell
+openshell gateway login <gateway-name>
+```
+
+Create the sandbox after login so OpenShell can bind the sandbox to the authenticated user token:
+
+```shell
+openshell sandbox create --name okta-obo-smoke
+```
+
+Fetch the sandbox metadata and record the sandbox ID:
+
+```shell
+openshell sandbox get okta-obo-smoke
+```
+
+## Create the OBO Provider
+
+Create the provider from the imported profile:
+
+```shell
+openshell provider create \
+  --name okta-obo-runtime \
+  --type okta-obo
+```
+
+## Configure Token Exchange
+
+Configure the delegated credential refresh:
+
+```shell
+openshell provider refresh configure okta-obo-runtime \
+  --credential-key OKTA_OBO_ACCESS_TOKEN \
+  --strategy oauth2-token-exchange \
+  --material client_id="$OKTA_OBO_CLIENT_ID" \
+  --material client_secret="$OKTA_OBO_CLIENT_SECRET" \
+  --material sandbox_id="<sandbox-id>" \
+  --material audience="$OKTA_OBO_AUDIENCE" \
+  --material scope="$OKTA_OBO_SCOPE" \
+  --secret-material-key client_secret
+```
+
+Check refresh status:
+
+```shell
+openshell provider refresh status okta-obo-runtime \
+  --credential-key OKTA_OBO_ACCESS_TOKEN
+```
+
+## Attach the Provider
+
+Attach the OBO provider to the sandbox:
+
+```shell
+openshell sandbox provider attach okta-obo-smoke okta-obo-runtime
+```
+
+## Verify the Delegated Token Path
+
+Exec into the sandbox and confirm the delegated credential placeholder exists:
+
+```shell
+openshell sandbox exec --name okta-obo-smoke -- /bin/sh -lc 'printenv OKTA_OBO_ACCESS_TOKEN'
+```
+
+The value should be an OpenShell-managed placeholder rather than a raw token. OpenShell resolves it to the current delegated token when the workload uses the supported authorization path.
+
+</Steps>

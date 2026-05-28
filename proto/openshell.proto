@@ -904,6 +904,7 @@ enum ProviderCredentialRefreshStrategy {
   PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OAUTH2_REFRESH_TOKEN = 3;
   PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OAUTH2_CLIENT_CREDENTIALS = 4;
   PROVIDER_CREDENTIAL_REFRESH_STRATEGY_GOOGLE_SERVICE_ACCOUNT_JWT = 5;
+  PROVIDER_CREDENTIAL_REFRESH_STRATEGY_OAUTH2_TOKEN_EXCHANGE = 6;
 }
 
 message ProviderCredentialRefreshMaterial {
@@ -957,6 +958,18 @@ message StoredProviderCredentialRefreshState {
   repeated string scopes = 14;
   int64 refresh_before_seconds = 15;
   int64 max_lifetime_seconds = 16;
+}
+
+message StoredSandboxDelegationBinding {
+  openshell.datamodel.v1.ObjectMeta metadata = 1;
+  string sandbox_id = 2;
+  string sandbox_name = 3;
+  string subject = 4;
+  string display_name = 5;
+  string identity_provider = 6;
+  string access_token = 7;
+  repeated string scopes = 8;
+  int64 captured_at_ms = 9;
 }
 
 message GetProviderRefreshStatusRequest {

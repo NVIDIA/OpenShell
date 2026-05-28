@@ -1099,6 +1099,89 @@ async fn provider_refresh_cli_run_functions_wire_requests() {
 }
 
 #[tokio::test]
+async fn provider_refresh_cli_supports_oauth2_token_exchange_strategy() {
+    let ts = run_server().await;
+
+    ts.state.profiles.lock().await.insert(
+        "okta-obo".to_string(),
+        ProviderProfile {
+            id: "okta-obo".to_string(),
+            display_name: "Okta OBO".to_string(),
+            credentials: vec![ProviderProfileCredential {
+                name: "OKTA_OBO_ACCESS_TOKEN".to_string(),
+                required: true,
+                refresh: Some(ProviderCredentialRefresh {
+                    strategy: ProviderCredentialRefreshStrategy::Oauth2TokenExchange as i32,
+                    token_url: "https://example.okta.com/oauth2/default/v1/token".to_string(),
+                    material: vec![
+                        openshell_core::proto::ProviderCredentialRefreshMaterial {
+                            name: "client_id".to_string(),
+                            required: true,
+                            ..Default::default()
+                        },
+                        openshell_core::proto::ProviderCredentialRefreshMaterial {
+                            name: "sandbox_id".to_string(),
+                            required: true,
+                            ..Default::default()
+                        },
+                        openshell_core::proto::ProviderCredentialRefreshMaterial {
+                            name: "audience".to_string(),
+                            required: true,
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    );
+
+    run::provider_create(
+        &ts.endpoint,
+        "okta-obo-runtime",
+        "okta-obo",
+        false,
+        &[],
+        &[],
+        &ts.tls,
+    )
+    .await
+    .expect("provider create");
+
+    run::provider_refresh_config(
+        &ts.endpoint,
+        run::ProviderRefreshConfigInput {
+            name: "okta-obo-runtime",
+            credential_key: "OKTA_OBO_ACCESS_TOKEN",
+            strategy: "oauth2_token_exchange",
+            material: &[
+                "client_id=client-id".to_string(),
+                "sandbox_id=sandbox-123".to_string(),
+                "audience=api://downstream".to_string(),
+                "scope=api:access:read".to_string(),
+            ],
+            secret_material_keys: &["client_secret".to_string()],
+            credential_expires_at_ms: None,
+        },
+        &ts.tls,
+    )
+    .await
+    .expect("provider refresh configure");
+
+    let requests = ts.state.refresh_requests.lock().await.clone();
+    assert_eq!(
+        requests,
+        vec![ProviderRefreshRequestLog::Configure {
+            provider_name: "okta-obo-runtime".to_string(),
+            credential_key: "OKTA_OBO_ACCESS_TOKEN".to_string(),
+            expires_at_ms: None,
+        }]
+    );
+}
+
+#[tokio::test]
 async fn provider_create_allows_empty_credentials_for_gateway_refresh_profiles() {
     let ts = run_server().await;
     ts.state.profiles.lock().await.insert(
@@ -1706,6 +1789,51 @@ endpoints:
     run::provider_profile_export(&ts.endpoint, "custom-good", "yaml", &ts.tls)
         .await
         .expect_err("valid profiles should not be partially imported after local parse errors");
+}
+
+#[tokio::test]
+async fn built_in_okta_obo_profile_is_available_via_provider_profile_api() {
+    let ts = run_server().await;
+
+    let mut client = openshell_cli::tls::grpc_client(&ts.endpoint, &ts.tls)
+        .await
+        .expect("grpc client should connect");
+    let profile = client
+        .get_provider_profile(openshell_core::proto::GetProviderProfileRequest {
+            id: "okta-obo".to_string(),
+        })
+        .await
+        .expect("get provider profile")
+        .into_inner()
+        .profile
+        .expect("profile should exist");
+
+    assert_eq!(profile.id, "okta-obo");
+    let credential = profile
+        .credentials
+        .iter()
+        .find(|credential| credential.name == "obo_access_token")
+        .expect("obo access token credential");
+    let refresh = credential
+        .refresh
+        .as_ref()
+        .expect("obo credential should include refresh config");
+    assert_eq!(
+        refresh.strategy,
+        ProviderCredentialRefreshStrategy::Oauth2TokenExchange as i32
+    );
+    assert!(
+        refresh
+            .material
+            .iter()
+            .any(|material| material.name == "sandbox_id" && material.required)
+    );
+    assert!(
+        refresh
+            .material
+            .iter()
+            .any(|material| material.name == "audience" && material.required)
+    );
 }
 
 #[tokio::test]

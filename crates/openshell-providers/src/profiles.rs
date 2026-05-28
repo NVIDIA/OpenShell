@@ -21,6 +21,7 @@ const BUILT_IN_PROFILE_YAMLS: &[&str] = &[
     include_str!("../../../providers/github.yaml"),
     include_str!("../../../providers/google-vertex-ai.yaml"),
     include_str!("../../../providers/nvidia.yaml"),
+    include_str!("../../../providers/okta-obo.yaml"),
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -530,6 +531,7 @@ pub fn provider_refresh_strategy_from_yaml(raw: &str) -> Option<ProviderCredenti
         "oauth2_client_credentials" => {
             Some(ProviderCredentialRefreshStrategy::Oauth2ClientCredentials)
         }
+        "oauth2_token_exchange" => Some(ProviderCredentialRefreshStrategy::Oauth2TokenExchange),
         "google_service_account_jwt" => {
             Some(ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt)
         }
@@ -546,6 +548,7 @@ pub fn provider_refresh_strategy_to_yaml(
         ProviderCredentialRefreshStrategy::External => "external",
         ProviderCredentialRefreshStrategy::Oauth2RefreshToken => "oauth2_refresh_token",
         ProviderCredentialRefreshStrategy::Oauth2ClientCredentials => "oauth2_client_credentials",
+        ProviderCredentialRefreshStrategy::Oauth2TokenExchange => "oauth2_token_exchange",
         ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => "google_service_account_jwt",
         ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
     }
@@ -1170,6 +1173,59 @@ mod tests {
             "github profile endpoints should all be read-only"
         );
         assert_eq!(proto.binaries.len(), 4);
+    }
+
+    #[test]
+    fn okta_obo_profile_exposes_token_exchange_shape() {
+        let profile = get_default_profile("okta-obo").expect("okta-obo profile");
+        let credential = profile
+            .credentials
+            .iter()
+            .find(|credential| credential.name == "obo_access_token")
+            .expect("okta-obo access token credential");
+        let refresh = credential
+            .refresh
+            .as_ref()
+            .expect("okta-obo credential should be refreshable");
+
+        assert_eq!(
+            refresh.strategy,
+            openshell_core::proto::ProviderCredentialRefreshStrategy::Oauth2TokenExchange
+        );
+        assert_eq!(
+            refresh.token_url,
+            "https://example.okta.com/oauth2/default/v1/token"
+        );
+
+        let material_names = refresh
+            .material
+            .iter()
+            .map(|material| material.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            material_names,
+            vec![
+                "client_id",
+                "sandbox_id",
+                "audience",
+                "client_secret",
+                "scope"
+            ]
+        );
+        assert!(
+            refresh
+                .material
+                .iter()
+                .find(|material| material.name == "sandbox_id")
+                .is_some_and(|material| material.required)
+        );
+        assert!(
+            refresh
+                .material
+                .iter()
+                .find(|material| material.name == "audience")
+                .is_some_and(|material| material.required)
+        );
     }
 
     #[test]

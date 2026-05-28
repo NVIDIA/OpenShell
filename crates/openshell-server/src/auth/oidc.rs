@@ -109,6 +109,22 @@ pub struct OidcClaims {
 
 const STANDARD_OIDC_SCOPES: &[&str] = &["openid", "profile", "email", "offline_access"];
 
+/// Raw OIDC bearer token captured from the inbound request.
+///
+/// Stored in request extensions only after OIDC authentication succeeds so
+/// later handlers can persist or exchange the user token without reparsing the
+/// header.
+#[derive(Debug, Clone)]
+pub struct RawBearerToken(pub String);
+
+/// Extract a bearer token from an `Authorization` header.
+pub fn extract_bearer_token(headers: &http::HeaderMap) -> Option<&str> {
+    headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+}
+
 impl OidcClaims {
     /// Extract roles from the JWT claims using a dot-separated path.
     ///
@@ -372,11 +388,7 @@ impl Authenticator for OidcAuthenticator {
         headers: &http::HeaderMap,
         _path: &str,
     ) -> Result<Option<Principal>, Status> {
-        let Some(token) = headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-        else {
+        let Some(token) = extract_bearer_token(headers) else {
             return Ok(None);
         };
 

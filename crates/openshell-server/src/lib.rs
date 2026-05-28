@@ -25,6 +25,7 @@ pub mod cli;
 mod compute;
 pub mod config_file;
 mod defaults;
+mod delegation;
 mod grpc;
 mod http;
 mod inference;

@@ -278,6 +278,7 @@ pub fn refresh_strategy_name(strategy: i32) -> &'static str {
         ProviderCredentialRefreshStrategy::External => "external",
         ProviderCredentialRefreshStrategy::Oauth2RefreshToken => "oauth2_refresh_token",
         ProviderCredentialRefreshStrategy::Oauth2ClientCredentials => "oauth2_client_credentials",
+        ProviderCredentialRefreshStrategy::Oauth2TokenExchange => "oauth2_token_exchange",
         ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => "google_service_account_jwt",
         ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
     }
@@ -288,6 +289,7 @@ pub fn is_gateway_mintable_strategy(strategy: ProviderCredentialRefreshStrategy)
         strategy,
         ProviderCredentialRefreshStrategy::Oauth2RefreshToken
             | ProviderCredentialRefreshStrategy::Oauth2ClientCredentials
+            | ProviderCredentialRefreshStrategy::Oauth2TokenExchange
             | ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt
     )
 }
@@ -317,7 +319,7 @@ pub async fn refresh_provider_credential(
         "provider credential refresh started"
     );
 
-    match mint_credential(&state).await {
+    match mint_credential(store, &state).await {
         Ok(minted) => {
             let now_ms = current_time_ms();
             if let Err(err) =
@@ -435,6 +437,7 @@ async fn apply_minted_credential(
 }
 
 async fn mint_credential(
+    store: &Store,
     state: &StoredProviderCredentialRefreshState,
 ) -> Result<MintedCredential, Status> {
     let strategy = ProviderCredentialRefreshStrategy::try_from(state.strategy)
@@ -445,6 +448,9 @@ async fn mint_credential(
         }
         ProviderCredentialRefreshStrategy::Oauth2ClientCredentials => {
             mint_oauth2_client_credentials(state).await
+        }
+        ProviderCredentialRefreshStrategy::Oauth2TokenExchange => {
+            mint_oauth2_token_exchange(store, state).await
         }
         ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => {
             mint_google_service_account_jwt(state).await
@@ -470,6 +476,51 @@ async fn mint_oauth2_refresh_token(
     ];
     if let Some(client_secret) = material_value(&state.material, &["client_secret"]) {
         form.push(("client_secret".to_string(), client_secret));
+    }
+    let scope = refresh_scopes(state).join(" ");
+    if !scope.is_empty() {
+        form.push(("scope".to_string(), scope));
+    }
+
+    request_token(&token_url, &form, state.max_lifetime_seconds).await
+}
+
+async fn mint_oauth2_token_exchange(
+    store: &Store,
+    state: &StoredProviderCredentialRefreshState,
+) -> Result<MintedCredential, Status> {
+    let token_url = oauth2_token_url(state)?;
+    let client_id = required_material(&state.material, "client_id")?;
+    let sandbox_id = required_material(&state.material, "sandbox_id")?;
+    let binding = crate::delegation::get_binding(store, &sandbox_id)
+        .await?
+        .ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "sandbox delegation binding not found for sandbox_id '{sandbox_id}'"
+            ))
+        })?;
+
+    let mut form = vec![
+        (
+            "grant_type".to_string(),
+            "urn:ietf:params:oauth:grant-type:token-exchange".to_string(),
+        ),
+        ("client_id".to_string(), client_id),
+        ("subject_token".to_string(), binding.access_token),
+        (
+            "subject_token_type".to_string(),
+            "urn:ietf:params:oauth:token-type:access_token".to_string(),
+        ),
+        (
+            "requested_token_type".to_string(),
+            "urn:ietf:params:oauth:token-type:access_token".to_string(),
+        ),
+    ];
+    if let Some(client_secret) = material_value(&state.material, &["client_secret"]) {
+        form.push(("client_secret".to_string(), client_secret));
+    }
+    if let Some(audience) = material_value(&state.material, &["audience", "resource"]) {
+        form.push(("audience".to_string(), audience));
     }
     let scope = refresh_scopes(state).join(" ");
     if !scope.is_empty() {
@@ -648,7 +699,7 @@ fn oauth2_token_url(state: &StoredProviderCredentialRefreshState) -> Result<Stri
         return Ok(state.token_url.clone());
     }
     Err(Status::invalid_argument(
-        "oauth2_client_credentials requires token_url or tenant_id material",
+        "oauth2 token flow requires token_url or tenant_id material",
     ))
 }
 
@@ -776,6 +827,7 @@ mod tests {
         refresh_provider_credential, refresh_state_name, refresh_strategy_name,
         run_refresh_worker_tick, seconds_until_ms,
     };
+    use crate::delegation::{new_binding, put_binding};
     use crate::persistence::Store;
     use openshell_core::ObjectId;
     use openshell_core::proto::datamodel::v1::ObjectMeta;
@@ -1063,6 +1115,96 @@ mod tests {
                 .secret_material_keys
                 .iter()
                 .any(|key| key == "refresh_token")
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth2_token_exchange_refresh_uses_sandbox_delegation_binding() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(body_string_contains(
+                "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange",
+            ))
+            .and(body_string_contains("client_id=client-id"))
+            .and(body_string_contains("subject_token=user-access-token"))
+            .and(body_string_contains(
+                "subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token",
+            ))
+            .and(body_string_contains(
+                "requested_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token",
+            ))
+            .and(body_string_contains("audience=api%3A%2F%2Fdownstream"))
+            .and(body_string_contains("scope=files.read"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "delegated-downstream-token",
+                "expires_in": 3600,
+                "token_type": "Bearer"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let store = test_store().await;
+        let sandbox = Sandbox {
+            metadata: Some(ObjectMeta {
+                id: "sandbox-obo".to_string(),
+                name: "obo".to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+                resource_version: 0,
+            }),
+            spec: Some(SandboxSpec::default()),
+            ..Default::default()
+        };
+        let binding = new_binding(
+            &sandbox,
+            "user-123",
+            Some("alex"),
+            "oidc",
+            "user-access-token",
+            &["sandbox:write".to_string()],
+        )
+        .unwrap();
+        put_binding(&store, &binding).await.unwrap();
+
+        let provider = provider("my-obo", "okta");
+        store.put_message(&provider).await.unwrap();
+        let state = new_refresh_state(
+            &provider,
+            "OKTA_ACCESS_TOKEN",
+            NewRefreshStateConfig {
+                strategy: ProviderCredentialRefreshStrategy::Oauth2TokenExchange,
+                material: HashMap::from([
+                    ("client_id".to_string(), "client-id".to_string()),
+                    ("client_secret".to_string(), "client-secret".to_string()),
+                    ("sandbox_id".to_string(), "sandbox-obo".to_string()),
+                    ("audience".to_string(), "api://downstream".to_string()),
+                    ("scope".to_string(), "files.read".to_string()),
+                ]),
+                secret_material_keys: vec!["client_secret".to_string()],
+                expires_at_ms: 0,
+                token_url: format!("{}/token", mock_server.uri()),
+                scopes: Vec::new(),
+                refresh_before_seconds: 30,
+                max_lifetime_seconds: 60,
+            },
+        )
+        .unwrap();
+        put_refresh_state(&store, &state).await.unwrap();
+
+        let refreshed = refresh_provider_credential(&store, "my-obo", "OKTA_ACCESS_TOKEN")
+            .await
+            .unwrap();
+        assert_eq!(refreshed.status, "refreshed");
+
+        let stored_provider = store
+            .get_message_by_name::<Provider>("my-obo")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored_provider.credentials.get("OKTA_ACCESS_TOKEN"),
+            Some(&"delegated-downstream-token".to_string())
         );
     }
 
