@@ -194,13 +194,8 @@ scenario_deploy_external_pg() {
   pg_host="pg-external-postgresql.${NAMESPACE}.svc.cluster.local"
   pg_uri="postgresql://openshell:ext-test-password@${pg_host}:5432/openshell"
 
-  echo "==> Creating Secret with PostgreSQL credentials..."
+  echo "==> Creating Secret with PostgreSQL URI..."
   kctl -n "${NAMESPACE}" create secret generic my-pg-credentials \
-    --from-literal=host="${pg_host}" \
-    --from-literal=port="5432" \
-    --from-literal=username="openshell" \
-    --from-literal=password="ext-test-password" \
-    --from-literal=database="openshell" \
     --from-literal=uri="${pg_uri}" \
     2>/dev/null || true
 }
@@ -537,17 +532,14 @@ if [ "${OPENSHELL_E2E_KUBE_DB_SCENARIOS:-0}" = "1" ]; then
   run_scenario "SQLite (default)" sqlite \
     "${helm_extra_args[@]}"
 
-  run_scenario "Bundled PostgreSQL (deploy=true)" bundled-pg \
+  run_scenario "Bundled PostgreSQL" bundled-pg \
     "${helm_extra_args[@]}" \
-    --set postgres.enabled=true \
-    --set postgres.deploy=true \
-    --set postgres.auth.password=test-password
+    --set postgres.enabled=true
 
   scenario_deploy_external_pg
-  run_scenario "External PostgreSQL (existingSecret)" external-pg \
+  run_scenario "External PostgreSQL (externalDbSecret)" external-pg \
     "${helm_extra_args[@]}" \
-    --set postgres.enabled=true \
-    --set postgres.external.existingSecret=my-pg-credentials
+    --set server.externalDbSecret=my-pg-credentials
   scenario_cleanup_external_pg
 
   echo ""

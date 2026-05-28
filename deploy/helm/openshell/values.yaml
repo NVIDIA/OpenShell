@@ -138,8 +138,13 @@ server:
   # -- Namespace where sandbox pods are created. Defaults to the Helm release
   # namespace (.Release.Namespace) when left empty.
   sandboxNamespace: ""
-  # -- Gateway database URL.
+  # -- Gateway database URL (used for the default SQLite backend).
   dbUrl: "sqlite:/var/openshell/openshell.db"
+  # -- Name of a pre-existing Opaque Secret containing a PostgreSQL
+  # connection URI (key: uri). When set, the gateway reads OPENSHELL_DB_URL
+  # from this Secret instead of using dbUrl. The Secret must contain a
+  # `uri` key, e.g. postgresql://user:pass@host:5432/dbname.
+  externalDbSecret: ""
   # -- Default sandbox image used when requests do not specify one.
   sandboxImage: "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
   # -- Kubernetes imagePullPolicy for sandbox pods. Empty = Kubernetes default
@@ -235,40 +240,22 @@ server:
     # issuer uses a non-public CA (e.g. OpenShift ingress, private PKI).
     caConfigMapName: ""
 
-# Optional PostgreSQL backing store.
-# - enabled=false (default): gateway uses server.dbUrl (SQLite by default).
-# - enabled=true + deploy=true: deploy bundled PostgreSQL subchart and derive dbUrl.
-# - enabled=true + deploy=false: use postgres.external.existingSecret or compose
-#   from postgres.external.* fields.
+# Bundled PostgreSQL backing store (Bitnami subchart).
+# Set enabled=true to deploy a PostgreSQL instance alongside the gateway.
+# For external PostgreSQL, leave enabled=false and set server.externalDbSecret
+# to a pre-existing Secret containing a `uri` key.
 postgres:
+  # -- Deploy the bundled Bitnami PostgreSQL subchart.
   enabled: false
-  # -- Deploy the bundled Bitnami PostgreSQL subchart. Set to true to
-  # run PostgreSQL alongside the gateway. Leave false when using an
-  # external PostgreSQL instance.
-  deploy: false
-  # External mode connection settings (used when deploy=false).
-  external:
-    # -- Name of a pre-existing Opaque Secret containing PostgreSQL
-    # credentials. When set, the chart does not create its own db Secret
-    # and reads directly from this one. The Secret must contain a `uri`
-    # key with the full connection string, e.g.
-    # postgresql://user:pass@host:5432/dbname.
-    existingSecret: ""
-    host: ""
-    port: 5432
-    database: openshell
-    username: openshell
-    password: ""
-  # Values below also configure the bundled Bitnami PostgreSQL subchart
+  # Values below configure the bundled Bitnami PostgreSQL subchart
   # (aliased as "postgres" in Chart.yaml). The subchart uses these to
-  # initialise the PostgreSQL instance; the gateway uses them to compose
-  # the connection URL. They must stay in sync.
+  # initialise the PostgreSQL instance.
   auth:
     username: openshell
     password: ""
     database: openshell
-  # Enable Bitnami service-binding Secrets so the gateway can read the
-  # connection URI directly from the subchart-managed Secret.
+  # Bitnami service-binding Secrets — must stay true. The gateway reads
+  # the connection URI from the subchart-managed Secret.
   serviceBindings:
     enabled: true
   primary:

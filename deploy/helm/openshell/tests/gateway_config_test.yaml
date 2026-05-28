@@ -5,7 +5,6 @@ suite: gateway TOML config shape
 templates:
   - templates/gateway-config.yaml
   - templates/statefulset.yaml
-  - templates/db-secret.yaml
 release:
   name: openshell
   namespace: my-namespace
@@ -134,28 +133,29 @@ tests:
           path: spec.template.spec.containers[0].args
           content: "sqlite:/var/openshell/openshell.db"
 
-  - it: does not create a db Secret when postgres is disabled
-    template: templates/db-secret.yaml
-    asserts:
-      - hasDocuments:
-          count: 0
-
-  - it: does not pass --db-url in args when postgres is enabled
+  - it: does not pass --db-url in args when postgres.enabled is true
     template: templates/statefulset.yaml
     set:
       postgres.enabled: true
-      postgres.deploy: true
       postgres.auth.password: test-pw
     asserts:
       - notContains:
           path: spec.template.spec.containers[0].args
           content: "--db-url"
 
-  - it: references Bitnami service-binding Secret when postgres.deploy is true
+  - it: does not pass --db-url in args when externalDbSecret is set
+    template: templates/statefulset.yaml
+    set:
+      server.externalDbSecret: my-pg-secret
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: "--db-url"
+
+  - it: references Bitnami service-binding Secret when postgres.enabled is true
     template: templates/statefulset.yaml
     set:
       postgres.enabled: true
-      postgres.deploy: true
       postgres.auth.password: test-pw
     asserts:
       - contains:
@@ -171,7 +171,6 @@ tests:
     template: templates/statefulset.yaml
     set:
       postgres.enabled: true
-      postgres.deploy: true
       postgres.auth.password: test-pw
       postgres.fullnameOverride: my-pg
     asserts:
@@ -188,7 +187,6 @@ tests:
     template: templates/statefulset.yaml
     set:
       postgres.enabled: true
-      postgres.deploy: true
       postgres.auth.password: test-pw
       postgres.nameOverride: pgdb
     asserts:
@@ -201,13 +199,21 @@ tests:
                 name: openshell-pgdb-svcbind-custom-user
                 key: uri
 
-  - it: references chart-created Secret for external postgres
+  - it: fails when serviceBindings is disabled with bundled postgres
     template: templates/statefulset.yaml
     set:
       postgres.enabled: true
-      postgres.deploy: false
-      postgres.external.host: pg.example.com
-      postgres.external.password: ext-pw
+      postgres.serviceBindings.enabled: false
+    asserts:
+      - failedTemplate:
+          errorMessage: "postgres.serviceBindings.enabled must be true when using bundled PostgreSQL"
+
+  - it: allows serviceBindings disabled when externalDbSecret is set
+    template: templates/statefulset.yaml
+    set:
+      postgres.enabled: true
+      postgres.serviceBindings.enabled: false
+      server.externalDbSecret: my-external-secret
     asserts:
       - contains:
           path: spec.template.spec.containers[0].env
@@ -215,14 +221,13 @@ tests:
             name: OPENSHELL_DB_URL
             valueFrom:
               secretKeyRef:
-                name: openshell-db
+                name: my-external-secret
                 key: uri
 
-  - it: references existing Secret when existingSecret is set
+  - it: references externalDbSecret when set without postgres.enabled
     template: templates/statefulset.yaml
     set:
-      postgres.enabled: true
-      postgres.external.existingSecret: my-pg-secret
+      server.externalDbSecret: my-pg-secret
     asserts:
       - contains:
           path: spec.template.spec.containers[0].env
@@ -233,88 +238,18 @@ tests:
                 name: my-pg-secret
                 key: uri
 
-  - it: does not create db Secret when postgres.deploy is true
-    template: templates/db-secret.yaml
+  - it: externalDbSecret overrides bundled secret when both are set
+    template: templates/statefulset.yaml
     set:
       postgres.enabled: true
-      postgres.deploy: true
       postgres.auth.password: test-pw
+      server.externalDbSecret: my-external-secret
     asserts:
-      - hasDocuments:
-          count: 0
-
-  - it: does not create db Secret when existingSecret is set
-    template: templates/db-secret.yaml
-    set:
-      postgres.enabled: true
-      postgres.external.existingSecret: my-pg-secret
-    asserts:
-      - hasDocuments:
-          count: 0
-
-  - it: creates db Secret with individual keys for external postgres
-    template: templates/db-secret.yaml
-    set:
-      postgres.enabled: true
-      postgres.deploy: false
-      postgres.external.host: external-postgres.example.com
-      postgres.external.port: 5432
-      postgres.external.database: openshell_ext
-      postgres.external.username: ext_user
-      postgres.external.password: ext_pass
-    asserts:
-      - isKind:
-          of: Secret
-      - equal:
-          path: data.host
-          decodeBase64: true
-          value: "external-postgres.example.com"
-      - equal:
-          path: data.username
-          decodeBase64: true
-          value: "ext_user"
-      - equal:
-          path: data.password
-          decodeBase64: true
-          value: "ext_pass"
-      - equal:
-          path: data.database
-          decodeBase64: true
-          value: "openshell_ext"
-      - equal:
-          path: data.uri
-          decodeBase64: true
-          value: "postgresql://ext_user:ext_pass@external-postgres.example.com:5432/openshell_ext"
-
-  - it: URL-encodes special characters in external credentials
-    template: templates/db-secret.yaml
-    set:
-      postgres.enabled: true
-      postgres.deploy: false
-      postgres.external.host: pg.example.com
-      postgres.external.username: "user@corp"
-      postgres.external.password: "p@ss:word/secret"
-      postgres.external.database: mydb
-    asserts:
-      - equal:
-          path: data.uri
-          decodeBase64: true
-          value: "postgresql://user%40corp:p%40ss%3Aword%2Fsecret@pg.example.com:5432/mydb"
-
-  - it: fails when postgres.deploy=true but postgres.enabled=false
-    template: templates/statefulset.yaml
-    set:
-      postgres.deploy: true
-    asserts:
-      - failedTemplate:
-          errorMessage: "postgres.deploy=true requires postgres.enabled=true"
-
-  - it: fails when external postgres has no password and no existingSecret
-    template: templates/statefulset.yaml
-    set:
-      postgres.enabled: true
-      postgres.deploy: false
-      postgres.external.host: my-host.example.com
-    asserts:
-      - failedTemplate:
-          errorMessage: "postgres.external.password is required when postgres.deploy=false and no postgres.external.existingSecret is provided"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_DB_URL
+            valueFrom:
+              secretKeyRef:
+                name: my-external-secret
+                key: uri

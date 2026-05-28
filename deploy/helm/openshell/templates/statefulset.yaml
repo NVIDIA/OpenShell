@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-{{- if and .Values.postgres.deploy (not .Values.postgres.enabled) }}
-{{- fail "postgres.deploy=true requires postgres.enabled=true" }}
+{{- if and .Values.postgres.enabled (not .Values.postgres.serviceBindings.enabled) (not .Values.server.externalDbSecret) }}
+{{- fail "postgres.serviceBindings.enabled must be true when using bundled PostgreSQL" }}
 {{- end }}
 apiVersion: apps/v1
 kind: StatefulSet
@@ -23,9 +23,6 @@ spec:
         # without this annotation a `helm upgrade` that only mutates the
         # ConfigMap would leave pods running with stale config.
         checksum/gateway-config: {{ include (print $.Template.BasePath "/gateway-config.yaml") . | sha256sum }}
-        {{- if and .Values.postgres.enabled (not .Values.postgres.deploy) (not .Values.postgres.external.existingSecret) }}
-        checksum/db-secret: {{ include (print $.Template.BasePath "/db-secret.yaml") . | sha256sum }}
-        {{- end }}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -59,12 +56,12 @@ spec:
           args:
             - --config
             - /etc/openshell/gateway.toml
-            {{- if not .Values.postgres.enabled }}
+            {{- if not (or .Values.postgres.enabled .Values.server.externalDbSecret) }}
             - --db-url
             - {{ .Values.server.dbUrl | quote }}
             {{- end }}
           env:
-            {{- if .Values.postgres.enabled }}
+            {{- if or .Values.postgres.enabled .Values.server.externalDbSecret }}
             - name: OPENSHELL_DB_URL
               valueFrom:
                 secretKeyRef:

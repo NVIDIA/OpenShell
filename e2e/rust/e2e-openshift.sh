@@ -105,17 +105,15 @@ helm install "$RELEASE" "$CHART_PATH" -n "$NAMESPACE" \
 verify_gateway "$SCENARIO"
 cleanup_release
 
-# --- scenario 2: Bundled PostgreSQL (deploy=true) ---------------------------
+# --- scenario 2: Bundled PostgreSQL -------------------------------------------
 
-SCENARIO="Bundled PostgreSQL (deploy=true)"
+SCENARIO="Bundled PostgreSQL"
 log "Testing: $SCENARIO"
 cleanup_release
 
 helm install "$RELEASE" "$CHART_PATH" -n "$NAMESPACE" \
   "${OPENSHIFT_FLAGS[@]}" \
-  --set postgres.enabled=true \
-  --set postgres.deploy=true \
-  --set postgres.auth.password=test-password
+  --set postgres.enabled=true
 
 # Wait for postgres to be ready first
 log "Waiting for bundled PostgreSQL..."
@@ -126,7 +124,7 @@ cleanup_release
 
 # --- scenario 3: External PostgreSQL with existing Secret -------------------
 
-SCENARIO="External PostgreSQL (existingSecret)"
+SCENARIO="External PostgreSQL (externalDbSecret)"
 log "Testing: $SCENARIO"
 cleanup_release
 
@@ -151,22 +149,16 @@ wait_for_ready "app.kubernetes.io/name=postgresql,app.kubernetes.io/instance=$EX
 EXTERNAL_PG_HOST="${EXTERNAL_PG_RELEASE}-postgresql.${NAMESPACE}.svc.cluster.local"
 EXTERNAL_PG_URI="postgresql://${EXTERNAL_PG_USERNAME}:${EXTERNAL_PG_PASSWORD}@${EXTERNAL_PG_HOST}:5432/${EXTERNAL_PG_DATABASE}"
 
-# Create the existing Secret with the expected keys
+# Create the existing Secret with the uri key
 log "Creating existing Secret with PostgreSQL credentials..."
 oc create secret generic my-pg-credentials -n "$NAMESPACE" \
-  --from-literal=host="$EXTERNAL_PG_HOST" \
-  --from-literal=port="5432" \
-  --from-literal=username="$EXTERNAL_PG_USERNAME" \
-  --from-literal=password="$EXTERNAL_PG_PASSWORD" \
-  --from-literal=database="$EXTERNAL_PG_DATABASE" \
   --from-literal=uri="$EXTERNAL_PG_URI" \
   2>/dev/null || true
 
 # Install OpenShell pointing at the existing Secret
 helm install "$RELEASE" "$CHART_PATH" -n "$NAMESPACE" \
   "${OPENSHIFT_FLAGS[@]}" \
-  --set postgres.enabled=true \
-  --set postgres.external.existingSecret=my-pg-credentials
+  --set server.externalDbSecret=my-pg-credentials
 
 verify_gateway "$SCENARIO"
 

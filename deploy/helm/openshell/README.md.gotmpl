@@ -68,62 +68,35 @@ postgres:
   enabled: false
 ```
 
-#### Use an existing Kubernetes Secret
+#### External PostgreSQL
 
-If you already have a Secret containing PostgreSQL credentials (e.g. managed
-via GitOps or external-secrets-operator), point the chart at it directly:
+Create a Secret containing the PostgreSQL connection URI if one does not
+already exist:
+
+```bash
+kubectl create secret generic my-pg-credentials -n openshell \
+  --from-literal=uri="postgresql://user:pass@host:5432/dbname"
+```
+
+Then install the chart pointing at that Secret:
 
 ```bash
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
-  --set postgres.enabled=true \
-  --set postgres.external.existingSecret=my-pg-credentials
+  -n openshell \
+  --set server.externalDbSecret=my-pg-credentials
 ```
 
-On OpenShift, append the platform overrides:
+#### Bundled PostgreSQL
+
+Deploy a PostgreSQL instance alongside the gateway using the bundled
+Bitnami subchart. A random password is generated automatically:
 
 ```bash
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
-  --set postgres.enabled=true \
-  --set postgres.external.existingSecret=my-pg-credentials \
-  --set server.disableTls=true \
-  --set podSecurityContext.fsGroup=null \
-  --set securityContext.runAsUser=null
+  --set postgres.enabled=true
 ```
 
-The Secret must contain a `uri` key with the full connection string:
-
-```yaml
-apiVersion: v1
-kind: Secret
-metadata:
-  name: my-pg-credentials
-type: Opaque
-data:
-  uri: <base64>  # postgresql://user:pass@host:5432/dbname
-```
-
-#### Kubernetes
-
-Enable bundled PostgreSQL:
-
-```bash
-helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
-  --set postgres.enabled=true \
-  --set postgres.deploy=true \
-  --set postgres.auth.password=my-secret-password
-```
-
-Use external PostgreSQL (chart creates the Secret from fields):
-
-```bash
-helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
-  --set postgres.enabled=true \
-  --set postgres.external.host=my-postgres.example.com \
-  --set postgres.external.port=5432 \
-  --set postgres.external.database=openshell \
-  --set postgres.external.username=openshell \
-  --set postgres.external.password=my-password
-```
+To set an explicit password, add `--set postgres.auth.password=my-secret-password`.
 
 #### OpenShift
 
@@ -133,33 +106,6 @@ Append these flags to any of the PostgreSQL commands above for OpenShift:
 --set server.disableTls=true \
 --set podSecurityContext.fsGroup=null \
 --set securityContext.runAsUser=null
-```
-
-Enable bundled PostgreSQL on OpenShift:
-
-```bash
-helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
-  --set postgres.enabled=true \
-  --set postgres.deploy=true \
-  --set postgres.auth.password=my-secret-password \
-  --set server.disableTls=true \
-  --set podSecurityContext.fsGroup=null \
-  --set securityContext.runAsUser=null
-```
-
-Use external PostgreSQL on OpenShift:
-
-```bash
-helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
-  --set postgres.enabled=true \
-  --set postgres.external.host=my-postgres.example.com \
-  --set postgres.external.port=5432 \
-  --set postgres.external.database=openshell \
-  --set postgres.external.username=openshell \
-  --set postgres.external.password=my-password \
-  --set server.disableTls=true \
-  --set podSecurityContext.fsGroup=null \
-  --set securityContext.runAsUser=null
 ```
 
 ## PKI bootstrap

@@ -122,15 +122,14 @@ postgres.fullnameOverride or postgres.nameOverride.
 
 {{/*
 Name of the Secret holding the PostgreSQL connection URI.
-- deploy=true: derive from Bitnami service-binding naming convention
-- deploy=false + existingSecret set: use it verbatim
-- deploy=false + no existingSecret: use chart-generated "<fullname>-db"
+- server.externalDbSecret set: use it verbatim (always wins)
+- postgres.enabled=true: derive from Bitnami service-binding naming convention
 */}}
 {{- define "openshell.dbSecretName" -}}
-{{- if .Values.postgres.deploy -}}
-{{- printf "%s-svcbind-custom-user" (include "openshell.postgresFullname" .) -}}
+{{- if .Values.server.externalDbSecret -}}
+{{- .Values.server.externalDbSecret -}}
 {{- else -}}
-{{- .Values.postgres.external.existingSecret | default (printf "%s-db" (include "openshell.fullname" .)) -}}
+{{- printf "%s-svcbind-custom-user" (include "openshell.postgresFullname" .) -}}
 {{- end -}}
 {{- end }}
 

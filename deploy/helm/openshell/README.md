@@ -68,62 +68,35 @@ postgres:
   enabled: false
 ```
 
-#### Use an existing Kubernetes Secret
+#### External PostgreSQL
 
-If you already have a Secret containing PostgreSQL credentials (e.g. managed
-via GitOps or external-secrets-operator), point the chart at it directly:
+Create a Secret containing the PostgreSQL connection URI if one does not
+already exist:
+
+```bash
+kubectl create secret generic my-pg-credentials -n openshell \
+  --from-literal=uri="postgresql://user:pass@host:5432/dbname"
+```
+
+Then install the chart pointing at that Secret:
 
 ```bash
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
-  --set postgres.enabled=true \
-  --set postgres.external.existingSecret=my-pg-credentials
+  -n openshell \
+  --set server.externalDbSecret=my-pg-credentials
 ```
 
-On OpenShift, append the platform overrides:
+#### Bundled PostgreSQL
+
+Deploy a PostgreSQL instance alongside the gateway using the bundled
+Bitnami subchart. A random password is generated automatically:
 
 ```bash
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
-  --set postgres.enabled=true \
-  --set postgres.external.existingSecret=my-pg-credentials \
-  --set server.disableTls=true \
-  --set podSecurityContext.fsGroup=null \
-  --set securityContext.runAsUser=null
+  --set postgres.enabled=true
 ```
 
-The Secret must contain a `uri` key with the full connection string:
-
-```yaml
-apiVersion: v1
-kind: Secret
-metadata:
-  name: my-pg-credentials
-type: Opaque
-data:
-  uri: <base64>  # postgresql://user:pass@host:5432/dbname
-```
-
-#### Kubernetes
-
-Enable bundled PostgreSQL:
-
-```bash
-helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
-  --set postgres.enabled=true \
-  --set postgres.deploy=true \
-  --set postgres.auth.password=my-secret-password
-```
-
-Use external PostgreSQL (chart creates the Secret from fields):
-
-```bash
-helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
-  --set postgres.enabled=true \
-  --set postgres.external.host=my-postgres.example.com \
-  --set postgres.external.port=5432 \
-  --set postgres.external.database=openshell \
-  --set postgres.external.username=openshell \
-  --set postgres.external.password=my-password
-```
+To set an explicit password, add `--set postgres.auth.password=my-secret-password`.
 
 #### OpenShift
 
@@ -133,33 +106,6 @@ Append these flags to any of the PostgreSQL commands above for OpenShift:
 --set server.disableTls=true \
 --set podSecurityContext.fsGroup=null \
 --set securityContext.runAsUser=null
-```
-
-Enable bundled PostgreSQL on OpenShift:
-
-```bash
-helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
-  --set postgres.enabled=true \
-  --set postgres.deploy=true \
-  --set postgres.auth.password=my-secret-password \
-  --set server.disableTls=true \
-  --set podSecurityContext.fsGroup=null \
-  --set securityContext.runAsUser=null
-```
-
-Use external PostgreSQL on OpenShift:
-
-```bash
-helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
-  --set postgres.enabled=true \
-  --set postgres.external.host=my-postgres.example.com \
-  --set postgres.external.port=5432 \
-  --set postgres.external.database=openshell \
-  --set postgres.external.username=openshell \
-  --set postgres.external.password=my-password \
-  --set server.disableTls=true \
-  --set podSecurityContext.fsGroup=null \
-  --set securityContext.runAsUser=null
 ```
 
 ## PKI bootstrap
@@ -218,14 +164,7 @@ cert-manager alternative.
 | postgres.auth.database | string | `"openshell"` |  |
 | postgres.auth.password | string | `""` |  |
 | postgres.auth.username | string | `"openshell"` |  |
-| postgres.deploy | bool | `false` | Deploy the bundled Bitnami PostgreSQL subchart. Set to true to run PostgreSQL alongside the gateway. Leave false when using an external PostgreSQL instance. |
-| postgres.enabled | bool | `false` |  |
-| postgres.external.database | string | `"openshell"` |  |
-| postgres.external.existingSecret | string | `""` | Name of a pre-existing Opaque Secret containing PostgreSQL credentials. When set, the chart does not create its own db Secret and reads directly from this one. The Secret must contain a `uri` key with the full connection string, e.g. postgresql://user:pass@host:5432/dbname. |
-| postgres.external.host | string | `""` |  |
-| postgres.external.password | string | `""` |  |
-| postgres.external.port | int | `5432` |  |
-| postgres.external.username | string | `"openshell"` |  |
+| postgres.enabled | bool | `false` | Deploy the bundled Bitnami PostgreSQL subchart. |
 | postgres.primary.persistence.enabled | bool | `true` |  |
 | postgres.serviceBindings.enabled | bool | `true` |  |
 | probes.liveness.failureThreshold | int | `3` | Liveness probe failure threshold before the container is restarted. |
@@ -249,10 +188,11 @@ cert-manager alternative.
 | securityContext.runAsNonRoot | bool | `true` | Require the gateway container to run as a non-root user. |
 | securityContext.runAsUser | int | `1000` | UID assigned to the gateway container. |
 | server.auth.allowUnauthenticatedUsers | bool | `false` | UNSAFE: accept unauthenticated CLI/user requests as a local developer principal. Intended only for trusted local Skaffold/k3d development or a fully trusted fronting proxy. Leave false for shared or production clusters. |
-| server.dbUrl | string | `"sqlite:/var/openshell/openshell.db"` | Gateway database URL. |
+| server.dbUrl | string | `"sqlite:/var/openshell/openshell.db"` | Gateway database URL (used for the default SQLite backend). |
 | server.disableTls | bool | `false` | Disable TLS entirely - the server listens on plaintext HTTP. Set to true when a reverse proxy / tunnel terminates TLS at the edge. |
 | server.enableLoopbackServiceHttp | bool | `true` | Enable plaintext HTTP routing for loopback sandbox service URLs on TLS-enabled gateways. |
 | server.enableUserNamespaces | bool | `false` | Enable Kubernetes user namespace isolation (hostUsers: false) for sandbox pods. Requires Kubernetes 1.33+ with user namespace support available (beta through 1.35, GA in 1.36+), plus a supporting container runtime and Linux 5.12+. When enabled, container UID 0 maps to an unprivileged host UID and capabilities become namespaced. |
+| server.externalDbSecret | string | `""` | Name of a pre-existing Opaque Secret containing a PostgreSQL connection URI (key: uri). When set, the gateway reads OPENSHELL_DB_URL from this Secret instead of using dbUrl. The Secret must contain a `uri` key, e.g. postgresql://user:pass@host:5432/dbname. |
 | server.grpcEndpoint | string | `""` | gRPC endpoint sandboxes call back into the gateway. Leave empty to derive it from the chart fullname, release namespace, service port, and disableTls flag, for example https://openshell.openshell.svc.cluster.local:8080. Override only when sandboxes must reach the gateway via a different hostname (e.g. an external ingress or a host alias). |
 | server.hostGatewayIP | string | `""` | Host gateway IP for sandbox pod hostAliases. When set, sandbox pods get hostAliases entries mapping host.docker.internal and host.openshell.internal to this IP, allowing them to reach services running on the Docker host. Auto-detected by the cluster entrypoint script. |
 | server.logLevel | string | `"info"` | Gateway log level. |

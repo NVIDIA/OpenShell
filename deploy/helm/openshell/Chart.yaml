@@ -15,5 +15,5 @@ dependencies:
   - name: postgresql
     version: 18.6.7
     repository: oci://registry-1.docker.io/bitnamicharts
-    condition: postgres.deploy
+    condition: postgres.enabled
     alias: postgres
