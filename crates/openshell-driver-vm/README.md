@@ -146,7 +146,7 @@ Select the VM driver with `--drivers vm`, `OPENSHELL_DRIVERS=vm`, or `compute_dr
 | `vcpus` | `2` | vCPUs per sandbox. |
 | `mem_mib` | `2048` | Memory per sandbox, in MiB. |
 | `overlay_disk_mib` | `4096` | Sparse writable overlay disk size per sandbox, in MiB. |
-| `krun_log_level` | `1` | libkrun verbosity (0-5). |
+| `hypervisor_log_level` | `1` | Hypervisor helper verbosity. `krun_log_level` remains accepted as a compatibility alias. |
 | `guest_tls_ca` | unset | CA cert for the guest's mTLS client bundle. Required when `grpc_endpoint` uses `https://`. |
 | `guest_tls_cert` | unset | Guest client certificate. |
 | `guest_tls_key` | unset | Guest client private key. |

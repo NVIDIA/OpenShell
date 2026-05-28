@@ -87,7 +87,7 @@ compute_drivers = ["vm"]
 
 For a launch-time override, set `OPENSHELL_DRIVERS=vm` in the gateway environment and restart the service.
 
-Configure VM driver values such as `grpc_endpoint`, `driver_dir`, `state_dir`, `default_image`, `bootstrap_image`, `vcpus`, `mem_mib`, `overlay_disk_mib`, `krun_log_level`, and `guest_tls_*` in `[openshell.drivers.vm]`. The VM `state_dir` stores overlay disks, console logs, runtime state, image-rootfs cache, and the private `run/compute-driver.sock` socket.
+Configure VM driver values such as `grpc_endpoint`, `driver_dir`, `state_dir`, `default_image`, `bootstrap_image`, `vcpus`, `mem_mib`, `overlay_disk_mib`, `hypervisor_log_level`, and `guest_tls_*` in `[openshell.drivers.vm]`. The VM `state_dir` stores overlay disks, console logs, runtime state, image-rootfs cache, and the private `run/compute-driver.sock` socket.
 
 The gateway starts `openshell-driver-vm` over a private Unix socket and passes its process ID so the driver can reject unexpected local clients. The driver's standalone TCP listener is disabled unless `--allow-unauthenticated-tcp` is set for local development.
 
