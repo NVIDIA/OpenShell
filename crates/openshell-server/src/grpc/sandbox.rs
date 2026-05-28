@@ -10,6 +10,7 @@
 #![allow(clippy::cast_possible_wrap)] // Intentional u32->i32 conversions for proto compat
 
 use crate::ServerState;
+use crate::auth::principal::Principal;
 use crate::persistence::{ObjectType, WriteCondition, generate_name};
 use futures::future;
 use openshell_core::proto::{
@@ -119,6 +120,7 @@ async fn handle_create_sandbox_inner(
 ) -> Result<Response<SandboxResponse>, Status> {
     use crate::persistence::current_time_ms;
 
+    let principal = request.extensions().get::<Principal>().cloned();
     let request = request.into_inner();
     let spec = request
         .spec
@@ -215,6 +217,11 @@ async fn handle_create_sandbox_inner(
     let sandbox = state.compute.create_sandbox(sandbox, sandbox_token).await?;
 
     info!(
+        actor_kind = principal.as_ref().map_or("unknown", Principal::audit_actor_kind),
+        actor_subject = principal
+            .as_ref()
+            .map_or("unknown", Principal::audit_actor_subject),
+        actor_display = principal.as_ref().and_then(Principal::audit_actor_display),
         sandbox_id = %id,
         sandbox_name = %name,
         "CreateSandbox request completed successfully"
@@ -283,6 +290,7 @@ pub(super) async fn handle_attach_sandbox_provider(
     state: &Arc<ServerState>,
     request: Request<AttachSandboxProviderRequest>,
 ) -> Result<Response<AttachSandboxProviderResponse>, Status> {
+    let principal = request.extensions().get::<Principal>().cloned();
     let request = request.into_inner();
     if request.provider_name.is_empty() {
         return Err(Status::invalid_argument("provider_name is required"));
@@ -381,6 +389,11 @@ pub(super) async fn handle_attach_sandbox_provider(
     let attached = attached.load(Ordering::Relaxed);
 
     info!(
+        actor_kind = principal.as_ref().map_or("unknown", Principal::audit_actor_kind),
+        actor_subject = principal
+            .as_ref()
+            .map_or("unknown", Principal::audit_actor_subject),
+        actor_display = principal.as_ref().and_then(Principal::audit_actor_display),
         sandbox_name = %request.sandbox_name,
         provider_name = %request.provider_name,
         attached,
@@ -397,6 +410,7 @@ pub(super) async fn handle_detach_sandbox_provider(
     state: &Arc<ServerState>,
     request: Request<DetachSandboxProviderRequest>,
 ) -> Result<Response<DetachSandboxProviderResponse>, Status> {
+    let principal = request.extensions().get::<Principal>().cloned();
     let request = request.into_inner();
     if request.provider_name.is_empty() {
         return Err(Status::invalid_argument("provider_name is required"));
@@ -456,6 +470,11 @@ pub(super) async fn handle_detach_sandbox_provider(
     let detached = detached.load(Ordering::Relaxed);
 
     info!(
+        actor_kind = principal.as_ref().map_or("unknown", Principal::audit_actor_kind),
+        actor_subject = principal
+            .as_ref()
+            .map_or("unknown", Principal::audit_actor_subject),
+        actor_display = principal.as_ref().and_then(Principal::audit_actor_display),
         sandbox_name = %request.sandbox_name,
         provider_name = %request.provider_name,
         detached,
@@ -489,6 +508,7 @@ async fn handle_delete_sandbox_inner(
     state: &Arc<ServerState>,
     request: Request<DeleteSandboxRequest>,
 ) -> Result<Response<DeleteSandboxResponse>, Status> {
+    let principal = request.extensions().get::<Principal>().cloned();
     let name = request.into_inner().name;
     if name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
@@ -505,7 +525,16 @@ async fn handle_delete_sandbox_inner(
     if deleted && let Some(sandbox_id) = sandbox_id {
         state.telemetry.end_sandbox_session(&sandbox_id);
     }
-    info!(sandbox_name = %name, "DeleteSandbox request completed successfully");
+    info!(
+        actor_kind = principal.as_ref().map_or("unknown", Principal::audit_actor_kind),
+        actor_subject = principal
+            .as_ref()
+            .map_or("unknown", Principal::audit_actor_subject),
+        actor_display = principal.as_ref().and_then(Principal::audit_actor_display),
+        sandbox_name = %name,
+        deleted,
+        "DeleteSandbox request completed successfully"
+    );
     Ok(Response::new(DeleteSandboxResponse { deleted }))
 }
 

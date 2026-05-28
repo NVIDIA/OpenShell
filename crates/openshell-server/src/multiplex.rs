@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tower::ServiceExt;
 use tower_http::request_id::{MakeRequestId, RequestId};
-use tracing::Span;
+use tracing::{Span, warn};
 
 use crate::{
     OpenShellService, ServerState,
@@ -158,7 +158,7 @@ impl MultiplexService {
         let authz_policy = self.state.config.oidc.as_ref().map(|oidc| AuthzPolicy {
             admin_role: oidc.admin_role.clone(),
             user_role: oidc.user_role.clone(),
-            scopes_enabled: !oidc.scopes_claim.is_empty(),
+            scopes_enabled: !oidc.effective_scopes_claim().is_empty(),
         });
         let authenticator_chain = build_authenticator_chain(&self.state);
         let grpc_service = AuthGrpcRouter::with_peer_identity(
@@ -450,11 +450,35 @@ where
                     if let Some(ref policy) = authz_policy
                         && let Err(status) = policy.check(&user.identity, &path)
                     {
+                        let requirement = AuthzPolicy::requirement_for(&path);
+                        warn!(
+                            actor_kind = %principal.audit_actor_kind(),
+                            actor_subject = %principal.audit_actor_subject(),
+                            actor_display = principal.audit_actor_display(),
+                            permission = requirement.permission,
+                            required_scope = requirement.scope,
+                            required_role = if requirement.requires_admin {
+                                policy.admin_role.as_str()
+                            } else {
+                                policy.user_role.as_str()
+                            },
+                            method = %path,
+                            grpc_code = ?status.code(),
+                            grpc_message = status.message(),
+                            "authorization denied for authenticated gateway caller"
+                        );
                         return Ok(status_response(status));
                     }
                 }
                 Principal::Sandbox(_) => {
                     if !crate::auth::sandbox_methods::is_sandbox_callable(&path) {
+                        warn!(
+                            actor_kind = %principal.audit_actor_kind(),
+                            actor_subject = %principal.audit_actor_subject(),
+                            actor_display = principal.audit_actor_display(),
+                            method = %path,
+                            "authorization denied for sandbox principal on non-sandbox method"
+                        );
                         return Ok(status_response(tonic::Status::permission_denied(
                             "sandbox principals may not call this method",
                         )));

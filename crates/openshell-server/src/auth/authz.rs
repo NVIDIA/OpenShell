@@ -13,11 +13,216 @@
 //! authorization is a gateway concern.
 
 use super::identity::Identity;
-use super::method_authz::{self, Role};
+use super::method_authz::Role;
 use tonic::Status;
 use tracing::debug;
 
 const SCOPE_ALL: &str = "openshell:all";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MethodPermission {
+    pub permission: &'static str,
+    pub scope: &'static str,
+    pub requires_admin: bool,
+}
+
+impl MethodPermission {
+    const fn new(permission: &'static str, scope: &'static str, requires_admin: bool) -> Self {
+        Self {
+            permission,
+            scope,
+            requires_admin,
+        }
+    }
+}
+
+/// Exhaustive mapping of Bearer-authenticated gRPC methods to `OpenShell`
+/// permissions and scopes. Methods not listed here fall back to
+/// `openshell:all` when scope enforcement is enabled.
+const METHOD_PERMISSIONS: &[(&str, MethodPermission)] = &[
+    // sandbox.read
+    (
+        "/openshell.v1.OpenShell/GetSandbox",
+        MethodPermission::new("sandbox.read", "sandbox:read", false),
+    ),
+    (
+        "/openshell.v1.OpenShell/ListSandboxes",
+        MethodPermission::new("sandbox.read", "sandbox:read", false),
+    ),
+    (
+        "/openshell.v1.OpenShell/ListSandboxProviders",
+        MethodPermission::new("sandbox.read", "sandbox:read", false),
+    ),
+    (
+        "/openshell.v1.OpenShell/WatchSandbox",
+        MethodPermission::new("sandbox.read", "sandbox:read", false),
+    ),
+    (
+        "/openshell.v1.OpenShell/GetSandboxLogs",
+        MethodPermission::new("sandbox.read", "sandbox:read", false),
+    ),
+    (
+        "/openshell.v1.OpenShell/GetService",
+        MethodPermission::new("sandbox.read", "sandbox:read", false),
+    ),
+    (
+        "/openshell.v1.OpenShell/ListServices",
+        MethodPermission::new("sandbox.read", "sandbox:read", false),
+    ),
+    (
+        "/openshell.v1.OpenShell/GetSandboxPolicyStatus",
+        MethodPermission::new("sandbox.read", "sandbox:read", false),
+    ),
+    (
+        "/openshell.v1.OpenShell/ListSandboxPolicies",
+        MethodPermission::new("sandbox.read", "sandbox:read", false),
+    ),
+    // sandbox.write
+    (
+        "/openshell.v1.OpenShell/CreateSandbox",
+        MethodPermission::new("sandbox.write", "sandbox:write", false),
+    ),
+    (
+        "/openshell.v1.OpenShell/DeleteSandbox",
+        MethodPermission::new("sandbox.write", "sandbox:write", false),
+    ),
+    (
+        "/openshell.v1.OpenShell/ExecSandbox",
+        MethodPermission::new("sandbox.write", "sandbox:write", false),
+    ),
+    (
+        "/openshell.v1.OpenShell/ForwardTcp",
+        MethodPermission::new("sandbox.write", "sandbox:write", false),
+    ),
+    (
+        "/openshell.v1.OpenShell/CreateSshSession",
+        MethodPermission::new("sandbox.write", "sandbox:write", false),
+    ),
+    (
+        "/openshell.v1.OpenShell/RevokeSshSession",
+        MethodPermission::new("sandbox.write", "sandbox:write", false),
+    ),
+    (
+        "/openshell.v1.OpenShell/ExposeService",
+        MethodPermission::new("sandbox.write", "sandbox:write", false),
+    ),
+    (
+        "/openshell.v1.OpenShell/DeleteService",
+        MethodPermission::new("sandbox.write", "sandbox:write", false),
+    ),
+    (
+        "/openshell.v1.OpenShell/AttachSandboxProvider",
+        MethodPermission::new("sandbox.write", "sandbox:write", false),
+    ),
+    (
+        "/openshell.v1.OpenShell/DetachSandboxProvider",
+        MethodPermission::new("sandbox.write", "sandbox:write", false),
+    ),
+    // provider.read
+    (
+        "/openshell.v1.OpenShell/GetProvider",
+        MethodPermission::new("provider.read", "provider:read", false),
+    ),
+    (
+        "/openshell.v1.OpenShell/ListProviders",
+        MethodPermission::new("provider.read", "provider:read", false),
+    ),
+    (
+        "/openshell.v1.OpenShell/GetProviderRefreshStatus",
+        MethodPermission::new("provider.read", "provider:read", false),
+    ),
+    // provider.write
+    (
+        "/openshell.v1.OpenShell/CreateProvider",
+        MethodPermission::new("provider.write", "provider:write", true),
+    ),
+    (
+        "/openshell.v1.OpenShell/UpdateProvider",
+        MethodPermission::new("provider.write", "provider:write", true),
+    ),
+    (
+        "/openshell.v1.OpenShell/DeleteProvider",
+        MethodPermission::new("provider.write", "provider:write", true),
+    ),
+    (
+        "/openshell.v1.OpenShell/ConfigureProviderRefresh",
+        MethodPermission::new("provider.write", "provider:write", true),
+    ),
+    (
+        "/openshell.v1.OpenShell/RotateProviderCredential",
+        MethodPermission::new("provider.write", "provider:write", true),
+    ),
+    (
+        "/openshell.v1.OpenShell/DeleteProviderRefresh",
+        MethodPermission::new("provider.write", "provider:write", true),
+    ),
+    // config.read
+    (
+        "/openshell.v1.OpenShell/GetGatewayConfig",
+        MethodPermission::new("config.read", "config:read", false),
+    ),
+    (
+        "/openshell.v1.OpenShell/GetSandboxConfig",
+        MethodPermission::new("config.read", "config:read", false),
+    ),
+    (
+        "/openshell.v1.OpenShell/GetDraftPolicy",
+        MethodPermission::new("config.read", "config:read", false),
+    ),
+    (
+        "/openshell.v1.OpenShell/GetDraftHistory",
+        MethodPermission::new("config.read", "config:read", false),
+    ),
+    // config.write
+    (
+        "/openshell.v1.OpenShell/UpdateConfig",
+        MethodPermission::new("config.write", "config:write", true),
+    ),
+    (
+        "/openshell.v1.OpenShell/ApproveDraftChunk",
+        MethodPermission::new("config.write", "config:write", true),
+    ),
+    (
+        "/openshell.v1.OpenShell/ApproveAllDraftChunks",
+        MethodPermission::new("config.write", "config:write", true),
+    ),
+    (
+        "/openshell.v1.OpenShell/RejectDraftChunk",
+        MethodPermission::new("config.write", "config:write", true),
+    ),
+    (
+        "/openshell.v1.OpenShell/EditDraftChunk",
+        MethodPermission::new("config.write", "config:write", true),
+    ),
+    (
+        "/openshell.v1.OpenShell/UndoDraftChunk",
+        MethodPermission::new("config.write", "config:write", true),
+    ),
+    (
+        "/openshell.v1.OpenShell/ClearDraftChunks",
+        MethodPermission::new("config.write", "config:write", true),
+    ),
+    // inference.read
+    (
+        "/openshell.inference.v1.Inference/GetClusterInference",
+        MethodPermission::new("inference.read", "inference:read", false),
+    ),
+    // inference.write
+    (
+        "/openshell.inference.v1.Inference/SetClusterInference",
+        MethodPermission::new("inference.write", "inference:write", true),
+    ),
+];
+
+const UNKNOWN_METHOD_PERMISSION: MethodPermission =
+    MethodPermission::new("gateway.unknown", SCOPE_ALL, false);
+
+fn method_permission(method: &str) -> MethodPermission {
+    METHOD_PERMISSIONS
+        .iter()
+        .find(|(candidate, _)| *candidate == method)
+        .map_or(UNKNOWN_METHOD_PERMISSION, |(_, permission)| *permission)
+}
 
 /// Authorization policy configuration.
 ///
@@ -57,6 +262,11 @@ impl AuthzPolicy {
 }
 
 impl AuthzPolicy {
+    #[must_use]
+    pub(crate) fn requirement_for(method: &str) -> MethodPermission {
+        method_permission(method)
+    }
+
     /// Check whether the identity is authorized to call the given method.
     ///
     /// Returns `Ok(())` if authorized, `Err(PERMISSION_DENIED)` if not.
@@ -64,12 +274,11 @@ impl AuthzPolicy {
     /// (authentication-only mode for providers like GitHub).
     #[allow(clippy::result_large_err)]
     pub fn check(&self, identity: &Identity, method: &str) -> Result<(), Status> {
-        let required = match method_authz::required_role(method) {
-            Some(Role::Admin) => &self.admin_role,
-            // Default to user role for unknown methods, matching the
-            // pre-annotation behavior. The exhaustiveness test ensures
-            // every real RPC has an explicit declaration.
-            Some(Role::User) | None => &self.user_role,
+        let permission = method_permission(method);
+        let required = if permission.requires_admin {
+            &self.admin_role
+        } else {
+            &self.user_role
         };
 
         // Empty role name = skip role check for this level (auth-only mode).
@@ -84,31 +293,36 @@ impl AuthzPolicy {
             if !has_role {
                 debug!(
                     sub = %identity.subject,
+                    required_permission = permission.permission,
                     required_role = required,
                     user_roles = ?identity.roles,
                     method = method,
                     "authorization denied: missing role"
                 );
                 return Err(Status::permission_denied(format!(
-                    "role '{required}' required"
+                    "permission '{}' requires role '{required}'",
+                    permission.permission,
                 )));
             }
         }
 
         if self.scopes_enabled {
-            self.check_scope(identity, method)?;
+            Self::check_scope(identity, method, permission)?;
         }
 
         Ok(())
     }
 
-    #[allow(clippy::result_large_err, clippy::unused_self)]
-    fn check_scope(&self, identity: &Identity, method: &str) -> Result<(), Status> {
+    #[allow(clippy::result_large_err)]
+    fn check_scope(
+        identity: &Identity,
+        method: &str,
+        permission: MethodPermission,
+    ) -> Result<(), Status> {
         if identity.scopes.iter().any(|s| s == SCOPE_ALL) {
             return Ok(());
         }
-
-        let required_scope = method_authz::required_scope(method).unwrap_or(SCOPE_ALL);
+        let required_scope = permission.scope;
 
         if identity.scopes.iter().any(|s| s == required_scope) {
             return Ok(());
@@ -116,13 +330,15 @@ impl AuthzPolicy {
 
         debug!(
             sub = %identity.subject,
+            required_permission = permission.permission,
             required_scope = required_scope,
             user_scopes = ?identity.scopes,
             method = method,
             "authorization denied: missing scope"
         );
         Err(Status::permission_denied(format!(
-            "scope '{required_scope}' required"
+            "permission '{}' requires scope '{required_scope}'",
+            permission.permission,
         )))
     }
 }
@@ -546,5 +762,49 @@ mod tests {
                 .check(&id_without_scope, "/openshell.v1.OpenShell/ListSandboxes")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn method_permission_maps_sandbox_write_methods() {
+        let permission = method_permission("/openshell.v1.OpenShell/CreateSandbox");
+        assert_eq!(permission.permission, "sandbox.write");
+        assert_eq!(permission.scope, "sandbox:write");
+        assert!(!permission.requires_admin);
+    }
+
+    #[test]
+    fn method_permission_maps_admin_provider_writes() {
+        let permission = method_permission("/openshell.v1.OpenShell/CreateProvider");
+        assert_eq!(permission.permission, "provider.write");
+        assert_eq!(permission.scope, "provider:write");
+        assert!(permission.requires_admin);
+    }
+
+    #[test]
+    fn method_permission_falls_back_for_unknown_methods() {
+        let permission = method_permission("/openshell.v1.OpenShell/SomeFutureMethod");
+        assert_eq!(permission, UNKNOWN_METHOD_PERMISSION);
+    }
+
+    #[test]
+    fn denied_role_message_includes_permission_name() {
+        let id = identity_with_roles(&["openshell-user"]);
+        let policy = default_policy();
+        let err = policy
+            .check(&id, "/openshell.v1.OpenShell/CreateProvider")
+            .unwrap_err();
+        assert!(err.message().contains("provider.write"));
+        assert!(err.message().contains("openshell-admin"));
+    }
+
+    #[test]
+    fn denied_scope_message_includes_permission_name() {
+        let id = identity_with_roles_and_scopes(&["openshell-user"], &["sandbox:read"]);
+        let policy = scoped_policy();
+        let err = policy
+            .check(&id, "/openshell.v1.OpenShell/CreateSandbox")
+            .unwrap_err();
+        assert!(err.message().contains("sandbox.write"));
+        assert!(err.message().contains("sandbox:write"));
     }
 }

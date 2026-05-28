@@ -23,6 +23,8 @@ For how the CLI resolves gateways and stores credentials, refer to [Gateway Auth
 
 Set `server.oidc.issuer` to enable OIDC. The gateway validates the `Authorization: Bearer <token>` header on every request against the issuer's JWKS endpoint.
 
+OpenShell authorizes gateway requests from access-token claims. For Okta, that means the choice of authorization server matters. If you want to map Okta groups to OpenShell gateway roles, use an Okta custom authorization server that emits groups in access tokens. Okta's org authorization server can emit groups in ID tokens, but not in access tokens.
+
 ```shell
 helm upgrade openshell \
   oci://ghcr.io/nvidia/openshell/helm-chart \
@@ -73,6 +75,10 @@ Both `adminRole` and `userRole` must be set, or both must be empty. Setting only
 | Keycloak | `realm_access.roles` |
 | Microsoft Entra ID | `roles` |
 | Okta | `groups` |
+
+For Okta, pair `rolesClaim=groups` with a custom authorization server when you need gateway RBAC from group membership. If you also enable scope-based authorization, use `server.oidc.scopesClaim=scp`.
+
+For interactive CLI login against an Okta-backed gateway, register the CLI as an Okta native app and use Authorization Code with PKCE. When the gateway enforces scopes, the CLI must also request those scopes during login with `openshell gateway add --oidc-scopes "..."` or the resulting access token will authenticate successfully but still be denied for scoped methods.
 
 ## Reverse-Proxy Auth Termination
 

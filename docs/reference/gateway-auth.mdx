@@ -68,6 +68,10 @@ Gateways can validate OpenID Connect access tokens on gRPC requests. Configure O
 
 OIDC is application-layer authentication. TLS still controls the transport. If TLS client certificates remain required, the CLI must also have an mTLS bundle for the gateway.
 
+For Okta, pay attention to which authorization server issues the access token that the CLI sends to the gateway. OpenShell authorizes requests from access-token claims, not from the ID token. If you want to use Okta groups for gateway RBAC, use an Okta custom authorization server that includes the groups claim in access tokens. Okta's org authorization server can include groups in ID tokens, but not in access tokens.
+
+For interactive CLI login, register the OpenShell CLI as an Okta native app and use Authorization Code with PKCE. Web-app client settings and confidential-client flows are a different shape and are not the right fit for the local browser callback used by `openshell gateway login`.
+
 Configure the gateway with an issuer and audience:
 
 ```shell
@@ -90,6 +94,15 @@ The same settings are available through environment variables:
 | `OPENSHELL_OIDC_ADMIN_ROLE` | Role required for admin operations. | `openshell-admin` |
 | `OPENSHELL_OIDC_USER_ROLE` | Role required for standard user operations. | `openshell-user` |
 | `OPENSHELL_OIDC_SCOPES_CLAIM` | Dot-separated claim path containing scopes. Empty disables scope enforcement. | Empty |
+
+Provider-specific claim guidance:
+
+| Provider | `rolesClaim` | `scopesClaim` | Notes |
+|---|---|---|---|
+| Keycloak | `realm_access.roles` | `scope` | Default OpenShell examples use this shape. |
+| Microsoft Entra ID | `roles` | `scp` | `scp` is an array in access tokens. |
+| Okta custom authorization server | `groups` | `scp` | Recommended for OpenShell gateway RBAC. |
+| Okta org authorization server | `groups` | `scp` | Use only if you do not depend on groups in the access token. Okta doesn't include groups in org-server access tokens. |
 
 For Helm deployments, set the same values under `server.oidc`:
 
@@ -114,6 +127,17 @@ openshell gateway add https://gateway.example.com \
   --oidc-audience openshell-cli
 ```
 
+When the gateway enforces scope-based authorization, also tell the CLI which scopes to request during login:
+
+```shell
+openshell gateway add https://gateway.example.com \
+  --name production \
+  --oidc-issuer https://idp.example.com/realms/openshell \
+  --oidc-client-id openshell-cli \
+  --oidc-audience openshell-cli \
+  --oidc-scopes "config:write provider:write sandbox:write"
+```
+
 When you register or log in to an OIDC gateway, the CLI uses the Authorization Code flow with PKCE. It opens a browser, receives the authorization code on a localhost callback, exchanges the code for tokens, and stores the token bundle under the gateway credential directory. If `OPENSHELL_OIDC_CLIENT_SECRET` is set, the CLI uses the client credentials flow instead. Use that mode for CI and other non-interactive automation.
 
 The connection flow:
@@ -126,6 +150,8 @@ The connection flow:
 6. The gateway authorizes the gRPC method. Admin methods require the admin role, other authenticated methods require the user role. Admin role holders also satisfy user-role checks.
 
 If `OPENSHELL_OIDC_SCOPES_CLAIM` is set, the gateway also enforces scopes. It accepts space-delimited scope strings such as `scope: "openid sandbox:read"` and JSON arrays such as `scp: ["sandbox:read"]`. Standard OIDC scopes such as `openid`, `profile`, `email`, and `offline_access` are ignored for authorization. `openshell:all` grants access to all scoped methods.
+
+OpenShell treats roles and scopes as separate checks. For example, an admin-level config update can require both the `openshell-admin` role and the `config:write` scope in the same access token. If the token only carries the role, or only carries the scope, the gateway denies the request.
 
 Supervisor-to-gateway RPCs do not use user OIDC tokens or mTLS user identity. Each sandbox supervisor presents a gateway-minted `Authorization: Bearer` token scoped to its sandbox ID. On Kubernetes, the gateway mints that token only after TokenReview validates the projected ServiceAccount token, the pod UID matches the live pod, and the pod's controlling `Sandbox` ownerReference matches the live Sandbox CR. Log upload, policy status, credential environment lookup, inference bundle lookup, and sandbox config sync run with sandbox-restricted scope, while CLI users authenticate with OIDC, edge auth, local mTLS user authentication, or an explicitly enabled unauthenticated local developer mode. `GetInferenceBundle` returns route material that includes provider credentials, so it requires a sandbox principal; user callers manage inference configuration through the user-facing inference APIs instead.
 

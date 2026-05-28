@@ -1741,6 +1741,11 @@ async fn handle_update_config_inner(
             );
         }
         info!(
+            actor_kind = principal.as_ref().map_or("unknown", Principal::audit_actor_kind),
+            actor_subject = principal
+                .as_ref()
+                .map_or("unknown", Principal::audit_actor_subject),
+            actor_display = principal.as_ref().and_then(Principal::audit_actor_display),
             sandbox_id = %sandbox_id,
             version,
             policy_hash = %hash,
@@ -1800,6 +1805,11 @@ async fn handle_update_config_inner(
             .await
             .map_err(|e| super::persistence_error_to_status(e, "backfill spec.policy"))?;
         info!(
+            actor_kind = principal.as_ref().map_or("unknown", Principal::audit_actor_kind),
+            actor_subject = principal
+                .as_ref()
+                .map_or("unknown", Principal::audit_actor_subject),
+            actor_display = principal.as_ref().and_then(Principal::audit_actor_display),
             sandbox_id = %sandbox_id,
             "UpdateConfig: backfilled spec.policy from sandbox-discovered policy"
         );
@@ -1842,6 +1852,11 @@ async fn handle_update_config_inner(
     state.sandbox_watch_bus.notify(&sandbox_id);
 
     info!(
+        actor_kind = principal.as_ref().map_or("unknown", Principal::audit_actor_kind),
+        actor_subject = principal
+            .as_ref()
+            .map_or("unknown", Principal::audit_actor_subject),
+        actor_display = principal.as_ref().and_then(Principal::audit_actor_display),
         sandbox_id = %sandbox_id,
         version = next_version,
         policy_hash = %hash,

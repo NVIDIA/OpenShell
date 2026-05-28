@@ -331,12 +331,13 @@ impl JwksCache {
         })?;
 
         let mut claims = token_data.claims;
-        claims.extract_roles(&self.config.roles_claim);
+        claims.extract_roles(self.config.effective_roles_claim());
 
-        let scopes = if self.config.scopes_claim.is_empty() {
+        let scopes_claim = self.config.effective_scopes_claim();
+        let scopes = if scopes_claim.is_empty() {
             vec![]
         } else {
-            claims.extract_scopes(&self.config.scopes_claim)
+            claims.extract_scopes(scopes_claim)
         };
 
         Ok(Identity {
@@ -388,6 +389,7 @@ impl Authenticator for OidcAuthenticator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openshell_core::OidcProviderProfile;
 
     #[test]
     fn health_is_unauthenticated() {
@@ -509,5 +511,53 @@ mod tests {
         let claims: OidcClaims = serde_json::from_value(json).unwrap();
         let scopes = claims.extract_scopes("scope");
         assert!(scopes.is_empty());
+    }
+
+    #[test]
+    fn okta_workforce_profile_prefers_groups_and_scp_defaults() {
+        let config = OidcConfig {
+            issuer: "https://example.okta.com/oauth2/default".to_string(),
+            audience: "openshell-cli".to_string(),
+            provider_profile: OidcProviderProfile::OktaWorkforce,
+            jwks_ttl_secs: 3600,
+            roles_claim: "realm_access.roles".to_string(),
+            admin_role: "openshell-admin".to_string(),
+            user_role: "openshell-user".to_string(),
+            scopes_claim: String::new(),
+        };
+        let json = serde_json::json!({
+            "sub": "user1",
+            "groups": ["openshell-admin"],
+            "scp": ["openid", "sandbox:write", "provider:read"],
+            "realm_access": { "roles": ["ignored-role"] }
+        });
+        let mut claims: OidcClaims = serde_json::from_value(json).unwrap();
+        claims.extract_roles(config.effective_roles_claim());
+        let scopes = claims.extract_scopes(config.effective_scopes_claim());
+        assert_eq!(claims.roles, vec!["openshell-admin"]);
+        assert_eq!(scopes, vec!["sandbox:write", "provider:read"]);
+    }
+
+    #[test]
+    fn generic_profile_keeps_explicit_claim_settings() {
+        let config = OidcConfig {
+            issuer: "https://example.okta.com/oauth2/default".to_string(),
+            audience: "openshell-cli".to_string(),
+            provider_profile: OidcProviderProfile::Generic,
+            jwks_ttl_secs: 3600,
+            roles_claim: "realm_access.roles".to_string(),
+            admin_role: "openshell-admin".to_string(),
+            user_role: "openshell-user".to_string(),
+            scopes_claim: String::new(),
+        };
+        let json = serde_json::json!({
+            "sub": "user1",
+            "groups": ["openshell-admin"],
+            "realm_access": { "roles": ["kept-role"] }
+        });
+        let mut claims: OidcClaims = serde_json::from_value(json).unwrap();
+        claims.extract_roles(config.effective_roles_claim());
+        assert_eq!(claims.roles, vec!["kept-role"]);
+        assert!(config.effective_scopes_claim().is_empty());
     }
 }

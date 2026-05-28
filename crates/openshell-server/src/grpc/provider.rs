@@ -14,7 +14,7 @@ use openshell_core::telemetry::{
 };
 use prost::Message;
 use tonic::Status;
-use tracing::warn;
+use tracing::{info, warn};
 
 use super::validation::validate_provider_fields;
 use super::{
@@ -689,6 +689,7 @@ impl ObjectType for Provider {
 // ---------------------------------------------------------------------------
 
 use crate::ServerState;
+use crate::auth::principal::Principal;
 use openshell_core::proto::{
     ConfigureProviderRefreshRequest, ConfigureProviderRefreshResponse, CreateProviderRequest,
     DeleteProviderProfileRequest, DeleteProviderProfileResponse, DeleteProviderRefreshRequest,
@@ -713,6 +714,7 @@ pub(super) async fn handle_create_provider(
     state: &Arc<ServerState>,
     request: Request<CreateProviderRequest>,
 ) -> Result<Response<ProviderResponse>, Status> {
+    let principal = request.extensions().get::<Principal>().cloned();
     let req = request.into_inner();
     let Some(provider) = req.provider else {
         emit_provider_lifecycle(
@@ -730,6 +732,16 @@ pub(super) async fn handle_create_provider(
                 &provider.r#type,
                 LifecycleOperation::Create,
                 TelemetryOutcome::Success,
+            );
+            info!(
+                actor_kind = principal.as_ref().map_or("unknown", Principal::audit_actor_kind),
+                actor_subject = principal
+                    .as_ref()
+                    .map_or("unknown", Principal::audit_actor_subject),
+                actor_display = principal.as_ref().and_then(Principal::audit_actor_display),
+                provider_name = provider.object_name(),
+                provider_type = %provider.r#type,
+                "CreateProvider request completed successfully"
             );
             Ok(Response::new(ProviderResponse {
                 provider: Some(provider),
@@ -1158,6 +1170,7 @@ pub(super) async fn handle_update_provider(
     state: &Arc<ServerState>,
     request: Request<UpdateProviderRequest>,
 ) -> Result<Response<ProviderResponse>, Status> {
+    let principal = request.extensions().get::<Principal>().cloned();
     let req = request.into_inner();
     let Some(mut provider) = req.provider else {
         emit_provider_lifecycle(
@@ -1178,6 +1191,16 @@ pub(super) async fn handle_update_provider(
                 &provider.r#type,
                 LifecycleOperation::Update,
                 TelemetryOutcome::Success,
+            );
+            info!(
+                actor_kind = principal.as_ref().map_or("unknown", Principal::audit_actor_kind),
+                actor_subject = principal
+                    .as_ref()
+                    .map_or("unknown", Principal::audit_actor_subject),
+                actor_display = principal.as_ref().and_then(Principal::audit_actor_display),
+                provider_name = provider.object_name(),
+                provider_type = %provider.r#type,
+                "UpdateProvider request completed successfully"
             );
             Ok(Response::new(ProviderResponse {
                 provider: Some(provider),
@@ -1238,6 +1261,7 @@ pub(super) async fn handle_configure_provider_refresh(
     state: &Arc<ServerState>,
     request: Request<ConfigureProviderRefreshRequest>,
 ) -> Result<Response<ConfigureProviderRefreshResponse>, Status> {
+    let principal = request.extensions().get::<Principal>().cloned();
     let request = request.into_inner();
     let provider_name = request.provider.trim();
     let credential_key = request.credential_key.trim();
@@ -1425,6 +1449,20 @@ pub(super) async fn handle_configure_provider_refresh(
         update_provider_record(state.store.as_ref(), updated).await?;
     }
 
+    info!(
+        actor_kind = principal
+            .as_ref()
+            .map_or("unknown", Principal::audit_actor_kind),
+        actor_subject = principal
+            .as_ref()
+            .map_or("unknown", Principal::audit_actor_subject),
+        actor_display = principal.as_ref().and_then(Principal::audit_actor_display),
+        provider_name,
+        credential_key,
+        strategy = crate::provider_refresh::refresh_strategy_name(strategy as i32),
+        "ConfigureProviderRefresh request completed successfully"
+    );
+
     Ok(Response::new(ConfigureProviderRefreshResponse {
         status: Some(crate::provider_refresh::refresh_status_from_state(
             &state_record,
@@ -1436,6 +1474,7 @@ pub(super) async fn handle_rotate_provider_credential(
     state: &Arc<ServerState>,
     request: Request<RotateProviderCredentialRequest>,
 ) -> Result<Response<RotateProviderCredentialResponse>, Status> {
+    let principal = request.extensions().get::<Principal>().cloned();
     let request = request.into_inner();
     let provider_name = request.provider.trim();
     let credential_key = request.credential_key.trim();
@@ -1452,6 +1491,19 @@ pub(super) async fn handle_rotate_provider_credential(
     )
     .await?;
 
+    info!(
+        actor_kind = principal
+            .as_ref()
+            .map_or("unknown", Principal::audit_actor_kind),
+        actor_subject = principal
+            .as_ref()
+            .map_or("unknown", Principal::audit_actor_subject),
+        actor_display = principal.as_ref().and_then(Principal::audit_actor_display),
+        provider_name,
+        credential_key,
+        "RotateProviderCredential request completed successfully"
+    );
+
     Ok(Response::new(RotateProviderCredentialResponse {
         status: Some(crate::provider_refresh::refresh_status_from_state(
             &refresh_state,
@@ -1463,6 +1515,7 @@ pub(super) async fn handle_delete_provider_refresh(
     state: &Arc<ServerState>,
     request: Request<DeleteProviderRefreshRequest>,
 ) -> Result<Response<DeleteProviderRefreshResponse>, Status> {
+    let principal = request.extensions().get::<Principal>().cloned();
     let request = request.into_inner();
     let provider_name = request.provider.trim();
     let credential_key = request.credential_key.trim();
@@ -1520,6 +1573,20 @@ pub(super) async fn handle_delete_provider_refresh(
         update_provider_record(state.store.as_ref(), updated).await?;
     }
 
+    info!(
+        actor_kind = principal
+            .as_ref()
+            .map_or("unknown", Principal::audit_actor_kind),
+        actor_subject = principal
+            .as_ref()
+            .map_or("unknown", Principal::audit_actor_subject),
+        actor_display = principal.as_ref().and_then(Principal::audit_actor_display),
+        provider_name,
+        credential_key,
+        deleted = deleted_refresh_state,
+        "DeleteProviderRefresh request completed successfully"
+    );
+
     Ok(Response::new(DeleteProviderRefreshResponse {
         deleted: deleted_refresh_state,
     }))
@@ -1529,6 +1596,7 @@ pub(super) async fn handle_delete_provider(
     state: &Arc<ServerState>,
     request: Request<DeleteProviderRequest>,
 ) -> Result<Response<DeleteProviderResponse>, Status> {
+    let principal = request.extensions().get::<Principal>().cloned();
     let name = request.into_inner().name;
     let provider_profile = provider_profile_for_name(state.store.as_ref(), &name).await;
     let result = delete_provider_record(state.store.as_ref(), &name).await;
@@ -1539,6 +1607,16 @@ pub(super) async fn handle_delete_provider(
                 provider_profile.unwrap_or(TelemetryProviderProfile::Custom),
                 LifecycleOperation::Delete,
                 outcome,
+            );
+            info!(
+                actor_kind = principal.as_ref().map_or("unknown", Principal::audit_actor_kind),
+                actor_subject = principal
+                    .as_ref()
+                    .map_or("unknown", Principal::audit_actor_subject),
+                actor_display = principal.as_ref().and_then(Principal::audit_actor_display),
+                provider_name = %name,
+                deleted,
+                "DeleteProvider request completed successfully"
             );
             Ok(Response::new(DeleteProviderResponse { deleted }))
         }

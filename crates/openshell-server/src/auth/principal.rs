@@ -76,3 +76,70 @@ pub enum SandboxIdentitySource {
     /// via `IssueSandboxToken`. Populated only on that one RPC path.
     K8sServiceAccount { pod_name: String, pod_uid: String },
 }
+
+impl Principal {
+    /// Stable actor kind for gateway audit logs.
+    #[must_use]
+    pub const fn audit_actor_kind(&self) -> &'static str {
+        match self {
+            Self::User(_) => "user",
+            Self::Sandbox(_) => "sandbox",
+            Self::Anonymous => "anonymous",
+        }
+    }
+
+    /// Stable actor subject for gateway audit logs.
+    #[must_use]
+    pub fn audit_actor_subject(&self) -> &str {
+        match self {
+            Self::User(user) => &user.identity.subject,
+            Self::Sandbox(sandbox) => &sandbox.sandbox_id,
+            Self::Anonymous => "anonymous",
+        }
+    }
+
+    /// Optional human-readable actor display for gateway audit logs.
+    #[must_use]
+    pub fn audit_actor_display(&self) -> Option<&str> {
+        match self {
+            Self::User(user) => user.identity.display_name.as_deref(),
+            Self::Sandbox(_) | Self::Anonymous => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::identity::{Identity, IdentityProvider};
+
+    #[test]
+    fn user_principal_formats_audit_actor_fields() {
+        let principal = Principal::User(UserPrincipal {
+            identity: Identity {
+                subject: "user-123".to_string(),
+                display_name: Some("alice".to_string()),
+                roles: vec!["openshell-user".to_string()],
+                scopes: vec![],
+                provider: IdentityProvider::Oidc,
+            },
+        });
+        assert_eq!(principal.audit_actor_kind(), "user");
+        assert_eq!(principal.audit_actor_subject(), "user-123");
+        assert_eq!(principal.audit_actor_display(), Some("alice"));
+    }
+
+    #[test]
+    fn sandbox_principal_formats_audit_actor_fields() {
+        let principal = Principal::Sandbox(SandboxPrincipal {
+            sandbox_id: "sandbox-123".to_string(),
+            source: SandboxIdentitySource::BootstrapJwt {
+                issuer: "openshell-gateway:test".to_string(),
+            },
+            trust_domain: Some("openshell".to_string()),
+        });
+        assert_eq!(principal.audit_actor_kind(), "sandbox");
+        assert_eq!(principal.audit_actor_subject(), "sandbox-123");
+        assert_eq!(principal.audit_actor_display(), None);
+    }
+}

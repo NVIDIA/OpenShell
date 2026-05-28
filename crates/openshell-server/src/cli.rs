@@ -6,8 +6,8 @@
 use clap::parser::ValueSource;
 use clap::{ArgAction, ArgMatches, Command, CommandFactory, FromArgMatches, Parser};
 use miette::{IntoDiagnostic, Result};
-use openshell_core::ComputeDriverKind;
 use openshell_core::config::DEFAULT_SERVER_PORT;
+use openshell_core::{ComputeDriverKind, OidcProviderProfile};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use tracing::{info, warn};
@@ -140,12 +140,23 @@ struct RunArgs {
     #[arg(long, env = "OPENSHELL_OIDC_AUDIENCE", default_value = "openshell-cli")]
     oidc_audience: String,
 
+    /// OIDC provider profile preset for provider-specific claim layouts.
+    #[arg(
+        long,
+        env = "OPENSHELL_OIDC_PROVIDER_PROFILE",
+        default_value = "generic",
+        value_parser = parse_oidc_provider_profile
+    )]
+    oidc_provider_profile: OidcProviderProfile,
+
     /// JWKS key cache TTL in seconds.
     #[arg(long, env = "OPENSHELL_OIDC_JWKS_TTL", default_value_t = 3600)]
     oidc_jwks_ttl: u64,
 
     /// Dot-separated path to the roles array in the JWT claims.
     /// Keycloak: `realm_access.roles` (default). Entra ID: "roles". Okta: "groups".
+    /// For Okta group-based RBAC, prefer a custom authorization server so
+    /// the groups claim is available in access tokens.
     #[arg(
         long,
         env = "OPENSHELL_OIDC_ROLES_CLAIM",
@@ -171,7 +182,7 @@ struct RunArgs {
 
     /// Dot-separated path to the scopes value in the JWT claims.
     /// When set, the server enforces scope-based permissions on top of roles.
-    /// Keycloak: "scope". Okta: "scp". Leave empty to disable scope enforcement.
+    /// Keycloak: "scope". Entra ID / Okta: "scp". Leave empty to disable scope enforcement.
     #[arg(long, env = "OPENSHELL_OIDC_SCOPES_CLAIM", default_value = "")]
     oidc_scopes_claim: String,
 
@@ -367,6 +378,7 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
         config = config.with_oidc(openshell_core::OidcConfig {
             issuer,
             audience: args.oidc_audience.clone(),
+            provider_profile: args.oidc_provider_profile,
             jwks_ttl_secs: args.oidc_jwks_ttl,
             roles_claim: args.oidc_roles_claim.clone(),
             admin_role: args.oidc_admin_role.clone(),
@@ -442,6 +454,10 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
 }
 
 fn parse_compute_driver(value: &str) -> std::result::Result<ComputeDriverKind, String> {
+    value.parse()
+}
+
+fn parse_oidc_provider_profile(value: &str) -> std::result::Result<OidcProviderProfile, String> {
     value.parse()
 }
 
@@ -592,6 +608,9 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
         if arg_defaulted(matches, "oidc_audience") {
             args.oidc_audience.clone_from(&oidc.audience);
         }
+        if arg_defaulted(matches, "oidc_provider_profile") {
+            args.oidc_provider_profile = oidc.provider_profile;
+        }
         if arg_defaulted(matches, "oidc_jwks_ttl") {
             args.oidc_jwks_ttl = oidc.jwks_ttl_secs;
         }
@@ -726,6 +745,7 @@ mod tests {
     use super::{Cli, command};
     use crate::TEST_ENV_LOCK as ENV_LOCK;
     use clap::Parser;
+    use openshell_core::OidcProviderProfile;
     use std::net::{IpAddr, Ipv4Addr};
 
     struct EnvVarGuard {
@@ -1271,6 +1291,7 @@ log_level = "debug"
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _g1 = EnvVarGuard::remove("OPENSHELL_OIDC_ISSUER");
         let _g2 = EnvVarGuard::remove("OPENSHELL_OIDC_AUDIENCE");
+        let _g3 = EnvVarGuard::remove("OPENSHELL_OIDC_PROVIDER_PROFILE");
 
         let (mut args, matches) =
             parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
@@ -1279,12 +1300,17 @@ log_level = "debug"
 [openshell.gateway.oidc]
 issuer = "https://idp.example.com"
 audience = "openshell-cli"
+provider_profile = "okta-workforce"
 "#,
         );
         merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
 
         assert_eq!(args.oidc_issuer.as_deref(), Some("https://idp.example.com"));
         assert_eq!(args.oidc_audience, "openshell-cli");
+        assert_eq!(
+            args.oidc_provider_profile,
+            OidcProviderProfile::OktaWorkforce
+        );
     }
 
     #[test]

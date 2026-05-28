@@ -88,6 +88,47 @@ impl FromStr for ComputeDriverKind {
     }
 }
 
+/// OIDC provider profile presets for common issuer-specific claim layouts.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum OidcProviderProfile {
+    /// Generic OIDC provider. Use explicit claim paths when defaults don't fit.
+    #[default]
+    Generic,
+    /// Okta Workforce identity using access tokens from a custom authorization server.
+    OktaWorkforce,
+}
+
+impl OidcProviderProfile {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Generic => "generic",
+            Self::OktaWorkforce => "okta-workforce",
+        }
+    }
+}
+
+impl fmt::Display for OidcProviderProfile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for OidcProviderProfile {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "generic" => Ok(Self::Generic),
+            "okta-workforce" => Ok(Self::OktaWorkforce),
+            other => Err(format!(
+                "unsupported OIDC provider profile '{other}'. expected one of: generic, okta-workforce"
+            )),
+        }
+    }
+}
+
 /// Auto-detect the appropriate compute driver based on the runtime environment.
 ///
 /// Priority order: Kubernetes → Podman → Docker.
@@ -307,6 +348,10 @@ pub struct OidcConfig {
     /// Expected audience (`aud`) claim. Typically the OIDC client ID.
     pub audience: String,
 
+    /// Optional provider-specific claim preset.
+    #[serde(default)]
+    pub provider_profile: OidcProviderProfile,
+
     /// JWKS cache TTL in seconds. Defaults to 3600 (1 hour).
     #[serde(default = "default_jwks_ttl_secs")]
     pub jwks_ttl_secs: u64,
@@ -330,6 +375,104 @@ pub struct OidcConfig {
     /// Keycloak: `scope` (space-delimited string). Okta: `scp` (JSON array).
     #[serde(default)]
     pub scopes_claim: String,
+}
+
+impl OidcConfig {
+    /// Effective roles claim after applying provider profile defaults.
+    #[must_use]
+    pub fn effective_roles_claim(&self) -> &str {
+        match self.provider_profile {
+            OidcProviderProfile::OktaWorkforce if self.roles_claim == default_roles_claim() => {
+                "groups"
+            }
+            _ => self.roles_claim.as_str(),
+        }
+    }
+
+    /// Effective scopes claim after applying provider profile defaults.
+    #[must_use]
+    pub fn effective_scopes_claim(&self) -> &str {
+        match self.provider_profile {
+            OidcProviderProfile::OktaWorkforce if self.scopes_claim.is_empty() => "scp",
+            _ => self.scopes_claim.as_str(),
+        }
+    }
+
+    /// Return startup validation errors for OIDC configurations that are
+    /// incompatible with the selected provider profile.
+    #[must_use]
+    pub fn startup_errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+
+        if self.provider_profile == OidcProviderProfile::OktaWorkforce
+            && self.is_okta_org_authorization_server()
+        {
+            errors.push(
+                "OIDC provider_profile='okta-workforce' requires an Okta custom authorization server issuer (for example `https://example.okta.com/oauth2/default`). Okta org authorization server access tokens are not suitable for OpenShell gateway RBAC."
+                    .to_string(),
+            );
+        }
+
+        errors
+    }
+
+    /// Return advisory startup warnings for OIDC configurations that are valid
+    /// but likely surprising in practice.
+    #[must_use]
+    pub fn advisory_warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        let effective_roles_claim = self.effective_roles_claim();
+        let effective_scopes_claim = self.effective_scopes_claim();
+
+        if self.is_okta_issuer() {
+            if self.provider_profile == OidcProviderProfile::Generic
+                && self.roles_claim == default_roles_claim()
+                && self.scopes_claim.is_empty()
+            {
+                warnings.push(
+                    "Okta issuer detected with the generic OIDC provider profile and default claim settings. Consider provider_profile='okta-workforce' so OpenShell defaults to Okta-friendly access-token claims (`groups` and `scp`)."
+                        .to_string(),
+                );
+            }
+
+            if self.is_okta_org_authorization_server() {
+                warnings.push(
+                    "Okta issuer appears to be the org authorization server. OpenShell validates access tokens as a resource server; Okta org authorization server access tokens are intended for Okta APIs and aren't recommended for third-party resource-server validation. Prefer an Okta custom authorization server."
+                        .to_string(),
+                );
+            }
+
+            if effective_roles_claim == "groups" && self.is_okta_org_authorization_server() {
+                warnings.push(
+                    "Okta issuer appears to be the org authorization server while roles_claim=groups. OpenShell authorizes from access-token claims; Okta org authorization servers do not emit groups in access tokens. Use an Okta custom authorization server for group-based RBAC."
+                        .to_string(),
+                );
+            }
+
+            if effective_roles_claim == "realm_access.roles" {
+                warnings.push(
+                    "Okta issuer detected but roles_claim is still set to 'realm_access.roles', which is the OpenShell default for Keycloak. Okta gateway RBAC usually uses 'groups' or another custom access-token claim from an Okta custom authorization server."
+                        .to_string(),
+                );
+            }
+
+            if !effective_scopes_claim.is_empty() && effective_scopes_claim != "scp" {
+                warnings.push(format!(
+                    "Okta issuer detected but scopes_claim is set to '{effective_scopes_claim}'. Okta access tokens typically expose OAuth scopes via the 'scp' claim."
+                ));
+            }
+        }
+
+        warnings
+    }
+
+    fn is_okta_issuer(&self) -> bool {
+        self.issuer.contains(".okta.com") || self.issuer.contains(".oktapreview.com")
+    }
+
+    fn is_okta_org_authorization_server(&self) -> bool {
+        self.is_okta_issuer() && !self.issuer.contains("/oauth2/")
+    }
 }
 
 /// mTLS user authentication for local, single-user gateways.
@@ -598,8 +741,8 @@ const fn default_ssh_session_ttl_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ComputeDriverKind, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, detect_driver,
-        docker_host_unix_socket_path, is_unix_socket,
+        ComputeDriverKind, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, OidcConfig, OidcProviderProfile,
+        default_roles_claim, detect_driver, docker_host_unix_socket_path, is_unix_socket,
     };
     use std::net::SocketAddr;
     #[cfg(unix)]
@@ -701,6 +844,137 @@ mod tests {
         let addr: SocketAddr = "0.0.0.0:9090".parse().expect("valid address");
         let cfg = Config::new(None).with_health_bind_address(addr);
         assert_eq!(cfg.health_bind_address, Some(addr));
+    }
+
+    #[test]
+    fn oidc_advisory_warnings_flag_okta_org_server_groups_claim() {
+        let cfg = OidcConfig {
+            issuer: "https://example.okta.com".to_string(),
+            audience: "openshell-cli".to_string(),
+            provider_profile: OidcProviderProfile::Generic,
+            jwks_ttl_secs: 3600,
+            roles_claim: "groups".to_string(),
+            admin_role: "openshell-admin".to_string(),
+            user_role: "openshell-user".to_string(),
+            scopes_claim: String::new(),
+        };
+        let warnings = cfg.advisory_warnings();
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings.iter().any(|w| w.contains("resource server")));
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("groups in access tokens"))
+        );
+    }
+
+    #[test]
+    fn oidc_advisory_warnings_accept_okta_custom_server_groups_claim() {
+        let cfg = OidcConfig {
+            issuer: "https://example.okta.com/oauth2/default".to_string(),
+            audience: "openshell-cli".to_string(),
+            provider_profile: OidcProviderProfile::Generic,
+            jwks_ttl_secs: 3600,
+            roles_claim: "groups".to_string(),
+            admin_role: "openshell-admin".to_string(),
+            user_role: "openshell-user".to_string(),
+            scopes_claim: "scp".to_string(),
+        };
+        assert!(cfg.advisory_warnings().is_empty());
+    }
+
+    #[test]
+    fn oidc_advisory_warnings_flag_okta_default_keycloak_roles_claim() {
+        let cfg = OidcConfig {
+            issuer: "https://example.okta.com/oauth2/default".to_string(),
+            audience: "openshell-cli".to_string(),
+            provider_profile: OidcProviderProfile::Generic,
+            jwks_ttl_secs: 3600,
+            roles_claim: "realm_access.roles".to_string(),
+            admin_role: "openshell-admin".to_string(),
+            user_role: "openshell-user".to_string(),
+            scopes_claim: String::new(),
+        };
+        let warnings = cfg.advisory_warnings();
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings.iter().any(|w| w.contains("realm_access.roles")));
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("provider_profile='okta-workforce'"))
+        );
+    }
+
+    #[test]
+    fn oidc_advisory_warnings_flag_okta_nonstandard_scopes_claim() {
+        let cfg = OidcConfig {
+            issuer: "https://example.okta.com/oauth2/default".to_string(),
+            audience: "openshell-cli".to_string(),
+            provider_profile: OidcProviderProfile::Generic,
+            jwks_ttl_secs: 3600,
+            roles_claim: "groups".to_string(),
+            admin_role: "openshell-admin".to_string(),
+            user_role: "openshell-user".to_string(),
+            scopes_claim: "scope".to_string(),
+        };
+        let warnings = cfg.advisory_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("'scp'"));
+    }
+
+    #[test]
+    fn okta_workforce_profile_supplies_effective_claim_defaults() {
+        let cfg = OidcConfig {
+            issuer: "https://example.okta.com/oauth2/default".to_string(),
+            audience: "openshell-cli".to_string(),
+            provider_profile: OidcProviderProfile::OktaWorkforce,
+            jwks_ttl_secs: 3600,
+            roles_claim: default_roles_claim(),
+            admin_role: "openshell-admin".to_string(),
+            user_role: "openshell-user".to_string(),
+            scopes_claim: String::new(),
+        };
+        assert_eq!(cfg.effective_roles_claim(), "groups");
+        assert_eq!(cfg.effective_scopes_claim(), "scp");
+        assert!(cfg.startup_errors().is_empty());
+        assert!(cfg.advisory_warnings().is_empty());
+    }
+
+    #[test]
+    fn generic_okta_profile_with_default_claims_suggests_okta_workforce_profile() {
+        let cfg = OidcConfig {
+            issuer: "https://example.okta.com/oauth2/default".to_string(),
+            audience: "openshell-cli".to_string(),
+            provider_profile: OidcProviderProfile::Generic,
+            jwks_ttl_secs: 3600,
+            roles_claim: default_roles_claim(),
+            admin_role: "openshell-admin".to_string(),
+            user_role: "openshell-user".to_string(),
+            scopes_claim: String::new(),
+        };
+        let warnings = cfg.advisory_warnings();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("provider_profile='okta-workforce'"))
+        );
+    }
+
+    #[test]
+    fn okta_workforce_profile_rejects_org_authorization_server() {
+        let cfg = OidcConfig {
+            issuer: "https://example.okta.com".to_string(),
+            audience: "openshell-cli".to_string(),
+            provider_profile: OidcProviderProfile::OktaWorkforce,
+            jwks_ttl_secs: 3600,
+            roles_claim: default_roles_claim(),
+            admin_role: "openshell-admin".to_string(),
+            user_role: "openshell-user".to_string(),
+            scopes_claim: String::new(),
+        };
+        let errors = cfg.startup_errors();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("custom authorization server issuer"));
     }
 
     #[test]

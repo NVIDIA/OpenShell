@@ -206,11 +206,14 @@ pub async fn run_server(
     let store = Arc::new(Store::connect(database_url).await?);
 
     let oidc_cache = if let Some(ref oidc) = config.oidc {
+        if let Some(error) = oidc.startup_errors().into_iter().next() {
+            return Err(Error::config(error));
+        }
         // Validate RBAC configuration before starting.
         let policy = auth::authz::AuthzPolicy {
             admin_role: oidc.admin_role.clone(),
             user_role: oidc.user_role.clone(),
-            scopes_enabled: !oidc.scopes_claim.is_empty(),
+            scopes_enabled: !oidc.effective_scopes_claim().is_empty(),
         };
         policy.validate().map_err(Error::config)?;
 
@@ -218,6 +221,9 @@ pub async fn run_server(
             .await
             .map_err(|e| Error::config(format!("OIDC initialization failed: {e}")))?;
         info!("OIDC JWT validation enabled (issuer: {})", oidc.issuer);
+        for warning in oidc.advisory_warnings() {
+            warn!(issuer = %oidc.issuer, "{warning}");
+        }
         Some(Arc::new(cache))
     } else {
         None
