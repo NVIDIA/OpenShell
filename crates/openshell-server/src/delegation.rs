@@ -24,6 +24,7 @@ pub fn binding_name(sandbox_id: &str) -> String {
     format!("sandbox-delegation-{sandbox_id}")
 }
 
+#[allow(clippy::result_large_err)]
 pub fn new_binding(
     sandbox: &Sandbox,
     subject: &str,

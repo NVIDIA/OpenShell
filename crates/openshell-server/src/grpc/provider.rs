@@ -8,6 +8,9 @@
 use crate::persistence::{
     ObjectId, ObjectLabels, ObjectName, ObjectType, Store, WriteCondition, generate_name,
 };
+use crate::auth::identity::IdentityProvider;
+use crate::auth::oidc::RawBearerToken;
+use crate::auth::principal::Principal;
 use openshell_core::proto::{Provider, Sandbox};
 use openshell_core::telemetry::{
     LifecycleOperation, ProviderProfile as TelemetryProviderProfile, TelemetryOutcome,
@@ -1238,6 +1241,8 @@ pub(super) async fn handle_configure_provider_refresh(
     state: &Arc<ServerState>,
     request: Request<ConfigureProviderRefreshRequest>,
 ) -> Result<Response<ConfigureProviderRefreshResponse>, Status> {
+    let principal = request.extensions().get::<Principal>().cloned();
+    let raw_bearer_token = request.extensions().get::<RawBearerToken>().cloned();
     let request = request.into_inner();
     let provider_name = request.provider.trim();
     let credential_key = request.credential_key.trim();
@@ -1379,6 +1384,7 @@ pub(super) async fn handle_configure_provider_refresh(
         credential_key,
     )
     .await?;
+    let sandbox_id_for_binding = request.material.get("sandbox_id").cloned();
     let expires_at_ms = request.expires_at_ms.unwrap_or_else(|| {
         existing_refresh_state
             .as_ref()
@@ -1404,6 +1410,29 @@ pub(super) async fn handle_configure_provider_refresh(
         state_record.last_refresh_at_ms = existing.last_refresh_at_ms;
     }
     crate::provider_refresh::put_refresh_state(state.store.as_ref(), &state_record).await?;
+
+    if strategy == ProviderCredentialRefreshStrategy::Oauth2TokenExchange
+        && let (Some(Principal::User(user)), Some(raw)) =
+            (principal.as_ref(), raw_bearer_token.as_ref())
+        && user.identity.provider == IdentityProvider::Oidc
+        && let Some(sandbox_id) = sandbox_id_for_binding.as_deref().map(str::trim)
+        && !sandbox_id.is_empty()
+        && let Some(sandbox) = state
+            .store
+            .get_message::<Sandbox>(sandbox_id)
+            .await
+            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+    {
+        let binding = crate::delegation::new_binding(
+            &sandbox,
+            &user.identity.subject,
+            user.identity.display_name.as_deref(),
+            "oidc",
+            &raw.0,
+            &user.identity.scopes,
+        )?;
+        crate::delegation::put_binding(state.store.as_ref(), &binding).await?;
+    }
 
     if let Some(expires_at_ms) = request.expires_at_ms {
         let updated = Provider {

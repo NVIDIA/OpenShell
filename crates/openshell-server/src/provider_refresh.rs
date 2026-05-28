@@ -471,18 +471,19 @@ async fn mint_oauth2_refresh_token(
     let refresh_token = required_material(&state.material, "refresh_token")?;
     let mut form = vec![
         ("grant_type".to_string(), "refresh_token".to_string()),
-        ("client_id".to_string(), client_id),
         ("refresh_token".to_string(), refresh_token),
     ];
-    if let Some(client_secret) = material_value(&state.material, &["client_secret"]) {
-        form.push(("client_secret".to_string(), client_secret));
+    let basic_auth = material_value(&state.material, &["client_secret"])
+        .map(|client_secret| (client_id.clone(), client_secret));
+    if basic_auth.is_none() {
+        form.push(("client_id".to_string(), client_id));
     }
     let scope = refresh_scopes(state).join(" ");
     if !scope.is_empty() {
         form.push(("scope".to_string(), scope));
     }
 
-    request_token(&token_url, &form, state.max_lifetime_seconds).await
+    request_token(&token_url, &form, basic_auth, state.max_lifetime_seconds).await
 }
 
 async fn mint_oauth2_token_exchange(
@@ -505,7 +506,6 @@ async fn mint_oauth2_token_exchange(
             "grant_type".to_string(),
             "urn:ietf:params:oauth:grant-type:token-exchange".to_string(),
         ),
-        ("client_id".to_string(), client_id),
         ("subject_token".to_string(), binding.access_token),
         (
             "subject_token_type".to_string(),
@@ -516,8 +516,10 @@ async fn mint_oauth2_token_exchange(
             "urn:ietf:params:oauth:token-type:access_token".to_string(),
         ),
     ];
-    if let Some(client_secret) = material_value(&state.material, &["client_secret"]) {
-        form.push(("client_secret".to_string(), client_secret));
+    let basic_auth = material_value(&state.material, &["client_secret"])
+        .map(|client_secret| (client_id.clone(), client_secret));
+    if basic_auth.is_none() {
+        form.push(("client_id".to_string(), client_id));
     }
     if let Some(audience) = material_value(&state.material, &["audience", "resource"]) {
         form.push(("audience".to_string(), audience));
@@ -527,7 +529,7 @@ async fn mint_oauth2_token_exchange(
         form.push(("scope".to_string(), scope));
     }
 
-    request_token(&token_url, &form, state.max_lifetime_seconds).await
+    request_token(&token_url, &form, basic_auth, state.max_lifetime_seconds).await
 }
 
 async fn mint_oauth2_client_credentials(
@@ -536,17 +538,14 @@ async fn mint_oauth2_client_credentials(
     let token_url = oauth2_token_url(state)?;
     let client_id = required_material(&state.material, "client_id")?;
     let client_secret = required_material(&state.material, "client_secret")?;
-    let mut form = vec![
-        ("grant_type".to_string(), "client_credentials".to_string()),
-        ("client_id".to_string(), client_id),
-        ("client_secret".to_string(), client_secret),
-    ];
+    let mut form = vec![("grant_type".to_string(), "client_credentials".to_string())];
+    let basic_auth = Some((client_id, client_secret));
     let scope = refresh_scopes(state).join(" ");
     if !scope.is_empty() {
         form.push(("scope".to_string(), scope));
     }
 
-    request_token(&token_url, &form, state.max_lifetime_seconds).await
+    request_token(&token_url, &form, basic_auth, state.max_lifetime_seconds).await
 }
 
 async fn mint_google_service_account_jwt(
@@ -592,12 +591,13 @@ async fn mint_google_service_account_jwt(
         ),
         ("assertion".to_string(), assertion),
     ];
-    request_token(&token_url, &form, lifetime_secs).await
+    request_token(&token_url, &form, None, lifetime_secs).await
 }
 
 async fn request_token(
     token_url: &str,
     form: &[(String, String)],
+    basic_auth: Option<(String, String)>,
     max_lifetime_seconds: i64,
 ) -> Result<MintedCredential, Status> {
     let parsed = reqwest::Url::parse(token_url)
@@ -616,16 +616,24 @@ async fn request_token(
         .timeout(Duration::from_secs(30))
         .build()
         .map_err(|e| Status::internal(format!("build refresh HTTP client failed: {e}")))?;
-    let response = client
-        .post(parsed)
-        .form(form)
+    let request = client.post(parsed).form(form);
+    let request = if let Some((client_id, client_secret)) = basic_auth {
+        request.basic_auth(client_id, Some(client_secret))
+    } else {
+        request
+    };
+    let response = request
         .send()
         .await
         .map_err(|e| Status::unavailable(format!("token endpoint request failed: {e}")))?;
     let status = response.status();
     if !status.is_success() {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "<unreadable body>".to_string());
         return Err(Status::failed_precondition(format!(
-            "token endpoint returned HTTP {status}"
+            "token endpoint returned HTTP {status}: {body}"
         )));
     }
     let token = response

@@ -660,6 +660,7 @@ enum OutputFormat {
 enum CliProviderRefreshStrategy {
     Oauth2RefreshToken,
     Oauth2ClientCredentials,
+    Oauth2TokenExchange,
     GoogleServiceAccountJwt,
 }
 
@@ -668,6 +669,7 @@ impl CliProviderRefreshStrategy {
         match self {
             Self::Oauth2RefreshToken => "oauth2_refresh_token",
             Self::Oauth2ClientCredentials => "oauth2_client_credentials",
+            Self::Oauth2TokenExchange => "oauth2_token_exchange",
             Self::GoogleServiceAccountJwt => "google_service_account_jwt",
         }
     }
