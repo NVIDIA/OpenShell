@@ -17,10 +17,10 @@ use miette::{IntoDiagnostic, Result};
 use oauth2::basic::BasicClient;
 use oauth2::{
     AuthType, AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge,
-    RedirectUrl, RefreshToken, Scope, TokenResponse, TokenUrl,
+    RedirectUrl, Scope, TokenResponse, TokenUrl,
 };
 use openshell_bootstrap::oidc_token::OidcTokenBundle;
-use serde::Deserialize;
+use openshell_sdk::oidc::{RefreshTokenInput, discover, http_client, refresh_token};
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -29,50 +29,6 @@ use tokio::sync::oneshot;
 use tracing::debug;
 
 const AUTH_TIMEOUT: Duration = Duration::from_secs(120);
-
-/// OIDC discovery document (subset of fields we need).
-#[derive(Debug, Deserialize)]
-struct OidcDiscovery {
-    issuer: String,
-    authorization_endpoint: String,
-    token_endpoint: String,
-}
-
-/// Discover OIDC endpoints from the issuer's well-known configuration.
-///
-/// Validates that the discovery document's `issuer` field matches the
-/// configured issuer URL to prevent SSRF or misdirection.
-async fn discover(issuer: &str, insecure: bool) -> Result<OidcDiscovery> {
-    let normalized_issuer = issuer.trim_end_matches('/');
-    let url = format!("{normalized_issuer}/.well-known/openid-configuration");
-    let client = http_client(insecure);
-    let resp: OidcDiscovery = client
-        .get(&url)
-        .send()
-        .await
-        .into_diagnostic()?
-        .json()
-        .await
-        .into_diagnostic()?;
-
-    let discovered_issuer = resp.issuer.trim_end_matches('/');
-    if discovered_issuer != normalized_issuer {
-        return Err(miette::miette!(
-            "OIDC discovery issuer mismatch: expected '{}', got '{}'",
-            normalized_issuer,
-            discovered_issuer
-        ));
-    }
-    Ok(resp)
-}
-
-fn http_client(insecure: bool) -> reqwest::Client {
-    let mut builder = reqwest::ClientBuilder::new().redirect(reqwest::redirect::Policy::none());
-    if insecure {
-        builder = builder.danger_accept_invalid_certs(true);
-    }
-    builder.build().expect("failed to build HTTP client")
-}
 
 fn build_scopes(scopes: Option<&str>) -> Vec<Scope> {
     let mut result = vec![Scope::new("openid".to_string())];
@@ -227,36 +183,33 @@ pub async fn oidc_client_credentials_flow(
 
 /// Refresh an OIDC token using the `refresh_token` grant.
 ///
-/// Preserves the existing refresh token if the server does not return a new
-/// one (per OAuth 2.0 spec, the refresh response may omit `refresh_token`).
+/// Wraps [`openshell_sdk::oidc::refresh_token`] with the CLI's
+/// [`OidcTokenBundle`] storage shape. Preserves the existing refresh
+/// token when the server omits one (per OAuth 2.0 the refresh response
+/// is allowed to leave `refresh_token` out).
 pub async fn oidc_refresh_token(
     bundle: &OidcTokenBundle,
     insecure: bool,
 ) -> Result<OidcTokenBundle> {
-    let refresh_token = bundle.refresh_token.as_deref().ok_or_else(|| {
+    let refresh = bundle.refresh_token.as_deref().ok_or_else(|| {
         miette::miette!(
             "no refresh token available — re-authenticate with: openshell gateway login"
         )
     })?;
 
-    let discovery = discover(&bundle.issuer, insecure).await?;
+    let input =
+        RefreshTokenInput::new(refresh, &bundle.issuer, &bundle.client_id).with_insecure(insecure);
+    let output = refresh_token(&input).await.into_diagnostic()?;
 
-    let client = BasicClient::new(ClientId::new(bundle.client_id.clone()))
-        .set_token_uri(TokenUrl::new(discovery.token_endpoint).into_diagnostic()?);
-
-    let http = http_client(insecure);
-    let token_response = client
-        .exchange_refresh_token(&RefreshToken::new(refresh_token.to_string()))
-        .request_async(&http)
-        .await
-        .map_err(|e| miette::miette!("token refresh failed: {e}"))?;
-
-    let mut refreshed =
-        bundle_from_oauth2_response(&token_response, &bundle.issuer, &bundle.client_id);
-    if refreshed.refresh_token.is_none() {
-        refreshed.refresh_token.clone_from(&bundle.refresh_token);
-    }
-    Ok(refreshed)
+    Ok(OidcTokenBundle {
+        access_token: output.access_token,
+        refresh_token: output
+            .refresh_token
+            .or_else(|| bundle.refresh_token.clone()),
+        expires_at: output.expires_at,
+        issuer: bundle.issuer.clone(),
+        client_id: bundle.client_id.clone(),
+    })
 }
 
 /// Ensure we have a valid OIDC token for the given gateway, refreshing if needed.

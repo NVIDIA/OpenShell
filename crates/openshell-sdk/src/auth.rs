@@ -1,15 +1,15 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! gRPC authentication interceptor shared by CLI and TUI.
+//! Bearer-token authentication interceptor for outgoing gRPC requests.
 
-use miette::Result;
+use crate::error::{Result, SdkError};
 
 /// Interceptor that injects authentication headers into every outgoing gRPC request.
 ///
-/// Supports application-layer Bearer tokens (standard `authorization`
-/// header) and Cloudflare Access tokens (custom headers). When no token is
-/// set, acts as a no-op. OIDC takes precedence over edge tokens.
+/// Supports OIDC Bearer tokens (standard `authorization` header) and
+/// Cloudflare Access tokens (custom headers). When no token is set, acts
+/// as a no-op. OIDC takes precedence over edge tokens.
 #[derive(Clone)]
 #[allow(clippy::struct_field_names)]
 pub struct EdgeAuthInterceptor {
@@ -21,14 +21,14 @@ pub struct EdgeAuthInterceptor {
 impl EdgeAuthInterceptor {
     /// Create an interceptor from optional token strings.
     ///
-    /// OIDC bearer tokens take precedence over edge tokens. Returns a no-op
-    /// interceptor when no token is provided.
+    /// OIDC bearer token takes precedence over edge token. Returns a no-op
+    /// interceptor when neither token is provided.
     pub fn new(oidc_token: Option<&str>, edge_token: Option<&str>) -> Result<Self> {
         if let Some(token) = oidc_token {
             let bearer: tonic::metadata::MetadataValue<tonic::metadata::Ascii> =
                 format!("Bearer {token}")
                     .parse()
-                    .map_err(|_| miette::miette!("invalid bearer token value"))?;
+                    .map_err(|_| SdkError::auth("invalid OIDC token value"))?;
             return Ok(Self {
                 bearer_value: Some(bearer),
                 header_value: None,
@@ -40,11 +40,11 @@ impl EdgeAuthInterceptor {
             Some(t) => {
                 let hv: tonic::metadata::MetadataValue<tonic::metadata::Ascii> = t
                     .parse()
-                    .map_err(|_| miette::miette!("invalid edge token value"))?;
+                    .map_err(|_| SdkError::auth("invalid edge token value"))?;
                 let cv: tonic::metadata::MetadataValue<tonic::metadata::Ascii> =
                     format!("CF_Authorization={t}")
                         .parse()
-                        .map_err(|_| miette::miette!("invalid edge token value for cookie"))?;
+                        .map_err(|_| SdkError::auth("invalid edge token value for cookie"))?;
                 (Some(hv), Some(cv))
             }
             None => (None, None),
