@@ -116,6 +116,38 @@ pub fn ensure_parent_dir_restricted(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Atomically write a sensitive file with owner-only read/write permissions.
+///
+/// The parent directory is created with [`create_dir_restricted`]. The content
+/// is written to a sibling temporary file, synced, chmodded to `0o600` on Unix,
+/// and then renamed into place.
+pub fn write_file_owner_only_atomic(path: &Path, contents: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| miette::miette!("path has no parent: {}", path.display()))?;
+    create_dir_restricted(parent)?;
+    let mut temp = tempfile::Builder::new()
+        .prefix(".openshell-")
+        .tempfile_in(parent)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to create temp file in {}", parent.display()))?;
+
+    std::io::Write::write_all(&mut temp, contents)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to write temp file for {}", path.display()))?;
+    temp.as_file()
+        .sync_all()
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to sync temp file for {}", path.display()))?;
+    set_file_owner_only(temp.path())?;
+    temp.persist(path)
+        .map_err(|err| err.error)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to rename temp file into {}", path.display()))?;
+    set_file_owner_only(path)?;
+    Ok(())
+}
+
 /// Check whether a file has permissions that are too open (group/other readable).
 ///
 /// Returns `true` if the file has group or other read/write/execute bits set.
@@ -178,6 +210,22 @@ mod tests {
         set_file_owner_only(&file).unwrap();
         let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "expected 0600, got {mode:04o}");
+    }
+
+    #[test]
+    fn write_file_owner_only_atomic_replaces_contents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("nested").join("secret");
+        write_file_owner_only_atomic(&file, b"first\n").unwrap();
+        write_file_owner_only_atomic(&file, b"second\n").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "second\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "expected 0600, got {mode:04o}");
+        }
     }
 
     #[cfg(unix)]

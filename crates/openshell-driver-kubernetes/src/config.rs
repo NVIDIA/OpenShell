@@ -75,22 +75,20 @@ pub struct KubernetesComputeConfig {
     pub enable_user_namespaces: bool,
     pub workspace_default_storage_size: String,
     /// Lifetime (seconds) of the projected `ServiceAccount` token kubelet
-    /// writes into each sandbox pod. Used only for the one-shot
-    /// `IssueSandboxToken` bootstrap exchange — the gateway-minted JWT
-    /// that follows has its own TTL set via `gateway_jwt.ttl_secs`.
+    /// writes into each sandbox pod. Used for `IssueSandboxToken` exchanges;
+    /// the gateway-minted JWT has its own TTL set via `gateway_jwt.ttl_secs`.
     ///
-    /// Kubelet enforces a minimum of 600 seconds; the supervisor uses
-    /// this token within a few seconds of pod start, so any value at
-    /// the floor is sufficient. Default 3600.
+    /// Kubelet enforces a minimum of 600 seconds and rotates the projected
+    /// token before expiry, so any value at the floor is sufficient. Default
+    /// 3600.
     pub sa_token_ttl_secs: i64,
 }
 
 /// Lower bound enforced by kubelet for projected SA tokens.
 pub const MIN_SA_TOKEN_TTL_SECS: i64 = 600;
 
-/// Cap at 24h — operators who want longer-lived bootstrap tokens are
-/// almost certainly misconfigured (the token is consumed seconds after
-/// pod start).
+/// Cap at 24h. Longer projected tokens are unnecessary because kubelet rotates
+/// the token file and the supervisor re-exchanges it as needed.
 pub const MAX_SA_TOKEN_TTL_SECS: i64 = 86_400;
 
 impl Default for KubernetesComputeConfig {

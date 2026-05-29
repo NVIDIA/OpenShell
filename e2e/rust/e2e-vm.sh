@@ -50,6 +50,11 @@ DRIVER_BIN="${ROOT}/target/debug/openshell-driver-vm"
 E2E_TEST="${OPENSHELL_E2E_VM_TEST:-smoke}"
 E2E_FEATURES="${OPENSHELL_E2E_VM_FEATURES:-e2e-vm}"
 
+if [ "${E2E_TEST}" = "vm_gateway_resume_expired_token" ] \
+   && [ -z "${OPENSHELL_E2E_SANDBOX_JWT_TTL_SECS:-}" ]; then
+  export OPENSHELL_E2E_SANDBOX_JWT_TTL_SECS=3
+fi
+
 # The VM driver places `compute-driver.sock` under `[openshell.drivers.vm].state_dir`.
 # AF_UNIX SUN_LEN is 104 bytes on macOS (108 on Linux), so paths anchored
 # in the workspace's `target/` blow the limit on typical developer
@@ -197,6 +202,17 @@ echo "==> Starting openshell-gateway on 127.0.0.1:${HOST_PORT} (state: ${RUN_STA
 # (192.168.127.1) does NOT forward arbitrary host ports.
 e2e_generate_gateway_jwt "${JWT_DIR}"
 e2e_generate_pki "${GATEWAY_BIN}" "${PKI_DIR}"
+SANDBOX_JWT_TTL_SECS="${OPENSHELL_E2E_SANDBOX_JWT_TTL_SECS:-3600}"
+case "${SANDBOX_JWT_TTL_SECS}" in
+  ''|*[!0-9]*)
+    echo "ERROR: OPENSHELL_E2E_SANDBOX_JWT_TTL_SECS must be a positive integer, got '${SANDBOX_JWT_TTL_SECS}'" >&2
+    exit 1
+    ;;
+esac
+if [ "${SANDBOX_JWT_TTL_SECS}" -lt 1 ]; then
+  echo "ERROR: OPENSHELL_E2E_SANDBOX_JWT_TTL_SECS must be >= 1" >&2
+  exit 1
+fi
 
 cat >"${GATEWAY_CONFIG}" <<EOF
 [openshell]
@@ -219,7 +235,7 @@ signing_key_path = "${JWT_DIR}/signing.pem"
 public_key_path = "${JWT_DIR}/public.pem"
 kid_path = "${JWT_DIR}/kid"
 gateway_id = "${GATEWAY_NAME}"
-ttl_secs = 3600
+ttl_secs = ${SANDBOX_JWT_TTL_SECS}
 
 [openshell.drivers.vm]
 grpc_endpoint = "https://host.openshell.internal:${HOST_PORT}"
@@ -280,6 +296,7 @@ e2e_register_mtls_gateway \
   "${PKI_DIR}"
 
 export OPENSHELL_GATEWAY_ENDPOINT="${CLI_GATEWAY_ENDPOINT}"
+export OPENSHELL_GATEWAY="${GATEWAY_NAME}"
 export OPENSHELL_E2E_EXPECT_VM_OVERLAY=1
 export OPENSHELL_E2E_DRIVER="vm"
 e2e_export_gateway_restart_metadata \

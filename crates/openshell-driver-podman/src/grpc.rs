@@ -7,9 +7,10 @@ use futures::{Stream, StreamExt};
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest, GetSandboxResponse,
-    ListSandboxesRequest, ListSandboxesResponse, StopSandboxRequest, StopSandboxResponse,
-    ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesEvent,
-    WatchSandboxesRequest, compute_driver_server::ComputeDriver,
+    ListSandboxesRequest, ListSandboxesResponse, ResumeSandboxRequest, ResumeSandboxResponse,
+    StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
+    ValidateSandboxCreateResponse, WatchSandboxesEvent, WatchSandboxesRequest,
+    WriteSandboxTokenRequest, WriteSandboxTokenResponse, compute_driver_server::ComputeDriver,
 };
 use std::pin::Pin;
 use tonic::{Request, Response, Status};
@@ -102,6 +103,46 @@ impl ComputeDriver for ComputeDriverService {
             .await
             .map_err(Status::from)?;
         Ok(Response::new(CreateSandboxResponse {}))
+    }
+
+    async fn resume_sandbox(
+        &self,
+        request: Request<ResumeSandboxRequest>,
+    ) -> Result<Response<ResumeSandboxResponse>, Status> {
+        let request = request.into_inner();
+        if request.sandbox_id.is_empty() {
+            return Err(Status::invalid_argument("sandbox_id is required"));
+        }
+        if request.sandbox_name.is_empty() {
+            return Err(Status::invalid_argument("sandbox_name is required"));
+        }
+        let resumed = self
+            .driver
+            .resume_sandbox(
+                &request.sandbox_id,
+                &request.sandbox_name,
+                (!request.sandbox_token.is_empty()).then_some(request.sandbox_token.as_str()),
+            )
+            .await
+            .map_err(Status::from)?;
+        Ok(Response::new(ResumeSandboxResponse { resumed }))
+    }
+
+    async fn write_sandbox_token(
+        &self,
+        request: Request<WriteSandboxTokenRequest>,
+    ) -> Result<Response<WriteSandboxTokenResponse>, Status> {
+        let request = request.into_inner();
+        if request.sandbox_id.is_empty() {
+            return Err(Status::invalid_argument("sandbox_id is required"));
+        }
+        if request.sandbox_token.is_empty() {
+            return Err(Status::invalid_argument("sandbox_token is required"));
+        }
+        self.driver
+            .write_sandbox_token(&request.sandbox_id, &request.sandbox_token)
+            .map_err(Status::from)?;
+        Ok(Response::new(WriteSandboxTokenResponse {}))
     }
 
     async fn stop_sandbox(

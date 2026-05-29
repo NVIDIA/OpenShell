@@ -118,8 +118,8 @@ pub struct GatewayFileSection {
     #[serde(default)]
     pub enable_user_namespaces: Option<bool>,
     /// Lifetime (seconds) of the projected `ServiceAccount` token kubelet
-    /// writes for the `IssueSandboxToken` bootstrap exchange. Driver
-    /// clamps to `[600, 86400]`.
+    /// writes for `IssueSandboxToken` exchanges. Driver clamps to
+    /// `[600, 86400]`.
     #[serde(default)]
     pub sa_token_ttl_secs: Option<i64>,
     #[serde(default)]

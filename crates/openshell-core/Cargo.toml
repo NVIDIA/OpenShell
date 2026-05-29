@@ -20,6 +20,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 url = { workspace = true }
 ipnet = "2"
+tempfile = "3"
 
 [features]
 ## Include test-only settings (dummy_bool, dummy_int) in the registry.
@@ -30,9 +31,6 @@ dev-settings = []
 [build-dependencies]
 tonic-build = { workspace = true }
 protobuf-src = { workspace = true }
-
-[dev-dependencies]
-tempfile = "3"
 
 [lints]
 workspace = true

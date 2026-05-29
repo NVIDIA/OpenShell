@@ -419,10 +419,48 @@ fn handle_gateway_message(
                 relay_close_from_gateway_event(crate::ocsf_ctx(), &close.channel_id, &close.reason);
             ocsf_emit!(event);
         }
+        Some(gateway_message::Payload::SandboxTokenUpdate(update)) => {
+            persist_gateway_managed_sandbox_token(sandbox_id, update);
+        }
         _ => {
             warn!(sandbox_id = %sandbox_id, "supervisor session: unexpected gateway message");
         }
     }
+}
+
+fn persist_gateway_managed_sandbox_token(
+    sandbox_id: &str,
+    update: &openshell_core::proto::SandboxTokenUpdate,
+) {
+    if update.token.is_empty() {
+        warn!(sandbox_id = %sandbox_id, "supervisor session: ignoring empty sandbox token update");
+        return;
+    }
+    let Some(path) = grpc_client::supervisor_pushed_token_file_path() else {
+        warn!(
+            sandbox_id = %sandbox_id,
+            "supervisor session: received sandbox token update without supervisor-push token mode"
+        );
+        return;
+    };
+    let contents = format!("{}\n", update.token);
+    if let Err(err) =
+        openshell_core::paths::write_file_owner_only_atomic(&path, contents.as_bytes())
+    {
+        warn!(
+            sandbox_id = %sandbox_id,
+            path = %path.display(),
+            error = %err,
+            "supervisor session: failed to persist sandbox token update"
+        );
+        return;
+    }
+    debug!(
+        sandbox_id = %sandbox_id,
+        path = %path.display(),
+        expires_at_ms = update.expires_at_ms,
+        "supervisor session: persisted gateway-managed sandbox token update"
+    );
 }
 
 /// Handle a `RelayOpen` by initiating a `RelayStream` RPC on the gateway and

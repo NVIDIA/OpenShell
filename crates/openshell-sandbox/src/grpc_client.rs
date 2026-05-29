@@ -5,20 +5,20 @@
 //! route bundles from `OpenShell` server.
 //!
 //! Every request carries a gateway-minted JWT in the `Authorization` header.
-//! The token is resolved at startup from one of three sources:
+//! The token is resolved at startup from the explicit
+//! `OPENSHELL_SANDBOX_AUTH_MODE`:
 //!
-//! 1. `OPENSHELL_SANDBOX_TOKEN` — raw JWT in the env (test harness path).
-//! 2. `OPENSHELL_SANDBOX_TOKEN_FILE` — file containing the JWT (Docker /
-//!    Podman / VM drivers write this to a bundle file at sandbox-create
-//!    time).
-//! 3. `OPENSHELL_K8S_SA_TOKEN_FILE` — projected `ServiceAccount` JWT; the
-//!    supervisor exchanges it for a gateway JWT via `IssueSandboxToken`
-//!    once at startup.
-//!
-//! The resolved gateway JWT is held in process memory thereafter and
-//! injected on every outbound call by [`AuthInterceptor`].
+//! - `static-token` reads `OPENSHELL_SANDBOX_TOKEN` and never refreshes it.
+//! - `gateway-managed-file` reads `OPENSHELL_SANDBOX_TOKEN_FILE`; Docker and
+//!   Podman refresh that host-side file from the gateway.
+//! - `gateway-managed-supervisor-push` reads `OPENSHELL_SANDBOX_TOKEN_FILE`;
+//!   VM refreshes that file through gateway control-stream pushes.
+//! - `kubernetes-service-account-exchange` reads
+//!   `OPENSHELL_K8S_SA_TOKEN_FILE` and exchanges it for a gateway JWT via
+//!   `IssueSandboxToken`.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -26,11 +26,12 @@ use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::proto::{
     DenialSummary, GetDraftPolicyRequest, GetInferenceBundleRequest, GetInferenceBundleResponse,
     GetSandboxConfigRequest, GetSandboxProviderEnvironmentRequest, IssueSandboxTokenRequest,
-    PolicyChunk, PolicySource, PolicyStatus, RefreshSandboxTokenRequest, ReportPolicyStatusRequest,
+    PolicyChunk, PolicySource, PolicyStatus, ReportPolicyStatusRequest,
     SandboxPolicy as ProtoSandboxPolicy, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse,
     UpdateConfigRequest, inference_client::InferenceClient, open_shell_client::OpenShellClient,
 };
 use openshell_core::sandbox_env;
+use openshell_core::sandbox_env::SandboxAuthMode;
 use tonic::Status;
 use tonic::metadata::AsciiMetadataValue;
 use tonic::service::interceptor::InterceptedService;
@@ -41,16 +42,28 @@ use tracing::{debug, info, warn};
 /// generated client type signatures stay readable.
 pub type AuthedChannel = InterceptedService<Channel, AuthInterceptor>;
 
-/// Shared, refreshable Bearer header. All [`AuthInterceptor`] clones read
-/// the same slot, so the renewal task can replace the token in place without
+/// Shared Bearer header. All [`AuthInterceptor`] clones read the same slot, so
+/// Kubernetes token re-exchange can replace the token in place without
 /// rebuilding the channel.
 type TokenSlot = Arc<RwLock<AsciiMetadataValue>>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum TokenSource {
-    Env,
-    File,
-    K8sServiceAccount,
+    StaticToken,
+    GatewayManagedFile { path: PathBuf },
+    GatewayManagedSupervisorPush { path: PathBuf },
+    K8sServiceAccount { path: PathBuf },
+}
+
+impl TokenSource {
+    fn token_file_path(&self) -> Option<&Path> {
+        match self {
+            Self::GatewayManagedFile { path } | Self::GatewayManagedSupervisorPush { path } => {
+                Some(path)
+            }
+            Self::StaticToken | Self::K8sServiceAccount { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -60,7 +73,8 @@ struct AcquiredToken {
 }
 
 /// Process-wide token slot. Initialized by the first [`connect_channel`]
-/// call and shared with every subsequent client and the renewal loop.
+/// call and shared with every subsequent client and the Kubernetes exchange
+/// loop, when that auth mode is active.
 static TOKEN_SLOT: OnceLock<TokenSlot> = OnceLock::new();
 
 /// Source used to acquire the process-wide token slot.
@@ -68,16 +82,21 @@ static TOKEN_SOURCE: OnceLock<TokenSource> = OnceLock::new();
 
 /// Serializes the first token acquisition. Several supervisor subsystems
 /// connect during startup; without this guard they can all observe an empty
-/// [`TOKEN_SLOT`] and perform duplicate K8s bootstrap exchanges.
+/// [`TOKEN_SLOT`] and perform duplicate Kubernetes `ServiceAccount` exchanges.
 static TOKEN_INIT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// One-shot guard so the renewal loop spawns at most once per process.
+/// One-shot guard so the Kubernetes exchange loop spawns at most once per
+/// process.
 static REFRESH_SPAWNED: OnceLock<()> = OnceLock::new();
 
-fn install_token_slot(token: &str) -> Result<TokenSlot> {
-    let bearer = AsciiMetadataValue::try_from(format!("Bearer {token}"))
+fn bearer_value(token: &str) -> Result<AsciiMetadataValue> {
+    AsciiMetadataValue::try_from(format!("Bearer {token}"))
         .into_diagnostic()
-        .wrap_err("sandbox JWT contained characters not valid for a header value")?;
+        .wrap_err("sandbox JWT contained characters not valid for a header value")
+}
+
+fn install_token_slot(token: &str) -> Result<TokenSlot> {
+    let bearer = bearer_value(token)?;
     if let Some(existing) = TOKEN_SLOT.get() {
         *existing.write().expect("token slot poisoned") = bearer;
         return Ok(existing.clone());
@@ -88,16 +107,46 @@ fn install_token_slot(token: &str) -> Result<TokenSlot> {
 }
 
 /// gRPC interceptor that injects `authorization: Bearer <token>` on every
-/// outbound request. The token lives in a shared [`TokenSlot`] so the renewal
-/// task can replace it without rebuilding clients.
+/// outbound request. The token lives in a shared [`TokenSlot`] so Kubernetes
+/// token re-exchange can replace it without rebuilding clients.
 #[derive(Clone)]
 pub struct AuthInterceptor {
     bearer: TokenSlot,
+    source: TokenSource,
 }
 
 impl AuthInterceptor {
-    fn new(bearer: TokenSlot) -> Self {
-        Self { bearer }
+    fn new(bearer: TokenSlot, source: TokenSource) -> Self {
+        Self { bearer, source }
+    }
+
+    fn current_bearer(&self) -> AsciiMetadataValue {
+        if let Some(path) = self.source.token_file_path() {
+            match read_sandbox_token_file(path).and_then(|token| bearer_value(&token)) {
+                Ok(value) => {
+                    if let Ok(mut guard) = self.bearer.write()
+                        && *guard != value
+                    {
+                        *guard = value.clone();
+                        debug!(
+                            path = %path.display(),
+                            "loaded rotated sandbox token from file"
+                        );
+                    }
+                    return value;
+                }
+                Err(err) => warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "failed to reload sandbox token file; using cached token"
+                ),
+            }
+        }
+
+        self.bearer
+            .read()
+            .expect("auth interceptor token slot poisoned")
+            .clone()
     }
 }
 
@@ -106,12 +155,8 @@ impl tonic::service::Interceptor for AuthInterceptor {
         &mut self,
         mut req: tonic::Request<()>,
     ) -> std::result::Result<tonic::Request<()>, Status> {
-        let bearer = self
-            .bearer
-            .read()
-            .expect("auth interceptor token slot poisoned")
-            .clone();
-        req.metadata_mut().insert("authorization", bearer);
+        req.metadata_mut()
+            .insert("authorization", self.current_bearer());
         Ok(req)
     }
 }
@@ -179,23 +224,24 @@ async fn build_plain_channel(endpoint: &str) -> Result<Channel> {
 
 /// Build a Bearer-authenticated channel to the gateway.
 ///
-/// First call per process resolves the sandbox JWT via the three-step
-/// lookup (env → file → K8s SA bootstrap exchange) and installs it into
-/// the process-wide [`TOKEN_SLOT`]. Subsequent calls reuse the cached
-/// slot — the renewal loop keeps the value fresh, so re-running the
-/// bootstrap is both unnecessary and (on the K8s SA path) expensive
-/// (one apiserver round-trip per call). The renewal loop itself is
-/// spawned once per process via [`REFRESH_SPAWNED`].
+/// First call per process resolves the sandbox JWT from
+/// `OPENSHELL_SANDBOX_AUTH_MODE` and installs it into the process-wide
+/// [`TOKEN_SLOT`]. Subsequent calls reuse the cached slot. For Kubernetes
+/// service-account exchange mode, the refresh loop is spawned once per process
+/// via [`REFRESH_SPAWNED`].
 async fn connect_channel(endpoint: &str) -> Result<AuthedChannel> {
     let channel = build_plain_channel(endpoint).await?;
     let (slot, source) = token_slot(endpoint, &channel).await?;
     let plain_channel = channel.clone();
-    let intercepted = InterceptedService::new(channel, AuthInterceptor::new(slot.clone()));
-    if REFRESH_SPAWNED.set(()).is_ok() {
-        let refresh_channel = intercepted.clone();
+    let intercepted =
+        InterceptedService::new(channel, AuthInterceptor::new(slot.clone(), source.clone()));
+    if let TokenSource::K8sServiceAccount { path } = &source
+        && REFRESH_SPAWNED.set(()).is_ok()
+    {
         let endpoint = endpoint.to_string();
+        let path = path.clone();
         tokio::spawn(async move {
-            refresh_token_loop(refresh_channel, slot, source, endpoint, plain_channel).await;
+            refresh_k8s_exchange_loop(slot, endpoint, plain_channel, path).await;
         });
     }
     Ok(intercepted)
@@ -203,20 +249,26 @@ async fn connect_channel(endpoint: &str) -> Result<AuthedChannel> {
 
 async fn token_slot(endpoint: &str, plain_channel: &Channel) -> Result<(TokenSlot, TokenSource)> {
     if let Some(existing) = TOKEN_SLOT.get() {
-        let source = TOKEN_SOURCE.get().copied().unwrap_or(TokenSource::Env);
+        let source = TOKEN_SOURCE
+            .get()
+            .cloned()
+            .unwrap_or(TokenSource::StaticToken);
         return Ok((existing.clone(), source));
     }
 
     let _guard = TOKEN_INIT_LOCK.lock().await;
 
     if let Some(existing) = TOKEN_SLOT.get() {
-        let source = TOKEN_SOURCE.get().copied().unwrap_or(TokenSource::Env);
+        let source = TOKEN_SOURCE
+            .get()
+            .cloned()
+            .unwrap_or(TokenSource::StaticToken);
         return Ok((existing.clone(), source));
     }
 
     let acquired = acquire_sandbox_token(endpoint, plain_channel).await?;
     let slot = install_token_slot(&acquired.token)?;
-    let _ = TOKEN_SOURCE.set(acquired.source);
+    let _ = TOKEN_SOURCE.set(acquired.source.clone());
     Ok((slot, acquired.source))
 }
 
@@ -227,58 +279,94 @@ async fn token_slot(endpoint: &str, plain_channel: &Channel) -> Result<(TokenSlo
 /// bootstrap path, which uses `plain_channel` to call `IssueSandboxToken`
 /// once before the steady-state Bearer-authenticated channel is built.
 async fn acquire_sandbox_token(endpoint: &str, plain_channel: &Channel) -> Result<AcquiredToken> {
-    if let Ok(t) = std::env::var(sandbox_env::SANDBOX_TOKEN)
-        && !t.is_empty()
-    {
-        debug!(source = "env", "loaded sandbox token");
-        return Ok(AcquiredToken {
-            token: t,
-            source: TokenSource::Env,
-        });
-    }
+    let auth_mode = sandbox_auth_mode()?;
 
-    if let Ok(path) = std::env::var(sandbox_env::SANDBOX_TOKEN_FILE)
-        && !path.is_empty()
-    {
-        let contents = std::fs::read_to_string(&path)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to read sandbox token from {path}"))?;
-        debug!(source = "file", path = %path, "loaded sandbox token");
-        return Ok(AcquiredToken {
-            token: contents.trim().to_string(),
-            source: TokenSource::File,
-        });
+    match auth_mode {
+        SandboxAuthMode::StaticToken => {
+            let token = required_env(sandbox_env::SANDBOX_TOKEN, auth_mode)?;
+            debug!(
+                source = "env",
+                mode = auth_mode.as_str(),
+                "loaded sandbox token"
+            );
+            Ok(AcquiredToken {
+                token,
+                source: TokenSource::StaticToken,
+            })
+        }
+        SandboxAuthMode::GatewayManagedFile => {
+            let path = required_path_env(sandbox_env::SANDBOX_TOKEN_FILE, auth_mode)?;
+            let token = read_sandbox_token_file(&path)?;
+            debug!(source = "file", mode = auth_mode.as_str(), path = %path.display(), "loaded sandbox token");
+            Ok(AcquiredToken {
+                token,
+                source: TokenSource::GatewayManagedFile { path },
+            })
+        }
+        SandboxAuthMode::GatewayManagedSupervisorPush => {
+            let path = required_path_env(sandbox_env::SANDBOX_TOKEN_FILE, auth_mode)?;
+            let token = read_sandbox_token_file(&path)?;
+            debug!(source = "file", mode = auth_mode.as_str(), path = %path.display(), "loaded sandbox token");
+            Ok(AcquiredToken {
+                token,
+                source: TokenSource::GatewayManagedSupervisorPush { path },
+            })
+        }
+        SandboxAuthMode::KubernetesServiceAccountExchange => {
+            let path = required_path_env(sandbox_env::K8S_SA_TOKEN_FILE, auth_mode)?;
+            Ok(AcquiredToken {
+                token: acquire_k8s_sandbox_token(endpoint, plain_channel, &path).await?,
+                source: TokenSource::K8sServiceAccount { path },
+            })
+        }
     }
+}
 
-    if let Ok(sa_path) = std::env::var(sandbox_env::K8S_SA_TOKEN_FILE)
-        && !sa_path.is_empty()
-    {
-        return Ok(AcquiredToken {
-            token: acquire_k8s_sandbox_token(endpoint, plain_channel, &sa_path).await?,
-            source: TokenSource::K8sServiceAccount,
-        });
-    }
+fn sandbox_auth_mode() -> Result<SandboxAuthMode> {
+    let value = std::env::var(sandbox_env::SANDBOX_AUTH_MODE)
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!(
+                "{} is required (expected one of: {})",
+                sandbox_env::SANDBOX_AUTH_MODE,
+                SandboxAuthMode::allowed_values()
+            )
+        })?;
+    value
+        .parse::<SandboxAuthMode>()
+        .map_err(|err| miette::miette!("{err}"))
+}
 
-    Err(miette::miette!(
-        "no sandbox token source available — set one of {}, {}, or {}",
-        sandbox_env::SANDBOX_TOKEN,
-        sandbox_env::SANDBOX_TOKEN_FILE,
-        sandbox_env::K8S_SA_TOKEN_FILE,
-    ))
+fn required_env(name: &str, auth_mode: SandboxAuthMode) -> Result<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            miette::miette!(
+                "{} is required when {}={}",
+                name,
+                sandbox_env::SANDBOX_AUTH_MODE,
+                auth_mode.as_str()
+            )
+        })
+}
+
+fn required_path_env(name: &str, auth_mode: SandboxAuthMode) -> Result<PathBuf> {
+    required_env(name, auth_mode).map(PathBuf::from)
 }
 
 async fn acquire_k8s_sandbox_token(
     endpoint: &str,
     plain_channel: &Channel,
-    sa_path: &str,
+    sa_path: &Path,
 ) -> Result<String> {
     let sa_token = std::fs::read_to_string(sa_path)
         .into_diagnostic()
-        .wrap_err_with(|| format!("failed to read K8s SA token from {sa_path}"))?
+        .wrap_err_with(|| format!("failed to read K8s SA token from {}", sa_path.display()))?
         .trim()
         .to_string();
     info!(endpoint = %endpoint, "exchanging K8s ServiceAccount token for sandbox JWT");
-    // The bootstrap exchange uses a one-off interceptor pinned to the
+    // The ServiceAccount exchange uses a one-off interceptor pinned to the
     // SA token; the resulting gateway JWT becomes the value in the
     // shared `TOKEN_SLOT` once `connect_channel` returns.
     let bootstrap_slot: TokenSlot = Arc::new(RwLock::new(
@@ -286,14 +374,14 @@ async fn acquire_k8s_sandbox_token(
             .into_diagnostic()
             .wrap_err("SA token contained characters not valid for a header value")?,
     ));
-    let interceptor = AuthInterceptor::new(bootstrap_slot);
+    let interceptor = AuthInterceptor::new(bootstrap_slot, TokenSource::StaticToken);
     let bootstrap = InterceptedService::new(plain_channel.clone(), interceptor);
     let mut client = OpenShellClient::new(bootstrap);
     let resp = client
         .issue_sandbox_token(IssueSandboxTokenRequest {})
         .await
         .into_diagnostic()
-        .wrap_err("IssueSandboxToken bootstrap exchange failed")?;
+        .wrap_err("IssueSandboxToken service-account exchange failed")?;
     Ok(resp.into_inner().token)
 }
 
@@ -303,86 +391,65 @@ pub async fn connect_channel_pub(endpoint: &str) -> Result<AuthedChannel> {
     connect_channel(endpoint).await
 }
 
-/// Background task that renews the sandbox JWT at ~80% of its remaining
-/// lifetime. The new token replaces the value in [`TOKEN_SLOT`], so all
-/// in-flight and future clients pick it up on their next request. The
-/// loop never panics: every failure is logged and re-attempted after a
-/// bounded backoff.
-async fn refresh_token_loop(
-    channel: AuthedChannel,
+/// Background task that re-exchanges the Kubernetes `ServiceAccount` JWT at
+/// ~80% of the gateway JWT's remaining lifetime. The new gateway token
+/// replaces the value in [`TOKEN_SLOT`], so all in-flight and future clients
+/// pick it up on their next request. The loop never panics: every failure is
+/// logged and retried after a bounded backoff.
+async fn refresh_k8s_exchange_loop(
     slot: TokenSlot,
-    source: TokenSource,
     endpoint: String,
     plain_channel: Channel,
+    sa_path: PathBuf,
 ) {
-    let mut client = OpenShellClient::new(channel);
     loop {
         let sleep = compute_refresh_delay(&slot);
         tokio::time::sleep(sleep).await;
-        match client
-            .refresh_sandbox_token(RefreshSandboxTokenRequest {})
-            .await
-        {
-            Ok(resp) => {
-                let new_token = resp.into_inner().token;
-                match AsciiMetadataValue::try_from(format!("Bearer {new_token}")) {
-                    Ok(value) => {
-                        if let Ok(mut guard) = slot.write() {
-                            *guard = value;
-                            info!("renewed gateway sandbox JWT in-place");
-                        }
+        match acquire_k8s_sandbox_token(&endpoint, &plain_channel, &sa_path).await {
+            Ok(new_token) => match AsciiMetadataValue::try_from(format!("Bearer {new_token}")) {
+                Ok(value) => {
+                    if let Ok(mut guard) = slot.write() {
+                        *guard = value;
+                        info!("re-exchanged Kubernetes ServiceAccount token for sandbox JWT");
                     }
-                    Err(e) => warn!(error = %e, "refreshed JWT contained invalid header bytes"),
                 }
-            }
-            Err(status) => {
-                if status.code() == tonic::Code::Unauthenticated
-                    && source == TokenSource::K8sServiceAccount
-                {
-                    if let Some(sa_path) = std::env::var(sandbox_env::K8S_SA_TOKEN_FILE)
-                        .ok()
-                        .filter(|p| !p.is_empty())
-                    {
-                        match acquire_k8s_sandbox_token(&endpoint, &plain_channel, &sa_path).await {
-                            Ok(new_token) => {
-                                match AsciiMetadataValue::try_from(format!("Bearer {new_token}")) {
-                                    Ok(value) => {
-                                        if let Ok(mut guard) = slot.write() {
-                                            *guard = value;
-                                            info!(
-                                                "rebootstrapped gateway sandbox JWT after refresh authentication failure"
-                                            );
-                                            continue;
-                                        }
-                                    }
-                                    Err(e) => warn!(
-                                        error = %e,
-                                        "rebootstrapped JWT contained invalid header bytes"
-                                    ),
-                                }
-                            }
-                            Err(e) => warn!(
-                                error = %e,
-                                "K8s ServiceAccount bootstrap retry failed after refresh authentication failure"
-                            ),
-                        }
-                    } else {
-                        warn!(
-                            "RefreshSandboxToken returned Unauthenticated and K8s SA token file is unavailable"
-                        );
-                    }
-                } else if status.code() == tonic::Code::Unauthenticated {
-                    warn!(
-                        source = ?source,
-                        "RefreshSandboxToken returned Unauthenticated; static token sources cannot rebootstrap automatically"
-                    );
-                }
-                warn!(error = %status, "RefreshSandboxToken failed; will retry");
+                Err(e) => warn!(error = %e, "refreshed JWT contained invalid header bytes"),
+            },
+            Err(err) => {
+                warn!(
+                    path = %sa_path.display(),
+                    error = %err,
+                    "Kubernetes ServiceAccount token exchange failed; will retry"
+                );
                 // Backoff so we don't spin against a sustained failure.
                 tokio::time::sleep(Duration::from_secs(10)).await;
             }
         }
     }
+}
+
+pub fn supervisor_pushed_token_file_path() -> Option<PathBuf> {
+    if sandbox_auth_mode().ok() != Some(SandboxAuthMode::GatewayManagedSupervisorPush) {
+        return None;
+    }
+    std::env::var(sandbox_env::SANDBOX_TOKEN_FILE)
+        .ok()
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+}
+
+fn read_sandbox_token_file(path: &Path) -> Result<String> {
+    let contents = std::fs::read_to_string(path)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to read sandbox token from {}", path.display()))?;
+    let token = contents.trim().to_string();
+    if token.is_empty() {
+        return Err(miette::miette!(
+            "sandbox token file {} was empty",
+            path.display()
+        ));
+    }
+    Ok(token)
 }
 
 /// Compute the next refresh delay: 80 % of the time remaining until the
@@ -511,6 +578,40 @@ mod auth_tests {
             delay.as_secs() < 30,
             "expected refresh before 30s expiry, got {delay:?}",
         );
+    }
+
+    #[test]
+    fn file_token_interceptor_reads_rotated_token_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sandbox.jwt");
+        std::fs::write(&path, "old-token\n").unwrap();
+        let slot: TokenSlot = Arc::new(RwLock::new(bearer_value("old-token").unwrap()));
+        let mut interceptor = AuthInterceptor::new(
+            slot.clone(),
+            TokenSource::GatewayManagedFile { path: path.clone() },
+        );
+
+        let req =
+            tonic::service::Interceptor::call(&mut interceptor, tonic::Request::new(())).unwrap();
+        assert_eq!(
+            req.metadata()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer old-token")
+        );
+
+        std::fs::write(&path, "new-token\n").unwrap();
+
+        let req =
+            tonic::service::Interceptor::call(&mut interceptor, tonic::Request::new(())).unwrap();
+        assert_eq!(
+            req.metadata()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer new-token")
+        );
+        let guard = slot.read().unwrap();
+        assert_eq!(guard.to_str().ok(), Some("Bearer new-token"));
     }
 }
 

@@ -336,8 +336,36 @@ pub async fn run_server(
     // shutdown so the running compute state matches the persisted store.
     // Runs before watchers spawn so the watch loop sees the post-resume
     // snapshot on its first poll.
-    if let Err(err) = state.compute.resume_persisted_sandboxes().await {
+    if let Err(err) = state
+        .compute
+        .resume_persisted_sandboxes(state.sandbox_jwt_issuer.as_deref())
+        .await
+    {
         warn!(error = %err, "Failed to resume persisted sandboxes during startup");
+    }
+
+    if let Some(issuer) = state.sandbox_jwt_issuer.as_deref() {
+        match state
+            .compute
+            .refresh_gateway_managed_sandbox_tokens(issuer)
+            .await
+        {
+            Ok((_refreshed, failed)) => {
+                if failed > 0 {
+                    warn!(
+                        failed,
+                        "Some gateway-managed sandbox JWTs failed to refresh during startup"
+                    );
+                }
+            }
+            Err(err) => warn!(error = %err, "Failed to refresh sandbox JWT files during startup"),
+        }
+    }
+
+    if let Some(issuer) = state.sandbox_jwt_issuer.clone() {
+        state
+            .compute
+            .spawn_gateway_managed_sandbox_token_rotator(issuer);
     }
 
     state.compute.spawn_watchers();

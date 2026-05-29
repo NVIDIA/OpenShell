@@ -47,13 +47,28 @@ path = "tests/gateway_resume.rs"
 required-features = ["e2e-docker"]
 
 [[test]]
+name = "gateway_resume_expired_token"
+path = "tests/gateway_resume_expired_token.rs"
+required-features = ["e2e-docker"]
+
+[[test]]
 name = "podman_gateway_resume"
 path = "tests/podman_gateway_resume.rs"
 required-features = ["e2e-podman"]
 
 [[test]]
+name = "podman_gateway_resume_expired_token"
+path = "tests/podman_gateway_resume_expired_token.rs"
+required-features = ["e2e-podman"]
+
+[[test]]
 name = "vm_gateway_resume"
 path = "tests/vm_gateway_resume.rs"
+required-features = ["e2e-vm"]
+
+[[test]]
+name = "vm_gateway_resume_expired_token"
+path = "tests/vm_gateway_resume_expired_token.rs"
 required-features = ["e2e-vm"]
 
 [[test]]

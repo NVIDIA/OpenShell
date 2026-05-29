@@ -13,8 +13,8 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use openshell_core::proto::{
-    GatewayMessage, RelayFrame, RelayInit, RelayOpen, Sandbox, SessionAccepted, SshRelayTarget,
-    SupervisorMessage, gateway_message, relay_open, supervisor_message,
+    GatewayMessage, RelayFrame, RelayInit, RelayOpen, Sandbox, SandboxTokenUpdate, SessionAccepted,
+    SshRelayTarget, SupervisorMessage, gateway_message, relay_open, supervisor_message,
 };
 
 use crate::ServerState;
@@ -199,6 +199,29 @@ impl SupervisorSessionRegistry {
 
     pub fn has_session(&self, sandbox_id: &str) -> bool {
         self.sessions.lock().unwrap().contains_key(sandbox_id)
+    }
+
+    pub async fn send_sandbox_token_update(
+        &self,
+        sandbox_id: &str,
+        token: String,
+        expires_at_ms: i64,
+    ) -> Result<bool, String> {
+        let Some(tx) = self.lookup_session(sandbox_id) else {
+            return Ok(false);
+        };
+        let msg = GatewayMessage {
+            payload: Some(gateway_message::Payload::SandboxTokenUpdate(
+                SandboxTokenUpdate {
+                    token,
+                    expires_at_ms,
+                },
+            )),
+        };
+        tx.send(msg)
+            .await
+            .map_err(|_| "supervisor session disconnected".to_string())?;
+        Ok(true)
     }
 
     fn pending_channel_ids(&self, sandbox_id: &str) -> Vec<String> {

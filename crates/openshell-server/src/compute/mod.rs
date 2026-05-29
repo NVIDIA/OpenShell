@@ -19,9 +19,9 @@ use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, DeleteSandboxRequest, DriverCondition, DriverPlatformEvent,
     DriverResourceRequirements, DriverSandbox, DriverSandboxSpec, DriverSandboxStatus,
     DriverSandboxTemplate, GetCapabilitiesRequest, GetSandboxRequest, ListSandboxesRequest,
-    ValidateSandboxCreateRequest, WatchSandboxesEvent, WatchSandboxesRequest,
-    compute_driver_client::ComputeDriverClient, compute_driver_server::ComputeDriver,
-    watch_sandboxes_event,
+    ResumeSandboxRequest, StopSandboxRequest, ValidateSandboxCreateRequest, WatchSandboxesEvent,
+    WatchSandboxesRequest, WriteSandboxTokenRequest, compute_driver_client::ComputeDriverClient,
+    compute_driver_server::ComputeDriver, watch_sandboxes_event,
 };
 use openshell_core::proto::{
     PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
@@ -70,23 +70,85 @@ impl ShutdownCleanup for DockerComputeDriver {
 }
 
 /// Resume a single sandbox whose store record indicates it should be
-/// running. Implemented by drivers (currently only Docker) where compute
+/// running. Implemented by local drivers where compute
 /// resources do not auto-restart with the gateway. Returns `Ok(true)` if
 /// the backend resource was found and resumed (or was already running),
 /// `Ok(false)` if no backend resource exists.
 #[tonic::async_trait]
 trait StartupResume: Send + Sync {
-    async fn resume_sandbox(&self, sandbox_id: &str, sandbox_name: &str) -> Result<bool, String>;
+    async fn resume_sandbox(
+        &self,
+        sandbox_id: &str,
+        sandbox_name: &str,
+        sandbox_token: Option<String>,
+    ) -> Result<bool, String>;
+}
+
+/// Writes gateway-minted sandbox JWTs into driver-owned token state.
+///
+/// Local single-player drivers use this for startup reissue and periodic
+/// rotation. Docker and Podman write host files mounted into containers; VM
+/// updates its persisted sandbox request and the connected supervisor receives
+/// the same token over the control stream.
+#[tonic::async_trait]
+trait SandboxTokenWriter: Send + Sync {
+    async fn write_sandbox_token(
+        &self,
+        sandbox_id: &str,
+        sandbox_token: String,
+    ) -> Result<(), String>;
 }
 
 #[tonic::async_trait]
 impl StartupResume for DockerComputeDriver {
-    async fn resume_sandbox(&self, sandbox_id: &str, sandbox_name: &str) -> Result<bool, String> {
-        Self::resume_sandbox(self, sandbox_id, sandbox_name)
+    async fn resume_sandbox(
+        &self,
+        sandbox_id: &str,
+        sandbox_name: &str,
+        sandbox_token: Option<String>,
+    ) -> Result<bool, String> {
+        Self::resume_sandbox(self, sandbox_id, sandbox_name, sandbox_token.as_deref())
             .await
             .map_err(|err| err.to_string())
     }
 }
+
+#[tonic::async_trait]
+impl StartupResume for PodmanComputeDriver {
+    async fn resume_sandbox(
+        &self,
+        sandbox_id: &str,
+        sandbox_name: &str,
+        sandbox_token: Option<String>,
+    ) -> Result<bool, String> {
+        Self::resume_sandbox(self, sandbox_id, sandbox_name, sandbox_token.as_deref())
+            .await
+            .map_err(|err| err.to_string())
+    }
+}
+
+#[tonic::async_trait]
+impl SandboxTokenWriter for DockerComputeDriver {
+    async fn write_sandbox_token(
+        &self,
+        sandbox_id: &str,
+        sandbox_token: String,
+    ) -> Result<(), String> {
+        Self::write_sandbox_token(self, sandbox_id, &sandbox_token).map_err(|err| err.to_string())
+    }
+}
+
+#[tonic::async_trait]
+impl SandboxTokenWriter for PodmanComputeDriver {
+    async fn write_sandbox_token(
+        &self,
+        sandbox_id: &str,
+        sandbox_token: String,
+    ) -> Result<(), String> {
+        Self::write_sandbox_token(self, sandbox_id, &sandbox_token).map_err(|err| err.to_string())
+    }
+}
+
 /// Interval between store-vs-backend reconciliation sweeps.
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -187,9 +249,29 @@ impl ComputeDriver for RemoteComputeDriver {
         client.create_sandbox(request).await
     }
 
+    async fn resume_sandbox(
+        &self,
+        request: Request<ResumeSandboxRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::compute::v1::ResumeSandboxResponse>, Status>
+    {
+        let mut client = self.client();
+        client.resume_sandbox(request).await
+    }
+
+    async fn write_sandbox_token(
+        &self,
+        request: Request<WriteSandboxTokenRequest>,
+    ) -> Result<
+        tonic::Response<openshell_core::proto::compute::v1::WriteSandboxTokenResponse>,
+        Status,
+    > {
+        let mut client = self.client();
+        client.write_sandbox_token(request).await
+    }
+
     async fn stop_sandbox(
         &self,
-        request: Request<openshell_core::proto::compute::v1::StopSandboxRequest>,
+        request: Request<StopSandboxRequest>,
     ) -> Result<tonic::Response<openshell_core::proto::compute::v1::StopSandboxResponse>, Status>
     {
         let mut client = self.client();
@@ -216,11 +298,52 @@ impl ComputeDriver for RemoteComputeDriver {
     }
 }
 
+#[tonic::async_trait]
+impl StartupResume for RemoteComputeDriver {
+    async fn resume_sandbox(
+        &self,
+        sandbox_id: &str,
+        sandbox_name: &str,
+        sandbox_token: Option<String>,
+    ) -> Result<bool, String> {
+        let mut client = self.client();
+        let response = client
+            .resume_sandbox(Request::new(ResumeSandboxRequest {
+                sandbox_id: sandbox_id.to_string(),
+                sandbox_name: sandbox_name.to_string(),
+                sandbox_token: sandbox_token.unwrap_or_default(),
+            }))
+            .await
+            .map_err(|status| status.message().to_string())?;
+        Ok(response.into_inner().resumed)
+    }
+}
+
+#[tonic::async_trait]
+impl SandboxTokenWriter for RemoteComputeDriver {
+    async fn write_sandbox_token(
+        &self,
+        sandbox_id: &str,
+        sandbox_token: String,
+    ) -> Result<(), String> {
+        let mut client = self.client();
+        client
+            .write_sandbox_token(Request::new(WriteSandboxTokenRequest {
+                sandbox_id: sandbox_id.to_string(),
+                sandbox_token,
+            }))
+            .await
+            .map_err(|status| status.message().to_string())?;
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub struct ComputeRuntime {
     driver: SharedComputeDriver,
     shutdown_cleanup: Option<Arc<dyn ShutdownCleanup>>,
     startup_resume: Option<Arc<dyn StartupResume>>,
+    sandbox_token_writer: Option<Arc<dyn SandboxTokenWriter>>,
     _driver_process: Option<Arc<ManagedDriverProcess>>,
     default_image: String,
     store: Arc<Store>,
@@ -228,6 +351,7 @@ pub struct ComputeRuntime {
     sandbox_watch_bus: SandboxWatchBus,
     tracing_log_bus: TracingLogBus,
     supervisor_sessions: Arc<SupervisorSessionRegistry>,
+    push_token_updates_to_supervisors: bool,
     sync_lock: Arc<Mutex<()>>,
     gateway_bind_addresses: Vec<SocketAddr>,
 }
@@ -244,12 +368,14 @@ impl ComputeRuntime {
         driver: SharedComputeDriver,
         shutdown_cleanup: Option<Arc<dyn ShutdownCleanup>>,
         startup_resume: Option<Arc<dyn StartupResume>>,
+        sandbox_token_writer: Option<Arc<dyn SandboxTokenWriter>>,
         driver_process: Option<Arc<ManagedDriverProcess>>,
         store: Arc<Store>,
         sandbox_index: SandboxIndex,
         sandbox_watch_bus: SandboxWatchBus,
         tracing_log_bus: TracingLogBus,
         supervisor_sessions: Arc<SupervisorSessionRegistry>,
+        push_token_updates_to_supervisors: bool,
         _allows_loopback_endpoints: bool,
         gateway_bind_addresses: Vec<SocketAddr>,
     ) -> Result<Self, ComputeError> {
@@ -263,6 +389,7 @@ impl ComputeRuntime {
             driver,
             shutdown_cleanup,
             startup_resume,
+            sandbox_token_writer,
             _driver_process: driver_process,
             default_image,
             store,
@@ -270,6 +397,7 @@ impl ComputeRuntime {
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
+            push_token_updates_to_supervisors,
             sync_lock: Arc::new(Mutex::new(())),
             gateway_bind_addresses,
         })
@@ -302,17 +430,20 @@ impl ComputeRuntime {
         let gateway_bind_addresses = driver.gateway_bind_addresses();
         let shutdown_cleanup: Arc<dyn ShutdownCleanup> = driver.clone();
         let startup_resume: Arc<dyn StartupResume> = driver.clone();
+        let sandbox_token_writer: Arc<dyn SandboxTokenWriter> = driver.clone();
         let driver: SharedComputeDriver = driver;
         Self::from_driver(
             driver,
             Some(shutdown_cleanup),
             Some(startup_resume),
+            Some(sandbox_token_writer),
             None,
             store,
             sandbox_index,
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
+            false,
             true,
             gateway_bind_addresses,
         )
@@ -336,11 +467,13 @@ impl ComputeRuntime {
             None,
             None,
             None,
+            None,
             store,
             sandbox_index,
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
+            false,
             false,
             Vec::new(),
         )
@@ -356,17 +489,20 @@ impl ComputeRuntime {
         tracing_log_bus: TracingLogBus,
         supervisor_sessions: Arc<SupervisorSessionRegistry>,
     ) -> Result<Self, ComputeError> {
-        let driver: SharedComputeDriver = Arc::new(RemoteComputeDriver::new(channel));
+        let remote_driver = Arc::new(RemoteComputeDriver::new(channel));
+        let driver: SharedComputeDriver = remote_driver.clone();
         Self::from_driver(
             driver,
             None,
-            None,
+            Some(remote_driver.clone()),
+            Some(remote_driver),
             driver_process,
             store,
             sandbox_index,
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
+            true,
             true,
             Vec::new(),
         )
@@ -381,20 +517,27 @@ impl ComputeRuntime {
         tracing_log_bus: TracingLogBus,
         supervisor_sessions: Arc<SupervisorSessionRegistry>,
     ) -> Result<Self, ComputeError> {
-        let driver = PodmanComputeDriver::new(config)
-            .await
-            .map_err(|err| ComputeError::Message(err.to_string()))?;
-        let driver: SharedComputeDriver = Arc::new(PodmanDriverService::new(driver));
+        let podman_driver = Arc::new(
+            PodmanComputeDriver::new(config)
+                .await
+                .map_err(|err| ComputeError::Message(err.to_string()))?,
+        );
+        let startup_resume: Arc<dyn StartupResume> = podman_driver.clone();
+        let sandbox_token_writer: Arc<dyn SandboxTokenWriter> = podman_driver.clone();
+        let driver: SharedComputeDriver =
+            Arc::new(PodmanDriverService::new((*podman_driver).clone()));
         Self::from_driver(
             driver,
             None,
-            None,
+            Some(startup_resume),
+            Some(sandbox_token_writer),
             None,
             store,
             sandbox_index,
             sandbox_watch_bus,
             tracing_log_bus,
             supervisor_sessions,
+            false,
             true,
             Vec::new(),
         )
@@ -577,7 +720,7 @@ impl ComputeRuntime {
 
     /// Resume sandboxes whose store records say they should be running.
     /// Drivers that do not auto-restart compute resources across gateway
-    /// restarts (currently only Docker) implement `StartupResume`. For
+    /// restarts implement `StartupResume`. For
     /// each sandbox in the store whose phase is not `Deleting` or
     /// `Error`, we ask the driver to resume the underlying resource. If
     /// the driver reports that the resource no longer exists or fails to
@@ -586,7 +729,10 @@ impl ComputeRuntime {
     ///
     /// Should be called once at gateway startup, before watchers spawn,
     /// so the watch loop sees the post-resume state on its first poll.
-    pub async fn resume_persisted_sandboxes(&self) -> Result<(), String> {
+    pub async fn resume_persisted_sandboxes(
+        &self,
+        sandbox_jwt_issuer: Option<&crate::auth::sandbox_jwt::SandboxJwtIssuer>,
+    ) -> Result<(), String> {
         let Some(resume) = &self.startup_resume else {
             return Ok(());
         };
@@ -615,8 +761,18 @@ impl ComputeRuntime {
                 continue;
             }
 
+            let sandbox_token = match sandbox_jwt_issuer {
+                Some(issuer) => Some(
+                    issuer
+                        .mint(sandbox.object_id())
+                        .map_err(|status| status.message().to_string())?
+                        .token,
+                ),
+                None => None,
+            };
+
             match resume
-                .resume_sandbox(sandbox.object_id(), sandbox.object_name())
+                .resume_sandbox(sandbox.object_id(), sandbox.object_name(), sandbox_token)
                 .await
             {
                 Ok(true) => {
@@ -674,6 +830,136 @@ impl ComputeRuntime {
             );
         }
         Ok(())
+    }
+
+    /// Reissue gateway-managed sandbox JWTs into local driver token state.
+    ///
+    /// Docker and Podman rewrite token files mounted into containers. VM
+    /// updates persisted driver state and receives live token pushes over the
+    /// supervisor control stream. Startup and periodic refresh let supervisors
+    /// recover from gateway restarts without self-refreshing their own tokens.
+    pub async fn refresh_gateway_managed_sandbox_tokens(
+        &self,
+        sandbox_jwt_issuer: &crate::auth::sandbox_jwt::SandboxJwtIssuer,
+    ) -> Result<(usize, usize), String> {
+        let Some(writer) = &self.sandbox_token_writer else {
+            return Ok((0, 0));
+        };
+
+        let records = self
+            .store
+            .list(Sandbox::object_type(), 1000, 0)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let mut refreshed = 0usize;
+        let mut failed = 0usize;
+
+        for record in records {
+            let sandbox = match Sandbox::decode(record.payload.as_slice()) {
+                Ok(sandbox) => sandbox,
+                Err(err) => {
+                    warn!(error = %err, "Failed to decode sandbox record during token refresh");
+                    continue;
+                }
+            };
+
+            let phase = SandboxPhase::try_from(sandbox.phase).unwrap_or(SandboxPhase::Unknown);
+            if !sandbox_phase_should_be_running(phase) {
+                continue;
+            }
+
+            let minted = match sandbox_jwt_issuer.mint(sandbox.object_id()) {
+                Ok(minted) => minted,
+                Err(status) => {
+                    failed += 1;
+                    warn!(
+                        sandbox_id = %sandbox.object_id(),
+                        sandbox_name = %sandbox.object_name(),
+                        error = %status,
+                        "Failed to mint replacement sandbox JWT"
+                    );
+                    continue;
+                }
+            };
+            let sandbox_token = minted.token.clone();
+
+            match writer
+                .write_sandbox_token(sandbox.object_id(), sandbox_token)
+                .await
+            {
+                Ok(()) => {
+                    refreshed += 1;
+                    if self.push_token_updates_to_supervisors
+                        && let Err(err) = self
+                            .supervisor_sessions
+                            .send_sandbox_token_update(
+                                sandbox.object_id(),
+                                minted.token,
+                                minted.expires_at_ms,
+                            )
+                            .await
+                    {
+                        warn!(
+                            sandbox_id = %sandbox.object_id(),
+                            sandbox_name = %sandbox.object_name(),
+                            error = %err,
+                            "Failed to deliver replacement sandbox JWT to connected supervisor"
+                        );
+                    }
+                }
+                Err(err) => {
+                    failed += 1;
+                    warn!(
+                        sandbox_id = %sandbox.object_id(),
+                        sandbox_name = %sandbox.object_name(),
+                        error = %err,
+                        "Failed to write replacement sandbox JWT"
+                    );
+                }
+            }
+        }
+
+        if refreshed > 0 || failed > 0 {
+            info!(
+                refreshed,
+                failed, "Gateway-managed sandbox token refresh sweep complete"
+            );
+        }
+
+        Ok((refreshed, failed))
+    }
+
+    pub fn spawn_gateway_managed_sandbox_token_rotator(
+        &self,
+        sandbox_jwt_issuer: Arc<crate::auth::sandbox_jwt::SandboxJwtIssuer>,
+    ) {
+        if self.sandbox_token_writer.is_none() {
+            return;
+        }
+
+        let runtime = Arc::new(self.clone());
+        let interval = sandbox_token_rotation_interval(sandbox_jwt_issuer.ttl());
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                match runtime
+                    .refresh_gateway_managed_sandbox_tokens(&sandbox_jwt_issuer)
+                    .await
+                {
+                    Ok((_refreshed, failed)) if failed > 0 => {
+                        warn!(failed, "Some gateway-managed sandbox JWTs failed to rotate");
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        warn!(
+                            error = %err,
+                            "Gateway-managed sandbox token rotation sweep failed"
+                        );
+                    }
+                }
+            }
+        });
     }
 
     async fn mark_sandbox_error(&self, sandbox: &Sandbox, reason: &str, message: &str) {
@@ -1638,6 +1924,25 @@ fn sandbox_phase_should_be_running(phase: SandboxPhase) -> bool {
     )
 }
 
+fn sandbox_token_rotation_interval(ttl: Duration) -> Duration {
+    let ttl_ms = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX);
+    if ttl_ms <= 1 {
+        return Duration::from_millis(1);
+    }
+
+    let max_ms = u64::try_from(Duration::from_secs(12 * 60 * 60).as_millis()).unwrap_or(u64::MAX);
+    let before_expiry_ms = ttl_ms.saturating_sub(1).max(1);
+    let rotate_ms = ttl_ms
+        .saturating_mul(4)
+        .checked_div(5)
+        .unwrap_or(1)
+        .max(250)
+        .min(max_ms)
+        .min(before_expiry_ms)
+        .max(1);
+    Duration::from_millis(rotate_ms)
+}
+
 fn is_terminal_failure_reason(reason: &str) -> bool {
     let reason = reason.to_ascii_lowercase();
     let transient_reasons = [
@@ -1719,9 +2024,31 @@ impl ComputeDriver for NoopTestDriver {
         ))
     }
 
+    async fn resume_sandbox(
+        &self,
+        _request: Request<ResumeSandboxRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::compute::v1::ResumeSandboxResponse>, Status>
+    {
+        Ok(tonic::Response::new(
+            openshell_core::proto::compute::v1::ResumeSandboxResponse { resumed: false },
+        ))
+    }
+
+    async fn write_sandbox_token(
+        &self,
+        _request: Request<WriteSandboxTokenRequest>,
+    ) -> Result<
+        tonic::Response<openshell_core::proto::compute::v1::WriteSandboxTokenResponse>,
+        Status,
+    > {
+        Ok(tonic::Response::new(
+            openshell_core::proto::compute::v1::WriteSandboxTokenResponse {},
+        ))
+    }
+
     async fn stop_sandbox(
         &self,
-        _request: Request<openshell_core::proto::compute::v1::StopSandboxRequest>,
+        _request: Request<StopSandboxRequest>,
     ) -> Result<tonic::Response<openshell_core::proto::compute::v1::StopSandboxResponse>, Status>
     {
         Ok(tonic::Response::new(
@@ -1753,6 +2080,7 @@ pub async fn new_test_runtime(store: Arc<Store>) -> ComputeRuntime {
         driver: Arc::new(NoopTestDriver),
         shutdown_cleanup: None,
         startup_resume: None,
+        sandbox_token_writer: None,
         _driver_process: None,
         default_image: "openshell/sandbox:test".to_string(),
         store,
@@ -1760,6 +2088,7 @@ pub async fn new_test_runtime(store: Arc<Store>) -> ComputeRuntime {
         sandbox_watch_bus: SandboxWatchBus::new(),
         tracing_log_bus: TracingLogBus::new(),
         supervisor_sessions: Arc::new(SupervisorSessionRegistry::new()),
+        push_token_updates_to_supervisors: false,
         sync_lock: Arc::new(Mutex::new(())),
         gateway_bind_addresses: Vec::new(),
     }
@@ -1769,9 +2098,11 @@ pub async fn new_test_runtime(store: Arc<Store>) -> ComputeRuntime {
 mod tests {
     use super::*;
     use futures::stream;
+    use openshell_bootstrap::jwt::generate_jwt_key;
     use openshell_core::proto::compute::v1::{
         CreateSandboxResponse, DeleteSandboxResponse, GetCapabilitiesResponse, GetSandboxRequest,
-        GetSandboxResponse, StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateResponse,
+        GetSandboxResponse, ResumeSandboxResponse, StopSandboxRequest, StopSandboxResponse,
+        ValidateSandboxCreateResponse, WriteSandboxTokenResponse,
     };
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -1883,6 +2214,22 @@ mod tests {
             Ok(tonic::Response::new(CreateSandboxResponse {}))
         }
 
+        async fn resume_sandbox(
+            &self,
+            _request: Request<ResumeSandboxRequest>,
+        ) -> Result<tonic::Response<ResumeSandboxResponse>, Status> {
+            Ok(tonic::Response::new(ResumeSandboxResponse {
+                resumed: false,
+            }))
+        }
+
+        async fn write_sandbox_token(
+            &self,
+            _request: Request<WriteSandboxTokenRequest>,
+        ) -> Result<tonic::Response<WriteSandboxTokenResponse>, Status> {
+            Ok(tonic::Response::new(WriteSandboxTokenResponse {}))
+        }
+
         async fn stop_sandbox(
             &self,
             _request: Request<StopSandboxRequest>,
@@ -1908,18 +2255,27 @@ mod tests {
     }
 
     async fn test_runtime(driver: SharedComputeDriver) -> ComputeRuntime {
-        test_runtime_with_resume(driver, None).await
+        test_runtime_with_hooks(driver, None, None).await
     }
 
     async fn test_runtime_with_resume(
         driver: SharedComputeDriver,
         startup_resume: Option<Arc<dyn StartupResume>>,
     ) -> ComputeRuntime {
+        test_runtime_with_hooks(driver, startup_resume, None).await
+    }
+
+    async fn test_runtime_with_hooks(
+        driver: SharedComputeDriver,
+        startup_resume: Option<Arc<dyn StartupResume>>,
+        sandbox_token_writer: Option<Arc<dyn SandboxTokenWriter>>,
+    ) -> ComputeRuntime {
         let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
         ComputeRuntime {
             driver,
             shutdown_cleanup: None,
             startup_resume,
+            sandbox_token_writer,
             _driver_process: None,
             default_image: "openshell/sandbox:test".to_string(),
             store,
@@ -1927,6 +2283,7 @@ mod tests {
             sandbox_watch_bus: SandboxWatchBus::new(),
             tracing_log_bus: TracingLogBus::new(),
             supervisor_sessions: Arc::new(SupervisorSessionRegistry::new()),
+            push_token_updates_to_supervisors: false,
             sync_lock: Arc::new(Mutex::new(())),
             gateway_bind_addresses: Vec::new(),
         }
@@ -2744,12 +3101,53 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingResume {
-        calls: Mutex<Vec<(String, String)>>,
+        calls: Mutex<Vec<(String, String, Option<String>)>>,
         results: Mutex<HashMap<String, Result<bool, String>>>,
     }
 
     impl RecordingResume {
         async fn set_result(&self, sandbox_id: &str, result: Result<bool, String>) {
+            self.results
+                .lock()
+                .await
+                .insert(sandbox_id.to_string(), result);
+        }
+
+        async fn calls(&self) -> Vec<(String, String, Option<String>)> {
+            self.calls.lock().await.clone()
+        }
+    }
+
+    #[tonic::async_trait]
+    impl StartupResume for RecordingResume {
+        async fn resume_sandbox(
+            &self,
+            sandbox_id: &str,
+            sandbox_name: &str,
+            sandbox_token: Option<String>,
+        ) -> Result<bool, String> {
+            self.calls.lock().await.push((
+                sandbox_id.to_string(),
+                sandbox_name.to_string(),
+                sandbox_token,
+            ));
+            self.results
+                .lock()
+                .await
+                .get(sandbox_id)
+                .cloned()
+                .unwrap_or(Ok(true))
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingTokenWriter {
+        calls: Mutex<Vec<(String, String)>>,
+        results: Mutex<HashMap<String, Result<(), String>>>,
+    }
+
+    impl RecordingTokenWriter {
+        async fn set_result(&self, sandbox_id: &str, result: Result<(), String>) {
             self.results
                 .lock()
                 .await
@@ -2762,22 +3160,22 @@ mod tests {
     }
 
     #[tonic::async_trait]
-    impl StartupResume for RecordingResume {
-        async fn resume_sandbox(
+    impl SandboxTokenWriter for RecordingTokenWriter {
+        async fn write_sandbox_token(
             &self,
             sandbox_id: &str,
-            sandbox_name: &str,
-        ) -> Result<bool, String> {
+            sandbox_token: String,
+        ) -> Result<(), String> {
             self.calls
                 .lock()
                 .await
-                .push((sandbox_id.to_string(), sandbox_name.to_string()));
+                .push((sandbox_id.to_string(), sandbox_token));
             self.results
                 .lock()
                 .await
                 .get(sandbox_id)
                 .cloned()
-                .unwrap_or(Ok(true))
+                .unwrap_or(Ok(()))
         }
     }
 
@@ -2798,13 +3196,13 @@ mod tests {
             runtime.store.put_message(&sandbox).await.unwrap();
         }
 
-        runtime.resume_persisted_sandboxes().await.unwrap();
+        runtime.resume_persisted_sandboxes(None).await.unwrap();
 
         let mut called_ids = resume
             .calls()
             .await
             .into_iter()
-            .map(|(id, _)| id)
+            .map(|(id, _, _)| id)
             .collect::<Vec<_>>();
         called_ids.sort();
         assert_eq!(
@@ -2818,6 +3216,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resume_persisted_sandboxes_mints_tokens_for_startup_resume() {
+        let resume = Arc::new(RecordingResume::default());
+        let runtime =
+            test_runtime_with_resume(Arc::new(TestDriver::default()), Some(resume.clone())).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+        let mat = generate_jwt_key().expect("jwt key");
+        let issuer = crate::auth::sandbox_jwt::SandboxJwtIssuer::from_pem(
+            mat.signing_key_pem.as_bytes(),
+            mat.kid,
+            "test-gateway",
+            Duration::from_secs(3600),
+        )
+        .unwrap();
+
+        runtime
+            .resume_persisted_sandboxes(Some(&issuer))
+            .await
+            .unwrap();
+
+        let calls = resume.calls().await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "sb-1");
+        assert_eq!(calls[0].1, "sandbox-a");
+        let token = calls[0].2.as_deref().expect("startup resume token");
+        assert_eq!(token.split('.').count(), 3);
+    }
+
+    #[tokio::test]
     async fn resume_persisted_sandboxes_marks_missing_backend_as_error() {
         let resume = Arc::new(RecordingResume::default());
         resume.set_result("sb-1", Ok(false)).await;
@@ -2827,7 +3254,7 @@ mod tests {
         let sandbox = sandbox_record("sb-1", "missing", SandboxPhase::Ready);
         runtime.store.put_message(&sandbox).await.unwrap();
 
-        runtime.resume_persisted_sandboxes().await.unwrap();
+        runtime.resume_persisted_sandboxes(None).await.unwrap();
 
         let stored = runtime
             .store
@@ -2859,7 +3286,7 @@ mod tests {
         let sandbox = sandbox_record("sb-1", "broken", SandboxPhase::Provisioning);
         runtime.store.put_message(&sandbox).await.unwrap();
 
-        runtime.resume_persisted_sandboxes().await.unwrap();
+        runtime.resume_persisted_sandboxes(None).await.unwrap();
 
         let stored = runtime
             .store
@@ -2886,7 +3313,7 @@ mod tests {
         let sandbox = sandbox_record("sb-1", "anywhere", SandboxPhase::Ready);
         runtime.store.put_message(&sandbox).await.unwrap();
 
-        runtime.resume_persisted_sandboxes().await.unwrap();
+        runtime.resume_persisted_sandboxes(None).await.unwrap();
 
         let stored = runtime
             .store
@@ -2897,6 +3324,122 @@ mod tests {
         assert_eq!(
             SandboxPhase::try_from(stored.phase()).unwrap(),
             SandboxPhase::Ready
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_gateway_managed_sandbox_tokens_writes_running_phase_tokens() {
+        let writer = Arc::new(RecordingTokenWriter::default());
+        let runtime =
+            test_runtime_with_hooks(Arc::new(TestDriver::default()), None, Some(writer.clone()))
+                .await;
+
+        for (id, name, phase) in [
+            ("sb-prov", "prov", SandboxPhase::Provisioning),
+            ("sb-ready", "ready", SandboxPhase::Ready),
+            ("sb-unknown", "unknown", SandboxPhase::Unknown),
+            ("sb-deleting", "deleting", SandboxPhase::Deleting),
+            ("sb-error", "error", SandboxPhase::Error),
+        ] {
+            let sandbox = sandbox_record(id, name, phase);
+            runtime.store.put_message(&sandbox).await.unwrap();
+        }
+
+        let mat = generate_jwt_key().expect("jwt key");
+        let issuer = crate::auth::sandbox_jwt::SandboxJwtIssuer::from_pem(
+            mat.signing_key_pem.as_bytes(),
+            mat.kid,
+            "test-gateway",
+            Duration::from_secs(3600),
+        )
+        .unwrap();
+
+        let (refreshed, failed) = runtime
+            .refresh_gateway_managed_sandbox_tokens(&issuer)
+            .await
+            .unwrap();
+
+        assert_eq!(refreshed, 3);
+        assert_eq!(failed, 0);
+        let mut calls = writer.calls().await;
+        calls.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(
+            calls
+                .iter()
+                .map(|(sandbox_id, _)| sandbox_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sb-prov", "sb-ready", "sb-unknown"]
+        );
+        for (_sandbox_id, token) in calls {
+            assert_eq!(token.split('.').count(), 3);
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_gateway_managed_sandbox_tokens_counts_write_failures() {
+        let writer = Arc::new(RecordingTokenWriter::default());
+        writer
+            .set_result("sb-1", Err("disk is read-only".to_string()))
+            .await;
+        let runtime =
+            test_runtime_with_hooks(Arc::new(TestDriver::default()), None, Some(writer.clone()))
+                .await;
+
+        let sandbox = sandbox_record("sb-1", "ready", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let mat = generate_jwt_key().expect("jwt key");
+        let issuer = crate::auth::sandbox_jwt::SandboxJwtIssuer::from_pem(
+            mat.signing_key_pem.as_bytes(),
+            mat.kid,
+            "test-gateway",
+            Duration::from_secs(3600),
+        )
+        .unwrap();
+
+        let (refreshed, failed) = runtime
+            .refresh_gateway_managed_sandbox_tokens(&issuer)
+            .await
+            .unwrap();
+
+        assert_eq!(refreshed, 0);
+        assert_eq!(failed, 1);
+        assert_eq!(writer.calls().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn refresh_gateway_managed_sandbox_tokens_is_noop_without_writer() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-1", "ready", SandboxPhase::Ready);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        let mat = generate_jwt_key().expect("jwt key");
+        let issuer = crate::auth::sandbox_jwt::SandboxJwtIssuer::from_pem(
+            mat.signing_key_pem.as_bytes(),
+            mat.kid,
+            "test-gateway",
+            Duration::from_secs(3600),
+        )
+        .unwrap();
+
+        let (refreshed, failed) = runtime
+            .refresh_gateway_managed_sandbox_tokens(&issuer)
+            .await
+            .unwrap();
+
+        assert_eq!((refreshed, failed), (0, 0));
+    }
+
+    #[test]
+    fn sandbox_token_rotation_interval_rotates_before_expiry() {
+        assert_eq!(
+            sandbox_token_rotation_interval(Duration::from_secs(3)),
+            Duration::from_millis(2400)
+        );
+        assert!(sandbox_token_rotation_interval(Duration::from_secs(1)) < Duration::from_secs(1));
+        assert_eq!(
+            sandbox_token_rotation_interval(Duration::from_secs(24 * 60 * 60)),
+            Duration::from_secs(12 * 60 * 60)
         );
     }
 

@@ -80,6 +80,8 @@ overwrites security-critical keys:
 - `OPENSHELL_SANDBOX`
 - `OPENSHELL_SSH_SOCKET_PATH`
 - `OPENSHELL_SANDBOX_COMMAND`
+- `OPENSHELL_SANDBOX_AUTH_MODE=gateway-managed-file` and
+  `OPENSHELL_SANDBOX_TOKEN_FILE` when gateway JWT auth is enabled
 - TLS path variables when HTTPS is enabled
 
 Do not allow sandbox images or templates to override these values.

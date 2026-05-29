@@ -51,6 +51,7 @@ const TLS_CA_MOUNT_PATH: &str = "/etc/openshell/tls/client/ca.crt";
 const TLS_CERT_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.crt";
 const TLS_KEY_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.key";
 const SANDBOX_TOKEN_MOUNT_PATH: &str = "/etc/openshell/auth/sandbox.jwt";
+const SANDBOX_TOKEN_MOUNT_DIR: &str = "/etc/openshell/auth";
 
 /// Build a Podman container name from the sandbox name.
 #[must_use]
@@ -304,6 +305,7 @@ fn build_env(
 
     env.remove(openshell_core::sandbox_env::SANDBOX_TOKEN);
     env.remove(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE);
+    env.remove(openshell_core::sandbox_env::SANDBOX_AUTH_MODE);
 
     // 4. Gateway-minted sandbox JWT. Keep the raw bearer out of container
     //    metadata; the supervisor reads it from a driver-owned bind mount.
@@ -313,6 +315,12 @@ fn build_env(
         env.insert(
             openshell_core::sandbox_env::SANDBOX_TOKEN_FILE.into(),
             SANDBOX_TOKEN_MOUNT_PATH.into(),
+        );
+        env.insert(
+            openshell_core::sandbox_env::SANDBOX_AUTH_MODE.into(),
+            openshell_core::sandbox_env::SandboxAuthMode::GatewayManagedFile
+                .as_str()
+                .into(),
         );
     }
 
@@ -395,7 +403,7 @@ pub fn build_container_spec(sandbox: &DriverSandbox, config: &PodmanComputeConfi
 pub fn build_container_spec_with_token(
     sandbox: &DriverSandbox,
     config: &PodmanComputeConfig,
-    token_host_path: Option<&std::path::Path>,
+    token_host_dir: Option<&std::path::Path>,
 ) -> Value {
     let image = resolve_image(sandbox, config);
     let name = container_name(&sandbox.name);
@@ -592,7 +600,7 @@ pub fn build_container_spec_with_token(
                     options: ro,
                 });
             }
-            if let Some(path) = token_host_path {
+            if let Some(path) = token_host_dir {
                 let mut ro = vec!["ro".into(), "rbind".into()];
                 if is_selinux_enabled() {
                     ro.push("z".into());
@@ -600,7 +608,7 @@ pub fn build_container_spec_with_token(
                 m.push(Mount {
                     kind: "bind".into(),
                     source: path.display().to_string(),
-                    destination: SANDBOX_TOKEN_MOUNT_PATH.into(),
+                    destination: SANDBOX_TOKEN_MOUNT_DIR.into(),
                     options: ro,
                 });
             }
@@ -1224,9 +1232,9 @@ mod tests {
             ..Default::default()
         });
         let config = test_config();
-        let token_path = std::path::Path::new("/host/token.jwt");
+        let token_dir = std::path::Path::new("/host/token-dir");
 
-        let spec = build_container_spec_with_token(&sandbox, &config, Some(token_path));
+        let spec = build_container_spec_with_token(&sandbox, &config, Some(token_dir));
 
         let env_map = spec["env"].as_object().expect("env should be an object");
         assert_eq!(
@@ -1241,13 +1249,22 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("/etc/openshell/auth/sandbox.jwt")
         );
+        assert_eq!(
+            env_map
+                .get(openshell_core::sandbox_env::SANDBOX_AUTH_MODE)
+                .and_then(|v| v.as_str()),
+            Some(openshell_core::sandbox_env::SandboxAuthMode::GatewayManagedFile.as_str())
+        );
         let mounts = spec["mounts"]
             .as_array()
             .expect("mounts should be an array");
         assert!(mounts.iter().any(|m| {
             m["type"].as_str() == Some("bind")
-                && m["source"].as_str() == Some("/host/token.jwt")
-                && m["destination"].as_str() == Some("/etc/openshell/auth/sandbox.jwt")
+                && m["source"].as_str() == Some("/host/token-dir")
+                && m["destination"].as_str() == Some("/etc/openshell/auth")
+                && m["options"].as_array().is_some_and(|options| {
+                    options.iter().any(|option| option.as_str() == Some("ro"))
+                })
         }));
     }
 
