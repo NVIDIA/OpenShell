@@ -55,6 +55,11 @@ For Docker-backed sandboxes, GPU injection uses Docker CDI. If you enable Docker
 CDI after the gateway starts, restart the gateway so OpenShell can detect the
 updated Docker daemon capability.
 
+The built-in default policy includes the filesystem access CUDA needs after GPU
+devices are injected. If you use a custom policy with `--gpu`, keep the injected
+GPU device nodes and `/proc` in `filesystem_policy.read_write`; CUDA
+initialization may fail when `/proc` remains read-only.
+
 ### Custom Containers
 
 Use `--from` to create a sandbox from the base image, another pre-built sandbox name, a local directory, or a container image:
