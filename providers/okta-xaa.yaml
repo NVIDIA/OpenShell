@@ -27,10 +27,13 @@ credentials:
         - name: resource
           description: Okta XAA resource or resource connection identifier
           required: true
-        - name: client_assertion
-          description: JWT client assertion used to authenticate the AI agent with Okta
+        - name: private_key_pem
+          description: RSA private key PEM used to sign the Okta XAA client assertion
           required: true
           secret: true
+        - name: kid
+          description: Optional key ID for the registered Okta public key
+          required: false
         - name: client_assertion_type
           description: OAuth client assertion type, usually urn:ietf:params:oauth:client-assertion-type:jwt-bearer
           required: false

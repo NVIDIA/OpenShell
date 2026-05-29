@@ -1889,7 +1889,7 @@ async fn built_in_okta_xaa_profile_is_available_via_provider_profile_api() {
         refresh
             .material
             .iter()
-            .any(|material| material.name == "client_assertion"
+            .any(|material| material.name == "private_key_pem"
                 && material.required
                 && material.secret)
     );

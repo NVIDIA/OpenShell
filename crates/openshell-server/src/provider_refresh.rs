@@ -246,6 +246,16 @@ struct GoogleServiceAccountClaims<'a> {
     sub: Option<&'a str>,
 }
 
+#[derive(Debug, Serialize)]
+struct OktaXaaClientAssertionClaims<'a> {
+    iss: &'a str,
+    sub: &'a str,
+    aud: &'a str,
+    iat: i64,
+    exp: i64,
+    jti: String,
+}
+
 pub fn next_refresh_at_ms(
     expires_at_ms: i64,
     refresh_before_seconds: i64,
@@ -566,7 +576,7 @@ async fn mint_okta_xaa_token_exchange(
     }
 
     let client_id = required_material(&state.material, "client_id")?;
-    let client_assertion = required_material(&state.material, "client_assertion")?;
+    let client_assertion = build_okta_xaa_client_assertion(state, &token_url, &client_id)?;
     let client_assertion_type = material_value(&state.material, &["client_assertion_type"])
         .unwrap_or_else(|| "urn:ietf:params:oauth:client-assertion-type:jwt-bearer".to_string());
     let resource = required_material(&state.material, "resource")?;
@@ -592,6 +602,37 @@ async fn mint_okta_xaa_token_exchange(
     }
 
     request_token(&token_url, &form, None, state.max_lifetime_seconds).await
+}
+
+fn build_okta_xaa_client_assertion(
+    state: &StoredProviderCredentialRefreshState,
+    token_url: &str,
+    client_id: &str,
+) -> Result<String, Status> {
+    let private_key_pem = required_material(&state.material, "private_key_pem")?;
+    let lifetime_secs = if state.max_lifetime_seconds > 0 {
+        state.max_lifetime_seconds.min(DEFAULT_MAX_LIFETIME_SECONDS)
+    } else {
+        DEFAULT_MAX_LIFETIME_SECONDS
+    };
+    let now_secs = current_time_ms() / 1000;
+    let claims = OktaXaaClientAssertionClaims {
+        iss: client_id,
+        sub: client_id,
+        aud: token_url,
+        iat: now_secs,
+        exp: now_secs.saturating_add(lifetime_secs),
+        jti: uuid::Uuid::new_v4().to_string(),
+    };
+    let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+    header.kid = material_value(&state.material, &["kid"]);
+    jsonwebtoken::encode(
+        &header,
+        &claims,
+        &jsonwebtoken::EncodingKey::from_rsa_pem(private_key_pem.as_bytes())
+            .map_err(|_| Status::invalid_argument("okta_xaa private_key_pem must be RSA PEM"))?,
+    )
+    .map_err(|_| Status::internal("sign okta xaa client assertion failed"))
 }
 
 async fn mint_google_service_account_jwt(
@@ -1237,6 +1278,95 @@ mod tests {
         assert_eq!(
             stored_provider.credentials.get("OKTA_ACCESS_TOKEN"),
             Some(&"delegated-downstream-token".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn okta_xaa_refresh_uses_id_token_and_generated_client_assertion() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(body_string_contains(
+                "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange",
+            ))
+            .and(body_string_contains(
+                "subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aid_token",
+            ))
+            .and(body_string_contains("resource=jira-connection"))
+            .and(body_string_contains("client_assertion="))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "xaa-delegated-token",
+                "expires_in": 1800,
+                "token_type": "Bearer"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let store = test_store().await;
+        let sandbox = Sandbox {
+            metadata: Some(ObjectMeta {
+                id: "sandbox-xaa".to_string(),
+                name: "xaa".to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+                resource_version: 0,
+            }),
+            spec: Some(SandboxSpec::default()),
+            ..Default::default()
+        };
+        let binding = new_binding(
+            &sandbox,
+            "user-123",
+            Some("alex"),
+            "oidc",
+            "user-access-token",
+            Some("user-id-token"),
+            &["jira.read".to_string()],
+        )
+        .unwrap();
+        put_binding(&store, &binding).await.unwrap();
+
+        let provider = provider("my-xaa", "okta-xaa");
+        store.put_message(&provider).await.unwrap();
+        let state = new_refresh_state(
+            &provider,
+            "OKTA_XAA_ACCESS_TOKEN",
+            NewRefreshStateConfig {
+                strategy: ProviderCredentialRefreshStrategy::OktaXaa,
+                material: HashMap::from([
+                    ("client_id".to_string(), "agent-client-id".to_string()),
+                    ("sandbox_id".to_string(), "sandbox-xaa".to_string()),
+                    ("resource".to_string(), "jira-connection".to_string()),
+                    (
+                        "private_key_pem".to_string(),
+                        TEST_RSA_PRIVATE_KEY.to_string(),
+                    ),
+                    ("kid".to_string(), "test-key-id".to_string()),
+                ]),
+                secret_material_keys: vec!["private_key_pem".to_string()],
+                expires_at_ms: 0,
+                token_url: format!("{}/token", mock_server.uri()),
+                scopes: vec!["jira.read".to_string()],
+                refresh_before_seconds: 300,
+                max_lifetime_seconds: 3600,
+            },
+        )
+        .unwrap();
+        put_refresh_state(&store, &state).await.unwrap();
+
+        let refreshed = refresh_provider_credential(&store, "my-xaa", "OKTA_XAA_ACCESS_TOKEN")
+            .await
+            .unwrap();
+        assert_eq!(refreshed.status, "refreshed");
+
+        let stored = store
+            .get_message_by_name::<Provider>("my-xaa")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.credentials.get("OKTA_XAA_ACCESS_TOKEN"),
+            Some(&"xaa-delegated-token".to_string())
         );
     }
 

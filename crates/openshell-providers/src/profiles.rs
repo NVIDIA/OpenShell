@@ -1264,7 +1264,8 @@ mod tests {
                 "client_id",
                 "sandbox_id",
                 "resource",
-                "client_assertion",
+                "private_key_pem",
+                "kid",
                 "client_assertion_type",
                 "scope"
             ]
@@ -1273,7 +1274,7 @@ mod tests {
             refresh
                 .material
                 .iter()
-                .find(|material| material.name == "client_assertion")
+                .find(|material| material.name == "private_key_pem")
                 .is_some_and(|material| material.required && material.secret)
         );
     }
