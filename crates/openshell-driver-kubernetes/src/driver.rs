@@ -358,7 +358,6 @@ impl KubernetesComputeDriver {
             grpc_endpoint: &self.config.grpc_endpoint,
             ssh_socket_path: self.ssh_socket_path(),
             runtime_class_name: &self.config.runtime_class_name,
-            runtime_class_outer_isolation: self.config.runtime_class_outer_isolation,
             client_tls_secret_name: &self.config.client_tls_secret_name,
             host_gateway_ip: &self.config.host_gateway_ip,
             enable_user_namespaces: self.config.enable_user_namespaces,
@@ -1093,7 +1092,6 @@ struct SandboxPodParams<'a> {
     grpc_endpoint: &'a str,
     ssh_socket_path: &'a str,
     runtime_class_name: &'a str,
-    runtime_class_outer_isolation: bool,
     client_tls_secret_name: &'a str,
     host_gateway_ip: &'a str,
     enable_user_namespaces: bool,
@@ -1121,7 +1119,6 @@ impl Default for SandboxPodParams<'_> {
             grpc_endpoint: "",
             ssh_socket_path: "",
             runtime_class_name: "",
-            runtime_class_outer_isolation: false,
             client_tls_secret_name: "",
             host_gateway_ip: "",
             enable_user_namespaces: false,
@@ -1305,9 +1302,6 @@ fn sandbox_template_to_k8s(
             serde_json::json!(runtime_class),
         );
     }
-    let runtime_class_outer_isolation =
-        platform_config_bool(template, "runtime_class_outer_isolation")
-            .unwrap_or(params.runtime_class_outer_isolation);
     if let Some(node_selector) = platform_config_struct(template, "node_selector") {
         spec.insert("nodeSelector".to_string(), node_selector);
     }
@@ -1383,13 +1377,6 @@ fn sandbox_template_to_k8s(
         openshell_core::sandbox_env::NETWORK_ENFORCEMENT_MODE,
         params.network_enforcement_mode.as_str(),
     );
-    if runtime_class_outer_isolation {
-        upsert_env(
-            &mut env,
-            openshell_core::sandbox_env::OUTER_RUNTIME_ISOLATION,
-            "runtime-class",
-        );
-    }
     if matches!(
         params.network_enforcement_mode,
         NetworkEnforcementMode::ExternalEnforcer
@@ -2372,89 +2359,6 @@ mod tests {
         assert_eq!(
             pod_template["spec"]["runtimeClassName"],
             serde_json::json!("gvisor")
-        );
-    }
-
-    #[test]
-    fn runtime_class_name_does_not_imply_outer_runtime_isolation_env() {
-        let params = SandboxPodParams {
-            runtime_class_name: "gvisor",
-            ..Default::default()
-        };
-        let pod_template = sandbox_template_to_k8s(
-            &SandboxTemplate::default(),
-            false,
-            &std::collections::HashMap::new(),
-            true,
-            &params,
-        );
-
-        assert_eq!(
-            pod_env_value(
-                &pod_template,
-                openshell_core::sandbox_env::OUTER_RUNTIME_ISOLATION
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn explicit_runtime_class_outer_isolation_sets_outer_runtime_env() {
-        let params = SandboxPodParams {
-            runtime_class_name: "gvisor",
-            runtime_class_outer_isolation: true,
-            ..Default::default()
-        };
-        let pod_template = sandbox_template_to_k8s(
-            &SandboxTemplate::default(),
-            false,
-            &std::collections::HashMap::new(),
-            true,
-            &params,
-        );
-
-        assert_eq!(
-            pod_env_value(
-                &pod_template,
-                openshell_core::sandbox_env::OUTER_RUNTIME_ISOLATION
-            ),
-            Some("runtime-class")
-        );
-    }
-
-    #[test]
-    fn template_runtime_class_outer_isolation_overrides_configured_default() {
-        let template = SandboxTemplate {
-            platform_config: Some(Struct {
-                fields: std::iter::once((
-                    "runtime_class_outer_isolation".to_string(),
-                    Value {
-                        kind: Some(Kind::BoolValue(false)),
-                    },
-                ))
-                .collect(),
-            }),
-            ..SandboxTemplate::default()
-        };
-        let params = SandboxPodParams {
-            runtime_class_name: "gvisor",
-            runtime_class_outer_isolation: true,
-            ..Default::default()
-        };
-        let pod_template = sandbox_template_to_k8s(
-            &template,
-            false,
-            &std::collections::HashMap::new(),
-            true,
-            &params,
-        );
-
-        assert_eq!(
-            pod_env_value(
-                &pod_template,
-                openshell_core::sandbox_env::OUTER_RUNTIME_ISOLATION
-            ),
-            None
         );
     }
 

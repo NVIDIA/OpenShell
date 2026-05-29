@@ -54,10 +54,6 @@ pub const SANDBOX_TOKEN_FILE: &str = "OPENSHELL_SANDBOX_TOKEN_FILE";
 /// for a gateway JWT at startup and on refresh.
 pub const K8S_SA_TOKEN_FILE: &str = "OPENSHELL_K8S_SA_TOKEN_FILE";
 
-/// Indicates that an outer runtime boundary, such as a Kubernetes `RuntimeClass`
-/// backed by gVisor or Kata Containers, provides kernel isolation.
-pub const OUTER_RUNTIME_ISOLATION: &str = "OPENSHELL_OUTER_RUNTIME_ISOLATION";
-
 /// Runtime role selected for the sandbox supervisor binary.
 pub const SUPERVISOR_ROLE: &str = "OPENSHELL_SUPERVISOR_ROLE";
 

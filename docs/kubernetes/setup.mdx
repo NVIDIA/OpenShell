@@ -136,7 +136,6 @@ The most commonly changed values are:
 | `server.sandboxNamespace` | Namespace where sandbox pods are created. Defaults to the Helm release namespace when left empty. |
 | `server.sandboxImage` | Default sandbox image used when a sandbox does not specify one. |
 | `server.runtimeClassName` | Default Kubernetes RuntimeClass for sandbox pods, such as `gvisor` or a Kata RuntimeClass name. Leave empty to use the cluster default. The gateway validates this RuntimeClass at startup when configured. |
-| `server.runtimeClassOuterIsolation` | Treat the configured RuntimeClass as the sandbox's outer kernel isolation boundary. Set explicitly for gVisor, GKE Sandbox, or Kata RuntimeClasses. |
 | `server.grpcEndpoint` | Endpoint that sandbox supervisors use to call back to the gateway. Must be reachable from inside the cluster. |
 | `server.disableTls` | Run the gateway over plaintext HTTP. Use only behind a trusted transport. |
 | `server.auth.allowUnauthenticatedUsers` | Accept user-facing calls without OIDC or mTLS credentials. Use only for trusted local development or a fully trusted access proxy. |

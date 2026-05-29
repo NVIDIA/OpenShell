@@ -174,10 +174,6 @@ server:
   # Kata RuntimeClass name where Kata Containers are installed. When set, the
   # gateway validates that this RuntimeClass exists during startup.
   runtimeClassName: ""
-  # -- Treat the configured RuntimeClass as the sandbox's outer kernel
-  # isolation boundary. Set explicitly for runtimes such as gVisor or Kata
-  # Containers; OpenShell does not infer this from the RuntimeClass name.
-  runtimeClassOuterIsolation: false
   # -- gRPC endpoint sandboxes call back into the gateway. Leave empty to derive
   # it from the chart fullname, release namespace, service port, and
   # disableTls flag, for example https://openshell.openshell.svc.cluster.local:8080.

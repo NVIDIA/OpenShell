@@ -40,11 +40,7 @@ pub fn enforce(prepared: PreparedSandbox) -> Result<()> {
     if let Some(ruleset) = prepared.landlock {
         landlock::enforce(ruleset)?;
     }
-    if let Err(err) = seccomp::apply(&prepared.policy) {
-        if !crate::outer_runtime_isolation_enabled() {
-            return Err(err);
-        }
-    }
+    seccomp::apply(&prepared.policy)?;
     Ok(())
 }
 

@@ -101,9 +101,6 @@ data:
     {{- if .Values.server.runtimeClassName }}
     runtime_class_name           = {{ .Values.server.runtimeClassName | quote }}
     {{- end }}
-    {{- if .Values.server.runtimeClassOuterIsolation }}
-    runtime_class_outer_isolation = true
-    {{- end }}
     supervisor_role             = {{ .Values.server.supervisorRole | quote }}
     network_enforcement_mode    = {{ .Values.server.networkEnforcementMode | quote }}
     {{- if .Values.server.enforcerEndpoint }}

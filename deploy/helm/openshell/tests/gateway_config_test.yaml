@@ -74,22 +74,6 @@ tests:
       - matchRegex:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?runtime_class_name\s*=\s*"gvisor"'
-      - notMatchRegex:
-          path: data["gateway.toml"]
-          pattern: 'runtime_class_outer_isolation\s*='
-
-  - it: renders explicit RuntimeClass outer isolation when enabled
-    template: templates/gateway-config.yaml
-    set:
-      server.runtimeClassName: gvisor
-      server.runtimeClassOuterIsolation: true
-    asserts:
-      - matchRegex:
-          path: data["gateway.toml"]
-          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?runtime_class_name\s*=\s*"gvisor"'
-      - matchRegex:
-          path: data["gateway.toml"]
-          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?runtime_class_outer_isolation\s*=\s*true'
 
   - it: renders default supervisor workload soft-proxy mode
     template: templates/gateway-config.yaml

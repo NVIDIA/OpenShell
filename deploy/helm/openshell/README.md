@@ -157,7 +157,6 @@ cert-manager alternative.
 | server.oidc.scopesClaim | string | `""` | Dot-separated path to the scopes array in the JWT claims. |
 | server.oidc.userRole | string | `""` | Role name for standard user access. |
 | server.runtimeClassName | string | `""` | Default Kubernetes RuntimeClass assigned to sandbox pods. Leave empty to use the cluster default. Set to "gvisor" for minikube/GKE Sandbox or to a Kata RuntimeClass name where Kata Containers are installed. When set, the gateway validates that this RuntimeClass exists during startup. |
-| server.runtimeClassOuterIsolation | bool | `false` | Treat the configured RuntimeClass as the sandbox's outer kernel isolation boundary. Set explicitly for runtimes such as gVisor or Kata Containers; OpenShell does not infer this from the RuntimeClass name. |
 | server.sandboxImage | string | `"ghcr.io/nvidia/openshell-community/sandboxes/base:latest"` | Default sandbox image used when requests do not specify one. |
 | server.sandboxImagePullPolicy | string | `""` | Kubernetes imagePullPolicy for sandbox pods. Empty = Kubernetes default (Always for :latest, IfNotPresent otherwise). Set to "Always" for dev clusters so new images are picked up without manual eviction. |
 | server.sandboxJwt.gatewayId | string | `""` | Stable gateway identity embedded in iss/aud of every minted token. Defaults to the release name so HA replicas share identity. |

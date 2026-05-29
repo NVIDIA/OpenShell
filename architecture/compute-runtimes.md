@@ -80,18 +80,16 @@ runtime still owns GPU device injection.
 Kubernetes deployments use the Helm chart under `deploy/helm/openshell`.
 The Kubernetes driver can set a default `runtimeClassName` for sandbox pods,
 for example `gvisor` or a Kata Containers RuntimeClass, while preserving
-per-sandbox template overrides. If the RuntimeClass is the sandbox's outer
-kernel isolation boundary, that behavior is configured explicitly; OpenShell
-does not infer isolation semantics from RuntimeClass names. When a default
-RuntimeClass is configured, the Kubernetes driver validates its existence at
-startup so missing cluster runtime support fails before any sandbox pods are
-requested. Per-sandbox RuntimeClass overrides are validated during sandbox
-admission/create because they are not known at gateway startup. The Kubernetes
-driver can also set `securityContext.privileged` on all sandbox pod containers
-as a deployment-wide, short-term compatibility escape hatch for clusters that
-require privileged pod admission; this weakens the container boundary and is not
-a replacement for a stronger runtime isolation model. Kubernetes deployments
-also select an explicit supervisor/network topology. The default is
+per-sandbox template overrides. When a default RuntimeClass is configured, the
+Kubernetes driver validates its existence at startup so missing cluster runtime
+support fails before any sandbox pods are requested. Per-sandbox RuntimeClass
+overrides are validated during sandbox admission/create because they are not
+known at gateway startup. The Kubernetes driver can also set
+`securityContext.privileged` on all sandbox pod containers as a deployment-wide,
+short-term compatibility escape hatch for clusters that require privileged pod
+admission; this weakens the container boundary and is not a replacement for a
+stronger runtime isolation model. Kubernetes deployments also select an
+explicit supervisor/network topology. The default is
 `supervisor_role = "workload"` with `network_enforcement_mode = "soft-proxy"`,
 which keeps sandbox pods unprivileged and relies on the proxy for cooperative
 traffic while reporting that direct sockets are not kernel-blocked. The existing

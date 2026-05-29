@@ -113,35 +113,6 @@ pub(crate) fn agent_proposals_enabled() -> bool {
         .is_some_and(|flag| flag.load(Ordering::Relaxed))
 }
 
-pub(crate) fn outer_runtime_isolation_enabled() -> bool {
-    std::env::var(openshell_core::sandbox_env::OUTER_RUNTIME_ISOLATION)
-        .ok()
-        .is_some_and(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "runtime-class" | "true" | "1" | "yes"
-            )
-        })
-}
-
-fn emit_outer_runtime_degradation(control: &str, error: &dyn std::fmt::Display) {
-    warn!(
-        control = control,
-        error = %error,
-        "Continuing without supervisor-managed isolation control because outer runtime isolation is enabled"
-    );
-    ocsf_emit!(
-        ConfigStateChangeBuilder::new(ocsf_ctx())
-            .severity(SeverityId::High)
-            .status(StatusId::Failure)
-            .state(StateId::Disabled, "outer-runtime")
-            .message(format!(
-                "{control} unavailable; continuing because outer runtime isolation is enabled: {error}"
-            ))
-            .build()
-    );
-}
-
 /// Test-only helpers shared across sibling test modules.
 #[cfg(test)]
 pub(crate) mod test_helpers {
@@ -259,7 +230,6 @@ impl EffectiveNetworkEnforcementMode {
 pub fn resolve_network_enforcement_mode(
     role: SupervisorRole,
     requested: NetworkEnforcementMode,
-    outer_runtime_isolation: bool,
 ) -> EffectiveNetworkEnforcementMode {
     match requested {
         NetworkEnforcementMode::SoftProxy => EffectiveNetworkEnforcementMode::SoftProxy,
@@ -268,7 +238,7 @@ pub fn resolve_network_enforcement_mode(
             EffectiveNetworkEnforcementMode::ExternalEnforcer
         }
         NetworkEnforcementMode::Auto => {
-            if outer_runtime_isolation || matches!(role, SupervisorRole::Workload) {
+            if matches!(role, SupervisorRole::Workload) {
                 EffectiveNetworkEnforcementMode::SoftProxy
             } else {
                 EffectiveNetworkEnforcementMode::SupervisorNetns
@@ -417,17 +387,14 @@ pub async fn run_sandbox(
         }
     }
 
-    let outer_runtime_isolation = outer_runtime_isolation_enabled();
     let effective_network_enforcement = resolve_network_enforcement_mode(
         runtime_config.role,
         runtime_config.network_enforcement_mode,
-        outer_runtime_isolation,
     );
     info!(
         supervisor_role = %runtime_config.role,
         requested_network_enforcement = %runtime_config.network_enforcement_mode,
         effective_network_enforcement = effective_network_enforcement.as_str(),
-        outer_runtime_isolation,
         "Resolved sandbox supervisor runtime mode"
     );
     ocsf_emit!(
@@ -744,13 +711,7 @@ pub async fn run_sandbox(
     // Install the supervisor seccomp prelude after privileged startup helpers
     // (network namespace setup, nftables probes) complete, but before the SSH
     // listener and workload process are exposed.
-    if let Err(e) = apply_supervisor_startup_hardening() {
-        if outer_runtime_isolation_enabled() {
-            emit_outer_runtime_degradation("supervisor seccomp prelude", &e);
-        } else {
-            return Err(e);
-        }
-    }
+    apply_supervisor_startup_hardening()?;
 
     // Shared PID: set after process spawn so the proxy can look up
     // the entrypoint process's /proc/net/tcp for identity binding.
@@ -2914,7 +2875,6 @@ mod tests {
             resolve_network_enforcement_mode(
                 SupervisorRole::Workload,
                 NetworkEnforcementMode::Auto,
-                false
             ),
             EffectiveNetworkEnforcementMode::SoftProxy
         );
@@ -2926,21 +2886,8 @@ mod tests {
             resolve_network_enforcement_mode(
                 SupervisorRole::Combined,
                 NetworkEnforcementMode::Auto,
-                false
             ),
             EffectiveNetworkEnforcementMode::SupervisorNetns
-        );
-    }
-
-    #[test]
-    fn auto_network_mode_degrades_to_soft_with_outer_runtime_isolation() {
-        assert_eq!(
-            resolve_network_enforcement_mode(
-                SupervisorRole::Combined,
-                NetworkEnforcementMode::Auto,
-                true
-            ),
-            EffectiveNetworkEnforcementMode::SoftProxy
         );
     }
 
@@ -2950,7 +2897,6 @@ mod tests {
             resolve_network_enforcement_mode(
                 SupervisorRole::Workload,
                 NetworkEnforcementMode::SupervisorNetns,
-                false
             ),
             EffectiveNetworkEnforcementMode::SupervisorNetns
         );
@@ -2958,7 +2904,6 @@ mod tests {
             resolve_network_enforcement_mode(
                 SupervisorRole::Combined,
                 NetworkEnforcementMode::ExternalEnforcer,
-                false
             ),
             EffectiveNetworkEnforcementMode::ExternalEnforcer
         );

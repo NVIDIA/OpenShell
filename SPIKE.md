@@ -23,12 +23,12 @@ problematic for managed clusters and hardened runtimes:
 
 - Sandbox containers needed elevated network permissions to install bypass
   prevention rules.
-- GKE with gVisor rejected privileged sandbox pods with:
+- Managed runtime environments can reject privileged sandbox pods with:
   `Privileged=true is not supported`.
 - A per-sandbox `--privileged` CLI flag was the wrong product shape because this
   is gateway/operator configuration, not per-sandbox user configuration.
-- RuntimeClass-based isolation is useful, but depending on gVisor or Kata would
-  make OpenShell rely on cluster-specific runtime availability.
+- Runtime-specific isolation layers can still be useful future hardening, but
+  this spike should not rely on cluster-specific runtime availability.
 - Kubernetes `NetworkPolicy` and most CNI-level controls are too static for our
   current need: OpenShell must be able to update enforcement for a running
   sandbox as policy changes.
@@ -293,7 +293,7 @@ node-level infrastructure component.
 That is likely the right direction if the goal is:
 
 - Agent-controlled workload containers are not privileged.
-- RuntimeClass is optional, not required.
+- Runtime-specific sandboxing is out of scope for this spike, not required.
 - OpenShell keeps dynamic network proxy enforcement.
 - The supervisor remains responsible for the agent lifecycle.
 - Non-Kubernetes deployments can keep the existing combined supervisor mode.
@@ -305,19 +305,22 @@ It is not a claim that the system has no privileged code. On Linux, dynamic
 network namespace enforcement needs some trusted component with elevated
 authority unless we delegate entirely to a CNI, runtime, or kernel feature.
 
-## Why Not Only RuntimeClass
+## RuntimeClass Is Out Of Scope
 
-gVisor or Kata can still be valuable defense-in-depth, especially for kernel
-isolation, but making them required creates deployment friction:
+RuntimeClass was useful as an early validation stimulus because it exposed why
+privileged sandbox pods are a brittle product shape. It is not part of the final
+spike topology.
 
-- Not all clusters have the runtime installed.
-- RuntimeClass behavior differs by provider.
-- Some runtime classes reject the Linux privileges needed by the old topology.
-- RuntimeClass does not solve dynamic per-sandbox policy updates by itself.
+The node-enforcer result does not depend on gVisor, Kata, or any other
+RuntimeClass. The workload pod starts with normal Kubernetes networking, reports
+its pod IP to the node-local enforcer, and the enforcer installs rules into that
+pod's network namespace. That path works independently of whether a cluster also
+uses a runtime isolation layer.
 
-The better product shape is to support runtime classes as an optional outer
-isolation layer, not as the core mechanism required for OpenShell network
-enforcement.
+RuntimeClass may still be useful later as defense-in-depth, but it should remain
+separate from OpenShell's network enforcement model. It does not solve dynamic
+per-sandbox policy updates by itself, and it should not be part of this spike's
+enforcement design.
 
 ## Why Not Only CNI or NetworkPolicy
 

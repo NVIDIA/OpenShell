@@ -16,14 +16,11 @@ credential injection, policy polling, logs, and the gateway relay.
 Set `runtime_class_name` in the driver config to assign a default Kubernetes
 RuntimeClass, such as `gvisor` or a Kata Containers RuntimeClass, to sandbox
 pods. Per-sandbox template `runtime_class_name` values override the driver
-default. When that RuntimeClass is the outer isolation boundary for the
-sandbox, set `runtime_class_outer_isolation = true` explicitly; the driver does
-not infer isolation semantics from RuntimeClass names. When a default
-`runtime_class_name` is configured, the driver validates that the cluster has
-that RuntimeClass during startup so a missing runtime fails fast instead of
-surfacing later as pod sandbox creation errors. Per-sandbox RuntimeClass
-overrides are dynamic and are validated during sandbox admission/create.
-As a short-term compatibility escape hatch, the driver config can set
+default. When a default `runtime_class_name` is configured, the driver validates
+that the cluster has that RuntimeClass during startup so a missing runtime fails
+fast instead of surfacing later as pod sandbox creation errors. Per-sandbox
+RuntimeClass overrides are dynamic and are validated during sandbox
+admission/create. As a short-term compatibility escape hatch, the driver can set
 `privileged = true` deployment-wide; the driver maps that to
 `podTemplate.spec.containers[0].securityContext.privileged` for all sandbox pod
 containers. Use it only for trusted clusters that require privileged pod
