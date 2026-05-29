@@ -73,7 +73,7 @@ parts:
       set -euo pipefail
 
       cargo build --release --locked -p openshell-cli --features bundled-z3
-      cargo build --release --locked -p openshell-server --bin openshell-gateway
+      cargo build --release --locked -p openshell-server --bin openshell-gateway --features bundled-z3
       cargo build --release --locked -p openshell-sandbox --bin openshell-sandbox
 
       install -D -m 0755 "$CRAFT_PART_BUILD/target/release/openshell" \
