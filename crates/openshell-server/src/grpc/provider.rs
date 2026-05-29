@@ -1821,9 +1821,12 @@ mod tests {
             vec![
                 "claude-code",
                 "codex",
+                "copilot",
+                "cursor",
                 "github",
                 "google-vertex-ai",
                 "nvidia",
+                "pypi"
             ]
         );
 

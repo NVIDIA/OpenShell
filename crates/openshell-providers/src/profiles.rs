@@ -19,9 +19,12 @@ use std::sync::OnceLock;
 const BUILT_IN_PROFILE_YAMLS: &[&str] = &[
     include_str!("../../../providers/claude-code.yaml"),
     include_str!("../../../providers/codex.yaml"),
+    include_str!("../../../providers/copilot.yaml"),
+    include_str!("../../../providers/cursor.yaml"),
     include_str!("../../../providers/github.yaml"),
     include_str!("../../../providers/google-vertex-ai.yaml"),
     include_str!("../../../providers/nvidia.yaml"),
+    include_str!("../../../providers/pypi.yaml"),
 ];
 
 #[derive(Debug, thiserror::Error)]

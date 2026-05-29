@@ -380,9 +380,13 @@ pub struct ProviderDetailView {
     pub provider_id: String,
     pub provider_type: String,
     pub resource_version: u64,
+    pub summary_scroll: usize,
     pub show_raw_profile: bool,
+    pub show_raw_provider: bool,
     pub raw_profile_scroll: usize,
+    pub raw_provider_scroll: usize,
     pub raw_profile_yaml: Option<String>,
+    pub raw_provider_yaml: String,
     pub profile_name: Option<String>,
     pub profile_category: Option<String>,
     pub profile_description: Option<String>,
@@ -741,6 +745,93 @@ fn mask_secret(value: &str) -> String {
         let end: String = value.chars().skip(len - 2).collect();
         format!("{start}{}…{end}", "*".repeat(len.saturating_sub(4).min(20)))
     }
+}
+
+fn provider_to_redacted_yaml(provider: &openshell_core::proto::Provider) -> String {
+    let mut out = String::new();
+    out.push_str("name: ");
+    out.push_str(&yaml_scalar(provider_name(provider)));
+    out.push('\n');
+    out.push_str("type: ");
+    out.push_str(&yaml_scalar(&provider.r#type));
+    out.push('\n');
+
+    out.push_str("credentials:");
+    if provider.credentials.is_empty() {
+        out.push_str(" {}\n");
+    } else {
+        out.push('\n');
+        let mut keys = provider.credentials.keys().collect::<Vec<_>>();
+        keys.sort();
+        for key in keys {
+            out.push_str("  ");
+            out.push_str(key);
+            out.push_str(": \"<redacted>\"\n");
+        }
+    }
+
+    out.push_str("config:");
+    if provider.config.is_empty() {
+        out.push_str(" {}\n");
+    } else {
+        out.push('\n');
+        let mut entries = provider.config.iter().collect::<Vec<_>>();
+        entries.sort_by_key(|(key, _)| *key);
+        for (key, value) in entries {
+            out.push_str("  ");
+            out.push_str(key);
+            out.push_str(": ");
+            out.push_str(&yaml_scalar(value));
+            out.push('\n');
+        }
+    }
+
+    if !provider.credential_expires_at_ms.is_empty() {
+        out.push_str("credential_expires_at_ms:\n");
+        let mut entries = provider.credential_expires_at_ms.iter().collect::<Vec<_>>();
+        entries.sort_by_key(|(key, _)| *key);
+        for (key, value) in entries {
+            out.push_str("  ");
+            out.push_str(key);
+            out.push_str(": ");
+            out.push_str(&value.to_string());
+            out.push('\n');
+        }
+    }
+
+    if let Some(metadata) = &provider.metadata {
+        out.push_str("metadata:\n");
+        out.push_str("  id: ");
+        out.push_str(&yaml_scalar(&metadata.id));
+        out.push('\n');
+        out.push_str("  resource_version: ");
+        out.push_str(&metadata.resource_version.to_string());
+        out.push('\n');
+        if !metadata.labels.is_empty() {
+            out.push_str("  labels:\n");
+            let mut labels = metadata.labels.iter().collect::<Vec<_>>();
+            labels.sort_by_key(|(key, _)| *key);
+            for (key, value) in labels {
+                out.push_str("    ");
+                out.push_str(key);
+                out.push_str(": ");
+                out.push_str(&yaml_scalar(value));
+                out.push('\n');
+            }
+        }
+    }
+
+    out
+}
+
+fn yaml_scalar(value: &str) -> String {
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t");
+    format!("\"{escaped}\"")
 }
 
 impl App {
@@ -2248,12 +2339,22 @@ impl App {
             return;
         };
         match key.code {
+            KeyCode::Esc if detail.show_raw_profile || detail.show_raw_provider => {
+                detail.show_raw_profile = false;
+                detail.show_raw_provider = false;
+            }
             KeyCode::Esc | KeyCode::Enter => {
                 self.provider_detail = None;
             }
             KeyCode::Char('y') if detail.raw_profile_yaml.is_some() => {
                 detail.show_raw_profile = !detail.show_raw_profile;
+                detail.show_raw_provider = false;
                 detail.raw_profile_scroll = 0;
+            }
+            KeyCode::Char('o') => {
+                detail.show_raw_provider = !detail.show_raw_provider;
+                detail.show_raw_profile = false;
+                detail.raw_provider_scroll = 0;
             }
             KeyCode::Char('j') | KeyCode::Down if detail.show_raw_profile => {
                 let max_scroll = detail
@@ -2264,6 +2365,19 @@ impl App {
             }
             KeyCode::Char('k') | KeyCode::Up if detail.show_raw_profile => {
                 detail.raw_profile_scroll = detail.raw_profile_scroll.saturating_sub(1);
+            }
+            KeyCode::Char('j') | KeyCode::Down if detail.show_raw_provider => {
+                let max_scroll = detail.raw_provider_yaml.lines().count().saturating_sub(1);
+                detail.raw_provider_scroll = (detail.raw_provider_scroll + 1).min(max_scroll);
+            }
+            KeyCode::Char('k') | KeyCode::Up if detail.show_raw_provider => {
+                detail.raw_provider_scroll = detail.raw_provider_scroll.saturating_sub(1);
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                detail.summary_scroll = detail.summary_scroll.saturating_add(1);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                detail.summary_scroll = detail.summary_scroll.saturating_sub(1);
             }
             _ => {}
         }
@@ -2575,9 +2689,13 @@ impl App {
             provider_id: provider_id(provider).to_string(),
             provider_type: provider.r#type.clone(),
             resource_version: provider_resource_version(provider),
+            summary_scroll: 0,
             show_raw_profile: false,
+            show_raw_provider: false,
             raw_profile_scroll: 0,
+            raw_provider_scroll: 0,
             raw_profile_yaml,
+            raw_provider_yaml: provider_to_redacted_yaml(provider),
             profile_name: profile.map(|profile| {
                 if profile.display_name.is_empty() {
                     profile.id.clone()

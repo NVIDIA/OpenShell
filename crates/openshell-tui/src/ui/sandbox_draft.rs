@@ -4,7 +4,7 @@
 //! Network rules panel for the sandbox screen.
 
 use crate::app::App;
-use openshell_core::proto::PolicyChunk;
+use openshell_core::proto::{L7Allow, L7DenyRule, L7QueryMatcher, NetworkEndpoint, PolicyChunk};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
@@ -113,12 +113,12 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 spans.push(Span::raw("  "));
             }
 
-            // Endpoint summary (host:port).
+            // Endpoint summary with L4/L7 detail.
             let endpoint_str = chunk
                 .proposed_rule
                 .as_ref()
                 .and_then(|r| r.endpoints.first())
-                .map(|ep| format!("{}:{}", ep.host, ep.port))
+                .map(format_endpoint_summary)
                 .unwrap_or_default();
 
             spans.push(Span::styled(&chunk.rule_name, name_style));
@@ -237,8 +237,15 @@ pub fn draw_detail_popup(
             lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled("-> ", t.muted),
-                Span::styled(format!("{}:{}", ep.host, ep.port), t.accent),
+                Span::styled(format_endpoint_summary(ep), t.accent),
             ]));
+
+            for detail in format_endpoint_details(ep) {
+                lines.push(Line::from(vec![
+                    Span::raw("     "),
+                    Span::styled(detail, t.text),
+                ]));
+            }
         }
 
         // Binaries.
@@ -375,7 +382,7 @@ pub fn draw_approve_all_popup(
             .proposed_rule
             .as_ref()
             .and_then(|r| r.endpoints.first())
-            .map(|ep| format!("{}:{}", ep.host, ep.port))
+            .map(format_endpoint_summary)
             .unwrap_or_default();
 
         // Truncate to fit within the popup width.
@@ -430,6 +437,156 @@ fn truncate_str(s: &str, max_len: usize) -> String {
         out.push_str("...");
         out
     }
+}
+
+fn format_endpoint_summary(endpoint: &NetworkEndpoint) -> String {
+    let host_port = if endpoint.port > 0 {
+        format!("{}:{}", endpoint.host, endpoint.port)
+    } else {
+        endpoint.host.clone()
+    };
+
+    let mut tags = vec![endpoint_layer_label(endpoint).to_string()];
+    if !endpoint.access.is_empty() {
+        tags.push(format!("access={}", endpoint.access));
+    }
+    for rule in &endpoint.rules {
+        if let Some(allow) = &rule.allow {
+            tags.push(format!("allow {}", format_allow_rule(allow)));
+        }
+    }
+    for deny in &endpoint.deny_rules {
+        tags.push(format!("deny {}", format_deny_rule(deny)));
+    }
+
+    format!("{host_port} [{}]", tags.join(", "))
+}
+
+fn format_endpoint_details(endpoint: &NetworkEndpoint) -> Vec<String> {
+    let mut details = Vec::new();
+
+    if !endpoint.path.is_empty() {
+        details.push(format!("Path scope: {}", endpoint.path));
+    }
+    if !endpoint.tls.is_empty() {
+        details.push(format!("TLS: {}", endpoint.tls));
+    }
+    if !endpoint.enforcement.is_empty() {
+        details.push(format!("Enforcement: {}", endpoint.enforcement));
+    }
+    if endpoint.request_body_credential_rewrite {
+        details.push("Request body credential rewrite".to_string());
+    }
+    if endpoint.websocket_credential_rewrite {
+        details.push("WebSocket credential rewrite".to_string());
+    }
+    for rule in &endpoint.rules {
+        if let Some(allow) = &rule.allow {
+            details.push(format!("Allow: {}", format_allow_rule(allow)));
+        }
+    }
+    for deny in &endpoint.deny_rules {
+        details.push(format!("Deny: {}", format_deny_rule(deny)));
+    }
+
+    details
+}
+
+fn endpoint_layer_label(endpoint: &NetworkEndpoint) -> &str {
+    if endpoint.protocol.eq_ignore_ascii_case("rest") {
+        "L7 rest"
+    } else if endpoint.protocol.is_empty() {
+        "L4"
+    } else {
+        endpoint.protocol.as_str()
+    }
+}
+
+fn format_allow_rule(allow: &L7Allow) -> String {
+    let mut parts = Vec::new();
+    if !allow.method.is_empty() || !allow.path.is_empty() {
+        parts.push(format!(
+            "{} {}",
+            non_empty_or(&allow.method, "*"),
+            non_empty_or(&allow.path, "*")
+        ));
+    }
+    if !allow.command.is_empty() {
+        parts.push(format!("command {}", allow.command));
+    }
+    if !allow.operation_type.is_empty() || !allow.operation_name.is_empty() {
+        parts.push(format!(
+            "graphql {} {}",
+            non_empty_or(&allow.operation_type, "*"),
+            non_empty_or(&allow.operation_name, "*")
+        ));
+    }
+    if !allow.fields.is_empty() {
+        parts.push(format!("fields {}", allow.fields.join(",")));
+    }
+    append_query_matchers(&mut parts, &allow.query);
+    if parts.is_empty() {
+        "*".to_string()
+    } else {
+        parts.join("; ")
+    }
+}
+
+fn format_deny_rule(deny: &L7DenyRule) -> String {
+    let mut parts = Vec::new();
+    if !deny.method.is_empty() || !deny.path.is_empty() {
+        parts.push(format!(
+            "{} {}",
+            non_empty_or(&deny.method, "*"),
+            non_empty_or(&deny.path, "*")
+        ));
+    }
+    if !deny.command.is_empty() {
+        parts.push(format!("command {}", deny.command));
+    }
+    if !deny.operation_type.is_empty() || !deny.operation_name.is_empty() {
+        parts.push(format!(
+            "graphql {} {}",
+            non_empty_or(&deny.operation_type, "*"),
+            non_empty_or(&deny.operation_name, "*")
+        ));
+    }
+    if !deny.fields.is_empty() {
+        parts.push(format!("fields {}", deny.fields.join(",")));
+    }
+    append_query_matchers(&mut parts, &deny.query);
+    if parts.is_empty() {
+        "*".to_string()
+    } else {
+        parts.join("; ")
+    }
+}
+
+fn append_query_matchers(
+    parts: &mut Vec<String>,
+    query: &std::collections::HashMap<String, L7QueryMatcher>,
+) {
+    if query.is_empty() {
+        return;
+    }
+    let mut entries: Vec<_> = query.iter().collect();
+    entries.sort_by_key(|(key, _)| *key);
+    let formatted = entries
+        .into_iter()
+        .map(|(key, matcher)| {
+            if matcher.any.is_empty() {
+                format!("{key}={}", non_empty_or(&matcher.glob, "*"))
+            } else {
+                format!("{key} in [{}]", matcher.any.join(","))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    parts.push(format!("query {formatted}"));
+}
+
+fn non_empty_or<'a>(value: &'a str, fallback: &'a str) -> &'a str {
+    if value.is_empty() { fallback } else { value }
 }
 
 fn format_short_time(epoch_ms: i64) -> String {

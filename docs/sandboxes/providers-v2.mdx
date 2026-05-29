@@ -93,9 +93,13 @@ Built-in Providers v2 profiles currently include:
 | Profile ID | Category | Credential environment variables |
 |---|---|---|
 | `claude-code` | `agent` | `ANTHROPIC_API_KEY`, `CLAUDE_API_KEY` |
+| `codex` | `agent` | `CODEX_AUTH_ACCESS_TOKEN`, `CODEX_AUTH_REFRESH_TOKEN`, `CODEX_AUTH_ACCOUNT_ID`, `CODEX_AUTH_ID_TOKEN` |
+| `copilot` | `agent` | `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN` |
+| `cursor` | `agent` | None |
 | `github` | `source_control` | `GITHUB_TOKEN`, `GH_TOKEN` |
 | `google-vertex-ai` | `inference` | `GOOGLE_SERVICE_ACCOUNT_KEY`, `GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN`, `VERTEX_AI_SERVICE_ACCOUNT_TOKEN`, `GOOGLE_VERTEX_AI_TOKEN`, `VERTEX_AI_TOKEN` |
 | `nvidia` | `inference` | `NVIDIA_API_KEY` |
+| `pypi` | `data` | None |
 
 Export a built-in profile as YAML:
 
