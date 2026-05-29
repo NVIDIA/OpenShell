@@ -94,6 +94,10 @@ seccompiler = "0.5"
 tempfile = "3"
 uuid = { version = "1", features = ["v4"] }
 
+[[test]]
+name = "sigv4_signing"
+path = "tests/sigv4_signing.rs"
+
 [dev-dependencies]
 tempfile = "3"
 temp-env = "0.3"
