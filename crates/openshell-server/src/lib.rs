@@ -749,6 +749,9 @@ async fn build_compute_runtime(
             if let Ok(p) = std::env::var("OPENSHELL_PODMAN_SOCKET") {
                 podman.socket_path = PathBuf::from(p);
             }
+            if let Ok(ip) = std::env::var("OPENSHELL_PODMAN_HOST_GATEWAY_IP") {
+                podman.host_gateway_ip = ip;
+            }
             apply_podman_local_tls_defaults(config, &mut podman)?;
 
             ComputeRuntime::new_podman(

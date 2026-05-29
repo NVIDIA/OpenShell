@@ -223,15 +223,22 @@ The container spec configures:
 - `networks` to attach to the configured bridge, `openshell` by default.
 - `portmappings` with `host_port: 0`, `container_port: 2222`, and `protocol:
   "tcp"` to publish the SSH compatibility port on an ephemeral host port.
-- `hostadd` entries for `host.containers.internal:host-gateway` and
-  `host.openshell.internal:host-gateway`.
+- `hostadd` entries for `host.containers.internal` and
+  `host.openshell.internal`, using Podman's `host-gateway` resolver or the
+  configured `host_gateway_ip`.
 
 Pasta is not explicitly configured by the driver. The driver requests bridge
 mode and logs the network backend that Podman reports at startup.
 
 The `host.containers.internal` hostname is injected into `/etc/hosts` so the
-supervisor can reach the gateway on the host. If `OPENSHELL_GRPC_ENDPOINT` is
-empty, the driver auto-detects:
+supervisor can reach the gateway on the host. Linux defaults to
+`host-gateway`; macOS Podman machine defaults to `192.168.127.254`, gvproxy's
+host-loopback IP, because older Podman machine images can fail to resolve
+`host-gateway`. Override this with `host_gateway_ip` or
+`OPENSHELL_PODMAN_HOST_GATEWAY_IP` when a Podman machine uses a non-standard
+host-loopback address.
+
+If `OPENSHELL_GRPC_ENDPOINT` is empty, the driver auto-detects:
 
 ```rust
 if config.grpc_endpoint.is_empty() {

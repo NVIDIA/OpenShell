@@ -275,6 +275,7 @@ fn inheritable_keys(driver: ComputeDriverKind) -> &'static [&'static str] {
         ComputeDriverKind::Podman => &[
             "default_image",
             "supervisor_image",
+            "host_gateway_ip",
             "guest_tls_ca",
             "guest_tls_cert",
             "guest_tls_key",
@@ -495,6 +496,25 @@ version = 2
         assert_eq!(
             table.get("host_gateway_ip").and_then(|v| v.as_str()),
             Some("10.0.0.1")
+        );
+    }
+
+    #[test]
+    fn podman_driver_table_inherits_gateway_host_gateway_ip() {
+        let gateway = GatewayFileSection {
+            default_image: Some("ghcr.io/nvidia/openshell/sandbox:0.9".to_string()),
+            host_gateway_ip: Some("192.168.127.254".to_string()),
+            ..Default::default()
+        };
+        let merged = driver_table(ComputeDriverKind::Podman, &gateway, None);
+        let table = merged.as_table().expect("table");
+        assert_eq!(
+            table.get("default_image").and_then(|v| v.as_str()),
+            Some("ghcr.io/nvidia/openshell/sandbox:0.9")
+        );
+        assert_eq!(
+            table.get("host_gateway_ip").and_then(|v| v.as_str()),
+            Some("192.168.127.254")
         );
     }
 
