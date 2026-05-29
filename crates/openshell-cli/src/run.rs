@@ -684,24 +684,10 @@ fn is_loopback_gateway_endpoint(endpoint: &str) -> bool {
     }
 }
 
-/// Check whether mTLS client certs exist on disk for the gateway that
-/// would serve this endpoint.
-///
-/// Loopback endpoints (`localhost`, `127.0.0.1`, `::1`) resolve to the
-/// `"openshell"` gateway name, matching the convention used by local
-/// `openshell-gateway generate-certs` and the TLS cert resolver in `tls.rs`.
-fn mtls_certs_exist_for_endpoint(name: &str, endpoint: &str) -> bool {
-    let cert_name = if is_loopback_gateway_endpoint(endpoint) {
-        "openshell"
-    } else {
-        name
-    };
+/// Check whether mTLS client certs exist on disk for a gateway name.
+fn mtls_certs_exist_for_gateway(name: &str) -> bool {
     openshell_core::paths::xdg_config_dir().is_ok_and(|d| {
-        let mtls = d
-            .join("openshell")
-            .join("gateways")
-            .join(cert_name)
-            .join("mtls");
+        let mtls = d.join("openshell").join("gateways").join(name).join("mtls");
         mtls.join("ca.crt").is_file()
             && mtls.join("tls.crt").is_file()
             && mtls.join("tls.key").is_file()
@@ -1033,7 +1019,7 @@ pub async fn gateway_add(
     if endpoint.starts_with("http://") {
         // Warn if mTLS certs exist for this gateway — the user likely
         // meant to use https:// instead of http://.
-        let has_mtls_certs = mtls_certs_exist_for_endpoint(name, &endpoint);
+        let has_mtls_certs = mtls_certs_exist_for_gateway(name);
 
         if has_mtls_certs {
             let https_endpoint = endpoint.replacen("http://", "https://", 1);
@@ -1087,8 +1073,7 @@ pub async fn gateway_add(
         } else {
             None
         };
-        let certs_on_disk =
-            imported_mtls_dir.is_some() || mtls_certs_exist_for_endpoint(name, &endpoint);
+        let certs_on_disk = imported_mtls_dir.is_some() || mtls_certs_exist_for_gateway(name);
         if !certs_on_disk {
             return Err(miette::miette!(
                 "mTLS certificates for gateway '{name}' were not found.\n\
@@ -7474,9 +7459,9 @@ mod tests {
         format_gateway_select_items, format_provider_attachment_table, gateway_add,
         gateway_auth_label, gateway_env_override_warning, gateway_select_with, gateway_type_label,
         git_sync_files, http_health_check, image_requests_gpu, import_local_package_mtls_bundle,
-        inferred_provider_type, package_managed_tls_dirs, parse_cli_setting_value,
-        parse_credential_expiry_cli_value, parse_credential_expiry_pairs, parse_credential_pairs,
-        plaintext_gateway_is_remote, progress_step_from_metadata,
+        inferred_provider_type, mtls_certs_exist_for_gateway, package_managed_tls_dirs,
+        parse_cli_setting_value, parse_credential_expiry_cli_value, parse_credential_expiry_pairs,
+        parse_credential_pairs, plaintext_gateway_is_remote, progress_step_from_metadata,
         provider_profile_allows_refresh_bootstrap, provisioning_timeout_message,
         ready_false_condition_message, refresh_status_header, refresh_status_row, resolve_from,
         sandbox_should_persist, sandbox_upload_plan, service_expose_status_error,
@@ -8482,6 +8467,21 @@ mod tests {
                 fs::read_to_string(mtls.join("tls.key")).unwrap(),
                 "client key",
             );
+        });
+    }
+
+    #[test]
+    fn mtls_certs_exist_for_gateway_uses_explicit_name_for_loopback_endpoint() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let mtls = tmpdir.path().join("openshell/gateways/k8s/mtls");
+        fs::create_dir_all(&mtls).expect("create mtls dir");
+        fs::write(mtls.join("ca.crt"), "ca").expect("write ca");
+        fs::write(mtls.join("tls.crt"), "client cert").expect("write cert");
+        fs::write(mtls.join("tls.key"), "client key").expect("write key");
+
+        with_tmp_xdg(tmpdir.path(), || {
+            assert!(mtls_certs_exist_for_gateway("k8s"));
+            assert!(!mtls_certs_exist_for_gateway("openshell"));
         });
     }
 
