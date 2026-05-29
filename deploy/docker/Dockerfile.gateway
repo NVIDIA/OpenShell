@@ -16,10 +16,20 @@
 #
 # The runtime is distroless Debian 13, which provides glibc and the dynamic
 # loader needed by the GNU-linked gateway binary while keeping the attack
-# surface small. The default digest currently carries Debian glibc
-# 2.41-12+deb13u3.
+# surface small. The gateway links to libz3 through openshell-prover, so copy
+# the matching Debian runtime library from a Debian 13 package stage.
+# The default distroless digest currently carries Debian glibc 2.41-12+deb13u3.
 
 ARG GATEWAY_BASE_IMAGE=gcr.io/distroless/cc-debian13:nonroot@sha256:e1fd250ce83d94603e9887ec991156a6c26905a6b0001039b7a43699018c0733
+ARG Z3_PACKAGE_IMAGE=debian:trixie-slim@sha256:b6e2a152f22a40ff69d92cb397223c906017e1391a73c952b588e51af8883bf8
+
+FROM ${Z3_PACKAGE_IMAGE} AS z3-runtime
+
+RUN DEBIAN_FRONTEND=noninteractive apt-get update \
+    && apt-get install -y --no-install-recommends libz3-4 \
+    && mkdir -p /z3 \
+    && cp /usr/lib/*-linux-gnu/libz3.so.4 /z3/libz3.so.4 \
+    && rm -rf /var/lib/apt/lists/*
 
 FROM ${GATEWAY_BASE_IMAGE} AS gateway
 
@@ -27,7 +37,10 @@ ARG TARGETARCH
 
 WORKDIR /app
 
+COPY --from=z3-runtime /z3/libz3.so.4 /usr/lib/libz3.so.4
 COPY deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-gateway /usr/local/bin/openshell-gateway
+
+ENV LD_LIBRARY_PATH=/usr/lib
 
 USER 1000:1000
 EXPOSE 8080
