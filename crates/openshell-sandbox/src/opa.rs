@@ -1058,6 +1058,9 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                     if !e.allowed_ips.is_empty() {
                         ep["allowed_ips"] = e.allowed_ips.clone().into();
                     }
+                    if e.advisor_proposed {
+                        ep["advisor_proposed"] = true.into();
+                    }
                     if !e.deny_rules.is_empty() {
                         let deny_rules: Vec<serde_json::Value> = e
                             .deny_rules
@@ -3718,6 +3721,60 @@ process:
             "advisor proposal should still allow at OPA L4"
         );
         assert!(!engine.query_exact_declared_endpoint_host(&input).unwrap());
+    }
+
+    #[test]
+    fn exact_declared_endpoint_host_false_for_advisor_proposed_endpoint() {
+        let mut network_policies = std::collections::HashMap::new();
+        network_policies.insert(
+            "app-api".to_string(),
+            NetworkPolicyRule {
+                name: "app-api".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "internal-admin.local".to_string(),
+                    port: 443,
+                    ports: vec![443],
+                    advisor_proposed: true,
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/python".to_string(),
+                    ..Default::default()
+                }],
+            },
+        );
+        let proto = ProtoSandboxPolicy {
+            version: 1,
+            filesystem: Some(ProtoFs {
+                include_workdir: true,
+                read_only: vec![],
+                read_write: vec![],
+            }),
+            landlock: Some(openshell_core::proto::LandlockPolicy {
+                compatibility: "best_effort".to_string(),
+            }),
+            process: Some(ProtoProc {
+                run_as_user: "sandbox".to_string(),
+                run_as_group: "sandbox".to_string(),
+            }),
+            network_policies,
+        };
+        let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
+        let input = NetworkInput {
+            host: "internal-admin.local".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/python"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        let decision = engine.evaluate_network(&input).unwrap();
+        assert!(decision.allowed, "policy should still allow at OPA L4");
+        assert!(
+            !engine.query_exact_declared_endpoint_host(&input).unwrap(),
+            "advisor endpoint provenance should block exact-host SSRF trust"
+        );
     }
 
     #[test]

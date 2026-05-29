@@ -676,6 +676,7 @@ matched_endpoint_config := _matching_endpoint_configs[0] if {
 _policy_has_exact_declared_endpoint(policy) if {
 	some ep
 	ep := policy.endpoints[_]
+	not object.get(ep, "advisor_proposed", false)
 	not contains(ep.host, "*")
 	lower(ep.host) == lower(input.network.host)
 	ep.ports[_] == input.network.port

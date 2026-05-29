@@ -1004,7 +1004,11 @@ fn network_rule_from_json(
     let endpoints = rule
         .endpoints
         .into_iter()
-        .map(network_endpoint_from_json)
+        .map(|endpoint| {
+            let mut endpoint = network_endpoint_from_json(endpoint)?;
+            endpoint.advisor_proposed = true;
+            Ok::<NetworkEndpoint, String>(endpoint)
+        })
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let binaries = rule
         .binaries
@@ -1100,6 +1104,7 @@ fn network_endpoint_from_json(
         allow_encoded_slash: endpoint.allow_encoded_slash,
         websocket_credential_rewrite: false,
         request_body_credential_rewrite: false,
+        advisor_proposed: false,
         // GraphQL persisted-query knobs and path scoping default empty —
         // agent proposals don't author them today.
         persisted_queries: String::new(),

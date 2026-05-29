@@ -129,6 +129,7 @@ pub fn generate_proposals(summaries: &[DenialSummary]) -> Vec<PolicyChunk> {
                 protocol: "rest".to_string(),
                 enforcement: "enforce".to_string(),
                 rules: l7_rules,
+                advisor_proposed: true,
                 ..Default::default()
             }
         } else {
@@ -136,6 +137,7 @@ pub fn generate_proposals(summaries: &[DenialSummary]) -> Vec<PolicyChunk> {
                 host: host.clone(),
                 port: *port,
                 ports: vec![*port],
+                advisor_proposed: true,
                 ..Default::default()
             }
         };
