@@ -5,6 +5,7 @@
 //!
 //! This crate provides process sandboxing and monitoring capabilities.
 
+mod activity_aggregator;
 pub mod bypass_monitor;
 mod child_env;
 pub mod debug_rpc;
@@ -235,6 +236,23 @@ fn route_refresh_interval_secs() -> u64 {
             );
             DEFAULT_ROUTE_REFRESH_INTERVAL_SECS
         }
+    }
+}
+
+type ActivityCollectionChannels = (
+    Option<activity_aggregator::ActivitySender>,
+    Option<tokio::sync::mpsc::Receiver<activity_aggregator::ActivityEvent>>,
+    Option<activity_aggregator::ActivitySender>,
+);
+
+fn activity_collection_channels(sandbox_id: Option<&str>) -> ActivityCollectionChannels {
+    if sandbox_id.is_some() && openshell_core::telemetry::enabled() {
+        let (tx, rx) =
+            tokio::sync::mpsc::channel(activity_aggregator::ACTIVITY_EVENT_QUEUE_CAPACITY);
+        let bypass_tx = tx.clone();
+        (Some(tx), Some(rx), Some(bypass_tx))
+    } else {
+        (None, None, None)
     }
 }
 
@@ -582,66 +600,79 @@ pub async fn run_sandbox(
     // the entrypoint process's /proc/net/tcp for identity binding.
     let entrypoint_pid = Arc::new(AtomicU32::new(0));
 
-    let (_proxy, denial_rx, bypass_denial_tx) = if matches!(policy.network.mode, NetworkMode::Proxy)
-    {
-        let proxy_policy = policy.network.proxy.as_ref().ok_or_else(|| {
-            miette::miette!("Network mode is set to proxy but no proxy configuration was provided")
-        })?;
+    let (_proxy, denial_rx, bypass_denial_tx, activity_rx, bypass_activity_tx) =
+        if matches!(policy.network.mode, NetworkMode::Proxy) {
+            let proxy_policy = policy.network.proxy.as_ref().ok_or_else(|| {
+                miette::miette!(
+                    "Network mode is set to proxy but no proxy configuration was provided"
+                )
+            })?;
 
-        let engine = opa_engine.clone().ok_or_else(|| {
-            miette::miette!("Proxy mode requires an OPA engine (--rego-policy and --rego-data)")
-        })?;
+            let engine = opa_engine.clone().ok_or_else(|| {
+                miette::miette!("Proxy mode requires an OPA engine (--rego-policy and --rego-data)")
+            })?;
 
-        let cache = identity_cache.clone().ok_or_else(|| {
-            miette::miette!("Proxy mode requires an identity cache (OPA engine must be configured)")
-        })?;
+            let cache = identity_cache.clone().ok_or_else(|| {
+                miette::miette!(
+                    "Proxy mode requires an identity cache (OPA engine must be configured)"
+                )
+            })?;
 
-        // If we have a network namespace, bind to the veth host IP so sandboxed
-        // processes can reach the proxy via TCP.
-        #[cfg(target_os = "linux")]
-        let bind_addr = netns.as_ref().map(|ns| {
-            let port = proxy_policy.http_addr.map_or(3128, |addr| addr.port());
-            SocketAddr::new(ns.host_ip(), port)
-        });
+            // If we have a network namespace, bind to the veth host IP so sandboxed
+            // processes can reach the proxy via TCP.
+            #[cfg(target_os = "linux")]
+            let bind_addr = netns.as_ref().map(|ns| {
+                let port = proxy_policy.http_addr.map_or(3128, |addr| addr.port());
+                SocketAddr::new(ns.host_ip(), port)
+            });
 
-        #[cfg(not(target_os = "linux"))]
-        let bind_addr: Option<SocketAddr> = None;
+            #[cfg(not(target_os = "linux"))]
+            let bind_addr: Option<SocketAddr> = None;
 
-        // Build inference context for local routing of intercepted inference calls.
-        let inference_ctx = build_inference_context(
-            sandbox_id.as_deref(),
-            openshell_endpoint_for_proxy.as_deref(),
-            inference_routes.as_deref(),
-        )
-        .await?;
+            // Build inference context for local routing of intercepted inference calls.
+            let inference_ctx = build_inference_context(
+                sandbox_id.as_deref(),
+                openshell_endpoint_for_proxy.as_deref(),
+                inference_routes.as_deref(),
+            )
+            .await?;
 
-        // Create denial aggregator channel if in gRPC mode (sandbox_id present).
-        // Clone the sender for the bypass monitor before passing to the proxy.
-        let (denial_tx, denial_rx, bypass_denial_tx) = if sandbox_id.is_some() {
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            let bypass_tx = tx.clone();
-            (Some(tx), Some(rx), Some(bypass_tx))
+            // Create denial aggregator channel if in gRPC mode (sandbox_id present).
+            // Clone the sender for the bypass monitor before passing to the proxy.
+            let (denial_tx, denial_rx, bypass_denial_tx) = if sandbox_id.is_some() {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                let bypass_tx = tx.clone();
+                (Some(tx), Some(rx), Some(bypass_tx))
+            } else {
+                (None, None, None)
+            };
+            let (activity_tx, activity_rx, bypass_activity_tx) =
+                activity_collection_channels(sandbox_id.as_deref());
+
+            let proxy_handle = ProxyHandle::start_with_bind_addr(
+                proxy_policy,
+                bind_addr,
+                engine,
+                cache,
+                entrypoint_pid.clone(),
+                tls_state,
+                inference_ctx,
+                Some(provider_credentials.clone()),
+                Some(policy_local_ctx.clone()),
+                denial_tx,
+                activity_tx,
+            )
+            .await?;
+            (
+                Some(proxy_handle),
+                denial_rx,
+                bypass_denial_tx,
+                activity_rx,
+                bypass_activity_tx,
+            )
         } else {
-            (None, None, None)
+            (None, None, None, None, None)
         };
-
-        let proxy_handle = ProxyHandle::start_with_bind_addr(
-            proxy_policy,
-            bind_addr,
-            engine,
-            cache,
-            entrypoint_pid.clone(),
-            tls_state,
-            inference_ctx,
-            Some(provider_credentials.clone()),
-            Some(policy_local_ctx.clone()),
-            denial_tx,
-        )
-        .await?;
-        (Some(proxy_handle), denial_rx, bypass_denial_tx)
-    } else {
-        (None, None, None)
-    };
 
     // Spawn bypass detection monitor (Linux only, proxy mode only).
     // Reads /dev/kmsg for nftables log entries and emits structured
@@ -652,12 +683,15 @@ pub async fn run_sandbox(
             ns.name().to_string(),
             entrypoint_pid.clone(),
             bypass_denial_tx,
+            bypass_activity_tx,
         )
     });
 
     // On non-Linux, bypass_denial_tx is unused (no /dev/kmsg).
     #[cfg(not(target_os = "linux"))]
     drop(bypass_denial_tx);
+    #[cfg(not(target_os = "linux"))]
+    drop(bypass_activity_tx);
 
     // Compute the proxy URL and netns fd for SSH sessions.
     // SSH shell processes need both to enforce network policy:
@@ -1001,6 +1035,32 @@ pub async fn run_sandbox(
                                     .await
                             {
                                 warn!(error = %e, "Failed to flush denial summaries to gateway");
+                            }
+                        }
+                    })
+                    .await;
+            });
+        }
+        if let Some(rx) = activity_rx {
+            let agg_name = sandbox_name_for_agg.clone().unwrap_or_else(|| id.clone());
+            let agg_endpoint = endpoint.clone();
+            let flush_interval_secs = activity_aggregator::activity_flush_interval_secs_from_env(
+                std::env::var("OPENSHELL_ACTIVITY_FLUSH_INTERVAL_SECS")
+                    .ok()
+                    .as_deref(),
+            );
+            let aggregator = activity_aggregator::ActivityAggregator::new(rx, flush_interval_secs);
+
+            tokio::spawn(async move {
+                aggregator
+                    .run(move |summary| {
+                        let endpoint = agg_endpoint.clone();
+                        let sandbox_name = agg_name.clone();
+                        async move {
+                            if let Err(e) =
+                                flush_activity_to_gateway(&endpoint, &sandbox_name, summary).await
+                            {
+                                warn!(error = %e, "Failed to flush activity summary to gateway");
                             }
                         }
                     })
@@ -2363,9 +2423,42 @@ async fn flush_proposals_to_gateway(
     );
 
     client
-        .submit_policy_analysis(sandbox_name, proto_summaries, proposals, "mechanistic")
+        .submit_policy_analysis(
+            sandbox_name,
+            proto_summaries,
+            proposals,
+            vec![],
+            "mechanistic",
+        )
         .await?;
 
+    Ok(())
+}
+
+async fn flush_activity_to_gateway(
+    endpoint: &str,
+    sandbox_name: &str,
+    summary: activity_aggregator::FlushableActivitySummary,
+) -> Result<()> {
+    use crate::grpc_client::CachedOpenShellClient;
+    use openshell_core::proto::{DenialGroupCount, NetworkActivitySummary};
+
+    let client = CachedOpenShellClient::connect(endpoint).await?;
+    let summary = NetworkActivitySummary {
+        network_activity_count: summary.network_activity_count,
+        denied_action_count: summary.denied_action_count,
+        denials_by_group: summary
+            .denials_by_group
+            .into_iter()
+            .map(|(deny_group, denied_count)| DenialGroupCount {
+                deny_group,
+                denied_count,
+            })
+            .collect(),
+    };
+    client
+        .submit_policy_analysis(sandbox_name, vec![], vec![], vec![summary], "telemetry")
+        .await?;
     Ok(())
 }
 
@@ -3111,6 +3204,32 @@ filesystem_policy:
                 );
             },
         );
+    }
+
+    #[test]
+    fn telemetry_opt_out_disables_activity_collection_and_flush_channel() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        with_vars([("OPENSHELL_TELEMETRY_ENABLED", Some("false"))], || {
+            let (activity_tx, activity_rx, bypass_activity_tx) =
+                activity_collection_channels(Some("sb-1"));
+
+            assert!(activity_tx.is_none());
+            assert!(activity_rx.is_none());
+            assert!(bypass_activity_tx.is_none());
+        });
+    }
+
+    #[test]
+    fn telemetry_enabled_creates_activity_collection_and_flush_channel() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        with_vars([("OPENSHELL_TELEMETRY_ENABLED", Some("true"))], || {
+            let (activity_tx, activity_rx, bypass_activity_tx) =
+                activity_collection_channels(Some("sb-1"));
+
+            assert!(activity_tx.is_some());
+            assert!(activity_rx.is_some());
+            assert!(bypass_activity_tx.is_some());
+        });
     }
 
     #[tokio::test]

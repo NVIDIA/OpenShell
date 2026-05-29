@@ -38,6 +38,7 @@ mod sandbox_watch;
 mod service_routing;
 mod ssh_sessions;
 pub mod supervisor_session;
+mod telemetry;
 mod tls;
 pub mod tracing_bus;
 mod ws_tunnel;
@@ -90,6 +91,9 @@ pub struct ServerState {
 
     /// In-memory bus for server process logs.
     pub tracing_log_bus: TracingLogBus,
+
+    /// In-memory anonymous telemetry accounting for active sandbox sessions.
+    pub(crate) telemetry: telemetry::TelemetryState,
 
     /// Active SSH tunnel connection counts per session token.
     pub ssh_connections_by_token: Mutex<HashMap<String, u32>>,
@@ -167,6 +171,7 @@ impl ServerState {
             sandbox_index,
             sandbox_watch_bus,
             tracing_log_bus,
+            telemetry: telemetry::TelemetryState::new(),
             ssh_connections_by_token: Mutex::new(HashMap::new()),
             ssh_connections_by_sandbox: Mutex::new(HashMap::new()),
             settings_mutex: tokio::sync::Mutex::new(()),

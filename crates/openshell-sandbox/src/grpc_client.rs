@@ -26,9 +26,10 @@ use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::proto::{
     DenialSummary, GetDraftPolicyRequest, GetInferenceBundleRequest, GetInferenceBundleResponse,
     GetSandboxConfigRequest, GetSandboxProviderEnvironmentRequest, IssueSandboxTokenRequest,
-    PolicyChunk, PolicySource, PolicyStatus, RefreshSandboxTokenRequest, ReportPolicyStatusRequest,
-    SandboxPolicy as ProtoSandboxPolicy, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse,
-    UpdateConfigRequest, inference_client::InferenceClient, open_shell_client::OpenShellClient,
+    NetworkActivitySummary, PolicyChunk, PolicySource, PolicyStatus, RefreshSandboxTokenRequest,
+    ReportPolicyStatusRequest, SandboxPolicy as ProtoSandboxPolicy, SubmitPolicyAnalysisRequest,
+    SubmitPolicyAnalysisResponse, UpdateConfigRequest, inference_client::InferenceClient,
+    open_shell_client::OpenShellClient,
 };
 use openshell_core::sandbox_env;
 use tonic::Status;
@@ -735,6 +736,7 @@ impl CachedOpenShellClient {
         sandbox_name: &str,
         summaries: Vec<DenialSummary>,
         proposed_chunks: Vec<PolicyChunk>,
+        network_activity_summaries: Vec<NetworkActivitySummary>,
         analysis_mode: &str,
     ) -> Result<SubmitPolicyAnalysisResponse> {
         let response = self
@@ -744,6 +746,7 @@ impl CachedOpenShellClient {
                 name: sandbox_name.to_string(),
                 summaries,
                 proposed_chunks,
+                network_activity_summaries,
                 analysis_mode: analysis_mode.to_string(),
             })
             .await
