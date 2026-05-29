@@ -507,7 +507,7 @@ where
                         &full_request,
                         &options.host,
                         &region,
-                        &service,
+                        service,
                         access_key,
                         secret_key,
                     );

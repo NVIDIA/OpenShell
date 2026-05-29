@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use aws_credential_types::Credentials;
-use aws_sigv4::http_request::{sign, SignableBody, SignableRequest, SigningSettings};
+use aws_sigv4::http_request::{
+    sign, PayloadChecksumKind, SignableBody, SignableRequest, SigningSettings,
+};
 use aws_sigv4::sign::v4;
 use aws_smithy_runtime_api::client::identity::Identity;
 use std::time::SystemTime;
@@ -102,22 +104,21 @@ pub fn apply_sigv4_to_request(
         ("GET", "/")
     };
 
-    // Collect existing headers, skipping AWS auth headers we'll replace
+    // Collect only headers that should be included in the SigV4 signature.
+    // The old hand-rolled code only signed host, content-type, and
+    // content-length. Signing all headers causes failures when the proxy
+    // or transport modifies unsigned-by-convention headers (Connection,
+    // Accept-Encoding, etc.) between signing and delivery.
     let mut existing_headers: Vec<(String, String)> = Vec::new();
     for line in lines.iter().skip(1) {
         if line.is_empty() {
             break;
         }
-        let lower = line.to_ascii_lowercase();
-        if lower.starts_with("authorization:")
-            || lower.starts_with("x-amz-date:")
-            || lower.starts_with("x-amz-security-token:")
-            || lower.starts_with("x-amz-content-sha256:")
-        {
-            continue;
-        }
         if let Some((k, v)) = line.split_once(':') {
-            existing_headers.push((k.trim().to_string(), v.trim().to_string()));
+            let lower = k.trim().to_ascii_lowercase();
+            if lower == "host" || lower == "content-type" || lower == "content-length" {
+                existing_headers.push((lower, v.trim().to_string()));
+            }
         }
     }
 
@@ -132,12 +133,15 @@ pub fn apply_sigv4_to_request(
     )
     .into();
 
+    let mut settings = SigningSettings::default();
+    settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
+
     let signing_params = v4::SigningParams::builder()
         .identity(&identity)
         .region(region)
         .name(service)
         .time(SystemTime::now())
-        .settings(SigningSettings::default())
+        .settings(settings)
         .build()
         .expect("all required signing params provided")
         .into();
@@ -219,6 +223,7 @@ mod tests {
         );
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.contains("authorization: AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/"));
+        assert!(result_str.contains("x-amz-content-sha256: "));
         assert!(result_str.contains("x-amz-date: "));
     }
 
