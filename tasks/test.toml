@@ -5,11 +5,16 @@
 
 [test]
 description = "Run all tests (Rust + Python)"
-depends = ["test:rust", "test:python", "test:install-sh"]
+depends = ["test:rust", "test:python", "test:install-sh", "test:packaging-assets"]
 
 ["test:install-sh"]
 description = "Run focused install.sh shell tests"
 run = "tasks/scripts/test-install-sh.sh"
+hide = true
+
+["test:packaging-assets"]
+description = "Run static packaging asset tests"
+run = "tasks/scripts/test-packaging-assets.sh"
 hide = true
 
 [e2e]
