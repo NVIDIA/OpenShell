@@ -156,16 +156,19 @@ fn apply_auth(tls: &mut TlsOptions, gateway_name: &str) {
                             &refreshed,
                         );
                         tls.oidc_token = Some(refreshed.access_token);
+                        tls.oidc_id_token = refreshed.id_token;
                     }
                     Err(e) => {
                         tracing::warn!("OIDC token refresh failed: {e}");
                         // Use the expired token anyway — server will reject it
                         // with a clear error prompting re-login.
                         tls.oidc_token = Some(bundle.access_token);
+                        tls.oidc_id_token = bundle.id_token;
                     }
                 }
             } else {
                 tls.oidc_token = Some(bundle.access_token);
+                tls.oidc_id_token = bundle.id_token;
             }
         }
         _ => {}
@@ -2927,6 +2930,7 @@ async fn main() -> Result<()> {
             let channel = openshell_cli::tls::build_channel(&ctx.endpoint, &tls).await?;
             let interceptor = openshell_core::auth::EdgeAuthInterceptor::new(
                 tls.oidc_token.as_deref(),
+                tls.oidc_id_token.as_deref(),
                 tls.edge_token.as_deref(),
             )?;
             openshell_tui::run(channel, interceptor, &ctx.name, &ctx.endpoint, theme).await?;

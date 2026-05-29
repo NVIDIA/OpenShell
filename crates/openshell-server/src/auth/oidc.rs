@@ -117,12 +117,28 @@ const STANDARD_OIDC_SCOPES: &[&str] = &["openid", "profile", "email", "offline_a
 #[derive(Debug, Clone)]
 pub struct RawBearerToken(pub String);
 
+/// Raw OIDC ID token forwarded from the authenticated CLI/TUI request.
+///
+/// This is a gateway-private metadata channel used for delegated/XAA flows.
+/// The gateway only trusts it after the access token has already authenticated
+/// the caller as an OIDC user.
+#[derive(Debug, Clone)]
+pub struct RawIdToken(pub String);
+
 /// Extract a bearer token from an `Authorization` header.
 pub fn extract_bearer_token(headers: &http::HeaderMap) -> Option<&str> {
     headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
+}
+
+/// Extract the forwarded OIDC ID token from a private gRPC metadata header.
+pub fn extract_id_token(headers: &http::HeaderMap) -> Option<&str> {
+    headers
+        .get("x-openshell-oidc-id-token")
+        .and_then(|v| v.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
 }
 
 impl OidcClaims {

@@ -14,6 +14,7 @@ use miette::Result;
 #[allow(clippy::struct_field_names)]
 pub struct EdgeAuthInterceptor {
     bearer_value: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
+    oidc_id_token_value: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
     header_value: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
     cookie_value: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
 }
@@ -23,14 +24,27 @@ impl EdgeAuthInterceptor {
     ///
     /// OIDC bearer tokens take precedence over edge tokens. Returns a no-op
     /// interceptor when no token is provided.
-    pub fn new(oidc_token: Option<&str>, edge_token: Option<&str>) -> Result<Self> {
+    pub fn new(
+        oidc_token: Option<&str>,
+        oidc_id_token: Option<&str>,
+        edge_token: Option<&str>,
+    ) -> Result<Self> {
         if let Some(token) = oidc_token {
             let bearer: tonic::metadata::MetadataValue<tonic::metadata::Ascii> =
                 format!("Bearer {token}")
                     .parse()
                     .map_err(|_| miette::miette!("invalid bearer token value"))?;
+            let oidc_id_token_value = match oidc_id_token {
+                Some(token) => Some(
+                    token
+                        .parse()
+                        .map_err(|_| miette::miette!("invalid OIDC ID token value"))?,
+                ),
+                None => None,
+            };
             return Ok(Self {
                 bearer_value: Some(bearer),
+                oidc_id_token_value,
                 header_value: None,
                 cookie_value: None,
             });
@@ -51,6 +65,7 @@ impl EdgeAuthInterceptor {
         };
         Ok(Self {
             bearer_value: None,
+            oidc_id_token_value: None,
             header_value,
             cookie_value,
         })
@@ -60,6 +75,7 @@ impl EdgeAuthInterceptor {
     pub fn noop() -> Self {
         Self {
             bearer_value: None,
+            oidc_id_token_value: None,
             header_value: None,
             cookie_value: None,
         }
@@ -73,6 +89,10 @@ impl tonic::service::Interceptor for EdgeAuthInterceptor {
     ) -> std::result::Result<tonic::Request<()>, tonic::Status> {
         if let Some(ref val) = self.bearer_value {
             req.metadata_mut().insert("authorization", val.clone());
+        }
+        if let Some(ref val) = self.oidc_id_token_value {
+            req.metadata_mut()
+                .insert("x-openshell-oidc-id-token", val.clone());
         }
         if let Some(ref val) = self.header_value {
             req.metadata_mut()

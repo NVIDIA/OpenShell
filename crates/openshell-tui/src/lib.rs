@@ -528,7 +528,8 @@ async fn connect_to_gateway(name: &str, endpoint: &str) -> Result<(Channel, Edge
                  Re-authenticate with: openshell gateway login"
             );
         }
-        let interceptor = EdgeAuthInterceptor::new(Some(&bundle.access_token), None)?;
+        let interceptor =
+            EdgeAuthInterceptor::new(Some(&bundle.access_token), bundle.id_token.as_deref(), None)?;
         let channel = build_oidc_channel(name, endpoint).await?;
         Ok((channel, interceptor))
     } else {

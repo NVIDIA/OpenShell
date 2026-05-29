@@ -40,6 +40,9 @@ pub struct TlsOptions {
     /// OIDC bearer token — when set, injects `authorization: Bearer <token>`
     /// on every gRPC request. Takes precedence over `edge_token`.
     pub oidc_token: Option<String>,
+    /// OIDC ID token — when set, injects a gateway-private metadata header
+    /// so delegated/XAA flows can bind the signed-in user session.
+    pub oidc_id_token: Option<String>,
     /// Skip TLS certificate verification for gateway connections.
     pub gateway_insecure: bool,
 }
@@ -53,6 +56,7 @@ impl TlsOptions {
             gateway_name: None,
             edge_token: None,
             oidc_token: None,
+            oidc_id_token: None,
             gateway_insecure: false,
         }
     }
@@ -441,7 +445,11 @@ pub async fn grpc_client(server: &str, tls: &TlsOptions) -> Result<GrpcClient> {
 }
 
 fn interceptor_from_tls(tls: &TlsOptions) -> Result<EdgeAuthInterceptor> {
-    EdgeAuthInterceptor::new(tls.oidc_token.as_deref(), tls.edge_token.as_deref())
+    EdgeAuthInterceptor::new(
+        tls.oidc_token.as_deref(),
+        tls.oidc_id_token.as_deref(),
+        tls.edge_token.as_deref(),
+    )
 }
 
 pub async fn grpc_inference_client(server: &str, tls: &TlsOptions) -> Result<GrpcInferenceClient> {

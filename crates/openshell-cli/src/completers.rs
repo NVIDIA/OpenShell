@@ -102,13 +102,16 @@ async fn completion_grpc_client(
                             Ok(refreshed) => {
                                 let _ = store_oidc_token(gateway_name, &refreshed);
                                 tls_opts.oidc_token = Some(refreshed.access_token);
+                                tls_opts.oidc_id_token = refreshed.id_token;
                             }
                             Err(_) => {
                                 tls_opts.oidc_token = Some(bundle.access_token);
+                                tls_opts.oidc_id_token = bundle.id_token;
                             }
                         }
                     } else {
                         tls_opts.oidc_token = Some(bundle.access_token);
+                        tls_opts.oidc_id_token = bundle.id_token;
                     }
                 }
             }
@@ -124,6 +127,7 @@ async fn completion_grpc_client(
     let channel = build_channel(server, &tls_opts).await.ok()?;
     let interceptor = EdgeAuthInterceptor::new(
         tls_opts.oidc_token.as_deref(),
+        tls_opts.oidc_id_token.as_deref(),
         tls_opts.edge_token.as_deref(),
     )
     .ok()?;

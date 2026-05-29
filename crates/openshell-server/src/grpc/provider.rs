@@ -6,7 +6,7 @@
 #![allow(clippy::result_large_err)] // gRPC handlers return Result<Response<_>, Status>
 
 use crate::auth::identity::IdentityProvider;
-use crate::auth::oidc::RawBearerToken;
+use crate::auth::oidc::{RawBearerToken, RawIdToken};
 use crate::auth::principal::Principal;
 use crate::persistence::{
     ObjectId, ObjectLabels, ObjectName, ObjectType, Store, WriteCondition, generate_name,
@@ -1243,6 +1243,7 @@ pub(super) async fn handle_configure_provider_refresh(
 ) -> Result<Response<ConfigureProviderRefreshResponse>, Status> {
     let principal = request.extensions().get::<Principal>().cloned();
     let raw_bearer_token = request.extensions().get::<RawBearerToken>().cloned();
+    let raw_id_token = request.extensions().get::<RawIdToken>().cloned();
     let request = request.into_inner();
     let provider_name = request.provider.trim();
     let credential_key = request.credential_key.trim();

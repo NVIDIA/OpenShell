@@ -479,6 +479,18 @@ where
             if let Some(token) = raw_oidc_bearer {
                 req.extensions_mut().insert(oidc::RawBearerToken(token));
             }
+            let raw_oidc_id_token = if let Principal::User(ref user) = principal {
+                if user.identity.provider == crate::auth::identity::IdentityProvider::Oidc {
+                    oidc::extract_id_token(req.headers()).map(str::to_owned)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some(token) = raw_oidc_id_token {
+                req.extensions_mut().insert(oidc::RawIdToken(token));
+            }
 
             req.extensions_mut().insert(principal);
             inner.ready().await?.call(req).await
