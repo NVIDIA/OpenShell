@@ -3,10 +3,13 @@ authors:
   - "@zanetworker"
 state: draft
 links:
+  - "RFC 0005 / PR #1617 (shared SDK core and TS binding, @maxdubrinsky)"
+  - "PR #1621 (Python SDK OIDC auth, @mrunalp)"
   - "PR #1404 (per-sandbox auth, merged)"
   - "PR #1547 (Python SDK fixes, open)"
   - "PR #1117 (Python wheels, open)"
   - "PR #1511 (proxy egress RFC, open)"
+  - "Issue #1044 (SDK roadmap)"
 ---
 
 # RFC 0006 - SDK Consumption Entrypoints and File Transfer
@@ -18,8 +21,25 @@ consumable as programmable infrastructure for agent platforms and
 frameworks. Add streaming UploadFile/DownloadFile gRPC RPCs to the
 gateway so SDK consumers can move files in and out of sandboxes
 without shelling out to the CLI. Support OIDC authentication in both
-SDKs so cross-namespace K8s deployments work without copying mTLS
-secrets.
+SDKs so any OIDC-enabled gateway is reachable without distributing
+client certificates.
+
+### Relationship to RFC 0005
+
+RFC 0005 (PR #1617, @maxdubrinsky) proposes the shared Rust SDK core
+and TypeScript binding via napi-rs, with a working prototype. This RFC
+is complementary: it covers the broader SDK strategy (consumption
+patterns, file transfer RPCs, Python SDK surface expansion, platform
+integration examples) that RFC 0005 is the first implementation phase
+of. RFC 0005 delivers the "how" for the shared core and TS binding;
+this RFC frames the "why" and "what" across both languages.
+
+Areas this RFC covers that RFC 0005 explicitly defers:
+
+- File transfer RPCs (UploadFile/DownloadFile)
+- Python SDK surface expansion (provider, watch, policy, services)
+- Platform consumption patterns (Anthropic, OpenAI, OpenClaw, CI/CD)
+- Python-on-shared-core migration path
 
 ## Motivation
 
@@ -113,7 +133,7 @@ Add wrappers for existing gateway RPCs. No gateway changes needed.
 
 | Method | RPC | Why |
 |--------|-----|-----|
-| OIDC auth | gRPC metadata interceptor | mTLS-only locks SDK to single namespace. Every K8s production deployment needs cross-namespace auth. |
+| OIDC auth | gRPC metadata interceptor | mTLS-only requires distributing client certificates to every SDK consumer. OIDC bearer tokens let any consumer connect to an OIDC-enabled gateway without certificate distribution, regardless of deployment model. |
 | `attach_provider()` / `detach_provider()` / `list_providers()` | AttachSandboxProvider, DetachSandboxProvider, ListSandboxProviders | Credential separation is Mode 2's core security property. Without it, SDK consumers must bake credentials into sandbox images or pass them as env vars visible to agent code. |
 | `watch()` | WatchSandbox | Polling at scale is untenable. Platforms need real-time status, logs, and error detection. |
 | `upload_path()` / `download_path()` | UploadFile, DownloadFile (new RPCs, see below) | Every use case involving local files is blocked without this. |
@@ -237,19 +257,20 @@ Implementation: a gRPC call credentials interceptor that attaches
 20 lines per SDK.
 
 ```python
-# mTLS (today): certs manually copied from another namespace
+# mTLS (today): client certificates distributed to every consumer
 client = SandboxClient(endpoint=..., tls=TlsConfig(ca_path=..., cert_path=..., key_path=...))
 
 # OIDC (proposed): one token from your existing IdP
 client = SandboxClient(endpoint=..., auth=OidcAuth(token=os.environ["OIDC_TOKEN"]))
 ```
 
-**Why this is required, not nice-to-have:** mTLS secrets live in the
-gateway's namespace. Every SDK consumer in a different namespace must
-manually copy the Secret and re-copy on every cert rotation. In a
-multi-tenant platform, that's N tenant namespaces each needing a
-copy. OIDC eliminates this entirely: the SDK sends a JWT, the gateway
-validates against the IdP's public keys, no secrets to copy.
+**Why this is required, not nice-to-have:** mTLS requires distributing
+client certificates to every SDK consumer. Each consumer needs the CA
+cert, client cert, and client key, and must re-distribute on every
+rotation. In multi-tenant or multi-host deployments, that's N
+consumers each needing a copy. OIDC eliminates this: the SDK sends a
+JWT, the gateway validates against the IdP's public keys, no
+certificates to distribute.
 
 ## Implementation plan
 
@@ -268,7 +289,7 @@ proves everything works. Phase 5 is independent.
 - Tests
 
 **Enables:** Remote-mode workloads (git clone inside sandbox, no file
-transfer needed). OIDC auth for cross-namespace K8s. Credential
+transfer needed). OIDC auth for any gateway deployment. Credential
 separation via provider attach.
 
 **Related PRs:** #1404 (auth foundation, merged), #1547 (Python SDK
