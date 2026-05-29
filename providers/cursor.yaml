@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+id: cursor
+display_name: Cursor
+description: Cursor editor server bootstrap and update endpoints
+category: agent
+endpoints:
+  - host: cursor.blob.core.windows.net
+    port: 443
+  - host: api2.cursor.sh
+    port: 443
+  - host: repo.cursor.sh
+    port: 443
+  - host: download.cursor.sh
+    port: 443
+  - host: cursor.download.prss.microsoft.com
+    port: 443
+binaries:
+  - /usr/bin/curl
+  - /usr/bin/wget
+  - /sandbox/.cursor-server/**

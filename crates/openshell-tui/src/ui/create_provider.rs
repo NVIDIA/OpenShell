@@ -490,7 +490,9 @@ pub fn draw_detail(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
     frame.render_widget(Clear, popup_area);
 
-    let title = if detail.show_raw_profile {
+    let title = if detail.show_raw_provider {
+        " Provider Object YAML "
+    } else if detail.show_raw_profile {
         " Provider Profile YAML "
     } else {
         " Provider Detail "
@@ -504,8 +506,32 @@ pub fn draw_detail(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let inner = block.inner(popup_area);
     frame.render_widget(block, popup_area);
 
+    if detail.show_raw_provider {
+        draw_raw_yaml(
+            frame,
+            &detail.raw_provider_yaml,
+            detail.raw_provider_scroll,
+            "Summary",
+            "o",
+            inner,
+            t,
+        );
+        return;
+    }
+
     if detail.show_raw_profile {
-        draw_raw_profile(frame, detail, inner, t);
+        draw_raw_yaml(
+            frame,
+            detail
+                .raw_profile_yaml
+                .as_deref()
+                .unwrap_or("No provider profile is available for this provider."),
+            detail.raw_profile_scroll,
+            "Summary",
+            "y",
+            inner,
+            t,
+        );
         return;
     }
 
@@ -551,19 +577,43 @@ pub fn draw_detail(frame: &mut Frame<'_>, app: &App, area: Rect) {
     push_section(&mut lines, "Policy", &detail.policy_lines, t);
     push_section(&mut lines, "Discovery", &detail.discovery_lines, t);
     push_section(&mut lines, "Refresh", &detail.refresh_lines, t);
-    lines.push(Line::from(vec![
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(inner);
+    let total = lines.len();
+    let scroll = detail.summary_scroll.min(total.saturating_sub(1));
+    frame.render_widget(
+        Paragraph::new(lines).scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)),
+        chunks[0],
+    );
+    let position = (scroll + 1).min(total.max(1));
+    let mut hint_spans = vec![
+        Span::styled("[j/k]", t.key_hint),
+        Span::styled(" Scroll  ", t.muted),
+        Span::styled("[o]", t.key_hint),
+        Span::styled(" Object YAML  ", t.muted),
+    ];
+    if detail.raw_profile_yaml.is_some() {
+        hint_spans.extend([
+            Span::styled("[y]", t.key_hint),
+            Span::styled(" Profile YAML  ", t.muted),
+        ]);
+    }
+    hint_spans.extend([
         Span::styled("[Esc]", t.key_hint),
         Span::styled(" Close  ", t.muted),
-        Span::styled("[y]", t.key_hint),
-        Span::styled(" Profile YAML", t.muted),
-    ]));
-
-    frame.render_widget(Paragraph::new(lines), inner);
+        Span::styled(format!("[{position}/{total}]"), t.muted),
+    ]);
+    frame.render_widget(Paragraph::new(Line::from(hint_spans)), chunks[1]);
 }
 
-fn draw_raw_profile(
+fn draw_raw_yaml(
     frame: &mut Frame<'_>,
-    detail: &crate::app::ProviderDetailView,
+    raw: &str,
+    scroll: usize,
+    toggle_label: &'static str,
+    toggle_key: &'static str,
     area: Rect,
     t: &crate::theme::Theme,
 ) {
@@ -571,24 +621,17 @@ fn draw_raw_profile(
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(0), Constraint::Length(1)])
         .split(area);
-    let raw = detail
-        .raw_profile_yaml
-        .as_deref()
-        .unwrap_or("No provider profile is available for this provider.");
     frame.render_widget(
-        Paragraph::new(raw).scroll((
-            u16::try_from(detail.raw_profile_scroll).unwrap_or(u16::MAX),
-            0,
-        )),
+        Paragraph::new(raw).scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)),
         chunks[0],
     );
     let total = raw.lines().count();
-    let position = (detail.raw_profile_scroll + 1).min(total.max(1));
+    let position = (scroll + 1).min(total.max(1));
     let hint = Line::from(vec![
         Span::styled("[j/k]", t.key_hint),
         Span::styled(" Scroll  ", t.muted),
-        Span::styled("[y]", t.key_hint),
-        Span::styled(" Summary  ", t.muted),
+        Span::styled(format!("[{toggle_key}]"), t.key_hint),
+        Span::styled(format!(" {toggle_label}  "), t.muted),
         Span::styled("[Esc]", t.key_hint),
         Span::styled(" Close  ", t.muted),
         Span::styled(format!("[{position}/{total}]"), t.muted),
@@ -604,17 +647,11 @@ fn push_section(
 ) {
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(title, t.heading)));
-    for value in values.iter().take(5) {
+    for value in values {
         lines.push(Line::from(vec![
             Span::styled("  - ", t.muted),
             Span::styled(value.clone(), t.text),
         ]));
-    }
-    if values.len() > 5 {
-        lines.push(Line::from(Span::styled(
-            format!("  ... {} more", values.len() - 5),
-            t.muted,
-        )));
     }
 }
 
