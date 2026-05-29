@@ -89,7 +89,7 @@ jobs:
           chown openshell-test: "/run/user/$(id -u openshell-test)"
           chmod 700 "/run/user/$(id -u openshell-test)"
           chown -R openshell-test: .
-          for dir in /root/.cargo /root/.rustup /root/.local/share/mise /opt/mise; do
+          for dir in /root/.cargo /root/.rustup /root/.local/bin /root/.local/share/mise /opt/mise; do
             [ -d "$dir" ] && chmod -R a+rX "$dir"
           done
 
@@ -107,7 +107,7 @@ jobs:
             runuser -u openshell-test -- env \
               XDG_RUNTIME_DIR="/run/user/${TESTUID}" \
               HOME="/home/openshell-test" \
-              PATH="/root/.cargo/bin:/opt/mise/shims:/opt/mise/bin:${PATH}" \
+              PATH="/root/.cargo/bin:/root/.local/bin:/opt/mise/shims:/opt/mise/bin:${PATH}" \
               CARGO_HOME="/root/.cargo" \
               RUSTUP_HOME="/root/.rustup" \
               OPENSHELL_SUPERVISOR_IMAGE="${OPENSHELL_SUPERVISOR_IMAGE}" \
