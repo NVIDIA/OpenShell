@@ -221,7 +221,7 @@ jobs:
           set -euo pipefail
           # z3 built with zig c++ uses libc++ symbols (std::__1::*).
           # Override z3-sys default (stdc++) so Rust links the matching runtime.
-          if [[ ""${{ inputs.component }}" == "cli" ]]; then
+          if [[ "${{ inputs.component }}" == "cli" ]]; then
             echo "CXXSTDLIB=c++" >> "$GITHUB_ENV"
           fi
 
