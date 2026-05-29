@@ -129,8 +129,6 @@ struct NetworkEndpointDef {
     /// placeholders before forwarding upstream. Defaults to false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     request_body_credential_rewrite: bool,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    advisor_proposed: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     persisted_queries: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -330,7 +328,9 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                             allow_encoded_slash: e.allow_encoded_slash,
                             websocket_credential_rewrite: e.websocket_credential_rewrite,
                             request_body_credential_rewrite: e.request_body_credential_rewrite,
-                            advisor_proposed: e.advisor_proposed,
+                            // Advisor provenance is internal runtime state, not
+                            // a user-authored policy schema field.
+                            advisor_proposed: false,
                             persisted_queries: e.persisted_queries,
                             graphql_persisted_queries: e
                                 .graphql_persisted_queries
@@ -496,7 +496,6 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                             allow_encoded_slash: e.allow_encoded_slash,
                             websocket_credential_rewrite: e.websocket_credential_rewrite,
                             request_body_credential_rewrite: e.request_body_credential_rewrite,
-                            advisor_proposed: e.advisor_proposed,
                             persisted_queries: e.persisted_queries.clone(),
                             graphql_persisted_queries: e
                                 .graphql_persisted_queries

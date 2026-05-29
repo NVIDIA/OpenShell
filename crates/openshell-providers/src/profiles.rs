@@ -587,6 +587,7 @@ fn endpoint_to_proto(endpoint: &EndpointProfile) -> NetworkEndpoint {
         allow_encoded_slash: endpoint.allow_encoded_slash,
         websocket_credential_rewrite: endpoint.websocket_credential_rewrite,
         request_body_credential_rewrite: endpoint.request_body_credential_rewrite,
+        advisor_proposed: false,
         persisted_queries: endpoint.persisted_queries.clone(),
         graphql_persisted_queries: endpoint
             .graphql_persisted_queries
