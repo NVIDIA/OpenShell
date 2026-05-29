@@ -5005,6 +5005,7 @@ fn provider_refresh_strategy(strategy: &str) -> Result<ProviderCredentialRefresh
             Ok(ProviderCredentialRefreshStrategy::Oauth2ClientCredentials)
         }
         "oauth2_token_exchange" => Ok(ProviderCredentialRefreshStrategy::Oauth2TokenExchange),
+        "okta_xaa" => Ok(ProviderCredentialRefreshStrategy::OktaXaa),
         "google_service_account_jwt" => {
             Ok(ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt)
         }
@@ -5060,6 +5061,7 @@ fn provider_refresh_strategy_name(strategy: ProviderCredentialRefreshStrategy) -
         ProviderCredentialRefreshStrategy::Oauth2RefreshToken => "oauth2_refresh_token",
         ProviderCredentialRefreshStrategy::Oauth2ClientCredentials => "oauth2_client_credentials",
         ProviderCredentialRefreshStrategy::Oauth2TokenExchange => "oauth2_token_exchange",
+        ProviderCredentialRefreshStrategy::OktaXaa => "okta_xaa",
         ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => "google_service_account_jwt",
         ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
     }

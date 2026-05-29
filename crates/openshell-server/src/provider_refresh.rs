@@ -279,6 +279,7 @@ pub fn refresh_strategy_name(strategy: i32) -> &'static str {
         ProviderCredentialRefreshStrategy::Oauth2RefreshToken => "oauth2_refresh_token",
         ProviderCredentialRefreshStrategy::Oauth2ClientCredentials => "oauth2_client_credentials",
         ProviderCredentialRefreshStrategy::Oauth2TokenExchange => "oauth2_token_exchange",
+        ProviderCredentialRefreshStrategy::OktaXaa => "okta_xaa",
         ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => "google_service_account_jwt",
         ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
     }
@@ -290,6 +291,7 @@ pub fn is_gateway_mintable_strategy(strategy: ProviderCredentialRefreshStrategy)
         ProviderCredentialRefreshStrategy::Oauth2RefreshToken
             | ProviderCredentialRefreshStrategy::Oauth2ClientCredentials
             | ProviderCredentialRefreshStrategy::Oauth2TokenExchange
+            | ProviderCredentialRefreshStrategy::OktaXaa
             | ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt
     )
 }
@@ -453,6 +455,9 @@ async fn mint_credential(
             let _ = store;
             mint_oauth2_token_exchange(state).await
         }
+        ProviderCredentialRefreshStrategy::OktaXaa => {
+            mint_okta_xaa_token_exchange(store, state).await
+        }
         ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => {
             mint_google_service_account_jwt(state).await
         }
@@ -539,6 +544,54 @@ async fn mint_oauth2_client_credentials(
     }
 
     request_token(&token_url, &form, basic_auth, state.max_lifetime_seconds).await
+}
+
+async fn mint_okta_xaa_token_exchange(
+    store: &Store,
+    state: &StoredProviderCredentialRefreshState,
+) -> Result<MintedCredential, Status> {
+    let token_url = oauth2_token_url(state)?;
+    let sandbox_id = required_material(&state.material, "sandbox_id")?;
+    let binding = crate::delegation::get_binding(store, &sandbox_id)
+        .await?
+        .ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "sandbox delegation binding not found for sandbox_id '{sandbox_id}'"
+            ))
+        })?;
+    if binding.id_token.trim().is_empty() {
+        return Err(Status::failed_precondition(
+            "sandbox delegation binding does not contain an OIDC id_token",
+        ));
+    }
+
+    let client_id = required_material(&state.material, "client_id")?;
+    let client_assertion = required_material(&state.material, "client_assertion")?;
+    let client_assertion_type = material_value(&state.material, &["client_assertion_type"])
+        .unwrap_or_else(|| "urn:ietf:params:oauth:client-assertion-type:jwt-bearer".to_string());
+    let resource = required_material(&state.material, "resource")?;
+
+    let mut form = vec![
+        (
+            "grant_type".to_string(),
+            "urn:ietf:params:oauth:grant-type:token-exchange".to_string(),
+        ),
+        ("client_id".to_string(), client_id),
+        ("client_assertion".to_string(), client_assertion),
+        ("client_assertion_type".to_string(), client_assertion_type),
+        ("subject_token".to_string(), binding.id_token),
+        (
+            "subject_token_type".to_string(),
+            "urn:ietf:params:oauth:token-type:id_token".to_string(),
+        ),
+        ("resource".to_string(), resource),
+    ];
+    let scope = refresh_scopes(state).join(" ");
+    if !scope.is_empty() {
+        form.push(("scope".to_string(), scope));
+    }
+
+    request_token(&token_url, &form, None, state.max_lifetime_seconds).await
 }
 
 async fn mint_google_service_account_jwt(

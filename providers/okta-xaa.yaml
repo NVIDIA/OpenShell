@@ -1,0 +1,42 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+id: okta-xaa
+display_name: Okta XAA
+description: Okta Cross App Access tokens minted from the authenticated OpenShell user's OIDC ID token
+category: other
+credentials:
+  - name: xaa_access_token
+    description: Okta XAA delegated access token for downstream resources
+    env_vars: [OKTA_XAA_ACCESS_TOKEN]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+    refresh:
+      strategy: okta_xaa
+      token_url: https://example.okta.com/oauth2/v1/token
+      refresh_before_seconds: 300
+      max_lifetime_seconds: 3600
+      material:
+        - name: client_id
+          description: Okta AI agent client ID used for XAA token exchange
+          required: true
+        - name: sandbox_id
+          description: OpenShell sandbox ID bound to the authenticated user's OIDC tokens
+          required: true
+        - name: resource
+          description: Okta XAA resource or resource connection identifier
+          required: true
+        - name: client_assertion
+          description: JWT client assertion used to authenticate the AI agent with Okta
+          required: true
+          secret: true
+        - name: client_assertion_type
+          description: OAuth client assertion type, usually urn:ietf:params:oauth:client-assertion-type:jwt-bearer
+          required: false
+        - name: scope
+          description: Space-delimited scopes requested for the delegated token
+          required: false
+binaries:
+  - /usr/bin/curl
+  - /usr/local/bin/curl

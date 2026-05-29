@@ -664,6 +664,7 @@ enum CliProviderRefreshStrategy {
     Oauth2RefreshToken,
     Oauth2ClientCredentials,
     Oauth2TokenExchange,
+    OktaXaa,
     GoogleServiceAccountJwt,
 }
 
@@ -673,6 +674,7 @@ impl CliProviderRefreshStrategy {
             Self::Oauth2RefreshToken => "oauth2_refresh_token",
             Self::Oauth2ClientCredentials => "oauth2_client_credentials",
             Self::Oauth2TokenExchange => "oauth2_token_exchange",
+            Self::OktaXaa => "okta_xaa",
             Self::GoogleServiceAccountJwt => "google_service_account_jwt",
         }
     }

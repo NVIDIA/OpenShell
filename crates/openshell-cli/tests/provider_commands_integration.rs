@@ -1843,6 +1843,59 @@ async fn built_in_okta_obo_profile_is_available_via_provider_profile_api() {
 }
 
 #[tokio::test]
+async fn built_in_okta_xaa_profile_is_available_via_provider_profile_api() {
+    let ts = run_server().await;
+
+    let mut client = openshell_cli::tls::grpc_client(&ts.endpoint, &ts.tls)
+        .await
+        .expect("grpc client should connect");
+    let profile = client
+        .get_provider_profile(openshell_core::proto::GetProviderProfileRequest {
+            id: "okta-xaa".to_string(),
+        })
+        .await
+        .expect("get provider profile")
+        .into_inner()
+        .profile
+        .expect("profile should exist");
+
+    assert_eq!(profile.id, "okta-xaa");
+    let credential = profile
+        .credentials
+        .iter()
+        .find(|credential| credential.name == "xaa_access_token")
+        .expect("xaa access token credential");
+    let refresh = credential
+        .refresh
+        .as_ref()
+        .expect("xaa credential should include refresh config");
+    assert_eq!(
+        refresh.strategy,
+        ProviderCredentialRefreshStrategy::OktaXaa as i32
+    );
+    assert!(
+        refresh
+            .material
+            .iter()
+            .any(|material| material.name == "sandbox_id" && material.required)
+    );
+    assert!(
+        refresh
+            .material
+            .iter()
+            .any(|material| material.name == "resource" && material.required)
+    );
+    assert!(
+        refresh
+            .material
+            .iter()
+            .any(|material| material.name == "client_assertion"
+                && material.required
+                && material.secret)
+    );
+}
+
+#[tokio::test]
 async fn provider_profile_lint_from_directory_reports_parse_errors_without_importing() {
     let ts = run_server().await;
     let dir = tempfile::tempdir().unwrap();
