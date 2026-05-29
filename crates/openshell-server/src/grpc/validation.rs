@@ -595,6 +595,11 @@ fn validate_filesystem_additive(
                     "filesystem include_workdir cannot be changed on a live sandbox",
                 ));
             }
+            if base.runtime_baseline_conflicts != upd.runtime_baseline_conflicts {
+                return Err(Status::invalid_argument(
+                    "filesystem runtime_baseline_conflicts cannot be changed on a live sandbox",
+                ));
+            }
             for path in &base.read_only {
                 if !upd.read_only.contains(path) {
                     return Err(Status::invalid_argument(format!(
@@ -1292,6 +1297,7 @@ mod tests {
                 include_workdir: true,
                 read_only: vec!["/usr".into()],
                 read_write: vec!["/tmp".into()],
+                ..Default::default()
             }),
             process: Some(ProcessPolicy {
                 run_as_user: "root".into(),
@@ -1314,6 +1320,7 @@ mod tests {
                 include_workdir: true,
                 read_only: vec!["/usr/../etc/shadow".into()],
                 read_write: vec!["/tmp".into()],
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -1332,6 +1339,7 @@ mod tests {
                 include_workdir: true,
                 read_only: vec!["/usr".into()],
                 read_write: vec!["/".into()],
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -1380,6 +1388,7 @@ mod tests {
                 include_workdir: true,
                 read_only: vec!["/usr".into()],
                 read_write: vec!["/tmp".into()],
+                ..Default::default()
             }),
             landlock: Some(LandlockPolicy {
                 compatibility: "best_effort".into(),
@@ -1470,6 +1479,7 @@ mod tests {
                 read_only: vec!["/usr".into(), "/lib".into(), "/etc".into()],
                 read_write: vec!["/sandbox".into(), "/tmp".into()],
                 include_workdir: true,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -1497,6 +1507,47 @@ mod tests {
         let result = validate_static_fields_unchanged(&baseline, &changed);
         assert!(result.is_err());
         assert!(result.unwrap_err().message().contains("include_workdir"));
+    }
+
+    #[test]
+    fn validate_static_fields_rejects_runtime_baseline_conflict_change() {
+        use openshell_core::proto::{
+            FilesystemPolicy, ReadOnlyToReadWriteConflictPolicy, RuntimeBaselineConflicts,
+        };
+
+        let baseline = ProtoSandboxPolicy {
+            filesystem: Some(FilesystemPolicy {
+                runtime_baseline_conflicts: Some(RuntimeBaselineConflicts {
+                    read_only_to_read_write: Some(ReadOnlyToReadWriteConflictPolicy {
+                        mode: "reject_unlisted".into(),
+                        allow_promotion: vec!["/proc".into()],
+                    }),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let changed = ProtoSandboxPolicy {
+            filesystem: Some(FilesystemPolicy {
+                runtime_baseline_conflicts: Some(RuntimeBaselineConflicts {
+                    read_only_to_read_write: Some(ReadOnlyToReadWriteConflictPolicy {
+                        mode: "promote_all".into(),
+                        allow_promotion: vec![],
+                    }),
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let result = validate_static_fields_unchanged(&baseline, &changed);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .message()
+                .contains("runtime_baseline_conflicts")
+        );
     }
 
     // ---- Exec validation ----
