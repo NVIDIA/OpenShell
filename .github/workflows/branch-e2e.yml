@@ -76,6 +76,17 @@ jobs:
       component: supervisor
       image-tag: ${{ github.sha }}
 
+  build-cli:
+    needs: [pr_metadata]
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: cli
+      platform: linux/amd64
+
   e2e:
     needs: [pr_metadata, build-gateway, build-supervisor]
     if: needs.pr_metadata.outputs.should_run == 'true' && needs.pr_metadata.outputs.run_core_e2e == 'true'
