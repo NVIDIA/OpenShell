@@ -78,6 +78,7 @@ pub fn apply_sigv4_to_request(
     service: &str,
     access_key: &str,
     secret_key: &str,
+    session_token: Option<&str>,
 ) -> Vec<u8> {
     let header_end = raw
         .windows(4)
@@ -127,7 +128,7 @@ pub fn apply_sigv4_to_request(
     let identity: Identity = Credentials::new(
         access_key,
         secret_key,
-        None,
+        session_token.map(|s| s.to_string()),
         None,
         "openshell",
     )
@@ -220,11 +221,30 @@ mod tests {
             "bedrock",
             "AKIAIOSFODNN7EXAMPLE",
             "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            None,
         );
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.contains("authorization: AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/"));
         assert!(result_str.contains("x-amz-content-sha256: "));
         assert!(result_str.contains("x-amz-date: "));
+        assert!(!result_str.contains("x-amz-security-token"));
+    }
+
+    #[test]
+    fn sign_with_session_token() {
+        let raw = b"POST /model/test/invoke HTTP/1.1\r\nHost: bedrock-runtime.us-east-2.amazonaws.com\r\nContent-Type: application/json\r\n\r\n{}";
+        let result = apply_sigv4_to_request(
+            raw,
+            "bedrock-runtime.us-east-2.amazonaws.com",
+            "us-east-2",
+            "bedrock",
+            "ASIAEXAMPLE",
+            "secret",
+            Some("FwoGZXIvYXdzEBYaDH+session+token"),
+        );
+        let result_str = String::from_utf8_lossy(&result);
+        assert!(result_str.contains("authorization: AWS4-HMAC-SHA256 Credential=ASIAEXAMPLE/"));
+        assert!(result_str.contains("x-amz-security-token: FwoGZXIvYXdzEBYaDH+session+token"));
     }
 
     #[test]
@@ -237,6 +257,7 @@ mod tests {
             "bedrock",
             "AKIATEST",
             "secret",
+            None,
         );
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.contains("authorization: AWS4-HMAC-SHA256 Credential=AKIATEST/"));

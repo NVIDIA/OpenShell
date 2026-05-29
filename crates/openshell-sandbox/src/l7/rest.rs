@@ -467,12 +467,15 @@ where
                 crate::secrets::placeholder_for_env_key("AWS_ACCESS_KEY_ID");
             let secret_key_placeholder =
                 crate::secrets::placeholder_for_env_key("AWS_SECRET_ACCESS_KEY");
+            let session_token_placeholder =
+                crate::secrets::placeholder_for_env_key("AWS_SESSION_TOKEN");
 
             match (
                 resolver.resolve_placeholder(&access_key_placeholder),
                 resolver.resolve_placeholder(&secret_key_placeholder),
             ) {
                 (Some(access_key), Some(secret_key)) => {
+                    let session_token = resolver.resolve_placeholder(&session_token_placeholder);
                     let region = crate::sigv4::extract_aws_region(&options.host)
                         .unwrap_or_else(|| "us-east-1".to_string());
                     let service = &options.signing_service;
@@ -510,6 +513,7 @@ where
                         service,
                         access_key,
                         secret_key,
+                        session_token.as_deref(),
                     );
                     upstream.write_all(&signed).await.into_diagnostic()?;
                 }
