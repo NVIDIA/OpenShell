@@ -85,7 +85,7 @@ jobs:
     if: needs.pr_metadata.outputs.should_run == 'true'
     permissions:
       contents: read
-      packages: read
+      packages: write
     uses: ./.github/workflows/docker-build.yml
     with:
       component: cli
