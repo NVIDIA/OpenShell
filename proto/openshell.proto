@@ -298,10 +298,9 @@ message Sandbox {
   SandboxSpec spec = 2;
   // Latest user-facing observed status derived by the gateway.
   SandboxStatus status = 3;
-  // Gateway-derived lifecycle summary.
-  SandboxPhase phase = 4;
-  // Currently active policy version (updated when sandbox reports loaded).
-  uint32 current_policy_version = 5;
+
+  reserved 4, 5;
+  reserved "phase", "current_policy_version";
 }
 
 // Desired sandbox configuration provided through the public API.
@@ -358,8 +357,7 @@ message SandboxTemplate {
 
 // User-facing sandbox status derived by the gateway from compute-driver observations.
 //
-// Lifecycle summary is exposed separately as `Sandbox.phase`. Public status does
-// not embed driver-only flags such as `deleting`.
+// Public status does not embed driver-only flags such as `deleting`.
 message SandboxStatus {
   // Compute-platform sandbox object name.
   string sandbox_name = 1;
@@ -371,6 +369,10 @@ message SandboxStatus {
   string sandbox_fd = 4;
   // Latest user-facing readiness and lifecycle conditions.
   repeated SandboxCondition conditions = 5;
+  // Gateway-derived lifecycle summary.
+  SandboxPhase phase = 6;
+  // Currently active policy version (updated when sandbox reports loaded).
+  uint32 current_policy_version = 7;
 }
 
 // User-facing sandbox condition derived from driver-native conditions.

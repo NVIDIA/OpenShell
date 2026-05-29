@@ -1888,11 +1888,11 @@ pub async fn sandbox_create(
         .into_diagnostic()?
         .into_inner();
 
-    let mut last_phase = sandbox.phase;
+    let mut last_phase = sandbox.phase();
     let mut last_error_reason = String::new();
     let mut last_condition_message = ready_false_condition_message(sandbox.status.as_ref());
     // Track whether we have seen a non-Ready phase during the watch.
-    let mut saw_non_ready = SandboxPhase::try_from(sandbox.phase) != Ok(SandboxPhase::Ready);
+    let mut saw_non_ready = SandboxPhase::try_from(sandbox.phase()) != Ok(SandboxPhase::Ready);
     let provision_timeout = Duration::from_secs(
         std::env::var("OPENSHELL_PROVISION_TIMEOUT")
             .ok()
@@ -1945,8 +1945,8 @@ pub async fn sandbox_create(
         let evt = item.into_diagnostic()?;
         match evt.payload {
             Some(openshell_core::proto::sandbox_stream_event::Payload::Sandbox(s)) => {
-                let phase = SandboxPhase::try_from(s.phase).unwrap_or(SandboxPhase::Unknown);
-                last_phase = s.phase;
+                let phase = SandboxPhase::try_from(s.phase()).unwrap_or(SandboxPhase::Unknown);
+                last_phase = s.phase();
                 if let Some(message) = ready_false_condition_message(s.status.as_ref()) {
                     last_condition_message = Some(message);
                 }
@@ -2507,7 +2507,7 @@ pub async fn sandbox_get(
     };
     println!("  {} {}", "Id:".dimmed(), id);
     println!("  {} {}", "Name:".dimmed(), name);
-    println!("  {} {}", "Phase:".dimmed(), phase_name(sandbox.phase));
+    println!("  {} {}", "Phase:".dimmed(), phase_name(sandbox.phase()));
     println!(
         "  {} {}",
         "Resource version:".dimmed(),
@@ -2591,11 +2591,11 @@ pub async fn sandbox_exec_grpc(
         .ok_or_else(|| miette::miette!("sandbox not found"))?;
 
     // Verify the sandbox is ready before issuing the exec.
-    if SandboxPhase::try_from(sandbox.phase) != Ok(SandboxPhase::Ready) {
+    if SandboxPhase::try_from(sandbox.phase()) != Ok(SandboxPhase::Ready) {
         return Err(miette::miette!(
             "sandbox '{}' is not ready (phase: {}); wait for it to reach Ready state",
             name,
-            phase_name(sandbox.phase)
+            phase_name(sandbox.phase())
         ));
     }
 
@@ -2803,11 +2803,11 @@ async fn fetch_ready_sandbox_for_forward(
         .sandbox
         .ok_or_else(|| miette::miette!("sandbox '{name}' not found"))?;
 
-    if SandboxPhase::try_from(sandbox.phase) != Ok(SandboxPhase::Ready) {
+    if SandboxPhase::try_from(sandbox.phase()) != Ok(SandboxPhase::Ready) {
         return Err(miette::miette!(
             "sandbox '{}' is no longer ready (phase: {}); stopping service forward",
             name,
-            phase_name(sandbox.phase)
+            phase_name(sandbox.phase())
         ));
     }
 
@@ -3251,8 +3251,8 @@ pub async fn sandbox_list(
 
     // Print rows
     for sandbox in sandboxes {
-        let phase = phase_name(sandbox.phase);
-        let phase_colored = match SandboxPhase::try_from(sandbox.phase) {
+        let phase = phase_name(sandbox.phase());
+        let phase_colored = match SandboxPhase::try_from(sandbox.phase()) {
             Ok(SandboxPhase::Ready) => phase.green().to_string(),
             Ok(SandboxPhase::Error) => phase.red().to_string(),
             Ok(SandboxPhase::Provisioning) => phase.yellow().to_string(),
@@ -3280,8 +3280,8 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
         "labels": labels,
         "resource_version": meta.map_or(0, |m| m.resource_version),
         "created_at": format_epoch_ms(meta.map_or(0, |m| m.created_at_ms)),
-        "phase": phase_name(sandbox.phase),
-        "current_policy_version": sandbox.current_policy_version,
+        "phase": phase_name(sandbox.phase()),
+        "current_policy_version": sandbox.current_policy_version(),
     })
 }
 
@@ -7727,8 +7727,6 @@ mod tests {
         let status = SandboxStatus {
             sandbox_name: "gpu".to_string(),
             agent_pod: "gpu-pod".to_string(),
-            agent_fd: String::new(),
-            sandbox_fd: String::new(),
             conditions: vec![SandboxCondition {
                 r#type: "Ready".to_string(),
                 status: "False".to_string(),
@@ -7736,6 +7734,7 @@ mod tests {
                 message: "Another GPU sandbox may already be using the available GPU.".to_string(),
                 last_transition_time: String::new(),
             }],
+            ..Default::default()
         };
 
         assert_eq!(
@@ -7749,8 +7748,6 @@ mod tests {
         let status = SandboxStatus {
             sandbox_name: "gpu".to_string(),
             agent_pod: "gpu-pod".to_string(),
-            agent_fd: String::new(),
-            sandbox_fd: String::new(),
             conditions: vec![SandboxCondition {
                 r#type: "Scheduled".to_string(),
                 status: "True".to_string(),
@@ -7758,6 +7755,7 @@ mod tests {
                 message: "Sandbox scheduled".to_string(),
                 last_transition_time: String::new(),
             }],
+            ..Default::default()
         };
 
         assert!(ready_false_condition_message(Some(&status)).is_none());

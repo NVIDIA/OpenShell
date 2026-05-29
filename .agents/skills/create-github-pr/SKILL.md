@@ -15,6 +15,15 @@ Create pull requests on GitHub using the `gh` CLI.
 
 ## Before Creating a PR
 
+### Check Config Documentation
+
+If the branch changes gateway TOML parsing, `[openshell.gateway]` fields,
+`[openshell.drivers.<name>]` fields, driver config defaults, or Helm rendering
+of `gateway.toml`, verify that `docs/reference/gateway-config.mdx` is updated
+in the same branch. If the change affects user-facing compute-driver setup,
+also update `docs/reference/sandbox-compute-drivers.mdx` or the relevant
+deployment docs.
+
 ### Run Pre-commit Checks
 
 Run the local pre-commit task before opening a PR:

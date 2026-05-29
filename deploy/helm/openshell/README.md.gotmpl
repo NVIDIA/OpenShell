@@ -34,7 +34,6 @@ oc adm policy add-scc-to-user privileged -z openshell-sandbox -n openshell
 
 # Deploy openshell with overrides to allow SCC assignment of fsGroup and runAsUser for the gateway
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> -n openshell \
-  --set pkiInitJob.enabled=false \
   --set server.disableTls=true \
   --set podSecurityContext.fsGroup=null \
   --set securityContext.runAsUser=null
@@ -57,6 +56,57 @@ See [`values.yaml`](values.yaml) for source defaults. Selected overlays:
 - [`ci/values-gateway.yaml`](ci/values-gateway.yaml) - gateway-only configuration
 - [`ci/values-cert-manager.yaml`](ci/values-cert-manager.yaml) - cert-manager integration
 - [`ci/values-keycloak.yaml`](ci/values-keycloak.yaml) - Keycloak OIDC integration
+
+### Database backend
+
+By default, OpenShell uses SQLite:
+
+```yaml
+server:
+  dbUrl: "sqlite:/var/openshell/openshell.db"
+postgres:
+  enabled: false
+```
+
+#### External PostgreSQL
+
+Create a Secret containing the PostgreSQL connection URI if one does not
+already exist:
+
+```bash
+kubectl create secret generic my-pg-credentials -n openshell \
+  --from-literal=uri="postgresql://user:pass@host:5432/dbname"
+```
+
+Then install the chart pointing at that Secret:
+
+```bash
+helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
+  -n openshell \
+  --set server.externalDbSecret=my-pg-credentials
+```
+
+#### Bundled PostgreSQL
+
+Deploy a PostgreSQL instance alongside the gateway using the bundled
+Bitnami subchart. A random password is generated automatically:
+
+```bash
+helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
+  --set postgres.enabled=true
+```
+
+To set an explicit password, add `--set postgres.auth.password=my-secret-password`.
+
+#### OpenShift
+
+Append these flags to any of the PostgreSQL commands above for OpenShift:
+
+```
+--set server.disableTls=true \
+--set podSecurityContext.fsGroup=null \
+--set securityContext.runAsUser=null
+```
 
 ## PKI bootstrap
 

@@ -20,6 +20,7 @@ use crossterm::terminal::{
 use miette::{IntoDiagnostic, Result};
 use openshell_core::auth::EdgeAuthInterceptor;
 use openshell_core::metadata::{ObjectId, ObjectLabels, ObjectName};
+use openshell_core::proto::SandboxPhase;
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -1418,10 +1419,10 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
                 if let Ok(resp) = client.get_sandbox(req).await
                     && let Some(sandbox) = resp.into_inner().sandbox
                 {
-                    if sandbox.phase == 2 {
+                    if sandbox.phase() == SandboxPhase::Ready as i32 {
                         break sandbox.object_id().to_string();
                     }
-                    if sandbox.phase == 3 {
+                    if sandbox.phase() == SandboxPhase::Error as i32 {
                         let _ = tx.send(Event::CreateResult(Err(
                             "sandbox entered error state".to_string()
                         )));
@@ -2274,7 +2275,7 @@ async fn refresh_sandboxes(app: &mut App) {
                 .iter()
                 .map(|s| s.object_name().to_string())
                 .collect();
-            app.sandbox_phases = sandboxes.iter().map(|s| phase_label(s.phase)).collect();
+            app.sandbox_phases = sandboxes.iter().map(|s| phase_label(s.phase())).collect();
             app.sandbox_images = sandboxes
                 .iter()
                 .map(|s| {
@@ -2304,8 +2305,10 @@ async fn refresh_sandboxes(app: &mut App) {
                 })
                 .collect();
 
-            app.sandbox_policy_versions =
-                sandboxes.iter().map(|s| s.current_policy_version).collect();
+            app.sandbox_policy_versions = sandboxes
+                .iter()
+                .map(openshell_core::proto::Sandbox::current_policy_version)
+                .collect();
 
             // Build NOTES column from active port forwards.
             let forwards = openshell_core::forward::list_forwards().unwrap_or_default();
@@ -2428,10 +2431,10 @@ async fn refresh_sandbox_draft_counts(app: &mut App) {
 
 fn phase_label(phase: i32) -> String {
     match phase {
-        1 => "Provisioning",
-        2 => "Ready",
-        3 => "Error",
-        4 => "Deleting",
+        x if x == SandboxPhase::Provisioning as i32 => "Provisioning",
+        x if x == SandboxPhase::Ready as i32 => "Ready",
+        x if x == SandboxPhase::Error as i32 => "Error",
+        x if x == SandboxPhase::Deleting as i32 => "Deleting",
         _ => "Unknown",
     }
     .to_string()

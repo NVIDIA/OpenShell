@@ -1808,7 +1808,7 @@ pub(super) async fn handle_get_sandbox_policy_status(
             .ok_or_else(|| Status::not_found("sandbox not found"))?;
         (
             sandbox.object_id().to_string(),
-            sandbox.current_policy_version,
+            sandbox.current_policy_version(),
         )
     };
 
@@ -1937,7 +1937,7 @@ pub(super) async fn handle_report_policy_status(
         state
             .store
             .update_message_cas::<Sandbox, _>(&req.sandbox_id, 0, |sandbox| {
-                sandbox.current_policy_version = version_to_set;
+                sandbox.set_current_policy_version(version_to_set);
             })
             .await
             .map_err(|e| super::persistence_error_to_status(e, "update current_policy_version"))?;
@@ -3826,7 +3826,7 @@ mod tests {
         // Two sandboxes; the caller is principal of A, the request body
         // references B.
         for (id, name) in [("sb-a", "sandbox-a"), ("sb-b", "sandbox-b")] {
-            let sandbox = Sandbox {
+            let mut sandbox = Sandbox {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: id.to_string(),
                     name: name.to_string(),
@@ -3838,9 +3838,9 @@ mod tests {
                     policy: None,
                     ..Default::default()
                 }),
-                phase: SandboxPhase::Provisioning as i32,
                 ..Default::default()
             };
+            sandbox.set_phase(SandboxPhase::Provisioning as i32);
             state.store.put_message(&sandbox).await.unwrap();
         }
         let req = with_sandbox(
@@ -3859,7 +3859,7 @@ mod tests {
     async fn same_sandbox_get_sandbox_config_allowed() {
         use openshell_core::proto::{SandboxPhase, SandboxSpec};
         let state = test_server_state().await;
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-self".to_string(),
                 name: "self".to_string(),
@@ -3871,9 +3871,9 @@ mod tests {
                 policy: None,
                 ..Default::default()
             }),
-            phase: SandboxPhase::Provisioning as i32,
             ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Provisioning as i32);
         state.store.put_message(&sandbox).await.unwrap();
         let req = with_sandbox(
             Request::new(GetSandboxConfigRequest {
@@ -3891,7 +3891,7 @@ mod tests {
         use openshell_core::proto::{SandboxPhase, SandboxSpec};
         let state = test_server_state().await;
         for (id, name) in [("sb-a", "sandbox-a"), ("sb-b", "sandbox-b")] {
-            let sandbox = Sandbox {
+            let mut sandbox = Sandbox {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: id.to_string(),
                     name: name.to_string(),
@@ -3903,9 +3903,9 @@ mod tests {
                     policy: None,
                     ..Default::default()
                 }),
-                phase: SandboxPhase::Provisioning as i32,
                 ..Default::default()
             };
+            sandbox.set_phase(SandboxPhase::Provisioning as i32);
             state.store.put_message(&sandbox).await.unwrap();
         }
         let req = with_sandbox(
@@ -3926,7 +3926,7 @@ mod tests {
         use openshell_core::proto::{SandboxPhase, SandboxSpec};
         let state = test_server_state().await;
         for (id, name) in [("sb-a", "sandbox-a"), ("sb-b", "sandbox-b")] {
-            let sandbox = Sandbox {
+            let mut sandbox = Sandbox {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: id.to_string(),
                     name: name.to_string(),
@@ -3938,9 +3938,9 @@ mod tests {
                     policy: None,
                     ..Default::default()
                 }),
-                phase: SandboxPhase::Provisioning as i32,
                 ..Default::default()
             };
+            sandbox.set_phase(SandboxPhase::Provisioning as i32);
             state.store.put_message(&sandbox).await.unwrap();
         }
         let req = with_sandbox(
@@ -4013,7 +4013,7 @@ mod tests {
         // RBAC was the user gate; the IDOR guard must NOT trip for users.
         use openshell_core::proto::{SandboxPhase, SandboxSpec};
         let state = test_server_state().await;
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-x".to_string(),
                 name: "x".to_string(),
@@ -4025,9 +4025,9 @@ mod tests {
                 policy: None,
                 ..Default::default()
             }),
-            phase: SandboxPhase::Provisioning as i32,
             ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Provisioning as i32);
         state.store.put_message(&sandbox).await.unwrap();
         let req = with_user(Request::new(GetSandboxConfigRequest {
             sandbox_id: "sb-x".to_string(),
@@ -4080,7 +4080,7 @@ mod tests {
 
         let store = test_store().await;
 
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-no-policy".to_string(),
                 name: "no-policy-sandbox".to_string(),
@@ -4092,9 +4092,9 @@ mod tests {
                 policy: None,
                 ..Default::default()
             }),
-            phase: SandboxPhase::Provisioning as i32,
             ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Provisioning as i32);
         store.put_message(&sandbox).await.unwrap();
 
         let loaded = store
@@ -4149,7 +4149,7 @@ mod tests {
     ) -> Sandbox {
         use openshell_core::proto::{SandboxPhase, SandboxSpec};
 
-        Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: id.to_string(),
                 name: name.to_string(),
@@ -4162,9 +4162,10 @@ mod tests {
                 providers,
                 ..Default::default()
             }),
-            phase: SandboxPhase::Ready as i32,
             ..Default::default()
-        }
+        };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        sandbox
     }
 
     async fn enable_providers_v2(state: &Arc<ServerState>) {
@@ -5035,7 +5036,7 @@ mod tests {
             .collect(),
             ..Default::default()
         };
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-global-profile".to_string(),
                 name: "global-profile-sandbox".to_string(),
@@ -5048,9 +5049,9 @@ mod tests {
                 providers: vec!["work-github".to_string()],
                 ..Default::default()
             }),
-            phase: SandboxPhase::Ready as i32,
             ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox).await.unwrap();
 
         let global_policy = SandboxPolicy {
@@ -5124,7 +5125,7 @@ mod tests {
 
         let store = test_store().await;
 
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-backfill".to_string(),
                 name: "backfill-sandbox".to_string(),
@@ -5136,9 +5137,9 @@ mod tests {
                 policy: None,
                 ..Default::default()
             }),
-            phase: SandboxPhase::Provisioning as i32,
             ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Provisioning as i32);
         store.put_message(&sandbox).await.unwrap();
 
         let new_policy = ProtoSandboxPolicy {
@@ -5228,7 +5229,7 @@ mod tests {
             .put_message(&test_provider("github-pat", "github"))
             .await
             .unwrap();
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-draft-flow".to_string(),
                 name: "draft-flow".to_string(),
@@ -5241,9 +5242,9 @@ mod tests {
                 providers: vec!["github-pat".to_string()],
                 ..Default::default()
             }),
-            phase: SandboxPhase::Ready as i32,
             ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox).await.unwrap();
         let sandbox_name = sandbox.object_name().to_string();
 
@@ -5443,7 +5444,7 @@ mod tests {
 
         let state = test_server_state().await;
         let sandbox_name = "agent-feedback-loop".to_string();
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-feedback".to_string(),
                 name: sandbox_name.clone(),
@@ -5455,9 +5456,9 @@ mod tests {
                 policy: None,
                 ..Default::default()
             }),
-            phase: SandboxPhase::Ready as i32,
             ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox).await.unwrap();
 
         let proposed_rule = NetworkPolicyRule {
@@ -5539,7 +5540,7 @@ mod tests {
 
         let state = test_server_state().await;
         let sandbox_name = "agent-l7-verdict".to_string();
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-agent-l7-verdict".to_string(),
                 name: sandbox_name.clone(),
@@ -5558,9 +5559,9 @@ mod tests {
                 }),
                 ..Default::default()
             }),
-            phase: SandboxPhase::Ready as i32,
             ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox).await.unwrap();
         // Opt this sandbox into auto-approval via the settings model — same
         // path the CLI's `--approval-mode auto` exercises — to test the
@@ -5654,7 +5655,7 @@ mod tests {
             .await
             .unwrap();
         let sandbox_name = "supersede-flow".to_string();
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-supersede-flow".to_string(),
                 name: sandbox_name.clone(),
@@ -5674,9 +5675,9 @@ mod tests {
                 providers: vec!["github-pat".to_string()],
                 ..Default::default()
             }),
-            phase: SandboxPhase::Ready as i32,
             ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox).await.unwrap();
 
         // Step 1: mechanistic submits a broad L4 grant; the prover flags it
@@ -5857,7 +5858,7 @@ mod tests {
 
         let state = test_server_state().await;
         let sandbox_name = "mechanistic-clean".to_string();
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-mechanistic-clean".to_string(),
                 name: sandbox_name.clone(),
@@ -5877,9 +5878,9 @@ mod tests {
                 // No providers → no credential in scope for the proposed host.
                 ..Default::default()
             }),
-            phase: SandboxPhase::Ready as i32,
             ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox).await.unwrap();
         // Opt into auto mode via the settings model to test the
         // proposer-agnostic gate.
@@ -5954,7 +5955,7 @@ mod tests {
             .await
             .unwrap();
         let sandbox_name = "l7-full-with-cred".to_string();
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-l7-full-with-cred".to_string(),
                 name: sandbox_name.clone(),
@@ -5974,9 +5975,9 @@ mod tests {
                 providers: vec!["github-pat".to_string()],
                 ..Default::default()
             }),
-            phase: SandboxPhase::Ready as i32,
             ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox).await.unwrap();
         seed_sandbox_approval_mode(&state, &sandbox_name, "auto").await;
 
@@ -6059,7 +6060,7 @@ mod tests {
 
         let state = test_server_state().await;
         let sandbox_name = "default-manual-mode".to_string();
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-default-manual-mode".to_string(),
                 name: sandbox_name.clone(),
@@ -6080,9 +6081,9 @@ mod tests {
                 // scope — the resolver must treat absence as "manual".
                 ..Default::default()
             }),
-            phase: SandboxPhase::Ready as i32,
             ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox).await.unwrap();
 
         let proposed_rule = NetworkPolicyRule {
@@ -6152,7 +6153,7 @@ mod tests {
 
         let state = test_server_state().await;
         let sandbox_name = "unknown-mode".to_string();
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-unknown-mode".to_string(),
                 name: sandbox_name.clone(),
@@ -6171,9 +6172,9 @@ mod tests {
                 }),
                 ..Default::default()
             }),
-            phase: SandboxPhase::Ready as i32,
             ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox).await.unwrap();
         // A future-CLI value the current gateway doesn't recognize.
         seed_sandbox_approval_mode(&state, &sandbox_name, "auto_on_low_risk").await;
@@ -6237,7 +6238,7 @@ mod tests {
 
         let state = test_server_state().await;
         let sandbox_name = "explicit-manual-mode".to_string();
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-explicit-manual-mode".to_string(),
                 name: sandbox_name.clone(),
@@ -6256,9 +6257,9 @@ mod tests {
                 }),
                 ..Default::default()
             }),
-            phase: SandboxPhase::Ready as i32,
             ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox).await.unwrap();
         seed_sandbox_approval_mode(&state, &sandbox_name, "manual").await;
 
@@ -6324,7 +6325,7 @@ mod tests {
 
         let state = test_server_state().await;
         let sandbox_name = "gateway-auto-mode".to_string();
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-gateway-auto-mode".to_string(),
                 name: sandbox_name.clone(),
@@ -6343,9 +6344,9 @@ mod tests {
                 }),
                 ..Default::default()
             }),
-            phase: SandboxPhase::Ready as i32,
             ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox).await.unwrap();
         // Fleet-wide opt-in — no sandbox-scope setting.
         seed_global_approval_mode(&state, "auto").await;
@@ -6411,7 +6412,7 @@ mod tests {
 
         let state = test_server_state().await;
         let sandbox_name = "gateway-pinned-manual".to_string();
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-gateway-pinned-manual".to_string(),
                 name: sandbox_name.clone(),
@@ -6430,9 +6431,9 @@ mod tests {
                 }),
                 ..Default::default()
             }),
-            phase: SandboxPhase::Ready as i32,
             ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox).await.unwrap();
         // Gateway pins manual; the sandbox-scope override is supplied (test
         // helper bypasses the UpdateConfig precondition, simulating the
@@ -6503,7 +6504,7 @@ mod tests {
 
         let state = test_server_state().await;
         let sandbox_name = "reject-provider-prefix".to_string();
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-reject-provider-prefix".to_string(),
                 name: sandbox_name.clone(),
@@ -6522,9 +6523,9 @@ mod tests {
                 }),
                 ..Default::default()
             }),
-            phase: SandboxPhase::Ready as i32,
             ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox).await.unwrap();
 
         let proposed_rule = NetworkPolicyRule {
@@ -6589,7 +6590,7 @@ mod tests {
             .await
             .unwrap();
         let sandbox_name = "agent-l4-with-cred".to_string();
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-agent-l4-with-cred".to_string(),
                 name: sandbox_name.clone(),
@@ -6609,9 +6610,9 @@ mod tests {
                 providers: vec!["github-pat".to_string()],
                 ..Default::default()
             }),
-            phase: SandboxPhase::Ready as i32,
             ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox).await.unwrap();
 
         let proposed_rule = NetworkPolicyRule {
@@ -6685,7 +6686,7 @@ mod tests {
 
         let state = test_server_state().await;
         let sandbox_name = "agent-l4-no-cred".to_string();
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-agent-l4-no-cred".to_string(),
                 name: sandbox_name.clone(),
@@ -6705,9 +6706,9 @@ mod tests {
                 // No providers — credential set will be empty.
                 ..Default::default()
             }),
-            phase: SandboxPhase::Ready as i32,
             ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox).await.unwrap();
 
         let proposed_rule = NetworkPolicyRule {
@@ -6770,7 +6771,7 @@ mod tests {
 
         let state = test_server_state().await;
         let sandbox_name = "agent-link-local".to_string();
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-agent-link-local".to_string(),
                 name: sandbox_name.clone(),
@@ -6790,9 +6791,9 @@ mod tests {
                 // Deliberately no provider — link-local should still fire.
                 ..Default::default()
             }),
-            phase: SandboxPhase::Ready as i32,
             ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox).await.unwrap();
 
         let proposed_rule = NetworkPolicyRule {
@@ -6901,7 +6902,7 @@ mod tests {
             .unwrap();
 
         let sandbox_name = "agent-provider-effective-policy".to_string();
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-agent-provider-effective-policy".to_string(),
                 name: sandbox_name.clone(),
@@ -6921,9 +6922,9 @@ mod tests {
                 providers: vec!["work-custom".to_string()],
                 ..Default::default()
             }),
-            phase: SandboxPhase::Ready as i32,
             ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox).await.unwrap();
 
         let proposed_rule = NetworkPolicyRule {
@@ -7023,7 +7024,7 @@ mod tests {
             .unwrap();
 
         let sandbox_name = "full-loop-v2".to_string();
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-full-loop-v2".to_string(),
                 name: sandbox_name.clone(),
@@ -7043,9 +7044,9 @@ mod tests {
                 providers: vec!["github-pat".to_string()],
                 ..Default::default()
             }),
-            phase: SandboxPhase::Ready as i32,
             ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox).await.unwrap();
         seed_sandbox_approval_mode(&state, &sandbox_name, "auto").await;
 
@@ -7209,7 +7210,7 @@ mod tests {
 
         let state = test_server_state().await;
         let sandbox_name = "redraft-loop".to_string();
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-redraft".to_string(),
                 name: sandbox_name.clone(),
@@ -7221,9 +7222,9 @@ mod tests {
                 policy: None,
                 ..Default::default()
             }),
-            phase: SandboxPhase::Ready as i32,
             ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox).await.unwrap();
 
         // Two proposals with the same host|port|binary (so the mechanistic
@@ -7323,7 +7324,7 @@ mod tests {
 
         let state = test_server_state().await;
         let sandbox_name = "mechanistic-dedup".to_string();
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-mech-dedup".to_string(),
                 name: sandbox_name.clone(),
@@ -7335,9 +7336,9 @@ mod tests {
                 policy: None,
                 ..Default::default()
             }),
-            phase: SandboxPhase::Ready as i32,
             ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox).await.unwrap();
 
         let proposed_rule = NetworkPolicyRule {
@@ -7423,7 +7424,7 @@ mod tests {
 
         let state = test_server_state().await;
         let sandbox_name = "undo-clears-reason".to_string();
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-undo-clears".to_string(),
                 name: sandbox_name.clone(),
@@ -7435,9 +7436,9 @@ mod tests {
                 policy: None,
                 ..Default::default()
             }),
-            phase: SandboxPhase::Ready as i32,
             ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox).await.unwrap();
 
         let proposed_rule = NetworkPolicyRule {
@@ -7537,7 +7538,7 @@ mod tests {
             .put_message(&test_provider("github-pat", "github"))
             .await
             .unwrap();
-        let sandbox_a = Sandbox {
+        let mut sandbox_a = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-draft-owner".to_string(),
                 name: "draft-owner".to_string(),
@@ -7550,10 +7551,10 @@ mod tests {
                 providers: vec!["github-pat".to_string()],
                 ..Default::default()
             }),
-            phase: SandboxPhase::Ready as i32,
             ..Default::default()
         };
-        let sandbox_b = Sandbox {
+        sandbox_a.set_phase(SandboxPhase::Ready as i32);
+        let mut sandbox_b = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-draft-other".to_string(),
                 name: "draft-other".to_string(),
@@ -7565,9 +7566,9 @@ mod tests {
                 policy: None,
                 ..Default::default()
             }),
-            phase: SandboxPhase::Ready as i32,
             ..Default::default()
         };
+        sandbox_b.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox_a).await.unwrap();
         state.store.put_message(&sandbox_b).await.unwrap();
 
@@ -9124,7 +9125,7 @@ mod tests {
 
         // Create a sandbox WITHOUT a policy (spec.policy = None)
         // This simulates a sandbox before the supervisor has discovered and synced a policy
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-1".to_string(),
                 name: "test-sandbox".to_string(),
@@ -9137,9 +9138,9 @@ mod tests {
                 providers: Vec::new(),
                 ..Default::default()
             }),
-            phase: SandboxPhase::Provisioning as i32,
             ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Provisioning as i32);
         state.store.put_message(&sandbox).await.unwrap();
 
         // Fetch the sandbox to get its current resource_version
@@ -9199,7 +9200,7 @@ mod tests {
         let state = test_server_state().await;
 
         // Create a sandbox WITHOUT a policy
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-1".to_string(),
                 name: "test-sandbox".to_string(),
@@ -9212,9 +9213,9 @@ mod tests {
                 providers: Vec::new(),
                 ..Default::default()
             }),
-            phase: SandboxPhase::Provisioning as i32,
             ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Provisioning as i32);
         state.store.put_message(&sandbox).await.unwrap();
 
         // Get current version
@@ -9280,7 +9281,7 @@ mod tests {
         let state = Arc::new(test_server_state().await);
 
         // Create a sandbox WITHOUT a policy
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-1".to_string(),
                 name: "test-sandbox".to_string(),
@@ -9293,9 +9294,9 @@ mod tests {
                 providers: Vec::new(),
                 ..Default::default()
             }),
-            phase: SandboxPhase::Provisioning as i32,
             ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Provisioning as i32);
         state.store.put_message(&sandbox).await.unwrap();
 
         // All three clients fetch the sandbox and see the same version

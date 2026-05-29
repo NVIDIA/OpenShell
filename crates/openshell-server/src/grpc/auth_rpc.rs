@@ -193,7 +193,7 @@ mod tests {
     }
 
     async fn insert_sandbox(state: &Arc<ServerState>, sandbox_id: &str) {
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(ObjectMeta {
                 id: sandbox_id.to_string(),
                 name: sandbox_id.to_string(),
@@ -205,9 +205,9 @@ mod tests {
                 policy: None,
                 ..Default::default()
             }),
-            phase: SandboxPhase::Ready as i32,
             ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox).await.unwrap();
     }
 

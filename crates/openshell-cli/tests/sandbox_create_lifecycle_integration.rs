@@ -79,18 +79,19 @@ impl OpenShell for TestOpenShell {
             name
         };
 
-        Ok(Response::new(SandboxResponse {
-            sandbox: Some(Sandbox {
-                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
-                    id: format!("id-{sandbox_name}"),
-                    name: sandbox_name,
-                    created_at_ms: 0,
-                    labels: HashMap::new(),
-                    resource_version: 0,
-                }),
-                phase: SandboxPhase::Provisioning as i32,
-                ..Sandbox::default()
+        let mut sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: format!("id-{sandbox_name}"),
+                name: sandbox_name,
+                created_at_ms: 0,
+                labels: HashMap::new(),
+                resource_version: 0,
             }),
+            ..Sandbox::default()
+        };
+        sandbox.set_phase(SandboxPhase::Provisioning as i32);
+        Ok(Response::new(SandboxResponse {
+            sandbox: Some(sandbox),
         }))
     }
 
@@ -99,18 +100,19 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<GetSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
         let name = request.into_inner().name;
-        Ok(Response::new(SandboxResponse {
-            sandbox: Some(Sandbox {
-                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
-                    id: format!("id-{name}"),
-                    name,
-                    created_at_ms: 0,
-                    labels: HashMap::new(),
-                    resource_version: 0,
-                }),
-                phase: SandboxPhase::Ready as i32,
-                ..Sandbox::default()
+        let mut sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: format!("id-{name}"),
+                name,
+                created_at_ms: 0,
+                labels: HashMap::new(),
+                resource_version: 0,
             }),
+            ..Sandbox::default()
+        };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        Ok(Response::new(SandboxResponse {
+            sandbox: Some(sandbox),
         }))
     }
 
@@ -351,7 +353,7 @@ impl OpenShell for TestOpenShell {
         let vm_log_churn_before_ready = self.state.vm_log_churn_before_ready.load(Ordering::SeqCst);
 
         tokio::spawn(async move {
-            let provisioning = Sandbox {
+            let mut provisioning = Sandbox {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: sandbox_id.clone(),
                     name: sandbox_id.trim_start_matches("id-").to_string(),
@@ -359,16 +361,12 @@ impl OpenShell for TestOpenShell {
                     labels: HashMap::new(),
                     resource_version: 0,
                 }),
-                phase: SandboxPhase::Provisioning as i32,
                 ..Sandbox::default()
             };
-            let error = Sandbox {
-                phase: SandboxPhase::Error as i32,
+            provisioning.set_phase(SandboxPhase::Provisioning as i32);
+            let mut error = Sandbox {
                 status: Some(SandboxStatus {
                     sandbox_name: sandbox_id.trim_start_matches("id-").to_string(),
-                    agent_pod: String::new(),
-                    agent_fd: String::new(),
-                    sandbox_fd: String::new(),
                     conditions: vec![SandboxCondition {
                         r#type: "Ready".to_string(),
                         status: "False".to_string(),
@@ -376,13 +374,13 @@ impl OpenShell for TestOpenShell {
                         message: "VM process exited with status 0".to_string(),
                         last_transition_time: String::new(),
                     }],
+                    ..Default::default()
                 }),
                 ..provisioning.clone()
             };
-            let ready = Sandbox {
-                phase: SandboxPhase::Ready as i32,
-                ..provisioning.clone()
-            };
+            error.set_phase(SandboxPhase::Error as i32);
+            let mut ready = provisioning.clone();
+            ready.set_phase(SandboxPhase::Ready as i32);
 
             let _ = tx
                 .send(Ok(SandboxStreamEvent {

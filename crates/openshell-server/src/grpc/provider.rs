@@ -3623,7 +3623,7 @@ mod tests {
         .await
         .unwrap();
 
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sandbox-001".to_string(),
                 name: "test-sandbox".to_string(),
@@ -3636,9 +3636,8 @@ mod tests {
                 ..SandboxSpec::default()
             }),
             status: None,
-            phase: SandboxPhase::Ready as i32,
-            ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
         store.put_message(&sandbox).await.unwrap();
 
         let loaded = store
@@ -3660,7 +3659,7 @@ mod tests {
 
         let store = test_store().await;
 
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sandbox-002".to_string(),
                 name: "empty-sandbox".to_string(),
@@ -3670,9 +3669,8 @@ mod tests {
             }),
             spec: Some(SandboxSpec::default()),
             status: None,
-            phase: SandboxPhase::Ready as i32,
-            ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
         store.put_message(&sandbox).await.unwrap();
 
         let loaded = store
