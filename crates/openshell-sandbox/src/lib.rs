@@ -1579,7 +1579,11 @@ fn effective_runtime_read_only_conflict_policy_from_proto(
         } else {
             policy.mode.clone()
         },
-        allow_promotion: policy.allow_promotion.clone(),
+        allow_promotion: policy
+            .allow_promotion
+            .iter()
+            .map(|path| openshell_policy::normalize_path(path))
+            .collect(),
     }
 }
 
@@ -1600,7 +1604,11 @@ fn effective_runtime_read_only_conflict_policy_from_local(
         } else {
             policy.mode.clone()
         },
-        allow_promotion: policy.allow_promotion.clone(),
+        allow_promotion: policy
+            .allow_promotion
+            .iter()
+            .map(|path| openshell_policy::normalize_path(path))
+            .collect(),
     }
 }
 
@@ -1661,11 +1669,18 @@ where
         }
     }
     for path in &paths.read_write {
-        if fs.read_write.iter().any(|p| p == path) {
+        if fs
+            .read_write
+            .iter()
+            .any(|p| openshell_policy::normalize_path(p) == *path)
+        {
             continue;
         }
 
-        let read_only_conflict = fs.read_only.iter().position(|p| p == path);
+        let read_only_conflict = fs
+            .read_only
+            .iter()
+            .position(|p| openshell_policy::normalize_path(p) == *path);
         if let Some(index) = read_only_conflict {
             if promotion_allowed(conflict_policy, path) {
                 fs.read_only.remove(index);
@@ -1755,16 +1770,18 @@ where
     }
     for path in &paths.read_write {
         let p = std::path::PathBuf::from(path);
-        if policy.filesystem.read_write.contains(&p) {
+        if policy
+            .filesystem
+            .read_write
+            .iter()
+            .any(|existing| openshell_policy::normalize_path(&existing.to_string_lossy()) == *path)
+        {
             continue;
         }
 
-        if let Some(index) = policy
-            .filesystem
-            .read_only
-            .iter()
-            .position(|existing| existing == &p)
-        {
+        if let Some(index) = policy.filesystem.read_only.iter().position(|existing| {
+            openshell_policy::normalize_path(&existing.to_string_lossy()) == *path
+        }) {
             if promotion_allowed(conflict_policy, path) {
                 policy.filesystem.read_only.remove(index);
                 policy.filesystem.read_write.push(p);
@@ -1967,7 +1984,7 @@ mod baseline_tests {
     fn proto_default_conflict_policy_promotes_proc() {
         let mut policy = openshell_policy::restrictive_default_policy();
         policy.filesystem = Some(openshell_core::proto::FilesystemPolicy {
-            read_only: vec!["/proc".to_string()],
+            read_only: vec!["/proc/".to_string()],
             read_write: vec![],
             include_workdir: false,
             ..Default::default()
@@ -1987,7 +2004,7 @@ mod baseline_tests {
 
         let filesystem = policy.filesystem.expect("filesystem policy");
         assert!(enriched);
-        assert!(!filesystem.read_only.contains(&"/proc".to_string()));
+        assert!(!filesystem.read_only.contains(&"/proc/".to_string()));
         assert!(filesystem.read_write.contains(&"/proc".to_string()));
     }
 
