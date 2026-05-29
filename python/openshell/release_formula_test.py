@@ -96,7 +96,7 @@ def test_generate_homebrew_formula_uses_tagged_macos_driver_asset_without_defaul
 
 def test_snap_wrapper_uses_optional_gateway_config_without_generating_toml() -> None:
     repo_root = Path(__file__).resolve().parents[2]
-    wrapper = (repo_root / "deploy/snap/bin/openshell-gateway-wrapper").read_text(
+    wrapper = (repo_root / "tasks/scripts/snap-gateway-wrapper.sh").read_text(
         encoding="utf-8"
     )
 
