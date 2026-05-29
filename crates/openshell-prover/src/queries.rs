@@ -56,6 +56,17 @@ pub(crate) fn is_link_local(host: &str) -> bool {
     }
 }
 
+/// Return true for static cloud metadata hostnames that should be treated like
+/// link-local metadata reach without performing DNS resolution.
+pub(crate) fn is_known_metadata_hostname(host: &str) -> bool {
+    let normalized = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    matches!(normalized.as_str(), "metadata.google.internal")
+}
+
+fn is_link_local_or_metadata_host(host: &str) -> bool {
+    is_link_local(host) || is_known_metadata_hostname(host)
+}
+
 /// Run all four formal queries against the model and emit one finding
 /// per category that has at least one path.
 ///
@@ -80,11 +91,11 @@ pub fn check_credential_safety(model: &ReachabilityModel) -> Vec<Finding> {
                 continue;
             }
 
-            let host_is_link_local = is_link_local(&eid.host);
+            let host_is_link_local = is_link_local_or_metadata_host(&eid.host);
             let has_credential = !model.credentials.credentials_for_host(&eid.host).is_empty();
 
-            // Tier 1: link-local. Unconditional. Other categories not
-            // emitted on link-local hosts — the link-local signal is the
+            // Tier 1: link-local/metadata. Unconditional. Other categories
+            // are not emitted on these hosts — the metadata signal is the
             // story.
             if host_is_link_local {
                 link_local_paths.push(ExfilPath {
@@ -174,13 +185,14 @@ pub fn check_credential_safety(model: &ReachabilityModel) -> Vec<Finding> {
     if !link_local_paths.is_empty() {
         findings.push(build_finding(
             category::LINK_LOCAL_REACH,
-            "Link-Local Reach",
-            "Reach to a host in a link-local range — cloud-metadata territory.",
+            "Link-Local or Metadata Reach",
+            "Reach to a host in a link-local range or known metadata hostname — cloud-metadata territory.",
             link_local_paths,
             vec![
-                "Endpoint host is in a link-local range (cloud-metadata territory). \
-                 Sandboxes should not reach these endpoints — reaching them can return \
-                 host credentials the sandbox should not have."
+                "Endpoint host is in a link-local range or known metadata hostname \
+                 (cloud-metadata territory). Sandboxes should not reach these \
+                 endpoints — reaching them can return host credentials the sandbox \
+                 should not have."
                     .to_owned(),
             ],
         ));
@@ -317,7 +329,19 @@ mod tests {
     #[test]
     fn is_link_local_rejects_hostnames() {
         assert!(!is_link_local("api.github.com"));
-        assert!(!is_link_local("metadata.google.internal"));
         assert!(!is_link_local(""));
+    }
+
+    #[test]
+    fn is_known_metadata_hostname_recognises_gcp_variants() {
+        assert!(is_known_metadata_hostname("metadata.google.internal"));
+        assert!(is_known_metadata_hostname("METADATA.GOOGLE.INTERNAL"));
+        assert!(is_known_metadata_hostname("metadata.google.internal."));
+    }
+
+    #[test]
+    fn is_known_metadata_hostname_rejects_other_hostnames() {
+        assert!(!is_known_metadata_hostname("api.github.com"));
+        assert!(!is_known_metadata_hostname(""));
     }
 }

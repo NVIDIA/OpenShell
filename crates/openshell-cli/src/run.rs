@@ -5557,14 +5557,16 @@ fn parse_cli_setting_value(key: &str, raw_value: &str) -> Result<SettingValue> {
             // proposal_approval_mode autom` errors immediately instead of
             // round-tripping through the server. The server enforces the
             // same check independently for non-CLI callers.
-            setting.validate_string_value(raw_value).map_err(|allowed| {
-                miette::miette!(
-                    "invalid value '{}' for key '{}'; expected one of: {}",
-                    raw_value,
-                    key,
-                    allowed.join(", ")
-                )
-            })?;
+            setting
+                .validate_string_value(raw_value)
+                .map_err(|allowed| {
+                    miette::miette!(
+                        "invalid value '{}' for key '{}'; expected one of: {}",
+                        raw_value,
+                        key,
+                        allowed.join(", ")
+                    )
+                })?;
             setting_value::Value::StringValue(raw_value.to_string())
         }
         SettingValueKind::Int => {

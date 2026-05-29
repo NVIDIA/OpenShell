@@ -12,7 +12,7 @@
 //! The LLM-powered `PolicyAdvisor` (issue #205) wraps and enriches these
 //! mechanistic proposals with context-aware rationale and smarter grouping.
 
-use openshell_core::net::is_always_blocked_ip;
+use openshell_core::net::{is_always_blocked_ip, is_known_metadata_hostname};
 use openshell_core::proto::{
     DenialSummary, L7Allow, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, PolicyChunk,
 };
@@ -106,15 +106,15 @@ pub fn generate_proposals(summaries: &[DenialSummary]) -> Vec<PolicyChunk> {
         }
 
         // Skip proposals for always-blocked destinations (loopback,
-        // link-local, unspecified).  These would be denied at runtime by the
-        // proxy's is_always_blocked_ip check regardless of policy, producing
-        // an infinite proposal loop in the TUI.
+        // link-local, unspecified, and known metadata hostnames). These would
+        // be denied at runtime regardless of policy, producing an infinite
+        // proposal loop in the TUI.
         if is_always_blocked_destination(host) {
             tracing::info!(
                 host,
                 port,
                 "Skipped proposal for always-blocked destination \
-                 (SSRF hardening — loopback/link-local/unspecified)"
+                 (SSRF hardening — loopback/link-local/unspecified/metadata)"
             );
             continue;
         }
@@ -416,7 +416,7 @@ fn short_binary_name(path: &str) -> String {
 /// Check if a destination host is always-blocked.
 ///
 /// For literal IP hosts, checks against [`is_always_blocked_ip`].
-/// For hostnames like "localhost", checks well-known loopback names.
+/// For hostnames, checks well-known loopback and cloud metadata names.
 /// For other hostnames, returns false (DNS may resolve to anything).
 fn is_always_blocked_destination(host: &str) -> bool {
     // Check literal IP addresses
@@ -425,7 +425,7 @@ fn is_always_blocked_destination(host: &str) -> bool {
     }
     // Check well-known loopback hostnames
     let host_lc = host.to_lowercase();
-    host_lc == "localhost" || host_lc == "localhost."
+    host_lc == "localhost" || host_lc == "localhost." || is_known_metadata_hostname(host)
 }
 
 #[cfg(test)]
@@ -599,6 +599,12 @@ mod tests {
     }
 
     #[test]
+    fn test_always_blocked_destination_known_metadata_hostname() {
+        assert!(is_always_blocked_destination("metadata.google.internal"));
+        assert!(is_always_blocked_destination("METADATA.GOOGLE.INTERNAL."));
+    }
+
+    #[test]
     fn test_always_blocked_destination_allows_rfc1918() {
         assert!(!is_always_blocked_destination("10.0.5.20"));
         assert!(!is_always_blocked_destination("192.168.1.1"));
@@ -648,6 +654,26 @@ mod tests {
         assert!(
             proposals.is_empty(),
             "should skip proposals for link-local: {proposals:?}"
+        );
+    }
+
+    #[test]
+    fn test_generate_proposals_skips_known_metadata_hostname() {
+        let summaries = vec![DenialSummary {
+            host: "metadata.google.internal".to_string(),
+            port: 80,
+            binary: "/usr/bin/curl".to_string(),
+            count: 5,
+            first_seen_ms: 1000,
+            last_seen_ms: 2000,
+            denial_stage: "ssrf".to_string(),
+            ..Default::default()
+        }];
+
+        let proposals = generate_proposals(&summaries);
+        assert!(
+            proposals.is_empty(),
+            "should skip proposals for metadata hostname: {proposals:?}"
         );
     }
 

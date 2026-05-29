@@ -198,6 +198,80 @@ filesystem_policy:
         }
     }
 
+    #[test]
+    fn test_wildcard_endpoint_covering_credential_host_emits_credential_reach() {
+        use finding::{FindingPath, category};
+
+        let policy = policy::parse_policy_str(
+            r#"
+version: 1
+network_policies:
+  github_wildcard:
+    name: github-wildcard
+    endpoints:
+      - host: "*.github.com"
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        access: read-write
+    binaries:
+      - path: /usr/bin/curl
+"#,
+        )
+        .expect("parse policy");
+        let cred_set =
+            credentials::load_credential_set_embedded(&testdata_dir().join("credentials.yaml"))
+                .expect("load creds");
+        let bin_reg = registry::load_embedded_binary_registry().expect("load registry");
+
+        let z3_model = build_model(policy, cred_set, bin_reg);
+        let findings = run_all_queries(&z3_model);
+
+        let reach = findings
+            .iter()
+            .find(|finding| finding.query == category::CREDENTIAL_REACH_EXPANSION)
+            .expect("wildcard host covering api.github.com must be credentialed");
+        assert!(reach.paths.iter().any(|path| matches!(
+            path,
+            FindingPath::Exfil(exfil)
+                if exfil.endpoint_host == "*.github.com" && exfil.binary == "/usr/bin/curl"
+        )));
+    }
+
+    #[test]
+    fn test_known_metadata_hostname_emits_link_local_finding() {
+        use finding::{FindingPath, category};
+
+        let policy = policy::parse_policy_str(
+            r"
+version: 1
+network_policies:
+  metadata:
+    name: metadata
+    endpoints:
+      - host: metadata.google.internal
+        port: 80
+    binaries:
+      - path: /usr/bin/curl
+",
+        )
+        .expect("parse policy");
+        let bin_reg = registry::load_embedded_binary_registry().expect("load registry");
+
+        let z3_model = build_model(policy, credentials::CredentialSet::default(), bin_reg);
+        let findings = run_all_queries(&z3_model);
+
+        let link_local = findings
+            .iter()
+            .find(|finding| finding.query == category::LINK_LOCAL_REACH)
+            .expect("known metadata hostname must emit link-local/metadata finding");
+        assert!(link_local.paths.iter().any(|path| matches!(
+            path,
+            FindingPath::Exfil(exfil)
+                if exfil.endpoint_host == "metadata.google.internal"
+        )));
+    }
+
     // 7. Empty policy produces no findings.
     #[test]
     fn test_empty_policy_no_findings() {

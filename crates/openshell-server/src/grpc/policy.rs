@@ -3064,30 +3064,44 @@ fn generate_security_notes(host: &str, port: u16) -> String {
 ///
 /// This is defense-in-depth: the proxy blocks these at runtime, so
 /// merging them into the active policy would be silently un-enforceable.
+fn validate_host_not_always_blocked(host: &str) -> Result<(), Status> {
+    use openshell_core::net::{is_always_blocked_ip, is_known_metadata_hostname};
+    use std::net::IpAddr;
+
+    let host = host.trim();
+    // Check if the host is a literal always-blocked IP.
+    if let Ok(ip) = host.parse::<IpAddr>()
+        && is_always_blocked_ip(ip)
+    {
+        return Err(Status::invalid_argument(format!(
+            "proposed rule endpoint host '{host}' is an always-blocked address \
+             (loopback/link-local/unspecified); the proxy will deny traffic \
+             to this destination regardless of policy"
+        )));
+    }
+    let host_lc = host.to_lowercase();
+    if host_lc == "localhost" || host_lc == "localhost." {
+        return Err(Status::invalid_argument(
+            "proposed rule endpoint host 'localhost' is always blocked; \
+             the proxy will deny traffic to loopback regardless of policy"
+                .to_string(),
+        ));
+    }
+    if is_known_metadata_hostname(host) {
+        return Err(Status::invalid_argument(format!(
+            "proposed rule endpoint host '{host}' is a known cloud metadata hostname; \
+             the proxy will deny traffic to this destination regardless of policy"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_rule_not_always_blocked(rule: &NetworkPolicyRule) -> Result<(), Status> {
-    use openshell_core::net::{is_always_blocked_ip, is_always_blocked_net};
+    use openshell_core::net::is_always_blocked_net;
     use std::net::IpAddr;
 
     for ep in &rule.endpoints {
-        // Check if the endpoint host is a literal always-blocked IP.
-        if let Ok(ip) = ep.host.parse::<IpAddr>()
-            && is_always_blocked_ip(ip)
-        {
-            return Err(Status::invalid_argument(format!(
-                "proposed rule endpoint host '{}' is an always-blocked address \
-                 (loopback/link-local/unspecified); the proxy will deny traffic \
-                 to this destination regardless of policy",
-                ep.host
-            )));
-        }
-        let host_lc = ep.host.to_lowercase();
-        if host_lc == "localhost" || host_lc == "localhost." {
-            return Err(Status::invalid_argument(
-                "proposed rule endpoint host 'localhost' is always blocked; \
-                 the proxy will deny traffic to loopback regardless of policy"
-                    .to_string(),
-            ));
-        }
+        validate_host_not_always_blocked(&ep.host)?;
 
         // Check allowed_ips entries.
         for entry in &ep.allowed_ips {
@@ -3258,8 +3272,10 @@ fn parse_proto_add_allow_rules(
 
 fn validate_merge_operations_for_server(operations: &[PolicyMergeOp]) -> Result<(), Status> {
     for operation in operations {
-        if let PolicyMergeOp::AddRule { rule, .. } = operation {
-            validate_rule_not_always_blocked(rule)?;
+        match operation {
+            PolicyMergeOp::AddRule { rule, .. } => validate_rule_not_always_blocked(rule)?,
+            PolicyMergeOp::AddAllowRules { host, .. } => validate_host_not_always_blocked(host)?,
+            _ => {}
         }
     }
     Ok(())
@@ -8243,6 +8259,52 @@ mod tests {
     }
 
     #[test]
+    fn validate_rule_rejects_known_metadata_hostname() {
+        use openshell_core::proto::{NetworkEndpoint, NetworkPolicyRule};
+
+        let rule = NetworkPolicyRule {
+            name: "bad".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "METADATA.GOOGLE.INTERNAL.".to_string(),
+                port: 80,
+                ..Default::default()
+            }],
+            binaries: vec![],
+        };
+        let result = validate_rule_not_always_blocked(&rule);
+        assert!(result.is_err());
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(status.message().contains("cloud metadata hostname"));
+    }
+
+    #[test]
+    fn validate_merge_operations_rejects_add_allow_for_known_metadata_hostname() {
+        let operation = PolicyMergeOp::AddAllowRules {
+            host: "metadata.google.internal".to_string(),
+            port: 80,
+            rules: vec![L7Rule {
+                allow: Some(openshell_core::proto::L7Allow {
+                    method: "GET".to_string(),
+                    path: "/computeMetadata/v1/**".to_string(),
+                    command: String::new(),
+                    query: HashMap::new(),
+                    operation_type: String::new(),
+                    operation_name: String::new(),
+                    fields: Vec::new(),
+                }),
+            }],
+        };
+
+        let result = validate_merge_operations_for_server(&[operation]);
+
+        assert!(result.is_err());
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(status.message().contains("cloud metadata hostname"));
+    }
+
+    #[test]
     fn validate_rule_accepts_rfc1918_allowed_ips() {
         use openshell_core::proto::{NetworkEndpoint, NetworkPolicyRule};
 
@@ -8399,11 +8461,8 @@ mod tests {
             let value = SettingValue {
                 value: Some(setting_value::Value::StringValue(raw.to_string())),
             };
-            let stored = proto_setting_to_stored(
-                settings::PROPOSAL_APPROVAL_MODE_KEY,
-                &value,
-            )
-            .unwrap_or_else(|e| panic!("expected '{raw}' to be accepted, got: {e}"));
+            let stored = proto_setting_to_stored(settings::PROPOSAL_APPROVAL_MODE_KEY, &value)
+                .unwrap_or_else(|e| panic!("expected '{raw}' to be accepted, got: {e}"));
             assert_eq!(stored, StoredSettingValue::String(raw.to_string()));
         }
     }
@@ -8418,11 +8477,11 @@ mod tests {
             let value = SettingValue {
                 value: Some(setting_value::Value::StringValue(raw.to_string())),
             };
-            let res = proto_setting_to_stored(
-                settings::PROPOSAL_APPROVAL_MODE_KEY,
-                &value,
+            let res = proto_setting_to_stored(settings::PROPOSAL_APPROVAL_MODE_KEY, &value);
+            assert!(
+                res.is_err(),
+                "expected '{raw}' to be rejected, got: {res:?}"
             );
-            assert!(res.is_err(), "expected '{raw}' to be rejected, got: {res:?}");
             let err = res.unwrap_err();
             assert_eq!(err.code(), Code::InvalidArgument);
         }
@@ -8433,11 +8492,8 @@ mod tests {
         let value = SettingValue {
             value: Some(setting_value::Value::StringValue("autom".to_string())),
         };
-        let err = proto_setting_to_stored(
-            settings::PROPOSAL_APPROVAL_MODE_KEY,
-            &value,
-        )
-        .unwrap_err();
+        let err =
+            proto_setting_to_stored(settings::PROPOSAL_APPROVAL_MODE_KEY, &value).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         let msg = err.message();
         assert!(msg.contains("manual"), "missing 'manual' in {msg}");

@@ -1018,12 +1018,12 @@ impl App {
                             }
                         }
                         SettingValueKind::String => {
-                            if let Some(setting) = settings::setting_for_key(&entry.key) {
-                                if let Err(allowed) = setting.validate_string_value(raw) {
-                                    edit.error =
-                                        Some(format!("expected one of: {}", allowed.join(", ")));
-                                    return;
-                                }
+                            if let Some(setting) = settings::setting_for_key(&entry.key)
+                                && let Err(allowed) = setting.validate_string_value(raw)
+                            {
+                                edit.error =
+                                    Some(format!("expected one of: {}", allowed.join(", ")));
+                                return;
                             }
                         }
                     }
@@ -1270,12 +1270,12 @@ impl App {
                             }
                         }
                         SettingValueKind::String => {
-                            if let Some(setting) = settings::setting_for_key(&entry.key) {
-                                if let Err(allowed) = setting.validate_string_value(raw) {
-                                    edit.error =
-                                        Some(format!("expected one of: {}", allowed.join(", ")));
-                                    return;
-                                }
+                            if let Some(setting) = settings::setting_for_key(&entry.key)
+                                && let Err(allowed) = setting.validate_string_value(raw)
+                            {
+                                edit.error =
+                                    Some(format!("expected one of: {}", allowed.join(", ")));
+                                return;
                             }
                         }
                     }

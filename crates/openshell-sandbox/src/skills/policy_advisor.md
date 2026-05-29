@@ -149,7 +149,8 @@ Each "yes" answer is its own categorical finding — there is no
 severity grade. Any finding blocks auto-approval.
 
 - **`link_local_reach`** — the proposal grants reach to a link-local IP
-  range (`169.254.0.0/16`, `fe80::/10`). Cloud metadata endpoints like
+  range (`169.254.0.0/16`, `fe80::/10`) or a known metadata hostname
+  such as `metadata.google.internal`. Cloud metadata endpoints like
   `169.254.169.254` live here. **Never** propose access to these —
   these endpoints serve credentials regardless of what the sandbox
   itself holds.
@@ -203,8 +204,9 @@ The new submission wins by structural overlap.
 - Do not propose wildcard hosts such as `**` or `*.com`.
 - Do not propose `access: full` to fix a single denied REST request.
 - Do not propose access to link-local addresses (`169.254.0.0/16`,
-  `fe80::/10`). Cloud-metadata endpoints there can hand out the host's
-  credentials.
+  `fe80::/10`) or known metadata hostnames such as
+  `metadata.google.internal`. Cloud-metadata endpoints there can hand out
+  the host's credentials.
 - Do not include query strings, tokens, credentials, or secret values in
   paths.
 - Explain uncertainty in `intent_summary` instead of widening the rule.

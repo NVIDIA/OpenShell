@@ -198,6 +198,8 @@ An upstream that the proxy cannot reach returns `502 Bad Gateway`:
 
 The `error` field is a short machine-readable code (`policy_denied`, `ssrf_denied`, `upstream_unreachable`). The `detail` field is a human-readable explanation suitable for display in an agent transcript.
 
+For L7 REST denials, the body also includes structured policy fields such as `method`, `path`, `rule_missing`, and `next_steps`. When policy advisor is enabled, it also includes `agent_guidance`, a short plain-language instruction telling the agent to read `/etc/openshell/skills/policy_advisor.md`, propose the narrowest rule through `http://policy.local/v1/proposals`, wait for `policy_reloaded: true`, and retry.
+
 ## Filesystem Sandbox Logs
 
 Landlock filesystem restrictions emit `CONFIG:` events at startup and whenever the sandbox has to skip a requested path.

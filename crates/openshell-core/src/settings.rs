@@ -100,10 +100,11 @@ pub const AGENT_POLICY_PROPOSALS_ENABLED_KEY: &str = "agent_policy_proposals_ena
 /// global is set.
 pub const PROPOSAL_APPROVAL_MODE_KEY: &str = "proposal_approval_mode";
 
-/// Allowed values for [`PROPOSAL_APPROVAL_MODE_KEY`]. Any other string is
-/// rejected at configure time (so operators get immediate feedback on typos
-/// like `"autom"`) while the runtime resolver still fail-closes on unknown
-/// persisted values for defense in depth.
+/// Allowed values for [`PROPOSAL_APPROVAL_MODE_KEY`].
+///
+/// Any other string is rejected at configure time (so operators get immediate
+/// feedback on typos like `"autom"`) while the runtime resolver still
+/// fail-closes on unknown persisted values for defense in depth.
 pub const PROPOSAL_APPROVAL_MODE_VALUES: &[&str] = &["manual", "auto"];
 
 pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
@@ -242,7 +243,15 @@ mod tests {
     fn proposal_approval_mode_rejects_typos_and_future_modes() {
         let setting = setting_for_key(PROPOSAL_APPROVAL_MODE_KEY)
             .expect("proposal_approval_mode should be registered");
-        for bad in ["autom", "AUTO", "Manual", "", " auto", "auto_on_low_risk", "yes"] {
+        for bad in [
+            "autom",
+            "AUTO",
+            "Manual",
+            "",
+            " auto",
+            "auto_on_low_risk",
+            "yes",
+        ] {
             let err = setting
                 .validate_string_value(bad)
                 .expect_err(&format!("expected '{bad}' to be rejected"));

@@ -92,13 +92,14 @@ Only `manual` and `auto` are accepted; typos like `autom` are rejected at config
 When policy advisor is enabled, the sandbox supervisor turns on three agent-facing surfaces:
 
 - It installs `/etc/openshell/skills/policy_advisor.md` inside the sandbox.
+- It also installs `/etc/openshell/skills/policy-advisor/SKILL.md` as a short Codex/generic-agent pointer, and writes a root `/AGENTS.md` pointer only when the image does not already provide one.
 - It serves `http://policy.local` from inside the sandbox.
-- It adds `next_steps` to L7 `policy_denied` response bodies so the agent can find the skill and local API.
+- It adds `agent_guidance` and `next_steps` to L7 `policy_denied` response bodies so the agent can find the skill and local API.
 
 The loop has seven steps:
 
 1. A sandboxed process attempts a network request that policy denies.
-2. For inspected REST traffic, OpenShell returns a structured `403` body with fields such as `layer`, `host`, `port`, `binary`, `method`, `path`, `rule_missing`, and `next_steps`.
+2. For inspected REST traffic, OpenShell returns a structured `403` body with fields such as `layer`, `host`, `port`, `binary`, `method`, `path`, `rule_missing`, `agent_guidance`, and `next_steps`.
 3. The agent reads the policy advisor skill, inspects the current policy, and optionally reads recent denial log lines.
 4. The agent submits one or more `addRule` proposals to `http://policy.local/v1/proposals`.
 5. The gateway stores accepted proposals as pending draft chunks for the sandbox and runs the [policy prover](#what-auto-approval-checks) against the proposed delta.
@@ -165,7 +166,7 @@ The policy prover runs against every proposal — mechanistic and agent-authored
 
 | Category | Triggered when |
 |---|---|
-| `link_local_reach` | The proposal reaches a host in `169.254.0.0/16` or `fe80::/10` (the cloud-metadata range, which serves credentials regardless of sandbox state). Unconditional. |
+| `link_local_reach` | The proposal reaches a host in `169.254.0.0/16`, `fe80::/10`, or a known metadata hostname such as `metadata.google.internal` (cloud-metadata territory, which serves credentials regardless of sandbox state). Unconditional. |
 | `l7_bypass_credentialed` | A binary using a wire protocol the L7 proxy cannot inspect (`git-remote-https`, `ssh`, `nc`) gains reach to a host where a credential is in scope. |
 | `credential_reach_expansion` | A binary gains credentialed reach to a `(host, port)` it could not reach before. |
 | `capability_expansion` | On a `(binary, host, port)` that already had credentialed reach, the proposal adds a new HTTP method. The finding cites the specific method. |
@@ -218,7 +219,7 @@ The rejection reason is returned to the agent through `policy.local`. The agent 
 | `GET /v1/proposals/{chunk_id}` | Returns one proposal's current `pending`, `approved`, or `rejected` status. |
 | `GET /v1/proposals/{chunk_id}/wait?timeout=300` | Holds one HTTP request open until the proposal is approved, rejected, or the timeout expires. |
 
-If policy advisor is disabled, every route returns `404 feature_disabled`, the skill is not installed for new sandboxes, and L7 deny bodies do not advertise `policy.local` routes.
+If policy advisor is disabled, every route returns `404 feature_disabled`, the skill is not installed for new sandboxes, and L7 deny bodies do not advertise `policy.local` routes or include `agent_guidance`.
 
 ## What to Expect
 
