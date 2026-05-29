@@ -163,6 +163,21 @@ helm -n openshell get values openshell | grep -E 'repository|tag|supervisorImage
 
 The gateway image built from `deploy/docker/Dockerfile.gateway` and the scratch supervisor image built from `deploy/docker/Dockerfile.supervisor` should use the same build tag in branch and E2E deploys. A stale supervisor image can make sandbox behavior lag behind gateway policy or proto changes.
 
+Check the sandbox supervisor topology rendered into gateway config:
+
+```bash
+kubectl -n openshell get configmap openshell-config -o jsonpath='{.data.gateway\.toml}' | grep -E 'supervisor_role|network_enforcement_mode|enforcer_endpoint|privileged'
+```
+
+Expected Kubernetes default is `supervisor_role = "workload"` and
+`network_enforcement_mode = "soft-proxy"`. This starts unprivileged sandbox
+pods and logs that direct socket egress is not kernel-blocked. Use
+`network_enforcement_mode = "supervisor-netns"` only when the sandbox pod has
+the required capabilities or `server.sandboxPrivileged=true`. Use
+`network_enforcement_mode = "external-enforcer"` with `nodeEnforcer.enabled=true`
+to test node-enforcer enforcement; the enforcer should log workload
+registration and successful sandbox network egress enforcement installation.
+
 For local/external pull mode (the default local path via `mise run cluster`), local images are tagged to the configured local registry base, pushed to that registry, and pulled by k3s via the `registries.yaml` mirror endpoint. The `cluster` task pushes prebuilt local tags (`openshell/*:dev`, falling back to `localhost:5000/openshell/*:dev` or `127.0.0.1:5000/openshell/*:dev`).
 
 Gateway image builds stage a partial Rust workspace from `deploy/docker/Dockerfile.images`. If cargo fails with a missing manifest under `/build/crates/...`, or an imported symbol exists locally but is missing in the image build, verify that every current gateway dependency crate, including `openshell-driver-docker`, `openshell-driver-kubernetes`, and `openshell-ocsf`, is copied into the staged workspace there.
@@ -186,6 +201,18 @@ Check service exposure:
 ```bash
 kubectl -n openshell get svc openshell -o wide
 kubectl -n openshell get endpoints openshell
+```
+
+When the gateway is exposed through Envoy Gateway, deployment infrastructure may
+need a `BackendTrafficPolicy` to disable Envoy's request and stream duration
+timeouts for OpenShell's long-lived gRPC streams. A missing or rejected policy
+commonly shows up as CLI failures around 15 seconds with `h2 protocol error:
+error reading a body from connection`, especially on `sandbox create -- <cmd>`,
+upload/download, sync, `WatchSandbox`, `ForwardTcp`, and `RelayStream` paths.
+
+```bash
+kubectl -n openshell get backendtrafficpolicy openshell-grpc-streams -o yaml
+kubectl -n openshell get grpcroute openshell -o yaml
 ```
 
 For local port-forward testing:

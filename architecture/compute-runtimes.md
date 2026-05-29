@@ -90,7 +90,18 @@ admission/create because they are not known at gateway startup. The Kubernetes
 driver can also set `securityContext.privileged` on all sandbox pod containers
 as a deployment-wide, short-term compatibility escape hatch for clusters that
 require privileged pod admission; this weakens the container boundary and is not
-a replacement for a stronger runtime isolation model.
+a replacement for a stronger runtime isolation model. Kubernetes deployments
+also select an explicit supervisor/network topology. The default is
+`supervisor_role = "workload"` with `network_enforcement_mode = "soft-proxy"`,
+which keeps sandbox pods unprivileged and relies on the proxy for cooperative
+traffic while reporting that direct sockets are not kernel-blocked. The existing
+hard supervisor-managed netns/veth/nft path remains available through
+`network_enforcement_mode = "supervisor-netns"`. The experimental
+`external-enforcer` mode registers workload supervisors with a privileged
+node-side enforcer DaemonSet, which enters the pod network namespace and
+installs coarse nftables egress rules so non-root sandbox processes must use the
+proxy. Dynamic endpoint, binary, and L7 policy remains inside the workload
+proxy.
 Standalone local deployments start the gateway with a selected runtime such as
 Docker, Podman, or VM. The CLI can register multiple gateways and switch between
 them without changing the sandbox architecture.

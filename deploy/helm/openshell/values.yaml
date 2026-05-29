@@ -122,6 +122,25 @@ probes:
 # -- Gateway pod resource requests and limits.
 resources: {}
 
+# Optional node-side enforcer topology. This runs the supervisor image as a
+# privileged DaemonSet so sandbox pods can stay unprivileged while a node
+# component owns coarse pod-network-namespace egress enforcement.
+nodeEnforcer:
+  # -- Deploy the privileged node enforcer DaemonSet.
+  enabled: false
+  # -- Listen address for the node enforcer registration endpoint.
+  listenAddress: "0.0.0.0:17671"
+  # -- Node enforcer log level.
+  logLevel: info
+  # -- Node enforcer pod resource requests and limits.
+  resources: {}
+  # -- Node selector for the node enforcer DaemonSet.
+  nodeSelector: {}
+  # -- Tolerations for the node enforcer DaemonSet.
+  tolerations: []
+  # -- Affinity rules for the node enforcer DaemonSet.
+  affinity: {}
+
 # -- Node selector for the gateway pod.
 nodeSelector: {}
 
@@ -178,6 +197,19 @@ server:
   # Linux 5.12+. When enabled, container UID 0 maps to an unprivileged host
   # UID and capabilities become namespaced.
   enableUserNamespaces: false
+  # -- Runtime role passed to the sandbox supervisor. Kubernetes defaults to
+  # workload mode so the injected binary owns agent lifecycle without assuming
+  # it can perform host/node-level enforcement.
+  supervisorRole: workload
+  # -- Network enforcement mode for sandbox supervisors. soft-proxy keeps pods
+  # unprivileged and enforces proxy-aware traffic; direct socket bypass is not
+  # kernel-blocked. Use supervisor-netns only with trusted privileged sandbox
+  # pods. external-enforcer registers with the optional nodeEnforcer DaemonSet
+  # for coarse pod-netns egress blocking while dynamic policy stays in the proxy.
+  networkEnforcementMode: soft-proxy
+  # -- Endpoint template for external-enforcer mode. Empty defaults each
+  # sandbox to http://$(OPENSHELL_NODE_IP):17671.
+  enforcerEndpoint: ""
   # -- Set securityContext.privileged on all sandbox pod containers. This is a
   # short-term compatibility escape hatch for trusted clusters that require
   # privileged pod admission and weakens the container boundary.

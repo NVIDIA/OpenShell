@@ -9,6 +9,7 @@ use tracing_subscriber::EnvFilter;
 
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
+use openshell_core::sandbox_env::{NetworkEnforcementMode, SupervisorRole};
 use openshell_driver_kubernetes::{
     ComputeDriverService, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, KubernetesComputeConfig,
     KubernetesComputeDriver, SupervisorSideloadMethod,
@@ -76,6 +77,26 @@ struct Args {
     #[arg(long, env = "OPENSHELL_ENABLE_USER_NAMESPACES")]
     enable_user_namespaces: bool,
 
+    /// Runtime role passed to openshell-sandbox in workload pods.
+    #[arg(
+        long,
+        env = "OPENSHELL_SUPERVISOR_ROLE",
+        default_value_t = SupervisorRole::Workload
+    )]
+    supervisor_role: SupervisorRole,
+
+    /// Network enforcement mode passed to openshell-sandbox in workload pods.
+    #[arg(
+        long,
+        env = "OPENSHELL_NETWORK_ENFORCEMENT_MODE",
+        default_value_t = NetworkEnforcementMode::SoftProxy
+    )]
+    network_enforcement_mode: NetworkEnforcementMode,
+
+    /// Endpoint template for the optional node/host enforcer.
+    #[arg(long, env = "OPENSHELL_ENFORCER_ENDPOINT")]
+    enforcer_endpoint: Option<String>,
+
     /// Default Kubernetes `RuntimeClass` assigned to sandbox pods.
     /// Per-sandbox template `runtime_class_name` values override this default.
     #[arg(long, env = "OPENSHELL_RUNTIME_CLASS_NAME")]
@@ -120,6 +141,9 @@ async fn main() -> Result<()> {
         client_tls_secret_name: args.client_tls_secret_name.unwrap_or_default(),
         host_gateway_ip: args.host_gateway_ip.unwrap_or_default(),
         enable_user_namespaces: args.enable_user_namespaces,
+        supervisor_role: args.supervisor_role,
+        network_enforcement_mode: args.network_enforcement_mode,
+        enforcer_endpoint: args.enforcer_endpoint.unwrap_or_default(),
         privileged: false,
         workspace_default_storage_size: std::env::var(
             "OPENSHELL_K8S_WORKSPACE_DEFAULT_STORAGE_SIZE",

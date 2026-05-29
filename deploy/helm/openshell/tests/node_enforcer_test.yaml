@@ -1,0 +1,30 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: node enforcer
+templates:
+  - templates/node-enforcer.yaml
+tests:
+  - it: does not render by default
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders privileged node enforcer daemonset when enabled
+    set:
+      nodeEnforcer.enabled: true
+    asserts:
+      - isKind:
+          of: DaemonSet
+      - equal:
+          path: spec.template.spec.hostNetwork
+          value: true
+      - equal:
+          path: spec.template.spec.hostPID
+          value: true
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.privileged
+          value: true
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: external-enforcer

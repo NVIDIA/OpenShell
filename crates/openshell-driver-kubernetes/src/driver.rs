@@ -29,6 +29,7 @@ use openshell_core::proto::compute::v1::{
     GetCapabilitiesResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
     WatchSandboxesPlatformEvent, WatchSandboxesSandboxEvent, watch_sandboxes_event,
 };
+use openshell_core::sandbox_env::{NetworkEnforcementMode, SupervisorRole};
 use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::time::Duration;
@@ -361,6 +362,9 @@ impl KubernetesComputeDriver {
             client_tls_secret_name: &self.config.client_tls_secret_name,
             host_gateway_ip: &self.config.host_gateway_ip,
             enable_user_namespaces: self.config.enable_user_namespaces,
+            supervisor_role: self.config.supervisor_role,
+            network_enforcement_mode: self.config.network_enforcement_mode,
+            enforcer_endpoint: &self.config.enforcer_endpoint,
             privileged: self.config.privileged,
             workspace_default_storage_size: &self.config.workspace_default_storage_size,
             sa_token_ttl_secs: self.config.effective_sa_token_ttl_secs(),
@@ -1093,6 +1097,9 @@ struct SandboxPodParams<'a> {
     client_tls_secret_name: &'a str,
     host_gateway_ip: &'a str,
     enable_user_namespaces: bool,
+    supervisor_role: SupervisorRole,
+    network_enforcement_mode: NetworkEnforcementMode,
+    enforcer_endpoint: &'a str,
     privileged: bool,
     workspace_default_storage_size: &'a str,
     /// Lifetime (seconds) of the projected `ServiceAccount` token used
@@ -1118,6 +1125,9 @@ impl Default for SandboxPodParams<'_> {
             client_tls_secret_name: "",
             host_gateway_ip: "",
             enable_user_namespaces: false,
+            supervisor_role: SupervisorRole::Workload,
+            network_enforcement_mode: NetworkEnforcementMode::SoftProxy,
+            enforcer_endpoint: "",
             privileged: false,
             workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE,
             sa_token_ttl_secs: 3600,
@@ -1363,6 +1373,16 @@ fn sandbox_template_to_k8s(
         !params.client_tls_secret_name.is_empty(),
     );
     let mut env = env;
+    upsert_env(
+        &mut env,
+        openshell_core::sandbox_env::SUPERVISOR_ROLE,
+        params.supervisor_role.as_str(),
+    );
+    upsert_env(
+        &mut env,
+        openshell_core::sandbox_env::NETWORK_ENFORCEMENT_MODE,
+        params.network_enforcement_mode.as_str(),
+    );
     if runtime_class_outer_isolation {
         upsert_env(
             &mut env,
@@ -1370,10 +1390,38 @@ fn sandbox_template_to_k8s(
             "runtime-class",
         );
     }
+    if matches!(
+        params.network_enforcement_mode,
+        NetworkEnforcementMode::ExternalEnforcer
+    ) {
+        upsert_env_field_ref(
+            &mut env,
+            openshell_core::sandbox_env::NODE_IP,
+            "status.hostIP",
+        );
+        upsert_env_field_ref(
+            &mut env,
+            openshell_core::sandbox_env::POD_IP,
+            "status.podIP",
+        );
+        upsert_env(
+            &mut env,
+            openshell_core::sandbox_env::ENFORCER_ENDPOINT,
+            if params.enforcer_endpoint.is_empty() {
+                "http://$(OPENSHELL_NODE_IP):17671"
+            } else {
+                params.enforcer_endpoint
+            },
+        );
+    }
 
     container.insert("env".to_string(), serde_json::Value::Array(env));
 
-    let mut capabilities: Vec<&str> = vec!["SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE", "SYSLOG"];
+    let mut capabilities: Vec<&str> = if pod_uses_supervisor_netns(params) {
+        vec!["SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE", "SYSLOG"]
+    } else {
+        vec!["SYS_PTRACE"]
+    };
     if use_user_namespaces {
         // In a user namespace the bounding set is reset. SETUID/SETGID are
         // needed for the supervisor to drop privileges to the sandbox user.
@@ -1650,6 +1698,36 @@ fn upsert_env(env: &mut Vec<serde_json::Value>, name: &str, value: &str) {
     env.push(serde_json::json!({"name": name, "value": value}));
 }
 
+fn upsert_env_field_ref(env: &mut Vec<serde_json::Value>, name: &str, field_path: &str) {
+    let value = serde_json::json!({
+        "name": name,
+        "valueFrom": {
+            "fieldRef": {
+                "fieldPath": field_path
+            }
+        }
+    });
+    if let Some(existing) = env
+        .iter_mut()
+        .find(|item| item.get("name").and_then(|value| value.as_str()) == Some(name))
+    {
+        *existing = value;
+        return;
+    }
+
+    env.push(value);
+}
+
+fn pod_uses_supervisor_netns(params: &SandboxPodParams<'_>) -> bool {
+    matches!(
+        params.network_enforcement_mode,
+        NetworkEnforcementMode::SupervisorNetns
+    ) || (matches!(
+        params.network_enforcement_mode,
+        NetworkEnforcementMode::Auto
+    ) && matches!(params.supervisor_role, SupervisorRole::Combined))
+}
+
 /// Extract a string value from the template's `platform_config` Struct.
 fn platform_config_string(template: &SandboxTemplate, key: &str) -> Option<String> {
     let config = template.platform_config.as_ref()?;
@@ -1786,6 +1864,15 @@ mod tests {
             .iter()
             .find(|item| item.get("name").and_then(|value| value.as_str()) == Some(name))
             .and_then(|item| item.get("value"))
+            .and_then(|value| value.as_str())
+    }
+
+    fn pod_env_field_ref<'a>(pod_template: &'a serde_json::Value, name: &str) -> Option<&'a str> {
+        pod_template["spec"]["containers"][0]["env"]
+            .as_array()?
+            .iter()
+            .find(|item| item.get("name").and_then(|value| value.as_str()) == Some(name))
+            .and_then(|item| item.pointer("/valueFrom/fieldRef/fieldPath"))
             .and_then(|value| value.as_str())
     }
 
@@ -2372,6 +2459,67 @@ mod tests {
     }
 
     #[test]
+    fn kubernetes_default_sets_workload_soft_proxy_env() {
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &SandboxPodParams::default(),
+        );
+
+        assert_eq!(
+            pod_env_value(&pod_template, openshell_core::sandbox_env::SUPERVISOR_ROLE),
+            Some("workload")
+        );
+        assert_eq!(
+            pod_env_value(
+                &pod_template,
+                openshell_core::sandbox_env::NETWORK_ENFORCEMENT_MODE
+            ),
+            Some("soft-proxy")
+        );
+    }
+
+    #[test]
+    fn external_enforcer_mode_injects_node_registration_env() {
+        let params = SandboxPodParams {
+            network_enforcement_mode: NetworkEnforcementMode::ExternalEnforcer,
+            ..Default::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+
+        assert_eq!(
+            pod_env_value(
+                &pod_template,
+                openshell_core::sandbox_env::NETWORK_ENFORCEMENT_MODE
+            ),
+            Some("external-enforcer")
+        );
+        assert_eq!(
+            pod_env_value(
+                &pod_template,
+                openshell_core::sandbox_env::ENFORCER_ENDPOINT
+            ),
+            Some("http://$(OPENSHELL_NODE_IP):17671")
+        );
+        assert_eq!(
+            pod_env_field_ref(&pod_template, openshell_core::sandbox_env::NODE_IP),
+            Some("status.hostIP")
+        );
+        assert_eq!(
+            pod_env_field_ref(&pod_template, openshell_core::sandbox_env::POD_IP),
+            Some("status.podIP")
+        );
+    }
+
+    #[test]
     fn gpu_sandbox_preserves_existing_resource_limits() {
         use openshell_core::proto::compute::v1::DriverResourceRequirements;
         let template = SandboxTemplate {
@@ -2682,7 +2830,7 @@ mod tests {
         let caps = pod_template["spec"]["containers"][0]["securityContext"]["capabilities"]["add"]
             .as_array()
             .unwrap();
-        assert_eq!(caps.len(), 4);
+        assert_eq!(caps, &[serde_json::json!("SYS_PTRACE")]);
         assert!(!caps.contains(&serde_json::json!("SETUID")));
     }
 
@@ -2702,14 +2850,34 @@ mod tests {
         let caps = pod_template["spec"]["containers"][0]["securityContext"]["capabilities"]["add"]
             .as_array()
             .unwrap();
+        assert!(caps.contains(&serde_json::json!("SYS_PTRACE")));
+        assert!(caps.contains(&serde_json::json!("SETUID")));
+        assert!(caps.contains(&serde_json::json!("SETGID")));
+        assert!(caps.contains(&serde_json::json!("DAC_READ_SEARCH")));
+        assert_eq!(caps.len(), 4);
+    }
+
+    #[test]
+    fn supervisor_netns_mode_adds_network_capabilities() {
+        let params = SandboxPodParams {
+            network_enforcement_mode: NetworkEnforcementMode::SupervisorNetns,
+            ..Default::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+        let caps = pod_template["spec"]["containers"][0]["securityContext"]["capabilities"]["add"]
+            .as_array()
+            .unwrap();
         assert!(caps.contains(&serde_json::json!("SYS_ADMIN")));
         assert!(caps.contains(&serde_json::json!("NET_ADMIN")));
         assert!(caps.contains(&serde_json::json!("SYS_PTRACE")));
         assert!(caps.contains(&serde_json::json!("SYSLOG")));
-        assert!(caps.contains(&serde_json::json!("SETUID")));
-        assert!(caps.contains(&serde_json::json!("SETGID")));
-        assert!(caps.contains(&serde_json::json!("DAC_READ_SEARCH")));
-        assert_eq!(caps.len(), 7);
+        assert_eq!(caps.len(), 4);
     }
 
     #[test]
@@ -2783,7 +2951,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             caps.len(),
-            4,
+            1,
             "extra capabilities must not be added when user namespaces are disabled"
         );
     }

@@ -104,6 +104,11 @@ data:
     {{- if .Values.server.runtimeClassOuterIsolation }}
     runtime_class_outer_isolation = true
     {{- end }}
+    supervisor_role             = {{ .Values.server.supervisorRole | quote }}
+    network_enforcement_mode    = {{ .Values.server.networkEnforcementMode | quote }}
+    {{- if .Values.server.enforcerEndpoint }}
+    enforcer_endpoint           = {{ .Values.server.enforcerEndpoint | quote }}
+    {{- end }}
     {{- if .Values.server.sandboxPrivileged }}
     privileged                   = true
     {{- end }}

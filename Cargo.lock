@@ -3680,6 +3680,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "url",
  "uuid",
  "webpki-roots 1.0.7",
 ]

@@ -9,6 +9,7 @@ pub mod bypass_monitor;
 mod child_env;
 pub mod debug_rpc;
 pub mod denial_aggregator;
+pub mod enforcer;
 mod grpc_client;
 mod identity;
 pub mod l7;
@@ -42,6 +43,7 @@ use std::time::Duration;
 use tokio::time::timeout;
 use tracing::{debug, info, trace, warn};
 
+use openshell_core::sandbox_env::{NetworkEnforcementMode, SupervisorRole};
 use openshell_ocsf::{
     ActionId, ActivityId, AppLifecycleBuilder, ConfigStateChangeBuilder, DetectionFindingBuilder,
     DispositionId, FindingInfo, LaunchTypeId, Process as OcsfProcess, ProcessActivityBuilder,
@@ -217,6 +219,64 @@ pub use sandbox::apply_supervisor_startup_hardening;
 /// refreshed.
 const DEFAULT_ROUTE_REFRESH_INTERVAL_SECS: u64 = 5;
 
+#[derive(Debug, Clone)]
+pub struct SupervisorRuntimeConfig {
+    pub role: SupervisorRole,
+    pub network_enforcement_mode: NetworkEnforcementMode,
+    pub enforcer_endpoint: Option<String>,
+    pub pod_ip: Option<String>,
+}
+
+impl Default for SupervisorRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            role: SupervisorRole::Combined,
+            network_enforcement_mode: NetworkEnforcementMode::Auto,
+            enforcer_endpoint: None,
+            pod_ip: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffectiveNetworkEnforcementMode {
+    SoftProxy,
+    SupervisorNetns,
+    ExternalEnforcer,
+}
+
+impl EffectiveNetworkEnforcementMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::SoftProxy => "soft-proxy",
+            Self::SupervisorNetns => "supervisor-netns",
+            Self::ExternalEnforcer => "external-enforcer",
+        }
+    }
+}
+
+pub fn resolve_network_enforcement_mode(
+    role: SupervisorRole,
+    requested: NetworkEnforcementMode,
+    outer_runtime_isolation: bool,
+) -> EffectiveNetworkEnforcementMode {
+    match requested {
+        NetworkEnforcementMode::SoftProxy => EffectiveNetworkEnforcementMode::SoftProxy,
+        NetworkEnforcementMode::SupervisorNetns => EffectiveNetworkEnforcementMode::SupervisorNetns,
+        NetworkEnforcementMode::ExternalEnforcer => {
+            EffectiveNetworkEnforcementMode::ExternalEnforcer
+        }
+        NetworkEnforcementMode::Auto => {
+            if outer_runtime_isolation || matches!(role, SupervisorRole::Workload) {
+                EffectiveNetworkEnforcementMode::SoftProxy
+            } else {
+                EffectiveNetworkEnforcementMode::SupervisorNetns
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InferenceRouteSource {
     File,
@@ -312,6 +372,7 @@ fn is_managed_child(pid: i32) -> bool {
 #[allow(clippy::too_many_arguments, clippy::similar_names)]
 pub async fn run_sandbox(
     command: Vec<String>,
+    runtime_config: SupervisorRuntimeConfig,
     workdir: Option<String>,
     timeout_secs: u64,
     interactive: bool,
@@ -355,6 +416,33 @@ pub async fn run_sandbox(
             debug!("OCSF context already initialized, keeping existing");
         }
     }
+
+    let outer_runtime_isolation = outer_runtime_isolation_enabled();
+    let effective_network_enforcement = resolve_network_enforcement_mode(
+        runtime_config.role,
+        runtime_config.network_enforcement_mode,
+        outer_runtime_isolation,
+    );
+    info!(
+        supervisor_role = %runtime_config.role,
+        requested_network_enforcement = %runtime_config.network_enforcement_mode,
+        effective_network_enforcement = effective_network_enforcement.as_str(),
+        outer_runtime_isolation,
+        "Resolved sandbox supervisor runtime mode"
+    );
+    ocsf_emit!(
+        ConfigStateChangeBuilder::new(ocsf_ctx())
+            .severity(SeverityId::Informational)
+            .status(StatusId::Success)
+            .state(StateId::Enabled, "resolved")
+            .message(format!(
+                "Supervisor mode resolved [role:{} requested_network:{} effective_network:{}]",
+                runtime_config.role,
+                runtime_config.network_enforcement_mode,
+                effective_network_enforcement.as_str()
+            ))
+            .build()
+    );
 
     // Load policy and initialize OPA engine
     let openshell_endpoint_for_proxy = openshell_endpoint.clone();
@@ -555,11 +643,62 @@ pub async fn run_sandbox(
         (None, None)
     };
 
+    if matches!(policy.network.mode, NetworkMode::Proxy) {
+        match effective_network_enforcement {
+            EffectiveNetworkEnforcementMode::SoftProxy => {
+                warn!(
+                    "Network enforcement is running in soft-proxy mode; proxy-aware traffic is enforced, but direct sockets are not kernel-blocked"
+                );
+                ocsf_emit!(
+                    ConfigStateChangeBuilder::new(ocsf_ctx())
+                        .severity(SeverityId::High)
+                        .status(StatusId::Success)
+                        .state(StateId::Other, "soft-proxy")
+                        .message(
+                            "Network enforcement is soft-proxy only; direct egress bypass is not kernel-blocked"
+                        )
+                        .build()
+                );
+            }
+            EffectiveNetworkEnforcementMode::ExternalEnforcer => {
+                let endpoint = runtime_config.enforcer_endpoint.as_deref().ok_or_else(|| {
+                    miette::miette!(
+                        "external-enforcer mode requires {} to be set",
+                        openshell_core::sandbox_env::ENFORCER_ENDPOINT
+                    )
+                })?;
+                let id = sandbox_id.as_deref().ok_or_else(|| {
+                    miette::miette!("external-enforcer mode requires a sandbox id")
+                })?;
+                enforcer::register_workload(enforcer::WorkloadRegistration {
+                    endpoint: endpoint.to_string(),
+                    sandbox_id: id.to_string(),
+                    sandbox_name: sandbox_name_for_agg.clone(),
+                    pod_ip: runtime_config.pod_ip.clone(),
+                })
+                .await?;
+                ocsf_emit!(
+                    ConfigStateChangeBuilder::new(ocsf_ctx())
+                        .severity(SeverityId::Informational)
+                        .status(StatusId::Success)
+                        .state(StateId::Other, "external-enforcer")
+                        .message("External network enforcer registration acknowledged")
+                        .build()
+                );
+            }
+            EffectiveNetworkEnforcementMode::SupervisorNetns => {}
+        }
+    }
+
     // Create network namespace for proxy mode (Linux only)
     // This must be created before the proxy AND SSH server so that SSH
     // sessions can enter the namespace for network isolation.
     #[cfg(target_os = "linux")]
-    let netns = if matches!(policy.network.mode, NetworkMode::Proxy) {
+    let netns = if matches!(policy.network.mode, NetworkMode::Proxy)
+        && matches!(
+            effective_network_enforcement,
+            EffectiveNetworkEnforcementMode::SupervisorNetns
+        ) {
         match NetworkNamespace::create() {
             Ok(ns) => {
                 // Install bypass detection rules (nftables log + reject).
@@ -586,16 +725,11 @@ pub async fn run_sandbox(
                 Some(ns)
             }
             Err(e) => {
-                if outer_runtime_isolation_enabled() {
-                    emit_outer_runtime_degradation("network namespace creation", &e);
-                    None
-                } else {
-                    return Err(miette::miette!(
-                        "Network namespace creation failed and proxy mode requires isolation. \
-                         Ensure CAP_NET_ADMIN and CAP_SYS_ADMIN are available and iproute2 is installed. \
-                         Error: {e}"
-                    ));
-                }
+                return Err(miette::miette!(
+                    "Network namespace creation failed and supervisor-netns mode requires isolation. \
+                     Ensure CAP_NET_ADMIN and CAP_SYS_ADMIN are available and iproute2 is installed, \
+                     or select soft-proxy/external-enforcer mode. Error: {e}"
+                ));
             }
         }
     } else {
@@ -2773,6 +2907,62 @@ mod tests {
     use temp_env::with_vars;
 
     static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    #[test]
+    fn auto_network_mode_resolves_to_soft_for_workload_role() {
+        assert_eq!(
+            resolve_network_enforcement_mode(
+                SupervisorRole::Workload,
+                NetworkEnforcementMode::Auto,
+                false
+            ),
+            EffectiveNetworkEnforcementMode::SoftProxy
+        );
+    }
+
+    #[test]
+    fn auto_network_mode_preserves_current_combined_netns_default() {
+        assert_eq!(
+            resolve_network_enforcement_mode(
+                SupervisorRole::Combined,
+                NetworkEnforcementMode::Auto,
+                false
+            ),
+            EffectiveNetworkEnforcementMode::SupervisorNetns
+        );
+    }
+
+    #[test]
+    fn auto_network_mode_degrades_to_soft_with_outer_runtime_isolation() {
+        assert_eq!(
+            resolve_network_enforcement_mode(
+                SupervisorRole::Combined,
+                NetworkEnforcementMode::Auto,
+                true
+            ),
+            EffectiveNetworkEnforcementMode::SoftProxy
+        );
+    }
+
+    #[test]
+    fn explicit_network_mode_overrides_role_resolution() {
+        assert_eq!(
+            resolve_network_enforcement_mode(
+                SupervisorRole::Workload,
+                NetworkEnforcementMode::SupervisorNetns,
+                false
+            ),
+            EffectiveNetworkEnforcementMode::SupervisorNetns
+        );
+        assert_eq!(
+            resolve_network_enforcement_mode(
+                SupervisorRole::Combined,
+                NetworkEnforcementMode::ExternalEnforcer,
+                false
+            ),
+            EffectiveNetworkEnforcementMode::ExternalEnforcer
+        );
+    }
 
     #[test]
     fn bundle_to_resolved_routes_converts_all_fields() {

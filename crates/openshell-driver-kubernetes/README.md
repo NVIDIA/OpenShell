@@ -29,6 +29,17 @@ As a short-term compatibility escape hatch, the driver config can set
 containers. Use it only for trusted clusters that require privileged pod
 admission because it weakens the container boundary.
 
+Kubernetes deployments default to `supervisor_role = "workload"` and
+`network_enforcement_mode = "soft-proxy"`. In this mode the supervisor runs the
+proxy, policy reload, relay, and agent lifecycle without creating a Linux
+network namespace; proxy-aware traffic is enforced, but direct socket egress is
+not kernel-blocked. Set `network_enforcement_mode = "supervisor-netns"` to use
+the existing netns/veth/nft path when the sandbox pod has the required Linux
+capabilities. Set `network_enforcement_mode = "external-enforcer"` to try the
+node-enforcer topology; the workload supervisor registers with a node-side
+enforcer, which installs coarse pod-netns egress rules while dynamic endpoint
+policy stays inside the proxy.
+
 ## Sandbox Resource
 
 The driver works with the `agents.x-k8s.io/v1alpha1` `Sandbox` custom resource.
