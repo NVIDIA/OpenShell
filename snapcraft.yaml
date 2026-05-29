@@ -38,12 +38,21 @@ apps:
   gateway:
     command: bin/openshell-gateway-wrapper
     daemon: simple
+    # refresh-mode: endure prevents snapd from restarting the gateway daemon
+    # during snap refreshes, which would kill active sandbox sessions.
+    # Operators must manually restart the service after a refresh if needed.
     refresh-mode: endure
+    # The wrapper sets OPENSHELL_DISABLE_TLS=true and OPENSHELL_DB_URL to
+    # use $SNAP_COMMON/gateway.db. If $SNAP_COMMON/gateway.toml exists it is
+    # passed to the gateway as --config, allowing operators to override
+    # settings without rebuilding the snap.
     environment:
       XDG_DATA_HOME: "$SNAP_COMMON"
       XDG_RUNTIME_DIR: "$SNAP_COMMON"
     plugs:
       - docker
+      # Docker snap is required because the snap uses the docker:docker-daemon
+      # interface slot. It does not work with system-installed Docker.
       - log-observe
       - network
       - network-bind
@@ -82,7 +91,7 @@ parts:
         "$CRAFT_PART_INSTALL/bin/openshell-gateway"
       install -D -m 0755 "$CRAFT_PART_BUILD/target/release/openshell-sandbox" \
         "$CRAFT_PART_INSTALL/bin/openshell-sandbox"
-      install -D -m 0755 "$CRAFT_PROJECT_DIR/deploy/snap/bin/openshell-gateway-wrapper" \
+      install -D -m 0755 "$CRAFT_PROJECT_DIR/tasks/scripts/snap-gateway-wrapper.sh" \
         "$CRAFT_PART_INSTALL/bin/openshell-gateway-wrapper"
       install -D -m 0644 "$CRAFT_PROJECT_DIR/LICENSE" \
         "$CRAFT_PART_INSTALL/usr/share/doc/openshell/LICENSE"
