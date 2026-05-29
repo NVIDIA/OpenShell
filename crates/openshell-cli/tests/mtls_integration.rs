@@ -6,7 +6,11 @@ mod helpers;
 use helpers::{
     EnvVarGuard, build_ca, build_client_cert, build_server_cert, install_rustls_provider,
 };
-use openshell_cli::tls::{TlsOptions, grpc_client};
+use openshell_bootstrap::{get_gateway_metadata, load_active_gateway};
+use openshell_cli::{
+    run,
+    tls::{TlsOptions, grpc_client},
+};
 use openshell_core::proto::{
     CreateProviderRequest, CreateSshSessionRequest, CreateSshSessionResponse,
     DeleteProviderRequest, DeleteProviderResponse, ExecSandboxEvent, ExecSandboxInput,
@@ -492,6 +496,167 @@ async fn run_server(
     });
 
     addr
+}
+
+fn write_gateway_mtls_bundle(
+    config_dir: &std::path::Path,
+    gateway_name: &str,
+    ca_cert: &str,
+    client_cert: &str,
+    client_key: &str,
+) {
+    let mtls = config_dir
+        .join("openshell")
+        .join("gateways")
+        .join(gateway_name)
+        .join("mtls");
+    std::fs::create_dir_all(&mtls).unwrap();
+    std::fs::write(mtls.join("ca.crt"), ca_cert).unwrap();
+    std::fs::write(mtls.join("tls.crt"), client_cert).unwrap();
+    std::fs::write(mtls.join("tls.key"), client_key).unwrap();
+}
+
+fn isolated_gateway_add_env(
+    config_dir: &std::path::Path,
+    state_dir: &std::path::Path,
+) -> EnvVarGuard {
+    let xdg_config = config_dir.to_string_lossy().into_owned();
+    let xdg_state = state_dir.to_string_lossy().into_owned();
+    let local_tls_dir = state_dir.join("no-package-managed-tls");
+    let local_tls = local_tls_dir.to_string_lossy().into_owned();
+
+    EnvVarGuard::set(&[
+        ("XDG_CONFIG_HOME", xdg_config.as_str()),
+        ("XDG_STATE_HOME", xdg_state.as_str()),
+        ("HOME", xdg_state.as_str()),
+        ("OPENSHELL_LOCAL_TLS_DIR", local_tls.as_str()),
+        ("OPENSHELL_GATEWAY", "unused-by-named-gateway-add"),
+    ])
+}
+
+#[tokio::test]
+async fn gateway_add_mtls_loopback_uses_explicit_gateway_name() {
+    install_rustls_provider();
+
+    let (ca, ca_key) = build_ca();
+    let (server_cert, server_key) = build_server_cert(&ca, &ca_key);
+    let (client_cert, client_key) = build_client_cert(&ca, &ca_key);
+    let ca_cert = ca.pem();
+    let addr = run_server(server_cert, server_key, ca_cert.clone()).await;
+
+    let config_dir = tempdir().unwrap();
+    let state_dir = tempdir().unwrap();
+    write_gateway_mtls_bundle(
+        config_dir.path(),
+        "k8s",
+        &ca_cert,
+        &client_cert,
+        &client_key,
+    );
+    let _env = isolated_gateway_add_env(config_dir.path(), state_dir.path());
+
+    let endpoint = format!("https://localhost:{}", addr.port());
+    run::gateway_add(
+        &endpoint,
+        Some("k8s"),
+        None,
+        true,
+        None,
+        "openshell-cli",
+        None,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+
+    let metadata = get_gateway_metadata("k8s").unwrap();
+    assert_eq!(metadata.name, "k8s");
+    assert_eq!(metadata.gateway_endpoint, endpoint);
+    assert_eq!(metadata.auth_mode.as_deref(), Some("mtls"));
+    assert_eq!(load_active_gateway().as_deref(), Some("k8s"));
+    assert!(get_gateway_metadata("openshell").is_none());
+}
+
+#[tokio::test]
+async fn gateway_add_mtls_loopback_without_name_uses_openshell_default() {
+    install_rustls_provider();
+
+    let (ca, ca_key) = build_ca();
+    let (server_cert, server_key) = build_server_cert(&ca, &ca_key);
+    let (client_cert, client_key) = build_client_cert(&ca, &ca_key);
+    let ca_cert = ca.pem();
+    let addr = run_server(server_cert, server_key, ca_cert.clone()).await;
+
+    let config_dir = tempdir().unwrap();
+    let state_dir = tempdir().unwrap();
+    write_gateway_mtls_bundle(
+        config_dir.path(),
+        "openshell",
+        &ca_cert,
+        &client_cert,
+        &client_key,
+    );
+    let _env = isolated_gateway_add_env(config_dir.path(), state_dir.path());
+
+    let endpoint = format!("https://localhost:{}", addr.port());
+    run::gateway_add(
+        &endpoint,
+        None,
+        None,
+        true,
+        None,
+        "openshell-cli",
+        None,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+
+    let metadata = get_gateway_metadata("openshell").unwrap();
+    assert_eq!(metadata.name, "openshell");
+    assert_eq!(metadata.gateway_endpoint, endpoint);
+    assert_eq!(metadata.auth_mode.as_deref(), Some("mtls"));
+    assert_eq!(load_active_gateway().as_deref(), Some("openshell"));
+}
+
+#[tokio::test]
+async fn gateway_add_mtls_loopback_explicit_name_does_not_fallback_to_openshell_certs() {
+    install_rustls_provider();
+
+    let (ca, ca_key) = build_ca();
+    let (client_cert, client_key) = build_client_cert(&ca, &ca_key);
+    let ca_cert = ca.pem();
+
+    let config_dir = tempdir().unwrap();
+    let state_dir = tempdir().unwrap();
+    write_gateway_mtls_bundle(
+        config_dir.path(),
+        "openshell",
+        &ca_cert,
+        &client_cert,
+        &client_key,
+    );
+    let _env = isolated_gateway_add_env(config_dir.path(), state_dir.path());
+
+    let err = run::gateway_add(
+        "https://localhost:1",
+        Some("k8s"),
+        None,
+        true,
+        None,
+        "openshell-cli",
+        None,
+        None,
+        false,
+    )
+    .await
+    .expect_err("explicit name should require matching named mTLS material");
+
+    assert!(err.to_string().contains("gateway 'k8s'"));
+    assert!(get_gateway_metadata("k8s").is_none());
+    assert!(load_active_gateway().is_none());
 }
 
 #[tokio::test]
