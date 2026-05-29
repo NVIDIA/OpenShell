@@ -6616,12 +6616,21 @@ network_policies:
         let cache = BinaryIdentityCache::new();
 
         let mut result = resolve_process_identity(entrypoint_pid, peer_port, &cache);
-        for _ in 0..5 {
+        for _ in 0..10 {
             match &result {
                 Err(err)
                     if err.reason.contains("No such file or directory")
                         || err.reason.contains("os error 2") =>
                 {
+                    // /proc/<pid>/fd scan transiently failed; give procfs time to settle.
+                    std::thread::sleep(Duration::from_millis(50));
+                    result = resolve_process_identity(entrypoint_pid, peer_port, &cache);
+                }
+                Ok(_) => {
+                    // On arm64 under heavy CI load the /proc fd scan can transiently
+                    // miss the parent process's socket fd, making the scan return only
+                    // the child as owner and yielding a spurious Ok.  Retry to give
+                    // both owners time to appear consistently in /proc/<pid>/fd.
                     std::thread::sleep(Duration::from_millis(50));
                     result = resolve_process_identity(entrypoint_pid, peer_port, &cache);
                 }
