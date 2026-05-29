@@ -14,13 +14,17 @@ use hyper::{Method, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
 use miette::{IntoDiagnostic, Result};
-use oauth2::basic::BasicClient;
 use oauth2::{
-    AuthType, AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge,
-    RedirectUrl, RefreshToken, Scope, TokenResponse, TokenUrl,
+    AuthType, AuthUrl, AuthorizationCode, Client, ClientId, ClientSecret, CsrfToken,
+    EndpointNotSet, ExtraTokenFields, PkceCodeChallenge, RedirectUrl, RefreshToken, Scope,
+    StandardRevocableToken, StandardTokenResponse, TokenResponse, TokenUrl,
+    basic::{
+        BasicErrorResponse, BasicRevocationErrorResponse, BasicTokenIntrospectionResponse,
+        BasicTokenType,
+    },
 };
 use openshell_bootstrap::oidc_token::OidcTokenBundle;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -29,6 +33,34 @@ use tokio::sync::oneshot;
 use tracing::debug;
 
 const AUTH_TIMEOUT: Duration = Duration::from_secs(120);
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct OidcExtraTokenFields {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    id_token: Option<String>,
+}
+
+impl ExtraTokenFields for OidcExtraTokenFields {}
+
+type OidcTokenResponse = StandardTokenResponse<OidcExtraTokenFields, BasicTokenType>;
+type OidcClient<
+    HasAuthUrl = EndpointNotSet,
+    HasDeviceAuthUrl = EndpointNotSet,
+    HasIntrospectionUrl = EndpointNotSet,
+    HasRevocationUrl = EndpointNotSet,
+    HasTokenUrl = EndpointNotSet,
+> = Client<
+    BasicErrorResponse,
+    OidcTokenResponse,
+    BasicTokenIntrospectionResponse,
+    StandardRevocableToken,
+    BasicRevocationErrorResponse,
+    HasAuthUrl,
+    HasDeviceAuthUrl,
+    HasIntrospectionUrl,
+    HasRevocationUrl,
+    HasTokenUrl,
+>;
 
 /// OIDC discovery document (subset of fields we need).
 #[derive(Debug, Deserialize)]
@@ -112,7 +144,7 @@ pub async fn oidc_browser_auth_flow(
     let port = listener.local_addr().into_diagnostic()?.port();
     let redirect_uri = format!("http://127.0.0.1:{port}/callback");
 
-    let client = BasicClient::new(ClientId::new(client_id.to_string()))
+    let client = OidcClient::new(ClientId::new(client_id.to_string()))
         .set_auth_uri(AuthUrl::new(discovery.authorization_endpoint).into_diagnostic()?)
         .set_token_uri(TokenUrl::new(discovery.token_endpoint).into_diagnostic()?)
         .set_redirect_uri(RedirectUrl::new(redirect_uri).into_diagnostic()?);
@@ -167,7 +199,7 @@ pub async fn oidc_browser_auth_flow(
     server_handle.abort();
 
     let http = http_client(insecure);
-    let token_response = client
+    let token_response: OidcTokenResponse = client
         .exchange_code(AuthorizationCode::new(code))
         .set_pkce_verifier(pkce_verifier)
         .request_async(&http)
@@ -199,7 +231,7 @@ pub async fn oidc_client_credentials_flow(
 
     let discovery = discover(issuer, insecure).await?;
 
-    let client = BasicClient::new(ClientId::new(client_id.to_string()))
+    let client = OidcClient::new(ClientId::new(client_id.to_string()))
         .set_client_secret(ClientSecret::new(client_secret))
         .set_token_uri(TokenUrl::new(discovery.token_endpoint).into_diagnostic()?)
         .set_auth_type(AuthType::RequestBody);
@@ -213,7 +245,7 @@ pub async fn oidc_client_credentials_flow(
     }
 
     let http = http_client(insecure);
-    let token_response = request
+    let token_response: OidcTokenResponse = request
         .request_async(&http)
         .await
         .map_err(|e| miette::miette!("client credentials token exchange failed: {e}"))?;
@@ -241,11 +273,11 @@ pub async fn oidc_refresh_token(
 
     let discovery = discover(&bundle.issuer, insecure).await?;
 
-    let client = BasicClient::new(ClientId::new(bundle.client_id.clone()))
+    let client = OidcClient::new(ClientId::new(bundle.client_id.clone()))
         .set_token_uri(TokenUrl::new(discovery.token_endpoint).into_diagnostic()?);
 
     let http = http_client(insecure);
-    let token_response = client
+    let token_response: OidcTokenResponse = client
         .exchange_refresh_token(&RefreshToken::new(refresh_token.to_string()))
         .request_async(&http)
         .await
@@ -287,7 +319,7 @@ pub async fn ensure_valid_oidc_token(gateway_name: &str, insecure: bool) -> Resu
 // ── Helpers ──────────────────────────────────────────────────────────
 
 fn bundle_from_oauth2_response(
-    resp: &oauth2::basic::BasicTokenResponse,
+    resp: &OidcTokenResponse,
     issuer: &str,
     client_id: &str,
 ) -> OidcTokenBundle {
@@ -298,6 +330,7 @@ fn bundle_from_oauth2_response(
 
     OidcTokenBundle {
         access_token: resp.access_token().secret().clone(),
+        id_token: resp.extra_fields().id_token.clone(),
         refresh_token: resp.refresh_token().map(|rt| rt.secret().clone()),
         expires_at: resp.expires_in().map(|ei| now + ei.as_secs()),
         issuer: issuer.to_string(),
@@ -518,14 +551,13 @@ mod tests {
 
     #[test]
     fn bundle_from_response_sets_fields() {
-        use oauth2::basic::BasicTokenResponse;
-
-        let token_response: BasicTokenResponse = serde_json::from_str(
-            r#"{"access_token":"test-access","token_type":"bearer","expires_in":300,"refresh_token":"test-refresh"}"#,
+        let token_response: OidcTokenResponse = serde_json::from_str(
+            r#"{"access_token":"test-access","token_type":"bearer","expires_in":300,"refresh_token":"test-refresh","id_token":"test-id"}"#,
         )
         .unwrap();
         let bundle = bundle_from_oauth2_response(&token_response, "https://issuer", "my-client");
         assert_eq!(bundle.access_token, "test-access");
+        assert_eq!(bundle.id_token.as_deref(), Some("test-id"));
         assert_eq!(bundle.refresh_token.as_deref(), Some("test-refresh"));
         assert_eq!(bundle.issuer, "https://issuer");
         assert_eq!(bundle.client_id, "my-client");

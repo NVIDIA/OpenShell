@@ -19,6 +19,10 @@ pub struct OidcTokenBundle {
     /// `OAuth2` access token (JWT).
     pub access_token: String,
 
+    /// Optional OIDC ID token returned by the provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id_token: Option<String>,
+
     /// `OAuth2` refresh token. `None` for `client_credentials` grants.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh_token: Option<String>,
