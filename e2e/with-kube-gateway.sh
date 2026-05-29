@@ -72,6 +72,21 @@ helmctl() {
   helm --kube-context "${KUBE_CONTEXT}" "$@"
 }
 
+chart_without_dependencies() {
+  local src="${ROOT}/deploy/helm/openshell"
+  local dst="${WORKDIR}/helm-chart-no-deps"
+
+  rm -rf "${dst}"
+  cp -a "${src}" "${dst}"
+  rm -rf "${dst}/charts" "${dst}/Chart.lock"
+  awk '
+    /^dependencies:[[:space:]]*$/ { skip = 1; next }
+    skip && /^[^[:space:]-]/ { skip = 0 }
+    !skip { print }
+  ' "${src}/Chart.yaml" >"${dst}/Chart.yaml"
+  printf '%s\n' "${dst}"
+}
+
 cleanup() {
   local exit_code=$?
 
@@ -520,9 +535,9 @@ if [ -n "${HOST_GATEWAY_IP}" ]; then
   helm_extra_args+=(--set "server.hostGatewayIP=${HOST_GATEWAY_IP}")
 fi
 
-helm dependency build "${ROOT}/deploy/helm/openshell"
-
 if [ "${OPENSHELL_E2E_KUBE_DB_SCENARIOS:-0}" = "1" ]; then
+  helm dependency build "${ROOT}/deploy/helm/openshell"
+
   # --- Multi-scenario mode: test all database backends ---
   DB_PASSED=0
   DB_FAILED=0
@@ -558,8 +573,9 @@ if [ "${OPENSHELL_E2E_KUBE_DB_SCENARIOS:-0}" = "1" ]; then
   fi
 else
   # --- Single-install mode (default, existing behavior) ---
+  chart_dir="$(chart_without_dependencies)"
   echo "Installing Helm chart (release=${RELEASE_NAME}, namespace=${NAMESPACE}, tag=${IMAGE_TAG_VALUE})..."
-  helmctl install "${RELEASE_NAME}" "${ROOT}/deploy/helm/openshell" \
+  helmctl install "${RELEASE_NAME}" "${chart_dir}" \
     --namespace "${NAMESPACE}" --create-namespace \
     --values "${ROOT}/deploy/helm/openshell/ci/values-skaffold.yaml" \
     --set "fullnameOverride=openshell" \

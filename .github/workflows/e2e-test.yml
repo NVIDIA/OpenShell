@@ -89,6 +89,8 @@ jobs:
           chown openshell-test: "/run/user/$(id -u openshell-test)"
           chmod 700 "/run/user/$(id -u openshell-test)"
           chown -R openshell-test: .
+          mkdir -p /home/openshell-test/.cache/mise /home/openshell-test/.local/state/mise
+          chown -R openshell-test: /home/openshell-test/.cache /home/openshell-test/.local
           install -m 0755 "$(command -v mise)" /usr/local/bin/mise
           chmod a+x /root /root/.local /root/.local/bin
           for dir in /root/.cargo /root/.rustup /root/.local/share/mise /opt/mise; do
@@ -112,6 +114,9 @@ jobs:
               PATH="/usr/local/bin:/root/.cargo/bin:/opt/mise/shims:/root/.local/bin:${PATH}" \
               CARGO_HOME="/root/.cargo" \
               RUSTUP_HOME="/root/.rustup" \
+              MISE_DATA_DIR="/opt/mise" \
+              MISE_CACHE_DIR="/home/openshell-test/.cache/mise" \
+              MISE_STATE_DIR="/home/openshell-test/.local/state/mise" \
               OPENSHELL_SUPERVISOR_IMAGE="${OPENSHELL_SUPERVISOR_IMAGE}" \
               OPENSHELL_REGISTRY="${OPENSHELL_REGISTRY}" \
               OPENSHELL_REGISTRY_HOST="${OPENSHELL_REGISTRY_HOST}" \
