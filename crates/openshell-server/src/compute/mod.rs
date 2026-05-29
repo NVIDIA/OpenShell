@@ -507,6 +507,8 @@ impl ComputeRuntime {
     }
 
     pub async fn delete_sandbox(&self, name: &str) -> Result<bool, Status> {
+        let _guard = self.sync_lock.lock().await;
+
         // Resolve sandbox ID from name
         let sandbox = self
             .store
