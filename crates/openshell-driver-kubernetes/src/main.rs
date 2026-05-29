@@ -120,6 +120,7 @@ async fn main() -> Result<()> {
         client_tls_secret_name: args.client_tls_secret_name.unwrap_or_default(),
         host_gateway_ip: args.host_gateway_ip.unwrap_or_default(),
         enable_user_namespaces: args.enable_user_namespaces,
+        privileged: false,
         workspace_default_storage_size: std::env::var(
             "OPENSHELL_K8S_WORKSPACE_DEFAULT_STORAGE_SIZE",
         )

@@ -361,6 +361,7 @@ impl KubernetesComputeDriver {
             client_tls_secret_name: &self.config.client_tls_secret_name,
             host_gateway_ip: &self.config.host_gateway_ip,
             enable_user_namespaces: self.config.enable_user_namespaces,
+            privileged: self.config.privileged,
             workspace_default_storage_size: &self.config.workspace_default_storage_size,
             sa_token_ttl_secs: self.config.effective_sa_token_ttl_secs(),
         };
@@ -1092,6 +1093,7 @@ struct SandboxPodParams<'a> {
     client_tls_secret_name: &'a str,
     host_gateway_ip: &'a str,
     enable_user_namespaces: bool,
+    privileged: bool,
     workspace_default_storage_size: &'a str,
     /// Lifetime (seconds) of the projected `ServiceAccount` token used
     /// for the bootstrap `IssueSandboxToken` exchange.
@@ -1116,6 +1118,7 @@ impl Default for SandboxPodParams<'_> {
             client_tls_secret_name: "",
             host_gateway_ip: "",
             enable_user_namespaces: false,
+            privileged: false,
             workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE,
             sa_token_ttl_secs: 3600,
         }
@@ -1378,13 +1381,17 @@ fn sandbox_template_to_k8s(
         // for process identity resolution in network policy enforcement.
         capabilities.extend(["SETUID", "SETGID", "DAC_READ_SEARCH"]);
     }
+    let mut security_context = serde_json::Map::new();
+    security_context.insert(
+        "capabilities".to_string(),
+        serde_json::json!({ "add": capabilities }),
+    );
+    if params.privileged {
+        security_context.insert("privileged".to_string(), serde_json::json!(true));
+    }
     container.insert(
         "securityContext".to_string(),
-        serde_json::json!({
-            "capabilities": {
-                "add": capabilities
-            }
-        }),
+        serde_json::Value::Object(security_context),
     );
 
     // Mount client TLS secret for mTLS to the server, plus the projected
@@ -2778,6 +2785,43 @@ mod tests {
             caps.len(),
             4,
             "extra capabilities must not be added when user namespaces are disabled"
+        );
+    }
+
+    #[test]
+    fn configured_privileged_sets_container_security_context() {
+        let params = SandboxPodParams {
+            privileged: true,
+            ..SandboxPodParams::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+
+        assert_eq!(
+            pod_template["spec"]["containers"][0]["securityContext"]["privileged"],
+            serde_json::json!(true),
+            "privileged config must map to container securityContext"
+        );
+    }
+
+    #[test]
+    fn privileged_omitted_by_default() {
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &SandboxPodParams::default(),
+        );
+
+        assert!(
+            pod_template["spec"]["containers"][0]["securityContext"]["privileged"].is_null(),
+            "privileged must be omitted unless configured"
         );
     }
 

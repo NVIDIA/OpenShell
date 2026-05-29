@@ -23,6 +23,11 @@ not infer isolation semantics from RuntimeClass names. When a default
 that RuntimeClass during startup so a missing runtime fails fast instead of
 surfacing later as pod sandbox creation errors. Per-sandbox RuntimeClass
 overrides are dynamic and are validated during sandbox admission/create.
+As a short-term compatibility escape hatch, the driver config can set
+`privileged = true` deployment-wide; the driver maps that to
+`podTemplate.spec.containers[0].securityContext.privileged` for all sandbox pod
+containers. Use it only for trusted clusters that require privileged pod
+admission because it weakens the container boundary.
 
 ## Sandbox Resource
 

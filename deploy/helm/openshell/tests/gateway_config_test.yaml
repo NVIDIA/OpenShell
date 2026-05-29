@@ -91,6 +91,25 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?runtime_class_outer_isolation\s*=\s*true'
 
+  - it: omits privileged sandbox pods by default
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'privileged\s*='
+
+  - it: renders privileged sandbox pods under [openshell.drivers.kubernetes]
+    template: templates/gateway-config.yaml
+    set:
+      server.sandboxPrivileged: true
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?privileged\s*=\s*true'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\][^\[]*?privileged\s*='
+
   - it: does not render local mTLS user auth for Kubernetes deployments
     template: templates/gateway-config.yaml
     asserts:

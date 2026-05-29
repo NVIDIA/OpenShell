@@ -178,6 +178,10 @@ server:
   # Linux 5.12+. When enabled, container UID 0 maps to an unprivileged host
   # UID and capabilities become namespaced.
   enableUserNamespaces: false
+  # -- Set securityContext.privileged on all sandbox pod containers. This is a
+  # short-term compatibility escape hatch for trusted clusters that require
+  # privileged pod admission and weakens the container boundary.
+  sandboxPrivileged: false
   # -- Disable TLS entirely - the server listens on plaintext HTTP.
   # Set to true when a reverse proxy / tunnel terminates TLS at the edge.
   disableTls: false

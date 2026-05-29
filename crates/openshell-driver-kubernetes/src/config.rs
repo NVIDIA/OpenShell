@@ -83,6 +83,12 @@ pub struct KubernetesComputeConfig {
     pub client_tls_secret_name: String,
     pub host_gateway_ip: String,
     pub enable_user_namespaces: bool,
+    /// Set `securityContext.privileged` on sandbox pod containers.
+    ///
+    /// This is a deployment-wide compatibility escape hatch for clusters that
+    /// require privileged pod admission. It weakens the container boundary and
+    /// should stay disabled unless the Kubernetes environment is trusted.
+    pub privileged: bool,
     pub workspace_default_storage_size: String,
     /// Lifetime (seconds) of the projected `ServiceAccount` token kubelet
     /// writes into each sandbox pod. Used only for the one-shot
@@ -124,6 +130,7 @@ impl Default for KubernetesComputeConfig {
             client_tls_secret_name: String::new(),
             host_gateway_ip: String::new(),
             enable_user_namespaces: false,
+            privileged: false,
             workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE.to_string(),
             sa_token_ttl_secs: 3600,
         }
@@ -201,5 +208,14 @@ mod tests {
         });
         let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
         assert!(cfg.runtime_class_outer_isolation);
+    }
+
+    #[test]
+    fn serde_override_privileged() {
+        let json = serde_json::json!({
+            "privileged": true
+        });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+        assert!(cfg.privileged);
     }
 }
