@@ -13,7 +13,7 @@ use prost::Message;
 use tonic::Status;
 use tracing::warn;
 
-use super::validation::validate_provider_fields;
+use super::validation::{validate_provider_fields, validate_provider_mutable_fields};
 use super::{
     MAX_MAP_KEY_LEN, MAX_MAP_VALUE_LEN, MAX_PAGE_SIZE, MAX_PROVIDER_CONFIG_ENTRIES, clamp_limit,
 };
@@ -215,9 +215,14 @@ pub(super) async fn update_provider_record(
         provider.credential_expires_at_ms,
     );
 
-    // Validate BEFORE writing to prevent persisting invalid state
+    // Validate BEFORE writing to prevent persisting invalid state.
+    // Validate only the mutable fields (credentials/config) plus metadata and
+    // attached-sandbox invariants. The immutable name/type are carried forward
+    // from `existing` and re-running full `validate_provider_fields` here would
+    // strand legacy records whose stored type predates current limits. See
+    // #1347.
     super::validation::validate_object_metadata(candidate.metadata.as_ref(), "provider")?;
-    validate_provider_fields(&candidate)?;
+    validate_provider_mutable_fields(&candidate)?;
     validate_provider_update_against_attached_sandboxes(store, &candidate).await?;
 
     // Serialize labels for storage
@@ -1443,8 +1448,8 @@ pub(super) async fn handle_delete_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grpc::MAX_MAP_KEY_LEN;
     use crate::grpc::test_support::test_server_state;
+    use crate::grpc::{MAX_MAP_KEY_LEN, MAX_PROVIDER_TYPE_LEN};
 
     async fn test_store() -> Store {
         Store::connect("sqlite::memory:?cache=shared")
@@ -3265,6 +3270,52 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err.code(), Code::InvalidArgument);
+    }
+
+    /// Regression for #1347: a credential rotation must not fail just because the
+    /// existing record's `type` field exceeds the current `MAX_PROVIDER_TYPE_LEN`.
+    /// The caller never touches `type`; re-validating it strands legacy records.
+    #[tokio::test]
+    async fn update_provider_allows_credential_rotation_on_legacy_oversized_type() {
+        let store = test_store().await;
+
+        let oversized_type = "x".repeat(MAX_PROVIDER_TYPE_LEN + 15);
+        let legacy = Provider {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: "legacy-oversized-type".to_string(),
+                created_at_ms: 0,
+                labels: HashMap::new(),
+                resource_version: 0,
+            }),
+            r#type: oversized_type.clone(),
+            credentials: std::iter::once(("API_TOKEN".to_string(), "old".to_string())).collect(),
+            config: HashMap::new(),
+            credential_expires_at_ms: HashMap::new(),
+        };
+        store.put_message(&legacy).await.unwrap();
+
+        let updated = update_provider_record(
+            &store,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "legacy-oversized-type".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                r#type: String::new(),
+                credentials: std::iter::once(("API_TOKEN".to_string(), "new".to_string()))
+                    .collect(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(updated.r#type, oversized_type);
     }
 
     #[tokio::test]
