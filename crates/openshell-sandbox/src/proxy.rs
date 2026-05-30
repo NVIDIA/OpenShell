@@ -4,7 +4,7 @@
 //! HTTP CONNECT proxy with OPA policy evaluation and process-identity binding.
 
 use crate::denial_aggregator::DenialEvent;
-use crate::identity::BinaryIdentityCache;
+use openshell_supervisor_networking::identity::BinaryIdentityCache;
 use crate::l7::tls::ProxyTlsState;
 use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard};
 use crate::policy_local::{POLICY_LOCAL_HOST, PolicyLocalContext};
@@ -6645,7 +6645,7 @@ network_policies:
     #[cfg(target_os = "linux")]
     #[test]
     fn resolve_process_identity_surfaces_binary_integrity_violation_on_hot_swap() {
-        use crate::identity::BinaryIdentityCache;
+        use openshell_supervisor_networking::identity::BinaryIdentityCache;
         use std::io::Read;
         use std::net::TcpListener;
         use std::os::unix::fs::PermissionsExt;
@@ -6777,7 +6777,7 @@ network_policies:
     // SELinux-enforcing hosts.  Fix by building a test-sleep-helper binary in
     // the same crate so it inherits the user_home_t label.
     fn resolve_process_identity_denies_fork_exec_shared_socket_ambiguity() {
-        use crate::identity::BinaryIdentityCache;
+        use openshell_supervisor_networking::identity::BinaryIdentityCache;
         use std::ffi::CString;
         use std::net::{TcpListener, TcpStream};
         use std::os::fd::AsRawFd;

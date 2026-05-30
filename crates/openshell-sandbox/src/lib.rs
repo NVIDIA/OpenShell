@@ -9,7 +9,6 @@ pub mod bypass_monitor;
 pub mod debug_rpc;
 pub mod denial_aggregator;
 mod grpc_client;
-mod identity;
 pub mod l7;
 pub mod log_push;
 pub mod opa;
@@ -163,7 +162,7 @@ pub(crate) mod test_helpers {
     }
 }
 
-use crate::identity::BinaryIdentityCache;
+use openshell_supervisor_networking::identity::BinaryIdentityCache;
 use crate::l7::tls::{
     CertCache, ProxyTlsState, SandboxCa, build_upstream_client_config, read_system_ca_bundle,
     write_ca_files,

@@ -13,9 +13,11 @@ rust-version.workspace = true
 [dependencies]
 openshell-core = { path = "../openshell-core" }
 
+miette = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true

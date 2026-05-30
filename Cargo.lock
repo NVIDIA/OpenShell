@@ -3772,7 +3772,9 @@ dependencies = [
 name = "openshell-supervisor-networking"
 version = "0.0.0"
 dependencies = [
+ "miette",
  "openshell-core",
+ "tempfile",
  "tracing",
 ]
 

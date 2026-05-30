@@ -79,6 +79,12 @@ pub struct BinaryIdentityCache {
     hashes: Mutex<HashMap<PathBuf, CachedBinary>>,
 }
 
+impl Default for BinaryIdentityCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BinaryIdentityCache {
     pub fn new() -> Self {
         Self {
