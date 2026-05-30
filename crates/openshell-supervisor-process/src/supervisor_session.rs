@@ -258,13 +258,18 @@ async fn run_session_loop(
 
         match run_single_session(&endpoint, &sandbox_id, &ssh_socket_path, netns_fd).await {
             Ok(()) => {
-                let event = session_closed_event(crate::ocsf_ctx(), &endpoint, &sandbox_id);
+                let event =
+                    session_closed_event(openshell_ocsf::ctx::ctx(), &endpoint, &sandbox_id);
                 ocsf_emit!(event);
                 break;
             }
             Err(e) => {
-                let event =
-                    session_failed_event(crate::ocsf_ctx(), &endpoint, attempt, &e.to_string());
+                let event = session_failed_event(
+                    openshell_ocsf::ctx::ctx(),
+                    &endpoint,
+                    attempt,
+                    &e.to_string(),
+                );
                 ocsf_emit!(event);
                 tokio::time::sleep(backoff).await;
                 backoff = (backoff * 2).min(MAX_BACKOFF);
@@ -326,7 +331,7 @@ async fn run_single_session(
 
     let heartbeat_secs = accepted.heartbeat_interval_secs.max(5);
     let event = session_established_event(
-        crate::ocsf_ctx(),
+        openshell_ocsf::ctx::ctx(),
         endpoint,
         &accepted.session_id,
         heartbeat_secs,
@@ -385,20 +390,23 @@ fn handle_gateway_message(
             let ssh_socket_path = ssh_socket_path.to_path_buf();
             let tx = tx.clone();
 
-            let event = relay_open_event(crate::ocsf_ctx(), &relay_open, &ssh_socket_path);
+            let event = relay_open_event(openshell_ocsf::ctx::ctx(), &relay_open, &ssh_socket_path);
             ocsf_emit!(event);
 
             tokio::spawn(async move {
                 let event_open = relay_open.clone();
                 match handle_relay_open(relay_open, &ssh_socket_path, netns_fd, channel, tx).await {
                     Ok(()) => {
-                        let event =
-                            relay_closed_event(crate::ocsf_ctx(), &event_open, &ssh_socket_path);
+                        let event = relay_closed_event(
+                            openshell_ocsf::ctx::ctx(),
+                            &event_open,
+                            &ssh_socket_path,
+                        );
                         ocsf_emit!(event);
                     }
                     Err(e) => {
                         let event = relay_failed_event(
-                            crate::ocsf_ctx(),
+                            openshell_ocsf::ctx::ctx(),
                             &event_open,
                             &ssh_socket_path,
                             &e.to_string(),
@@ -415,8 +423,11 @@ fn handle_gateway_message(
             });
         }
         Some(gateway_message::Payload::RelayClose(close)) => {
-            let event =
-                relay_close_from_gateway_event(crate::ocsf_ctx(), &close.channel_id, &close.reason);
+            let event = relay_close_from_gateway_event(
+                openshell_ocsf::ctx::ctx(),
+                &close.channel_id,
+                &close.reason,
+            );
             ocsf_emit!(event);
         }
         _ => {

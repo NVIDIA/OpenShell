@@ -12,7 +12,6 @@ mod process;
 pub mod proxy;
 mod sandbox;
 mod ssh;
-mod supervisor_session;
 
 use miette::{IntoDiagnostic, Result};
 #[cfg(target_os = "linux")]
@@ -625,7 +624,7 @@ async fn run_process(
     if let (Some(endpoint), Some(id), Some(socket)) =
         (openshell_endpoint, sandbox_id, ssh_socket_path.as_ref())
     {
-        supervisor_session::spawn(
+        openshell_supervisor_process::supervisor_session::spawn(
             endpoint.to_string(),
             id.to_string(),
             socket.clone(),

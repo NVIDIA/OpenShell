@@ -14,3 +14,4 @@ pub mod debug_rpc;
 pub mod log_push;
 pub mod proposals;
 pub mod skills;
+pub mod supervisor_session;
