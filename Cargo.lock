@@ -3656,6 +3656,7 @@ dependencies = [
  "openshell-ocsf",
  "openshell-policy",
  "openshell-router",
+ "openshell-supervisor-networking",
  "openshell-supervisor-process",
  "rand_core 0.6.4",
  "rcgen",
@@ -3767,6 +3768,10 @@ dependencies = [
 [[package]]
 name = "openshell-supervisor-networking"
 version = "0.0.0"
+dependencies = [
+ "openshell-core",
+ "tracing",
+]
 
 [[package]]
 name = "openshell-supervisor-process"

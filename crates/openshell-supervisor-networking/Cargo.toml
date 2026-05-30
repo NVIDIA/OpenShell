@@ -11,6 +11,9 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+openshell-core = { path = "../openshell-core" }
+
+tracing = { workspace = true }
 
 [dev-dependencies]
 

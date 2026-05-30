@@ -12,7 +12,6 @@ mod grpc_client;
 mod identity;
 pub mod l7;
 pub mod log_push;
-pub mod mechanistic_mapper;
 pub mod opa;
 mod policy_local;
 mod process;
@@ -174,6 +173,7 @@ use crate::opa::OpaEngine;
 use crate::proxy::ProxyHandle;
 use openshell_core::policy::{NetworkMode, NetworkPolicy, ProxyPolicy, SandboxPolicy};
 use openshell_supervisor_process::skills;
+use openshell_supervisor_networking::mechanistic_mapper;
 #[cfg(target_os = "linux")]
 use crate::sandbox::linux::netns::NetworkNamespace;
 pub use process::{ProcessHandle, ProcessStatus};
