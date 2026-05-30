@@ -3777,6 +3777,7 @@ dependencies = [
  "miette",
  "openshell-core",
  "tempfile",
+ "tokio",
  "tracing",
 ]
 

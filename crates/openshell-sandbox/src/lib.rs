@@ -7,7 +7,6 @@
 
 pub mod bypass_monitor;
 pub mod debug_rpc;
-pub mod denial_aggregator;
 pub mod l7;
 pub mod log_push;
 pub mod opa;
@@ -248,7 +247,7 @@ struct Networking {
     ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
     ssh_proxy_url: Option<String>,
     ssh_netns_fd: Option<i32>,
-    denial_rx: Option<tokio::sync::mpsc::UnboundedReceiver<denial_aggregator::DenialEvent>>,
+    denial_rx: Option<tokio::sync::mpsc::UnboundedReceiver<openshell_core::DenialEvent>>,
 }
 
 /// Set up the networking stack: ephemeral CA + TLS state, proxy server,
@@ -489,7 +488,7 @@ async fn run_process(
     ssh_netns_fd: Option<i32>,
     ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
     #[cfg(target_os = "linux")] netns: Option<&NetworkNamespace>,
-    denial_rx: Option<tokio::sync::mpsc::UnboundedReceiver<denial_aggregator::DenialEvent>>,
+    denial_rx: Option<tokio::sync::mpsc::UnboundedReceiver<openshell_core::DenialEvent>>,
 ) -> Result<i32> {
     // Zombie reaper — openshell-sandbox may run as PID 1 in containers and
     // must reap orphaned grandchildren (e.g. background daemons started by
@@ -783,7 +782,11 @@ async fn run_process(
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(10);
 
-            let aggregator = denial_aggregator::DenialAggregator::new(rx, flush_interval_secs);
+            let aggregator =
+                openshell_supervisor_networking::denial_aggregator::DenialAggregator::new(
+                    rx,
+                    flush_interval_secs,
+                );
 
             tokio::spawn(async move {
                 aggregator
@@ -2360,7 +2363,7 @@ fn prepare_filesystem(_policy: &SandboxPolicy) -> Result<()> {
 async fn flush_proposals_to_gateway(
     endpoint: &str,
     sandbox_name: &str,
-    summaries: Vec<denial_aggregator::FlushableDenialSummary>,
+    summaries: Vec<openshell_supervisor_networking::denial_aggregator::FlushableDenialSummary>,
 ) -> Result<()> {
     use openshell_core::grpc_client::CachedOpenShellClient;
     use openshell_core::proto::{DenialSummary, L7RequestSample};

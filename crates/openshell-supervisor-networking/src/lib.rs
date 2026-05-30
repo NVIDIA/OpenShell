@@ -7,5 +7,6 @@
 //! inference routing, TLS interception, and denial aggregation. Populated by
 //! follow-up commits as modules migrate out of `openshell-sandbox`.
 
+pub mod denial_aggregator;
 pub mod identity;
 pub mod mechanistic_mapper;

@@ -14,6 +14,7 @@ rust-version.workspace = true
 openshell-core = { path = "../openshell-core" }
 
 miette = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
