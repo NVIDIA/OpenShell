@@ -282,6 +282,50 @@ fn is_managed_child(pid: i32) -> bool {
 /// tears down the proxy and bypass-monitor tasks. They must remain alive for
 /// the duration of the sandbox wait loop, which is achieved by holding the
 /// returned `Networking` value in `run_sandbox`'s frame.
+/// Create the workload's network namespace and install bypass detection
+/// rules. Returns `None` when the policy is not in proxy mode. Linux-only.
+///
+/// The namespace is shared infrastructure: the proxy binds to its host-side
+/// veth IP and reads /dev/kmsg from inside it for bypass detection, while
+/// the workload child and SSH sessions enter it via `setns()`.
+#[cfg(target_os = "linux")]
+fn create_netns_for_proxy(policy: &SandboxPolicy) -> Result<Option<NetworkNamespace>> {
+    if !matches!(policy.network.mode, NetworkMode::Proxy) {
+        return Ok(None);
+    }
+    match NetworkNamespace::create() {
+        Ok(ns) => {
+            // Install bypass detection rules (nftables log + reject).
+            // This provides fast-fail UX and diagnostic logging for direct
+            // connection attempts that bypass the HTTP CONNECT proxy.
+            let proxy_port = policy
+                .network
+                .proxy
+                .as_ref()
+                .and_then(|p| p.http_addr)
+                .map_or(3128, |addr| addr.port());
+            if let Err(e) = ns.install_bypass_rules(proxy_port) {
+                ocsf_emit!(
+                    ConfigStateChangeBuilder::new(ocsf_ctx())
+                        .severity(SeverityId::Medium)
+                        .status(StatusId::Failure)
+                        .state(StateId::Disabled, "degraded")
+                        .message(format!(
+                            "Failed to install bypass detection rules (non-fatal): {e}"
+                        ))
+                        .build()
+                );
+            }
+            Ok(Some(ns))
+        }
+        Err(e) => Err(miette::miette!(
+            "Network namespace creation failed and proxy mode requires isolation. \
+             Ensure CAP_NET_ADMIN and CAP_SYS_ADMIN are available and iproute2 is installed. \
+             Error: {e}"
+        )),
+    }
+}
+
 struct Networking {
     #[allow(dead_code, reason = "RAII handle: drop tears down the proxy task")]
     _proxy: Option<ProxyHandle>,
@@ -289,19 +333,22 @@ struct Networking {
     #[allow(dead_code, reason = "RAII handle: drop joins the bypass monitor task")]
     _bypass_monitor: Option<tokio::task::JoinHandle<()>>,
 
-    #[cfg(target_os = "linux")]
-    netns: Option<NetworkNamespace>,
     ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
     ssh_proxy_url: Option<String>,
     ssh_netns_fd: Option<i32>,
     denial_rx: Option<tokio::sync::mpsc::UnboundedReceiver<denial_aggregator::DenialEvent>>,
 }
 
-/// Set up the networking stack: ephemeral CA + TLS state, network namespace,
-/// proxy server, bypass monitor, and the SSH-side proxy URL / netns FD.
+/// Set up the networking stack: ephemeral CA + TLS state, proxy server,
+/// bypass monitor, and the SSH-side proxy URL / netns FD.
+///
+/// The network namespace is created by `run_sandbox` and borrowed in here —
+/// it is shared infrastructure used by both the proxy (bind address, bypass
+/// monitor) and the workload child (entered via `setns()` in `pre_exec`).
 #[allow(clippy::too_many_arguments)]
 async fn run_networking(
     policy: &SandboxPolicy,
+    #[cfg(target_os = "linux")] netns: Option<&NetworkNamespace>,
     opa_engine: Option<&Arc<OpaEngine>>,
     entrypoint_pid: Arc<AtomicU32>,
     provider_credentials: &provider_credentials::ProviderCredentialState,
@@ -373,48 +420,6 @@ async fn run_networking(
         (None, None)
     };
 
-    // Create network namespace for proxy mode (Linux only).
-    // This must be created before the proxy AND SSH server so that SSH
-    // sessions can enter the namespace for network isolation.
-    #[cfg(target_os = "linux")]
-    let netns = if matches!(policy.network.mode, NetworkMode::Proxy) {
-        match NetworkNamespace::create() {
-            Ok(ns) => {
-                // Install bypass detection rules (nftables log + reject).
-                // This provides fast-fail UX and diagnostic logging for direct
-                // connection attempts that bypass the HTTP CONNECT proxy.
-                let proxy_port = policy
-                    .network
-                    .proxy
-                    .as_ref()
-                    .and_then(|p| p.http_addr)
-                    .map_or(3128, |addr| addr.port());
-                if let Err(e) = ns.install_bypass_rules(proxy_port) {
-                    ocsf_emit!(
-                        ConfigStateChangeBuilder::new(ocsf_ctx())
-                            .severity(SeverityId::Medium)
-                            .status(StatusId::Failure)
-                            .state(StateId::Disabled, "degraded")
-                            .message(format!(
-                                "Failed to install bypass detection rules (non-fatal): {e}"
-                            ))
-                            .build()
-                    );
-                }
-                Some(ns)
-            }
-            Err(e) => {
-                return Err(miette::miette!(
-                    "Network namespace creation failed and proxy mode requires isolation. \
-                     Ensure CAP_NET_ADMIN and CAP_SYS_ADMIN are available and iproute2 is installed. \
-                     Error: {e}"
-                ));
-            }
-        }
-    } else {
-        None
-    };
-
     let (proxy_handle, denial_rx, bypass_denial_tx) =
         if matches!(policy.network.mode, NetworkMode::Proxy) {
             let proxy_policy = policy.network.proxy.as_ref().ok_or_else(|| {
@@ -436,7 +441,7 @@ async fn run_networking(
             // If we have a network namespace, bind to the veth host IP so sandboxed
             // processes can reach the proxy via TCP.
             #[cfg(target_os = "linux")]
-            let bind_addr = netns.as_ref().map(|ns| {
+            let bind_addr = netns.map(|ns| {
                 let port = proxy_policy.http_addr.map_or(3128, |addr| addr.port());
                 SocketAddr::new(ns.host_ip(), port)
             });
@@ -480,7 +485,7 @@ async fn run_networking(
     // Reads /dev/kmsg for nftables log entries and emits structured
     // tracing events for direct connection attempts that bypass the proxy.
     #[cfg(target_os = "linux")]
-    let bypass_monitor_handle = netns.as_ref().and_then(|ns| {
+    let bypass_monitor_handle = netns.and_then(|ns| {
         bypass_monitor::spawn(
             ns.name().to_string(),
             entrypoint_pid.clone(),
@@ -499,7 +504,7 @@ async fn run_networking(
     // - proxy_url: set proxy env vars so cooperative tools route through the
     //   CONNECT proxy; this also opts Node.js into honoring those vars
     #[cfg(target_os = "linux")]
-    let ssh_netns_fd = netns.as_ref().and_then(NetworkNamespace::ns_fd);
+    let ssh_netns_fd = netns.and_then(NetworkNamespace::ns_fd);
 
     #[cfg(not(target_os = "linux"))]
     let ssh_netns_fd: Option<i32> = None;
@@ -507,7 +512,7 @@ async fn run_networking(
     let ssh_proxy_url = if matches!(policy.network.mode, NetworkMode::Proxy) {
         #[cfg(target_os = "linux")]
         {
-            netns.as_ref().map(|ns| {
+            netns.map(|ns| {
                 let port = policy
                     .network
                     .proxy
@@ -534,13 +539,396 @@ async fn run_networking(
         _proxy: proxy_handle,
         #[cfg(target_os = "linux")]
         _bypass_monitor: bypass_monitor_handle,
-        #[cfg(target_os = "linux")]
-        netns,
         ca_file_paths,
         ssh_proxy_url,
         ssh_netns_fd,
         denial_rx,
     })
+}
+
+/// Run the sandbox workload: spawn the zombie reaper, the SSH server, the
+/// supervisor session, the entrypoint process, the OPA symlink probe, and the
+/// policy poll loop / denial aggregator; then wait for the entrypoint with an
+/// optional timeout and emit the exit OCSF event.
+///
+/// Networking outputs (`ssh_proxy_url`, `ssh_netns_fd`, `ca_file_paths`,
+/// `netns`, `denial_rx`) are passed in individually so that this fn does not
+/// depend on the `Networking` struct directly.
+#[allow(clippy::too_many_arguments, clippy::similar_names)]
+async fn run_process(
+    program: &str,
+    args: &[String],
+    workdir: Option<&str>,
+    timeout_secs: u64,
+    interactive: bool,
+    sandbox_id: Option<&str>,
+    sandbox_name_for_agg: Option<&str>,
+    openshell_endpoint: Option<&str>,
+    ssh_socket_path: Option<String>,
+    policy: &SandboxPolicy,
+    opa_engine: Option<&Arc<OpaEngine>>,
+    retained_proto: Option<&openshell_core::proto::SandboxPolicy>,
+    entrypoint_pid: Arc<AtomicU32>,
+    provider_credentials: provider_credentials::ProviderCredentialState,
+    provider_env: std::collections::HashMap<String, String>,
+    policy_local_ctx: Arc<policy_local::PolicyLocalContext>,
+    ocsf_enabled: Arc<std::sync::atomic::AtomicBool>,
+    ssh_proxy_url: Option<String>,
+    ssh_netns_fd: Option<i32>,
+    ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
+    #[cfg(target_os = "linux")] netns: Option<&NetworkNamespace>,
+    denial_rx: Option<tokio::sync::mpsc::UnboundedReceiver<denial_aggregator::DenialEvent>>,
+) -> Result<i32> {
+    // Zombie reaper — openshell-sandbox may run as PID 1 in containers and
+    // must reap orphaned grandchildren (e.g. background daemons started by
+    // coding agents) to prevent zombie accumulation.
+    //
+    // Use waitid(..., WNOWAIT) so we can inspect exited children before
+    // actually reaping them. This avoids racing explicit `child.wait()` calls
+    // for managed children (entrypoint and SSH session processes).
+    #[cfg(target_os = "linux")]
+    tokio::spawn(async {
+        use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid, waitpid};
+        use tokio::signal::unix::{SignalKind, signal};
+        use tokio::time::MissedTickBehavior;
+
+        let mut sigchld = match signal(SignalKind::child()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to register SIGCHLD handler for zombie reaping");
+                return;
+            }
+        };
+        let mut retry = tokio::time::interval(Duration::from_secs(5));
+        retry.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                _ = sigchld.recv() => {}
+                _ = retry.tick() => {}
+            }
+
+            loop {
+                let status = match waitid(
+                    Id::All,
+                    WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
+                ) {
+                    Ok(WaitStatus::StillAlive) | Err(nix::errno::Errno::ECHILD) => break,
+                    Ok(status) => status,
+                    Err(nix::errno::Errno::EINTR) => continue,
+                    Err(e) => {
+                        tracing::debug!(error = %e, "waitid error during zombie reaping");
+                        break;
+                    }
+                };
+
+                let Some(pid) = status.pid() else {
+                    break;
+                };
+
+                if is_managed_child(pid.as_raw()) {
+                    // Let the explicit waiter own this child status.
+                    break;
+                }
+
+                match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
+                    Ok(WaitStatus::StillAlive)
+                    | Err(nix::errno::Errno::ECHILD | nix::errno::Errno::EINTR) => {}
+                    Ok(reaped) => {
+                        tracing::debug!(?reaped, "Reaped orphaned child process");
+                    }
+                    Err(e) => {
+                        tracing::debug!(error = %e, "waitpid error during orphan reap");
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let ssh_socket_path: Option<std::path::PathBuf> = ssh_socket_path.map(std::path::PathBuf::from);
+    if let Some(listen_path) = ssh_socket_path.clone() {
+        let policy_clone = policy.clone();
+        let workdir_clone = workdir.map(str::to_string);
+        let proxy_url = ssh_proxy_url;
+        let netns_fd = ssh_netns_fd;
+        let ca_paths = ca_file_paths.clone();
+        let provider_credentials_clone = provider_credentials.clone();
+
+        let (ssh_ready_tx, ssh_ready_rx) = tokio::sync::oneshot::channel();
+
+        tokio::spawn(async move {
+            if let Err(err) = ssh::run_ssh_server(
+                listen_path,
+                ssh_ready_tx,
+                policy_clone,
+                workdir_clone,
+                netns_fd,
+                proxy_url,
+                ca_paths,
+                provider_credentials_clone,
+            )
+            .await
+            {
+                ocsf_emit!(
+                    AppLifecycleBuilder::new(ocsf_ctx())
+                        .activity(ActivityId::Fail)
+                        .severity(SeverityId::Critical)
+                        .status(StatusId::Failure)
+                        .message(format!("SSH server failed: {err}"))
+                        .build()
+                );
+            }
+        });
+
+        // Wait for the SSH server to bind its socket before spawning the
+        // entrypoint process. This prevents exec requests from racing against
+        // SSH server startup when Kubernetes marks the pod Ready.
+        match timeout(Duration::from_secs(10), ssh_ready_rx).await {
+            Ok(Ok(Ok(()))) => {
+                ocsf_emit!(
+                    AppLifecycleBuilder::new(ocsf_ctx())
+                        .activity(ActivityId::Open)
+                        .severity(SeverityId::Informational)
+                        .status(StatusId::Success)
+                        .message("SSH server is ready to accept connections")
+                        .build()
+                );
+            }
+            Ok(Ok(Err(err))) => {
+                return Err(err.context("SSH server failed during startup"));
+            }
+            Ok(Err(_)) => {
+                return Err(miette::miette!(
+                    "SSH server task panicked before signaling ready"
+                ));
+            }
+            Err(_) => {
+                return Err(miette::miette!(
+                    "SSH server did not start within 10 seconds"
+                ));
+            }
+        }
+    }
+
+    // Spawn the persistent supervisor session if we have a gateway endpoint
+    // and sandbox identity. The session provides relay channels for SSH
+    // connect and ExecSandbox through the gateway.
+    if let (Some(endpoint), Some(id), Some(socket)) =
+        (openshell_endpoint, sandbox_id, ssh_socket_path.as_ref())
+    {
+        supervisor_session::spawn(
+            endpoint.to_string(),
+            id.to_string(),
+            socket.clone(),
+            ssh_netns_fd,
+        );
+        info!("supervisor session task spawned");
+    }
+
+    #[cfg(target_os = "linux")]
+    let mut handle = ProcessHandle::spawn(
+        program,
+        args,
+        workdir,
+        interactive,
+        policy,
+        netns,
+        ca_file_paths.as_ref(),
+        &provider_env,
+    )?;
+
+    #[cfg(not(target_os = "linux"))]
+    let mut handle = ProcessHandle::spawn(
+        program,
+        args,
+        workdir,
+        interactive,
+        policy,
+        ca_file_paths.as_ref(),
+        &provider_env,
+    )?;
+
+    // Store the entrypoint PID so the proxy can resolve TCP peer identity
+    entrypoint_pid.store(handle.pid(), Ordering::Release);
+    ocsf_emit!(
+        ProcessActivityBuilder::new(ocsf_ctx())
+            .activity(ActivityId::Open)
+            .action(ActionId::Allowed)
+            .disposition(DispositionId::Allowed)
+            .severity(SeverityId::Informational)
+            .status(StatusId::Success)
+            .launch_type(LaunchTypeId::Spawn)
+            .process(OcsfProcess::new(program, i64::from(handle.pid())))
+            .message(format!("Process started: pid={}", handle.pid()))
+            .build()
+    );
+
+    // Spawn a task to resolve policy binary symlinks after the container
+    // filesystem becomes accessible via /proc/<pid>/root/. This expands
+    // symlinks like /usr/bin/python3 → /usr/bin/python3.11 in the OPA
+    // policy data so that either path matches at evaluation time.
+    //
+    // We cannot do this synchronously here because the child process has
+    // just been spawned and its mount namespace / procfs entries may not
+    // be fully populated yet. Instead, we probe with retries until
+    // /proc/<pid>/root/ is accessible or we exhaust attempts.
+    if let (Some(engine), Some(proto)) = (opa_engine, retained_proto) {
+        let resolve_engine = engine.clone();
+        let resolve_proto = proto.clone();
+        let resolve_pid = entrypoint_pid.clone();
+        tokio::spawn(async move {
+            let pid = resolve_pid.load(Ordering::Acquire);
+            let probe_path = format!("/proc/{pid}/root/");
+            // Retry up to 10 times with 500ms intervals (5s total).
+            // The child's mount namespace is typically ready within a
+            // few hundred ms of spawn.
+            for attempt in 1..=10 {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                if std::fs::metadata(&probe_path).is_ok() {
+                    info!(
+                        pid = pid,
+                        attempt = attempt,
+                        "Container filesystem accessible, resolving policy binary symlinks"
+                    );
+                    match resolve_engine.reload_from_proto_with_pid(&resolve_proto, pid) {
+                        Ok(()) => {
+                            info!(
+                                pid = pid,
+                                "Policy binary symlink resolution complete \
+                                 (check logs above for per-binary results)"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to rebuild OPA engine with symlink resolution \
+                                 (non-fatal, falling back to literal path matching): {e}"
+                            );
+                        }
+                    }
+                    return;
+                }
+                debug!(
+                    pid = pid,
+                    attempt = attempt,
+                    probe_path = %probe_path,
+                    "Container filesystem not yet accessible, retrying symlink resolution"
+                );
+            }
+            warn!(
+                "Container filesystem /proc/{pid}/root/ not accessible after 10 attempts (5s); \
+                 binary symlink resolution skipped. Policy binary paths will be matched literally. \
+                 If binaries are symlinks, use canonical paths in your policy \
+                 (run 'readlink -f <path>' inside the sandbox)"
+            );
+        });
+    }
+
+    // Spawn background policy poll task (gRPC mode only).
+    if let (Some(id), Some(endpoint), Some(engine)) = (sandbox_id, openshell_endpoint, opa_engine) {
+        let poll_id = id.to_string();
+        let poll_endpoint = endpoint.to_string();
+        let poll_engine = engine.clone();
+        let poll_ocsf_enabled = ocsf_enabled.clone();
+        let poll_pid = entrypoint_pid.clone();
+        let poll_provider_credentials = provider_credentials.clone();
+        let poll_policy_local = policy_local_ctx.clone();
+        let poll_interval_secs: u64 = std::env::var("OPENSHELL_POLICY_POLL_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+        let poll_ctx = PolicyPollLoopContext {
+            endpoint: poll_endpoint,
+            sandbox_id: poll_id,
+            opa_engine: poll_engine,
+            entrypoint_pid: poll_pid,
+            interval_secs: poll_interval_secs,
+            ocsf_enabled: poll_ocsf_enabled,
+            provider_credentials: poll_provider_credentials,
+            policy_local_ctx: Some(poll_policy_local),
+        };
+
+        tokio::spawn(async move {
+            if let Err(e) = run_policy_poll_loop(poll_ctx).await {
+                ocsf_emit!(
+                    AppLifecycleBuilder::new(ocsf_ctx())
+                        .activity(ActivityId::Fail)
+                        .severity(SeverityId::Medium)
+                        .status(StatusId::Failure)
+                        .message(format!("Policy poll loop exited with error: {e}"))
+                        .build()
+                );
+            }
+        });
+
+        // Spawn denial aggregator (gRPC mode only, when proxy is active).
+        if let Some(rx) = denial_rx {
+            // SubmitPolicyAnalysis resolves by sandbox *name*, not UUID.
+            let agg_name = sandbox_name_for_agg.map_or_else(|| id.to_string(), str::to_string);
+            let agg_endpoint = endpoint.to_string();
+            let flush_interval_secs: u64 = std::env::var("OPENSHELL_DENIAL_FLUSH_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10);
+
+            let aggregator = denial_aggregator::DenialAggregator::new(rx, flush_interval_secs);
+
+            tokio::spawn(async move {
+                aggregator
+                    .run(|summaries| {
+                        let endpoint = agg_endpoint.clone();
+                        let sandbox_name = agg_name.clone();
+                        async move {
+                            if let Err(e) =
+                                flush_proposals_to_gateway(&endpoint, &sandbox_name, summaries)
+                                    .await
+                            {
+                                warn!(error = %e, "Failed to flush denial summaries to gateway");
+                            }
+                        }
+                    })
+                    .await;
+            });
+        }
+    }
+
+    // Wait for process with optional timeout
+    let result = if timeout_secs > 0 {
+        if let Ok(result) = timeout(Duration::from_secs(timeout_secs), handle.wait()).await {
+            result
+        } else {
+            ocsf_emit!(
+                ProcessActivityBuilder::new(ocsf_ctx())
+                    .activity(ActivityId::Close)
+                    .action(ActionId::Denied)
+                    .disposition(DispositionId::Blocked)
+                    .severity(SeverityId::Critical)
+                    .status(StatusId::Failure)
+                    .message("Process timed out, killing")
+                    .build()
+            );
+            handle.kill()?;
+            return Ok(124); // Standard timeout exit code
+        }
+    } else {
+        handle.wait().await
+    };
+
+    let status = result.into_diagnostic()?;
+
+    ocsf_emit!(
+        ProcessActivityBuilder::new(ocsf_ctx())
+            .activity(ActivityId::Close)
+            .action(ActionId::Allowed)
+            .disposition(DispositionId::Allowed)
+            .severity(SeverityId::Informational)
+            .status(StatusId::Success)
+            .exit_code(status.code())
+            .message(format!("Process exited with code {}", status.code()))
+            .build()
+    );
+
+    Ok(status.code())
 }
 
 /// Run a command in the sandbox.
@@ -734,8 +1122,18 @@ pub async fn run_sandbox(
     // the entrypoint process's /proc/net/tcp for identity binding.
     let entrypoint_pid = Arc::new(AtomicU32::new(0));
 
+    // Create the workload's network namespace. It is shared infrastructure:
+    // the proxy binds to its host-side veth IP, the bypass monitor reads
+    // /dev/kmsg from inside it, and the workload child / SSH sessions enter
+    // it via setns(). The RAII handle lives in this frame for the duration
+    // of the sandbox.
+    #[cfg(target_os = "linux")]
+    let netns = create_netns_for_proxy(&policy)?;
+
     let mut networking = run_networking(
         &policy,
+        #[cfg(target_os = "linux")]
+        netns.as_ref(),
         opa_engine.as_ref(),
         entrypoint_pid.clone(),
         &provider_credentials,
@@ -751,360 +1149,34 @@ pub async fn run_sandbox(
     // listener and workload process are exposed.
     apply_supervisor_startup_hardening()?;
 
-    // Zombie reaper — openshell-sandbox may run as PID 1 in containers and
-    // must reap orphaned grandchildren (e.g. background daemons started by
-    // coding agents) to prevent zombie accumulation.
-    //
-    // Use waitid(..., WNOWAIT) so we can inspect exited children before
-    // actually reaping them. This avoids racing explicit `child.wait()` calls
-    // for managed children (entrypoint and SSH session processes).
-    #[cfg(target_os = "linux")]
-    tokio::spawn(async {
-        use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid, waitpid};
-        use tokio::signal::unix::{SignalKind, signal};
-        use tokio::time::MissedTickBehavior;
-
-        let mut sigchld = match signal(SignalKind::child()) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to register SIGCHLD handler for zombie reaping");
-                return;
-            }
-        };
-        let mut retry = tokio::time::interval(Duration::from_secs(5));
-        retry.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-        loop {
-            tokio::select! {
-                _ = sigchld.recv() => {}
-                _ = retry.tick() => {}
-            }
-
-            loop {
-                let status = match waitid(
-                    Id::All,
-                    WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
-                ) {
-                    Ok(WaitStatus::StillAlive) | Err(nix::errno::Errno::ECHILD) => break,
-                    Ok(status) => status,
-                    Err(nix::errno::Errno::EINTR) => continue,
-                    Err(e) => {
-                        tracing::debug!(error = %e, "waitid error during zombie reaping");
-                        break;
-                    }
-                };
-
-                let Some(pid) = status.pid() else {
-                    break;
-                };
-
-                if is_managed_child(pid.as_raw()) {
-                    // Let the explicit waiter own this child status.
-                    break;
-                }
-
-                match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
-                    Ok(WaitStatus::StillAlive)
-                    | Err(nix::errno::Errno::ECHILD | nix::errno::Errno::EINTR) => {}
-                    Ok(reaped) => {
-                        tracing::debug!(?reaped, "Reaped orphaned child process");
-                    }
-                    Err(e) => {
-                        tracing::debug!(error = %e, "waitpid error during orphan reap");
-                        break;
-                    }
-                }
-            }
-        }
-    });
-
-    let ssh_socket_path: Option<std::path::PathBuf> = ssh_socket_path.map(std::path::PathBuf::from);
-    if let Some(listen_path) = ssh_socket_path.clone() {
-        let policy_clone = policy.clone();
-        let workdir_clone = workdir.clone();
-        let proxy_url = networking.ssh_proxy_url.take();
-        let netns_fd = networking.ssh_netns_fd;
-        let ca_paths = networking.ca_file_paths.clone();
-        let provider_credentials_clone = provider_credentials.clone();
-
-        let (ssh_ready_tx, ssh_ready_rx) = tokio::sync::oneshot::channel();
-
-        tokio::spawn(async move {
-            if let Err(err) = ssh::run_ssh_server(
-                listen_path,
-                ssh_ready_tx,
-                policy_clone,
-                workdir_clone,
-                netns_fd,
-                proxy_url,
-                ca_paths,
-                provider_credentials_clone,
-            )
-            .await
-            {
-                ocsf_emit!(
-                    AppLifecycleBuilder::new(ocsf_ctx())
-                        .activity(ActivityId::Fail)
-                        .severity(SeverityId::Critical)
-                        .status(StatusId::Failure)
-                        .message(format!("SSH server failed: {err}"))
-                        .build()
-                );
-            }
-        });
-
-        // Wait for the SSH server to bind its socket before spawning the
-        // entrypoint process. This prevents exec requests from racing against
-        // SSH server startup when Kubernetes marks the pod Ready.
-        match timeout(Duration::from_secs(10), ssh_ready_rx).await {
-            Ok(Ok(Ok(()))) => {
-                ocsf_emit!(
-                    AppLifecycleBuilder::new(ocsf_ctx())
-                        .activity(ActivityId::Open)
-                        .severity(SeverityId::Informational)
-                        .status(StatusId::Success)
-                        .message("SSH server is ready to accept connections")
-                        .build()
-                );
-            }
-            Ok(Ok(Err(err))) => {
-                return Err(err.context("SSH server failed during startup"));
-            }
-            Ok(Err(_)) => {
-                return Err(miette::miette!(
-                    "SSH server task panicked before signaling ready"
-                ));
-            }
-            Err(_) => {
-                return Err(miette::miette!(
-                    "SSH server did not start within 10 seconds"
-                ));
-            }
-        }
-    }
-
-    // Spawn the persistent supervisor session if we have a gateway endpoint
-    // and sandbox identity. The session provides relay channels for SSH
-    // connect and ExecSandbox through the gateway.
-    if let (Some(endpoint), Some(id), Some(socket)) = (
-        openshell_endpoint.as_ref(),
-        sandbox_id.as_ref(),
-        ssh_socket_path.as_ref(),
-    ) {
-        supervisor_session::spawn(
-            endpoint.clone(),
-            id.clone(),
-            socket.clone(),
-            networking.ssh_netns_fd,
-        );
-        info!("supervisor session task spawned");
-    }
-
-    #[cfg(target_os = "linux")]
-    let mut handle = ProcessHandle::spawn(
+    let exit_code = run_process(
         program,
         args,
         workdir.as_deref(),
+        timeout_secs,
         interactive,
+        sandbox_id.as_deref(),
+        sandbox_name_for_agg.as_deref(),
+        openshell_endpoint.as_deref(),
+        ssh_socket_path,
         &policy,
-        networking.netns.as_ref(),
-        networking.ca_file_paths.as_ref(),
-        &provider_env,
-    )?;
+        opa_engine.as_ref(),
+        retained_proto.as_ref(),
+        entrypoint_pid,
+        provider_credentials,
+        provider_env,
+        policy_local_ctx,
+        ocsf_enabled,
+        networking.ssh_proxy_url.take(),
+        networking.ssh_netns_fd,
+        networking.ca_file_paths.clone(),
+        #[cfg(target_os = "linux")]
+        netns.as_ref(),
+        networking.denial_rx.take(),
+    )
+    .await?;
 
-    #[cfg(not(target_os = "linux"))]
-    let mut handle = ProcessHandle::spawn(
-        program,
-        args,
-        workdir.as_deref(),
-        interactive,
-        &policy,
-        networking.ca_file_paths.as_ref(),
-        &provider_env,
-    )?;
-
-    // Store the entrypoint PID so the proxy can resolve TCP peer identity
-    entrypoint_pid.store(handle.pid(), Ordering::Release);
-    ocsf_emit!(
-        ProcessActivityBuilder::new(ocsf_ctx())
-            .activity(ActivityId::Open)
-            .action(ActionId::Allowed)
-            .disposition(DispositionId::Allowed)
-            .severity(SeverityId::Informational)
-            .status(StatusId::Success)
-            .launch_type(LaunchTypeId::Spawn)
-            .process(OcsfProcess::new(program, i64::from(handle.pid())))
-            .message(format!("Process started: pid={}", handle.pid()))
-            .build()
-    );
-
-    // Spawn a task to resolve policy binary symlinks after the container
-    // filesystem becomes accessible via /proc/<pid>/root/. This expands
-    // symlinks like /usr/bin/python3 → /usr/bin/python3.11 in the OPA
-    // policy data so that either path matches at evaluation time.
-    //
-    // We cannot do this synchronously here because the child process has
-    // just been spawned and its mount namespace / procfs entries may not
-    // be fully populated yet. Instead, we probe with retries until
-    // /proc/<pid>/root/ is accessible or we exhaust attempts.
-    if let (Some(engine), Some(proto)) = (&opa_engine, &retained_proto) {
-        let resolve_engine = engine.clone();
-        let resolve_proto = proto.clone();
-        let resolve_pid = entrypoint_pid.clone();
-        tokio::spawn(async move {
-            let pid = resolve_pid.load(Ordering::Acquire);
-            let probe_path = format!("/proc/{pid}/root/");
-            // Retry up to 10 times with 500ms intervals (5s total).
-            // The child's mount namespace is typically ready within a
-            // few hundred ms of spawn.
-            for attempt in 1..=10 {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                if std::fs::metadata(&probe_path).is_ok() {
-                    info!(
-                        pid = pid,
-                        attempt = attempt,
-                        "Container filesystem accessible, resolving policy binary symlinks"
-                    );
-                    match resolve_engine.reload_from_proto_with_pid(&resolve_proto, pid) {
-                        Ok(()) => {
-                            info!(
-                                pid = pid,
-                                "Policy binary symlink resolution complete \
-                                 (check logs above for per-binary results)"
-                            );
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Failed to rebuild OPA engine with symlink resolution \
-                                 (non-fatal, falling back to literal path matching): {e}"
-                            );
-                        }
-                    }
-                    return;
-                }
-                debug!(
-                    pid = pid,
-                    attempt = attempt,
-                    probe_path = %probe_path,
-                    "Container filesystem not yet accessible, retrying symlink resolution"
-                );
-            }
-            warn!(
-                "Container filesystem /proc/{pid}/root/ not accessible after 10 attempts (5s); \
-                 binary symlink resolution skipped. Policy binary paths will be matched literally. \
-                 If binaries are symlinks, use canonical paths in your policy \
-                 (run 'readlink -f <path>' inside the sandbox)"
-            );
-        });
-    }
-
-    // Spawn background policy poll task (gRPC mode only).
-    if let (Some(id), Some(endpoint), Some(engine)) =
-        (&sandbox_id, &openshell_endpoint, &opa_engine)
-    {
-        let poll_id = id.clone();
-        let poll_endpoint = endpoint.clone();
-        let poll_engine = engine.clone();
-        let poll_ocsf_enabled = ocsf_enabled.clone();
-        let poll_pid = entrypoint_pid.clone();
-        let poll_provider_credentials = provider_credentials.clone();
-        let poll_policy_local = policy_local_ctx.clone();
-        let poll_interval_secs: u64 = std::env::var("OPENSHELL_POLICY_POLL_INTERVAL_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(10);
-        let poll_ctx = PolicyPollLoopContext {
-            endpoint: poll_endpoint,
-            sandbox_id: poll_id,
-            opa_engine: poll_engine,
-            entrypoint_pid: poll_pid,
-            interval_secs: poll_interval_secs,
-            ocsf_enabled: poll_ocsf_enabled,
-            provider_credentials: poll_provider_credentials,
-            policy_local_ctx: Some(poll_policy_local),
-        };
-
-        tokio::spawn(async move {
-            if let Err(e) = run_policy_poll_loop(poll_ctx).await {
-                ocsf_emit!(
-                    AppLifecycleBuilder::new(ocsf_ctx())
-                        .activity(ActivityId::Fail)
-                        .severity(SeverityId::Medium)
-                        .status(StatusId::Failure)
-                        .message(format!("Policy poll loop exited with error: {e}"))
-                        .build()
-                );
-            }
-        });
-
-        // Spawn denial aggregator (gRPC mode only, when proxy is active).
-        if let Some(rx) = networking.denial_rx.take() {
-            // SubmitPolicyAnalysis resolves by sandbox *name*, not UUID.
-            let agg_name = sandbox_name_for_agg.clone().unwrap_or_else(|| id.clone());
-            let agg_endpoint = endpoint.clone();
-            let flush_interval_secs: u64 = std::env::var("OPENSHELL_DENIAL_FLUSH_INTERVAL_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(10);
-
-            let aggregator = denial_aggregator::DenialAggregator::new(rx, flush_interval_secs);
-
-            tokio::spawn(async move {
-                aggregator
-                    .run(|summaries| {
-                        let endpoint = agg_endpoint.clone();
-                        let sandbox_name = agg_name.clone();
-                        async move {
-                            if let Err(e) =
-                                flush_proposals_to_gateway(&endpoint, &sandbox_name, summaries)
-                                    .await
-                            {
-                                warn!(error = %e, "Failed to flush denial summaries to gateway");
-                            }
-                        }
-                    })
-                    .await;
-            });
-        }
-    }
-
-    // Wait for process with optional timeout
-    let result = if timeout_secs > 0 {
-        if let Ok(result) = timeout(Duration::from_secs(timeout_secs), handle.wait()).await {
-            result
-        } else {
-            ocsf_emit!(
-                ProcessActivityBuilder::new(ocsf_ctx())
-                    .activity(ActivityId::Close)
-                    .action(ActionId::Denied)
-                    .disposition(DispositionId::Blocked)
-                    .severity(SeverityId::Critical)
-                    .status(StatusId::Failure)
-                    .message("Process timed out, killing")
-                    .build()
-            );
-            handle.kill()?;
-            return Ok(124); // Standard timeout exit code
-        }
-    } else {
-        handle.wait().await
-    };
-
-    let status = result.into_diagnostic()?;
-
-    ocsf_emit!(
-        ProcessActivityBuilder::new(ocsf_ctx())
-            .activity(ActivityId::Close)
-            .action(ActionId::Allowed)
-            .disposition(DispositionId::Allowed)
-            .severity(SeverityId::Informational)
-            .status(StatusId::Success)
-            .exit_code(status.code())
-            .message(format!("Process exited with code {}", status.code()))
-            .build()
-    );
-
-    Ok(status.code())
+    Ok(exit_code)
 }
 
 /// Build an inference context for local routing, if route sources are available.
