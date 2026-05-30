@@ -3764,6 +3764,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-supervisor-networking"
+version = "0.0.0"
+
+[[package]]
+name = "openshell-supervisor-process"
+version = "0.0.0"
+
+[[package]]
 name = "openshell-tui"
 version = "0.0.0"
 dependencies = [
