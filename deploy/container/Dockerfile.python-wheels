@@ -24,7 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.95.0
 RUN pip install --no-cache-dir maturin
 
-COPY deploy/docker/cross-build.sh /usr/local/bin/
+COPY deploy/container/cross-build.sh /usr/local/bin/
 
 FROM base AS builder
 

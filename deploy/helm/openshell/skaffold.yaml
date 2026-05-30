@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Local dev: builds gateway + supervisor images via tasks/scripts/docker-build-image.sh,
+# Local dev: builds gateway + supervisor images via tasks/scripts/container-build-image.sh,
 # which first stages Rust binaries natively on the host (using cargo / cargo-zigbuild
 # when cross-compiling) and then builds the image from the prebuilt binary. This
 # mirrors CI and is faster than compiling inside Docker on every rebuild because
@@ -28,15 +28,15 @@ build:
         buildCommand: |
           IMAGE_NAME="${IMAGE%:*}" \
           IMAGE_TAG="${IMAGE##*:}" \
-          tasks/scripts/docker-build-image.sh gateway
+          tasks/scripts/container-build-image.sh gateway
         dependencies:
           paths:
             - Cargo.toml
             - Cargo.lock
             - crates/**
             - proto/**
-            - deploy/docker/Dockerfile.gateway
-            - tasks/scripts/docker-build-image.sh
+            - deploy/container/Dockerfile.gateway
+            - tasks/scripts/container-build-image.sh
             - tasks/scripts/stage-prebuilt-binaries.sh
     - image: openshell/supervisor
       context: ../../..
@@ -44,15 +44,15 @@ build:
         buildCommand: |
           IMAGE_NAME="${IMAGE%:*}" \
           IMAGE_TAG="${IMAGE##*:}" \
-          tasks/scripts/docker-build-image.sh supervisor
+          tasks/scripts/container-build-image.sh supervisor
         dependencies:
           paths:
             - Cargo.toml
             - Cargo.lock
             - crates/**
             - proto/**
-            - deploy/docker/Dockerfile.supervisor
-            - tasks/scripts/docker-build-image.sh
+            - deploy/container/Dockerfile.supervisor
+            - tasks/scripts/container-build-image.sh
             - tasks/scripts/stage-prebuilt-binaries.sh
 deploy:
   helm:

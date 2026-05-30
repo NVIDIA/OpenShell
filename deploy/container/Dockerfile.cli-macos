@@ -8,7 +8,7 @@
 # wheel wrapping.
 #
 # Usage:
-#   docker buildx build -f deploy/docker/Dockerfile.cli-macos \
+#   docker buildx build -f deploy/container/Dockerfile.cli-macos \
 #     --build-arg OPENSHELL_CARGO_VERSION=0.6.0 \
 #     --output type=local,dest=out/ .
 

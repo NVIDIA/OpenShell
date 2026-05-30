@@ -8,6 +8,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/container-engine.sh"
 
+# Backwards-compatible env var fallbacks: accept CONTAINER_* or DOCKER_*
+CONTAINER_BUILD_CACHE_DIR="${CONTAINER_BUILD_CACHE_DIR:-${DOCKER_BUILD_CACHE_DIR:-.cache/buildkit}}"
+CONTAINER_BUILDER="${CONTAINER_BUILDER:-${DOCKER_BUILDER:-}}"
+CONTAINER_PLATFORM="${CONTAINER_PLATFORM:-${DOCKER_PLATFORM:-}}"
+CONTAINER_OUTPUT="${CONTAINER_OUTPUT:-${DOCKER_OUTPUT:-}}"
+CONTAINER_PUSH="${CONTAINER_PUSH:-${DOCKER_PUSH:-}}"
+
 normalize_arch() {
 	case "$1" in
 		x86_64|amd64) echo "amd64" ;;
@@ -17,8 +24,8 @@ normalize_arch() {
 }
 
 prebuilt_arches() {
-	if [[ -n "${DOCKER_PLATFORM:-}" ]]; then
-		local raw_platforms=${DOCKER_PLATFORM//[[:space:]]/}
+	if [[ -n "${CONTAINER_PLATFORM:-}" ]]; then
+		local raw_platforms=${CONTAINER_PLATFORM//[[:space:]]/}
 		local platform
 		IFS=',' read -r -a platforms <<< "${raw_platforms}"
 		for platform in "${platforms[@]}"; do
@@ -26,7 +33,7 @@ prebuilt_arches() {
 				linux/amd64) echo "amd64" ;;
 				linux/arm64) echo "arm64" ;;
 				*)
-					echo "Error: unsupported DOCKER_PLATFORM '${platform}'" >&2
+					echo "Error: unsupported CONTAINER_PLATFORM '${platform}'" >&2
 					echo "Supported platforms: linux/amd64, linux/arm64" >&2
 					exit 1
 					;;
@@ -43,7 +50,7 @@ required_prebuilt_binaries() {
 		gateway)
 			echo "openshell-gateway"
 			;;
-		supervisor|supervisor-sideload|supervisor-output)
+		supervisor|supervisor-output)
 			echo "openshell-sandbox"
 			;;
 	esac
@@ -61,7 +68,7 @@ missing_prebuilt_paths() {
 
 	for arch in "${arches[@]}"; do
 		for binary in "${binaries[@]}"; do
-			path="deploy/docker/.build/prebuilt-binaries/${arch}/${binary}"
+			path="deploy/container/.build/prebuilt-binaries/${arch}/${binary}"
 			if [[ ! -f "${path}" ]]; then
 				echo "${path}"
 			fi
@@ -75,7 +82,7 @@ ensure_prebuilt_binaries() {
 	local arch
 
 	if [[ -z "${CI:-}" && "${PREBUILT_AUTO_STAGE:-1}" != "0" ]]; then
-		echo "Staging prebuilt Rust binaries for Docker target '${target}'..."
+		echo "Staging prebuilt Rust binaries for container target '${target}'..."
 		local arches=()
 		while IFS= read -r _a; do arches+=("$_a"); done < <(prebuilt_arches)
 		for arch in "${arches[@]}"; do
@@ -85,39 +92,39 @@ ensure_prebuilt_binaries() {
 
 	missing="$(missing_prebuilt_paths "${target}")"
 	if [[ -n "${missing}" ]]; then
-		echo "Error: missing prebuilt Rust binaries required by Docker target '${target}':" >&2
+		echo "Error: missing prebuilt Rust binaries required by container target '${target}':" >&2
 		printf '  %s\n' ${missing} >&2
-		echo "Stage binaries at deploy/docker/.build/prebuilt-binaries/<arch>/ before building." >&2
+		echo "Stage binaries at deploy/container/.build/prebuilt-binaries/<arch>/ before building." >&2
 		exit 1
 	fi
 }
 
-TARGET=${1:?"Usage: docker-build-image.sh <gateway|supervisor|supervisor-output> [extra-args...]"}
+TARGET=${1:?"Usage: container-build-image.sh <gateway|supervisor|supervisor-output> [extra-args...]"}
 shift
 
 IS_FINAL_IMAGE=0
 IMAGE_NAME=""
-DOCKER_TARGET=""
-DOCKERFILE=""
+CONTAINER_TARGET=""
+CONTAINERFILE=""
 case "${TARGET}" in
   gateway)
     IS_FINAL_IMAGE=1
     IMAGE_NAME="openshell/gateway"
-    DOCKER_TARGET="gateway"
-    DOCKERFILE="deploy/docker/Dockerfile.gateway"
+    CONTAINER_TARGET="gateway"
+    CONTAINERFILE=$(ce_resolve_containerfile deploy/container gateway)
     ;;
   supervisor)
     IS_FINAL_IMAGE=1
     IMAGE_NAME="openshell/supervisor"
-    DOCKER_TARGET="supervisor"
-    DOCKERFILE="deploy/docker/Dockerfile.supervisor"
+    CONTAINER_TARGET="supervisor"
+    CONTAINERFILE=$(ce_resolve_containerfile deploy/container supervisor)
     ;;
   supervisor-output)
     # Backward-compat alias: same as "supervisor".
     IS_FINAL_IMAGE=1
     IMAGE_NAME="openshell/supervisor"
-    DOCKER_TARGET="supervisor"
-    DOCKERFILE="deploy/docker/Dockerfile.supervisor"
+    CONTAINER_TARGET="supervisor"
+    CONTAINERFILE=$(ce_resolve_containerfile deploy/container supervisor)
     ;;
   *)
     echo "Error: unsupported target '${TARGET}'" >&2
@@ -125,25 +132,19 @@ case "${TARGET}" in
     ;;
 esac
 
-if [[ ! -f "${DOCKERFILE}" ]]; then
-	echo "Error: Dockerfile not found: ${DOCKERFILE}" >&2
-	exit 1
-fi
-
 if [[ -n "${IMAGE_REGISTRY:-}" && "${IS_FINAL_IMAGE}" == "1" ]]; then
 	IMAGE_NAME="${IMAGE_REGISTRY}/${IMAGE_NAME#openshell/}"
 fi
 
 IMAGE_TAG=${IMAGE_TAG:-dev}
-DOCKER_BUILD_CACHE_DIR=${DOCKER_BUILD_CACHE_DIR:-.cache/buildkit}
-CACHE_PATH="${DOCKER_BUILD_CACHE_DIR}/images"
+CACHE_PATH="${CONTAINER_BUILD_CACHE_DIR}/images"
 mkdir -p "${CACHE_PATH}"
 
 BUILDER_ARGS=()
 if ce_is_docker; then
-	if [[ -n "${DOCKER_BUILDER:-}" ]]; then
-		BUILDER_ARGS=(--builder "${DOCKER_BUILDER}")
-	elif [[ -z "${DOCKER_PLATFORM:-}" && -z "${CI:-}" ]]; then
+	if [[ -n "${CONTAINER_BUILDER}" ]]; then
+		BUILDER_ARGS=(--builder "${CONTAINER_BUILDER}")
+	elif [[ -z "${CONTAINER_PLATFORM}" && -z "${CI:-}" ]]; then
 		_ctx=$(ce_context_name)
 		BUILDER_ARGS=(--builder "${_ctx}")
 	fi
@@ -169,27 +170,27 @@ if [[ "${IS_FINAL_IMAGE}" == "1" ]]; then
 fi
 
 OUTPUT_ARGS=()
-if [[ -n "${DOCKER_OUTPUT:-}" ]]; then
-	OUTPUT_ARGS=(--output "${DOCKER_OUTPUT}")
+if [[ -n "${CONTAINER_OUTPUT}" ]]; then
+	OUTPUT_ARGS=(--output "${CONTAINER_OUTPUT}")
 elif [[ "${IS_FINAL_IMAGE}" == "1" ]]; then
-	if [[ "${DOCKER_PUSH:-}" == "1" ]]; then
+	if [[ "${CONTAINER_PUSH}" == "1" ]]; then
 		OUTPUT_ARGS=(--push)
-	elif [[ "${DOCKER_PLATFORM:-}" == *","* ]]; then
+	elif [[ "${CONTAINER_PLATFORM}" == *","* ]]; then
 		OUTPUT_ARGS=(--push)
 	else
 		OUTPUT_ARGS=(--load)
 	fi
 else
-	echo "Error: DOCKER_OUTPUT must be set when building target '${TARGET}'" >&2
+	echo "Error: CONTAINER_OUTPUT must be set when building target '${TARGET}'" >&2
 	exit 1
 fi
 
 ce_build \
 	${BUILDER_ARGS[@]+"${BUILDER_ARGS[@]}"} \
-	${DOCKER_PLATFORM:+--platform ${DOCKER_PLATFORM}} \
+	${CONTAINER_PLATFORM:+--platform ${CONTAINER_PLATFORM}} \
 	${CACHE_ARGS[@]+"${CACHE_ARGS[@]}"} \
-	-f "${DOCKERFILE}" \
-	--target "${DOCKER_TARGET}" \
+	-f "${CONTAINERFILE}" \
+	--target "${CONTAINER_TARGET}" \
 	${TAG_ARGS[@]+"${TAG_ARGS[@]}"} \
 	--provenance=false \
 	"$@" \

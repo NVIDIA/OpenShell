@@ -147,7 +147,7 @@ build_component_for_arch() {
 
   resolve_component "$component"
   target="$(target_triple "$arch" "$target_libc")"
-  stage="${ROOT}/deploy/docker/.build/prebuilt-binaries/${arch}"
+  stage="${ROOT}/deploy/container/.build/prebuilt-binaries/${arch}"
   features="${EXTRA_CARGO_FEATURES:-openshell-core/dev-settings}"
   if [[ "$component" == "gateway" && " ${features} " != *" bundled-z3 "* ]]; then
     features="${features} bundled-z3"
@@ -172,7 +172,7 @@ build_component_for_arch() {
     else
       echo "Error: cannot build ${binary} for linux/${arch} on ${current_host_os}/${current_host_arch}." >&2
       echo "Install cargo-zigbuild + zig, build on a matching Linux host, or provide prebuilt binaries in:" >&2
-      echo "  deploy/docker/.build/prebuilt-binaries/${arch}/" >&2
+      echo "  deploy/container/.build/prebuilt-binaries/${arch}/" >&2
       exit 1
     fi
   fi
