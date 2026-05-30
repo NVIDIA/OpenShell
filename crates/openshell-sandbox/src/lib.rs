@@ -92,75 +92,12 @@ pub(crate) fn ocsf_ctx() -> &'static SandboxContext {
 /// to gate the agent-controlled mutation surface. Exposed `pub(crate)` so
 /// unit tests in sibling modules can flip the flag through a serialized
 /// guard (see `policy_local::tests::ProposalsFlagGuard`).
-pub(crate) static AGENT_PROPOSALS_ENABLED: OnceLock<Arc<std::sync::atomic::AtomicBool>> =
-    OnceLock::new();
+pub(crate) use openshell_supervisor_process::proposals::{
+    AGENT_PROPOSALS_ENABLED, agent_proposals_enabled,
+};
 
-/// Read the current value of the agent proposals feature flag.
-///
-/// Returns `false` if `run_sandbox()` has not initialized the flag (e.g.
-/// during unit tests), matching the documented default for the setting.
-pub(crate) fn agent_proposals_enabled() -> bool {
-    AGENT_PROPOSALS_ENABLED
-        .get()
-        .is_some_and(|flag| flag.load(Ordering::Relaxed))
-}
-
-/// Test-only helpers shared across sibling test modules.
 #[cfg(test)]
-pub(crate) mod test_helpers {
-    #![allow(
-        clippy::redundant_pub_crate,
-        reason = "intentional crate-private module"
-    )]
-    use std::sync::Arc;
-    use std::sync::LazyLock;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use tokio::sync::MutexGuard;
-
-    static PROPOSALS_FLAG_LOCK: LazyLock<tokio::sync::Mutex<()>> =
-        LazyLock::new(|| tokio::sync::Mutex::new(()));
-
-    /// Guard for tests that toggle the process-wide
-    /// `AGENT_PROPOSALS_ENABLED` flag. Acquires a process-wide async mutex,
-    /// swaps in the requested value, and restores the previous value on drop.
-    /// Hold the guard for the duration of any code that reads
-    /// `agent_proposals_enabled()`.
-    pub(crate) struct ProposalsFlagGuard {
-        prev: bool,
-        flag: Arc<AtomicBool>,
-        _lock: MutexGuard<'static, ()>,
-    }
-
-    impl ProposalsFlagGuard {
-        pub(crate) async fn set(enabled: bool) -> Self {
-            let lock = PROPOSALS_FLAG_LOCK.lock().await;
-            Self::with_lock(enabled, lock)
-        }
-
-        pub(crate) fn set_blocking(enabled: bool) -> Self {
-            let lock = PROPOSALS_FLAG_LOCK.blocking_lock();
-            Self::with_lock(enabled, lock)
-        }
-
-        fn with_lock(enabled: bool, lock: MutexGuard<'static, ()>) -> Self {
-            let flag = super::AGENT_PROPOSALS_ENABLED
-                .get_or_init(|| Arc::new(AtomicBool::new(false)))
-                .clone();
-            let prev = flag.swap(enabled, Ordering::Relaxed);
-            Self {
-                prev,
-                flag,
-                _lock: lock,
-            }
-        }
-    }
-
-    impl Drop for ProposalsFlagGuard {
-        fn drop(&mut self) {
-            self.flag.store(self.prev, Ordering::Relaxed);
-        }
-    }
-}
+pub(crate) use openshell_supervisor_process::proposals::test_helpers;
 
 use openshell_supervisor_networking::identity::BinaryIdentityCache;
 use crate::l7::tls::{
