@@ -8,7 +8,6 @@
 pub mod bypass_monitor;
 pub mod debug_rpc;
 pub mod denial_aggregator;
-mod grpc_client;
 pub mod l7;
 pub mod log_push;
 pub mod opa;
@@ -920,7 +919,7 @@ pub async fn run_sandbox(
     // even if provider env fetch fails (graceful degradation).
     let (provider_env_revision, provider_env, provider_credential_expires_at_ms) =
         if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
-            match grpc_client::fetch_provider_environment(endpoint, id).await {
+            match openshell_core::grpc_client::fetch_provider_environment(endpoint, id).await {
                 Ok(result) => {
                     ocsf_emit!(
                         ConfigStateChangeBuilder::new(ocsf_ctx())
@@ -1001,7 +1000,8 @@ pub async fn run_sandbox(
     // at startup rather than waiting for the poll loop's first tick. In
     // offline/file-mode there is no gateway, so the flag stays false.
     if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint)
-        && let Ok(client) = grpc_client::CachedOpenShellClient::connect(endpoint).await
+        && let Ok(client) =
+            openshell_core::grpc_client::CachedOpenShellClient::connect(endpoint).await
         && let Ok(result) = client.poll_settings(id).await
     {
         let initial = extract_bool_setting(
@@ -1156,7 +1156,7 @@ async fn build_inference_context(
 
             // Cluster mode: fetch bundle from gateway
             info!(endpoint = %endpoint, "Fetching inference route bundle from gateway");
-            match grpc_client::fetch_inference_bundle(endpoint).await {
+            match openshell_core::grpc_client::fetch_inference_bundle(endpoint).await {
                 Ok(bundle) => {
                     initial_revision = Some(bundle.revision.clone());
                     ocsf_emit!(
@@ -1357,7 +1357,7 @@ pub(crate) fn spawn_route_refresh(
         loop {
             tick.tick().await;
 
-            match grpc_client::fetch_inference_bundle(&endpoint).await {
+            match openshell_core::grpc_client::fetch_inference_bundle(&endpoint).await {
                 Ok(bundle) => {
                     if current_revision.as_deref() == Some(&bundle.revision) {
                         trace!(revision = %bundle.revision, "Inference bundle unchanged");
@@ -2026,8 +2026,10 @@ async fn load_policy(
             endpoint = %endpoint,
             "Fetching sandbox policy via gRPC"
         );
-        let proto_policy =
-            grpc_retry("Policy fetch", || grpc_client::fetch_policy(endpoint, id)).await?;
+        let proto_policy = grpc_retry("Policy fetch", || {
+            openshell_core::grpc_client::fetch_policy(endpoint, id)
+        })
+        .await?;
 
         let mut proto_policy = if let Some(p) = proto_policy {
             p
@@ -2057,7 +2059,12 @@ async fn load_policy(
             // Sync and re-fetch over a single connection to avoid extra
             // TLS handshakes.
             grpc_retry("Policy discovery sync", || {
-                grpc_client::discover_and_sync_policy(endpoint, id, sandbox, &discovered)
+                openshell_core::grpc_client::discover_and_sync_policy(
+                    endpoint,
+                    id,
+                    sandbox,
+                    &discovered,
+                )
             })
             .await?
         };
@@ -2068,7 +2075,9 @@ async fn load_policy(
         let enriched = enrich_proto_baseline_paths(&mut proto_policy);
         if enriched
             && let Some(sandbox_name) = sandbox.as_deref()
-            && let Err(e) = grpc_client::sync_policy(endpoint, sandbox_name, &proto_policy).await
+            && let Err(e) =
+                openshell_core::grpc_client::sync_policy(endpoint, sandbox_name, &proto_policy)
+                    .await
         {
             warn!(
                 error = %e,
@@ -2353,7 +2362,7 @@ async fn flush_proposals_to_gateway(
     sandbox_name: &str,
     summaries: Vec<denial_aggregator::FlushableDenialSummary>,
 ) -> Result<()> {
-    use crate::grpc_client::CachedOpenShellClient;
+    use openshell_core::grpc_client::CachedOpenShellClient;
     use openshell_core::proto::{DenialSummary, L7RequestSample};
 
     let client = CachedOpenShellClient::connect(endpoint).await?;
@@ -2427,7 +2436,7 @@ struct PolicyPollLoopContext {
 }
 
 async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
-    use crate::grpc_client::CachedOpenShellClient;
+    use openshell_core::grpc_client::CachedOpenShellClient;
     use openshell_core::proto::PolicySource;
     use std::sync::atomic::Ordering;
 
@@ -2493,7 +2502,12 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
             .build());
 
         if provider_env_changed {
-            match grpc_client::fetch_provider_environment(&ctx.endpoint, &ctx.sandbox_id).await {
+            match openshell_core::grpc_client::fetch_provider_environment(
+                &ctx.endpoint,
+                &ctx.sandbox_id,
+            )
+            .await
+            {
                 Ok(env_result) => {
                     let env_count = ctx.provider_credentials.install_environment(
                         env_result.provider_env_revision,

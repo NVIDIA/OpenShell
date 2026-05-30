@@ -30,7 +30,7 @@ use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tracing::{debug, warn};
 
-use crate::grpc_client;
+use openshell_core::grpc_client;
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);

@@ -7,7 +7,7 @@
 //! channel to a background task. The task batches lines and streams them to
 //! the server using the `PushSandboxLogs` client-streaming RPC.
 
-use crate::grpc_client::CachedOpenShellClient;
+use openshell_core::grpc_client::CachedOpenShellClient;
 use openshell_core::proto::{PushSandboxLogsRequest, SandboxLogLine};
 use tokio::sync::mpsc;
 use tracing::{Event, Subscriber};

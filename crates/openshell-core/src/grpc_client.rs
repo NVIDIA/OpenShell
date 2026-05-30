@@ -22,15 +22,15 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use miette::{IntoDiagnostic, Result, WrapErr};
-use openshell_core::proto::{
+use crate::proto::{
     DenialSummary, GetDraftPolicyRequest, GetInferenceBundleRequest, GetInferenceBundleResponse,
     GetSandboxConfigRequest, GetSandboxProviderEnvironmentRequest, IssueSandboxTokenRequest,
     PolicyChunk, PolicySource, PolicyStatus, RefreshSandboxTokenRequest, ReportPolicyStatusRequest,
     SandboxPolicy as ProtoSandboxPolicy, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse,
     UpdateConfigRequest, inference_client::InferenceClient, open_shell_client::OpenShellClient,
 };
-use openshell_core::sandbox_env;
+use crate::sandbox_env;
+use miette::{IntoDiagnostic, Result, WrapErr};
 use tonic::Status;
 use tonic::metadata::AsciiMetadataValue;
 use tonic::service::interceptor::InterceptedService;
@@ -674,7 +674,7 @@ pub struct SettingsPollResult {
     pub config_revision: u64,
     pub policy_source: PolicySource,
     /// Effective settings keyed by name.
-    pub settings: HashMap<String, openshell_core::proto::EffectiveSetting>,
+    pub settings: HashMap<String, crate::proto::EffectiveSetting>,
     /// When `policy_source` is `Global`, the version of the global policy revision.
     pub global_policy_version: u32,
     pub provider_env_revision: u64,

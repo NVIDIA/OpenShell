@@ -484,7 +484,7 @@ async fn submit_proposal(ctx: &PolicyLocalContext, body: &[u8]) -> (u16, serde_j
         Err(error) => return (400, error_payload("invalid_proposal", error)),
     };
 
-    let client = match crate::grpc_client::CachedOpenShellClient::connect(endpoint).await {
+    let client = match openshell_core::grpc_client::CachedOpenShellClient::connect(endpoint).await {
         Ok(client) => client,
         Err(error) => {
             return (
@@ -877,7 +877,7 @@ fn parse_timeout_query(query: &str) -> u64 {
 /// per request and reused for every `fetch_chunk` call in a wait loop so a
 /// 60-second wait does one TLS handshake, not sixty.
 struct LookupSession<'a> {
-    client: crate::grpc_client::CachedOpenShellClient,
+    client: openshell_core::grpc_client::CachedOpenShellClient,
     sandbox_name: &'a str,
 }
 
@@ -909,7 +909,7 @@ async fn open_lookup_session(
                 ),
             )
         })?;
-    let client = crate::grpc_client::CachedOpenShellClient::connect(endpoint)
+    let client = openshell_core::grpc_client::CachedOpenShellClient::connect(endpoint)
         .await
         .map_err(|e| (502, error_payload("gateway_connect_failed", e.to_string())))?;
     Ok(LookupSession {

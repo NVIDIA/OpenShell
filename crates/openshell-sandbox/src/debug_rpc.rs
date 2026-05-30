@@ -24,7 +24,7 @@ use openshell_core::proto::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::grpc_client::{AuthedChannel, connect_channel_pub};
+use openshell_core::grpc_client::{AuthedChannel, connect_channel_pub};
 
 /// Entry point for the `debug-rpc` subcommand. Returns the process exit
 /// code; `main` propagates it.
