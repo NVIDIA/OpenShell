@@ -8,7 +8,6 @@
 pub mod bypass_monitor;
 pub mod debug_rpc;
 pub mod l7;
-pub mod log_push;
 pub mod opa;
 mod policy_local;
 mod process;

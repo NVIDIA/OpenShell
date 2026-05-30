@@ -9,5 +9,6 @@
 //! `openshell-sandbox`.
 
 pub mod child_env;
+pub mod log_push;
 pub mod proposals;
 pub mod skills;

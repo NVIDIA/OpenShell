@@ -3786,8 +3786,13 @@ name = "openshell-supervisor-process"
 version = "0.0.0"
 dependencies = [
  "miette",
+ "openshell-core",
+ "openshell-ocsf",
  "tempfile",
  "tokio",
+ "tokio-stream",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
