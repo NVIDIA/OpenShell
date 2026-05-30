@@ -25,10 +25,8 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::LazyLock;
 #[cfg(any(target_os = "linux", test))]
 use std::sync::Mutex;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::time::timeout;
@@ -59,29 +57,12 @@ use openshell_ocsf::{
 // policy changes, or observable sandbox behavior worth structuring.
 // ---------------------------------------------------------------------------
 
-/// Process-wide OCSF sandbox context. Initialized once during `run_sandbox()`
-/// startup and accessible from any module in the crate via [`ocsf_ctx()`].
-static OCSF_CTX: OnceLock<SandboxContext> = OnceLock::new();
-
-/// Fallback context used when `OCSF_CTX` has not been initialized (e.g. in
-/// unit tests that exercise individual functions without calling `run_sandbox`).
-static OCSF_CTX_FALLBACK: LazyLock<SandboxContext> = LazyLock::new(|| SandboxContext {
-    sandbox_id: String::new(),
-    sandbox_name: String::new(),
-    container_image: String::new(),
-    hostname: "test".to_string(),
-    product_version: openshell_core::VERSION.to_string(),
-    proxy_ip: std::net::IpAddr::from([127, 0, 0, 1]),
-    proxy_port: 3128,
-});
-
-/// Return a reference to the process-wide [`SandboxContext`].
+/// Re-export the process-wide OCSF sandbox context getter.
 ///
-/// Falls back to a default context if `run_sandbox()` has not yet been called
-/// (e.g. during unit tests).
-pub(crate) fn ocsf_ctx() -> &'static SandboxContext {
-    OCSF_CTX.get().unwrap_or(&OCSF_CTX_FALLBACK)
-}
+/// The singleton lives in `openshell-ocsf` so both supervisor leaves can
+/// reach it without depending on `openshell-sandbox`. Initialised once during
+/// `run_sandbox()` startup via `openshell_ocsf::ctx::set_ctx`.
+pub(crate) use openshell_ocsf::ctx::ctx as ocsf_ctx;
 
 /// Process-wide flag for the agent-driven policy proposal surface.
 /// Set once during `run_sandbox()` startup and updated by the settings poll
@@ -899,18 +880,15 @@ pub async fn run_sandbox(
             |s| s.trim().to_string(),
         );
 
-        if OCSF_CTX
-            .set(SandboxContext {
-                sandbox_id: sandbox_id.clone().unwrap_or_default(),
-                sandbox_name: sandbox.as_deref().unwrap_or_default().to_string(),
-                container_image: std::env::var("OPENSHELL_CONTAINER_IMAGE").unwrap_or_default(),
-                hostname,
-                product_version: openshell_core::VERSION.to_string(),
-                proxy_ip: std::net::IpAddr::from([127, 0, 0, 1]),
-                proxy_port: 3128,
-            })
-            .is_err()
-        {
+        if !openshell_ocsf::ctx::set_ctx(SandboxContext {
+            sandbox_id: sandbox_id.clone().unwrap_or_default(),
+            sandbox_name: sandbox.as_deref().unwrap_or_default().to_string(),
+            container_image: std::env::var("OPENSHELL_CONTAINER_IMAGE").unwrap_or_default(),
+            hostname,
+            product_version: openshell_core::VERSION.to_string(),
+            proxy_ip: std::net::IpAddr::from([127, 0, 0, 1]),
+            proxy_port: 3128,
+        }) {
             debug!("OCSF context already initialized, keeping existing");
         }
     }
@@ -2780,6 +2758,7 @@ mod tests {
     use openshell_core::policy::{FilesystemPolicy, LandlockPolicy, ProcessPolicy};
     #[cfg(unix)]
     use std::os::unix::fs::{MetadataExt, symlink};
+    use std::sync::LazyLock;
     use temp_env::with_vars;
 
     static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
