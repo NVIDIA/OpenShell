@@ -92,9 +92,10 @@ an empty incoming list preserves the existing list while auto-pruning entries
 whose credential was deleted in the same update; a non-empty list replaces the
 stored list verbatim; setting `UpdateProviderRequest.clear_passthrough_credentials = true`
 revokes passthrough for every credential by replacing the list with the empty
-list (mutually exclusive with a non-empty incoming list). When two providers
-declare the same credential key, the first provider's value wins and the
-passthrough flag follows the winning value.
+list (mutually exclusive with a non-empty incoming list). Credential keys must
+be unique across the providers attached to a single sandbox: env resolution
+rejects the request with `FailedPrecondition` if two providers declare the same
+key, so the operator must rename or drop one entry before the sandbox can start.
 
 Passthrough drops the "agent never sees the real secret" invariant for the
 listed keys: the real value is at rest in `/proc/<agent-pid>/environ` and any

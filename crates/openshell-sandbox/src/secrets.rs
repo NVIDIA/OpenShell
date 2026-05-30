@@ -119,7 +119,7 @@ impl SecretResolver {
     /// Test helper: build a `SecretResolver` from the provider env map with no
     /// passthrough keys and revision 0. Production callers must use
     /// [`Self::from_provider_env_for_revision`] so passthrough and rotation
-    /// metadata are honoured.
+    /// metadata are applied.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn from_provider_env(
         provider_env: HashMap<String, String>,

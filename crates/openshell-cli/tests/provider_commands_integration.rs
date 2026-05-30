@@ -460,10 +460,17 @@ impl OpenShell for TestOpenShell {
         &self,
         request: tonic::Request<UpdateProviderRequest>,
     ) -> Result<Response<ProviderResponse>, Status> {
-        let provider = request
-            .into_inner()
+        let inner = request.into_inner();
+        let clear_passthrough_credentials = inner.clear_passthrough_credentials;
+        let provider = inner
             .provider
             .ok_or_else(|| Status::invalid_argument("provider is required"))?;
+        if clear_passthrough_credentials && !provider.passthrough_credentials.is_empty() {
+            return Err(Status::invalid_argument(
+                "clear_passthrough_credentials is mutually exclusive with a non-empty \
+                 provider.passthrough_credentials list",
+            ));
+        }
 
         let mut providers = self.state.providers.lock().await;
         let existing = providers
@@ -516,7 +523,9 @@ impl OpenShell for TestOpenShell {
                 existing.credential_expires_at_ms,
                 provider.credential_expires_at_ms,
             ),
-            passthrough_credentials: if provider.passthrough_credentials.is_empty() {
+            passthrough_credentials: if clear_passthrough_credentials {
+                Vec::new()
+            } else if provider.passthrough_credentials.is_empty() {
                 existing.passthrough_credentials
             } else {
                 provider.passthrough_credentials
@@ -1772,5 +1781,178 @@ async fn provider_create_supports_nvidia_type_with_nvidia_api_key() {
     assert_eq!(
         provider.credentials.get("NVIDIA_API_KEY"),
         Some(&"nvapi-live-test".to_string())
+    );
+}
+
+#[tokio::test]
+async fn provider_update_clear_passthrough_revokes_all_passthrough_entries() {
+    let ts = run_server().await;
+
+    // Seed the provider with two passthrough entries so the test exercises the
+    // server-side "replace with empty list" semantics rather than the no-op
+    // "preserve when incoming is empty" branch.
+    run::provider_create(
+        &ts.endpoint,
+        "my-claude",
+        "claude",
+        false,
+        &["API_KEY=abc".to_string(), "SECONDARY=zzz".to_string()],
+        &[],
+        &["API_KEY".to_string(), "SECONDARY".to_string()],
+        &ts.tls,
+    )
+    .await
+    .expect("provider create");
+
+    let mut client = openshell_cli::tls::grpc_client(&ts.endpoint, &ts.tls)
+        .await
+        .expect("grpc client should connect");
+    let seeded = client
+        .get_provider(GetProviderRequest {
+            name: "my-claude".to_string(),
+        })
+        .await
+        .expect("get provider")
+        .into_inner()
+        .provider
+        .expect("provider must exist");
+    assert_eq!(
+        seeded.passthrough_credentials,
+        vec!["API_KEY".to_string(), "SECONDARY".to_string()],
+        "seeded provider must carry both passthrough entries before revoke"
+    );
+
+    // `--clear-passthrough` without `--passthrough` flips
+    // `UpdateProviderRequest.clear_passthrough_credentials = true` while
+    // leaving the request's passthrough list empty. The fake server enforces
+    // the same "replace with empty list" semantics as production, so the
+    // post-update provider must carry no passthrough entries.
+    run::provider_update(
+        &ts.endpoint,
+        "my-claude",
+        false,
+        &[],
+        &[],
+        &[],
+        true,
+        &[],
+        &ts.tls,
+    )
+    .await
+    .expect("provider update --clear-passthrough should succeed");
+
+    let cleared = client
+        .get_provider(GetProviderRequest {
+            name: "my-claude".to_string(),
+        })
+        .await
+        .expect("get provider")
+        .into_inner()
+        .provider
+        .expect("provider must exist");
+    assert!(
+        cleared.passthrough_credentials.is_empty(),
+        "passthrough_credentials must be empty after --clear-passthrough, got {:?}",
+        cleared.passthrough_credentials,
+    );
+    // The credentials themselves must be preserved — only the passthrough
+    // allow-list is cleared. This pins the "clear the flag, keep the secret"
+    // contract that the placeholder rewrite relies on.
+    assert!(cleared.credentials.contains_key("API_KEY"));
+    assert!(cleared.credentials.contains_key("SECONDARY"));
+}
+
+#[tokio::test]
+async fn provider_update_clear_passthrough_with_non_empty_list_is_rejected() {
+    let ts = run_server().await;
+
+    run::provider_create(
+        &ts.endpoint,
+        "my-claude",
+        "claude",
+        false,
+        &["API_KEY=abc".to_string()],
+        &[],
+        &["API_KEY".to_string()],
+        &ts.tls,
+    )
+    .await
+    .expect("provider create");
+
+    // Mirrors the server-side `FailedPrecondition` from
+    // `UpdateProvider`: `clear_passthrough_credentials` cannot coexist with a
+    // non-empty incoming list because the server cannot apply "clear and then
+    // set" in a single round-trip.
+    let err = run::provider_update(
+        &ts.endpoint,
+        "my-claude",
+        false,
+        &[],
+        &[],
+        &["API_KEY".to_string()],
+        true,
+        &[],
+        &ts.tls,
+    )
+    .await
+    .expect_err("provider update with both --passthrough and --clear-passthrough should fail");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("mutually exclusive"),
+        "expected mutual-exclusion error, got: {message}"
+    );
+}
+
+#[tokio::test]
+async fn provider_update_with_empty_passthrough_and_no_clear_preserves_existing_list() {
+    let ts = run_server().await;
+
+    run::provider_create(
+        &ts.endpoint,
+        "my-claude",
+        "claude",
+        false,
+        &["API_KEY=abc".to_string()],
+        &[],
+        &["API_KEY".to_string()],
+        &ts.tls,
+    )
+    .await
+    .expect("provider create");
+
+    // An update that touches only `--config` (no `--passthrough`, no
+    // `--clear-passthrough`) must leave the stored passthrough list intact.
+    // This is the no-op branch that the explicit clear flag was added to
+    // distinguish from a deliberate revoke.
+    run::provider_update(
+        &ts.endpoint,
+        "my-claude",
+        false,
+        &[],
+        &["profile=prod".to_string()],
+        &[],
+        false,
+        &[],
+        &ts.tls,
+    )
+    .await
+    .expect("provider update should succeed");
+
+    let mut client = openshell_cli::tls::grpc_client(&ts.endpoint, &ts.tls)
+        .await
+        .expect("grpc client should connect");
+    let provider = client
+        .get_provider(GetProviderRequest {
+            name: "my-claude".to_string(),
+        })
+        .await
+        .expect("get provider")
+        .into_inner()
+        .provider
+        .expect("provider must exist");
+    assert_eq!(
+        provider.passthrough_credentials,
+        vec!["API_KEY".to_string()],
+        "empty incoming passthrough list with no clear flag must preserve the stored list"
     );
 }

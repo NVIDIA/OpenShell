@@ -48,11 +48,6 @@ pub(super) struct ProviderEnvironment {
 
 impl ProviderEnvironment {
     #[cfg(test)]
-    fn is_empty(&self) -> bool {
-        self.environment.is_empty()
-    }
-
-    #[cfg(test)]
     fn get(&self, key: &str) -> Option<&String> {
         self.environment.get(key)
     }

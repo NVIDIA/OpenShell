@@ -540,7 +540,9 @@ pub(super) async fn compute_provider_env_revision(
     provider_names: &[String],
 ) -> Result<u64, Status> {
     let mut hasher = Sha256::new();
-    hasher.update(b"openshell-provider-env-revision-v1");
+    // Bump this tag when the hashed field set changes so cached revisions are
+    // recomputed automatically on rollout.
+    hasher.update(b"openshell-provider-env-revision-v2");
 
     for provider_name in provider_names {
         hasher.update(provider_name.as_bytes());
@@ -552,23 +554,54 @@ pub(super) async fn compute_provider_env_revision(
             })? {
             Some(record) => {
                 hasher.update(record.id.as_bytes());
-                hasher.update(record.updated_at_ms.to_le_bytes());
+                // `resource_version` is the persistence layer's
+                // compare-and-swap counter, incremented on every write. It is
+                // monotonic per record and immune to same-millisecond
+                // collisions that `updated_at_ms` would suffer when two
+                // writes (e.g. a passthrough revoke followed by a credential
+                // rotate) land inside the same Tokio tick.
+                hasher.update(record.resource_version.to_le_bytes());
 
                 let provider = Provider::decode(record.payload.as_slice()).map_err(|e| {
                     Status::internal(format!("decode provider '{provider_name}' failed: {e}"))
                 })?;
                 hasher.update(provider.r#type.as_bytes());
 
-                let mut credential_keys: Vec<_> = provider.credentials.keys().collect();
-                credential_keys.sort();
-                for key in credential_keys {
+                // Hash the (key, value) pairs sorted by key so a credential
+                // rotation that does not change the key set still flips the
+                // revision. Null delimiters keep "AB"+"C" distinct from
+                // "A"+"BC". This also covers the case where the persistence
+                // layer's unconditional `put` does not bump
+                // `resource_version` — every credential value change is still
+                // reflected in the digest. SHA-256 is one-way, so the value
+                // material does not leak through the truncated u64 surfaced
+                // to clients.
+                let mut credential_pairs: Vec<(&String, &String)> =
+                    provider.credentials.iter().collect();
+                credential_pairs.sort_by(|a, b| a.0.cmp(b.0));
+                for (key, value) in credential_pairs {
                     hasher.update(key.as_bytes());
+                    hasher.update(b"\0");
+                    hasher.update(value.as_bytes());
+                    hasher.update(b"\0");
                 }
                 let mut expiry_keys: Vec<_> = provider.credential_expires_at_ms.keys().collect();
                 expiry_keys.sort();
                 for key in expiry_keys {
                     hasher.update(key.as_bytes());
+                    hasher.update(b"\0");
                     hasher.update(provider.credential_expires_at_ms[key].to_le_bytes());
+                }
+                // Hash the sorted passthrough allow-list explicitly so a
+                // toggle between real-secret and placeholder env values
+                // surfaces in the revision even when `resource_version`
+                // changes are masked by an external caller copying records.
+                let mut passthrough_keys: Vec<&String> =
+                    provider.passthrough_credentials.iter().collect();
+                passthrough_keys.sort();
+                for key in passthrough_keys {
+                    hasher.update(key.as_bytes());
+                    hasher.update(b"\0");
                 }
             }
             None => {

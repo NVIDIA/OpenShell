@@ -5025,6 +5025,12 @@ fn print_provider_type_row(profile: &ProviderProfile) {
     );
 }
 
+// The CLI surface for `provider update` already shipped with eight discrete
+// flags; the new `clear_passthrough` boolean pushes us over the seven-argument
+// clippy limit. Refactoring into a struct here would force every call site
+// (CLI dispatch, every integration test) to rebuild a builder, with no real
+// readability win at the call sites — they already pass the flags positionally.
+#[allow(clippy::too_many_arguments)]
 pub async fn provider_update(
     server: &str,
     name: &str,
