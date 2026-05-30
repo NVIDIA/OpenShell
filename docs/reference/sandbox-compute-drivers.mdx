@@ -46,7 +46,7 @@ The gateway talks to the Docker daemon to create sandbox containers. Docker is a
 
 For maintainer-level implementation details, refer to the [Docker driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-docker/README.md).
 
-Select Docker with `compute_drivers = ["docker"]` in `[openshell.gateway]`. Configure Docker driver values such as `grpc_endpoint`, `network_name`, `supervisor_bin`, `supervisor_image`, `image_pull_policy`, and `guest_tls_*` in `[openshell.drivers.docker]`.
+Select Docker with `compute_drivers = ["docker"]` in `[openshell.gateway]`. Configure Docker driver values such as `grpc_endpoint`, `network_name`, `supervisor_bin`, `supervisor_image`, `image_pull_policy`, `ssh_socket_path`, `sandbox_pids_limit`, and `guest_tls_*` in `[openshell.drivers.docker]`.
 
 For GPU-backed Docker sandboxes, configure Docker CDI before starting the gateway so OpenShell can detect the daemon capability.
 
@@ -58,7 +58,9 @@ The gateway talks to the Podman API socket. The Podman driver requires Podman 5.
 
 For maintainer-level implementation details, refer to the [Podman driver README](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-podman/README.md) and [Podman networking notes](https://github.com/NVIDIA/OpenShell/blob/main/crates/openshell-driver-podman/NETWORKING.md).
 
-Select Podman with `compute_drivers = ["podman"]` in `[openshell.gateway]`. Configure Podman driver values such as `socket_path`, `network_name`, `supervisor_image`, `stop_timeout_secs`, `image_pull_policy`, `grpc_endpoint`, and `guest_tls_*` in `[openshell.drivers.podman]`.
+Select Podman with `compute_drivers = ["podman"]` in `[openshell.gateway]`. Configure Podman driver values such as `socket_path`, `network_name`, `supervisor_image`, `stop_timeout_secs`, `image_pull_policy`, `grpc_endpoint`, `host_gateway_ip`, `sandbox_ssh_socket_path`, `sandbox_pids_limit`, and `guest_tls_*` in `[openshell.drivers.podman]`.
+
+On macOS with `podman machine`, the driver uses gvproxy's host-loopback IP, `192.168.127.254`, for sandbox host aliases by default. Set `host_gateway_ip` only when your Podman machine uses a non-standard host-loopback address. On Linux, an empty `host_gateway_ip` keeps Podman's `host-gateway` resolver behavior.
 
 ## MicroVM Driver
 
@@ -122,6 +124,14 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 | `image_pull_policy` | `server.sandboxImagePullPolicy` | Set the Kubernetes image pull policy for sandbox pods. |
 | `grpc_endpoint` | `server.grpcEndpoint` | Set the gateway callback endpoint reachable from sandbox pods. |
 | `client_tls_secret_name` | `server.tls.clientTlsSecretName` | Mount sandbox client TLS materials from a Kubernetes secret. |
+| `supervisor_image` | `supervisor.image.repository` / `supervisor.image.tag` | Set the supervisor image that provides the `openshell-sandbox` binary. |
+| `supervisor_image_pull_policy` | `supervisor.image.pullPolicy` | Set the Kubernetes image pull policy for the supervisor image. |
 | `supervisor_sideload_method` | `supervisor.sideloadMethod` | How the supervisor binary is delivered into sandbox pods. Leave empty to auto-detect from cluster version. Set to `image-volume` to mount the supervisor OCI image directly as a volume (requires Kubernetes 1.33+ with the ImageVolume feature gate; GA in 1.36), or `init-container` to copy it through an init container on older clusters. |
+| `workspace_default_storage_size` | `server.workspaceDefaultStorageSize` | Set the default workspace PVC size for new sandboxes. |
+| `sa_token_ttl_secs` | `server.sandboxJwt.k8sSaTokenTtlSecs` | Set the projected ServiceAccount token TTL used for the bootstrap token exchange. |
 
 The Kubernetes driver creates namespaced `agents.x-k8s.io/v1alpha1` `Sandbox` resources from the Kubernetes SIG Apps [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) project. The Agent Sandbox controller turns those resources into sandbox pods and related storage.
+
+<Note>
+`Sandbox.spec.volumeClaimTemplates` is immutable after creation. To change storage configuration, delete the sandbox and create a new one with the updated spec.
+</Note>

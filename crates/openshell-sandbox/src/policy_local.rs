@@ -24,6 +24,10 @@ pub const POLICY_LOCAL_HOST: &str = "policy.local";
 /// renders the same path. Changing the location is a one-line update here.
 pub const SKILL_PATH: &str = "/etc/openshell/skills/policy_advisor.md";
 
+/// Human-readable guidance for agents that are more likely to follow plain
+/// instructions than structured next-step JSON alone.
+pub const AGENT_GUIDANCE: &str = "OpenShell blocked this request with sandbox policy. If the user's task still needs this network action, do not stop here: read /etc/openshell/skills/policy_advisor.md, submit the narrowest policy proposal to http://policy.local/v1/proposals, wait for approval and `policy_reloaded: true`, then retry the original request.";
+
 /// Routes served by the in-sandbox policy advisor API. Held in one place so
 /// the L7 deny `next_steps` array, the route dispatcher, the skill content,
 /// and tests all stay in sync — change the wire path here and every caller
@@ -240,6 +244,12 @@ pub fn agent_next_steps() -> serde_json::Value {
             "body_type": "PolicyMergeOperation",
         },
     ])
+}
+
+/// Build the optional natural-language guidance embedded in L7 deny bodies.
+#[must_use]
+pub fn agent_guidance() -> Option<&'static str> {
+    crate::agent_proposals_enabled().then_some(AGENT_GUIDANCE)
 }
 
 async fn current_policy_response(ctx: &PolicyLocalContext) -> (u16, serde_json::Value) {
@@ -1004,14 +1014,27 @@ fn network_rule_from_json(
     let endpoints = rule
         .endpoints
         .into_iter()
-        .map(network_endpoint_from_json)
+        .map(|endpoint| {
+            let mut endpoint = network_endpoint_from_json(endpoint)?;
+            endpoint.advisor_proposed = true;
+            Ok::<NetworkEndpoint, String>(endpoint)
+        })
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let binaries = rule
         .binaries
         .into_iter()
-        .map(|binary| NetworkBinary {
-            path: binary.path,
-            ..Default::default()
+        .map(|binary| {
+            let mut proposal_binary = NetworkBinary {
+                path: binary.path,
+                ..Default::default()
+            };
+            // The deprecated harness bit is ignored by policy YAML, but OPA
+            // maps it to advisor_proposed to preserve the SSRF two-step flow.
+            #[allow(deprecated)]
+            {
+                proposal_binary.harness = true;
+            }
+            proposal_binary
         })
         .collect();
 
@@ -1091,6 +1114,7 @@ fn network_endpoint_from_json(
         allow_encoded_slash: endpoint.allow_encoded_slash,
         websocket_credential_rewrite: false,
         request_body_credential_rewrite: false,
+        advisor_proposed: false,
         // GraphQL persisted-query knobs and path scoping default empty —
         // agent proposals don't author them today.
         persisted_queries: String::new(),
@@ -1339,6 +1363,10 @@ mod tests {
         assert_eq!(rule.endpoints[0].port, 443);
         assert_eq!(rule.endpoints[0].ports, vec![443]);
         assert_eq!(rule.endpoints[0].protocol, "rest");
+        #[allow(deprecated)]
+        {
+            assert!(rule.binaries[0].harness);
+        }
         assert_eq!(
             rule.endpoints[0].rules[0].allow.as_ref().unwrap().path,
             "/user/repos"
@@ -1565,6 +1593,22 @@ mod tests {
             .collect();
         assert!(actions.contains(&"read_skill"));
         assert!(actions.contains(&"submit_proposal"));
+    }
+
+    #[test]
+    fn agent_guidance_is_absent_when_flag_off() {
+        let _guard = ProposalsFlagGuard::set_blocking(false);
+        assert!(agent_guidance().is_none());
+    }
+
+    #[test]
+    fn agent_guidance_points_to_policy_advisor_when_flag_on() {
+        let _guard = ProposalsFlagGuard::set_blocking(true);
+        let guidance = agent_guidance().expect("guidance when proposals are enabled");
+        assert!(guidance.contains("do not stop"));
+        assert!(guidance.contains("/etc/openshell/skills/policy_advisor.md"));
+        assert!(guidance.contains("http://policy.local/v1/proposals"));
+        assert!(guidance.contains("policy_reloaded: true"));
     }
 
     #[tokio::test]

@@ -219,6 +219,8 @@ struct ProvisioningDisplay {
     completed_steps: Vec<ProvisioningStep>,
     /// Progress bars for completed steps (so they can be cleared).
     completed_bars: Vec<ProgressBar>,
+    /// The currently active provisioning step.
+    active_step: Option<ProvisioningStep>,
     /// The currently active step label (shown on the spinner).
     active_label: String,
     /// Detail text shown next to the active step (e.g. image name).
@@ -253,6 +255,7 @@ impl ProvisioningDisplay {
             spacer,
             completed_steps: Vec::new(),
             completed_bars: Vec::new(),
+            active_step: None,
             active_label: ProvisioningStep::RequestingSandbox
                 .active_label()
                 .to_string(),
@@ -290,11 +293,15 @@ impl ProvisioningDisplay {
         self.step_start = Instant::now();
         self.spinner.reset_elapsed();
         self.active_detail.clear();
+        if self.active_step == Some(step) {
+            self.active_step = None;
+        }
     }
 
     /// Set the active (in-progress) step shown on the spinner.
-    fn set_active(&mut self, label: &str) {
-        self.active_label = label.to_string();
+    fn set_active(&mut self, step: ProvisioningStep) {
+        self.active_step = Some(step);
+        self.active_label = step.active_label().to_string();
         self.active_detail.clear();
         // Reset the spinner's elapsed time for the new step.
         self.spinner.reset_elapsed();
@@ -304,11 +311,17 @@ impl ProvisioningDisplay {
 
     /// Set the active step from a known provisioning step enum.
     fn set_active_step(&mut self, step: ProvisioningStep) {
-        self.set_active(step.active_label());
+        if self.active_step == Some(step) {
+            return;
+        }
+        self.set_active(step);
     }
 
     /// Set detail text shown alongside the active step (e.g. image name).
     fn set_active_detail(&mut self, detail: &str) {
+        if self.active_detail == detail {
+            return;
+        }
         self.active_detail = detail.to_string();
         self.update_spinner();
     }
@@ -1680,6 +1693,7 @@ pub async fn sandbox_create(
     tty_override: Option<bool>,
     auto_providers_override: Option<bool>,
     labels: &HashMap<String, String>,
+    approval_mode: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
     if editor.is_some() && !command.is_empty() {
@@ -1793,6 +1807,38 @@ pub async fn sandbox_create(
         let _ = save_last_sandbox(gateway, &sandbox_name);
     }
 
+    // Persist `--approval-mode` as a sandbox-scoped setting now that the
+    // sandbox exists. `manual` is the implicit default (no setting needed);
+    // any other value is written so it survives sandbox restarts and can be
+    // flipped later via `openshell settings set <name> proposal_approval_mode`.
+    // If the write fails the sandbox still runs in default `manual` — surface
+    // the recovery command so the user can retry.
+    if approval_mode != "manual" {
+        let setting = parse_cli_setting_value(settings::PROPOSAL_APPROVAL_MODE_KEY, approval_mode)?;
+        match client
+            .update_config(UpdateConfigRequest {
+                name: sandbox_name.clone(),
+                policy: None,
+                setting_key: settings::PROPOSAL_APPROVAL_MODE_KEY.to_string(),
+                setting_value: Some(setting),
+                delete_setting: false,
+                global: false,
+                merge_operations: vec![],
+                expected_resource_version: 0,
+            })
+            .await
+        {
+            Ok(_) => {}
+            Err(status) => {
+                eprintln!(
+                    "{} failed to set approval mode '{approval_mode}' on sandbox '{sandbox_name}': {}\n  retry with: openshell settings set {sandbox_name} proposal_approval_mode {approval_mode}",
+                    "warning:".yellow().bold(),
+                    status.message(),
+                );
+            }
+        }
+    }
+
     // Set up display — interactive terminals get a step-based checklist with
     // spinners; non-interactive (pipes / CI) get timestamped lines.
     let mut display = if interactive {
@@ -1842,11 +1888,11 @@ pub async fn sandbox_create(
         .into_diagnostic()?
         .into_inner();
 
-    let mut last_phase = sandbox.phase;
+    let mut last_phase = sandbox.phase();
     let mut last_error_reason = String::new();
     let mut last_condition_message = ready_false_condition_message(sandbox.status.as_ref());
     // Track whether we have seen a non-Ready phase during the watch.
-    let mut saw_non_ready = SandboxPhase::try_from(sandbox.phase) != Ok(SandboxPhase::Ready);
+    let mut saw_non_ready = SandboxPhase::try_from(sandbox.phase()) != Ok(SandboxPhase::Ready);
     let provision_timeout = Duration::from_secs(
         std::env::var("OPENSHELL_PROVISION_TIMEOUT")
             .ok()
@@ -1899,8 +1945,8 @@ pub async fn sandbox_create(
         let evt = item.into_diagnostic()?;
         match evt.payload {
             Some(openshell_core::proto::sandbox_stream_event::Payload::Sandbox(s)) => {
-                let phase = SandboxPhase::try_from(s.phase).unwrap_or(SandboxPhase::Unknown);
-                last_phase = s.phase;
+                let phase = SandboxPhase::try_from(s.phase()).unwrap_or(SandboxPhase::Unknown);
+                last_phase = s.phase();
                 if let Some(message) = ready_false_condition_message(s.status.as_ref()) {
                     last_condition_message = Some(message);
                 }
@@ -2007,7 +2053,17 @@ pub async fn sandbox_create(
                     "\u{2022}".dimmed(),
                 );
                 let local = Path::new(local_path);
-                if *git_ignore && let Ok((base_dir, files)) = git_sync_files(local) {
+                if !local_upload_path_exists(local) {
+                    return Err(miette::miette!(
+                        "local path does not exist: {}",
+                        local.display()
+                    ));
+                }
+
+                if *git_ignore
+                    && !local_upload_path_is_symlink(local)
+                    && let Ok((base_dir, files)) = git_sync_files(local)
+                {
                     sandbox_sync_up_files(
                         &effective_server,
                         &sandbox_name,
@@ -2018,7 +2074,7 @@ pub async fn sandbox_create(
                         &effective_tls,
                     )
                     .await?;
-                } else if local.exists() {
+                } else {
                     sandbox_sync_up(
                         &effective_server,
                         &sandbox_name,
@@ -2363,7 +2419,7 @@ pub async fn sandbox_sync_command(
     match (up, down) {
         (Some(local_path), None) => {
             let local = Path::new(local_path);
-            if !local.exists() {
+            if !local_upload_path_exists(local) {
                 return Err(miette::miette!(
                     "local path does not exist: {}",
                     local.display()
@@ -2451,7 +2507,7 @@ pub async fn sandbox_get(
     };
     println!("  {} {}", "Id:".dimmed(), id);
     println!("  {} {}", "Name:".dimmed(), name);
-    println!("  {} {}", "Phase:".dimmed(), phase_name(sandbox.phase));
+    println!("  {} {}", "Phase:".dimmed(), phase_name(sandbox.phase()));
     println!(
         "  {} {}",
         "Resource version:".dimmed(),
@@ -2535,11 +2591,11 @@ pub async fn sandbox_exec_grpc(
         .ok_or_else(|| miette::miette!("sandbox not found"))?;
 
     // Verify the sandbox is ready before issuing the exec.
-    if SandboxPhase::try_from(sandbox.phase) != Ok(SandboxPhase::Ready) {
+    if SandboxPhase::try_from(sandbox.phase()) != Ok(SandboxPhase::Ready) {
         return Err(miette::miette!(
             "sandbox '{}' is not ready (phase: {}); wait for it to reach Ready state",
             name,
-            phase_name(sandbox.phase)
+            phase_name(sandbox.phase())
         ));
     }
 
@@ -2747,11 +2803,11 @@ async fn fetch_ready_sandbox_for_forward(
         .sandbox
         .ok_or_else(|| miette::miette!("sandbox '{name}' not found"))?;
 
-    if SandboxPhase::try_from(sandbox.phase) != Ok(SandboxPhase::Ready) {
+    if SandboxPhase::try_from(sandbox.phase()) != Ok(SandboxPhase::Ready) {
         return Err(miette::miette!(
             "sandbox '{}' is no longer ready (phase: {}); stopping service forward",
             name,
-            phase_name(sandbox.phase)
+            phase_name(sandbox.phase())
         ));
     }
 
@@ -3195,8 +3251,8 @@ pub async fn sandbox_list(
 
     // Print rows
     for sandbox in sandboxes {
-        let phase = phase_name(sandbox.phase);
-        let phase_colored = match SandboxPhase::try_from(sandbox.phase) {
+        let phase = phase_name(sandbox.phase());
+        let phase_colored = match SandboxPhase::try_from(sandbox.phase()) {
             Ok(SandboxPhase::Ready) => phase.green().to_string(),
             Ok(SandboxPhase::Error) => phase.red().to_string(),
             Ok(SandboxPhase::Provisioning) => phase.yellow().to_string(),
@@ -3224,8 +3280,8 @@ fn sandbox_to_json(sandbox: &Sandbox) -> serde_json::Value {
         "labels": labels,
         "resource_version": meta.map_or(0, |m| m.resource_version),
         "created_at": format_epoch_ms(meta.map_or(0, |m| m.created_at_ms)),
-        "phase": phase_name(sandbox.phase),
-        "current_policy_version": sandbox.current_policy_version,
+        "phase": phase_name(sandbox.phase()),
+        "current_policy_version": sandbox.current_policy_version(),
     })
 }
 
@@ -5488,6 +5544,14 @@ pub fn git_sync_files(local_path: &Path) -> Result<(PathBuf, Vec<String>)> {
     Ok((base_dir, files))
 }
 
+pub fn local_upload_path_exists(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+pub fn local_upload_path_is_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+}
+
 // ---------------------------------------------------------------------------
 // Sandbox policy commands
 // ---------------------------------------------------------------------------
@@ -5577,7 +5641,23 @@ fn parse_cli_setting_value(key: &str, raw_value: &str) -> Result<SettingValue> {
     })?;
 
     let value = match setting.kind {
-        SettingValueKind::String => setting_value::Value::StringValue(raw_value.to_string()),
+        SettingValueKind::String => {
+            // Reject typos client-side so `openshell settings set ...
+            // proposal_approval_mode autom` errors immediately instead of
+            // round-tripping through the server. The server enforces the
+            // same check independently for non-CLI callers.
+            setting
+                .validate_string_value(raw_value)
+                .map_err(|allowed| {
+                    miette::miette!(
+                        "invalid value '{}' for key '{}'; expected one of: {}",
+                        raw_value,
+                        key,
+                        allowed.join(", ")
+                    )
+                })?;
+            setting_value::Value::StringValue(raw_value.to_string())
+        }
         SettingValueKind::Int => {
             let parsed = raw_value.trim().parse::<i64>().map_err(|_| {
                 miette::miette!(
@@ -6797,6 +6877,13 @@ pub async fn sandbox_draft_get(
                 chunk.security_notes.yellow()
             );
         }
+        if !chunk.validation_result.is_empty() {
+            println!(
+                "  {} {}",
+                "Validation:".dimmed(),
+                chunk.validation_result.cyan()
+            );
+        }
 
         if let Some(ref rule) = chunk.proposed_rule {
             println!("  {} {}", "Endpoints:".dimmed(), format_endpoints(rule));
@@ -7038,17 +7125,18 @@ fn format_timestamp_ms(ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ProvisioningStep, TlsOptions, build_sandbox_resource_limits,
+        ProvisioningDisplay, ProvisioningStep, TlsOptions, build_sandbox_resource_limits,
         dockerfile_sources_supported_for_gateway, format_endpoint, format_gateway_select_header,
         format_gateway_select_items, format_provider_attachment_table, gateway_add,
         gateway_auth_label, gateway_env_override_warning, gateway_select_with, gateway_type_label,
         git_sync_files, http_health_check, image_requests_gpu, import_local_package_mtls_bundle,
-        inferred_provider_type, package_managed_tls_dirs, parse_cli_setting_value,
-        parse_credential_expiry_cli_value, parse_credential_expiry_pairs, parse_credential_pairs,
-        plaintext_gateway_is_remote, progress_step_from_metadata,
-        provider_profile_allows_refresh_bootstrap, provisioning_timeout_message,
-        ready_false_condition_message, refresh_status_header, refresh_status_row, resolve_from,
-        sandbox_should_persist, service_expose_status_error, service_url_for_gateway,
+        inferred_provider_type, local_upload_path_exists, local_upload_path_is_symlink,
+        package_managed_tls_dirs, parse_cli_setting_value, parse_credential_expiry_cli_value,
+        parse_credential_expiry_pairs, parse_credential_pairs, plaintext_gateway_is_remote,
+        progress_step_from_metadata, provider_profile_allows_refresh_bootstrap,
+        provisioning_timeout_message, ready_false_condition_message, refresh_status_header,
+        refresh_status_row, resolve_from, sandbox_should_persist, service_expose_status_error,
+        service_url_for_gateway,
     };
     use crate::TEST_ENV_LOCK;
     use hyper::StatusCode;
@@ -7059,6 +7147,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::thread;
+    use std::time::{Duration, Instant};
     use tonic::Status;
 
     use openshell_bootstrap::GatewayMetadata;
@@ -7266,6 +7355,48 @@ mod tests {
             Some(ProvisioningStep::StartingSandbox)
         );
         assert_eq!(progress_step_from_metadata("driver-private-step"), None);
+    }
+
+    #[test]
+    fn provisioning_display_ignores_repeated_active_step_updates() {
+        let mut display = ProvisioningDisplay::new();
+        display.set_active_step(ProvisioningStep::PullingSandboxImage);
+        display.set_active_detail("Downloading layer-1 (1 MB/2 MB)");
+
+        let original_step_start = Instant::now()
+            .checked_sub(Duration::from_secs(5))
+            .expect("test duration should be representable");
+        display.step_start = original_step_start;
+
+        display.set_active_step(ProvisioningStep::PullingSandboxImage);
+        display.set_active_detail("Downloading layer-1 (1 MB/2 MB)");
+
+        assert_eq!(
+            display.active_step,
+            Some(ProvisioningStep::PullingSandboxImage)
+        );
+        assert_eq!(display.active_detail, "Downloading layer-1 (1 MB/2 MB)");
+        assert_eq!(display.step_start, original_step_start);
+        display.clear();
+    }
+
+    #[test]
+    fn provisioning_display_resets_detail_on_active_step_transition() {
+        let mut display = ProvisioningDisplay::new();
+        display.set_active_step(ProvisioningStep::PullingSandboxImage);
+        display.set_active_detail("Downloading layer-1 (1 MB/2 MB)");
+
+        let original_step_start = Instant::now()
+            .checked_sub(Duration::from_secs(5))
+            .expect("test duration should be representable");
+        display.step_start = original_step_start;
+
+        display.set_active_step(ProvisioningStep::StartingSandbox);
+
+        assert_eq!(display.active_step, Some(ProvisioningStep::StartingSandbox));
+        assert!(display.active_detail.is_empty());
+        assert!(display.step_start > original_step_start);
+        display.clear();
     }
 
     #[test]
@@ -7686,8 +7817,6 @@ mod tests {
         let status = SandboxStatus {
             sandbox_name: "gpu".to_string(),
             agent_pod: "gpu-pod".to_string(),
-            agent_fd: String::new(),
-            sandbox_fd: String::new(),
             conditions: vec![SandboxCondition {
                 r#type: "Ready".to_string(),
                 status: "False".to_string(),
@@ -7695,6 +7824,7 @@ mod tests {
                 message: "Another GPU sandbox may already be using the available GPU.".to_string(),
                 last_transition_time: String::new(),
             }],
+            ..Default::default()
         };
 
         assert_eq!(
@@ -7708,8 +7838,6 @@ mod tests {
         let status = SandboxStatus {
             sandbox_name: "gpu".to_string(),
             agent_pod: "gpu-pod".to_string(),
-            agent_fd: String::new(),
-            sandbox_fd: String::new(),
             conditions: vec![SandboxCondition {
                 r#type: "Scheduled".to_string(),
                 status: "True".to_string(),
@@ -7717,6 +7845,7 @@ mod tests {
                 message: "Sandbox scheduled".to_string(),
                 last_transition_time: String::new(),
             }],
+            ..Default::default()
         };
 
         assert!(ready_false_condition_message(Some(&status)).is_none());
@@ -7790,6 +7919,31 @@ mod tests {
             fs::canonicalize(repo.join("nested")).expect("canonicalize nested path")
         );
         assert_eq!(files, vec!["file.txt", "inner/child.txt"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_upload_path_helpers_accept_symlinks() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let target = tmpdir.path().join("target.txt");
+        let link = tmpdir.path().join("link.txt");
+        fs::write(&target, "target").expect("write target");
+        std::os::unix::fs::symlink("target.txt", &link).expect("create symlink");
+
+        assert!(local_upload_path_exists(&link));
+        assert!(local_upload_path_is_symlink(&link));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_upload_path_helpers_accept_dangling_symlinks() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let link = tmpdir.path().join("dangling-link.txt");
+        std::os::unix::fs::symlink("missing.txt", &link).expect("create symlink");
+
+        assert!(local_upload_path_exists(&link));
+        assert!(local_upload_path_is_symlink(&link));
+        assert!(!link.exists(), "std::path::Path::exists follows symlinks");
     }
 
     #[test]

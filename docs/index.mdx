@@ -8,6 +8,7 @@ position: 1
 ---
 
 import { BadgeLinks } from "./_components/BadgeLinks";
+import { CommandTerminal } from "./_components/CommandTerminal";
 
 <BadgeLinks
   badges={[
@@ -38,49 +39,9 @@ uncontrolled network activity.
 
 Install OpenShell and create your first sandbox in two commands.
 
-{/*Terminal demo styles live in fern/main.css. Inline <style> with { } breaks MDX/acorn*/}
 <llms-ignore>
 
-<div className="nc-term">
-  <div className="nc-term-bar">
-    <span className="nc-term-dot nc-term-dot-r" />
-    <span className="nc-term-dot nc-term-dot-y" />
-    <span className="nc-term-dot nc-term-dot-g" />
-  </div>
-  <div className="nc-term-body">
-    <div>
-      <span className="nc-ps">$ </span>
-      <span>
-        {
-          "curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh"
-        }
-      </span>
-    </div>
-    <div>
-      <span className="nc-ps">$ </span>
-      <span>{"openshell sandbox create "}</span>
-      <span className="nc-swap">
-        <span>
-          {"-- "}
-          <span className="nc-hl">claude</span>
-          <span className="nc-cursor" />
-        </span>
-        <span>
-          {"-- "}
-          <span className="nc-hl">opencode</span>
-          <span className="nc-cursor" />
-        </span>
-        <span>
-          {"-- "}
-          <span className="nc-hl">
-            codex
-            <span className="nc-cursor" />
-          </span>
-        </span>
-      </span>
-    </div>
-  </div>
-</div>
+<CommandTerminal command="curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh" />
 
 </llms-ignore>
 

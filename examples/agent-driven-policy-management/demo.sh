@@ -5,25 +5,11 @@
 
 # Agent-driven policy management demo.
 #
-# Runs the full loop end-to-end:
-#
-#   1. A Codex agent inside an OpenShell sandbox attempts a PUT that the L7
-#      proxy denies with a structured policy_denied 403.
-#   2. The agent reads /etc/openshell/skills/policy_advisor.md.
-#   3. The agent submits a narrow proposal (exact host, port, method, path)
-#      to policy.local and saves the returned chunk_id.
-#   4. The agent blocks on `GET /v1/proposals/{chunk_id}/wait` — one HTTP
-#      call that sleeps on a socket. THE AGENT BURNS ZERO LLM TOKENS WHILE
-#      IT WAITS; this is the load-bearing UX win over polling.
-#   5. The developer (this script, simulating the host side) sees the pending
-#      proposal in `openshell rule get` and approves it.
-#   6. The agent's /wait returns approved within ~1 second of the approval,
-#      retries the original PUT once against the hot-reloaded policy, and
-#      exits.
-#
-# The whole loop is feature-flagged behind agent_policy_proposals_enabled and
-# requires no GitHub credentials beyond the repo write token already used by
-# the existing demo flow.
+# Shows the approval loop in one run:
+#   deny → agent proposes narrow access → gateway validates → approve → retry.
+# A public raw.githubusercontent.com GET auto-approves; the GitHub PUT waits
+# for review because a GitHub credential is in scope. See README.md for the
+# full walkthrough.
 
 set -euo pipefail
 
@@ -51,6 +37,8 @@ DEMO_FILE_PATH="${DEMO_FILE_DIR}/${DEMO_RUN_ID}.md"
 DEMO_SANDBOX_NAME="${DEMO_SANDBOX_NAME:-policy-demo-${DEMO_RUN_ID}}"
 DEMO_CODEX_PROVIDER_NAME="${DEMO_CODEX_PROVIDER_NAME:-codex-policy-demo-${DEMO_RUN_ID}}"
 DEMO_GITHUB_PROVIDER_NAME="${DEMO_GITHUB_PROVIDER_NAME:-github-policy-demo-${DEMO_RUN_ID}}"
+DEMO_CODEX_MODEL="${DEMO_CODEX_MODEL:-gpt-5.4-mini}"
+DEMO_CODEX_LOCAL_BIN="${DEMO_CODEX_LOCAL_BIN:-}"
 DEMO_MANUAL_APPROVE="${DEMO_MANUAL_APPROVE:-0}"
 # Manual approvals need more headroom than the auto-approve loop — a human
 # reads the proposal, thinks, and decides. Bump the default to 30 min when
@@ -134,19 +122,18 @@ spin_clear() {
 # — a sed delimiter collision in one of the substitutions blanks the entire
 # log tail, hiding the very failure context we're trying to surface.
 redact_log() {
-    python3 - \
-        "${DEMO_GITHUB_TOKEN:-}" \
-        "${CODEX_AUTH_ACCESS_TOKEN:-}" \
-        "${CODEX_AUTH_REFRESH_TOKEN:-}" \
-        "${CODEX_AUTH_ACCOUNT_ID:-}" \
-        <<'PY'
+    python3 -c '
 import sys
 tokens = [t for t in sys.argv[1:] if t]
 for line in sys.stdin:
     for t in tokens:
         line = line.replace(t, "[redacted]")
     sys.stdout.write(line)
-PY
+' \
+        "${DEMO_GITHUB_TOKEN:-}" \
+        "${CODEX_AUTH_ACCESS_TOKEN:-}" \
+        "${CODEX_AUTH_REFRESH_TOKEN:-}" \
+        "${CODEX_AUTH_ACCOUNT_ID:-}"
 }
 
 fail() {
@@ -186,6 +173,20 @@ cleanup() {
         fi
     fi
 
+    # Restore the providers_v2_enabled setting to what it was before this
+    # run. The demo opts in to v2 composition so provider profiles
+    # contribute to the effective policy; restore so the host's broader
+    # workflow isn't affected.
+    if [[ -n "${PRIOR_PROVIDERS_V2_FLAG:-}" ]]; then
+        if [[ "$PRIOR_PROVIDERS_V2_FLAG" == "(unset)" ]]; then
+            "$OPENSHELL_BIN" settings delete --global --key providers_v2_enabled --yes \
+                >/dev/null 2>&1 || true
+        else
+            "$OPENSHELL_BIN" settings set --global --key providers_v2_enabled \
+                --value "$PRIOR_PROVIDERS_V2_FLAG" --yes >/dev/null 2>&1 || true
+        fi
+    fi
+
     if [[ $status -eq 0 ]]; then
         rm -rf "$TMP_DIR"
     else
@@ -219,7 +220,7 @@ resolve_github_token() {
 
 resolve_codex_auth() {
     [[ -f "${HOME}/.codex/auth.json" ]] || fail "missing local Codex sign-in; run: codex login"
-    export CODEX_AUTH_ACCESS_TOKEN CODEX_AUTH_REFRESH_TOKEN CODEX_AUTH_ACCOUNT_ID
+    export CODEX_AUTH_ACCESS_TOKEN CODEX_AUTH_REFRESH_TOKEN CODEX_AUTH_ACCOUNT_ID DEMO_CODEX_MODEL
     CODEX_AUTH_ACCESS_TOKEN="$(jq -r '.tokens.access_token // empty' "${HOME}/.codex/auth.json")"
     CODEX_AUTH_REFRESH_TOKEN="$(jq -r '.tokens.refresh_token // empty' "${HOME}/.codex/auth.json")"
     CODEX_AUTH_ACCOUNT_ID="$(jq -r '.tokens.account_id // empty' "${HOME}/.codex/auth.json")"
@@ -330,7 +331,13 @@ render_payload() {
         -e "s|{{FILE_PATH}}|${DEMO_FILE_PATH}|g" \
         -e "s|{{RUN_ID}}|${DEMO_RUN_ID}|g" \
         "$TASK_TEMPLATE" > "${PAYLOAD_DIR}/agent-task.md"
-    cp "$SANDBOX_AGENT" "${PAYLOAD_DIR}/sandbox-agent.sh"
+    sed "s|DEMO_CODEX_MODEL=\"\${DEMO_CODEX_MODEL:-gpt-5.4-mini}\"|DEMO_CODEX_MODEL=\"\${DEMO_CODEX_MODEL:-${DEMO_CODEX_MODEL}}\"|" \
+        "$SANDBOX_AGENT" > "${PAYLOAD_DIR}/sandbox-agent.sh"
+    if [[ -n "$DEMO_CODEX_LOCAL_BIN" ]]; then
+        [[ -x "$DEMO_CODEX_LOCAL_BIN" ]] || fail "DEMO_CODEX_LOCAL_BIN is not executable: $DEMO_CODEX_LOCAL_BIN"
+        cp "$DEMO_CODEX_LOCAL_BIN" "${PAYLOAD_DIR}/codex"
+        chmod +x "${PAYLOAD_DIR}/codex"
+    fi
     cp "$POLICY_TEMPLATE" "$POLICY_FILE"
 }
 
@@ -347,7 +354,7 @@ create_providers() {
 
     "$OPENSHELL_BIN" provider create \
         --name "$DEMO_GITHUB_PROVIDER_NAME" \
-        --type generic \
+        --type github \
         --credential DEMO_GITHUB_TOKEN >/dev/null
 
     info "providers created (codex, github) — credentials injected as env vars only"
@@ -357,9 +364,10 @@ start_agent_sandbox() {
     step "Launching sandbox; agent will hit a policy block and draft a proposal"
     "$OPENSHELL_BIN" sandbox delete "$DEMO_SANDBOX_NAME" >/dev/null 2>&1 || true
 
-    info "initial policy:  read-only access to api.github.com (no PUT)"
-    info "agent task:      PUT /repos/${DEMO_GITHUB_OWNER}/${DEMO_GITHUB_REPO}/contents/${DEMO_FILE_PATH}"
-    info "live log:        ${AGENT_LOG}"
+    info "policy:   raw GitHub schema path denied; GitHub writes denied"
+    info "approval: auto for no new findings; review for credential risk"
+    info "target:   PUT /repos/${DEMO_GITHUB_OWNER}/${DEMO_GITHUB_REPO}/contents/${DEMO_FILE_PATH}"
+    info "log:      ${AGENT_LOG}"
 
     # `--upload <dir>:/sandbox` preserves the source directory basename
     # (matches `scp -r`/`cp -r`, see PRs #952 / #1028), so `${PAYLOAD_DIR}`
@@ -372,6 +380,7 @@ start_agent_sandbox() {
             --provider "$DEMO_CODEX_PROVIDER_NAME" \
             --provider "$DEMO_GITHUB_PROVIDER_NAME" \
             --policy "$POLICY_FILE" \
+            --approval-mode auto \
             --upload "${PAYLOAD_DIR}:/sandbox" \
             --no-git-ignore \
             --no-auto-providers \
@@ -381,51 +390,97 @@ start_agent_sandbox() {
     AGENT_PID="$!"
 }
 
-# Strip the rule_get output down to the lines a developer needs to make an
-# informed approve/reject decision: rationale, binary, endpoint. Filters the
-# noisy fields (UUID, agent-generated rule_name, hardcoded confidence,
-# duplicate Binaries) until `openshell rule get` learns to print L7
-# method/path itself (tracked separately).
-#
-# `openshell rule get` colorizes labels with ANSI escapes; strip them before
-# parsing so the field-name match works in piped contexts.
+# Strip `rule get` down to the approval contract: chunk, binary, access,
+# and the prover's categorical findings (no severity grade — the prover
+# emits category names like `credential_reach_expansion` and
+# `capability_expansion`).
 summarize_pending() {
     local pending="$1"
     sed 's/\x1b\[[0-9;]*m//g' "$pending" \
         | awk '
-            /Rationale:/ { sub(/^[[:space:]]*/, ""); print "  " $0; next }
-            /Binary:/    { sub(/^[[:space:]]*/, ""); print "  " $0; next }
-            /Endpoints:/ { sub(/^[[:space:]]*/, ""); print "  " $0; next }
+            BEGIN {
+                in_validation = 0
+                chunk_count = 0
+                validation_printed = 0
+            }
+            /^[[:space:]]*Chunk:/ {
+                in_validation = 0
+                chunk_count++
+                validation_printed = 0
+                if (chunk_count > 1) print ""
+                sub(/^[[:space:]]*/, "")
+                chunk_id = $2
+                short_id = substr(chunk_id, 1, 8)
+                print "  Request " chunk_count ": chunk " short_id
+                next
+            }
+            /Binary:/ {
+                in_validation = 0
+                sub(/^[[:space:]]*/, "")
+                sub(/^Binary:/, "Binary:    ")
+                print "    " $0
+                next
+            }
+            /Endpoints:/ {
+                in_validation = 0
+                sub(/^[[:space:]]*/, "")
+                if (!validation_printed) {
+                    print "    Prover:    no verdict shown"
+                    validation_printed = 1
+                }
+                sub(/^Endpoints:/, "Access:    ")
+                print "    " $0
+                next
+            }
+            /Validation:/ {
+                in_validation = 1
+                validation_printed = 1
+                sub(/^[[:space:]]*/, "")
+                sub(/^Validation:[[:space:]]*(prover:[[:space:]]*)?/, "Prover:    ")
+                print "    " $0
+                next
+            }
+            /Rationale:/ {
+                in_validation = 0
+                sub(/^[[:space:]]*/, "")
+                sub(/^Rationale:/, "Reason:    ")
+                print "    " $0
+                next
+            }
+            # Indented continuation lines of the validation block are
+            # category-named finding rows (e.g.,
+            # `capability_expansion: PUT on api.github.com:443 via /usr/bin/curl`).
+            in_validation && /^[[:space:]]+(credential_reach_expansion|capability_expansion|l7_bypass_credentialed|link_local_reach):/ {
+                sub(/^[[:space:]]*/, "")
+                print "    Finding:   " $0
+                next
+            }
+            { in_validation = 0 }
         '
 }
 
+pending_requires_review() {
+    local pending="$1"
+    local clean
+    # Empty-delta chunks can appear in the pending view for a moment before the
+    # gateway records auto-approval. Keep the demo focused on actual review
+    # work: findings, merge failures, or policy validation failures.
+    clean="$(sed 's/\x1b\[[0-9;]*m//g' "$pending")"
+    if grep -Eq 'Validation: (prover: [1-9][0-9]* new finding|merge failed|policy invalid)|^[[:space:]]+(credential_reach_expansion|capability_expansion|l7_bypass_credentialed|link_local_reach):' <<<"$clean"; then
+        return 0
+    fi
+    if grep -q 'Validation:' <<<"$clean"; then
+        return 1
+    fi
+    return 0
+}
+
 narrate_sandbox_workflow() {
-    info "Inside the sandbox right now:"
+    info "Loop: deny → propose → validate → decide → retry"
+    info "  auto:   scoped requests with no new findings continue"
+    info "  review: credentialed or risky requests pause here"
     info ""
-    info "  • agent: ${DIM}curl -X PUT https://api.github.com/repos/${DEMO_GITHUB_OWNER}/${DEMO_GITHUB_REPO}/contents/...${RESET}"
-    info "  • L7 proxy denies the write and returns a structured 403 the"
-    info "    agent can parse and act on:"
-    cat <<EOF
-${DIM}        {
-          "error":      "policy_denied",
-          "layer":      "l7",
-          "method":     "PUT",
-          "path":       "/repos/${DEMO_GITHUB_OWNER}/${DEMO_GITHUB_REPO}/contents/${DEMO_FILE_PATH}",
-          "rule_missing": { "type": "rest_allow", "host": "api.github.com", "port": 443, "method": "PUT", ... },
-          "next_steps": [
-            { "action": "read_skill",      "path": "/etc/openshell/skills/policy_advisor.md" },
-            { "action": "submit_proposal", "url":  "http://policy.local/v1/proposals" }
-          ]
-        }${RESET}
-EOF
-    info "  • agent reads the skill, drafts a narrow ${DIM}addRule${RESET} for exactly that path"
-    info "  • agent POSTs to ${DIM}http://policy.local/v1/proposals${RESET}, saves the"
-    info "    returned ${DIM}accepted_chunk_ids[0]${RESET}"
-    info "  • agent calls ${DIM}GET /v1/proposals/{chunk_id}/wait?timeout=300${RESET}"
-    info "    — one HTTP call that sleeps on a socket until the developer decides."
-    info "    ${BOLD}Zero LLM tokens burn during this wait.${RESET}"
-    info ""
-    info "${DIM}Watching for the pending draft on the gateway...${RESET}"
+    info "${DIM}Watching for review requests...${RESET}"
 }
 
 # In DEMO_MANUAL_APPROVE mode, swap auto-approve for a human-in-the-loop pause.
@@ -475,7 +530,10 @@ approve_pending_until_agent_exits() {
     approval_count=0
 
     while true; do
-        # Agent finished? Drain its exit status and we're done.
+        # Agent finished? Drain its exit status and we're done. Under v1
+        # auto-approval, the agent's narrow L7 proposals auto-approve at the
+        # gateway and the agent can exit without any escalation surfacing
+        # here. That's the success case — no human action required.
         if ! kill -0 "$AGENT_PID" >/dev/null 2>&1; then
             spin_clear
             if ! wait "$AGENT_PID"; then
@@ -484,27 +542,44 @@ approve_pending_until_agent_exits() {
             fi
             AGENT_PID=""
             if (( approval_count == 0 )); then
-                fail "agent exited before any pending proposal appeared"
+                info "agent exited with zero review approvals (all proposals auto-approved)"
+            else
+                info "agent exited after ${approval_count} review approval(s)"
             fi
-            info "agent exited after ${approval_count} approval(s)"
             return
         fi
 
-        # Anything pending? Approve and keep watching — the agent may
-        # redraft if a previous proposal didn't yield the access it needed.
+        # Anything pending needs an explicit host-side decision. Auto mode only
+        # bypasses this when the gateway validation finds no new risk.
         if "$OPENSHELL_BIN" rule get "$DEMO_SANDBOX_NAME" --status pending >"$pending" 2>/dev/null \
             && grep -q "Chunk:" "$pending" && grep -q "pending" "$pending"; then
+            if ! pending_requires_review "$pending"; then
+                spin_wait "waiting for auto-approvals to settle" 2
+                continue
+            fi
             spin_clear
             info ""
-            info "${GREEN}proposal received:${RESET}"
+            info "${YELLOW}approval requested${RESET}"
             summarize_pending "$pending"
 
             if [[ "$DEMO_MANUAL_APPROVE" == "1" ]]; then
                 approve_manually "$pending"
             else
-                step "Approving — the agent's /wait will return within ~1s"
-                "$OPENSHELL_BIN" rule approve-all "$DEMO_SANDBOX_NAME" \
-                    | awk '/approved/ { print "  " $0 }'
+                info ""
+                spin_wait "letting the proposal land before approving" 2
+                spin_clear
+                step "Approving for demo"
+                local approve_output
+                if ! approve_output="$("$OPENSHELL_BIN" rule approve-all "$DEMO_SANDBOX_NAME" 2>&1)"; then
+                    if grep -q "no pending chunks to approve" <<<"$approve_output"; then
+                        info "  decision already recorded"
+                    else
+                        printf "%s\n" "$approve_output" >&2
+                        fail "could not approve pending proposal"
+                    fi
+                else
+                    awk '/approved/ { print "  " $0 }' <<<"$approve_output"
+                fi
             fi
             approval_count=$((approval_count + 1))
         fi
@@ -532,21 +607,13 @@ verify_github_write() {
     jq -r '"  file: \(.path)", "  url:  \(.html_url)"' "$body"
 }
 
-# Print the OCSF JSONL trace, filtered to the three events that *are* the
-# demo's story: the L7 PUT deny, the policy hot-reload, and the L7 PUT allow.
-# The native OCSF shorthand is informative and consistent with the rest of
-# OpenShell's logging — keep it as-is rather than re-formatting.
+# Print the concise OCSF trace that shows deny, proposal, decision, reload,
+# and successful retry.
 show_logs() {
-    step "Policy decision trace (OCSF)"
-    # Filter to the events that tell the loop's story end-to-end, ordered by
-    # the trace's own timestamps:
-    #   HTTP:PUT DENIED          — initial proxy enforcement
-    #   CONFIG:PROPOSED          — agent submitted a chunk to the gateway
-    #   CONFIG:APPROVED/REJECTED — developer decided; agent's /wait woke up
-    #   CONFIG:LOADED            — supervisor hot-reloaded the merged policy
-    #   HTTP:PUT ALLOWED         — agent's retry succeeded
+    step "Decision trace"
     "$OPENSHELL_BIN" logs "$DEMO_SANDBOX_NAME" --since 10m -n 200 2>&1 \
-        | grep -E 'HTTP:PUT.*(DENIED|ALLOWED)|CONFIG:(PROPOSED|APPROVED|REJECTED|LOADED)' \
+        | grep -E 'HTTP:PUT.*(DENIED|ALLOWED)|agent_authored proposal|auto-approved: no new prover findings \(source=agent_authored\)|gateway approved draft chunk .*PUT|Policy reloaded successfully' \
+        | grep -v 'source=mechanistic' \
         | sed 's/^/  /' || true
 }
 
@@ -557,12 +624,24 @@ enable_agent_proposals() {
     # delete` rather than a value write.
     local prior
     prior="$("$OPENSHELL_BIN" settings get --global --json 2>/dev/null \
-        | grep -o '"agent_policy_proposals_enabled"[^,}]*' \
-        | grep -o 'true\|false' | head -1)"
+        | jq -r '.settings.agent_policy_proposals_enabled // empty | tostring | select(. == "true" or . == "false")')"
     PRIOR_PROPOSALS_FLAG="${prior:-(unset)}"
     "$OPENSHELL_BIN" settings set --global \
         --key agent_policy_proposals_enabled --value true --yes >/dev/null \
         || fail "could not enable agent_policy_proposals_enabled globally"
+}
+
+enable_providers_v2() {
+    # Providers-v2 composition is behind a global flag. The demo opts in
+    # so provider profiles (codex, github) contribute to the effective
+    # policy via composition. Cleanup restores the prior value.
+    local prior
+    prior="$("$OPENSHELL_BIN" settings get --global --json 2>/dev/null \
+        | jq -r '.settings.providers_v2_enabled // empty | tostring | select(. == "true" or . == "false")')"
+    PRIOR_PROVIDERS_V2_FLAG="${prior:-(unset)}"
+    "$OPENSHELL_BIN" settings set --global \
+        --key providers_v2_enabled --value true --yes >/dev/null \
+        || fail "could not enable providers_v2_enabled globally"
 }
 
 main() {
@@ -574,6 +653,7 @@ main() {
     render_payload
     create_providers
     enable_agent_proposals
+    enable_providers_v2
 
     show_run_summary
 

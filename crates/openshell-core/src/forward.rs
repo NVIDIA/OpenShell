@@ -455,7 +455,7 @@ pub fn resolve_ssh_gateway(
     if let Ok(url) = url::Url::parse(cluster_url)
         && let Some(host) = url.host_str()
     {
-        let cluster_port = url.port().unwrap_or(gateway_port);
+        let cluster_port = url.port_or_known_default().unwrap_or(gateway_port);
         let cluster_is_loopback =
             host == "127.0.0.1" || host == "0.0.0.0" || host == "localhost" || host == "::1";
         if !cluster_is_loopback {
@@ -675,28 +675,35 @@ mod tests {
     fn resolve_ssh_gateway_overrides_loopback_with_cluster_host() {
         let (host, port) = resolve_ssh_gateway("127.0.0.1", 8080, "https://spark.local");
         assert_eq!(host, "spark.local");
-        assert_eq!(port, 8080);
+        assert_eq!(port, 443);
     }
 
     #[test]
     fn resolve_ssh_gateway_overrides_zeros_with_cluster_host() {
         let (host, port) = resolve_ssh_gateway("0.0.0.0", 8080, "https://10.0.0.5:443");
         assert_eq!(host, "10.0.0.5");
-        assert_eq!(port, 8080);
+        assert_eq!(port, 443);
+    }
+
+    #[test]
+    fn resolve_ssh_gateway_uses_known_default_http_port() {
+        let (host, port) = resolve_ssh_gateway("0.0.0.0", 8080, "http://gateway.example.test");
+        assert_eq!(host, "gateway.example.test");
+        assert_eq!(port, 80);
     }
 
     #[test]
     fn resolve_ssh_gateway_overrides_localhost() {
         let (host, port) = resolve_ssh_gateway("localhost", 8080, "https://remote-host:443");
         assert_eq!(host, "remote-host");
-        assert_eq!(port, 8080);
+        assert_eq!(port, 443);
     }
 
     #[test]
     fn resolve_ssh_gateway_no_override_when_cluster_is_also_loopback() {
         let (host, port) = resolve_ssh_gateway("127.0.0.1", 8080, "https://127.0.0.1:443");
         assert_eq!(host, "127.0.0.1");
-        assert_eq!(port, 8080);
+        assert_eq!(port, 443);
     }
 
     #[test]

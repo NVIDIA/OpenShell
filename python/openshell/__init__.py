@@ -15,6 +15,7 @@ from .sandbox import (
     SandboxError,
     SandboxRef,
     SandboxSession,
+    SandboxStatusRef,
     TlsConfig,
 )
 
@@ -35,6 +36,7 @@ __all__ = [
     "SandboxError",
     "SandboxRef",
     "SandboxSession",
+    "SandboxStatusRef",
     "TlsConfig",
     "__version__",
 ]

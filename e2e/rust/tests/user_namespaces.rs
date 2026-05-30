@@ -114,6 +114,23 @@ async fn wait_for_sandbox_pod(name: &str, timeout_secs: u64) -> Result<(), Strin
     Err(format!("sandbox pod {name} did not appear within {timeout_secs}s"))
 }
 
+// Disabled by default — not reachable from any project-controlled cluster
+// and brittle by design. See https://github.com/NVIDIA/OpenShell/issues/1597
+// for the tracking issue context. Re-enable with `cargo test -- --ignored`
+// after the issues below are addressed.
+//
+// Blocking issues:
+//   1. `kubectl` is invoked as `docker exec openshell-cluster-openshell kubectl`.
+//      No setup in the repo (helm-k3s-local.sh, e2e/with-kube-gateway.sh, the
+//      CI kind workflow) creates a docker container with that name; only an
+//      external OpenShift/manual setup matches it.
+//   2. The test mutates the gateway StatefulSet via `kubectl set env`, which
+//      triggers a pod rollout mid-test. The wrapper's `kubectl port-forward`
+//      to the old pod is disrupted during the rollout, and the test's
+//      `openshell sandbox create` is spawned without capturing stderr, so
+//      transient connection failures surface as a generic "sandbox did not
+//      appear within 60s" with no actionable signal.
+#[ignore = "broken: hardcoded docker exec container name + brittle mid-test gateway rollout (see header)"]
 #[tokio::test]
 async fn sandbox_pod_spec_has_user_namespace_fields() {
     // Enable user namespaces on the gateway.

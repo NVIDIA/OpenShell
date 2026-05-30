@@ -37,6 +37,12 @@ health, metrics, or tunnel routes. The plaintext service router also rejects
 browser requests whose Fetch Metadata, Origin, or Referer headers indicate a
 cross-origin or sibling-subdomain request.
 
+Dedicated health listeners expose `/healthz` (process liveness only) and
+`/readyz` (dependency-aware readiness). Readiness reflects the latest result
+of an in-process background task that pings the persistence layer on a
+fixed cadence; the handler reads a cached state, so responses are
+sub-millisecond and never race the kubelet probe timeout.
+
 Supported auth modes:
 
 | Mode | Use |
@@ -361,6 +367,10 @@ table.
 - Docker-backed local gateways use Docker's `host-gateway` callback alias on
   macOS and Docker Desktop-style runtimes. Native Linux Docker may expose an
   additional bridge-gateway listener because the host can bind that bridge IP.
+- Podman-backed macOS gateways use gvproxy's host-loopback IP for sandbox host
+  aliases by default so stale Podman machine images do not need Podman's
+  `host-gateway` resolver. Linux Podman keeps the resolver unless
+  `host_gateway_ip` is configured.
 - Gateway restarts recover persisted objects from storage, but live relay
   streams must be re-established by supervisors.
 - User-facing behavior changes must update published docs in `docs/`; this file

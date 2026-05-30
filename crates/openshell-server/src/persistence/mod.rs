@@ -164,6 +164,28 @@ impl Store {
         }
     }
 
+    /// Verify connectivity to the underlying database.
+    pub async fn ping(&self) -> PersistenceResult<()> {
+        match self {
+            Self::Postgres(store) => store.ping().await,
+            Self::Sqlite(store) => store.ping().await,
+        }
+    }
+
+    /// Test support only: close the underlying connection pool.
+    ///
+    /// There is no runtime shutdown path yet. If we add graceful shutdown,
+    /// this API can be made public for that explicit shutdown flow.
+    ///
+    /// Do not call from runtime code today; this tears down the active pool.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn close(&self) {
+        match self {
+            Self::Postgres(store) => store.close().await,
+            Self::Sqlite(store) => store.close().await,
+        }
+    }
+
     /// Insert or update a generic object with compare-and-swap support.
     ///
     /// # Arguments

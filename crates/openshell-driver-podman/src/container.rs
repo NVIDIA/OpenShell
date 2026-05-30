@@ -183,6 +183,8 @@ struct HealthConfig {
 struct ResourceLimits {
     cpu: CpuLimits,
     memory: MemoryLimits,
+    #[serde(rename = "PidsLimit", skip_serializing_if = "Option::is_none")]
+    pids_limit: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -340,7 +342,7 @@ fn build_labels(sandbox: &DriverSandbox) -> BTreeMap<String, String> {
 }
 
 /// Parse resource limits from the sandbox template, falling back to defaults.
-fn build_resource_limits(sandbox: &DriverSandbox) -> ResourceLimits {
+fn build_resource_limits(sandbox: &DriverSandbox, config: &PodmanComputeConfig) -> ResourceLimits {
     let resources = sandbox
         .spec
         .as_ref()
@@ -363,7 +365,12 @@ fn build_resource_limits(sandbox: &DriverSandbox) -> ResourceLimits {
             period: DEFAULT_CPU_PERIOD,
         },
         memory: MemoryLimits { limit: mem_bytes },
+        pids_limit: podman_pids_limit(config.sandbox_pids_limit),
     }
+}
+
+fn podman_pids_limit(value: i64) -> Option<i64> {
+    if value > 0 { Some(value) } else { None }
 }
 
 /// Build CDI GPU device list if GPU is requested.
@@ -396,7 +403,7 @@ pub fn build_container_spec_with_token(
 
     let env = build_env(sandbox, config, image);
     let labels = build_labels(sandbox);
-    let resource_limits = build_resource_limits(sandbox);
+    let resource_limits = build_resource_limits(sandbox, config);
     let devices = build_devices(sandbox);
 
     // Network configuration -- always bridge mode.
@@ -530,10 +537,7 @@ pub fn build_container_spec_with_token(
         // Inject stable host aliases into /etc/hosts so sandbox containers can
         // reach services on the host. `host.openshell.internal` is the driver-
         // neutral alias used by policies and e2e tests.
-        hostadd: vec![
-            "host.containers.internal:host-gateway".into(),
-            "host.openshell.internal:host-gateway".into(),
-        ],
+        hostadd: hostadd_entries(config),
         netns: NetNS {
             nsmode: "bridge".to_string(),
         },
@@ -613,6 +617,21 @@ pub fn build_container_spec_with_token(
     };
 
     serde_json::to_value(container_spec).expect("ContainerSpec serialization cannot fail")
+}
+
+fn hostadd_entries(config: &PodmanComputeConfig) -> Vec<String> {
+    let host_gateway_ip = config.host_gateway_ip.trim();
+    if host_gateway_ip.is_empty() {
+        return vec![
+            "host.containers.internal:host-gateway".into(),
+            "host.openshell.internal:host-gateway".into(),
+        ];
+    }
+
+    vec![
+        format!("host.containers.internal:{host_gateway_ip}"),
+        format!("host.openshell.internal:{host_gateway_ip}"),
+    ]
 }
 
 /// Parse a Kubernetes-style CPU quantity to cgroup quota microseconds
@@ -735,6 +754,20 @@ mod tests {
             spec["resource_limits"]["memory"]["limit"].as_u64(),
             Some(2 * 1024 * 1024 * 1024)
         );
+        assert_eq!(
+            spec["resource_limits"]["PidsLimit"].as_i64(),
+            Some(crate::config::DEFAULT_SANDBOX_PIDS_LIMIT)
+        );
+    }
+
+    #[test]
+    fn container_spec_can_inherit_runtime_pids_limit() {
+        let sandbox = test_sandbox("test-id", "test-name");
+        let mut config = test_config();
+        config.sandbox_pids_limit = 0;
+        let spec = build_container_spec(&sandbox, &config);
+
+        assert!(spec["resource_limits"].get("PidsLimit").is_none());
     }
 
     #[test]
@@ -1050,6 +1083,7 @@ mod tests {
             socket_path: std::path::PathBuf::from("/tmp/test.sock"),
             default_image: "test-image:latest".to_string(),
             grpc_endpoint: "http://localhost:50051".to_string(),
+            host_gateway_ip: String::new(),
             sandbox_ssh_socket_path: "/run/openshell/test-ssh.sock".to_string(),
             ..PodmanComputeConfig::default()
         }
@@ -1085,6 +1119,34 @@ mod tests {
             vol["rw"].as_bool(),
             Some(false),
             "image volume should be read-only"
+        );
+    }
+
+    #[test]
+    fn container_spec_uses_configured_host_gateway_ip() {
+        let sandbox = test_sandbox("test-id", "test-name");
+        let mut config = test_config();
+        config.host_gateway_ip = "192.168.127.254".to_string();
+        let spec = build_container_spec(&sandbox, &config);
+
+        let hostadd: Vec<&str> = spec["hostadd"]
+            .as_array()
+            .expect("hostadd should be an array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+
+        assert!(
+            hostadd.contains(&"host.containers.internal:192.168.127.254"),
+            "missing Podman host alias with configured host gateway IP"
+        );
+        assert!(
+            hostadd.contains(&"host.openshell.internal:192.168.127.254"),
+            "missing OpenShell host alias with configured host gateway IP"
+        );
+        assert!(
+            !hostadd.contains(&"host.containers.internal:host-gateway"),
+            "configured host gateway IP should avoid Podman's host-gateway resolver"
         );
     }
 

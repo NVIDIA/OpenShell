@@ -135,18 +135,115 @@ pub struct CredentialSet {
 }
 
 impl CredentialSet {
-    /// Credentials that target a given host.
+    /// Credentials that target a given host. Matching mirrors runtime host
+    /// policy semantics for exact names and first-label wildcards, so a
+    /// proposal for `*.github.com` is treated as credentialed when the
+    /// attached credential targets `api.github.com`.
     pub fn credentials_for_host(&self, host: &str) -> Vec<&Credential> {
         self.credentials
             .iter()
-            .filter(|c| c.target_hosts.iter().any(|h| h == host))
+            .filter(|c| {
+                c.target_hosts
+                    .iter()
+                    .any(|target| host_patterns_overlap(host, target))
+            })
             .collect()
     }
 
-    /// API capability registry for a given host.
+    /// API capability registry for a given host. Exact matches win, then
+    /// wildcard host overlap is used so credentialed wildcard proposals can be
+    /// evaluated against concrete API capability registries.
     pub fn api_for_host(&self, host: &str) -> Option<&ApiCapability> {
-        self.api_registries.values().find(|api| api.host == host)
+        let needle = normalize_host(host);
+        self.api_registries
+            .values()
+            .find(|api| normalize_host(&api.host) == needle)
+            .or_else(|| {
+                self.api_registries
+                    .values()
+                    .find(|api| host_patterns_overlap(host, &api.host))
+            })
     }
+}
+
+fn normalize_host(host: &str) -> String {
+    host.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn host_patterns_overlap(left: &str, right: &str) -> bool {
+    let left = normalize_host(left);
+    let right = normalize_host(right);
+    if left.is_empty() || right.is_empty() {
+        return false;
+    }
+    left == right || host_pattern_covers(&left, &right) || host_pattern_covers(&right, &left)
+}
+
+fn host_pattern_covers(pattern: &str, host: &str) -> bool {
+    let pattern_labels: Vec<&str> = pattern.split('.').collect();
+    let host_labels: Vec<&str> = host.split('.').collect();
+    let Some(first_pattern_label) = pattern_labels.first().copied() else {
+        return false;
+    };
+
+    if first_pattern_label == "**" {
+        let suffix = &pattern_labels[1..];
+        let host_suffix = host_labels
+            .len()
+            .checked_sub(suffix.len())
+            .map(|start| &host_labels[start..]);
+        return !suffix.is_empty()
+            && host_labels.len() > suffix.len()
+            && matches!(host_suffix, Some(host_suffix) if host_suffix == suffix);
+    }
+
+    if !first_pattern_label.contains('*') {
+        return false;
+    }
+
+    // Runtime host wildcards only apply in the first DNS label. Wildcards in
+    // later labels are not treated as policy globs here.
+    pattern_labels.len() == host_labels.len()
+        && pattern_labels[1..] == host_labels[1..]
+        && wildcard_label_matches(first_pattern_label, host_labels[0])
+}
+
+fn wildcard_label_matches(pattern: &str, label: &str) -> bool {
+    if pattern == "*" {
+        return !label.is_empty();
+    }
+    if label.is_empty() || !pattern.contains('*') {
+        return false;
+    }
+
+    let parts: Vec<&str> = pattern.split('*').collect();
+    let mut remaining = label;
+
+    if let Some(prefix) = parts.first().copied().filter(|part| !part.is_empty()) {
+        let Some(stripped) = remaining.strip_prefix(prefix) else {
+            return false;
+        };
+        remaining = stripped;
+    }
+
+    if parts.len() > 2 {
+        for part in parts[1..parts.len() - 1]
+            .iter()
+            .copied()
+            .filter(|part| !part.is_empty())
+        {
+            let Some(offset) = remaining.find(part) else {
+                return false;
+            };
+            remaining = &remaining[offset + part.len()..];
+        }
+    }
+
+    parts
+        .last()
+        .copied()
+        .filter(|suffix| !suffix.is_empty())
+        .is_none_or(|suffix| remaining.ends_with(suffix))
 }
 
 // ---------------------------------------------------------------------------
@@ -266,4 +363,98 @@ pub fn load_credential_set_from_dir(
         credentials: creds,
         api_registries,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn github_credential() -> Credential {
+        Credential {
+            name: "github-pat".to_string(),
+            cred_type: "github-pat".to_string(),
+            scopes: vec!["repo".to_string()],
+            injected_via: "GITHUB_TOKEN".to_string(),
+            target_hosts: vec!["api.github.com".to_string()],
+        }
+    }
+
+    fn github_api() -> ApiCapability {
+        ApiCapability {
+            api: "github".to_string(),
+            host: "api.github.com".to_string(),
+            port: 443,
+            credential_type: "github-pat".to_string(),
+            scope_capabilities: HashMap::new(),
+            action_risk: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn host_patterns_overlap_matches_exact_case_and_trailing_dot() {
+        assert!(host_patterns_overlap("API.GITHUB.COM.", "api.github.com"));
+        assert!(!host_patterns_overlap(
+            "api.github.com",
+            "uploads.github.com"
+        ));
+    }
+
+    #[test]
+    fn host_patterns_overlap_matches_first_label_wildcard_only() {
+        assert!(host_patterns_overlap("*.github.com", "api.github.com"));
+        assert!(!host_patterns_overlap("*.github.com", "github.com"));
+        assert!(!host_patterns_overlap(
+            "*.github.com",
+            "deep.api.github.com"
+        ));
+    }
+
+    #[test]
+    fn host_patterns_overlap_matches_intra_label_first_label_wildcard() {
+        assert!(host_patterns_overlap(
+            "api-*.github.com",
+            "api-v3.github.com"
+        ));
+        assert!(!host_patterns_overlap(
+            "api-*.github.com",
+            "uploads.github.com"
+        ));
+        assert!(!host_patterns_overlap(
+            "api.*.github.com",
+            "api.v3.github.com"
+        ));
+    }
+
+    #[test]
+    fn host_patterns_overlap_matches_recursive_first_label_wildcard() {
+        assert!(host_patterns_overlap("**.github.com", "api.github.com"));
+        assert!(host_patterns_overlap(
+            "**.github.com",
+            "deep.api.github.com"
+        ));
+        assert!(!host_patterns_overlap("**.github.com", "github.com"));
+    }
+
+    #[test]
+    fn wildcard_policy_host_finds_credentialed_concrete_target() {
+        let set = CredentialSet {
+            credentials: vec![github_credential()],
+            api_registries: HashMap::new(),
+        };
+
+        let creds = set.credentials_for_host("*.github.com");
+        assert_eq!(creds.len(), 1);
+        assert_eq!(creds[0].name, "github-pat");
+    }
+
+    #[test]
+    fn wildcard_policy_host_finds_concrete_api_registry() {
+        let set = CredentialSet {
+            credentials: Vec::new(),
+            api_registries: HashMap::from([("github".to_string(), github_api())]),
+        };
+
+        let api = set.api_for_host("*.github.com").expect("github API");
+        assert_eq!(api.host, "api.github.com");
+    }
 }

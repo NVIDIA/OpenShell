@@ -1317,6 +1317,9 @@ fn deny_response_body(
         "next_steps".to_string(),
         crate::policy_local::agent_next_steps(),
     );
+    if let Some(guidance) = crate::policy_local::agent_guidance() {
+        body.insert("agent_guidance".to_string(), serde_json::json!(guidance));
+    }
 
     serde_json::Value::Object(body)
 }
@@ -2333,9 +2336,46 @@ mod tests {
             "/etc/openshell/skills/policy_advisor.md"
         );
         assert_eq!(body["next_steps"][3]["body_type"], "PolicyMergeOperation");
+        let guidance = body["agent_guidance"]
+            .as_str()
+            .expect("agent_guidance is present when proposals are enabled");
+        assert!(guidance.contains("do not stop"));
+        assert!(guidance.contains("/etc/openshell/skills/policy_advisor.md"));
+        assert!(guidance.contains("http://policy.local/v1/proposals"));
         assert!(
             !body.to_string().contains("secret-token"),
             "deny body must not leak query params or credential values"
+        );
+    }
+
+    #[test]
+    fn deny_response_body_omits_agent_guidance_when_policy_advisor_is_off() {
+        let _proposals = crate::test_helpers::ProposalsFlagGuard::set_blocking(false);
+        let req = L7Request {
+            action: "GET".to_string(),
+            target: "/gists".to_string(),
+            query_params: HashMap::new(),
+            raw_header: Vec::new(),
+            body_length: BodyLength::None,
+        };
+
+        let body = deny_response_body(
+            &req,
+            "github-readonly",
+            "no matching L7 allow rule",
+            None,
+            Some(DenyResponseContext {
+                host: Some("api.github.com"),
+                port: Some(443),
+                binary: Some("/usr/bin/gh"),
+            }),
+        );
+
+        assert_eq!(body["error"], "policy_denied");
+        assert_eq!(body["next_steps"], serde_json::json!([]));
+        assert!(
+            body.get("agent_guidance").is_none(),
+            "agent_guidance must only be present when the policy advisor is enabled"
         );
     }
 
@@ -2384,6 +2424,7 @@ mod tests {
         assert_eq!(body["path"], "/user/repos");
         assert_eq!(body["rule_missing"]["host"], "api.github.com");
         assert_eq!(body["next_steps"][2]["action"], "inspect_recent_denials");
+        assert!(body["agent_guidance"].as_str().unwrap().contains("retry"));
     }
 
     #[test]

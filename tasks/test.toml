@@ -26,7 +26,12 @@ depends = ["e2e:python:gpu"]
 
 ["test:rust"]
 description = "Run Rust tests"
-run = "cargo test --workspace"
+run = [
+  # Run the workspace once without openshell-server so we can run that crate
+  # with test-only helpers enabled.
+  "cargo test --workspace --exclude openshell-server",
+  "cargo test -p openshell-server --features test-support",
+]
 hide = true
 
 ["test:python"]
@@ -66,6 +71,10 @@ run = "e2e/with-docker-gateway.sh uv run pytest -o python_files='test_*.py' -m g
 description = "Run Rust CLI e2e tests against a Podman-backed gateway"
 run = "e2e/rust/e2e-podman.sh"
 
+["e2e:podman:rootless"]
+description = "Run Rust CLI e2e tests against a rootless Podman-backed gateway"
+run = "e2e/rust/e2e-podman-rootless.sh"
+
 ["e2e:podman:gpu"]
 description = "Run GPU e2e against a standalone gateway with the Podman compute driver"
 env = { OPENSHELL_E2E_PODMAN_GPU = "1", OPENSHELL_E2E_PODMAN_TEST = "gpu_device_selection", OPENSHELL_E2E_PODMAN_FEATURES = "e2e-podman-gpu" }
@@ -73,6 +82,11 @@ run = "e2e/rust/e2e-podman.sh"
 
 ["e2e:kubernetes"]
 description = "Run Rust CLI e2e tests against an OpenShell gateway deployed on Kubernetes via Helm (set OPENSHELL_E2E_KUBE_CONTEXT to reuse a cluster; otherwise creates a local k3d cluster when k3d is installed; set OPENSHELL_E2E_KUBE_TEST=<name> to scope to one test)"
+run = "e2e/rust/e2e-kubernetes.sh"
+
+["e2e:kubernetes:db"]
+description = "Run Kubernetes e2e with all database backend scenarios (SQLite, bundled PostgreSQL, external PostgreSQL with existingSecret)"
+env = { OPENSHELL_E2E_KUBE_DB_SCENARIOS = "1" }
 run = "e2e/rust/e2e-kubernetes.sh"
 
 ["e2e:vm"]
@@ -94,3 +108,7 @@ run = [
 description = "Run GPU e2e against a standalone gateway with the Docker compute driver"
 env = { OPENSHELL_E2E_DOCKER_GPU = "1", OPENSHELL_E2E_DOCKER_TEST = "gpu_device_selection", OPENSHELL_E2E_DOCKER_FEATURES = "e2e-docker-gpu" }
 run = "e2e/rust/e2e-docker.sh"
+
+["e2e:openshift"]
+description = "Run OpenShift database-backend integration scenarios against a live cluster (requires oc CLI authenticated to an OpenShift cluster)"
+run = "e2e/rust/e2e-openshift.sh"

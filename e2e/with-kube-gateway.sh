@@ -23,6 +23,12 @@
 #   - Existing-context mode pulls from ${OPENSHELL_REGISTRY}/{gateway,supervisor}:${IMAGE_TAG}
 #     (defaults: ghcr.io/nvidia/openshell, latest). CI sets IMAGE_TAG to the
 #     commit SHA and preloads or publishes the images before running this script.
+#
+# Database backend scenarios:
+#   Set OPENSHELL_E2E_KUBE_DB_SCENARIOS=1 to run the test command against
+#   three database configurations (SQLite, bundled PostgreSQL, external
+#   PostgreSQL with existingSecret). When unset, the default single-install
+#   behavior is unchanged.
 
 set -euo pipefail
 
@@ -49,7 +55,10 @@ NAMESPACE="openshell"
 RELEASE_NAME="openshell"
 PORTFORWARD_PID=""
 PORTFORWARD_LOG="${WORKDIR}/portforward.log"
+PORTFORWARD_HEALTH_PID=""
+PORTFORWARD_HEALTH_LOG="${WORKDIR}/portforward-health.log"
 HELM_INSTALLED=0
+EXTERNAL_PG_DEPLOYED=0
 
 # Isolate CLI/SDK gateway metadata from the developer's real config.
 export XDG_CONFIG_HOME="${WORKDIR}/config"
@@ -63,12 +72,32 @@ helmctl() {
   helm --kube-context "${KUBE_CONTEXT}" "$@"
 }
 
+chart_without_dependencies() {
+  local src="${ROOT}/deploy/helm/openshell"
+  local dst="${WORKDIR}/helm-chart-no-deps"
+
+  rm -rf "${dst}"
+  cp -a "${src}" "${dst}"
+  rm -rf "${dst}/charts" "${dst}/Chart.lock"
+  awk '
+    /^dependencies:[[:space:]]*$/ { skip = 1; next }
+    skip && /^[^[:space:]-]/ { skip = 0 }
+    !skip { print }
+  ' "${src}/Chart.yaml" >"${dst}/Chart.yaml"
+  printf '%s\n' "${dst}"
+}
+
 cleanup() {
   local exit_code=$?
 
   if [ -n "${PORTFORWARD_PID}" ]; then
     kill "${PORTFORWARD_PID}" >/dev/null 2>&1 || true
     wait "${PORTFORWARD_PID}" >/dev/null 2>&1 || true
+  fi
+
+  if [ -n "${PORTFORWARD_HEALTH_PID}" ]; then
+    kill "${PORTFORWARD_HEALTH_PID}" >/dev/null 2>&1 || true
+    wait "${PORTFORWARD_HEALTH_PID}" >/dev/null 2>&1 || true
   fi
 
   if [ "${exit_code}" -ne 0 ] && [ -n "${KUBE_CONTEXT}" ] && [ -n "${NAMESPACE}" ]; then
@@ -90,6 +119,20 @@ cleanup() {
       cat "${PORTFORWARD_LOG}" || true
       echo "=== end port-forward log ==="
     fi
+    if [ -f "${PORTFORWARD_HEALTH_LOG}" ]; then
+      echo "=== health port-forward log ==="
+      cat "${PORTFORWARD_HEALTH_LOG}" || true
+      echo "=== end health port-forward log ==="
+    fi
+  fi
+
+  if [ "${EXTERNAL_PG_DEPLOYED}" = "1" ] && [ -n "${KUBE_CONTEXT}" ] && [ -n "${NAMESPACE}" ]; then
+    helmctl uninstall pg-external --namespace "${NAMESPACE}" --wait \
+      --timeout 60s >/dev/null 2>&1 || true
+    kctl -n "${NAMESPACE}" delete secret my-pg-credentials \
+      --ignore-not-found >/dev/null 2>&1 || true
+    kctl delete pvc -n "${NAMESPACE}" \
+      -l "app.kubernetes.io/instance=pg-external" --wait=false >/dev/null 2>&1 || true
   fi
 
   if [ "${HELM_INSTALLED}" = "1" ] && [ -n "${KUBE_CONTEXT}" ] && [ -n "${NAMESPACE}" ]; then
@@ -116,6 +159,204 @@ cleanup() {
   rm -rf "${WORKDIR}" 2>/dev/null || true
 }
 trap cleanup EXIT
+
+# --- DB-scenario helpers (used only when OPENSHELL_E2E_KUBE_DB_SCENARIOS=1) ---
+
+scenario_stop_portforward() {
+  if [ -n "${PORTFORWARD_PID}" ]; then
+    kill "${PORTFORWARD_PID}" >/dev/null 2>&1 || true
+    wait "${PORTFORWARD_PID}" >/dev/null 2>&1 || true
+    PORTFORWARD_PID=""
+  fi
+  if [ -n "${PORTFORWARD_HEALTH_PID}" ]; then
+    kill "${PORTFORWARD_HEALTH_PID}" >/dev/null 2>&1 || true
+    wait "${PORTFORWARD_HEALTH_PID}" >/dev/null 2>&1 || true
+    PORTFORWARD_HEALTH_PID=""
+  fi
+}
+
+scenario_cleanup_release() {
+  helmctl uninstall "${RELEASE_NAME}" --namespace "${NAMESPACE}" --wait \
+    --timeout 120s 2>/dev/null || true
+  HELM_INSTALLED=0
+  for _ in $(seq 1 30); do
+    remaining="$(kctl get pods -n "${NAMESPACE}" \
+      -l "app.kubernetes.io/instance=${RELEASE_NAME}" --no-headers 2>/dev/null || true)"
+    if [ -z "${remaining}" ]; then
+      break
+    fi
+    sleep 2
+  done
+  kctl delete pvc -n "${NAMESPACE}" \
+    -l "app.kubernetes.io/instance=${RELEASE_NAME}" --wait=false 2>/dev/null || true
+}
+
+scenario_deploy_external_pg() {
+  local pg_host pg_uri
+  echo "==> Deploying standalone PostgreSQL as external database..."
+  helmctl install pg-external oci://registry-1.docker.io/bitnamicharts/postgresql \
+    --namespace "${NAMESPACE}" \
+    --set auth.username=openshell \
+    --set auth.password=ext-test-password \
+    --set auth.database=openshell \
+    --wait --timeout 120s 2>/dev/null || true
+  EXTERNAL_PG_DEPLOYED=1
+
+  kctl -n "${NAMESPACE}" wait pod \
+    -l "app.kubernetes.io/name=postgresql,app.kubernetes.io/instance=pg-external" \
+    --for=condition=Ready --timeout=120s || true
+
+  pg_host="pg-external-postgresql.${NAMESPACE}.svc.cluster.local"
+  pg_uri="postgresql://openshell:ext-test-password@${pg_host}:5432/openshell"
+
+  echo "==> Creating Secret with PostgreSQL URI..."
+  kctl -n "${NAMESPACE}" create secret generic my-pg-credentials \
+    --from-literal=uri="${pg_uri}" \
+    2>/dev/null || true
+}
+
+scenario_cleanup_external_pg() {
+  echo "==> Cleaning up external PostgreSQL..."
+  helmctl uninstall pg-external --namespace "${NAMESPACE}" --wait \
+    --timeout 60s 2>/dev/null || true
+  kctl -n "${NAMESPACE}" delete secret my-pg-credentials \
+    --ignore-not-found >/dev/null 2>&1 || true
+  kctl delete pvc -n "${NAMESPACE}" \
+    -l "app.kubernetes.io/instance=pg-external" --wait=false 2>/dev/null || true
+  EXTERNAL_PG_DEPLOYED=0
+}
+
+# Run a single DB-backend scenario: install chart → port-forward → run tests → cleanup.
+# Usage: run_scenario "label" "type" [extra --set flags...]
+#   type: sqlite | bundled-pg | external-pg
+run_scenario() {
+  local scenario_label="$1" scenario_type="$2"
+  shift 2
+  local scenario_exit=0
+
+  echo ""
+  echo "========================================"
+  echo "==> Scenario: ${scenario_label}"
+  echo "========================================"
+
+  helmctl install "${RELEASE_NAME}" "${ROOT}/deploy/helm/openshell" \
+    --namespace "${NAMESPACE}" --create-namespace \
+    --values "${ROOT}/deploy/helm/openshell/ci/values-skaffold.yaml" \
+    --set "fullnameOverride=openshell" \
+    --set "image.repository=${REGISTRY_VALUE}/gateway" \
+    --set "image.tag=${IMAGE_TAG_VALUE}" \
+    --set "supervisor.image.repository=${REGISTRY_VALUE}/supervisor" \
+    --set "supervisor.image.tag=${IMAGE_TAG_VALUE}" \
+    "$@" \
+    --wait --timeout 5m
+  HELM_INSTALLED=1
+
+  if [ "${scenario_type}" = "bundled-pg" ]; then
+    echo "Waiting for bundled PostgreSQL to become ready..."
+    kctl -n "${NAMESPACE}" wait pod \
+      -l "app.kubernetes.io/name=postgres,app.kubernetes.io/instance=${RELEASE_NAME}" \
+      --for=condition=Ready --timeout=120s || true
+  fi
+
+  LOCAL_PORT="$(e2e_pick_port)"
+  echo "Starting kubectl port-forward svc/openshell ${LOCAL_PORT}:8080..."
+  kctl -n "${NAMESPACE}" port-forward "svc/openshell" \
+    "${LOCAL_PORT}:8080" >"${PORTFORWARD_LOG}" 2>&1 &
+  PORTFORWARD_PID=$!
+
+  local elapsed=0 pf_timeout=30
+  while [ "${elapsed}" -lt "${pf_timeout}" ]; do
+    if ! kill -0 "${PORTFORWARD_PID}" 2>/dev/null; then
+      echo "ERROR: kubectl port-forward exited before becoming reachable" >&2
+      cat "${PORTFORWARD_LOG}" >&2 || true
+      DB_FAILED=$((DB_FAILED + 1))
+      DB_SCENARIOS_SUMMARY+=("FAIL  ${scenario_label}: port-forward died")
+      scenario_stop_portforward
+      scenario_cleanup_release
+      return
+    fi
+    if curl -s -o /dev/null --connect-timeout 1 "http://127.0.0.1:${LOCAL_PORT}"; then
+      break
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  if [ "${elapsed}" -ge "${pf_timeout}" ]; then
+    echo "ERROR: port-forward did not accept TCP within ${pf_timeout}s" >&2
+    cat "${PORTFORWARD_LOG}" >&2 || true
+    DB_FAILED=$((DB_FAILED + 1))
+    DB_SCENARIOS_SUMMARY+=("FAIL  ${scenario_label}: port-forward timeout")
+    scenario_stop_portforward
+    scenario_cleanup_release
+    return
+  fi
+
+  HEALTH_LOCAL_PORT="$(e2e_pick_port)"
+  echo "Starting kubectl port-forward sts/${RELEASE_NAME} ${HEALTH_LOCAL_PORT}:health..."
+  kctl -n "${NAMESPACE}" port-forward "sts/${RELEASE_NAME}" \
+    "${HEALTH_LOCAL_PORT}:health" >"${PORTFORWARD_HEALTH_LOG}" 2>&1 &
+  PORTFORWARD_HEALTH_PID=$!
+
+  elapsed=0
+  while [ "${elapsed}" -lt "${pf_timeout}" ]; do
+    if ! kill -0 "${PORTFORWARD_HEALTH_PID}" 2>/dev/null; then
+      echo "ERROR: kubectl health port-forward exited before becoming reachable" >&2
+      cat "${PORTFORWARD_HEALTH_LOG}" >&2 || true
+      DB_FAILED=$((DB_FAILED + 1))
+      DB_SCENARIOS_SUMMARY+=("FAIL  ${scenario_label}: health port-forward died")
+      scenario_stop_portforward
+      scenario_cleanup_release
+      return
+    fi
+    if curl -s -o /dev/null --connect-timeout 1 "http://127.0.0.1:${HEALTH_LOCAL_PORT}/healthz"; then
+      break
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  if [ "${elapsed}" -ge "${pf_timeout}" ]; then
+    echo "ERROR: health port-forward did not accept TCP within ${pf_timeout}s" >&2
+    cat "${PORTFORWARD_HEALTH_LOG}" >&2 || true
+    DB_FAILED=$((DB_FAILED + 1))
+    DB_SCENARIOS_SUMMARY+=("FAIL  ${scenario_label}: health port-forward timeout")
+    scenario_stop_portforward
+    scenario_cleanup_release
+    return
+  fi
+
+  export OPENSHELL_E2E_HEALTH_PORT="${HEALTH_LOCAL_PORT}"
+
+  GATEWAY_NAME="openshell-e2e-kube-${LOCAL_PORT}"
+  GATEWAY_ENDPOINT="http://127.0.0.1:${LOCAL_PORT}"
+  e2e_register_plaintext_gateway \
+    "${XDG_CONFIG_HOME}" \
+    "${GATEWAY_NAME}" \
+    "${GATEWAY_ENDPOINT}" \
+    "${LOCAL_PORT}"
+
+  export OPENSHELL_GATEWAY="${GATEWAY_NAME}"
+  export OPENSHELL_E2E_DRIVER="kubernetes"
+  export OPENSHELL_E2E_SANDBOX_NAMESPACE="${NAMESPACE}"
+  export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-300}"
+
+  echo "Running e2e command against ${GATEWAY_ENDPOINT}: ${E2E_CMD[*]}"
+  "${E2E_CMD[@]}" || scenario_exit=$?
+
+  scenario_stop_portforward
+  scenario_cleanup_release
+
+  if [ "${scenario_exit}" -eq 0 ]; then
+    echo "==> PASS: ${scenario_label}"
+    DB_PASSED=$((DB_PASSED + 1))
+    DB_SCENARIOS_SUMMARY+=("PASS  ${scenario_label}")
+  else
+    echo "==> FAIL: ${scenario_label} (exit code ${scenario_exit})"
+    DB_FAILED=$((DB_FAILED + 1))
+    DB_SCENARIOS_SUMMARY+=("FAIL  ${scenario_label}: exit code ${scenario_exit}")
+  fi
+}
+
+# --- end DB-scenario helpers ---
 
 require_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -294,57 +535,125 @@ if [ -n "${HOST_GATEWAY_IP}" ]; then
   helm_extra_args+=(--set "server.hostGatewayIP=${HOST_GATEWAY_IP}")
 fi
 
-echo "Installing Helm chart (release=${RELEASE_NAME}, namespace=${NAMESPACE}, tag=${IMAGE_TAG_VALUE})..."
-helmctl install "${RELEASE_NAME}" "${ROOT}/deploy/helm/openshell" \
-  --namespace "${NAMESPACE}" --create-namespace \
-  --values "${ROOT}/deploy/helm/openshell/ci/values-skaffold.yaml" \
-  --set "fullnameOverride=openshell" \
-  --set "image.repository=${REGISTRY_VALUE}/gateway" \
-  --set "image.tag=${IMAGE_TAG_VALUE}" \
-  --set "supervisor.image.repository=${REGISTRY_VALUE}/supervisor" \
-  --set "supervisor.image.tag=${IMAGE_TAG_VALUE}" \
-  "${helm_extra_args[@]}" \
-  --wait --timeout 5m
-HELM_INSTALLED=1
+if [ "${OPENSHELL_E2E_KUBE_DB_SCENARIOS:-0}" = "1" ]; then
+  helm dependency build "${ROOT}/deploy/helm/openshell"
 
-LOCAL_PORT="$(e2e_pick_port)"
-echo "Starting kubectl port-forward svc/openshell ${LOCAL_PORT}:8080..."
-kctl -n "${NAMESPACE}" port-forward "svc/openshell" \
-  "${LOCAL_PORT}:8080" >"${PORTFORWARD_LOG}" 2>&1 &
-PORTFORWARD_PID=$!
+  # --- Multi-scenario mode: test all database backends ---
+  DB_PASSED=0
+  DB_FAILED=0
+  DB_SCENARIOS_SUMMARY=()
+  E2E_CMD=("$@")
 
-elapsed=0
-timeout=30
-while [ "${elapsed}" -lt "${timeout}" ]; do
-  if ! kill -0 "${PORTFORWARD_PID}" 2>/dev/null; then
-    echo "ERROR: kubectl port-forward exited before becoming reachable" >&2
+  run_scenario "SQLite (default)" sqlite \
+    "${helm_extra_args[@]}"
+
+  run_scenario "Bundled PostgreSQL" bundled-pg \
+    "${helm_extra_args[@]}" \
+    --set postgres.enabled=true
+
+  scenario_deploy_external_pg
+  run_scenario "External PostgreSQL (externalDbSecret)" external-pg \
+    "${helm_extra_args[@]}" \
+    --set server.externalDbSecret=my-pg-credentials
+  scenario_cleanup_external_pg
+
+  echo ""
+  echo "========================================"
+  echo "  DB Scenario Test Summary"
+  echo "========================================"
+  for s in "${DB_SCENARIOS_SUMMARY[@]}"; do
+    echo "  $s"
+  done
+  echo "----------------------------------------"
+  echo "  Passed: $DB_PASSED  Failed: $DB_FAILED"
+  echo "========================================"
+
+  if [ "$DB_FAILED" -gt 0 ]; then
+    exit 1
+  fi
+else
+  # --- Single-install mode (default, existing behavior) ---
+  chart_dir="$(chart_without_dependencies)"
+  echo "Installing Helm chart (release=${RELEASE_NAME}, namespace=${NAMESPACE}, tag=${IMAGE_TAG_VALUE})..."
+  helmctl install "${RELEASE_NAME}" "${chart_dir}" \
+    --namespace "${NAMESPACE}" --create-namespace \
+    --values "${ROOT}/deploy/helm/openshell/ci/values-skaffold.yaml" \
+    --set "fullnameOverride=openshell" \
+    --set "image.repository=${REGISTRY_VALUE}/gateway" \
+    --set "image.tag=${IMAGE_TAG_VALUE}" \
+    --set "supervisor.image.repository=${REGISTRY_VALUE}/supervisor" \
+    --set "supervisor.image.tag=${IMAGE_TAG_VALUE}" \
+    "${helm_extra_args[@]}" \
+    --wait --timeout 5m
+  HELM_INSTALLED=1
+
+  LOCAL_PORT="$(e2e_pick_port)"
+  echo "Starting kubectl port-forward svc/openshell ${LOCAL_PORT}:8080..."
+  kctl -n "${NAMESPACE}" port-forward "svc/openshell" \
+    "${LOCAL_PORT}:8080" >"${PORTFORWARD_LOG}" 2>&1 &
+  PORTFORWARD_PID=$!
+
+  elapsed=0
+  timeout=30
+  while [ "${elapsed}" -lt "${timeout}" ]; do
+    if ! kill -0 "${PORTFORWARD_PID}" 2>/dev/null; then
+      echo "ERROR: kubectl port-forward exited before becoming reachable" >&2
+      cat "${PORTFORWARD_LOG}" >&2 || true
+      exit 1
+    fi
+    if curl -s -o /dev/null --connect-timeout 1 "http://127.0.0.1:${LOCAL_PORT}"; then
+      break
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  if [ "${elapsed}" -ge "${timeout}" ]; then
+    echo "ERROR: port-forward did not accept TCP within ${timeout}s" >&2
     cat "${PORTFORWARD_LOG}" >&2 || true
     exit 1
   fi
-  if curl -s -o /dev/null --connect-timeout 1 "http://127.0.0.1:${LOCAL_PORT}"; then
-    break
+
+  HEALTH_LOCAL_PORT="$(e2e_pick_port)"
+  echo "Starting kubectl port-forward sts/${RELEASE_NAME} ${HEALTH_LOCAL_PORT}:health..."
+  kctl -n "${NAMESPACE}" port-forward "sts/${RELEASE_NAME}" \
+    "${HEALTH_LOCAL_PORT}:health" >"${PORTFORWARD_HEALTH_LOG}" 2>&1 &
+  PORTFORWARD_HEALTH_PID=$!
+
+  elapsed=0
+  timeout=30
+  while [ "${elapsed}" -lt "${timeout}" ]; do
+    if ! kill -0 "${PORTFORWARD_HEALTH_PID}" 2>/dev/null; then
+      echo "ERROR: kubectl health port-forward exited before becoming reachable" >&2
+      cat "${PORTFORWARD_HEALTH_LOG}" >&2 || true
+      exit 1
+    fi
+    if curl -s -o /dev/null --connect-timeout 1 "http://127.0.0.1:${HEALTH_LOCAL_PORT}/healthz"; then
+      break
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  if [ "${elapsed}" -ge "${timeout}" ]; then
+    echo "ERROR: health port-forward did not accept TCP within ${timeout}s" >&2
+    cat "${PORTFORWARD_HEALTH_LOG}" >&2 || true
+    exit 1
   fi
-  sleep 1
-  elapsed=$((elapsed + 1))
-done
-if [ "${elapsed}" -ge "${timeout}" ]; then
-  echo "ERROR: port-forward did not accept TCP within ${timeout}s" >&2
-  cat "${PORTFORWARD_LOG}" >&2 || true
-  exit 1
+
+  export OPENSHELL_E2E_HEALTH_PORT="${HEALTH_LOCAL_PORT}"
+
+  GATEWAY_NAME="openshell-e2e-kube-${LOCAL_PORT}"
+  GATEWAY_ENDPOINT="http://127.0.0.1:${LOCAL_PORT}"
+  e2e_register_plaintext_gateway \
+    "${XDG_CONFIG_HOME}" \
+    "${GATEWAY_NAME}" \
+    "${GATEWAY_ENDPOINT}" \
+    "${LOCAL_PORT}"
+
+  export OPENSHELL_GATEWAY="${GATEWAY_NAME}"
+  export OPENSHELL_E2E_DRIVER="kubernetes"
+  export OPENSHELL_E2E_SANDBOX_NAMESPACE="${NAMESPACE}"
+  export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-300}"
+
+  echo "Running e2e command against ${GATEWAY_ENDPOINT}: $*"
+  "$@"
 fi
-
-GATEWAY_NAME="openshell-e2e-kube-${LOCAL_PORT}"
-GATEWAY_ENDPOINT="http://127.0.0.1:${LOCAL_PORT}"
-e2e_register_plaintext_gateway \
-  "${XDG_CONFIG_HOME}" \
-  "${GATEWAY_NAME}" \
-  "${GATEWAY_ENDPOINT}" \
-  "${LOCAL_PORT}"
-
-export OPENSHELL_GATEWAY="${GATEWAY_NAME}"
-export OPENSHELL_E2E_DRIVER="kubernetes"
-export OPENSHELL_E2E_SANDBOX_NAMESPACE="${NAMESPACE}"
-export OPENSHELL_PROVISION_TIMEOUT="${OPENSHELL_PROVISION_TIMEOUT:-300}"
-
-echo "Running e2e command against ${GATEWAY_ENDPOINT}: $*"
-"$@"

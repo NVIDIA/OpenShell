@@ -1017,7 +1017,15 @@ impl App {
                                 return;
                             }
                         }
-                        SettingValueKind::String => {}
+                        SettingValueKind::String => {
+                            if let Some(setting) = settings::setting_for_key(&entry.key)
+                                && let Err(allowed) = setting.validate_string_value(raw)
+                            {
+                                edit.error =
+                                    Some(format!("expected one of: {}", allowed.join(", ")));
+                                return;
+                            }
+                        }
                     }
                 }
                 edit.error = None;
@@ -1261,7 +1269,15 @@ impl App {
                                 return;
                             }
                         }
-                        SettingValueKind::String => {}
+                        SettingValueKind::String => {
+                            if let Some(setting) = settings::setting_for_key(&entry.key)
+                                && let Err(allowed) = setting.validate_string_value(raw)
+                            {
+                                edit.error =
+                                    Some(format!("expected one of: {}", allowed.join(", ")));
+                                return;
+                            }
+                        }
                     }
                 }
                 edit.error = None;

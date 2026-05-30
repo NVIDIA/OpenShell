@@ -559,10 +559,14 @@ async fn handle_tcp_connection(
     // allowlist instead of blanket-blocking all private IPs.
     // When the policy host is already a literal IP address, treat it as
     // implicitly allowed — the user explicitly declared the destination.
+    // Exact declared hostnames also skip the private-IP blanket block below,
+    // while keeping loopback/link-local/unspecified addresses denied.
     let mut raw_allowed_ips = query_allowed_ips(&opa_engine, &decision, &host_lc, port);
     if raw_allowed_ips.is_empty() {
         raw_allowed_ips = implicit_allowed_ips_for_ip_host(&host);
     }
+    let exact_declared_endpoint_host =
+        query_exact_declared_endpoint_host(&opa_engine, &decision, &host_lc, port);
 
     // Defense-in-depth: resolve DNS and reject connections to internal IPs.
     let dns_connect_start = std::time::Instant::now();
@@ -721,6 +725,61 @@ async fn handle_tcp_connection(
                         "Forbidden",
                         "ssrf_denied",
                         &format!("CONNECT {host_lc}:{port} blocked: invalid allowed_ips in policy"),
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+    } else if exact_declared_endpoint_host {
+        // Exact declared hostname mode: the operator explicitly allowed this
+        // host:port, so private IP resolution is permitted without duplicating
+        // the resolved IP in allowed_ips. Always-blocked addresses and
+        // control-plane ports remain denied.
+        match resolve_and_check_declared_endpoint(&host, port, sandbox_entrypoint_pid).await {
+            Ok(addrs) => TcpStream::connect(addrs.as_slice())
+                .await
+                .into_diagnostic()?,
+            Err(reason) => {
+                {
+                    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                        .activity(ActivityId::Open)
+                        .action(ActionId::Denied)
+                        .disposition(DispositionId::Blocked)
+                        .severity(SeverityId::Medium)
+                        .status(StatusId::Failure)
+                        .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                        .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+                        .actor_process(
+                            Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
+                                .with_cmd_line(&cmdline_str),
+                        )
+                        .firewall_rule("-", "ssrf")
+                        .message(format!(
+                            "CONNECT blocked: declared endpoint check failed for {host_lc}:{port}"
+                        ))
+                        .status_detail(&reason)
+                        .build();
+                    ocsf_emit!(event);
+                }
+                emit_denial(
+                    &denial_tx,
+                    &host_lc,
+                    port,
+                    &binary_str,
+                    &decision,
+                    &reason,
+                    "ssrf",
+                );
+                respond(
+                    &mut client,
+                    &build_json_error_response(
+                        403,
+                        "Forbidden",
+                        "ssrf_denied",
+                        &format!(
+                            "CONNECT {host_lc}:{port} blocked: declared endpoint check failed"
+                        ),
                     ),
                 )
                 .await?;
@@ -2230,6 +2289,36 @@ fn validate_allowed_ips_for_resolved_addrs(
     Ok(())
 }
 
+fn validate_declared_endpoint_resolved_addrs(
+    host: &str,
+    port: u16,
+    addrs: &[SocketAddr],
+) -> std::result::Result<(), String> {
+    if addrs.is_empty() {
+        return Err(format!(
+            "DNS resolution returned no addresses for {}",
+            normalize_host_lookup_key(host)
+        ));
+    }
+
+    if BLOCKED_CONTROL_PLANE_PORTS.contains(&port) {
+        return Err(format!(
+            "port {port} is a blocked control-plane port, connection rejected"
+        ));
+    }
+
+    for addr in addrs {
+        if is_always_blocked_ip(addr.ip()) {
+            return Err(format!(
+                "{host} resolves to always-blocked address {}, connection rejected",
+                addr.ip()
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Resolve a host:port using sandbox `/etc/hosts` first (when available), then
 /// reject if any resolved address is internal.
 ///
@@ -2261,6 +2350,21 @@ async fn resolve_and_check_allowed_ips(
 ) -> std::result::Result<Vec<SocketAddr>, String> {
     let addrs = resolve_socket_addrs(host, port, entrypoint_pid).await?;
     validate_allowed_ips_for_resolved_addrs(host, port, &addrs, allowed_ips)?;
+    Ok(addrs)
+}
+
+/// Resolve a host:port that was explicitly declared by hostname in policy.
+///
+/// Exact declared hostnames are the operator's trust signal, so RFC1918 and
+/// other private ranges are allowed without a duplicated `allowed_ips` entry.
+/// Loopback, link-local, unspecified, and control-plane ports remain blocked.
+async fn resolve_and_check_declared_endpoint(
+    host: &str,
+    port: u16,
+    entrypoint_pid: u32,
+) -> std::result::Result<Vec<SocketAddr>, String> {
+    let addrs = resolve_socket_addrs(host, port, entrypoint_pid).await?;
+    validate_declared_endpoint_resolved_addrs(host, port, &addrs)?;
     Ok(addrs)
 }
 
@@ -2384,6 +2488,46 @@ fn query_allowed_ips(
                 .build();
             ocsf_emit!(event);
             vec![]
+        }
+    }
+}
+
+/// Query whether the matched endpoint was declared as this exact hostname.
+fn query_exact_declared_endpoint_host(
+    engine: &OpaEngine,
+    decision: &ConnectDecision,
+    host: &str,
+    port: u16,
+) -> bool {
+    let has_policy = match &decision.action {
+        NetworkAction::Allow { matched_policy } => matched_policy.is_some(),
+        NetworkAction::Deny { .. } => false,
+    };
+    if !has_policy {
+        return false;
+    }
+
+    let input = crate::opa::NetworkInput {
+        host: host.to_string(),
+        port,
+        binary_path: decision.binary.clone().unwrap_or_default(),
+        binary_sha256: String::new(),
+        ancestors: decision.ancestors.clone(),
+        cmdline_paths: decision.cmdline_paths.clone(),
+    };
+
+    match engine.query_exact_declared_endpoint_host(&input) {
+        Ok(is_exact_declared) => is_exact_declared,
+        Err(e) => {
+            let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                .activity(ActivityId::Fail)
+                .severity(SeverityId::Low)
+                .status(StatusId::Failure)
+                .dst_endpoint(Endpoint::from_domain(host, port))
+                .message(format!("Failed to query exact declared endpoint host: {e}"))
+                .build();
+            ocsf_emit!(event);
+            false
         }
     }
 }
@@ -3215,13 +3359,17 @@ async fn handle_forward_proxy(
     //      tiers and validate only against the trusted gateway IP.
     //    - If allowed_ips is set: validate resolved IPs against the allowlist
     //      (this is the SSRF override for private IP destinations).
-    //    - If allowed_ips is empty: reject internal IPs, allow public IPs through.
+    //    - If the endpoint is an exact declared hostname: allow private IPs,
+    //      but still reject always-blocked addresses and control-plane ports.
+    //    - Otherwise: reject internal IPs, allow public IPs through.
     //    When the policy host is already a literal IP address, treat it as
     //    implicitly allowed — the user explicitly declared the destination.
     let mut raw_allowed_ips = query_allowed_ips(&opa_engine, &decision, &host_lc, port);
     if raw_allowed_ips.is_empty() {
         raw_allowed_ips = implicit_allowed_ips_for_ip_host(&host);
     }
+    let exact_declared_endpoint_host =
+        query_exact_declared_endpoint_host(&opa_engine, &decision, &host_lc, port);
 
     // The trusted-gateway branch is the first path; reading it before the
     // allowed_ips and default branches matches the policy decision narrative.
@@ -3382,6 +3530,62 @@ async fn handle_forward_proxy(
                         "ssrf_denied",
                         &format!(
                             "{method} {host_lc}:{port} blocked: invalid allowed_ips in policy"
+                        ),
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+    } else if exact_declared_endpoint_host {
+        // Exact declared hostname mode mirrors CONNECT: private resolved
+        // addresses are allowed for this operator-declared host:port, while
+        // always-blocked addresses and control-plane ports remain denied.
+        match resolve_and_check_declared_endpoint(&host, port, sandbox_entrypoint_pid).await {
+            Ok(addrs) => addrs,
+            Err(reason) => {
+                {
+                    let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+                        .activity(ActivityId::Other)
+                        .action(ActionId::Denied)
+                        .disposition(DispositionId::Blocked)
+                        .severity(SeverityId::Medium)
+                        .status(StatusId::Failure)
+                        .http_request(HttpRequest::new(
+                            method,
+                            OcsfUrl::new("http", &host_lc, &path, port),
+                        ))
+                        .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                        .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
+                        .actor_process(
+                            Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
+                                .with_cmd_line(&cmdline_str),
+                        )
+                        .firewall_rule(policy_str, "ssrf")
+                        .message(format!(
+                            "FORWARD blocked: declared endpoint check failed for {host_lc}:{port}"
+                        ))
+                        .status_detail(&reason)
+                        .build();
+                    ocsf_emit!(event);
+                }
+                emit_denial_simple(
+                    denial_tx,
+                    &host_lc,
+                    port,
+                    &binary_str,
+                    &decision,
+                    &reason,
+                    "ssrf",
+                );
+                respond(
+                    client,
+                    &build_json_error_response(
+                        403,
+                        "Forbidden",
+                        "ssrf_denied",
+                        &format!(
+                            "{method} {host_lc}:{port} blocked: declared endpoint check failed"
                         ),
                     ),
                 )
@@ -4408,6 +4612,59 @@ network_policies:
         let nets = parse_allowed_ips(&["192.168.1.105/32".to_string()]).unwrap();
         assert!(
             validate_allowed_ips_for_resolved_addrs("searxng.local", 8080, &addrs, &nets).is_ok()
+        );
+    }
+
+    #[test]
+    fn test_declared_endpoint_private_hosts_file_resolution_allowed() {
+        let addrs = resolve_from_hosts_file_contents(
+            "192.168.1.105 searxng.local\n",
+            "searxng.local",
+            8080,
+        );
+
+        assert!(validate_declared_endpoint_resolved_addrs("searxng.local", 8080, &addrs).is_ok());
+    }
+
+    #[test]
+    fn test_declared_endpoint_loopback_stays_blocked() {
+        let addrs =
+            resolve_from_hosts_file_contents("127.0.0.1 loopback.local\n", "loopback.local", 80);
+
+        let err =
+            validate_declared_endpoint_resolved_addrs("loopback.local", 80, &addrs).unwrap_err();
+        assert!(
+            err.contains("always-blocked"),
+            "expected loopback to stay blocked: {err}"
+        );
+    }
+
+    #[test]
+    fn test_declared_endpoint_link_local_stays_blocked() {
+        let addrs = resolve_from_hosts_file_contents(
+            "169.254.169.254 metadata.local\n",
+            "metadata.local",
+            80,
+        );
+
+        let err =
+            validate_declared_endpoint_resolved_addrs("metadata.local", 80, &addrs).unwrap_err();
+        assert!(
+            err.contains("always-blocked"),
+            "expected link-local to stay blocked: {err}"
+        );
+    }
+
+    #[test]
+    fn test_declared_endpoint_blocks_control_plane_ports() {
+        let addrs =
+            resolve_from_hosts_file_contents("10.0.0.5 kube-api.local\n", "kube-api.local", 6443);
+
+        let err =
+            validate_declared_endpoint_resolved_addrs("kube-api.local", 6443, &addrs).unwrap_err();
+        assert!(
+            err.contains("blocked control-plane port"),
+            "expected control-plane port to stay blocked: {err}"
         );
     }
 

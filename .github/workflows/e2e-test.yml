@@ -40,6 +40,10 @@ jobs:
           - suite: rust-podman
             cmd: "mise run --no-deps --skip-deps e2e:podman"
             apt_packages: "openssh-client podman"
+          - suite: rust-podman-rootless
+            cmd: "mise run --no-deps --skip-deps e2e:podman:rootless"
+            apt_packages: "openssh-client podman uidmap"
+            rootless: true
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
@@ -72,8 +76,26 @@ jobs:
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Log in to GHCR with Podman
-        if: matrix.suite == 'rust-podman'
+        if: startsWith(matrix.suite, 'rust-podman')
         run: echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Set up rootless Podman user
+        if: matrix.rootless
+        run: |
+          useradd -m openshell-test
+          echo "openshell-test:100000:65536" >> /etc/subuid
+          echo "openshell-test:100000:65536" >> /etc/subgid
+          mkdir -p "/run/user/$(id -u openshell-test)"
+          chown openshell-test: "/run/user/$(id -u openshell-test)"
+          chmod 700 "/run/user/$(id -u openshell-test)"
+          chown -R openshell-test: .
+          mkdir -p /home/openshell-test/.cache/mise /home/openshell-test/.cargo /home/openshell-test/.local/state/mise
+          chown -R openshell-test: /home/openshell-test/.cache /home/openshell-test/.cargo /home/openshell-test/.local
+          install -m 0755 "$(command -v mise)" /usr/local/bin/mise
+          chmod a+x /root /root/.local /root/.local/bin
+          for dir in /root/.cargo /root/.rustup /root/.local/share/mise /opt/mise; do
+            [ -d "$dir" ] && chmod -R a+rX "$dir"
+          done
 
       - name: Install Python dependencies and generate protobuf stubs
         if: matrix.suite == 'python'
@@ -82,4 +104,27 @@ jobs:
       - name: Run tests
         env:
           OPENSHELL_SUPERVISOR_IMAGE: ${{ format('ghcr.io/nvidia/openshell/supervisor:{0}', inputs.image-tag) }}
-        run: ${{ matrix.cmd }}
+          E2E_CMD: ${{ matrix.cmd }}
+        run: |
+          if [ "${{ matrix.rootless }}" = "true" ]; then
+            TESTUID="$(id -u openshell-test)"
+            runuser -u openshell-test -- env \
+              XDG_RUNTIME_DIR="/run/user/${TESTUID}" \
+              HOME="/home/openshell-test" \
+              PATH="/usr/local/bin:/root/.cargo/bin:/opt/mise/shims:/root/.local/bin:${PATH}" \
+              CARGO_HOME="/home/openshell-test/.cargo" \
+              RUSTUP_HOME="/root/.rustup" \
+              MISE_DATA_DIR="/opt/mise" \
+              MISE_CACHE_DIR="/home/openshell-test/.cache/mise" \
+              MISE_STATE_DIR="/home/openshell-test/.local/state/mise" \
+              OPENSHELL_SUPERVISOR_IMAGE="${OPENSHELL_SUPERVISOR_IMAGE}" \
+              OPENSHELL_REGISTRY="${OPENSHELL_REGISTRY}" \
+              OPENSHELL_REGISTRY_HOST="${OPENSHELL_REGISTRY_HOST}" \
+              OPENSHELL_REGISTRY_USERNAME="${OPENSHELL_REGISTRY_USERNAME}" \
+              OPENSHELL_REGISTRY_PASSWORD="${OPENSHELL_REGISTRY_PASSWORD}" \
+              IMAGE_TAG="${IMAGE_TAG}" \
+              MISE_GITHUB_TOKEN="${MISE_GITHUB_TOKEN}" \
+              bash -c "${E2E_CMD}"
+          else
+            ${E2E_CMD}
+          fi

@@ -300,22 +300,41 @@ impl OcsfEvent {
                     },
                 );
                 let what = e.base.message.as_deref().unwrap_or("config");
-                let version_ctx = e
+                // Bracketed suffix carries the structured provenance fields a
+                // reviewer needs to scan a CONFIG audit line. Auto-approval
+                // emits `auto`/`source`/`prover_delta`; every config change
+                // also carries `policy_version` and `policy_hash`. Order is
+                // stable so logs are greppable.
+                let suffix = e
                     .base
                     .unmapped
                     .as_ref()
-                    .and_then(|u| {
-                        let ver = u.get("policy_version").and_then(|v| v.as_str());
-                        let hash = u.get("policy_hash").and_then(|v| v.as_str());
-                        match (ver, hash) {
-                            (Some(v), Some(h)) => Some(format!(" [version:{v} hash:{h}]")),
-                            (Some(v), None) => Some(format!(" [version:{v}]")),
-                            _ => None,
+                    .map(|u| {
+                        let mut parts: Vec<String> = Vec::new();
+                        let mut push = |key: &str| {
+                            if let Some(value) = u.get(key).and_then(|v| v.as_str()) {
+                                parts.push(format!("{key}:{value}"));
+                            }
+                        };
+                        push("auto");
+                        push("source");
+                        push("prover_delta");
+                        push("resolved_from");
+                        if let Some(ver) = u.get("policy_version").and_then(|v| v.as_str()) {
+                            parts.push(format!("version:{ver}"));
+                        }
+                        if let Some(hash) = u.get("policy_hash").and_then(|v| v.as_str()) {
+                            parts.push(format!("hash:{hash}"));
+                        }
+                        if parts.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" [{}]", parts.join(" "))
                         }
                     })
                     .unwrap_or_default();
 
-                format!("CONFIG:{state} {sev} {what}{version_ctx}")
+                format!("CONFIG:{state} {sev} {what}{suffix}")
             }
 
             Self::Base(e) => {
@@ -826,6 +845,37 @@ mod tests {
         assert_eq!(
             shorthand,
             "CONFIG:LOADED [INFO] policy reloaded [version:v3 hash:sha256:abc123def456]"
+        );
+    }
+
+    /// Auto-approval audit events carry `auto`, `source`, `prover_delta`, and
+    /// `resolved_from` as unmapped fields. Lock the suffix order so operators
+    /// (and the demo's grep) can rely on it.
+    #[test]
+    fn test_config_state_change_shorthand_includes_auto_approve_fields() {
+        let mut b = base(5019, "Device Config State Change", 5, "Discovery", 1, "Log");
+        b.set_message("auto-approved: no new prover findings (source=agent_authored)");
+        b.add_unmapped("auto", serde_json::json!("true"));
+        b.add_unmapped("source", serde_json::json!("agent_authored"));
+        b.add_unmapped("prover_delta", serde_json::json!("empty"));
+        b.add_unmapped("resolved_from", serde_json::json!("sandbox"));
+        b.add_unmapped("policy_version", serde_json::json!("v4"));
+        b.add_unmapped("policy_hash", serde_json::json!("sha256:cafe"));
+
+        let event = OcsfEvent::DeviceConfigStateChange(DeviceConfigStateChangeEvent {
+            base: b,
+            state: Some(StateId::Other),
+            state_custom_label: Some("APPROVED".to_string()),
+            security_level: None,
+            prev_security_level: None,
+        });
+
+        let shorthand = event.format_shorthand();
+        assert_eq!(
+            shorthand,
+            "CONFIG:APPROVED [INFO] auto-approved: no new prover findings (source=agent_authored) \
+             [auto:true source:agent_authored prover_delta:empty resolved_from:sandbox \
+             version:v4 hash:sha256:cafe]"
         );
     }
 

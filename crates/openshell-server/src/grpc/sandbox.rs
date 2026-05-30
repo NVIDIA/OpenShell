@@ -107,7 +107,7 @@ pub(super) async fn handle_create_sandbox(
 
     let now_ms = current_time_ms();
 
-    let sandbox = Sandbox {
+    let mut sandbox = Sandbox {
         metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
             id: id.clone(),
             name: name.clone(),
@@ -117,9 +117,8 @@ pub(super) async fn handle_create_sandbox(
         }),
         spec: Some(spec),
         status: None,
-        phase: SandboxPhase::Provisioning as i32,
-        current_policy_version: 0,
     };
+    sandbox.set_phase(SandboxPhase::Provisioning as i32);
 
     // Ensure metadata is valid (defense in depth - should always be true for server-constructed metadata)
     super::validation::validate_object_metadata(sandbox.metadata.as_ref(), "sandbox")?;
@@ -560,7 +559,7 @@ pub(super) async fn handle_watch_sandbox(
 
                 if stop_on_terminal {
                     let phase =
-                        SandboxPhase::try_from(sandbox.phase).unwrap_or(SandboxPhase::Unknown);
+                        SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
                     if phase == SandboxPhase::Ready {
                         return;
                     }
@@ -630,7 +629,7 @@ pub(super) async fn handle_watch_sandbox(
                                         return;
                                     }
                                     if stop_on_terminal {
-                                        let phase = SandboxPhase::try_from(sandbox.phase).unwrap_or(SandboxPhase::Unknown);
+                                        let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
                                         if phase == SandboxPhase::Ready {
                                             return;
                                         }
@@ -733,7 +732,7 @@ pub(super) async fn handle_exec_sandbox(
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
 
-    if SandboxPhase::try_from(sandbox.phase).ok() != Some(SandboxPhase::Ready) {
+    if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
         return Err(Status::failed_precondition("sandbox is not ready"));
     }
 
@@ -847,7 +846,7 @@ pub(super) async fn handle_forward_tcp(
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
 
-    if SandboxPhase::try_from(sandbox.phase).ok() != Some(SandboxPhase::Ready) {
+    if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
         return Err(Status::failed_precondition("sandbox is not ready"));
     }
 
@@ -1176,7 +1175,7 @@ pub(super) async fn handle_exec_sandbox_interactive(
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
 
-    if SandboxPhase::try_from(sandbox.phase).ok() != Some(SandboxPhase::Ready) {
+    if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
         return Err(Status::failed_precondition("sandbox is not ready"));
     }
 
@@ -1249,7 +1248,7 @@ pub(super) async fn handle_create_ssh_session(
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
 
-    if SandboxPhase::try_from(sandbox.phase).ok() != Some(SandboxPhase::Ready) {
+    if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
         return Err(Status::failed_precondition("sandbox is not ready"));
     }
 
@@ -2092,7 +2091,7 @@ mod tests {
     }
 
     fn test_sandbox(name: &str, providers: Vec<String>) -> Sandbox {
-        Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(ObjectMeta {
                 id: format!("sandbox-{name}"),
                 name: name.to_string(),
@@ -2106,10 +2105,11 @@ mod tests {
                 providers,
                 ..Default::default()
             }),
-            phase: SandboxPhase::Ready as i32,
-            current_policy_version: 7,
             ..Default::default()
-        }
+        };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        sandbox.set_current_policy_version(7);
+        sandbox
     }
 
     #[tokio::test]
@@ -2145,11 +2145,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(sandbox.phase(), SandboxPhase::Ready as i32);
+        assert_eq!(sandbox.current_policy_version(), 7);
         let spec = sandbox.spec.unwrap();
         assert_eq!(spec.providers, vec!["work-github"]);
         assert_eq!(spec.log_level, "debug");
-        assert_eq!(sandbox.phase, SandboxPhase::Ready as i32);
-        assert_eq!(sandbox.current_policy_version, 7);
     }
 
     #[tokio::test]
@@ -2430,7 +2430,7 @@ mod tests {
     async fn interactive_exec_rejects_sandbox_not_ready() {
         let state = test_server_state().await;
         let mut sandbox = test_sandbox("not-ready", Vec::new());
-        sandbox.phase = SandboxPhase::Provisioning as i32;
+        sandbox.set_phase(SandboxPhase::Provisioning as i32);
         state.store.put_message(&sandbox).await.unwrap();
 
         let stored = state
@@ -2440,7 +2440,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_ne!(
-            SandboxPhase::try_from(stored.phase).ok(),
+            SandboxPhase::try_from(stored.phase()).ok(),
             Some(SandboxPhase::Ready)
         );
     }

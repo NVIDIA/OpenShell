@@ -46,11 +46,21 @@ use openshell_ocsf::{
 };
 use openshell_policy::{
     PolicyMergeOp, ProviderPolicyLayer, compose_effective_policy, merge_policy,
+    serialize_sandbox_policy,
+};
+use openshell_prover::{
+    credentials::{Credential, CredentialSet},
+    finding::{Finding, FindingPath},
+    model::build_model,
+    policy::parse_policy_str,
+    queries::run_all_queries,
+    registry::load_embedded_binary_registry,
+    report::finding_shorthand,
 };
 use openshell_providers::{get_default_profile, normalize_provider_type};
 use prost::Message;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
@@ -92,6 +102,45 @@ fn emit_gateway_policy_audit_log(
         detail,
         version,
         policy_hash,
+        &[],
+    );
+    info!(
+        target: OCSF_TARGET,
+        sandbox_id = %sandbox_id,
+        message = %message
+    );
+}
+
+/// Emit a `CONFIG:APPROVED` audit event for an auto-approval — same event
+/// class as a human approval, with extra unmapped fields carrying the
+/// safety reasoning so the audit is reconstructable. `source` records the
+/// proposer (`mechanistic` or `agent_authored`) for provenance.
+/// `resolved_from` records the scope that supplied the `auto` mode setting
+/// (`gateway`, `sandbox`, or `default`) so operators can see why a given
+/// approval was auto vs manual.
+fn emit_gateway_policy_auto_approve_audit_log(
+    sandbox_id: &str,
+    sandbox_name: &str,
+    detail: impl Into<String>,
+    version: i64,
+    policy_hash: &str,
+    source: &str,
+    resolved_from: &str,
+) {
+    let extra = [
+        ("auto", "true".to_string()),
+        ("source", source.to_string()),
+        ("prover_delta", "empty".to_string()),
+        ("resolved_from", resolved_from.to_string()),
+    ];
+    let message = build_gateway_policy_audit_message(
+        sandbox_id,
+        sandbox_name,
+        "approved",
+        detail,
+        version,
+        policy_hash,
+        &extra,
     );
     info!(
         target: OCSF_TARGET,
@@ -107,6 +156,7 @@ fn build_gateway_policy_audit_message(
     detail: impl Into<String>,
     version: i64,
     policy_hash: &str,
+    extra_fields: &[(&str, String)],
 ) -> String {
     let ctx = SandboxContext {
         sandbox_id: sandbox_id.to_string(),
@@ -127,6 +177,9 @@ fn build_gateway_policy_audit_message(
     }
     if !policy_hash.is_empty() {
         builder = builder.unmapped("policy_hash", policy_hash.to_string());
+    }
+    for (key, value) in extra_fields {
+        builder = builder.unmapped(key, value.clone());
     }
     let event: OcsfEvent = builder.build();
     event.format_shorthand()
@@ -303,6 +356,595 @@ fn summarize_draft_chunk_rule(chunk: &DraftChunkRecord) -> Result<String, Status
     let rule = NetworkPolicyRule::decode(chunk.proposed_rule.as_slice())
         .map_err(|e| Status::internal(format!("decode proposed_rule failed: {e}")))?;
     Ok(summarize_add_rule(&chunk.rule_name, &rule))
+}
+
+/// Run prover queries against the merged policy and render a short
+/// human-readable verdict for the reviewer. The verdict reports only the
+/// **delta** — findings the proposal introduces on top of the current policy.
+/// Baseline gaps (pre-existing findings) are intentionally not surfaced here;
+/// they belong on a posture surface, not on the per-proposal approval moment.
+///
+/// The string is the entire output — no taxonomy, no greppable prefixes; the
+/// reviewer reads it like an OCSF shorthand line. One of:
+///
+/// - `prover: no new findings`
+/// - `prover: N new finding(s)` followed by one `  <category>: <detail>`
+///   line per finding path (categorical shorthand from `openshell-prover`)
+/// - `merge failed: <one-line error>` — proposal won't merge into the current
+///   policy
+/// - `policy invalid: <one-line error>` — merged policy fails the cheap
+///   structural safety check
+/// - `validation unavailable` — gateway-side infrastructure failure (registry
+///   load, YAML serialize/parse). Internal error detail is logged via
+///   `warn!`, never exposed to the reviewer.
+fn validation_result_for_agent_proposal(
+    current_policy: ProtoSandboxPolicy,
+    rule_name: &str,
+    proposed_rule: &NetworkPolicyRule,
+    credentials: &CredentialSet,
+) -> String {
+    let merge_op = PolicyMergeOp::AddRule {
+        rule_name: rule_name.to_string(),
+        rule: proposed_rule.clone(),
+    };
+    let merged = match merge_policy(current_policy.clone(), &[merge_op]) {
+        Ok(result) => result.policy,
+        Err(error) => return format!("merge failed: {}", one_line(&error.to_string())),
+    };
+    if let Err(error) = validate_policy_safety(&merged) {
+        return format!("policy invalid: {}", one_line(&error.to_string()));
+    }
+
+    let merged_findings = match run_prover_findings(&merged, credentials) {
+        Ok(findings) => findings,
+        Err(error) => {
+            warn!(error = %error, "prover validation unavailable for merged policy");
+            return "validation unavailable".to_string();
+        }
+    };
+    // If the baseline prover run fails (e.g. the current policy uses a shape
+    // the prover hasn't caught up to yet), fall back to an empty baseline so
+    // every merged finding surfaces as new. Safer to over-warn than miss a
+    // real regression introduced by the proposal.
+    let base_findings = match run_prover_findings(&current_policy, credentials) {
+        Ok(findings) => findings,
+        Err(error) => {
+            warn!(error = %error, "prover baseline run failed; treating baseline as empty");
+            Vec::new()
+        }
+    };
+
+    let new_findings = finding_delta(&base_findings, &merged_findings);
+    if new_findings.is_empty() {
+        return "prover: no new findings".to_string();
+    }
+    let count = new_findings.len();
+    let mut out = format!(
+        "prover: {} new finding{}",
+        count,
+        if count == 1 { "" } else { "s" }
+    );
+    for finding in &new_findings {
+        out.push_str("\n  ");
+        out.push_str(&finding_shorthand(finding));
+    }
+    out
+}
+
+/// Run the prover end-to-end against a single policy with the given
+/// credential set. Returns the raw finding list, or a short error string
+/// identifying which infrastructure step failed.
+///
+/// The credential set is passed in because it's stable across all chunks in
+/// one `SubmitPolicyAnalysis` batch — the caller builds it once and shares.
+fn run_prover_findings(
+    policy: &ProtoSandboxPolicy,
+    credentials: &CredentialSet,
+) -> Result<Vec<Finding>, String> {
+    let yaml =
+        serialize_sandbox_policy(policy).map_err(|e| format!("serialize policy failed: {e}"))?;
+    let prover_policy = parse_policy_str(&yaml).map_err(|e| format!("parse policy failed: {e}"))?;
+    let registry =
+        load_embedded_binary_registry().map_err(|e| format!("load registry failed: {e}"))?;
+    let model = build_model(prover_policy, credentials.clone(), registry);
+    Ok(run_all_queries(&model))
+}
+
+/// Build a `CredentialSet` for the sandbox by walking its attached providers.
+///
+/// v1 models "credential is present in scope for these hosts" — no scope
+/// modeling. Each attached provider produces one [`Credential`] entry whose
+/// `target_hosts` lists the hosts from the provider's profile endpoints.
+/// Missing providers or providers whose type has no profile are skipped with
+/// a `warn!` — the merged policy already excludes them at compose time, so
+/// silently treating them as absent here keeps the credential set consistent
+/// with the merged policy the prover validates against.
+async fn build_credential_set_for_sandbox(
+    store: &Store,
+    provider_names: &[String],
+) -> Result<CredentialSet, Status> {
+    let mut credentials = Vec::new();
+
+    for name in provider_names {
+        let Some(provider) = store
+            .get_message_by_name::<Provider>(name)
+            .await
+            .map_err(|e| Status::internal(format!("failed to fetch provider '{name}': {e}")))?
+        else {
+            warn!(provider_name = %name, "provider not found while building credential set; skipping");
+            continue;
+        };
+
+        let provider_type = provider.r#type.trim();
+        let profile = if let Some(canonical_type) = normalize_provider_type(provider_type) {
+            let Some(profile) = get_default_profile(canonical_type) else {
+                warn!(
+                    provider_name = %name,
+                    provider_type,
+                    "legacy provider type has no profile; skipping credential entry"
+                );
+                continue;
+            };
+            profile.clone()
+        } else {
+            let Some(profile) =
+                super::provider::get_provider_type_profile(store, provider_type).await?
+            else {
+                warn!(
+                    provider_name = %name,
+                    provider_type,
+                    "provider type has no profile; skipping credential entry"
+                );
+                continue;
+            };
+            profile
+        };
+
+        let target_hosts: Vec<String> = profile
+            .endpoints
+            .iter()
+            .map(|ep| ep.host.to_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect();
+
+        if target_hosts.is_empty() {
+            continue;
+        }
+
+        credentials.push(Credential {
+            name: name.clone(),
+            cred_type: provider_type.to_string(),
+            scopes: Vec::new(),
+            injected_via: String::new(),
+            target_hosts,
+        });
+    }
+
+    Ok(CredentialSet {
+        credentials,
+        api_registries: HashMap::new(),
+    })
+}
+
+/// Stable identity key for a finding path. Deliberately excludes
+/// `policy_name`: two paths with identical (binary, endpoint, mechanism) are
+/// the same security gap whether they live in rule `foo` or rule `bar`. This
+/// keeps the delta from spuriously surfacing baseline gaps just because the
+/// proposal added a new rule name that produces the same gap shape.
+fn finding_path_key(path: &FindingPath) -> String {
+    let FindingPath::Exfil(p) = path;
+    // Include the category and (for capability_expansion) the method so
+    // adding a new method on an already-reached host surfaces as a new
+    // path; reuse of an existing method does not.
+    format!(
+        "exfil|{}|{}:{}|{}|{}",
+        p.binary, p.endpoint_host, p.endpoint_port, p.category, p.method
+    )
+}
+
+/// Return the merged-policy findings that aren't already present in the
+/// baseline. Comparison is per-(query, path) so that a single finding whose
+/// evidence grew (e.g. a new method allowed on an already-reached host)
+/// surfaces only the new evidence paths.
+///
+/// **Category suppression:** `capability_expansion` paths whose (binary,
+/// host, port) tuple appears in the `credential_reach_expansion` delta
+/// are suppressed. A brand-new credentialed reach is described by the
+/// reach-expansion finding alone; we don't double-report by also
+/// flagging every method as a separate `capability_expansion`.
+fn finding_delta(base: &[Finding], merged: &[Finding]) -> Vec<Finding> {
+    use openshell_prover::finding::category;
+
+    let base_keys: HashSet<(String, String)> = base
+        .iter()
+        .flat_map(|f| {
+            let query = f.query.clone();
+            f.paths
+                .iter()
+                .map(move |p| (query.clone(), finding_path_key(p)))
+        })
+        .collect();
+    let mut delta: Vec<Finding> = Vec::new();
+    for finding in merged {
+        let new_paths: Vec<FindingPath> = finding
+            .paths
+            .iter()
+            .filter(|p| !base_keys.contains(&(finding.query.clone(), finding_path_key(p))))
+            .cloned()
+            .collect();
+        if new_paths.is_empty() {
+            continue;
+        }
+        delta.push(Finding {
+            paths: new_paths,
+            ..finding.clone()
+        });
+    }
+
+    // Suppress capability_expansion paths whose (binary, host, port)
+    // appears in the credential_reach_expansion delta — a new reach is
+    // described once, by the reach-expansion category, not also by per-
+    // method capability findings.
+    let reach_tuples: HashSet<(String, String, u16)> = delta
+        .iter()
+        .filter(|f| f.query == category::CREDENTIAL_REACH_EXPANSION)
+        .flat_map(|f| {
+            f.paths.iter().map(|p| {
+                let FindingPath::Exfil(e) = p;
+                (e.binary.clone(), e.endpoint_host.clone(), e.endpoint_port)
+            })
+        })
+        .collect();
+    delta.retain_mut(|f| {
+        if f.query != category::CAPABILITY_EXPANSION {
+            return true;
+        }
+        f.paths.retain(|p| {
+            let FindingPath::Exfil(e) = p;
+            !reach_tuples.contains(&(e.binary.clone(), e.endpoint_host.clone(), e.endpoint_port))
+        });
+        !f.paths.is_empty()
+    });
+
+    delta
+}
+
+/// Collapse multi-line / multi-message error text to a single line so the
+/// `validation_result` stays a clean, scannable string.
+fn one_line(s: &str) -> String {
+    s.split('\n')
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Auto-reject any pending chunks for the same sandbox that share the
+/// `(host, port, binary)` of the newly-submitted chunk. Mode-agnostic: the
+/// rule is "the latest submission for this endpoint wins; older pending
+/// proposals are stale."
+///
+/// In practice this implements the supersede behavior for the
+/// `mechanistic`→`agent_authored` refinement loop: when the agent submits a
+/// narrow L7 proposal in response to a denial, any pending mechanistic L4
+/// draft for the same key gets auto-rejected here, without the agent or the
+/// proto needing an explicit `supersedes_chunk_id` field.
+///
+/// Failures (DB error, scan error) are logged via `warn!` and the function
+/// returns silently. The new chunk's persistence has already succeeded;
+/// failing this cleanup pass should not abort the submission flow.
+async fn supersede_other_pending_chunks_for_endpoint(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+    new_chunk_id: &str,
+    host: &str,
+    port: i32,
+    binary: &str,
+) {
+    // Empty host/port/binary should not supersede anything — the matcher would
+    // accidentally cover unrelated chunks. Defensive skip.
+    if host.is_empty() || port == 0 || binary.is_empty() {
+        return;
+    }
+
+    let pending = match state
+        .store
+        .list_draft_chunks(sandbox_id, Some("pending"))
+        .await
+    {
+        Ok(records) => records,
+        Err(err) => {
+            warn!(
+                sandbox_id = %sandbox_id,
+                error = %err,
+                "supersede scan failed; older pending chunks (if any) remain pending"
+            );
+            return;
+        }
+    };
+
+    let now_ms = current_time_ms();
+    for other in pending {
+        if other.id == new_chunk_id
+            || other.host != host
+            || other.port != port
+            || other.binary != binary
+        {
+            continue;
+        }
+
+        let reason = format!("superseded by chunk {new_chunk_id}");
+        match state
+            .store
+            .update_draft_chunk_status(&other.id, "rejected", Some(now_ms), Some(&reason))
+            .await
+        {
+            Ok(_) => {
+                info!(
+                    sandbox_id = %sandbox_id,
+                    superseded_chunk = %other.id,
+                    by_chunk = %new_chunk_id,
+                    host = %host,
+                    port = port,
+                    binary = %binary,
+                    "Auto-rejected pending chunk: superseded by newer submission for same (host, port, binary)"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    chunk_id = %other.id,
+                    error = %err,
+                    "supersede auto-reject failed; chunk remains pending"
+                );
+            }
+        }
+    }
+}
+
+/// If the just-submitted mechanistic chunk targets a `(host, port, binary)`
+/// already covered by an approved `agent_authored` chunk, auto-reject the
+/// mechanistic chunk on arrival. The agent has already handled this access
+/// decision; the mechanistic draft would only add approval-queue noise.
+///
+/// `agent_authored` submissions are NEVER self-rejected — that path remains
+/// open for refinement. Only the mechanistic side is asymmetric.
+async fn self_reject_mechanistic_if_already_covered(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+    new_chunk_id: &str,
+    host: &str,
+    port: i32,
+    binary: &str,
+) {
+    if host.is_empty() || port == 0 || binary.is_empty() {
+        return;
+    }
+
+    let approved = match state
+        .store
+        .list_draft_chunks(sandbox_id, Some("approved"))
+        .await
+    {
+        Ok(records) => records,
+        Err(err) => {
+            warn!(
+                sandbox_id = %sandbox_id,
+                error = %err,
+                "approved-chunk scan for self-reject failed; mechanistic chunk remains pending"
+            );
+            return;
+        }
+    };
+
+    // If any approved chunk for this sandbox already targets the same
+    // (host, port, binary), the mechanistic submission is redundant.
+    let covered_by = approved
+        .iter()
+        .find(|c| c.host == host && c.port == port && c.binary == binary);
+    let Some(covering) = covered_by else {
+        return;
+    };
+
+    let reason = format!(
+        "already covered by approved chunk {} (agent_authored or prior auto-approval)",
+        covering.id
+    );
+    match state
+        .store
+        .update_draft_chunk_status(
+            new_chunk_id,
+            "rejected",
+            Some(current_time_ms()),
+            Some(&reason),
+        )
+        .await
+    {
+        Ok(_) => {
+            info!(
+                sandbox_id = %sandbox_id,
+                chunk_id = %new_chunk_id,
+                covering_chunk = %covering.id,
+                host = %host,
+                port = port,
+                binary = %binary,
+                "Auto-rejected incoming mechanistic chunk: endpoint already covered by an approved chunk"
+            );
+        }
+        Err(err) => {
+            warn!(
+                chunk_id = %new_chunk_id,
+                error = %err,
+                "mechanistic self-reject failed; chunk remains pending"
+            );
+        }
+    }
+}
+
+/// Internally approve a chunk on the auto-approval path: merge into the
+/// active policy, flip status to "approved", notify watchers, and emit a
+/// `CONFIG:APPROVED` audit event carrying `auto=true`, `source=<mode>`,
+/// `prover_delta=empty` so the audit trail records why no human approved
+/// this chunk.
+///
+/// `source` is the `analysis_mode` of the originating submission
+/// (`mechanistic` or `agent_authored`). The audit copy says "auto-approved:
+/// no new prover findings" — never "safe" — because the claim is about the
+/// prover's reasoning, not the world.
+/// Resolve the effective proposal-approval mode for a sandbox.
+///
+/// Precedence (matches the rest of the settings model): gateway scope wins
+/// over sandbox scope. A reviewer can pin manual mode fleet-wide by setting
+/// it globally; per-sandbox overrides only apply when no global is set.
+///
+/// Returns `(auto_approve_enabled, resolved_from)` where `resolved_from`
+/// is `"gateway"`, `"sandbox"`, or `"default"`. Only an exact `"auto"`
+/// value enables auto-approval; any other string (including future-
+/// reserved modes like `"auto_on_low_risk"`) is conservatively treated as
+/// manual.
+async fn resolve_proposal_approval_mode(
+    store: &Store,
+    sandbox_name: &str,
+) -> Result<(bool, &'static str), Status> {
+    let global = load_global_settings(store).await?;
+    if let Some(StoredSettingValue::String(value)) =
+        global.settings.get(settings::PROPOSAL_APPROVAL_MODE_KEY)
+    {
+        return Ok((value == "auto", "gateway"));
+    }
+
+    let sandbox = load_sandbox_settings(store, sandbox_name).await?;
+    if let Some(StoredSettingValue::String(value)) =
+        sandbox.settings.get(settings::PROPOSAL_APPROVAL_MODE_KEY)
+    {
+        return Ok((value == "auto", "sandbox"));
+    }
+
+    Ok((false, "default"))
+}
+
+async fn auto_approve_chunk(
+    state: &Arc<ServerState>,
+    sandbox_id: &str,
+    sandbox_name: &str,
+    chunk_id: &str,
+    source: &str,
+    resolved_from: &str,
+) -> Result<(), Status> {
+    // Same gate the human-driven approve paths apply: if a global policy is
+    // active, sandbox-scoped chunk approvals are meaningless because
+    // `GetSandboxConfig` prefers the global policy. Auto-approving here
+    // would persist a sandbox revision that the runtime silently ignores
+    // and leave a misleading "approved" chunk in the table. Bail before
+    // touching state; the calling site logs this as `warn!` and leaves the
+    // chunk pending.
+    require_no_global_policy(state).await?;
+
+    let chunk = state
+        .store
+        .get_draft_chunk(chunk_id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch chunk failed: {e}")))?
+        .ok_or_else(|| Status::not_found("chunk not found"))?;
+
+    // The chunk may have been superseded or rejected by something else
+    // between persist and auto-approve. Only approve from a pending state.
+    if chunk.status != "pending" {
+        return Ok(());
+    }
+
+    let (version, hash) = merge_chunk_into_policy(state.store.as_ref(), sandbox_id, &chunk).await?;
+    let chunk_summary = summarize_draft_chunk_rule(&chunk)?;
+
+    let now_ms = current_time_ms();
+    state
+        .store
+        .update_draft_chunk_status(chunk_id, "approved", Some(now_ms), None)
+        .await
+        .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
+
+    state.sandbox_watch_bus.notify(sandbox_id);
+
+    let source_label = if source.is_empty() {
+        "unspecified"
+    } else {
+        source
+    };
+    emit_gateway_policy_auto_approve_audit_log(
+        sandbox_id,
+        sandbox_name,
+        format!(
+            "auto-approved: no new prover findings (source={source_label}) — chunk {chunk_id}: {chunk_summary}"
+        ),
+        version,
+        &hash,
+        source_label,
+        resolved_from,
+    );
+
+    info!(
+        sandbox_id = %sandbox_id,
+        chunk_id = %chunk_id,
+        rule_name = %chunk.rule_name,
+        version = version,
+        policy_hash = %hash,
+        source = %source_label,
+        resolved_from = %resolved_from,
+        "Auto-approved chunk: no new prover findings"
+    );
+
+    Ok(())
+}
+
+// TODO: share effective-policy lookup with `load_sandbox_policy` /
+// `GetSandboxConfig`. They re-implement very similar global-settings +
+// providers_v2 + compose logic; consolidating them is out of scope for the
+// agent-authored proposal validation slice.
+async fn current_effective_policy_for_sandbox(
+    state: &ServerState,
+    sandbox: &Sandbox,
+    sandbox_id: &str,
+) -> Result<ProtoSandboxPolicy, Status> {
+    let mut policy = if let Some(record) = state
+        .store
+        .get_latest_policy(sandbox_id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch latest policy failed: {e}")))?
+    {
+        ProtoSandboxPolicy::decode(record.policy_payload.as_slice())
+            .map_err(|e| Status::internal(format!("decode current policy failed: {e}")))?
+    } else {
+        sandbox
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.policy.clone())
+            .unwrap_or_default()
+    };
+
+    let global_settings = load_global_settings(state.store.as_ref()).await?;
+    let policy_source = decode_policy_from_global_settings(&global_settings)?.map_or(
+        PolicySource::Sandbox,
+        |global_policy| {
+            policy = global_policy;
+            PolicySource::Global
+        },
+    );
+
+    let providers_v2_enabled =
+        bool_setting_enabled(&global_settings, settings::PROVIDERS_V2_ENABLED_KEY)?;
+    if providers_v2_enabled && !matches!(policy_source, PolicySource::Global) {
+        let provider_names = sandbox
+            .spec
+            .as_ref()
+            .map(|spec| spec.providers.clone())
+            .unwrap_or_default();
+        let provider_layers =
+            profile_provider_policy_layers(state.store.as_ref(), &provider_names).await?;
+        if !provider_layers.is_empty() {
+            policy = compose_effective_policy(&policy, &provider_layers);
+        }
+    }
+
+    Ok(policy)
 }
 
 fn truncate_for_log(input: &str, max_chars: usize) -> String {
@@ -1201,7 +1843,7 @@ pub(super) async fn handle_get_sandbox_policy_status(
             .ok_or_else(|| Status::not_found("sandbox not found"))?;
         (
             sandbox.object_id().to_string(),
-            sandbox.current_policy_version,
+            sandbox.current_policy_version(),
         )
     };
 
@@ -1330,7 +1972,7 @@ pub(super) async fn handle_report_policy_status(
         state
             .store
             .update_message_cas::<Sandbox, _>(&req.sandbox_id, 0, |sandbox| {
-                sandbox.current_policy_version = version_to_set;
+                sandbox.set_current_policy_version(version_to_set);
             })
             .await
             .map_err(|e| super::persistence_error_to_status(e, "update current_policy_version"))?;
@@ -1479,6 +2121,35 @@ pub(super) async fn handle_submit_policy_analysis(
     let sandbox =
         resolve_sandbox_by_name_for_principal(state.store.as_ref(), &principal, &req.name).await?;
     let sandbox_id = sandbox.object_id().to_string();
+    // `current_policy` is captured ONCE at the top of the batch and frozen
+    // for every chunk's delta computation, even if an earlier chunk in the
+    // batch auto-approves and merges. This is intentional v1 behavior:
+    // multi-chunk batches with overlapping endpoints would otherwise have
+    // chunk N+1 fail to see chunk N's contribution, which is a degenerate
+    // case for the common single-chunk submission shape. If real workloads
+    // surface a problem with batches that interact across chunks, the right
+    // fix is to recompute baseline after each successful auto-approve.
+    let current_policy = current_effective_policy_for_sandbox(state, &sandbox, &sandbox_id).await?;
+
+    // Auto-approval is an opt-in behavior, sourced from the settings model
+    // (sandbox or gateway scope) so it can be flipped on a running sandbox
+    // and managed fleet-wide. Default (no setting, or any value other than
+    // exact "auto") preserves OpenShell's default-deny posture: every
+    // proposal lands in `pending` for a human reviewer.
+    let (auto_approve_enabled, resolved_from) =
+        resolve_proposal_approval_mode(state.store.as_ref(), sandbox.object_name()).await?;
+
+    // The credential set is stable across all chunks in this batch, so build
+    // it once. v1 captures presence only — no scope modeling — so the prover
+    // can answer "is there a credential in scope for this host?" but not
+    // "what action class does that credential authorize?"
+    let provider_names_for_creds: Vec<String> = sandbox
+        .spec
+        .as_ref()
+        .map(|spec| spec.providers.clone())
+        .unwrap_or_default();
+    let credential_set =
+        build_credential_set_for_sandbox(state.store.as_ref(), &provider_names_for_creds).await?;
 
     let current_version = state
         .store
@@ -1496,6 +2167,21 @@ pub(super) async fn handle_submit_policy_analysis(
         if chunk.rule_name.is_empty() {
             rejected += 1;
             rejection_reasons.push("chunk missing rule_name".to_string());
+            continue;
+        }
+        // `_provider_*` is the reserved namespace for rules synthesized from
+        // provider profiles during composition. Agent submissions that target
+        // those keys would merge directly into the provider rule and bypass
+        // the merge.rs guard that splits agent-authored chunks into their
+        // own rule so the prover sees their contribution honestly. Reject at
+        // the entry boundary — the agent never has reason to address a
+        // provider rule by name.
+        if chunk.rule_name.starts_with("_provider_") {
+            rejected += 1;
+            rejection_reasons.push(format!(
+                "chunk '{}' uses reserved '_provider_' rule-name prefix",
+                chunk.rule_name
+            ));
             continue;
         }
         if chunk.proposed_rule.is_none() {
@@ -1520,6 +2206,17 @@ pub(super) async fn handle_submit_policy_analysis(
             .and_then(|r| r.binaries.first())
             .map(|b| b.path.clone())
             .unwrap_or_default();
+
+        // The prover runs on every proposal regardless of `analysis_mode`.
+        // Source provenance (mechanistic vs agent_authored) is preserved in
+        // OCSF audit fields, but the safety decision is grounded in the
+        // merged-policy consequence, not the author — proposer-agnostic.
+        let validation_result = validation_result_for_agent_proposal(
+            current_policy.clone(),
+            &chunk.rule_name,
+            chunk.proposed_rule.as_ref().expect("checked above"),
+            &credential_set,
+        );
 
         let record = DraftChunkRecord {
             // The handler proposes an id; the store may swap it for an
@@ -1553,7 +2250,7 @@ pub(super) async fn handle_submit_policy_analysis(
             } else {
                 now_ms
             },
-            validation_result: String::new(),
+            validation_result: validation_result.clone(),
             rejection_reason: String::new(),
         };
         // Mechanistic mode dedups N denials targeting the same endpoint
@@ -1569,6 +2266,71 @@ pub(super) async fn handle_submit_policy_analysis(
             .await
             .map_err(|e| Status::internal(format!("persist draft chunk failed: {e}")))?;
         accepted += 1;
+
+        // Implicit supersede: any other pending chunk for the same
+        // (host, port, binary) in this sandbox is now stale because this
+        // newer submission covers the same access decision. Auto-reject the
+        // older chunks with a clear reason. This is what lets the agent
+        // refine a mechanistic L4 draft into an L7 narrow proposal without
+        // any explicit `supersedes_chunk_id` plumbing — the gateway figures
+        // out the relationship by structural overlap.
+        supersede_other_pending_chunks_for_endpoint(
+            state,
+            &sandbox_id,
+            &effective_id,
+            &record.host,
+            record.port,
+            &record.binary,
+        )
+        .await;
+
+        // Asymmetric self-reject: if this is a mechanistic proposal that
+        // arrived AFTER an already-approved agent_authored chunk covered the
+        // same (host, port, binary), the mechanistic submission is
+        // redundant — the agent already handled it. Auto-reject so it
+        // doesn't pile up as approval-queue noise. Agent_authored
+        // submissions never self-reject; refinement is always allowed.
+        if req.analysis_mode == "mechanistic" {
+            self_reject_mechanistic_if_already_covered(
+                state,
+                &sandbox_id,
+                &effective_id,
+                &record.host,
+                record.port,
+                &record.binary,
+            )
+            .await;
+        }
+
+        // Auto-approval gate (proposer-agnostic, opt-in): only fire when
+        // BOTH the prover found nothing new in this proposal's delta AND
+        // the reviewer opted in via the `proposal_approval_mode` setting
+        // (gateway or sandbox scope). On any failure (merge conflict,
+        // status update error), the chunk stays pending so a human can
+        // review — never silently lose a proposal. The `validation_result`
+        // literal here is the canonical empty-delta verdict; any other
+        // string means findings or infrastructure error, both of which
+        // require human attention.
+        if auto_approve_enabled
+            && validation_result == "prover: no new findings"
+            && let Err(err) = auto_approve_chunk(
+                state,
+                &sandbox_id,
+                sandbox.object_name(),
+                &effective_id,
+                &req.analysis_mode,
+                resolved_from,
+            )
+            .await
+        {
+            warn!(
+                chunk_id = %effective_id,
+                sandbox_id = %sandbox_id,
+                error = %err,
+                "auto-approval failed; chunk remains pending for human review"
+            );
+        }
+
         accepted_chunk_ids.push(effective_id);
     }
 
@@ -2337,30 +3099,44 @@ fn generate_security_notes(host: &str, port: u16) -> String {
 ///
 /// This is defense-in-depth: the proxy blocks these at runtime, so
 /// merging them into the active policy would be silently un-enforceable.
+fn validate_host_not_always_blocked(host: &str) -> Result<(), Status> {
+    use openshell_core::net::{is_always_blocked_ip, is_known_metadata_hostname};
+    use std::net::IpAddr;
+
+    let host = host.trim();
+    // Check if the host is a literal always-blocked IP.
+    if let Ok(ip) = host.parse::<IpAddr>()
+        && is_always_blocked_ip(ip)
+    {
+        return Err(Status::invalid_argument(format!(
+            "proposed rule endpoint host '{host}' is an always-blocked address \
+             (loopback/link-local/unspecified); the proxy will deny traffic \
+             to this destination regardless of policy"
+        )));
+    }
+    let host_lc = host.to_lowercase();
+    if host_lc == "localhost" || host_lc == "localhost." {
+        return Err(Status::invalid_argument(
+            "proposed rule endpoint host 'localhost' is always blocked; \
+             the proxy will deny traffic to loopback regardless of policy"
+                .to_string(),
+        ));
+    }
+    if is_known_metadata_hostname(host) {
+        return Err(Status::invalid_argument(format!(
+            "proposed rule endpoint host '{host}' is a known cloud metadata hostname; \
+             the proxy will deny traffic to this destination regardless of policy"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_rule_not_always_blocked(rule: &NetworkPolicyRule) -> Result<(), Status> {
-    use openshell_core::net::{is_always_blocked_ip, is_always_blocked_net};
+    use openshell_core::net::is_always_blocked_net;
     use std::net::IpAddr;
 
     for ep in &rule.endpoints {
-        // Check if the endpoint host is a literal always-blocked IP.
-        if let Ok(ip) = ep.host.parse::<IpAddr>()
-            && is_always_blocked_ip(ip)
-        {
-            return Err(Status::invalid_argument(format!(
-                "proposed rule endpoint host '{}' is an always-blocked address \
-                 (loopback/link-local/unspecified); the proxy will deny traffic \
-                 to this destination regardless of policy",
-                ep.host
-            )));
-        }
-        let host_lc = ep.host.to_lowercase();
-        if host_lc == "localhost" || host_lc == "localhost." {
-            return Err(Status::invalid_argument(
-                "proposed rule endpoint host 'localhost' is always blocked; \
-                 the proxy will deny traffic to loopback regardless of policy"
-                    .to_string(),
-            ));
-        }
+        validate_host_not_always_blocked(&ep.host)?;
 
         // Check allowed_ips entries.
         for entry in &ep.allowed_ips {
@@ -2531,8 +3307,10 @@ fn parse_proto_add_allow_rules(
 
 fn validate_merge_operations_for_server(operations: &[PolicyMergeOp]) -> Result<(), Status> {
     for operation in operations {
-        if let PolicyMergeOp::AddRule { rule, .. } = operation {
-            validate_rule_not_always_blocked(rule)?;
+        match operation {
+            PolicyMergeOp::AddRule { rule, .. } => validate_rule_not_always_blocked(rule)?,
+            PolicyMergeOp::AddAllowRules { host, .. } => validate_host_not_always_blocked(host)?,
+            _ => {}
         }
     }
     Ok(())
@@ -2681,25 +3459,36 @@ async fn remove_chunk_from_policy(
 // Settings helpers
 // ---------------------------------------------------------------------------
 
-fn validate_registered_setting_key(key: &str) -> Result<SettingValueKind, Status> {
-    settings::setting_for_key(key)
-        .map(|entry| entry.kind)
-        .ok_or_else(|| {
-            Status::invalid_argument(format!(
-                "unknown setting key '{key}'. Allowed keys: {}",
-                settings::registered_keys_csv()
-            ))
-        })
+fn validate_registered_setting_key(
+    key: &str,
+) -> Result<&'static settings::RegisteredSetting, Status> {
+    settings::setting_for_key(key).ok_or_else(|| {
+        Status::invalid_argument(format!(
+            "unknown setting key '{key}'. Allowed keys: {}",
+            settings::registered_keys_csv()
+        ))
+    })
 }
 
 fn proto_setting_to_stored(key: &str, value: &SettingValue) -> Result<StoredSettingValue, Status> {
-    let expected = validate_registered_setting_key(key)?;
+    let setting = validate_registered_setting_key(key)?;
+    let expected = setting.kind;
     let inner = value
         .value
         .as_ref()
         .ok_or_else(|| Status::invalid_argument("setting_value.value is required"))?;
     let stored = match (expected, inner) {
         (SettingValueKind::String, setting_value::Value::StringValue(v)) => {
+            // Enforce per-key string whitelist at configure time so typos
+            // (e.g. `proposal_approval_mode=autom`) get rejected here instead
+            // of silently falling back to the default at runtime.
+            if let Err(allowed) = setting.validate_string_value(v) {
+                return Err(Status::invalid_argument(format!(
+                    "setting '{key}' expects one of [{}]; got '{}'",
+                    allowed.join(", "),
+                    v
+                )));
+            }
             StoredSettingValue::String(v.clone())
         }
         (SettingValueKind::Bool, setting_value::Value::BoolValue(v)) => {
@@ -3072,7 +3861,7 @@ mod tests {
         // Two sandboxes; the caller is principal of A, the request body
         // references B.
         for (id, name) in [("sb-a", "sandbox-a"), ("sb-b", "sandbox-b")] {
-            let sandbox = Sandbox {
+            let mut sandbox = Sandbox {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: id.to_string(),
                     name: name.to_string(),
@@ -3084,9 +3873,9 @@ mod tests {
                     policy: None,
                     ..Default::default()
                 }),
-                phase: SandboxPhase::Provisioning as i32,
                 ..Default::default()
             };
+            sandbox.set_phase(SandboxPhase::Provisioning as i32);
             state.store.put_message(&sandbox).await.unwrap();
         }
         let req = with_sandbox(
@@ -3105,7 +3894,7 @@ mod tests {
     async fn same_sandbox_get_sandbox_config_allowed() {
         use openshell_core::proto::{SandboxPhase, SandboxSpec};
         let state = test_server_state().await;
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-self".to_string(),
                 name: "self".to_string(),
@@ -3117,9 +3906,9 @@ mod tests {
                 policy: None,
                 ..Default::default()
             }),
-            phase: SandboxPhase::Provisioning as i32,
             ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Provisioning as i32);
         state.store.put_message(&sandbox).await.unwrap();
         let req = with_sandbox(
             Request::new(GetSandboxConfigRequest {
@@ -3137,7 +3926,7 @@ mod tests {
         use openshell_core::proto::{SandboxPhase, SandboxSpec};
         let state = test_server_state().await;
         for (id, name) in [("sb-a", "sandbox-a"), ("sb-b", "sandbox-b")] {
-            let sandbox = Sandbox {
+            let mut sandbox = Sandbox {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: id.to_string(),
                     name: name.to_string(),
@@ -3149,9 +3938,9 @@ mod tests {
                     policy: None,
                     ..Default::default()
                 }),
-                phase: SandboxPhase::Provisioning as i32,
                 ..Default::default()
             };
+            sandbox.set_phase(SandboxPhase::Provisioning as i32);
             state.store.put_message(&sandbox).await.unwrap();
         }
         let req = with_sandbox(
@@ -3172,7 +3961,7 @@ mod tests {
         use openshell_core::proto::{SandboxPhase, SandboxSpec};
         let state = test_server_state().await;
         for (id, name) in [("sb-a", "sandbox-a"), ("sb-b", "sandbox-b")] {
-            let sandbox = Sandbox {
+            let mut sandbox = Sandbox {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: id.to_string(),
                     name: name.to_string(),
@@ -3184,9 +3973,9 @@ mod tests {
                     policy: None,
                     ..Default::default()
                 }),
-                phase: SandboxPhase::Provisioning as i32,
                 ..Default::default()
             };
+            sandbox.set_phase(SandboxPhase::Provisioning as i32);
             state.store.put_message(&sandbox).await.unwrap();
         }
         let req = with_sandbox(
@@ -3259,7 +4048,7 @@ mod tests {
         // RBAC was the user gate; the IDOR guard must NOT trip for users.
         use openshell_core::proto::{SandboxPhase, SandboxSpec};
         let state = test_server_state().await;
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-x".to_string(),
                 name: "x".to_string(),
@@ -3271,9 +4060,9 @@ mod tests {
                 policy: None,
                 ..Default::default()
             }),
-            phase: SandboxPhase::Provisioning as i32,
             ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Provisioning as i32);
         state.store.put_message(&sandbox).await.unwrap();
         let req = with_user(Request::new(GetSandboxConfigRequest {
             sandbox_id: "sb-x".to_string(),
@@ -3326,7 +4115,7 @@ mod tests {
 
         let store = test_store().await;
 
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-no-policy".to_string(),
                 name: "no-policy-sandbox".to_string(),
@@ -3338,9 +4127,9 @@ mod tests {
                 policy: None,
                 ..Default::default()
             }),
-            phase: SandboxPhase::Provisioning as i32,
             ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Provisioning as i32);
         store.put_message(&sandbox).await.unwrap();
 
         let loaded = store
@@ -3396,7 +4185,7 @@ mod tests {
     ) -> Sandbox {
         use openshell_core::proto::{SandboxPhase, SandboxSpec};
 
-        Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: id.to_string(),
                 name: name.to_string(),
@@ -3409,9 +4198,10 @@ mod tests {
                 providers,
                 ..Default::default()
             }),
-            phase: SandboxPhase::Ready as i32,
             ..Default::default()
-        }
+        };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        sandbox
     }
 
     async fn enable_providers_v2(state: &Arc<ServerState>) {
@@ -4282,7 +5072,7 @@ mod tests {
             .collect(),
             ..Default::default()
         };
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-global-profile".to_string(),
                 name: "global-profile-sandbox".to_string(),
@@ -4295,9 +5085,9 @@ mod tests {
                 providers: vec!["work-github".to_string()],
                 ..Default::default()
             }),
-            phase: SandboxPhase::Ready as i32,
             ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox).await.unwrap();
 
         let global_policy = SandboxPolicy {
@@ -4371,7 +5161,7 @@ mod tests {
 
         let store = test_store().await;
 
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-backfill".to_string(),
                 name: "backfill-sandbox".to_string(),
@@ -4383,9 +5173,9 @@ mod tests {
                 policy: None,
                 ..Default::default()
             }),
-            phase: SandboxPhase::Provisioning as i32,
             ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Provisioning as i32);
         store.put_message(&sandbox).await.unwrap();
 
         let new_policy = ProtoSandboxPolicy {
@@ -4426,6 +5216,37 @@ mod tests {
         assert_eq!(policy.process.unwrap().run_as_user, "sandbox");
     }
 
+    /// Test helper: pin the proposal approval mode for a sandbox via the
+    /// settings model, mirroring what `openshell settings set <name>
+    /// proposal_approval_mode <mode>` would do at runtime.
+    async fn seed_sandbox_approval_mode(state: &Arc<ServerState>, sandbox_name: &str, mode: &str) {
+        let mut settings = load_sandbox_settings(state.store.as_ref(), sandbox_name)
+            .await
+            .unwrap();
+        settings.settings.insert(
+            settings::PROPOSAL_APPROVAL_MODE_KEY.to_string(),
+            StoredSettingValue::String(mode.to_string()),
+        );
+        settings.revision = settings.revision.wrapping_add(1);
+        save_sandbox_settings(state.store.as_ref(), sandbox_name, &settings)
+            .await
+            .unwrap();
+    }
+
+    /// Test helper: pin the gateway-wide proposal approval mode, mirroring
+    /// `openshell settings set --global proposal_approval_mode <mode>`.
+    async fn seed_global_approval_mode(state: &Arc<ServerState>, mode: &str) {
+        let mut settings = load_global_settings(state.store.as_ref()).await.unwrap();
+        settings.settings.insert(
+            settings::PROPOSAL_APPROVAL_MODE_KEY.to_string(),
+            StoredSettingValue::String(mode.to_string()),
+        );
+        settings.revision = settings.revision.wrapping_add(1);
+        save_global_settings(state.store.as_ref(), &settings)
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn draft_chunk_handler_lifecycle_round_trip() {
         use openshell_core::proto::{
@@ -4433,7 +5254,18 @@ mod tests {
         };
 
         let state = test_server_state().await;
-        let sandbox = Sandbox {
+        // Attach a github provider so the proposal below has a credential in
+        // scope for api.github.com. This causes the prover to emit a HIGH
+        // finding (L4 + credential in scope), keeping the chunk pending so
+        // the manual approve/reject lifecycle this test exercises is
+        // reachable. Without a provider, the proposal would auto-approve and
+        // the lifecycle assertions would no longer apply.
+        state
+            .store
+            .put_message(&test_provider("github-pat", "github"))
+            .await
+            .unwrap();
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-draft-flow".to_string(),
                 name: "draft-flow".to_string(),
@@ -4443,18 +5275,19 @@ mod tests {
             }),
             spec: Some(SandboxSpec {
                 policy: None,
+                providers: vec!["github-pat".to_string()],
                 ..Default::default()
             }),
-            phase: SandboxPhase::Ready as i32,
             ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox).await.unwrap();
         let sandbox_name = sandbox.object_name().to_string();
 
         let proposed_rule = NetworkPolicyRule {
-            name: "allow_example".to_string(),
+            name: "allow_github".to_string(),
             endpoints: vec![NetworkEndpoint {
-                host: "api.example.com".to_string(),
+                host: "api.github.com".to_string(),
                 port: 443,
                 ..Default::default()
             }],
@@ -4469,7 +5302,7 @@ mod tests {
             with_user(Request::new(SubmitPolicyAnalysisRequest {
                 name: sandbox_name.clone(),
                 proposed_chunks: vec![PolicyChunk {
-                    rule_name: "allow_example".to_string(),
+                    rule_name: "allow_github".to_string(),
                     proposed_rule: Some(proposed_rule.clone()),
                     rationale: "observed denied request".to_string(),
                     confidence: 0.85,
@@ -4502,6 +5335,9 @@ mod tests {
         .into_inner();
         assert_eq!(draft_policy.draft_version, 1);
         assert_eq!(draft_policy.chunks.len(), 1);
+        // The proposal is L4 to a host with a credential in scope, so the
+        // prover emits a HIGH finding and the chunk stays pending for the
+        // manual approve path this test exercises.
         assert_eq!(draft_policy.chunks[0].status, "pending");
         let chunk_id = draft_policy.chunks[0].id.clone();
 
@@ -4644,7 +5480,7 @@ mod tests {
 
         let state = test_server_state().await;
         let sandbox_name = "agent-feedback-loop".to_string();
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-feedback".to_string(),
                 name: sandbox_name.clone(),
@@ -4656,9 +5492,9 @@ mod tests {
                 policy: None,
                 ..Default::default()
             }),
-            phase: SandboxPhase::Ready as i32,
             ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox).await.unwrap();
 
         let proposed_rule = NetworkPolicyRule {
@@ -4724,8 +5560,1676 @@ mod tests {
             rejected.rejection_reason, guidance,
             "reviewer's free-form reason must round-trip into the chunk for agent readback"
         );
-        // validation_result is unpopulated until the prover runs (#1097).
-        assert!(rejected.validation_result.is_empty());
+        // The prover now runs on every proposal regardless of analysis_mode.
+        // For this rule (L4 to api.example.com, no provider attached, no
+        // credential in scope), v1 calibration emits no finding — so the
+        // verdict is the clean "no new findings" string, not empty.
+        assert_eq!(rejected.validation_result, "prover: no new findings");
+    }
+
+    #[tokio::test]
+    async fn agent_authored_exact_l7_proposal_gets_prover_pass_verdict() {
+        use openshell_core::proto::{
+            FilesystemPolicy, L7Allow, L7Rule, NetworkBinary, NetworkEndpoint, SandboxPhase,
+            SandboxPolicy, SandboxSpec,
+        };
+
+        let state = test_server_state().await;
+        let sandbox_name = "agent-l7-verdict".to_string();
+        let mut sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-agent-l7-verdict".to_string(),
+                name: sandbox_name.clone(),
+                created_at_ms: 1_000_000,
+                labels: std::collections::HashMap::new(),
+                resource_version: 0,
+            }),
+            spec: Some(SandboxSpec {
+                policy: Some(SandboxPolicy {
+                    version: 1,
+                    filesystem: Some(FilesystemPolicy {
+                        read_write: vec!["/sandbox".to_string()],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+        // Opt this sandbox into auto-approval via the settings model — same
+        // path the CLI's `--approval-mode auto` exercises — to test the
+        // empty-delta → approved path.
+        seed_sandbox_approval_mode(&state, &sandbox_name, "auto").await;
+
+        let proposed_rule = NetworkPolicyRule {
+            name: "github_contents_write".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "api.github.com".to_string(),
+                port: 443,
+                protocol: "rest".to_string(),
+                enforcement: "enforce".to_string(),
+                rules: vec![L7Rule {
+                    allow: Some(L7Allow {
+                        method: "PUT".to_string(),
+                        path: "/repos/org/repo/contents/demo/file.md".to_string(),
+                        ..Default::default()
+                    }),
+                }],
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.clone(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "github_contents_write".to_string(),
+                    proposed_rule: Some(proposed_rule),
+                    rationale: "write one demo file".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap();
+
+        let draft = handle_get_draft_policy(
+            &state,
+            with_user(Request::new(GetDraftPolicyRequest {
+                name: sandbox_name,
+                status_filter: String::new(),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let verdict = &draft.chunks[0].validation_result;
+        assert_eq!(
+            verdict, "prover: no new findings",
+            "exact L7 PUT against an inspected endpoint should not introduce \
+             any new findings over baseline; got: {verdict}"
+        );
+        // Auto-approval gate: empty delta + sandbox opted into auto mode →
+        // status flips to approved without human action. The canonical
+        // happy path for agent speed.
+        assert_eq!(
+            draft.chunks[0].status, "approved",
+            "empty-delta agent-authored proposal under auto mode must auto-approve; \
+             got status: {}",
+            draft.chunks[0].status
+        );
+    }
+
+    /// Implicit supersede: when a refined agent-authored proposal lands for
+    /// the same `(host, port, binary)` as a pending mechanistic chunk, the
+    /// older mechanistic chunk is auto-rejected with a "superseded by
+    /// chunk X" reason. This is the refinement loop without a
+    /// `supersedes_chunk_id` field — structural overlap is enough.
+    #[tokio::test]
+    async fn agent_authored_submission_supersedes_pending_mechanistic_for_same_endpoint() {
+        use openshell_core::proto::{
+            FilesystemPolicy, L7Allow, L7Rule, NetworkBinary, NetworkEndpoint, SandboxPhase,
+            SandboxPolicy, SandboxSpec,
+        };
+
+        let state = test_server_state().await;
+        // github provider attached so the mechanistic L4 lands a HIGH
+        // finding and stays pending.
+        state
+            .store
+            .put_message(&test_provider("github-pat", "github"))
+            .await
+            .unwrap();
+        let sandbox_name = "supersede-flow".to_string();
+        let mut sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-supersede-flow".to_string(),
+                name: sandbox_name.clone(),
+                created_at_ms: 1_000_000,
+                labels: std::collections::HashMap::new(),
+                resource_version: 0,
+            }),
+            spec: Some(SandboxSpec {
+                policy: Some(SandboxPolicy {
+                    version: 1,
+                    filesystem: Some(FilesystemPolicy {
+                        read_write: vec!["/sandbox".to_string()],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                providers: vec!["github-pat".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+
+        // Step 1: mechanistic submits a broad L4 grant; the prover flags it
+        // HIGH, so it lands in pending.
+        let mechanistic_rule = NetworkPolicyRule {
+            name: "allow_api_github_com_443".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "api.github.com".to_string(),
+                port: 443,
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+        let mechanistic_submit = handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.clone(),
+                analysis_mode: "mechanistic".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "allow_api_github_com_443".to_string(),
+                    proposed_rule: Some(mechanistic_rule),
+                    rationale: "Allow /usr/bin/curl to connect to api.github.com:443.".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let mechanistic_chunk_id = mechanistic_submit.accepted_chunk_ids[0].clone();
+
+        // Sanity-check: the mechanistic chunk is pending and carries a HIGH
+        // finding.
+        let draft = handle_get_draft_policy(
+            &state,
+            with_user(Request::new(GetDraftPolicyRequest {
+                name: sandbox_name.clone(),
+                status_filter: String::new(),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let mech = draft
+            .chunks
+            .iter()
+            .find(|c| c.id == mechanistic_chunk_id)
+            .expect("mechanistic chunk present");
+        assert_eq!(mech.status, "pending");
+        // Mechanistic L4 with credential in scope flags as new credentialed
+        // reach for the binary on the host.
+        assert!(
+            mech.validation_result
+                .contains("credential_reach_expansion"),
+            "mechanistic L4 with credential in scope should emit \
+             credential_reach_expansion; got: {}",
+            mech.validation_result
+        );
+
+        // Step 2: the agent refines into a narrow L7 proposal for the SAME
+        // (host, port, binary). Under the v1 calibration, an L7 PUT on a
+        // host where the binary already had credentialed reach (read-only)
+        // emits a capability_expansion finding (new method on already-
+        // reached host) rather than a fresh reach expansion. The agent
+        // chunk stays pending for human review. The mechanistic chunk gets
+        // auto-rejected as superseded regardless of the agent chunk's own
+        // validation verdict — supersede is unconditional on `(host, port,
+        // binary)` overlap.
+        let agent_rule = NetworkPolicyRule {
+            name: "github_contents_put".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "api.github.com".to_string(),
+                port: 443,
+                protocol: "rest".to_string(),
+                enforcement: "enforce".to_string(),
+                rules: vec![L7Rule {
+                    allow: Some(L7Allow {
+                        method: "PUT".to_string(),
+                        path: "/repos/owner/name/contents/path/file.md".to_string(),
+                        ..Default::default()
+                    }),
+                }],
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+        let agent_submit = handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.clone(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "github_contents_put".to_string(),
+                    proposed_rule: Some(agent_rule),
+                    rationale: "refined L7 scope for the demo write".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let agent_chunk_id = agent_submit.accepted_chunk_ids[0].clone();
+
+        let draft_after = handle_get_draft_policy(
+            &state,
+            with_user(Request::new(GetDraftPolicyRequest {
+                name: sandbox_name,
+                status_filter: String::new(),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        let agent = draft_after
+            .chunks
+            .iter()
+            .find(|c| c.id == agent_chunk_id)
+            .expect("agent chunk present");
+        let mech_after = draft_after
+            .chunks
+            .iter()
+            .find(|c| c.id == mechanistic_chunk_id)
+            .expect("mechanistic chunk should still be visible (with new status)");
+
+        assert_eq!(
+            agent.status, "pending",
+            "agent-authored L7 PUT with credential in scope must land in pending; \
+             the baseline policy has no pre-existing rule for curl on api.github.com \
+             so the agent's chunk grants brand-new credentialed reach. got: {}",
+            agent.status
+        );
+        assert!(
+            agent
+                .validation_result
+                .contains("credential_reach_expansion"),
+            "agent chunk should carry credential_reach_expansion (new credentialed reach \
+             on api.github.com); got: {}",
+            agent.validation_result
+        );
+        assert_eq!(
+            mech_after.status, "rejected",
+            "older mechanistic chunk for same (host, port, binary) should be superseded; \
+             got: {}",
+            mech_after.status
+        );
+        assert!(
+            mech_after.rejection_reason.contains(&agent_chunk_id),
+            "rejection reason should cite the superseding chunk id; got: {}",
+            mech_after.rejection_reason
+        );
+        assert!(
+            mech_after.rejection_reason.contains("superseded"),
+            "rejection reason should explain the supersede; got: {}",
+            mech_after.rejection_reason
+        );
+    }
+
+    /// Auto-approval is **proposer-agnostic**: a mechanistic proposal whose
+    /// prover delta is empty auto-approves the same way an agent-authored one
+    /// does. Source provenance is preserved in the audit trail (OCSF event
+    /// `source=mechanistic`) but does not change the safety decision.
+    #[tokio::test]
+    async fn mechanistic_proposal_with_empty_delta_also_auto_approves() {
+        use openshell_core::proto::{
+            FilesystemPolicy, NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxPolicy,
+            SandboxSpec,
+        };
+
+        let state = test_server_state().await;
+        let sandbox_name = "mechanistic-clean".to_string();
+        let mut sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-mechanistic-clean".to_string(),
+                name: sandbox_name.clone(),
+                created_at_ms: 1_000_000,
+                labels: std::collections::HashMap::new(),
+                resource_version: 0,
+            }),
+            spec: Some(SandboxSpec {
+                policy: Some(SandboxPolicy {
+                    version: 1,
+                    filesystem: Some(FilesystemPolicy {
+                        read_write: vec!["/sandbox".to_string()],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                // No providers → no credential in scope for the proposed host.
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+        // Opt into auto mode via the settings model to test the
+        // proposer-agnostic gate.
+        seed_sandbox_approval_mode(&state, &sandbox_name, "auto").await;
+
+        let proposed_rule = NetworkPolicyRule {
+            name: "anon_l4".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "example.com".to_string(),
+                port: 443,
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.clone(),
+                analysis_mode: "mechanistic".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "anon_l4".to_string(),
+                    proposed_rule: Some(proposed_rule),
+                    rationale: "Allow /usr/bin/curl to connect to example.com:443.".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap();
+
+        let draft = handle_get_draft_policy(
+            &state,
+            with_user(Request::new(GetDraftPolicyRequest {
+                name: sandbox_name,
+                status_filter: String::new(),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let verdict = &draft.chunks[0].validation_result;
+        assert_eq!(verdict, "prover: no new findings");
+        assert_eq!(
+            draft.chunks[0].status, "approved",
+            "empty-delta mechanistic proposal under auto mode must auto-approve \
+             (proposer-agnostic); got status: {}",
+            draft.chunks[0].status
+        );
+    }
+
+    /// `protocol: rest, access: full` on a host where the binary had no
+    /// prior credentialed reach: the prover emits
+    /// `credential_reach_expansion`. (The per-method `capability_expansion`
+    /// paths are suppressed by the gateway delta because the reach is
+    /// new; one finding describes the change, not eight.)
+    #[tokio::test]
+    async fn agent_authored_l7_full_with_credential_emits_reach_expansion() {
+        use openshell_core::proto::{
+            FilesystemPolicy, NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxPolicy,
+            SandboxSpec,
+        };
+
+        let state = test_server_state().await;
+        state
+            .store
+            .put_message(&test_provider("github-pat", "github"))
+            .await
+            .unwrap();
+        let sandbox_name = "l7-full-with-cred".to_string();
+        let mut sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-l7-full-with-cred".to_string(),
+                name: sandbox_name.clone(),
+                created_at_ms: 1_000_000,
+                labels: std::collections::HashMap::new(),
+                resource_version: 0,
+            }),
+            spec: Some(SandboxSpec {
+                policy: Some(SandboxPolicy {
+                    version: 1,
+                    filesystem: Some(FilesystemPolicy {
+                        read_write: vec!["/sandbox".to_string()],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                providers: vec!["github-pat".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+        seed_sandbox_approval_mode(&state, &sandbox_name, "auto").await;
+
+        // L7-annotated (protocol: rest, enforce) but access: full — no
+        // method/path bound. Credential in scope.
+        let proposed_rule = NetworkPolicyRule {
+            name: "github_l7_full".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "api.github.com".to_string(),
+                port: 443,
+                protocol: "rest".to_string(),
+                enforcement: "enforce".to_string(),
+                access: "full".to_string(),
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.clone(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "github_l7_full".to_string(),
+                    proposed_rule: Some(proposed_rule),
+                    rationale: "broad L7 dressing".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap();
+
+        let draft = handle_get_draft_policy(
+            &state,
+            with_user(Request::new(GetDraftPolicyRequest {
+                name: sandbox_name,
+                status_filter: String::new(),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let verdict = &draft.chunks[0].validation_result;
+        assert!(
+            verdict.contains("credential_reach_expansion"),
+            "L7 `access: full` on a host the binary did not previously reach must emit \
+             credential_reach_expansion; got: {verdict}"
+        );
+        // Capability_expansion paths for the same (binary, host:port) are
+        // suppressed when the reach itself is new — one finding, not many.
+        assert!(
+            !verdict.contains("capability_expansion"),
+            "capability_expansion must be suppressed when reach itself is new; got: {verdict}"
+        );
+        assert_eq!(
+            draft.chunks[0].status, "pending",
+            "any prover finding must keep the chunk in pending despite auto mode; got: {}",
+            draft.chunks[0].status
+        );
+    }
+
+    /// Acceptance criterion #7: default approval mode is manual. A sandbox
+    /// with no `proposal_approval_mode` setting at either scope must NOT
+    /// auto-approve empty-delta proposals; the chunk lands in `pending` for
+    /// human review. This is the default-deny safeguard: auto-approval is
+    /// an explicit opt-in, not a global behavior change shipped under a
+    /// feature.
+    #[tokio::test]
+    async fn empty_delta_does_not_auto_approve_when_mode_unset() {
+        use openshell_core::proto::{
+            FilesystemPolicy, NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxPolicy,
+            SandboxSpec,
+        };
+
+        let state = test_server_state().await;
+        let sandbox_name = "default-manual-mode".to_string();
+        let mut sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-default-manual-mode".to_string(),
+                name: sandbox_name.clone(),
+                created_at_ms: 1_000_000,
+                labels: std::collections::HashMap::new(),
+                resource_version: 0,
+            }),
+            spec: Some(SandboxSpec {
+                policy: Some(SandboxPolicy {
+                    version: 1,
+                    filesystem: Some(FilesystemPolicy {
+                        read_write: vec!["/sandbox".to_string()],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                // No approval-mode setting seeded at sandbox or gateway
+                // scope — the resolver must treat absence as "manual".
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let proposed_rule = NetworkPolicyRule {
+            name: "anon_l4".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "example.com".to_string(),
+                port: 443,
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.clone(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "anon_l4".to_string(),
+                    proposed_rule: Some(proposed_rule),
+                    rationale: "un-credentialed L4 — prover sees no finding".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap();
+
+        let draft = handle_get_draft_policy(
+            &state,
+            with_user(Request::new(GetDraftPolicyRequest {
+                name: sandbox_name,
+                status_filter: String::new(),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let verdict = &draft.chunks[0].validation_result;
+        assert_eq!(
+            verdict, "prover: no new findings",
+            "prover should still emit no findings; gate is downstream",
+        );
+        assert_eq!(
+            draft.chunks[0].status, "pending",
+            "default (unset) proposal_approval_mode must not auto-approve; \
+             chunk should wait for human review. got status: {}",
+            draft.chunks[0].status
+        );
+    }
+
+    /// Unknown `proposal_approval_mode` strings (typos, future-mode values
+    /// the gateway doesn't yet know about) fall back to manual. This locks
+    /// in forward-compat: a future CLI that learns about `"auto_on_low_risk"`
+    /// can never accidentally bypass an older gateway's review gate just by
+    /// virtue of an unrecognized value defaulting to "auto."
+    #[tokio::test]
+    async fn empty_delta_does_not_auto_approve_when_mode_unknown_string() {
+        use openshell_core::proto::{
+            FilesystemPolicy, NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxPolicy,
+            SandboxSpec,
+        };
+
+        let state = test_server_state().await;
+        let sandbox_name = "unknown-mode".to_string();
+        let mut sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-unknown-mode".to_string(),
+                name: sandbox_name.clone(),
+                created_at_ms: 1_000_000,
+                labels: std::collections::HashMap::new(),
+                resource_version: 0,
+            }),
+            spec: Some(SandboxSpec {
+                policy: Some(SandboxPolicy {
+                    version: 1,
+                    filesystem: Some(FilesystemPolicy {
+                        read_write: vec!["/sandbox".to_string()],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+        // A future-CLI value the current gateway doesn't recognize.
+        seed_sandbox_approval_mode(&state, &sandbox_name, "auto_on_low_risk").await;
+
+        let proposed_rule = NetworkPolicyRule {
+            name: "anon_l4".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "example.com".to_string(),
+                port: 443,
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.clone(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "anon_l4".to_string(),
+                    proposed_rule: Some(proposed_rule),
+                    rationale: "un-credentialed L4".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap();
+
+        let draft = handle_get_draft_policy(
+            &state,
+            with_user(Request::new(GetDraftPolicyRequest {
+                name: sandbox_name,
+                status_filter: String::new(),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(
+            draft.chunks[0].status, "pending",
+            "unknown approval-mode strings must fall back to manual; \
+             only the literal \"auto\" opts in. got: {}",
+            draft.chunks[0].status
+        );
+    }
+
+    /// Explicit `"manual"` is equivalent to the unset default — chunk lands
+    /// in pending even with empty delta.
+    #[tokio::test]
+    async fn empty_delta_does_not_auto_approve_when_mode_explicit_manual() {
+        use openshell_core::proto::{
+            FilesystemPolicy, NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxPolicy,
+            SandboxSpec,
+        };
+
+        let state = test_server_state().await;
+        let sandbox_name = "explicit-manual-mode".to_string();
+        let mut sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-explicit-manual-mode".to_string(),
+                name: sandbox_name.clone(),
+                created_at_ms: 1_000_000,
+                labels: std::collections::HashMap::new(),
+                resource_version: 0,
+            }),
+            spec: Some(SandboxSpec {
+                policy: Some(SandboxPolicy {
+                    version: 1,
+                    filesystem: Some(FilesystemPolicy {
+                        read_write: vec!["/sandbox".to_string()],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+        seed_sandbox_approval_mode(&state, &sandbox_name, "manual").await;
+
+        let proposed_rule = NetworkPolicyRule {
+            name: "anon_l4".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "example.com".to_string(),
+                port: 443,
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.clone(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "anon_l4".to_string(),
+                    proposed_rule: Some(proposed_rule),
+                    rationale: "un-credentialed L4 — prover sees no finding".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap();
+
+        let draft = handle_get_draft_policy(
+            &state,
+            with_user(Request::new(GetDraftPolicyRequest {
+                name: sandbox_name,
+                status_filter: String::new(),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(
+            draft.chunks[0].status, "pending",
+            "explicit manual mode must equal default mode — no auto-approval; \
+             got: {}",
+            draft.chunks[0].status
+        );
+    }
+
+    /// Gateway-scope `proposal_approval_mode = "auto"` enables auto-approval
+    /// for any sandbox under that gateway, with no per-sandbox setting
+    /// required. This is the fleet-wide opt-in path — a reviewer flips the
+    /// gateway setting once and every sandbox without an explicit override
+    /// gets prover-gated auto-approval.
+    #[tokio::test]
+    async fn empty_delta_auto_approves_from_gateway_scope_setting() {
+        use openshell_core::proto::{
+            FilesystemPolicy, NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxPolicy,
+            SandboxSpec,
+        };
+
+        let state = test_server_state().await;
+        let sandbox_name = "gateway-auto-mode".to_string();
+        let mut sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-gateway-auto-mode".to_string(),
+                name: sandbox_name.clone(),
+                created_at_ms: 1_000_000,
+                labels: std::collections::HashMap::new(),
+                resource_version: 0,
+            }),
+            spec: Some(SandboxSpec {
+                policy: Some(SandboxPolicy {
+                    version: 1,
+                    filesystem: Some(FilesystemPolicy {
+                        read_write: vec!["/sandbox".to_string()],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+        // Fleet-wide opt-in — no sandbox-scope setting.
+        seed_global_approval_mode(&state, "auto").await;
+
+        let proposed_rule = NetworkPolicyRule {
+            name: "anon_l4".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "example.com".to_string(),
+                port: 443,
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.clone(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "anon_l4".to_string(),
+                    proposed_rule: Some(proposed_rule),
+                    rationale: "un-credentialed L4 — empty delta".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap();
+
+        let draft = handle_get_draft_policy(
+            &state,
+            with_user(Request::new(GetDraftPolicyRequest {
+                name: sandbox_name,
+                status_filter: String::new(),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(
+            draft.chunks[0].status, "approved",
+            "empty-delta proposal must auto-approve when the gateway-scope \
+             setting is \"auto\" and no sandbox-scope override exists. got: {}",
+            draft.chunks[0].status
+        );
+    }
+
+    /// Gateway scope wins over sandbox scope. A reviewer can pin manual mode
+    /// fleet-wide; a per-sandbox `"auto"` value is silently ignored. Matches
+    /// the existing settings precedence convention (global wins, sandbox is
+    /// the per-sandbox override only when no global is set).
+    #[tokio::test]
+    async fn gateway_manual_overrides_sandbox_auto() {
+        use openshell_core::proto::{
+            FilesystemPolicy, NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxPolicy,
+            SandboxSpec,
+        };
+
+        let state = test_server_state().await;
+        let sandbox_name = "gateway-pinned-manual".to_string();
+        let mut sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-gateway-pinned-manual".to_string(),
+                name: sandbox_name.clone(),
+                created_at_ms: 1_000_000,
+                labels: std::collections::HashMap::new(),
+                resource_version: 0,
+            }),
+            spec: Some(SandboxSpec {
+                policy: Some(SandboxPolicy {
+                    version: 1,
+                    filesystem: Some(FilesystemPolicy {
+                        read_write: vec!["/sandbox".to_string()],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+        // Gateway pins manual; the sandbox-scope override is supplied (test
+        // helper bypasses the UpdateConfig precondition, simulating the
+        // before-pin state) to prove the resolver still picks the gateway
+        // value.
+        seed_global_approval_mode(&state, "manual").await;
+        seed_sandbox_approval_mode(&state, &sandbox_name, "auto").await;
+
+        let proposed_rule = NetworkPolicyRule {
+            name: "anon_l4".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "example.com".to_string(),
+                port: 443,
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.clone(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "anon_l4".to_string(),
+                    proposed_rule: Some(proposed_rule),
+                    rationale: "un-credentialed L4 — empty delta".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap();
+
+        let draft = handle_get_draft_policy(
+            &state,
+            with_user(Request::new(GetDraftPolicyRequest {
+                name: sandbox_name,
+                status_filter: String::new(),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(
+            draft.chunks[0].status, "pending",
+            "gateway-scope \"manual\" must win over sandbox-scope \"auto\"; \
+             got: {}",
+            draft.chunks[0].status
+        );
+    }
+
+    /// Agent submissions targeting a `_provider_*` rule name are rejected at
+    /// the submit boundary. Provider-synthesized rules are a reserved
+    /// namespace; an agent that addresses one by name could otherwise
+    /// circumvent the merge guard that splits agent contributions into their
+    /// own rule (so the prover sees them honestly).
+    #[tokio::test]
+    async fn submit_rejects_reserved_provider_rule_name_prefix() {
+        use openshell_core::proto::{
+            FilesystemPolicy, NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxPolicy,
+            SandboxSpec,
+        };
+
+        let state = test_server_state().await;
+        let sandbox_name = "reject-provider-prefix".to_string();
+        let mut sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-reject-provider-prefix".to_string(),
+                name: sandbox_name.clone(),
+                created_at_ms: 1_000_000,
+                labels: std::collections::HashMap::new(),
+                resource_version: 0,
+            }),
+            spec: Some(SandboxSpec {
+                policy: Some(SandboxPolicy {
+                    version: 1,
+                    filesystem: Some(FilesystemPolicy {
+                        read_write: vec!["/sandbox".to_string()],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let proposed_rule = NetworkPolicyRule {
+            name: "github".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "api.github.com".to_string(),
+                port: 443,
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        let response = handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.clone(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "_provider_work_github".to_string(),
+                    proposed_rule: Some(proposed_rule),
+                    rationale: "should be rejected — addresses provider rule by name".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert_eq!(response.accepted_chunks, 0, "chunk must be rejected");
+        assert_eq!(response.rejected_chunks, 1);
+        assert!(
+            response
+                .rejection_reasons
+                .iter()
+                .any(|r| r.contains("_provider_")),
+            "rejection reason must cite the reserved-prefix rule. got: {:?}",
+            response.rejection_reasons,
+        );
+    }
+
+    /// v1 calibration row: **L4 with a credential in scope → HIGH finding.**
+    /// The sandbox has a github provider attached, so a credential is in
+    /// scope for api.github.com. A broad L4 proposal therefore lands in
+    /// pending with a HIGH finding.
+    #[tokio::test]
+    async fn agent_authored_l4_proposal_with_credential_records_high_finding() {
+        use openshell_core::proto::{
+            FilesystemPolicy, NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxPolicy,
+            SandboxSpec,
+        };
+
+        let state = test_server_state().await;
+        // Attach a github provider so a credential is in scope for api.github.com.
+        state
+            .store
+            .put_message(&test_provider("github-pat", "github"))
+            .await
+            .unwrap();
+        let sandbox_name = "agent-l4-with-cred".to_string();
+        let mut sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-agent-l4-with-cred".to_string(),
+                name: sandbox_name.clone(),
+                created_at_ms: 1_000_000,
+                labels: std::collections::HashMap::new(),
+                resource_version: 0,
+            }),
+            spec: Some(SandboxSpec {
+                policy: Some(SandboxPolicy {
+                    version: 1,
+                    filesystem: Some(FilesystemPolicy {
+                        read_write: vec!["/sandbox".to_string()],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                providers: vec!["github-pat".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let proposed_rule = NetworkPolicyRule {
+            name: "github_l4".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "api.github.com".to_string(),
+                port: 443,
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.clone(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "github_l4".to_string(),
+                    proposed_rule: Some(proposed_rule),
+                    rationale: "broad fallback".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap();
+
+        let draft = handle_get_draft_policy(
+            &state,
+            with_user(Request::new(GetDraftPolicyRequest {
+                name: sandbox_name,
+                status_filter: String::new(),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let verdict = &draft.chunks[0].validation_result;
+        let first_line = verdict.lines().next().unwrap_or("");
+        assert!(
+            first_line.starts_with("prover: ") && first_line.contains("new finding"),
+            "expected first line like `prover: N new finding(s)`, got: {verdict}"
+        );
+        assert!(
+            verdict.contains("credential_reach_expansion"),
+            "L4 + credential in scope emits credential_reach_expansion (the binary gains \
+             credentialed reach to a new host:port); got: {verdict}"
+        );
+        assert!(
+            verdict.contains("api.github.com:443"),
+            "expected the finding line to cite the proposed endpoint, got: {verdict}"
+        );
+    }
+
+    /// v1 calibration row: **L4 with NO credential in scope → no finding.**
+    /// Without an attached provider, no credential targets api.github.com,
+    /// so the prover treats the L4 grant as bounded (no privileged action
+    /// available) and emits nothing. The proposal verdict reads
+    /// `prover: no new findings`, eligible for auto-approval.
+    #[tokio::test]
+    async fn agent_authored_l4_proposal_without_credential_emits_no_finding() {
+        use openshell_core::proto::{
+            FilesystemPolicy, NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxPolicy,
+            SandboxSpec,
+        };
+
+        let state = test_server_state().await;
+        let sandbox_name = "agent-l4-no-cred".to_string();
+        let mut sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-agent-l4-no-cred".to_string(),
+                name: sandbox_name.clone(),
+                created_at_ms: 1_000_000,
+                labels: std::collections::HashMap::new(),
+                resource_version: 0,
+            }),
+            spec: Some(SandboxSpec {
+                policy: Some(SandboxPolicy {
+                    version: 1,
+                    filesystem: Some(FilesystemPolicy {
+                        read_write: vec!["/sandbox".to_string()],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                // No providers — credential set will be empty.
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let proposed_rule = NetworkPolicyRule {
+            name: "anon_l4".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "example.com".to_string(),
+                port: 443,
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.clone(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "anon_l4".to_string(),
+                    proposed_rule: Some(proposed_rule),
+                    rationale: "no privileged access available".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap();
+
+        let draft = handle_get_draft_policy(
+            &state,
+            with_user(Request::new(GetDraftPolicyRequest {
+                name: sandbox_name,
+                status_filter: String::new(),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let verdict = &draft.chunks[0].validation_result;
+        assert_eq!(
+            verdict, "prover: no new findings",
+            "L4 grant with no credential in scope is bounded in v1; got: {verdict}"
+        );
+    }
+
+    /// v1 calibration row: **link-local host → HIGH finding regardless of
+    /// credentials.** Even with no provider attached, a proposal targeting
+    /// `169.254.169.254` (AWS IMDS / cloud metadata) emits a HIGH finding.
+    /// This is the one categorical safety floor v1 ships.
+    #[tokio::test]
+    async fn agent_authored_link_local_proposal_records_high_finding() {
+        use openshell_core::proto::{
+            FilesystemPolicy, NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxPolicy,
+            SandboxSpec,
+        };
+
+        let state = test_server_state().await;
+        let sandbox_name = "agent-link-local".to_string();
+        let mut sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-agent-link-local".to_string(),
+                name: sandbox_name.clone(),
+                created_at_ms: 1_000_000,
+                labels: std::collections::HashMap::new(),
+                resource_version: 0,
+            }),
+            spec: Some(SandboxSpec {
+                policy: Some(SandboxPolicy {
+                    version: 1,
+                    filesystem: Some(FilesystemPolicy {
+                        read_write: vec!["/sandbox".to_string()],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                // Deliberately no provider — link-local should still fire.
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let proposed_rule = NetworkPolicyRule {
+            name: "metadata_endpoint".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "169.254.169.254".to_string(),
+                port: 80,
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.clone(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "metadata_endpoint".to_string(),
+                    proposed_rule: Some(proposed_rule),
+                    rationale: "agent is curious about IMDS".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap();
+
+        let draft = handle_get_draft_policy(
+            &state,
+            with_user(Request::new(GetDraftPolicyRequest {
+                name: sandbox_name,
+                status_filter: String::new(),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let verdict = &draft.chunks[0].validation_result;
+        assert!(
+            verdict.contains("link_local_reach"),
+            "link-local proposal must emit link_local_reach regardless of credentials; \
+             got: {verdict}"
+        );
+        assert!(
+            verdict.contains("169.254.169.254"),
+            "finding line must cite the link-local host; got: {verdict}"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_authored_validation_uses_providers_v2_effective_policy() {
+        use openshell_core::proto::{
+            FilesystemPolicy, L7Allow, L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint,
+            ProviderProfile, ProviderProfileCategory, SandboxPhase, SandboxPolicy, SandboxSpec,
+            StoredProviderProfile,
+        };
+
+        let state = test_server_state().await;
+        enable_providers_v2(&state).await;
+        state
+            .store
+            .put_message(&test_provider("work-custom", "custom-api"))
+            .await
+            .unwrap();
+        state
+            .store
+            .put_message(&StoredProviderProfile {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "profile-custom-api".to_string(),
+                    name: "custom-api".to_string(),
+                    created_at_ms: 1_000_000,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                profile: Some(ProviderProfile {
+                    id: "custom-api".to_string(),
+                    display_name: "Custom API".to_string(),
+                    description: String::new(),
+                    category: ProviderProfileCategory::Other as i32,
+                    credentials: Vec::new(),
+                    endpoints: vec![NetworkEndpoint {
+                        host: "api.github.com".to_string(),
+                        port: 443,
+                        protocol: "rest".to_string(),
+                        deny_rules: vec![L7DenyRule {
+                            method: "DELETE".to_string(),
+                            path: "/repos/*".to_string(),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }],
+                    binaries: vec![NetworkBinary {
+                        path: "/usr/bin/curl".to_string(),
+                        ..Default::default()
+                    }],
+                    inference_capable: false,
+                    discovery: None,
+                }),
+            })
+            .await
+            .unwrap();
+
+        let sandbox_name = "agent-provider-effective-policy".to_string();
+        let mut sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-agent-provider-effective-policy".to_string(),
+                name: sandbox_name.clone(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+                resource_version: 0,
+            }),
+            spec: Some(SandboxSpec {
+                policy: Some(SandboxPolicy {
+                    version: 1,
+                    filesystem: Some(FilesystemPolicy {
+                        read_write: vec!["/sandbox".to_string()],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                providers: vec!["work-custom".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let proposed_rule = NetworkPolicyRule {
+            name: "github_contents_write".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "api.github.com".to_string(),
+                port: 443,
+                protocol: "rest".to_string(),
+                enforcement: "enforce".to_string(),
+                rules: vec![L7Rule {
+                    allow: Some(L7Allow {
+                        method: "PUT".to_string(),
+                        path: "/repos/org/repo/contents/demo/file.md".to_string(),
+                        ..Default::default()
+                    }),
+                }],
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.clone(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "github_contents_write".to_string(),
+                    proposed_rule: Some(proposed_rule),
+                    rationale: "write one demo file".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap();
+
+        let draft = handle_get_draft_policy(
+            &state,
+            with_user(Request::new(GetDraftPolicyRequest {
+                name: sandbox_name,
+                status_filter: String::new(),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let verdict = &draft.chunks[0].validation_result;
+        let first_line = verdict.lines().next().unwrap_or("");
+        assert!(
+            first_line.starts_with("prover: "),
+            "validation should run end-to-end against the providers-v2 composed \
+             effective policy and produce a prover verdict; got: {verdict}"
+        );
+        assert!(
+            !verdict.contains("validation unavailable"),
+            "providers-v2 composition must not break the prover pipeline; \
+             got: {verdict}"
+        );
+    }
+
+    /// End-to-end loop test against the v1 calibration and the auto-approval
+    /// gate. Mirrors the two-path flow in `examples/agent-driven-policy-management`:
+    ///
+    /// 1. Un-credentialed L7 proposal (raw.githubusercontent.com GET) →
+    ///    prover sees no findings → sandbox in `auto` mode → chunk
+    ///    auto-approves without human action.
+    ///
+    /// 2. Credentialed L7 proposal (api.github.com PUT) → prover sees
+    ///    `github_token` in scope, emits MEDIUM → chunk lands in pending
+    ///    for human review even under `auto` mode.
+    ///
+    /// This is the deterministic counterpart of the demo's product UX
+    /// claim: "narrow safe = free, narrow credentialed = one approval."
+    #[tokio::test]
+    async fn full_loop_under_v2_auto_mode_splits_credentialed_and_uncredentialed() {
+        use openshell_core::proto::{
+            FilesystemPolicy, L7Allow, L7Rule, NetworkBinary, NetworkEndpoint, SandboxPhase,
+            SandboxPolicy, SandboxSpec,
+        };
+
+        let state = test_server_state().await;
+        enable_providers_v2(&state).await;
+
+        // Github provider attached: a credential ends up in scope for
+        // api.github.com (PUT proposal flags MEDIUM). raw.githubusercontent.com
+        // is not declared by any provider, so the bootstrap fetch is
+        // un-credentialed and auto-approves.
+        state
+            .store
+            .put_message(&test_provider("github-pat", "github"))
+            .await
+            .unwrap();
+
+        let sandbox_name = "full-loop-v2".to_string();
+        let mut sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-full-loop-v2".to_string(),
+                name: sandbox_name.clone(),
+                created_at_ms: 1_000_000,
+                labels: std::collections::HashMap::new(),
+                resource_version: 0,
+            }),
+            spec: Some(SandboxSpec {
+                policy: Some(SandboxPolicy {
+                    version: 1,
+                    filesystem: Some(FilesystemPolicy {
+                        read_write: vec!["/sandbox".to_string()],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                providers: vec!["github-pat".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+        seed_sandbox_approval_mode(&state, &sandbox_name, "auto").await;
+
+        // ── Step 1: un-credentialed GET → expected auto-approve ──
+        let uncredentialed_rule = NetworkPolicyRule {
+            name: "github_raw_openapi_get".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "raw.githubusercontent.com".to_string(),
+                port: 443,
+                protocol: "rest".to_string(),
+                enforcement: "enforce".to_string(),
+                rules: vec![L7Rule {
+                    allow: Some(L7Allow {
+                        method: "GET".to_string(),
+                        path: "/github/rest-api-description/main/descriptions/api.github.com/api.github.com.json"
+                            .to_string(),
+                        ..Default::default()
+                    }),
+                }],
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+        let step1 = handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.clone(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "github_raw_openapi_get".to_string(),
+                    proposed_rule: Some(uncredentialed_rule),
+                    rationale: "fetch the public github openapi description".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let step1_chunk_id = step1.accepted_chunk_ids[0].clone();
+
+        // ── Step 2: credentialed PUT → expected MEDIUM, pending ──
+        let credentialed_rule = NetworkPolicyRule {
+            name: "github_contents_put".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "api.github.com".to_string(),
+                port: 443,
+                protocol: "rest".to_string(),
+                enforcement: "enforce".to_string(),
+                rules: vec![L7Rule {
+                    allow: Some(L7Allow {
+                        method: "PUT".to_string(),
+                        path: "/repos/owner/name/contents/path/file.md".to_string(),
+                        ..Default::default()
+                    }),
+                }],
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+        let step2 = handle_submit_policy_analysis(
+            &state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.clone(),
+                analysis_mode: "agent_authored".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "github_contents_put".to_string(),
+                    proposed_rule: Some(credentialed_rule),
+                    rationale: "write the demo file via the GitHub Contents API".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        let step2_chunk_id = step2.accepted_chunk_ids[0].clone();
+
+        let draft = handle_get_draft_policy(
+            &state,
+            with_user(Request::new(GetDraftPolicyRequest {
+                name: sandbox_name,
+                status_filter: String::new(),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        let step1_chunk = draft
+            .chunks
+            .iter()
+            .find(|c| c.id == step1_chunk_id)
+            .expect("step1 chunk present");
+        let step2_chunk = draft
+            .chunks
+            .iter()
+            .find(|c| c.id == step2_chunk_id)
+            .expect("step2 chunk present");
+
+        assert_eq!(
+            step1_chunk.status, "approved",
+            "un-credentialed L7 proposal under v2 + auto mode must auto-approve; got: {}",
+            step1_chunk.status
+        );
+        assert_eq!(
+            step1_chunk.validation_result, "prover: no new findings",
+            "un-credentialed L7 verdict should be `no new findings`; got: {}",
+            step1_chunk.validation_result
+        );
+
+        assert_eq!(
+            step2_chunk.status, "pending",
+            "credentialed L7 PUT under v2 + auto mode must stay pending; got: {}",
+            step2_chunk.status
+        );
+        // This test's spec policy has no pre-existing rule for curl on
+        // api.github.com, so the agent's chunk grants brand-new
+        // credentialed reach: the finding is credential_reach_expansion,
+        // not capability_expansion. (The capability_expansion path is
+        // suppressed by the delta because the reach is new — one finding
+        // per change, not two.) The demo's policy.template.yaml has
+        // github_api_readonly which exercises the capability_expansion
+        // path; that's covered by the supersede test above.
+        assert!(
+            step2_chunk
+                .validation_result
+                .contains("credential_reach_expansion"),
+            "credentialed PUT on a host the binary did not previously reach must carry \
+             credential_reach_expansion; got: {}",
+            step2_chunk.validation_result
+        );
+        assert!(
+            !step2_chunk
+                .validation_result
+                .contains("capability_expansion"),
+            "capability_expansion must be suppressed when reach itself is new; got: {}",
+            step2_chunk.validation_result
+        );
     }
 
     /// Two agent-authored proposals targeting the same host/port/binary must
@@ -4742,7 +7246,7 @@ mod tests {
 
         let state = test_server_state().await;
         let sandbox_name = "redraft-loop".to_string();
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-redraft".to_string(),
                 name: sandbox_name.clone(),
@@ -4754,9 +7258,9 @@ mod tests {
                 policy: None,
                 ..Default::default()
             }),
-            phase: SandboxPhase::Ready as i32,
             ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox).await.unwrap();
 
         // Two proposals with the same host|port|binary (so the mechanistic
@@ -4856,7 +7360,7 @@ mod tests {
 
         let state = test_server_state().await;
         let sandbox_name = "mechanistic-dedup".to_string();
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-mech-dedup".to_string(),
                 name: sandbox_name.clone(),
@@ -4868,9 +7372,9 @@ mod tests {
                 policy: None,
                 ..Default::default()
             }),
-            phase: SandboxPhase::Ready as i32,
             ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox).await.unwrap();
 
         let proposed_rule = NetworkPolicyRule {
@@ -4956,7 +7460,7 @@ mod tests {
 
         let state = test_server_state().await;
         let sandbox_name = "undo-clears-reason".to_string();
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-undo-clears".to_string(),
                 name: sandbox_name.clone(),
@@ -4968,9 +7472,9 @@ mod tests {
                 policy: None,
                 ..Default::default()
             }),
-            phase: SandboxPhase::Ready as i32,
             ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox).await.unwrap();
 
         let proposed_rule = NetworkPolicyRule {
@@ -5062,7 +7566,15 @@ mod tests {
         use openshell_core::proto::{NetworkBinary, NetworkEndpoint, SandboxPhase, SandboxSpec};
 
         let state = test_server_state().await;
-        let sandbox_a = Sandbox {
+        // Attach a github provider so the L4 proposal below has a credential
+        // in scope and the prover emits a HIGH finding — keeps the chunk
+        // pending so this cross-sandbox approve check is reachable.
+        state
+            .store
+            .put_message(&test_provider("github-pat", "github"))
+            .await
+            .unwrap();
+        let mut sandbox_a = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-draft-owner".to_string(),
                 name: "draft-owner".to_string(),
@@ -5072,12 +7584,13 @@ mod tests {
             }),
             spec: Some(SandboxSpec {
                 policy: None,
+                providers: vec!["github-pat".to_string()],
                 ..Default::default()
             }),
-            phase: SandboxPhase::Ready as i32,
             ..Default::default()
         };
-        let sandbox_b = Sandbox {
+        sandbox_a.set_phase(SandboxPhase::Ready as i32);
+        let mut sandbox_b = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-draft-other".to_string(),
                 name: "draft-other".to_string(),
@@ -5089,16 +7602,16 @@ mod tests {
                 policy: None,
                 ..Default::default()
             }),
-            phase: SandboxPhase::Ready as i32,
             ..Default::default()
         };
+        sandbox_b.set_phase(SandboxPhase::Ready as i32);
         state.store.put_message(&sandbox_a).await.unwrap();
         state.store.put_message(&sandbox_b).await.unwrap();
 
         let proposed_rule = NetworkPolicyRule {
-            name: "allow_example".to_string(),
+            name: "allow_github".to_string(),
             endpoints: vec![NetworkEndpoint {
-                host: "api.example.com".to_string(),
+                host: "api.github.com".to_string(),
                 port: 443,
                 ..Default::default()
             }],
@@ -5208,11 +7721,56 @@ mod tests {
             "gateway merged incremental policy op: add-allow api.github.com:443 [POST /repos/*/issues]",
             7,
             "sha256:testhash",
+            &[],
         );
 
         assert_eq!(
             message,
             "CONFIG:MERGED [INFO] gateway merged incremental policy op: add-allow api.github.com:443 [POST /repos/*/issues] [version:v7 hash:sha256:testhash]"
+        );
+    }
+
+    /// Auto-approval audit messages carry `auto=true`, `source=<mode>`, and
+    /// `prover_delta=empty` as extra unmapped fields so a reviewer can
+    /// reconstruct the safety reasoning without needing to grep the chunk
+    /// table. The message text itself says "auto-approved: no new prover
+    /// findings" — never "safe" — because the claim is about the prover's
+    /// reasoning, not the world.
+    #[test]
+    fn build_gateway_policy_audit_message_carries_auto_approve_provenance() {
+        let extra = [
+            ("auto", "true".to_string()),
+            ("source", "agent_authored".to_string()),
+            ("prover_delta", "empty".to_string()),
+        ];
+        let message = build_gateway_policy_audit_message(
+            "sb-123",
+            "demo-sandbox",
+            "approved",
+            "auto-approved: no new prover findings (source=agent_authored) — chunk abc: add-rule x",
+            12,
+            "sha256:autohash",
+            &extra,
+        );
+        assert!(
+            message.contains("CONFIG:APPROVED"),
+            "auto-approval reuses CONFIG:APPROVED; got: {message}"
+        );
+        assert!(
+            message.contains("auto-approved: no new prover findings"),
+            "audit copy must say `no new prover findings`, not `safe`; got: {message}"
+        );
+        assert!(
+            message.contains("auto:true"),
+            "missing auto field: {message}"
+        );
+        assert!(
+            message.contains("source:agent_authored"),
+            "missing source field: {message}"
+        );
+        assert!(
+            message.contains("prover_delta:empty"),
+            "missing prover_delta field: {message}"
         );
     }
 
@@ -5738,6 +8296,52 @@ mod tests {
     }
 
     #[test]
+    fn validate_rule_rejects_known_metadata_hostname() {
+        use openshell_core::proto::{NetworkEndpoint, NetworkPolicyRule};
+
+        let rule = NetworkPolicyRule {
+            name: "bad".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "METADATA.GOOGLE.INTERNAL.".to_string(),
+                port: 80,
+                ..Default::default()
+            }],
+            binaries: vec![],
+        };
+        let result = validate_rule_not_always_blocked(&rule);
+        assert!(result.is_err());
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(status.message().contains("cloud metadata hostname"));
+    }
+
+    #[test]
+    fn validate_merge_operations_rejects_add_allow_for_known_metadata_hostname() {
+        let operation = PolicyMergeOp::AddAllowRules {
+            host: "metadata.google.internal".to_string(),
+            port: 80,
+            rules: vec![L7Rule {
+                allow: Some(openshell_core::proto::L7Allow {
+                    method: "GET".to_string(),
+                    path: "/computeMetadata/v1/**".to_string(),
+                    command: String::new(),
+                    query: HashMap::new(),
+                    operation_type: String::new(),
+                    operation_name: String::new(),
+                    fields: Vec::new(),
+                }),
+            }],
+        };
+
+        let result = validate_merge_operations_for_server(&[operation]);
+
+        assert!(result.is_err());
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(status.message().contains("cloud metadata hostname"));
+    }
+
+    #[test]
     fn validate_rule_accepts_rfc1918_allowed_ips() {
         use openshell_core::proto::{NetworkEndpoint, NetworkPolicyRule};
 
@@ -5886,6 +8490,78 @@ mod tests {
         };
         let stored = proto_setting_to_stored("dummy_bool", &value).unwrap();
         assert_eq!(stored, StoredSettingValue::Bool(true));
+    }
+
+    #[test]
+    fn proto_setting_to_stored_accepts_allowed_proposal_approval_mode_values() {
+        for raw in ["manual", "auto"] {
+            let value = SettingValue {
+                value: Some(setting_value::Value::StringValue(raw.to_string())),
+            };
+            let stored = proto_setting_to_stored(settings::PROPOSAL_APPROVAL_MODE_KEY, &value)
+                .unwrap_or_else(|e| panic!("expected '{raw}' to be accepted, got: {e}"));
+            assert_eq!(stored, StoredSettingValue::String(raw.to_string()));
+        }
+    }
+
+    #[test]
+    fn proto_setting_to_stored_rejects_invalid_proposal_approval_mode_value() {
+        // Typos and future-reserved modes must be rejected at configure time
+        // — without this, the value silently resolves to manual at runtime
+        // (fail-closed) and the operator never finds out they fat-fingered
+        // the setting.
+        for raw in ["autom", "AUTO", "Manual", "auto_on_low_risk", "", " auto"] {
+            let value = SettingValue {
+                value: Some(setting_value::Value::StringValue(raw.to_string())),
+            };
+            let res = proto_setting_to_stored(settings::PROPOSAL_APPROVAL_MODE_KEY, &value);
+            assert!(
+                res.is_err(),
+                "expected '{raw}' to be rejected, got: {res:?}"
+            );
+            let err = res.unwrap_err();
+            assert_eq!(err.code(), Code::InvalidArgument);
+        }
+    }
+
+    #[test]
+    fn proto_setting_to_stored_rejection_message_lists_allowed_proposal_approval_mode_values() {
+        let value = SettingValue {
+            value: Some(setting_value::Value::StringValue("autom".to_string())),
+        };
+        let err =
+            proto_setting_to_stored(settings::PROPOSAL_APPROVAL_MODE_KEY, &value).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        let msg = err.message();
+        assert!(msg.contains("manual"), "missing 'manual' in {msg}");
+        assert!(msg.contains("auto"), "missing 'auto' in {msg}");
+        assert!(msg.contains("autom"), "missing offending value in {msg}");
+    }
+
+    /// Locks in that invalid `proposal_approval_mode` is rejected at the
+    /// `UpdateConfig` RPC boundary — not just in the `proto_setting_to_stored`
+    /// helper. Prevents a future refactor from accidentally routing setting
+    /// writes around the validation chokepoint.
+    #[tokio::test]
+    async fn update_config_global_rejects_invalid_proposal_approval_mode() {
+        let state = test_server_state().await;
+        let req = with_user(Request::new(UpdateConfigRequest {
+            global: true,
+            setting_key: settings::PROPOSAL_APPROVAL_MODE_KEY.to_string(),
+            setting_value: Some(SettingValue {
+                value: Some(setting_value::Value::StringValue("autom".to_string())),
+            }),
+            ..Default::default()
+        }));
+        let err = handle_update_config(&state, req)
+            .await
+            .expect_err("invalid proposal_approval_mode must be rejected at UpdateConfig");
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(
+            err.message().contains("autom") && err.message().contains("manual"),
+            "expected rejection message to echo the bad value and list allowed values; got: {}",
+            err.message()
+        );
     }
 
     #[cfg(feature = "dev-settings")]
@@ -6485,7 +9161,7 @@ mod tests {
 
         // Create a sandbox WITHOUT a policy (spec.policy = None)
         // This simulates a sandbox before the supervisor has discovered and synced a policy
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-1".to_string(),
                 name: "test-sandbox".to_string(),
@@ -6498,9 +9174,9 @@ mod tests {
                 providers: Vec::new(),
                 ..Default::default()
             }),
-            phase: SandboxPhase::Provisioning as i32,
             ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Provisioning as i32);
         state.store.put_message(&sandbox).await.unwrap();
 
         // Fetch the sandbox to get its current resource_version
@@ -6560,7 +9236,7 @@ mod tests {
         let state = test_server_state().await;
 
         // Create a sandbox WITHOUT a policy
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-1".to_string(),
                 name: "test-sandbox".to_string(),
@@ -6573,9 +9249,9 @@ mod tests {
                 providers: Vec::new(),
                 ..Default::default()
             }),
-            phase: SandboxPhase::Provisioning as i32,
             ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Provisioning as i32);
         state.store.put_message(&sandbox).await.unwrap();
 
         // Get current version
@@ -6641,7 +9317,7 @@ mod tests {
         let state = Arc::new(test_server_state().await);
 
         // Create a sandbox WITHOUT a policy
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sb-1".to_string(),
                 name: "test-sandbox".to_string(),
@@ -6654,9 +9330,9 @@ mod tests {
                 providers: Vec::new(),
                 ..Default::default()
             }),
-            phase: SandboxPhase::Provisioning as i32,
             ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Provisioning as i32);
         state.store.put_message(&sandbox).await.unwrap();
 
         // All three clients fetch the sandbox and see the same version

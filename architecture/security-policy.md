@@ -89,21 +89,71 @@ because it changes the effective access model for every sandbox on the gateway.
 ## Policy Advisor
 
 The policy advisor pipeline turns observed denials into draft policy
-recommendations:
+recommendations. There are two proposers (sandbox-side mechanistic mapper,
+agent-authored via `policy.local`); the gateway is the single referee.
+When enabled, L7 `policy_denied` responses include both structured
+`next_steps` and a short `agent_guidance` string so generic agents can continue
+through the proposal loop instead of treating the denial as terminal.
 
-1. The sandbox aggregates denied network events.
-2. A mechanistic mapper proposes minimal endpoint, binary, or rule additions.
-3. The gateway validates and stores draft recommendations.
-4. A human or admin workflow approves or rejects drafts.
-5. Approved drafts merge into the target sandbox policy.
+1. **Submit.** Both proposers POST through the same `SubmitPolicyAnalysis`
+   path. Each chunk is persisted with its `analysis_mode` for audit provenance.
+2. **Validate.** The gateway runs the prover (`openshell-prover`) on every
+   chunk regardless of mode. The prover builds a Z3 model from the merged
+   policy plus the sandbox's attached-provider credential set, then computes
+   the delta of findings between the current baseline and the merged policy.
+3. **Auto-approval gate (proposer-agnostic, opt-in).** Auto-approval fires
+   when *both* (a) the prover delta is empty (`prover: no new findings`) AND
+   (b) the `proposal_approval_mode` setting resolves to `"auto"` — gateway
+   scope wins, sandbox scope is the per-sandbox override, default is
+   `"manual"`. When both hold, the gateway internally invokes the approve
+   path with actor identity `system:auto`. The audit event uses
+   `CONFIG:APPROVED` and carries `auto=true`, `source=<mode>`,
+   `prover_delta=empty`, and `resolved_from=<gateway|sandbox>` as unmapped
+   fields, with message text `"auto-approved: no new prover findings"` —
+   never `safe`. The opt-in gate preserves OpenShell's default-deny
+   posture: with no setting at either scope, every proposal lands in
+   `pending` for human review, even when the prover sees no findings.
+4. **Implicit supersede.** On any successful submission, the gateway scans
+   the sandbox's pending chunks for matches on `(host, port, binary)` and
+   auto-rejects the older ones with reason `"superseded by chunk X"`. This
+   gives the agent a refinement path (broad mechanistic L4 → narrow agent
+   L7) without an explicit `supersedes_chunk_id` field.
+5. **Escalation.** Anything else lands in `pending` for human review.
+
+## What the prover decides
+
+The prover answers four formal questions about each proposed policy
+change. Each "yes" answer becomes its own categorical finding — there is
+no severity grade. Any finding (of any category) blocks auto-approval.
+The categories are intended to be (mostly) mutually exclusive per
+underlying change: the gateway suppresses `capability_expansion` paths
+whose `(binary, host, port)` is also in the `credential_reach_expansion`
+delta, so a brand-new credentialed reach surfaces as one finding rather
+than one reach + N method findings.
+
+| Category | The prover detects… |
+|---|---|
+| `link_local_reach` | The proposal grants reach to a host in `169.254.0.0/16`, `fe80::/10`, or a known metadata hostname such as `metadata.google.internal`. Unconditional — cloud-metadata endpoints serve credentials regardless of sandbox state. |
+| `l7_bypass_credentialed` | The proposal lets a binary using a non-HTTP wire protocol (`git-remote-https`, `ssh`, `nc`) reach a host where a sandbox credential is in scope. The L7 proxy cannot inspect the wire protocol; the reviewer decides whether to trust the binary with the credential. |
+| `credential_reach_expansion` | A binary gained credentialed reach to a (host, port) it could not reach before. New authenticated reach is a stated intent change; the reviewer confirms the binary should authenticate to the host at all. |
+| `capability_expansion` | On a (binary, host, port) that already had credentialed reach, the policy adds a new HTTP method. The reviewer sees exactly which method was added (e.g., PUT) and decides if it's part of the agent's task. |
+
+"Credential in scope" is sandbox-coarse, not binary-fine: a credential is
+considered in scope if the sandbox has a provider attached whose
+`target_hosts` include the proposed endpoint's host, including runtime-like
+first-label wildcard coverage such as `*.github.com` covering
+`api.github.com`. v1 does not model credential scopes (read-only vs write);
+presence is enough.
 
 Proposals intentionally omit `allowed_ips`. If a proposed rule targets a host
 that resolves to a private IP, the proxy's runtime SSRF classification blocks
 the connection. The operator must then add an explicit `allowed_ips` entry to
 permit it — a two-step flow that keeps SSRF protection on by default.
 
-The advisor should propose narrow additions and preserve explicit-deny behavior.
-It is a workflow aid, not an automatic permission grant.
+The advisor proposes narrow additions and preserves explicit-deny behavior.
+Auto-approval is gated on prover determinism, not human judgment; an LLM-based
+contextual reviewer is a deliberate future addition layered on top of the
+deterministic prover gate.
 
 ## Security Logging
 

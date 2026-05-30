@@ -43,3 +43,10 @@ pub const VERSION: &str = match option_env!("OPENSHELL_GIT_VERSION") {
     Some(v) => v,
     None => env!("CARGO_PKG_VERSION"),
 };
+
+/// Encoded protobuf `FileDescriptorSet` for every proto in `proto/`.
+///
+/// Emitted by `build.rs` via `tonic_build::configure().file_descriptor_set_path(...)`.
+/// Used by tests in `openshell-server` to enumerate every RPC and verify that
+/// each one has an `#[rpc_auth(...)]` declaration on its handler.
+pub const FILE_DESCRIPTOR_SET: &[u8] = include_bytes!(env!("OPENSHELL_DESCRIPTOR_PATH"));

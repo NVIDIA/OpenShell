@@ -394,13 +394,19 @@ async fn plaintext_server_accepts_grpc_and_http() {
         HealthRequest, ServiceStatus, open_shell_client::OpenShellClient,
         open_shell_server::OpenShellServer,
     };
-    use openshell_server::{MultiplexedService, health_router};
+    use openshell_server::{MultiplexedService, Store, health_router};
+    use std::sync::Arc;
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
+    let store = Arc::new(
+        Store::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite store for tests"),
+    );
     let grpc_service = OpenShellServer::new(TestOpenShell);
-    let http_service = health_router();
+    let http_service = health_router(store);
     let service = MultiplexedService::new(grpc_service, http_service);
 
     let server = tokio::spawn(async move {

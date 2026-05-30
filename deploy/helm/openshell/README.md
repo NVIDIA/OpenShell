@@ -34,7 +34,6 @@ oc adm policy add-scc-to-user privileged -z openshell-sandbox -n openshell
 
 # Deploy openshell with overrides to allow SCC assignment of fsGroup and runAsUser for the gateway
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> -n openshell \
-  --set pkiInitJob.enabled=false \
   --set server.disableTls=true \
   --set podSecurityContext.fsGroup=null \
   --set securityContext.runAsUser=null
@@ -57,6 +56,57 @@ See [`values.yaml`](values.yaml) for source defaults. Selected overlays:
 - [`ci/values-gateway.yaml`](ci/values-gateway.yaml) - gateway-only configuration
 - [`ci/values-cert-manager.yaml`](ci/values-cert-manager.yaml) - cert-manager integration
 - [`ci/values-keycloak.yaml`](ci/values-keycloak.yaml) - Keycloak OIDC integration
+
+### Database backend
+
+By default, OpenShell uses SQLite:
+
+```yaml
+server:
+  dbUrl: "sqlite:/var/openshell/openshell.db"
+postgres:
+  enabled: false
+```
+
+#### External PostgreSQL
+
+Create a Secret containing the PostgreSQL connection URI if one does not
+already exist:
+
+```bash
+kubectl create secret generic my-pg-credentials -n openshell \
+  --from-literal=uri="postgresql://user:pass@host:5432/dbname"
+```
+
+Then install the chart pointing at that Secret:
+
+```bash
+helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
+  -n openshell \
+  --set server.externalDbSecret=my-pg-credentials
+```
+
+#### Bundled PostgreSQL
+
+Deploy a PostgreSQL instance alongside the gateway using the bundled
+Bitnami subchart. A random password is generated automatically:
+
+```bash
+helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
+  --set postgres.enabled=true
+```
+
+To set an explicit password, add `--set postgres.auth.password=my-secret-password`.
+
+#### OpenShift
+
+Append these flags to any of the PostgreSQL commands above for OpenShift:
+
+```
+--set server.disableTls=true \
+--set podSecurityContext.fsGroup=null \
+--set securityContext.runAsUser=null
+```
 
 ## PKI bootstrap
 
@@ -111,6 +161,12 @@ cert-manager alternative.
 | podLabels | object | `{}` | Extra labels to add to the gateway pod. |
 | podLifecycle.terminationGracePeriodSeconds | int | `5` | Grace period, in seconds, before Kubernetes terminates the gateway pod. |
 | podSecurityContext.fsGroup | int | `1000` | fsGroup assigned to the gateway pod. |
+| postgres.auth.database | string | `"openshell"` |  |
+| postgres.auth.password | string | `""` |  |
+| postgres.auth.username | string | `"openshell"` |  |
+| postgres.enabled | bool | `false` | Deploy the bundled Bitnami PostgreSQL subchart. |
+| postgres.primary.persistence.enabled | bool | `true` |  |
+| postgres.serviceBindings.enabled | bool | `true` |  |
 | probes.liveness.failureThreshold | int | `3` | Liveness probe failure threshold before the container is restarted. |
 | probes.liveness.initialDelaySeconds | int | `2` | Liveness probe initial delay, in seconds. |
 | probes.liveness.periodSeconds | int | `5` | Liveness probe period, in seconds. |
@@ -132,10 +188,11 @@ cert-manager alternative.
 | securityContext.runAsNonRoot | bool | `true` | Require the gateway container to run as a non-root user. |
 | securityContext.runAsUser | int | `1000` | UID assigned to the gateway container. |
 | server.auth.allowUnauthenticatedUsers | bool | `false` | UNSAFE: accept unauthenticated CLI/user requests as a local developer principal. Intended only for trusted local Skaffold/k3d development or a fully trusted fronting proxy. Leave false for shared or production clusters. |
-| server.dbUrl | string | `"sqlite:/var/openshell/openshell.db"` | Gateway database URL. |
+| server.dbUrl | string | `"sqlite:/var/openshell/openshell.db"` | Gateway database URL (used for the default SQLite backend). |
 | server.disableTls | bool | `false` | Disable TLS entirely - the server listens on plaintext HTTP. Set to true when a reverse proxy / tunnel terminates TLS at the edge. |
 | server.enableLoopbackServiceHttp | bool | `true` | Enable plaintext HTTP routing for loopback sandbox service URLs on TLS-enabled gateways. |
 | server.enableUserNamespaces | bool | `false` | Enable Kubernetes user namespace isolation (hostUsers: false) for sandbox pods. Requires Kubernetes 1.33+ with user namespace support available (beta through 1.35, GA in 1.36+), plus a supporting container runtime and Linux 5.12+. When enabled, container UID 0 maps to an unprivileged host UID and capabilities become namespaced. |
+| server.externalDbSecret | string | `""` | Name of a pre-existing Opaque Secret containing a PostgreSQL connection URI (key: uri). When set, the gateway reads OPENSHELL_DB_URL from this Secret instead of using dbUrl. The Secret must contain a `uri` key, e.g. postgresql://user:pass@host:5432/dbname. |
 | server.grpcEndpoint | string | `""` | gRPC endpoint sandboxes call back into the gateway. Leave empty to derive it from the chart fullname, release namespace, service port, and disableTls flag, for example https://openshell.openshell.svc.cluster.local:8080. Override only when sandboxes must reach the gateway via a different hostname (e.g. an external ingress or a host alias). |
 | server.hostGatewayIP | string | `""` | Host gateway IP for sandbox pod hostAliases. When set, sandbox pods get hostAliases entries mapping host.docker.internal and host.openshell.internal to this IP, allowing them to reach services running on the Docker host. Auto-detected by the cluster entrypoint script. |
 | server.logLevel | string | `"info"` | Gateway log level. |
@@ -151,6 +208,7 @@ cert-manager alternative.
 | server.sandboxImagePullPolicy | string | `""` | Kubernetes imagePullPolicy for sandbox pods. Empty = Kubernetes default (Always for :latest, IfNotPresent otherwise). Set to "Always" for dev clusters so new images are picked up without manual eviction. |
 | server.sandboxJwt.gatewayId | string | `""` | Stable gateway identity embedded in iss/aud of every minted token. Defaults to the release name so HA replicas share identity. |
 | server.sandboxJwt.k8sSaTokenTtlSecs | int | `3600` | Lifetime (seconds) of the projected ServiceAccount token kubelet writes into each sandbox pod for the IssueSandboxToken bootstrap exchange. Kubelet enforces a minimum of 600s; the driver clamps values outside [600, 86400]. Default 3600 — generous, since the supervisor consumes the token within seconds of pod start. |
+| server.sandboxJwt.secretDefaultMode | string | `""` | File mode for the mounted JWT signing key Secret. Default 0400 (owner-read only). Override to 0440 or 0444 if the container UID does not match the volume file owner. |
 | server.sandboxJwt.signingSecretName | string | `""` | Name of the Opaque Secret holding the signing key material. Empty falls back to the chart fullname with "-jwt-keys" appended. |
 | server.sandboxJwt.ttlSecs | int | `3600` | Token TTL in seconds. Defaults to 3600 (1h). |
 | server.sandboxNamespace | string | `""` | Namespace where sandbox pods are created. Defaults to the Helm release namespace (.Release.Namespace) when left empty. |

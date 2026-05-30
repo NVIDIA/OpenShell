@@ -295,6 +295,8 @@ openshell sandbox upload my-sandbox ./src /sandbox/src
 
 When the local path is a named directory, OpenShell preserves that basename at the destination, matching `scp -r` and `cp -r`. The example above creates `/sandbox/src/src`.
 
+OpenShell preserves symlinks during upload. A symlink arrives in the sandbox as a symlink with the same target path instead of an expanded copy of the target file or directory. Dangling symlinks are also preserved.
+
 Download files from the sandbox to your host:
 
 ```shell

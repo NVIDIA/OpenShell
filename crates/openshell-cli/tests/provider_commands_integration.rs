@@ -126,8 +126,6 @@ impl OpenShell for TestOpenShell {
                 }),
                 spec: None,
                 status: None,
-                phase: 0,
-                current_policy_version: 0,
             }),
         }))
     }

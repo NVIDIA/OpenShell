@@ -2,191 +2,122 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Terminal report rendering (full and compact).
+//!
+//! The prover output is categorical, not severity-graded. Each finding
+//! names *what* the policy change does (e.g., `capability_expansion`);
+//! per-path evidence carries the structured detail. There is no HIGH /
+//! MEDIUM / CRITICAL grade — the category itself is the signal.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use owo_colors::OwoColorize;
 
-use crate::finding::{Finding, FindingPath, RiskLevel};
+use crate::finding::{Finding, FindingPath, category};
 
 // ---------------------------------------------------------------------------
-// Compact titles (short labels for each query type)
+// Category labels (display strings keyed off `Finding.query`)
 // ---------------------------------------------------------------------------
 
-fn compact_title(query: &str) -> &str {
+fn category_label(query: &str) -> &str {
     match query {
-        "data_exfiltration" => "Data exfiltration possible",
-        "write_bypass" => "Write bypass \u{2014} read-only intent violated",
-        _ => "Unknown finding",
+        category::LINK_LOCAL_REACH => "link-local reach",
+        category::L7_BYPASS_CREDENTIALED => "L7-bypass binary with credential",
+        category::CREDENTIAL_REACH_EXPANSION => "credentialed reach expansion",
+        category::CAPABILITY_EXPANSION => "capability expansion on credentialed host",
+        _ => "unknown finding",
     }
 }
 
 // ---------------------------------------------------------------------------
-// Compact detail line
+// One-line shorthand (used by the gateway's `validation_result`)
 // ---------------------------------------------------------------------------
 
-fn compact_detail(finding: &Finding) -> String {
-    match finding.query.as_str() {
-        "data_exfiltration" => {
-            let mut by_status: HashMap<&str, HashSet<String>> = HashMap::new();
-            for path in &finding.paths {
-                if let FindingPath::Exfil(p) = path {
-                    by_status
-                        .entry(&p.l7_status)
-                        .or_default()
-                        .insert(format!("{}:{}", p.endpoint_host, p.endpoint_port));
-                }
-            }
-            let mut parts = Vec::new();
-            if let Some(eps) = by_status.get("l4_only") {
-                let mut sorted: Vec<&String> = eps.iter().collect();
-                sorted.sort();
-                parts.push(format!(
-                    "L4-only: {}",
-                    sorted
-                        .iter()
-                        .map(|s| s.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-            }
-            if let Some(eps) = by_status.get("l7_bypassed") {
-                let mut sorted: Vec<&String> = eps.iter().collect();
-                sorted.sort();
-                parts.push(format!(
-                    "wire protocol bypass: {}",
-                    sorted
-                        .iter()
-                        .map(|s| s.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-            }
-            if let Some(eps) = by_status.get("l7_allows_write") {
-                let mut sorted: Vec<&String> = eps.iter().collect();
-                sorted.sort();
-                parts.push(format!(
-                    "L7 write: {}",
-                    sorted
-                        .iter()
-                        .map(|s| s.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-            }
-            parts.join("; ")
+/// Render a finding as one or more single-line strings, suitable for
+/// embedding in the gateway `validation_result`, demo output, and logs.
+///
+/// Shape: `<category>: <per-path detail>` — one line per path. The
+/// gateway concatenates these into the chunk's `validation_result` so
+/// the reviewer reads what changed without parsing the category enum.
+pub fn finding_shorthand(finding: &Finding) -> String {
+    let mut lines = Vec::new();
+    for path in &finding.paths {
+        let FindingPath::Exfil(p) = path;
+        lines.push(format_path_line(&finding.query, p));
+    }
+    lines.join("\n  ")
+}
+
+fn format_path_line(query: &str, p: &crate::finding::ExfilPath) -> String {
+    let endpoint = format!("{}:{}", p.endpoint_host, p.endpoint_port);
+    match query {
+        category::LINK_LOCAL_REACH => {
+            format!("link_local_reach: {endpoint} via {}", p.binary)
         }
-        "write_bypass" => {
-            let mut reasons = HashSet::new();
-            let mut endpoints = HashSet::new();
-            for path in &finding.paths {
-                if let FindingPath::WriteBypass(p) = path {
-                    reasons.insert(p.bypass_reason.as_str());
-                    endpoints.insert(format!("{}:{}", p.endpoint_host, p.endpoint_port));
-                }
-            }
-            let mut sorted_eps: Vec<&String> = endpoints.iter().collect();
-            sorted_eps.sort();
-            let ep_list = sorted_eps
-                .iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            if reasons.contains("l4_only") && reasons.contains("l7_bypass_protocol") {
-                format!("L4-only + wire protocol: {ep_list}")
-            } else if reasons.contains("l4_only") {
-                format!("L4-only (no inspection): {ep_list}")
-            } else if reasons.contains("l7_bypass_protocol") {
-                format!("wire protocol bypasses L7: {ep_list}")
-            } else {
-                String::new()
-            }
+        category::L7_BYPASS_CREDENTIALED => {
+            format!("l7_bypass_credentialed: {endpoint} via {}", p.binary)
         }
-        _ => String::new(),
+        category::CREDENTIAL_REACH_EXPANSION => {
+            format!("credential_reach_expansion: {endpoint} via {}", p.binary)
+        }
+        category::CAPABILITY_EXPANSION => {
+            format!(
+                "capability_expansion: {method} on {endpoint} via {bin}",
+                method = p.method,
+                bin = p.binary
+            )
+        }
+        _ => format!("{query}: {endpoint} via {}", p.binary),
     }
 }
 
 // ---------------------------------------------------------------------------
-// Risk formatting
+// Compact output (CLI lint mode)
 // ---------------------------------------------------------------------------
 
-fn risk_label(risk: RiskLevel) -> String {
-    match risk {
-        RiskLevel::Critical => "CRITICAL".to_owned(),
-        RiskLevel::High => "HIGH".to_owned(),
-    }
-}
-
-fn print_risk_label(risk: RiskLevel) {
-    match risk {
-        RiskLevel::Critical => print!("{}", "CRITICAL".bold().red()),
-        RiskLevel::High => print!("{}", "    HIGH".red()),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Compact output
-// ---------------------------------------------------------------------------
-
-/// Render compact output (one-line-per-finding for demos and CI).
-/// Returns exit code: 0 = pass, 1 = critical/high found.
+/// Render compact output (one-line-per-finding-line for demos and CI).
+/// Returns exit code: 0 = pass, 1 = any findings present.
 pub fn render_compact(findings: &[Finding], _policy_path: &str, _credentials_path: &str) -> i32 {
     let active: Vec<&Finding> = findings.iter().filter(|f| !f.accepted).collect();
     let accepted: Vec<&Finding> = findings.iter().filter(|f| f.accepted).collect();
 
     for finding in &active {
-        print!("  ");
-        print_risk_label(finding.risk);
-        println!("  {}", compact_title(&finding.query));
-        let detail = compact_detail(finding);
-        if !detail.is_empty() {
-            println!("             {detail}");
+        for path in &finding.paths {
+            let FindingPath::Exfil(p) = path;
+            println!("  {} {}", "•".yellow(), format_path_line(&finding.query, p));
         }
-        println!();
+        if !finding.paths.is_empty() {
+            println!();
+        }
     }
 
     for finding in &accepted {
         println!(
-            "  {}  {}",
+            "  {} {}",
             "ACCEPTED".dimmed(),
-            compact_title(&finding.query).dimmed()
+            category_label(&finding.query).dimmed()
         );
     }
     if !accepted.is_empty() {
         println!();
     }
 
-    // Verdict
-    let mut counts: HashMap<RiskLevel, usize> = HashMap::new();
-    for f in &active {
-        *counts.entry(f.risk).or_default() += 1;
-    }
-    let has_critical = counts.contains_key(&RiskLevel::Critical);
-    let has_high = counts.contains_key(&RiskLevel::High);
     let accepted_note = if accepted.is_empty() {
         String::new()
     } else {
         format!(", {} accepted", accepted.len())
     };
 
-    if has_critical || has_high {
-        let n = counts.get(&RiskLevel::Critical).unwrap_or(&0)
-            + counts.get(&RiskLevel::High).unwrap_or(&0);
+    let path_count: usize = active.iter().map(|f| f.paths.len()).sum();
+    if path_count > 0 {
         println!(
-            "   {}  {n} critical/high gaps{accepted_note}",
-            " FAIL ".white().bold().on_red()
+            "   {}  {path_count} finding path(s) require review{accepted_note}",
+            " REVIEW ".black().bold().on_yellow()
         );
         1
-    } else if !active.is_empty() {
-        println!(
-            "   {}  advisories only{accepted_note}",
-            " PASS ".black().bold().on_yellow()
-        );
-        0
     } else {
         println!(
-            "   {}  all findings accepted{accepted_note}",
+            "   {}  no findings{accepted_note}",
             " PASS ".white().bold().on_green()
         );
         0
@@ -198,7 +129,7 @@ pub fn render_compact(findings: &[Finding], _policy_path: &str, _credentials_pat
 // ---------------------------------------------------------------------------
 
 /// Render a full terminal report with finding panels.
-/// Returns exit code: 0 = pass, 1 = critical/high found.
+/// Returns exit code: 0 = pass, 1 = any findings present.
 pub fn render_report(findings: &[Finding], policy_path: &str, credentials_path: &str) -> i32 {
     let policy_name = Path::new(policy_path)
         .file_name()
@@ -221,50 +152,36 @@ pub fn render_report(findings: &[Finding], policy_path: &str, credentials_path: 
     let active: Vec<&Finding> = findings.iter().filter(|f| !f.accepted).collect();
     let accepted: Vec<&Finding> = findings.iter().filter(|f| f.accepted).collect();
 
-    // Summary
-    let mut counts: HashMap<RiskLevel, usize> = HashMap::new();
+    // Per-category summary
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
     for f in &active {
-        *counts.entry(f.risk).or_default() += 1;
+        *counts.entry(f.query.as_str()).or_default() += f.paths.len();
     }
-
-    println!("{}", "Finding Summary".bold().underline());
-    for level in [RiskLevel::Critical, RiskLevel::High] {
-        if let Some(&count) = counts.get(&level) {
-            match level {
-                RiskLevel::Critical => {
-                    println!("  {:>10}  {count}", "CRITICAL".bold().red());
-                }
-                RiskLevel::High => println!("  {:>10}  {count}", "HIGH".red()),
-            }
-        }
-    }
-    if !accepted.is_empty() {
-        println!("  {:>10}  {}", "ACCEPTED".dimmed(), accepted.len());
-    }
-    println!();
 
     if active.is_empty() && accepted.is_empty() {
         println!("{}", "No findings. Policy posture is clean.".green().bold());
         return 0;
     }
 
-    // Per-finding details
-    for (i, finding) in active.iter().enumerate() {
-        let label = risk_label(finding.risk);
-        let border = match finding.risk {
-            RiskLevel::Critical => format!("{}", format!("[{label}]").bold().red()),
-            RiskLevel::High => format!("{}", format!("[{label}]").red()),
-        };
+    println!("{}", "Finding Summary".bold().underline());
+    for (query, count) in &counts {
+        println!("  {:>40}  {count} path(s)", category_label(query).yellow());
+    }
+    if !accepted.is_empty() {
+        println!("  {:>40}  {}", "ACCEPTED".dimmed(), accepted.len());
+    }
+    println!();
 
-        println!("--- Finding #{} {border} ---", i + 1);
+    for (i, finding) in active.iter().enumerate() {
+        println!(
+            "--- Finding #{} [{}] ---",
+            i + 1,
+            category_label(&finding.query)
+        );
         println!("  {}", finding.title.bold());
         println!("  {}", finding.description);
         println!();
-
-        // Render paths
         render_paths(&finding.paths);
-
-        // Remediation
         if !finding.remediation.is_empty() {
             println!("  {}", "Remediation:".bold());
             for r in &finding.remediation {
@@ -274,13 +191,12 @@ pub fn render_report(findings: &[Finding], policy_path: &str, credentials_path: 
         }
     }
 
-    // Accepted findings
     if !accepted.is_empty() {
-        println!("{}", "--- Accepted Risks ---".dimmed());
+        println!("{}", "--- Accepted Findings ---".dimmed());
         for finding in &accepted {
             println!(
                 "  {}  {}",
-                risk_label(finding.risk).dimmed(),
+                category_label(&finding.query).dimmed(),
                 finding.title.dimmed()
             );
             println!(
@@ -291,33 +207,20 @@ pub fn render_report(findings: &[Finding], policy_path: &str, credentials_path: 
         }
     }
 
-    // Verdict
-    let has_critical = counts.contains_key(&RiskLevel::Critical);
-    let has_high = counts.contains_key(&RiskLevel::High);
+    let path_count: usize = active.iter().map(|f| f.paths.len()).sum();
     let accepted_note = if accepted.is_empty() {
         String::new()
     } else {
         format!(" ({} accepted)", accepted.len())
     };
-
-    if has_critical {
+    if path_count > 0 {
         println!(
             "{}{accepted_note}",
-            "FAIL \u{2014} Critical gaps found.".bold().red()
+            "REVIEW \u{2014} prover findings require human attention."
+                .bold()
+                .yellow()
         );
         1
-    } else if has_high {
-        println!(
-            "{}{accepted_note}",
-            "FAIL \u{2014} High-risk gaps found.".bold().red()
-        );
-        1
-    } else if !active.is_empty() {
-        println!(
-            "{}{accepted_note}",
-            "PASS \u{2014} Advisories only.".bold().yellow()
-        );
-        0
     } else {
         println!(
             "{}{accepted_note}",
@@ -331,63 +234,134 @@ fn render_paths(paths: &[FindingPath]) {
     if paths.is_empty() {
         return;
     }
-
-    match &paths[0] {
-        FindingPath::Exfil(_) => render_exfil_paths(paths),
-        FindingPath::WriteBypass(_) => render_write_bypass_paths(paths),
-    }
-}
-
-fn render_exfil_paths(paths: &[FindingPath]) {
-    println!(
-        "  {:<30} {:<25} {:<15} {}",
-        "Binary".bold(),
-        "Endpoint".bold(),
-        "L7 Status".bold(),
-        "Mechanism".bold(),
-    );
+    // Group paths by binary for compact display.
+    let mut by_binary: BTreeMap<&str, Vec<&crate::finding::ExfilPath>> = BTreeMap::new();
     for path in paths {
-        if let FindingPath::Exfil(p) = path {
-            let l7_display = match p.l7_status.as_str() {
-                "l4_only" => format!("{}", "L4-only".red()),
-                "l7_bypassed" => format!("{}", "bypassed".red()),
-                "l7_allows_write" => format!("{}", "L7 write".yellow()),
-                _ => p.l7_status.clone(),
-            };
-            let ep = format!("{}:{}", p.endpoint_host, p.endpoint_port);
-            // Truncate mechanism for display
-            let mech = if p.mechanism.len() > 50 {
-                format!("{}...", &p.mechanism[..47])
-            } else {
-                p.mechanism.clone()
-            };
-            println!("  {:<30} {:<25} {:<15} {}", p.binary, ep, l7_display, mech);
+        let FindingPath::Exfil(p) = path;
+        by_binary.entry(&p.binary).or_default().push(p);
+    }
+    for (binary, ps) in &by_binary {
+        println!("  Binary: {}", binary.cyan());
+        let mut endpoints: BTreeSet<String> = BTreeSet::new();
+        let mut methods: BTreeSet<String> = BTreeSet::new();
+        for p in ps {
+            endpoints.insert(format!("{}:{}", p.endpoint_host, p.endpoint_port));
+            if !p.method.is_empty() {
+                methods.insert(p.method.clone());
+            }
         }
-    }
-    println!();
-}
-
-fn render_write_bypass_paths(paths: &[FindingPath]) {
-    println!(
-        "  {:<30} {:<25} {:<15} {}",
-        "Binary".bold(),
-        "Endpoint".bold(),
-        "Bypass".bold(),
-        "Intent".bold(),
-    );
-    for path in paths {
-        if let FindingPath::WriteBypass(p) = path {
-            let ep = format!("{}:{}", p.endpoint_host, p.endpoint_port);
-            let bypass_display = match p.bypass_reason.as_str() {
-                "l4_only" => format!("{}", "L4-only".red()),
-                "l7_bypass_protocol" => format!("{}", "wire proto".red()),
-                _ => p.bypass_reason.clone(),
-            };
+        println!(
+            "    Endpoints: {}",
+            endpoints.iter().cloned().collect::<Vec<_>>().join(", ")
+        );
+        if !methods.is_empty() {
             println!(
-                "  {:<30} {:<25} {:<15} {}",
-                p.binary, ep, bypass_display, p.policy_intent
+                "    Methods:   {}",
+                methods.iter().cloned().collect::<Vec<_>>().join(", ")
             );
         }
     }
     println!();
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::finding::ExfilPath;
+
+    fn exfil_path(category_name: &str, method: &str, host: &str, port: u16) -> ExfilPath {
+        ExfilPath {
+            binary: "/usr/bin/curl".to_owned(),
+            endpoint_host: host.to_owned(),
+            endpoint_port: port,
+            mechanism: String::new(),
+            policy_name: "rule".to_owned(),
+            category: category_name.to_owned(),
+            method: method.to_owned(),
+        }
+    }
+
+    fn finding_with(category_name: &str, paths: Vec<ExfilPath>) -> Finding {
+        Finding {
+            query: category_name.to_owned(),
+            title: "test".to_owned(),
+            description: String::new(),
+            paths: paths.into_iter().map(FindingPath::Exfil).collect(),
+            remediation: vec![],
+            accepted: false,
+            accepted_reason: String::new(),
+        }
+    }
+
+    #[test]
+    fn shorthand_renders_capability_expansion_with_method() {
+        let f = finding_with(
+            category::CAPABILITY_EXPANSION,
+            vec![exfil_path(
+                category::CAPABILITY_EXPANSION,
+                "PUT",
+                "api.github.com",
+                443,
+            )],
+        );
+        assert_eq!(
+            finding_shorthand(&f),
+            "capability_expansion: PUT on api.github.com:443 via /usr/bin/curl"
+        );
+    }
+
+    #[test]
+    fn shorthand_renders_credential_reach_expansion() {
+        let f = finding_with(
+            category::CREDENTIAL_REACH_EXPANSION,
+            vec![exfil_path(
+                category::CREDENTIAL_REACH_EXPANSION,
+                "",
+                "uploads.github.com",
+                443,
+            )],
+        );
+        assert_eq!(
+            finding_shorthand(&f),
+            "credential_reach_expansion: uploads.github.com:443 via /usr/bin/curl"
+        );
+    }
+
+    #[test]
+    fn shorthand_renders_link_local() {
+        let f = finding_with(
+            category::LINK_LOCAL_REACH,
+            vec![exfil_path(
+                category::LINK_LOCAL_REACH,
+                "",
+                "169.254.169.254",
+                80,
+            )],
+        );
+        assert_eq!(
+            finding_shorthand(&f),
+            "link_local_reach: 169.254.169.254:80 via /usr/bin/curl"
+        );
+    }
+
+    #[test]
+    fn shorthand_renders_l7_bypass() {
+        let f = finding_with(
+            category::L7_BYPASS_CREDENTIALED,
+            vec![exfil_path(
+                category::L7_BYPASS_CREDENTIALED,
+                "",
+                "github.com",
+                443,
+            )],
+        );
+        assert_eq!(
+            finding_shorthand(&f),
+            "l7_bypass_credentialed: github.com:443 via /usr/bin/curl"
+        );
+    }
 }

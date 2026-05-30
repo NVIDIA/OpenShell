@@ -74,9 +74,29 @@ cd "$WORK"
 # compare runs.
 DEMO_CODEX_REASONING="${DEMO_CODEX_REASONING:-low}"
 
-exec codex exec \
-    --skip-git-repo-check \
-    --sandbox danger-full-access \
-    --ephemeral \
+# Pin the model to one that ChatGPT-account Codex users can reach and that is
+# quick enough for the mechanical proposal loop. Override with DEMO_CODEX_MODEL
+# if your account supports something different.
+DEMO_CODEX_MODEL="${DEMO_CODEX_MODEL:-gpt-5.4-mini}"
+CODEX_BIN="${CODEX_BIN:-codex}"
+if [[ -x /sandbox/payload/codex ]]; then
+    CODEX_BIN="/sandbox/payload/codex"
+fi
+
+CODEX_EXEC_ARGS=(
+    exec
+    --skip-git-repo-check
+    --sandbox danger-full-access
+    --ephemeral
+)
+if "$CODEX_BIN" exec --help 2>/dev/null | grep -q -- "--ignore-user-config"; then
+    CODEX_EXEC_ARGS+=(--ignore-user-config)
+fi
+if "$CODEX_BIN" exec --help 2>/dev/null | grep -q -- "--ignore-rules"; then
+    CODEX_EXEC_ARGS+=(--ignore-rules)
+fi
+
+exec "$CODEX_BIN" "${CODEX_EXEC_ARGS[@]}" \
+    -c "model=\"${DEMO_CODEX_MODEL}\"" \
     -c "model_reasoning_effort=\"${DEMO_CODEX_REASONING}\"" \
     "$(cat /sandbox/payload/agent-task.md)"

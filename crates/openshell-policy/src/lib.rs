@@ -328,6 +328,9 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                             allow_encoded_slash: e.allow_encoded_slash,
                             websocket_credential_rewrite: e.websocket_credential_rewrite,
                             request_body_credential_rewrite: e.request_body_credential_rewrite,
+                            // Advisor provenance is internal runtime state, not
+                            // a user-authored policy schema field.
+                            advisor_proposed: false,
                             persisted_queries: e.persisted_queries,
                             graphql_persisted_queries: e
                                 .graphql_persisted_queries

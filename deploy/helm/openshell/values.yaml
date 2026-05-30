@@ -138,8 +138,13 @@ server:
   # -- Namespace where sandbox pods are created. Defaults to the Helm release
   # namespace (.Release.Namespace) when left empty.
   sandboxNamespace: ""
-  # -- Gateway database URL.
+  # -- Gateway database URL (used for the default SQLite backend).
   dbUrl: "sqlite:/var/openshell/openshell.db"
+  # -- Name of a pre-existing Opaque Secret containing a PostgreSQL
+  # connection URI (key: uri). When set, the gateway reads OPENSHELL_DB_URL
+  # from this Secret instead of using dbUrl. The Secret must contain a
+  # `uri` key, e.g. postgresql://user:pass@host:5432/dbname.
+  externalDbSecret: ""
   # -- Default sandbox image used when requests do not specify one.
   sandboxImage: "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
   # -- Kubernetes imagePullPolicy for sandbox pods. Empty = Kubernetes default
@@ -206,6 +211,10 @@ server:
     # values outside [600, 86400]. Default 3600 — generous, since the
     # supervisor consumes the token within seconds of pod start.
     k8sSaTokenTtlSecs: 3600
+    # -- File mode for the mounted JWT signing key Secret. Default 0400
+    # (owner-read only). Override to 0440 or 0444 if the container UID
+    # does not match the volume file owner.
+    secretDefaultMode: ""
   # OIDC (OpenID Connect) configuration for JWT-based authentication.
   # When issuer is set, the server validates Bearer tokens on gRPC requests.
   oidc:
@@ -230,6 +239,28 @@ server:
     # for verifying the OIDC issuer's TLS certificate. Required when the
     # issuer uses a non-public CA (e.g. OpenShift ingress, private PKI).
     caConfigMapName: ""
+
+# Bundled PostgreSQL backing store (Bitnami subchart).
+# Set enabled=true to deploy a PostgreSQL instance alongside the gateway.
+# For external PostgreSQL, leave enabled=false and set server.externalDbSecret
+# to a pre-existing Secret containing a `uri` key.
+postgres:
+  # -- Deploy the bundled Bitnami PostgreSQL subchart.
+  enabled: false
+  # Values below configure the bundled Bitnami PostgreSQL subchart
+  # (aliased as "postgres" in Chart.yaml). The subchart uses these to
+  # initialise the PostgreSQL instance.
+  auth:
+    username: openshell
+    password: ""
+    database: openshell
+  # Bitnami service-binding Secrets — must stay true. The gateway reads
+  # the connection URI from the subchart-managed Secret.
+  serviceBindings:
+    enabled: true
+  primary:
+    persistence:
+      enabled: true
 
 # NetworkPolicy restricting SSH ingress on sandbox pods to the gateway only.
 networkPolicy:

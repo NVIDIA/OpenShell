@@ -10,7 +10,7 @@ use crate::policy_store::{
     policy_record_from_parts,
 };
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{PgPool, Row};
+use sqlx::{Connection, PgPool, Row};
 
 static POSTGRES_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/postgres");
 
@@ -37,6 +37,21 @@ impl PostgresStore {
             .run(&self.pool)
             .await
             .map_err(|e| map_migrate_error(&e))
+    }
+
+    /// Verify the database is reachable by acquiring a pooled connection
+    /// and issuing a protocol-level ping.
+    pub async fn ping(&self) -> PersistenceResult<()> {
+        let mut conn = self.pool.acquire().await.map_err(|e| map_db_error(&e))?;
+        conn.ping().await.map_err(|e| map_db_error(&e))
+    }
+
+    /// Test support only: close the underlying connection pool.
+    ///
+    /// Do not call from runtime code; this tears down the active pool.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn close(&self) {
+        self.pool.close().await;
     }
 
     pub async fn put(

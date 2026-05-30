@@ -57,6 +57,11 @@ path = "tests/vm_gateway_resume.rs"
 required-features = ["e2e-vm"]
 
 [[test]]
+name = "readyz_health"
+path = "tests/readyz_health.rs"
+required-features = ["e2e-kubernetes"]
+
+[[test]]
 name = "websocket_conformance"
 path = "tests/websocket_conformance.rs"
 required-features = ["e2e-host-gateway"]
@@ -88,6 +93,10 @@ required-features = ["e2e-gpu"]
 
 [dependencies]
 base64 = "0.22"
+bytes = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 tokio = { version = "1.43", features = ["full"] }
 tempfile = "3"
 sha1 = "0.10"

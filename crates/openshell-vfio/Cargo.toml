@@ -3,7 +3,7 @@
 
 [package]
 name = "openshell-vfio"
-description = "VFIO GPU passthrough lifecycle for OpenShell VM sandboxes"
+description = "VFIO PCIe passthrough lifecycle for OpenShell VM sandboxes"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
