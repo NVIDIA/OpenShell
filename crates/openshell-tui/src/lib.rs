@@ -18,6 +18,7 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use miette::{IntoDiagnostic, Result};
+use openshell_bootstrap::list_gateways_with_source;
 use openshell_core::auth::EdgeAuthInterceptor;
 use openshell_core::metadata::{ObjectId, ObjectLabels, ObjectName};
 use openshell_core::proto::SandboxPhase;
@@ -456,30 +457,29 @@ pub async fn run(
 
 /// Refresh the list of known gateways from disk.
 fn refresh_gateway_list(app: &mut App) {
-    if let Ok(gateways) = openshell_bootstrap::list_gateways() {
+    if let Ok(gateways) = list_gateways_with_source() {
         app.gateways = gateways
             .into_iter()
-            .map(|m| GatewayEntry {
-                name: m.name,
-                endpoint: m.gateway_endpoint,
-                is_remote: m.is_remote,
+            .map(|gateway| GatewayEntry {
+                source: Some(gateway.source),
+                name: gateway.metadata.name,
+                endpoint: gateway.metadata.gateway_endpoint,
+                is_remote: gateway.metadata.is_remote,
             })
             .collect();
 
-        // Keep selection in bounds.
         if app.gateway_selected >= app.gateways.len() && !app.gateways.is_empty() {
             app.gateway_selected = app.gateways.len() - 1;
         }
 
-        // If the active gateway appears in the list, move cursor to it on first load.
-        if let Some(idx) = app.gateways.iter().position(|g| g.name == app.gateway_name) {
-            // Only snap the cursor when it's still at 0 (initial state).
-            if app.gateway_selected == 0 {
-                app.gateway_selected = idx;
-            }
+        if let Some(idx) = app.gateways.iter().position(|g| g.name == app.gateway_name)
+            && app.gateway_selected == 0
+        {
+            app.gateway_selected = idx;
         }
     }
 }
+
 
 /// Handle a pending gateway switch requested by the user.
 async fn handle_gateway_switch(app: &mut App) {

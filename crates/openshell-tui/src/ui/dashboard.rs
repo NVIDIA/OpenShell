@@ -40,6 +40,7 @@ fn draw_gateway_list(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let header = Row::new(vec![
         Cell::from(Span::styled("  NAME", t.muted)),
         Cell::from(Span::styled("TYPE", t.muted)),
+        Cell::from(Span::styled("SOURCE", t.muted)),
         Cell::from(Span::styled("STATUS", t.muted)),
         Cell::from(Span::styled("", t.muted)),
     ])
@@ -92,6 +93,7 @@ fn draw_gateway_list(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Row::new(vec![
                 name_cell,
                 Cell::from(Span::styled(type_label, t.muted)),
+                Cell::from(Span::styled(entry.source_label(), t.muted)),
                 status_cell,
                 policy_cell,
             ])
@@ -107,9 +109,10 @@ fn draw_gateway_list(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .padding(Padding::horizontal(1));
 
     let widths = [
-        Constraint::Percentage(30),
+        Constraint::Percentage(24),
         Constraint::Percentage(10),
-        Constraint::Percentage(25),
+        Constraint::Percentage(10),
+        Constraint::Percentage(21),
         Constraint::Percentage(35),
     ];
 
