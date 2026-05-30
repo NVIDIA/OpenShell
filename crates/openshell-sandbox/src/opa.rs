@@ -52,6 +52,13 @@ pub struct NetworkInput {
     pub cmdline_paths: Vec<PathBuf>,
 }
 
+pub(crate) fn network_host_is_safe(host: &str) -> bool {
+    !host.is_empty()
+        && !host.chars().any(|ch| {
+            ch.is_ascii_control() || ch.is_ascii_whitespace() || matches!(ch, '%' | '/' | '\\')
+        })
+}
+
 /// Sandbox configuration extracted from OPA data at startup.
 pub struct SandboxConfig {
     pub filesystem: FilesystemPolicy,
@@ -239,6 +246,14 @@ impl OpaEngine {
     /// `allow_network` rule, and returns a `PolicyDecision` with the result,
     /// deny reason, and matched policy name.
     pub fn evaluate_network(&self, input: &NetworkInput) -> Result<PolicyDecision> {
+        if !network_host_is_safe(&input.host) {
+            return Ok(PolicyDecision {
+                allowed: false,
+                reason: "invalid network host".to_string(),
+                matched_policy: None,
+            });
+        }
+
         let ancestor_strs: Vec<String> = input
             .ancestors
             .iter()
@@ -309,6 +324,16 @@ impl OpaEngine {
         &self,
         input: &NetworkInput,
     ) -> Result<(NetworkAction, u64)> {
+        let generation = self.current_generation();
+        if !network_host_is_safe(&input.host) {
+            return Ok((
+                NetworkAction::Deny {
+                    reason: "invalid network host".to_string(),
+                },
+                generation,
+            ));
+        }
+
         let ancestor_strs: Vec<String> = input
             .ancestors
             .iter()
@@ -335,7 +360,6 @@ impl OpaEngine {
             .engine
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
-        let generation = self.current_generation();
 
         engine
             .set_input_json(&input_json.to_string())
@@ -4204,6 +4228,71 @@ network_policies:
             decision.allowed,
             "Host wildcards should be case-insensitive: {}",
             decision.reason
+        );
+    }
+
+    #[test]
+    fn wildcard_host_rejects_malformed_input_hosts() {
+        let data = r#"
+network_policies:
+  wildcard:
+    name: wildcard
+    endpoints:
+      - { host: "*.example.com", port: 443 }
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+
+        for host in [
+            "api%00.example.com",
+            "api%2eexample.com",
+            "api.example.com\u{0}",
+            "api.example.com\t",
+            "api.example.com/path",
+            "api.example.com\\path",
+        ] {
+            let input = NetworkInput {
+                host: host.into(),
+                port: 443,
+                binary_path: PathBuf::from("/usr/bin/curl"),
+                binary_sha256: "unused".into(),
+                ancestors: vec![],
+                cmdline_paths: vec![],
+            };
+            let decision = engine.evaluate_network(&input).unwrap();
+            assert!(!decision.allowed, "malformed host {host:?} must deny");
+            assert_eq!(decision.reason, "invalid network host");
+            assert_eq!(decision.matched_policy, None);
+        }
+    }
+
+    #[test]
+    fn network_action_rejects_malformed_input_host_before_policy_allow() {
+        let data = r#"
+network_policies:
+  wildcard:
+    name: wildcard
+    endpoints:
+      - { host: "*.example.com", port: 443 }
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let input = NetworkInput {
+            host: "api%00.example.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        assert_eq!(
+            engine.evaluate_network_action(&input).unwrap(),
+            NetworkAction::Deny {
+                reason: "invalid network host".to_string()
+            }
         );
     }
 

@@ -6,7 +6,7 @@
 use crate::denial_aggregator::DenialEvent;
 use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::ProxyTlsState;
-use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard};
+use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard, network_host_is_safe};
 use crate::policy::ProxyPolicy;
 use crate::policy_local::{POLICY_LOCAL_HOST, PolicyLocalContext};
 use crate::provider_credentials::ProviderCredentialState;
@@ -3822,6 +3822,9 @@ fn parse_target(target: &str) -> Result<(String, u16)> {
     let (host, port_str) = target
         .split_once(':')
         .ok_or_else(|| miette::miette!("CONNECT target missing port: {target}"))?;
+    if !network_host_is_safe(host) {
+        return Err(miette::miette!("Invalid host in CONNECT target: {target}"));
+    }
     let port: u16 = port_str
         .parse()
         .map_err(|_| miette::miette!("Invalid port in CONNECT target: {target}"))?;
@@ -5513,6 +5516,31 @@ network_policies:
         assert_eq!(msg, "inference service error");
         // SEC-008: must NOT leak file paths to sandboxed code
         assert!(!msg.contains("/etc/openshell"));
+    }
+
+    #[test]
+    fn parse_target_accepts_plain_authority() {
+        let (host, port) = parse_target("api.example.com:443").expect("parse CONNECT target");
+        assert_eq!(host, "api.example.com");
+        assert_eq!(port, 443);
+    }
+
+    #[test]
+    fn parse_target_rejects_malformed_hostname_differentials() {
+        for target in [
+            "api%00.example.com:443",
+            "api%2eexample.com:443",
+            "api.example.com\u{0}:443",
+            "api.example.com\t:443",
+            "api.example.com/path:443",
+            "api.example.com\\path:443",
+        ] {
+            let err = parse_target(target).expect_err("malformed CONNECT host must be rejected");
+            assert!(
+                format!("{err}").contains("Invalid host"),
+                "unexpected error for {target:?}: {err}"
+            );
+        }
     }
 
     #[test]
