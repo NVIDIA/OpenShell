@@ -3,11 +3,11 @@
 
 //! Embedded SSH server for sandbox access.
 
-use crate::child_env;
 use crate::process::drop_privileges;
 use crate::provider_credentials::ProviderCredentialState;
 use crate::sandbox;
 use openshell_core::policy::SandboxPolicy;
+use openshell_supervisor_process::child_env;
 #[cfg(target_os = "linux")]
 use crate::{register_managed_child, unregister_managed_child};
 use miette::{IntoDiagnostic, Result};

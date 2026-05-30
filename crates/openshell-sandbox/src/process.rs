@@ -3,11 +3,11 @@
 
 //! Process management and signal handling.
 
-use crate::child_env;
 use crate::sandbox;
 #[cfg(target_os = "linux")]
 use crate::sandbox::linux::netns::NetworkNamespace;
 use openshell_core::policy::{NetworkMode, SandboxPolicy};
+use openshell_supervisor_process::child_env;
 #[cfg(target_os = "linux")]
 use crate::{register_managed_child, unregister_managed_child};
 use miette::{IntoDiagnostic, Result};

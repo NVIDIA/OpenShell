@@ -19,6 +19,7 @@ openshell-core = { path = "../openshell-core" }
 openshell-ocsf = { path = "../openshell-ocsf" }
 openshell-policy = { path = "../openshell-policy" }
 openshell-router = { path = "../openshell-router" }
+openshell-supervisor-process = { path = "../openshell-supervisor-process" }
 
 # Async runtime
 tokio = { workspace = true }

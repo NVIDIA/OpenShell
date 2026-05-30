@@ -3656,6 +3656,7 @@ dependencies = [
  "openshell-ocsf",
  "openshell-policy",
  "openshell-router",
+ "openshell-supervisor-process",
  "rand_core 0.6.4",
  "rcgen",
  "regorus",
