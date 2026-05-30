@@ -11,8 +11,10 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+miette = { workspace = true }
 
 [dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true

@@ -21,7 +21,6 @@ mod provider_credentials;
 pub mod proxy;
 mod sandbox;
 mod secrets;
-mod skills;
 mod ssh;
 mod supervisor_session;
 
@@ -174,6 +173,7 @@ use crate::l7::tls::{
 use crate::opa::OpaEngine;
 use crate::proxy::ProxyHandle;
 use openshell_core::policy::{NetworkMode, NetworkPolicy, ProxyPolicy, SandboxPolicy};
+use openshell_supervisor_process::skills;
 #[cfg(target_os = "linux")]
 use crate::sandbox::linux::netns::NetworkNamespace;
 pub use process::{ProcessHandle, ProcessStatus};

@@ -9,3 +9,4 @@
 //! `openshell-sandbox`.
 
 pub mod child_env;
+pub mod skills;

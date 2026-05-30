@@ -3771,6 +3771,10 @@ version = "0.0.0"
 [[package]]
 name = "openshell-supervisor-process"
 version = "0.0.0"
+dependencies = [
+ "miette",
+ "tempfile",
+]
 
 [[package]]
 name = "openshell-tui"
