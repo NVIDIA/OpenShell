@@ -3457,6 +3457,7 @@ dependencies = [
 name = "openshell-core"
 version = "0.0.0"
 dependencies = [
+ "base64 0.22.1",
  "hex",
  "ipnet",
  "miette",

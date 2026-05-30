@@ -117,13 +117,13 @@ impl fmt::Debug for SecretResolver {
 
 impl SecretResolver {
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn from_provider_env(
+    pub fn from_provider_env(
         provider_env: HashMap<String, String>,
     ) -> (HashMap<String, String>, Option<Self>) {
         Self::from_provider_env_for_revision(provider_env, HashMap::new(), 0)
     }
 
-    pub(crate) fn from_provider_env_for_revision(
+    pub fn from_provider_env_for_revision(
         provider_env: HashMap<String, String>,
         credential_expires_at_ms: HashMap<String, i64>,
         revision: u64,
@@ -136,7 +136,7 @@ impl SecretResolver {
         )
     }
 
-    pub(crate) fn from_provider_env_for_current_revision(
+    pub fn from_provider_env_for_current_revision(
         provider_env: HashMap<String, String>,
         credential_expires_at_ms: HashMap<String, i64>,
         revision: u64,
@@ -201,7 +201,7 @@ impl SecretResolver {
         (child_env, Some(Self { by_placeholder }))
     }
 
-    pub(crate) fn merge<'a>(resolvers: impl IntoIterator<Item = &'a Self>) -> Option<Self> {
+    pub fn merge<'a>(resolvers: impl IntoIterator<Item = &'a Self>) -> Option<Self> {
         let mut by_placeholder = HashMap::new();
         for resolver in resolvers {
             by_placeholder.extend(resolver.by_placeholder.clone());
@@ -217,7 +217,7 @@ impl SecretResolver {
     ///
     /// Returns `None` if the placeholder is unknown or the resolved value
     /// contains prohibited control characters (CRLF, null byte).
-    pub(crate) fn resolve_placeholder(&self, value: &str) -> Option<&str> {
+    pub fn resolve_placeholder(&self, value: &str) -> Option<&str> {
         let secret = if let Some(secret) = self.by_placeholder.get(value) {
             secret
         } else {
@@ -245,7 +245,7 @@ impl SecretResolver {
         }
     }
 
-    pub(crate) fn rewrite_header_value(
+    pub fn rewrite_header_value(
         &self,
         value: &str,
     ) -> Result<Option<String>, UnresolvedPlaceholderError> {
@@ -287,7 +287,7 @@ impl SecretResolver {
         Ok(None)
     }
 
-    pub(crate) fn rewrite_text_placeholders(
+    pub fn rewrite_text_placeholders(
         &self,
         text: &mut String,
         location: &'static str,
@@ -352,7 +352,7 @@ impl SecretResolver {
     /// The message is mutated only after all placeholders resolve
     /// successfully. The return value is the number of replacements; callers
     /// must not log the rewritten text.
-    pub(crate) fn rewrite_websocket_text_placeholders(
+    pub fn rewrite_websocket_text_placeholders(
         &self,
         text: &mut String,
     ) -> Result<usize, UnresolvedPlaceholderError> {

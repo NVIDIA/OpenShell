@@ -3,7 +3,7 @@
 
 //! Runtime provider credential snapshots.
 
-use crate::secrets::SecretResolver;
+use openshell_core::secrets::SecretResolver;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, RwLock};
 

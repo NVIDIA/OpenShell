@@ -9,9 +9,9 @@ use crate::l7::tls::ProxyTlsState;
 use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard};
 use crate::policy_local::{POLICY_LOCAL_HOST, PolicyLocalContext};
 use crate::provider_credentials::ProviderCredentialState;
-use crate::secrets::{SecretResolver, rewrite_header_line_checked};
 use miette::{IntoDiagnostic, Result};
 use openshell_core::net::{is_always_blocked_ip, is_internal_ip, is_link_local_ip};
+use openshell_core::secrets::{SecretResolver, rewrite_header_line_checked};
 use openshell_core::policy::ProxyPolicy;
 use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, Endpoint, HttpActivityBuilder, HttpRequest,
@@ -2663,14 +2663,14 @@ fn rewrite_forward_request(
     path: &str,
     secret_resolver: Option<&SecretResolver>,
     request_body_credential_rewrite: bool,
-) -> Result<Vec<u8>, crate::secrets::UnresolvedPlaceholderError> {
+) -> Result<Vec<u8>, openshell_core::secrets::UnresolvedPlaceholderError> {
     let header_end = raw[..used]
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .map_or(used, |p| p + 4);
     let websocket_upgrade = crate::l7::rest::request_is_websocket_upgrade(&raw[..header_end]);
     let upstream_path = match secret_resolver {
-        Some(resolver) => crate::secrets::rewrite_target_for_eval(path, resolver)?.resolved,
+        Some(resolver) => openshell_core::secrets::rewrite_target_for_eval(path, resolver)?.resolved,
         None => path.to_string(),
     };
 
@@ -2763,10 +2763,10 @@ fn rewrite_forward_request(
             output.len()
         };
         let output_str = String::from_utf8_lossy(&output[..scan_end]);
-        if output_str.contains(crate::secrets::PLACEHOLDER_PREFIX_PUBLIC)
-            || output_str.contains(crate::secrets::PROVIDER_ALIAS_MARKER_PUBLIC)
+        if output_str.contains(openshell_core::secrets::PLACEHOLDER_PREFIX_PUBLIC)
+            || output_str.contains(openshell_core::secrets::PROVIDER_ALIAS_MARKER_PUBLIC)
         {
-            return Err(crate::secrets::UnresolvedPlaceholderError { location: "header" });
+            return Err(openshell_core::secrets::UnresolvedPlaceholderError { location: "header" });
         }
     }
 

@@ -9,7 +9,7 @@
 
 use crate::l7::provider::{BodyLength, L7Provider, L7Request, RelayOutcome};
 use crate::opa::PolicyGenerationGuard;
-use crate::secrets::{
+use openshell_core::secrets::{
     SecretResolver, contains_reserved_credential_marker, rewrite_http_header_block,
 };
 use base64::Engine as _;
@@ -2001,7 +2001,7 @@ fn is_benign_close(err: &std::io::Error) -> bool {
 mod tests {
     use super::*;
     use crate::opa::OpaEngine;
-    use crate::secrets::SecretResolver;
+    use openshell_core::secrets::SecretResolver;
     use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
     use std::sync::Arc;
 

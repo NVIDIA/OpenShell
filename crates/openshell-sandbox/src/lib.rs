@@ -17,7 +17,6 @@ mod process;
 mod provider_credentials;
 pub mod proxy;
 mod sandbox;
-mod secrets;
 mod ssh;
 mod supervisor_session;
 
