@@ -14,7 +14,6 @@ pub mod log_push;
 pub mod opa;
 mod policy_local;
 mod process;
-mod provider_credentials;
 pub mod proxy;
 mod sandbox;
 mod ssh;
@@ -98,18 +97,19 @@ pub(crate) use openshell_supervisor_process::proposals::{
 #[cfg(test)]
 pub(crate) use openshell_supervisor_process::proposals::test_helpers;
 
-use openshell_supervisor_networking::identity::BinaryIdentityCache;
 use crate::l7::tls::{
     CertCache, ProxyTlsState, SandboxCa, build_upstream_client_config, read_system_ca_bundle,
     write_ca_files,
 };
 use crate::opa::OpaEngine;
 use crate::proxy::ProxyHandle;
-use openshell_core::policy::{NetworkMode, NetworkPolicy, ProxyPolicy, SandboxPolicy};
-use openshell_supervisor_process::skills;
-use openshell_supervisor_networking::mechanistic_mapper;
 #[cfg(target_os = "linux")]
 use crate::sandbox::linux::netns::NetworkNamespace;
+use openshell_core::policy::{NetworkMode, NetworkPolicy, ProxyPolicy, SandboxPolicy};
+use openshell_core::provider_credentials::ProviderCredentialState;
+use openshell_supervisor_networking::identity::BinaryIdentityCache;
+use openshell_supervisor_networking::mechanistic_mapper;
+use openshell_supervisor_process::skills;
 pub use process::{ProcessHandle, ProcessStatus};
 pub use sandbox::apply_supervisor_startup_hardening;
 
@@ -283,7 +283,7 @@ async fn run_networking(
     #[cfg(target_os = "linux")] netns: Option<&NetworkNamespace>,
     opa_engine: Option<&Arc<OpaEngine>>,
     entrypoint_pid: Arc<AtomicU32>,
-    provider_credentials: &provider_credentials::ProviderCredentialState,
+    provider_credentials: &ProviderCredentialState,
     policy_local_ctx: &Arc<policy_local::PolicyLocalContext>,
     sandbox_id: Option<&str>,
     openshell_endpoint: Option<&str>,
@@ -501,7 +501,7 @@ async fn run_process(
     opa_engine: Option<&Arc<OpaEngine>>,
     retained_proto: Option<&openshell_core::proto::SandboxPolicy>,
     entrypoint_pid: Arc<AtomicU32>,
-    provider_credentials: provider_credentials::ProviderCredentialState,
+    provider_credentials: ProviderCredentialState,
     provider_env: std::collections::HashMap<String, String>,
     policy_local_ctx: Arc<policy_local::PolicyLocalContext>,
     ocsf_enabled: Arc<std::sync::atomic::AtomicBool>,
@@ -987,7 +987,7 @@ pub async fn run_sandbox(
             )
         };
 
-    let provider_credentials = provider_credentials::ProviderCredentialState::from_environment(
+    let provider_credentials = ProviderCredentialState::from_environment(
         provider_env_revision,
         provider_env,
         provider_credential_expires_at_ms,
@@ -2444,7 +2444,7 @@ struct PolicyPollLoopContext {
     entrypoint_pid: Arc<AtomicU32>,
     interval_secs: u64,
     ocsf_enabled: Arc<std::sync::atomic::AtomicBool>,
-    provider_credentials: provider_credentials::ProviderCredentialState,
+    provider_credentials: ProviderCredentialState,
     policy_local_ctx: Option<Arc<policy_local::PolicyLocalContext>>,
 }
 
@@ -2775,9 +2775,9 @@ fn format_setting_value(es: &openshell_core::proto::EffectiveSetting) -> String 
 )]
 mod tests {
     use super::*;
-    use openshell_core::policy::{FilesystemPolicy, LandlockPolicy, ProcessPolicy};
     #[cfg(unix)]
     use nix::unistd::{Group, User};
+    use openshell_core::policy::{FilesystemPolicy, LandlockPolicy, ProcessPolicy};
     #[cfg(unix)]
     use std::os::unix::fs::{MetadataExt, symlink};
     use temp_env::with_vars;

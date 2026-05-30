@@ -11,8 +11,8 @@ use crate::l7::provider::{L7Provider, RelayOutcome};
 use crate::l7::rest::WebSocketExtensionMode;
 use crate::l7::{EnforcementMode, L7EndpointConfig, L7Protocol, L7RequestInfo};
 use crate::opa::{PolicyGenerationGuard, TunnelPolicyEngine};
-use openshell_core::secrets::{self, SecretResolver};
 use miette::{IntoDiagnostic, Result, miette};
+use openshell_core::secrets::{self, SecretResolver};
 use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, Endpoint, HttpActivityBuilder, HttpRequest,
     NetworkActivityBuilder, SeverityId, StatusId, Url as OcsfUrl, ocsf_emit,

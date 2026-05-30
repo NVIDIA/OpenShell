@@ -25,6 +25,7 @@ pub mod policy;
 pub mod procfs;
 pub mod progress;
 pub mod proto;
+pub mod provider_credentials;
 pub mod sandbox_env;
 pub mod secrets;
 pub mod settings;

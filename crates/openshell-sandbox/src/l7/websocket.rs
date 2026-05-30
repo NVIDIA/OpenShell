@@ -9,9 +9,9 @@
 use crate::l7::relay::{L7EvalContext, evaluate_l7_request};
 use crate::l7::{EnforcementMode, L7RequestInfo};
 use crate::opa::TunnelPolicyEngine;
-use openshell_core::secrets::SecretResolver;
 use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress, Status};
 use miette::{IntoDiagnostic, Result, miette};
+use openshell_core::secrets::SecretResolver;
 use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, Endpoint, NetworkActivityBuilder, SeverityId, StatusId,
     ocsf_emit,
