@@ -2443,6 +2443,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
         if provider_env_changed {
             match grpc_client::fetch_provider_environment(&ctx.endpoint, &ctx.sandbox_id).await {
                 Ok(env_result) => {
+                    let passthrough_count = env_result.passthrough_keys.len();
                     let env_count = ctx.provider_credentials.install_environment(
                         env_result.provider_env_revision,
                         env_result.environment,
@@ -2460,7 +2461,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
                                 serde_json::json!(current_provider_env_revision)
                             )
                             .message(format!(
-                                "Provider environment refreshed [revision:{current_provider_env_revision} env_count:{env_count}]"
+                                "Provider environment refreshed [revision:{current_provider_env_revision} env_count:{env_count} passthrough_count:{passthrough_count}]"
                             ))
                             .build()
                     );

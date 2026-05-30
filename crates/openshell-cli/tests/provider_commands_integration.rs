@@ -1877,7 +1877,7 @@ async fn provider_update_clear_passthrough_with_non_empty_list_is_rejected() {
     .await
     .expect("provider create");
 
-    // Mirrors the server-side `FailedPrecondition` from
+    // Mirrors the server-side `InvalidArgument` from
     // `UpdateProvider`: `clear_passthrough_credentials` cannot coexist with a
     // non-empty incoming list because the server cannot apply "clear and then
     // set" in a single round-trip.
