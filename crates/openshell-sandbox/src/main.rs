@@ -168,7 +168,7 @@ fn main() -> Result<()> {
             .into_diagnostic()?;
         return runtime.block_on(async move {
             let _ = rustls::crypto::ring::default_provider().install_default();
-            let exit = openshell_sandbox::debug_rpc::run(&raw_args[2..]).await?;
+            let exit = openshell_supervisor_process::debug_rpc::run(&raw_args[2..]).await?;
             std::process::exit(exit);
         });
     }

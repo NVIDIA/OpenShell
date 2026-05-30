@@ -5,7 +5,6 @@
 //!
 //! This crate provides process sandboxing and monitoring capabilities.
 
-pub mod debug_rpc;
 pub mod l7;
 pub mod opa;
 mod policy_local;
