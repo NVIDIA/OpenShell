@@ -8,9 +8,7 @@
 pub mod l7;
 pub mod opa;
 mod policy_local;
-mod process;
 pub mod proxy;
-mod ssh;
 
 use miette::{IntoDiagnostic, Result};
 use std::future::Future;
@@ -79,9 +77,9 @@ use openshell_core::policy::{NetworkMode, NetworkPolicy, ProxyPolicy, SandboxPol
 use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_supervisor_networking::identity::BinaryIdentityCache;
 use openshell_supervisor_networking::mechanistic_mapper;
+pub use openshell_supervisor_process::process::{ProcessHandle, ProcessStatus};
 pub use openshell_supervisor_process::sandbox::apply_supervisor_startup_hardening;
 use openshell_supervisor_process::skills;
-pub use process::{ProcessHandle, ProcessStatus};
 
 /// Default interval (seconds) for re-fetching the inference route bundle from
 /// the gateway in cluster mode. Override at runtime with the
@@ -526,7 +524,7 @@ async fn run_process(
         let (ssh_ready_tx, ssh_ready_rx) = tokio::sync::oneshot::channel();
 
         tokio::spawn(async move {
-            if let Err(err) = ssh::run_ssh_server(
+            if let Err(err) = openshell_supervisor_process::ssh::run_ssh_server(
                 listen_path,
                 ssh_ready_tx,
                 policy_clone,

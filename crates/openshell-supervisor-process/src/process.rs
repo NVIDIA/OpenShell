@@ -3,16 +3,16 @@
 
 //! Process management and signal handling.
 
+use crate::child_env;
+#[cfg(target_os = "linux")]
+use crate::managed_children;
+use crate::sandbox;
 use miette::{IntoDiagnostic, Result};
 use nix::sys::signal::{self, Signal};
 use nix::unistd::{Group, Pid, User};
 #[cfg(target_os = "linux")]
 use openshell_core::netns::NetworkNamespace;
 use openshell_core::policy::{NetworkMode, SandboxPolicy};
-use openshell_supervisor_process::child_env;
-#[cfg(target_os = "linux")]
-use openshell_supervisor_process::managed_children;
-use openshell_supervisor_process::sandbox;
 use std::collections::HashMap;
 use std::ffi::CString;
 #[cfg(target_os = "linux")]
@@ -463,7 +463,7 @@ impl ProcessHandle {
         // First try SIGTERM
         if let Err(e) = self.signal(Signal::SIGTERM) {
             openshell_ocsf::ocsf_emit!(
-                openshell_ocsf::ProcessActivityBuilder::new(crate::ocsf_ctx())
+                openshell_ocsf::ProcessActivityBuilder::new(openshell_ocsf::ctx::ctx())
                     .activity(openshell_ocsf::ActivityId::Close)
                     .severity(openshell_ocsf::SeverityId::Medium)
                     .status(openshell_ocsf::StatusId::Failure)

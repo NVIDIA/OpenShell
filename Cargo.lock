@@ -3787,11 +3787,17 @@ dependencies = [
 name = "openshell-supervisor-process"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
  "base64 0.22.1",
  "hex",
+ "libc",
  "miette",
+ "nix",
  "openshell-core",
  "openshell-ocsf",
+ "rand_core 0.6.4",
+ "russh",
+ "rustix 1.1.4",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",

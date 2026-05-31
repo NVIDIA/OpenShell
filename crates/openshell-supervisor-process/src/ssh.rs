@@ -3,7 +3,11 @@
 
 //! Embedded SSH server for sandbox access.
 
+use crate::child_env;
+#[cfg(target_os = "linux")]
+use crate::managed_children;
 use crate::process::drop_privileges;
+use crate::sandbox;
 use miette::{IntoDiagnostic, Result};
 use nix::pty::{Winsize, openpty};
 use nix::unistd::setsid;
@@ -12,10 +16,6 @@ use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, SeverityId, SshActivityBuilder, StatusId, ocsf_emit,
 };
-use openshell_supervisor_process::child_env;
-#[cfg(target_os = "linux")]
-use openshell_supervisor_process::managed_children;
-use openshell_supervisor_process::sandbox;
 use rand_core::OsRng;
 use russh::keys::{Algorithm, PrivateKey};
 use russh::server::{Auth, Handle, Session};
@@ -86,7 +86,7 @@ fn ssh_server_init(
     }
 
     ocsf_emit!(
-        SshActivityBuilder::new(crate::ocsf_ctx())
+        SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
             .activity(ActivityId::Listen)
             .severity(SeverityId::Informational)
             .status(StatusId::Success)
@@ -146,7 +146,7 @@ pub async fn run_ssh_server(
             .await
             {
                 ocsf_emit!(
-                    SshActivityBuilder::new(crate::ocsf_ctx())
+                    SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
                         .activity(ActivityId::Fail)
                         .severity(SeverityId::Low)
                         .status(StatusId::Failure)
@@ -173,7 +173,7 @@ async fn handle_connection(
     // not by an application-level preface. The supervisor bridges the
     // gateway's RelayStream directly into this socket.
     ocsf_emit!(
-        SshActivityBuilder::new(crate::ocsf_ctx())
+        SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
             .activity(ActivityId::Open)
             .action(ActionId::Allowed)
             .disposition(DispositionId::Allowed)
@@ -292,7 +292,7 @@ impl russh::server::Handler for SshHandler {
         // uses u32 for ports, but valid TCP ports are 0-65535.  Without this
         // check, port 65537 truncates to port 1 (privileged).
         if port_to_connect > u32::from(u16::MAX) {
-            ocsf_emit!(SshActivityBuilder::new(crate::ocsf_ctx())
+            ocsf_emit!(SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .activity(ActivityId::Refuse)
                 .action(ActionId::Denied)
                 .disposition(DispositionId::Blocked)
@@ -307,7 +307,7 @@ impl russh::server::Handler for SshHandler {
         // Only allow forwarding to loopback destinations to prevent the
         // sandbox SSH server from being used as a generic proxy.
         if !is_loopback_host(host_to_connect) {
-            ocsf_emit!(SshActivityBuilder::new(crate::ocsf_ctx())
+            ocsf_emit!(SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .activity(ActivityId::Refuse)
                 .action(ActionId::Denied)
                 .disposition(DispositionId::Blocked)
@@ -331,7 +331,7 @@ impl russh::server::Handler for SshHandler {
                 Ok(stream) => stream,
                 Err(err) => {
                     ocsf_emit!(
-                        SshActivityBuilder::new(crate::ocsf_ctx())
+                        SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
                             .activity(ActivityId::Fail)
                             .severity(SeverityId::Low)
                             .status(StatusId::Failure)
@@ -465,7 +465,7 @@ impl russh::server::Handler for SshHandler {
             state.input_sender = Some(input_sender);
         } else {
             ocsf_emit!(
-                SshActivityBuilder::new(crate::ocsf_ctx())
+                SshActivityBuilder::new(openshell_ocsf::ctx::ctx())
                     .activity(ActivityId::Refuse)
                     .action(ActionId::Denied)
                     .disposition(DispositionId::Rejected)
@@ -1065,8 +1065,7 @@ mod unsafe_pty {
         _workdir: Option<String>,
         slave_fd: RawFd,
         netns_fd: Option<RawFd>,
-        #[cfg(target_os = "linux")]
-        prepared: openshell_supervisor_process::sandbox::linux::PreparedSandbox,
+        #[cfg(target_os = "linux")] prepared: crate::sandbox::linux::PreparedSandbox,
     ) {
         // Wrap in Option so we can .take() it out of the FnMut closure.
         // pre_exec is only called once (after fork, before exec).
@@ -1096,8 +1095,7 @@ mod unsafe_pty {
         policy: SandboxPolicy,
         _workdir: Option<String>,
         netns_fd: Option<RawFd>,
-        #[cfg(target_os = "linux")]
-        prepared: openshell_supervisor_process::sandbox::linux::PreparedSandbox,
+        #[cfg(target_os = "linux")] prepared: crate::sandbox::linux::PreparedSandbox,
     ) {
         #[cfg(target_os = "linux")]
         let mut prepared = Some(prepared);
@@ -1116,9 +1114,7 @@ mod unsafe_pty {
     fn enter_netns_and_sandbox(
         netns_fd: Option<RawFd>,
         policy: &SandboxPolicy,
-        #[cfg(target_os = "linux")] prepared: Option<
-            openshell_supervisor_process::sandbox::linux::PreparedSandbox,
-        >,
+        #[cfg(target_os = "linux")] prepared: Option<crate::sandbox::linux::PreparedSandbox>,
     ) -> std::io::Result<()> {
         // Enter network namespace before dropping privileges.
         // This ensures SSH shell processes are isolated to the same
@@ -1146,7 +1142,7 @@ mod unsafe_pty {
         // restrict_self() does not require root.
         #[cfg(target_os = "linux")]
         if let Some(prepared) = prepared {
-            openshell_supervisor_process::sandbox::linux::enforce(prepared)
+            crate::sandbox::linux::enforce(prepared)
                 .map_err(|err| std::io::Error::other(err.to_string()))?;
         }
 

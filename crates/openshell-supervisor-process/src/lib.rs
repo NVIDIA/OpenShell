@@ -13,6 +13,8 @@ pub mod child_env;
 pub mod debug_rpc;
 pub mod log_push;
 pub mod managed_children;
+pub mod process;
 pub mod sandbox;
 pub mod skills;
+pub mod ssh;
 pub mod supervisor_session;

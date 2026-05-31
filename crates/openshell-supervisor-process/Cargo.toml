@@ -14,9 +14,13 @@ rust-version.workspace = true
 openshell-core = { path = "../openshell-core" }
 openshell-ocsf = { path = "../openshell-ocsf" }
 
+anyhow = { workspace = true }
 base64 = { workspace = true }
 hex = "0.4"
 miette = { workspace = true }
+nix = { workspace = true }
+rand_core = "0.6"
+russh = "0.57"
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true }
@@ -25,6 +29,10 @@ tonic = { workspace = true, features = ["channel", "tls"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+rustix = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
