@@ -4,7 +4,6 @@
 //! Embedded SSH server for sandbox access.
 
 use crate::process::drop_privileges;
-use crate::sandbox;
 use miette::{IntoDiagnostic, Result};
 use nix::pty::{Winsize, openpty};
 use nix::unistd::setsid;
@@ -16,6 +15,7 @@ use openshell_ocsf::{
 use openshell_supervisor_process::child_env;
 #[cfg(target_os = "linux")]
 use openshell_supervisor_process::managed_children;
+use openshell_supervisor_process::sandbox;
 use rand_core::OsRng;
 use russh::keys::{Algorithm, PrivateKey};
 use russh::server::{Auth, Handle, Session};
@@ -1065,7 +1065,8 @@ mod unsafe_pty {
         _workdir: Option<String>,
         slave_fd: RawFd,
         netns_fd: Option<RawFd>,
-        #[cfg(target_os = "linux")] prepared: crate::sandbox::linux::PreparedSandbox,
+        #[cfg(target_os = "linux")]
+        prepared: openshell_supervisor_process::sandbox::linux::PreparedSandbox,
     ) {
         // Wrap in Option so we can .take() it out of the FnMut closure.
         // pre_exec is only called once (after fork, before exec).
@@ -1095,7 +1096,8 @@ mod unsafe_pty {
         policy: SandboxPolicy,
         _workdir: Option<String>,
         netns_fd: Option<RawFd>,
-        #[cfg(target_os = "linux")] prepared: crate::sandbox::linux::PreparedSandbox,
+        #[cfg(target_os = "linux")]
+        prepared: openshell_supervisor_process::sandbox::linux::PreparedSandbox,
     ) {
         #[cfg(target_os = "linux")]
         let mut prepared = Some(prepared);
@@ -1114,7 +1116,9 @@ mod unsafe_pty {
     fn enter_netns_and_sandbox(
         netns_fd: Option<RawFd>,
         policy: &SandboxPolicy,
-        #[cfg(target_os = "linux")] prepared: Option<crate::sandbox::linux::PreparedSandbox>,
+        #[cfg(target_os = "linux")] prepared: Option<
+            openshell_supervisor_process::sandbox::linux::PreparedSandbox,
+        >,
     ) -> std::io::Result<()> {
         // Enter network namespace before dropping privileges.
         // This ensures SSH shell processes are isolated to the same
@@ -1142,7 +1146,7 @@ mod unsafe_pty {
         // restrict_self() does not require root.
         #[cfg(target_os = "linux")]
         if let Some(prepared) = prepared {
-            crate::sandbox::linux::enforce(prepared)
+            openshell_supervisor_process::sandbox::linux::enforce(prepared)
                 .map_err(|err| std::io::Error::other(err.to_string()))?;
         }
 

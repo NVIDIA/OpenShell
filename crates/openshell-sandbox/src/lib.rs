@@ -82,9 +82,9 @@ use openshell_core::policy::{NetworkMode, NetworkPolicy, ProxyPolicy, SandboxPol
 use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_supervisor_networking::identity::BinaryIdentityCache;
 use openshell_supervisor_networking::mechanistic_mapper;
+pub use openshell_supervisor_process::sandbox::apply_supervisor_startup_hardening;
 use openshell_supervisor_process::skills;
 pub use process::{ProcessHandle, ProcessStatus};
-pub use sandbox::apply_supervisor_startup_hardening;
 
 /// Default interval (seconds) for re-fetching the inference route bundle from
 /// the gateway in cluster mode. Override at runtime with the

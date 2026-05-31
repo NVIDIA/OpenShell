@@ -128,7 +128,7 @@ pub fn prepare(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<Option<P
         match compatibility {
             LandlockCompatibility::BestEffort => {
                 openshell_ocsf::ocsf_emit!(
-                    openshell_ocsf::DetectionFindingBuilder::new(crate::ocsf_ctx())
+                    openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
                         .activity(openshell_ocsf::ActivityId::Open)
                         .severity(openshell_ocsf::SeverityId::High)
                         .confidence(openshell_ocsf::ConfidenceId::High)
@@ -161,7 +161,7 @@ pub fn prepare(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<Option<P
     let total_paths = read_only.len() + read_write.len();
     let abi = ABI::V2;
     openshell_ocsf::ocsf_emit!(
-        openshell_ocsf::ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+        openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
             .severity(openshell_ocsf::SeverityId::Informational)
             .status(openshell_ocsf::StatusId::Success)
             .state(openshell_ocsf::StateId::Enabled, "applying")
@@ -217,7 +217,7 @@ pub fn prepare(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<Option<P
 
         let skipped = total_paths - rules_applied;
         openshell_ocsf::ocsf_emit!(
-            openshell_ocsf::ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+            openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
                 .severity(openshell_ocsf::SeverityId::Informational)
                 .status(openshell_ocsf::StatusId::Success)
                 .state(openshell_ocsf::StateId::Enabled, "built")
@@ -238,7 +238,7 @@ pub fn prepare(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<Option<P
         Err(err) => {
             if matches!(compatibility, LandlockCompatibility::BestEffort) {
                 openshell_ocsf::ocsf_emit!(
-                    openshell_ocsf::DetectionFindingBuilder::new(crate::ocsf_ctx())
+                    openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
                         .activity(openshell_ocsf::ActivityId::Open)
                         .severity(openshell_ocsf::SeverityId::High)
                         .confidence(openshell_ocsf::ConfidenceId::High)
@@ -278,7 +278,7 @@ pub fn enforce(prepared: PreparedRuleset) -> Result<()> {
     if let Err(err) = result {
         if matches!(prepared.compatibility, LandlockCompatibility::BestEffort) {
             openshell_ocsf::ocsf_emit!(
-                openshell_ocsf::DetectionFindingBuilder::new(crate::ocsf_ctx())
+                openshell_ocsf::DetectionFindingBuilder::new(openshell_ocsf::ctx::ctx())
                     .activity(openshell_ocsf::ActivityId::Open)
                     .severity(openshell_ocsf::SeverityId::High)
                     .confidence(openshell_ocsf::ConfidenceId::High)
@@ -354,7 +354,7 @@ fn try_open_path(path: &Path, compatibility: &LandlockCompatibility) -> Result<O
                         );
                     } else {
                         openshell_ocsf::ocsf_emit!(
-                            openshell_ocsf::ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+                            openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
                                 .severity(openshell_ocsf::SeverityId::Medium)
                                 .status(openshell_ocsf::StatusId::Failure)
                                 .state(openshell_ocsf::StateId::Other, "degraded")

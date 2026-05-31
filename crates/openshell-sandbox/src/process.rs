@@ -3,7 +3,6 @@
 
 //! Process management and signal handling.
 
-use crate::sandbox;
 #[cfg(target_os = "linux")]
 use crate::sandbox::linux::netns::NetworkNamespace;
 use miette::{IntoDiagnostic, Result};
@@ -13,6 +12,7 @@ use openshell_core::policy::{NetworkMode, SandboxPolicy};
 use openshell_supervisor_process::child_env;
 #[cfg(target_os = "linux")]
 use openshell_supervisor_process::managed_children;
+use openshell_supervisor_process::sandbox;
 use std::collections::HashMap;
 use std::ffi::CString;
 #[cfg(target_os = "linux")]
