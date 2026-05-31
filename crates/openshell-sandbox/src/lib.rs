@@ -420,22 +420,16 @@ async fn run_process(
     timeout_secs: u64,
     interactive: bool,
     sandbox_id: Option<&str>,
-    sandbox_name_for_agg: Option<&str>,
     openshell_endpoint: Option<&str>,
     ssh_socket_path: Option<String>,
     policy: &SandboxPolicy,
-    opa_engine: Option<&Arc<OpaEngine>>,
-    retained_proto: Option<&openshell_core::proto::SandboxPolicy>,
     entrypoint_pid: Arc<AtomicU32>,
     provider_credentials: ProviderCredentialState,
     provider_env: std::collections::HashMap<String, String>,
-    policy_local_ctx: Arc<openshell_supervisor_networking::policy_local::PolicyLocalContext>,
-    ocsf_enabled: Arc<std::sync::atomic::AtomicBool>,
     ssh_proxy_url: Option<String>,
     ssh_netns_fd: Option<i32>,
     ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
     #[cfg(target_os = "linux")] netns: Option<&NetworkNamespace>,
-    denial_rx: Option<tokio::sync::mpsc::UnboundedReceiver<openshell_core::DenialEvent>>,
 ) -> Result<i32> {
     // Zombie reaper — openshell-sandbox may run as PID 1 in containers and
     // must reap orphaned grandchildren (e.g. background daemons started by
@@ -621,138 +615,6 @@ async fn run_process(
             .message(format!("Process started: pid={}", handle.pid()))
             .build()
     );
-
-    // Spawn a task to resolve policy binary symlinks after the container
-    // filesystem becomes accessible via /proc/<pid>/root/. This expands
-    // symlinks like /usr/bin/python3 → /usr/bin/python3.11 in the OPA
-    // policy data so that either path matches at evaluation time.
-    //
-    // We cannot do this synchronously here because the child process has
-    // just been spawned and its mount namespace / procfs entries may not
-    // be fully populated yet. Instead, we probe with retries until
-    // /proc/<pid>/root/ is accessible or we exhaust attempts.
-    if let (Some(engine), Some(proto)) = (opa_engine, retained_proto) {
-        let resolve_engine = engine.clone();
-        let resolve_proto = proto.clone();
-        let resolve_pid = entrypoint_pid.clone();
-        tokio::spawn(async move {
-            let pid = resolve_pid.load(Ordering::Acquire);
-            let probe_path = format!("/proc/{pid}/root/");
-            // Retry up to 10 times with 500ms intervals (5s total).
-            // The child's mount namespace is typically ready within a
-            // few hundred ms of spawn.
-            for attempt in 1..=10 {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                if std::fs::metadata(&probe_path).is_ok() {
-                    info!(
-                        pid = pid,
-                        attempt = attempt,
-                        "Container filesystem accessible, resolving policy binary symlinks"
-                    );
-                    match resolve_engine.reload_from_proto_with_pid(&resolve_proto, pid) {
-                        Ok(()) => {
-                            info!(
-                                pid = pid,
-                                "Policy binary symlink resolution complete \
-                                 (check logs above for per-binary results)"
-                            );
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Failed to rebuild OPA engine with symlink resolution \
-                                 (non-fatal, falling back to literal path matching): {e}"
-                            );
-                        }
-                    }
-                    return;
-                }
-                debug!(
-                    pid = pid,
-                    attempt = attempt,
-                    probe_path = %probe_path,
-                    "Container filesystem not yet accessible, retrying symlink resolution"
-                );
-            }
-            warn!(
-                "Container filesystem /proc/{pid}/root/ not accessible after 10 attempts (5s); \
-                 binary symlink resolution skipped. Policy binary paths will be matched literally. \
-                 If binaries are symlinks, use canonical paths in your policy \
-                 (run 'readlink -f <path>' inside the sandbox)"
-            );
-        });
-    }
-
-    // Spawn background policy poll task (gRPC mode only).
-    if let (Some(id), Some(endpoint), Some(engine)) = (sandbox_id, openshell_endpoint, opa_engine) {
-        let poll_id = id.to_string();
-        let poll_endpoint = endpoint.to_string();
-        let poll_engine = engine.clone();
-        let poll_ocsf_enabled = ocsf_enabled.clone();
-        let poll_pid = entrypoint_pid.clone();
-        let poll_provider_credentials = provider_credentials.clone();
-        let poll_policy_local = policy_local_ctx.clone();
-        let poll_interval_secs: u64 = std::env::var("OPENSHELL_POLICY_POLL_INTERVAL_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(10);
-        let poll_ctx = PolicyPollLoopContext {
-            endpoint: poll_endpoint,
-            sandbox_id: poll_id,
-            opa_engine: poll_engine,
-            entrypoint_pid: poll_pid,
-            interval_secs: poll_interval_secs,
-            ocsf_enabled: poll_ocsf_enabled,
-            provider_credentials: poll_provider_credentials,
-            policy_local_ctx: Some(poll_policy_local),
-        };
-
-        tokio::spawn(async move {
-            if let Err(e) = run_policy_poll_loop(poll_ctx).await {
-                ocsf_emit!(
-                    AppLifecycleBuilder::new(ocsf_ctx())
-                        .activity(ActivityId::Fail)
-                        .severity(SeverityId::Medium)
-                        .status(StatusId::Failure)
-                        .message(format!("Policy poll loop exited with error: {e}"))
-                        .build()
-                );
-            }
-        });
-
-        // Spawn denial aggregator (gRPC mode only, when proxy is active).
-        if let Some(rx) = denial_rx {
-            // SubmitPolicyAnalysis resolves by sandbox *name*, not UUID.
-            let agg_name = sandbox_name_for_agg.map_or_else(|| id.to_string(), str::to_string);
-            let agg_endpoint = endpoint.to_string();
-            let flush_interval_secs: u64 = std::env::var("OPENSHELL_DENIAL_FLUSH_INTERVAL_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(10);
-
-            let aggregator =
-                openshell_supervisor_networking::denial_aggregator::DenialAggregator::new(
-                    rx,
-                    flush_interval_secs,
-                );
-
-            tokio::spawn(async move {
-                aggregator
-                    .run(|summaries| {
-                        let endpoint = agg_endpoint.clone();
-                        let sandbox_name = agg_name.clone();
-                        async move {
-                            if let Err(e) =
-                                flush_proposals_to_gateway(&endpoint, &sandbox_name, summaries)
-                                    .await
-                            {
-                                warn!(error = %e, "Failed to flush denial summaries to gateway");
-                            }
-                        }
-                    })
-                    .await;
-            });
-        }
-    }
 
     // Wait for process with optional timeout
     let result = if timeout_secs > 0 {
@@ -1011,6 +873,143 @@ pub async fn run_sandbox(
     // listener and workload process are exposed.
     apply_supervisor_startup_hardening()?;
 
+    // Spawn a task to resolve policy binary symlinks after the container
+    // filesystem becomes accessible via /proc/<pid>/root/. This expands
+    // symlinks like /usr/bin/python3 → /usr/bin/python3.11 in the OPA
+    // policy data so that either path matches at evaluation time.
+    //
+    // The task probes /proc/<pid>/root/ with retries until accessible. It
+    // reads `entrypoint_pid` lazily, so spawning here (before `run_process`
+    // sets the PID) is safe — the probe loop just waits.
+    if let (Some(engine), Some(proto)) = (opa_engine.as_ref(), retained_proto.as_ref()) {
+        let resolve_engine = engine.clone();
+        let resolve_proto = proto.clone();
+        let resolve_pid = entrypoint_pid.clone();
+        tokio::spawn(async move {
+            let pid = resolve_pid.load(Ordering::Acquire);
+            let probe_path = format!("/proc/{pid}/root/");
+            // Retry up to 10 times with 500ms intervals (5s total).
+            // The child's mount namespace is typically ready within a
+            // few hundred ms of spawn.
+            for attempt in 1..=10 {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                if std::fs::metadata(&probe_path).is_ok() {
+                    info!(
+                        pid = pid,
+                        attempt = attempt,
+                        "Container filesystem accessible, resolving policy binary symlinks"
+                    );
+                    match resolve_engine.reload_from_proto_with_pid(&resolve_proto, pid) {
+                        Ok(()) => {
+                            info!(
+                                pid = pid,
+                                "Policy binary symlink resolution complete \
+                                 (check logs above for per-binary results)"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to rebuild OPA engine with symlink resolution \
+                                 (non-fatal, falling back to literal path matching): {e}"
+                            );
+                        }
+                    }
+                    return;
+                }
+                debug!(
+                    pid = pid,
+                    attempt = attempt,
+                    probe_path = %probe_path,
+                    "Container filesystem not yet accessible, retrying symlink resolution"
+                );
+            }
+            warn!(
+                "Container filesystem /proc/{pid}/root/ not accessible after 10 attempts (5s); \
+                 binary symlink resolution skipped. Policy binary paths will be matched literally. \
+                 If binaries are symlinks, use canonical paths in your policy \
+                 (run 'readlink -f <path>' inside the sandbox)"
+            );
+        });
+    }
+
+    // Spawn background policy poll task (gRPC mode only).
+    if let (Some(id), Some(endpoint), Some(engine)) = (
+        sandbox_id.as_deref(),
+        openshell_endpoint.as_deref(),
+        opa_engine.as_ref(),
+    ) {
+        let poll_id = id.to_string();
+        let poll_endpoint = endpoint.to_string();
+        let poll_engine = engine.clone();
+        let poll_ocsf_enabled = ocsf_enabled.clone();
+        let poll_pid = entrypoint_pid.clone();
+        let poll_provider_credentials = provider_credentials.clone();
+        let poll_policy_local = policy_local_ctx.clone();
+        let poll_interval_secs: u64 = std::env::var("OPENSHELL_POLICY_POLL_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+        let poll_ctx = PolicyPollLoopContext {
+            endpoint: poll_endpoint,
+            sandbox_id: poll_id,
+            opa_engine: poll_engine,
+            entrypoint_pid: poll_pid,
+            interval_secs: poll_interval_secs,
+            ocsf_enabled: poll_ocsf_enabled,
+            provider_credentials: poll_provider_credentials,
+            policy_local_ctx: Some(poll_policy_local),
+        };
+
+        tokio::spawn(async move {
+            if let Err(e) = run_policy_poll_loop(poll_ctx).await {
+                ocsf_emit!(
+                    AppLifecycleBuilder::new(ocsf_ctx())
+                        .activity(ActivityId::Fail)
+                        .severity(SeverityId::Medium)
+                        .status(StatusId::Failure)
+                        .message(format!("Policy poll loop exited with error: {e}"))
+                        .build()
+                );
+            }
+        });
+
+        // Spawn denial aggregator (gRPC mode only, when proxy is active).
+        if let Some(rx) = networking.denial_rx.take() {
+            // SubmitPolicyAnalysis resolves by sandbox *name*, not UUID.
+            let agg_name = sandbox_name_for_agg
+                .as_deref()
+                .map_or_else(|| id.to_string(), str::to_string);
+            let agg_endpoint = endpoint.to_string();
+            let flush_interval_secs: u64 = std::env::var("OPENSHELL_DENIAL_FLUSH_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10);
+
+            let aggregator =
+                openshell_supervisor_networking::denial_aggregator::DenialAggregator::new(
+                    rx,
+                    flush_interval_secs,
+                );
+
+            tokio::spawn(async move {
+                aggregator
+                    .run(|summaries| {
+                        let endpoint = agg_endpoint.clone();
+                        let sandbox_name = agg_name.clone();
+                        async move {
+                            if let Err(e) =
+                                flush_proposals_to_gateway(&endpoint, &sandbox_name, summaries)
+                                    .await
+                            {
+                                warn!(error = %e, "Failed to flush denial summaries to gateway");
+                            }
+                        }
+                    })
+                    .await;
+            });
+        }
+    }
+
     let exit_code = run_process(
         program,
         args,
@@ -1018,23 +1017,17 @@ pub async fn run_sandbox(
         timeout_secs,
         interactive,
         sandbox_id.as_deref(),
-        sandbox_name_for_agg.as_deref(),
         openshell_endpoint.as_deref(),
         ssh_socket_path,
         &policy,
-        opa_engine.as_ref(),
-        retained_proto.as_ref(),
         entrypoint_pid,
         provider_credentials,
         provider_env,
-        policy_local_ctx,
-        ocsf_enabled,
         networking.ssh_proxy_url.take(),
         networking.ssh_netns_fd,
         networking.ca_file_paths.clone(),
         #[cfg(target_os = "linux")]
         netns.as_ref(),
-        networking.denial_rx.take(),
     )
     .await?;
 
