@@ -954,7 +954,7 @@ fn emit_rewrite_event(host: &str, port: u16, policy_name: &str, replacements: us
     } else {
         policy_name
     };
-    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
         .activity(ActivityId::Other)
         .action(ActionId::Allowed)
         .disposition(DispositionId::Allowed)
@@ -1001,7 +1001,7 @@ fn emit_websocket_l7_event(
         ),
     };
     let summary = graphql.map(graphql_log_summary).unwrap_or_default();
-    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
         .activity(ActivityId::Other)
         .action(action_id)
         .disposition(disposition_id)
@@ -1082,7 +1082,7 @@ fn emit_protocol_failure(host: &str, port: u16, policy_name: &str, failure_class
     } else {
         policy_name
     };
-    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
         .activity(ActivityId::Open)
         .action(ActionId::Denied)
         .disposition(DispositionId::Blocked)

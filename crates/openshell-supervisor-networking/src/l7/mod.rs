@@ -122,7 +122,7 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
     let tls = match get_object_str(val, "tls").as_deref() {
         Some("skip") => TlsMode::Skip,
         Some("terminate") => {
-            let event = openshell_ocsf::NetworkActivityBuilder::new(crate::ocsf_ctx())
+            let event = openshell_ocsf::NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .activity(openshell_ocsf::ActivityId::Other)
                 .severity(openshell_ocsf::SeverityId::Medium)
                 .message(
@@ -134,7 +134,7 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
             TlsMode::Auto
         }
         Some("passthrough") => {
-            let event = openshell_ocsf::NetworkActivityBuilder::new(crate::ocsf_ctx())
+            let event = openshell_ocsf::NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .activity(openshell_ocsf::ActivityId::Other)
                 .severity(openshell_ocsf::SeverityId::Medium)
                 .message(

@@ -9,7 +9,7 @@
 
 use openshell_router::Router;
 use openshell_router::config::{AuthHeader, ResolvedRoute};
-use openshell_sandbox::proxy::InferenceContext;
+use openshell_supervisor_networking::proxy::InferenceContext;
 
 fn make_system_route() -> ResolvedRoute {
     ResolvedRoute {
@@ -42,7 +42,7 @@ fn make_user_route() -> ResolvedRoute {
 #[tokio::test]
 async fn system_inference_routes_to_mock_backend() {
     let router = Router::new().unwrap();
-    let patterns = openshell_sandbox::l7::inference::default_patterns();
+    let patterns = openshell_supervisor_networking::l7::inference::default_patterns();
 
     let ctx = InferenceContext::new(
         patterns,
@@ -86,7 +86,7 @@ async fn system_inference_routes_to_mock_backend() {
 #[tokio::test]
 async fn system_inference_uses_system_routes_not_user_routes() {
     let router = Router::new().unwrap();
-    let patterns = openshell_sandbox::l7::inference::default_patterns();
+    let patterns = openshell_supervisor_networking::l7::inference::default_patterns();
 
     // Only user routes configured — no system routes
     let ctx = InferenceContext::new(patterns, router, vec![make_user_route()], vec![]);
@@ -118,7 +118,7 @@ async fn system_inference_uses_system_routes_not_user_routes() {
 #[tokio::test]
 async fn system_inference_with_anthropic_protocol() {
     let router = Router::new().unwrap();
-    let patterns = openshell_sandbox::l7::inference::default_patterns();
+    let patterns = openshell_supervisor_networking::l7::inference::default_patterns();
 
     let system_route = ResolvedRoute {
         name: "sandbox-system".to_string(),

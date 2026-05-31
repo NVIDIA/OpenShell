@@ -26,8 +26,8 @@
 
 use futures::SinkExt;
 use futures::stream::StreamExt;
-use openshell_sandbox::l7::provider::{BodyLength, L7Provider, L7Request, RelayOutcome};
-use openshell_sandbox::l7::rest::RestProvider;
+use openshell_supervisor_networking::l7::provider::{BodyLength, L7Provider, L7Request, RelayOutcome};
+use openshell_supervisor_networking::l7::rest::RestProvider;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

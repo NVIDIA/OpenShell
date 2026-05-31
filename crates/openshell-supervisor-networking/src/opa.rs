@@ -202,7 +202,7 @@ impl OpaEngine {
         let (errors, warnings) = crate::l7::validate_l7_policies(&data);
         for w in &warnings {
             openshell_ocsf::ocsf_emit!(
-                openshell_ocsf::ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+                openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
                     .severity(openshell_ocsf::SeverityId::Medium)
                     .status(openshell_ocsf::StatusId::Success)
                     .state(openshell_ocsf::StateId::Enabled, "validated")
@@ -728,7 +728,7 @@ fn preprocess_yaml_data(yaml_str: &str) -> Result<String> {
     let (errors, warnings) = crate::l7::validate_l7_policies(&data);
     for w in &warnings {
         openshell_ocsf::ocsf_emit!(
-            openshell_ocsf::ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+            openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
                 .severity(openshell_ocsf::SeverityId::Medium)
                 .status(openshell_ocsf::StatusId::Success)
                 .state(openshell_ocsf::StateId::Enabled, "validated")

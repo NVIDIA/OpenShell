@@ -3,6 +3,7 @@
 
 //! HTTP CONNECT proxy with OPA policy evaluation and process-identity binding.
 
+use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::ProxyTlsState;
 use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard};
 use crate::policy_local::{POLICY_LOCAL_HOST, PolicyLocalContext};
@@ -16,7 +17,6 @@ use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, Endpoint, HttpActivityBuilder, HttpRequest,
     NetworkActivityBuilder, Process, SeverityId, StatusId, Url as OcsfUrl, ocsf_emit,
 };
-use openshell_supervisor_networking::identity::BinaryIdentityCache;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -175,7 +175,7 @@ impl ProxyHandle {
     /// The proxy uses OPA for network decisions with process-identity binding
     /// via `/proc/net/tcp`. All connections are evaluated through OPA policy.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn start_with_bind_addr(
+    pub async fn start_with_bind_addr(
         policy: &ProxyPolicy,
         bind_addr: Option<SocketAddr>,
         opa_engine: Arc<OpaEngine>,
@@ -204,7 +204,7 @@ impl ProxyHandle {
         let listener = TcpListener::bind(http_addr).await.into_diagnostic()?;
         let local_addr = listener.local_addr().into_diagnostic()?;
         {
-            let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+            let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .activity(ActivityId::Listen)
                 .severity(SeverityId::Informational)
                 .status(StatusId::Success)
@@ -256,7 +256,7 @@ impl ProxyHandle {
                             )
                             .await
                             {
-                                let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                                let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                                     .activity(ActivityId::Fail)
                                     .severity(SeverityId::Low)
                                     .status(StatusId::Failure)
@@ -267,7 +267,7 @@ impl ProxyHandle {
                         });
                     }
                     Err(err) => {
-                        let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                        let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                             .activity(ActivityId::Fail)
                             .severity(SeverityId::Low)
                             .status(StatusId::Failure)
@@ -435,7 +435,7 @@ async fn handle_tcp_connection(
         )
         .await?;
         if let InferenceOutcome::Denied { reason } = outcome {
-            let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+            let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .activity(ActivityId::Open)
                 .action(ActionId::Denied)
                 .disposition(DispositionId::Blocked)
@@ -513,7 +513,7 @@ async fn handle_tcp_connection(
     // Allowed connections are logged after the L7 config check (below)
     // so we can distinguish CONNECT (L4-only) from CONNECT_L7 (L7 follows).
     if matches!(decision.action, NetworkAction::Deny { .. }) {
-        let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+        let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
             .activity(ActivityId::Open)
             .action(ActionId::Denied)
             .disposition(DispositionId::Blocked)
@@ -587,7 +587,7 @@ async fn handle_tcp_connection(
                 .into_diagnostic()?,
             Err(reason) => {
                 {
-                    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                         .activity(ActivityId::Open)
                         .action(ActionId::Denied)
                         .disposition(DispositionId::Blocked)
@@ -642,7 +642,7 @@ async fn handle_tcp_connection(
                         .into_diagnostic()?,
                     Err(reason) => {
                         {
-                            let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                            let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                                 .activity(ActivityId::Open)
                                 .action(ActionId::Denied)
                                 .disposition(DispositionId::Blocked)
@@ -689,7 +689,7 @@ async fn handle_tcp_connection(
             }
             Err(reason) => {
                 {
-                    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                         .activity(ActivityId::Open)
                         .action(ActionId::Denied)
                         .disposition(DispositionId::Blocked)
@@ -742,7 +742,7 @@ async fn handle_tcp_connection(
                 .into_diagnostic()?,
             Err(reason) => {
                 {
-                    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                         .activity(ActivityId::Open)
                         .action(ActionId::Denied)
                         .disposition(DispositionId::Blocked)
@@ -794,7 +794,7 @@ async fn handle_tcp_connection(
                 .into_diagnostic()?,
             Err(reason) => {
                 {
-                    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                         .activity(ActivityId::Open)
                         .action(ActionId::Denied)
                         .disposition(DispositionId::Blocked)
@@ -860,7 +860,7 @@ async fn handle_tcp_connection(
         "CONNECT"
     };
     {
-        let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+        let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
             .activity(ActivityId::Open)
             .action(ActionId::Allowed)
             .disposition(DispositionId::Allowed)
@@ -1002,7 +1002,7 @@ async fn handle_tcp_connection(
                         "TLS connection closed"
                     );
                 } else {
-                    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                         .activity(ActivityId::Fail)
                         .severity(SeverityId::Low)
                         .status(StatusId::Failure)
@@ -1014,7 +1014,7 @@ async fn handle_tcp_connection(
             }
         } else {
             {
-                let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                     .activity(ActivityId::Fail)
                     .severity(SeverityId::Low)
                     .status(StatusId::Failure)
@@ -1067,7 +1067,7 @@ async fn handle_tcp_connection(
                 if is_benign_relay_error(&e) {
                     debug!(host = %host_lc, port = port, error = %e, "L7 connection closed");
                 } else {
-                    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                         .activity(ActivityId::Fail)
                         .severity(SeverityId::Low)
                         .status(StatusId::Failure)
@@ -1100,7 +1100,7 @@ async fn handle_tcp_connection(
                 if is_benign_relay_error(&e) {
                     debug!(host = %host_lc, port = port, error = %e, "HTTP relay closed");
                 } else {
-                    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                         .activity(ActivityId::Fail)
                         .severity(SeverityId::Low)
                         .status(StatusId::Failure)
@@ -1550,7 +1550,7 @@ async fn process_inference_keepalive<S: tokio::io::AsyncRead + tokio::io::AsyncW
             }
             ParseResult::Invalid(reason) => {
                 {
-                    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                         .activity(ActivityId::Refuse)
                         .action(ActionId::Denied)
                         .disposition(DispositionId::Rejected)
@@ -1589,7 +1589,7 @@ async fn route_inference_request(
         detect_inference_pattern(&request.method, &normalized_path, &ctx.patterns)
     {
         {
-            let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+            let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .activity(ActivityId::Open)
                 .action(ActionId::Allowed)
                 .disposition(DispositionId::Detected)
@@ -1677,7 +1677,7 @@ async fn route_inference_request(
                         }
                         Ok(Ok(None)) => break,
                         Ok(Err(e)) => {
-                            let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                            let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                                 .activity(ActivityId::Fail)
                                 .severity(SeverityId::Medium)
                                 .status(StatusId::Failure)
@@ -1693,7 +1693,7 @@ async fn route_inference_request(
                             break;
                         }
                         Err(_) => {
-                            let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                            let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                                 .activity(ActivityId::Fail)
                                 .severity(SeverityId::Medium)
                                 .status(StatusId::Failure)
@@ -1717,7 +1717,7 @@ async fn route_inference_request(
             }
             Err(e) => {
                 {
-                    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                         .activity(ActivityId::Fail)
                         .severity(SeverityId::Low)
                         .status(StatusId::Failure)
@@ -1743,7 +1743,7 @@ async fn route_inference_request(
     } else {
         // Not an inference request — deny
         {
-            let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+            let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .activity(ActivityId::Open)
                 .action(ActionId::Denied)
                 .disposition(DispositionId::Blocked)
@@ -1836,7 +1836,7 @@ struct L7RouteSnapshot {
 }
 
 fn emit_l7_tunnel_close_after_policy_change(host: &str, port: u16, error: miette::Report) {
-    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
         .activity(ActivityId::Open)
         .action(ActionId::Denied)
         .disposition(DispositionId::Blocked)
@@ -1888,7 +1888,7 @@ fn query_l7_route_snapshot(
             generation,
         }),
         Err(e) => {
-            let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+            let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .activity(ActivityId::Fail)
                 .severity(SeverityId::Low)
                 .status(StatusId::Failure)
@@ -2429,7 +2429,7 @@ fn parse_allowed_ips(raw: &[String]) -> std::result::Result<Vec<ipnet::IpNet>, S
                 }
 
                 if n.prefix_len() < MIN_SAFE_PREFIX_LEN {
-                    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                         .activity(ActivityId::Other)
                         .severity(SeverityId::Medium)
                         .message(format!(
@@ -2481,7 +2481,7 @@ fn query_allowed_ips(
     match engine.query_allowed_ips(&input) {
         Ok(ips) => ips,
         Err(e) => {
-            let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+            let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .activity(ActivityId::Fail)
                 .severity(SeverityId::Low)
                 .status(StatusId::Failure)
@@ -2523,7 +2523,7 @@ fn query_exact_declared_endpoint_host(
     match engine.query_exact_declared_endpoint_host(&input) {
         Ok(is_exact_declared) => is_exact_declared,
         Err(e) => {
-            let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+            let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .activity(ActivityId::Fail)
                 .severity(SeverityId::Low)
                 .status(StatusId::Failure)
@@ -2857,7 +2857,7 @@ async fn handle_forward_proxy(
     let (scheme, host, port, mut path) = match parse_proxy_uri(target_uri) {
         Ok(parsed) => parsed,
         Err(e) => {
-            let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+            let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .activity(ActivityId::Fail)
                 .severity(SeverityId::Low)
                 .status(StatusId::Failure)
@@ -2905,7 +2905,7 @@ async fn handle_forward_proxy(
     // 2. Reject HTTPS — must use CONNECT for TLS
     if scheme == "https" {
         {
-            let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+            let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .activity(ActivityId::Refuse)
                 .action(ActionId::Denied)
                 .disposition(DispositionId::Rejected)
@@ -2981,7 +2981,7 @@ async fn handle_forward_proxy(
         NetworkAction::Allow { matched_policy } => matched_policy.clone(),
         NetworkAction::Deny { reason } => {
             {
-                let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+                let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
                     .activity(ActivityId::Other)
                     .action(ActionId::Denied)
                     .disposition(DispositionId::Blocked)
@@ -3153,7 +3153,7 @@ async fn handle_forward_proxy(
                     params
                 }
                 Err(e) => {
-                    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                         .activity(ActivityId::Fail)
                         .severity(SeverityId::Medium)
                         .status(StatusId::Failure)
@@ -3221,7 +3221,7 @@ async fn handle_forward_proxy(
             {
                 Ok(info) => info,
                 Err(e) => {
-                    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                         .activity(ActivityId::Fail)
                         .severity(SeverityId::Medium)
                         .status(StatusId::Failure)
@@ -3264,7 +3264,7 @@ async fn handle_forward_proxy(
             || {
                 crate::l7::relay::evaluate_l7_request(&tunnel_engine, &l7_ctx, &request_info)
                     .unwrap_or_else(|e| {
-                        let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                        let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                             .activity(ActivityId::Fail)
                             .severity(SeverityId::Low)
                             .status(StatusId::Failure)
@@ -3309,7 +3309,7 @@ async fn handle_forward_proxy(
             } else {
                 "FORWARD_L7"
             };
-            let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+            let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .activity(ActivityId::Other)
                 .action(action_id)
                 .disposition(disposition_id)
@@ -3388,7 +3388,7 @@ async fn handle_forward_proxy(
             Ok(addrs) => addrs,
             Err(reason) => {
                 {
-                    let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+                    let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
                         .activity(ActivityId::Other)
                         .action(ActionId::Denied)
                         .disposition(DispositionId::Blocked)
@@ -3444,7 +3444,7 @@ async fn handle_forward_proxy(
                     Ok(addrs) => addrs,
                     Err(reason) => {
                         {
-                            let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+                            let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
                                 .activity(ActivityId::Other)
                                 .action(ActionId::Denied)
                                 .disposition(DispositionId::Blocked)
@@ -3495,7 +3495,7 @@ async fn handle_forward_proxy(
             }
             Err(reason) => {
                 {
-                    let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+                    let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
                         .activity(ActivityId::Other)
                         .action(ActionId::Denied)
                         .disposition(DispositionId::Blocked)
@@ -3551,7 +3551,7 @@ async fn handle_forward_proxy(
             Ok(addrs) => addrs,
             Err(reason) => {
                 {
-                    let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+                    let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
                         .activity(ActivityId::Other)
                         .action(ActionId::Denied)
                         .disposition(DispositionId::Blocked)
@@ -3605,7 +3605,7 @@ async fn handle_forward_proxy(
             Ok(addrs) => addrs,
             Err(reason) => {
                 {
-                    let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+                    let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
                         .activity(ActivityId::Other)
                         .action(ActionId::Denied)
                         .disposition(DispositionId::Blocked)
@@ -3672,7 +3672,7 @@ async fn handle_forward_proxy(
     let mut upstream = match TcpStream::connect(addrs.as_slice()).await {
         Ok(s) => s,
         Err(e) => {
-            let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+            let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .activity(ActivityId::Fail)
                 .severity(SeverityId::Low)
                 .status(StatusId::Failure)
@@ -3707,7 +3707,7 @@ async fn handle_forward_proxy(
 
     // Log success
     {
-        let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+        let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
             .activity(ActivityId::Other)
             .action(ActionId::Allowed)
             .disposition(DispositionId::Allowed)
@@ -6651,7 +6651,7 @@ network_policies:
     #[cfg(target_os = "linux")]
     #[test]
     fn resolve_process_identity_surfaces_binary_integrity_violation_on_hot_swap() {
-        use openshell_supervisor_networking::identity::BinaryIdentityCache;
+        use crate::identity::BinaryIdentityCache;
         use std::io::Read;
         use std::net::TcpListener;
         use std::os::unix::fs::PermissionsExt;
@@ -6783,7 +6783,7 @@ network_policies:
     // SELinux-enforcing hosts.  Fix by building a test-sleep-helper binary in
     // the same crate so it inherits the user_home_t label.
     fn resolve_process_identity_denies_fork_exec_shared_socket_ambiguity() {
-        use openshell_supervisor_networking::identity::BinaryIdentityCache;
+        use crate::identity::BinaryIdentityCache;
         use std::ffi::CString;
         use std::net::{TcpListener, TcpStream};
         use std::os::fd::AsRawFd;

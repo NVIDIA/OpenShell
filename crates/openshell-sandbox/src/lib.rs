@@ -5,11 +5,6 @@
 //!
 //! This crate provides process sandboxing and monitoring capabilities.
 
-pub mod l7;
-pub mod opa;
-mod policy_local;
-pub mod proxy;
-
 use miette::{IntoDiagnostic, Result};
 use std::future::Future;
 use std::net::SocketAddr;
@@ -62,21 +57,18 @@ pub(crate) use openshell_ocsf::ctx::ctx as ocsf_ctx;
 /// guard (see `policy_local::tests::ProposalsFlagGuard`).
 pub(crate) use openshell_core::proposals::{AGENT_PROPOSALS_ENABLED, agent_proposals_enabled};
 
-#[cfg(test)]
-pub(crate) use openshell_core::proposals::test_helpers;
-
-use crate::l7::tls::{
-    CertCache, ProxyTlsState, SandboxCa, build_upstream_client_config, read_system_ca_bundle,
-    write_ca_files,
-};
-use crate::opa::OpaEngine;
-use crate::proxy::ProxyHandle;
 #[cfg(target_os = "linux")]
 use openshell_core::netns::NetworkNamespace;
 use openshell_core::policy::{NetworkMode, NetworkPolicy, ProxyPolicy, SandboxPolicy};
 use openshell_core::provider_credentials::ProviderCredentialState;
 use openshell_supervisor_networking::identity::BinaryIdentityCache;
+use openshell_supervisor_networking::l7::tls::{
+    CertCache, ProxyTlsState, SandboxCa, build_upstream_client_config, read_system_ca_bundle,
+    write_ca_files,
+};
 use openshell_supervisor_networking::mechanistic_mapper;
+use openshell_supervisor_networking::opa::OpaEngine;
+use openshell_supervisor_networking::proxy::ProxyHandle;
 pub use openshell_supervisor_process::process::{ProcessHandle, ProcessStatus};
 pub use openshell_supervisor_process::sandbox::apply_supervisor_startup_hardening;
 use openshell_supervisor_process::skills;
@@ -218,7 +210,7 @@ async fn run_networking(
     opa_engine: Option<&Arc<OpaEngine>>,
     entrypoint_pid: Arc<AtomicU32>,
     provider_credentials: &ProviderCredentialState,
-    policy_local_ctx: &Arc<policy_local::PolicyLocalContext>,
+    policy_local_ctx: &Arc<openshell_supervisor_networking::policy_local::PolicyLocalContext>,
     sandbox_id: Option<&str>,
     openshell_endpoint: Option<&str>,
     inference_routes: Option<&str>,
@@ -437,7 +429,7 @@ async fn run_process(
     entrypoint_pid: Arc<AtomicU32>,
     provider_credentials: ProviderCredentialState,
     provider_env: std::collections::HashMap<String, String>,
-    policy_local_ctx: Arc<policy_local::PolicyLocalContext>,
+    policy_local_ctx: Arc<openshell_supervisor_networking::policy_local::PolicyLocalContext>,
     ocsf_enabled: Arc<std::sync::atomic::AtomicBool>,
     ssh_proxy_url: Option<String>,
     ssh_netns_fd: Option<i32>,
@@ -861,11 +853,13 @@ pub async fn run_sandbox(
         policy_data,
     )
     .await?;
-    let policy_local_ctx = Arc::new(policy_local::PolicyLocalContext::new(
-        retained_proto.clone(),
-        openshell_endpoint.clone(),
-        sandbox_name_for_agg.clone().or_else(|| sandbox_id.clone()),
-    ));
+    let policy_local_ctx = Arc::new(
+        openshell_supervisor_networking::policy_local::PolicyLocalContext::new(
+            retained_proto.clone(),
+            openshell_endpoint.clone(),
+            sandbox_name_for_agg.clone().or_else(|| sandbox_id.clone()),
+        ),
+    );
 
     // Validate that the required "sandbox" user exists in this image.
     // All sandbox images must include this user for privilege dropping.
@@ -1064,7 +1058,7 @@ async fn build_inference_context(
     sandbox_id: Option<&str>,
     openshell_endpoint: Option<&str>,
     inference_routes: Option<&str>,
-) -> Result<Option<Arc<proxy::InferenceContext>>> {
+) -> Result<Option<Arc<openshell_supervisor_networking::proxy::InferenceContext>>> {
     use openshell_router::Router;
     use openshell_router::config::RouterConfig;
 
@@ -1210,14 +1204,16 @@ async fn build_inference_context(
 
     let router =
         Router::new().map_err(|e| miette::miette!("failed to initialize inference router: {e}"))?;
-    let patterns = l7::inference::default_patterns();
+    let patterns = openshell_supervisor_networking::l7::inference::default_patterns();
 
-    let ctx = Arc::new(proxy::InferenceContext::new(
-        patterns,
-        router,
-        user_routes,
-        system_routes,
-    ));
+    let ctx = Arc::new(
+        openshell_supervisor_networking::proxy::InferenceContext::new(
+            patterns,
+            router,
+            user_routes,
+            system_routes,
+        ),
+    );
 
     // Spawn background route cache refresh for cluster mode at startup so
     // request handling never depends on control-plane latency.
@@ -2390,7 +2386,8 @@ struct PolicyPollLoopContext {
     interval_secs: u64,
     ocsf_enabled: Arc<std::sync::atomic::AtomicBool>,
     provider_credentials: ProviderCredentialState,
-    policy_local_ctx: Option<Arc<policy_local::PolicyLocalContext>>,
+    policy_local_ctx:
+        Option<Arc<openshell_supervisor_networking::policy_local::PolicyLocalContext>>,
 }
 
 async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {

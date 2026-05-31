@@ -3776,11 +3776,38 @@ dependencies = [
 name = "openshell-supervisor-networking"
 version = "0.0.0"
 dependencies = [
+ "apollo-parser",
+ "base64 0.22.1",
+ "bytes",
+ "flate2",
+ "futures",
+ "glob",
+ "hex",
+ "ipnet",
  "miette",
  "openshell-core",
+ "openshell-ocsf",
+ "openshell-policy",
+ "openshell-router",
+ "rcgen",
+ "regorus",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "serde_yml",
+ "sha1 0.10.6",
+ "sha2 0.10.9",
+ "temp-env",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite 0.26.2",
  "tracing",
+ "url",
+ "uuid",
+ "webpki-roots 1.0.7",
 ]
 
 [[package]]

@@ -19,6 +19,7 @@ use tokio::sync::RwLock;
 pub const POLICY_LOCAL_HOST: &str = "policy.local";
 
 /// Filesystem path of the static agent guidance bundle inside the sandbox.
+///
 /// Single source of truth: the skill installer writes here, the L7 deny body
 /// references this path in `next_steps`, and the skill's own documentation
 /// renders the same path. Changing the location is a one-line update here.
@@ -28,7 +29,9 @@ pub const SKILL_PATH: &str = "/etc/openshell/skills/policy_advisor.md";
 /// instructions than structured next-step JSON alone.
 pub const AGENT_GUIDANCE: &str = "OpenShell blocked this request with sandbox policy. If the user's task still needs this network action, do not stop here: read /etc/openshell/skills/policy_advisor.md, submit the narrowest policy proposal to http://policy.local/v1/proposals, wait for approval and `policy_reloaded: true`, then retry the original request.";
 
-/// Routes served by the in-sandbox policy advisor API. Held in one place so
+/// Routes served by the in-sandbox policy advisor API.
+///
+/// Held in one place so
 /// the L7 deny `next_steps` array, the route dispatcher, the skill content,
 /// and tests all stay in sync — change the wire path here and every caller
 /// follows. See `agent_next_steps()` for the consumer that surfaces these
@@ -146,7 +149,7 @@ async fn route_request(
     // when the flag is off — including the diagnostic `current_policy` and
     // `denials` routes. The skill is also not installed in that mode, so a
     // disabled sandbox has no entry point into this API at all.
-    if !crate::agent_proposals_enabled() {
+    if !openshell_core::proposals::agent_proposals_enabled() {
         return (
             404,
             serde_json::json!({
@@ -209,7 +212,9 @@ fn not_found_payload(path: &str) -> (u16, serde_json::Value) {
 }
 
 /// Build the `next_steps` array embedded in the L7 deny body so the agent has
-/// machine-readable pointers to this API. Centralizes the shape here to keep
+/// machine-readable pointers to this API.
+///
+/// Centralizes the shape here to keep
 /// the deny body and the actual route table from drifting — adding or
 /// renaming a route only requires touching the route constants above.
 ///
@@ -218,7 +223,7 @@ fn not_found_payload(path: &str) -> (u16, serde_json::Value) {
 /// caller still emits the field (with `[]`) so the wire shape is stable.
 #[must_use]
 pub fn agent_next_steps() -> serde_json::Value {
-    if !crate::agent_proposals_enabled() {
+    if !openshell_core::proposals::agent_proposals_enabled() {
         return serde_json::json!([]);
     }
     let host = POLICY_LOCAL_HOST;
@@ -249,7 +254,7 @@ pub fn agent_next_steps() -> serde_json::Value {
 /// Build the optional natural-language guidance embedded in L7 deny bodies.
 #[must_use]
 pub fn agent_guidance() -> Option<&'static str> {
-    crate::agent_proposals_enabled().then_some(AGENT_GUIDANCE)
+    openshell_core::proposals::agent_proposals_enabled().then_some(AGENT_GUIDANCE)
 }
 
 async fn current_policy_response(ctx: &PolicyLocalContext) -> (u16, serde_json::Value) {
@@ -558,7 +563,7 @@ async fn submit_proposal(ctx: &PolicyLocalContext, body: &[u8]) -> (u16, serde_j
 /// to see in the audit trace to correlate against the inbox card.
 fn emit_policy_propose_event(chunk_id: &str, summary: &str) {
     ocsf_emit!(
-        ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+        ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
             .severity(SeverityId::Informational)
             .status(StatusId::Success)
             .state(StateId::Other, "PROPOSED")
@@ -578,7 +583,7 @@ fn emit_policy_decision_event(chunk: &PolicyChunk) {
     let summary = summarize_chunk_for_audit(chunk);
     match chunk.status.as_str() {
         "approved" => ocsf_emit!(
-            ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+            ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
                 .severity(SeverityId::Informational)
                 .status(StatusId::Success)
                 .state(StateId::Enabled, "APPROVED")
@@ -600,7 +605,7 @@ fn emit_policy_decision_event(chunk: &PolicyChunk) {
                 format!("\"{sanitized}\"")
             };
             ocsf_emit!(
-                ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+                ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
                     .severity(SeverityId::Low)
                     .status(StatusId::Success)
                     .state(StateId::Disabled, "REJECTED")
@@ -1568,7 +1573,7 @@ mod tests {
         assert!(surfaced.ends_with("...[truncated]"));
     }
 
-    use crate::test_helpers::ProposalsFlagGuard;
+    use openshell_core::proposals::test_helpers::ProposalsFlagGuard;
 
     #[test]
     fn agent_next_steps_returns_empty_when_flag_off() {

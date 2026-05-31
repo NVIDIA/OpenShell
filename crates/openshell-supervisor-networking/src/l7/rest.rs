@@ -2285,7 +2285,8 @@ mod tests {
     #[test]
     fn deny_response_body_is_agent_readable_and_redacted() {
         // Agent-readable next_steps is gated on the proposals feature flag.
-        let _proposals = crate::test_helpers::ProposalsFlagGuard::set_blocking(true);
+        let _proposals =
+            openshell_core::proposals::test_helpers::ProposalsFlagGuard::set_blocking(true);
         let req = L7Request {
             action: "PUT".to_string(),
             target: "/repos/NVIDIA/OpenShell/contents/README.md?access_token=secret-token"
@@ -2350,7 +2351,8 @@ mod tests {
 
     #[test]
     fn deny_response_body_omits_agent_guidance_when_policy_advisor_is_off() {
-        let _proposals = crate::test_helpers::ProposalsFlagGuard::set_blocking(false);
+        let _proposals =
+            openshell_core::proposals::test_helpers::ProposalsFlagGuard::set_blocking(false);
         let req = L7Request {
             action: "GET".to_string(),
             target: "/gists".to_string(),
@@ -2382,7 +2384,8 @@ mod tests {
     #[tokio::test]
     async fn send_deny_response_writes_structured_json_403() {
         // Agent-readable next_steps is gated on the proposals feature flag.
-        let _proposals = crate::test_helpers::ProposalsFlagGuard::set(true).await;
+        let _proposals =
+            openshell_core::proposals::test_helpers::ProposalsFlagGuard::set(true).await;
         let (mut client, mut server) = tokio::io::duplex(4096);
         let send = tokio::spawn(async move {
             let req = L7Request {

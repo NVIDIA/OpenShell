@@ -104,7 +104,7 @@ fn emit_parse_rejection(ctx: &L7EvalContext, detail: &str, engine_type: &str) {
     } else {
         &ctx.policy_name
     };
-    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+    let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
         .activity(ActivityId::Open)
         .action(ActionId::Denied)
         .disposition(DispositionId::Blocked)
@@ -150,7 +150,7 @@ where
             }
             // SQL provider is Phase 3 — fall through to passthrough with warning
             {
-                let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                let event = NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                     .activity(ActivityId::Other)
                     .severity(SeverityId::Low)
                     .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
@@ -431,7 +431,7 @@ fn emit_l7_request_log(
     let summary = graphql_info
         .map(|info| format!(" {}", graphql_log_summary(info)))
         .unwrap_or_default();
-    let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+    let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
         .activity(ActivityId::Other)
         .action(action_id)
         .disposition(disposition_id)
@@ -477,7 +477,7 @@ where
         "raw bidirectional relay (L7 enforcement no longer active)"
     };
     ocsf_emit!(
-        NetworkActivityBuilder::new(crate::ocsf_ctx())
+        NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
             .activity(ActivityId::Other)
             .activity_name("Upgrade")
             .severity(SeverityId::Informational)
@@ -735,7 +735,7 @@ where
                     SeverityId::Informational,
                 ),
             };
-            let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+            let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .activity(ActivityId::Other)
                 .action(action_id)
                 .disposition(disposition_id)
@@ -828,7 +828,7 @@ fn close_if_stale(guard: &PolicyGenerationGuard, ctx: &L7EvalContext) -> bool {
     }
 
     ocsf_emit!(
-        NetworkActivityBuilder::new(crate::ocsf_ctx())
+        NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
             .activity(ActivityId::Open)
             .action(ActionId::Denied)
             .disposition(DispositionId::Blocked)
@@ -968,7 +968,7 @@ where
                 ),
             };
             let gql_summary = graphql_log_summary(&graphql_info);
-            let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+            let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .activity(ActivityId::Other)
                 .action(action_id)
                 .disposition(disposition_id)
@@ -1229,7 +1229,7 @@ where
         // Uses redacted_target (path only, no query params) to avoid logging secrets.
         let has_creds = resolver.is_some();
         {
-            let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+            let event = HttpActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .activity(ActivityId::Other)
                 .action(ActionId::Allowed)
                 .disposition(DispositionId::Allowed)
