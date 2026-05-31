@@ -1,0 +1,68 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Gateway Configuration"
+description: "Reference for configuring the OpenShell gateway with environment variables."
+keywords: "Generative AI, Cybersecurity, Gateway, Configuration, Environment Variables, Docker, Podman, Kubernetes, MicroVM, Reference"
+position: 2
+---
+
+Configure a standalone gateway with environment variables. Package-managed and Helm deployments set many of these values for you, but the same variable names apply when you run `openshell-gateway` directly.
+
+| Environment variable | Use |
+|---|---|
+| `OPENSHELL_BIND_ADDRESS` | IP address for the gateway, health, and metrics listeners. |
+| `OPENSHELL_SERVER_PORT` | Main gateway gRPC and HTTP port. |
+| `OPENSHELL_HEALTH_PORT` | Optional unauthenticated health endpoint port. Set to `0` to disable the dedicated health listener. |
+| `OPENSHELL_METRICS_PORT` | Optional Prometheus metrics endpoint port. Set to `0` to disable the dedicated metrics listener. |
+| `OPENSHELL_LOG_LEVEL` | Gateway log level. |
+| `OPENSHELL_DB_URL` | Persistence database URL for gateway state. |
+| `OPENSHELL_GRPC_ENDPOINT` | Endpoint sandbox supervisors use to call back to the gateway. |
+| `OPENSHELL_SSH_GATEWAY_HOST` | Hostname or address advertised for SSH proxy connections. |
+| `OPENSHELL_SSH_GATEWAY_PORT` | Port advertised for SSH proxy connections. |
+| `OPENSHELL_SSH_CONNECT_PATH` | HTTP path used for SSH CONNECT or upgrade traffic. |
+| `OPENSHELL_SSH_HANDSHAKE_SECRET` | Shared secret for gateway-to-sandbox SSH handshake authentication. |
+| `OPENSHELL_SSH_HANDSHAKE_SKEW_SECS` | Allowed clock skew for SSH handshake validation. |
+| `OPENSHELL_TLS_CERT` | Path to the gateway server TLS certificate. |
+| `OPENSHELL_TLS_KEY` | Path to the gateway server TLS private key. |
+| `OPENSHELL_TLS_CLIENT_CA` | Path to the CA certificate used to verify mTLS clients. |
+| `OPENSHELL_DISABLE_TLS` | Disable gateway TLS and listen with plaintext HTTP. |
+| `OPENSHELL_DISABLE_GATEWAY_AUTH` | Disable the mTLS client certificate requirement while keeping TLS enabled. |
+| `OPENSHELL_DRIVERS` | Compute driver selection. Supported values are `docker`, `podman`, `kubernetes`, and `vm`. |
+| `OPENSHELL_SANDBOX_NAMESPACE` | Namespace used for sandbox resources. |
+| `OPENSHELL_SANDBOX_IMAGE` | Default sandbox image. |
+| `OPENSHELL_SANDBOX_IMAGE_PULL_POLICY` | Image pull policy for sandbox workloads. |
+| `OPENSHELL_SANDBOX_SSH_PORT` | SSH port inside sandbox workloads. |
+| `OPENSHELL_CLIENT_TLS_SECRET_NAME` | Kubernetes secret name containing client TLS materials for sandbox pods. |
+| `OPENSHELL_HOST_GATEWAY_IP` | Host IP mapped to `host.docker.internal` and `host.openshell.internal` for sandbox workloads. |
+| `OPENSHELL_ENABLE_USER_NAMESPACES` | Enable Kubernetes user namespace isolation for sandbox pods. |
+| `OPENSHELL_SUPERVISOR_IMAGE` | Supervisor image used by Kubernetes and Podman drivers. |
+| `OPENSHELL_SUPERVISOR_IMAGE_PULL_POLICY` | Image pull policy for the Kubernetes supervisor image. |
+| `OPENSHELL_SUPERVISOR_SIDELOAD_METHOD` | Kubernetes supervisor delivery method. |
+| `OPENSHELL_DOCKER_SUPERVISOR_BIN` | Local Linux `openshell-sandbox` binary for Docker-backed sandboxes. |
+| `OPENSHELL_DOCKER_SUPERVISOR_IMAGE` | Image used to extract the Linux `openshell-sandbox` binary for Docker-backed sandboxes. |
+| `OPENSHELL_DOCKER_TLS_CA` | CA certificate mounted into Docker-backed sandboxes for mTLS callback. |
+| `OPENSHELL_DOCKER_TLS_CERT` | Client certificate mounted into Docker-backed sandboxes for mTLS callback. |
+| `OPENSHELL_DOCKER_TLS_KEY` | Client private key mounted into Docker-backed sandboxes for mTLS callback. |
+| `OPENSHELL_DOCKER_NETWORK_NAME` | Docker bridge network used for sandbox containers. |
+| `OPENSHELL_PODMAN_SOCKET` | Podman API socket path. |
+| `OPENSHELL_NETWORK_NAME` | Podman network name for sandbox containers. |
+| `OPENSHELL_STOP_TIMEOUT` | Podman container stop timeout in seconds. |
+| `OPENSHELL_PODMAN_TLS_CA` | CA certificate mounted into Podman-backed sandboxes for mTLS callback. |
+| `OPENSHELL_PODMAN_TLS_CERT` | Client certificate mounted into Podman-backed sandboxes for mTLS callback. |
+| `OPENSHELL_PODMAN_TLS_KEY` | Client private key mounted into Podman-backed sandboxes for mTLS callback. |
+| `OPENSHELL_VM_DRIVER_STATE_DIR` | VM driver state directory. |
+| `OPENSHELL_DRIVER_DIR` | Directory searched for compute-driver binaries such as `openshell-driver-vm`. |
+| `OPENSHELL_VM_KRUN_LOG_LEVEL` | libkrun log level for VM helper processes. |
+| `OPENSHELL_VM_DRIVER_VCPUS` | Default vCPU count for VM sandboxes. |
+| `OPENSHELL_VM_DRIVER_MEM_MIB` | Default memory allocation for VM sandboxes. |
+| `OPENSHELL_VM_TLS_CA` | CA certificate installed into VM sandboxes for mTLS callback. |
+| `OPENSHELL_VM_TLS_CERT` | Client certificate installed into VM sandboxes for mTLS callback. |
+| `OPENSHELL_VM_TLS_KEY` | Client private key installed into VM sandboxes for mTLS callback. |
+| `OPENSHELL_OIDC_ISSUER` | OIDC issuer URL for JWT-based gateway authentication. |
+| `OPENSHELL_OIDC_AUDIENCE` | Expected OIDC audience claim. |
+| `OPENSHELL_OIDC_JWKS_TTL` | JWKS cache TTL in seconds. |
+| `OPENSHELL_OIDC_ROLES_CLAIM` | Dot-separated claim path containing roles. |
+| `OPENSHELL_OIDC_ADMIN_ROLE` | Role name that grants admin access. |
+| `OPENSHELL_OIDC_USER_ROLE` | Role name that grants standard user access. |
+| `OPENSHELL_OIDC_SCOPES_CLAIM` | Dot-separated claim path containing scopes. Empty disables scope enforcement. |

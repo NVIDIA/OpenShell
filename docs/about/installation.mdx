@@ -75,6 +75,65 @@ To keep the user service running after logout, enable linger:
 sudo loginctl enable-linger $USER
 ```
 
+## Manual Gateway Setup
+
+You can also install the gateway by downloading the release binary and starting `openshell-gateway` yourself.
+
+```shell
+case "$(uname -s)-$(uname -m)" in
+  Linux-x86_64|Linux-amd64) gateway_target="x86_64-unknown-linux-gnu" ;;
+  Linux-aarch64|Linux-arm64) gateway_target="aarch64-unknown-linux-gnu" ;;
+  Darwin-arm64|Darwin-aarch64) gateway_target="aarch64-apple-darwin" ;;
+  *)
+    echo "Unsupported gateway binary target: $(uname -s) $(uname -m)" >&2
+    exit 1
+    ;;
+esac
+
+mkdir -p "$HOME/.local/bin"
+curl -LsSf "https://github.com/NVIDIA/OpenShell/releases/latest/download/openshell-gateway-${gateway_target}.tar.gz" \
+  | tar -xz -C "$HOME/.local/bin" openshell-gateway
+chmod 755 "$HOME/.local/bin/openshell-gateway"
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+For the VM compute driver, also place `openshell-driver-vm` under the gateway libexec directory:
+
+```shell
+mkdir -p "$HOME/.local/libexec/openshell"
+curl -LsSf "https://github.com/NVIDIA/OpenShell/releases/latest/download/openshell-driver-vm-${gateway_target}.tar.gz" \
+  | tar -xz -C "$HOME/.local/libexec/openshell" openshell-driver-vm
+chmod 755 "$HOME/.local/libexec/openshell/openshell-driver-vm"
+```
+
+The gateway searches `$HOME/.local/libexec/openshell` by default. To use a different directory, set `OPENSHELL_DRIVER_DIR`.
+
+To configure the gateway process itself, refer to [Gateway Configuration](/reference/gateway-configuration).
+
+## Manual CLI Setup
+
+You can also install the CLI by downloading the release binary directly.
+
+```shell
+case "$(uname -s)-$(uname -m)" in
+  Linux-x86_64|Linux-amd64) cli_target="x86_64-unknown-linux-musl" ;;
+  Linux-aarch64|Linux-arm64) cli_target="aarch64-unknown-linux-musl" ;;
+  Darwin-arm64|Darwin-aarch64) cli_target="aarch64-apple-darwin" ;;
+  *)
+    echo "Unsupported CLI binary target: $(uname -s) $(uname -m)" >&2
+    exit 1
+    ;;
+esac
+
+mkdir -p "$HOME/.local/bin"
+curl -LsSf "https://github.com/NVIDIA/OpenShell/releases/latest/download/openshell-${cli_target}.tar.gz" \
+  | tar -xz -C "$HOME/.local/bin" openshell
+chmod 755 "$HOME/.local/bin/openshell"
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+After installing the CLI, use `openshell gateway add` to register a gateway. For gateway registration commands, refer to [Register an Existing Gateway](/sandboxes/manage-gateways#register-an-existing-gateway).
+
 ## Kubernetes
 
 Kubernetes deployments use the OpenShell Helm chart. For step-by-step installation, refer to [Kubernetes Setup](/kubernetes/setup). For chart values and packaging details, refer to the [Helm chart README](https://github.com/NVIDIA/OpenShell/blob/main/deploy/helm/openshell/README.md).
