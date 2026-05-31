@@ -14,6 +14,7 @@ pub mod debug_rpc;
 pub mod log_push;
 pub mod managed_children;
 pub mod process;
+pub mod run;
 pub mod sandbox;
 pub mod skills;
 pub mod ssh;
