@@ -26,12 +26,6 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 
-[features]
-## Expose proposals::test_helpers (`ProposalsFlagGuard`) to downstream test
-## code in other crates. Enabled by openshell-supervisor-networking and
-## openshell-sandbox dev-dependencies.
-test-helpers = []
-
 [dev-dependencies]
 tempfile = "3"
 

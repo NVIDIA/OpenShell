@@ -25,6 +25,7 @@ pub mod paths;
 pub mod policy;
 pub mod procfs;
 pub mod progress;
+pub mod proposals;
 pub mod proto;
 pub mod provider_credentials;
 pub mod sandbox_env;

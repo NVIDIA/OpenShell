@@ -63,12 +63,10 @@ pub(crate) use openshell_ocsf::ctx::ctx as ocsf_ctx;
 /// to gate the agent-controlled mutation surface. Exposed `pub(crate)` so
 /// unit tests in sibling modules can flip the flag through a serialized
 /// guard (see `policy_local::tests::ProposalsFlagGuard`).
-pub(crate) use openshell_supervisor_process::proposals::{
-    AGENT_PROPOSALS_ENABLED, agent_proposals_enabled,
-};
+pub(crate) use openshell_core::proposals::{AGENT_PROPOSALS_ENABLED, agent_proposals_enabled};
 
 #[cfg(test)]
-pub(crate) use openshell_supervisor_process::proposals::test_helpers;
+pub(crate) use openshell_core::proposals::test_helpers;
 
 use crate::l7::tls::{
     CertCache, ProxyTlsState, SandboxCa, build_upstream_client_config, read_system_ca_bundle,
