@@ -83,22 +83,25 @@ ls -la "$WHEEL_OUTPUT_DIR"/*.whl
 hide = true
 
 ["build:python:wheel:linux:amd64"]
-description = "Build Python wheel for Linux amd64 natively"
+description = "Build Python wheel for Linux amd64 natively (host glibc; non-portable)"
 depends = ["EXPECTED_HOST_ARCH=amd64 WHEEL_OUTPUT_DIR=target/wheels/linux-amd64 build:python:wheel:linux"]
 hide = true
 
-["python:build:linux:amd64"]
-description = "Alias for build:python:wheel:linux:amd64"
-depends = ["build:python:wheel:linux:amd64"]
-hide = true
-
 ["build:python:wheel:linux:arm64"]
-description = "Build Python wheel for Linux arm64 natively"
+description = "Build Python wheel for Linux arm64 natively (host glibc; non-portable)"
 depends = ["EXPECTED_HOST_ARCH=arm64 WHEEL_OUTPUT_DIR=target/wheels/linux-arm64 build:python:wheel:linux"]
 hide = true
 
+# Release-pipeline aliases. CI uses PyO3/maturin-action directly (see
+# .github/workflows/release-*.yml); these aliases remain for local iteration
+# and produce wheels tagged for the host glibc only.
+["python:build:linux:amd64"]
+description = "Build Python wheel for Linux amd64 (local dev; CI uses maturin-action)"
+depends = ["build:python:wheel:linux:amd64"]
+hide = true
+
 ["python:build:linux:arm64"]
-description = "Alias for build:python:wheel:linux:arm64"
+description = "Build Python wheel for Linux arm64 (local dev; CI uses maturin-action)"
 depends = ["build:python:wheel:linux:arm64"]
 hide = true
 

@@ -248,6 +248,7 @@ url = "https://ziglang.org/download/0.14.1/zig-aarch64-linux-0.14.1.tar.xz"
 [tools.zig."platforms.linux-x64"]
 checksum = "sha256:24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c"
 url = "https://ziglang.org/download/0.14.1/zig-x86_64-linux-0.14.1.tar.xz"
+provenance = "minisign"
 
 [tools.zig."platforms.macos-arm64"]
 checksum = "sha256:39f3dc5e79c22088ce878edc821dedb4ca5a1cd9f5ef915e9b3cc3053e8faefa"
