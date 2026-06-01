@@ -40,6 +40,8 @@ jobs:
       packages: read
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Keep bare-runner installs aligned with the project CI image.
+      MISE_VERSION: v2026.4.25
       KIND_CLUSTER_NAME: kube-e2e-${{ github.run_id }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
