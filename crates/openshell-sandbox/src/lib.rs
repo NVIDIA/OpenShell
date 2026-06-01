@@ -111,6 +111,55 @@ pub(crate) fn agent_proposals_enabled() -> bool {
         .is_some_and(|flag| flag.load(Ordering::Relaxed))
 }
 
+// Pluggable policy for bootstrap subsystems the host kernel may refuse
+// (netns create, supervisor seccomp, workload seccomp). Default
+// `StrictHandler` aborts; outer-sandbox integrations register their own
+// via `set_failure_handler`.
+
+/// Which bootstrap subsystem failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxFailureKind {
+    /// `unshare(CLONE_NEWNET)` or a follow-up netns op refused by the kernel.
+    NetworkNamespaceCreate,
+    /// Supervisor seccomp prelude install failed.
+    SupervisorSeccompInstall,
+    /// Workload per-policy seccomp filter failed in `sandbox::linux::enforce`.
+    WorkloadSeccompInstall,
+}
+
+/// Policy for handling bootstrap refusals. `Ok(())` continues in degraded
+/// mode; `Err` aborts. Invoked synchronously — do not block.
+pub trait SandboxFailureHandler: Send + Sync + 'static {
+    fn handle(&self, kind: SandboxFailureKind, err: miette::Report) -> Result<()>;
+}
+
+/// Default handler — every refusal aborts.
+pub struct StrictHandler;
+
+impl SandboxFailureHandler for StrictHandler {
+    fn handle(&self, _kind: SandboxFailureKind, err: miette::Report) -> Result<()> {
+        Err(err)
+    }
+}
+
+/// Set-once handler slot; lazy default is [`StrictHandler`].
+static FAILURE_HANDLER: OnceLock<Box<dyn SandboxFailureHandler>> = OnceLock::new();
+
+/// Register the process-wide handler. Call once at process start, before
+/// [`run_sandbox`]. Returns the handler back on `Err` if the slot is
+/// already set.
+pub fn set_failure_handler(
+    handler: Box<dyn SandboxFailureHandler>,
+) -> Result<(), Box<dyn SandboxFailureHandler>> {
+    FAILURE_HANDLER.set(handler)
+}
+
+pub(crate) fn failure_handler() -> &'static dyn SandboxFailureHandler {
+    FAILURE_HANDLER
+        .get_or_init(|| Box::new(StrictHandler))
+        .as_ref()
+}
+
 /// Test-only helpers shared across sibling test modules.
 #[cfg(test)]
 pub(crate) mod test_helpers {
@@ -557,11 +606,15 @@ pub async fn run_sandbox(
                 Some(ns)
             }
             Err(e) => {
-                return Err(miette::miette!(
-                    "Network namespace creation failed and proxy mode requires isolation. \
-                     Ensure CAP_NET_ADMIN and CAP_SYS_ADMIN are available and iproute2 is installed. \
-                     Error: {e}"
-                ));
+                failure_handler().handle(
+                    SandboxFailureKind::NetworkNamespaceCreate,
+                    miette::miette!(
+                        "Network namespace creation failed and proxy mode requires isolation. \
+                         Ensure CAP_NET_ADMIN and CAP_SYS_ADMIN are available and iproute2 is installed. \
+                         Error: {e}"
+                    ),
+                )?;
+                None
             }
         }
     } else {
@@ -576,7 +629,9 @@ pub async fn run_sandbox(
     // Install the supervisor seccomp prelude after privileged startup helpers
     // (network namespace setup, nftables probes) complete, but before the SSH
     // listener and workload process are exposed.
-    apply_supervisor_startup_hardening()?;
+    if let Err(e) = apply_supervisor_startup_hardening() {
+        failure_handler().handle(SandboxFailureKind::SupervisorSeccompInstall, e)?;
+    }
 
     // Shared PID: set after process spawn so the proxy can look up
     // the entrypoint process's /proc/net/tcp for identity binding.
