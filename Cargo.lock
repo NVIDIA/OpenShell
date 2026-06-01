@@ -3593,9 +3593,7 @@ dependencies = [
  "miette",
  "openshell-core",
  "openshell-policy-schema",
- "serde",
  "serde_json",
- "serde_yml",
 ]
 
 [[package]]

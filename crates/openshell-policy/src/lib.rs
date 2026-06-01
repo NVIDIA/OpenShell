@@ -13,7 +13,6 @@ mod compose;
 mod merge;
 
 use std::collections::HashMap;
-use std::fmt;
 use std::path::Path;
 
 use miette::Result;
@@ -429,68 +428,13 @@ pub fn ensure_sandbox_process_identity(policy: &mut SandboxPolicy) {
 // Policy safety validation
 // ---------------------------------------------------------------------------
 
+pub use openshell_policy_schema::PolicyViolation;
+
 /// Maximum number of filesystem paths (`read_only` + `read_write` combined).
 const MAX_FILESYSTEM_PATHS: usize = 256;
 
 /// Maximum length of any single filesystem path string.
 const MAX_PATH_LENGTH: usize = 4096;
-
-/// A safety violation found in a sandbox policy.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PolicyViolation {
-    /// `run_as_user` or `run_as_group` is not "sandbox".
-    InvalidProcessIdentity { field: &'static str, value: String },
-    /// A filesystem path contains `..` components.
-    PathTraversal { path: String },
-    /// A filesystem path is not absolute (does not start with `/`).
-    RelativePath { path: String },
-    /// A read-write filesystem path is overly broad (e.g. `/`).
-    OverlyBroadPath { path: String },
-    /// A filesystem path exceeds the maximum allowed length.
-    FieldTooLong { path: String, length: usize },
-    /// Too many filesystem paths in the policy.
-    TooManyPaths { count: usize },
-    /// A network endpoint uses a TLD wildcard (e.g. `*.com`).
-    TldWildcard { policy_name: String, host: String },
-}
-
-impl fmt::Display for PolicyViolation {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidProcessIdentity { field, value } => {
-                write!(f, "{field} must be 'sandbox', got '{value}'")
-            }
-            Self::PathTraversal { path } => {
-                write!(f, "path contains '..' traversal component: {path}")
-            }
-            Self::RelativePath { path } => {
-                write!(f, "path must be absolute (start with '/'): {path}")
-            }
-            Self::OverlyBroadPath { path } => {
-                write!(f, "read-write path is overly broad: {path}")
-            }
-            Self::FieldTooLong { path, length } => {
-                write!(
-                    f,
-                    "path exceeds maximum length ({length} > {MAX_PATH_LENGTH}): {path}"
-                )
-            }
-            Self::TooManyPaths { count } => {
-                write!(
-                    f,
-                    "too many filesystem paths ({count} > {MAX_FILESYSTEM_PATHS})"
-                )
-            }
-            Self::TldWildcard { policy_name, host } => {
-                write!(
-                    f,
-                    "network policy '{policy_name}': TLD wildcard '{host}' is not allowed; \
-                     use subdomain wildcards like '*.example.com' instead"
-                )
-            }
-        }
-    }
-}
 
 /// Validate that a sandbox policy does not contain unsafe content.
 ///
