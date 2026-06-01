@@ -115,6 +115,7 @@ impl ProviderRegistry {
         registry.register(providers::generic::GenericProvider);
         registry.register(providers::openai::SPEC);
         registry.register(providers::anthropic::SPEC);
+        registry.register(providers::aws_bedrock::SPEC);
         registry.register(providers::nvidia::SPEC);
         registry.register(providers::deepinfra::SPEC);
         registry.register(providers::gitlab::SPEC);

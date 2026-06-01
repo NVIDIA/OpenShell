@@ -1,0 +1,38 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+id: aws-bedrock
+display_name: AWS Bedrock
+description: Anthropic + Mistral + Llama models served via the AWS Bedrock InvokeModel API
+category: inference
+inference_capable: true
+credentials:
+  - name: aws_access_key_id
+    description: AWS access key id used for SigV4 signing of outbound Bedrock requests
+    env_vars: [AWS_ACCESS_KEY_ID]
+    required: true
+  - name: aws_secret_access_key
+    description: AWS secret access key paired with aws_access_key_id
+    env_vars: [AWS_SECRET_ACCESS_KEY]
+    required: true
+  - name: aws_session_token
+    description: Optional session token for temporary credentials (STS, IAM Roles for Service Accounts)
+    env_vars: [AWS_SESSION_TOKEN]
+    required: false
+  - name: aws_region
+    description: AWS region the Bedrock endpoint resolves into (e.g. us-east-1)
+    env_vars: [AWS_REGION, AWS_DEFAULT_REGION]
+    required: true
+discovery:
+  credentials: [aws_access_key_id, aws_secret_access_key, aws_region]
+endpoints:
+  # Default endpoint targets us-east-1 since the YAML loader does not yet
+  # substitute the `{region}` placeholder. Operators in other regions
+  # override via the `BEDROCK_BASE_URL` config-key the same way the
+  # `anthropic` provider accepts `ANTHROPIC_BASE_URL`.
+  - host: bedrock-runtime.us-east-1.amazonaws.com
+    port: 443
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+binaries: [/usr/bin/claude, /usr/local/bin/claude]

@@ -31,6 +31,7 @@ macro_rules! test_discovers_env_credential {
     };
 }
 pub mod anthropic;
+pub mod aws_bedrock;
 pub mod claude;
 pub mod codex;
 pub mod copilot;
