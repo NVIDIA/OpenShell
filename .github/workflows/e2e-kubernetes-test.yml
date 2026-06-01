@@ -17,11 +17,21 @@ on:
         required: false
         type: string
         default: ""
+      job-name:
+        description: "Display name for the Kubernetes e2e job"
+        required: false
+        type: string
+        default: "Kubernetes E2E (Rust smoke)"
       extra-helm-values:
         description: "Colon-separated Helm values files to layer on the Kubernetes e2e chart install"
         required: false
         type: string
         default: ""
+      mise-version:
+        description: "mise version to install on the bare Kubernetes e2e runner"
+        required: false
+        type: string
+        default: "v2026.4.25"
 
 permissions:
   contents: read
@@ -29,7 +39,7 @@ permissions:
 
 jobs:
   e2e-kubernetes:
-    name: Kubernetes E2E (Rust smoke)
+    name: ${{ inputs.job-name }}
     # Bare runner: running kind-in-container hits nested-Docker / kubeconfig
     # complications. The runner has Docker; mise installs helm, kubectl, and
     # the Rust toolchain.
@@ -41,7 +51,7 @@ jobs:
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       # Keep bare-runner installs aligned with the project CI image.
-      MISE_VERSION: v2026.4.25
+      MISE_VERSION: ${{ inputs.mise-version }}
       KIND_CLUSTER_NAME: kube-e2e-${{ github.run_id }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6

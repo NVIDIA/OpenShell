@@ -117,9 +117,11 @@ jobs:
     permissions:
       contents: read
       packages: read
-    uses: ./.github/workflows/e2e-kubernetes-ha-test.yml
+    uses: ./.github/workflows/e2e-kubernetes-test.yml
     with:
       image-tag: ${{ github.sha }}
+      job-name: Kubernetes HA E2E (Rust smoke)
+      extra-helm-values: deploy/helm/openshell/ci/values-high-availability.yaml
 
   core-e2e-result:
     name: Core E2E result
