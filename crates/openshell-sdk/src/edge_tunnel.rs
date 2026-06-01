@@ -19,13 +19,13 @@
 //! 3. Bidirectionally pipe bytes between the local TCP stream and the
 //!    WebSocket.
 //!
-//! The gRPC [`Channel`] then connects to `http://127.0.0.1:<local_port>`
+//! The gRPC `Channel` then connects to `http://127.0.0.1:<local_port>`
 //! (plaintext) — the edge handles TLS, and the WebSocket carries the raw
 //! bytes to the origin.
 
+use crate::error::{Result, SdkError};
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
-use miette::{IntoDiagnostic, Result};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -63,8 +63,8 @@ pub async fn start_tunnel_proxy(
     gateway_endpoint: &str,
     edge_token: &str,
 ) -> Result<EdgeTunnelProxy> {
-    let listener = TcpListener::bind("127.0.0.1:0").await.into_diagnostic()?;
-    let local_addr = listener.local_addr().into_diagnostic()?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let local_addr = listener.local_addr()?;
 
     // Convert the gateway endpoint to a WebSocket URL.
     // https://foo.com -> wss://foo.com
@@ -88,7 +88,6 @@ pub async fn start_tunnel_proxy(
         "starting edge tunnel proxy"
     );
 
-    // Spawn the accept loop.
     tokio::spawn(accept_loop(listener, config));
 
     Ok(EdgeTunnelProxy { local_addr })
@@ -149,13 +148,15 @@ async fn handle_connection(tcp_stream: TcpStream, config: &TunnelConfig) -> Resu
 
 /// Open a WebSocket connection to the edge proxy.
 async fn open_ws(config: &TunnelConfig) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
-    let mut request = (&config.ws_url).into_client_request().into_diagnostic()?;
+    let mut request = (&config.ws_url)
+        .into_client_request()
+        .map_err(|e| SdkError::invalid_config(format!("invalid tunnel URL: {e}")))?;
 
     // Inject the bearer token via multiple headers for compatibility with
     // Cloudflare Access (which checks `Cf-Access-Token`, the
     // `CF_Authorization` cookie, and the `Cf-Access-Jwt-Assertion` header).
     let token_val = HeaderValue::from_str(&config.edge_token)
-        .map_err(|e| miette::miette!("invalid edge token header value: {e}"))?;
+        .map_err(|e| SdkError::auth(format!("invalid edge token header value: {e}")))?;
     request
         .headers_mut()
         .insert("Cf-Access-Token", token_val.clone());
@@ -165,14 +166,14 @@ async fn open_ws(config: &TunnelConfig) -> Result<WebSocketStream<MaybeTlsStream
     request.headers_mut().insert(
         "Cookie",
         HeaderValue::from_str(&format!("CF_Authorization={}", config.edge_token))
-            .map_err(|e| miette::miette!("invalid edge token cookie value: {e}"))?,
+            .map_err(|e| SdkError::auth(format!("invalid edge token cookie value: {e}")))?,
     );
 
     debug!(url = %config.ws_url, "opening WebSocket to edge");
 
     let (ws_stream, response) = tokio_tungstenite::connect_async(request)
         .await
-        .map_err(|e| miette::miette!("WebSocket connect failed: {e}"))?;
+        .map_err(|e| SdkError::connect(format!("WebSocket connect failed: {e}")))?;
 
     debug!(
         status = %response.status(),

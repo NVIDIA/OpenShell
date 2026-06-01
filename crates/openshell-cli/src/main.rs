@@ -2918,7 +2918,7 @@ async fn main() -> Result<()> {
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_auth(&mut tls, &ctx.name);
             let channel = openshell_cli::tls::build_channel(&ctx.endpoint, &tls).await?;
-            let interceptor = openshell_core::auth::EdgeAuthInterceptor::new(
+            let interceptor = openshell_sdk::EdgeAuthInterceptor::new(
                 tls.oidc_token.as_deref(),
                 tls.edge_token.as_deref(),
             )?;

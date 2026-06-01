@@ -22,3 +22,8 @@ run = "tasks/scripts/keycloak-k8s-setup.sh"
 ["keycloak:k8s:teardown"]
 description = "Remove Keycloak from the local k3s cluster"
 run = "kubectl delete namespace keycloak --ignore-not-found"
+
+["oidc:smoke"]
+description = "Manual OIDC smoke against a local Keycloak (run `mise run keycloak` first)"
+depends = ["sdk-node:build"]
+run = "scripts/openshell-sdk-oidc-smoke.sh"
