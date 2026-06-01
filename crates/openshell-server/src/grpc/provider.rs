@@ -33,18 +33,20 @@ fn redact_provider_credentials(mut provider: Provider) -> Provider {
     provider
 }
 
+/// Resolved provider environment for a sandbox.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct ProviderEnvironment {
+    /// Credential environment variables (canonical and passthrough mixed).
     pub environment: std::collections::HashMap<String, String>,
+    /// Expiration timestamps for entries in `environment`.
     pub credential_expires_at_ms: std::collections::HashMap<String, i64>,
+    /// Subset of `environment` keys whose value is the real credential and
+    /// must be injected directly into the agent process — bypassing the
+    /// canonical placeholder substitution and L7 proxy rewriting.
+    pub passthrough_keys: Vec<String>,
 }
 
 impl ProviderEnvironment {
-    #[cfg(test)]
-    fn is_empty(&self) -> bool {
-        self.environment.is_empty()
-    }
-
     #[cfg(test)]
     fn get(&self, key: &str) -> Option<&String> {
         self.environment.get(key)
@@ -170,6 +172,22 @@ pub(super) async fn update_provider_record(
     store: &Store,
     provider: Provider,
 ) -> Result<Provider, Status> {
+    update_provider_record_inner(store, provider, false).await
+}
+
+pub(super) async fn update_provider_record_with_options(
+    store: &Store,
+    provider: Provider,
+    clear_passthrough_credentials: bool,
+) -> Result<Provider, Status> {
+    update_provider_record_inner(store, provider, clear_passthrough_credentials).await
+}
+
+async fn update_provider_record_inner(
+    store: &Store,
+    provider: Provider,
+    clear_passthrough_credentials: bool,
+) -> Result<Provider, Status> {
     use crate::persistence::{ObjectId, ObjectName};
 
     if provider.object_name().is_empty() {
@@ -214,6 +232,29 @@ pub(super) async fn update_provider_record(
         candidate.credential_expires_at_ms,
         provider.credential_expires_at_ms,
     );
+    // Passthrough merge:
+    // - `clear_passthrough_credentials=true` wipes the list to empty, regardless
+    //   of `provider.passthrough_credentials`. This is the only way to revoke
+    //   passthrough for every key, because proto3 cannot distinguish "absent"
+    //   from "empty list" on a repeated field.
+    // - When the caller does not declare a new passthrough list (empty incoming
+    //   = preserve), drop any entries whose credential was deleted in this same
+    //   update. Without this, deleting a credential that was marked passthrough
+    //   leaves the provider in a state that fails validation, and the operator
+    //   cannot recover without recreating the provider.
+    // - When the caller declares a non-empty list, replace verbatim and keep
+    //   strict validation — an explicit orphan is a caller bug and must surface.
+    let merged_passthrough = if clear_passthrough_credentials {
+        Vec::new()
+    } else if provider.passthrough_credentials.is_empty() {
+        std::mem::take(&mut candidate.passthrough_credentials)
+            .into_iter()
+            .filter(|key| candidate.credentials.contains_key(key))
+            .collect()
+    } else {
+        provider.passthrough_credentials
+    };
+    candidate.passthrough_credentials = merged_passthrough;
 
     // Validate BEFORE writing to prevent persisting invalid state
     super::validation::validate_object_metadata(candidate.metadata.as_ref(), "provider")?;
@@ -416,9 +457,12 @@ fn merge_i64_map(
 /// Resolve provider credentials into environment variables.
 ///
 /// For each provider name in the list, fetches the provider from the store and
-/// collects credential key-value pairs. Returns a map of environment variables
-/// to inject into the sandbox. Credential keys must be unique across attached
-/// providers so one provider cannot silently overwrite another provider's token.
+/// collects credential key-value pairs and the passthrough opt-in list. Returns
+/// a [`ProviderEnvironment`] describing the env map, expiry timestamps, and
+/// which keys are passthrough. Credential keys must be unique across attached
+/// providers so one provider cannot silently overwrite another provider's
+/// token. Duplicate credential keys across providers are rejected; a key is
+/// treated as passthrough if its owning provider lists it as passthrough.
 pub(super) async fn resolve_provider_environment(
     store: &Store,
     provider_names: &[String],
@@ -429,6 +473,7 @@ pub(super) async fn resolve_provider_environment(
 
     let mut env = std::collections::HashMap::new();
     let mut expires = std::collections::HashMap::new();
+    let mut passthrough = std::collections::HashSet::new();
     let now_ms = crate::persistence::current_time_ms();
     validate_provider_environment_keys_unique_at(store, provider_names, None, now_ms).await?;
 
@@ -439,39 +484,54 @@ pub(super) async fn resolve_provider_environment(
             .map_err(|e| Status::internal(format!("failed to fetch provider '{name}': {e}")))?
             .ok_or_else(|| Status::failed_precondition(format!("provider '{name}' not found")))?;
 
+        let provider_passthrough: std::collections::HashSet<&str> = provider
+            .passthrough_credentials
+            .iter()
+            .map(String::as_str)
+            .collect();
+
         for (key, value) in &provider.credentials {
-            if is_valid_env_key(key) {
-                let expires_at_ms = provider
-                    .credential_expires_at_ms
-                    .get(key)
-                    .copied()
-                    .unwrap_or_default();
-                if expires_at_ms > 0 && expires_at_ms <= now_ms {
-                    warn!(
-                        provider_name = %name,
-                        key = %key,
-                        expires_at_ms,
-                        "skipping expired provider credential"
-                    );
-                    continue;
-                }
-                if expires_at_ms > 0 {
-                    expires.entry(key.clone()).or_insert(expires_at_ms);
-                }
-                env.entry(key.clone()).or_insert_with(|| value.clone());
-            } else {
+            if !is_valid_env_key(key) {
                 warn!(
                     provider_name = %name,
                     key = %key,
                     "skipping credential with invalid env var key"
                 );
+                continue;
+            }
+            let expires_at_ms = provider
+                .credential_expires_at_ms
+                .get(key)
+                .copied()
+                .unwrap_or_default();
+            if expires_at_ms > 0 && expires_at_ms <= now_ms {
+                warn!(
+                    provider_name = %name,
+                    key = %key,
+                    expires_at_ms,
+                    "skipping expired provider credential"
+                );
+                continue;
+            }
+            if !env.contains_key(key) {
+                env.insert(key.clone(), value.clone());
+                if expires_at_ms > 0 {
+                    expires.insert(key.clone(), expires_at_ms);
+                }
+                if provider_passthrough.contains(key.as_str()) {
+                    passthrough.insert(key.clone());
+                }
             }
         }
     }
 
+    let mut passthrough_keys: Vec<String> = passthrough.into_iter().collect();
+    passthrough_keys.sort();
+
     Ok(ProviderEnvironment {
         environment: env,
         credential_expires_at_ms: expires,
+        passthrough_keys,
     })
 }
 
@@ -1085,10 +1145,20 @@ pub(super) async fn handle_update_provider(
     let mut provider = req
         .provider
         .ok_or_else(|| Status::invalid_argument("provider is required"))?;
+    if req.clear_passthrough_credentials && !provider.passthrough_credentials.is_empty() {
+        return Err(Status::invalid_argument(
+            "clear_passthrough_credentials and a non-empty passthrough_credentials list are mutually exclusive",
+        ));
+    }
     provider
         .credential_expires_at_ms
         .extend(req.credential_expires_at_ms);
-    let provider = update_provider_record(state.store.as_ref(), provider).await?;
+    let provider = update_provider_record_with_options(
+        state.store.as_ref(),
+        provider,
+        req.clear_passthrough_credentials,
+    )
+    .await?;
 
     Ok(Response::new(ProviderResponse {
         provider: Some(provider),
@@ -1322,6 +1392,7 @@ pub(super) async fn handle_configure_provider_refresh(
                 credential_key.to_string(),
                 expires_at_ms,
             )]),
+            passthrough_credentials: Vec::new(),
         };
         update_provider_record(state.store.as_ref(), updated).await?;
     }
@@ -1417,6 +1488,7 @@ pub(super) async fn handle_delete_provider_refresh(
                 credential_key.to_string(),
                 0,
             )]),
+            passthrough_credentials: Vec::new(),
         };
         update_provider_record(state.store.as_ref(), updated).await?;
     }
@@ -1502,6 +1574,7 @@ mod tests {
             .into_iter()
             .collect(),
             credential_expires_at_ms: HashMap::new(),
+            passthrough_credentials: Vec::new(),
         }
     }
 
@@ -2093,6 +2166,7 @@ mod tests {
                 .collect(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -2206,6 +2280,7 @@ mod tests {
                 .collect(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -2248,6 +2323,7 @@ mod tests {
                     "MS_GRAPH_ACCESS_TOKEN".to_string(),
                     manual_expires_at_ms,
                 )]),
+                passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -2301,6 +2377,7 @@ mod tests {
                 .collect(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -2320,6 +2397,7 @@ mod tests {
                     .collect(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -2389,6 +2467,7 @@ mod tests {
                     credentials: HashMap::new(),
                     config: HashMap::new(),
                     credential_expires_at_ms: HashMap::new(),
+                    passthrough_credentials: Vec::new(),
                 },
             )
             .await
@@ -2478,6 +2557,7 @@ mod tests {
                 .collect(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -2545,6 +2625,7 @@ mod tests {
                 .collect(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -2660,6 +2741,7 @@ mod tests {
                 config: std::iter::once(("endpoint".to_string(), "https://gitlab.com".to_string()))
                     .collect(),
                 credential_expires_at_ms: HashMap::new(),
+                passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -2825,6 +2907,7 @@ mod tests {
                 .collect(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -2854,6 +2937,7 @@ mod tests {
                 .collect(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -2884,6 +2968,7 @@ mod tests {
                 credentials: HashMap::new(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -2904,6 +2989,7 @@ mod tests {
                 credentials: HashMap::new(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -2975,6 +3061,7 @@ mod tests {
                 credentials: HashMap::new(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -3011,6 +3098,7 @@ mod tests {
                 credentials: HashMap::new(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -3047,6 +3135,7 @@ mod tests {
                 credentials: HashMap::new(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -3073,6 +3162,7 @@ mod tests {
                 credentials: HashMap::new(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -3101,6 +3191,7 @@ mod tests {
                 credentials: HashMap::new(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -3148,6 +3239,7 @@ mod tests {
                 credentials: std::iter::once(("SECONDARY".to_string(), String::new())).collect(),
                 config: std::iter::once(("region".to_string(), String::new())).collect(),
                 credential_expires_at_ms: HashMap::new(),
+                passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -3199,6 +3291,7 @@ mod tests {
                 credentials: HashMap::new(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -3228,6 +3321,7 @@ mod tests {
                 credentials: HashMap::new(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -3259,6 +3353,7 @@ mod tests {
                 credentials: std::iter::once((oversized_key, "value".to_string())).collect(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -3268,10 +3363,241 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_provider_prunes_passthrough_for_deleted_credential() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .unwrap();
+
+        create_provider_record(
+            &store,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "slack".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                r#type: "slack".to_string(),
+                credentials: [
+                    ("SLACK_BOT_TOKEN".to_string(), "xoxb".to_string()),
+                    ("SLACK_SIGNING_SECRET".to_string(), "sig".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+                passthrough_credentials: vec![
+                    "SLACK_BOT_TOKEN".to_string(),
+                    "SLACK_SIGNING_SECRET".to_string(),
+                ],
+            },
+        )
+        .await
+        .unwrap();
+
+        // Caller deletes the bot token without touching the passthrough list.
+        // The orphaned passthrough entry must be pruned, not block the update.
+        let updated = update_provider_record(
+            &store,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "slack".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                r#type: String::new(),
+                credentials: std::iter::once(("SLACK_BOT_TOKEN".to_string(), String::new()))
+                    .collect(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+                passthrough_credentials: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(!updated.credentials.contains_key("SLACK_BOT_TOKEN"));
+        assert!(updated.credentials.contains_key("SLACK_SIGNING_SECRET"));
+        assert_eq!(
+            updated.passthrough_credentials,
+            vec!["SLACK_SIGNING_SECRET".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn update_provider_rejects_explicit_passthrough_orphan() {
+        // When the caller declares a non-empty passthrough list, an entry that
+        // names a non-existent credential is a caller bug and must surface.
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .unwrap();
+
+        create_provider_record(
+            &store,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "slack-explicit".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                r#type: "slack".to_string(),
+                credentials: std::iter::once(("API_KEY".to_string(), "v".to_string())).collect(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+                passthrough_credentials: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let err = update_provider_record(
+            &store,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "slack-explicit".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                r#type: String::new(),
+                credentials: HashMap::new(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+                passthrough_credentials: vec!["UNKNOWN_KEY".to_string()],
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("not present in credentials"));
+    }
+
+    #[tokio::test]
+    async fn update_provider_clear_passthrough_credentials_wipes_list() {
+        // `clear_passthrough_credentials=true` revokes passthrough for every
+        // credential. The proto3 repeated field cannot distinguish "absent"
+        // from "empty list", so without this flag an empty incoming list is
+        // preserved.
+        let store = test_store().await;
+
+        create_provider_record(
+            &store,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "slack-clear".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                r#type: "slack".to_string(),
+                credentials: [
+                    ("SLACK_BOT_TOKEN".to_string(), "xoxb".to_string()),
+                    ("SLACK_SIGNING_SECRET".to_string(), "sig".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+                passthrough_credentials: vec![
+                    "SLACK_BOT_TOKEN".to_string(),
+                    "SLACK_SIGNING_SECRET".to_string(),
+                ],
+            },
+        )
+        .await
+        .unwrap();
+
+        let cleared = update_provider_record_with_options(
+            &store,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "slack-clear".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                r#type: String::new(),
+                credentials: HashMap::new(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+                passthrough_credentials: Vec::new(),
+            },
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert!(cleared.passthrough_credentials.is_empty());
+        assert!(cleared.credentials.contains_key("SLACK_BOT_TOKEN"));
+        assert!(cleared.credentials.contains_key("SLACK_SIGNING_SECRET"));
+    }
+
+    #[tokio::test]
+    async fn handle_update_provider_rejects_clear_combined_with_non_empty_passthrough() {
+        let state = test_server_state().await;
+        create_provider_record(
+            state.store.as_ref(),
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "slack-clear-conflict".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                r#type: "slack".to_string(),
+                credentials: std::iter::once(("API_KEY".to_string(), "v".to_string())).collect(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+                passthrough_credentials: Vec::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let err = handle_update_provider(
+            &state,
+            Request::new(UpdateProviderRequest {
+                provider: Some(Provider {
+                    metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                        id: String::new(),
+                        name: "slack-clear-conflict".to_string(),
+                        created_at_ms: 0,
+                        labels: HashMap::new(),
+                        resource_version: 0,
+                    }),
+                    r#type: String::new(),
+                    credentials: HashMap::new(),
+                    config: HashMap::new(),
+                    credential_expires_at_ms: HashMap::new(),
+                    passthrough_credentials: vec!["API_KEY".to_string()],
+                }),
+                credential_expires_at_ms: HashMap::new(),
+                clear_passthrough_credentials: true,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("mutually exclusive"));
+    }
+
+    #[tokio::test]
     async fn resolve_provider_env_empty_list_returns_empty() {
         let store = test_store().await;
         let result = resolve_provider_environment(&store, &[]).await.unwrap();
-        assert!(result.is_empty());
+        assert!(result.environment.is_empty());
+        assert!(result.passthrough_keys.is_empty());
     }
 
     #[tokio::test]
@@ -3298,15 +3624,23 @@ mod tests {
             ))
             .collect(),
             credential_expires_at_ms: HashMap::new(),
+            passthrough_credentials: Vec::new(),
         };
         create_provider_record(&store, provider).await.unwrap();
 
         let result = resolve_provider_environment(&store, &["claude-local".to_string()])
             .await
             .unwrap();
-        assert_eq!(result.get("ANTHROPIC_API_KEY"), Some(&"sk-abc".to_string()));
-        assert_eq!(result.get("CLAUDE_API_KEY"), Some(&"sk-abc".to_string()));
-        assert!(!result.contains_key("endpoint"));
+        assert_eq!(
+            result.environment.get("ANTHROPIC_API_KEY"),
+            Some(&"sk-abc".to_string())
+        );
+        assert_eq!(
+            result.environment.get("CLAUDE_API_KEY"),
+            Some(&"sk-abc".to_string())
+        );
+        assert!(!result.environment.contains_key("endpoint"));
+        assert!(result.passthrough_keys.is_empty());
     }
 
     #[tokio::test]
@@ -3335,6 +3669,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            passthrough_credentials: Vec::new(),
         };
         create_provider_record(&store, provider).await.unwrap();
 
@@ -3380,15 +3715,19 @@ mod tests {
             .collect(),
             config: HashMap::new(),
             credential_expires_at_ms: HashMap::new(),
+            passthrough_credentials: Vec::new(),
         };
         create_provider_record(&store, provider).await.unwrap();
 
         let result = resolve_provider_environment(&store, &["test-provider".to_string()])
             .await
             .unwrap();
-        assert_eq!(result.get("VALID_KEY"), Some(&"value".to_string()));
-        assert!(!result.contains_key("nested.api_key"));
-        assert!(!result.contains_key("bad-key"));
+        assert_eq!(
+            result.environment.get("VALID_KEY"),
+            Some(&"value".to_string())
+        );
+        assert!(!result.environment.contains_key("nested.api_key"));
+        assert!(!result.environment.contains_key("bad-key"));
     }
 
     #[tokio::test]
@@ -3412,6 +3751,7 @@ mod tests {
                 .collect(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -3431,6 +3771,7 @@ mod tests {
                     .collect(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -3442,8 +3783,14 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(result.get("ANTHROPIC_API_KEY"), Some(&"sk-abc".to_string()));
-        assert_eq!(result.get("GITLAB_TOKEN"), Some(&"glpat-xyz".to_string()));
+        assert_eq!(
+            result.environment.get("ANTHROPIC_API_KEY"),
+            Some(&"sk-abc".to_string())
+        );
+        assert_eq!(
+            result.environment.get("GITLAB_TOKEN"),
+            Some(&"glpat-xyz".to_string())
+        );
     }
 
     #[tokio::test]
@@ -3464,6 +3811,7 @@ mod tests {
                     .collect(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -3486,6 +3834,7 @@ mod tests {
                 .collect(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -3524,6 +3873,7 @@ mod tests {
                 .collect(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -3546,6 +3896,7 @@ mod tests {
                 .collect(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -3584,6 +3935,7 @@ mod tests {
                 .collect(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -3592,6 +3944,55 @@ mod tests {
         assert_eq!(err.code(), Code::FailedPrecondition);
         assert!(err.message().contains("collision"));
         assert!(err.message().contains("MS_GRAPH_ACCESS_TOKEN"));
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_env_propagates_passthrough_keys() {
+        let store = test_store().await;
+        create_provider_record(
+            &store,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "slack".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                r#type: "slack".to_string(),
+                credentials: [
+                    ("SLACK_BOT_TOKEN".to_string(), "xoxb-real".to_string()),
+                    ("SLACK_SIGNING_SECRET".to_string(), "sig-real".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+                passthrough_credentials: vec![
+                    "SLACK_BOT_TOKEN".to_string(),
+                    "SLACK_SIGNING_SECRET".to_string(),
+                ],
+            },
+        )
+        .await
+        .unwrap();
+
+        let result = resolve_provider_environment(&store, &["slack".to_string()])
+            .await
+            .unwrap();
+        let mut keys = result.passthrough_keys.clone();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "SLACK_BOT_TOKEN".to_string(),
+                "SLACK_SIGNING_SECRET".to_string(),
+            ]
+        );
+        assert_eq!(
+            result.environment.get("SLACK_BOT_TOKEN"),
+            Some(&"xoxb-real".to_string())
+        );
     }
 
     #[tokio::test]
@@ -3618,6 +4019,7 @@ mod tests {
                 .collect(),
                 config: HashMap::new(),
                 credential_expires_at_ms: HashMap::new(),
+                passthrough_credentials: Vec::new(),
             },
         )
         .await
@@ -3646,11 +4048,14 @@ mod tests {
             .unwrap()
             .unwrap();
         let spec = loaded.spec.unwrap();
-        let env = resolve_provider_environment(&store, &spec.providers)
+        let resolved = resolve_provider_environment(&store, &spec.providers)
             .await
             .unwrap();
 
-        assert_eq!(env.get("ANTHROPIC_API_KEY"), Some(&"sk-test".to_string()));
+        assert_eq!(
+            resolved.environment.get("ANTHROPIC_API_KEY"),
+            Some(&"sk-test".to_string())
+        );
     }
 
     #[tokio::test]
@@ -3679,11 +4084,12 @@ mod tests {
             .unwrap()
             .unwrap();
         let spec = loaded.spec.unwrap();
-        let env = resolve_provider_environment(&store, &spec.providers)
+        let resolved = resolve_provider_environment(&store, &spec.providers)
             .await
             .unwrap();
 
-        assert!(env.is_empty());
+        assert!(resolved.environment.is_empty());
+        assert!(resolved.passthrough_keys.is_empty());
     }
 
     #[tokio::test]
@@ -3718,6 +4124,7 @@ mod tests {
             credentials: HashMap::new(),
             config: HashMap::new(),
             credential_expires_at_ms: HashMap::new(),
+            passthrough_credentials: Vec::new(),
         };
 
         // Attempt to update with an oversized credential key (exceeds MAX_MAP_KEY_LEN)
@@ -3866,6 +4273,7 @@ mod tests {
             Request::new(UpdateProviderRequest {
                 provider: Some(updated_provider.clone()),
                 credential_expires_at_ms: HashMap::new(),
+                clear_passthrough_credentials: false,
             }),
         )
         .await
@@ -3934,6 +4342,7 @@ mod tests {
             Request::new(UpdateProviderRequest {
                 provider: Some(stale_provider),
                 credential_expires_at_ms: HashMap::new(),
+                clear_passthrough_credentials: false,
             }),
         )
         .await
@@ -4004,6 +4413,7 @@ mod tests {
                     Request::new(UpdateProviderRequest {
                         provider: Some(updated),
                         credential_expires_at_ms: HashMap::new(),
+                        clear_passthrough_credentials: false,
                     }),
                 )
                 .await

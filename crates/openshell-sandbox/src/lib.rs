@@ -352,57 +352,46 @@ pub async fn run_sandbox(
     // Fetch provider environment variables from the server.
     // This is done after loading the policy so the sandbox can still start
     // even if provider env fetch fails (graceful degradation).
-    let (provider_env_revision, provider_env, provider_credential_expires_at_ms) =
-        if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
-            match grpc_client::fetch_provider_environment(endpoint, id).await {
-                Ok(result) => {
-                    ocsf_emit!(
-                        ConfigStateChangeBuilder::new(ocsf_ctx())
-                            .severity(SeverityId::Informational)
-                            .status(StatusId::Success)
-                            .state(StateId::Enabled, "loaded")
-                            .message(format!(
-                                "Fetched provider environment [env_count:{}]",
-                                result.environment.len()
-                            ))
-                            .build()
-                    );
-                    (
-                        result.provider_env_revision,
-                        result.environment,
-                        result.credential_expires_at_ms,
-                    )
-                }
-                Err(e) => {
-                    ocsf_emit!(
-                        ConfigStateChangeBuilder::new(ocsf_ctx())
-                            .severity(SeverityId::Medium)
-                            .status(StatusId::Failure)
-                            .state(StateId::Other, "degraded")
-                            .message(format!(
-                                "Failed to fetch provider environment, continuing without: {e}"
-                            ))
-                            .build()
-                    );
-                    (
-                        0,
-                        std::collections::HashMap::new(),
-                        std::collections::HashMap::new(),
-                    )
-                }
+    let resolved = if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
+        match grpc_client::fetch_provider_environment(endpoint, id).await {
+            Ok(resolved) => {
+                ocsf_emit!(
+                    ConfigStateChangeBuilder::new(ocsf_ctx())
+                        .severity(SeverityId::Informational)
+                        .status(StatusId::Success)
+                        .state(StateId::Enabled, "loaded")
+                        .message(format!(
+                            "Fetched provider environment [env_count:{} passthrough_count:{}]",
+                            resolved.environment.len(),
+                            resolved.passthrough_keys.len()
+                        ))
+                        .build()
+                );
+                resolved
             }
-        } else {
-            (
-                0,
-                std::collections::HashMap::new(),
-                std::collections::HashMap::new(),
-            )
-        };
+            Err(e) => {
+                ocsf_emit!(
+                    ConfigStateChangeBuilder::new(ocsf_ctx())
+                        .severity(SeverityId::Medium)
+                        .status(StatusId::Failure)
+                        .state(StateId::Other, "degraded")
+                        .message(format!(
+                            "Failed to fetch provider environment, continuing without: {e}"
+                        ))
+                        .build()
+                );
+                grpc_client::ProviderEnvironment::default()
+            }
+        }
+    } else {
+        grpc_client::ProviderEnvironment::default()
+    };
 
     let provider_credentials = provider_credentials::ProviderCredentialState::from_environment(
-        provider_env_revision,
-        provider_env,
-        provider_credential_expires_at_ms,
+        resolved.provider_env_revision,
+        resolved.environment,
+        &resolved.passthrough_keys,
+        resolved.credential_expires_at_ms,
     );
     let provider_env = provider_credentials.snapshot().child_env.clone();
 
@@ -2454,9 +2443,11 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
         if provider_env_changed {
             match grpc_client::fetch_provider_environment(&ctx.endpoint, &ctx.sandbox_id).await {
                 Ok(env_result) => {
+                    let passthrough_count = env_result.passthrough_keys.len();
                     let env_count = ctx.provider_credentials.install_environment(
                         env_result.provider_env_revision,
                         env_result.environment,
+                        &env_result.passthrough_keys,
                         env_result.credential_expires_at_ms,
                     );
                     current_provider_env_revision = env_result.provider_env_revision;
@@ -2470,7 +2461,7 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
                                 serde_json::json!(current_provider_env_revision)
                             )
                             .message(format!(
-                                "Provider environment refreshed [revision:{current_provider_env_revision} env_count:{env_count}]"
+                                "Provider environment refreshed [revision:{current_provider_env_revision} env_count:{env_count} passthrough_count:{passthrough_count}]"
                             ))
                             .build()
                     );

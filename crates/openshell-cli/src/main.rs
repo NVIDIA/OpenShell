@@ -741,6 +741,15 @@ enum ProviderCommands {
         /// Provider config key/value pair.
         #[arg(long = "config", value_name = "KEY=VALUE")]
         config: Vec<String>,
+
+        /// Credential key whose real value is injected directly into the
+        /// agent process, bypassing the canonical placeholder substitution
+        /// and L7 proxy rewriting. Each key must also appear in `--credential`
+        /// (or be discovered via `--from-existing`). Drops the "agent never
+        /// sees the real secret" invariant for that key — see provider docs
+        /// for the security trade-off.
+        #[arg(long = "passthrough", value_name = "KEY")]
+        passthrough: Vec<String>,
     },
 
     /// Manage provider credential refresh.
@@ -805,6 +814,22 @@ enum ProviderCommands {
         /// Provider config key/value pair.
         #[arg(long = "config", value_name = "KEY=VALUE")]
         config: Vec<String>,
+
+        /// Credential key whose real value is injected directly into the
+        /// agent process, bypassing the canonical placeholder substitution
+        /// and L7 proxy rewriting. Replaces the existing passthrough list
+        /// when non-empty. Each key must also be present in the merged
+        /// credentials. Drops the "agent never sees the real secret"
+        /// invariant for that key.
+        #[arg(long = "passthrough", value_name = "KEY")]
+        passthrough: Vec<String>,
+
+        /// Revoke passthrough for every credential by replacing the
+        /// passthrough list with the empty list. Mutually exclusive with
+        /// `--passthrough` because passing both would be ambiguous (the
+        /// server cannot apply "clear and then set" in one request).
+        #[arg(long = "clear-passthrough", conflicts_with = "passthrough")]
+        clear_passthrough: bool,
 
         /// Credential expiry (`KEY=TIMESTAMP`). Accepts epoch milliseconds or RFC3339. A zero timestamp clears expiry.
         #[arg(long = "credential-expires-at", value_name = "KEY=TIMESTAMP")]
@@ -2790,6 +2815,7 @@ async fn main() -> Result<()> {
                     from_existing,
                     credentials,
                     config,
+                    passthrough,
                 } => {
                     run::provider_create(
                         endpoint,
@@ -2798,6 +2824,7 @@ async fn main() -> Result<()> {
                         from_existing,
                         &credentials,
                         &config,
+                        &passthrough,
                         &tls,
                     )
                     .await?;
@@ -2895,6 +2922,8 @@ async fn main() -> Result<()> {
                     from_existing,
                     credentials,
                     config,
+                    passthrough,
+                    clear_passthrough,
                     credential_expires_at,
                 } => {
                     run::provider_update(
@@ -2903,6 +2932,8 @@ async fn main() -> Result<()> {
                         from_existing,
                         &credentials,
                         &config,
+                        &passthrough,
+                        clear_passthrough,
                         &credential_expires_at,
                         &tls,
                     )

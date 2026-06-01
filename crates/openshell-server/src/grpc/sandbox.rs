@@ -2086,6 +2086,7 @@ mod tests {
                 .collect(),
             config: HashMap::new(),
             credential_expires_at_ms: HashMap::new(),
+            passthrough_credentials: Vec::new(),
         }
     }
 

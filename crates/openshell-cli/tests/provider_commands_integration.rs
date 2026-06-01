@@ -458,10 +458,17 @@ impl OpenShell for TestOpenShell {
         &self,
         request: tonic::Request<UpdateProviderRequest>,
     ) -> Result<Response<ProviderResponse>, Status> {
-        let provider = request
-            .into_inner()
+        let inner = request.into_inner();
+        let clear_passthrough_credentials = inner.clear_passthrough_credentials;
+        let provider = inner
             .provider
             .ok_or_else(|| Status::invalid_argument("provider is required"))?;
+        if clear_passthrough_credentials && !provider.passthrough_credentials.is_empty() {
+            return Err(Status::invalid_argument(
+                "clear_passthrough_credentials is mutually exclusive with a non-empty \
+                 provider.passthrough_credentials list",
+            ));
+        }
 
         let mut providers = self.state.providers.lock().await;
         let existing = providers
@@ -514,6 +521,13 @@ impl OpenShell for TestOpenShell {
                 existing.credential_expires_at_ms,
                 provider.credential_expires_at_ms,
             ),
+            passthrough_credentials: if clear_passthrough_credentials {
+                Vec::new()
+            } else if provider.passthrough_credentials.is_empty() {
+                existing.passthrough_credentials
+            } else {
+                provider.passthrough_credentials
+            },
         };
         let updated_name = updated.object_name().to_string();
         providers.insert(updated_name, updated.clone());
@@ -923,6 +937,7 @@ async fn provider_cli_run_functions_support_full_crud_flow() {
         false,
         &["API_KEY=abc".to_string()],
         &["profile=dev".to_string()],
+        &[],
         &ts.tls,
     )
     .await
@@ -941,6 +956,8 @@ async fn provider_cli_run_functions_support_full_crud_flow() {
         false,
         &["API_KEY=rotated".to_string()],
         &["profile=prod".to_string()],
+        &[],
+        false,
         &[],
         &ts.tls,
     )
@@ -971,6 +988,7 @@ async fn provider_refresh_cli_run_functions_wire_requests() {
         "outlook",
         false,
         &["MS_GRAPH_ACCESS_TOKEN=token".to_string()],
+        &[],
         &[],
         &ts.tls,
     )
@@ -1059,6 +1077,7 @@ async fn provider_create_allows_empty_credentials_for_gateway_refresh_profiles()
         false,
         &[],
         &[],
+        &[],
         &ts.tls,
     )
     .await
@@ -1080,6 +1099,7 @@ async fn sandbox_provider_cli_run_functions_wire_requests_and_idempotent_results
         "github",
         false,
         &["GITHUB_TOKEN=ghp-test".to_string()],
+        &[],
         &[],
         &ts.tls,
     )
@@ -1199,6 +1219,7 @@ binaries: [/usr/bin/custom]
         false,
         &["CUSTOM_API_KEY=abc".to_string()],
         &[],
+        &[],
         &ts.tls,
     )
     .await
@@ -1252,6 +1273,7 @@ async fn provider_create_from_existing_uses_profile_discovery_when_v2_enabled() 
         true,
         &[],
         &[],
+        &[],
         &ts.tls,
     )
     .await
@@ -1284,6 +1306,7 @@ async fn provider_create_from_existing_uses_registry_discovery_when_v2_disabled(
         true,
         &[],
         &[],
+        &[],
         &ts.tls,
     )
     .await
@@ -1310,9 +1333,18 @@ async fn provider_create_from_existing_requires_profile_when_v2_enabled() {
     enable_providers_v2(&ts).await;
     let _env = EnvVarGuard::set(&[("OPENAI_API_KEY", "legacy-openai-secret")]);
 
-    let err = run::provider_create(&ts.endpoint, "v2-openai", "openai", true, &[], &[], &ts.tls)
-        .await
-        .expect_err("v2 discovery without a profile should fail");
+    let err = run::provider_create(
+        &ts.endpoint,
+        "v2-openai",
+        "openai",
+        true,
+        &[],
+        &[],
+        &[],
+        &ts.tls,
+    )
+    .await
+    .expect_err("v2 discovery without a profile should fail");
 
     assert!(
         err.to_string()
@@ -1349,6 +1381,7 @@ async fn provider_create_from_existing_fails_when_profile_discovery_finds_nothin
         "empty-discovered",
         "empty-discovery",
         true,
+        &[],
         &[],
         &[],
         &ts.tls,
@@ -1403,13 +1436,24 @@ async fn provider_update_from_existing_uses_profile_discovery_when_v2_enabled() 
             credentials: HashMap::new(),
             config: HashMap::new(),
             credential_expires_at_ms: HashMap::new(),
+            passthrough_credentials: Vec::new(),
         },
     );
     let _env = EnvVarGuard::set(&[("CUSTOM_UPDATE_DISCOVERY_API_KEY", "updated-profile-secret")]);
 
-    run::provider_update(&ts.endpoint, "custom-update", true, &[], &[], &[], &ts.tls)
-        .await
-        .expect("profile-backed provider update --from-existing");
+    run::provider_update(
+        &ts.endpoint,
+        "custom-update",
+        true,
+        &[],
+        &[],
+        &[],
+        false,
+        &[],
+        &ts.tls,
+    )
+    .await
+    .expect("profile-backed provider update --from-existing");
 
     let provider = ts
         .state
@@ -1604,6 +1648,7 @@ async fn provider_create_rejects_key_only_credentials_without_local_env_value() 
         false,
         &["INVALID_PAIR".to_string()],
         &[],
+        &[],
         &ts.tls,
     )
     .await
@@ -1627,6 +1672,7 @@ async fn provider_create_supports_generic_type_and_env_lookup_credentials() {
         "generic",
         false,
         &["NAV_GENERIC_TEST_KEY".to_string()],
+        &[],
         &[],
         &ts.tls,
     )
@@ -1662,6 +1708,7 @@ async fn provider_create_rejects_combined_from_existing_and_credentials() {
         true,
         &["API_KEY=abc".to_string()],
         &[],
+        &[],
         &ts.tls,
     )
     .await
@@ -1685,6 +1732,7 @@ async fn provider_create_rejects_empty_env_var_for_key_only_credential() {
         "generic",
         false,
         &["NAV_EMPTY_ENV_KEY".to_string()],
+        &[],
         &[],
         &ts.tls,
     )
@@ -1710,6 +1758,7 @@ async fn provider_create_supports_nvidia_type_with_nvidia_api_key() {
         false,
         &["NVIDIA_API_KEY".to_string()],
         &[],
+        &[],
         &ts.tls,
     )
     .await
@@ -1730,5 +1779,178 @@ async fn provider_create_supports_nvidia_type_with_nvidia_api_key() {
     assert_eq!(
         provider.credentials.get("NVIDIA_API_KEY"),
         Some(&"nvapi-live-test".to_string())
+    );
+}
+
+#[tokio::test]
+async fn provider_update_clear_passthrough_revokes_all_passthrough_entries() {
+    let ts = run_server().await;
+
+    // Seed the provider with two passthrough entries so the test exercises the
+    // server-side "replace with empty list" semantics rather than the no-op
+    // "preserve when incoming is empty" branch.
+    run::provider_create(
+        &ts.endpoint,
+        "my-claude",
+        "claude",
+        false,
+        &["API_KEY=abc".to_string(), "SECONDARY=zzz".to_string()],
+        &[],
+        &["API_KEY".to_string(), "SECONDARY".to_string()],
+        &ts.tls,
+    )
+    .await
+    .expect("provider create");
+
+    let mut client = openshell_cli::tls::grpc_client(&ts.endpoint, &ts.tls)
+        .await
+        .expect("grpc client should connect");
+    let seeded = client
+        .get_provider(GetProviderRequest {
+            name: "my-claude".to_string(),
+        })
+        .await
+        .expect("get provider")
+        .into_inner()
+        .provider
+        .expect("provider must exist");
+    assert_eq!(
+        seeded.passthrough_credentials,
+        vec!["API_KEY".to_string(), "SECONDARY".to_string()],
+        "seeded provider must carry both passthrough entries before revoke"
+    );
+
+    // `--clear-passthrough` without `--passthrough` flips
+    // `UpdateProviderRequest.clear_passthrough_credentials = true` while
+    // leaving the request's passthrough list empty. The fake server enforces
+    // the same "replace with empty list" semantics as production, so the
+    // post-update provider must carry no passthrough entries.
+    run::provider_update(
+        &ts.endpoint,
+        "my-claude",
+        false,
+        &[],
+        &[],
+        &[],
+        true,
+        &[],
+        &ts.tls,
+    )
+    .await
+    .expect("provider update --clear-passthrough should succeed");
+
+    let cleared = client
+        .get_provider(GetProviderRequest {
+            name: "my-claude".to_string(),
+        })
+        .await
+        .expect("get provider")
+        .into_inner()
+        .provider
+        .expect("provider must exist");
+    assert!(
+        cleared.passthrough_credentials.is_empty(),
+        "passthrough_credentials must be empty after --clear-passthrough, got {:?}",
+        cleared.passthrough_credentials,
+    );
+    // The credentials themselves must be preserved — only the passthrough
+    // allow-list is cleared. This pins the "clear the flag, keep the secret"
+    // contract that the placeholder rewrite relies on.
+    assert!(cleared.credentials.contains_key("API_KEY"));
+    assert!(cleared.credentials.contains_key("SECONDARY"));
+}
+
+#[tokio::test]
+async fn provider_update_clear_passthrough_with_non_empty_list_is_rejected() {
+    let ts = run_server().await;
+
+    run::provider_create(
+        &ts.endpoint,
+        "my-claude",
+        "claude",
+        false,
+        &["API_KEY=abc".to_string()],
+        &[],
+        &["API_KEY".to_string()],
+        &ts.tls,
+    )
+    .await
+    .expect("provider create");
+
+    // Mirrors the server-side `InvalidArgument` from
+    // `UpdateProvider`: `clear_passthrough_credentials` cannot coexist with a
+    // non-empty incoming list because the server cannot apply "clear and then
+    // set" in a single round-trip.
+    let err = run::provider_update(
+        &ts.endpoint,
+        "my-claude",
+        false,
+        &[],
+        &[],
+        &["API_KEY".to_string()],
+        true,
+        &[],
+        &ts.tls,
+    )
+    .await
+    .expect_err("provider update with both --passthrough and --clear-passthrough should fail");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("mutually exclusive"),
+        "expected mutual-exclusion error, got: {message}"
+    );
+}
+
+#[tokio::test]
+async fn provider_update_with_empty_passthrough_and_no_clear_preserves_existing_list() {
+    let ts = run_server().await;
+
+    run::provider_create(
+        &ts.endpoint,
+        "my-claude",
+        "claude",
+        false,
+        &["API_KEY=abc".to_string()],
+        &[],
+        &["API_KEY".to_string()],
+        &ts.tls,
+    )
+    .await
+    .expect("provider create");
+
+    // An update that touches only `--config` (no `--passthrough`, no
+    // `--clear-passthrough`) must leave the stored passthrough list intact.
+    // This is the no-op branch that the explicit clear flag was added to
+    // distinguish from a deliberate revoke.
+    run::provider_update(
+        &ts.endpoint,
+        "my-claude",
+        false,
+        &[],
+        &["profile=prod".to_string()],
+        &[],
+        false,
+        &[],
+        &ts.tls,
+    )
+    .await
+    .expect("provider update should succeed");
+
+    let mut client = openshell_cli::tls::grpc_client(&ts.endpoint, &ts.tls)
+        .await
+        .expect("grpc client should connect");
+    let provider = client
+        .get_provider(GetProviderRequest {
+            name: "my-claude".to_string(),
+        })
+        .await
+        .expect("get provider")
+        .into_inner()
+        .provider
+        .expect("provider must exist");
+    assert_eq!(
+        provider.passthrough_credentials,
+        vec!["API_KEY".to_string()],
+        "empty incoming passthrough list with no clear flag must preserve the stored list"
     );
 }

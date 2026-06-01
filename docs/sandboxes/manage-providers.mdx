@@ -199,7 +199,7 @@ provider instance, and pass `--provider <name>` explicitly.
 
 ## How Credential Injection Works
 
-The agent process inside the sandbox never sees real credential values. At startup, the proxy replaces each credential with an opaque placeholder token in the agent's environment. When the agent sends an HTTP request containing a placeholder, the proxy resolves it to the real credential before forwarding upstream.
+By default, the agent process inside the sandbox never sees real credential values. At startup, the proxy replaces each credential with an opaque placeholder token in the agent's environment. When the agent sends an HTTP request containing a placeholder, the proxy resolves it to the real credential before forwarding upstream. This default is intentionally narrowed by the [selective passthrough](#selective-passthrough) opt-in below, which is required for credentials that an SDK validates in-process or sends over transports the proxy cannot rewrite.
 
 This resolution requires the proxy to see plaintext HTTP. Endpoints must use `protocol: rest` in the policy (which auto-terminates TLS) or explicit `tls: terminate`. Endpoints without TLS termination pass traffic through as an opaque stream, and credential placeholders are forwarded unresolved.
 
@@ -237,6 +237,40 @@ openshell provider create --name google --type generic --credential YOUTUBE_API_
 ```
 
 The agent sends `GET /youtube/v3/search?part=snippet&key=<placeholder>`. The proxy resolves the placeholder in the query parameter value and percent-encodes the result before forwarding.
+
+## Selective Passthrough
+
+Some SDKs reject the placeholder before any HTTP request is made — for example Slack's `@slack/web-api` checks the `xoxb-` prefix on bot tokens, and OAuth libraries parse JWT structure in process. Other credentials never reach the wire at all (Slack signing-secret HMAC, Discord interaction-signature verification) or flow through transports the proxy cannot rewrite (WebSocket payloads after HTTP `101 Switching Protocols`).
+
+For these cases, mark a credential key as **passthrough**: the supervisor injects the real value directly into the agent process instead of a placeholder.
+
+```shell
+openshell provider create \
+  --name slack \
+  --type generic \
+  --credential SLACK_BOT_TOKEN=xoxb-real-value \
+  --credential SLACK_SIGNING_SECRET=real-signing-secret \
+  --passthrough SLACK_BOT_TOKEN \
+  --passthrough SLACK_SIGNING_SECRET
+```
+
+`--passthrough` is repeatable, and the same flag is available on `openshell provider update`. Each key must exist in the resolved provider credentials — supplied via `--credential`, discovered through `--from-existing`, or, on `update`, already stored against the provider. On `update`, a non-empty `--passthrough KEY ...` list replaces the existing list verbatim; an empty list (i.e. omitting the flag) preserves the stored list and prunes any entries whose credential was deleted in the same update.
+
+<Warning>
+Passthrough drops the "agent never sees the real secret" invariant for the listed keys. The real value sits in `/proc/<agent-pid>/environ` and any descendant process inherits it. Use it only when the consumer demonstrably fails with the canonical placeholder — prefer the placeholder model whenever the consumer permits it.
+</Warning>
+
+### Revoking passthrough
+
+To revoke passthrough for every credential on a provider in one operation, use `--clear-passthrough` on `openshell provider update`:
+
+```shell
+openshell provider update --name slack --clear-passthrough
+```
+
+`--clear-passthrough` is mutually exclusive with `--passthrough` because passing both would be ambiguous (the server cannot apply "clear and then set" in one request — issue two updates instead). After the update, any sandbox launched (or relaunched) against the provider receives canonical placeholders for every credential. Agent processes that are already running keep the real values that were injected into their environment at launch until they are restarted; the gateway does not mutate the env of a live process.
+
+`openshell provider get <name>` annotates passthrough keys in its output, and `openshell provider list` shows a `PASSTHROUGH` column with the per-provider count.
 
 ## Supported Provider Types
 

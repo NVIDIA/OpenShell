@@ -631,13 +631,29 @@ pub async fn sync_policy(endpoint: &str, sandbox: &str, policy: &ProtoSandboxPol
 
 /// Fetch provider environment variables for a sandbox from `OpenShell` server via gRPC.
 ///
-/// Returns a map of environment variable names to values derived from provider
-/// credentials configured on the sandbox. Returns an empty map if the sandbox
-/// has no providers or the call fails.
+/// Resolved provider environment for the sandbox.
+#[derive(Debug, Default, Clone)]
+pub struct ProviderEnvironment {
+    /// Credential environment variables (canonical and passthrough mixed).
+    pub environment: HashMap<String, String>,
+    /// Subset of `environment` keys whose value is the real credential and
+    /// must be injected directly into the agent process — bypassing the
+    /// canonical placeholder substitution and L7 proxy rewriting.
+    pub passthrough_keys: Vec<String>,
+    /// Fingerprint for the provider credential inputs that produced
+    /// `environment`; used by the supervisor to detect rotation.
+    pub provider_env_revision: u64,
+    /// Expiration timestamps for entries in `environment`.
+    pub credential_expires_at_ms: HashMap<String, i64>,
+}
+
+/// Returns the env map and passthrough keys derived from provider credentials
+/// configured on the sandbox. Returns an empty result if the sandbox has no
+/// providers or the call fails.
 pub async fn fetch_provider_environment(
     endpoint: &str,
     sandbox_id: &str,
-) -> Result<ProviderEnvironmentResult> {
+) -> Result<ProviderEnvironment> {
     debug!(endpoint = %endpoint, sandbox_id = %sandbox_id, "Fetching provider environment");
 
     let mut client = connect(endpoint).await?;
@@ -650,8 +666,9 @@ pub async fn fetch_provider_environment(
         .into_diagnostic()?;
 
     let inner = response.into_inner();
-    Ok(ProviderEnvironmentResult {
+    Ok(ProviderEnvironment {
         environment: inner.environment,
+        passthrough_keys: inner.passthrough_keys,
         provider_env_revision: inner.provider_env_revision,
         credential_expires_at_ms: inner.credential_expires_at_ms,
     })
@@ -678,12 +695,6 @@ pub struct SettingsPollResult {
     /// When `policy_source` is `Global`, the version of the global policy revision.
     pub global_policy_version: u32,
     pub provider_env_revision: u64,
-}
-
-pub struct ProviderEnvironmentResult {
-    pub environment: HashMap<String, String>,
-    pub provider_env_revision: u64,
-    pub credential_expires_at_ms: HashMap<String, i64>,
 }
 
 impl CachedOpenShellClient {

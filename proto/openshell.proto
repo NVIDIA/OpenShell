@@ -842,6 +842,11 @@ message UpdateProviderRequest {
   // Optional per-credential expiry timestamps to merge into the provider.
   // A zero value removes the expiry for that credential.
   map<string, int64> credential_expires_at_ms = 2;
+  // When true, replace the provider's `passthrough_credentials` list with the
+  // empty list, removing every entry. Use this to revoke passthrough for all
+  // keys in one operation — an empty `provider.passthrough_credentials` field
+  // alone is treated as "preserve existing list" and cannot express clear.
+  bool clear_passthrough_credentials = 3;
 }
 
 // Delete provider request.
@@ -1092,6 +1097,11 @@ message GetSandboxProviderEnvironmentResponse {
   uint64 provider_env_revision = 2;
   // Expiration timestamps for returned environment variables.
   map<string, int64> credential_expires_at_ms = 3;
+  // Subset of keys in `environment` whose value is the real credential and
+  // must be injected directly into the agent process — bypassing the
+  // canonical placeholder substitution and L7 proxy rewriting. Sourced from
+  // each provider's `passthrough_credentials` list.
+  repeated string passthrough_keys = 4;
 }
 
 // ---------------------------------------------------------------------------

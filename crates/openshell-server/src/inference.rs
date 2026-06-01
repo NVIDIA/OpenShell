@@ -589,6 +589,7 @@ mod tests {
             credentials: std::iter::once((key_name.to_string(), key_value.to_string())).collect(),
             config: std::collections::HashMap::new(),
             credential_expires_at_ms: std::collections::HashMap::new(),
+            passthrough_credentials: Vec::new(),
         }
     }
 
@@ -756,6 +757,7 @@ mod tests {
             ))
             .collect(),
             credential_expires_at_ms: std::collections::HashMap::new(),
+            passthrough_credentials: Vec::new(),
         };
         store
             .put_message(&provider)
@@ -830,6 +832,7 @@ mod tests {
                 .collect(),
             config: provider.config.clone(),
             credential_expires_at_ms: provider.credential_expires_at_ms.clone(),
+            passthrough_credentials: provider.passthrough_credentials.clone(),
         };
         store
             .put_message(&rotated_provider)

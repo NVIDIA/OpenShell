@@ -1634,6 +1634,7 @@ fn spawn_create_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
                     credentials: credentials.clone(),
                     config: HashMap::default(),
                     credential_expires_at_ms: HashMap::default(),
+                    passthrough_credentials: Vec::new(),
                 }),
             };
 
@@ -1726,8 +1727,10 @@ fn spawn_update_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
                 credentials,
                 config: HashMap::default(),
                 credential_expires_at_ms: HashMap::default(),
+                passthrough_credentials: Vec::new(),
             }),
             credential_expires_at_ms: HashMap::default(),
+            clear_passthrough_credentials: false,
         };
 
         match tokio::time::timeout(Duration::from_secs(5), client.update_provider(req)).await {
