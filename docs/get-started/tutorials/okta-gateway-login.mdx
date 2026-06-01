@@ -1,0 +1,162 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Sign In to an Okta-Protected Gateway"
+sidebar-title: "Okta Gateway Login"
+slug: "get-started/tutorials/okta-gateway-login"
+description: "Configure Okta OIDC for an OpenShell gateway and sign in from the CLI with a native app and PKCE."
+keywords: "Generative AI, Cybersecurity, Tutorial, Okta, OIDC, Gateway, PKCE, Access Token"
+---
+
+Use Okta to sign in to an OpenShell gateway from the CLI. Okta authenticates the user in the browser, the CLI stores the resulting access token, and the gateway uses that token to decide which actions the user can perform.
+
+After completing this tutorial, you have:
+
+- An OpenShell gateway configured to validate Okta-issued access tokens.
+- An Okta native app configured for CLI browser login with PKCE.
+- A CLI gateway registration that can log in and call the gateway as an Okta-backed user.
+
+<Note>
+This tutorial covers gateway sign-in only. It does not configure sandbox runtime credentials or delegated token exchange.
+</Note>
+
+## Prerequisites
+
+- A working OpenShell installation and a gateway you can restart with new auth settings.
+- An Okta org and admin access.
+- A custom Okta authorization server if you want group-based gateway RBAC from access-token claims.
+
+<Warning>
+OpenShell reads roles and scopes from the access token, not the ID token. If you want to use Okta groups for gateway roles, use a custom authorization server that places groups in access tokens.
+</Warning>
+
+<Steps toc={true}>
+
+## Create the Okta Native App
+
+In Okta, create an OIDC native application for the OpenShell CLI browser callback.
+
+Use these settings:
+
+- Application type: `Native`
+- Sign-in redirect URI: `http://127.0.0.1:8765/callback`
+- Grant type: Authorization Code with PKCE
+
+Make a note of:
+
+- Okta issuer URL
+- CLI client ID
+
+If the gateway will enforce scopes, decide which scopes the CLI should request during login.
+
+## Configure the Gateway
+
+Start or restart the gateway with Okta OIDC enabled:
+
+```shell
+openshell-gateway \
+  --oidc-issuer https://your-okta-domain/oauth2/default \
+  --oidc-audience openshell-cli \
+  --oidc-roles-claim groups \
+  --oidc-admin-role openshell-admin \
+  --oidc-user-role openshell-user \
+  --oidc-scopes-claim scp
+```
+
+For Okta, use:
+
+- `groups` for role mapping
+- `scp` for scope checks
+
+If you start the gateway from environment variables instead, set:
+
+- `OPENSHELL_OIDC_ISSUER`
+- `OPENSHELL_OIDC_AUDIENCE`
+- `OPENSHELL_OIDC_ROLES_CLAIM`
+- `OPENSHELL_OIDC_ADMIN_ROLE`
+- `OPENSHELL_OIDC_USER_ROLE`
+- `OPENSHELL_OIDC_SCOPES_CLAIM`
+
+## Register the Gateway in the CLI
+
+Register the gateway and tell the CLI to use the Okta native app:
+
+```shell
+openshell gateway add https://gateway.example.com \
+  --name okta-gateway \
+  --oidc-issuer https://your-okta-domain/oauth2/default \
+  --oidc-client-id YOUR_OKTA_NATIVE_APP_CLIENT_ID \
+  --oidc-audience openshell-cli
+```
+
+If the gateway enforces scopes, request them at registration time:
+
+```shell
+openshell gateway add https://gateway.example.com \
+  --name okta-gateway \
+  --oidc-issuer https://your-okta-domain/oauth2/default \
+  --oidc-client-id YOUR_OKTA_NATIVE_APP_CLIENT_ID \
+  --oidc-audience openshell-cli \
+  --oidc-scopes "config:read provider:read sandbox:read"
+```
+
+## Sign In with the Browser Flow
+
+Force the browser callback port to match the redirect URI you configured in Okta:
+
+```shell
+OPENSHELL_OIDC_CALLBACK_PORT=8765 \
+openshell gateway login okta-gateway
+```
+
+The CLI opens your browser, completes the login, and stores the token bundle under:
+
+```text
+~/.config/openshell/gateways/okta-gateway/oidc_token.json
+```
+
+## Verify Gateway Access
+
+Once the login finishes, verify that the CLI can call the gateway:
+
+```shell
+openshell gateway ls
+openshell sandbox ls -g okta-gateway
+```
+
+If your Okta user has the expected role and any required scopes, the gateway accepts the request.
+
+## Troubleshooting
+
+### `redirect_uri` must be a Login redirect URI
+
+The callback URI in Okta and the CLI callback port do not match.
+
+If Okta is configured for:
+
+```text
+http://127.0.0.1:8765/callback
+```
+
+then login with:
+
+```shell
+OPENSHELL_OIDC_CALLBACK_PORT=8765 openshell gateway login okta-gateway
+```
+
+### Login succeeds but gateway methods are denied
+
+This usually means one of these common setup issues:
+
+- the access token does not contain the expected `groups`
+- the gateway is looking at the wrong claim
+- the CLI did not request the scopes required by the gateway
+
+Check:
+
+- the Okta authorization server issuing the access token
+- `rolesClaim=groups`
+- `scopesClaim=scp`
+- `--oidc-scopes` on the CLI registration
+
+</Steps>
