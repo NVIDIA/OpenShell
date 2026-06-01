@@ -1556,7 +1556,7 @@ where
         }
     }
     for path in rw {
-        if fs.read_only.iter().any(|p| p == path) || fs.read_write.iter().any(|p| p == path) {
+        if fs.read_write.iter().any(|p| p == path) {
             continue;
         }
         if !path_exists(path) {
@@ -1564,6 +1564,18 @@ where
                 path,
                 "Baseline read-write path does not exist, skipping enrichment"
             );
+            continue;
+        }
+        if fs.read_only.iter().any(|p| p == path) {
+            if path == "/proc" {
+                info!(
+                    path,
+                    "Promoting /proc from read-only to read-write for GPU runtime compatibility"
+                );
+                fs.read_only.retain(|p| p != path);
+                fs.read_write.push(path.clone());
+                modified = true;
+            }
             continue;
         }
         fs.read_write.push(path.clone());
@@ -1769,7 +1781,7 @@ mod baseline_tests {
     }
 
     #[test]
-    fn proto_gpu_enrichment_adds_devices_without_network_policy() {
+    fn proto_gpu_enrichment_promotes_proc_without_network_policy() {
         let mut policy = openshell_policy::restrictive_default_policy();
         assert!(
             policy.network_policies.is_empty(),
@@ -1790,6 +1802,14 @@ mod baseline_tests {
         assert!(
             filesystem.read_write.contains(&"/dev/nvidia0".to_string()),
             "GPU enrichment should add enumerated device nodes without network policies"
+        );
+        assert!(
+            !filesystem.read_only.contains(&"/proc".to_string()),
+            "GPU enrichment should remove /proc from read_only"
+        );
+        assert!(
+            filesystem.read_write.contains(&"/proc".to_string()),
+            "GPU enrichment should promote /proc to read_write"
         );
     }
 

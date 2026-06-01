@@ -21,6 +21,13 @@ For the field-by-field YAML reference, use
 Filesystem and process policy are startup-time controls. Network policy is
 dynamic and can be hot-reloaded when the new policy validates successfully.
 
+Before applying Landlock, the supervisor enriches baseline filesystem paths that
+the runtime needs. Missing baseline paths are skipped so one absent runtime path
+does not weaken the whole ruleset. When GPU devices are present, GPU baseline
+enrichment adds existing GPU device nodes as read-write paths and promotes
+`/proc` to read-write because CUDA workloads write thread metadata under
+`/proc/<pid>/task/<tid>/comm`.
+
 ## Network Decisions
 
 Ordinary network traffic follows this order:
