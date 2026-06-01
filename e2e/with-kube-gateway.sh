@@ -512,8 +512,9 @@ fi
 # every gateway K8s call 404s and CreateSandbox never produces a Pod.
 echo "Installing agent-sandbox CRDs and controller..."
 kctl apply -f "${ROOT}/deploy/kube/manifests/agent-sandbox.yaml"
+kctl apply -f "${ROOT}/deploy/kube/manifests/agent-sandbox-extensions.yaml"
 kctl wait --for=condition=Established crd/sandboxes.agents.x-k8s.io --timeout=120s
-kctl -n agent-sandbox-system rollout status statefulset/agent-sandbox-controller --timeout=300s
+kctl -n agent-sandbox-system rollout status deployment/agent-sandbox-controller --timeout=300s
 
 helm_extra_args=()
 if [ -n "${HOST_GATEWAY_IP}" ]; then

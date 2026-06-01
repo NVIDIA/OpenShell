@@ -2,108 +2,26 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Bundled from upstream agent-sandbox v0.4.6:
-# https://github.com/kubernetes-sigs/agent-sandbox/releases/download/v0.4.6/manifest.yaml
-# Do not edit by hand. To refresh, replace with the upstream manifest for the
+# https://github.com/kubernetes-sigs/agent-sandbox/releases/download/v0.4.6/extensions.yaml
+# Do not edit by hand. To refresh, replace with the upstream extensions for the
 # new tag and update the URL above.
 
----
-kind: Namespace
-apiVersion: v1
-metadata:
-  name: agent-sandbox-system
-
----
-
-kind: ServiceAccount
-apiVersion: v1
-metadata:
-  name: agent-sandbox-controller
-  namespace: agent-sandbox-system
-  labels:
-    app: agent-sandbox-controller
-
----
-
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: agent-sandbox-controller
-subjects:
-- kind: ServiceAccount
-  name: agent-sandbox-controller
-  namespace: agent-sandbox-system
-roleRef:
-  kind: ClusterRole
-  name: agent-sandbox-controller
-  apiGroup: rbac.authorization.k8s.io
-
----
-
-kind: Service
-apiVersion: v1
-metadata:
-  name: agent-sandbox-controller
-  namespace: agent-sandbox-system
-  labels:
-    app: agent-sandbox-controller
-spec:
-  selector:
-    app: agent-sandbox-controller
-  ports:
-  - name: metrics
-    port: 8080
-    targetPort: metrics
-    protocol: TCP
-
----
-
-kind: Deployment
-apiVersion: apps/v1
-metadata:
-  name: agent-sandbox-controller
-  namespace: agent-sandbox-system
-  labels:
-    app: agent-sandbox-controller
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: agent-sandbox-controller
-  template:
-    metadata:
-      labels:
-        app: agent-sandbox-controller
-    spec:
-      serviceAccountName: agent-sandbox-controller
-      containers:
-      - name: agent-sandbox-controller
-        image: registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.4.6
-        args:
-        - --leader-elect=true
-        ports:
-        - name: metrics
-          containerPort: 8080
-          protocol: TCP
-        - name: healthz
-          containerPort: 8081
-          protocol: TCP
----
 ---
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
     controller-gen.kubebuilder.io/version: v0.19.0
-  name: sandboxes.agents.x-k8s.io
+  name: sandboxclaims.extensions.agents.x-k8s.io
 spec:
-  group: agents.x-k8s.io
+  group: extensions.agents.x-k8s.io
   names:
-    kind: Sandbox
-    listKind: SandboxList
-    plural: sandboxes
+    kind: SandboxClaim
+    listKind: SandboxClaimList
+    plural: sandboxclaims
     shortNames:
-    - sandbox
-    singular: sandbox
+    - sandboxclaim
+    singular: sandboxclaim
   scope: Namespaced
   versions:
   - name: v1alpha1
@@ -118,6 +36,346 @@ spec:
             type: object
           spec:
             properties:
+              additionalPodMetadata:
+                properties:
+                  annotations:
+                    additionalProperties:
+                      type: string
+                    type: object
+                  labels:
+                    additionalProperties:
+                      type: string
+                    type: object
+                type: object
+              env:
+                items:
+                  properties:
+                    containerName:
+                      type: string
+                    name:
+                      type: string
+                    value:
+                      type: string
+                  required:
+                  - name
+                  - value
+                  type: object
+                type: array
+                x-kubernetes-list-type: atomic
+              lifecycle:
+                properties:
+                  shutdownPolicy:
+                    default: Retain
+                    enum:
+                    - Delete
+                    - DeleteForeground
+                    - Retain
+                    type: string
+                  shutdownTime:
+                    format: date-time
+                    type: string
+                  ttlSecondsAfterFinished:
+                    format: int32
+                    minimum: 0
+                    type: integer
+                type: object
+              sandboxTemplateRef:
+                properties:
+                  name:
+                    type: string
+                required:
+                - name
+                type: object
+              warmpool:
+                default: default
+                type: string
+            required:
+            - sandboxTemplateRef
+            type: object
+          status:
+            properties:
+              conditions:
+                items:
+                  properties:
+                    lastTransitionTime:
+                      format: date-time
+                      type: string
+                    message:
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              sandbox:
+                properties:
+                  name:
+                    type: string
+                  podIPs:
+                    items:
+                      type: string
+                    type: array
+                type: object
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+---
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.19.0
+  name: sandboxtemplates.extensions.agents.x-k8s.io
+spec:
+  group: extensions.agents.x-k8s.io
+  names:
+    kind: SandboxTemplate
+    listKind: SandboxTemplateList
+    plural: sandboxtemplates
+    shortNames:
+    - sandboxtemplate
+    singular: sandboxtemplate
+  scope: Namespaced
+  versions:
+  - name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        properties:
+          apiVersion:
+            type: string
+          kind:
+            type: string
+          metadata:
+            type: object
+          spec:
+            properties:
+              envVarsInjectionPolicy:
+                default: Disallowed
+                enum:
+                - Allowed
+                - Overrides
+                - Disallowed
+                type: string
+              networkPolicy:
+                properties:
+                  egress:
+                    items:
+                      properties:
+                        ports:
+                          items:
+                            properties:
+                              endPort:
+                                format: int32
+                                type: integer
+                              port:
+                                anyOf:
+                                - type: integer
+                                - type: string
+                                x-kubernetes-int-or-string: true
+                              protocol:
+                                type: string
+                            type: object
+                          type: array
+                          x-kubernetes-list-type: atomic
+                        to:
+                          items:
+                            properties:
+                              ipBlock:
+                                properties:
+                                  cidr:
+                                    type: string
+                                  except:
+                                    items:
+                                      type: string
+                                    type: array
+                                    x-kubernetes-list-type: atomic
+                                required:
+                                - cidr
+                                type: object
+                              namespaceSelector:
+                                properties:
+                                  matchExpressions:
+                                    items:
+                                      properties:
+                                        key:
+                                          type: string
+                                        operator:
+                                          type: string
+                                        values:
+                                          items:
+                                            type: string
+                                          type: array
+                                          x-kubernetes-list-type: atomic
+                                      required:
+                                      - key
+                                      - operator
+                                      type: object
+                                    type: array
+                                    x-kubernetes-list-type: atomic
+                                  matchLabels:
+                                    additionalProperties:
+                                      type: string
+                                    type: object
+                                type: object
+                                x-kubernetes-map-type: atomic
+                              podSelector:
+                                properties:
+                                  matchExpressions:
+                                    items:
+                                      properties:
+                                        key:
+                                          type: string
+                                        operator:
+                                          type: string
+                                        values:
+                                          items:
+                                            type: string
+                                          type: array
+                                          x-kubernetes-list-type: atomic
+                                      required:
+                                      - key
+                                      - operator
+                                      type: object
+                                    type: array
+                                    x-kubernetes-list-type: atomic
+                                  matchLabels:
+                                    additionalProperties:
+                                      type: string
+                                    type: object
+                                type: object
+                                x-kubernetes-map-type: atomic
+                            type: object
+                          type: array
+                          x-kubernetes-list-type: atomic
+                      type: object
+                    type: array
+                  ingress:
+                    items:
+                      properties:
+                        from:
+                          items:
+                            properties:
+                              ipBlock:
+                                properties:
+                                  cidr:
+                                    type: string
+                                  except:
+                                    items:
+                                      type: string
+                                    type: array
+                                    x-kubernetes-list-type: atomic
+                                required:
+                                - cidr
+                                type: object
+                              namespaceSelector:
+                                properties:
+                                  matchExpressions:
+                                    items:
+                                      properties:
+                                        key:
+                                          type: string
+                                        operator:
+                                          type: string
+                                        values:
+                                          items:
+                                            type: string
+                                          type: array
+                                          x-kubernetes-list-type: atomic
+                                      required:
+                                      - key
+                                      - operator
+                                      type: object
+                                    type: array
+                                    x-kubernetes-list-type: atomic
+                                  matchLabels:
+                                    additionalProperties:
+                                      type: string
+                                    type: object
+                                type: object
+                                x-kubernetes-map-type: atomic
+                              podSelector:
+                                properties:
+                                  matchExpressions:
+                                    items:
+                                      properties:
+                                        key:
+                                          type: string
+                                        operator:
+                                          type: string
+                                        values:
+                                          items:
+                                            type: string
+                                          type: array
+                                          x-kubernetes-list-type: atomic
+                                      required:
+                                      - key
+                                      - operator
+                                      type: object
+                                    type: array
+                                    x-kubernetes-list-type: atomic
+                                  matchLabels:
+                                    additionalProperties:
+                                      type: string
+                                    type: object
+                                type: object
+                                x-kubernetes-map-type: atomic
+                            type: object
+                          type: array
+                          x-kubernetes-list-type: atomic
+                        ports:
+                          items:
+                            properties:
+                              endPort:
+                                format: int32
+                                type: integer
+                              port:
+                                anyOf:
+                                - type: integer
+                                - type: string
+                                x-kubernetes-int-or-string: true
+                              protocol:
+                                type: string
+                            type: object
+                          type: array
+                          x-kubernetes-list-type: atomic
+                      type: object
+                    type: array
+                type: object
+              networkPolicyManagement:
+                default: Managed
+                enum:
+                - Managed
+                - Unmanaged
+                type: string
               podTemplate:
                 properties:
                   metadata:
@@ -3920,23 +4178,8 @@ spec:
                 required:
                 - spec
                 type: object
-              replicas:
-                default: 1
-                format: int32
-                maximum: 1
-                minimum: 0
-                type: integer
               service:
                 type: boolean
-              shutdownPolicy:
-                default: Retain
-                enum:
-                - Delete
-                - Retain
-                type: string
-              shutdownTime:
-                format: date-time
-                type: string
               volumeClaimTemplates:
                 items:
                   properties:
@@ -4050,56 +4293,85 @@ spec:
             - podTemplate
             type: object
           status:
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+---
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.19.0
+  name: sandboxwarmpools.extensions.agents.x-k8s.io
+spec:
+  group: extensions.agents.x-k8s.io
+  names:
+    kind: SandboxWarmPool
+    listKind: SandboxWarmPoolList
+    plural: sandboxwarmpools
+    shortNames:
+    - swp
+    singular: sandboxwarmpool
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.readyReplicas
+      name: Ready
+      type: integer
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        properties:
+          apiVersion:
+            type: string
+          kind:
+            type: string
+          metadata:
+            type: object
+          spec:
             properties:
-              conditions:
-                items:
-                  properties:
-                    lastTransitionTime:
-                      format: date-time
-                      type: string
-                    message:
-                      maxLength: 32768
-                      type: string
-                    observedGeneration:
-                      format: int64
-                      minimum: 0
-                      type: integer
-                    reason:
-                      maxLength: 1024
-                      minLength: 1
-                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
-                      type: string
-                    status:
-                      enum:
-                      - "True"
-                      - "False"
-                      - Unknown
-                      type: string
-                    type:
-                      maxLength: 316
-                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
-                      type: string
-                  required:
-                  - lastTransitionTime
-                  - message
-                  - reason
-                  - status
-                  - type
-                  type: object
-                type: array
-              podIPs:
-                items:
-                  type: string
-                type: array
               replicas:
                 format: int32
                 minimum: 0
                 type: integer
+              sandboxTemplateRef:
+                properties:
+                  name:
+                    type: string
+                required:
+                - name
+                type: object
+              updateStrategy:
+                properties:
+                  type:
+                    default: OnReplenish
+                    enum:
+                    - Recreate
+                    - OnReplenish
+                    type: string
+                type: object
+            required:
+            - replicas
+            - sandboxTemplateRef
+            type: object
+          status:
+            properties:
+              readyReplicas:
+                format: int32
+                type: integer
+              replicas:
+                format: int32
+                type: integer
               selector:
-                type: string
-              service:
-                type: string
-              serviceFQDN:
                 type: string
             type: object
         required:
@@ -4118,22 +4390,27 @@ spec:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: agent-sandbox-controller
+  name: agent-sandbox-controller-extensions
 rules:
 - apiGroups:
   - ""
   resources:
-  - persistentvolumeclaims
   - pods
-  - services
   verbs:
-  - create
-  - delete
   - get
   - list
   - patch
   - update
   - watch
+- apiGroups:
+  - ""
+  - events.k8s.io
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+  - update
 - apiGroups:
   - agents.x-k8s.io
   resources:
@@ -4147,30 +4424,102 @@ rules:
   - update
   - watch
 - apiGroups:
-  - agents.x-k8s.io
-  resources:
-  - sandboxes/finalizers
-  - sandboxes/status
-  verbs:
-  - get
-  - patch
-  - update
-- apiGroups:
   - coordination.k8s.io
   resources:
   - leases
   verbs:
   - create
+  - delete
   - get
   - list
   - patch
   - update
   - watch
 - apiGroups:
-  - events.k8s.io
+  - extensions.agents.x-k8s.io
   resources:
-  - events
+  - sandboxclaims
+  - sandboxtemplates
+  - sandboxwarmpools
   verbs:
   - create
+  - delete
+  - get
+  - list
   - patch
+  - update
+  - watch
+- apiGroups:
+  - extensions.agents.x-k8s.io
+  resources:
+  - sandboxclaims/finalizers
+  - sandboxclaims/status
+  - sandboxtemplates/finalizers
+  - sandboxtemplates/status
+  - sandboxwarmpools/finalizers
+  - sandboxwarmpools/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - networking.k8s.io
+  resources:
+  - networkpolicies
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+---
+---
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  name: agent-sandbox-controller
+  namespace: agent-sandbox-system
+  labels:
+    app: agent-sandbox-controller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agent-sandbox-controller
+  template:
+    metadata:
+      labels:
+        app: agent-sandbox-controller
+    spec:
+      serviceAccountName: agent-sandbox-controller
+      containers:
+      - name: agent-sandbox-controller
+        image: registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.4.6
+        args:
+        - "--leader-elect=true"
+        - "--extensions"
+        ports:
+        - name: metrics
+          containerPort: 8080
+          protocol: TCP
+        - name: healthz
+          containerPort: 8081
+          protocol: TCP
+---
+---
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: agent-sandbox-controller-extensions
+subjects:
+- kind: ServiceAccount
+  name: agent-sandbox-controller
+  namespace: agent-sandbox-system
+roleRef:
+  kind: ClusterRole
+  name: agent-sandbox-controller-extensions
+  apiGroup: rbac.authorization.k8s.io
 ---
