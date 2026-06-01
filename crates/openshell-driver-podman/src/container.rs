@@ -375,8 +375,8 @@ fn podman_pids_limit(value: i64) -> Option<i64> {
 
 /// Build CDI GPU device list if GPU is requested.
 fn build_devices(sandbox: &DriverSandbox) -> Option<Vec<LinuxDevice>> {
-    let spec = sandbox.spec.as_ref()?;
-    cdi_gpu_device_ids(spec.gpu, &spec.gpu_device).map(|device_ids| {
+    let gpu = sandbox.spec.as_ref().and_then(|spec| spec.gpu.as_ref());
+    cdi_gpu_device_ids(gpu).map(|device_ids| {
         device_ids
             .into_iter()
             .map(|path| LinuxDevice { path })
@@ -801,11 +801,11 @@ mod tests {
     #[test]
     fn container_spec_maps_empty_gpu_request_to_all_cdi_device() {
         use openshell_core::config::CDI_GPU_DEVICE_ALL;
-        use openshell_core::proto::compute::v1::DriverSandboxSpec;
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, GpuRequestSpec};
 
         let mut sandbox = test_sandbox("test-id", "test-name");
         sandbox.spec = Some(DriverSandboxSpec {
-            gpu: true,
+            gpu: Some(GpuRequestSpec { device_id: vec![] }),
             ..Default::default()
         });
         let config = test_config();
@@ -819,12 +819,13 @@ mod tests {
 
     #[test]
     fn container_spec_passes_explicit_cdi_device_id_through() {
-        use openshell_core::proto::compute::v1::DriverSandboxSpec;
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, GpuRequestSpec};
 
         let mut sandbox = test_sandbox("test-id", "test-name");
         sandbox.spec = Some(DriverSandboxSpec {
-            gpu: true,
-            gpu_device: "nvidia.com/gpu=0".to_string(),
+            gpu: Some(GpuRequestSpec {
+                device_id: vec!["nvidia.com/gpu=0".to_string()],
+            }),
             ..Default::default()
         });
         let config = test_config();
@@ -881,6 +882,34 @@ mod tests {
         assert!(
             !dropped.contains(&"ALL"),
             "must not use cap_drop:ALL in rootless Podman"
+        );
+    }
+
+    #[test]
+    fn container_spec_uses_secret_env_not_plaintext() {
+        let sandbox = test_sandbox("test-id", "test-name");
+        let config = test_config();
+        let spec = build_container_spec(&sandbox, &config);
+
+        // The handshake secret must NOT appear in the plaintext env map.
+        let env_map = spec["env"].as_object().expect("env should be an object");
+        assert!(
+            !env_map.contains_key("OPENSHELL_SSH_HANDSHAKE_SECRET"),
+            "handshake secret should not be in plaintext env"
+        );
+
+        // It should appear in secret_env (the libpod env-type secret map) instead.
+        let secret_env = spec["secret_env"]
+            .as_object()
+            .expect("secret_env should be an object");
+        assert!(
+            secret_env.contains_key("OPENSHELL_SSH_HANDSHAKE_SECRET"),
+            "secret_env should map OPENSHELL_SSH_HANDSHAKE_SECRET to its secret name"
+        );
+        assert_eq!(
+            secret_env["OPENSHELL_SSH_HANDSHAKE_SECRET"].as_str(),
+            Some("openshell-handshake-test-id"),
+            "secret_env value should be the Podman secret name for the sandbox"
         );
     }
 
