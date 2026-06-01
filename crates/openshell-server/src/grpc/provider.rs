@@ -440,6 +440,14 @@ pub(super) async fn resolve_provider_environment(
             .ok_or_else(|| Status::failed_precondition(format!("provider '{name}' not found")))?;
 
         for (key, value) in &provider.credentials {
+            if is_non_injectable_provider_credential(&provider, key) {
+                warn!(
+                    provider_name = %name,
+                    key = %key,
+                    "skipping non-injectable provider credential"
+                );
+                continue;
+            }
             if is_valid_env_key(key) {
                 let expires_at_ms = provider
                     .credential_expires_at_ms
@@ -465,6 +473,55 @@ pub(super) async fn resolve_provider_environment(
                     key = %key,
                     "skipping credential with invalid env var key"
                 );
+            }
+        }
+
+        // For Vertex AI providers, inject agent-specific config env vars so that
+        // Claude Code, Goose, and OpenCode inside the sandbox can reach Vertex AI
+        // without additional configuration. Credentials from the loop above take
+        // precedence via entry().or_insert(), and sandbox --env overrides are
+        // applied at the process level after this environment is installed, so
+        // they naturally shadow these values.
+        if openshell_core::inference::normalize_inference_provider_type(&provider.r#type)
+            == Some("google-vertex-ai")
+        {
+            let project_id = provider
+                .config
+                .get(openshell_core::inference::VERTEX_AI_PROJECT_ID_KEY)
+                .map(String::as_str)
+                .unwrap_or_default()
+                .trim();
+            let region = provider
+                .config
+                .get(openshell_core::inference::VERTEX_AI_REGION_KEY)
+                .map(String::as_str)
+                .unwrap_or_default()
+                .trim();
+
+            // Static flags -- always present for Vertex AI providers.
+            env.entry("CLAUDE_CODE_USE_VERTEX".to_string())
+                .or_insert_with(|| "1".to_string());
+            env.entry("GOOSE_PROVIDER".to_string())
+                .or_insert_with(|| "gcp_vertex_ai".to_string());
+
+            // Project ID derived vars.
+            if !project_id.is_empty() {
+                env.entry("ANTHROPIC_VERTEX_PROJECT_ID".to_string())
+                    .or_insert_with(|| project_id.to_string());
+                env.entry("GCP_PROJECT_ID".to_string())
+                    .or_insert_with(|| project_id.to_string());
+                env.entry("GOOGLE_CLOUD_PROJECT".to_string())
+                    .or_insert_with(|| project_id.to_string());
+            }
+
+            // Region derived vars.
+            if !region.is_empty() {
+                env.entry("CLOUD_ML_REGION".to_string())
+                    .or_insert_with(|| region.to_string());
+                env.entry("GCP_LOCATION".to_string())
+                    .or_insert_with(|| region.to_string());
+                env.entry("VERTEX_LOCATION".to_string())
+                    .or_insert_with(|| region.to_string());
             }
         }
     }
@@ -587,6 +644,7 @@ fn active_provider_credential_keys(provider: &Provider, now_ms: i64) -> Vec<Stri
     provider
         .credentials
         .keys()
+        .filter(|key| !is_non_injectable_provider_credential(provider, key))
         .filter(|key| is_valid_env_key(key))
         .filter(|key| {
             provider
@@ -596,6 +654,12 @@ fn active_provider_credential_keys(provider: &Provider, now_ms: i64) -> Vec<Stri
         })
         .cloned()
         .collect()
+}
+
+fn is_non_injectable_provider_credential(provider: &Provider, key: &str) -> bool {
+    openshell_core::inference::normalize_inference_provider_type(&provider.r#type)
+        == Some("google-vertex-ai")
+        && key == "GOOGLE_SERVICE_ACCOUNT_KEY"
 }
 
 pub(super) fn is_valid_env_key(key: &str) -> bool {
@@ -893,17 +957,7 @@ async fn provider_type_allows_empty_credentials_for_refresh(
     let Some(profile) = get_provider_type_profile(store, provider_type).await? else {
         return Ok(false);
     };
-    let required_credentials = profile
-        .credentials
-        .iter()
-        .filter(|credential| credential.required)
-        .collect::<Vec<_>>();
-    Ok(!required_credentials.is_empty()
-        && required_credentials.iter().all(|credential| {
-            credential.refresh.as_ref().is_some_and(|refresh| {
-                crate::provider_refresh::is_gateway_mintable_strategy(refresh.strategy)
-            })
-        }))
+    Ok(profile.allows_gateway_refresh_bootstrap())
 }
 
 async fn merged_provider_profiles(store: &Store) -> Result<Vec<ProviderTypeProfile>, Status> {
@@ -1617,7 +1671,10 @@ mod tests {
             .iter()
             .map(|profile| profile.id.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(ids, vec!["claude-code", "github", "nvidia"]);
+        assert_eq!(
+            ids,
+            vec!["claude-code", "github", "google-vertex-ai", "nvidia",]
+        );
 
         let github = response
             .profiles
@@ -1738,13 +1795,15 @@ mod tests {
 
     #[tokio::test]
     async fn import_provider_profile_allows_legacy_provider_type_ids_without_built_in_profiles() {
+        // Use an ID that is not a built-in profile to test legacy import.
+        // "custom-llm" is not registered as a built-in and never will be.
         let state = test_server_state().await;
         let response = handle_import_provider_profiles(
             &state,
             Request::new(ImportProviderProfilesRequest {
                 profiles: vec![ProviderProfileImportItem {
-                    profile: Some(custom_profile("codex")),
-                    source: "codex.yaml".to_string(),
+                    profile: Some(custom_profile("custom-llm")),
+                    source: "custom-llm.yaml".to_string(),
                 }],
             }),
         )
@@ -1758,15 +1817,15 @@ mod tests {
         let imported = handle_get_provider_profile(
             &state,
             Request::new(GetProviderProfileRequest {
-                id: "codex".to_string(),
+                id: "custom-llm".to_string(),
             }),
         )
         .await
         .unwrap()
         .into_inner()
         .profile
-        .expect("codex profile should be returned");
-        assert_eq!(imported.id, "codex");
+        .expect("custom-llm profile should be returned");
+        assert_eq!(imported.id, "custom-llm");
     }
 
     #[tokio::test]
@@ -2181,6 +2240,68 @@ mod tests {
             !provider_after_delete
                 .credential_expires_at_ms
                 .contains_key("MS_GRAPH_ACCESS_TOKEN")
+        );
+    }
+
+    #[tokio::test]
+    async fn configure_provider_refresh_accepts_vertex_service_account_token_key() {
+        let state = test_server_state().await;
+        create_provider_record(
+            state.store.as_ref(),
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "vertex-sa".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                r#type: "google-vertex-ai".to_string(),
+                credentials: std::iter::once((
+                    "GOOGLE_SERVICE_ACCOUNT_KEY".to_string(),
+                    "{\"type\":\"service_account\"}".to_string(),
+                ))
+                .collect(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let response = handle_configure_provider_refresh(
+            &state,
+            Request::new(ConfigureProviderRefreshRequest {
+                provider: "vertex-sa".to_string(),
+                credential_key: "GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN".to_string(),
+                strategy: ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt as i32,
+                material: HashMap::from([
+                    (
+                        "client_email".to_string(),
+                        "sa@test-project.iam.gserviceaccount.com".to_string(),
+                    ),
+                    (
+                        "private_key".to_string(),
+                        "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----".to_string(),
+                    ),
+                ]),
+                secret_material_keys: vec!["private_key".to_string()],
+                expires_at_ms: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .status
+        .expect("status");
+
+        assert_eq!(
+            response.credential_key,
+            "GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN"
+        );
+        assert_eq!(
+            response.strategy,
+            ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt as i32
         );
     }
 
@@ -3053,6 +3174,26 @@ mod tests {
         .unwrap();
         assert!(optional_static_empty.credentials.is_empty());
 
+        let vertex_empty = create_provider_record(
+            store,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "vertex-no-token-yet".to_string(),
+                    created_at_ms: 1_000_000,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                r#type: "google-vertex-ai".to_string(),
+                credentials: HashMap::new(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(vertex_empty.credentials.is_empty());
+
         let get_err = get_provider_record(store, "").await.unwrap_err();
         assert_eq!(get_err.code(), Code::InvalidArgument);
 
@@ -3501,6 +3642,265 @@ mod tests {
         assert!(err.message().contains("SHARED_KEY"));
         assert!(err.message().contains("provider-a"));
         assert!(err.message().contains("provider-b"));
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_env_injects_vertex_agent_config() {
+        let store = test_store().await;
+        create_provider_record(
+            &store,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "vertex-local".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                r#type: "google-vertex-ai".to_string(),
+                credentials: std::iter::once((
+                    "GOOGLE_VERTEX_AI_TOKEN".to_string(),
+                    "ya29.token".to_string(),
+                ))
+                .collect(),
+                config: [
+                    (
+                        "VERTEX_AI_PROJECT_ID".to_string(),
+                        "my-gcp-project".to_string(),
+                    ),
+                    ("VERTEX_AI_REGION".to_string(), "us-central1".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+                credential_expires_at_ms: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let result = resolve_provider_environment(&store, &["vertex-local".to_string()])
+            .await
+            .unwrap();
+
+        // Credential still injected.
+        assert_eq!(
+            result.get("GOOGLE_VERTEX_AI_TOKEN"),
+            Some(&"ya29.token".to_string())
+        );
+        // Static flags.
+        assert_eq!(result.get("CLAUDE_CODE_USE_VERTEX"), Some(&"1".to_string()));
+        assert_eq!(
+            result.get("GOOSE_PROVIDER"),
+            Some(&"gcp_vertex_ai".to_string())
+        );
+        // Project ID derived vars.
+        assert_eq!(
+            result.get("ANTHROPIC_VERTEX_PROJECT_ID"),
+            Some(&"my-gcp-project".to_string())
+        );
+        assert_eq!(
+            result.get("GCP_PROJECT_ID"),
+            Some(&"my-gcp-project".to_string())
+        );
+        assert_eq!(
+            result.get("GOOGLE_CLOUD_PROJECT"),
+            Some(&"my-gcp-project".to_string())
+        );
+        // Region derived vars.
+        assert_eq!(
+            result.get("CLOUD_ML_REGION"),
+            Some(&"us-central1".to_string())
+        );
+        assert_eq!(result.get("GCP_LOCATION"), Some(&"us-central1".to_string()));
+        assert_eq!(
+            result.get("VERTEX_LOCATION"),
+            Some(&"us-central1".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_env_vertex_never_injects_service_account_key() {
+        let store = test_store().await;
+        create_provider_record(
+            &store,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "vertex-bootstrap".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                r#type: "google-vertex-ai".to_string(),
+                credentials: [
+                    (
+                        "GOOGLE_SERVICE_ACCOUNT_KEY".to_string(),
+                        r#"{"type":"service_account","private_key":"secret"}"#.to_string(),
+                    ),
+                    (
+                        "GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN".to_string(),
+                        "ya29.short-lived".to_string(),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let result = resolve_provider_environment(&store, &["vertex-bootstrap".to_string()])
+            .await
+            .unwrap();
+
+        assert!(!result.contains_key("GOOGLE_SERVICE_ACCOUNT_KEY"));
+        assert_eq!(
+            result.get("GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN"),
+            Some(&"ya29.short-lived".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_env_vertex_omits_agent_config_when_project_and_region_absent() {
+        let store = test_store().await;
+        create_provider_record(
+            &store,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "vertex-no-config".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                r#type: "google-vertex-ai".to_string(),
+                credentials: std::iter::once((
+                    "GOOGLE_VERTEX_AI_TOKEN".to_string(),
+                    "ya29.token".to_string(),
+                ))
+                .collect(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let result = resolve_provider_environment(&store, &["vertex-no-config".to_string()])
+            .await
+            .unwrap();
+
+        // Static flags still present.
+        assert_eq!(result.get("CLAUDE_CODE_USE_VERTEX"), Some(&"1".to_string()));
+        assert_eq!(
+            result.get("GOOSE_PROVIDER"),
+            Some(&"gcp_vertex_ai".to_string())
+        );
+        // Project ID and region derived vars are absent.
+        assert!(!result.contains_key("ANTHROPIC_VERTEX_PROJECT_ID"));
+        assert!(!result.contains_key("GCP_PROJECT_ID"));
+        assert!(!result.contains_key("GOOGLE_CLOUD_PROJECT"));
+        assert!(!result.contains_key("CLOUD_ML_REGION"));
+        assert!(!result.contains_key("GCP_LOCATION"));
+        assert!(!result.contains_key("VERTEX_LOCATION"));
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_env_vertex_credential_wins_over_agent_config_key() {
+        // If a credential happens to share a name with one of the injected agent
+        // config keys, the credential value takes precedence because the credential
+        // loop runs first and entry().or_insert() does not overwrite.
+        let store = test_store().await;
+        create_provider_record(
+            &store,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "vertex-collision".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                r#type: "google-vertex-ai".to_string(),
+                credentials: [
+                    (
+                        "GOOGLE_VERTEX_AI_TOKEN".to_string(),
+                        "ya29.token".to_string(),
+                    ),
+                    // Same key as the injected static flag.
+                    (
+                        "CLAUDE_CODE_USE_VERTEX".to_string(),
+                        "custom-value".to_string(),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+                config: [
+                    ("VERTEX_AI_PROJECT_ID".to_string(), "my-project".to_string()),
+                    ("VERTEX_AI_REGION".to_string(), "us-east1".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+                credential_expires_at_ms: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let result = resolve_provider_environment(&store, &["vertex-collision".to_string()])
+            .await
+            .unwrap();
+
+        // Credential value wins over the injected "1".
+        assert_eq!(
+            result.get("CLAUDE_CODE_USE_VERTEX"),
+            Some(&"custom-value".to_string())
+        );
+        // Other injected vars are still present.
+        assert_eq!(
+            result.get("GOOSE_PROVIDER"),
+            Some(&"gcp_vertex_ai".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_env_non_vertex_provider_does_not_inject_agent_config() {
+        let store = test_store().await;
+        create_provider_record(
+            &store,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "openai-local".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                r#type: "openai".to_string(),
+                credentials: std::iter::once(("OPENAI_API_KEY".to_string(), "sk-test".to_string()))
+                    .collect(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let result = resolve_provider_environment(&store, &["openai-local".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(result.get("OPENAI_API_KEY"), Some(&"sk-test".to_string()));
+        assert!(!result.contains_key("CLAUDE_CODE_USE_VERTEX"));
+        assert!(!result.contains_key("GOOSE_PROVIDER"));
+        assert!(!result.contains_key("ANTHROPIC_VERTEX_PROJECT_ID"));
+        assert!(!result.contains_key("GCP_PROJECT_ID"));
+        assert!(!result.contains_key("GOOGLE_CLOUD_PROJECT"));
+        assert!(!result.contains_key("CLOUD_ML_REGION"));
+        assert!(!result.contains_key("GCP_LOCATION"));
+        assert!(!result.contains_key("VERTEX_LOCATION"));
     }
 
     #[tokio::test]

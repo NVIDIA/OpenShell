@@ -17,6 +17,8 @@ navigation:
     skip-slug: true
 - folder: sandboxes
   title: "Manage OpenShell"
+- folder: providers
+  title: "Providers"
 - folder: observability
   title: "Observability"
 - folder: kubernetes

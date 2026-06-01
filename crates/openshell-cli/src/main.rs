@@ -716,7 +716,7 @@ impl From<CliEditor> for openshell_cli::ssh::Editor {
 #[derive(Subcommand, Debug)]
 enum ProviderCommands {
     /// Create a provider config.
-    #[command(group = clap::ArgGroup::new("cred_source").required(true).args(["from_existing", "credentials"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    #[command(group = clap::ArgGroup::new("cred_source").required(true).args(["from_existing", "credentials", "from_gcloud_adc"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Create {
         /// Provider name.
         #[arg(long)]
@@ -727,16 +727,22 @@ enum ProviderCommands {
         provider_type: String,
 
         /// Load provider credentials/config from existing local state.
-        #[arg(long, conflicts_with = "credentials")]
+        #[arg(long, conflicts_with_all = ["credentials", "from_gcloud_adc"])]
         from_existing: bool,
 
         /// Provider credential pair (`KEY=VALUE`) or env lookup key (`KEY`).
         #[arg(
             long = "credential",
             value_name = "KEY[=VALUE]",
-            conflicts_with = "from_existing"
+            conflicts_with_all = ["from_existing", "from_gcloud_adc"]
         )]
         credentials: Vec<String>,
+
+        /// Configure credentials from gcloud Application Default Credentials
+        /// (`~/.config/gcloud/application_default_credentials.json`).
+        /// Only valid for google-vertex-ai providers.
+        #[arg(long, group = "cred_source", conflicts_with_all = ["from_existing", "credentials"])]
+        from_gcloud_adc: bool,
 
         /// Provider config key/value pair.
         #[arg(long = "config", value_name = "KEY=VALUE")]
@@ -2628,7 +2634,7 @@ async fn main() -> Result<()> {
                     apply_auth(&mut tls, &ctx.name);
                     let sandbox_dest = dest.as_deref();
                     let local = std::path::Path::new(&local_path);
-                    if !run::local_upload_path_exists(local) {
+                    if !local.exists() {
                         return Err(miette::miette!(
                             "local path does not exist: {}",
                             local.display()
@@ -2636,10 +2642,7 @@ async fn main() -> Result<()> {
                     }
                     let dest_display = sandbox_dest.unwrap_or("~");
                     eprintln!("Uploading {} -> sandbox:{}", local.display(), dest_display);
-                    if !no_git_ignore
-                        && !run::local_upload_path_is_symlink(local)
-                        && let Ok((base_dir, files)) = run::git_sync_files(local)
-                    {
+                    if !no_git_ignore && let Ok((base_dir, files)) = run::git_sync_files(local) {
                         run::sandbox_sync_up_files(
                             &ctx.endpoint,
                             &name,
@@ -2789,6 +2792,7 @@ async fn main() -> Result<()> {
                     provider_type,
                     from_existing,
                     credentials,
+                    from_gcloud_adc,
                     config,
                 } => {
                     run::provider_create(
@@ -2797,6 +2801,7 @@ async fn main() -> Result<()> {
                         provider_type.as_str(),
                         from_existing,
                         &credentials,
+                        from_gcloud_adc,
                         &config,
                         &tls,
                     )
@@ -3827,6 +3832,47 @@ mod tests {
             }
             other => panic!("expected provider create command, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn provider_create_rejects_from_gcloud_adc_with_from_existing() {
+        let err = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "create",
+            "--name",
+            "vertex-local",
+            "--type",
+            "google-vertex-ai",
+            "--from-existing",
+            "--from-gcloud-adc",
+        ])
+        .expect_err("clap should reject conflicting credential sources");
+
+        let msg = err.to_string();
+        assert!(msg.contains("--from-existing"));
+        assert!(msg.contains("--from-gcloud-adc"));
+    }
+
+    #[test]
+    fn provider_create_rejects_from_gcloud_adc_with_credential() {
+        let err = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "create",
+            "--name",
+            "vertex-local",
+            "--type",
+            "google-vertex-ai",
+            "--from-gcloud-adc",
+            "--credential",
+            "GOOGLE_VERTEX_AI_TOKEN=token",
+        ])
+        .expect_err("clap should reject conflicting credential sources");
+
+        let msg = err.to_string();
+        assert!(msg.contains("--credential"));
+        assert!(msg.contains("--from-gcloud-adc"));
     }
 
     #[test]

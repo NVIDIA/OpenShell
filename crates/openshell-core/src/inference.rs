@@ -61,6 +61,13 @@ const OPENAI_PROTOCOLS: &[&str] = &[
 
 const ANTHROPIC_PROTOCOLS: &[&str] = &["anthropic_messages", "model_discovery"];
 
+/// Default protocol set for the Vertex AI profile. These are overridden at route
+/// resolution time in `resolve_vertex_ai_route`: Anthropic models use
+/// `anthropic_messages`, while Gemini and other models use the OpenAI-compatible
+/// endpoint with `openai_chat_completions`. This default applies only to the
+/// base-URL-override escape hatch path.
+const VERTEX_AI_PROTOCOLS: &[&str] = &["anthropic_messages", "model_discovery"];
+
 static OPENAI_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
     provider_type: "openai",
     default_base_url: "https://api.openai.com/v1",
@@ -83,6 +90,59 @@ static ANTHROPIC_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
     passthrough_headers: &["anthropic-version", "anthropic-beta"],
 };
 
+/// Credential environment variable names for the Vertex AI provider, in priority order.
+///
+/// These are referenced by both the provider discovery logic in `openshell-providers`
+/// and the inference profile here so both crates agree on which env vars hold credentials.
+pub const VERTEX_AI_CREDENTIAL_KEY_NAMES: &[&str] = &[
+    "GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN",
+    "VERTEX_AI_SERVICE_ACCOUNT_TOKEN",
+    "GOOGLE_VERTEX_AI_TOKEN",
+    "VERTEX_AI_TOKEN",
+];
+
+/// The credential key used for tokens minted from gcloud Application Default Credentials.
+///
+/// This is the key written by the gateway's `OAuth2` refresh worker when using the
+/// `--from-gcloud-adc` CLI flow. It must match `VERTEX_AI_CREDENTIAL_KEY_NAMES[2]`.
+pub const VERTEX_AI_ADC_TOKEN_KEY: &str = "GOOGLE_VERTEX_AI_TOKEN";
+
+/// GCP project ID config key for Vertex AI providers.
+pub const VERTEX_AI_PROJECT_ID_KEY: &str = "VERTEX_AI_PROJECT_ID";
+
+/// GCP region/location config key for Vertex AI providers.
+pub const VERTEX_AI_REGION_KEY: &str = "VERTEX_AI_REGION";
+
+/// Publisher override config key for Vertex AI providers.
+///
+/// Set to `"anthropic"` to force Anthropic Messages API routing regardless of model name,
+/// or any other value to force OpenAI-compatible routing.
+pub const VERTEX_AI_PUBLISHER_KEY: &str = "VERTEX_AI_PUBLISHER";
+
+/// Config key names scanned during provider discovery, in addition to credential keys.
+///
+/// These are referenced by the provider discovery plugin in `openshell-providers` to
+/// collect Vertex AI config from the environment during `--from-existing` flows.
+pub const VERTEX_AI_CONFIG_KEY_NAMES: &[&str] = &[
+    VERTEX_AI_PROJECT_ID_KEY,
+    VERTEX_AI_REGION_KEY,
+    "GOOGLE_VERTEX_AI_BASE_URL",
+    "VERTEX_AI_BASE_URL",
+    VERTEX_AI_PUBLISHER_KEY,
+];
+
+static VERTEX_AI_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
+    provider_type: "google-vertex-ai",
+    // Base URL is project/region specific and built at route resolution time.
+    default_base_url: "",
+    protocols: VERTEX_AI_PROTOCOLS,
+    credential_key_names: VERTEX_AI_CREDENTIAL_KEY_NAMES,
+    base_url_config_keys: &["GOOGLE_VERTEX_AI_BASE_URL", "VERTEX_AI_BASE_URL"],
+    auth: AuthHeader::Bearer,
+    default_headers: &[],
+    passthrough_headers: &[],
+};
+
 static NVIDIA_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
     provider_type: "nvidia",
     default_base_url: "https://integrate.api.nvidia.com/v1",
@@ -94,15 +154,35 @@ static NVIDIA_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
     passthrough_headers: &["x-model-id"],
 };
 
+/// Canonicalize an inference provider type string to a well-known identifier.
+///
+/// Returns `Some(canonical_name)` for recognized inference providers,
+/// `None` for unrecognized inputs. This is the single source of truth for
+/// Vertex AI (and other inference provider) alias resolution so that both
+/// [`profile_for`] and `openshell-providers` normalization agree.
+#[must_use]
+pub fn normalize_inference_provider_type(input: &str) -> Option<&'static str> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "openai" => Some("openai"),
+        "anthropic" => Some("anthropic"),
+        "nvidia" => Some("nvidia"),
+        "google-vertex-ai" | "vertex" | "vertex-ai" | "google-vertex" | "gcp-vertex" => {
+            Some("google-vertex-ai")
+        }
+        _ => None,
+    }
+}
+
 /// Look up the inference provider profile for a given provider type.
 ///
 /// Returns `None` for provider types that don't support inference routing
 /// (e.g. `github`, `gitlab`, `outlook`).
 pub fn profile_for(provider_type: &str) -> Option<&'static InferenceProviderProfile> {
-    match provider_type.trim().to_ascii_lowercase().as_str() {
+    match normalize_inference_provider_type(provider_type)? {
         "openai" => Some(&OPENAI_PROFILE),
         "anthropic" => Some(&ANTHROPIC_PROFILE),
         "nvidia" => Some(&NVIDIA_PROFILE),
+        "google-vertex-ai" => Some(&VERTEX_AI_PROFILE),
         _ => None,
     }
 }
@@ -140,6 +220,28 @@ pub fn route_headers_for_provider_type(
             (profile.auth.clone(), headers, passthrough_headers)
         },
     )
+}
+
+/// Derive routing header policy for a specific resolved route.
+///
+/// Most providers only need their provider type. Vertex AI is special because
+/// Claude routes should forward `anthropic-beta`, while Gemini/OpenAI-compatible
+/// routes should not inherit Anthropic passthrough headers.
+pub fn route_headers_for_route(
+    provider_type: &str,
+    protocols: &[String],
+) -> (AuthHeader, Vec<(String, String)>, Vec<String>) {
+    let (auth, headers, mut passthrough_headers) = route_headers_for_provider_type(provider_type);
+    if profile_for(provider_type).is_some_and(|profile| profile.provider_type == "google-vertex-ai")
+    {
+        let is_vertex_anthropic = protocols
+            .iter()
+            .any(|protocol| protocol == "anthropic_messages");
+        if is_vertex_anthropic && !passthrough_headers.iter().any(|h| h == "anthropic-beta") {
+            passthrough_headers.push("anthropic-beta".to_string());
+        }
+    }
+    (auth, headers, passthrough_headers)
 }
 
 // ---------------------------------------------------------------------------
@@ -248,6 +350,37 @@ mod tests {
         let (auth, headers) = auth_for_provider_type("openai");
         assert_eq!(auth, AuthHeader::Bearer);
         assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn profile_for_vertex_types() {
+        for key in &["google-vertex-ai", "vertex", "vertex-ai"] {
+            let profile = profile_for(key).expect("vertex profile should be Some");
+            assert_eq!(profile.provider_type, "google-vertex-ai");
+        }
+    }
+
+    #[test]
+    fn auth_for_vertex_uses_bearer() {
+        let (auth, headers) = auth_for_provider_type("google-vertex-ai");
+        assert_eq!(auth, AuthHeader::Bearer);
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn route_headers_for_vertex_anthropic_route_forward_beta_only() {
+        let (_, headers, passthrough_headers) =
+            route_headers_for_route("google-vertex-ai", &["anthropic_messages".to_string()]);
+        assert!(headers.is_empty());
+        assert_eq!(passthrough_headers, vec!["anthropic-beta".to_string()]);
+    }
+
+    #[test]
+    fn route_headers_for_vertex_openai_route_do_not_forward_anthropic_headers() {
+        let (_, headers, passthrough_headers) =
+            route_headers_for_route("google-vertex-ai", &["openai_chat_completions".to_string()]);
+        assert!(headers.is_empty());
+        assert!(passthrough_headers.is_empty());
     }
 
     #[test]

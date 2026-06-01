@@ -55,7 +55,7 @@ Providers v2 currently includes these user-facing features:
 - `openshell provider list-profiles` with table, YAML, and JSON output.
 - `openshell provider profile export`, `import`, `lint`, and `delete` for custom profiles.
 - Provider instances created from built-in or imported profile IDs with `openshell provider create --type <id>`.
-- Profile-backed credential discovery for explicit `openshell provider create --from-existing` and `openshell provider update --from-existing` flows.
+- Profile-backed credential discovery for explicit `openshell provider create --from-existing` and `openshell provider update --from-existing` flows. The built-in `google-vertex-ai` profile also supplements discovery with Vertex config env vars such as `VERTEX_AI_PROJECT_ID` and `VERTEX_AI_REGION`.
 - Just-in-time effective policy composition from sandbox policy plus attached provider profiles.
 - Runtime sandbox provider lifecycle commands under `openshell sandbox provider list|attach|detach`.
 - Credential refresh configuration with `openshell provider refresh status|configure|rotate|delete`.
@@ -94,6 +94,7 @@ Built-in Providers v2 profiles currently include:
 |---|---|---|
 | `claude-code` | `agent` | `ANTHROPIC_API_KEY`, `CLAUDE_API_KEY` |
 | `github` | `source_control` | `GITHUB_TOKEN`, `GH_TOKEN` |
+| `google-vertex-ai` | `inference` | `GOOGLE_SERVICE_ACCOUNT_KEY`, `GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN`, `VERTEX_AI_SERVICE_ACCOUNT_TOKEN`, `GOOGLE_VERTEX_AI_TOKEN`, `VERTEX_AI_TOKEN` |
 | `nvidia` | `inference` | `NVIDIA_API_KEY` |
 
 Export a built-in profile as YAML:
