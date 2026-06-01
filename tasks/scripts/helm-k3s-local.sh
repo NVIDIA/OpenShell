@@ -136,8 +136,10 @@ merge_kubeconfig() {
 apply_base_manifests() {
   require_kubectl
   local manifest="${ROOT}/deploy/kube/manifests/agent-sandbox.yaml"
+  local extensions="${ROOT}/deploy/kube/manifests/agent-sandbox-extensions.yaml"
   echo "Applying agent-sandbox manifests..."
   kubectl --kubeconfig="${KUBECONFIG_TARGET}" apply -f "${manifest}"
+  kubectl --kubeconfig="${KUBECONFIG_TARGET}" apply -f "${extensions}"
 }
 
 configure_ghcr_credentials() {
