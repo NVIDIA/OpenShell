@@ -342,7 +342,7 @@ async fn run_networking(
     // tracing events for direct connection attempts that bypass the proxy.
     #[cfg(target_os = "linux")]
     let bypass_monitor_handle = netns.and_then(|ns| {
-        openshell_supervisor_process::bypass_monitor::spawn(
+        openshell_supervisor_networking::bypass_monitor::spawn(
             ns.name().to_string(),
             entrypoint_pid.clone(),
             bypass_denial_tx,

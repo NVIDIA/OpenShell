@@ -8,7 +8,6 @@
 //! and log push. Populated by follow-up commits as modules migrate out of
 //! `openshell-sandbox`.
 
-pub mod bypass_monitor;
 pub mod child_env;
 pub mod debug_rpc;
 pub mod log_push;
