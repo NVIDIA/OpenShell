@@ -138,11 +138,13 @@ The following steps outline the hot-reload policy update workflow.
 
    `--add-allow` and `--add-deny` target existing `protocol: rest` or `protocol: websocket` endpoints. If you pass multiple update flags in one command, OpenShell applies them as one atomic merge batch and persists at most one new revision.
 
-4. For larger edits, pull the current policy and edit the YAML directly. Strip the metadata header (Version, Hash, Status) before reusing the file.
+4. For larger edits, pull the current effective policy and edit the YAML directly. Before reusing the file, strip the metadata header above the `---` line. If the sandbox has attached Providers v2 providers, remove generated `_provider_*` entries before reapplying the policy; those entries are derived from provider profiles.
 
    ```shell
    openshell policy get <name> --full > current-policy.yaml
    ```
+
+   To inspect a stored sandbox-authored revision instead of the current effective policy, pass `--rev <version>`.
 
 5. Edit the YAML: add or adjust `network_policies` entries, binaries, `access`, or `rules`.
 

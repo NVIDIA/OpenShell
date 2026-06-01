@@ -127,13 +127,33 @@ impl OpenShell for TestOpenShell {
         let req = request.into_inner();
         assert_eq!(
             req.sandbox_id, "test-id",
-            "sandbox_get --policy-only should pass the id from GetSandbox"
+            "GetSandboxConfig should pass the id from GetSandbox"
         );
         Ok(Response::new(GetSandboxConfigResponse {
             policy: Some(SandboxPolicy {
-                version: 1,
+                version: 9,
+                network_policies: std::iter::once((
+                    "_provider_api".to_string(),
+                    NetworkPolicyRule {
+                        name: "_provider_api".to_string(),
+                        endpoints: vec![NetworkEndpoint {
+                            host: "api.provider.example.com".to_string(),
+                            port: 443,
+                            protocol: "rest".to_string(),
+                            enforcement: "enforce".to_string(),
+                            access: "read-only".to_string(),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                ))
+                .collect(),
                 ..Default::default()
             }),
+            version: 9,
+            policy_hash: "sha256:effective-policy".to_string(),
+            config_revision: 42,
+            policy_source: openshell_core::proto::PolicySource::Sandbox.into(),
             ..Default::default()
         }))
     }
@@ -346,7 +366,7 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<GetSandboxPolicyStatusResponse>, Status> {
         let req = request.into_inner();
         assert_eq!(req.name, "my-sandbox");
-        assert_eq!(req.version, 0);
+        assert_eq!(req.version, 3);
         assert!(!req.global);
 
         let policy = SandboxPolicy {
@@ -659,6 +679,50 @@ async fn policy_get_full_json_cli_prints_policy_payload() {
     assert!(
         stderr.is_empty(),
         "policy get should not print stderr: {}",
+        String::from_utf8_lossy(&stderr)
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&stdout).expect("stdout should be valid JSON");
+    assert_eq!(json["scope"], "sandbox");
+    assert_eq!(json["sandbox"], "my-sandbox");
+    assert_eq!(json["version"], 9);
+    assert_eq!(json["active_version"], 9);
+    assert_eq!(json["hash"], "sha256:effective-policy");
+    assert_eq!(json["status"], "effective");
+    assert_eq!(json["config_revision"], 42);
+    assert_eq!(json["policy_source"], "sandbox");
+    assert_eq!(
+        json["policy"]["network_policies"]["_provider_api"]["name"],
+        "_provider_api"
+    );
+    assert_eq!(
+        json["policy"]["network_policies"]["_provider_api"]["endpoints"][0]["host"],
+        "api.provider.example.com"
+    );
+}
+
+#[tokio::test]
+async fn policy_get_explicit_revision_uses_stored_policy_status() {
+    let ts = run_server().await;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+
+    run::sandbox_policy_get_to_writer(
+        &ts.endpoint,
+        "my-sandbox",
+        3,
+        true,
+        "json",
+        &ts.tls,
+        (&mut stdout, &mut stderr),
+    )
+    .await
+    .expect("policy get --rev should succeed");
+
+    assert!(
+        stderr.is_empty(),
+        "policy get --rev should not print stderr: {}",
         String::from_utf8_lossy(&stderr)
     );
 

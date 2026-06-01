@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+id: pypi
+display_name: PyPI
+description: Python package installation from PyPI and related package sources
+category: data
+endpoints:
+  - host: pypi.org
+    port: 443
+  - host: files.pythonhosted.org
+    port: 443
+  - host: github.com
+    port: 443
+  - host: objects.githubusercontent.com
+    port: 443
+  - host: api.github.com
+    port: 443
+  - host: downloads.python.org
+    port: 443
+binaries:
+  - /sandbox/.venv/bin/python
+  - /sandbox/.venv/bin/python3
+  - /sandbox/.venv/bin/pip
+  - /app/.venv/bin/python
+  - /app/.venv/bin/python3
+  - /app/.venv/bin/pip
+  - /usr/local/bin/uv
+  - /sandbox/.uv/python/**
