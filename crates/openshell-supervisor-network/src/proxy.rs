@@ -2922,6 +2922,9 @@ where
             generation_guard: Some(options.generation_guard),
             websocket_extensions: options.websocket_extensions,
             request_body_credential_rewrite: options.request_body_credential_rewrite,
+            credential_signing: crate::l7::CredentialSigning::None,
+            signing_service: "",
+            host: "",
         },
     )
     .await
@@ -3944,6 +3947,7 @@ async fn handle_forward_proxy(
             return Ok(());
         }
     };
+
     if let Err(e) = forward_generation_guard.ensure_current() {
         emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
         respond(
@@ -4095,6 +4099,8 @@ mod tests {
             websocket_credential_rewrite,
             request_body_credential_rewrite: false,
             websocket_graphql_policy: false,
+            credential_signing: crate::l7::CredentialSigning::None,
+            signing_service: String::new(),
         }
     }
 
@@ -4694,6 +4700,8 @@ network_policies:
                     websocket_credential_rewrite: false,
                     request_body_credential_rewrite: false,
                     websocket_graphql_policy: false,
+                    credential_signing: crate::l7::CredentialSigning::None,
+                    signing_service: String::new(),
                 },
             },
             L7ConfigSnapshot {
@@ -4707,6 +4715,8 @@ network_policies:
                     websocket_credential_rewrite: false,
                     request_body_credential_rewrite: false,
                     websocket_graphql_policy: false,
+                    credential_signing: crate::l7::CredentialSigning::None,
+                    signing_service: String::new(),
                 },
             },
         ];
