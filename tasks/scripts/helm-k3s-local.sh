@@ -32,6 +32,11 @@ HOST_LB_PORT="${HELM_K3S_LB_HOST_PORT:-8080}"
 DEFAULT_SANDBOX_PRELOAD_IMAGE="ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 PRELOAD_SANDBOX_IMAGE="${HELM_K3S_PRELOAD_SANDBOX_IMAGE-${DEFAULT_SANDBOX_PRELOAD_IMAGE}}"
 
+# Upstream agent-sandbox release pinned for both CRDs/controller and extensions.
+# Refresh this tag in lockstep with the supported field set in
+# crates/openshell-driver-kubernetes (see sandbox_to_k8s_spec).
+AGENT_SANDBOX_VERSION="${AGENT_SANDBOX_VERSION:-v0.4.6}"
+
 default_kubeconfig="${ROOT}/kubeconfig"
 if [[ -n "${HELM_K3S_KUBECONFIG:-}" ]]; then
   KUBECONFIG_TARGET="${HELM_K3S_KUBECONFIG}"
@@ -135,9 +140,9 @@ merge_kubeconfig() {
 
 apply_base_manifests() {
   require_kubectl
-  local manifest="${ROOT}/deploy/kube/manifests/agent-sandbox.yaml"
-  echo "Applying agent-sandbox manifests..."
-  kubectl --kubeconfig="${KUBECONFIG_TARGET}" apply -f "${manifest}"
+  local base="https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${AGENT_SANDBOX_VERSION}"
+  echo "Applying agent-sandbox manifest (${AGENT_SANDBOX_VERSION})..."
+  kubectl --kubeconfig="${KUBECONFIG_TARGET}" apply -f "${base}/manifest.yaml"
 }
 
 configure_ghcr_credentials() {

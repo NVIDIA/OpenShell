@@ -45,6 +45,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=e2e/support/gateway-common.sh
 source "${ROOT}/e2e/support/gateway-common.sh"
 
+# Upstream agent-sandbox release. Bump in lockstep with the supported Sandbox
+# field set in crates/openshell-driver-kubernetes (see sandbox_to_k8s_spec).
+AGENT_SANDBOX_VERSION="${AGENT_SANDBOX_VERSION:-v0.4.6}"
+
 e2e_preserve_mise_dirs
 e2e_align_docker_host_with_cli_context
 
@@ -529,10 +533,11 @@ fi
 # The Kubernetes compute driver creates and watches Sandbox CRs reconciled
 # by the upstream agent-sandbox-controller. Without the CRD + controller,
 # every gateway K8s call 404s and CreateSandbox never produces a Pod.
-echo "Installing agent-sandbox CRDs and controller..."
-kctl apply -f "${ROOT}/deploy/kube/manifests/agent-sandbox.yaml"
+echo "Installing agent-sandbox CRDs and controller (${AGENT_SANDBOX_VERSION})..."
+_agent_sandbox_base="https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${AGENT_SANDBOX_VERSION}"
+kctl apply -f "${_agent_sandbox_base}/manifest.yaml"
 kctl wait --for=condition=Established crd/sandboxes.agents.x-k8s.io --timeout=120s
-kctl -n agent-sandbox-system rollout status statefulset/agent-sandbox-controller --timeout=300s
+kctl -n agent-sandbox-system rollout status deployment/agent-sandbox-controller --timeout=300s
 
 helm_extra_args=()
 if [ -n "${HOST_GATEWAY_IP}" ]; then

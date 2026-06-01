@@ -30,14 +30,17 @@ Make sure the following are in place before you install.
 
 OpenShell uses the [Agent Sandbox](https://agent-sandbox.sigs.k8s.io) Kubernetes SIG project to provision sandbox pods. Install the Agent Sandbox controller and its CRDs on your cluster before installing the OpenShell Helm chart.
 
-Fetch the latest release tag and apply the manifest:
+Apply the latest release manifest:
 
 ```shell
-VERSION=$(curl -s https://api.github.com/repos/kubernetes-sigs/agent-sandbox/releases/latest | jq -r '.tag_name')
-kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${VERSION}/manifest.yaml
+kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/latest/download/manifest.yaml
 ```
 
-This creates the `agent-sandbox-system` namespace, installs the CRDs, and starts the controller.
+This creates the `agent-sandbox-system` namespace, installs the `sandboxes.agents.x-k8s.io` CRD, and starts the controller.
+
+<Note>
+**Air-gapped clusters:** mirror the manifest above and the `registry.k8s.io/agent-sandbox/agent-sandbox-controller` image referenced inside it to your internal registry, then point the manifest's image reference at your mirror before applying. You will also need to mirror the OpenShell gateway and sandbox images — see the chart's `image.repository` value for the gateway and `server.sandboxImage` / `server.supervisorImage` for the sandbox runtime.
+</Note>
 
 Confirm the controller pod is running before proceeding:
 
