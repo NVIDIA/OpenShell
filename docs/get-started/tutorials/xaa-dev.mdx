@@ -1,0 +1,151 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Run the XAA.dev Sample XAA Flow"
+sidebar-title: "XAA.dev Sample XAA"
+slug: "get-started/tutorials/xaa-dev"
+description: "Configure the built-in xaa-dev provider profile and prove the sample 2-step XAA flow from inside an OpenShell sandbox."
+keywords: "Generative AI, Cybersecurity, Tutorial, XAA, Cross App Access, ID-JAG, Providers, Sandbox"
+---
+
+Use the built-in `xaa-dev` profile to exercise the sample 2-step Cross App Access flow backed by `xaa.dev`. OpenShell binds the logged-in user identity to a sandbox, exchanges that user `id_token` for an `ID-JAG`, exchanges the `ID-JAG` for a delegated resource token, and injects the delegated token into the sandbox for outbound API calls.
+
+After completing this tutorial, you have:
+
+- A registered `xaa.dev` requesting app connected to the `Todo0 Resource App`.
+- A provider that mints `XAA_DEV_ACCESS_TOKEN` through the sample 2-step XAA flow.
+- A sandbox that can call the sample `Todo0` resource API with the delegated token.
+
+<Note>
+This tutorial documents the working `xaa.dev` sample path. It does not cover a tenant-integrated resource authorization server in your own Okta environment.
+</Note>
+
+## Prerequisites
+
+- A working OpenShell installation with an active gateway.
+- A local gateway login flow that can store an OIDC `id_token`.
+- `providers_v2_enabled=true` on the target gateway.
+- A `xaa.dev` requesting app registered at `https://xaa.dev/developer/register`.
+
+When you register the sample app, use:
+
+| Field | Value |
+|---|---|
+| Application Name | `OpenShell XAA Local` |
+| Redirect URI | `http://127.0.0.1:8767/callback` |
+| Post-Logout Redirect URI | `http://127.0.0.1:8767/` |
+| Resource Connection | `Todo0 Resource App` |
+
+Record these values from the `xaa.dev` registration and integration guide:
+
+| Variable | Value |
+|---|---|
+| `XAA_DEV_REQUESTING_CLIENT_ID` | Main requesting app client ID, for example `client_f8d67a261fab113c`. |
+| `XAA_DEV_REQUESTING_CLIENT_SECRET` | Main requesting app client secret. |
+| `XAA_DEV_RESOURCE_CLIENT_ID` | Resource client ID, for example `client_<id>-at-todo0`. |
+| `XAA_DEV_RESOURCE_CLIENT_SECRET` | Resource client secret from the Step 3 guide. |
+
+The sample endpoints used by the built-in profile are:
+
+| Purpose | URL |
+|---|---|
+| Identity provider token endpoint | `https://idp.xaa.dev/token` |
+| Resource authorization server token endpoint | `https://auth.resource.xaa.dev/token` |
+| Protected API base | `https://api.resource.xaa.dev` |
+
+<Steps toc={true}>
+
+## Enable Providers v2
+
+Enable profile-backed provider policy on the target gateway:
+
+```shell
+openshell settings set --global --key providers_v2_enabled --value true
+```
+
+## Log In and Create a Sandbox
+
+Log in before creating the sandbox so OpenShell can bind the sandbox to the authenticated user's `id_token`:
+
+```shell
+openshell gateway login <gateway-name>
+```
+
+Create a sandbox and record its UUID:
+
+```shell
+openshell sandbox create --name xaa-dev-sample
+openshell sandbox get xaa-dev-sample
+```
+
+The `provider refresh configure` command needs the sandbox UUID, not just the sandbox name.
+
+## Create the Sample Provider
+
+Create the provider from the built-in profile:
+
+```shell
+openshell provider create \
+  --name xaa-dev-runtime \
+  --type xaa-dev
+```
+
+## Configure the 2-Step XAA Refresh
+
+Configure the requesting-app and resource-app credentials:
+
+```shell
+openshell provider refresh configure xaa-dev-runtime \
+  --credential-key XAA_DEV_ACCESS_TOKEN \
+  --strategy okta-xaa \
+  --material requesting_client_id="$XAA_DEV_REQUESTING_CLIENT_ID" \
+  --material requesting_client_secret="$XAA_DEV_REQUESTING_CLIENT_SECRET" \
+  --material sandbox_id="<sandbox-uuid>" \
+  --material resource_client_id="$XAA_DEV_RESOURCE_CLIENT_ID" \
+  --material resource_client_secret="$XAA_DEV_RESOURCE_CLIENT_SECRET" \
+  --material audience="https://auth.resource.xaa.dev" \
+  --material resource="https://api.resource.xaa.dev" \
+  --material resource_token_url="https://auth.resource.xaa.dev/token" \
+  --material scope="todos.read" \
+  --secret-material-key requesting_client_secret \
+  --secret-material-key resource_client_secret
+```
+
+Force a refresh and confirm the credential status:
+
+```shell
+openshell provider refresh rotate xaa-dev-runtime \
+  --credential-key XAA_DEV_ACCESS_TOKEN
+
+openshell provider refresh status xaa-dev-runtime \
+  --credential-key XAA_DEV_ACCESS_TOKEN
+```
+
+The status should show `refreshed`.
+
+## Attach the Provider
+
+Attach the provider to the sandbox:
+
+```shell
+openshell sandbox provider attach xaa-dev-sample xaa-dev-runtime
+```
+
+## Verify the Delegated Token Path
+
+Run the sample API call from inside the sandbox:
+
+```shell
+openshell sandbox exec \
+  --name xaa-dev-sample \
+  -- /bin/sh -lc 'curl --http1.1 -sS -H "Authorization: Bearer $XAA_DEV_ACCESS_TOKEN" https://api.resource.xaa.dev/api/todos'
+```
+
+The command should return the sample `Todo0` JSON payload.
+
+</Steps>
+
+## Next Steps
+
+- Use [Providers v2](/sandboxes/providers-v2) for more detail on profile-backed provider behavior.
+- Use [Okta OBO Token Exchange](/get-started/tutorials/okta-obo) if you want the delegated Okta OBO path instead of the `xaa.dev` sample flow.
