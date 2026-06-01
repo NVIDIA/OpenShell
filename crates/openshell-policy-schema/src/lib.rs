@@ -671,7 +671,9 @@ network_policies:
     #[test]
     fn restrictive_default_has_filesystem_policy() {
         let policy = restrictive_default();
-        let fs = policy.filesystem_policy.expect("must have filesystem policy");
+        let fs = policy
+            .filesystem_policy
+            .expect("must have filesystem policy");
         assert!(fs.include_workdir);
         assert!(
             fs.read_only.iter().any(|p| p == "/usr"),
@@ -765,7 +767,9 @@ network_policies:
       - path: /usr/bin/curl
 "#;
         let policy = parse_policy(yaml).expect("parse failed");
-        let query = &policy.network_policies["query_test"].endpoints[0].rules[0].allow.query;
+        let query = &policy.network_policies["query_test"].endpoints[0].rules[0]
+            .allow
+            .query;
         assert!(
             matches!(&query["slug"], QueryMatcherDef::Glob(g) if g == "my-*"),
             "expected Glob(my-*)"
@@ -777,8 +781,9 @@ network_policies:
 
         let yaml_out = serialize_policy(&policy).expect("serialize failed");
         let policy2 = parse_policy(&yaml_out).expect("re-parse failed");
-        let query2 =
-            &policy2.network_policies["query_test"].endpoints[0].rules[0].allow.query;
+        let query2 = &policy2.network_policies["query_test"].endpoints[0].rules[0]
+            .allow
+            .query;
         assert!(matches!(&query2["slug"], QueryMatcherDef::Glob(g) if g == "my-*"));
         assert!(
             matches!(&query2["tag"], QueryMatcherDef::Any(a) if a.any == vec!["foo-*", "bar-*"])
