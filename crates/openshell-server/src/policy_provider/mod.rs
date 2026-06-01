@@ -122,11 +122,14 @@ pub struct PolicyMutationOutcome {
 
 /// Pluggable policy provider.
 ///
-/// Each provider answers two questions:
+/// Each provider answers three questions:
 ///   1. What is the effective policy for this sandbox at admission time?
 ///      (`get_effective_policy`)
-///   2. Will it accept a policy mutation from the gateway's control plane?
-///      (`set_policy`, `update_policy`, `delete_policy` — default `Unsupported`)
+///   2. Will it accept any mutation to policy state — the canonical
+///      mutator RPCs **and** the draft-chunk approval surface?
+///      (`permits_mutation` — default `Unsupported`; coarse gate)
+///   3. Will it accept this *specific* mutation? (`set_policy`,
+///      `update_policy`, `delete_policy` — default `Unsupported`)
 ///
 /// The default mutator impls returning `Unsupported` are load-bearing: a
 /// provider that should refuse `openshell policy set | update | delete`
@@ -156,6 +159,30 @@ pub trait PolicyProvider: Send + Sync + std::fmt::Debug {
         &self,
         sandbox_id: &str,
     ) -> Result<Option<openshell_core::proto::SandboxPolicy>, PolicyError>;
+
+    /// Coarse gate: does this provider permit any mutation to policy state?
+    ///
+    /// "Mutation" here means **both** the canonical RPC mutators
+    /// (`set_policy`, `update_policy`, `delete_policy`) and the draft-chunk
+    /// approval surface added by the agentic approval loop (the `*DraftChunk`
+    /// handlers in `grpc/policy.rs`). The gRPC layer calls this first — before
+    /// any DB read or write — so an alternate provider can refuse the entire
+    /// write surface without per-RPC trait methods. Default: `Unsupported`.
+    ///
+    /// Rationale: per-op overrides (`set_policy` etc.) remain the natural
+    /// extension point for *what work happens* once a mutation is permitted;
+    /// `permits_mutation` is the coarse gate that lets the forthcoming
+    /// `AttestedPolicyProvider` (whose authoritative policy is fed by an
+    /// off-host signed bundle and has no in-band mutation semantics at all)
+    /// refuse everything by inheriting this default. See the APP
+    /// implementation plan W-B section ("permits_mutation") for the design
+    /// alternatives that were considered and rejected.
+    async fn permits_mutation(&self) -> Result<(), PolicyError> {
+        Err(PolicyError::Unsupported {
+            policy_type: self.id(),
+            operation: "mutation",
+        })
+    }
 
     /// Replace the policy for a sandbox. Default: `Unsupported`.
     async fn set_policy(
@@ -271,6 +298,22 @@ mod tests {
         ) -> Result<Option<openshell_core::proto::SandboxPolicy>, PolicyError> {
             Ok(None)
         }
+    }
+
+    #[tokio::test]
+    async fn stub_provider_permits_mutation_returns_unsupported() {
+        let p = StubProvider;
+        let err = p
+            .permits_mutation()
+            .await
+            .expect_err("default impl must error");
+        assert!(matches!(
+            err,
+            PolicyError::Unsupported {
+                policy_type: "stub",
+                operation: "mutation"
+            }
+        ));
     }
 
     #[tokio::test]

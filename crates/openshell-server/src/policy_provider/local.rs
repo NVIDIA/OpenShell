@@ -75,6 +75,15 @@ impl PolicyProvider for LocalPolicyProvider {
         LOCAL_POLICY_TYPE_ID
     }
 
+    async fn permits_mutation(&self) -> Result<(), PolicyError> {
+        // The local provider owns the in-process policy store, so every
+        // mutation surface — the three canonical RPC mutators and the
+        // draft-chunk approval handlers — is supported. The attested
+        // provider will inherit the trait default (`Unsupported`) so the
+        // gateway's coarse gate refuses both surfaces uniformly.
+        Ok(())
+    }
+
     async fn get_effective_policy(
         &self,
         sandbox_id: &str,
@@ -197,6 +206,14 @@ mod tests {
                 .await
                 .expect("in-memory sqlite connects"),
         )
+    }
+
+    #[tokio::test]
+    async fn permits_mutation_is_ok_for_local_provider() {
+        let p = LocalPolicyProvider::new(fresh_store().await);
+        p.permits_mutation()
+            .await
+            .expect("local provider permits the entire mutation surface");
     }
 
     #[tokio::test]
