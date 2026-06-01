@@ -3,26 +3,19 @@
 
 //! Pluggable policy-provider subsystem.
 //!
-//! The gateway today resolves an effective policy and accepts policy mutations
-//! through inline calls to [`crate::persistence::Store`] from the gRPC layer.
-//! This module promotes that surface into a trait + registry so an alternate
-//! provider (next session: `AttestedPolicyProvider`, which consumes signed
-//! projections from a Runtime Policy Verifier daemon) can refuse the mutator
-//! methods while still serving an `Authoritative` effective policy at
-//! admission time. See the Attested Policy Projection RFC and
-//! `runtime-policy-verifier/docs/app-implementation-plan.md` W-B.
+//! The gateway today resolves an effective policy and accepts policy
+//! mutations through inline calls to [`crate::persistence::Store`] from the
+//! gRPC layer. This module promotes that surface into a trait so an
+//! alternate provider can refuse the mutator methods while still serving
+//! an authoritative effective policy at admission time.
 //!
-//! Structure intentionally mirrors `openshell-providers::ProviderPlugin` /
-//! `ProviderRegistry`: a trait, a `dyn`-safe registry keyed by canonical
-//! policy-type id (`type` in TOML, matching `ProviderPlugin`'s selector
-//! convention), and an error type with an `Unsupported { policy_type,
-//! operation }` variant that maps to `tonic::Status::unimplemented` at the
-//! gRPC edge.
+//! The error type carries an `Unsupported { policy_type, operation }`
+//! variant that maps to `tonic::Status::unimplemented` at the gRPC edge.
+//! Resolution of `[openshell.policy] type` to the concrete provider lives
+//! at the call site (`crate::resolve_policy_provider`) — a direct `match`
+//! suffices for the small number of provider shapes.
 
 mod local;
-
-use std::collections::HashMap;
-use std::sync::Arc;
 
 use async_trait::async_trait;
 
@@ -147,8 +140,8 @@ pub struct PolicyMutationOutcome {
 #[async_trait]
 pub trait PolicyProvider: Send + Sync + std::fmt::Debug {
     /// Canonical policy-type id, e.g. `"local"` or `"attested"`. Must match
-    /// the string the registry uses to look this provider up and the
-    /// `[openshell.policy] type = ...` value in the gateway config.
+    /// the `[openshell.policy] type = ...` value in the gateway config —
+    /// the resolver matches on this string when selecting the provider.
     fn id(&self) -> &'static str;
 
     /// Return the effective policy for `sandbox_id`. The store-backed local
@@ -218,58 +211,6 @@ pub trait PolicyProvider: Send + Sync + std::fmt::Debug {
             policy_type: self.id(),
             operation: "delete_policy",
         })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Registry
-// ---------------------------------------------------------------------------
-
-/// Resolves policy-type-id strings to a registered [`PolicyProvider`].
-/// Mirrors `openshell_providers::ProviderRegistry` so future providers can
-/// be added without changing the wiring at startup.
-#[derive(Default)]
-pub struct PolicyProviderRegistry {
-    providers: HashMap<&'static str, Arc<dyn PolicyProvider>>,
-}
-
-impl std::fmt::Debug for PolicyProviderRegistry {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PolicyProviderRegistry")
-            .field("providers", &self.providers.keys().collect::<Vec<_>>())
-            .finish()
-    }
-}
-
-impl PolicyProviderRegistry {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn register<P>(&mut self, provider: P)
-    where
-        P: PolicyProvider + 'static,
-    {
-        self.providers.insert(provider.id(), Arc::new(provider));
-    }
-
-    #[must_use]
-    pub fn get(&self, id: &str) -> Option<Arc<dyn PolicyProvider>> {
-        self.providers.get(id).cloned()
-    }
-
-    /// Registered policy-type ids, sorted. Used for diagnostic messages
-    /// when a configured policy type is not found; kept on the registry
-    /// surface even though no caller exercises it in v0 because it mirrors
-    /// `ProviderRegistry::known_types` and the next session's
-    /// `AttestedPolicyProvider` integration will consume it.
-    #[allow(dead_code)] // see doc comment
-    #[must_use]
-    pub fn known_policy_types(&self) -> Vec<&'static str> {
-        let mut ids: Vec<_> = self.providers.keys().copied().collect();
-        ids.sort_unstable();
-        ids
     }
 }
 
@@ -376,13 +317,4 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn registry_lookup_returns_registered_provider() {
-        let mut reg = PolicyProviderRegistry::new();
-        reg.register(StubProvider);
-        let resolved = reg.get("stub").expect("registered provider resolves");
-        assert_eq!(resolved.id(), "stub");
-        assert!(reg.get("nonexistent").is_none());
-        assert_eq!(reg.known_policy_types(), vec!["stub"]);
-    }
 }

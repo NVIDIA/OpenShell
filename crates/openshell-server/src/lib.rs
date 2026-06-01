@@ -482,24 +482,14 @@ pub async fn run_server(
     Ok(())
 }
 
-/// Build the policy-provider registry for this gateway process. Currently
-/// holds only `local`; the next session adds the `attested` policy type
-/// here.
-fn build_policy_provider_registry(store: Arc<Store>) -> policy_provider::PolicyProviderRegistry {
-    let mut registry = policy_provider::PolicyProviderRegistry::new();
-    registry.register(policy_provider::LocalPolicyProvider::new(store));
-    registry
-}
-
 /// Resolve the configured policy provider, if the config file selects one.
 /// Returns `Ok(None)` when no override is needed (the default `local`
 /// provider from `ServerState::new` already covers that case).
 ///
-/// `"local"` returns a fresh provider via the registry. `"attested"` is
-/// parsed at config-file load time but the registry does not yet contain
-/// the provider — startup returns a clear "policy type not yet available"
-/// error so deployments staging the value get a clear signal rather than
-/// silently falling back to local.
+/// `"attested"` is parsed at config-file load time but has no implementation
+/// yet — startup returns a clear "policy type not yet available" error so
+/// deployments staging the value get a clear signal rather than silently
+/// falling back to local.
 fn resolve_policy_provider(
     config_file: Option<&config_file::ConfigFile>,
     store: Arc<Store>,
@@ -513,21 +503,21 @@ fn resolve_policy_provider(
     let Some(policy_type) = policy.r#type.as_deref() else {
         return Ok(None);
     };
-    let registry = build_policy_provider_registry(store);
-    if let Some(provider) = registry.get(policy_type) {
-        return Ok(Some(provider));
-    }
-    if policy_type == policy_provider::ATTESTED_POLICY_TYPE_ID {
-        return Err(Error::config(
+
+    match policy_type {
+        policy_provider::LOCAL_POLICY_TYPE_ID => Ok(Some(Arc::new(
+            policy_provider::LocalPolicyProvider::new(store),
+        ))),
+        policy_provider::ATTESTED_POLICY_TYPE_ID => Err(Error::config(
             "[openshell.policy] type = 'attested' is not yet available in this build; \
              use 'local' or omit the [openshell.policy] table",
-        ));
+        )),
+        // Unreachable in practice — `config_file::load` already rejects
+        // unknown policy type names. Defensive for any straggler.
+        other => Err(Error::config(format!(
+            "unknown policy provider type '{other}'"
+        ))),
     }
-    // Unreachable in practice — `config_file::load` already rejects
-    // unknown policy type names. Treat any straggler defensively.
-    Err(Error::config(format!(
-        "unknown policy provider type '{policy_type}'"
-    )))
 }
 
 fn gateway_listener_addresses(
