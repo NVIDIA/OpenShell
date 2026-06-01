@@ -333,7 +333,6 @@ EOF
 case "${DRIVER}" in
   kubernetes)
     cat >>"${CONFIG_PATH}" <<EOF
-sandbox_namespace = "${SANDBOX_NAMESPACE}"
 
 [openshell.drivers.kubernetes]
 namespace = "${SANDBOX_NAMESPACE}"
