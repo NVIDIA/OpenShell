@@ -1,12 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Centralized XDG config directory resolution and permission helpers.
+//! Path utilities: XDG config directory resolution, permission helpers, and
+//! lexical path normalization.
 //!
 //! All `OpenShell` crates should use [`xdg_config_dir`] from this module instead
 //! of reimplementing the XDG lookup. The permission helpers ensure that
 //! sensitive files (private keys, tokens) and the directories containing them
-//! are created with restrictive modes.
+//! are created with restrictive modes. [`normalize_path`] performs purely
+//! lexical normalization (no filesystem access, no symlink resolution).
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use std::path::{Path, PathBuf};
@@ -126,6 +128,33 @@ pub fn is_file_permissions_too_open(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o077 != 0)
 }
 
+/// Normalize a filesystem path by collapsing redundant separators
+/// and removing trailing slashes, without requiring the path to exist on disk.
+///
+/// This is a lexical normalization only — it does NOT resolve symlinks or
+/// check the filesystem. `..` components are preserved verbatim; callers that
+/// need to reject parent traversal must validate separately.
+pub fn normalize_path(path: &str) -> String {
+    use std::path::Component;
+
+    let p = Path::new(path);
+    let mut normalized = PathBuf::new();
+    for component in p.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            #[allow(clippy::path_buf_push_overwrite)]
+            Component::RootDir => normalized.push("/"),
+            Component::CurDir => {} // skip "."
+            Component::ParentDir => {
+                // Keep ".." — validation will catch it separately
+                normalized.push("..");
+            }
+            Component::Normal(c) => normalized.push(c),
+        }
+    }
+    normalized.to_string_lossy().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,5 +229,18 @@ mod tests {
         std::fs::write(&file, "data").unwrap();
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(!is_file_permissions_too_open(&file));
+    }
+
+    #[test]
+    fn normalize_path_collapses_separators() {
+        assert_eq!(normalize_path("/usr//lib"), "/usr/lib");
+        assert_eq!(normalize_path("/usr/./lib"), "/usr/lib");
+        assert_eq!(normalize_path("/tmp/"), "/tmp");
+    }
+
+    #[test]
+    fn normalize_path_preserves_parent_dir() {
+        // normalize_path preserves ".." — validation catches it separately
+        assert_eq!(normalize_path("/usr/../etc"), "/usr/../etc");
     }
 }

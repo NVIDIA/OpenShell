@@ -3457,8 +3457,12 @@ dependencies = [
 name = "openshell-core"
 version = "0.0.0"
 dependencies = [
+ "base64 0.22.1",
  "ipnet",
+ "libc",
  "miette",
+ "nix",
+ "openshell-ocsf",
  "prost",
  "prost-types",
  "protobuf-src",
@@ -3466,9 +3470,12 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
  "tonic",
  "tonic-build",
+ "tracing",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -3648,22 +3655,20 @@ dependencies = [
  "hex",
  "hmac",
  "ipnet",
- "landlock",
- "libc",
  "miette",
  "nix",
  "openshell-core",
  "openshell-ocsf",
  "openshell-policy",
  "openshell-router",
+ "openshell-supervisor-network",
+ "openshell-supervisor-process",
  "rand_core 0.6.4",
  "rcgen",
  "regorus",
  "russh",
- "rustix 1.1.4",
  "rustls",
  "rustls-pemfile",
- "seccompiler",
  "serde",
  "serde_json",
  "serde_yml",
@@ -3761,6 +3766,72 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "openshell-supervisor-network"
+version = "0.0.0"
+dependencies = [
+ "apollo-parser",
+ "base64 0.22.1",
+ "bytes",
+ "flate2",
+ "futures",
+ "glob",
+ "hex",
+ "ipnet",
+ "miette",
+ "openshell-core",
+ "openshell-ocsf",
+ "openshell-policy",
+ "openshell-router",
+ "rcgen",
+ "regorus",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "serde_yml",
+ "sha1 0.10.6",
+ "sha2 0.10.9",
+ "temp-env",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite 0.26.2",
+ "tracing",
+ "url",
+ "uuid",
+ "webpki-roots 1.0.7",
+]
+
+[[package]]
+name = "openshell-supervisor-process"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "hex",
+ "landlock",
+ "libc",
+ "miette",
+ "nix",
+ "openshell-core",
+ "openshell-ocsf",
+ "rand_core 0.6.4",
+ "russh",
+ "rustix 1.1.4",
+ "seccompiler",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

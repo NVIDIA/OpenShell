@@ -1,0 +1,52 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "openshell-supervisor-network"
+description = "Network component of the OpenShell supervisor: proxy, L7 enforcement, OPA, inference routing, denial aggregator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+openshell-core = { path = "../openshell-core" }
+openshell-ocsf = { path = "../openshell-ocsf" }
+openshell-policy = { path = "../openshell-policy" }
+openshell-router = { path = "../openshell-router" }
+
+apollo-parser = { workspace = true }
+base64 = { workspace = true }
+bytes = { workspace = true }
+flate2 = "1"
+glob = { workspace = true }
+hex = "0.4"
+ipnet = "2"
+miette = { workspace = true }
+rcgen = { workspace = true }
+regorus = { version = "0.9", default-features = false, features = ["std", "arc", "glob", "yaml"] }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yml = { workspace = true }
+sha1 = "0.10"
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+webpki-roots = { workspace = true }
+
+[dev-dependencies]
+openshell-core = { path = "../openshell-core", features = ["test-helpers"] }
+tempfile = "3"
+temp-env = "0.3"
+tokio-tungstenite = { workspace = true }
+futures = { workspace = true }
+
+[lints]
+workspace = true

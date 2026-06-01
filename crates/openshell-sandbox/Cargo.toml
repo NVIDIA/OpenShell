@@ -19,6 +19,8 @@ openshell-core = { path = "../openshell-core" }
 openshell-ocsf = { path = "../openshell-ocsf" }
 openshell-policy = { path = "../openshell-policy" }
 openshell-router = { path = "../openshell-router" }
+openshell-supervisor-network = { path = "../openshell-supervisor-network" }
+openshell-supervisor-process = { path = "../openshell-supervisor-process" }
 
 # Async runtime
 tokio = { workspace = true }
@@ -79,17 +81,8 @@ tracing-appender = { workspace = true }
 # Unix/Process
 nix = { workspace = true }
 
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-rustix = { workspace = true }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-landlock = "0.4"
-seccompiler = "0.5"
-tempfile = "3"
-uuid = { version = "1", features = ["v4"] }
-
 [dev-dependencies]
+openshell-core = { path = "../openshell-core", features = ["test-helpers"] }
 tempfile = "3"
 temp-env = "0.3"
 tokio-tungstenite = { workspace = true }

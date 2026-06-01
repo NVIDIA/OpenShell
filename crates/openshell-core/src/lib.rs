@@ -15,14 +15,21 @@ pub mod driver_utils;
 pub mod error;
 pub mod forward;
 pub mod gpu;
+pub mod grpc_client;
 pub mod image;
 pub mod inference;
 pub mod metadata;
 pub mod net;
+#[cfg(target_os = "linux")]
+pub mod netns;
 pub mod paths;
+pub mod policy;
 pub mod progress;
+pub mod proposals;
 pub mod proto;
+pub mod provider_credentials;
 pub mod sandbox_env;
+pub mod secrets;
 pub mod settings;
 pub mod time;
 

@@ -33,6 +33,45 @@ const COPY_SELF_SUBCOMMAND: &str = "copy-self";
 /// to confirm the cross-sandbox IDOR guard fires.
 const DEBUG_RPC_SUBCOMMAND: &str = "debug-rpc";
 
+/// Default `--mode` value: run both supervisor leaves in a single binary.
+const DEFAULT_MODE: &str = "network,process";
+
+/// Which supervisor leaves are enabled in this process.
+///
+/// Parsed from a comma-separated `--mode` value, e.g. `network`,
+/// `process`, or `network,process`. At least one must be set.
+#[derive(Clone, Copy, Debug)]
+struct Mode {
+    network: bool,
+    process: bool,
+}
+
+impl std::str::FromStr for Mode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut mode = Self {
+            network: false,
+            process: false,
+        };
+        for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            match part {
+                "network" => mode.network = true,
+                "process" => mode.process = true,
+                other => {
+                    return Err(format!(
+                        "unknown mode component '{other}' (expected 'network' and/or 'process')"
+                    ));
+                }
+            }
+        }
+        if !mode.network && !mode.process {
+            return Err("--mode must enable at least one of: network, process".into());
+        }
+        Ok(mode)
+    }
+}
+
 /// `OpenShell` Sandbox - process isolation and monitoring.
 #[derive(Parser, Debug)]
 #[command(name = "openshell-sandbox")]
@@ -105,6 +144,14 @@ struct Args {
     /// Port for health check endpoint.
     #[arg(long, default_value = "8080")]
     health_port: u16,
+
+    /// Which supervisor components to run. Comma-separated list of
+    /// "network" and/or "process". Defaults to both (single-binary
+    /// topology). Use --mode=network for a network-only sidecar, or
+    /// --mode=process for a process-only supervisor when network
+    /// enforcement runs in another pod.
+    #[arg(long, default_value = DEFAULT_MODE)]
+    mode: Mode,
 }
 
 /// Copy the running executable to `dest`, creating parent directories as
@@ -168,7 +215,7 @@ fn main() -> Result<()> {
             .into_diagnostic()?;
         return runtime.block_on(async move {
             let _ = rustls::crypto::ring::default_provider().install_default();
-            let exit = openshell_sandbox::debug_rpc::run(&raw_args[2..]).await?;
+            let exit = openshell_supervisor_process::debug_rpc::run(&raw_args[2..]).await?;
             std::process::exit(exit);
         });
     }
@@ -206,11 +253,12 @@ fn main() -> Result<()> {
         let log_push_state = if let (Some(sandbox_id), Some(endpoint)) =
             (&args.sandbox_id, &args.openshell_endpoint)
         {
-            let (tx, handle) = openshell_sandbox::log_push::spawn_log_push_task(
+            let (tx, handle) = openshell_supervisor_process::log_push::spawn_log_push_task(
                 endpoint.clone(),
                 sandbox_id.clone(),
             );
-            let layer = openshell_sandbox::log_push::LogPushLayer::new(sandbox_id.clone(), tx);
+            let layer =
+                openshell_supervisor_process::log_push::LogPushLayer::new(sandbox_id.clone(), tx);
             Some((layer, handle))
         } else {
             None
@@ -307,6 +355,8 @@ fn main() -> Result<()> {
             args.health_port,
             args.inference_routes,
             ocsf_enabled,
+            args.mode.network,
+            args.mode.process,
         )
         .await
     })?;

@@ -13,19 +13,33 @@ repository.workspace = true
 [dependencies]
 prost = { workspace = true }
 prost-types = { workspace = true }
-tonic = { workspace = true }
+tonic = { workspace = true, features = ["channel", "tls"] }
+tokio = { workspace = true }
 thiserror = { workspace = true }
 miette = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tracing = { workspace = true }
 url = { workspace = true }
 ipnet = "2"
+base64 = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+openshell-ocsf = { path = "../openshell-ocsf" }
+uuid = { workspace = true }
+libc = "0.2"
+tempfile = "3"
+nix = { workspace = true }
 
 [features]
 ## Include test-only settings (dummy_bool, dummy_int) in the registry.
 ## Off by default so production builds have an empty registry.
 ## Enabled by e2e tests and during development.
 dev-settings = []
+## Expose proposals::test_helpers (`ProposalsFlagGuard`) to downstream test
+## code in other crates. Enabled by openshell-sandbox and
+## openshell-supervisor-network dev builds.
+test-helpers = []
 
 [build-dependencies]
 tonic-build = { workspace = true }
