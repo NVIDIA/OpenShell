@@ -1914,6 +1914,15 @@ fn host_runtime_requires_host_gateway_alias() -> bool {
 /// Each runtime is detected via the daemon's reported OS string or hostname,
 /// supplemented by labels where the runtime publishes them.
 fn uses_host_gateway_alias(info: &SystemInfo) -> bool {
+    // On macOS, Docker-compatible runtimes (Docker Desktop, Colima, Podman
+    // machine, etc.) run Linux networking inside a VM. The bridge gateway IP is
+    // therefore not assigned on the host interface where the gateway process
+    // runs, so binding the gateway listener to that IP fails with
+    // EADDRNOTAVAIL. Always route callbacks via host-gateway aliases.
+    if cfg!(target_os = "macos") {
+        return true;
+    }
+
     let operating_system = info
         .operating_system
         .as_deref()
