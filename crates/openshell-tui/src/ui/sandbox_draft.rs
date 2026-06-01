@@ -138,6 +138,15 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 format!("  {:.0}%", chunk.confidence * 100.0),
                 t.muted,
             ));
+            if let Some(annotation) = approval_annotation(chunk) {
+                let annotation_style = match annotation.kind {
+                    ApprovalAnnotationKind::AutoApproved => t.status_ok,
+                    ApprovalAnnotationKind::RequiresReview => t.status_warn,
+                    ApprovalAnnotationKind::Reviewed => t.muted,
+                };
+                spans.push(Span::styled("  ", t.muted));
+                spans.push(Span::styled(annotation.short_label, annotation_style));
+            }
             if chunk.hit_count > 1 {
                 spans.push(Span::styled(format!("  {}x", chunk.hit_count), t.accent));
             }
@@ -199,6 +208,18 @@ pub fn draw_detail_popup(
             Span::styled(format!("{:.0}%", chunk.confidence * 100.0), t.text),
         ]),
     ];
+
+    if let Some(annotation) = approval_annotation(chunk) {
+        let annotation_style = match annotation.kind {
+            ApprovalAnnotationKind::AutoApproved => t.status_ok.add_modifier(Modifier::BOLD),
+            ApprovalAnnotationKind::RequiresReview => t.status_warn.add_modifier(Modifier::BOLD),
+            ApprovalAnnotationKind::Reviewed => t.muted,
+        };
+        lines.push(Line::from(vec![
+            Span::styled("Review:     ", t.muted),
+            Span::styled(annotation.detail_label, annotation_style),
+        ]));
+    }
 
     // Binary (denormalized from the denial).
     if !chunk.binary.is_empty() {
@@ -436,6 +457,78 @@ fn truncate_str(s: &str, max_len: usize) -> String {
         let mut out: String = s.chars().take(max_len - 3).collect();
         out.push_str("...");
         out
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ApprovalAnnotationKind {
+    AutoApproved,
+    RequiresReview,
+    Reviewed,
+}
+
+struct ApprovalAnnotation {
+    kind: ApprovalAnnotationKind,
+    short_label: String,
+    detail_label: String,
+}
+
+fn approval_annotation(chunk: &PolicyChunk) -> Option<ApprovalAnnotation> {
+    let validation = chunk.validation_result.trim();
+    if validation.is_empty() {
+        return None;
+    }
+
+    if validation == "prover: no new findings" {
+        if chunk.status == "approved" {
+            return Some(ApprovalAnnotation {
+                kind: ApprovalAnnotationKind::AutoApproved,
+                short_label: "auto-approved".to_string(),
+                detail_label: "proposal was auto-approved; no additional risk detected".to_string(),
+            });
+        }
+
+        return Some(ApprovalAnnotation {
+            kind: ApprovalAnnotationKind::RequiresReview,
+            short_label: "review required".to_string(),
+            detail_label: "rule requires review; no additional risk detected".to_string(),
+        });
+    }
+
+    let issues = validation_issue_summary(validation);
+    if chunk.status == "approved" {
+        return Some(ApprovalAnnotation {
+            kind: ApprovalAnnotationKind::Reviewed,
+            short_label: "reviewed".to_string(),
+            detail_label: format!("rule was approved after review; possible issues: {issues}"),
+        });
+    }
+
+    Some(ApprovalAnnotation {
+        kind: ApprovalAnnotationKind::RequiresReview,
+        short_label: "review required".to_string(),
+        detail_label: format!(
+            "rule was not auto-approved and requires review; possible issues: {issues}"
+        ),
+    })
+}
+
+fn validation_issue_summary(validation: &str) -> String {
+    let mut issues = Vec::new();
+    for line in validation.lines().skip(1) {
+        let Some((category, _)) = line.trim().split_once(':') else {
+            continue;
+        };
+        let label = category.trim().replace('_', " ");
+        if !label.is_empty() && !issues.contains(&label) {
+            issues.push(label);
+        }
+    }
+
+    if issues.is_empty() {
+        validation.lines().next().unwrap_or(validation).to_string()
+    } else {
+        issues.join(", ")
     }
 }
 
