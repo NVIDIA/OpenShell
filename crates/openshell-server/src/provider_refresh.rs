@@ -560,6 +560,15 @@ async fn mint_okta_xaa_token_exchange(
     store: &Store,
     state: &StoredProviderCredentialRefreshState,
 ) -> Result<MintedCredential, Status> {
+    if material_value(
+        &state.material,
+        &["requesting_client_id", "requesting_client_secret", "resource_client_id", "resource_client_secret"],
+    )
+    .is_some()
+    {
+        return mint_okta_xaa_sample_token_exchange(store, state).await;
+    }
+
     let token_url = oauth2_token_url(state)?;
     let sandbox_id = required_material(&state.material, "sandbox_id")?;
     let binding = crate::delegation::get_binding(store, &sandbox_id)
@@ -579,12 +588,16 @@ async fn mint_okta_xaa_token_exchange(
     let client_assertion = build_okta_xaa_client_assertion(state, &token_url, &client_id)?;
     let client_assertion_type = material_value(&state.material, &["client_assertion_type"])
         .unwrap_or_else(|| "urn:ietf:params:oauth:client-assertion-type:jwt-bearer".to_string());
-    let resource = required_material(&state.material, "resource")?;
+    let audience = required_material(&state.material, "audience")?;
 
     let mut form = vec![
         (
             "grant_type".to_string(),
             "urn:ietf:params:oauth:grant-type:token-exchange".to_string(),
+        ),
+        (
+            "requested_token_type".to_string(),
+            "urn:ietf:params:oauth:token-type:id-jag".to_string(),
         ),
         ("client_id".to_string(), client_id),
         ("client_assertion".to_string(), client_assertion),
@@ -594,7 +607,7 @@ async fn mint_okta_xaa_token_exchange(
             "subject_token_type".to_string(),
             "urn:ietf:params:oauth:token-type:id_token".to_string(),
         ),
-        ("resource".to_string(), resource),
+        ("audience".to_string(), audience),
     ];
     let scope = refresh_scopes(state).join(" ");
     if !scope.is_empty() {
@@ -602,6 +615,110 @@ async fn mint_okta_xaa_token_exchange(
     }
 
     request_token(&token_url, &form, None, state.max_lifetime_seconds).await
+}
+
+async fn mint_okta_xaa_sample_token_exchange(
+    store: &Store,
+    state: &StoredProviderCredentialRefreshState,
+) -> Result<MintedCredential, Status> {
+    let sandbox_id = required_material(&state.material, "sandbox_id")?;
+    let binding = crate::delegation::get_binding(store, &sandbox_id)
+        .await?
+        .ok_or_else(|| {
+            Status::failed_precondition(format!(
+                "sandbox delegation binding not found for sandbox_id '{sandbox_id}'"
+            ))
+        })?;
+    if binding.id_token.trim().is_empty() {
+        return Err(Status::failed_precondition(
+            "sandbox delegation binding does not contain an OIDC id_token",
+        ));
+    }
+
+    let requesting_client_id = required_material(&state.material, "requesting_client_id")?;
+    let requesting_client_secret = required_material(&state.material, "requesting_client_secret")?;
+    let resource_client_id = required_material(&state.material, "resource_client_id")?;
+    let resource_client_secret = required_material(&state.material, "resource_client_secret")?;
+    let audience = required_material(&state.material, "audience")?;
+    let resource = material_value(&state.material, &["resource"])
+        .unwrap_or_else(|| audience.clone());
+    let scope = refresh_scopes(state).join(" ");
+
+    let idp_token_url = oauth2_token_url(state)?;
+    let mut jag_form = vec![
+        (
+            "grant_type".to_string(),
+            "urn:ietf:params:oauth:grant-type:token-exchange".to_string(),
+        ),
+        (
+            "requested_token_type".to_string(),
+            "urn:ietf:params:oauth:token-type:id-jag".to_string(),
+        ),
+        ("subject_token".to_string(), binding.id_token),
+        (
+            "subject_token_type".to_string(),
+            "urn:ietf:params:oauth:token-type:id_token".to_string(),
+        ),
+        ("audience".to_string(), audience.clone()),
+        ("resource".to_string(), resource),
+        ("client_id".to_string(), requesting_client_id),
+        ("client_secret".to_string(), requesting_client_secret),
+    ];
+    if !scope.is_empty() {
+        jag_form.push(("scope".to_string(), scope.clone()));
+    }
+
+    let id_jag = request_token(
+        &idp_token_url,
+        &jag_form,
+        None,
+        state.max_lifetime_seconds,
+    )
+    .await?
+    .access_token;
+
+    let resource_token_url = material_value(&state.material, &["resource_token_url"])
+        .map(Ok)
+        .unwrap_or_else(|| token_url_from_issuer(&audience))?;
+    let mut resource_form = vec![
+        (
+            "grant_type".to_string(),
+            "urn:ietf:params:oauth:grant-type:jwt-bearer".to_string(),
+        ),
+        ("assertion".to_string(), id_jag),
+        ("client_id".to_string(), resource_client_id),
+        ("client_secret".to_string(), resource_client_secret),
+    ];
+    if !scope.is_empty() {
+        resource_form.push(("scope".to_string(), scope));
+    }
+
+    request_token(
+        &resource_token_url,
+        &resource_form,
+        None,
+        state.max_lifetime_seconds,
+    )
+    .await
+}
+
+fn token_url_from_issuer(issuer: &str) -> Result<String, Status> {
+    let mut url = reqwest::Url::parse(issuer)
+        .map_err(|_| Status::invalid_argument("issuer must be an absolute URL"))?;
+    let mut path = url.path().trim_end_matches('/').to_string();
+    if path.is_empty() {
+        path = "/oauth2/v1/token".to_string();
+    } else if path.ends_with("/oauth2") {
+        path.push_str("/v1/token");
+    } else if path.ends_with("/oauth2/default") || path.contains("/oauth2/") {
+        path.push_str("/v1/token");
+    } else {
+        path.push_str("/oauth2/v1/token");
+    }
+    url.set_path(&path);
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url.to_string())
 }
 
 fn build_okta_xaa_client_assertion(
@@ -1292,7 +1409,12 @@ mod tests {
             .and(body_string_contains(
                 "subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aid_token",
             ))
-            .and(body_string_contains("resource=jira-connection"))
+            .and(body_string_contains(
+                "requested_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aid-jag",
+            ))
+            .and(body_string_contains(
+                "audience=https%3A%2F%2Fnvidia-partner.oktapreview.com",
+            ))
             .and(body_string_contains("client_assertion="))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token": "xaa-delegated-token",
@@ -1336,7 +1458,10 @@ mod tests {
                 material: HashMap::from([
                     ("client_id".to_string(), "agent-client-id".to_string()),
                     ("sandbox_id".to_string(), "sandbox-xaa".to_string()),
-                    ("resource".to_string(), "jira-connection".to_string()),
+                    (
+                        "audience".to_string(),
+                        "https://nvidia-partner.oktapreview.com".to_string(),
+                    ),
                     (
                         "private_key_pem".to_string(),
                         TEST_RSA_PRIVATE_KEY.to_string(),

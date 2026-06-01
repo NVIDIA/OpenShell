@@ -33,6 +33,9 @@ use tokio::sync::oneshot;
 use tracing::debug;
 
 const AUTH_TIMEOUT: Duration = Duration::from_secs(120);
+const DEFAULT_OIDC_CALLBACK_BIND: &str = "127.0.0.1:0";
+const OIDC_CALLBACK_PORT_ENV: &str = "OPENSHELL_OIDC_CALLBACK_PORT";
+const OIDC_CLIENT_SECRET_ENV: &str = "OPENSHELL_OIDC_CLIENT_SECRET";
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct OidcExtraTokenFields {
@@ -127,6 +130,25 @@ fn build_ci_scopes(scopes: Option<&str>) -> Vec<Scope> {
         .collect()
 }
 
+fn oidc_callback_bind_address() -> Result<String> {
+    match std::env::var(OIDC_CALLBACK_PORT_ENV) {
+        Ok(raw) => {
+            let port = raw.parse::<u16>().map_err(|_| {
+                miette::miette!(
+                    "{OIDC_CALLBACK_PORT_ENV} must be a valid TCP port number, got '{raw}'"
+                )
+            })?;
+            if port == 0 {
+                return Err(miette::miette!(
+                    "{OIDC_CALLBACK_PORT_ENV} must be greater than 0"
+                ));
+            }
+            Ok(format!("127.0.0.1:{port}"))
+        }
+        Err(_) => Ok(DEFAULT_OIDC_CALLBACK_BIND.to_string()),
+    }
+}
+
 /// Run the OIDC Authorization Code + PKCE browser flow.
 ///
 /// Opens the user's browser to the Keycloak login page and waits for
@@ -140,14 +162,21 @@ pub async fn oidc_browser_auth_flow(
 ) -> Result<OidcTokenBundle> {
     let discovery = discover(issuer, insecure).await?;
 
-    let listener = TcpListener::bind("127.0.0.1:0").await.into_diagnostic()?;
+    let listener = TcpListener::bind(oidc_callback_bind_address()?)
+        .await
+        .into_diagnostic()?;
     let port = listener.local_addr().into_diagnostic()?.port();
     let redirect_uri = format!("http://127.0.0.1:{port}/callback");
 
-    let client = OidcClient::new(ClientId::new(client_id.to_string()))
+    let mut client = OidcClient::new(ClientId::new(client_id.to_string()))
         .set_auth_uri(AuthUrl::new(discovery.authorization_endpoint).into_diagnostic()?)
         .set_token_uri(TokenUrl::new(discovery.token_endpoint).into_diagnostic()?)
         .set_redirect_uri(RedirectUrl::new(redirect_uri).into_diagnostic()?);
+    if let Ok(client_secret) = std::env::var(OIDC_CLIENT_SECRET_ENV) {
+        client = client
+            .set_client_secret(ClientSecret::new(client_secret))
+            .set_auth_type(AuthType::RequestBody);
+    }
 
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
 
@@ -223,9 +252,9 @@ pub async fn oidc_client_credentials_flow(
     scopes: Option<&str>,
     insecure: bool,
 ) -> Result<OidcTokenBundle> {
-    let client_secret = std::env::var("OPENSHELL_OIDC_CLIENT_SECRET").map_err(|_| {
+    let client_secret = std::env::var(OIDC_CLIENT_SECRET_ENV).map_err(|_| {
         miette::miette!(
-            "OPENSHELL_OIDC_CLIENT_SECRET environment variable is required for client credentials flow"
+            "{OIDC_CLIENT_SECRET_ENV} environment variable is required for client credentials flow"
         )
     })?;
 

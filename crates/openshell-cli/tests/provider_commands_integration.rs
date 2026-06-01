@@ -1883,13 +1883,70 @@ async fn built_in_okta_xaa_profile_is_available_via_provider_profile_api() {
         refresh
             .material
             .iter()
-            .any(|material| material.name == "resource" && material.required)
+            .any(|material| material.name == "requesting_client_id" && material.required)
     );
     assert!(
         refresh
             .material
             .iter()
-            .any(|material| material.name == "private_key_pem"
+            .any(|material| material.name == "requesting_client_secret"
+                && material.required
+                && material.secret)
+    );
+    assert!(
+        refresh
+            .material
+            .iter()
+            .any(|material| material.name == "resource_client_id" && material.required)
+    );
+    assert!(
+        refresh
+            .material
+            .iter()
+            .any(|material| material.name == "resource_client_secret"
+                && material.required
+                && material.secret)
+    );
+}
+
+#[tokio::test]
+async fn built_in_xaa_dev_profile_is_available_via_provider_profile_api() {
+    let ts = run_server().await;
+
+    let mut client = openshell_cli::tls::grpc_client(&ts.endpoint, &ts.tls)
+        .await
+        .expect("grpc client should connect");
+    let profile = client
+        .get_provider_profile(openshell_core::proto::GetProviderProfileRequest {
+            id: "xaa-dev".to_string(),
+        })
+        .await
+        .expect("get provider profile")
+        .into_inner()
+        .profile
+        .expect("profile should exist");
+
+    assert_eq!(profile.id, "xaa-dev");
+    let credential = profile
+        .credentials
+        .iter()
+        .find(|credential| credential.name == "xaa_access_token")
+        .expect("xaa access token credential");
+    let refresh = credential
+        .refresh
+        .as_ref()
+        .expect("xaa credential should include refresh config");
+    assert_eq!(
+        refresh.strategy,
+        ProviderCredentialRefreshStrategy::OktaXaa as i32
+    );
+    assert_eq!(refresh.token_url, "https://idp.xaa.dev/token");
+    assert_eq!(refresh.scopes, vec!["todos.read"]);
+    assert!(
+        refresh
+            .material
+            .iter()
+            .any(|material| material.name == "resource_client_secret"
                 && material.required
                 && material.secret)
     );

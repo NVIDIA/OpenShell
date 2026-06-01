@@ -23,6 +23,7 @@ const BUILT_IN_PROFILE_YAMLS: &[&str] = &[
     include_str!("../../../providers/nvidia.yaml"),
     include_str!("../../../providers/okta-obo.yaml"),
     include_str!("../../../providers/okta-xaa.yaml"),
+    include_str!("../../../providers/xaa-dev.yaml"),
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -1261,12 +1262,14 @@ mod tests {
         assert_eq!(
             material_names,
             vec![
-                "client_id",
+                "requesting_client_id",
+                "requesting_client_secret",
                 "sandbox_id",
+                "resource_client_id",
+                "resource_client_secret",
+                "audience",
                 "resource",
-                "private_key_pem",
-                "kid",
-                "client_assertion_type",
+                "resource_token_url",
                 "scope"
             ]
         );
@@ -1274,9 +1277,61 @@ mod tests {
             refresh
                 .material
                 .iter()
-                .find(|material| material.name == "private_key_pem")
+                .find(|material| material.name == "requesting_client_secret")
                 .is_some_and(|material| material.required && material.secret)
         );
+        assert!(
+            refresh
+                .material
+                .iter()
+                .find(|material| material.name == "resource_client_secret")
+                .is_some_and(|material| material.required && material.secret)
+        );
+    }
+
+    #[test]
+    fn xaa_dev_profile_exposes_sample_two_step_shape() {
+        let profile = get_default_profile("xaa-dev").expect("xaa-dev profile");
+        let credential = profile
+            .credentials
+            .iter()
+            .find(|credential| credential.name == "xaa_access_token")
+            .expect("xaa-dev access token credential");
+        let refresh = credential
+            .refresh
+            .as_ref()
+            .expect("xaa-dev credential should be refreshable");
+
+        assert_eq!(
+            refresh.strategy,
+            openshell_core::proto::ProviderCredentialRefreshStrategy::OktaXaa
+        );
+        assert_eq!(refresh.token_url, "https://idp.xaa.dev/token");
+        assert_eq!(refresh.scopes, vec!["todos.read"]);
+
+        let material_names = refresh
+            .material
+            .iter()
+            .map(|material| material.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            material_names,
+            vec![
+                "requesting_client_id",
+                "requesting_client_secret",
+                "sandbox_id",
+                "resource_client_id",
+                "resource_client_secret",
+                "audience",
+                "resource",
+                "resource_token_url",
+            ]
+        );
+        assert_eq!(profile.endpoints.len(), 3);
+        assert_eq!(profile.endpoints[0].host, "idp.xaa.dev");
+        assert_eq!(profile.endpoints[1].host, "auth.resource.xaa.dev");
+        assert_eq!(profile.endpoints[2].host, "api.resource.xaa.dev");
+        assert_eq!(profile.endpoints[2].access, "read-only");
     }
 
     #[test]

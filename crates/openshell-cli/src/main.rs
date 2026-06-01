@@ -140,6 +140,15 @@ fn apply_auth(tls: &mut TlsOptions, gateway_name: &str) {
             else {
                 return;
             };
+            let bearer_for_gateway = |access_token: &str, id_token: Option<&String>| {
+                if access_token.matches('.').count() == 2 {
+                    access_token.to_string()
+                } else {
+                    id_token
+                        .cloned()
+                        .unwrap_or_else(|| access_token.to_string())
+                }
+            };
             if openshell_bootstrap::oidc_token::is_token_expired(&bundle) {
                 let insecure = std::env::var("OPENSHELL_GATEWAY_INSECURE")
                     .is_ok_and(|v| !v.is_empty() && v != "0" && v != "false");
@@ -155,19 +164,28 @@ fn apply_auth(tls: &mut TlsOptions, gateway_name: &str) {
                             gateway_name,
                             &refreshed,
                         );
-                        tls.oidc_token = Some(refreshed.access_token);
+                        tls.oidc_token = Some(bearer_for_gateway(
+                            &refreshed.access_token,
+                            refreshed.id_token.as_ref(),
+                        ));
                         tls.oidc_id_token = refreshed.id_token;
                     }
                     Err(e) => {
                         tracing::warn!("OIDC token refresh failed: {e}");
                         // Use the expired token anyway — server will reject it
                         // with a clear error prompting re-login.
-                        tls.oidc_token = Some(bundle.access_token);
+                        tls.oidc_token = Some(bearer_for_gateway(
+                            &bundle.access_token,
+                            bundle.id_token.as_ref(),
+                        ));
                         tls.oidc_id_token = bundle.id_token;
                     }
                 }
             } else {
-                tls.oidc_token = Some(bundle.access_token);
+                tls.oidc_token = Some(bearer_for_gateway(
+                    &bundle.access_token,
+                    bundle.id_token.as_ref(),
+                ));
                 tls.oidc_id_token = bundle.id_token;
             }
         }

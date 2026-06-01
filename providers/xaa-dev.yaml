@@ -1,0 +1,66 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+id: xaa-dev
+display_name: XAA.dev Sample
+description: Sample 2-step XAA flow using idp.xaa.dev and the Todo0 Resource App
+category: other
+credentials:
+  - name: xaa_access_token
+    description: XAA.dev delegated access token for the Todo0 sample resource API
+    env_vars: [XAA_DEV_ACCESS_TOKEN]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+    refresh:
+      strategy: okta_xaa
+      token_url: https://idp.xaa.dev/token
+      refresh_before_seconds: 300
+      max_lifetime_seconds: 3600
+      scopes: [todos.read]
+      material:
+        - name: requesting_client_id
+          description: XAA.dev requesting app client ID used for the ID token to ID-JAG exchange
+          required: true
+        - name: requesting_client_secret
+          description: XAA.dev requesting app client secret used for the ID token to ID-JAG exchange
+          required: true
+          secret: true
+        - name: sandbox_id
+          description: OpenShell sandbox ID bound to the authenticated user's OIDC id_token
+          required: true
+        - name: resource_client_id
+          description: Resource client ID for the Todo0 sample resource authorization server
+          required: true
+        - name: resource_client_secret
+          description: Resource client secret for the Todo0 sample resource authorization server
+          required: true
+          secret: true
+        - name: audience
+          description: Resource authorization server issuer used when minting the ID-JAG
+          required: true
+        - name: resource
+          description: Optional protected resource URL requested during the ID-JAG exchange
+          required: false
+        - name: resource_token_url
+          description: Optional resource authorization server token endpoint
+          required: false
+endpoints:
+  - host: idp.xaa.dev
+    port: 443
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+  - host: auth.resource.xaa.dev
+    port: 443
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+  - host: api.resource.xaa.dev
+    port: 443
+    protocol: rest
+    access: read-only
+    enforcement: enforce
+binaries:
+  - /usr/bin/curl
+  - /usr/local/bin/curl

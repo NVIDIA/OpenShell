@@ -18,24 +18,31 @@ credentials:
       refresh_before_seconds: 300
       max_lifetime_seconds: 3600
       material:
-        - name: client_id
-          description: Okta AI agent client ID used for XAA token exchange
+        - name: requesting_client_id
+          description: XAA requesting app client ID used for the ID token to ID-JAG exchange
           required: true
+        - name: requesting_client_secret
+          description: XAA requesting app client secret used for the ID token to ID-JAG exchange
+          required: true
+          secret: true
         - name: sandbox_id
           description: OpenShell sandbox ID bound to the authenticated user's OIDC tokens
           required: true
-        - name: resource
-          description: Okta XAA resource or resource connection identifier
+        - name: resource_client_id
+          description: XAA resource app client ID used for the ID-JAG to access-token exchange
           required: true
-        - name: private_key_pem
-          description: RSA private key PEM used to sign the Okta XAA client assertion
+        - name: resource_client_secret
+          description: XAA resource app client secret used for the ID-JAG to access-token exchange
           required: true
           secret: true
-        - name: kid
-          description: Optional key ID for the registered Okta public key
+        - name: audience
+          description: Okta XAA resource authorization server issuer used as the audience for the ID-JAG exchange
+          required: true
+        - name: resource
+          description: Optional resource URL sent during the ID token to ID-JAG exchange. Defaults to the audience when omitted.
           required: false
-        - name: client_assertion_type
-          description: OAuth client assertion type, usually urn:ietf:params:oauth:client-assertion-type:jwt-bearer
+        - name: resource_token_url
+          description: Optional resource app token endpoint. Defaults to the audience issuer with /oauth2/v1/token.
           required: false
         - name: scope
           description: Space-delimited scopes requested for the delegated token
