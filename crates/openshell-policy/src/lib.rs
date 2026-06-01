@@ -12,7 +12,7 @@
 mod compose;
 mod merge;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 
@@ -22,211 +22,17 @@ use openshell_core::proto::{
     LandlockPolicy, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, ProcessPolicy,
     SandboxPolicy,
 };
-use serde::{Deserialize, Serialize};
+use openshell_policy_schema::{
+    FilesystemDef, GraphqlOperationDef, L7AllowDef, L7DenyRuleDef, L7RuleDef, LandlockDef,
+    NetworkBinaryDef, NetworkEndpointDef, NetworkPolicyRuleDef, PolicyFile, ProcessDef,
+    QueryAnyDef, QueryMatcherDef,
+};
 
 pub use compose::{ProviderPolicyLayer, compose_effective_policy, provider_rule_name};
 pub use merge::{
     PolicyMergeError, PolicyMergeOp, PolicyMergeResult, PolicyMergeWarning, generated_rule_name,
     merge_policy, policy_covers_rule,
 };
-
-// ---------------------------------------------------------------------------
-// YAML serde types (canonical — used for both parsing and serialization)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PolicyFile {
-    version: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    filesystem_policy: Option<FilesystemDef>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    landlock: Option<LandlockDef>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    process: Option<ProcessDef>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    network_policies: BTreeMap<String, NetworkPolicyRuleDef>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FilesystemDef {
-    #[serde(default)]
-    include_workdir: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    read_only: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    read_write: Vec<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LandlockDef {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    compatibility: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProcessDef {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    run_as_user: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    run_as_group: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NetworkPolicyRuleDef {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    name: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    endpoints: Vec<NetworkEndpointDef>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    binaries: Vec<NetworkBinaryDef>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NetworkEndpointDef {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    host: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    path: String,
-    /// Single port (backwards compat). Mutually exclusive with `ports`.
-    /// Uses `u16` to reject invalid values >65535 at parse time.
-    #[serde(default, skip_serializing_if = "is_zero")]
-    port: u16,
-    /// Multiple ports. When non-empty, this endpoint covers all listed ports.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    ports: Vec<u16>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    protocol: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    tls: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    enforcement: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    access: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    rules: Vec<L7RuleDef>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    allowed_ips: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    deny_rules: Vec<L7DenyRuleDef>,
-    /// When true, percent-encoded `/` (`%2F`) is preserved in path segments
-    /// rather than rejected by the L7 path canonicalizer. Required for
-    /// upstreams like GitLab that embed `%2F` in namespaced resource paths.
-    /// Defaults to false (strict).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    allow_encoded_slash: bool,
-    /// When true, client-to-server WebSocket text messages on this REST
-    /// endpoint rewrite credential placeholders after an allowed 101 upgrade.
-    /// Defaults to false.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    websocket_credential_rewrite: bool,
-    /// When true, supported textual REST request bodies rewrite credential
-    /// placeholders before forwarding upstream. Defaults to false.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    request_body_credential_rewrite: bool,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    persisted_queries: String,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    graphql_persisted_queries: BTreeMap<String, GraphqlOperationDef>,
-    #[serde(default, skip_serializing_if = "is_zero_u32")]
-    graphql_max_body_bytes: u32,
-}
-
-// Signature dictated by serde's `skip_serializing_if`, which requires `&T`.
-#[allow(clippy::trivially_copy_pass_by_ref)]
-fn is_zero(v: &u16) -> bool {
-    *v == 0
-}
-
-// Signature dictated by serde's `skip_serializing_if`, which requires `&T`.
-#[allow(clippy::trivially_copy_pass_by_ref)]
-fn is_zero_u32(v: &u32) -> bool {
-    *v == 0
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct GraphqlOperationDef {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    operation_type: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    operation_name: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    fields: Vec<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct L7RuleDef {
-    allow: L7AllowDef,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct L7AllowDef {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    method: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    path: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    command: String,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    query: BTreeMap<String, QueryMatcherDef>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    operation_type: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    operation_name: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    fields: Vec<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(untagged)]
-enum QueryMatcherDef {
-    Glob(String),
-    Any(QueryAnyDef),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct QueryAnyDef {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    any: Vec<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct L7DenyRuleDef {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    method: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    path: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    command: String,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    query: BTreeMap<String, QueryMatcherDef>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    operation_type: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    operation_name: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    fields: Vec<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NetworkBinaryDef {
-    path: String,
-    /// Deprecated: ignored. Kept for backward compat with existing YAML files.
-    #[serde(default, skip_serializing)]
-    #[allow(dead_code)]
-    harness: bool,
-}
 
 // ---------------------------------------------------------------------------
 // YAML → proto conversion
