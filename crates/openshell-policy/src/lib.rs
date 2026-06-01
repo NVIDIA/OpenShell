@@ -702,6 +702,8 @@ pub enum PolicyViolation {
     TooManyPaths { count: usize },
     /// A network endpoint uses a TLD wildcard (e.g. `*.com`).
     TldWildcard { policy_name: String, host: String },
+    /// `credential_signing` is set but `signing_service` is missing.
+    MissingSigningService { policy_name: String, host: String },
 }
 
 impl fmt::Display for PolicyViolation {
@@ -736,6 +738,13 @@ impl fmt::Display for PolicyViolation {
                     f,
                     "network policy '{policy_name}': TLD wildcard '{host}' is not allowed; \
                      use subdomain wildcards like '*.example.com' instead"
+                )
+            }
+            Self::MissingSigningService { policy_name, host } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': endpoint '{host}' has credential_signing \
+                     set but signing_service is empty"
                 )
             }
         }
@@ -841,6 +850,12 @@ pub fn validate_sandbox_policy(
                         host: ep.host.clone(),
                     });
                 }
+            }
+            if !ep.credential_signing.is_empty() && ep.signing_service.is_empty() {
+                violations.push(PolicyViolation::MissingSigningService {
+                    policy_name: name.clone(),
+                    host: ep.host.clone(),
+                });
             }
         }
     }
@@ -1393,6 +1408,49 @@ network_policies:
                 endpoints: vec![NetworkEndpoint {
                     host: "example.com".into(),
                     port: 443,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        assert!(validate_sandbox_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_credential_signing_without_signing_service() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "aws".into(),
+            NetworkPolicyRule {
+                name: "bedrock".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "bedrock-runtime.us-east-1.amazonaws.com".into(),
+                    port: 443,
+                    credential_signing: "sigv4".into(),
+                    signing_service: String::new(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(violations
+            .iter()
+            .any(|v| matches!(v, PolicyViolation::MissingSigningService { .. })));
+    }
+
+    #[test]
+    fn validate_accepts_credential_signing_with_signing_service() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "aws".into(),
+            NetworkPolicyRule {
+                name: "bedrock".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "bedrock-runtime.us-east-1.amazonaws.com".into(),
+                    port: 443,
+                    credential_signing: "sigv4".into(),
+                    signing_service: "bedrock".into(),
                     ..Default::default()
                 }],
                 ..Default::default()
