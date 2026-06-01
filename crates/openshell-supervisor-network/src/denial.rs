@@ -6,9 +6,7 @@
 //! `DenialEvent` is emitted by the supervisor's networking proxy (on L4/L7
 //! deny) and by the bypass monitor (on direct-connect attempts that bypass
 //! the proxy). It is consumed by the networking-side denial aggregator that
-//! deduplicates and flushes summaries to the gateway. The type lives in
-//! `openshell-core` so that the eventual networking and process supervisor
-//! crates can both reference it without depending on each other.
+//! deduplicates and flushes summaries to the gateway.
 
 /// A single denial event emitted by the proxy or the bypass monitor.
 #[derive(Debug, Clone)]

@@ -8,6 +8,7 @@
 //! follow-up commits as modules migrate out of `openshell-sandbox`.
 
 pub mod bypass_monitor;
+pub mod denial;
 pub mod denial_aggregator;
 pub mod identity;
 pub mod inference_routes;

@@ -11,7 +11,6 @@
 
 pub mod auth;
 pub mod config;
-pub mod denial;
 pub mod driver_utils;
 pub mod error;
 pub mod forward;
@@ -39,7 +38,6 @@ pub use config::{
     ComputeDriverKind, Config, GatewayAuthConfig, GatewayJwtConfig, MtlsAuthConfig, OidcConfig,
     TlsConfig,
 };
-pub use denial::DenialEvent;
 pub use error::{ComputeDriverError, Error, Result};
 pub use metadata::{GetResourceVersion, ObjectId, ObjectLabels, ObjectName, SetResourceVersion};
 

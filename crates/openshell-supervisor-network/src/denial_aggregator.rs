@@ -14,7 +14,7 @@ use std::future::Future;
 use tokio::sync::mpsc;
 use tracing::debug;
 
-use openshell_core::DenialEvent;
+use crate::denial::DenialEvent;
 
 /// Aggregated denial summary keyed by `(host, port, binary)`.
 #[derive(Debug, Clone)]

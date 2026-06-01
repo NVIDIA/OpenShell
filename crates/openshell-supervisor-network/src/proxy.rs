@@ -8,7 +8,7 @@ use crate::l7::tls::ProxyTlsState;
 use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard};
 use crate::policy_local::{POLICY_LOCAL_HOST, PolicyLocalContext};
 use miette::{IntoDiagnostic, Result};
-use openshell_core::DenialEvent;
+use crate::denial::DenialEvent;
 use openshell_core::net::{is_always_blocked_ip, is_internal_ip, is_link_local_ip};
 use openshell_core::policy::ProxyPolicy;
 use openshell_core::provider_credentials::ProviderCredentialState;

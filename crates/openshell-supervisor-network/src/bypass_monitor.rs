@@ -16,7 +16,7 @@
 //! the monitor logs a one-time warning and returns. The nftables reject rules
 //! still provide fast-fail UX — the monitor only adds diagnostic visibility.
 
-use openshell_core::DenialEvent;
+use crate::denial::DenialEvent;
 use openshell_ocsf::{
     ActionId, ActivityId, ConfidenceId, DetectionFindingBuilder, DispositionId, Endpoint,
     FindingInfo, NetworkActivityBuilder, Process, SeverityId, ocsf_emit,
