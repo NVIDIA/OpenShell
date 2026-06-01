@@ -1,0 +1,36 @@
+name: Windows MSVC (build-only)
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  x64:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v3
+        with:
+          install: false
+          experimental: true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - run: mise run --skip-tools windows:check:x64
+      - run: mise run --skip-tools windows:build:x64
+      - run: mise run --skip-tools windows:test:x64
+      - run: mise run --skip-tools windows:test:unsupported:x64
+  arm64:
+    # TODO: provision a windows-arm64 self-hosted runner
+    runs-on: [self-hosted, windows-arm64]
+    if: false # flip to true once the runner is online
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v3
+        with:
+          install: false
+          experimental: true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-pc-windows-msvc
+      - run: mise run --skip-tools windows:check:arm64
+      - run: mise run --skip-tools windows:build:arm64
