@@ -16,6 +16,10 @@ Create and manage providers that supply credentials to sandboxes.
 Providers v2 is available for profile-backed provider policy, provider-owned network rules, and gateway-managed credential refresh. This page remains the credential-focused provider command reference. For the new workflow, see [Providers v2](/sandboxes/providers-v2).
 </Info>
 
+<Note>
+Most providers inject placeholder environment variables such as `GITHUB_TOKEN` or `OPENAI_API_KEY`. Brokered runtime providers such as `microsoft-agent-s2s` are different: the sandbox receives a local token-provider URL, and the gateway mints short-lived tokens at runtime instead of projecting the long-lived provider secret into the workload.
+</Note>
+
 Provider profiles include metadata for known endpoints and binaries. View
 the available profiles before creating a provider:
 
@@ -45,6 +49,19 @@ Supply a credential value directly:
 
 ```shell
 openshell provider create --name my-api --type generic --credential API_KEY=sk-abc123
+```
+
+Brokered providers can combine one secret credential with non-secret config. For example, create a Microsoft Agent S2S provider by storing the blueprint client secret as the credential and the Microsoft identity metadata as provider config:
+
+```shell
+openshell provider create \
+  --name microsoft-a365 \
+  --type microsoft-agent-s2s \
+  --credential A365_BLUEPRINT_CLIENT_SECRET="$A365_BLUEPRINT_CLIENT_SECRET" \
+  --config AZURE_TENANT_ID="$AZURE_TENANT_ID" \
+  --config A365_BLUEPRINT_CLIENT_ID="$A365_BLUEPRINT_CLIENT_ID" \
+  --config A365_RUNTIME_AGENT_ID="$A365_RUNTIME_AGENT_ID" \
+  --config A365_ALLOWED_AUDIENCES="$A365_ALLOWED_AUDIENCES"
 ```
 
 ### Bare Key Form
@@ -203,6 +220,19 @@ The agent process inside the sandbox never sees real credential values. At start
 
 This resolution requires the proxy to see plaintext HTTP. Endpoints must use `protocol: rest` in the policy (which auto-terminates TLS) or explicit `tls: terminate`. Endpoints without TLS termination pass traffic through as an opaque stream, and credential placeholders are forwarded unresolved.
 
+### Brokered Runtime Providers
+
+Some providers do not inject the primary credential into the workload at all. `microsoft-agent-s2s` is the first built-in example.
+
+Instead of projecting `A365_BLUEPRINT_CLIENT_SECRET` into the sandbox, OpenShell injects sandbox-local token broker metadata:
+
+- `A365_TOKEN_PROVIDER_URL`
+- `OPENSHELL_MICROSOFT_AGENT_S2S_TOKEN_PROVIDER_URL`
+- `OPENSHELL_MICROSOFT_AGENT_S2S_TOKEN_URL`
+- `OPENSHELL_MICROSOFT_AGENT_S2S_DEFAULT_AUDIENCE`, when the provider config resolves one automatically
+
+The workload calls the local token URL when it needs a bearer token. The gateway validates that the sandbox has the provider attached, checks that the requested audience is allowed by the provider config, and returns a short-lived Microsoft token. This keeps blueprint client secrets and Microsoft token exchange logic out of the sandboxed application process.
+
 ### Supported injection locations
 
 The proxy resolves credential placeholders in the following parts of an HTTP request:
@@ -251,6 +281,7 @@ The following provider types are supported.
 | `generic` | User-defined | Any service with custom credentials |
 | `github` | `GITHUB_TOKEN`, `GH_TOKEN` | GitHub API and `gh` CLI. Refer to [GitHub Sandbox](/get-started/tutorials/github-sandbox). |
 | `gitlab` | `GITLAB_TOKEN`, `GLAB_TOKEN`, `CI_JOB_TOKEN` | GitLab API, `glab` CLI |
+| `microsoft-agent-s2s` | `A365_TOKEN_PROVIDER_URL`, `OPENSHELL_MICROSOFT_AGENT_S2S_TOKEN_PROVIDER_URL`, `OPENSHELL_MICROSOFT_AGENT_S2S_TOKEN_URL`, optional `OPENSHELL_MICROSOFT_AGENT_S2S_DEFAULT_AUDIENCE` | Brokered Microsoft Agent 365 service-to-service access. The sandbox receives a local token broker URL rather than the blueprint client secret. Refer to [Microsoft Agent S2S Provider](/get-started/tutorials/microsoft-agent-s2s). |
 | `nvidia` | `NVIDIA_API_KEY` | NVIDIA API Catalog |
 | `openai` | `OPENAI_API_KEY` | Any OpenAI-compatible endpoint. Set `--config OPENAI_BASE_URL` to point to the provider. Refer to [Inference Routing](/sandboxes/inference-routing). |
 | `opencode` | `OPENCODE_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY` | OpenCode |

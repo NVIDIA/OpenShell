@@ -25,6 +25,7 @@ Providers v2 keeps those pieces together:
 | Custom provider definitions | You can export, edit, lint, import, list, and delete custom profiles. |
 | Runtime provider lifecycle | You can list, attach, and detach providers on existing sandboxes. |
 | Credential rotation | Provider refresh metadata lets the gateway refresh short-lived access tokens and update provider records. |
+| Brokered runtime tokens | Selected providers can keep long-lived identity material at the gateway and inject a sandbox-local token URL instead. |
 | Backward compatibility | Credential delivery still uses environment placeholders and proxy rewrite. |
 
 ## Enable Providers v2
@@ -60,6 +61,7 @@ Providers v2 currently includes these user-facing features:
 - Runtime sandbox provider lifecycle commands under `openshell sandbox provider list|attach|detach`.
 - Credential refresh configuration with `openshell provider refresh status|configure|rotate|delete`.
 - Credential expiry metadata with `openshell provider update --credential-expires-at`; values accept Unix epoch milliseconds or ISO/RFC3339 timestamps.
+- Brokered runtime provider contracts for workloads that need the gateway to mint tokens on demand instead of injecting the underlying secret.
 
 ## Roadmap
 
@@ -94,6 +96,7 @@ Built-in Providers v2 profiles currently include:
 |---|---|---|
 | `claude-code` | `agent` | `ANTHROPIC_API_KEY`, `CLAUDE_API_KEY` |
 | `github` | `source_control` | `GITHUB_TOKEN`, `GH_TOKEN` |
+| `microsoft-agent-s2s` | `agent` | `A365_TOKEN_PROVIDER_URL`, `OPENSHELL_MICROSOFT_AGENT_S2S_TOKEN_PROVIDER_URL`, `OPENSHELL_MICROSOFT_AGENT_S2S_TOKEN_URL`, optional `OPENSHELL_MICROSOFT_AGENT_S2S_DEFAULT_AUDIENCE` |
 | `nvidia` | `inference` | `NVIDIA_API_KEY` |
 
 Export a built-in profile as YAML:
@@ -236,6 +239,8 @@ binaries:
 
 `credentials` declares the credential names, environment variables, auth metadata, and optional refresh metadata for the provider type. The current runtime still exposes configured credential keys as placeholder environment variables and resolves placeholders in outbound HTTP requests.
 
+Some provider profiles intentionally use a brokered runtime contract instead of direct credential projection. `microsoft-agent-s2s` is the built-in example. It stores `A365_BLUEPRINT_CLIENT_SECRET` and related Microsoft identity config on the gateway, injects a sandbox-local token URL into the workload, and lets the gateway mint short-lived tokens for approved audiences on demand.
+
 `discovery` controls what `--from-existing` scans when
 `providers_v2_enabled=true`. Each entry in `discovery.credentials` must name a
 credential declared under `credentials`. OpenShell scans the referenced
@@ -273,6 +278,24 @@ Gateway-managed refresh strategies use these material keys:
 | `google_service_account_jwt` | `client_email`, `private_key`, optional `subject` or `sub`. |
 
 OpenShell keeps token endpoints profile-owned. Refresh material cannot override `token_url` or `token_uri` during refresh configuration.
+
+## Brokered Runtime Providers
+
+Most Providers v2 instances still follow the placeholder injection model: the sandbox process receives a credential placeholder such as `GITHUB_TOKEN`, then the proxy resolves it in outbound HTTP traffic.
+
+Brokered runtime providers are different. They keep the long-lived identity material at the gateway and inject a local token broker contract into the sandbox instead. The first built-in brokered provider is `microsoft-agent-s2s`.
+
+For `microsoft-agent-s2s`:
+
+- the provider instance stores `A365_BLUEPRINT_CLIENT_SECRET` as the credential
+- provider config stores `AZURE_TENANT_ID`, `A365_BLUEPRINT_CLIENT_ID`, `A365_RUNTIME_AGENT_ID`, and allowed audiences
+- the sandbox receives `A365_TOKEN_PROVIDER_URL` and related OpenShell metadata env vars
+- the workload calls the local URL when it needs a Microsoft bearer token
+- the gateway validates the attached provider and requested audience, then returns a short-lived token
+
+This is useful for workloads such as Microsoft Agent 365 or NAT/A365 integrations that already expect a token callback or resolver instead of a static bearer token.
+
+Brokered runtime providers do not currently imply provider-owned network policy. The built-in `microsoft-agent-s2s` profile intentionally ships without default endpoint rules, so you can pair it with the workload-specific policy or ingress model that fits your deployment.
 
 ## Provider Instances
 
