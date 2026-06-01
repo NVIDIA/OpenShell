@@ -1207,11 +1207,15 @@ mod tests {
 
         let expected = format!(
             "sqlite:{}",
-            tmp.path().join("openshell/gateway/openshell.db").display()
+            tmp.path()
+                .join("openshell")
+                .join("gateway")
+                .join("openshell.db")
+                .display()
         );
         assert!(local_tls.is_none());
         assert_eq!(args.db_url.as_deref(), Some(expected.as_str()));
-        assert!(tmp.path().join("openshell/gateway").is_dir());
+        assert!(tmp.path().join("openshell").join("gateway").is_dir());
     }
 
     #[test]

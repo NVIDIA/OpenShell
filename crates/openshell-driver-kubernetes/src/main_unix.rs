@@ -1,8 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-#[cfg(not(target_os = "windows"))]
-include!("main_unix.rs");
+use clap::{ArgAction, Parser};
+use miette::{IntoDiagnostic, Result};
+use std::net::SocketAddr;
+use tracing::info;
+use tracing_subscriber::EnvFilter;
 
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
@@ -55,7 +58,7 @@ struct Args {
     #[arg(
         long,
         env = "OPENSHELL_SANDBOX_SSH_SOCKET_PATH",
-        default_value = openshell_core::container_paths::SSH_SOCKET_PATH
+        default_value = "/run/openshell/ssh.sock"
     )]
     sandbox_ssh_socket_path: String,
 
@@ -157,8 +160,6 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| {
             openshell_driver_kubernetes::DEFAULT_WORKSPACE_STORAGE_SIZE.to_string()
         }),
-        workspace_storage_class: std::env::var("OPENSHELL_K8S_WORKSPACE_STORAGE_CLASS")
-            .unwrap_or_default(),
         default_runtime_class_name: std::env::var("OPENSHELL_K8S_DEFAULT_RUNTIME_CLASS_NAME")
             .unwrap_or_default(),
         sa_token_ttl_secs: args.sa_token_ttl_secs,

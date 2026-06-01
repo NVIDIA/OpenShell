@@ -1,11 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-#[cfg(target_os = "windows")]
-mod windows;
+//! Docker compute driver.
 
-#[cfg(target_os = "windows")]
-pub use windows::{DockerComputeConfig, default_docker_supervisor_image};
+#![allow(clippy::result_large_err)]
 
 use bollard::Docker;
 use bollard::errors::Error as BollardError;
@@ -41,14 +39,12 @@ use openshell_core::progress::{
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     DriverCondition, DriverPlatformEvent, DriverSandbox, DriverSandboxStatus,
-    DriverSandboxTemplate, GatewayListenerRequirement, GetCapabilitiesRequest,
-    GetCapabilitiesResponse, GetGatewayListenerRequirementsRequest,
-    GetGatewayListenerRequirementsResponse, GetSandboxRequest, GetSandboxResponse,
-    GpuResourceRequirements, ListSandboxesRequest, ListSandboxesResponse, StopSandboxRequest,
-    StopSandboxResponse, ValidateSandboxCreateRequest, ValidateSandboxCreateResponse,
-    WatchSandboxesDeletedEvent, WatchSandboxesEvent, WatchSandboxesPlatformEvent,
-    WatchSandboxesRequest, WatchSandboxesSandboxEvent, compute_driver_server::ComputeDriver,
-    gateway_listener_requirement::Selector, watch_sandboxes_event,
+    DriverSandboxTemplate, GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest,
+    GetSandboxResponse, GpuResourceRequirements, ListSandboxesRequest, ListSandboxesResponse,
+    StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
+    ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
+    WatchSandboxesPlatformEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
+    compute_driver_server::ComputeDriver, watch_sandboxes_event,
 };
 use openshell_core::proto_struct::{
     deserialize_optional_non_empty_string_list, struct_to_json_value,
@@ -82,6 +78,17 @@ const SUPERVISOR_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 const HOST_OPENSHELL_INTERNAL: &str = "host.openshell.internal";
 const HOST_DOCKER_INTERNAL: &str = "host.docker.internal";
 const DOCKER_NETWORK_DRIVER: &str = "bridge";
+
+/// Queried by the Docker driver to decide when a sandbox's supervisor
+/// relay is live. Implementations return `true` once a sandbox has an
+/// active `ConnectSupervisor` session registered.
+///
+/// The driver cannot observe the supervisor's SSH socket directly (it
+/// lives inside the container), so it leans on this signal to flip the
+/// Ready condition from `DependenciesNotReady` to `True`.
+pub trait SupervisorReadiness: Send + Sync + 'static {
+    fn is_supervisor_connected(&self, sandbox_id: &str) -> bool;
+}
 
 /// Gateway-local configuration for the Docker compute driver.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -156,7 +163,7 @@ impl Default for DockerComputeConfig {
             guest_tls_key: None,
             network_name: DEFAULT_DOCKER_NETWORK_NAME.to_string(),
             host_gateway_ip: String::new(),
-            ssh_socket_path: openshell_core::container_paths::SSH_SOCKET_PATH.to_string(),
+            ssh_socket_path: "/run/openshell/ssh.sock".to_string(),
             sandbox_pids_limit: DEFAULT_SANDBOX_PIDS_LIMIT,
             enable_bind_mounts: false,
         }
@@ -205,6 +212,7 @@ pub struct DockerComputeDriver {
     config: DockerDriverRuntimeConfig,
     events: broadcast::Sender<WatchSandboxesEvent>,
     pending: Arc<Mutex<HashMap<String, PendingSandboxRecord>>>,
+    supervisor_readiness: Arc<dyn SupervisorReadiness>,
     gpu_selector: Arc<CdiGpuDefaultSelector>,
 }
 
@@ -217,14 +225,6 @@ struct PendingSandboxRecord {
 struct DockerProvisioningFailure {
     reason: &'static str,
     message: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DockerImageMetadata {
-    id: String,
-    user: String,
-    working_dir: String,
-    volumes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -309,7 +309,11 @@ type WatchStream =
     Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, Status>> + Send + 'static>>;
 
 impl DockerComputeDriver {
-    pub async fn new(config: &Config, docker_config: &DockerComputeConfig) -> CoreResult<Self> {
+    pub async fn new(
+        config: &Config,
+        docker_config: &DockerComputeConfig,
+        supervisor_readiness: Arc<dyn SupervisorReadiness>,
+    ) -> CoreResult<Self> {
         let socket_path = docker_config
             .socket_path
             .clone()
@@ -391,6 +395,7 @@ impl DockerComputeDriver {
             },
             events: broadcast::channel(WATCH_BUFFER).0,
             pending: Arc::new(Mutex::new(HashMap::new())),
+            supervisor_readiness,
             gpu_selector: Arc::new(CdiGpuDefaultSelector::new(
                 cdi_gpu_inventory,
                 allow_all_default_gpu,
@@ -403,6 +408,14 @@ impl DockerComputeDriver {
         });
 
         Ok(driver)
+    }
+
+    #[must_use]
+    pub fn gateway_bind_addresses(&self) -> Vec<SocketAddr> {
+        match self.config.gateway_route {
+            DockerGatewayRoute::Bridge { bind_address, .. } => vec![bind_address],
+            DockerGatewayRoute::HostGateway => Vec::new(),
+        }
     }
 
     fn capabilities(&self) -> GetCapabilitiesResponse {
@@ -593,9 +606,9 @@ impl DockerComputeDriver {
         let container = self
             .find_managed_container_summary(sandbox_id, sandbox_name)
             .await?;
-        if let Some(sandbox) =
-            container.and_then(|summary| sandbox_from_container_summary(&summary))
-        {
+        if let Some(sandbox) = container.and_then(|summary| {
+            sandbox_from_container_summary(&summary, self.supervisor_readiness.as_ref())
+        }) {
             return Ok(Some(sandbox));
         }
 
@@ -606,7 +619,9 @@ impl DockerComputeDriver {
         let containers = self.list_managed_container_summaries().await?;
         let container_sandboxes = containers
             .iter()
-            .filter_map(sandbox_from_container_summary)
+            .filter_map(|summary| {
+                sandbox_from_container_summary(summary, self.supervisor_readiness.as_ref())
+            })
             .collect::<Vec<_>>();
         let mut by_id = self.pending_snapshot_map().await;
         for sandbox in container_sandboxes {
@@ -622,13 +637,19 @@ impl DockerComputeDriver {
         Self::validate_sandbox_auth(sandbox)?;
         self.validate_user_volume_mounts_available(&validated.driver_config)
             .await?;
-        let _ = self
+        let gpu_devices = self
             .resolve_gpu_cdi_devices(
                 validated.gpu_requirements,
                 &validated.driver_config,
                 CdiGpuDefaultSelector::peek_device_ids,
             )
             .await?;
+        let _ = build_container_create_body_with_gpu_devices(
+            sandbox,
+            &self.config,
+            &validated.driver_config,
+            gpu_devices.as_deref(),
+        )?;
 
         if self
             .find_managed_container_summary(&sandbox.id, &sandbox.name)
@@ -689,8 +710,7 @@ impl DockerComputeDriver {
             DockerProvisioningFailure::new("ContainerCreateFailed", status.message())
         })?;
         let template = validated.template;
-        let image = self
-            .ensure_image_available(&sandbox.id, &template.image)
+        self.ensure_image_available(&sandbox.id, &template.image)
             .await
             .map_err(|status| {
                 DockerProvisioningFailure::new("ImagePullFailed", status.message())
@@ -715,12 +735,11 @@ impl DockerComputeDriver {
                 }
                 DockerProvisioningFailure::new("ContainerCreateFailed", status.message())
             })?;
-        let create_body = build_container_create_body_for_image(
+        let create_body = build_container_create_body_with_gpu_devices(
             sandbox,
             &self.config,
             &validated.driver_config,
             gpu_devices.as_deref(),
-            &image,
         )
         .map_err(|status| {
             if token_file_created {
@@ -1104,7 +1123,8 @@ impl DockerComputeDriver {
         if let Some(summary) = self
             .find_managed_container_summary(sandbox_id, sandbox_name)
             .await?
-            && let Some(sandbox) = sandbox_from_container_summary(&summary)
+            && let Some(sandbox) =
+                sandbox_from_container_summary(&summary, self.supervisor_readiness.as_ref())
         {
             self.publish_sandbox_snapshot(sandbox);
         }
@@ -1260,82 +1280,41 @@ impl DockerComputeDriver {
         }))
     }
 
-    async fn ensure_image_available(
-        &self,
-        sandbox_id: &str,
-        image: &str,
-    ) -> Result<DockerImageMetadata, Status> {
+    async fn ensure_image_available(&self, sandbox_id: &str, image: &str) -> Result<(), Status> {
         let policy = self.config.image_pull_policy.trim().to_ascii_lowercase();
-        let inspect = match policy.as_str() {
+        match policy.as_str() {
             "" | "ifnotpresent" => {
-                if let Ok(inspect) = self.docker.inspect_image(image).await {
+                if self.docker.inspect_image(image).await.is_ok() {
                     self.publish_docker_progress(
                         sandbox_id,
                         "ImagePresent",
                         format!("Docker image \"{image}\" is already present"),
                         HashMap::from([("image_ref".to_string(), image.to_string())]),
                     );
-                    inspect
-                } else {
-                    self.pull_image(sandbox_id, image).await?;
-                    self.docker
-                        .inspect_image(image)
-                        .await
-                        .map_err(|err| internal_status("inspect Docker image after pull", err))?
+                    return Ok(());
                 }
+                self.pull_image(sandbox_id, image).await
             }
-            "always" => {
-                self.pull_image(sandbox_id, image).await?;
-                self.docker
-                    .inspect_image(image)
-                    .await
-                    .map_err(|err| internal_status("inspect Docker image after pull", err))?
-            }
+            "always" => self.pull_image(sandbox_id, image).await,
             "never" => match self.docker.inspect_image(image).await {
-                Ok(inspect) => {
+                Ok(_) => {
                     self.publish_docker_progress(
                         sandbox_id,
                         "ImagePresent",
                         format!("Docker image \"{image}\" is already present"),
                         HashMap::from([("image_ref".to_string(), image.to_string())]),
                     );
-                    inspect
+                    Ok(())
                 }
-                Err(err) if is_not_found_error(&err) => {
-                    return Err(Status::failed_precondition(format!(
-                        "docker image '{image}' is not present locally and image_pull_policy=Never"
-                    )));
-                }
-                Err(err) => return Err(internal_status("inspect Docker image", err)),
+                Err(err) if is_not_found_error(&err) => Err(Status::failed_precondition(format!(
+                    "docker image '{image}' is not present locally and image_pull_policy=Never"
+                ))),
+                Err(err) => Err(internal_status("inspect Docker image", err)),
             },
-            other => {
-                return Err(Status::failed_precondition(format!(
-                    "unsupported docker image_pull_policy '{other}'; expected Always, IfNotPresent, or Never",
-                )));
-            }
-        };
-
-        let id = inspect.id.ok_or_else(|| {
-            Status::failed_precondition(format!(
-                "docker image '{image}' inspection did not return an immutable image ID"
-            ))
-        })?;
-        let (user, working_dir, volumes) = inspect.config.map_or_else(
-            || (String::new(), String::new(), Vec::new()),
-            |config| {
-                (
-                    config.user.unwrap_or_default(),
-                    config.working_dir.unwrap_or_default(),
-                    config.volumes.unwrap_or_default(),
-                )
-            },
-        );
-        Ok(DockerImageMetadata {
-            id,
-            user,
-            working_dir,
-            volumes,
-        })
+            other => Err(Status::failed_precondition(format!(
+                "unsupported docker image_pull_policy '{other}'; expected Always, IfNotPresent, or Never",
+            ))),
+        }
     }
 
     async fn pull_image(&self, sandbox_id: &str, image: &str) -> Result<(), Status> {
@@ -1387,24 +1366,6 @@ impl ComputeDriver for DockerComputeDriver {
         _request: Request<GetCapabilitiesRequest>,
     ) -> Result<Response<GetCapabilitiesResponse>, Status> {
         Ok(Response::new(self.capabilities()))
-    }
-
-    async fn get_gateway_listener_requirements(
-        &self,
-        _request: Request<GetGatewayListenerRequirementsRequest>,
-    ) -> Result<Response<GetGatewayListenerRequirementsResponse>, Status> {
-        let requirements = match self.config.gateway_route {
-            DockerGatewayRoute::Bridge { bind_address, .. } => {
-                vec![GatewayListenerRequirement {
-                    reason: "docker managed bridge gateway".to_string(),
-                    selector: Some(Selector::ExactBindAddress(bind_address.to_string())),
-                }]
-            }
-            DockerGatewayRoute::HostGateway => Vec::new(),
-        };
-        Ok(Response::new(GetGatewayListenerRequirementsResponse {
-            requirements,
-        }))
     }
 
     async fn validate_sandbox_create(
@@ -2171,16 +2132,7 @@ fn cleanup_sandbox_token_file_by_id(sandbox_id: &str, config: &DockerDriverRunti
     }
 }
 
-#[cfg(test)]
 fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig) -> Vec<String> {
-    build_environment_for_oci_user(sandbox, config, "")
-}
-
-fn build_environment_for_oci_user(
-    sandbox: &DriverSandbox,
-    config: &DockerDriverRuntimeConfig,
-    oci_user: &str,
-) -> Vec<String> {
     let mut environment = HashMap::from([
         ("HOME".to_string(), "/root".to_string()),
         ("PATH".to_string(), SUPERVISOR_PATH.to_string()),
@@ -2252,18 +2204,6 @@ fn build_environment_for_oci_user(
 
     environment.remove(openshell_core::sandbox_env::SANDBOX_TOKEN);
     environment.remove(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE);
-    environment.insert(
-        openshell_core::sandbox_env::OCI_IMAGE_USER.to_string(),
-        oci_user.to_string(),
-    );
-    environment.insert(
-        openshell_core::sandbox_env::SANDBOX_UID.to_string(),
-        String::new(),
-    );
-    environment.insert(
-        openshell_core::sandbox_env::SANDBOX_GID.to_string(),
-        String::new(),
-    );
 
     // Gateway-minted sandbox JWT. Keep the raw bearer out of container
     // metadata; the supervisor reads it from this driver-owned bind mount.
@@ -2343,38 +2283,11 @@ fn build_container_create_body(
     build_container_create_body_with_gpu_devices(sandbox, config, &driver_config, cdi_devices)
 }
 
-#[cfg(test)]
 fn build_container_create_body_with_gpu_devices(
     sandbox: &DriverSandbox,
     config: &DockerDriverRuntimeConfig,
     driver_config: &DockerSandboxDriverConfig,
     gpu_device_ids: Option<&[String]>,
-) -> Result<ContainerCreateBody, Status> {
-    let template = sandbox
-        .spec
-        .as_ref()
-        .and_then(|spec| spec.template.as_ref())
-        .ok_or_else(|| Status::invalid_argument("sandbox.spec.template is required"))?;
-    build_container_create_body_for_image(
-        sandbox,
-        config,
-        driver_config,
-        gpu_device_ids,
-        &DockerImageMetadata {
-            id: template.image.clone(),
-            user: String::new(),
-            working_dir: String::new(),
-            volumes: Vec::new(),
-        },
-    )
-}
-
-fn build_container_create_body_for_image(
-    sandbox: &DriverSandbox,
-    config: &DockerDriverRuntimeConfig,
-    driver_config: &DockerSandboxDriverConfig,
-    gpu_device_ids: Option<&[String]>,
-    image: &DockerImageMetadata,
 ) -> Result<ContainerCreateBody, Status> {
     let spec = sandbox
         .spec
@@ -2385,36 +2298,6 @@ fn build_container_create_body_for_image(
         .as_ref()
         .ok_or_else(|| Status::invalid_argument("sandbox.spec.template is required"))?;
     let resource_limits = docker_resource_limits(template)?;
-    let workspace_root = driver_mounts::resolve_oci_workspace_root(&image.working_dir)
-        .map_err(Status::failed_precondition)?;
-    driver_mounts::validate_workspace_control_path(&workspace_root, &config.ssh_socket_path)
-        .map_err(Status::failed_precondition)?;
-    for volume in &image.volumes {
-        driver_mounts::validate_container_mount_target(volume).map_err(|error| {
-            Status::failed_precondition(format!(
-                "invalid image-declared volume '{volume}': {error}"
-            ))
-        })?;
-        driver_mounts::validate_workspace_mount_target(volume, &workspace_root).map_err(|_| {
-            Status::failed_precondition(format!(
-                "image-declared volume '{volume}' masks OCI WorkingDir '{workspace_root}' before workspace validation"
-            ))
-        })?;
-        driver_mounts::validate_mount_control_path(volume, &config.ssh_socket_path)
-            .map_err(Status::failed_precondition)?;
-    }
-    for mount in &driver_config.mounts {
-        let target = match mount {
-            DockerDriverMountConfig::Bind { target, .. }
-            | DockerDriverMountConfig::Volume { target, .. }
-            | DockerDriverMountConfig::Tmpfs { target, .. }
-            | DockerDriverMountConfig::Image { target, .. } => target,
-        };
-        driver_mounts::validate_workspace_mount_target(target, &workspace_root)
-            .map_err(Status::failed_precondition)?;
-        driver_mounts::validate_mount_control_path(target, &config.ssh_socket_path)
-            .map_err(Status::failed_precondition)?;
-    }
     let user_mounts = docker_driver_mounts(driver_config)?;
     let user_bind_strings = docker_driver_bind_strings(driver_config)?;
     let device_requests = gpu_device_ids.map(|device_ids| {
@@ -2445,16 +2328,13 @@ fn build_container_create_body_for_image(
     );
 
     Ok(ContainerCreateBody {
-        image: Some(image.id.clone()),
+        image: Some(template.image.clone()),
         user: Some("0".to_string()),
-        // The image workspace may need to be created or rejected by the
-        // supervisor, so do not let the OCI runtime chdir there first.
-        working_dir: Some("/".to_string()),
-        env: Some(build_environment_for_oci_user(sandbox, config, &image.user)),
+        env: Some(build_environment(sandbox, config)),
         entrypoint: Some(vec![SUPERVISOR_MOUNT_PATH.to_string()]),
-        // Replace the image CMD with the supervisor's resolved workspace
-        // argument so Docker cannot append inherited image arguments.
-        cmd: Some(vec!["--workdir".to_string(), workspace_root]),
+        // Clear the image CMD so Docker does not append inherited args to the
+        // supervisor entrypoint.
+        cmd: Some(Vec::new()),
         labels: Some(labels),
         host_config: Some(HostConfig {
             nano_cpus: resource_limits.nano_cpus,
@@ -2858,7 +2738,10 @@ fn parse_memory_limit(value: &str) -> Result<Option<i64>, Status> {
     Ok(Some((amount * multiplier).round() as i64))
 }
 
-fn sandbox_from_container_summary(summary: &ContainerSummary) -> Option<DriverSandbox> {
+fn sandbox_from_container_summary(
+    summary: &ContainerSummary,
+    readiness: &dyn SupervisorReadiness,
+) -> Option<DriverSandbox> {
     let labels = summary.labels.as_ref()?;
     let id = labels.get(LABEL_SANDBOX_ID)?.clone();
     let name = labels.get(LABEL_SANDBOX_NAME)?.clone();
@@ -2871,12 +2754,17 @@ fn sandbox_from_container_summary(summary: &ContainerSummary) -> Option<DriverSa
         .cloned()
         .unwrap_or_default();
 
+    let supervisor_connected = readiness.is_supervisor_connected(&id);
     Some(DriverSandbox {
         id,
         name: name.clone(),
         namespace,
         spec: None,
-        status: Some(driver_status_from_summary(summary, &name)),
+        status: Some(driver_status_from_summary(
+            summary,
+            &name,
+            supervisor_connected,
+        )),
         workspace,
     })
 }
@@ -2884,9 +2772,10 @@ fn sandbox_from_container_summary(summary: &ContainerSummary) -> Option<DriverSa
 fn driver_status_from_summary(
     summary: &ContainerSummary,
     sandbox_name: &str,
+    supervisor_connected: bool,
 ) -> DriverSandboxStatus {
     let state = summary.state.unwrap_or(ContainerSummaryStateEnum::EMPTY);
-    let (ready, reason, message, deleting) = container_ready_condition(state);
+    let (ready, reason, message, deleting) = container_ready_condition(state, supervisor_connected);
 
     DriverSandboxStatus {
         sandbox_name: summary_container_name(summary).unwrap_or_else(|| sandbox_name.to_string()),
@@ -2906,10 +2795,25 @@ fn driver_status_from_summary(
 
 fn container_ready_condition(
     state: ContainerSummaryStateEnum,
+    supervisor_connected: bool,
 ) -> (&'static str, &'static str, &'static str, bool) {
     match state {
         ContainerSummaryStateEnum::RUNNING => {
-            ("True", "BackendReady", "Container is running", false)
+            if supervisor_connected {
+                (
+                    "True",
+                    "SupervisorConnected",
+                    "Supervisor relay is live",
+                    false,
+                )
+            } else {
+                (
+                    "False",
+                    "DependenciesNotReady",
+                    "Container is running; waiting for supervisor relay",
+                    false,
+                )
+            }
         }
         ContainerSummaryStateEnum::CREATED => ("False", "Starting", "Container created", false),
         ContainerSummaryStateEnum::RESTARTING => (

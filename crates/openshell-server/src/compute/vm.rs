@@ -59,8 +59,11 @@ use tonic::transport::Endpoint;
 #[cfg(unix)]
 use tower::service_fn;
 
+#[cfg(unix)]
 const DRIVER_BIN_NAME: &str = "openshell-driver-vm";
+#[cfg(unix)]
 const COMPUTE_DRIVER_SOCKET_RUN_DIR: &str = "run";
+#[cfg(unix)]
 const COMPUTE_DRIVER_SOCKET_NAME: &str = "compute-driver.sock";
 
 /// Configuration for launching and talking to the VM compute driver.
@@ -139,6 +142,7 @@ impl VmComputeConfig {
         4096
     }
 
+    #[cfg(unix)]
     #[must_use]
     fn default_driver_search_dirs(home: Option<PathBuf>) -> Vec<PathBuf> {
         let mut dirs = Vec::new();
@@ -189,6 +193,7 @@ pub struct VmGuestTlsPaths {
 ///    `/usr/local/libexec/openshell`, `/usr/local/libexec`.
 /// 3. Sibling of the gateway's own executable (last-resort fallback so
 ///    local development builds still work out of the box).
+#[cfg(unix)]
 pub fn resolve_compute_driver_bin(vm_config: &VmComputeConfig) -> Result<PathBuf> {
     let mut searched: Vec<PathBuf> = Vec::new();
 
@@ -227,6 +232,7 @@ pub fn resolve_compute_driver_bin(vm_config: &VmComputeConfig) -> Result<PathBuf
     )))
 }
 
+#[cfg(unix)]
 fn resolve_driver_search_dirs(vm_config: &VmComputeConfig) -> Vec<PathBuf> {
     vm_config.driver_dir.clone().map_or_else(
         || {
@@ -248,6 +254,7 @@ fn resolve_driver_search_dirs(vm_config: &VmComputeConfig) -> Vec<PathBuf> {
     )
 }
 
+#[cfg(unix)]
 fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
     if !paths.iter().any(|existing| existing == &path) {
         paths.push(path);
@@ -255,6 +262,7 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
 }
 
 /// Path of the Unix domain socket the driver will listen on.
+#[cfg(unix)]
 pub fn compute_driver_socket_path(vm_config: &VmComputeConfig) -> PathBuf {
     vm_config
         .state_dir
@@ -527,7 +535,21 @@ fn append_otlp_args(command: &mut Command, otlp_config: Option<&OtlpConfig>) {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(target_os = "windows")]
+fn unsupported_vm_message() -> &'static str {
+    "VM compute driver is unsupported on Windows"
+}
+
+#[cfg(target_os = "windows")]
+pub async fn spawn(
+    _config: &Config,
+    _vm_config: &VmComputeConfig,
+    _otlp_config: Option<&OtlpConfig>,
+) -> Result<AcquiredRemoteDriverEndpoint> {
+    Err(Error::config(unsupported_vm_message()))
+}
+
+#[cfg(all(not(unix), not(target_os = "windows")))]
 pub async fn spawn(
     _config: &Config,
     _vm_config: &VmComputeConfig,
@@ -945,5 +967,13 @@ mod tests {
 
         drop(listener);
         assert!(!socket_path.exists());
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod windows_tests {
+    #[test]
+    fn windows_spawn_reports_unsupported() {
+        assert!(super::unsupported_vm_message().contains("unsupported on Windows"));
     }
 }
