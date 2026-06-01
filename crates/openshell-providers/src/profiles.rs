@@ -632,6 +632,8 @@ fn endpoint_to_proto(endpoint: &EndpointProfile) -> NetworkEndpoint {
             .collect(),
         graphql_max_body_bytes: endpoint.graphql_max_body_bytes,
         path: endpoint.path.clone(),
+        credential_signing: String::new(),
+        signing_service: String::new(),
     }
 }
 

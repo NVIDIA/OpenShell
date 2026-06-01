@@ -355,6 +355,9 @@ where
                     websocket_extensions: websocket_extension_mode(config),
                     request_body_credential_rewrite: config.protocol == L7Protocol::Rest
                         && config.request_body_credential_rewrite,
+                    credential_signing: config.credential_signing,
+                    signing_service: &config.signing_service,
+                    host: &ctx.host,
                 },
             )
             .await?;
@@ -780,6 +783,9 @@ where
                     websocket_extensions: websocket_extension_mode(config),
                     request_body_credential_rewrite: config.protocol == L7Protocol::Rest
                         && config.request_body_credential_rewrite,
+                    credential_signing: config.credential_signing,
+                    signing_service: &config.signing_service,
+                    host: &ctx.host,
                 },
             )
             .await?;
@@ -1429,6 +1435,8 @@ network_policies:
             websocket_credential_rewrite: true,
             request_body_credential_rewrite: false,
             websocket_graphql_policy: false,
+            credential_signing: crate::l7::CredentialSigning::None,
+            signing_service: String::new(),
         }];
         let ctx = L7EvalContext {
             host: "gateway.example.test".into(),
@@ -1530,6 +1538,8 @@ network_policies:
             websocket_credential_rewrite: true,
             request_body_credential_rewrite: false,
             websocket_graphql_policy: false,
+            credential_signing: crate::l7::CredentialSigning::None,
+            signing_service: String::new(),
         }];
         let (child_env, resolver) = SecretResolver::from_provider_env(
             std::iter::once(("DISCORD_BOT_TOKEN".to_string(), "real-token".to_string())).collect(),
@@ -1648,6 +1658,8 @@ network_policies:
             websocket_credential_rewrite: true,
             request_body_credential_rewrite: false,
             websocket_graphql_policy: true,
+            credential_signing: crate::l7::CredentialSigning::None,
+            signing_service: String::new(),
         }];
         let (child_env, resolver) = SecretResolver::from_provider_env(
             std::iter::once(("T".to_string(), "real-token".to_string())).collect(),

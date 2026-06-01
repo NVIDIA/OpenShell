@@ -135,6 +135,10 @@ struct NetworkEndpointDef {
     graphql_persisted_queries: BTreeMap<String, GraphqlOperationDef>,
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     graphql_max_body_bytes: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    credential_signing: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    signing_service: String,
 }
 
 // Signature dictated by serde's `skip_serializing_if`, which requires `&T`.
@@ -347,6 +351,8 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                                 })
                                 .collect(),
                             graphql_max_body_bytes: e.graphql_max_body_bytes,
+                            credential_signing: e.credential_signing,
+                            signing_service: e.signing_service,
                         }
                     })
                     .collect(),
@@ -512,6 +518,8 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                                 })
                                 .collect(),
                             graphql_max_body_bytes: e.graphql_max_body_bytes,
+                            credential_signing: e.credential_signing.clone(),
+                            signing_service: e.signing_service.clone(),
                         }
                     })
                     .collect(),
