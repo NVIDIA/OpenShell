@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 
-use miette::{IntoDiagnostic, Result, WrapErr};
+use miette::Result;
 use openshell_core::proto::{
     FilesystemPolicy, GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule,
     LandlockPolicy, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, ProcessPolicy,
@@ -349,10 +349,7 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
 
 /// Parse a sandbox policy from a YAML string.
 pub fn parse_sandbox_policy(yaml: &str) -> Result<SandboxPolicy> {
-    let raw: PolicyFile = serde_yml::from_str(yaml)
-        .into_diagnostic()
-        .wrap_err("failed to parse sandbox policy YAML")?;
-    Ok(to_proto(raw))
+    openshell_policy_schema::parse_policy(yaml).map(to_proto)
 }
 
 /// Serialize a proto sandbox policy to a YAML string.
@@ -361,10 +358,7 @@ pub fn parse_sandbox_policy(yaml: &str) -> Result<SandboxPolicy> {
 /// canonical YAML field names (e.g. `filesystem_policy`, not `filesystem`)
 /// and is round-trippable through `parse_sandbox_policy`.
 pub fn serialize_sandbox_policy(policy: &SandboxPolicy) -> Result<String> {
-    let yaml_repr = from_proto(policy);
-    serde_yml::to_string(&yaml_repr)
-        .into_diagnostic()
-        .wrap_err("failed to serialize policy to YAML")
+    openshell_policy_schema::serialize_policy(&from_proto(policy))
 }
 
 /// Convert a proto sandbox policy into the canonical policy JSON representation.
@@ -372,18 +366,12 @@ pub fn serialize_sandbox_policy(policy: &SandboxPolicy) -> Result<String> {
 /// The shape mirrors the YAML schema used by [`serialize_sandbox_policy`], so
 /// automation can use the same documented field names in either format.
 pub fn sandbox_policy_to_json_value(policy: &SandboxPolicy) -> Result<serde_json::Value> {
-    let json_repr = from_proto(policy);
-    serde_json::to_value(&json_repr)
-        .into_diagnostic()
-        .wrap_err("failed to serialize policy to JSON")
+    openshell_policy_schema::policy_to_json_value(&from_proto(policy))
 }
 
 /// Serialize a proto sandbox policy to a pretty-printed JSON string.
 pub fn serialize_sandbox_policy_json(policy: &SandboxPolicy) -> Result<String> {
-    let json_repr = sandbox_policy_to_json_value(policy)?;
-    serde_json::to_string_pretty(&json_repr)
-        .into_diagnostic()
-        .wrap_err("failed to serialize policy to JSON")
+    openshell_policy_schema::serialize_policy_json(&from_proto(policy))
 }
 
 /// Load a sandbox policy from an explicit source.
@@ -396,20 +384,7 @@ pub fn serialize_sandbox_policy_json(policy: &SandboxPolicy) -> Result<String> {
 /// caller to omit the policy and let the server / sandbox apply its own
 /// default.
 pub fn load_sandbox_policy(cli_path: Option<&str>) -> Result<Option<SandboxPolicy>> {
-    let contents = if let Some(p) = cli_path {
-        let path = Path::new(p);
-        std::fs::read_to_string(path)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to read sandbox policy from {}", path.display()))?
-    } else if let Ok(policy_path) = std::env::var("OPENSHELL_SANDBOX_POLICY") {
-        let path = Path::new(&policy_path);
-        std::fs::read_to_string(path)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to read sandbox policy from {}", path.display()))?
-    } else {
-        return Ok(None);
-    };
-    parse_sandbox_policy(&contents).map(Some)
+    Ok(openshell_policy_schema::load_policy(cli_path)?.map(to_proto))
 }
 
 /// Well-known path where a sandbox container image can ship a policy YAML file.
@@ -432,30 +407,7 @@ pub const LEGACY_CONTAINER_POLICY_PATH: &str = "/etc/navigator/policy.yaml";
 /// `sandbox` user, enables Landlock in best-effort mode, and **blocks all
 /// network access** (no network policies, no inference routing).
 pub fn restrictive_default_policy() -> SandboxPolicy {
-    SandboxPolicy {
-        version: 1,
-        filesystem: Some(FilesystemPolicy {
-            include_workdir: true,
-            read_only: vec![
-                "/usr".into(),
-                "/lib".into(),
-                "/proc".into(),
-                "/dev/urandom".into(),
-                "/app".into(),
-                "/etc".into(),
-                "/var/log".into(),
-            ],
-            read_write: vec!["/sandbox".into(), "/tmp".into(), "/dev/null".into()],
-        }),
-        landlock: Some(LandlockPolicy {
-            compatibility: "best_effort".into(),
-        }),
-        process: Some(ProcessPolicy {
-            run_as_user: "sandbox".into(),
-            run_as_group: "sandbox".into(),
-        }),
-        network_policies: HashMap::new(),
-    }
+    to_proto(openshell_policy_schema::restrictive_default())
 }
 
 /// Ensure the policy has `run_as_user: sandbox` and `run_as_group: sandbox`.
