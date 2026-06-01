@@ -36,12 +36,12 @@ def test_exact_tag_versions_are_stable_release_versions() -> None:
 def test_dev_versions_share_one_build_identity() -> None:
     versions = release._versions_from_parts((0, 0, 37), 108, "152d05940", "v0.0.37")
 
-    assert versions.python == "0.0.38.dev108+g152d05940"
-    assert versions.cargo == "0.0.38-dev.108+g152d05940"
-    assert versions.docker == "0.0.38-dev.108-g152d05940"
-    assert versions.deb == "0.0.38~dev.108+g152d05940-1"
-    assert versions.rpm_version == "0.0.38"
-    assert versions.rpm_release == "0.dev.108.g152d05940"
+    assert versions.python == "0.0.37.post108+g152d05940"
+    assert versions.cargo == "0.0.37+post.108.g152d05940"
+    assert versions.docker == "0.0.37-post.108.g152d05940"
+    assert versions.deb == "0.0.37+post.108.g152d05940-1"
+    assert versions.rpm_version == "0.0.37"
+    assert versions.rpm_release == "2.dev.108.g152d05940"
 
 
 def test_semver_tag_parser_excludes_vm_tags() -> None:

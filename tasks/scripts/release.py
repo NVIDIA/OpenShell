@@ -97,14 +97,18 @@ def _versions_from_parts(
         rpm_version = python_version
         rpm_release = "1"
     else:
-        next_version = _format_semver(_next_patch(base_version))
-        python_version = f"{next_version}.dev{git_distance}+g{git_sha}"
-        rpm_version = next_version
-        rpm_release = f"0.dev.{git_distance}.g{git_sha}"
+        latest_version = _format_semver(base_version)
+        python_version = f"{latest_version}.post{git_distance}+g{git_sha}"
+        rpm_version = latest_version
+        rpm_release = f"2.dev.{git_distance}.g{git_sha}"
 
-    # Convert PEP 440 to a SemVer-ish string for Cargo:
-    # 0.1.0.dev3+gabcdef -> 0.1.0-dev.3+gabcdef
-    cargo_version = re.sub(r"\.dev(\d+)", r"-dev.\1", python_version)
+    # Convert PEP 440 to a SemVer-ish string for Cargo. Dev builds are
+    # post-release package-manager builds, represented as SemVer metadata so
+    # Cargo accepts the workspace version:
+    # 0.1.0.post3+gabcdef -> 0.1.0+post.3.gabcdef
+    cargo_version = re.sub(
+        r"\.post(\d+)\+g([0-9a-f]+)$", r"+post.\1.g\2", python_version
+    )
 
     # Docker tags can't contain '+'.
     docker_version = cargo_version.replace("+", "-")
@@ -114,10 +118,10 @@ def _versions_from_parts(
     if len(snap_version) > 32:
         raise ValueError(f"snap version must be at most 32 characters: {snap_version}")
 
-    # Debian versions use '~' so prereleases sort before the eventual release.
+    # Debian post-release versions use '+' so dev builds sort after the
+    # matching stable package.
     deb_version = cargo_version
     deb_version = deb_version[1:] if deb_version.startswith("v") else deb_version
-    deb_version = deb_version.replace("-dev.", "~dev.", 1)
     deb_version = f"{deb_version}-1"
 
     return Versions(
