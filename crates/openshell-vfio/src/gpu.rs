@@ -162,7 +162,7 @@ pub fn prepare_gpu_for_passthrough(
     ))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::bind::test_refcounts;

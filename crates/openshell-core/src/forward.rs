@@ -1358,6 +1358,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn check_port_available_occupied_ipv6_wildcard() {
         // Bind on [::]:0 (IPv6 wildcard) — this simulates a server like

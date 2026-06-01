@@ -30,7 +30,7 @@ impl SysfsRoot {
         Self { base: base.into() }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn base(&self) -> &Path {
         &self.base
     }
@@ -223,7 +223,7 @@ pub(crate) fn write_sysfs(path: &Path, value: &str) -> Result<(), VfioError> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::test_support::{create_pci_device, setup_mock_sysfs};

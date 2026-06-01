@@ -20,6 +20,10 @@ pub fn xdg_config_dir() -> Result<PathBuf> {
     if let Ok(path) = std::env::var("XDG_CONFIG_HOME") {
         return Ok(PathBuf::from(path));
     }
+    #[cfg(target_os = "windows")]
+    if let Ok(path) = std::env::var("APPDATA") {
+        return Ok(PathBuf::from(path));
+    }
     let home = std::env::var("HOME")
         .into_diagnostic()
         .wrap_err("HOME is not set")?;
@@ -38,6 +42,10 @@ pub fn xdg_state_dir() -> Result<PathBuf> {
     if let Ok(path) = std::env::var("XDG_STATE_HOME") {
         return Ok(PathBuf::from(path));
     }
+    #[cfg(target_os = "windows")]
+    if let Ok(path) = std::env::var("LOCALAPPDATA") {
+        return Ok(PathBuf::from(path));
+    }
     let home = std::env::var("HOME")
         .into_diagnostic()
         .wrap_err("HOME is not set")?;
@@ -54,6 +62,10 @@ pub fn openshell_state_dir() -> Result<PathBuf> {
 /// Returns `$XDG_DATA_HOME` if set, otherwise `$HOME/.local/share`.
 pub fn xdg_data_dir() -> Result<PathBuf> {
     if let Ok(path) = std::env::var("XDG_DATA_HOME") {
+        return Ok(PathBuf::from(path));
+    }
+    #[cfg(target_os = "windows")]
+    if let Ok(path) = std::env::var("LOCALAPPDATA") {
         return Ok(PathBuf::from(path));
     }
     let home = std::env::var("HOME")

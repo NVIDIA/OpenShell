@@ -22,7 +22,7 @@ pub mod pci;
 pub mod reconcile;
 pub mod sysfs;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod test_support;
 
 pub use error::VfioError;

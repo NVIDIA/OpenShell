@@ -23,6 +23,7 @@ tonic-prost-build = "0.14"
 prost = "0.14"
 prost-types = "0.14"
 prost-reflect = { version = "0.16.5", features = ["serde"] }
+protoc-bin-vendored = "3.2.0"
 
 # HTTP server
 axum = { version = "0.8", features = ["ws"] }

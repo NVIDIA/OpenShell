@@ -13,7 +13,10 @@ repository.workspace = true
 [features]
 bundled-z3 = ["z3/bundled"]
 
-[dependencies]
+[target.'cfg(target_os = "windows")'.dependencies]
+miette = { workspace = true }
+
+[target.'cfg(not(target_os = "windows"))'.dependencies]
 z3 = { workspace = true }
 serde = { workspace = true }
 serde_yml = { workspace = true }

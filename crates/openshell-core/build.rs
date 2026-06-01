@@ -22,19 +22,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Protobuf compilation ---
     // Re-run when anything under proto/ changes (including newly added .proto files).
     println!("cargo:rerun-if-changed={PROTO_REL}");
-    // Use bundled protoc from protobuf-src.  The system protoc (from apt-get)
-    // does not bundle the well-known type includes (google/protobuf/struct.proto
-    // etc.), so we must use protobuf-src which ships both the binary and the
-    // include tree.
+    // Use a bundled protoc.  The system protoc (from apt-get) does not bundle
+    // the well-known type includes (google/protobuf/struct.proto etc.), so the
+    // build script picks a vendored provider per platform.
     // SAFETY: This is run at build time in a single-threaded build script context.
     // No other threads are reading environment variables concurrently.
     #[allow(unsafe_code)]
     unsafe {
-        env::set_var("PROTOC", protobuf_src::protoc());
+        env::set_var("PROTOC", protoc_path()?);
     }
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
     let proto_root = manifest_dir.join(PROTO_REL);
+    let proto_includes = proto_include_dirs(&proto_root)?;
+    let proto_include_refs = proto_includes
+        .iter()
+        .map(PathBuf::as_path)
+        .collect::<Vec<_>>();
 
     let mut proto_files = Vec::new();
     collect_proto_files(&proto_root, &mut proto_files)?;
@@ -51,7 +55,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Emit a binary FileDescriptorSet so the server can enumerate every
         // RPC at runtime (used by the per-handler auth exhaustiveness test).
         .file_descriptor_set_path(&descriptor_path)
-        .compile_protos(&proto_files, &[proto_root])?;
+        .compile_protos(&proto_files, &proto_include_refs)?;
 
     println!(
         "cargo:rustc-env=OPENSHELL_DESCRIPTOR_PATH={}",
@@ -59,6 +63,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn protoc_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    Ok(protoc_bin_vendored::protoc_bin_path()?)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn protoc_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    Ok(protobuf_src::protoc())
+}
+
+fn proto_include_dirs(proto_root: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    let mut includes = vec![proto_root.to_path_buf()];
+    #[cfg(target_os = "windows")]
+    {
+        includes.push(protoc_bin_vendored::include_path()?);
+    }
+    Ok(includes)
 }
 
 fn collect_proto_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {

@@ -1820,8 +1820,10 @@ impl Drop for RawModeGuard {
     }
 }
 
+#[cfg(unix)]
 struct TaskGuard(tokio::task::JoinHandle<()>);
 
+#[cfg(unix)]
 impl Drop for TaskGuard {
     fn drop(&mut self) {
         self.0.abort();
@@ -1836,7 +1838,9 @@ async fn sandbox_exec_interactive_grpc(
     timeout_seconds: u32,
     environment: &HashMap<String, String>,
 ) -> Result<i32> {
-    use openshell_core::proto::{ExecSandboxInput, ExecSandboxWindowResize, exec_sandbox_input};
+    #[cfg(unix)]
+    use openshell_core::proto::ExecSandboxWindowResize;
+    use openshell_core::proto::{ExecSandboxInput, exec_sandbox_input};
     use tokio_stream::wrappers::ReceiverStream;
 
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
