@@ -26,7 +26,7 @@ use oci_client::secrets::RegistryAuth;
 use oci_client::{Reference, RegistryOperation};
 use openshell_core::progress::{
     PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX, PROGRESS_STEP_STARTING_SANDBOX,
-    mark_progress_active, mark_progress_complete, mark_progress_detail,
+    format_bytes, mark_progress_active, mark_progress_complete, mark_progress_detail,
 };
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
@@ -4404,24 +4404,6 @@ fn pulling_layer_detail(metadata: &HashMap<String, String>) -> Option<String> {
         || format!("Layer {index}/{total}"),
         |size| format!("Layer {index}/{total} ({size})"),
     ))
-}
-
-fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = 1024 * KB;
-    const GB: u64 = 1024 * MB;
-
-    if bytes >= GB {
-        #[allow(clippy::cast_precision_loss)]
-        let gb = bytes as f64 / GB as f64;
-        format!("{gb:.1} GB")
-    } else if bytes >= MB {
-        format!("{} MB", bytes / MB)
-    } else if bytes >= KB {
-        format!("{} KB", bytes / KB)
-    } else {
-        format!("{bytes} B")
-    }
 }
 
 #[cfg(test)]

@@ -39,6 +39,11 @@ pub const DEFAULT_SUPERVISOR_IMAGE: &str = "ghcr.io/nvidia/openshell/supervisor:
 /// CDI device identifier for requesting all NVIDIA GPUs.
 pub const CDI_GPU_DEVICE_ALL: &str = "nvidia.com/gpu=all";
 
+/// Default maximum number of processes (PIDs) allowed inside a sandbox container.
+///
+/// Shared by the Docker and Podman drivers; override via driver config.
+pub const DEFAULT_SANDBOX_PIDS_LIMIT: i64 = 2048;
+
 /// Compute backends the gateway can orchestrate sandboxes through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

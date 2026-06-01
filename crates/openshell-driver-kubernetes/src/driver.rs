@@ -19,7 +19,7 @@ use openshell_core::driver_utils::{
 };
 use openshell_core::progress::{
     PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX, PROGRESS_STEP_STARTING_SANDBOX,
-    mark_progress_active, mark_progress_complete, mark_progress_detail,
+    format_bytes, mark_progress_active, mark_progress_complete, mark_progress_detail,
 };
 use openshell_core::proto::compute::v1::{
     DriverCondition as SandboxCondition, DriverPlatformEvent as PlatformEvent,
@@ -722,24 +722,6 @@ fn extract_image_size(message: &str) -> Option<u64> {
     let rest = &message[start..];
     let end = rest.find(' ')?;
     rest[..end].parse().ok()
-}
-
-fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = 1024 * KB;
-    const GB: u64 = 1024 * MB;
-
-    if bytes >= GB {
-        #[allow(clippy::cast_precision_loss)]
-        let gb = bytes as f64 / GB as f64;
-        format!("{gb:.1} GB")
-    } else if bytes >= MB {
-        format!("{} MB", bytes / MB)
-    } else if bytes >= KB {
-        format!("{} KB", bytes / KB)
-    } else {
-        format!("{bytes} B")
-    }
 }
 
 /// Path where the supervisor binary is mounted inside the agent container.

@@ -18,7 +18,9 @@ use bollard::query_parameters::{
 };
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
-use openshell_core::config::{DEFAULT_DOCKER_NETWORK_NAME, DEFAULT_STOP_TIMEOUT_SECS};
+use openshell_core::config::{
+    DEFAULT_DOCKER_NETWORK_NAME, DEFAULT_SANDBOX_PIDS_LIMIT, DEFAULT_STOP_TIMEOUT_SECS,
+};
 use openshell_core::driver_utils::{
     LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
     LABEL_SANDBOX_NAMESPACE, SUPERVISOR_IMAGE_BINARY_PATH,
@@ -26,7 +28,7 @@ use openshell_core::driver_utils::{
 use openshell_core::gpu::cdi_gpu_device_ids;
 use openshell_core::progress::{
     PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX, PROGRESS_STEP_STARTING_SANDBOX,
-    mark_progress_active, mark_progress_complete, mark_progress_detail,
+    format_bytes, mark_progress_active, mark_progress_complete, mark_progress_detail,
 };
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
@@ -67,7 +69,6 @@ const SUPERVISOR_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 const HOST_OPENSHELL_INTERNAL: &str = "host.openshell.internal";
 const HOST_DOCKER_INTERNAL: &str = "host.docker.internal";
 const DOCKER_NETWORK_DRIVER: &str = "bridge";
-const DEFAULT_SANDBOX_PIDS_LIMIT: i64 = 2048;
 
 /// Default image holding the Linux `openshell-sandbox` binary. The gateway
 /// pulls this image and extracts the binary to a host-side cache when no
@@ -1443,24 +1444,6 @@ fn format_progress_detail(progress: &ProgressDetail) -> Option<String> {
         }
         (Some(current), _) if current > 0 => Some(format_bytes(current)),
         _ => None,
-    }
-}
-
-fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = 1024 * KB;
-    const GB: u64 = 1024 * MB;
-
-    if bytes >= GB {
-        #[allow(clippy::cast_precision_loss)]
-        let gb = bytes as f64 / GB as f64;
-        format!("{gb:.1} GB")
-    } else if bytes >= MB {
-        format!("{} MB", bytes / MB)
-    } else if bytes >= KB {
-        format!("{} KB", bytes / KB)
-    } else {
-        format!("{bytes} B")
     }
 }
 
