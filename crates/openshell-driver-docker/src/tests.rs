@@ -282,20 +282,56 @@ fn docker_gateway_route_uses_bridge_gateway_for_linux_docker() {
         false,
     );
 
-    assert_eq!(
-        route,
-        DockerGatewayRoute::Bridge {
-            bind_address: "172.18.0.1:17670".parse().unwrap(),
-            host_alias_ip: IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
-        }
+    if cfg!(target_os = "macos") {
+        assert_eq!(route, DockerGatewayRoute::HostGateway);
+        assert_eq!(
+            docker_extra_hosts(&route),
+            vec![
+                "host.docker.internal:host-gateway".to_string(),
+                "host.openshell.internal:host-gateway".to_string()
+            ]
+        );
+    } else {
+        assert_eq!(
+            route,
+            DockerGatewayRoute::Bridge {
+                bind_address: "172.18.0.1:17670".parse().unwrap(),
+                host_alias_ip: IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
+            }
+        );
+        assert_eq!(
+            docker_extra_hosts(&route),
+            vec![
+                "host.docker.internal:172.18.0.1".to_string(),
+                "host.openshell.internal:172.18.0.1".to_string()
+            ]
+        );
+    }
+}
+
+// Regression for macOS + OPENSHELL_DRIVERS=docker against a Podman-machine socket
+// (OpenShell issue #1358): the daemon looks like generic Linux, but the bridge
+// gateway IP only exists inside the VM. Binding it on the host fails with
+// EADDRNOTAVAIL during gateway startup.
+#[test]
+#[cfg(target_os = "macos")]
+fn docker_gateway_route_uses_host_gateway_for_podman_machine_on_macos() {
+    let info = SystemInfo {
+        // Observed values when docker CLI talks to podman machine API.
+        operating_system: Some("fedora".to_string()),
+        name: Some("localhost.localdomain".to_string()),
+        labels: None,
+        ..Default::default()
+    };
+
+    let route = docker_gateway_route(
+        &info,
+        // Typical Podman machine bridge gateway; not routable on the macOS host.
+        IpAddr::V4(Ipv4Addr::new(10, 89, 0, 1)),
+        DEFAULT_SERVER_PORT,
+        None,
     );
-    assert_eq!(
-        docker_extra_hosts(&route),
-        vec![
-            "host.docker.internal:172.18.0.1".to_string(),
-            "host.openshell.internal:172.18.0.1".to_string()
-        ]
-    );
+    assert_eq!(route, DockerGatewayRoute::HostGateway);
 }
 
 #[test]
