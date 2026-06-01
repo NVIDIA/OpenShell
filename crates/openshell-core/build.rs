@@ -12,8 +12,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // builds where .git is absent, this silently does nothing and the binary
     // falls back to CARGO_PKG_VERSION (which is already sed-patched by the
     // build pipeline).
-    println!("cargo:rerun-if-changed=../../.git/HEAD");
-    println!("cargo:rerun-if-changed=../../.git/refs/tags");
+    if Path::new("../../.git/HEAD").exists() {
+        println!("cargo:rerun-if-changed=../../.git/HEAD");
+    }
+    if Path::new("../../.git/refs/tags").exists() {
+        println!("cargo:rerun-if-changed=../../.git/refs/tags");
+    }
 
     if let Some(version) = git_version() {
         println!("cargo:rustc-env=OPENSHELL_GIT_VERSION={version}");

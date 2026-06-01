@@ -10,6 +10,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lib]
+name = "openshell_providers"
+path = "src/lib.rs"
+
 [dependencies]
 glob = { workspace = true }
 openshell-core = { path = "../openshell-core", default-features = false }

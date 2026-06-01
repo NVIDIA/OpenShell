@@ -10,6 +10,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lib]
+name = "openshell_driver_docker"
+path = "src/lib.rs"
+
 [dependencies]
 openshell-core = { path = "../openshell-core", default-features = false }
 
