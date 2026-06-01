@@ -48,7 +48,7 @@ jobs:
 
       - name: Install mise
         run: |
-          curl https://mise.run | sh
+          curl https://mise.run | MISE_VERSION=v2026.4.25 sh
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           echo "$HOME/.local/share/mise/shims" >> "$GITHUB_PATH"
 
