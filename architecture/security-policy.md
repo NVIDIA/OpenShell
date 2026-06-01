@@ -21,6 +21,15 @@ For the field-by-field YAML reference, use
 Filesystem and process policy are startup-time controls. Network policy is
 dynamic and can be hot-reloaded when the new policy validates successfully.
 
+The sandbox supervisor also injects runtime baseline filesystem paths before
+the child process starts. Proxy mode adds the standard read-only system paths
+and writable work paths needed by the proxy and shell environment. GPU runtimes
+add the NVIDIA or WSL2 device nodes exposed inside the sandbox and promote
+`/proc` to read-write for default-like policies because CUDA initialization
+writes `/proc/<pid>/task/<tid>/comm`. Custom policies that explicitly keep a
+GPU-required path read-only fail at startup with an actionable diagnostic
+instead of being silently widened.
+
 ## Network Decisions
 
 Ordinary network traffic follows this order:

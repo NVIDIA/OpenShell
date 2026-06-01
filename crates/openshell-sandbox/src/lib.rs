@@ -1461,6 +1461,33 @@ fn enumerate_gpu_device_nodes() -> Vec<String> {
     paths
 }
 
+#[derive(Debug, Clone)]
+struct BaselineEnrichmentPaths {
+    read_only: Vec<String>,
+    read_write: Vec<String>,
+    gpu_required_read_write: Vec<String>,
+}
+
+impl BaselineEnrichmentPaths {
+    fn is_empty(&self) -> bool {
+        self.read_only.is_empty() && self.read_write.is_empty()
+    }
+
+    fn is_gpu_required_read_write(&self, path: &str) -> bool {
+        self.gpu_required_read_write.iter().any(|p| p == path)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BaselineConflictMode {
+    /// Normalize baseline-compatible policy conflicts, such as moving a
+    /// GPU-required path from `read_only` to `read_write`.
+    NormalizeBaseline,
+    /// Preserve explicit policy choices. If a GPU-required read-write path is
+    /// explicitly read-only, fail startup instead of silently widening it.
+    PreserveExplicitPolicy,
+}
+
 fn push_unique(paths: &mut Vec<String>, path: String) {
     if !paths.iter().any(|p| p == &path) {
         paths.push(path);
@@ -1471,40 +1498,47 @@ fn collect_baseline_enrichment_paths(
     include_proxy: bool,
     include_gpu: bool,
     gpu_device_nodes: Vec<String>,
-) -> (Vec<String>, Vec<String>) {
-    let mut ro = Vec::new();
-    let mut rw = Vec::new();
+) -> BaselineEnrichmentPaths {
+    let mut read_only = Vec::new();
+    let mut read_write = Vec::new();
+    let mut gpu_required_read_write = Vec::new();
 
     if include_proxy {
         for &path in PROXY_BASELINE_READ_ONLY {
-            push_unique(&mut ro, path.to_string());
+            push_unique(&mut read_only, path.to_string());
         }
         for &path in PROXY_BASELINE_READ_WRITE {
-            push_unique(&mut rw, path.to_string());
+            push_unique(&mut read_write, path.to_string());
         }
     }
 
     if include_gpu {
         for &path in GPU_BASELINE_READ_ONLY {
-            push_unique(&mut ro, path.to_string());
+            push_unique(&mut read_only, path.to_string());
         }
         for &path in GPU_BASELINE_READ_WRITE {
-            push_unique(&mut rw, path.to_string());
+            push_unique(&mut read_write, path.to_string());
+            push_unique(&mut gpu_required_read_write, path.to_string());
         }
         for path in gpu_device_nodes {
-            push_unique(&mut rw, path);
+            push_unique(&mut read_write, path.clone());
+            push_unique(&mut gpu_required_read_write, path);
         }
     }
 
     // A path promoted to read_write (e.g. /proc for GPU) should not also
-    // appear in read_only — Landlock handles the overlap correctly but the
-    // duplicate is confusing when inspecting the effective policy.
-    ro.retain(|p| !rw.contains(p));
+    // appear in read_only. Landlock handles the overlap correctly, but the
+    // duplicate obscures the effective policy when operators inspect it.
+    read_only.retain(|p| !read_write.contains(p));
 
-    (ro, rw)
+    BaselineEnrichmentPaths {
+        read_only,
+        read_write,
+        gpu_required_read_write,
+    }
 }
 
-fn active_baseline_enrichment_paths(include_proxy: bool) -> (Vec<String>, Vec<String>) {
+fn active_baseline_enrichment_paths(include_proxy: bool) -> BaselineEnrichmentPaths {
     let include_gpu = has_gpu_devices();
     let gpu_device_nodes = if include_gpu {
         enumerate_gpu_device_nodes()
@@ -1518,20 +1552,51 @@ fn active_baseline_enrichment_paths(include_proxy: bool) -> (Vec<String>, Vec<St
 /// Returns `(read_only, read_write)` as owned `String` vecs.
 #[cfg(test)]
 fn baseline_enrichment_paths() -> (Vec<String>, Vec<String>) {
-    active_baseline_enrichment_paths(true)
+    let paths = active_baseline_enrichment_paths(true);
+    (paths.read_only, paths.read_write)
+}
+
+fn proto_baseline_conflict_mode(
+    proto: &openshell_core::proto::SandboxPolicy,
+) -> BaselineConflictMode {
+    if proto == &openshell_policy::restrictive_default_policy() {
+        BaselineConflictMode::NormalizeBaseline
+    } else {
+        BaselineConflictMode::PreserveExplicitPolicy
+    }
+}
+
+fn baseline_read_write_conflict(path: &str) -> miette::Report {
+    miette::miette!(
+        "GPU sandbox policy keeps required path '{path}' read-only. \
+         CUDA workloads require this path to be read-write under the current Landlock runtime. \
+         Move '{path}' from filesystem_policy.read_only to filesystem_policy.read_write, \
+         or omit the custom filesystem policy to use OpenShell's GPU default."
+    )
+}
+
+fn emit_baseline_enriched_event() {
+    ocsf_emit!(
+        ConfigStateChangeBuilder::new(ocsf_ctx())
+            .severity(SeverityId::Informational)
+            .status(StatusId::Success)
+            .state(StateId::Enabled, "enriched")
+            .message("Enriched policy with baseline filesystem paths")
+            .build()
+    );
 }
 
 fn enrich_proto_baseline_paths_with<F>(
     proto: &mut openshell_core::proto::SandboxPolicy,
-    ro: &[String],
-    rw: &[String],
+    paths: &BaselineEnrichmentPaths,
+    conflict_mode: BaselineConflictMode,
     path_exists: F,
-) -> bool
+) -> Result<bool>
 where
     F: Fn(&str) -> bool,
 {
-    if ro.is_empty() && rw.is_empty() {
-        return false;
+    if paths.is_empty() {
+        return Ok(false);
     }
 
     let fs = proto
@@ -1541,24 +1606,26 @@ where
             ..Default::default()
         });
 
+    // Baseline paths are system-injected. Skip paths that do not exist in
+    // this container image to avoid noisy warnings from Landlock and, more
+    // critically, to prevent a single missing baseline path from abandoning
+    // the entire Landlock ruleset under best-effort mode (see issue #664).
     let mut modified = false;
-    for path in ro {
-        if !fs.read_only.iter().any(|p| p == path) && !fs.read_write.iter().any(|p| p == path) {
-            if !path_exists(path) {
-                debug!(
-                    path,
-                    "Baseline read-only path does not exist, skipping enrichment"
-                );
-                continue;
-            }
-            fs.read_only.push(path.clone());
-            modified = true;
-        }
-    }
-    for path in rw {
+    for path in &paths.read_only {
         if fs.read_only.iter().any(|p| p == path) || fs.read_write.iter().any(|p| p == path) {
             continue;
         }
+        if !path_exists(path) {
+            debug!(
+                path,
+                "Baseline read-only path does not exist, skipping enrichment"
+            );
+            continue;
+        }
+        fs.read_only.push(path.clone());
+        modified = true;
+    }
+    for path in &paths.read_write {
         if !path_exists(path) {
             debug!(
                 path,
@@ -1566,95 +1633,150 @@ where
             );
             continue;
         }
+
+        if fs.read_write.iter().any(|p| p == path) {
+            if conflict_mode == BaselineConflictMode::NormalizeBaseline
+                && paths.is_gpu_required_read_write(path)
+            {
+                let before = fs.read_only.len();
+                fs.read_only.retain(|p| p != path);
+                modified |= fs.read_only.len() != before;
+            }
+            continue;
+        }
+
+        if fs.read_only.iter().any(|p| p == path) {
+            if paths.is_gpu_required_read_write(path) {
+                if conflict_mode == BaselineConflictMode::PreserveExplicitPolicy {
+                    return Err(baseline_read_write_conflict(path));
+                }
+                fs.read_only.retain(|p| p != path);
+                fs.read_write.push(path.clone());
+                modified = true;
+            }
+            continue;
+        }
+
         fs.read_write.push(path.clone());
         modified = true;
     }
 
-    modified
-}
-
-/// Ensure a proto `SandboxPolicy` includes the baseline filesystem paths
-/// required by proxy-mode sandboxes and GPU runtimes. Paths are only added if
-/// missing; user-specified paths are never removed.
-///
-/// Returns `true` if the policy was modified (caller may want to sync back).
-fn enrich_proto_baseline_paths(proto: &mut openshell_core::proto::SandboxPolicy) -> bool {
-    let (ro, rw) = active_baseline_enrichment_paths(!proto.network_policies.is_empty());
-
-    // Baseline paths are system-injected, not user-specified.  Skip paths
-    // that do not exist in this container image to avoid noisy warnings from
-    // Landlock and, more critically, to prevent a single missing baseline
-    // path from abandoning the entire Landlock ruleset under best-effort
-    // mode (see issue #664).
-    let modified = enrich_proto_baseline_paths_with(proto, &ro, &rw, |path| {
-        std::path::Path::new(path).exists()
-    });
-
     if modified {
-        ocsf_emit!(
-            ConfigStateChangeBuilder::new(ocsf_ctx())
-                .severity(SeverityId::Informational)
-                .status(StatusId::Success)
-                .state(StateId::Enabled, "enriched")
-                .message("Enriched policy with baseline filesystem paths for proxy mode")
-                .build()
-        );
+        emit_baseline_enriched_event();
     }
 
-    modified
+    Ok(modified)
 }
 
-/// Ensure a `SandboxPolicy` (Rust type) includes the baseline filesystem
-/// paths required by proxy-mode sandboxes and GPU runtimes. Used for the
-/// local-file code path where no proto is available.
-fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
-    let (ro, rw) =
-        active_baseline_enrichment_paths(matches!(policy.network.mode, NetworkMode::Proxy));
-    if ro.is_empty() && rw.is_empty() {
-        return;
+/// Ensure a proto `SandboxPolicy` includes the active baseline filesystem
+/// paths required by proxy mode and GPU runtimes.
+///
+/// Returns `true` if the policy was modified (caller may want to sync back).
+fn enrich_proto_baseline_paths_with_conflict_mode(
+    proto: &mut openshell_core::proto::SandboxPolicy,
+    conflict_mode: BaselineConflictMode,
+) -> Result<bool> {
+    let include_proxy = !proto.network_policies.is_empty();
+    let paths = active_baseline_enrichment_paths(include_proxy);
+    enrich_proto_baseline_paths_with(proto, &paths, conflict_mode, |path| {
+        std::path::Path::new(path).exists()
+    })
+}
+
+fn enrich_proto_baseline_paths(proto: &mut openshell_core::proto::SandboxPolicy) -> Result<bool> {
+    enrich_proto_baseline_paths_with_conflict_mode(proto, proto_baseline_conflict_mode(proto))
+}
+
+fn enrich_sandbox_baseline_paths_with<F>(
+    policy: &mut SandboxPolicy,
+    paths: &BaselineEnrichmentPaths,
+    conflict_mode: BaselineConflictMode,
+    path_exists: F,
+) -> Result<bool>
+where
+    F: Fn(&str) -> bool,
+{
+    if paths.is_empty() {
+        return Ok(false);
     }
 
     let mut modified = false;
-    for path in &ro {
-        let p = std::path::PathBuf::from(path);
-        if !policy.filesystem.read_only.contains(&p) && !policy.filesystem.read_write.contains(&p) {
-            if !p.exists() {
-                debug!(
-                    path,
-                    "Baseline read-only path does not exist, skipping enrichment"
-                );
-                continue;
-            }
-            policy.filesystem.read_only.push(p);
-            modified = true;
-        }
-    }
-    for path in &rw {
+    for path in &paths.read_only {
         let p = std::path::PathBuf::from(path);
         if policy.filesystem.read_only.contains(&p) || policy.filesystem.read_write.contains(&p) {
             continue;
         }
-        if !p.exists() {
+        if !path_exists(path) {
+            debug!(
+                path,
+                "Baseline read-only path does not exist, skipping enrichment"
+            );
+            continue;
+        }
+        policy.filesystem.read_only.push(p);
+        modified = true;
+    }
+    for path in &paths.read_write {
+        let p = std::path::PathBuf::from(path);
+        if !path_exists(path) {
             debug!(
                 path,
                 "Baseline read-write path does not exist, skipping enrichment"
             );
             continue;
         }
+
+        if policy.filesystem.read_write.contains(&p) {
+            if conflict_mode == BaselineConflictMode::NormalizeBaseline
+                && paths.is_gpu_required_read_write(path)
+            {
+                let before = policy.filesystem.read_only.len();
+                policy
+                    .filesystem
+                    .read_only
+                    .retain(|existing| existing != &p);
+                modified |= policy.filesystem.read_only.len() != before;
+            }
+            continue;
+        }
+
+        if policy.filesystem.read_only.contains(&p) {
+            if paths.is_gpu_required_read_write(path) {
+                if conflict_mode == BaselineConflictMode::PreserveExplicitPolicy {
+                    return Err(baseline_read_write_conflict(path));
+                }
+                policy
+                    .filesystem
+                    .read_only
+                    .retain(|existing| existing != &p);
+                policy.filesystem.read_write.push(p);
+                modified = true;
+            }
+            continue;
+        }
+
         policy.filesystem.read_write.push(p);
         modified = true;
     }
 
     if modified {
-        ocsf_emit!(
-            ConfigStateChangeBuilder::new(ocsf_ctx())
-                .severity(SeverityId::Informational)
-                .status(StatusId::Success)
-                .state(StateId::Enabled, "enriched")
-                .message("Enriched policy with baseline filesystem paths for proxy mode")
-                .build()
-        );
+        emit_baseline_enriched_event();
     }
+
+    Ok(modified)
+}
+
+/// Ensure a `SandboxPolicy` (Rust type) includes active baseline filesystem
+/// paths. Used for the local-file code path where no proto is available.
+fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) -> Result<bool> {
+    let include_proxy = matches!(policy.network.mode, NetworkMode::Proxy);
+    let paths = active_baseline_enrichment_paths(include_proxy);
+    enrich_sandbox_baseline_paths_with(
+        policy,
+        &paths,
+        BaselineConflictMode::PreserveExplicitPolicy,
+        |path| std::path::Path::new(path).exists(),
+    )
 }
 
 #[cfg(test)]
@@ -1735,6 +1857,31 @@ mod baseline_tests {
     }
 
     #[test]
+    fn restrictive_default_policy_uses_baseline_normalization() {
+        let policy = openshell_policy::restrictive_default_policy();
+
+        assert_eq!(
+            proto_baseline_conflict_mode(&policy),
+            BaselineConflictMode::NormalizeBaseline
+        );
+    }
+
+    #[test]
+    fn custom_proto_policy_preserves_explicit_conflicts() {
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.filesystem = Some(openshell_core::proto::FilesystemPolicy {
+            read_only: vec!["/proc".to_string()],
+            read_write: vec![],
+            include_workdir: false,
+        });
+
+        assert_eq!(
+            proto_baseline_conflict_mode(&policy),
+            BaselineConflictMode::PreserveExplicitPolicy
+        );
+    }
+
+    #[test]
     fn proto_enrichment_preserves_explicit_read_only_for_baseline_read_write_paths() {
         let mut policy = openshell_policy::restrictive_default_policy();
         policy.filesystem = Some(openshell_core::proto::FilesystemPolicy {
@@ -1755,7 +1902,7 @@ mod baseline_tests {
             },
         );
 
-        enrich_proto_baseline_paths(&mut policy);
+        enrich_proto_baseline_paths(&mut policy).expect("baseline enrichment should succeed");
 
         let filesystem = policy.filesystem.expect("filesystem policy");
         assert!(
@@ -1769,28 +1916,118 @@ mod baseline_tests {
     }
 
     #[test]
-    fn proto_gpu_enrichment_adds_devices_without_network_policy() {
+    fn proto_gpu_enrichment_promotes_default_proc_without_network_policy() {
         let mut policy = openshell_policy::restrictive_default_policy();
         assert!(
             policy.network_policies.is_empty(),
             "regression setup must exercise the no-network default path"
         );
-        let (ro, rw) =
-            collect_baseline_enrichment_paths(false, true, vec!["/dev/nvidia0".to_string()]);
 
-        let enriched = enrich_proto_baseline_paths_with(&mut policy, &ro, &rw, |path| {
-            matches!(path, "/proc" | "/dev/nvidia0")
-        });
+        let paths =
+            collect_baseline_enrichment_paths(false, true, vec!["/dev/nvidia0".to_string()]);
+        let enriched = enrich_proto_baseline_paths_with(
+            &mut policy,
+            &paths,
+            BaselineConflictMode::NormalizeBaseline,
+            |_| true,
+        )
+        .expect("default GPU enrichment should succeed");
 
         let filesystem = policy.filesystem.expect("filesystem policy");
+        assert!(enriched, "default GPU enrichment should modify policy");
         assert!(
-            enriched,
-            "GPU enrichment should not require network policies"
+            !filesystem.read_only.contains(&"/proc".to_string()),
+            "default GPU enrichment should remove /proc from read_only"
+        );
+        assert!(
+            filesystem.read_write.contains(&"/proc".to_string()),
+            "default GPU enrichment should promote /proc to read_write"
         );
         assert!(
             filesystem.read_write.contains(&"/dev/nvidia0".to_string()),
-            "GPU enrichment should add enumerated device nodes without network policies"
+            "default GPU enrichment should add enumerated GPU devices"
         );
+    }
+
+    #[test]
+    fn proto_gpu_enrichment_promotes_discovered_image_policy_proc() {
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.network_policies.insert(
+            "image-policy".into(),
+            openshell_core::proto::NetworkPolicyRule {
+                name: "image-policy".into(),
+                endpoints: vec![openshell_core::proto::NetworkEndpoint {
+                    host: "example.com".into(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+
+        let paths = collect_baseline_enrichment_paths(true, true, vec!["/dev/nvidia0".to_string()]);
+        let enriched = enrich_proto_baseline_paths_with(
+            &mut policy,
+            &paths,
+            BaselineConflictMode::NormalizeBaseline,
+            |_| true,
+        )
+        .expect("discovered image policy GPU enrichment should succeed");
+
+        let filesystem = policy.filesystem.expect("filesystem policy");
+        assert!(enriched, "discovered image policy should be enriched");
+        assert!(
+            !filesystem.read_only.contains(&"/proc".to_string()),
+            "image-discovered GPU policy should remove /proc from read_only"
+        );
+        assert!(
+            filesystem.read_write.contains(&"/proc".to_string()),
+            "image-discovered GPU policy should promote /proc to read_write"
+        );
+    }
+
+    #[test]
+    fn proto_gpu_enrichment_adds_missing_custom_gpu_paths() {
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.filesystem = Some(openshell_core::proto::FilesystemPolicy {
+            read_only: vec![],
+            read_write: vec![],
+            include_workdir: true,
+        });
+
+        let paths =
+            collect_baseline_enrichment_paths(false, true, vec!["/dev/nvidia0".to_string()]);
+        let enriched = enrich_proto_baseline_paths_with(
+            &mut policy,
+            &paths,
+            BaselineConflictMode::PreserveExplicitPolicy,
+            |path| matches!(path, "/proc" | "/dev/nvidia0"),
+        )
+        .expect("custom GPU enrichment should add omitted baseline paths");
+
+        let filesystem = policy.filesystem.expect("filesystem policy");
+        assert!(enriched, "custom GPU enrichment should modify policy");
+        assert!(filesystem.read_write.contains(&"/proc".to_string()));
+        assert!(filesystem.read_write.contains(&"/dev/nvidia0".to_string()));
+    }
+
+    #[test]
+    fn proto_gpu_enrichment_rejects_custom_read_only_proc() {
+        let mut policy = openshell_policy::restrictive_default_policy();
+        let paths =
+            collect_baseline_enrichment_paths(false, true, vec!["/dev/nvidia0".to_string()]);
+
+        let error = enrich_proto_baseline_paths_with(
+            &mut policy,
+            &paths,
+            BaselineConflictMode::PreserveExplicitPolicy,
+            |path| path == "/proc",
+        )
+        .expect_err("custom read-only /proc should conflict with GPU baseline");
+
+        let message = error.to_string();
+        assert!(message.contains("GPU sandbox policy keeps required path '/proc' read-only"));
+        assert!(message.contains("filesystem_policy.read_write"));
     }
 
     #[test]
@@ -1821,7 +2058,7 @@ mod baseline_tests {
             process: ProcessPolicy::default(),
         };
 
-        enrich_sandbox_baseline_paths(&mut policy);
+        enrich_sandbox_baseline_paths(&mut policy).expect("baseline enrichment should succeed");
 
         assert!(
             policy
@@ -1836,6 +2073,40 @@ mod baseline_tests {
                 .read_write
                 .contains(&std::path::PathBuf::from("/tmp")),
             "baseline enrichment must not promote explicit read_only /tmp to read_write"
+        );
+    }
+
+    #[test]
+    fn local_gpu_enrichment_rejects_custom_read_only_proc() {
+        let mut policy = SandboxPolicy {
+            version: 1,
+            filesystem: FilesystemPolicy {
+                read_only: vec![std::path::PathBuf::from("/proc")],
+                read_write: vec![],
+                include_workdir: false,
+            },
+            network: NetworkPolicy {
+                mode: NetworkMode::Block,
+                proxy: None,
+            },
+            landlock: LandlockPolicy::default(),
+            process: ProcessPolicy::default(),
+        };
+        let paths =
+            collect_baseline_enrichment_paths(false, true, vec!["/dev/nvidia0".to_string()]);
+
+        let error = enrich_sandbox_baseline_paths_with(
+            &mut policy,
+            &paths,
+            BaselineConflictMode::PreserveExplicitPolicy,
+            |path| path == "/proc",
+        )
+        .expect_err("custom read-only /proc should conflict with GPU baseline");
+
+        assert!(
+            error
+                .to_string()
+                .contains("GPU sandbox policy keeps required path '/proc' read-only")
         );
     }
 
@@ -1974,7 +2245,7 @@ async fn load_policy(
             landlock: config.landlock,
             process: config.process,
         };
-        enrich_sandbox_baseline_paths(&mut policy);
+        enrich_sandbox_baseline_paths(&mut policy)?;
         return Ok((policy, Some(Arc::new(engine)), None));
     }
 
@@ -2005,7 +2276,10 @@ async fn load_policy(
             let mut discovered = discover_policy_from_disk_or_default();
             // Enrich before syncing so the gateway baseline includes
             // baseline paths from the start.
-            enrich_proto_baseline_paths(&mut discovered);
+            enrich_proto_baseline_paths_with_conflict_mode(
+                &mut discovered,
+                BaselineConflictMode::NormalizeBaseline,
+            )?;
             let sandbox = sandbox.as_deref().ok_or_else(|| {
                 miette::miette!(
                     "Cannot sync discovered policy: sandbox not available.\n\
@@ -2024,7 +2298,7 @@ async fn load_policy(
         // Ensure baseline filesystem paths are present for proxy-mode
         // sandboxes.  If the policy was enriched, sync the updated version
         // back to the gateway so users can see the effective policy.
-        let enriched = enrich_proto_baseline_paths(&mut proto_policy);
+        let enriched = enrich_proto_baseline_paths(&mut proto_policy)?;
         if enriched
             && let Some(sandbox_name) = sandbox.as_deref()
             && let Err(e) = grpc_client::sync_policy(endpoint, sandbox_name, &proto_policy).await
