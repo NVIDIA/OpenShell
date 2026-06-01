@@ -12,6 +12,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 E2E_TEST="${OPENSHELL_E2E_PODMAN_TEST:-}"
 E2E_FEATURES="${OPENSHELL_E2E_PODMAN_FEATURES:-e2e-podman}"
 
+if [ "${E2E_TEST}" = "podman_gateway_resume_expired_token" ] \
+   && [ -z "${OPENSHELL_E2E_SANDBOX_JWT_TTL_SECS:-}" ]; then
+  export OPENSHELL_E2E_SANDBOX_JWT_TTL_SECS=3
+fi
+
 cargo build -p openshell-cli --features openshell-core/dev-settings
 
 TEST_ARGS=(

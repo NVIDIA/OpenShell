@@ -32,10 +32,11 @@ use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     DriverCondition, DriverPlatformEvent, DriverSandbox, DriverSandboxStatus,
     DriverSandboxTemplate, GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest,
-    GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse, StopSandboxRequest,
-    StopSandboxResponse, ValidateSandboxCreateRequest, ValidateSandboxCreateResponse,
-    WatchSandboxesDeletedEvent, WatchSandboxesEvent, WatchSandboxesPlatformEvent,
-    WatchSandboxesRequest, WatchSandboxesSandboxEvent, compute_driver_server::ComputeDriver,
+    GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse, ResumeSandboxRequest,
+    ResumeSandboxResponse, StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
+    ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
+    WatchSandboxesPlatformEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
+    WriteSandboxTokenRequest, WriteSandboxTokenResponse, compute_driver_server::ComputeDriver,
     watch_sandboxes_event,
 };
 use openshell_core::{Config, Error, Result as CoreResult};
@@ -62,6 +63,7 @@ const TLS_CA_MOUNT_PATH: &str = "/etc/openshell/tls/client/ca.crt";
 const TLS_CERT_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.crt";
 const TLS_KEY_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.key";
 const SANDBOX_TOKEN_MOUNT_PATH: &str = "/etc/openshell/auth/sandbox.jwt";
+const SANDBOX_TOKEN_MOUNT_DIR: &str = "/etc/openshell/auth";
 const SANDBOX_COMMAND: &str = "sleep infinity";
 const SUPERVISOR_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const HOST_OPENSHELL_INTERNAL: &str = "host.openshell.internal";
@@ -522,9 +524,8 @@ impl DockerComputeDriver {
             .map_err(|status| {
                 DockerProvisioningFailure::new("ImagePullFailed", status.message())
             })?;
-        let token_file_created = write_sandbox_token_file(sandbox, &self.config)
-            .await
-            .map_err(|status| {
+        let token_file_created =
+            write_sandbox_token_file(sandbox, &self.config).map_err(|status| {
                 DockerProvisioningFailure::new("SandboxTokenWriteFailed", status.message())
             })?;
 
@@ -720,6 +721,7 @@ impl DockerComputeDriver {
         &self,
         sandbox_id: &str,
         sandbox_name: &str,
+        sandbox_token: Option<&str>,
     ) -> Result<bool, Status> {
         let Some(container) = self
             .find_managed_container_summary(sandbox_id, sandbox_name)
@@ -731,6 +733,9 @@ impl DockerComputeDriver {
             return Ok(false);
         };
         let state = container.state.unwrap_or(ContainerSummaryStateEnum::EMPTY);
+        if let Some(token) = sandbox_token.filter(|token| !token.is_empty()) {
+            self.write_sandbox_token(sandbox_id, token)?;
+        }
         if !container_state_needs_resume(state) {
             return Ok(true);
         }
@@ -743,6 +748,10 @@ impl DockerComputeDriver {
             Err(err) if is_not_found_error(&err) => Ok(false),
             Err(err) => Err(internal_status("start docker sandbox container", err)),
         }
+    }
+
+    pub fn write_sandbox_token(&self, sandbox_id: &str, token: &str) -> Result<(), Status> {
+        write_sandbox_token_file_by_id(sandbox_id, &self.config, token)
     }
 
     pub async fn stop_managed_containers_on_shutdown(&self) -> Result<usize, Status> {
@@ -1212,6 +1221,37 @@ impl ComputeDriver for DockerComputeDriver {
         Ok(Response::new(CreateSandboxResponse {}))
     }
 
+    async fn resume_sandbox(
+        &self,
+        request: Request<ResumeSandboxRequest>,
+    ) -> Result<Response<ResumeSandboxResponse>, Status> {
+        let request = request.into_inner();
+        require_sandbox_identifier(&request.sandbox_id, &request.sandbox_name)?;
+        let resumed = Self::resume_sandbox(
+            self,
+            &request.sandbox_id,
+            &request.sandbox_name,
+            (!request.sandbox_token.is_empty()).then_some(request.sandbox_token.as_str()),
+        )
+        .await?;
+        Ok(Response::new(ResumeSandboxResponse { resumed }))
+    }
+
+    async fn write_sandbox_token(
+        &self,
+        request: Request<WriteSandboxTokenRequest>,
+    ) -> Result<Response<WriteSandboxTokenResponse>, Status> {
+        let request = request.into_inner();
+        if request.sandbox_id.is_empty() {
+            return Err(Status::invalid_argument("sandbox_id is required"));
+        }
+        if request.sandbox_token.is_empty() {
+            return Err(Status::invalid_argument("sandbox_token is required"));
+        }
+        Self::write_sandbox_token(self, &request.sandbox_id, &request.sandbox_token)?;
+        Ok(Response::new(WriteSandboxTokenResponse {}))
+    }
+
     async fn stop_sandbox(
         &self,
         request: Request<StopSandboxRequest>,
@@ -1548,18 +1588,31 @@ fn build_binds(
     {
         binds.push(format!(
             "{}:{}:ro,z",
-            sandbox_token_host_path(sandbox, config)?.display(),
-            SANDBOX_TOKEN_MOUNT_PATH
+            sandbox_token_host_dir(sandbox, config)?.display(),
+            SANDBOX_TOKEN_MOUNT_DIR
         ));
     }
     Ok(binds)
 }
 
-fn sandbox_token_host_path(
+fn sandbox_token_host_dir(
     sandbox: &DriverSandbox,
     config: &DockerDriverRuntimeConfig,
 ) -> Result<PathBuf, Status> {
-    sandbox_token_host_path_by_id(&sandbox.id, config)
+    sandbox_token_host_dir_by_id(&sandbox.id, config)
+}
+
+fn sandbox_token_host_dir_by_id(
+    sandbox_id: &str,
+    config: &DockerDriverRuntimeConfig,
+) -> Result<PathBuf, Status> {
+    let path = sandbox_token_host_path_by_id(sandbox_id, config)?;
+    path.parent().map(PathBuf::from).ok_or_else(|| {
+        Status::internal(format!(
+            "resolve sandbox token directory failed: {} has no parent",
+            path.display()
+        ))
+    })
 }
 
 fn sandbox_token_host_path_by_id(
@@ -1578,7 +1631,7 @@ fn sandbox_token_host_path_by_id(
     })
 }
 
-async fn write_sandbox_token_file(
+fn write_sandbox_token_file(
     sandbox: &DriverSandbox,
     config: &DockerDriverRuntimeConfig,
 ) -> Result<bool, Status> {
@@ -1588,17 +1641,17 @@ async fn write_sandbox_token_file(
     if spec.sandbox_token.is_empty() {
         return Ok(false);
     }
-    let path = sandbox_token_host_path(sandbox, config)?;
-    if let Some(parent) = path.parent() {
-        openshell_core::paths::create_dir_restricted(parent).map_err(|err| {
-            Status::internal(format!(
-                "create sandbox token directory {} failed: {err}",
-                parent.display()
-            ))
-        })?;
-    }
-    tokio::fs::write(&path, format!("{}\n", spec.sandbox_token))
-        .await
+    write_sandbox_token_file_by_id(&sandbox.id, config, &spec.sandbox_token)?;
+    Ok(true)
+}
+
+fn write_sandbox_token_file_by_id(
+    sandbox_id: &str,
+    config: &DockerDriverRuntimeConfig,
+    token: &str,
+) -> Result<(), Status> {
+    let path = sandbox_token_host_path_by_id(sandbox_id, config)?;
+    openshell_core::paths::write_file_owner_only_atomic(&path, format!("{token}\n").as_bytes())
         .map_err(|err| {
             Status::internal(format!(
                 "write sandbox token file {} failed: {err}",
@@ -1611,7 +1664,7 @@ async fn write_sandbox_token_file(
             path.display()
         ))
     })?;
-    Ok(true)
+    Ok(())
 }
 
 fn cleanup_sandbox_token_file(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig) {
@@ -1707,6 +1760,7 @@ fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig
 
     environment.remove(openshell_core::sandbox_env::SANDBOX_TOKEN);
     environment.remove(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE);
+    environment.remove(openshell_core::sandbox_env::SANDBOX_AUTH_MODE);
 
     // Gateway-minted sandbox JWT. Keep the raw bearer out of container
     // metadata; the supervisor reads it from this driver-owned bind mount.
@@ -1716,6 +1770,12 @@ fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig
         environment.insert(
             openshell_core::sandbox_env::SANDBOX_TOKEN_FILE.to_string(),
             SANDBOX_TOKEN_MOUNT_PATH.to_string(),
+        );
+        environment.insert(
+            openshell_core::sandbox_env::SANDBOX_AUTH_MODE.to_string(),
+            openshell_core::sandbox_env::SandboxAuthMode::GatewayManagedFile
+                .as_str()
+                .to_string(),
         );
     }
 

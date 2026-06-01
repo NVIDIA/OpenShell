@@ -31,11 +31,13 @@ use openshell_core::progress::{
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     DriverCondition as SandboxCondition, DriverPlatformEvent as PlatformEvent,
-    DriverSandbox as Sandbox, DriverSandboxStatus as SandboxStatus, GetCapabilitiesRequest,
-    GetCapabilitiesResponse, GetSandboxRequest, GetSandboxResponse, ListSandboxesRequest,
-    ListSandboxesResponse, StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
-    ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
-    WatchSandboxesPlatformEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
+    DriverSandbox as Sandbox, DriverSandboxSpec as SandboxSpec,
+    DriverSandboxStatus as SandboxStatus, GetCapabilitiesRequest, GetCapabilitiesResponse,
+    GetSandboxRequest, GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse,
+    ResumeSandboxRequest, ResumeSandboxResponse, StopSandboxRequest, StopSandboxResponse,
+    ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent,
+    WatchSandboxesEvent, WatchSandboxesPlatformEvent, WatchSandboxesRequest,
+    WatchSandboxesSandboxEvent, WriteSandboxTokenRequest, WriteSandboxTokenResponse,
     compute_driver_server::ComputeDriver, watch_sandboxes_event,
 };
 use openshell_vfio::SysfsRoot;
@@ -367,7 +369,6 @@ impl VmDriver {
             gpu_inventory,
             subnet_allocator,
         };
-        driver.restore_persisted_sandboxes().await;
         Ok(driver)
     }
 
@@ -507,6 +508,121 @@ impl VmDriver {
         }
 
         Ok(CreateSandboxResponse {})
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn resume_sandbox(
+        &self,
+        sandbox_id: &str,
+        sandbox_name: &str,
+        sandbox_token: Option<&str>,
+    ) -> Result<bool, Status> {
+        validate_sandbox_id(sandbox_id)?;
+        let state_dir = {
+            let registry = self.registry.lock().await;
+            registry.get(sandbox_id).map_or_else(
+                || sandboxes_root_dir(&self.config.state_dir).join(sandbox_id),
+                |record| record.state_dir.clone(),
+            )
+        };
+
+        let metadata = match tokio::fs::metadata(&state_dir).await {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => {
+                return Err(Status::internal(format!(
+                    "stat persisted vm sandbox state dir {}: {err}",
+                    state_dir.display()
+                )));
+            }
+        };
+        if !metadata.is_dir() {
+            return Err(Status::internal(format!(
+                "persisted vm sandbox state path is not a directory: {}",
+                state_dir.display()
+            )));
+        }
+
+        let mut sandbox = read_sandbox_request(&state_dir.join(SANDBOX_REQUEST_FILE))
+            .await
+            .map_err(|err| {
+                Status::internal(format!(
+                    "read persisted vm sandbox request {}: {err}",
+                    state_dir.join(SANDBOX_REQUEST_FILE).display()
+                ))
+            })?;
+        if sandbox.id != sandbox_id {
+            return Err(Status::failed_precondition(format!(
+                "persisted sandbox id '{}' does not match requested id '{}'",
+                sandbox.id, sandbox_id
+            )));
+        }
+        if !sandbox_name.is_empty() && sandbox.name != sandbox_name {
+            return Err(Status::failed_precondition(format!(
+                "persisted sandbox name '{}' does not match requested name '{}'",
+                sandbox.name, sandbox_name
+            )));
+        }
+        validate_restored_sandbox_state(&self.config.state_dir, &state_dir, &sandbox)?;
+
+        if let Some(token) = sandbox_token {
+            set_sandbox_token(&mut sandbox, token);
+            write_sandbox_request(&state_dir, &sandbox)
+                .await
+                .map_err(|err| {
+                    Status::internal(format!(
+                        "write refreshed vm sandbox request {}: {err}",
+                        state_dir.join(SANDBOX_REQUEST_FILE).display()
+                    ))
+                })?;
+        }
+
+        if self.registry.lock().await.contains_key(sandbox_id) {
+            return Ok(true);
+        }
+
+        self.restore_persisted_sandbox(sandbox, state_dir).await?;
+        Ok(true)
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub async fn write_sandbox_token(
+        &self,
+        sandbox_id: &str,
+        sandbox_token: &str,
+    ) -> Result<(), Status> {
+        validate_sandbox_id(sandbox_id)?;
+        if sandbox_token.is_empty() {
+            return Err(Status::invalid_argument("sandbox_token is required"));
+        }
+        let state_dir = {
+            let registry = self.registry.lock().await;
+            registry.get(sandbox_id).map_or_else(
+                || sandboxes_root_dir(&self.config.state_dir).join(sandbox_id),
+                |record| record.state_dir.clone(),
+            )
+        };
+        let request_path = state_dir.join(SANDBOX_REQUEST_FILE);
+        let mut sandbox = read_sandbox_request(&request_path).await.map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                Status::not_found("persisted vm sandbox request not found")
+            } else {
+                Status::internal(format!(
+                    "read persisted vm sandbox request {}: {err}",
+                    request_path.display()
+                ))
+            }
+        })?;
+        validate_restored_sandbox_state(&self.config.state_dir, &state_dir, &sandbox)?;
+        set_sandbox_token(&mut sandbox, sandbox_token);
+        write_sandbox_request(&state_dir, &sandbox)
+            .await
+            .map_err(|err| {
+                Status::internal(format!(
+                    "write refreshed vm sandbox request {}: {err}",
+                    request_path.display()
+                ))
+            })
     }
 
     async fn provision_sandbox(
@@ -902,88 +1018,20 @@ impl VmDriver {
         snapshots
     }
 
-    async fn restore_persisted_sandboxes(&self) {
-        let state_root = sandboxes_root_dir(&self.config.state_dir);
-        let mut entries = match tokio::fs::read_dir(&state_root).await {
-            Ok(entries) => entries,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
-            Err(err) => {
-                warn!(
-                    state_root = %state_root.display(),
-                    error = %err,
-                    "vm driver: failed to scan persisted sandboxes"
-                );
-                return;
-            }
-        };
-
-        loop {
-            let entry = match entries.next_entry().await {
-                Ok(Some(entry)) => entry,
-                Ok(None) => break,
-                Err(err) => {
-                    warn!(
-                        state_root = %state_root.display(),
-                        error = %err,
-                        "vm driver: failed to continue scanning persisted sandboxes"
-                    );
-                    break;
-                }
-            };
-            let state_dir = entry.path();
-            let is_dir = match entry.file_type().await {
-                Ok(file_type) => file_type.is_dir(),
-                Err(err) => {
-                    warn!(
-                        state_dir = %state_dir.display(),
-                        error = %err,
-                        "vm driver: failed to inspect persisted sandbox state dir"
-                    );
-                    continue;
-                }
-            };
-            if !is_dir {
-                continue;
-            }
-
-            let request_path = state_dir.join(SANDBOX_REQUEST_FILE);
-            let sandbox = match read_sandbox_request(&request_path).await {
-                Ok(sandbox) => sandbox,
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(err) => {
-                    warn!(
-                        state_dir = %state_dir.display(),
-                        error = %err,
-                        "vm driver: failed to read persisted sandbox request"
-                    );
-                    continue;
-                }
-            };
-
-            if let Err(status) =
-                validate_restored_sandbox_state(&self.config.state_dir, &state_dir, &sandbox)
-            {
-                warn!(
-                    sandbox_id = %sandbox.id,
-                    state_dir = %state_dir.display(),
-                    error = %status.message(),
-                    "vm driver: ignoring invalid persisted sandbox state"
-                );
-                continue;
-            }
-
-            self.restore_persisted_sandbox(sandbox, state_dir).await;
-        }
-    }
-
-    async fn restore_persisted_sandbox(&self, sandbox: Sandbox, state_dir: PathBuf) {
+    async fn restore_persisted_sandbox(
+        &self,
+        sandbox: Sandbox,
+        state_dir: PathBuf,
+    ) -> Result<(), Status> {
         let Some(image_ref) = self.resolved_sandbox_image(&sandbox) else {
             warn!(
                 sandbox_id = %sandbox.id,
                 sandbox_name = %sandbox.name,
                 "vm driver: cannot restore persisted sandbox without image"
             );
-            return;
+            return Err(Status::failed_precondition(
+                "vm sandbox cannot be restored without an image",
+            ));
         };
         let tls_paths = match self.config.tls_paths() {
             Ok(paths) => paths,
@@ -994,7 +1042,7 @@ impl VmDriver {
                     error = %err,
                     "vm driver: cannot restore persisted sandbox TLS configuration"
                 );
-                return;
+                return Err(Status::failed_precondition(err));
             }
         };
 
@@ -1002,7 +1050,7 @@ impl VmDriver {
         {
             let mut registry = self.registry.lock().await;
             if registry.contains_key(&sandbox.id) {
-                return;
+                return Ok(());
             }
             registry.insert(
                 sandbox.id.clone(),
@@ -1052,6 +1100,7 @@ impl VmDriver {
         } else {
             task.abort();
         }
+        Ok(())
     }
 
     fn release_gpu_and_subnet(&self, sandbox_id: &str) {
@@ -2452,6 +2501,30 @@ impl ComputeDriver for VmDriver {
         Ok(Response::new(response))
     }
 
+    async fn resume_sandbox(
+        &self,
+        request: Request<ResumeSandboxRequest>,
+    ) -> Result<Response<ResumeSandboxResponse>, Status> {
+        let request = request.into_inner();
+        let resumed = Self::resume_sandbox(
+            self,
+            &request.sandbox_id,
+            &request.sandbox_name,
+            (!request.sandbox_token.is_empty()).then_some(request.sandbox_token.as_str()),
+        )
+        .await?;
+        Ok(Response::new(ResumeSandboxResponse { resumed }))
+    }
+
+    async fn write_sandbox_token(
+        &self,
+        request: Request<WriteSandboxTokenRequest>,
+    ) -> Result<Response<WriteSandboxTokenResponse>, Status> {
+        let request = request.into_inner();
+        Self::write_sandbox_token(self, &request.sandbox_id, &request.sandbox_token).await?;
+        Ok(Response::new(WriteSandboxTokenResponse {}))
+    }
+
     async fn get_sandbox(
         &self,
         request: Request<GetSandboxRequest>,
@@ -3508,6 +3581,7 @@ fn build_guest_environment(
     environment.extend(merged_environment(sandbox));
     environment.remove(openshell_core::sandbox_env::SANDBOX_TOKEN);
     environment.remove(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE);
+    environment.remove(openshell_core::sandbox_env::SANDBOX_AUTH_MODE);
     if sandbox
         .spec
         .as_ref()
@@ -3516,6 +3590,12 @@ fn build_guest_environment(
         environment.insert(
             openshell_core::sandbox_env::SANDBOX_TOKEN_FILE.to_string(),
             GUEST_SANDBOX_TOKEN_PATH.to_string(),
+        );
+        environment.insert(
+            openshell_core::sandbox_env::SANDBOX_AUTH_MODE.to_string(),
+            openshell_core::sandbox_env::SandboxAuthMode::GatewayManagedSupervisorPush
+                .as_str()
+                .to_string(),
         );
     }
 
@@ -3806,6 +3886,11 @@ async fn read_sandbox_request(path: &Path) -> Result<Sandbox, std::io::Error> {
             format!("decode persisted sandbox request: {err}"),
         )
     })
+}
+
+fn set_sandbox_token(sandbox: &mut Sandbox, token: &str) {
+    let spec = sandbox.spec.get_or_insert_with(SandboxSpec::default);
+    spec.sandbox_token = token.to_string();
 }
 
 async fn write_private_file(path: &Path, bytes: Vec<u8>) -> Result<(), std::io::Error> {
@@ -4732,6 +4817,58 @@ mod tests {
         let _ = std::fs::remove_dir_all(base);
     }
 
+    #[tokio::test]
+    async fn write_sandbox_token_updates_persisted_request() {
+        let base = unique_temp_dir();
+        let driver_state = base.join("driver-state");
+        let state_dir = sandbox_state_dir(&driver_state, "sandbox-123").unwrap();
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let sandbox = Sandbox {
+            id: "sandbox-123".to_string(),
+            name: "sandbox-123".to_string(),
+            spec: Some(SandboxSpec {
+                sandbox_token: "old-token".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        write_sandbox_request(&state_dir, &sandbox)
+            .await
+            .expect("write persisted sandbox request");
+        let driver = VmDriver {
+            config: VmDriverConfig {
+                state_dir: driver_state,
+                ..Default::default()
+            },
+            launcher_bin: PathBuf::from("openshell-driver-vm"),
+            registry: Arc::new(Mutex::new(HashMap::new())),
+            image_cache_lock: Arc::new(Mutex::new(())),
+            events: broadcast::channel(WATCH_BUFFER).0,
+            gpu_inventory: None,
+            subnet_allocator: Arc::new(std::sync::Mutex::new(SubnetAllocator::new(
+                Ipv4Addr::new(10, 0, 128, 0),
+                17,
+            ))),
+        };
+
+        driver
+            .write_sandbox_token("sandbox-123", "fresh-token")
+            .await
+            .expect("write sandbox token");
+
+        let restored = read_sandbox_request(&state_dir.join(SANDBOX_REQUEST_FILE))
+            .await
+            .expect("read persisted sandbox request");
+        assert_eq!(
+            restored
+                .spec
+                .as_ref()
+                .map(|spec| spec.sandbox_token.as_str()),
+            Some("fresh-token")
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
     #[test]
     fn prepare_sandbox_overlay_preserves_existing_overlay_on_resume() {
         let base = unique_temp_dir();
@@ -5043,6 +5180,11 @@ mod tests {
         assert!(env.contains(&format!(
             "{}={GUEST_SANDBOX_TOKEN_PATH}",
             openshell_core::sandbox_env::SANDBOX_TOKEN_FILE
+        )));
+        assert!(env.contains(&format!(
+            "{}={}",
+            openshell_core::sandbox_env::SANDBOX_AUTH_MODE,
+            openshell_core::sandbox_env::SandboxAuthMode::GatewayManagedSupervisorPush.as_str()
         )));
     }
 

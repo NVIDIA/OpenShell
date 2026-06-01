@@ -505,6 +505,31 @@ fn build_environment_uses_token_file_without_raw_token_env() {
         "{}={SANDBOX_TOKEN_MOUNT_PATH}",
         openshell_core::sandbox_env::SANDBOX_TOKEN_FILE
     )));
+    assert!(env.contains(&format!(
+        "{}={}",
+        openshell_core::sandbox_env::SANDBOX_AUTH_MODE,
+        openshell_core::sandbox_env::SandboxAuthMode::GatewayManagedFile.as_str()
+    )));
+}
+
+#[test]
+fn build_binds_mounts_token_auth_directory_read_only() {
+    let mut sandbox = test_sandbox();
+    sandbox.spec.as_mut().unwrap().sandbox_token = "secret.jwt.value".to_string();
+    let config = runtime_config();
+    let token_dir = sandbox_token_host_dir(&sandbox, &config).unwrap();
+
+    let binds = build_binds(&sandbox, &config).unwrap();
+
+    assert!(binds.contains(&format!(
+        "{}:{SANDBOX_TOKEN_MOUNT_DIR}:ro,z",
+        token_dir.display()
+    )));
+    assert!(
+        binds
+            .iter()
+            .all(|bind| !bind.ends_with(&format!(":{SANDBOX_TOKEN_MOUNT_PATH}:ro,z")))
+    );
 }
 
 #[test]

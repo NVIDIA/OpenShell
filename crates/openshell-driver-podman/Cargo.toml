@@ -35,7 +35,7 @@ thiserror = { workspace = true }
 miette = { workspace = true }
 
 [dev-dependencies]
-temp-env = "0.3"
+temp-env = { version = "0.3", features = ["async_closure"] }
 
 [lints]
 workspace = true

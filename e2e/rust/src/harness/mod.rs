@@ -6,6 +6,7 @@
 pub mod binary;
 pub mod cli;
 pub mod container;
+pub mod docker;
 pub mod gateway;
 pub mod output;
 pub mod port;

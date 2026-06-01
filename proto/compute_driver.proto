@@ -32,6 +32,14 @@ service ComputeDriver {
   // Provision platform resources for a sandbox.
   rpc CreateSandbox(CreateSandboxRequest) returns (CreateSandboxResponse);
 
+  // Resume previously provisioned platform resources without resetting
+  // driver-owned persistent state.
+  rpc ResumeSandbox(ResumeSandboxRequest) returns (ResumeSandboxResponse);
+
+  // Write a gateway-managed sandbox token into driver-owned persistent state.
+  rpc WriteSandboxToken(WriteSandboxTokenRequest)
+      returns (WriteSandboxTokenResponse);
+
   // Stop platform resources for a sandbox without deleting its record.
   rpc StopSandbox(StopSandboxRequest) returns (StopSandboxResponse);
 
@@ -92,9 +100,10 @@ message DriverSandboxSpec {
   string gpu_device = 10;
   // Gateway-minted JWT identifying this sandbox to the gateway. Set by
   // the gateway on create; the driver materialises it via its native
-  // secret mechanism (Docker/Podman/VM bind-mount a per-sandbox file;
-  // the Kubernetes driver ignores this field and relies on its projected
-  // ServiceAccount token bootstrap instead). Never echoed to the public
+  // secret mechanism (Docker/Podman bind-mount a per-sandbox file; VM
+  // injects the file into the guest overlay; the Kubernetes driver ignores
+  // this field and relies on its projected ServiceAccount token bootstrap
+  // instead). Never echoed to the public
   // Sandbox proto.
   string sandbox_token = 11;
 }
@@ -225,6 +234,31 @@ message CreateSandboxRequest {
 }
 
 message CreateSandboxResponse {}
+
+message ResumeSandboxRequest {
+  // Stable sandbox ID stored by the gateway.
+  string sandbox_id = 1;
+  // Compute-runtime name used by the driver.
+  string sandbox_name = 2;
+  // Fresh gateway-minted JWT for the sandbox. Empty when per-sandbox auth is
+  // disabled.
+  string sandbox_token = 3;
+}
+
+message ResumeSandboxResponse {
+  // True when the driver found persisted platform state and resumed it, or the
+  // sandbox was already running.
+  bool resumed = 1;
+}
+
+message WriteSandboxTokenRequest {
+  // Stable sandbox ID stored by the gateway.
+  string sandbox_id = 1;
+  // Fresh gateway-minted JWT for the sandbox.
+  string sandbox_token = 2;
+}
+
+message WriteSandboxTokenResponse {}
 
 message StopSandboxRequest {
   // Stable sandbox ID stored by the gateway.

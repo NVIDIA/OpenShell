@@ -207,6 +207,7 @@ is injected as an environment variable.
 |---|---|---|---|
 | mTLS client cert/key | Bind-mounted file paths (`OPENSHELL_TLS_*` env vars point at them) | Yes (paths only) | Yes (paths only) |
 | Sandbox identity | Plaintext env var | Yes | Yes |
+| Sandbox JWT | Read-only bind-mounted token directory | No | Yes |
 | gRPC endpoint | Plaintext env var, override-protected | Yes | Yes |
 | Supervisor relay socket path | Plaintext env var, override-protected | Yes | Yes |
 
@@ -220,6 +221,8 @@ via sandbox templates:
 - `OPENSHELL_SSH_SOCKET_PATH`
 - `OPENSHELL_CONTAINER_IMAGE`
 - `OPENSHELL_SANDBOX_COMMAND`
+- `OPENSHELL_SANDBOX_AUTH_MODE=gateway-managed-file` and
+  `OPENSHELL_SANDBOX_TOKEN_FILE` when gateway JWT auth is enabled
 
 ## Sandbox Lifecycle
 

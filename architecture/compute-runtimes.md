@@ -29,7 +29,7 @@ reason strings.
 | Docker | Local development with Docker available. | Container plus nested sandbox namespace. | Uses host networking so loopback gateway endpoints work from the supervisor. |
 | Podman | Rootless or single-machine deployments. | Container plus nested sandbox namespace. | Uses the Podman REST API, OCI image volumes, and CDI GPU devices when available. |
 | Kubernetes | Cluster deployment through Helm. | Pod plus nested sandbox namespace. | Uses Kubernetes API objects, service accounts, secrets, PVC-backed workspace storage, and GPU resources. |
-| VM | Experimental microVM isolation. | Per-sandbox libkrun VM. | Gateway spawns `openshell-driver-vm` as a subprocess over a private, state-local Unix socket. The VM driver boots a cached bootstrap `rootfs.ext4`, prepares requested OCI images inside a bootstrap VM with `umoci`, attaches the prepared image disk read-only, and gives each sandbox a writable `overlay.ext4` for merged-root changes and runtime material. The driver persists each accepted launch request beside the overlay and restarts those VMs on driver startup without recreating the overlay. |
+| VM | Experimental microVM isolation. | Per-sandbox libkrun VM. | Gateway spawns `openshell-driver-vm` as a subprocess over a private, state-local Unix socket. The VM driver boots a cached bootstrap `rootfs.ext4`, prepares requested OCI images inside a bootstrap VM with `umoci`, attaches the prepared image disk read-only, and gives each sandbox a writable `overlay.ext4` for merged-root changes and runtime material. The driver persists each accepted launch request beside the overlay; the gateway explicitly calls the driver's resume RPC on startup so it can supply a fresh sandbox token before the VM is relaunched. |
 
 Per-sandbox CPU and memory values currently enter the driver layer through
 template resource limits. Docker and Podman apply them as runtime limits.
@@ -63,6 +63,28 @@ The supervisor must be available inside each sandbox workload:
 Driver-controlled environment variables must override sandbox image or template
 values for sandbox ID, sandbox name, gateway endpoint, relay socket path, TLS
 paths, and command metadata.
+
+## Sandbox Tokens
+
+When gateway-minted sandbox JWTs are enabled, each runtime declares its token
+contract with `OPENSHELL_SANDBOX_AUTH_MODE`:
+
+- Docker and Podman use `gateway-managed-file`. The gateway writes host token
+  files that are mounted read-only into the container, and the supervisor
+  re-reads `OPENSHELL_SANDBOX_TOKEN_FILE` on outbound gateway calls.
+- VM uses `gateway-managed-supervisor-push`. The gateway supplies a fresh token
+  through the driver's resume/write RPCs and sends live token updates over
+  `ConnectSupervisor` so the guest can rewrite
+  `/opt/openshell/auth/sandbox.jwt`.
+- Kubernetes uses `kubernetes-service-account-exchange`. The supervisor reads
+  the projected ServiceAccount token from `OPENSHELL_K8S_SA_TOKEN_FILE` and
+  exchanges it for a gateway JWT with `IssueSandboxToken`.
+
+During startup, local-driver resume hooks receive a freshly minted token before
+starting or re-adopting each persisted sandbox. The gateway also runs a refresh
+sweep after startup resume and then rotates local-runtime tokens before expiry.
+This lets a local sandbox recover after the gateway, container, or VM was
+stopped long enough for the previous token to expire.
 
 ## Images
 

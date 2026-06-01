@@ -11,7 +11,7 @@
 //!
 //! Subcommands:
 //! - `get-sandbox-config --sandbox-id <id>` — call `GetSandboxConfig`
-//! - `refresh` — call `RefreshSandboxToken`
+//! - `refresh` — manually call the legacy `RefreshSandboxToken` RPC
 //! - `show-token` — print a token fingerprint and expiry, never the bearer
 //! - `show-principal` — pretty-print the decoded JWT claims
 //!   (no signature verification — the supervisor already trusts the
@@ -54,13 +54,12 @@ usage: openshell-sandbox debug-rpc <command> [options]
 
 commands:
   get-sandbox-config --sandbox-id <UUID>  call GetSandboxConfig
-  refresh                                 renew the gateway JWT
+  refresh                                 manually call RefreshSandboxToken
   show-token                              print JWT fingerprint and expiry
   show-principal                          print decoded JWT claims
 
-requires: OPENSHELL_ENDPOINT in env, plus one of OPENSHELL_SANDBOX_TOKEN,
-OPENSHELL_SANDBOX_TOKEN_FILE, or OPENSHELL_K8S_SA_TOKEN_FILE so the
-supervisor's normal token-acquisition path can resolve a JWT.";
+requires: OPENSHELL_ENDPOINT and OPENSHELL_SANDBOX_AUTH_MODE in env, plus
+the token variable required by that auth mode.";
 
 async fn open_client() -> Result<OpenShellClient<AuthedChannel>> {
     let endpoint = std::env::var(openshell_core::sandbox_env::ENDPOINT)
@@ -183,9 +182,9 @@ fn token_fingerprint(token: &str) -> String {
     format!("sha256:{}", &hex::encode(digest)[..16])
 }
 
-/// Read the token from the env/file/SA-bootstrap chain, but only the
-/// "already a gateway JWT" paths — show-token / show-principal don't
-/// want to actually exchange an SA token.
+/// Read the token from the static or file-backed auth modes, but only the
+/// "already a gateway JWT" paths — show-token / show-principal don't want to
+/// actually exchange a Kubernetes `ServiceAccount` token.
 fn read_local_token() -> Result<String> {
     if let Ok(t) = std::env::var(openshell_core::sandbox_env::SANDBOX_TOKEN)
         && !t.is_empty()
@@ -203,7 +202,7 @@ fn read_local_token() -> Result<String> {
     }
     Err(miette::miette!(
         "no in-process gateway JWT available — set OPENSHELL_SANDBOX_TOKEN or \
-         OPENSHELL_SANDBOX_TOKEN_FILE. The K8s SA-bootstrap path is intentionally \
+         OPENSHELL_SANDBOX_TOKEN_FILE. The K8s ServiceAccount exchange path is intentionally \
          excluded from `show-token` / `show-principal` to avoid issuing a fresh \
          token just for inspection."
     ))

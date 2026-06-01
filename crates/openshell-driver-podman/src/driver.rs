@@ -61,7 +61,17 @@ fn sandbox_token_host_path(sandbox_id: &str) -> Result<PathBuf, ComputeDriverErr
         .map_err(|err| ComputeDriverError::Message(format!("resolve state dir failed: {err}")))
 }
 
-async fn write_sandbox_token_file(
+fn sandbox_token_host_dir(sandbox_id: &str) -> Result<PathBuf, ComputeDriverError> {
+    let path = sandbox_token_host_path(sandbox_id)?;
+    path.parent().map(PathBuf::from).ok_or_else(|| {
+        ComputeDriverError::Message(format!(
+            "resolve sandbox token directory failed: {} has no parent",
+            path.display()
+        ))
+    })
+}
+
+fn write_sandbox_token_file(
     sandbox: &DriverSandbox,
 ) -> Result<Option<PathBuf>, ComputeDriverError> {
     let Some(spec) = sandbox.spec.as_ref() else {
@@ -70,17 +80,13 @@ async fn write_sandbox_token_file(
     if spec.sandbox_token.is_empty() {
         return Ok(None);
     }
-    let path = sandbox_token_host_path(&sandbox.id)?;
-    if let Some(parent) = path.parent() {
-        openshell_core::paths::create_dir_restricted(parent).map_err(|err| {
-            ComputeDriverError::Message(format!(
-                "create sandbox token directory {} failed: {err}",
-                parent.display()
-            ))
-        })?;
-    }
-    tokio::fs::write(&path, format!("{}\n", spec.sandbox_token))
-        .await
+    write_sandbox_token_file_by_id(&sandbox.id, &spec.sandbox_token)?;
+    sandbox_token_host_dir(&sandbox.id).map(Some)
+}
+
+fn write_sandbox_token_file_by_id(sandbox_id: &str, token: &str) -> Result<(), ComputeDriverError> {
+    let path = sandbox_token_host_path(sandbox_id)?;
+    openshell_core::paths::write_file_owner_only_atomic(&path, format!("{token}\n").as_bytes())
         .map_err(|err| {
             ComputeDriverError::Message(format!(
                 "write sandbox token file {} failed: {err}",
@@ -93,7 +99,7 @@ async fn write_sandbox_token_file(
             path.display()
         ))
     })?;
-    Ok(Some(path))
+    Ok(())
 }
 
 fn cleanup_sandbox_token_file(sandbox_id: &str) {
@@ -356,7 +362,7 @@ impl PodmanComputeDriver {
         if let Err(e) = self.client.create_volume(&vol_name).await {
             return Err(ComputeDriverError::from(e));
         }
-        let token_host_path = match write_sandbox_token_file(sandbox).await {
+        let token_host_dir = match write_sandbox_token_file(sandbox) {
             Ok(path) => path,
             Err(e) => {
                 let _ = self.client.remove_volume(&vol_name).await;
@@ -368,7 +374,7 @@ impl PodmanComputeDriver {
         let spec = container::build_container_spec_with_token(
             sandbox,
             &self.config,
-            token_host_path.as_deref(),
+            token_host_dir.as_deref(),
         );
         match self.client.create_container(&spec).await {
             Ok(_) => {}
@@ -419,6 +425,58 @@ impl PodmanComputeDriver {
             .stop_container(&name, self.config.stop_timeout_secs)
             .await
             .map_err(ComputeDriverError::from)
+    }
+
+    /// Start a managed sandbox container that should still be running.
+    pub async fn resume_sandbox(
+        &self,
+        sandbox_id: &str,
+        sandbox_name: &str,
+        sandbox_token: Option<&str>,
+    ) -> Result<bool, ComputeDriverError> {
+        let name = validated_container_name(sandbox_name)?;
+        let inspect = match self.client.inspect_container(&name).await {
+            Ok(inspect) => inspect,
+            Err(PodmanApiError::NotFound(_)) => return Ok(false),
+            Err(err) => return Err(ComputeDriverError::from(err)),
+        };
+
+        match inspect.config.labels.get(LABEL_SANDBOX_ID) {
+            Some(label_id) if label_id == sandbox_id => {}
+            Some(label_id) => {
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    sandbox_name = %sandbox_name,
+                    container = %name,
+                    label_sandbox_id = %label_id,
+                    "Podman container label sandbox ID did not match startup resume request"
+                );
+                return Ok(false);
+            }
+            None => return Ok(false),
+        }
+
+        if let Some(token) = sandbox_token.filter(|token| !token.is_empty()) {
+            self.write_sandbox_token(sandbox_id, token)?;
+        }
+
+        if inspect.state.running {
+            return Ok(true);
+        }
+
+        self.client
+            .start_container(&name)
+            .await
+            .map_err(ComputeDriverError::from)?;
+        Ok(true)
+    }
+
+    pub fn write_sandbox_token(
+        &self,
+        sandbox_id: &str,
+        token: &str,
+    ) -> Result<(), ComputeDriverError> {
+        write_sandbox_token_file_by_id(sandbox_id, token)
     }
 
     /// Delete a sandbox container and its workspace volume.
@@ -884,6 +942,66 @@ mod tests {
                 api_path(&format!("/libpod/volumes/{volume_name}"))
             )]
         );
+        let _ = std::fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn resume_sandbox_rewrites_token_for_running_container() {
+        let sandbox_id = "sandbox-resume-running";
+        let sandbox_name = "demo";
+        let container_name = container::container_name(sandbox_name);
+        let inspect_body = serde_json::json!({
+            "Id": "container-id",
+            "Name": format!("/{container_name}"),
+            "State": {
+                "Status": "running",
+                "Running": true
+            },
+            "Config": {
+                "Labels": {
+                    LABEL_SANDBOX_ID: sandbox_id
+                }
+            }
+        })
+        .to_string();
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "resume-running-token",
+            vec![StubResponse::new(StatusCode::OK, inspect_body)],
+        );
+        let driver = test_driver(socket_path.clone());
+        let state_dir = socket_path.with_extension("state");
+        let state_dir_string = state_dir.to_string_lossy().to_string();
+
+        let resumed = temp_env::async_with_vars(
+            [("XDG_STATE_HOME", Some(state_dir_string.as_str()))],
+            driver.resume_sandbox(sandbox_id, sandbox_name, Some("fresh-token")),
+        )
+        .await
+        .expect("resume should succeed");
+
+        assert!(resumed, "running container should report resumed");
+        handle.await.expect("stub task should finish");
+        let requests = request_log
+            .lock()
+            .expect("request log lock should not be poisoned")
+            .clone();
+        assert_eq!(
+            requests,
+            vec![format!(
+                "GET {}",
+                api_path(&format!("/libpod/containers/{container_name}/json"))
+            )]
+        );
+        let token_path = state_dir
+            .join("openshell")
+            .join("podman-sandbox-tokens")
+            .join(sandbox_id)
+            .join("sandbox.jwt");
+        assert_eq!(
+            std::fs::read_to_string(&token_path).expect("token file should exist"),
+            "fresh-token\n"
+        );
+        let _ = std::fs::remove_dir_all(state_dir);
         let _ = std::fs::remove_file(socket_path);
     }
 }

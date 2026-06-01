@@ -227,17 +227,16 @@ service OpenShell {
 
   // Exchange a sandbox-bootstrap credential (e.g. a Kubernetes projected
   // ServiceAccount token) for a gateway-minted JWT bound to the calling
-  // sandbox's UUID. Used by the Kubernetes driver path; singleplayer
-  // drivers receive the gateway JWT directly from the create-sandbox flow
-  // and never call this RPC.
+  // sandbox's UUID. Used by the Kubernetes driver path for bootstrap and
+  // re-exchange; singleplayer drivers receive gateway JWTs directly from
+  // the gateway-managed create/resume/refresh flow and never call this RPC.
   rpc IssueSandboxToken(IssueSandboxTokenRequest) returns (IssueSandboxTokenResponse);
 
-  // Renew the calling sandbox's gateway JWT. Older tokens remain valid
-  // until their own expiry; deployments should keep token TTLs short to
-  // bound replay exposure. The supervisor calls this from a background
-  // task at ~80% of the token's lifetime; the new token is cached in
-  // memory only — the on-disk bootstrap file is intentionally not
-  // rewritten.
+  // Renew the calling sandbox's gateway JWT. Older tokens remain valid until
+  // their own expiry; deployments should keep token TTLs short to bound replay
+  // exposure. Current supervisors use explicit auth modes instead: local
+  // runtimes are gateway-managed, and Kubernetes supervisors re-exchange
+  // ServiceAccount identity through IssueSandboxToken.
   rpc RefreshSandboxToken(RefreshSandboxTokenRequest)
       returns (RefreshSandboxTokenResponse);
 }
@@ -257,13 +256,13 @@ message IssueSandboxTokenResponse {
   int64 expires_at_ms = 2;
 }
 
-// RefreshSandboxToken request. Empty body; the calling principal must
-// already be a sandbox principal (i.e. the request carries a still-valid
+// RefreshSandboxToken request. Empty body; the calling principal must already
+// be a sandbox principal (i.e. the request carries a still-valid
 // gateway-minted JWT in its Authorization header).
 message RefreshSandboxTokenRequest {}
 
-// RefreshSandboxToken response. The new token replaces the supervisor's
-// in-memory bearer credential.
+// RefreshSandboxToken response. Retained for direct/manual callers that still
+// refresh an already-valid sandbox JWT.
 message RefreshSandboxTokenResponse {
   // Fresh gateway-minted JWT bound to the same sandbox UUID.
   string token = 1;
@@ -1324,6 +1323,7 @@ message GatewayMessage {
     GatewayHeartbeat heartbeat = 3;
     RelayOpen relay_open = 4;
     RelayClose relay_close = 5;
+    SandboxTokenUpdate sandbox_token_update = 6;
   }
 }
 
@@ -1354,6 +1354,16 @@ message SupervisorHeartbeat {}
 
 // Gateway heartbeat.
 message GatewayHeartbeat {}
+
+// Gateway-managed sandbox JWT rotation for supervisors running in
+// gateway-managed-supervisor-push mode. The supervisor persists this token for
+// subsequent outbound RPCs and reconnects.
+message SandboxTokenUpdate {
+  // Fresh gateway-minted JWT for this sandbox.
+  string token = 1;
+  // Absolute expiry of the token, milliseconds since the epoch.
+  int64 expires_at_ms = 2;
+}
 
 // Gateway requests the supervisor to open a relay channel.
 //

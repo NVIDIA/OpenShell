@@ -1529,6 +1529,11 @@ fn apply_required_env(
     // and exchanges it for a gateway-minted JWT via `IssueSandboxToken`.
     upsert_env(
         env,
+        openshell_core::sandbox_env::SANDBOX_AUTH_MODE,
+        openshell_core::sandbox_env::SandboxAuthMode::KubernetesServiceAccountExchange.as_str(),
+    );
+    upsert_env(
+        env,
         openshell_core::sandbox_env::K8S_SA_TOKEN_FILE,
         "/var/run/secrets/openshell/token",
     );

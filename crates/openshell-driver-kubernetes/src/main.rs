@@ -77,9 +77,9 @@ struct Args {
     enable_user_namespaces: bool,
 
     /// Lifetime (seconds) of the projected `ServiceAccount` token
-    /// kubelet writes into each sandbox pod for the `IssueSandboxToken`
-    /// bootstrap exchange. Kubelet enforces a minimum of 600s; the
-    /// gateway clamps values outside `[600, 86400]`. Default 3600.
+    /// kubelet writes into each sandbox pod for `IssueSandboxToken`
+    /// exchanges. Kubelet enforces a minimum of 600s; the gateway clamps
+    /// values outside `[600, 86400]`. Default 3600.
     #[arg(long, env = "OPENSHELL_K8S_SA_TOKEN_TTL_SECS", default_value_t = 3600)]
     sa_token_ttl_secs: i64,
 }

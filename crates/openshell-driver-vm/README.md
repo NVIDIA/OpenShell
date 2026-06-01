@@ -194,9 +194,16 @@ during the first prepare.
 
 The driver also writes the accepted `DriverSandbox` launch request to
 `<state-dir>/sandboxes/<id>/sandbox.pb`. If the gateway restarts, it starts a
-new VM driver process; that process scans the sandbox state directories,
-restarts each persisted VM launcher, and preserves any existing `overlay.ext4`
-instead of cloning a fresh overlay template. If a restart happened before the
+new VM driver process and then calls the driver's `ResumeSandbox` RPC for each
+gateway-persisted sandbox that should still be running. The resume request
+includes a freshly minted sandbox JWT, so the driver updates `sandbox.pb` before
+restarting the VM launcher and preserves any existing `overlay.ext4` instead of
+cloning a fresh overlay template. While the VM is running, the gateway rotates
+tokens through the driver and sends live token updates over `ConnectSupervisor`.
+The VM supervisor runs with
+`OPENSHELL_SANDBOX_AUTH_MODE=gateway-managed-supervisor-push`, so it treats
+`/opt/openshell/auth/sandbox.jwt` as a gateway-owned token file and rewrites it
+only when the gateway pushes a fresh token. If a restart happened before the
 overlay was created, the driver creates it during the resume attempt.
 
 ## Logs and debugging

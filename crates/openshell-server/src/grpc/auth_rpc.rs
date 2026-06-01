@@ -4,8 +4,8 @@
 //! Authentication-related RPC handlers.
 //!
 //! Hosts the two sandbox-identity RPCs:
-//! - `IssueSandboxToken` — bootstrap exchange (K8s SA token → gateway JWT)
-//! - `RefreshSandboxToken` — renew a still-valid gateway JWT
+//! - `IssueSandboxToken` - Kubernetes SA token exchange to gateway JWT
+//! - `RefreshSandboxToken` - manual/direct renewal of a still-valid gateway JWT
 //!
 //! Both end in a fresh gateway-signed JWT minted by
 //! [`crate::auth::sandbox_jwt::SandboxJwtIssuer`]. Older tokens remain valid
@@ -38,9 +38,9 @@ pub async fn handle_issue_sandbox_token(
         ));
     };
 
-    // Only the bootstrap K8s ServiceAccount path can mint a fresh gateway JWT
-    // via this RPC. Sandboxes already holding a gateway JWT use
-    // `RefreshSandboxToken` instead.
+    // Only the K8s ServiceAccount exchange path can mint a fresh gateway JWT
+    // via this RPC. Local runtimes receive gateway-managed token updates
+    // through their compute driver or supervisor session instead.
     if !matches!(
         sandbox.source,
         SandboxIdentitySource::K8sServiceAccount { .. }
@@ -50,7 +50,7 @@ pub async fn handle_issue_sandbox_token(
             "IssueSandboxToken rejected: non-bootstrap principal source"
         );
         return Err(Status::permission_denied(
-            "this principal cannot mint a sandbox token; use RefreshSandboxToken",
+            "this principal cannot mint a sandbox token with IssueSandboxToken",
         ));
     }
 
@@ -100,7 +100,7 @@ pub async fn handle_refresh_sandbox_token(
             "RefreshSandboxToken rejected: non-gateway-JWT principal source"
         );
         return Err(Status::permission_denied(
-            "this principal cannot refresh; use IssueSandboxToken for bootstrap",
+            "this principal cannot refresh; use IssueSandboxToken for service-account exchange",
         ));
     };
 
@@ -313,8 +313,8 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_rejects_k8s_sa_principal() {
-        // K8s SA-bootstrap principals must use IssueSandboxToken, not
-        // RefreshSandboxToken — the refresh path assumes a still-valid
+        // K8s ServiceAccount principals must use IssueSandboxToken, not
+        // RefreshSandboxToken, because this path assumes a still-valid
         // gateway-minted JWT exists.
         use crate::auth::principal::SandboxIdentitySource;
         let state = state_with_issuer().await;

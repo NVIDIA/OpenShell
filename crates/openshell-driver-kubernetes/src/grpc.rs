@@ -7,9 +7,10 @@ use futures::{Stream, StreamExt};
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest, GetSandboxResponse,
-    ListSandboxesRequest, ListSandboxesResponse, StopSandboxRequest, StopSandboxResponse,
-    ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesEvent,
-    WatchSandboxesRequest, compute_driver_server::ComputeDriver,
+    ListSandboxesRequest, ListSandboxesResponse, ResumeSandboxRequest, ResumeSandboxResponse,
+    StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
+    ValidateSandboxCreateResponse, WatchSandboxesEvent, WatchSandboxesRequest,
+    WriteSandboxTokenRequest, WriteSandboxTokenResponse, compute_driver_server::ComputeDriver,
 };
 use std::pin::Pin;
 use tonic::{Request, Response, Status};
@@ -105,6 +106,24 @@ impl ComputeDriver for ComputeDriverService {
             .await
             .map_err(|e| Status::from(openshell_core::ComputeDriverError::from(e)))?;
         Ok(Response::new(CreateSandboxResponse {}))
+    }
+
+    async fn resume_sandbox(
+        &self,
+        _request: Request<ResumeSandboxRequest>,
+    ) -> Result<Response<ResumeSandboxResponse>, Status> {
+        Err(Status::unimplemented(
+            "resume sandbox is not implemented by the kubernetes compute driver",
+        ))
+    }
+
+    async fn write_sandbox_token(
+        &self,
+        _request: Request<WriteSandboxTokenRequest>,
+    ) -> Result<Response<WriteSandboxTokenResponse>, Status> {
+        Err(Status::unimplemented(
+            "gateway-managed sandbox token files are not implemented by the kubernetes compute driver",
+        ))
     }
 
     async fn stop_sandbox(
