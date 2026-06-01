@@ -166,6 +166,21 @@ fn is_hop_by_hop_header(name: &str) -> bool {
 /// Returns the prepared [`reqwest::RequestBuilder`] with auth, headers, model
 /// rewrite, and body applied. The caller decides whether to apply a total
 /// request timeout before sending.
+///
+/// `stream_response` controls whether Vertex AI Anthropic routes upgrade the
+/// stored `:rawPredict` suffix to `:streamRawPredict` in the upstream URL.
+/// It must match the transport the caller intends to use:
+///
+/// | Caller                      | `stream_response` | Vertex suffix used     |
+/// |-----------------------------|-------------------|------------------------|
+/// | `send_backend_request`      | `false`           | `:rawPredict` (unary)  |
+/// | `send_backend_request_streaming` | `true`       | `:streamRawPredict`    |
+///
+/// `verify_backend_endpoint` explicitly passes `false` to probe the unary
+/// `:rawPredict` endpoint during validation. The `inference.local` intercept
+/// path always calls `send_backend_request_streaming` (and therefore always
+/// passes `true`), but `:streamRawPredict` accepts both streaming and
+/// non-streaming request bodies, so the behaviour is correct in all cases.
 fn prepare_backend_request(
     client: &reqwest::Client,
     route: &ResolvedRoute,
@@ -564,10 +579,15 @@ pub async fn proxy_to_backend_streaming(
 
 /// Build the upstream URL for a provider route.
 ///
+/// `stream_response` selects between the unary and streaming Vertex AI
+/// Anthropic endpoint suffixes. Pass the same value used for the enclosing
+/// [`prepare_backend_request`] call. See that function's documentation for the
+/// full caller table.
+///
 /// Behavior matrix (`request_path_override`, `model_in_path`):
 /// - `(Some(suffix), true)`: `{endpoint}/{model_id}{suffix}`
-///   Used by Vertex AI Anthropic: buffered requests keep `:rawPredict`, while
-///   streaming requests upgrade the rawPredict suffix to `:streamRawPredict`.
+///   Used by Vertex AI Anthropic: `stream_response=false` keeps `:rawPredict`
+///   (unary); `stream_response=true` upgrades to `:streamRawPredict`.
 /// - `(Some(override_path), false)`: `{endpoint}{override_path}`
 ///   Used when a fixed path replaces the protocol-derived path.
 /// - `(None, true)`: `{endpoint}/{model_id}/{protocol_path}`
@@ -631,8 +651,16 @@ fn build_backend_url(endpoint: &str, path: &str) -> String {
 
 /// Check whether a route targets a Vertex AI Anthropic rawPredict endpoint.
 ///
-/// The router persists the neutral `:rawPredict` suffix on resolved routes and
-/// upgrades it to `:streamRawPredict` only for streaming proxy calls.
+/// The predicate is purely structural — it tests `model_in_path`,
+/// `anthropic_messages` protocol, and `:rawPredict` suffix — so any future
+/// provider with the same route shape automatically inherits the same
+/// transforms without code changes.
+///
+/// The router stores the neutral `:rawPredict` suffix on resolved routes.
+/// [`build_provider_url`] upgrades it to `:streamRawPredict` when
+/// `stream_response=true` (see [`prepare_backend_request`] for the caller
+/// table). [`verify_backend_endpoint`] deliberately passes `stream_response=false`
+/// to probe the unary endpoint during validation.
 fn is_vertex_anthropic_rawpredict_route(route: &ResolvedRoute) -> bool {
     route.model_in_path
         && route.protocols.iter().any(|p| p == "anthropic_messages")
