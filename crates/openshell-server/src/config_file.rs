@@ -435,8 +435,8 @@ kid_path = "/tmp/jwt/kid"
 sandbox_namespace = "agents"
 "#;
         let tmp = write_tmp(toml);
-        let err =
-            load(tmp.path()).expect_err("unknown field in nested gateway_jwt table must be rejected");
+        let err = load(tmp.path())
+            .expect_err("unknown field in nested gateway_jwt table must be rejected");
         assert!(matches!(err, ConfigFileError::Parse { .. }));
     }
 
