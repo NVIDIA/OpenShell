@@ -1188,7 +1188,7 @@ enum SandboxCommands {
         /// `.gitignore` rules are applied by default; use `--no-git-ignore` to
         /// upload everything.
         #[arg(long, value_hint = ValueHint::AnyPath, help_heading = "UPLOAD FLAGS")]
-        upload: Option<String>,
+        upload: Vec<String>,
 
         /// Disable `.gitignore` filtering for `--upload`.
         #[arg(long, requires = "upload", help_heading = "UPLOAD FLAGS")]
@@ -2583,11 +2583,22 @@ async fn main() -> Result<()> {
                         labels_map.insert(parts[0].to_string(), parts[1].to_string());
                     }
 
-                    // Parse --upload spec into (local_path, sandbox_path, git_ignore).
-                    let upload_spec = upload.as_deref().map(|s| {
-                        let (local, remote) = parse_upload_spec(s);
-                        (local, remote, !no_git_ignore)
-                    });
+                    // Parse --upload specs into [(local_path, sandbox_path, git_ignore)].
+                    let upload_specs: Vec<(String, Option<String>, bool)> = upload
+                        .iter()
+                        .map(|s| {
+                            let (local, remote) = parse_upload_spec(s);
+                            (local, remote, !no_git_ignore)
+                        })
+                        .collect();
+
+                    // Validate all local paths before creating the sandbox so failures are
+                    // fast and have no side effects.
+                    for (local, _, _) in &upload_specs {
+                        if std::fs::symlink_metadata(local).is_err() {
+                            return Err(miette::miette!("local path does not exist: {}", local));
+                        }
+                    }
 
                     let editor = editor.map(Into::into);
                     let forward = forward
@@ -2604,7 +2615,7 @@ async fn main() -> Result<()> {
                         name.as_deref(),
                         from.as_deref(),
                         &ctx.name,
-                        upload_spec.as_ref(),
+                        &upload_specs,
                         keep,
                         gpu,
                         gpu_device.as_deref(),
@@ -3482,6 +3493,43 @@ mod tests {
         let (local, remote) = parse_upload_spec("./src:");
         assert_eq!(local, "./src");
         assert_eq!(remote, None);
+    }
+
+    #[test]
+    fn sandbox_create_upload_flag_accepts_multiple_values() {
+        let result = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--upload",
+            "./src:/workspace/src",
+            "--upload",
+            "./config:/workspace/config",
+        ]);
+        assert!(
+            result.is_ok(),
+            "--upload should be repeatable, got: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn sandbox_create_upload_flag_accepts_zero_values() {
+        let result = Cli::try_parse_from(["openshell", "sandbox", "create"]);
+        assert!(
+            result.is_ok(),
+            "sandbox create with no --upload should succeed, got: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn sandbox_create_no_git_ignore_requires_upload() {
+        let result = Cli::try_parse_from(["openshell", "sandbox", "create", "--no-git-ignore"]);
+        assert!(
+            result.is_err(),
+            "--no-git-ignore without --upload should be rejected"
+        );
     }
 
     #[test]

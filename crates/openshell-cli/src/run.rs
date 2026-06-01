@@ -1675,7 +1675,7 @@ pub async fn sandbox_create(
     name: Option<&str>,
     from: Option<&str>,
     gateway_name: &str,
-    upload: Option<&(String, Option<String>, bool)>,
+    uploads: &[(String, Option<String>, bool)],
     keep: bool,
     gpu: bool,
     gpu_device: Option<&str>,
@@ -2041,13 +2041,23 @@ pub async fn sandbox_create(
             drop(stream);
             drop(client);
 
-            if let Some((local_path, sandbox_path, git_ignore)) = upload {
+            let upload_count = uploads.len();
+            for (idx, (local_path, sandbox_path, git_ignore)) in uploads.iter().enumerate() {
                 let dest = sandbox_path.as_deref();
                 let dest_display = dest.unwrap_or("~");
-                eprintln!(
-                    "  {} Uploading files to {dest_display}...",
-                    "\u{2022}".dimmed(),
-                );
+                if upload_count > 1 {
+                    eprintln!(
+                        "  {} Uploading [{}/{}] files to {dest_display}...",
+                        "\u{2022}".dimmed(),
+                        idx + 1,
+                        upload_count,
+                    );
+                } else {
+                    eprintln!(
+                        "  {} Uploading files to {dest_display}...",
+                        "\u{2022}".dimmed(),
+                    );
+                }
                 let local = Path::new(local_path);
                 match sandbox_upload_plan(local, *git_ignore)? {
                     SandboxUploadPlan::GitAware { base_dir, files } => {
