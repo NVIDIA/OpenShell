@@ -6,9 +6,9 @@
 # Gateway image build.
 #
 # The Rust binary is built natively before this image build runs and staged at:
-#   deploy/docker/.build/prebuilt-binaries/<arch>/openshell-gateway
+#   deploy/container/.build/prebuilt-binaries/<arch>/openshell-gateway
 #
-# Use tasks/scripts/docker-build-image.sh gateway (or `mise run build:docker:gateway`)
+# Use tasks/scripts/container-build-image.sh gateway (or `mise run build:container:gateway`)
 # to stage the binary and build the image in one step. CI builds the binary
 # per-architecture via the `rust-native-build.yml` workflow and uploads it as
 # an artifact, which is downloaded into the same staging directory before the
@@ -27,7 +27,7 @@ ARG TARGETARCH
 
 WORKDIR /app
 
-COPY deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-gateway /usr/local/bin/openshell-gateway
+COPY deploy/container/.build/prebuilt-binaries/${TARGETARCH}/openshell-gateway /usr/local/bin/openshell-gateway
 
 USER 1000:1000
 EXPOSE 8080

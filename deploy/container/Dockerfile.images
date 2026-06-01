@@ -29,6 +29,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     cmake \
     pkg-config \
+    libclang-dev \
+    libz3-dev \
     libssl-dev \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*

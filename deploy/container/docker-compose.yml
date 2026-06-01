@@ -109,7 +109,7 @@ services:
 
       # TOML config — all gateway and driver settings live here.
       # Docker Compose resolves ./ relative to the directory that contains this
-      # docker-compose.yml file (deploy/docker/), not the CWD of the caller.
+      # docker-compose.yml file (deploy/container/), not the CWD of the caller.
       - type: bind
         source: ./gateway.toml
         target: /etc/openshell/gateway.toml

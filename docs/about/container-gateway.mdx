@@ -151,7 +151,7 @@ openshell gateway add https://127.0.0.1:8080 --local --name local
 
 ## Docker Compose
 
-The [`deploy/docker/`](https://github.com/NVIDIA/OpenShell/tree/main/deploy/docker) directory in
+The [`deploy/container/`](https://github.com/NVIDIA/OpenShell/tree/main/deploy/container) directory in
 the repository contains a production-ready Compose setup with full inline documentation:
 
 | File | Purpose |
@@ -162,7 +162,7 @@ the repository contains a production-ready Compose setup with full inline docume
 Clone or copy those files, then start the gateway:
 
 ```shell
-docker compose -f deploy/docker/docker-compose.yml up -d
+docker compose -f deploy/container/docker-compose.yml up -d
 ```
 
 Register the gateway with the CLI. If registering from the same machine:

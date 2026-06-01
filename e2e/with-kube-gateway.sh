@@ -510,9 +510,9 @@ if [ "${OPENSHELL_E2E_KUBE_BUILD_IMAGES}" = "1" ]; then
   require_cmd docker
   echo "Building local Kubernetes e2e images (${REGISTRY_VALUE}/{gateway,supervisor}:${IMAGE_TAG_VALUE})..."
   CONTAINER_ENGINE=docker IMAGE_REGISTRY="${REGISTRY_VALUE}" IMAGE_TAG="${IMAGE_TAG_VALUE}" \
-    bash "${ROOT}/tasks/scripts/docker-build-image.sh" gateway
+    bash "${ROOT}/tasks/scripts/container-build-image.sh" gateway
   CONTAINER_ENGINE=docker IMAGE_REGISTRY="${REGISTRY_VALUE}" IMAGE_TAG="${IMAGE_TAG_VALUE}" \
-    bash "${ROOT}/tasks/scripts/docker-build-image.sh" supervisor
+    bash "${ROOT}/tasks/scripts/container-build-image.sh" supervisor
 fi
 
 if [ -n "${import_cluster_name}" ]; then

@@ -25,7 +25,7 @@ After completing this tutorial you have:
 
 ## Compose files
 
-The Compose configuration lives at [`deploy/docker/`](https://github.com/NVIDIA/OpenShell/tree/main/deploy/docker) in the repository.
+The Compose configuration lives at [`deploy/container/`](https://github.com/NVIDIA/OpenShell/tree/main/deploy/container) in the repository.
 
 | File | Purpose |
 |---|---|
@@ -54,7 +54,7 @@ The Compose file uses `/var/lib/openshell` for this purpose and sets `create_hos
 ## Start the gateway
 
 ```shell
-cd deploy/docker
+cd deploy/container
 docker compose up -d
 ```
 

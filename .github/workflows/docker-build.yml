@@ -236,6 +236,7 @@ jobs:
       - name: Build ${{ inputs.component }} image
         env:
           DOCKER_BUILDER: openshell
+          USE_PREBUILT_BINARIES: "true"
         run: |
           set -euo pipefail
           mise exec -- tasks/scripts/container-build-image.sh "${{ inputs.component }}" \
