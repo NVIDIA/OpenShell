@@ -59,6 +59,8 @@ pub struct KubernetesComputeConfig {
     pub service_account_name: String,
     pub default_image: String,
     pub image_pull_policy: String,
+    /// Kubernetes `imagePullSecrets` names attached to sandbox pods.
+    pub image_pull_secrets: Vec<String>,
     /// Image that provides the `openshell-sandbox` supervisor binary.
     /// Mounted directly as an image volume, or copied via an init container,
     /// depending on `supervisor_sideload_method`.
@@ -104,6 +106,7 @@ impl Default for KubernetesComputeConfig {
             // IfNotPresent otherwise). `DEFAULT_IMAGE_PULL_POLICY` ("missing")
             // is Podman vocabulary and is not a valid Kubernetes value.
             image_pull_policy: String::new(),
+            image_pull_secrets: Vec::new(),
             supervisor_image: DEFAULT_SUPERVISOR_IMAGE.to_string(),
             supervisor_image_pull_policy: String::new(),
             supervisor_sideload_method: SupervisorSideloadMethod::default(),
@@ -171,5 +174,14 @@ mod tests {
         });
         let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
         assert_eq!(cfg.service_account_name, "openshell-sandbox");
+    }
+
+    #[test]
+    fn serde_override_image_pull_secrets() {
+        let json = serde_json::json!({
+            "image_pull_secrets": ["regcred", "backup-regcred"]
+        });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.image_pull_secrets, ["regcred", "backup-regcred"]);
     }
 }

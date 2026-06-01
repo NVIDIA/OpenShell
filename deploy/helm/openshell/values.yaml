@@ -151,6 +151,9 @@ server:
   # (Always for :latest, IfNotPresent otherwise). Set to "Always" for dev
   # clusters so new images are picked up without manual eviction.
   sandboxImagePullPolicy: ""
+  # -- Image pull secrets attached to sandbox pods. Referenced Secrets must exist
+  # in the sandbox namespace.
+  sandboxImagePullSecrets: []
   # -- Default storage size for the workspace PVC in sandbox pods.
   # Uses Kubernetes quantity syntax (e.g. "2Gi", "10Gi", "500Mi").
   # Empty = built-in default (2Gi).

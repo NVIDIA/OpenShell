@@ -317,6 +317,7 @@ impl KubernetesComputeDriver {
         let params = SandboxPodParams {
             default_image: &self.config.default_image,
             image_pull_policy: &self.config.image_pull_policy,
+            image_pull_secrets: &self.config.image_pull_secrets,
             supervisor_image: &self.config.supervisor_image,
             supervisor_image_pull_policy: &self.config.supervisor_image_pull_policy,
             supervisor_sideload_method: self.config.supervisor_sideload_method,
@@ -1046,6 +1047,7 @@ fn default_workspace_volume_claim_templates(storage_size: &str) -> serde_json::V
 struct SandboxPodParams<'a> {
     default_image: &'a str,
     image_pull_policy: &'a str,
+    image_pull_secrets: &'a [String],
     supervisor_image: &'a str,
     supervisor_image_pull_policy: &'a str,
     supervisor_sideload_method: SupervisorSideloadMethod,
@@ -1068,6 +1070,7 @@ impl Default for SandboxPodParams<'_> {
         Self {
             default_image: "",
             image_pull_policy: "",
+            image_pull_secrets: &[],
             supervisor_image: "",
             supervisor_image_pull_policy: "",
             supervisor_sideload_method: SupervisorSideloadMethod::default(),
@@ -1234,6 +1237,14 @@ fn sandbox_template_to_k8s(
         );
     }
 
+    let image_pull_secrets = image_pull_secret_refs(params.image_pull_secrets);
+    if !image_pull_secrets.is_empty() {
+        spec.insert(
+            "imagePullSecrets".to_string(),
+            serde_json::Value::Array(image_pull_secrets),
+        );
+    }
+
     // Disable service account token auto-mounting for security hardening.
     // Sandbox pods should not have access to the Kubernetes API by default.
     spec.insert(
@@ -1381,6 +1392,15 @@ fn sandbox_template_to_k8s(
     }
 
     result
+}
+
+fn image_pull_secret_refs(secrets: &[String]) -> Vec<serde_json::Value> {
+    secrets
+        .iter()
+        .map(|secret| secret.trim())
+        .filter(|secret| !secret.is_empty())
+        .map(|secret| serde_json::json!({ "name": secret }))
+        .collect()
 }
 
 fn container_resources(template: &SandboxTemplate, gpu: bool) -> Option<serde_json::Value> {
@@ -2534,6 +2554,80 @@ mod tests {
             pod_template["spec"]["automountServiceAccountToken"],
             serde_json::json!(false),
             "explicit service account selection must not re-enable default token automounting"
+        );
+    }
+
+    #[test]
+    fn sandbox_template_omits_empty_image_pull_secrets() {
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &SandboxPodParams::default(),
+        );
+
+        assert!(
+            pod_template["spec"]["imagePullSecrets"].is_null(),
+            "imagePullSecrets must be omitted when no secrets are configured"
+        );
+    }
+
+    #[test]
+    fn sandbox_template_renders_configured_image_pull_secrets() {
+        let secrets = vec![
+            "regcred".to_string(),
+            " backup-regcred ".to_string(),
+            String::new(),
+        ];
+        let params = SandboxPodParams {
+            image_pull_secrets: &secrets,
+            ..Default::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+
+        assert_eq!(
+            pod_template["spec"]["imagePullSecrets"],
+            serde_json::json!([
+                { "name": "regcred" },
+                { "name": "backup-regcred" }
+            ])
+        );
+    }
+
+    #[test]
+    fn sandbox_template_renders_image_pull_secrets_for_template_image() {
+        let secrets = vec!["regcred".to_string()];
+        let params = SandboxPodParams {
+            default_image: "default-image:latest",
+            image_pull_secrets: &secrets,
+            ..Default::default()
+        };
+        let template = SandboxTemplate {
+            image: "private.example.com/team/sandbox:v1".to_string(),
+            ..Default::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &template,
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+
+        assert_eq!(
+            pod_template["spec"]["containers"][0]["image"],
+            serde_json::json!("private.example.com/team/sandbox:v1")
+        );
+        assert_eq!(
+            pod_template["spec"]["imagePullSecrets"],
+            serde_json::json!([{ "name": "regcred" }])
         );
     }
 

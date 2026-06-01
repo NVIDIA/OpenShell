@@ -26,6 +26,7 @@ build:
       context: ../../..
       custom:
         buildCommand: |
+          CONTAINER_ENGINE=docker \
           IMAGE_NAME="${IMAGE%:*}" \
           IMAGE_TAG="${IMAGE##*:}" \
           tasks/scripts/docker-build-image.sh gateway
@@ -42,6 +43,7 @@ build:
       context: ../../..
       custom:
         buildCommand: |
+          CONTAINER_ENGINE=docker \
           IMAGE_NAME="${IMAGE%:*}" \
           IMAGE_TAG="${IMAGE##*:}" \
           tasks/scripts/docker-build-image.sh supervisor

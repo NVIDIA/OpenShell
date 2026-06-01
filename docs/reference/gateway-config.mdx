@@ -163,6 +163,7 @@ namespace                      = "agents"
 service_account_name           = "openshell-sandbox"
 default_image                  = "ghcr.io/nvidia/openshell/sandbox:latest"
 image_pull_policy              = "IfNotPresent"
+image_pull_secrets             = ["regcred"]
 supervisor_image               = "ghcr.io/nvidia/openshell/supervisor:latest"
 supervisor_image_pull_policy   = "IfNotPresent"
 # Use the image volume on Kubernetes >= 1.35 (GA in 1.36); switch to "init-container"
