@@ -10,6 +10,8 @@ license.workspace = true
 repository.workspace = true
 
 [lib]
+name = "openshell_server_macros"
+path = "src/lib.rs"
 proc-macro = true
 
 [dependencies]

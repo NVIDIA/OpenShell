@@ -10,6 +10,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lib]
+name = "openshell_driver_kubernetes"
+path = "src/lib.rs"
+
 [[bin]]
 name = "openshell-driver-kubernetes"
 path = "src/main.rs"

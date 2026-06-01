@@ -10,6 +10,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lib]
+name = "openshell_core"
+path = "src/lib.rs"
+
 [dependencies]
 prost = { workspace = true }
 prost-types = { workspace = true }

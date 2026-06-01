@@ -10,6 +10,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lib]
+name = "openshell_ocsf"
+path = "src/lib.rs"
+
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
 serde = { workspace = true }
