@@ -33,6 +33,7 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | `crates/openshell-server/` | Gateway server | Control-plane API, sandbox lifecycle, auth boundary |
 | `crates/openshell-sandbox/` | Sandbox runtime | Container supervision, policy-enforced egress routing |
 | `crates/openshell-policy/` | Policy engine | Filesystem, network, process, and inference constraints |
+| `crates/openshell-policy-schema/` | Policy YAML schema | Dependency-light serde types and pure YAML parsing — no proto, no gRPC |
 | `crates/openshell-router/` | Privacy router | Privacy-aware LLM routing |
 | `crates/openshell-bootstrap/` | Gateway metadata | Gateway registration metadata, auth token storage, mTLS bundle storage |
 | `crates/openshell-ocsf/` | OCSF logging | OCSF v1.7.0 event types, builders, shorthand/JSONL formatters, tracing layers |
