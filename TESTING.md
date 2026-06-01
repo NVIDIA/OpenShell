@@ -154,7 +154,7 @@ Suites:
 GPU device-selection tests compare OpenShell sandboxes against a plain Docker or
 Podman container that requests `--device nvidia.com/gpu=all`. The probe image
 defaults to the image used by the `gateway` stage in
-`deploy/docker/Dockerfile.images`; set `OPENSHELL_E2E_GPU_PROBE_IMAGE` to
+`deploy/container/Dockerfile.images`; set `OPENSHELL_E2E_GPU_PROBE_IMAGE` to
 override it. Per-device checks run only for NVIDIA CDI device IDs reported by
 the runtime's discovered devices list, so WSL2 hosts that expose only
 `nvidia.com/gpu=all` skip the index-based cases.

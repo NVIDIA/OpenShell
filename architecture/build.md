@@ -12,7 +12,6 @@ OpenShell builds these main artifacts:
 |---|---|
 | Gateway binary | `crates/openshell-server` |
 | CLI package and Python SDK | `python/openshell` plus Rust binaries where packaged |
-<<<<<<< HEAD
 | Gateway and supervisor container images | `deploy/container/Dockerfile.images` |
 | Helm chart | `deploy/helm/openshell` |
 | VM driver/runtime assets | `crates/openshell-driver-vm` |

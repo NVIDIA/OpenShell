@@ -254,7 +254,7 @@ ensure_podman_supervisor_image() {
      && [ -z "${CI:-}" ]; then
     echo "Building local Podman supervisor image ${image}..."
     with_podman_config env CONTAINER_ENGINE=podman IMAGE_TAG=dev \
-      bash "${ROOT}/tasks/scripts/docker-build-image.sh" supervisor
+      bash "${ROOT}/tasks/scripts/container-build-image.sh" supervisor
     if podman_cmd image exists "${image}" 2>/dev/null; then
       return 0
     fi
