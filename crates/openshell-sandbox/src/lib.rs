@@ -126,11 +126,6 @@ pub async fn run_sandbox(
         ),
     );
 
-    // Validate that the required "sandbox" user exists in this image.
-    // All sandbox images must include this user for privilege dropping.
-    #[cfg(unix)]
-    validate_sandbox_user(&policy)?;
-
     // Fetch provider environment variables from the server.
     // This is done after loading the policy so the sandbox can still start
     // even if provider env fetch fails (graceful degradation).
@@ -1141,45 +1136,6 @@ fn discover_policy_from_path(path: &std::path::Path) -> openshell_core::proto::S
             restrictive_default_policy()
         }
     }
-}
-
-/// Validate that the `sandbox` user exists in this image.
-///
-/// All sandbox images must include a `sandbox` user for privilege dropping.
-/// This check runs at supervisor startup (inside the container) where we can
-/// inspect `/etc/passwd`. If the user is missing, the sandbox fails fast
-/// with a clear error instead of silently running child processes as root.
-#[cfg(unix)]
-fn validate_sandbox_user(policy: &SandboxPolicy) -> Result<()> {
-    use nix::unistd::User;
-
-    let user_name = policy.process.run_as_user.as_deref().unwrap_or("sandbox");
-
-    if user_name.is_empty() || user_name == "sandbox" {
-        match User::from_name("sandbox") {
-            Ok(Some(_)) => {
-                ocsf_emit!(
-                    ConfigStateChangeBuilder::new(ocsf_ctx())
-                        .severity(SeverityId::Informational)
-                        .status(StatusId::Success)
-                        .state(StateId::Enabled, "validated")
-                        .message("Validated 'sandbox' user exists in image")
-                        .build()
-                );
-            }
-            Ok(None) => {
-                return Err(miette::miette!(
-                    "sandbox user 'sandbox' not found in image; \
-                     all sandbox images must include a 'sandbox' user and group"
-                ));
-            }
-            Err(e) => {
-                return Err(miette::miette!("failed to look up 'sandbox' user: {e}"));
-            }
-        }
-    }
-
-    Ok(())
 }
 
 /// Prepare a `read_write` path for the sandboxed process.

@@ -493,6 +493,43 @@ impl Drop for ProcessHandle {
     }
 }
 
+/// Validate that the `sandbox` user exists in this image.
+///
+/// All sandbox images must include a `sandbox` user for privilege dropping.
+/// This check runs at supervisor startup (inside the container) where we can
+/// inspect `/etc/passwd`. If the user is missing, the sandbox fails fast
+/// with a clear error instead of silently running child processes as root.
+#[cfg(unix)]
+pub fn validate_sandbox_user(policy: &SandboxPolicy) -> Result<()> {
+    let user_name = policy.process.run_as_user.as_deref().unwrap_or("sandbox");
+
+    if user_name.is_empty() || user_name == "sandbox" {
+        match User::from_name("sandbox") {
+            Ok(Some(_)) => {
+                openshell_ocsf::ocsf_emit!(
+                    openshell_ocsf::ConfigStateChangeBuilder::new(openshell_ocsf::ctx::ctx())
+                        .severity(openshell_ocsf::SeverityId::Informational)
+                        .status(openshell_ocsf::StatusId::Success)
+                        .state(openshell_ocsf::StateId::Enabled, "validated")
+                        .message("Validated 'sandbox' user exists in image")
+                        .build()
+                );
+            }
+            Ok(None) => {
+                return Err(miette::miette!(
+                    "sandbox user 'sandbox' not found in image; \
+                     all sandbox images must include a 'sandbox' user and group"
+                ));
+            }
+            Err(e) => {
+                return Err(miette::miette!("failed to look up 'sandbox' user: {e}"));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 // `effective_gid`/`effective_uid` are intentionally parallel names (same role
 // for different identifiers) and the noise from renaming would obscure intent.
 #[cfg(unix)]

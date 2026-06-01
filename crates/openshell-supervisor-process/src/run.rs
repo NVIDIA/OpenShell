@@ -60,6 +60,12 @@ pub async fn run_process(
     ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
     #[cfg(target_os = "linux")] netns: Option<&NetworkNamespace>,
 ) -> Result<i32> {
+    // Validate that the sandbox user exists in the image. All sandbox images
+    // must include a "sandbox" user for privilege dropping; failing fast here
+    // beats silently running children as root.
+    #[cfg(unix)]
+    crate::process::validate_sandbox_user(policy)?;
+
     // Install the supervisor seccomp prelude before spawning any workload-side
     // tasks. By this point the orchestrator has finished privileged startup
     // helpers (network namespace setup, nftables probes via run_networking),
