@@ -3519,6 +3519,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-policy-schema"
+version = "0.0.0"
+dependencies = [
+ "miette",
+ "serde",
+ "serde_json",
+ "serde_yml",
+]
+
+[[package]]
 name = "openshell-prover"
 version = "0.0.0"
 dependencies = [
