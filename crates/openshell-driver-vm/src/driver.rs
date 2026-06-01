@@ -373,17 +373,10 @@ impl VmDriver {
 
     #[must_use]
     pub fn capabilities(&self) -> GetCapabilitiesResponse {
-        let gpu_count = self
-            .gpu_inventory
-            .as_ref()
-            .and_then(|inv| inv.lock().ok())
-            .map_or(0, |inv| inv.gpu_count());
         GetCapabilitiesResponse {
             driver_name: DRIVER_NAME.to_string(),
             driver_version: openshell_core::VERSION.to_string(),
             default_image: self.config.default_image.clone(),
-            supports_gpu: self.gpu_inventory.is_some(),
-            gpu_count,
         }
     }
 

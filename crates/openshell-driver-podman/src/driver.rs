@@ -258,7 +258,6 @@ impl PodmanComputeDriver {
             "podman",
             openshell_core::VERSION,
             &self.config.default_image,
-            Self::has_gpu_capacity(),
         ))
     }
 
