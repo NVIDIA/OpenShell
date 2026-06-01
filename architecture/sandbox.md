@@ -74,6 +74,12 @@ Credential placeholders in proxied HTTP requests can be resolved by the proxy
 when policy allows the target endpoint. Secrets must not be logged in OCSF or
 plain tracing output.
 
+For AWS endpoints that require request-level signing, the proxy supports SigV4
+re-signing. When `credential_signing: sigv4` is set on an L7 endpoint, the proxy
+strips the client's placeholder-based AWS auth headers, buffers the request body,
+computes a fresh SigV4 signature using real credentials from the provider, and
+forwards the re-signed request upstream.
+
 ## Connect and Logs
 
 The supervisor runs an SSH server on a Unix socket inside the sandbox. The

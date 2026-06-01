@@ -34,9 +34,14 @@ clap = { workspace = true }
 miette = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
-hmac = "0.12"
 sha2 = { workspace = true }
 hex = "0.4"
+http = { workspace = true }
+
+# AWS SigV4 request signing
+aws-sigv4 = { version = "1", features = ["sign-http", "http1"] }
+aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
+aws-smithy-runtime-api = { version = "1", features = ["client"] }
 russh = "0.57"
 rand_core = "0.6"
 
@@ -88,6 +93,10 @@ landlock = "0.4"
 seccompiler = "0.5"
 tempfile = "3"
 uuid = { version = "1", features = ["v4"] }
+
+[[test]]
+name = "sigv4_signing"
+path = "tests/sigv4_signing.rs"
 
 [dev-dependencies]
 tempfile = "3"
