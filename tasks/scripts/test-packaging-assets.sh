@@ -28,8 +28,20 @@ assert_not_contains() {
   fi
 }
 
+assert_file_exists() {
+  local file=$1
+
+  if [[ ! -f "$file" ]]; then
+    echo "ERROR: ${file} not found" >&2
+    exit 1
+  fi
+}
+
 service="${ROOT}/deploy/deb/openshell-gateway.service"
 spec="${ROOT}/openshell.spec"
+
+assert_file_exists "$service"
+assert_file_exists "$spec"
 
 assert_contains \
   "$service" \
