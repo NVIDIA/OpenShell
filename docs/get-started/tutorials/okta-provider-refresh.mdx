@@ -8,7 +8,7 @@ description: "Configure the built-in Okta provider profile with gateway-managed 
 keywords: "Generative AI, Cybersecurity, Tutorial, Providers, Okta, OAuth2, Credential Refresh, Sandbox"
 ---
 
-Use Providers v2 to keep Okta access tokens short lived while sandboxes receive a stable `OKTA_ACCESS_TOKEN` placeholder. OpenShell stores the non-injectable refresh material at the gateway, refreshes the Okta access token before it expires, updates the provider record, and injects the current credential into newly launched sandbox processes.
+Use Providers v2 to keep Okta access tokens short lived while sandboxes continue to use the same `OKTA_ACCESS_TOKEN` placeholder. OpenShell stores the refresh material at the gateway, refreshes the access token before it expires, and supplies the latest token when a sandbox needs it.
 
 After completing this tutorial, you have:
 
@@ -17,7 +17,11 @@ After completing this tutorial, you have:
 - A sandbox that can call an Okta-protected API through provider-owned policy.
 
 <Note>
-This tutorial targets the runtime credential lane. It assumes you already have an Okta OAuth refresh token from a standards-compliant sign-in flow outside OpenShell. It does not cover delegated token exchange or workforce gateway login.
+This tutorial assumes you already have an Okta OAuth refresh token from a sign-in flow outside OpenShell. It does not cover gateway sign-in or delegated token exchange.
+</Note>
+
+<Note>
+If you also plan to use Okta for gateway sign-in, set that up separately. The runtime provider in this tutorial only needs the OAuth material required to refresh an API access token.
 </Note>
 
 ## Prerequisites
@@ -41,11 +45,15 @@ This tutorial targets the runtime credential lane. It assumes you already have a
 Do not commit access tokens, refresh tokens, client secrets, or local `.env` files. The commands below pass token material to the gateway; they are not examples of values to store in source control.
 </Warning>
 
+<Warning>
+For most Okta runtime-provider setups, use a custom authorization server instead of the org authorization server. It is the safer default when you need custom scopes or refresh-token policies for your API.
+</Warning>
+
 <Steps toc={true}>
 
 ## Enable Providers v2
 
-Enable provider profile policy composition on the active gateway:
+Enable Providers v2 on the active gateway:
 
 ```shell
 openshell settings set --global --key providers_v2_enabled --value true --yes
@@ -53,19 +61,19 @@ openshell settings set --global --key providers_v2_enabled --value true --yes
 
 ## Inspect the Built-in Okta Profile
 
-Export the built-in profile to inspect its credential and policy shape:
+Export the built-in profile to see what values it expects:
 
 ```shell
 openshell provider profile export okta -o yaml
 ```
 
-The built-in profile defines:
+The built-in profile includes:
 
-- `OKTA_ACCESS_TOKEN` as the injected credential.
+- `OKTA_ACCESS_TOKEN` as the sandbox credential.
 - `oauth2_refresh_token` as the refresh strategy.
 - `client_id`, `refresh_token`, and optional `client_secret` / `scope` as refresh material.
 
-For live use, update the exported YAML to replace `example.okta.com` with your Okta domain and import it as a custom profile override.
+For live use, replace `example.okta.com` with your Okta domain and import the result as a custom profile.
 
 ## Create a Tenant-Specific Okta Profile
 
@@ -98,7 +106,7 @@ openshell provider create \
   --credential OKTA_ACCESS_TOKEN="$OKTA_ACCESS_TOKEN"
 ```
 
-The current CLI requires an initial credential at provider creation time. Refresh material is configured separately and is not injected into the sandbox.
+The current CLI requires an initial credential at provider creation time. You configure the refresh material in the next step.
 
 ## Configure Refresh
 
@@ -157,6 +165,13 @@ openshell sandbox create \
   -- /bin/sh
 ```
 
-The sandbox process receives `OKTA_ACCESS_TOKEN` as an OpenShell placeholder. If the provider policy allows the destination API, the proxy resolves that placeholder to the current gateway-managed access token when the process sends it in the authorization header.
+The sandbox process receives `OKTA_ACCESS_TOKEN` as an OpenShell placeholder. When the process sends it in the authorization header, OpenShell resolves it to the latest gateway-managed token.
+
+## Common Okta Setup Mistakes
+
+- Using the Okta org authorization server when your API, scopes, or refresh-token policy were configured on a custom authorization server.
+- Forgetting to request the scopes your resource server expects during the original Okta sign-in flow.
+- Passing a refresh token that belongs to a different client ID than the one configured in provider refresh material.
+- Expecting this tutorial to configure gateway sign-in. Gateway sign-in and runtime token refresh are separate setups.
 
 </Steps>
