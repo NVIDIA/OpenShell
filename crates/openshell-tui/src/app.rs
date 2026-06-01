@@ -495,6 +495,8 @@ pub struct App {
     pub sandbox_providers_list: Vec<String>,
     pub policy_lines: Vec<ratatui::text::Line<'static>>,
     pub policy_scroll: usize,
+    /// Visible line count in the policy pane, set during draw for PageUp/PageDown.
+    pub policy_viewport_height: usize,
 
     // Create sandbox modal
     pub create_form: Option<CreateSandboxForm>,
@@ -656,6 +658,7 @@ impl App {
             sandbox_providers_list: Vec::new(),
             policy_lines: Vec::new(),
             policy_scroll: 0,
+            policy_viewport_height: 0,
             create_form: None,
             pending_create_sandbox: false,
             pending_forward_ports: Vec::new(),
@@ -1155,9 +1158,21 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => {
                 self.scroll_policy(-1);
             }
+            // Page-scroll by one viewport height.
+            KeyCode::PageDown => {
+                let delta = self.policy_viewport_height.max(1) as isize;
+                self.scroll_policy(delta);
+            }
+            KeyCode::PageUp => {
+                let delta = self.policy_viewport_height.max(1) as isize;
+                self.scroll_policy(-delta);
+            }
             KeyCode::Char('G') => {
-                // Scroll to bottom.
-                self.policy_scroll = self.policy_lines.len().saturating_sub(1);
+                // Scroll to bottom, keeping a full viewport visible.
+                self.policy_scroll = self
+                    .policy_lines
+                    .len()
+                    .saturating_sub(self.policy_viewport_height.max(1));
             }
             KeyCode::Char('g') => {
                 self.policy_scroll = 0;
@@ -1426,6 +1441,21 @@ impl App {
                     self.draft_scroll -= 1;
                 }
             }
+            // Page-scroll by one viewport height, clamping the cursor to
+            // stay within the visible range.
+            KeyCode::PageDown if total > 0 => {
+                let page = vh.max(1);
+                let max_scroll = total.saturating_sub(vh.min(total));
+                self.draft_scroll = (self.draft_scroll + page).min(max_scroll);
+                let visible = total.saturating_sub(self.draft_scroll).min(vh);
+                self.draft_selected = self.draft_selected.min(visible.saturating_sub(1));
+            }
+            KeyCode::PageUp => {
+                let page = vh.max(1);
+                self.draft_scroll = self.draft_scroll.saturating_sub(page);
+                let visible = total.saturating_sub(self.draft_scroll).min(vh);
+                self.draft_selected = self.draft_selected.min(visible.saturating_sub(1));
+            }
             KeyCode::Char('g') => {
                 self.draft_scroll = 0;
                 self.draft_selected = 0;
@@ -1490,8 +1520,11 @@ impl App {
     }
 
     /// Scroll policy pane by a delta (positive = down, negative = up).
+    ///
+    /// Clamps so at least one viewport of content remains visible.
     pub fn scroll_policy(&mut self, delta: isize) {
-        let max = self.policy_lines.len().saturating_sub(1);
+        let total = self.policy_lines.len();
+        let max = total.saturating_sub(self.policy_viewport_height.max(1));
         if delta < 0 {
             self.policy_scroll = self.policy_scroll.saturating_sub(delta.unsigned_abs());
         } else {
@@ -1607,6 +1640,15 @@ impl App {
                     self.sandbox_log_scroll -= 1;
                 }
                 self.log_autoscroll = false;
+            }
+            // Page-scroll by one viewport height.
+            KeyCode::PageDown => {
+                let delta = vh.max(1) as isize;
+                self.scroll_logs(delta);
+            }
+            KeyCode::PageUp => {
+                let delta = vh.max(1) as isize;
+                self.scroll_logs(-delta);
             }
             KeyCode::Char('G' | 'f') => {
                 self.log_selection_anchor = None;
