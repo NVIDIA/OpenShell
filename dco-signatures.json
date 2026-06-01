@@ -623,6 +623,14 @@
       "created_at": "2026-06-01T15:44:58Z",
       "repoId": 1166129534,
       "pullRequestNo": 1653
+    },
+    {
+      "name": "major",
+      "id": 89910,
+      "comment_id": 4594370369,
+      "created_at": "2026-06-01T16:09:47Z",
+      "repoId": 1166129534,
+      "pullRequestNo": 1656
     }
   ]
 }
