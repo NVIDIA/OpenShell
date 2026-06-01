@@ -864,7 +864,7 @@ impl ComputeRuntime {
                 }
             };
 
-            let phase = SandboxPhase::try_from(sandbox.phase).unwrap_or(SandboxPhase::Unknown);
+            let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
             if !sandbox_phase_should_be_running(phase) {
                 continue;
             }
