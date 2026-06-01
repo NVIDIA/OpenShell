@@ -76,7 +76,7 @@ jobs:
 
   tag-ghcr-dev:
     name: Tag GHCR Images as Dev
-    needs: [build-gateway, build-supervisor]
+    needs: [build-gateway, build-supervisor, release-dev]
     runs-on: linux-amd64-cpu8
     timeout-minutes: 10
     steps:
@@ -713,7 +713,7 @@ jobs:
   # ---------------------------------------------------------------------------
   release-dev:
     name: Release Dev
-    needs: [compute-versions, build-cli-linux, build-cli-macos, build-gateway-binary-linux, build-gateway-binary-macos, build-supervisor-binary-linux, build-python-wheels-linux, build-python-wheel-macos, build-driver-vm-linux, build-driver-vm-macos, build-deb, build-rpm, build-snap, smoke-linux-dev-artifacts]
+    needs: [compute-versions, build-cli-linux, build-cli-macos, build-gateway-binary-linux, build-gateway-binary-macos, build-supervisor-binary-linux, build-python-wheels-linux, build-python-wheel-macos, e2e, build-driver-vm-linux, build-driver-vm-macos, build-deb, build-rpm, build-snap, smoke-linux-dev-artifacts]
     runs-on: linux-amd64-cpu8
     timeout-minutes: 10
     permissions:
@@ -954,7 +954,7 @@ jobs:
 
   release-helm:
     name: Release Helm Chart (OCI, dev)
-    needs: [tag-ghcr-dev]
+    needs: [release-dev, tag-ghcr-dev]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
