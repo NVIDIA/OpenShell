@@ -24,6 +24,7 @@ mod provider_credentials;
 pub mod proxy;
 mod sandbox;
 mod secrets;
+pub mod sigv4;
 mod skills;
 mod spiffe_endpoint;
 mod ssh;

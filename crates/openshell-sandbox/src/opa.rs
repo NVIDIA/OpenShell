@@ -1116,6 +1116,12 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                     if e.request_body_credential_rewrite {
                         ep["request_body_credential_rewrite"] = true.into();
                     }
+                    if !e.credential_signing.is_empty() {
+                        ep["credential_signing"] = e.credential_signing.clone().into();
+                    }
+                    if !e.signing_service.is_empty() {
+                        ep["signing_service"] = e.signing_service.clone().into();
+                    }
                     if !e.persisted_queries.is_empty() {
                         ep["persisted_queries"] = e.persisted_queries.clone().into();
                     }
@@ -2716,6 +2722,65 @@ network_policies:
             .expect("endpoint config");
         let l7 = crate::l7::parse_l7_config(&config).unwrap();
         assert!(l7.websocket_credential_rewrite);
+    }
+
+    #[test]
+    fn l7_endpoint_config_preserves_proto_credential_signing() {
+        let mut network_policies = std::collections::HashMap::new();
+        network_policies.insert(
+            "bedrock".to_string(),
+            NetworkPolicyRule {
+                name: "bedrock".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "bedrock-runtime.us-east-2.amazonaws.com".to_string(),
+                    port: 443,
+                    protocol: "rest".to_string(),
+                    enforcement: "enforce".to_string(),
+                    access: "read-write".to_string(),
+                    credential_signing: "sigv4".to_string(),
+                    signing_service: "bedrock".to_string(),
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/local/bin/claude".to_string(),
+                    ..Default::default()
+                }],
+            },
+        );
+        let proto = ProtoSandboxPolicy {
+            version: 1,
+            filesystem: Some(ProtoFs {
+                include_workdir: true,
+                read_only: vec![],
+                read_write: vec![],
+            }),
+            landlock: Some(openshell_core::proto::LandlockPolicy {
+                compatibility: "best_effort".to_string(),
+            }),
+            process: Some(ProtoProc {
+                run_as_user: "sandbox".to_string(),
+                run_as_group: "sandbox".to_string(),
+            }),
+            network_policies,
+        };
+
+        let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
+        let input = NetworkInput {
+            host: "bedrock-runtime.us-east-2.amazonaws.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/local/bin/claude"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        let config = engine
+            .query_endpoint_config(&input)
+            .unwrap()
+            .expect("endpoint config");
+        let l7 = crate::l7::parse_l7_config(&config).unwrap();
+        assert_eq!(l7.credential_signing, crate::l7::CredentialSigning::SigV4);
+        assert_eq!(l7.signing_service, "bedrock");
     }
 
     #[test]
