@@ -1,0 +1,170 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package openshell.policy.v1alpha1;
+
+// OpenShell out-of-process policy delivery + handle-lifecycle contract.
+//
+// Defines the wire between the gateway and an external policy engine. The
+// engine answers four RPCs over UDS; the gateway acquires a handle for each
+// sandbox, fetches policy projections against that handle, and releases the
+// handle when the sandbox is dropped. Engine identity and policy integrity
+// are carried by signed envelope fields the gateway resolves against a
+// trust store it owns.
+//
+// The wire is OpenShell-owned: this proto is the API, and any conforming
+// engine on the other side is valid.
+
+// --------------------------------------------------------------------------
+// Service
+// --------------------------------------------------------------------------
+
+// Engine is the server side of the wire. A conforming implementation
+// answers four RPCs over UDS.
+service Engine {
+  // Health reports the engine's serving state. The gateway calls this
+  // once at startup, before admitting any sandbox through the engine,
+  // and may call it again periodically.
+  rpc Health(HealthRequest) returns (HealthResponse);
+
+  // AcquireHandle binds a gateway-asserted runtime context to an
+  // engine-chosen opaque handle. The handle is the join key for all
+  // subsequent projection lookups for that sandbox.
+  rpc AcquireHandle(AcquireHandleRequest) returns (AcquireHandleResponse);
+
+  // GetProjection returns the policy bound to `handle`, projected to the
+  // schema named by `surface_id`. The response envelope carries an
+  // optional detached signature the gateway verifies against its trust
+  // store before consuming `body`.
+  rpc GetProjection(GetProjectionRequest) returns (GetProjectionResponse);
+
+  // ReleaseHandle drops engine-side state held for `handle`. Idempotent;
+  // releasing an unknown or already-released handle returns OK.
+  rpc ReleaseHandle(ReleaseHandleRequest) returns (ReleaseHandleResponse);
+}
+
+// --------------------------------------------------------------------------
+// Health
+// --------------------------------------------------------------------------
+
+message HealthRequest {}
+
+message HealthResponse {
+  // Engine serving state.
+  enum Status {
+    // Proto3 zero default. Gateways should treat this as NOT_SERVING.
+    STATUS_UNSPECIFIED = 0;
+    // Engine is ready to bind handles and serve projections.
+    SERVING = 1;
+    // Engine is not currently serving — startup not complete, terminal
+    // failure, etc.
+    NOT_SERVING = 2;
+    // Graceful shutdown initiated. The gateway must stop admitting new
+    // sandboxes through this engine; already-bound handles remain valid
+    // until their sandboxes are released.
+    DRAINING = 3;
+  }
+  Status status = 1;
+}
+
+// --------------------------------------------------------------------------
+// AcquireHandle
+// --------------------------------------------------------------------------
+
+// RuntimeContextEnvelope is the gateway-asserted set of facts about a
+// sandbox session that the engine binds to a handle.
+message RuntimeContextEnvelope {
+  // Stable identifier of the sandbox the policy applies to.
+  string sandbox_id = 1;
+
+  // Authenticated subject of the principal that issued the sandbox
+  // request. Format is gateway-defined; engines should treat the value
+  // opaquely.
+  string user_subject = 2;
+
+  // Unix-millis timestamp the gateway stamped at acquisition time.
+  // Engines may use this for freshness or replay checks.
+  int64 attested_at_ms = 3;
+
+  // Detached signature over the preceding fields, produced by the
+  // gateway's runtime-context signing key. Empty when the gateway is
+  // not signing envelopes.
+  bytes signature = 4;
+}
+
+message AcquireHandleRequest {
+  RuntimeContextEnvelope envelope = 1;
+}
+
+message AcquireHandleResponse {
+  // Engine-chosen opaque token. The gateway treats this purely as
+  // bytes; it must not parse, hash, or otherwise derive identity from
+  // it.
+  bytes handle = 1;
+}
+
+// --------------------------------------------------------------------------
+// GetProjection
+// --------------------------------------------------------------------------
+
+message GetProjectionRequest {
+  // Handle previously returned by AcquireHandle.
+  bytes handle = 1;
+
+  // Schema identifier selecting the decoder for the response `body`
+  // (e.g. "openshell.sandbox.v1"). Surface version bumps track
+  // incompatible changes to the bound schema.
+  string surface_id = 2;
+}
+
+// ProjectionEnvelope carries the policy bytes plus integrity metadata.
+//
+// When `signature` is non-empty the gateway verifies it (Ed25519) over the
+// canonical serialization of `surface_id`, `schema_version`,
+// `policy_digest`, `bundle_digest`, and `body`, using the public key the
+// trust store resolves `signing_key_id` to.
+message ProjectionEnvelope {
+  // Echoes the requested surface. Always populated.
+  string surface_id = 1;
+
+  // Schema version of `body` within `surface_id`'s namespace.
+  string schema_version = 2;
+
+  // Digest over `body`. Stable identifier for the projected policy
+  // bytes.
+  bytes policy_digest = 3;
+
+  // Digest of the upstream source artifact this projection was lowered
+  // from. Provenance — one source produces many projections.
+  bytes bundle_digest = 4;
+
+  // Encoded policy body. Decoding is determined by `surface_id` +
+  // `schema_version`.
+  bytes body = 5;
+
+  // Detached signature over the envelope. May be empty; once non-empty,
+  // the gateway requires the trust store to recognise `signing_key_id`
+  // and the signature to verify.
+  bytes signature = 6;
+
+  // Identifier of the key that produced `signature`, opaque to the
+  // gateway except for trust-store lookup. Empty when `signature` is
+  // empty.
+  string signing_key_id = 7;
+}
+
+message GetProjectionResponse {
+  ProjectionEnvelope envelope = 1;
+}
+
+// --------------------------------------------------------------------------
+// ReleaseHandle
+// --------------------------------------------------------------------------
+
+message ReleaseHandleRequest {
+  bytes handle = 1;
+}
+
+message ReleaseHandleResponse {}

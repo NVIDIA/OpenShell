@@ -979,6 +979,12 @@ fn policy_error_to_status(error: PolicyError) -> Status {
         PolicyError::Persistence(err) => {
             super::persistence_error_to_status(err, "policy provider")
         }
+        // Source-side failures (engine unreachable, decode error, etc.)
+        // surface as `unavailable` so callers retry — the gateway itself
+        // is healthy.
+        PolicyError::SourceError(err) => {
+            Status::unavailable(format!("policy source failure: {err}"))
+        }
     }
 }
 

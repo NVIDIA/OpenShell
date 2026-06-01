@@ -71,26 +71,33 @@ pub struct OpenShellRoot {
 
 /// `[openshell.policy]` table.
 ///
-/// Selects the policy-provider type. Today the only fully-supported value
-/// is `"local"`, which keeps the gateway's historical in-process,
-/// store-backed policy semantics. `"attested"` is reserved for the
-/// Attested Policy Projection provider (forthcoming session); declaring it
-/// today is parsed successfully but rejected at gateway startup with a
-/// clear "policy type not yet available" error.
+/// Selects the policy-provider type. Supported values: `"local"` (the
+/// gateway's in-process, store-backed policy semantics) and `"attested"`
+/// (out-of-process policy delivery over the
+/// `openshell.policy.v1alpha1.Engine` wire — the gateway fetches signed
+/// projections from a configured source).
 ///
 /// The `type` key intentionally mirrors `openshell-providers`'
-/// `ProviderPlugin`-style selector convention rather than the APF/RFC
-/// "driver" vocabulary.
+/// `ProviderPlugin`-style selector convention.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PolicyFileSection {
     /// Policy-provider type. Accepted values: `"local"` (the default if
-    /// the table is omitted) and `"attested"` (declared but not yet
-    /// implemented). `type` is a Rust keyword, so the field is exposed as
-    /// `r#type` in code and renamed via `#[serde(rename = "type")]` for
-    /// the TOML surface.
+    /// the table is omitted) and `"attested"`. `type` is a Rust keyword,
+    /// so the field is exposed as `r#type` in code and renamed via
+    /// `#[serde(rename = "type")]` for the TOML surface.
     #[serde(default, rename = "type")]
     pub r#type: Option<String>,
+
+    /// UDS path the gateway dials to reach the policy source. Required
+    /// when `type = "attested"`. Ignored for `type = "local"`.
+    #[serde(default)]
+    pub source_uds_path: Option<PathBuf>,
+
+    /// Path to the gateway-side trust store JSON file. Required when
+    /// `type = "attested"`. Ignored for `type = "local"`.
+    #[serde(default)]
+    pub trust_store_path: Option<PathBuf>,
 }
 
 /// `[openshell.gateway]` section.
@@ -213,9 +220,14 @@ pub enum ConfigFileError {
         cli: &'static str,
     },
     #[error(
-        "[openshell.policy] type = '{policy_type}' is not a recognized policy type; accepted values are 'local' (default) or 'attested' (not yet available)"
+        "[openshell.policy] type = '{policy_type}' is not a recognized policy type; accepted values are 'local' (default) or 'attested'"
     )]
     UnknownPolicyType { policy_type: String },
+
+    #[error(
+        "[openshell.policy] type = 'attested' requires `{field}` to be set in the config file"
+    )]
+    MissingAttestedField { field: &'static str },
 }
 
 /// Load and validate a TOML config file.
@@ -249,10 +261,9 @@ pub fn load(path: &Path) -> Result<ConfigFile, ConfigFileError> {
         });
     }
 
-    // Validate the optional policy-provider type. The "attested" value is
-    // accepted at parse time because the config file may be written ahead
-    // of the provider landing; startup is responsible for turning that
-    // into a clear "policy type not yet available" error.
+    // Validate the optional policy-provider type. Unknown values are
+    // rejected here; required-field validation for known types runs
+    // immediately after.
     if let Some(ref policy) = file.openshell.policy
         && let Some(ref policy_type) = policy.r#type
         && !is_known_policy_type(policy_type)
@@ -260,6 +271,24 @@ pub fn load(path: &Path) -> Result<ConfigFile, ConfigFileError> {
         return Err(ConfigFileError::UnknownPolicyType {
             policy_type: policy_type.clone(),
         });
+    }
+
+    // `attested` requires both file paths. They are optional in the
+    // struct so `type = "local"` does not trip a deserialize error; the
+    // explicit check here surfaces a friendly message at load time.
+    if let Some(ref policy) = file.openshell.policy
+        && policy.r#type.as_deref() == Some("attested")
+    {
+        if policy.source_uds_path.is_none() {
+            return Err(ConfigFileError::MissingAttestedField {
+                field: "source_uds_path",
+            });
+        }
+        if policy.trust_store_path.is_none() {
+            return Err(ConfigFileError::MissingAttestedField {
+                field: "trust_store_path",
+            });
+        }
     }
 
     Ok(file)
@@ -503,17 +532,61 @@ type = "local"
 
     #[test]
     fn parses_policy_type_attested() {
-        // "attested" is accepted at parse time; the gateway startup turns
-        // this into a clear "policy type not yet available" error so
-        // deployments can stage the value ahead of the provider landing.
+        // "attested" requires both `source_uds_path` and
+        // `trust_store_path`; the loader rejects the table if either is
+        // missing. With both present, the policy section round-trips.
         let toml = r#"
 [openshell.policy]
 type = "attested"
+source_uds_path = "/run/openshell/policy.sock"
+trust_store_path = "/etc/openshell/trust.json"
 "#;
         let tmp = write_tmp(toml);
         let file = load(tmp.path()).expect("attested policy type parses");
         let policy = file.openshell.policy.expect("policy table present");
         assert_eq!(policy.r#type.as_deref(), Some("attested"));
+        assert_eq!(
+            policy.source_uds_path.as_deref(),
+            Some(Path::new("/run/openshell/policy.sock"))
+        );
+        assert_eq!(
+            policy.trust_store_path.as_deref(),
+            Some(Path::new("/etc/openshell/trust.json"))
+        );
+    }
+
+    #[test]
+    fn rejects_attested_without_source_uds_path() {
+        let toml = r#"
+[openshell.policy]
+type = "attested"
+trust_store_path = "/etc/openshell/trust.json"
+"#;
+        let tmp = write_tmp(toml);
+        let err = load(tmp.path()).expect_err("missing source_uds_path must error");
+        assert!(matches!(
+            err,
+            ConfigFileError::MissingAttestedField {
+                field: "source_uds_path"
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_attested_without_trust_store_path() {
+        let toml = r#"
+[openshell.policy]
+type = "attested"
+source_uds_path = "/run/openshell/policy.sock"
+"#;
+        let tmp = write_tmp(toml);
+        let err = load(tmp.path()).expect_err("missing trust_store_path must error");
+        assert!(matches!(
+            err,
+            ConfigFileError::MissingAttestedField {
+                field: "trust_store_path"
+            }
+        ));
     }
 
     #[test]

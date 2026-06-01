@@ -87,6 +87,7 @@ sha2 = "0.10"
 rand = "0.9"
 jsonwebtoken = "9"
 getrandom = "0.3"
+ed25519-dalek = { version = "2", features = ["rand_core", "pem", "pkcs8"] }
 
 # Filesystem embedding
 include_dir = "0.7"

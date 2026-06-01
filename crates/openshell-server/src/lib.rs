@@ -264,11 +264,8 @@ pub async fn run_server(
     );
 
     // Override the default `local` policy provider when the config file
-    // selects a different policy type. The `attested` type is reserved for
-    // the forthcoming Attested Policy Projection work; declaring it today
-    // returns a startup error rather than a generic "unknown policy type"
-    // message so deployments staging the value get a clear signal.
-    if let Some(provider) = resolve_policy_provider(config_file.as_ref(), store.clone())? {
+    // selects a different policy type.
+    if let Some(provider) = resolve_policy_provider(config_file.as_ref(), store.clone()).await? {
         state.policy_provider = provider;
     }
 
@@ -485,12 +482,7 @@ pub async fn run_server(
 /// Resolve the configured policy provider, if the config file selects one.
 /// Returns `Ok(None)` when no override is needed (the default `local`
 /// provider from `ServerState::new` already covers that case).
-///
-/// `"attested"` is parsed at config-file load time but has no implementation
-/// yet — startup returns a clear "policy type not yet available" error so
-/// deployments staging the value get a clear signal rather than silently
-/// falling back to local.
-fn resolve_policy_provider(
+async fn resolve_policy_provider(
     config_file: Option<&config_file::ConfigFile>,
     store: Arc<Store>,
 ) -> Result<Option<Arc<dyn policy_provider::PolicyProvider>>> {
@@ -508,16 +500,59 @@ fn resolve_policy_provider(
         policy_provider::LOCAL_POLICY_TYPE_ID => Ok(Some(Arc::new(
             policy_provider::LocalPolicyProvider::new(store),
         ))),
-        policy_provider::ATTESTED_POLICY_TYPE_ID => Err(Error::config(
-            "[openshell.policy] type = 'attested' is not yet available in this build; \
-             use 'local' or omit the [openshell.policy] table",
-        )),
+        policy_provider::ATTESTED_POLICY_TYPE_ID => {
+            Ok(Some(build_attested_policy_provider(policy).await?))
+        }
         // Unreachable in practice — `config_file::load` already rejects
         // unknown policy type names. Defensive for any straggler.
         other => Err(Error::config(format!(
             "unknown policy provider type '{other}'"
         ))),
     }
+}
+
+/// Construct an `AttestedPolicyProvider` from the parsed `[openshell.policy]`
+/// table. `config_file::load` has already validated the required fields
+/// are present.
+async fn build_attested_policy_provider(
+    policy: &config_file::PolicyFileSection,
+) -> Result<Arc<dyn policy_provider::PolicyProvider>> {
+    let source_uds_path = policy
+        .source_uds_path
+        .as_ref()
+        .expect("source_uds_path must be present (validated at config load)");
+    let trust_store_path = policy
+        .trust_store_path
+        .as_ref()
+        .expect("trust_store_path must be present (validated at config load)");
+
+    let trust_store = policy_provider::TrustStore::load(trust_store_path).map_err(|e| {
+        Error::config(format!(
+            "failed to load policy trust store from '{}': {e}",
+            trust_store_path.display()
+        ))
+    })?;
+
+    let source = policy_provider::GrpcPolicySource::connect(source_uds_path)
+        .await
+        .map_err(|e| {
+            Error::config(format!(
+                "failed to connect to policy source at '{}': {e}",
+                source_uds_path.display()
+            ))
+        })?;
+
+    let provider = policy_provider::AttestedPolicyProvider::new(Arc::new(source), trust_store)
+        .await
+        .map_err(|e| Error::config(format!("attested policy provider startup failed: {e}")))?;
+
+    info!(
+        source_uds_path = %source_uds_path.display(),
+        trust_store_path = %trust_store_path.display(),
+        "attested policy provider initialized"
+    );
+
+    Ok(Arc::new(provider))
 }
 
 fn gateway_listener_addresses(

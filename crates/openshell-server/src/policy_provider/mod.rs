@@ -6,8 +6,10 @@
 //! The gateway today resolves an effective policy and accepts policy
 //! mutations through inline calls to [`crate::persistence::Store`] from the
 //! gRPC layer. This module promotes that surface into a trait so an
-//! alternate provider can refuse the mutator methods while still serving
-//! an authoritative effective policy at admission time.
+//! alternate provider (`AttestedPolicyProvider`, which consumes signed
+//! projections from an out-of-process policy engine) can refuse the
+//! mutator methods while still serving an authoritative effective policy
+//! at admission time.
 //!
 //! The error type carries an `Unsupported { policy_type, operation }`
 //! variant that maps to `tonic::Status::unimplemented` at the gRPC edge.
@@ -15,13 +17,19 @@
 //! at the call site (`crate::resolve_policy_provider`) — a direct `match`
 //! suffices for the small number of provider shapes.
 
+mod attested;
 mod local;
+mod source;
+mod trust_store;
 
 use async_trait::async_trait;
 
 use crate::persistence::PersistenceError;
 
+pub use attested::AttestedPolicyProvider;
 pub use local::LocalPolicyProvider;
+pub use source::{GrpcPolicySource, PolicySourceError};
+pub use trust_store::TrustStore;
 
 /// Policy-type id for the in-process, store-backed policy provider.
 pub const LOCAL_POLICY_TYPE_ID: &str = "local";
@@ -62,6 +70,12 @@ pub enum PolicyError {
     /// produced before the provider seam existed.
     #[error("policy persistence error: {0}")]
     Persistence(#[from] PersistenceError),
+
+    /// Wraps an out-of-process policy source failure. The gRPC layer
+    /// maps this to `Status::unavailable` so callers retry rather than
+    /// treating the gateway as the source of the failure.
+    #[error("policy source error: {0}")]
+    SourceError(#[from] PolicySourceError),
 }
 
 /// Context describing the canonical sandbox-scoped policy replacement

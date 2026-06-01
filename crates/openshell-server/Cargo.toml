@@ -84,11 +84,17 @@ uuid = { workspace = true }
 hmac = "0.12"
 sha2 = { workspace = true }
 jsonwebtoken = { workspace = true }
+ed25519-dalek = { workspace = true }
 async-trait = "0.1"
 url = { workspace = true }
 hex = "0.4"
 russh = "0.57"
 rand = { workspace = true }
+# rand_core 0.6 is pinned here because ed25519-dalek v2 still consumes
+# `rand_core 0.6` traits. The workspace `rand = "0.9"` ships an `OsRng`
+# that implements the newer `rand_core 0.10` trait surface, so calls to
+# `SigningKey::generate` need a `rand_core 0.6`-compatible RNG.
+rand_core_06 = { package = "rand_core", version = "0.6", features = ["getrandom"] }
 petname = "2"
 ipnet = "2"
 tempfile = "3"
