@@ -174,7 +174,7 @@ use crate::l7::tls::{
     write_ca_files,
 };
 use crate::opa::OpaEngine;
-use crate::policy::{NetworkMode, NetworkPolicy, ProxyPolicy, SandboxPolicy};
+use crate::policy::{FilesystemPolicy, NetworkMode, NetworkPolicy, ProxyPolicy, SandboxPolicy};
 use crate::proxy::ProxyHandle;
 #[cfg(target_os = "linux")]
 use crate::sandbox::linux::netns::NetworkNamespace;
@@ -1461,6 +1461,44 @@ fn enumerate_gpu_device_nodes() -> Vec<String> {
     paths
 }
 
+#[derive(Debug, Clone)]
+struct BaselineEnrichmentPaths {
+    read_only: Vec<String>,
+    read_write: Vec<String>,
+}
+
+impl BaselineEnrichmentPaths {
+    fn is_empty(&self) -> bool {
+        self.read_only.is_empty() && self.read_write.is_empty()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeReadOnlyConflictPolicy {
+    mode: String,
+    allow_promotion: Vec<String>,
+}
+
+// Omitted policy is equivalent to:
+//
+// filesystem_policy:
+//   runtime_baseline_conflicts:
+//     read_only_to_read_write:
+//       mode: reject_unlisted
+//       allow_promotion:
+//         - /proc
+impl Default for RuntimeReadOnlyConflictPolicy {
+    fn default() -> Self {
+        Self {
+            mode: openshell_policy::RUNTIME_BASELINE_CONFLICT_MODE_REJECT_UNLISTED.to_string(),
+            allow_promotion: openshell_policy::DEFAULT_RUNTIME_BASELINE_ALLOW_PROMOTION
+                .iter()
+                .map(|path| (*path).to_string())
+                .collect(),
+        }
+    }
+}
+
 fn push_unique(paths: &mut Vec<String>, path: String) {
     if !paths.iter().any(|p| p == &path) {
         paths.push(path);
@@ -1471,40 +1509,43 @@ fn collect_baseline_enrichment_paths(
     include_proxy: bool,
     include_gpu: bool,
     gpu_device_nodes: Vec<String>,
-) -> (Vec<String>, Vec<String>) {
-    let mut ro = Vec::new();
-    let mut rw = Vec::new();
+) -> BaselineEnrichmentPaths {
+    let mut read_only = Vec::new();
+    let mut read_write = Vec::new();
 
     if include_proxy {
         for &path in PROXY_BASELINE_READ_ONLY {
-            push_unique(&mut ro, path.to_string());
+            push_unique(&mut read_only, path.to_string());
         }
         for &path in PROXY_BASELINE_READ_WRITE {
-            push_unique(&mut rw, path.to_string());
+            push_unique(&mut read_write, path.to_string());
         }
     }
 
     if include_gpu {
         for &path in GPU_BASELINE_READ_ONLY {
-            push_unique(&mut ro, path.to_string());
+            push_unique(&mut read_only, path.to_string());
         }
         for &path in GPU_BASELINE_READ_WRITE {
-            push_unique(&mut rw, path.to_string());
+            push_unique(&mut read_write, path.to_string());
         }
         for path in gpu_device_nodes {
-            push_unique(&mut rw, path);
+            push_unique(&mut read_write, path);
         }
     }
 
     // A path promoted to read_write (e.g. /proc for GPU) should not also
     // appear in read_only — Landlock handles the overlap correctly but the
     // duplicate is confusing when inspecting the effective policy.
-    ro.retain(|p| !rw.contains(p));
+    read_only.retain(|p| !read_write.contains(p));
 
-    (ro, rw)
+    BaselineEnrichmentPaths {
+        read_only,
+        read_write,
+    }
 }
 
-fn active_baseline_enrichment_paths(include_proxy: bool) -> (Vec<String>, Vec<String>) {
+fn active_baseline_enrichment_paths(include_proxy: bool) -> BaselineEnrichmentPaths {
     let include_gpu = has_gpu_devices();
     let gpu_device_nodes = if include_gpu {
         enumerate_gpu_device_nodes()
@@ -1518,21 +1559,94 @@ fn active_baseline_enrichment_paths(include_proxy: bool) -> (Vec<String>, Vec<St
 /// Returns `(read_only, read_write)` as owned `String` vecs.
 #[cfg(test)]
 fn baseline_enrichment_paths() -> (Vec<String>, Vec<String>) {
-    active_baseline_enrichment_paths(true)
+    let paths = active_baseline_enrichment_paths(true);
+    (paths.read_only, paths.read_write)
+}
+
+fn effective_runtime_read_only_conflict_policy_from_proto(
+    fs: Option<&openshell_core::proto::FilesystemPolicy>,
+) -> RuntimeReadOnlyConflictPolicy {
+    let Some(policy) = fs
+        .and_then(|fs| fs.runtime_baseline_conflicts.as_ref())
+        .and_then(|conflicts| conflicts.read_only_to_read_write.as_ref())
+    else {
+        return RuntimeReadOnlyConflictPolicy::default();
+    };
+
+    RuntimeReadOnlyConflictPolicy {
+        mode: if policy.mode.is_empty() {
+            openshell_policy::RUNTIME_BASELINE_CONFLICT_MODE_REJECT_UNLISTED.to_string()
+        } else {
+            policy.mode.clone()
+        },
+        allow_promotion: policy
+            .allow_promotion
+            .iter()
+            .map(|path| openshell_policy::normalize_path(path))
+            .collect(),
+    }
+}
+
+fn effective_runtime_read_only_conflict_policy_from_local(
+    fs: &FilesystemPolicy,
+) -> RuntimeReadOnlyConflictPolicy {
+    let Some(policy) = fs
+        .runtime_baseline_conflicts
+        .as_ref()
+        .and_then(|conflicts| conflicts.read_only_to_read_write.as_ref())
+    else {
+        return RuntimeReadOnlyConflictPolicy::default();
+    };
+
+    RuntimeReadOnlyConflictPolicy {
+        mode: if policy.mode.is_empty() {
+            openshell_policy::RUNTIME_BASELINE_CONFLICT_MODE_REJECT_UNLISTED.to_string()
+        } else {
+            policy.mode.clone()
+        },
+        allow_promotion: policy
+            .allow_promotion
+            .iter()
+            .map(|path| openshell_policy::normalize_path(path))
+            .collect(),
+    }
+}
+
+fn promotion_allowed(policy: &RuntimeReadOnlyConflictPolicy, path: &str) -> bool {
+    match policy.mode.as_str() {
+        openshell_policy::RUNTIME_BASELINE_CONFLICT_MODE_PROMOTE_ALL => true,
+        openshell_policy::RUNTIME_BASELINE_CONFLICT_MODE_REJECT_ALL => false,
+        _ => policy
+            .allow_promotion
+            .iter()
+            .any(|pattern| glob::Pattern::new(pattern).is_ok_and(|glob| glob.matches(path))),
+    }
+}
+
+fn runtime_baseline_read_write_conflict(path: &str) -> miette::Report {
+    miette::miette!(
+        "Runtime baseline requires path '{path}' to be read-write, \
+         but the effective policy lists it as read-only. \
+         Move '{path}' from filesystem_policy.read_only to filesystem_policy.read_write, \
+         or allow promotion with \
+         filesystem_policy.runtime_baseline_conflicts.read_only_to_read_write.allow_promotion."
+    )
 }
 
 fn enrich_proto_baseline_paths_with<F>(
     proto: &mut openshell_core::proto::SandboxPolicy,
-    ro: &[String],
-    rw: &[String],
+    paths: &BaselineEnrichmentPaths,
+    conflict_policy: &RuntimeReadOnlyConflictPolicy,
     path_exists: F,
-) -> bool
+) -> Result<bool>
 where
     F: Fn(&str) -> bool,
 {
-    if ro.is_empty() && rw.is_empty() {
-        return false;
+    if paths.is_empty() {
+        return Ok(false);
     }
+
+    let mut modified = false;
 
     let fs = proto
         .filesystem
@@ -1541,8 +1655,7 @@ where
             ..Default::default()
         });
 
-    let mut modified = false;
-    for path in ro {
+    for path in &paths.read_only {
         if !fs.read_only.iter().any(|p| p == path) && !fs.read_write.iter().any(|p| p == path) {
             if !path_exists(path) {
                 debug!(
@@ -1555,9 +1668,27 @@ where
             modified = true;
         }
     }
-    for path in rw {
-        if fs.read_only.iter().any(|p| p == path) || fs.read_write.iter().any(|p| p == path) {
+    for path in &paths.read_write {
+        if fs
+            .read_write
+            .iter()
+            .any(|p| openshell_policy::normalize_path(p) == *path)
+        {
             continue;
+        }
+
+        let read_only_conflict = fs
+            .read_only
+            .iter()
+            .position(|p| openshell_policy::normalize_path(p) == *path);
+        if let Some(index) = read_only_conflict {
+            if promotion_allowed(conflict_policy, path) {
+                fs.read_only.remove(index);
+                fs.read_write.push(path.clone());
+                modified = true;
+                continue;
+            }
+            return Err(runtime_baseline_read_write_conflict(path));
         }
         if !path_exists(path) {
             debug!(
@@ -1570,7 +1701,7 @@ where
         modified = true;
     }
 
-    modified
+    Ok(modified)
 }
 
 /// Ensure a proto `SandboxPolicy` includes the baseline filesystem paths
@@ -1578,17 +1709,19 @@ where
 /// missing; user-specified paths are never removed.
 ///
 /// Returns `true` if the policy was modified (caller may want to sync back).
-fn enrich_proto_baseline_paths(proto: &mut openshell_core::proto::SandboxPolicy) -> bool {
-    let (ro, rw) = active_baseline_enrichment_paths(!proto.network_policies.is_empty());
+fn enrich_proto_baseline_paths(proto: &mut openshell_core::proto::SandboxPolicy) -> Result<bool> {
+    let paths = active_baseline_enrichment_paths(!proto.network_policies.is_empty());
+    let conflict_policy =
+        effective_runtime_read_only_conflict_policy_from_proto(proto.filesystem.as_ref());
 
     // Baseline paths are system-injected, not user-specified.  Skip paths
     // that do not exist in this container image to avoid noisy warnings from
     // Landlock and, more critically, to prevent a single missing baseline
     // path from abandoning the entire Landlock ruleset under best-effort
     // mode (see issue #664).
-    let modified = enrich_proto_baseline_paths_with(proto, &ro, &rw, |path| {
+    let modified = enrich_proto_baseline_paths_with(proto, &paths, &conflict_policy, |path| {
         std::path::Path::new(path).exists()
-    });
+    })?;
 
     if modified {
         ocsf_emit!(
@@ -1601,24 +1734,30 @@ fn enrich_proto_baseline_paths(proto: &mut openshell_core::proto::SandboxPolicy)
         );
     }
 
-    modified
+    Ok(modified)
 }
 
 /// Ensure a `SandboxPolicy` (Rust type) includes the baseline filesystem
 /// paths required by proxy-mode sandboxes and GPU runtimes. Used for the
 /// local-file code path where no proto is available.
-fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
-    let (ro, rw) =
-        active_baseline_enrichment_paths(matches!(policy.network.mode, NetworkMode::Proxy));
-    if ro.is_empty() && rw.is_empty() {
-        return;
+fn enrich_sandbox_baseline_paths_with<F>(
+    policy: &mut SandboxPolicy,
+    paths: &BaselineEnrichmentPaths,
+    conflict_policy: &RuntimeReadOnlyConflictPolicy,
+    path_exists: F,
+) -> Result<bool>
+where
+    F: Fn(&str) -> bool,
+{
+    if paths.is_empty() {
+        return Ok(false);
     }
 
     let mut modified = false;
-    for path in &ro {
+    for path in &paths.read_only {
         let p = std::path::PathBuf::from(path);
         if !policy.filesystem.read_only.contains(&p) && !policy.filesystem.read_write.contains(&p) {
-            if !p.exists() {
+            if !path_exists(path) {
                 debug!(
                     path,
                     "Baseline read-only path does not exist, skipping enrichment"
@@ -1629,12 +1768,29 @@ fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
             modified = true;
         }
     }
-    for path in &rw {
+    for path in &paths.read_write {
         let p = std::path::PathBuf::from(path);
-        if policy.filesystem.read_only.contains(&p) || policy.filesystem.read_write.contains(&p) {
+        if policy
+            .filesystem
+            .read_write
+            .iter()
+            .any(|existing| openshell_policy::normalize_path(&existing.to_string_lossy()) == *path)
+        {
             continue;
         }
-        if !p.exists() {
+
+        if let Some(index) = policy.filesystem.read_only.iter().position(|existing| {
+            openshell_policy::normalize_path(&existing.to_string_lossy()) == *path
+        }) {
+            if promotion_allowed(conflict_policy, path) {
+                policy.filesystem.read_only.remove(index);
+                policy.filesystem.read_write.push(p);
+                modified = true;
+                continue;
+            }
+            return Err(runtime_baseline_read_write_conflict(path));
+        }
+        if !path_exists(path) {
             debug!(
                 path,
                 "Baseline read-write path does not exist, skipping enrichment"
@@ -1644,6 +1800,20 @@ fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
         policy.filesystem.read_write.push(p);
         modified = true;
     }
+
+    Ok(modified)
+}
+
+/// Ensure a `SandboxPolicy` (Rust type) includes the baseline filesystem
+/// paths required by proxy-mode sandboxes and GPU runtimes. Used for the
+/// local-file code path where no proto is available.
+fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) -> Result<bool> {
+    let paths = active_baseline_enrichment_paths(matches!(policy.network.mode, NetworkMode::Proxy));
+    let conflict_policy =
+        effective_runtime_read_only_conflict_policy_from_local(&policy.filesystem);
+    let modified = enrich_sandbox_baseline_paths_with(policy, &paths, &conflict_policy, |path| {
+        std::path::Path::new(path).exists()
+    })?;
 
     if modified {
         ocsf_emit!(
@@ -1655,6 +1825,8 @@ fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
                 .build()
         );
     }
+
+    Ok(modified)
 }
 
 #[cfg(test)]
@@ -1735,36 +1907,36 @@ mod baseline_tests {
     }
 
     #[test]
-    fn proto_enrichment_preserves_explicit_read_only_for_baseline_read_write_paths() {
+    fn proto_enrichment_rejects_unlisted_read_only_conflict() {
         let mut policy = openshell_policy::restrictive_default_policy();
         policy.filesystem = Some(openshell_core::proto::FilesystemPolicy {
             read_only: vec!["/tmp".to_string()],
             read_write: vec![],
             include_workdir: false,
+            ..Default::default()
         });
-        policy.network_policies.insert(
-            "test".into(),
-            openshell_core::proto::NetworkPolicyRule {
-                name: "test-rule".into(),
-                endpoints: vec![openshell_core::proto::NetworkEndpoint {
-                    host: "example.com".into(),
-                    port: 443,
-                    ..Default::default()
-                }],
-                ..Default::default()
-            },
+
+        let paths = BaselineEnrichmentPaths {
+            read_only: vec![],
+            read_write: vec!["/tmp".to_string()],
+        };
+        let err = enrich_proto_baseline_paths_with(
+            &mut policy,
+            &paths,
+            &RuntimeReadOnlyConflictPolicy::default(),
+            |_| true,
+        )
+        .expect_err("unlisted read-only conflict should be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("requires path '/tmp' to be read-write"),
+            "unexpected error: {err}"
         );
-
-        enrich_proto_baseline_paths(&mut policy);
-
         let filesystem = policy.filesystem.expect("filesystem policy");
         assert!(
             filesystem.read_only.contains(&"/tmp".to_string()),
-            "explicit read_only baseline path should be preserved"
-        );
-        assert!(
-            !filesystem.read_write.contains(&"/tmp".to_string()),
-            "baseline enrichment must not promote explicit read_only /tmp to read_write"
+            "rejected conflict should preserve the original read_only entry"
         );
     }
 
@@ -1775,12 +1947,16 @@ mod baseline_tests {
             policy.network_policies.is_empty(),
             "regression setup must exercise the no-network default path"
         );
-        let (ro, rw) =
+        let paths =
             collect_baseline_enrichment_paths(false, true, vec!["/dev/nvidia0".to_string()]);
 
-        let enriched = enrich_proto_baseline_paths_with(&mut policy, &ro, &rw, |path| {
-            matches!(path, "/proc" | "/dev/nvidia0")
-        });
+        let enriched = enrich_proto_baseline_paths_with(
+            &mut policy,
+            &paths,
+            &RuntimeReadOnlyConflictPolicy::default(),
+            |path| matches!(path, "/proc" | "/dev/nvidia0"),
+        )
+        .expect("default policy should allow /proc promotion");
 
         let filesystem = policy.filesystem.expect("filesystem policy");
         assert!(
@@ -1805,13 +1981,197 @@ mod baseline_tests {
     }
 
     #[test]
-    fn local_enrichment_preserves_explicit_read_only_for_baseline_read_write_paths() {
+    fn proto_default_conflict_policy_promotes_proc() {
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.filesystem = Some(openshell_core::proto::FilesystemPolicy {
+            read_only: vec!["/proc/".to_string()],
+            read_write: vec![],
+            include_workdir: false,
+            ..Default::default()
+        });
+        let paths = BaselineEnrichmentPaths {
+            read_only: vec![],
+            read_write: vec!["/proc".to_string()],
+        };
+
+        let enriched = enrich_proto_baseline_paths_with(
+            &mut policy,
+            &paths,
+            &RuntimeReadOnlyConflictPolicy::default(),
+            |_| true,
+        )
+        .expect("default policy should allow /proc promotion");
+
+        let filesystem = policy.filesystem.expect("filesystem policy");
+        assert!(enriched);
+        assert!(!filesystem.read_only.contains(&"/proc/".to_string()));
+        assert!(filesystem.read_write.contains(&"/proc".to_string()));
+    }
+
+    #[test]
+    fn proto_default_conflict_policy_rejects_device_node() {
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.filesystem = Some(openshell_core::proto::FilesystemPolicy {
+            read_only: vec!["/dev/nvidia0".to_string()],
+            read_write: vec![],
+            include_workdir: false,
+            ..Default::default()
+        });
+        let paths = BaselineEnrichmentPaths {
+            read_only: vec![],
+            read_write: vec!["/dev/nvidia0".to_string()],
+        };
+
+        let err = enrich_proto_baseline_paths_with(
+            &mut policy,
+            &paths,
+            &RuntimeReadOnlyConflictPolicy::default(),
+            |_| true,
+        )
+        .expect_err("device node conflict should require explicit opt-in");
+
+        assert!(
+            err.to_string()
+                .contains("requires path '/dev/nvidia0' to be read-write"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn proto_device_node_already_read_write_is_not_a_promotion_conflict() {
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.filesystem = Some(openshell_core::proto::FilesystemPolicy {
+            read_only: vec!["/dev/nvidia0".to_string()],
+            read_write: vec!["/dev/nvidia0".to_string()],
+            include_workdir: false,
+            ..Default::default()
+        });
+        let paths = BaselineEnrichmentPaths {
+            read_only: vec![],
+            read_write: vec!["/dev/nvidia0".to_string()],
+        };
+
+        let enriched = enrich_proto_baseline_paths_with(
+            &mut policy,
+            &paths,
+            &RuntimeReadOnlyConflictPolicy::default(),
+            |_| true,
+        )
+        .expect("path that is already read-write should not require promotion");
+
+        assert!(!enriched);
+    }
+
+    #[test]
+    fn proto_reject_all_conflict_policy_rejects_proc() {
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.filesystem = Some(openshell_core::proto::FilesystemPolicy {
+            read_only: vec!["/proc".to_string()],
+            read_write: vec![],
+            include_workdir: false,
+            ..Default::default()
+        });
+        let paths = BaselineEnrichmentPaths {
+            read_only: vec![],
+            read_write: vec!["/proc".to_string()],
+        };
+        let conflict_policy = RuntimeReadOnlyConflictPolicy {
+            mode: openshell_policy::RUNTIME_BASELINE_CONFLICT_MODE_REJECT_ALL.to_string(),
+            allow_promotion: vec!["/proc".to_string()],
+        };
+
+        let err = enrich_proto_baseline_paths_with(&mut policy, &paths, &conflict_policy, |_| true)
+            .expect_err("reject_all should reject even allow-listed /proc");
+
+        assert!(
+            err.to_string()
+                .contains("requires path '/proc' to be read-write"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn proto_promote_all_conflict_policy_promotes_device_node() {
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.filesystem = Some(openshell_core::proto::FilesystemPolicy {
+            read_only: vec!["/dev/nvidia0".to_string()],
+            read_write: vec![],
+            include_workdir: false,
+            ..Default::default()
+        });
+        let paths = BaselineEnrichmentPaths {
+            read_only: vec![],
+            read_write: vec!["/dev/nvidia0".to_string()],
+        };
+        let conflict_policy = RuntimeReadOnlyConflictPolicy {
+            mode: openshell_policy::RUNTIME_BASELINE_CONFLICT_MODE_PROMOTE_ALL.to_string(),
+            allow_promotion: vec![],
+        };
+
+        enrich_proto_baseline_paths_with(&mut policy, &paths, &conflict_policy, |_| true)
+            .expect("promote_all should promote device-node conflicts");
+
+        let filesystem = policy.filesystem.expect("filesystem policy");
+        assert!(!filesystem.read_only.contains(&"/dev/nvidia0".to_string()));
+        assert!(filesystem.read_write.contains(&"/dev/nvidia0".to_string()));
+    }
+
+    #[test]
+    fn proto_allow_promotion_pattern_promotes_device_node() {
+        let mut policy = policy_with_read_only_to_read_write_conflict_policy(
+            "/dev/nvidia0",
+            openshell_policy::RUNTIME_BASELINE_CONFLICT_MODE_REJECT_UNLISTED,
+            vec!["/dev/nvidia*"],
+        );
+        let paths = BaselineEnrichmentPaths {
+            read_only: vec![],
+            read_write: vec!["/dev/nvidia0".to_string()],
+        };
+        let conflict_policy =
+            effective_runtime_read_only_conflict_policy_from_proto(policy.filesystem.as_ref());
+
+        enrich_proto_baseline_paths_with(&mut policy, &paths, &conflict_policy, |_| true)
+            .expect("allow_promotion pattern should promote matching device node");
+
+        let filesystem = policy.filesystem.expect("filesystem policy");
+        assert!(!filesystem.read_only.contains(&"/dev/nvidia0".to_string()));
+        assert!(filesystem.read_write.contains(&"/dev/nvidia0".to_string()));
+    }
+
+    fn policy_with_read_only_to_read_write_conflict_policy(
+        read_only_path: &str,
+        mode: &str,
+        allow_promotion: Vec<&str>,
+    ) -> openshell_core::proto::SandboxPolicy {
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.filesystem = Some(openshell_core::proto::FilesystemPolicy {
+            read_only: vec![read_only_path.to_string()],
+            read_write: vec![],
+            include_workdir: false,
+            runtime_baseline_conflicts: Some(openshell_core::proto::RuntimeBaselineConflicts {
+                read_only_to_read_write: Some(
+                    openshell_core::proto::ReadOnlyToReadWriteConflictPolicy {
+                        mode: mode.to_string(),
+                        allow_promotion: allow_promotion
+                            .into_iter()
+                            .map(ToString::to_string)
+                            .collect(),
+                    },
+                ),
+            }),
+        });
+        policy
+    }
+
+    #[test]
+    fn local_enrichment_rejects_unlisted_read_only_conflict() {
         let mut policy = SandboxPolicy {
             version: 1,
             filesystem: FilesystemPolicy {
                 read_only: vec![std::path::PathBuf::from("/tmp")],
                 read_write: vec![],
                 include_workdir: false,
+                runtime_baseline_conflicts: None,
             },
             network: NetworkPolicy {
                 mode: NetworkMode::Proxy,
@@ -1820,22 +2180,30 @@ mod baseline_tests {
             landlock: LandlockPolicy::default(),
             process: ProcessPolicy::default(),
         };
+        let paths = BaselineEnrichmentPaths {
+            read_only: vec![],
+            read_write: vec!["/tmp".to_string()],
+        };
 
-        enrich_sandbox_baseline_paths(&mut policy);
+        let err = enrich_sandbox_baseline_paths_with(
+            &mut policy,
+            &paths,
+            &RuntimeReadOnlyConflictPolicy::default(),
+            |_| true,
+        )
+        .expect_err("unlisted local read-only conflict should be rejected");
 
+        assert!(
+            err.to_string()
+                .contains("requires path '/tmp' to be read-write"),
+            "unexpected error: {err}"
+        );
         assert!(
             policy
                 .filesystem
                 .read_only
                 .contains(&std::path::PathBuf::from("/tmp")),
-            "explicit read_only baseline path should be preserved"
-        );
-        assert!(
-            !policy
-                .filesystem
-                .read_write
-                .contains(&std::path::PathBuf::from("/tmp")),
-            "baseline enrichment must not promote explicit read_only /tmp to read_write"
+            "rejected conflict should preserve the original read_only entry"
         );
     }
 
@@ -1974,7 +2342,7 @@ async fn load_policy(
             landlock: config.landlock,
             process: config.process,
         };
-        enrich_sandbox_baseline_paths(&mut policy);
+        enrich_sandbox_baseline_paths(&mut policy)?;
         return Ok((policy, Some(Arc::new(engine)), None));
     }
 
@@ -2005,7 +2373,7 @@ async fn load_policy(
             let mut discovered = discover_policy_from_disk_or_default();
             // Enrich before syncing so the gateway baseline includes
             // baseline paths from the start.
-            enrich_proto_baseline_paths(&mut discovered);
+            enrich_proto_baseline_paths(&mut discovered)?;
             let sandbox = sandbox.as_deref().ok_or_else(|| {
                 miette::miette!(
                     "Cannot sync discovered policy: sandbox not available.\n\
@@ -2024,7 +2392,7 @@ async fn load_policy(
         // Ensure baseline filesystem paths are present for proxy-mode
         // sandboxes.  If the policy was enriched, sync the updated version
         // back to the gateway so users can see the effective policy.
-        let enriched = enrich_proto_baseline_paths(&mut proto_policy);
+        let enriched = enrich_proto_baseline_paths(&mut proto_policy)?;
         if enriched
             && let Some(sandbox_name) = sandbox.as_deref()
             && let Err(e) = grpc_client::sync_policy(endpoint, sandbox_name, &proto_policy).await
@@ -3152,6 +3520,7 @@ filesystem_policy:
                 read_only: vec![],
                 read_write: vec![path],
                 include_workdir: false,
+                runtime_baseline_conflicts: None,
             },
             network: NetworkPolicy::default(),
             landlock: LandlockPolicy::default(),

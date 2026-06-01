@@ -29,6 +29,9 @@ pub struct FilesystemPolicy {
 
     /// Automatically include the workdir as read-write.
     pub include_workdir: bool,
+
+    /// Controls runtime baseline read-only to read-write conflicts.
+    pub runtime_baseline_conflicts: Option<RuntimeBaselineConflictsPolicy>,
 }
 
 impl Default for FilesystemPolicy {
@@ -37,8 +40,20 @@ impl Default for FilesystemPolicy {
             read_only: Vec::new(),
             read_write: Vec::new(),
             include_workdir: true,
+            runtime_baseline_conflicts: None,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeBaselineConflictsPolicy {
+    pub read_only_to_read_write: Option<ReadOnlyToReadWriteConflictPolicy>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ReadOnlyToReadWriteConflictPolicy {
+    pub mode: String,
+    pub allow_promotion: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -133,6 +148,30 @@ impl From<ProtoFilesystemPolicy> for FilesystemPolicy {
                 .map(|p| PathBuf::from(openshell_policy::normalize_path(&p)))
                 .collect(),
             include_workdir: proto.include_workdir,
+            runtime_baseline_conflicts: proto
+                .runtime_baseline_conflicts
+                .map(RuntimeBaselineConflictsPolicy::from),
+        }
+    }
+}
+
+impl From<openshell_core::proto::RuntimeBaselineConflicts> for RuntimeBaselineConflictsPolicy {
+    fn from(proto: openshell_core::proto::RuntimeBaselineConflicts) -> Self {
+        Self {
+            read_only_to_read_write: proto
+                .read_only_to_read_write
+                .map(ReadOnlyToReadWriteConflictPolicy::from),
+        }
+    }
+}
+
+impl From<openshell_core::proto::ReadOnlyToReadWriteConflictPolicy>
+    for ReadOnlyToReadWriteConflictPolicy
+{
+    fn from(proto: openshell_core::proto::ReadOnlyToReadWriteConflictPolicy) -> Self {
+        Self {
+            mode: proto.mode,
+            allow_promotion: proto.allow_promotion,
         }
     }
 }
