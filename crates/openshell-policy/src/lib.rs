@@ -12,7 +12,6 @@
 mod compose;
 mod merge;
 
-use std::collections::HashMap;
 use std::path::Path;
 
 use miette::Result;
@@ -559,6 +558,8 @@ pub fn normalize_path(path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
 
     /// Verify that the serialized YAML uses `filesystem_policy` (not
