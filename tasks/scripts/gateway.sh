@@ -336,9 +336,9 @@ EOF
     ;;
   podman)
     cat >>"${CONFIG_PATH}" <<EOF
-supervisor_image = "${OPENSHELL_SUPERVISOR_IMAGE}"
 
 [openshell.drivers.podman]
+supervisor_image = "${OPENSHELL_SUPERVISOR_IMAGE}"
 image_pull_policy = "$(podman_pull_policy "${SANDBOX_IMAGE_PULL_POLICY}")"
 EOF
     if [[ -n "${GRPC_ENDPOINT}" ]]; then
