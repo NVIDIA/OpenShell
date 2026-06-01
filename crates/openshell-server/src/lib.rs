@@ -30,6 +30,7 @@ mod http;
 mod inference;
 mod multiplex;
 mod persistence;
+pub(crate) mod policy_provider;
 pub(crate) mod policy_store;
 mod provider_refresh;
 mod readiness;
@@ -78,6 +79,15 @@ pub struct ServerState {
 
     /// Persistence store.
     pub store: Arc<Store>,
+
+    /// Active policy provider.
+    ///
+    /// All `openshell policy set | update | delete` requests at the gRPC
+    /// layer route through this provider. The `local` type writes directly
+    /// to [`Self::store`]; other policy types may refuse mutations via
+    /// `PolicyError::Unsupported`, which the gRPC layer translates to
+    /// `Status::unimplemented`.
+    pub policy_provider: Arc<dyn policy_provider::PolicyProvider>,
 
     /// Compute orchestration over the configured driver.
     pub compute: ComputeRuntime,
@@ -148,6 +158,12 @@ fn is_benign_connection_close(error: &(dyn std::error::Error + 'static)) -> bool
 
 impl ServerState {
     /// Create new server state.
+    ///
+    /// Selects the default `local` policy provider. Callers that need to
+    /// substitute a different provider (test fixtures wanting to exercise
+    /// `Unsupported` behavior; or, when it lands, the `attested` policy
+    /// type) can replace `policy_provider` on the constructed value before
+    /// the state is shared.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -160,9 +176,12 @@ impl ServerState {
         supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
         oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
     ) -> Self {
+        let policy_provider: Arc<dyn policy_provider::PolicyProvider> =
+            Arc::new(policy_provider::LocalPolicyProvider::new(store.clone()));
         Self {
             config,
             store,
+            policy_provider,
             compute,
             sandbox_index,
             sandbox_watch_bus,
@@ -243,6 +262,15 @@ pub async fn run_server(
         supervisor_sessions,
         oidc_cache,
     );
+
+    // Override the default `local` policy provider when the config file
+    // selects a different policy type. The `attested` type is reserved for
+    // the forthcoming Attested Policy Projection work; declaring it today
+    // returns a startup error rather than a generic "unknown policy type"
+    // message so deployments staging the value get a clear signal.
+    if let Some(provider) = resolve_policy_provider(config_file.as_ref(), store.clone())? {
+        state.policy_provider = provider;
+    }
 
     // Load the gateway-minted sandbox JWT signing key when configured.
     // Optional so single-driver dev deployments without certgen continue
@@ -452,6 +480,54 @@ pub async fn run_server(
         .map_err(|err| Error::execution(format!("gateway shutdown cleanup failed: {err}")))?;
 
     Ok(())
+}
+
+/// Build the policy-provider registry for this gateway process. Currently
+/// holds only `local`; the next session adds the `attested` policy type
+/// here.
+fn build_policy_provider_registry(store: Arc<Store>) -> policy_provider::PolicyProviderRegistry {
+    let mut registry = policy_provider::PolicyProviderRegistry::new();
+    registry.register(policy_provider::LocalPolicyProvider::new(store));
+    registry
+}
+
+/// Resolve the configured policy provider, if the config file selects one.
+/// Returns `Ok(None)` when no override is needed (the default `local`
+/// provider from `ServerState::new` already covers that case).
+///
+/// `"local"` returns a fresh provider via the registry. `"attested"` is
+/// parsed at config-file load time but the registry does not yet contain
+/// the provider — startup returns a clear "policy type not yet available"
+/// error so deployments staging the value get a clear signal rather than
+/// silently falling back to local.
+fn resolve_policy_provider(
+    config_file: Option<&config_file::ConfigFile>,
+    store: Arc<Store>,
+) -> Result<Option<Arc<dyn policy_provider::PolicyProvider>>> {
+    let Some(file) = config_file else {
+        return Ok(None);
+    };
+    let Some(policy) = file.openshell.policy.as_ref() else {
+        return Ok(None);
+    };
+    let Some(policy_type) = policy.r#type.as_deref() else {
+        return Ok(None);
+    };
+    let registry = build_policy_provider_registry(store);
+    if let Some(provider) = registry.get(policy_type) {
+        return Ok(Some(provider));
+    }
+    if policy_type == policy_provider::ATTESTED_POLICY_TYPE_ID {
+        return Err(Error::config(
+            "[openshell.policy] type = 'attested' is not yet available in this build; \
+             use 'local' or omit the [openshell.policy] table",
+        ));
+    }
+    // Unreachable in practice — `config_file::load` already rejects
+    // unknown policy type names. Treat any straggler defensively.
+    Err(Error::config(format!(
+        "unknown policy provider type '{policy_type}'"
+    )))
 }
 
 fn gateway_listener_addresses(

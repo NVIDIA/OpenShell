@@ -13,6 +13,9 @@
 use crate::ServerState;
 use crate::auth::principal::Principal;
 use crate::persistence::{DraftChunkRecord, ObjectId, ObjectName, ObjectType, PolicyRecord, Store};
+use crate::policy_provider::{
+    DeleteGlobalPolicyCtx, PolicyError, SetSandboxPolicyCtx, UpdateSandboxPolicyCtx,
+};
 use crate::policy_store::PolicyStoreExt;
 use openshell_core::proto::policy_merge_operation;
 use openshell_core::proto::setting_value;
@@ -957,6 +960,28 @@ fn truncate_for_log(input: &str, max_chars: usize) -> String {
     }
 }
 
+/// Map a [`PolicyError`] to a `tonic::Status`.
+///
+/// `Unsupported` carries the policy-type id and the refused operation so
+/// the client (and audit) get a precise reason; it maps to
+/// `Status::unimplemented`. Persistence errors collapse to
+/// `Status::internal` here — handlers that need finer granularity (e.g.
+/// CAS conflict → `Status::aborted`) should match on `PolicyError` before
+/// calling this.
+fn policy_error_to_status(error: PolicyError) -> Status {
+    match error {
+        PolicyError::Unsupported {
+            policy_type,
+            operation,
+        } => Status::unimplemented(format!(
+            "policy type '{policy_type}' does not support operation '{operation}'"
+        )),
+        PolicyError::Persistence(err) => {
+            super::persistence_error_to_status(err, "policy provider")
+        }
+    }
+}
+
 #[cfg(test)]
 fn is_sandbox_caller<T>(request: &Request<T>) -> bool {
     matches!(
@@ -1498,20 +1523,23 @@ pub(super) async fn handle_update_config(
 
         let mut global_settings = load_global_settings(state.store.as_ref()).await?;
         let changed = if req.delete_setting {
-            let removed = global_settings.settings.remove(key).is_some();
-            if removed
-                && key == POLICY_SETTING_KEY
-                && let Ok(Some(latest)) = state
-                    .store
-                    .get_latest_policy(GLOBAL_POLICY_SANDBOX_ID)
+            // Gate global-policy deletion through the active policy
+            // provider. Local says yes (and supersedes older revisions as
+            // a side effect inside the trait method); other providers can
+            // refuse via the trait default, which maps to
+            // `Status::unimplemented` so `openshell policy delete
+            // --global` is rejected without a bespoke gate. Non-policy
+            // setting deletions skip the trait entirely.
+            if key == POLICY_SETTING_KEY {
+                state
+                    .policy_provider
+                    .delete_policy(&DeleteGlobalPolicyCtx {
+                        global_policy_sandbox_id: GLOBAL_POLICY_SANDBOX_ID.to_string(),
+                    })
                     .await
-            {
-                let _ = state
-                    .store
-                    .supersede_older_policies(GLOBAL_POLICY_SANDBOX_ID, latest.version + 1)
-                    .await;
+                    .map_err(policy_error_to_status)?;
             }
-            removed
+            global_settings.settings.remove(key).is_some()
         } else {
             let setting = req
                 .setting_value
@@ -1636,6 +1664,23 @@ pub(super) async fn handle_update_config(
             .ok_or_else(|| Status::internal("sandbox has no spec"))?;
         let merge_ops = parse_merge_operations(&req.merge_operations)?;
         validate_merge_operations_for_server(&merge_ops)?;
+
+        // Gate the merge through the active policy provider. The local
+        // provider returns Ok and the existing merge-with-retry path runs
+        // below; an alternate provider can refuse via the trait default
+        // (`Status::unimplemented`) so `openshell policy update` is
+        // rejected without a bespoke gate.
+        state
+            .policy_provider
+            .update_policy(&UpdateSandboxPolicyCtx {
+                sandbox_id: sandbox_id.clone(),
+                sandbox_name: sandbox.object_name().to_string(),
+                merge_operations: merge_ops.clone(),
+                baseline_policy: spec.policy.clone(),
+            })
+            .await
+            .map_err(policy_error_to_status)?;
+
         let (version, hash) = apply_merge_operations_with_retry(
             state.store.as_ref(),
             &sandbox_id,
@@ -1733,52 +1778,38 @@ pub(super) async fn handle_update_config(
         );
     }
 
-    let latest = state
-        .store
-        .get_latest_policy(&sandbox_id)
+    // Route the sandbox-scoped policy replacement through the active
+    // policy provider. `LocalPolicyProvider::set_policy` performs the same
+    // put-revision + supersede dance that used to live inline here; an
+    // alternate provider (next session: `AttestedPolicyProvider`) can
+    // refuse the mutation via the trait default, which maps to
+    // `Status::unimplemented` so `openshell policy set` is rejected
+    // automatically without a separate gate.
+    let ctx = SetSandboxPolicyCtx {
+        sandbox_id: sandbox_id.clone(),
+        sandbox_name: sandbox.object_name().to_string(),
+        expected_resource_version: req.expected_resource_version,
+        policy: new_policy,
+    };
+    let outcome = state
+        .policy_provider
+        .set_policy(&ctx)
         .await
-        .map_err(|e| Status::internal(format!("fetch latest policy failed: {e}")))?;
-
-    let payload = new_policy.encode_to_vec();
-    let hash = deterministic_policy_hash(&new_policy);
-
-    if let Some(ref current) = latest
-        && current.policy_hash == hash
-    {
-        return Ok(Response::new(UpdateConfigResponse {
-            version: u32::try_from(current.version).unwrap_or(0),
-            policy_hash: hash,
-            settings_revision: 0,
-            deleted: false,
-        }));
-    }
-
-    let next_version = latest.map_or(1, |r| r.version + 1);
-    let policy_id = uuid::Uuid::new_v4().to_string();
-
-    state
-        .store
-        .put_policy_revision(&policy_id, &sandbox_id, next_version, &payload, &hash)
-        .await
-        .map_err(|e| Status::internal(format!("persist policy revision failed: {e}")))?;
-
-    let _ = state
-        .store
-        .supersede_older_policies(&sandbox_id, next_version)
-        .await;
+        .map_err(policy_error_to_status)?;
 
     state.sandbox_watch_bus.notify(&sandbox_id);
 
     info!(
         sandbox_id = %sandbox_id,
-        version = next_version,
-        policy_hash = %hash,
+        version = outcome.version,
+        policy_hash = %outcome.policy_hash,
+        policy_type = %state.policy_provider.id(),
         "UpdateConfig: new policy version persisted"
     );
 
     Ok(Response::new(UpdateConfigResponse {
-        version: u32::try_from(next_version).unwrap_or(0),
-        policy_hash: hash,
+        version: outcome.version,
+        policy_hash: outcome.policy_hash,
         settings_revision: 0,
         deleted: false,
     }))
@@ -9370,5 +9401,222 @@ mod tests {
             final_sandbox.spec.as_ref().unwrap().policy.is_some(),
             "policy should be backfilled after one success"
         );
+    }
+
+    // ---- PolicyProvider integration (W-B half 1) ----
+
+    use crate::policy_provider::{PolicyError, PolicyProvider};
+    use async_trait::async_trait;
+
+    /// Test-only provider that returns `Unsupported` for every mutator —
+    /// stands in for the future `AttestedPolicyProvider` so we can verify
+    /// the gRPC-layer mapping to `Status::unimplemented`.
+    #[derive(Debug)]
+    struct RefusingProvider;
+
+    #[async_trait]
+    impl PolicyProvider for RefusingProvider {
+        fn id(&self) -> &'static str {
+            "refusing"
+        }
+
+        async fn get_effective_policy(
+            &self,
+            _sandbox_id: &str,
+        ) -> Result<Option<ProtoSandboxPolicy>, PolicyError> {
+            Ok(None)
+        }
+        // set_policy / update_policy / delete_policy inherit the default
+        // `Unsupported` impls — this is the property under test.
+    }
+
+    /// Swap the policy provider on a freshly-built test `ServerState`. The
+    /// `test_server_state` helper returns a unique `Arc`, so we can unwrap
+    /// it, mutate, and re-wrap.
+    fn override_policy_provider(
+        state: Arc<ServerState>,
+        provider: Arc<dyn PolicyProvider>,
+    ) -> Arc<ServerState> {
+        let inner = Arc::try_unwrap(state)
+            .map_err(|_| "expected unique test-state Arc")
+            .unwrap();
+        Arc::new(ServerState {
+            policy_provider: provider,
+            ..inner
+        })
+    }
+
+    #[test]
+    fn policy_error_unsupported_maps_to_unimplemented() {
+        let status = policy_error_to_status(PolicyError::Unsupported {
+            policy_type: "attested",
+            operation: "set_policy",
+        });
+        assert_eq!(status.code(), Code::Unimplemented);
+        assert!(status.message().contains("attested"));
+        assert!(status.message().contains("set_policy"));
+    }
+
+    #[test]
+    fn policy_error_persistence_maps_to_internal() {
+        let status = policy_error_to_status(PolicyError::Persistence(
+            crate::persistence::PersistenceError::Database("boom".to_string()),
+        ));
+        assert_eq!(status.code(), Code::Internal);
+    }
+
+    /// End-to-end: replace the state's provider with the refusing stub,
+    /// then drive `handle_update_config` through the sandbox-scoped
+    /// policy-replace path. The handler must surface
+    /// `Status::unimplemented` carrying the policy type and operation,
+    /// which is exactly what `openshell policy set` will see when the
+    /// attested provider is configured.
+    #[tokio::test]
+    async fn refusing_provider_sandbox_set_returns_unimplemented() {
+        use openshell_core::proto::{SandboxPhase, SandboxSpec};
+        let state = test_server_state().await;
+        // No baseline `spec.policy` — first-time policy discovery exercises
+        // the backfill path, which reaches the provider seam without first
+        // tripping `validate_static_fields_unchanged`.
+        let mut sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-refuse".to_string(),
+                name: "sb-refuse".to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+                resource_version: 0,
+            }),
+            spec: Some(SandboxSpec {
+                policy: None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Provisioning as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let state = override_policy_provider(state, Arc::new(RefusingProvider));
+
+        let req = with_user(Request::new(UpdateConfigRequest {
+            name: "sb-refuse".to_string(),
+            policy: Some(ProtoSandboxPolicy::default()),
+            ..Default::default()
+        }));
+        let err = handle_update_config(&state, req)
+            .await
+            .expect_err("refusing provider must reject set_policy");
+        assert_eq!(err.code(), Code::Unimplemented);
+        assert!(err.message().contains("refusing"));
+        assert!(err.message().contains("set_policy"));
+    }
+
+    #[tokio::test]
+    async fn refusing_provider_global_delete_returns_unimplemented() {
+        let state = test_server_state().await;
+        let state = override_policy_provider(state, Arc::new(RefusingProvider));
+
+        let req = with_user(Request::new(UpdateConfigRequest {
+            global: true,
+            setting_key: POLICY_SETTING_KEY.to_string(),
+            delete_setting: true,
+            ..Default::default()
+        }));
+        let err = handle_update_config(&state, req)
+            .await
+            .expect_err("refusing provider must reject global delete_policy");
+        assert_eq!(err.code(), Code::Unimplemented);
+        assert!(err.message().contains("delete_policy"));
+    }
+
+    #[tokio::test]
+    async fn refusing_provider_merge_ops_returns_unimplemented() {
+        use openshell_core::proto::{
+            NetworkEndpoint, NetworkPolicyRule, PolicyMergeOperation, SandboxPhase, SandboxSpec,
+            policy_merge_operation,
+        };
+        let state = test_server_state().await;
+        let mut sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-merge".to_string(),
+                name: "sb-merge".to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+                resource_version: 0,
+            }),
+            spec: Some(SandboxSpec {
+                policy: Some(ProtoSandboxPolicy::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Provisioning as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let state = override_policy_provider(state, Arc::new(RefusingProvider));
+
+        let merge_op = PolicyMergeOperation {
+            operation: Some(policy_merge_operation::Operation::AddRule(
+                openshell_core::proto::AddNetworkRule {
+                    rule_name: "test-rule".to_string(),
+                    rule: Some(NetworkPolicyRule {
+                        endpoints: vec![NetworkEndpoint {
+                            host: "example.com".to_string(),
+                            port: 443,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }),
+                },
+            )),
+        };
+        let req = with_user(Request::new(UpdateConfigRequest {
+            name: "sb-merge".to_string(),
+            merge_operations: vec![merge_op],
+            ..Default::default()
+        }));
+        let err = handle_update_config(&state, req)
+            .await
+            .expect_err("refusing provider must reject update_policy");
+        assert_eq!(err.code(), Code::Unimplemented);
+        assert!(err.message().contains("update_policy"));
+    }
+
+    /// Sanity-check that the default `local` provider preserves the
+    /// status-quo behavior for the sandbox-scoped policy replacement
+    /// path: the gRPC handler still returns version=1 and a non-empty
+    /// hash for a brand-new sandbox policy (first-time discovery /
+    /// backfill).
+    #[tokio::test]
+    async fn local_provider_sandbox_set_succeeds_with_version_and_hash() {
+        use openshell_core::proto::{SandboxPhase, SandboxSpec};
+        let state = test_server_state().await;
+        let mut sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "sb-local".to_string(),
+                name: "sb-local".to_string(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
+                resource_version: 0,
+            }),
+            spec: Some(SandboxSpec {
+                policy: None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Provisioning as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+
+        let req = with_user(Request::new(UpdateConfigRequest {
+            name: "sb-local".to_string(),
+            policy: Some(ProtoSandboxPolicy::default()),
+            ..Default::default()
+        }));
+        let resp = handle_update_config(&state, req)
+            .await
+            .expect("local provider must accept set_policy");
+        let resp = resp.into_inner();
+        assert_eq!(resp.version, 1);
+        assert!(!resp.policy_hash.is_empty());
     }
 }

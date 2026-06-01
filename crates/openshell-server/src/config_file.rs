@@ -55,12 +55,42 @@ pub struct OpenShellRoot {
     #[serde(default)]
     pub gateway: GatewayFileSection,
 
+    /// `[openshell.policy]` table — selects the active policy-provider
+    /// type. `None` here is equivalent to the local default; the loader
+    /// validates the chosen type in [`load`].
+    #[serde(default)]
+    pub policy: Option<PolicyFileSection>,
+
     /// `[openshell.drivers.<name>]` tables — passed verbatim to each driver
     /// crate's `Deserialize` impl after the gateway-side inheritance merge.
     /// Stored as raw [`toml::Value`] so each driver can evolve its schema
     /// independently of this crate.
     #[serde(default)]
     pub drivers: BTreeMap<String, toml::Value>,
+}
+
+/// `[openshell.policy]` table.
+///
+/// Selects the policy-provider type. Today the only fully-supported value
+/// is `"local"`, which keeps the gateway's historical in-process,
+/// store-backed policy semantics. `"attested"` is reserved for the
+/// Attested Policy Projection provider (forthcoming session); declaring it
+/// today is parsed successfully but rejected at gateway startup with a
+/// clear "policy type not yet available" error.
+///
+/// The `type` key intentionally mirrors `openshell-providers`'
+/// `ProviderPlugin`-style selector convention rather than the APF/RFC
+/// "driver" vocabulary.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PolicyFileSection {
+    /// Policy-provider type. Accepted values: `"local"` (the default if
+    /// the table is omitted) and `"attested"` (declared but not yet
+    /// implemented). `type` is a Rust keyword, so the field is exposed as
+    /// `r#type` in code and renamed via `#[serde(rename = "type")]` for
+    /// the TOML surface.
+    #[serde(default, rename = "type")]
+    pub r#type: Option<String>,
 }
 
 /// `[openshell.gateway]` section.
@@ -182,6 +212,10 @@ pub enum ConfigFileError {
         env: &'static str,
         cli: &'static str,
     },
+    #[error(
+        "[openshell.policy] type = '{policy_type}' is not a recognized policy type; accepted values are 'local' (default) or 'attested' (not yet available)"
+    )]
+    UnknownPolicyType { policy_type: String },
 }
 
 /// Load and validate a TOML config file.
@@ -215,7 +249,31 @@ pub fn load(path: &Path) -> Result<ConfigFile, ConfigFileError> {
         });
     }
 
+    // Validate the optional policy-provider type. The "attested" value is
+    // accepted at parse time because the config file may be written ahead
+    // of the provider landing; startup is responsible for turning that
+    // into a clear "policy type not yet available" error.
+    if let Some(ref policy) = file.openshell.policy
+        && let Some(ref policy_type) = policy.r#type
+        && !is_known_policy_type(policy_type)
+    {
+        return Err(ConfigFileError::UnknownPolicyType {
+            policy_type: policy_type.clone(),
+        });
+    }
+
     Ok(file)
+}
+
+/// Policy-type strings recognized by the policy-provider config validator.
+/// `"local"` is the historical (and v0) default; `"attested"` is reserved
+/// for the forthcoming Attested Policy Projection provider and is parsed
+/// successfully so deployments can stage the value ahead of the provider
+/// landing.
+pub const KNOWN_POLICY_TYPES: &[&str] = &["local", "attested"];
+
+fn is_known_policy_type(policy_type: &str) -> bool {
+    KNOWN_POLICY_TYPES.contains(&policy_type)
 }
 
 /// Build the merged TOML table for `driver` by overlaying inheritable
@@ -428,6 +486,70 @@ ssh_gateway_port = 8080
 ";
         let tmp = write_tmp(toml);
         let err = load(tmp.path()).expect_err("removed SSH endpoint keys must be rejected");
+        assert!(matches!(err, ConfigFileError::Parse { .. }));
+    }
+
+    #[test]
+    fn parses_policy_type_local() {
+        let toml = r#"
+[openshell.policy]
+type = "local"
+"#;
+        let tmp = write_tmp(toml);
+        let file = load(tmp.path()).expect("local policy type parses");
+        let policy = file.openshell.policy.expect("policy table present");
+        assert_eq!(policy.r#type.as_deref(), Some("local"));
+    }
+
+    #[test]
+    fn parses_policy_type_attested() {
+        // "attested" is accepted at parse time; the gateway startup turns
+        // this into a clear "policy type not yet available" error so
+        // deployments can stage the value ahead of the provider landing.
+        let toml = r#"
+[openshell.policy]
+type = "attested"
+"#;
+        let tmp = write_tmp(toml);
+        let file = load(tmp.path()).expect("attested policy type parses");
+        let policy = file.openshell.policy.expect("policy table present");
+        assert_eq!(policy.r#type.as_deref(), Some("attested"));
+    }
+
+    #[test]
+    fn rejects_unknown_policy_type() {
+        let toml = r#"
+[openshell.policy]
+type = "nonsense"
+"#;
+        let tmp = write_tmp(toml);
+        let err = load(tmp.path()).expect_err("unknown policy type must be rejected");
+        assert!(matches!(
+            err,
+            ConfigFileError::UnknownPolicyType { ref policy_type } if policy_type == "nonsense"
+        ));
+    }
+
+    #[test]
+    fn missing_policy_table_is_ok() {
+        let toml = r#"
+[openshell.gateway]
+log_level = "info"
+"#;
+        let tmp = write_tmp(toml);
+        let file = load(tmp.path()).expect("absent policy table is allowed");
+        assert!(file.openshell.policy.is_none());
+    }
+
+    #[test]
+    fn rejects_unknown_policy_field() {
+        let toml = r#"
+[openshell.policy]
+type = "local"
+nonsense = true
+"#;
+        let tmp = write_tmp(toml);
+        let err = load(tmp.path()).expect_err("unknown policy field must be rejected");
         assert!(matches!(err, ConfigFileError::Parse { .. }));
     }
 
