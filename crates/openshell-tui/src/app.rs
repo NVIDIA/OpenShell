@@ -495,6 +495,8 @@ pub struct App {
     pub sandbox_providers_list: Vec<String>,
     pub policy_lines: Vec<ratatui::text::Line<'static>>,
     pub policy_scroll: usize,
+    /// Visible line count in the policy pane, set during draw for PageUp/PageDown.
+    pub policy_viewport_height: usize,
 
     // Create sandbox modal
     pub create_form: Option<CreateSandboxForm>,
@@ -656,6 +658,7 @@ impl App {
             sandbox_providers_list: Vec::new(),
             policy_lines: Vec::new(),
             policy_scroll: 0,
+            policy_viewport_height: 0,
             create_form: None,
             pending_create_sandbox: false,
             pending_forward_ports: Vec::new(),
@@ -1155,9 +1158,21 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => {
                 self.scroll_policy(-1);
             }
+            // Page-scroll by one viewport height.
+            KeyCode::PageDown => {
+                let delta = self.policy_viewport_height.max(1).cast_signed();
+                self.scroll_policy(delta);
+            }
+            KeyCode::PageUp => {
+                let delta = self.policy_viewport_height.max(1).cast_signed();
+                self.scroll_policy(-delta);
+            }
             KeyCode::Char('G') => {
-                // Scroll to bottom.
-                self.policy_scroll = self.policy_lines.len().saturating_sub(1);
+                // Scroll to bottom, keeping a full viewport visible.
+                self.policy_scroll = self
+                    .policy_lines
+                    .len()
+                    .saturating_sub(self.policy_viewport_height.max(1));
             }
             KeyCode::Char('g') => {
                 self.policy_scroll = 0;
@@ -1426,6 +1441,21 @@ impl App {
                     self.draft_scroll -= 1;
                 }
             }
+            // Page-scroll by one viewport height, clamping the cursor to
+            // stay within the visible range.
+            KeyCode::PageDown if total > 0 => {
+                let page = vh.max(1);
+                let max_scroll = total.saturating_sub(vh.min(total));
+                self.draft_scroll = (self.draft_scroll + page).min(max_scroll);
+                let visible = total.saturating_sub(self.draft_scroll).min(vh);
+                self.draft_selected = self.draft_selected.min(visible.saturating_sub(1));
+            }
+            KeyCode::PageUp if total > 0 => {
+                let page = vh.max(1);
+                self.draft_scroll = self.draft_scroll.saturating_sub(page);
+                let visible = total.saturating_sub(self.draft_scroll).min(vh);
+                self.draft_selected = self.draft_selected.min(visible.saturating_sub(1));
+            }
             KeyCode::Char('g') => {
                 self.draft_scroll = 0;
                 self.draft_selected = 0;
@@ -1490,16 +1520,15 @@ impl App {
     }
 
     /// Scroll policy pane by a delta (positive = down, negative = up).
+    ///
+    /// Clamps so at least one viewport of content remains visible.
     pub fn scroll_policy(&mut self, delta: isize) {
-        let max = self.policy_lines.len().saturating_sub(1);
-        if delta < 0 {
-            self.policy_scroll = self.policy_scroll.saturating_sub(delta.unsigned_abs());
-        } else {
-            #[allow(clippy::cast_sign_loss)]
-            {
-                self.policy_scroll = (self.policy_scroll + delta as usize).min(max);
-            }
-        }
+        self.policy_scroll = clamped_scroll(
+            self.policy_scroll,
+            delta,
+            self.policy_lines.len(),
+            self.policy_viewport_height,
+        );
     }
 
     fn handle_logs_key(&mut self, key: KeyEvent) {
@@ -1606,6 +1635,17 @@ impl App {
                 } else if self.sandbox_log_scroll > 0 {
                     self.sandbox_log_scroll -= 1;
                 }
+                self.log_autoscroll = false;
+            }
+            // Page-scroll by one viewport height.
+            KeyCode::PageDown => {
+                let delta = vh.max(1).cast_signed();
+                self.scroll_logs(delta);
+                self.log_autoscroll = false;
+            }
+            KeyCode::PageUp => {
+                let delta = vh.max(1).cast_signed();
+                self.scroll_logs(-delta);
                 self.log_autoscroll = false;
             }
             KeyCode::Char('G' | 'f') => {
@@ -2246,4 +2286,95 @@ fn unique_provider_name(base: &str, existing: &[String]) -> String {
         }
     }
     base.to_string()
+}
+
+/// Compute a new scroll position after applying `delta`, clamped so the last
+/// viewport of content remains visible.
+///
+/// * `current` - current scroll offset
+/// * `delta`   - lines to scroll (positive = down, negative = up)
+/// * `total`   - total number of lines/items
+/// * `viewport` - visible line count (0 before first draw, treated as 1)
+fn clamped_scroll(current: usize, delta: isize, total: usize, viewport: usize) -> usize {
+    let max = total.saturating_sub(viewport.max(1));
+    if delta < 0 {
+        current.saturating_sub(delta.unsigned_abs())
+    } else {
+        #[allow(clippy::cast_sign_loss)]
+        let stepped = current + delta as usize;
+        stepped.min(max)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- clamped_scroll -------------------------------------------------
+
+    #[test]
+    fn scroll_empty_content() {
+        // No lines at all: scroll should stay at 0 regardless of delta.
+        assert_eq!(clamped_scroll(0, 1, 0, 10), 0);
+        assert_eq!(clamped_scroll(0, -1, 0, 10), 0);
+        assert_eq!(clamped_scroll(0, 20, 0, 10), 0);
+    }
+
+    #[test]
+    fn scroll_content_shorter_than_viewport() {
+        // 5 lines in a 10-line viewport: max scroll is 0.
+        assert_eq!(clamped_scroll(0, 1, 5, 10), 0);
+        assert_eq!(clamped_scroll(0, 5, 5, 10), 0);
+    }
+
+    #[test]
+    fn scroll_content_equals_viewport() {
+        // Exactly 10 lines in a 10-line viewport: max scroll is 0.
+        assert_eq!(clamped_scroll(0, 1, 10, 10), 0);
+        assert_eq!(clamped_scroll(0, -1, 10, 10), 0);
+    }
+
+    #[test]
+    fn scroll_down_one() {
+        // 100 lines, viewport 20, start at 0: scroll to 1.
+        assert_eq!(clamped_scroll(0, 1, 100, 20), 1);
+    }
+
+    #[test]
+    fn scroll_page_down() {
+        // 100 lines, viewport 20, start at 0: scroll to 20.
+        assert_eq!(clamped_scroll(0, 20, 100, 20), 20);
+    }
+
+    #[test]
+    fn scroll_page_down_clamps_at_bottom() {
+        // 100 lines, viewport 20: max scroll = 80.
+        assert_eq!(clamped_scroll(75, 20, 100, 20), 80);
+        assert_eq!(clamped_scroll(80, 20, 100, 20), 80);
+    }
+
+    #[test]
+    fn scroll_page_up_from_middle() {
+        assert_eq!(clamped_scroll(40, -20, 100, 20), 20);
+    }
+
+    #[test]
+    fn scroll_page_up_clamps_at_top() {
+        // Scrolling up past 0 saturates to 0.
+        assert_eq!(clamped_scroll(5, -20, 100, 20), 0);
+        assert_eq!(clamped_scroll(0, -1, 100, 20), 0);
+    }
+
+    #[test]
+    fn scroll_viewport_zero_before_first_draw() {
+        // viewport=0 is treated as 1 (the .max(1) fallback).
+        // 100 lines, viewport 0 -> max = 99.
+        assert_eq!(clamped_scroll(0, 1, 100, 0), 1);
+        assert_eq!(clamped_scroll(98, 5, 100, 0), 99);
+    }
+
+    #[test]
+    fn scroll_up_one() {
+        assert_eq!(clamped_scroll(10, -1, 100, 20), 9);
+    }
 }
