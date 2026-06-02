@@ -109,22 +109,19 @@ Append these flags to any of the PostgreSQL commands above for OpenShift:
 --set securityContext.runAsUser=null
 ```
 
-## PKI bootstrap
+## Secret bootstrap
 
 By default, a pre-install/pre-upgrade hook Job runs `openshell-gateway generate-certs`
-to create the gateway's server and client mTLS Secrets. The Job uses the gateway image
-itself, so air-gapped environments only need to mirror that one image (no separate
-openssl/alpine sidecar).
+to create the gateway's server/client mTLS Secrets and sandbox JWT signing Secret.
+The Job uses the gateway image itself, so air-gapped environments only need to
+mirror that one image (no separate openssl/alpine sidecar).
 
-The Job is idempotent:
-
-- Both target Secrets exist: log and exit 0.
-- Exactly one exists: fail with `kubectl delete secret -n <ns> <server> <client>` recovery hint.
-- Neither exists: generate a CA, server cert, and client cert; POST both `kubernetes.io/tls` Secrets (`tls.crt`, `tls.key`, `ca.crt`).
-
-Disable with `--set pkiInitJob.enabled=false` when bringing your own PKI (cert-manager,
-external CA, or pre-created Secrets). See `certManager.*` in `values.yaml` for the
-cert-manager alternative.
+When `certManager.enabled=true`, cert-manager owns the TLS Secrets and the chart
+runs the same hook in JWT-only mode because cert-manager does not create the
+sandbox JWT signing Secret. This precedence applies even if
+`pkiInitJob.enabled` remains true. Set `pkiInitJob.enabled=false` only when an
+external non-cert-manager TLS source manages TLS and you pre-create the sandbox
+JWT signing Secret.
 
 ## Values
 
@@ -135,7 +132,7 @@ cert-manager alternative.
 | certManager.certificateDuration | string | `"8760h"` | Duration for cert-manager-issued certificates. |
 | certManager.certificateRenewBefore | string | `"720h"` | Renewal window for cert-manager-issued certificates. |
 | certManager.clientCaFromServerTlsSecret | bool | `true` | Mount gateway client CA from the server TLS secret's ca.crt (populated by cert-manager for certs issued by a CA Issuer). Avoids a separate openshell-server-client-ca Secret. |
-| certManager.enabled | bool | `false` | Create cert-manager Issuer and Certificate resources instead of using the PKI bootstrap Job. |
+| certManager.enabled | bool | `false` | Create cert-manager Issuer and Certificate resources. When enabled, cert-manager owns TLS and the chart runs a JWT-only certgen hook to create the sandbox JWT signing Secret that cert-manager does not manage. |
 | certManager.serverDnsNames | list | `["openshell","openshell.openshell.svc","openshell.openshell.svc.cluster.local","localhost","openshell.localhost","*.openshell.localhost","host.docker.internal"]` | DNS SANs on the cert-manager-issued server certificate. |
 | certManager.serverIpAddresses | list | `["127.0.0.1"]` | IP SANs on the cert-manager-issued server certificate. |
 | fullnameOverride | string | `""` | Override the full generated resource name. |
@@ -155,7 +152,7 @@ cert-manager alternative.
 | nameOverride | string | `"openshell"` | Override the chart name used in generated resource names. |
 | networkPolicy.enabled | bool | `true` | Create a NetworkPolicy restricting SSH ingress on sandbox pods to the gateway. |
 | nodeSelector | object | `{}` | Node selector for the gateway pod. |
-| pkiInitJob.enabled | bool | `true` | Run a pre-install/pre-upgrade Job that creates gateway and client mTLS Secrets. |
+| pkiInitJob.enabled | bool | `true` | Run a pre-install/pre-upgrade Job that creates gateway and client mTLS Secrets. When certManager.enabled=true, cert-manager owns TLS and this same hook runs in JWT-only mode even if pkiInitJob.enabled remains true. |
 | pkiInitJob.serverDnsNames | list | `[]` | Extra DNS SANs to append to the server certificate. |
 | pkiInitJob.serverIpAddresses | list | `[]` | Extra IP SANs to append to the server certificate. |
 | podAnnotations | object | `{}` | Extra annotations to add to the gateway pod. |

@@ -18,7 +18,10 @@ The OpenShell gateway uses mTLS certificates for transport between the gateway a
 The rest of this page covers switching to cert-manager. The built-in mode requires no configuration.
 
 <Note>
-cert-manager and `pkiInitJob` are mutually exclusive. The chart fails if both are enabled at the same time.
+When `certManager.enabled=true`, cert-manager owns TLS certificate generation.
+The chart still runs a JWT-only initialization hook because cert-manager does
+not create the sandbox JWT signing Secret required by the gateway. This
+cert-manager precedence applies even if `pkiInitJob.enabled` remains true.
 </Note>
 
 ## Install cert-manager
@@ -50,11 +53,13 @@ helm upgrade --install openshell \
   oci://ghcr.io/nvidia/openshell/helm-chart \
   --version <version> \
   --namespace openshell \
-  --set certManager.enabled=true \
-  --set pkiInitJob.enabled=false
+  --set certManager.enabled=true
 ```
 
 The chart creates a self-signed CA, issues server and client certificates from it, and cert-manager handles renewal before expiry.
+The chart also runs a pre-install hook in JWT-only mode to create the gateway's
+sandbox JWT signing Secret. That Secret is separate from the cert-manager TLS
+certificate Secrets and is mounted at `/etc/openshell-jwt`.
 
 ## Next Steps
 

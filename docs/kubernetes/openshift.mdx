@@ -54,9 +54,13 @@ helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart \
 
 | Override | Reason |
 |---|---|
-| `pkiInitJob.enabled=false` | The PKI init Job runs as a non-root user with a fixed UID, which the SCC admission rewrites or rejects. Disabling it skips the Job; TLS must also be disabled. |
+| `pkiInitJob.enabled=false` | Skips the built-in TLS PKI Job. TLS must also be disabled unless you provide TLS Secrets another way. |
 | `server.disableTls=true` | The gateway has no certificates without `pkiInitJob`, so it must run plaintext. |
 | `podSecurityContext.fsGroup=null` / `securityContext.runAsUser=null` | Clear the chart's hardcoded UID and fsGroup so OpenShift's SCC admission can assign them. |
+
+The gateway still needs the sandbox JWT signing Secret. When disabling
+`pkiInitJob` without enabling cert-manager, pre-create that Secret before
+installing the chart.
 
 ## Wait for the gateway to be ready
 

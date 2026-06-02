@@ -134,6 +134,13 @@ Name of the Secret holding the PostgreSQL connection URI.
 {{- end }}
 
 {{/*
+Name of the Secret holding gateway-minted sandbox JWT signing material.
+*/}}
+{{- define "openshell.sandboxJwtSecretName" -}}
+{{- .Values.server.sandboxJwt.signingSecretName | default (printf "%s-jwt-keys" (include "openshell.fullname" .)) -}}
+{{- end }}
+
+{{/*
 gRPC endpoint sandbox pods use to call back into the gateway. An explicit
 .Values.server.grpcEndpoint is used verbatim. Otherwise it is derived from
 the in-cluster Service DNS, release namespace, service port, and disableTls

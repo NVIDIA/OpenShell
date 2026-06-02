@@ -363,32 +363,39 @@ requested for that relay.
 
 ## PKI Bootstrap
 
-`openshell-gateway generate-certs` is the one place mTLS materials are
-created. Both deployment paths use it:
+`openshell-gateway generate-certs` is the one place local mTLS materials and
+sandbox JWT signing material are created. Deployment paths use it as follows:
 
 | Output mode | Selector | Layout |
 |---|---|---|
-| Kubernetes Secrets | (default) `--namespace`, `--server-secret-name`, `--client-secret-name` | Two `kubernetes.io/tls` Secrets with `tls.crt` / `tls.key` / `ca.crt`. |
-| Filesystem | `--output-dir <DIR>` | `<dir>/{ca.crt, ca.key, server/tls.{crt,key}, client/tls.{crt,key}}`. Also copies client materials to `$XDG_CONFIG_HOME/openshell/gateways/openshell/mtls/` for CLI auto-discovery. |
+| Kubernetes Secrets | (default) `--namespace`, `--server-secret-name`, `--client-secret-name`, `--jwt-secret-name` | Two `kubernetes.io/tls` Secrets with `tls.crt` / `tls.key` / `ca.crt` plus one Opaque sandbox JWT Secret with `signing.pem` / `public.pem` / `kid`. |
+| Kubernetes JWT-only Secret | `--namespace`, `--jwt-only`, `--jwt-secret-name` | One Opaque sandbox JWT Secret with `signing.pem` / `public.pem` / `kid`. |
+| Filesystem | `--output-dir <DIR>` | `<dir>/{ca.crt, ca.key, server/tls.{crt,key}, client/tls.{crt,key}, jwt/{signing.pem,public.pem,kid}}`. Also copies client materials to `$XDG_CONFIG_HOME/openshell/gateways/openshell/mtls/` for CLI auto-discovery. |
 
 On Kubernetes, the Helm chart runs the command via a pre-install/pre-upgrade
 hook Job using the gateway image itself -- no separate cert-generation image,
-no extra mirror burden in air-gapped environments. On package-managed local
-gateways, the same command runs from the systemd unit's `ExecStartPre` to
-bootstrap PKI into the configured local TLS directory on first start. The
-Linux package unit defaults that directory to `~/.local/state/openshell/tls`
-through `OPENSHELL_LOCAL_TLS_DIR` so certificate generation and runtime
-auto-detection use the same path across systemd versions.
+no extra mirror burden in air-gapped environments. In the default built-in PKI
+path the hook creates TLS and sandbox JWT Secrets. When cert-manager is enabled,
+cert-manager owns TLS Secrets and the hook runs with `--jwt-only` so the
+required sandbox JWT Secret still exists before the gateway StatefulSet mounts
+it, even if `pkiInitJob.enabled` remains true. On package-managed local
+gateways, the same command runs from the systemd
+unit's `ExecStartPre` to bootstrap PKI into the configured local TLS directory
+on first start. The Linux package unit defaults that directory to
+`~/.local/state/openshell/tls` through `OPENSHELL_LOCAL_TLS_DIR` so certificate
+generation and runtime auto-detection use the same path across systemd
+versions.
 
-Both modes share the same idempotency contract: all targets present -> skip;
-partial state -> fail with a recovery hint; nothing present -> generate and
-write. This guards mTLS continuity across restarts and upgrades while still
-recovering cleanly if an operator deletes everything and starts over.
+The bootstrap paths share the same idempotency contract: all requested targets
+present -> skip; partial requested state -> fail with a recovery hint; nothing
+requested present -> generate and write. This guards continuity across restarts
+and upgrades while still recovering cleanly if an operator deletes everything
+and starts over.
 
-Operators who manage PKI externally (cert-manager, an enterprise CA, or
-pre-created Secrets) disable the Helm hook via `pkiInitJob.enabled=false`.
-The chart also ships a `certManager.*` path that produces equivalent Secrets
-through cert-manager `Issuer`/`Certificate` resources.
+Operators who manage TLS PKI with cert-manager enable `certManager.enabled`;
+cert-manager takes precedence over built-in TLS generation and the chart still
+renders the JWT-only hook. Operators who pre-create all TLS and JWT Secrets can
+disable both `pkiInitJob.enabled` and `certManager.enabled`.
 
 ## Configuration
 

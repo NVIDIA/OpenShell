@@ -196,9 +196,11 @@ server:
     clientCaSecretName: openshell-server-client-ca
     # -- K8s secret mounted into sandbox pods for mTLS to the server.
     clientTlsSecretName: openshell-client-tls
-  # Gateway-minted sandbox JWT signing keys. The pre-install certgen hook
-  # generates an Ed25519 keypair and writes it to a secret containing
-  # signing.pem (PKCS#8), public.pem (SPKI), and kid (plain text).
+  # Gateway-minted sandbox JWT signing keys. The certgen hook generates an
+  # Ed25519 keypair and writes it to a secret containing signing.pem (PKCS#8),
+  # public.pem (SPKI), and kid (plain text). The hook runs in full PKI mode when
+  # pkiInitJob.enabled=true unless certManager.enabled=true, which takes
+  # precedence and runs the hook in JWT-only mode.
   sandboxJwt:
     # -- Name of the Opaque Secret holding the signing key material. Empty
     # falls back to the chart fullname with "-jwt-keys" appended.
@@ -270,7 +272,7 @@ networkPolicy:
   # -- Create a NetworkPolicy restricting SSH ingress on sandbox pods to the gateway.
   enabled: true
 
-# PKI bootstrap via a pre-install/pre-upgrade hook Job.
+# Built-in TLS PKI bootstrap via a pre-install/pre-upgrade hook Job.
 # Runs `openshell-gateway generate-certs` to create the server and client TLS
 # Secrets in-cluster. Key material is written directly to K8s Secrets and
 # never appears in Helm release history. Idempotent: existing secrets are
@@ -285,7 +287,9 @@ networkPolicy:
 # that domain, for example `*.apps.example.com` enables
 # `<sandbox>--<service>.apps.example.com`.
 pkiInitJob:
-  # -- Run a pre-install/pre-upgrade Job that creates gateway and client mTLS Secrets.
+  # -- Run a pre-install/pre-upgrade Job that creates gateway and client mTLS
+  # Secrets. When certManager.enabled=true, cert-manager owns TLS and this same
+  # hook runs in JWT-only mode even if pkiInitJob.enabled remains true.
   enabled: true
   # -- Extra DNS SANs to append to the server certificate.
   serverDnsNames: []
@@ -295,7 +299,9 @@ pkiInitJob:
 # cert-manager Certificate/Issuer resources (requires cert-manager CRDs in-cluster).
 # Uses namespaced Issuers only (no ClusterIssuer). Does not install cert-manager itself.
 certManager:
-  # -- Create cert-manager Issuer and Certificate resources instead of using the PKI bootstrap Job.
+  # -- Create cert-manager Issuer and Certificate resources. When enabled,
+  # cert-manager owns TLS and the chart runs a JWT-only certgen hook to create
+  # the sandbox JWT signing Secret that cert-manager does not manage.
   enabled: false
   # -- Secret created for the intermediate CA (Certificate with isCA: true).
   caSecretName: openshell-ca-tls

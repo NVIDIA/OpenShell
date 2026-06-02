@@ -1,10 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-{{- if and .Values.pkiInitJob.enabled .Values.certManager.enabled }}
-{{- fail "pkiInitJob.enabled and certManager.enabled cannot both be true; disable one to avoid conflicting PKI sources." }}
-{{- end }}
-{{- if .Values.pkiInitJob.enabled }}
+{{- if or .Values.pkiInitJob.enabled .Values.certManager.enabled }}
 {{- $hookName := printf "%s-certgen" (include "openshell.fullname" .) }}
 {{- $ns := .Release.Namespace }}
 apiVersion: v1
@@ -98,13 +95,19 @@ spec:
           command: ["/usr/local/bin/openshell-gateway"]
           args:
             - generate-certs
+            {{- if .Values.certManager.enabled }}
+            - --jwt-only
+            {{- else }}
             - --server-secret-name={{ .Values.server.tls.certSecretName }}
             - --client-secret-name={{ .Values.server.tls.clientTlsSecretName }}
-            - --jwt-secret-name={{ .Values.server.sandboxJwt.signingSecretName | default (printf "%s-jwt-keys" (include "openshell.fullname" .)) }}
+            {{- end }}
+            - --jwt-secret-name={{ include "openshell.sandboxJwtSecretName" . }}
+            {{- if and .Values.pkiInitJob.enabled (not .Values.certManager.enabled) }}
             {{- range .Values.pkiInitJob.serverDnsNames }}
             - --server-san={{ . }}
             {{- end }}
             {{- range .Values.pkiInitJob.serverIpAddresses }}
             - --server-san={{ . }}
+            {{- end }}
             {{- end }}
 {{- end }}

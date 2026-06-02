@@ -147,7 +147,7 @@ spec:
             name: {{ include "openshell.fullname" . }}-config
         - name: sandbox-jwt
           secret:
-            secretName: {{ .Values.server.sandboxJwt.signingSecretName | default (printf "%s-jwt-keys" (include "openshell.fullname" .)) }}
+            secretName: {{ include "openshell.sandboxJwtSecretName" . }}
             defaultMode: {{ .Values.server.sandboxJwt.secretDefaultMode | default 0400 }}
         {{- if not .Values.server.disableTls }}
         - name: tls-cert

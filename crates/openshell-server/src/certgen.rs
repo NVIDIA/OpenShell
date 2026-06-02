@@ -6,8 +6,12 @@
 //! Two output modes, dispatched by the presence of `--output-dir`:
 //!
 //! - **Kubernetes mode** (default): create two `kubernetes.io/tls` Secrets
-//!   in the supplied namespace. Used by the Helm pre-install hook. Requires
-//!   `--namespace`, `--server-secret-name`, `--client-secret-name`.
+//!   and one sandbox-JWT signing Secret in the supplied namespace. Used by
+//!   the Helm pre-install hook. Requires `--namespace`,
+//!   `--server-secret-name`, `--client-secret-name`, and `--jwt-secret-name`.
+//! - **Kubernetes JWT-only mode** (`--jwt-only`): create only the
+//!   sandbox-JWT signing Secret. Used when another controller, such as
+//!   cert-manager, owns the TLS Secrets.
 //! - **Local mode** (`--output-dir <DIR>`): write PEMs to the local package
 //!   filesystem layout. Used by systemd units' `ExecStartPre`. Also copies
 //!   client materials to
@@ -47,11 +51,11 @@ pub struct CertgenArgs {
     namespace: Option<String>,
 
     /// Name of the server TLS Secret (`kubernetes.io/tls`) to create.
-    #[arg(long, required_unless_present = "output_dir")]
+    #[arg(long, required_unless_present_any = ["output_dir", "jwt_only"])]
     server_secret_name: Option<String>,
 
     /// Name of the client TLS Secret (`kubernetes.io/tls`) to create.
-    #[arg(long, required_unless_present = "output_dir")]
+    #[arg(long, required_unless_present_any = ["output_dir", "jwt_only"])]
     client_secret_name: Option<String>,
 
     /// Name of the sandbox-JWT signing-key Secret (`Opaque`) to create.
@@ -59,6 +63,11 @@ pub struct CertgenArgs {
     /// gateway pod (only) so it can mint and validate per-sandbox JWTs.
     #[arg(long, required_unless_present = "output_dir")]
     jwt_secret_name: Option<String>,
+
+    /// Create only the sandbox-JWT signing-key Secret in Kubernetes mode.
+    /// This is used when another controller owns TLS Secret provisioning.
+    #[arg(long, conflicts_with = "output_dir")]
+    jwt_only: bool,
 
     /// Extra Subject Alternative Name for the server certificate. Repeatable.
     /// Auto-detected as an IP address or DNS name.
@@ -116,6 +125,51 @@ async fn run_kubernetes(args: &CertgenArgs, bundle: &PkiBundle) -> Result<()> {
         .namespace
         .as_deref()
         .ok_or_else(|| miette::miette!("--namespace is required (or set POD_NAMESPACE)"))?;
+
+    let client = Client::try_default()
+        .await
+        .into_diagnostic()
+        .wrap_err("failed to construct in-cluster Kubernetes client")?;
+    let api: Api<Secret> = Api::namespaced(client, namespace);
+
+    if args.jwt_only {
+        let jwt_name = args
+            .jwt_secret_name
+            .as_deref()
+            .ok_or_else(|| miette::miette!("--jwt-secret-name is required"))?;
+        let jwt_exists = api
+            .get_opt(jwt_name)
+            .await
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to read secret {jwt_name}"))?
+            .is_some();
+        if jwt_exists {
+            info!(
+                namespace = %namespace,
+                jwt = %jwt_name,
+                "JWT signing secret already exists, skipping."
+            );
+            return Ok(());
+        }
+
+        let jwt_secret = jwt_signing_secret(
+            jwt_name,
+            &bundle.jwt_signing_key_pem,
+            &bundle.jwt_public_key_pem,
+            &bundle.jwt_key_id,
+        );
+        api.create(&PostParams::default(), &jwt_secret)
+            .await
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to create secret {jwt_name}"))?;
+        info!(
+            namespace = %namespace,
+            jwt = %jwt_name,
+            "JWT signing secret created."
+        );
+        return Ok(());
+    }
+
     let server_name = args
         .server_secret_name
         .as_deref()
@@ -124,17 +178,6 @@ async fn run_kubernetes(args: &CertgenArgs, bundle: &PkiBundle) -> Result<()> {
         .client_secret_name
         .as_deref()
         .ok_or_else(|| miette::miette!("--client-secret-name is required"))?;
-    let jwt_name = args
-        .jwt_secret_name
-        .as_deref()
-        .ok_or_else(|| miette::miette!("--jwt-secret-name is required"))?;
-
-    let client = Client::try_default()
-        .await
-        .into_diagnostic()
-        .wrap_err("failed to construct in-cluster Kubernetes client")?;
-    let api: Api<Secret> = Api::namespaced(client, namespace);
-
     let server_exists = api
         .get_opt(server_name)
         .await
@@ -147,6 +190,11 @@ async fn run_kubernetes(args: &CertgenArgs, bundle: &PkiBundle) -> Result<()> {
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to read secret {client_name}"))?
         .is_some();
+
+    let jwt_name = args
+        .jwt_secret_name
+        .as_deref()
+        .ok_or_else(|| miette::miette!("--jwt-secret-name is required"))?;
     let jwt_exists = api
         .get_opt(jwt_name)
         .await
@@ -193,33 +241,13 @@ async fn run_kubernetes(args: &CertgenArgs, bundle: &PkiBundle) -> Result<()> {
         K8sAction::CreateAll => {}
     }
 
-    let server_secret = tls_secret(
-        server_name,
-        &bundle.server_cert_pem,
-        &bundle.server_key_pem,
-        &bundle.ca_cert_pem,
-    );
-    let client_secret = tls_secret(
-        client_name,
-        &bundle.client_cert_pem,
-        &bundle.client_key_pem,
-        &bundle.ca_cert_pem,
-    );
+    create_tls_secrets(&api, server_name, client_name, bundle).await?;
     let jwt_secret = jwt_signing_secret(
         jwt_name,
         &bundle.jwt_signing_key_pem,
         &bundle.jwt_public_key_pem,
         &bundle.jwt_key_id,
     );
-
-    api.create(&PostParams::default(), &server_secret)
-        .await
-        .into_diagnostic()
-        .wrap_err_with(|| format!("failed to create secret {server_name}"))?;
-    api.create(&PostParams::default(), &client_secret)
-        .await
-        .into_diagnostic()
-        .wrap_err_with(|| format!("failed to create secret {client_name}"))?;
     api.create(&PostParams::default(), &jwt_secret)
         .await
         .into_diagnostic()
@@ -232,6 +260,36 @@ async fn run_kubernetes(args: &CertgenArgs, bundle: &PkiBundle) -> Result<()> {
         jwt = %jwt_name,
         "PKI secrets created."
     );
+    Ok(())
+}
+
+async fn create_tls_secrets(
+    api: &Api<Secret>,
+    server_name: &str,
+    client_name: &str,
+    bundle: &PkiBundle,
+) -> Result<()> {
+    let server_secret = tls_secret(
+        server_name,
+        &bundle.server_cert_pem,
+        &bundle.server_key_pem,
+        &bundle.ca_cert_pem,
+    );
+    let client_secret = tls_secret(
+        client_name,
+        &bundle.client_cert_pem,
+        &bundle.client_key_pem,
+        &bundle.ca_cert_pem,
+    );
+
+    api.create(&PostParams::default(), &server_secret)
+        .await
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to create secret {server_name}"))?;
+    api.create(&PostParams::default(), &client_secret)
+        .await
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to create secret {client_name}"))?;
     Ok(())
 }
 

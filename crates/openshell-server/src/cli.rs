@@ -980,6 +980,31 @@ mod tests {
     }
 
     #[test]
+    fn generate_certs_jwt_only_parses_without_tls_secret_names() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g1 = EnvVarGuard::remove("OPENSHELL_DB_URL");
+        let _g2 = EnvVarGuard::remove("POD_NAMESPACE");
+
+        let cli = Cli::try_parse_from([
+            "openshell-gateway",
+            "generate-certs",
+            "--namespace",
+            "openshell",
+            "--jwt-only",
+            "--jwt-secret-name",
+            "openshell-jwt-keys",
+        ])
+        .expect("--jwt-only should make TLS secret-name flags optional");
+
+        assert!(matches!(
+            cli.command,
+            Some(super::Commands::GenerateCerts(_))
+        ));
+    }
+
+    #[test]
     fn bare_invocation_with_no_db_url_parses_for_runtime_defaults() {
         // db_url is Option<String> at the clap level so subcommand parsing
         // does not require it. The Run path fills a default URL from XDG
