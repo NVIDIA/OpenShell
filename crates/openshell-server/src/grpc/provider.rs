@@ -5,12 +5,12 @@
 
 #![allow(clippy::result_large_err)] // gRPC handlers return Result<Response<_>, Status>
 
-use crate::persistence::{
-    ObjectId, ObjectLabels, ObjectName, ObjectType, Store, WriteCondition, generate_name,
-};
 use crate::auth::identity::IdentityProvider;
 use crate::auth::oidc::RawBearerToken;
 use crate::auth::principal::Principal;
+use crate::persistence::{
+    ObjectId, ObjectLabels, ObjectName, ObjectType, Store, WriteCondition, generate_name,
+};
 use openshell_core::proto::{Provider, Sandbox};
 use openshell_core::telemetry::{
     LifecycleOperation, ProviderProfile as TelemetryProviderProfile, TelemetryOutcome,
@@ -1847,7 +1847,13 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             ids,
-            vec!["claude-code", "github", "google-vertex-ai", "nvidia",]
+            vec![
+                "claude-code",
+                "github",
+                "google-vertex-ai",
+                "nvidia",
+                "okta-obo",
+            ]
         );
 
         let github = response

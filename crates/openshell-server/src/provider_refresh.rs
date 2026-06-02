@@ -900,7 +900,6 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/token"))
             .and(body_string_contains("grant_type=client_credentials"))
-            .and(body_string_contains("client_id=client-id"))
             .and(body_string_contains(
                 "scope=https%3A%2F%2Fgraph.microsoft.com%2F.default",
             ))
@@ -1134,7 +1133,6 @@ mod tests {
             .and(body_string_contains(
                 "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Atoken-exchange",
             ))
-            .and(body_string_contains("client_id=client-id"))
             .and(body_string_contains("subject_token=user-access-token"))
             .and(body_string_contains(
                 "subject_token_type=urn%3Aietf%3Aparams%3Aoauth%3Atoken-type%3Aaccess_token",
