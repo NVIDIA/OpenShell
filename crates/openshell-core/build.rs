@@ -26,15 +26,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Protobuf compilation ---
     // Re-run when anything under proto/ changes (including newly added .proto files).
     println!("cargo:rerun-if-changed={PROTO_REL}");
-    // Use bundled protoc from protobuf-src.  The system protoc (from apt-get)
-    // does not bundle the well-known type includes (google/protobuf/struct.proto
-    // etc.), so we must use protobuf-src which ships both the binary and the
-    // include tree.
-    // SAFETY: This is run at build time in a single-threaded build script context.
-    // No other threads are reading environment variables concurrently.
-    #[allow(unsafe_code)]
-    unsafe {
-        env::set_var("PROTOC", protobuf_src::protoc());
+    if env::var_os("PROTOC").is_none() && !path_has_protoc() {
+        // Keep non-Nix builds working without requiring users to install protoc.
+        // Nix builds provide protoc explicitly, so they do not rely on this
+        // vendored fallback.
+        // SAFETY: This is run at build time in a single-threaded build script context.
+        // No other threads are reading environment variables concurrently.
+        #[allow(unsafe_code)]
+        unsafe {
+            env::set_var("PROTOC", protobuf_src::protoc());
+        }
     }
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
@@ -74,6 +75,16 @@ fn collect_proto_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()
         }
     }
     Ok(())
+}
+
+fn path_has_protoc() -> bool {
+    let Some(path) = env::var_os("PATH") else {
+        return false;
+    };
+
+    env::split_paths(&path)
+        .map(|dir| dir.join(format!("protoc{}", env::consts::EXE_SUFFIX)))
+        .any(|candidate| candidate.is_file())
 }
 
 /// Derive a version string from `git describe --tags`.

@@ -9,7 +9,10 @@ let
   # z3 (found via pkg-config) and libclang (for z3-sys bindgen) are only needed
   # by crates whose closure contains openshell-prover.
   withZ3 = {
-    nativeBuildInputs = [ pkgs.pkg-config ];
+    nativeBuildInputs = [
+      pkgs.pkg-config
+      pkgs.protobuf
+    ];
     buildInputs = [ pkgs.z3 ];
     env.LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
   };
@@ -37,6 +40,7 @@ in
   };
   openshell-sandbox = {
     dir = "openshell-sandbox";
+    nativeBuildInputs = [ pkgs.protobuf ];
     assets = [
       (root + "/proto")
       (root + "/crates/openshell-sandbox/data")
@@ -45,6 +49,7 @@ in
   };
   openshell-driver-vm = {
     dir = "openshell-driver-vm";
+    nativeBuildInputs = [ pkgs.protobuf ];
     assets = [
       (root + "/proto")
       (root + "/crates/openshell-driver-vm/scripts")
@@ -52,10 +57,12 @@ in
   };
   openshell-driver-kubernetes = {
     dir = "openshell-driver-kubernetes";
+    nativeBuildInputs = [ pkgs.protobuf ];
     assets = [ (root + "/proto") ];
   };
   openshell-driver-podman = {
     dir = "openshell-driver-podman";
+    nativeBuildInputs = [ pkgs.protobuf ];
     assets = [ (root + "/proto") ];
   };
 }
