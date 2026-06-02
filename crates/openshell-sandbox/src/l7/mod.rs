@@ -197,18 +197,28 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
         Some(other) if !other.is_empty() => {
             let event = openshell_ocsf::NetworkActivityBuilder::new(crate::ocsf_ctx())
                 .activity(openshell_ocsf::ActivityId::Other)
-                .severity(openshell_ocsf::SeverityId::Medium)
+                .severity(openshell_ocsf::SeverityId::High)
                 .message(format!(
-                    "unrecognized credential_signing value {other:?}, falling back to none"
+                    "rejecting endpoint: unrecognized credential_signing value {other:?}"
                 ))
                 .build();
             openshell_ocsf::ocsf_emit!(event);
-            CredentialSigning::None
+            return None;
         }
         _ => CredentialSigning::None,
     };
 
     let signing_service = get_object_str(val, "signing_service").unwrap_or_default();
+
+    if credential_signing.is_sigv4() && signing_service.is_empty() {
+        let event = openshell_ocsf::NetworkActivityBuilder::new(crate::ocsf_ctx())
+            .activity(openshell_ocsf::ActivityId::Other)
+            .severity(openshell_ocsf::SeverityId::High)
+            .message("rejecting endpoint: credential_signing requires signing_service".to_string())
+            .build();
+        openshell_ocsf::ocsf_emit!(event);
+        return None;
+    }
 
     Some(L7EndpointConfig {
         protocol,
