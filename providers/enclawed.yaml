@@ -1,0 +1,35 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+id: enclawed
+display_name: Enclawed
+description: Classification-gated AI agent gateway with MCP-attested transport (enclawed-oss)
+category: agent
+inference_capable: true
+# Enclawed bootstraps every credential into the operator's OS keyring at
+# install time (libsecret on Linux, Keychain on macOS, Credential Manager
+# on Windows). Nothing is read from environment variables at sandbox
+# entry, so OpenShell performs no env-var discovery for this provider.
+# The sandbox image (enclawed/openshell-enclawed-sandbox) is responsible
+# for running Enclawed's installer at first boot to populate the keyring.
+credentials: []
+discovery:
+  credentials: []
+endpoints:
+  # Default Anthropic backend, used by the bundled coding-agent path
+  # (pi-coding-agent / codex). Operators whose Enclawed install targets
+  # a different LLM backend extend this allowlist in their sandbox
+  # config rather than here.
+  - host: api.anthropic.com
+    port: 443
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+  # Local Ollama, used by the bundled secretary path (default model
+  # qwen2.5:32b-instruct). Stays on loopback inside the sandbox.
+  - host: 127.0.0.1
+    port: 11434
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+binaries: [/usr/bin/enclawed, /usr/local/bin/enclawed]

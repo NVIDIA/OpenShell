@@ -154,6 +154,7 @@ Docker-backed GPU sandboxes auto-select CDI when available and otherwise fall ba
 | [Codex](https://developers.openai.com/codex)                  | [`base`](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base) | Works out of the box. Provider uses `OPENAI_API_KEY`.                         |
 | [GitHub Copilot CLI](https://docs.github.com/en/copilot/github-copilot-in-the-cli) | [`base`](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base) | Works out of the box. Provider uses `GITHUB_TOKEN` or `COPILOT_GITHUB_TOKEN`. |
 | [OpenClaw](https://openclaw.ai/)                 | [NemoClaw](https://github.com/NVIDIA/NemoClaw)                                   | Run OpenClaw more securely inside NVIDIA OpenShell with managed inference using NemoClaw.       |
+| [Enclawed](https://enclawed.com/)                             | [enclawed-sandbox](https://github.com/enclawed/openshell-enclawed-sandbox)       | Classification-gated AI agent gateway with MCP-attested transport. Credentials bootstrapped via the OS keyring at sandbox provisioning. |
 | [Ollama](https://ollama.com/)                                 | [Community](https://github.com/NVIDIA/OpenShell-Community)                       | Launch with `openshell sandbox create --from ollama`.                         |
 | [Pi](https://pi.dev/)                                 | [Community](https://github.com/NVIDIA/OpenShell-Community)                       | Launch with `openshell sandbox create --from pi`.                         |
 

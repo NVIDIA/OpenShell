@@ -111,6 +111,7 @@ impl ProviderRegistry {
         registry.register(providers::claude::SPEC);
         registry.register(providers::codex::SPEC);
         registry.register(providers::copilot::SPEC);
+        registry.register(providers::enclawed::EnclawedProvider);
         registry.register(providers::opencode::OpencodeProvider);
         registry.register(providers::generic::GenericProvider);
         registry.register(providers::openai::SPEC);
