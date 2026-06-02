@@ -11,6 +11,38 @@ description: |
   policy-enforced egress routing, credential proxying, and privacy-aware
   LLM inference routing.
 
+  The OpenShell snap ships a CLI (`openshell`), a terminal UI
+  (`openshell.term`), and a managed gateway daemon (`openshell.gateway`).
+
+  **Setup instructions**
+
+    1. Install the Docker snap:
+
+         sudo snap install docker
+
+       Support for system-installed Docker is coming in snapd 2.76.
+
+    2. Connect the required interfaces and start the gateway:
+
+         sudo snap connect openshell:docker docker:docker-daemon
+         sudo snap connect openshell:log-observe
+         sudo snap connect openshell:system-observe
+         sudo snap connect openshell:ssh-keys
+         sudo snap start openshell.gateway
+
+    3. Verify the gateway and register it locally:
+
+         snap services openshell.gateway
+         openshell status
+         openshell gateway add http://127.0.0.1:17670 --local --name openshell-gateway
+
+    After a snap refresh, restart the gateway to pick up the new revision:
+
+         sudo snap restart openshell.gateway
+
+    Restarting the gateway will interrupt active sandbox sessions. The gateway
+    is not restarted automatically to avoid disconnecting running sandboxes.
+
 base: core24
 grade: stable
 confinement: strict
