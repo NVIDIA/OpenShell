@@ -1194,13 +1194,17 @@ mod tests {
             "https://example.okta.com/oauth2/default/v1/token"
         );
         assert!(
-            refresh.material.iter().any(|entry| {
-                entry.name == "refresh_token" && entry.required && entry.secret
-            }),
+            refresh
+                .material
+                .iter()
+                .any(|entry| { entry.name == "refresh_token" && entry.required && entry.secret }),
             "okta profile should require a secret refresh token material entry"
         );
         assert!(
-            refresh.material.iter().any(|entry| entry.name == "client_id" && entry.required),
+            refresh
+                .material
+                .iter()
+                .any(|entry| entry.name == "client_id" && entry.required),
             "okta profile should require client_id refresh material"
         );
     }

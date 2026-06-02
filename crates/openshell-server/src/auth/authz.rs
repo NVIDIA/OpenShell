@@ -87,7 +87,10 @@ const SCOPED_METHODS: &[(&str, &str)] = &[
         "/openshell.v1.OpenShell/ListProviderProfiles",
         "provider:read",
     ),
-    ("/openshell.v1.OpenShell/GetProviderProfile", "provider:read"),
+    (
+        "/openshell.v1.OpenShell/GetProviderProfile",
+        "provider:read",
+    ),
     (
         "/openshell.v1.OpenShell/GetProviderRefreshStatus",
         "provider:read",

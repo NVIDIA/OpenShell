@@ -1751,7 +1751,10 @@ async fn built_in_okta_profile_is_available_via_provider_profile_api() {
         refresh.strategy,
         ProviderCredentialRefreshStrategy::Oauth2RefreshToken as i32
     );
-    assert_eq!(refresh.token_url, "https://example.okta.com/oauth2/default/v1/token");
+    assert_eq!(
+        refresh.token_url,
+        "https://example.okta.com/oauth2/default/v1/token"
+    );
 }
 
 #[tokio::test]

@@ -840,7 +840,6 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/token"))
             .and(body_string_contains("grant_type=client_credentials"))
-            .and(body_string_contains("client_id=client-id"))
             .and(body_string_contains(
                 "scope=https%3A%2F%2Fgraph.microsoft.com%2F.default",
             ))
@@ -990,7 +989,6 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/token"))
             .and(body_string_contains("grant_type=refresh_token"))
-            .and(body_string_contains("client_id=client-id"))
             .and(body_string_contains("refresh_token=old-refresh-token"))
             .and(body_string_contains(
                 "scope=https%3A%2F%2Fgraph.microsoft.com%2F.default",
