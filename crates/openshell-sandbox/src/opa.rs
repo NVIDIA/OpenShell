@@ -324,8 +324,8 @@ impl OpaEngine {
         &self,
         input: &NetworkInput,
     ) -> Result<(NetworkAction, u64)> {
-        let generation = self.current_generation();
         if !network_host_is_safe(&input.host) {
+            let generation = self.current_generation();
             return Ok((
                 NetworkAction::Deny {
                     reason: "invalid network host".to_string(),
@@ -360,6 +360,7 @@ impl OpaEngine {
             .engine
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        let generation = self.current_generation();
 
         engine
             .set_input_json(&input_json.to_string())
