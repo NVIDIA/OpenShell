@@ -76,6 +76,8 @@
           };
         };
 
+        checks = lib.mapAttrs' (name: crate: lib.nameValuePair "${name}-test" crate.test) workspaceCrates;
+
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
             rustToolchain

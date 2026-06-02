@@ -15,6 +15,10 @@
   };
   openshell-cli = {
     dir = "openshell-cli";
+    nativeCheckInputs = [
+      pkgs.cacert
+      pkgs.git
+    ];
     assets = [
       (root + "/proto")
       (root + "/providers")
@@ -28,7 +32,9 @@
       (root + "/providers")
       (root + "/crates/openshell-prover/registry")
       (root + "/crates/openshell-server/migrations")
+      (root + "/deploy/rpm/gateway.toml.default")
     ];
+    cargoTestExtraArgs = "--features test-support";
   };
   openshell-core = {
     dir = "openshell-core";
@@ -41,10 +47,15 @@
   };
   openshell-sandbox = {
     dir = "openshell-sandbox";
+    nativeCheckInputs = [
+      pkgs.bash
+      pkgs.coreutils
+    ];
     assets = [
       (root + "/proto")
       (root + "/crates/openshell-sandbox/data")
       (root + "/crates/openshell-sandbox/src/skills")
+      (root + "/crates/openshell-sandbox/testdata")
     ];
   };
   openshell-driver-vm = {

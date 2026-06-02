@@ -96,8 +96,10 @@ let
       dir,
       assets ? [ ],
       nativeBuildInputs ? [ ],
+      nativeCheckInputs ? [ ],
       buildInputs ? [ ],
       env ? { },
+      cargoTestExtraArgs ? "",
     }:
     let
       closure = closureOf dir;
@@ -107,6 +109,10 @@ let
       );
       effectiveBuildInputs = lib.unique (closureList closure "buildInputs" ++ buildInputs);
       effectiveEnv = lib.recursiveUpdate (closureEnv closure) env;
+      src = mkSrc {
+        dirs = closure;
+        inherit assets;
+      };
       common = {
         pname = dir;
         inherit version;
@@ -152,18 +158,39 @@ let
               '';
             }
           );
+
+      cratesTestDeps = craneLib.buildPackage (
+        common
+        // {
+          pname = "${dir}-test-deps";
+          src = mkWorkspaceLibsSrc;
+          inherit nativeCheckInputs;
+          cargoArtifacts = workspaceLibs;
+          cargoExtraArgs = "${common.cargoExtraArgs} --tests ${cargoTestExtraArgs}";
+          doInstallCargoArtifacts = true;
+        }
+      );
     in
-    {
+    let
       package = craneLib.buildPackage (
         common
         // {
-          src = mkSrc {
-            dirs = closure;
-            inherit assets;
-          };
+          inherit src;
           cargoArtifacts = workspaceLibs;
         }
       );
+
+      test = craneLib.cargoTest (
+        common
+        // {
+          doCheck = true;
+          inherit src nativeCheckInputs cargoTestExtraArgs;
+          cargoArtifacts = cratesTestDeps;
+        }
+      );
+    in
+    {
+      inherit package test;
     };
 in
 {
