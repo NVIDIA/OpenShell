@@ -47,7 +47,7 @@ mod tests {
 
     #[test]
     fn apply_proxy_env_includes_node_proxy_opt_in_and_local_bypass() {
-        let mut cmd = Command::new("/usr/bin/env");
+        let mut cmd = Command::new("env");
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -67,7 +67,7 @@ mod tests {
 
     #[test]
     fn apply_tls_env_sets_node_and_bundle_paths() {
-        let mut cmd = Command::new("/usr/bin/env");
+        let mut cmd = Command::new("env");
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
