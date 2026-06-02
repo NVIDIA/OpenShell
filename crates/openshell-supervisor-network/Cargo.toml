@@ -48,5 +48,8 @@ temp-env = "0.3"
 tokio-tungstenite = { workspace = true }
 futures = { workspace = true }
 
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
 [lints]
 workspace = true

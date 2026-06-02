@@ -3780,6 +3780,7 @@ dependencies = [
  "glob",
  "hex",
  "ipnet",
+ "libc",
  "miette",
  "openshell-core",
  "openshell-ocsf",
