@@ -18,6 +18,8 @@
   root,
   # Member directory, relative to root.
   crateDir ? "crates",
+  # Crate metadata keyed by workspace crate directory.
+  crateSpecs ? { },
   # Version stamped onto every crate derivation.
   version ? "0.0.0",
 }:
@@ -49,6 +51,12 @@ let
         operator = e: map (key: { inherit key; }) (directDeps e.key);
       }
     );
+
+  specFor = dir: lib.attrByPath [ dir ] { } crateSpecs;
+
+  closureList = closure: field: lib.concatLists (map (d: (specFor d).${field} or [ ]) closure);
+
+  closureEnv = closure: lib.foldl' lib.recursiveUpdate { } (map (d: (specFor d).env or { }) closure);
 
   # Every member's Cargo.toml, cargo must see all of them to resolve the
   # workspace even for crates whose source we leave out.
@@ -94,14 +102,17 @@ let
     let
       closure = closureOf dir;
       workspaceDeps = lib.filter (d: d != dir) closure;
+      effectiveNativeBuildInputs = lib.unique (
+        closureList closure "nativeBuildInputs" ++ nativeBuildInputs
+      );
+      effectiveBuildInputs = lib.unique (closureList closure "buildInputs" ++ buildInputs);
+      effectiveEnv = lib.recursiveUpdate (closureEnv closure) env;
       common = {
         pname = dir;
-        inherit
-          version
-          nativeBuildInputs
-          buildInputs
-          env
-          ;
+        inherit version;
+        nativeBuildInputs = effectiveNativeBuildInputs;
+        buildInputs = effectiveBuildInputs;
+        env = effectiveEnv;
         strictDeps = true;
         # Build only, skip the cargo test/check phase for now.
         doCheck = false;
@@ -142,16 +153,18 @@ let
             }
           );
     in
-    craneLib.buildPackage (
-      common
-      // {
-        src = mkSrc {
-          dirs = closure;
-          inherit assets;
-        };
-        cargoArtifacts = workspaceLibs;
-      }
-    );
+    {
+      package = craneLib.buildPackage (
+        common
+        // {
+          src = mkSrc {
+            dirs = closure;
+            inherit assets;
+          };
+          cargoArtifacts = workspaceLibs;
+        }
+      );
+    };
 in
 {
   inherit buildWorkspaceCrate;

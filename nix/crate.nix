@@ -5,23 +5,15 @@
   pkgs,
   root,
 }:
-let
-  # z3 (found via pkg-config) and libclang (for z3-sys bindgen) are only needed
-  # by crates whose closure contains openshell-prover.
-  withZ3 = {
-    nativeBuildInputs = [
-      pkgs.pkg-config
-      pkgs.protobuf
-    ];
-    buildInputs = [ pkgs.z3 ];
-    env.LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
-  };
-in
 {
-  # Each crate declares the compile-time assets its build needs: its own plus
-  # those of its workspace deps (proto/ arrives via openshell-core, providers/
-  # via openshell-providers, registry/ via openshell-prover).
-  openshell-cli = withZ3 // {
+  # Each crate declares the compile-time assets and build tools it needs. The
+  # workspace builder collects nativeBuildInputs/buildInputs/env from the
+  # transitive Cargo closure.
+  openshell-bootstrap = {
+    dir = "openshell-bootstrap";
+    assets = [ (root + "/proto") ];
+  };
+  openshell-cli = {
     dir = "openshell-cli";
     assets = [
       (root + "/proto")
@@ -29,7 +21,7 @@ in
       (root + "/crates/openshell-prover/registry")
     ];
   };
-  openshell-server = withZ3 // {
+  openshell-server = {
     dir = "openshell-server";
     assets = [
       (root + "/proto")
@@ -38,9 +30,17 @@ in
       (root + "/crates/openshell-server/migrations")
     ];
   };
+  openshell-core = {
+    dir = "openshell-core";
+    nativeBuildInputs = [ pkgs.protobuf ];
+    assets = [ (root + "/proto") ];
+  };
+  openshell-driver-docker = {
+    dir = "openshell-driver-docker";
+    assets = [ (root + "/proto") ];
+  };
   openshell-sandbox = {
     dir = "openshell-sandbox";
-    nativeBuildInputs = [ pkgs.protobuf ];
     assets = [
       (root + "/proto")
       (root + "/crates/openshell-sandbox/data")
@@ -49,7 +49,6 @@ in
   };
   openshell-driver-vm = {
     dir = "openshell-driver-vm";
-    nativeBuildInputs = [ pkgs.protobuf ];
     assets = [
       (root + "/proto")
       (root + "/crates/openshell-driver-vm/scripts")
@@ -57,12 +56,52 @@ in
   };
   openshell-driver-kubernetes = {
     dir = "openshell-driver-kubernetes";
-    nativeBuildInputs = [ pkgs.protobuf ];
     assets = [ (root + "/proto") ];
   };
   openshell-driver-podman = {
     dir = "openshell-driver-podman";
-    nativeBuildInputs = [ pkgs.protobuf ];
     assets = [ (root + "/proto") ];
+  };
+  openshell-ocsf = {
+    dir = "openshell-ocsf";
+    assets = [ (root + "/crates/openshell-ocsf/schemas") ];
+  };
+  openshell-policy = {
+    dir = "openshell-policy";
+    assets = [ (root + "/proto") ];
+  };
+  openshell-prover = {
+    dir = "openshell-prover";
+    nativeBuildInputs = [ pkgs.pkg-config ];
+    buildInputs = [ pkgs.z3 ];
+    env.LIBCLANG_PATH = "${pkgs.llvmPackages.libclang.lib}/lib";
+    assets = [
+      (root + "/crates/openshell-prover/registry")
+      (root + "/crates/openshell-prover/testdata")
+    ];
+  };
+  openshell-providers = {
+    dir = "openshell-providers";
+    assets = [
+      (root + "/proto")
+      (root + "/providers")
+    ];
+  };
+  openshell-router = {
+    dir = "openshell-router";
+    assets = [ (root + "/proto") ];
+  };
+  openshell-server-macros = {
+    dir = "openshell-server-macros";
+  };
+  openshell-tui = {
+    dir = "openshell-tui";
+    assets = [
+      (root + "/proto")
+      (root + "/providers")
+    ];
+  };
+  openshell-vfio = {
+    dir = "openshell-vfio";
   };
 }

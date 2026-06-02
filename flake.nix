@@ -39,19 +39,29 @@
 
         craneLib = (crane.mkLib pkgs).overrideToolchain (_: rustToolchain);
 
+        crateSpecs = import ./nix/crate.nix {
+          inherit pkgs;
+          root = ./.;
+        };
+
         # Crate-by-crate crane helpers (workspace graph, minimal per-crate
         # source, buildWorkspaceCrate). See nix/workspace.nix.
         workspace = import ./nix/workspace.nix {
           inherit lib pkgs craneLib;
           root = ./.;
+          inherit crateSpecs;
         };
         inherit (workspace) buildWorkspaceCrate;
 
-        crateSpecs = import ./nix/crate.nix {
-          inherit pkgs;
-          root = ./.;
+        workspaceCrates = lib.mapAttrs (_: buildWorkspaceCrate) crateSpecs;
+        crates = {
+          openshell = workspaceCrates.openshell-cli.package;
+          openshell-gateway = workspaceCrates.openshell-server.package;
+          openshell-sandbox = workspaceCrates.openshell-sandbox.package;
+          openshell-driver-vm = workspaceCrates.openshell-driver-vm.package;
+          openshell-driver-kubernetes = workspaceCrates.openshell-driver-kubernetes.package;
+          openshell-driver-podman = workspaceCrates.openshell-driver-podman.package;
         };
-        crates = lib.mapAttrs (_: buildWorkspaceCrate) crateSpecs;
 
         treefmtEval = treefmt-nix.lib.evalModule pkgs {
           projectRootFile = "flake.nix";
