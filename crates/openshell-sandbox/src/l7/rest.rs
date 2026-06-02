@@ -12,10 +12,12 @@ use crate::opa::PolicyGenerationGuard;
 use crate::secrets::{
     SecretResolver, contains_reserved_credential_marker, rewrite_http_header_block,
 };
+use aws_sigv4::http_request::SignableBody;
 use base64::Engine as _;
 use miette::{IntoDiagnostic, Result, miette};
 use sha1::{Digest, Sha1};
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::debug;
 
@@ -431,7 +433,7 @@ where
     // rewriting so the fail-closed placeholder scan doesn't reject the SigV4
     // Authorization header (which embeds placeholder strings).
     let raw_for_rewrite;
-    let header_source = if options.credential_signing == crate::l7::CredentialSigning::SigV4 {
+    let header_source = if options.credential_signing.is_sigv4() {
         raw_for_rewrite = crate::sigv4::strip_aws_headers(&req.raw_header[..header_end]);
         &raw_for_rewrite[..]
     } else {
@@ -459,9 +461,19 @@ where
         guard.ensure_current()?;
     }
 
-    // Apply SigV4 signing if configured. We need the full request (headers + body)
-    // to compute the signature, so for SigV4 we always buffer the body first.
-    if options.credential_signing == crate::l7::CredentialSigning::SigV4 {
+    // If the client sent `Expect: 100-continue`, acknowledge it so the client
+    // sends the body. Without this, clients like boto3's S3 PutObject wait
+    // for the 100 response before transmitting any body bytes.
+    if has_expect_continue(header_str) {
+        client
+            .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+            .await
+            .into_diagnostic()?;
+        client.flush().await.into_diagnostic()?;
+    }
+
+    // Apply SigV4 signing if configured.
+    if options.credential_signing.is_sigv4() {
         if let Some(resolver) = options.resolver {
             let access_key_placeholder =
                 crate::secrets::placeholder_for_env_key("AWS_ACCESS_KEY_ID");
@@ -484,44 +496,113 @@ where
                             "SigV4 signing configured but signing_service not set in policy"
                         ));
                     }
+
+                    let payload_mode = match options.credential_signing {
+                        crate::l7::CredentialSigning::SigV4Body => SigV4PayloadMode::SignBody,
+                        crate::l7::CredentialSigning::SigV4NoBody => {
+                            SigV4PayloadMode::UnsignedPayload
+                        }
+                        crate::l7::CredentialSigning::SigV4 => detect_payload_mode(header_str)?,
+                        crate::l7::CredentialSigning::None => unreachable!(),
+                    };
+
                     debug!(
                         host = %options.host,
                         region = %region,
                         service = %service,
+                        payload_mode = %payload_mode,
                         "applying SigV4 signing to CONNECT tunnel request"
                     );
 
-                    // Collect body from overflow + stream
-                    let overflow = &req.raw_header[header_end..];
-                    let mut full_request = rewrite_result.rewritten.clone();
-                    full_request.extend_from_slice(overflow);
-                    // Read remaining body based on content-length
-                    if let BodyLength::ContentLength(body_len) = parse_body_length(header_str)? {
-                        if body_len > MAX_REWRITE_BODY_BYTES as u64 {
-                            return Err(miette!(
-                                "SigV4 signing buffers at most {MAX_REWRITE_BODY_BYTES} bytes"
-                            ));
+                    if payload_mode == SigV4PayloadMode::SignBody {
+                        // Buffer body and include its hash in the signature.
+                        let overflow = &req.raw_header[header_end..];
+                        let mut full_request = rewrite_result.rewritten.clone();
+                        full_request.extend_from_slice(overflow);
+                        if let BodyLength::ContentLength(body_len) = parse_body_length(header_str)?
+                        {
+                            if body_len > MAX_REWRITE_BODY_BYTES as u64 {
+                                return Err(miette!(
+                                    "SigV4 body signing buffers at most {MAX_REWRITE_BODY_BYTES} bytes"
+                                ));
+                            }
+                            let already_have = overflow.len() as u64;
+                            if body_len > already_have {
+                                let remaining =
+                                    usize::try_from(body_len - already_have).unwrap_or(usize::MAX);
+                                let mut body_buf = vec![0u8; remaining];
+                                client.read_exact(&mut body_buf).await.into_diagnostic()?;
+                                full_request.extend_from_slice(&body_buf);
+                            }
                         }
-                        let already_have = overflow.len() as u64;
-                        if body_len > already_have {
-                            let remaining =
-                                usize::try_from(body_len - already_have).unwrap_or(usize::MAX);
-                            let mut body_buf = vec![0u8; remaining];
-                            client.read_exact(&mut body_buf).await.into_diagnostic()?;
-                            full_request.extend_from_slice(&body_buf);
+
+                        let signed = crate::sigv4::apply_sigv4_to_request(
+                            &full_request,
+                            options.host,
+                            &region,
+                            service,
+                            access_key,
+                            secret_key,
+                            session_token,
+                        )?;
+                        upstream.write_all(&signed).await.into_diagnostic()?;
+                    } else {
+                        // Sign headers only, stream body through.
+                        let signable_body = match payload_mode {
+                            SigV4PayloadMode::StreamingUnsignedTrailer => {
+                                SignableBody::StreamingUnsignedPayloadTrailer
+                            }
+                            _ => SignableBody::UnsignedPayload,
+                        };
+                        let signed_headers = crate::sigv4::apply_sigv4_headers_only_with_body(
+                            &rewrite_result.rewritten,
+                            options.host,
+                            &region,
+                            service,
+                            access_key,
+                            secret_key,
+                            session_token,
+                            signable_body,
+                        )?;
+                        upstream
+                            .write_all(&signed_headers)
+                            .await
+                            .into_diagnostic()?;
+
+                        let overflow = &req.raw_header[header_end..];
+                        if !overflow.is_empty() {
+                            if let Some(guard) = options.generation_guard {
+                                guard.ensure_current()?;
+                            }
+                            upstream.write_all(overflow).await.into_diagnostic()?;
+                        }
+                        let overflow_len = overflow.len() as u64;
+
+                        match req.body_length {
+                            BodyLength::ContentLength(len) => {
+                                let remaining = len.saturating_sub(overflow_len);
+                                if remaining > 0 {
+                                    relay_fixed(
+                                        client,
+                                        upstream,
+                                        remaining,
+                                        options.generation_guard,
+                                    )
+                                    .await?;
+                                }
+                            }
+                            BodyLength::Chunked => {
+                                relay_chunked(
+                                    client,
+                                    upstream,
+                                    &req.raw_header[header_end..],
+                                    options.generation_guard,
+                                )
+                                .await?;
+                            }
+                            BodyLength::None => {}
                         }
                     }
-
-                    let signed = crate::sigv4::apply_sigv4_to_request(
-                        &full_request,
-                        options.host,
-                        &region,
-                        service,
-                        access_key,
-                        secret_key,
-                        session_token,
-                    )?;
-                    upstream.write_all(&signed).await.into_diagnostic()?;
                 }
                 _ => {
                     return Err(miette!(
@@ -1418,6 +1499,67 @@ fn deny_response_body(
 
 fn non_empty(value: Option<&str>) -> Option<&str> {
     value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+/// Check if the request includes `Expect: 100-continue`.
+fn has_expect_continue(headers: &str) -> bool {
+    headers.lines().skip(1).any(|line| {
+        let lower = line.to_ascii_lowercase();
+        lower.starts_with("expect:")
+            && lower
+                .split_once(':')
+                .map_or(false, |(_, v)| v.trim() == "100-continue")
+    })
+}
+
+/// Resolved payload signing mode for a SigV4 request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SigV4PayloadMode {
+    /// Buffer body and include its SHA-256 hash in the signature.
+    SignBody,
+    /// Use literal `UNSIGNED-PAYLOAD` — no body buffering needed.
+    UnsignedPayload,
+    /// Use `STREAMING-UNSIGNED-PAYLOAD-TRAILER` for `aws-chunked` streams.
+    StreamingUnsignedTrailer,
+}
+
+impl fmt::Display for SigV4PayloadMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SignBody => write!(f, "sign_body"),
+            Self::UnsignedPayload => write!(f, "unsigned_payload"),
+            Self::StreamingUnsignedTrailer => write!(f, "streaming_unsigned_trailer"),
+        }
+    }
+}
+
+/// Auto-detect the payload signing mode from the client's original headers.
+///
+/// Mirrors the mode the client SDK chose by inspecting `x-amz-content-sha256`:
+/// - `STREAMING-UNSIGNED-PAYLOAD-TRAILER` → `StreamingUnsignedTrailer`
+/// - `UNSIGNED-PAYLOAD` → `UnsignedPayload`
+/// - Absent or a hex hash → `SignBody` (buffer + hash)
+fn detect_payload_mode(headers: &str) -> Result<SigV4PayloadMode> {
+    for line in headers.lines().skip(1) {
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("x-amz-content-sha256:") {
+            let val = lower.split_once(':').map_or("", |(_, v)| v.trim());
+            return Ok(match val {
+                "streaming-unsigned-payload-trailer" => SigV4PayloadMode::StreamingUnsignedTrailer,
+                "unsigned-payload" => SigV4PayloadMode::UnsignedPayload,
+                _ => SigV4PayloadMode::SignBody,
+            });
+        }
+    }
+    // No x-amz-content-sha256 header — default to signing body if Content-Length
+    // is present, otherwise unsigned.
+    Ok(
+        if matches!(parse_body_length(headers)?, BodyLength::ContentLength(_)) {
+            SigV4PayloadMode::SignBody
+        } else {
+            SigV4PayloadMode::UnsignedPayload
+        },
+    )
 }
 
 /// Parse Content-Length or Transfer-Encoding from HTTP headers.
