@@ -7,7 +7,7 @@
 
 use crate::proto::{
     InferenceRoute, ObjectForTest, Provider, Sandbox, ServiceEndpoint, SshSession,
-    StoredProviderCredentialRefreshState, StoredProviderProfile, StoredSandboxDelegationBinding,
+    StoredProviderCredentialRefreshState, StoredProviderProfile,
     SandboxStatus,
 };
 use std::collections::HashMap;
@@ -184,39 +184,6 @@ impl SetResourceVersion for StoredProviderCredentialRefreshState {
 }
 
 impl GetResourceVersion for StoredProviderCredentialRefreshState {
-    fn get_resource_version(&self) -> u64 {
-        self.metadata.as_ref().map_or(0, |m| m.resource_version)
-    }
-}
-
-// Implementations for StoredSandboxDelegationBinding
-impl ObjectId for StoredSandboxDelegationBinding {
-    fn object_id(&self) -> &str {
-        self.metadata.as_ref().map_or("", |m| m.id.as_str())
-    }
-}
-
-impl ObjectName for StoredSandboxDelegationBinding {
-    fn object_name(&self) -> &str {
-        self.metadata.as_ref().map_or("", |m| m.name.as_str())
-    }
-}
-
-impl ObjectLabels for StoredSandboxDelegationBinding {
-    fn object_labels(&self) -> Option<HashMap<String, String>> {
-        self.metadata.as_ref().map(|m| m.labels.clone())
-    }
-}
-
-impl SetResourceVersion for StoredSandboxDelegationBinding {
-    fn set_resource_version(&mut self, version: u64) {
-        if let Some(meta) = self.metadata.as_mut() {
-            meta.resource_version = version;
-        }
-    }
-}
-
-impl GetResourceVersion for StoredSandboxDelegationBinding {
     fn get_resource_version(&self) -> u64 {
         self.metadata.as_ref().map_or(0, |m| m.resource_version)
     }

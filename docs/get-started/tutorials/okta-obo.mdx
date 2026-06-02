@@ -8,13 +8,13 @@ description: "Configure the built-in Okta OBO provider profile so OpenShell can 
 keywords: "Generative AI, Cybersecurity, Tutorial, Providers, Okta, OBO, RFC 8693, Token Exchange, Delegation"
 ---
 
-Use the built-in `okta-obo` profile when a sandboxed workload must call a downstream API on behalf of the human who logged into OpenShell. The gateway keeps the inbound user token server-side, binds it to sandbox creation, and exchanges it for a short-lived delegated token using Okta token exchange.
+Use the built-in `okta-obo` profile when a sandboxed workload must call a downstream API on behalf of the human who logged into OpenShell. During refresh configuration, the gateway captures the logged-in user's bearer token as provider refresh secret material and later exchanges it for a short-lived delegated token using Okta token exchange.
 
 After completing this tutorial, you have:
 
 - A token-exchange service app in Okta for delegated access.
 - A customized `okta-obo` provider profile that points at your Okta tenant.
-- A sandbox whose attached provider can mint `OKTA_OBO_ACCESS_TOKEN` from the logged-in user's identity.
+- An attached provider that can mint `OKTA_OBO_ACCESS_TOKEN` from the logged-in user's identity.
 
 <Note>
 This tutorial covers the delegation lane. It assumes you already completed the gateway login lane and can log into the gateway with Okta before you create the sandbox.
@@ -71,24 +71,12 @@ openshell provider profile lint -f okta-obo.yaml
 openshell provider profile import -f okta-obo.yaml
 ```
 
-## Log In and Create the Sandbox
+## Log In
 
 Log into the gateway as the human user whose identity should be delegated:
 
 ```shell
 openshell gateway login <gateway-name>
-```
-
-Create the sandbox after login so OpenShell can bind the sandbox to the authenticated user token:
-
-```shell
-openshell sandbox create --name okta-obo-smoke
-```
-
-Fetch the sandbox metadata and record the sandbox ID:
-
-```shell
-openshell sandbox get okta-obo-smoke
 ```
 
 ## Create the OBO Provider
@@ -111,7 +99,6 @@ openshell provider refresh configure okta-obo-runtime \
   --strategy oauth2-token-exchange \
   --material client_id="$OKTA_OBO_CLIENT_ID" \
   --material client_secret="$OKTA_OBO_CLIENT_SECRET" \
-  --material sandbox_id="<sandbox-id>" \
   --material audience="$OKTA_OBO_AUDIENCE" \
   --material scope="$OKTA_OBO_SCOPE" \
   --secret-material-key client_secret
@@ -124,7 +111,13 @@ openshell provider refresh status okta-obo-runtime \
   --credential-key OKTA_OBO_ACCESS_TOKEN
 ```
 
-## Attach the Provider
+## Create the Sandbox and Attach the Provider
+
+Create the sandbox after configuring the provider:
+
+```shell
+openshell sandbox create --name okta-obo-smoke
+```
 
 Attach the OBO provider to the sandbox:
 

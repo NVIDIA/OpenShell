@@ -1384,7 +1384,48 @@ pub(super) async fn handle_configure_provider_refresh(
         credential_key,
     )
     .await?;
-    let sandbox_id_for_binding = request.material.get("sandbox_id").cloned();
+    let mut material = request.material;
+    let mut secret_material_keys = request.secret_material_keys;
+    if strategy == ProviderCredentialRefreshStrategy::Oauth2TokenExchange {
+        match (principal.as_ref(), raw_bearer_token.as_ref()) {
+            (Some(Principal::User(user)), Some(raw))
+                if user.identity.provider == IdentityProvider::Oidc =>
+            {
+                material.insert("subject_token".to_string(), raw.0.clone());
+                if !secret_material_keys
+                    .iter()
+                    .any(|key| key == "subject_token")
+                {
+                    secret_material_keys.push("subject_token".to_string());
+                }
+            }
+            _ => {
+                if let Some(existing) = existing_refresh_state
+                    .as_ref()
+                    .and_then(|state| state.material.get("subject_token"))
+                {
+                    material
+                        .entry("subject_token".to_string())
+                        .or_insert_with(|| existing.clone());
+                } else {
+                    return Err(Status::failed_precondition(
+                        "oauth2_token_exchange refresh requires an authenticated OIDC user bearer token during configuration",
+                    ));
+                }
+                if existing_refresh_state.as_ref().is_some_and(|state| {
+                    state
+                        .secret_material_keys
+                        .iter()
+                        .any(|key| key == "subject_token")
+                }) && !secret_material_keys
+                    .iter()
+                    .any(|key| key == "subject_token")
+                {
+                    secret_material_keys.push("subject_token".to_string());
+                }
+            }
+        }
+    }
     let expires_at_ms = request.expires_at_ms.unwrap_or_else(|| {
         existing_refresh_state
             .as_ref()
@@ -1396,8 +1437,8 @@ pub(super) async fn handle_configure_provider_refresh(
         credential_key,
         crate::provider_refresh::NewRefreshStateConfig {
             strategy,
-            material: request.material,
-            secret_material_keys: request.secret_material_keys,
+            material,
+            secret_material_keys,
             expires_at_ms,
             token_url,
             scopes,
@@ -1410,29 +1451,6 @@ pub(super) async fn handle_configure_provider_refresh(
         state_record.last_refresh_at_ms = existing.last_refresh_at_ms;
     }
     crate::provider_refresh::put_refresh_state(state.store.as_ref(), &state_record).await?;
-
-    if strategy == ProviderCredentialRefreshStrategy::Oauth2TokenExchange
-        && let (Some(Principal::User(user)), Some(raw)) =
-            (principal.as_ref(), raw_bearer_token.as_ref())
-        && user.identity.provider == IdentityProvider::Oidc
-        && let Some(sandbox_id) = sandbox_id_for_binding.as_deref().map(str::trim)
-        && !sandbox_id.is_empty()
-        && let Some(sandbox) = state
-            .store
-            .get_message::<Sandbox>(sandbox_id)
-            .await
-            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-    {
-        let binding = crate::delegation::new_binding(
-            &sandbox,
-            &user.identity.subject,
-            user.identity.display_name.as_deref(),
-            "oidc",
-            &raw.0,
-            &user.identity.scopes,
-        )?;
-        crate::delegation::put_binding(state.store.as_ref(), &binding).await?;
-    }
 
     if let Some(expires_at_ms) = request.expires_at_ms {
         let updated = Provider {

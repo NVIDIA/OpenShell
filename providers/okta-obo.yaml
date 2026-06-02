@@ -21,14 +21,15 @@ credentials:
         - name: client_id
           description: Okta OIDC application client ID used for token exchange
           required: true
-        - name: sandbox_id
-          description: OpenShell sandbox ID bound to the authenticated user token
-          required: true
         - name: audience
           description: Downstream Okta resource audience for the delegated token
           required: true
         - name: client_secret
           description: Okta client secret for confidential token-exchange clients
+          required: false
+          secret: true
+        - name: subject_token
+          description: Authenticated user bearer token captured during refresh configuration
           required: false
           secret: true
         - name: scope

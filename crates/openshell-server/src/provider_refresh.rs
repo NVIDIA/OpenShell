@@ -450,7 +450,8 @@ async fn mint_credential(
             mint_oauth2_client_credentials(state).await
         }
         ProviderCredentialRefreshStrategy::Oauth2TokenExchange => {
-            mint_oauth2_token_exchange(store, state).await
+            let _ = store;
+            mint_oauth2_token_exchange(state).await
         }
         ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => {
             mint_google_service_account_jwt(state).await
@@ -487,26 +488,18 @@ async fn mint_oauth2_refresh_token(
 }
 
 async fn mint_oauth2_token_exchange(
-    store: &Store,
     state: &StoredProviderCredentialRefreshState,
 ) -> Result<MintedCredential, Status> {
     let token_url = oauth2_token_url(state)?;
     let client_id = required_material(&state.material, "client_id")?;
-    let sandbox_id = required_material(&state.material, "sandbox_id")?;
-    let binding = crate::delegation::get_binding(store, &sandbox_id)
-        .await?
-        .ok_or_else(|| {
-            Status::failed_precondition(format!(
-                "sandbox delegation binding not found for sandbox_id '{sandbox_id}'"
-            ))
-        })?;
+    let subject_token = required_material(&state.material, "subject_token")?;
 
     let mut form = vec![
         (
             "grant_type".to_string(),
             "urn:ietf:params:oauth:grant-type:token-exchange".to_string(),
         ),
-        ("subject_token".to_string(), binding.access_token),
+        ("subject_token".to_string(), subject_token),
         (
             "subject_token_type".to_string(),
             "urn:ietf:params:oauth:token-type:access_token".to_string(),
@@ -835,7 +828,6 @@ mod tests {
         refresh_provider_credential, refresh_state_name, refresh_strategy_name,
         run_refresh_worker_tick, seconds_until_ms,
     };
-    use crate::delegation::{new_binding, put_binding};
     use crate::persistence::Store;
     use openshell_core::ObjectId;
     use openshell_core::proto::datamodel::v1::ObjectMeta;
@@ -1126,7 +1118,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oauth2_token_exchange_refresh_uses_sandbox_delegation_binding() {
+    async fn oauth2_token_exchange_refresh_uses_subject_token_material() {
         let mock_server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/token"))
@@ -1151,28 +1143,6 @@ mod tests {
             .await;
 
         let store = test_store().await;
-        let sandbox = Sandbox {
-            metadata: Some(ObjectMeta {
-                id: "sandbox-obo".to_string(),
-                name: "obo".to_string(),
-                created_at_ms: 1_000_000,
-                labels: HashMap::new(),
-                resource_version: 0,
-            }),
-            spec: Some(SandboxSpec::default()),
-            ..Default::default()
-        };
-        let binding = new_binding(
-            &sandbox,
-            "user-123",
-            Some("alex"),
-            "oidc",
-            "user-access-token",
-            &["sandbox:write".to_string()],
-        )
-        .unwrap();
-        put_binding(&store, &binding).await.unwrap();
-
         let provider = provider("my-obo", "okta");
         store.put_message(&provider).await.unwrap();
         let state = new_refresh_state(
@@ -1183,11 +1153,14 @@ mod tests {
                 material: HashMap::from([
                     ("client_id".to_string(), "client-id".to_string()),
                     ("client_secret".to_string(), "client-secret".to_string()),
-                    ("sandbox_id".to_string(), "sandbox-obo".to_string()),
+                    ("subject_token".to_string(), "user-access-token".to_string()),
                     ("audience".to_string(), "api://downstream".to_string()),
                     ("scope".to_string(), "files.read".to_string()),
                 ]),
-                secret_material_keys: vec!["client_secret".to_string()],
+                secret_material_keys: vec![
+                    "client_secret".to_string(),
+                    "subject_token".to_string(),
+                ],
                 expires_at_ms: 0,
                 token_url: format!("{}/token", mock_server.uri()),
                 scopes: Vec::new(),

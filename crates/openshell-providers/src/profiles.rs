@@ -1206,9 +1206,9 @@ mod tests {
             material_names,
             vec![
                 "client_id",
-                "sandbox_id",
                 "audience",
                 "client_secret",
+                "subject_token",
                 "scope"
             ]
         );
@@ -1216,8 +1216,8 @@ mod tests {
             refresh
                 .material
                 .iter()
-                .find(|material| material.name == "sandbox_id")
-                .is_some_and(|material| material.required)
+                .find(|material| material.name == "subject_token")
+                .is_some_and(|material| !material.required && material.secret)
         );
         assert!(
             refresh

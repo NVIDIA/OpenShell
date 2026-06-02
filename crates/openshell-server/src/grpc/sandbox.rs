@@ -10,9 +10,6 @@
 #![allow(clippy::cast_possible_wrap)] // Intentional u32->i32 conversions for proto compat
 
 use crate::ServerState;
-use crate::auth::identity::IdentityProvider;
-use crate::auth::oidc::RawBearerToken;
-use crate::auth::principal::Principal;
 use crate::persistence::{ObjectType, WriteCondition, generate_name};
 use futures::future;
 use openshell_core::proto::{
@@ -122,8 +119,6 @@ async fn handle_create_sandbox_inner(
 ) -> Result<Response<SandboxResponse>, Status> {
     use crate::persistence::current_time_ms;
 
-    let principal = request.extensions().get::<Principal>().cloned();
-    let raw_bearer_token = request.extensions().get::<RawBearerToken>().cloned();
     let request = request.into_inner();
     let spec = request
         .spec
@@ -216,38 +211,7 @@ async fn handle_create_sandbox_inner(
         Some(Err(status)) => return Err(status),
         None => None,
     };
-
-    let delegation_binding = match (principal.as_ref(), raw_bearer_token.as_ref()) {
-        (Some(Principal::User(user)), Some(raw))
-            if user.identity.provider == IdentityProvider::Oidc =>
-        {
-            Some(crate::delegation::new_binding(
-                &sandbox,
-                &user.identity.subject,
-                user.identity.display_name.as_deref(),
-                "oidc",
-                &raw.0,
-                &user.identity.scopes,
-            )?)
-        }
-        _ => None,
-    };
-
-    if let Some(binding) = delegation_binding.as_ref() {
-        crate::delegation::put_binding(state.store.as_ref(), binding).await?;
-    }
-
-    let sandbox = match state.compute.create_sandbox(sandbox, sandbox_token).await {
-        Ok(sandbox) => sandbox,
-        Err(err) => {
-            if let Some(binding) = delegation_binding.as_ref() {
-                let _ =
-                    crate::delegation::delete_binding(state.store.as_ref(), &binding.sandbox_id)
-                        .await;
-            }
-            return Err(err);
-        }
-    };
+    let sandbox = state.compute.create_sandbox(sandbox, sandbox_token).await?;
 
     info!(
         sandbox_id = %id,
@@ -529,26 +493,7 @@ async fn handle_delete_sandbox_inner(
         return Err(Status::invalid_argument("name is required"));
     }
 
-    let sandbox_id = state
-        .store
-        .get_message_by_name::<Sandbox>(&name)
-        .await
-        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-        .and_then(|sandbox| sandbox.metadata.map(|meta| meta.id));
-
     let deleted = state.compute.delete_sandbox(&name).await?;
-    if deleted && let Some(sandbox_id) = sandbox_id.as_deref() {
-        state.telemetry.end_sandbox_session(sandbox_id);
-        let deleted_binding = crate::delegation::delete_binding(state.store.as_ref(), sandbox_id)
-            .await
-            .unwrap_or(false);
-        debug!(
-            sandbox_name = %name,
-            sandbox_id,
-            deleted_binding,
-            "deleted sandbox delegation binding"
-        );
-    }
     info!(sandbox_name = %name, "DeleteSandbox request completed successfully");
     Ok(Response::new(DeleteSandboxResponse { deleted }))
 }
@@ -1982,9 +1927,6 @@ async fn run_exec_with_russh(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::identity::{Identity, IdentityProvider};
-    use crate::auth::oidc::RawBearerToken;
-    use crate::auth::principal::{Principal, UserPrincipal};
     use crate::grpc::test_support::test_server_state;
     use openshell_core::proto::datamodel::v1::ObjectMeta;
     use std::collections::HashMap;
@@ -2634,49 +2576,6 @@ mod tests {
         assert!(err.message().contains("TOKEN"));
         assert!(err.message().contains("provider-a"));
         assert!(err.message().contains("provider-b"));
-    }
-
-    #[tokio::test]
-    async fn create_sandbox_persists_delegation_binding_for_oidc_user() {
-        let state = test_server_state().await;
-        let mut request = Request::new(CreateSandboxRequest {
-            name: "delegated".to_string(),
-            spec: Some(openshell_core::proto::SandboxSpec::default()),
-            labels: HashMap::new(),
-        });
-        request
-            .extensions_mut()
-            .insert(Principal::User(UserPrincipal {
-                identity: Identity {
-                    subject: "user-123".to_string(),
-                    display_name: Some("alex".to_string()),
-                    roles: vec!["openshell-user".to_string()],
-                    scopes: vec!["sandbox:write".to_string()],
-                    provider: IdentityProvider::Oidc,
-                },
-            }));
-        request
-            .extensions_mut()
-            .insert(RawBearerToken("raw-access-token".to_string()));
-
-        let response = handle_create_sandbox(&state, request)
-            .await
-            .expect("sandbox create succeeds")
-            .into_inner();
-        let sandbox = response.sandbox.expect("sandbox present");
-        let binding = crate::delegation::get_binding(
-            state.store.as_ref(),
-            sandbox.metadata.as_ref().expect("metadata").id.as_str(),
-        )
-        .await
-        .expect("load binding")
-        .expect("binding present");
-
-        assert_eq!(binding.subject, "user-123");
-        assert_eq!(binding.display_name, "alex");
-        assert_eq!(binding.identity_provider, "oidc");
-        assert_eq!(binding.access_token, "raw-access-token");
-        assert_eq!(binding.scopes, vec!["sandbox:write".to_string()]);
     }
 
     #[tokio::test]

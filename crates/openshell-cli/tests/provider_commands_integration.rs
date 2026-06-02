@@ -1826,13 +1826,19 @@ async fn built_in_okta_obo_profile_is_available_via_provider_profile_api() {
         refresh
             .material
             .iter()
-            .any(|material| material.name == "sandbox_id" && material.required)
+            .any(|material| material.name == "client_id" && material.required)
     );
     assert!(
         refresh
             .material
             .iter()
             .any(|material| material.name == "audience" && material.required)
+    );
+    assert!(
+        refresh
+            .material
+            .iter()
+            .any(|material| material.name == "subject_token" && !material.required)
     );
 }
 
