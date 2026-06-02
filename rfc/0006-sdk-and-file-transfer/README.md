@@ -3,10 +3,13 @@ authors:
   - "@zanetworker"
 state: draft
 links:
+  - "RFC 0005 / PR #1617 (shared SDK core and TS binding, @maxdubrinsky)"
+  - "PR #1621 (Python SDK OIDC auth, @mrunalp)"
   - "PR #1404 (per-sandbox auth, merged)"
   - "PR #1547 (Python SDK fixes, open)"
   - "PR #1117 (Python wheels, open)"
   - "PR #1511 (proxy egress RFC, open)"
+  - "Issue #1044 (SDK roadmap)"
 ---
 
 # RFC 0006 - SDK Consumption Entrypoints and File Transfer
@@ -18,8 +21,25 @@ consumable as programmable infrastructure for agent platforms and
 frameworks. Add streaming UploadFile/DownloadFile gRPC RPCs to the
 gateway so SDK consumers can move files in and out of sandboxes
 without shelling out to the CLI. Support OIDC authentication in both
-SDKs so cross-namespace K8s deployments work without copying mTLS
-secrets.
+SDKs so any OIDC-enabled gateway is reachable without distributing
+client certificates.
+
+### Relationship to RFC 0005
+
+RFC 0005 (PR #1617, @maxdubrinsky) proposes the shared Rust SDK core
+and TypeScript binding via napi-rs, with a working prototype. This RFC
+is complementary: it covers the broader SDK strategy (consumption
+patterns, file transfer RPCs, Python SDK surface expansion, platform
+integration examples) that RFC 0005 is the first implementation phase
+of. RFC 0005 delivers the "how" for the shared core and TS binding;
+this RFC frames the "why" and "what" across both languages.
+
+Areas this RFC covers that RFC 0005 explicitly defers:
+
+- File transfer RPCs (UploadFile/DownloadFile)
+- Python SDK surface expansion (provider, watch, policy, services)
+- Platform consumption patterns (Anthropic, OpenAI, OpenClaw, CI/CD)
+- Python-on-shared-core migration path
 
 ## Motivation
 
@@ -97,13 +117,17 @@ Examples: OpenAI Agents SDK, OpenClaw, LangChain.
   SDKs use ExecSandbox.
 - **Supervisor protocol exposure.** ConnectSupervisor/RelayStream are
   internal. SDK consumers never talk to the supervisor directly.
-- **Provider CRUD in the SDK.** Providers are created by the platform
-  engineer via CLI. SDK consumers attach existing providers, not
-  create new ones.
 - **Draft policy workflow in the SDK.** Operator approval UI concern,
   not a programmatic SDK concern.
 - **Replacing the CLI.** The CLI remains the interface for Mode 1 and
   for platform engineers. The SDK serves programmatic consumers.
+- **Per-principal sandbox isolation.** OIDC gives authentication
+  (who is calling) but does not by itself give tenant isolation. The
+  gateway does not currently filter sandbox visibility per principal.
+  This RFC adds OIDC support to the SDK for identity and
+  cross-deployment connectivity, not for multi-tenancy enforcement.
+  Per-principal sandbox scoping is a gateway-side feature that should
+  be addressed separately.
 
 ## Proposal
 
@@ -113,8 +137,9 @@ Add wrappers for existing gateway RPCs. No gateway changes needed.
 
 | Method | RPC | Why |
 |--------|-----|-----|
-| OIDC auth | gRPC metadata interceptor | mTLS-only locks SDK to single namespace. Every K8s production deployment needs cross-namespace auth. |
+| OIDC auth | gRPC metadata interceptor | mTLS-only requires distributing client certificates to every SDK consumer. OIDC bearer tokens let any consumer connect to an OIDC-enabled gateway without certificate distribution, regardless of deployment model. |
 | `attach_provider()` / `detach_provider()` / `list_providers()` | AttachSandboxProvider, DetachSandboxProvider, ListSandboxProviders | Credential separation is Mode 2's core security property. Without it, SDK consumers must bake credentials into sandbox images or pass them as env vars visible to agent code. |
+| `create_provider()` / `get_provider()` / `update_provider()` / `delete_provider()` | CreateProvider, GetProvider, UpdateProvider, DeleteProvider | API parity with the CLI. Platforms onboarding tenants programmatically need full provider lifecycle without a human running CLI commands. |
 | `watch()` | WatchSandbox | Polling at scale is untenable. Platforms need real-time status, logs, and error detection. |
 | `upload_path()` / `download_path()` | UploadFile, DownloadFile (new RPCs, see below) | Every use case involving local files is blocked without this. |
 
@@ -237,19 +262,20 @@ Implementation: a gRPC call credentials interceptor that attaches
 20 lines per SDK.
 
 ```python
-# mTLS (today): certs manually copied from another namespace
+# mTLS (today): client certificates distributed to every consumer
 client = SandboxClient(endpoint=..., tls=TlsConfig(ca_path=..., cert_path=..., key_path=...))
 
 # OIDC (proposed): one token from your existing IdP
 client = SandboxClient(endpoint=..., auth=OidcAuth(token=os.environ["OIDC_TOKEN"]))
 ```
 
-**Why this is required, not nice-to-have:** mTLS secrets live in the
-gateway's namespace. Every SDK consumer in a different namespace must
-manually copy the Secret and re-copy on every cert rotation. In a
-multi-tenant platform, that's N tenant namespaces each needing a
-copy. OIDC eliminates this entirely: the SDK sends a JWT, the gateway
-validates against the IdP's public keys, no secrets to copy.
+**Why this is required, not nice-to-have:** mTLS requires distributing
+client certificates to every SDK consumer. Each consumer needs the CA
+cert, client cert, and client key, and must re-distribute on every
+rotation. In multi-tenant or multi-host deployments, that's N
+consumers each needing a copy. OIDC eliminates this: the SDK sends a
+JWT, the gateway validates against the IdP's public keys, no
+certificates to distribute.
 
 ## Implementation plan
 
@@ -268,7 +294,7 @@ proves everything works. Phase 5 is independent.
 - Tests
 
 **Enables:** Remote-mode workloads (git clone inside sandbox, no file
-transfer needed). OIDC auth for cross-namespace K8s. Credential
+transfer needed). OIDC auth for any gateway deployment. Credential
 separation via provider attach.
 
 **Related PRs:** #1404 (auth foundation, merged), #1547 (Python SDK
@@ -333,11 +359,13 @@ same privilege model as the exec relay. It does not grant new
 capabilities; it provides a typed interface for an operation the CLI
 already performs over SSH.
 
-**TypeScript SDK maintenance.** A second SDK doubles the maintenance
-surface. Mitigation: both SDKs are thin wrappers around generated
-proto stubs. The Python SDK is ~600 lines. The TypeScript SDK would
-be similar. The proto files are the source of truth; SDK updates are
-mechanical when protos change.
+**Multi-language SDK maintenance.** Multiple SDKs increase the
+maintenance surface. Mitigation: [#1617](https://github.com/NVIDIA/OpenShell/issues/1617)
+proposes a shared Rust core with language-specific thin bindings.
+SDKs would not reimplement workflows (OIDC, file transfer, image
+building) per language; they wrap the Rust core. This RFC's scope
+(which RPCs to expose, auth model, file transfer contract) informs
+what the shared core needs to implement.
 
 **Community SDK fragmentation.** `moonshot-partners/openshell-node`
 exists (1 contributor, MIT, 7 RPCs). Shipping an official TS SDK may
@@ -399,28 +427,36 @@ we're proposing, different transport (HTTP vs gRPC).
 `modal.Sandbox.create()`, `.exec()`, `.terminate()`. File transfer
 uses Modal's volume system rather than per-file upload RPCs.
 
+## Resolved questions
+
+1. **TypeScript SDK location.** In-repo for proto sync and release
+   alignment. Decided per review feedback.
+
+2. **Provider CRUD in SDK.** Included in scope. API parity with the
+   CLI is a design principle. The trust boundary (credentials never
+   in the sandbox) is preserved regardless of whether providers are
+   created via CLI or SDK.
+
+3. **API parity.** CLI and SDK should have API parity as a principle,
+   excluding interactive features (shell access, TUI).
+
 ## Open questions
 
-1. **TypeScript SDK location.** Build in-repo at
-   `typescript/openshell/` (proto sync, release alignment) or as a
-   standalone repo (more flexibility, separate release cycle)?
-   Recommendation: in-repo.
-
-2. **File transfer archive format.** The proto uses `is_archive` with
+1. **File transfer archive format.** The proto uses `is_archive` with
    tar. Should this be tar, tar.gz, tar.zstd, or configurable?
    Recommendation: tar (uncompressed). gRPC already compresses at the
    transport layer when enabled.
 
-3. **OIDC audience naming.** The gateway default is
+2. **OIDC audience naming.** The gateway default is
    `server.oidc.audience = "openshell-cli"`. Now that the SDK is a
    first-class client, should this be renamed to `openshell-api` or
    `openshell-gateway`?
 
-4. **Provider CRUD in SDK.** This RFC scopes the SDK to attach/detach
-   (bind existing providers). Should full provider CRUD
-   (create/update/delete) be in scope for platforms that want fully
-   programmatic provider lifecycle?
-
-5. **npm package name.** `@openshell/sdk`, `openshell`, or
+3. **npm package name.** `@openshell/sdk`, `openshell`, or
    `openshell-sdk`? Should align with the Python package name
    (`openshell` on PyPI).
+
+4. **Relationship to #1617 (shared Rust core).** This RFC defines
+   what the SDK exposes. #1617 defines how it is implemented (shared
+   Rust core with thin language bindings). The two RFCs should close
+   together since they inform each other.
