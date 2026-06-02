@@ -48,8 +48,25 @@ credentials:
     env_vars: [AWS_SESSION_TOKEN]
     required: true
 endpoints:
-  - host: "*.amazonaws.com"
+  # S3 uses virtual-hosted URLs like bucket.s3.region.amazonaws.com.
+  # The host wildcard validator only allows wildcards in the first DNS
+  # label, so we cannot write *.s3.**.amazonaws.com. Using **.amazonaws.com
+  # is broader than S3; use the generic 'aws' profile with a custom policy
+  # if you need tighter host scoping.
+  - host: "**.amazonaws.com"
     port: 443
     protocol: rest
+    tls: terminate
     access: read-write
     enforcement: enforce
+    credential_signing: sigv4
+    signing_service: s3
+binaries:
+  - /sandbox/.venv/bin/python
+  - /sandbox/.venv/bin/python3
+  - /sandbox/.uv/python/**
+  - /usr/bin/python3
+  - /usr/bin/python3.*
+  - /usr/bin/curl
+  - /usr/local/bin/aws
+  - /bin/bash

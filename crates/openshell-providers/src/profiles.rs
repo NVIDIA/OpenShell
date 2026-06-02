@@ -1647,6 +1647,11 @@ endpoints:
         let aws_s3 = get_default_profile("aws-s3").expect("aws-s3 profile should exist");
         assert_eq!(aws_s3.display_name, "AWS S3");
         assert!(!aws_s3.endpoints.is_empty());
-        assert!(aws_s3.endpoints.iter().any(|e| e.host.contains("amazonaws.com")));
+        assert!(
+            aws_s3
+                .endpoints
+                .iter()
+                .any(|e| e.host.contains("amazonaws.com"))
+        );
     }
 }

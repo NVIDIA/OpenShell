@@ -184,6 +184,9 @@ openshell provider refresh configure my-aws \
 Use the generic `aws` profile type for multi-service access and scope endpoints
 via sandbox network policy. Use `aws-s3` for S3-specific endpoint rules.
 
+The proxy re-signs requests using SigV4 before forwarding to AWS. Both curl and
+Python boto3 are supported.
+
 External refresh systems should continue to push new current credentials through
 `openshell provider update`. The `--credential-expires-at` option works for
 static credentials, externally refreshed credentials, and gateway-managed
