@@ -461,19 +461,19 @@ where
         guard.ensure_current()?;
     }
 
-    // If the client sent `Expect: 100-continue`, acknowledge it so the client
-    // sends the body. Without this, clients like boto3's S3 PutObject wait
-    // for the 100 response before transmitting any body bytes.
-    if has_expect_continue(header_str) {
-        client
-            .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
-            .await
-            .into_diagnostic()?;
-        client.flush().await.into_diagnostic()?;
-    }
-
     // Apply SigV4 signing if configured.
     if options.credential_signing.is_sigv4() {
+        // SigV4 re-signing needs the body before forwarding. If the client
+        // sent `Expect: 100-continue`, acknowledge it so the client transmits
+        // the body. Scoped to SigV4 paths only — non-SigV4 traffic forwards
+        // the Expect header to upstream for normal handling.
+        if has_expect_continue(header_str) {
+            client
+                .write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+                .await
+                .into_diagnostic()?;
+            client.flush().await.into_diagnostic()?;
+        }
         if let Some(resolver) = options.resolver {
             let access_key_placeholder =
                 crate::secrets::placeholder_for_env_key("AWS_ACCESS_KEY_ID");
@@ -506,13 +506,24 @@ where
                         crate::l7::CredentialSigning::None => unreachable!(),
                     };
 
-                    debug!(
-                        host = %options.host,
-                        region = %region,
-                        service = %service,
-                        payload_mode = %payload_mode,
-                        "applying SigV4 signing to CONNECT tunnel request"
-                    );
+                    let event = openshell_ocsf::NetworkActivityBuilder::new(
+                        crate::ocsf_ctx(),
+                    )
+                    .activity(openshell_ocsf::ActivityId::Other)
+                    .action(openshell_ocsf::ActionId::Allowed)
+                    .disposition(openshell_ocsf::DispositionId::Allowed)
+                    .severity(openshell_ocsf::SeverityId::Informational)
+                    .status(openshell_ocsf::StatusId::Success)
+                    .dst_endpoint(openshell_ocsf::Endpoint::from_domain(
+                        options.host,
+                        0,
+                    ))
+                    .message(format!(
+                        "SigV4 re-signing {host} service={service} region={region} mode={payload_mode}",
+                        host = options.host,
+                    ))
+                    .build();
+                    openshell_ocsf::ocsf_emit!(event);
 
                     if payload_mode == SigV4PayloadMode::SignBody {
                         // Buffer body and include its hash in the signature.
