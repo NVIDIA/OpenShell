@@ -55,7 +55,19 @@ pub enum TlsMode {
 pub enum CredentialSigning {
     #[default]
     None,
+    /// Auto-detect: include body in signature when Content-Length is present,
+    /// skip body when Transfer-Encoding is chunked or body is absent.
     SigV4,
+    /// Always include body in signature (buffer body, compute SHA-256 hash).
+    SigV4Body,
+    /// Never include body in signature (use UNSIGNED-PAYLOAD, stream through).
+    SigV4NoBody,
+}
+
+impl CredentialSigning {
+    pub fn is_sigv4(&self) -> bool {
+        matches!(self, Self::SigV4 | Self::SigV4Body | Self::SigV4NoBody)
+    }
 }
 
 /// Enforcement mode for L7 policy decisions.
@@ -180,6 +192,8 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
 
     let credential_signing = match get_object_str(val, "credential_signing").as_deref() {
         Some("sigv4") => CredentialSigning::SigV4,
+        Some("sigv4:body") => CredentialSigning::SigV4Body,
+        Some("sigv4:no_body") => CredentialSigning::SigV4NoBody,
         Some(other) if !other.is_empty() => {
             let event = openshell_ocsf::NetworkActivityBuilder::new(crate::ocsf_ctx())
                 .activity(openshell_ocsf::ActivityId::Other)
@@ -1227,6 +1241,41 @@ mod tests {
         assert_eq!(config.protocol, L7Protocol::Rest);
         assert_eq!(config.tls, TlsMode::Auto);
         assert_eq!(config.enforcement, EnforcementMode::Audit);
+    }
+
+    #[test]
+    fn parse_credential_signing_sigv4() {
+        let val = regorus::Value::from_json_str(
+            r#"{"protocol": "rest", "credential_signing": "sigv4", "signing_service": "bedrock", "host": "bedrock.us-east-1.amazonaws.com", "port": 443}"#,
+        ).unwrap();
+        let config = parse_l7_config(&val).unwrap();
+        assert_eq!(config.credential_signing, CredentialSigning::SigV4);
+        assert!(config.credential_signing.is_sigv4());
+    }
+
+    #[test]
+    fn parse_credential_signing_sigv4_body() {
+        let val = regorus::Value::from_json_str(
+            r#"{"protocol": "rest", "credential_signing": "sigv4:body", "signing_service": "bedrock", "host": "bedrock.us-east-1.amazonaws.com", "port": 443}"#,
+        ).unwrap();
+        let config = parse_l7_config(&val).unwrap();
+        assert_eq!(config.credential_signing, CredentialSigning::SigV4Body);
+        assert!(config.credential_signing.is_sigv4());
+    }
+
+    #[test]
+    fn parse_credential_signing_sigv4_no_body() {
+        let val = regorus::Value::from_json_str(
+            r#"{"protocol": "rest", "credential_signing": "sigv4:no_body", "signing_service": "s3", "host": "s3.us-east-1.amazonaws.com", "port": 443}"#,
+        ).unwrap();
+        let config = parse_l7_config(&val).unwrap();
+        assert_eq!(config.credential_signing, CredentialSigning::SigV4NoBody);
+        assert!(config.credential_signing.is_sigv4());
+    }
+
+    #[test]
+    fn is_sigv4_false_for_none() {
+        assert!(!CredentialSigning::None.is_sigv4());
     }
 
     #[test]
