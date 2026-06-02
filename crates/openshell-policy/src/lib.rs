@@ -704,6 +704,12 @@ pub enum PolicyViolation {
     TldWildcard { policy_name: String, host: String },
     /// `credential_signing` is set but `signing_service` is missing.
     MissingSigningService { policy_name: String, host: String },
+    /// `credential_signing` has an unrecognized value.
+    UnknownCredentialSigning {
+        policy_name: String,
+        host: String,
+        value: String,
+    },
 }
 
 impl fmt::Display for PolicyViolation {
@@ -745,6 +751,17 @@ impl fmt::Display for PolicyViolation {
                     f,
                     "network policy '{policy_name}': endpoint '{host}' has credential_signing \
                      set but signing_service is empty"
+                )
+            }
+            Self::UnknownCredentialSigning {
+                policy_name,
+                host,
+                value,
+            } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': endpoint '{host}' has unrecognized \
+                     credential_signing value '{value}' (expected sigv4, sigv4:body, or sigv4:no_body)"
                 )
             }
         }
@@ -850,6 +867,18 @@ pub fn validate_sandbox_policy(
                         host: ep.host.clone(),
                     });
                 }
+            }
+            if !ep.credential_signing.is_empty()
+                && !matches!(
+                    ep.credential_signing.as_str(),
+                    "sigv4" | "sigv4:body" | "sigv4:no_body"
+                )
+            {
+                violations.push(PolicyViolation::UnknownCredentialSigning {
+                    policy_name: name.clone(),
+                    host: ep.host.clone(),
+                    value: ep.credential_signing.clone(),
+                });
             }
             if !ep.credential_signing.is_empty() && ep.signing_service.is_empty() {
                 violations.push(PolicyViolation::MissingSigningService {
