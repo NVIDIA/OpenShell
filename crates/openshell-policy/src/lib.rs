@@ -1434,9 +1434,11 @@ network_policies:
             },
         );
         let violations = validate_sandbox_policy(&policy).unwrap_err();
-        assert!(violations
-            .iter()
-            .any(|v| matches!(v, PolicyViolation::MissingSigningService { .. })));
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::MissingSigningService { .. }))
+        );
     }
 
     #[test]
@@ -1457,6 +1459,71 @@ network_policies:
             },
         );
         assert!(validate_sandbox_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_sigv4_body_with_signing_service() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "aws".into(),
+            NetworkPolicyRule {
+                name: "bedrock".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "bedrock-runtime.us-east-1.amazonaws.com".into(),
+                    port: 443,
+                    credential_signing: "sigv4:body".into(),
+                    signing_service: "bedrock".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        assert!(validate_sandbox_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_sigv4_no_body_with_signing_service() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "aws".into(),
+            NetworkPolicyRule {
+                name: "s3".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "s3.us-east-1.amazonaws.com".into(),
+                    port: 443,
+                    credential_signing: "sigv4:no_body".into(),
+                    signing_service: "s3".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        assert!(validate_sandbox_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_sigv4_no_body_without_signing_service() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "aws".into(),
+            NetworkPolicyRule {
+                name: "s3".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "s3.us-east-1.amazonaws.com".into(),
+                    port: 443,
+                    credential_signing: "sigv4:no_body".into(),
+                    signing_service: String::new(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::MissingSigningService { .. }))
+        );
     }
 
     #[test]

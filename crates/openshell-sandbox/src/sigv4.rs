@@ -68,10 +68,140 @@ pub fn strip_aws_headers(raw: &[u8]) -> Vec<u8> {
     output
 }
 
+struct RequestParts<'a> {
+    method: &'a str,
+    path: &'a str,
+    request_line: &'a str,
+    headers_to_sign: Vec<(String, String)>,
+    all_headers: Vec<(String, String)>,
+}
+
+/// Parse raw HTTP headers into components needed for `SigV4` signing.
+///
+/// Only host, content-type, and content-length are included in the `SigV4`
+/// signature. Signing all headers causes failures when the proxy or
+/// transport modifies unsigned-by-convention headers (Connection,
+/// Accept-Encoding, etc.) between signing and delivery.
+fn parse_request_parts(header_str: &str) -> RequestParts<'_> {
+    let lines: Vec<&str> = header_str.split("\r\n").collect();
+
+    let (method, path, request_line) =
+        lines
+            .first()
+            .map_or(("GET", "/", "GET / HTTP/1.1"), |first_line| {
+                let parts: Vec<&str> = first_line.splitn(3, ' ').collect();
+                if parts.len() >= 2 {
+                    (parts[0], parts[1], *first_line)
+                } else {
+                    ("GET", "/", *first_line)
+                }
+            });
+
+    // Headers stripped entirely — the SDK re-generates auth headers, and
+    // `Expect` is handled by the proxy before forwarding.
+    const STRIP_HEADERS: &[&str] = &[
+        "authorization",
+        "x-amz-date",
+        "x-amz-security-token",
+        "x-amz-content-sha256",
+        "expect",
+    ];
+    // Headers forwarded but NOT signed — the proxy or transport may modify
+    // them between signing and delivery, which would invalidate the signature.
+    const UNSIGNED_HEADERS: &[&str] = &[
+        "connection",
+        "accept-encoding",
+        "transfer-encoding",
+        "user-agent",
+        "amz-sdk-invocation-id",
+        "amz-sdk-request",
+    ];
+
+    let mut headers_to_sign: Vec<(String, String)> = Vec::new();
+    let mut all_headers: Vec<(String, String)> = Vec::new();
+    for line in lines.iter().skip(1) {
+        if line.is_empty() {
+            break;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            let lower = k.trim().to_ascii_lowercase();
+            if STRIP_HEADERS.iter().any(|s| lower.starts_with(s)) {
+                continue;
+            }
+            all_headers.push((lower.clone(), v.trim().to_string()));
+            if !UNSIGNED_HEADERS.iter().any(|s| lower.starts_with(s)) {
+                headers_to_sign.push((lower, v.trim().to_string()));
+            }
+        }
+    }
+
+    RequestParts {
+        method,
+        path,
+        request_line,
+        headers_to_sign,
+        all_headers,
+    }
+}
+
+fn build_signing_params<'a>(
+    identity: &'a Identity,
+    region: &'a str,
+    service: &'a str,
+) -> Result<aws_sigv4::http_request::SigningParams<'a>> {
+    let mut settings = SigningSettings::default();
+    settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
+
+    Ok(v4::SigningParams::builder()
+        .identity(identity)
+        .region(region)
+        .name(service)
+        .time(SystemTime::now())
+        .settings(settings)
+        .build()
+        .map_err(|e| miette!("SigV4 signing params: {e}"))?
+        .into())
+}
+
+fn build_identity(access_key: &str, secret_key: &str, session_token: Option<&str>) -> Identity {
+    Credentials::new(
+        access_key,
+        secret_key,
+        session_token.map(ToString::to_string),
+        None,
+        "openshell",
+    )
+    .into()
+}
+
+fn rebuild_request(
+    parts: &RequestParts<'_>,
+    instructions: &aws_sigv4::http_request::SigningInstructions,
+    body: &[u8],
+) -> Vec<u8> {
+    let mut output = Vec::with_capacity(256 + body.len());
+
+    output.extend_from_slice(parts.request_line.as_bytes());
+    output.extend_from_slice(b"\r\n");
+
+    for (k, v) in &parts.all_headers {
+        output.extend_from_slice(format!("{k}: {v}\r\n").as_bytes());
+    }
+
+    for (name, value) in instructions.headers() {
+        output.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
+    }
+
+    output.extend_from_slice(b"\r\n");
+    output.extend_from_slice(body);
+
+    output
+}
+
 /// Apply AWS Signature Version 4 signing to a raw HTTP request buffer.
 ///
 /// Strips existing AWS auth headers, computes a new signature using the
-/// `aws-sigv4` crate, and returns the rewritten request bytes.
+/// `aws-sigv4` crate, and returns the rewritten request bytes including body.
 pub fn apply_sigv4_to_request(
     raw: &[u8],
     host: &str,
@@ -93,72 +223,16 @@ pub fn apply_sigv4_to_request(
     };
 
     let header_str = String::from_utf8_lossy(&raw[..header_end]);
-    let lines: Vec<&str> = header_str.split("\r\n").collect();
-
-    let (method, path) = lines.first().map_or(("GET", "/"), |first_line| {
-        let parts: Vec<&str> = first_line.splitn(3, ' ').collect();
-        if parts.len() >= 2 {
-            (parts[0], parts[1])
-        } else {
-            ("GET", "/")
-        }
-    });
-
-    // Collect all non-AWS headers for forwarding, and a subset for signing.
-    // Only host, content-type, and content-length are included in the SigV4
-    // signature. Signing all headers causes failures when the proxy or
-    // transport modifies unsigned-by-convention headers (Connection,
-    // Accept-Encoding, etc.) between signing and delivery.
-    let mut headers_to_sign: Vec<(String, String)> = Vec::new();
-    let mut all_headers: Vec<(String, String)> = Vec::new();
-    for line in lines.iter().skip(1) {
-        if line.is_empty() {
-            break;
-        }
-        if let Some((k, v)) = line.split_once(':') {
-            let lower = k.trim().to_ascii_lowercase();
-            if lower.starts_with("authorization")
-                || lower.starts_with("x-amz-date")
-                || lower.starts_with("x-amz-security-token")
-                || lower.starts_with("x-amz-content-sha256")
-            {
-                continue;
-            }
-            all_headers.push((lower.clone(), v.trim().to_string()));
-            if lower == "host" || lower == "content-type" || lower == "content-length" {
-                headers_to_sign.push((lower, v.trim().to_string()));
-            }
-        }
-    }
-
-    let uri = format!("https://{host}{path}");
-
-    let identity: Identity = Credentials::new(
-        access_key,
-        secret_key,
-        session_token.map(ToString::to_string),
-        None,
-        "openshell",
-    )
-    .into();
-
-    let mut settings = SigningSettings::default();
-    settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
-
-    let signing_params = v4::SigningParams::builder()
-        .identity(&identity)
-        .region(region)
-        .name(service)
-        .time(SystemTime::now())
-        .settings(settings)
-        .build()
-        .map_err(|e| miette!("SigV4 signing params: {e}"))?
-        .into();
+    let parts = parse_request_parts(&header_str);
+    let uri = format!("https://{host}{}", parts.path);
+    let identity = build_identity(access_key, secret_key, session_token);
+    let signing_params = build_signing_params(&identity, region, service)?;
 
     let signable_request = SignableRequest::new(
-        method,
+        parts.method,
         &uri,
-        headers_to_sign
+        parts
+            .headers_to_sign
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str())),
         SignableBody::Bytes(body),
@@ -169,32 +243,72 @@ pub fn apply_sigv4_to_request(
         .map_err(|e| miette!("SigV4 signing failed: {e}"))?
         .into_parts();
 
-    // Rebuild the request with signed headers
-    let mut output = Vec::with_capacity(raw.len() + 256);
+    Ok(rebuild_request(&parts, &instructions, body))
+}
 
-    // Request line
-    if let Some(first_line) = lines.first() {
-        output.extend_from_slice(first_line.as_bytes());
-        output.extend_from_slice(b"\r\n");
-    }
+/// Apply AWS `SigV4` signing to HTTP headers only, using UNSIGNED-PAYLOAD.
+///
+/// Returns signed headers ending with `\r\n\r\n`. The caller is responsible
+/// for streaming the body separately. Use when the body is chunked or when
+/// the service accepts unsigned payloads (e.g. S3 over HTTPS).
+pub fn apply_sigv4_headers_only(
+    raw_headers: &[u8],
+    host: &str,
+    region: &str,
+    service: &str,
+    access_key: &str,
+    secret_key: &str,
+    session_token: Option<&str>,
+) -> Result<Vec<u8>> {
+    apply_sigv4_headers_only_with_body(
+        raw_headers,
+        host,
+        region,
+        service,
+        access_key,
+        secret_key,
+        session_token,
+        SignableBody::UnsignedPayload,
+    )
+}
 
-    // All original non-AWS headers
-    for (k, v) in &all_headers {
-        output.extend_from_slice(format!("{k}: {v}\r\n").as_bytes());
-    }
+/// Apply AWS `SigV4` signing to HTTP headers only with a caller-chosen
+/// `SignableBody` mode (e.g. `UnsignedPayload` or
+/// `StreamingUnsignedPayloadTrailer`).
+///
+/// Returns signed headers ending with `\r\n\r\n`.
+pub fn apply_sigv4_headers_only_with_body(
+    raw_headers: &[u8],
+    host: &str,
+    region: &str,
+    service: &str,
+    access_key: &str,
+    secret_key: &str,
+    session_token: Option<&str>,
+    body: SignableBody<'_>,
+) -> Result<Vec<u8>> {
+    let header_str = String::from_utf8_lossy(raw_headers);
+    let parts = parse_request_parts(&header_str);
+    let uri = format!("https://{host}{}", parts.path);
+    let identity = build_identity(access_key, secret_key, session_token);
+    let signing_params = build_signing_params(&identity, region, service)?;
 
-    // Signed headers from the SDK
-    for (name, value) in instructions.headers() {
-        output.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
-    }
+    let signable_request = SignableRequest::new(
+        parts.method,
+        &uri,
+        parts
+            .headers_to_sign
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str())),
+        body,
+    )
+    .map_err(|e| miette!("SigV4 signable request: {e}"))?;
 
-    // End of headers
-    output.extend_from_slice(b"\r\n");
+    let (instructions, _signature) = sign(signable_request, &signing_params)
+        .map_err(|e| miette!("SigV4 signing failed: {e}"))?
+        .into_parts();
 
-    // Body
-    output.extend_from_slice(body);
-
-    Ok(output)
+    Ok(rebuild_request(&parts, &instructions, &[]))
 }
 
 #[cfg(test)]
@@ -299,5 +413,66 @@ mod tests {
         assert!(result_str.contains("authorization: AWS4-HMAC-SHA256 Credential=AKIATEST/"));
         assert!(!result_str.contains("old-invalid-sig"));
         assert!(!result_str.contains("old-date"));
+    }
+
+    #[test]
+    fn headers_only_produces_unsigned_payload() {
+        let raw = b"PUT /my-bucket/my-key HTTP/1.1\r\nHost: s3.us-east-1.amazonaws.com\r\nContent-Type: application/octet-stream\r\nContent-Length: 1024\r\n\r\n";
+        let result = apply_sigv4_headers_only(
+            raw,
+            "s3.us-east-1.amazonaws.com",
+            "us-east-1",
+            "s3",
+            "AKIAIOSFODNN7EXAMPLE",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            None,
+        )
+        .unwrap();
+        let result_str = String::from_utf8_lossy(&result);
+        assert!(
+            result_str.contains("authorization: AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/")
+        );
+        assert!(result_str.contains("x-amz-content-sha256: UNSIGNED-PAYLOAD"));
+        assert!(result_str.contains("x-amz-date: "));
+        assert!(result_str.ends_with("\r\n\r\n"));
+    }
+
+    #[test]
+    fn headers_only_strips_old_auth() {
+        let raw = b"PUT /bucket/key HTTP/1.1\r\nHost: s3.us-east-1.amazonaws.com\r\nAuthorization: AWS4-HMAC-SHA256 old-sig\r\nX-Amz-Date: old-date\r\nX-Amz-Content-Sha256: old-hash\r\nContent-Type: application/octet-stream\r\n\r\n";
+        let result = apply_sigv4_headers_only(
+            raw,
+            "s3.us-east-1.amazonaws.com",
+            "us-east-1",
+            "s3",
+            "AKIATEST",
+            "secret",
+            None,
+        )
+        .unwrap();
+        let result_str = String::from_utf8_lossy(&result);
+        assert!(result_str.contains("authorization: AWS4-HMAC-SHA256 Credential=AKIATEST/"));
+        assert!(!result_str.contains("old-sig"));
+        assert!(!result_str.contains("old-date"));
+        assert!(!result_str.contains("old-hash"));
+        assert!(result_str.contains("x-amz-content-sha256: UNSIGNED-PAYLOAD"));
+    }
+
+    #[test]
+    fn headers_only_with_session_token() {
+        let raw = b"PUT /bucket/key HTTP/1.1\r\nHost: s3.us-east-1.amazonaws.com\r\nContent-Type: application/octet-stream\r\n\r\n";
+        let result = apply_sigv4_headers_only(
+            raw,
+            "s3.us-east-1.amazonaws.com",
+            "us-east-1",
+            "s3",
+            "ASIAEXAMPLE",
+            "secret",
+            Some("FwoGZXIvYXdzEBYaDH+session+token"),
+        )
+        .unwrap();
+        let result_str = String::from_utf8_lossy(&result);
+        assert!(result_str.contains("x-amz-security-token: FwoGZXIvYXdzEBYaDH+session+token"));
+        assert!(result_str.contains("x-amz-content-sha256: UNSIGNED-PAYLOAD"));
     }
 }
