@@ -527,6 +527,16 @@ where
 
                     if payload_mode == SigV4PayloadMode::SignBody {
                         // Buffer body and include its hash in the signature.
+                        // This requires Content-Length — chunked bodies cannot
+                        // be buffered for signing. detect_payload_mode() should
+                        // route chunked requests to the streaming path, but
+                        // guard here as defense-in-depth.
+                        if matches!(parse_body_length(header_str)?, BodyLength::Chunked) {
+                            return Err(miette!(
+                                "SigV4 body signing requires Content-Length; \
+                                 chunked transfer encoding is not supported in this mode"
+                            ));
+                        }
                         let overflow = &req.raw_header[header_end..];
                         let mut full_request = rewrite_result.rewritten.clone();
                         full_request.extend_from_slice(overflow);
@@ -1549,21 +1559,27 @@ impl fmt::Display for SigV4PayloadMode {
 /// Mirrors the mode the client SDK chose by inspecting `x-amz-content-sha256`:
 /// - `STREAMING-UNSIGNED-PAYLOAD-TRAILER` → `StreamingUnsignedTrailer`
 /// - `UNSIGNED-PAYLOAD` → `UnsignedPayload`
-/// - Absent or a hex hash → `SignBody` (buffer + hash)
+/// - Hex hash → `SignBody` (buffer + hash, requires `Content-Length`)
+/// - `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` → rejected (per-chunk signing unsupported)
+/// - Absent → `SignBody` if `Content-Length` present, else `UnsignedPayload`
 fn detect_payload_mode(headers: &str) -> Result<SigV4PayloadMode> {
     for line in headers.lines().skip(1) {
         let lower = line.to_ascii_lowercase();
         if lower.starts_with("x-amz-content-sha256:") {
             let val = lower.split_once(':').map_or("", |(_, v)| v.trim());
-            return Ok(match val {
-                "streaming-unsigned-payload-trailer" => SigV4PayloadMode::StreamingUnsignedTrailer,
-                "unsigned-payload" => SigV4PayloadMode::UnsignedPayload,
-                _ => SigV4PayloadMode::SignBody,
-            });
+            return match val {
+                "streaming-unsigned-payload-trailer" => {
+                    Ok(SigV4PayloadMode::StreamingUnsignedTrailer)
+                }
+                "unsigned-payload" => Ok(SigV4PayloadMode::UnsignedPayload),
+                v if v.starts_with("streaming-") => Err(miette!(
+                    "SigV4 per-chunk streaming signing ({v}) is not supported; \
+                     use credential_signing: sigv4 (auto-detect) or sigv4:no_body"
+                )),
+                _ => Ok(SigV4PayloadMode::SignBody),
+            };
         }
     }
-    // No x-amz-content-sha256 header — default to signing body if Content-Length
-    // is present, otherwise unsigned.
     Ok(
         if matches!(parse_body_length(headers)?, BodyLength::ContentLength(_)) {
             SigV4PayloadMode::SignBody
