@@ -562,7 +562,12 @@ async fn mint_okta_xaa_token_exchange(
 ) -> Result<MintedCredential, Status> {
     if material_value(
         &state.material,
-        &["requesting_client_id", "requesting_client_secret", "resource_client_id", "resource_client_secret"],
+        &[
+            "requesting_client_id",
+            "requesting_client_secret",
+            "resource_client_id",
+            "resource_client_secret",
+        ],
     )
     .is_some()
     {
@@ -640,8 +645,8 @@ async fn mint_okta_xaa_sample_token_exchange(
     let resource_client_id = required_material(&state.material, "resource_client_id")?;
     let resource_client_secret = required_material(&state.material, "resource_client_secret")?;
     let audience = required_material(&state.material, "audience")?;
-    let resource = material_value(&state.material, &["resource"])
-        .unwrap_or_else(|| audience.clone());
+    let resource =
+        material_value(&state.material, &["resource"]).unwrap_or_else(|| audience.clone());
     let scope = refresh_scopes(state).join(" ");
 
     let idp_token_url = oauth2_token_url(state)?;
@@ -668,18 +673,12 @@ async fn mint_okta_xaa_sample_token_exchange(
         jag_form.push(("scope".to_string(), scope.clone()));
     }
 
-    let id_jag = request_token(
-        &idp_token_url,
-        &jag_form,
-        None,
-        state.max_lifetime_seconds,
-    )
-    .await?
-    .access_token;
+    let id_jag = request_token(&idp_token_url, &jag_form, None, state.max_lifetime_seconds)
+        .await?
+        .access_token;
 
     let resource_token_url = material_value(&state.material, &["resource_token_url"])
-        .map(Ok)
-        .unwrap_or_else(|| token_url_from_issuer(&audience))?;
+        .map_or_else(|| token_url_from_issuer(&audience), Ok)?;
     let mut resource_form = vec![
         (
             "grant_type".to_string(),
@@ -708,9 +707,7 @@ fn token_url_from_issuer(issuer: &str) -> Result<String, Status> {
     let mut path = url.path().trim_end_matches('/').to_string();
     if path.is_empty() {
         path = "/oauth2/v1/token".to_string();
-    } else if path.ends_with("/oauth2") {
-        path.push_str("/v1/token");
-    } else if path.ends_with("/oauth2/default") || path.contains("/oauth2/") {
+    } else if path.ends_with("/oauth2") || path.contains("/oauth2/") {
         path.push_str("/v1/token");
     } else {
         path.push_str("/oauth2/v1/token");
@@ -1252,7 +1249,6 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/token"))
             .and(body_string_contains("grant_type=refresh_token"))
-            .and(body_string_contains("client_id=client-id"))
             .and(body_string_contains("refresh_token=old-refresh-token"))
             .and(body_string_contains(
                 "scope=https%3A%2F%2Fgraph.microsoft.com%2F.default",

@@ -98,16 +98,15 @@ async fn completion_grpc_client(
             Some("oidc") => {
                 if let Some(bundle) = load_oidc_token(gateway_name) {
                     if is_token_expired(&bundle) {
-                        match oidc_refresh_token(&bundle, tls_opts.gateway_insecure).await {
-                            Ok(refreshed) => {
-                                let _ = store_oidc_token(gateway_name, &refreshed);
-                                tls_opts.oidc_token = Some(refreshed.access_token);
-                                tls_opts.oidc_id_token = refreshed.id_token;
-                            }
-                            Err(_) => {
-                                tls_opts.oidc_token = Some(bundle.access_token);
-                                tls_opts.oidc_id_token = bundle.id_token;
-                            }
+                        if let Ok(refreshed) =
+                            oidc_refresh_token(&bundle, tls_opts.gateway_insecure).await
+                        {
+                            let _ = store_oidc_token(gateway_name, &refreshed);
+                            tls_opts.oidc_token = Some(refreshed.access_token);
+                            tls_opts.oidc_id_token = refreshed.id_token;
+                        } else {
+                            tls_opts.oidc_token = Some(bundle.access_token);
+                            tls_opts.oidc_id_token = bundle.id_token;
                         }
                     } else {
                         tls_opts.oidc_token = Some(bundle.access_token);

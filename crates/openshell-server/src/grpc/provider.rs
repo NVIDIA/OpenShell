@@ -1872,6 +1872,8 @@ mod tests {
                 "google-vertex-ai",
                 "nvidia",
                 "okta-obo",
+                "okta-xaa",
+                "xaa-dev",
             ]
         );
 
