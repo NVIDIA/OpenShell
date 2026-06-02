@@ -1556,6 +1556,31 @@ network_policies:
     }
 
     #[test]
+    fn validate_rejects_unknown_credential_signing() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "aws".into(),
+            NetworkPolicyRule {
+                name: "test".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "example.amazonaws.com".into(),
+                    port: 443,
+                    credential_signing: "sigv4_typo".into(),
+                    signing_service: "bedrock".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::UnknownCredentialSigning { .. }))
+        );
+    }
+
+    #[test]
     fn normalize_path_collapses_separators() {
         assert_eq!(normalize_path("/usr//lib"), "/usr/lib");
         assert_eq!(normalize_path("/usr/./lib"), "/usr/lib");
