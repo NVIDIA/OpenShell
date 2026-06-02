@@ -509,7 +509,7 @@ where
                     let event = openshell_ocsf::NetworkActivityBuilder::new(
                         crate::ocsf_ctx(),
                     )
-                    .activity(openshell_ocsf::ActivityId::Other)
+                    .activity(openshell_ocsf::ActivityId::Traffic)
                     .action(openshell_ocsf::ActionId::Allowed)
                     .disposition(openshell_ocsf::DispositionId::Allowed)
                     .severity(openshell_ocsf::SeverityId::Informational)
