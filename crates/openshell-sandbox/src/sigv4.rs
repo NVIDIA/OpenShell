@@ -10,6 +10,18 @@ use aws_smithy_runtime_api::client::identity::Identity;
 use miette::{Result, miette};
 use std::time::SystemTime;
 
+/// AWS regions contain a hyphen followed by a digit (e.g., `us-east-1`).
+/// Service names like `s3` or `bedrock-runtime` do not.
+fn looks_like_region(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    for i in 0..bytes.len().saturating_sub(1) {
+        if bytes[i] == b'-' && bytes[i + 1].is_ascii_digit() {
+            return true;
+        }
+    }
+    false
+}
+
 /// Extract the AWS region from an AWS hostname.
 ///
 /// Supports standard, dualstack, FIPS, virtual-hosted, and China partition
@@ -23,7 +35,11 @@ pub fn extract_aws_region(host: &str) -> Option<String> {
         && parts[parts.len() - 2] == "com"
         && parts[parts.len() - 1] == "cn"
     {
-        return Some(parts[parts.len() - 4].to_string());
+        let candidate = parts[parts.len() - 4];
+        if looks_like_region(candidate) {
+            return Some(candidate.to_string());
+        }
+        return None;
     }
     // Standard/dualstack/FIPS/virtual-hosted: *.amazonaws.com
     // Scan right-to-left from "amazonaws", skipping non-region labels
@@ -36,7 +52,7 @@ pub fn extract_aws_region(host: &str) -> Option<String> {
         while idx > 0 && parts[idx] == "dualstack" {
             idx -= 1;
         }
-        if idx > 0 {
+        if idx > 0 && looks_like_region(parts[idx]) {
             return Some(parts[idx].to_string());
         }
     }
@@ -356,6 +372,11 @@ mod tests {
     #[test]
     fn global_endpoint_returns_none() {
         assert!(extract_aws_region("s3.amazonaws.com").is_none());
+    }
+
+    #[test]
+    fn virtual_hosted_global_endpoint_returns_none() {
+        assert!(extract_aws_region("my-bucket.s3.amazonaws.com").is_none());
     }
 
     #[test]
