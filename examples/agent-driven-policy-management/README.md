@@ -102,7 +102,7 @@ with three parts, each with a different trust level:
 |---|---|---|
 | `proposed_rule` (host, port, method, path, binary) | agent, schema-validated by the gateway | structured contract — *this* is what you're approving |
 | `rationale` (free-form prose) | agent | hint only — a compromised agent can lie here |
-| `validation_result` (prover output) | gateway-side prover | trust signal — but this surface is in progress (see [RFC 0001](../../rfc/0001-agent-driven-policy-management.md)) |
+| `validation_result` (prover output) | gateway-side prover | trust signal — but this surface is in progress (see [RFC 0002](../../rfc/0002-agent-driven-policy-management/README.md)) |
 
 The MVP today shows the structured rule plus the agent's rationale in
 `openshell rule get` and the TUI inbox panel. With prover validation wired
