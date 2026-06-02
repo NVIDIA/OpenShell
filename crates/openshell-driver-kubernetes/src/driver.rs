@@ -1337,7 +1337,7 @@ fn apply_required_env(
     ssh_handshake_skew_secs: u64,
     tls_enabled: bool,
 ) {
-                                                                                                                            upsert_env(env, "OPENSHELL_SANDBOX_ID", sandbox_id);
+    upsert_env(env, "OPENSHELL_SANDBOX_ID", sandbox_id);
     upsert_env(env, "OPENSHELL_SANDBOX", sandbox_name);
     upsert_env(env, "OPENSHELL_ENDPOINT", grpc_endpoint);
     upsert_env(env, "OPENSHELL_SANDBOX_COMMAND", "sleep infinity");
