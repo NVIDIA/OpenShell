@@ -26,14 +26,19 @@ pub fn extract_aws_region(host: &str) -> Option<String> {
         return Some(parts[parts.len() - 4].to_string());
     }
     // Standard/dualstack/FIPS/virtual-hosted: *.amazonaws.com
+    // Scan right-to-left from "amazonaws", skipping non-region labels
+    // like "dualstack". Handles: s3.us-east-1.amazonaws.com,
+    // s3.dualstack.us-west-2.amazonaws.com,
+    // s3-fips.dualstack.us-west-2.amazonaws.com, etc.
     if parts.len() >= 4 && parts[parts.len() - 2] == "amazonaws" && parts[parts.len() - 1] == "com"
     {
-        let region = parts[parts.len() - 3];
-        // Skip "dualstack" — the region is one level further left
-        if region == "dualstack" && parts.len() >= 5 {
-            return Some(parts[parts.len() - 4].to_string());
+        let mut idx = parts.len() - 3;
+        while idx > 0 && parts[idx] == "dualstack" {
+            idx -= 1;
         }
-        return Some(region.to_string());
+        if idx > 0 {
+            return Some(parts[idx].to_string());
+        }
     }
     None
 }
@@ -369,6 +374,18 @@ mod tests {
     fn extract_region_china() {
         let region = extract_aws_region("s3.cn-north-1.amazonaws.com.cn").unwrap();
         assert_eq!(region, "cn-north-1");
+    }
+
+    #[test]
+    fn extract_region_fips_dualstack() {
+        let region = extract_aws_region("s3-fips.dualstack.us-west-2.amazonaws.com").unwrap();
+        assert_eq!(region, "us-west-2");
+    }
+
+    #[test]
+    fn extract_region_govcloud() {
+        let region = extract_aws_region("s3.us-gov-west-1.amazonaws.com").unwrap();
+        assert_eq!(region, "us-gov-west-1");
     }
 
     #[test]
