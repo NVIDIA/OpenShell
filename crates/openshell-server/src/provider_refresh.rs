@@ -331,7 +331,7 @@ pub async fn refresh_provider_credential(
         "provider credential refresh started"
     );
 
-    match mint_credential(store, &state).await {
+    match mint_credential(&state).await {
         Ok(minted) => {
             let now_ms = current_time_ms();
             if let Err(err) =
@@ -449,7 +449,6 @@ async fn apply_minted_credential(
 }
 
 async fn mint_credential(
-    store: &Store,
     state: &StoredProviderCredentialRefreshState,
 ) -> Result<MintedCredential, Status> {
     let strategy = ProviderCredentialRefreshStrategy::try_from(state.strategy)
@@ -462,12 +461,9 @@ async fn mint_credential(
             mint_oauth2_client_credentials(state).await
         }
         ProviderCredentialRefreshStrategy::Oauth2TokenExchange => {
-            let _ = store;
             mint_oauth2_token_exchange(state).await
         }
-        ProviderCredentialRefreshStrategy::OktaXaa => {
-            mint_okta_xaa_token_exchange(store, state).await
-        }
+        ProviderCredentialRefreshStrategy::OktaXaa => mint_okta_xaa_token_exchange(state).await,
         ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => {
             mint_google_service_account_jwt(state).await
         }
@@ -557,7 +553,6 @@ async fn mint_oauth2_client_credentials(
 }
 
 async fn mint_okta_xaa_token_exchange(
-    store: &Store,
     state: &StoredProviderCredentialRefreshState,
 ) -> Result<MintedCredential, Status> {
     if material_value(
@@ -571,23 +566,11 @@ async fn mint_okta_xaa_token_exchange(
     )
     .is_some()
     {
-        return mint_okta_xaa_sample_token_exchange(store, state).await;
+        return mint_okta_xaa_sample_token_exchange(state).await;
     }
 
     let token_url = oauth2_token_url(state)?;
-    let sandbox_id = required_material(&state.material, "sandbox_id")?;
-    let binding = crate::delegation::get_binding(store, &sandbox_id)
-        .await?
-        .ok_or_else(|| {
-            Status::failed_precondition(format!(
-                "sandbox delegation binding not found for sandbox_id '{sandbox_id}'"
-            ))
-        })?;
-    if binding.id_token.trim().is_empty() {
-        return Err(Status::failed_precondition(
-            "sandbox delegation binding does not contain an OIDC id_token",
-        ));
-    }
+    let subject_token = required_material(&state.material, "subject_token")?;
 
     let client_id = required_material(&state.material, "client_id")?;
     let client_assertion = build_okta_xaa_client_assertion(state, &token_url, &client_id)?;
@@ -607,7 +590,7 @@ async fn mint_okta_xaa_token_exchange(
         ("client_id".to_string(), client_id),
         ("client_assertion".to_string(), client_assertion),
         ("client_assertion_type".to_string(), client_assertion_type),
-        ("subject_token".to_string(), binding.id_token),
+        ("subject_token".to_string(), subject_token),
         (
             "subject_token_type".to_string(),
             "urn:ietf:params:oauth:token-type:id_token".to_string(),
@@ -623,23 +606,9 @@ async fn mint_okta_xaa_token_exchange(
 }
 
 async fn mint_okta_xaa_sample_token_exchange(
-    store: &Store,
     state: &StoredProviderCredentialRefreshState,
 ) -> Result<MintedCredential, Status> {
-    let sandbox_id = required_material(&state.material, "sandbox_id")?;
-    let binding = crate::delegation::get_binding(store, &sandbox_id)
-        .await?
-        .ok_or_else(|| {
-            Status::failed_precondition(format!(
-                "sandbox delegation binding not found for sandbox_id '{sandbox_id}'"
-            ))
-        })?;
-    if binding.id_token.trim().is_empty() {
-        return Err(Status::failed_precondition(
-            "sandbox delegation binding does not contain an OIDC id_token",
-        ));
-    }
-
+    let subject_token = required_material(&state.material, "subject_token")?;
     let requesting_client_id = required_material(&state.material, "requesting_client_id")?;
     let requesting_client_secret = required_material(&state.material, "requesting_client_secret")?;
     let resource_client_id = required_material(&state.material, "resource_client_id")?;
@@ -659,7 +628,7 @@ async fn mint_okta_xaa_sample_token_exchange(
             "requested_token_type".to_string(),
             "urn:ietf:params:oauth:token-type:id-jag".to_string(),
         ),
-        ("subject_token".to_string(), binding.id_token),
+        ("subject_token".to_string(), subject_token),
         (
             "subject_token_type".to_string(),
             "urn:ietf:params:oauth:token-type:id_token".to_string(),
@@ -1421,29 +1390,6 @@ mod tests {
             .await;
 
         let store = test_store().await;
-        let sandbox = Sandbox {
-            metadata: Some(ObjectMeta {
-                id: "sandbox-xaa".to_string(),
-                name: "xaa".to_string(),
-                created_at_ms: 1_000_000,
-                labels: HashMap::new(),
-                resource_version: 0,
-            }),
-            spec: Some(SandboxSpec::default()),
-            ..Default::default()
-        };
-        let binding = new_binding(
-            &sandbox,
-            "user-123",
-            Some("alex"),
-            "oidc",
-            "user-access-token",
-            Some("user-id-token"),
-            &["jira.read".to_string()],
-        )
-        .unwrap();
-        put_binding(&store, &binding).await.unwrap();
-
         let provider = provider("my-xaa", "okta-xaa");
         store.put_message(&provider).await.unwrap();
         let state = new_refresh_state(
@@ -1453,7 +1399,7 @@ mod tests {
                 strategy: ProviderCredentialRefreshStrategy::OktaXaa,
                 material: HashMap::from([
                     ("client_id".to_string(), "agent-client-id".to_string()),
-                    ("sandbox_id".to_string(), "sandbox-xaa".to_string()),
+                    ("subject_token".to_string(), "user-id-token".to_string()),
                     (
                         "audience".to_string(),
                         "https://nvidia-partner.oktapreview.com".to_string(),
@@ -1464,7 +1410,10 @@ mod tests {
                     ),
                     ("kid".to_string(), "test-key-id".to_string()),
                 ]),
-                secret_material_keys: vec!["private_key_pem".to_string()],
+                secret_material_keys: vec![
+                    "private_key_pem".to_string(),
+                    "subject_token".to_string(),
+                ],
                 expires_at_ms: 0,
                 token_url: format!("{}/token", mock_server.uri()),
                 scopes: vec!["jira.read".to_string()],

@@ -8,7 +8,6 @@
 use crate::proto::{
     InferenceRoute, ObjectForTest, Provider, Sandbox, ServiceEndpoint, SshSession,
     StoredProviderCredentialRefreshState, StoredProviderProfile,
-    SandboxStatus,
 };
 use std::collections::HashMap;
 
@@ -67,26 +66,6 @@ impl SetResourceVersion for Sandbox {
 impl GetResourceVersion for Sandbox {
     fn get_resource_version(&self) -> u64 {
         self.metadata.as_ref().map_or(0, |m| m.resource_version)
-    }
-}
-
-impl Sandbox {
-    pub fn phase(&self) -> i32 {
-        self.status.as_ref().map_or(0, |s| s.phase)
-    }
-
-    pub fn set_phase(&mut self, phase: i32) {
-        self.status.get_or_insert_with(SandboxStatus::default).phase = phase;
-    }
-
-    pub fn current_policy_version(&self) -> u32 {
-        self.status.as_ref().map_or(0, |s| s.current_policy_version)
-    }
-
-    pub fn set_current_policy_version(&mut self, version: u32) {
-        self.status
-            .get_or_insert_with(SandboxStatus::default)
-            .current_policy_version = version;
     }
 }
 

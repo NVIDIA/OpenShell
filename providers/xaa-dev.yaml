@@ -26,9 +26,10 @@ credentials:
           description: XAA.dev requesting app client secret used for the ID token to ID-JAG exchange
           required: true
           secret: true
-        - name: sandbox_id
-          description: OpenShell sandbox ID bound to the authenticated user's OIDC id_token
-          required: true
+        - name: subject_token
+          description: OIDC id_token captured during refresh configuration for the sample XAA flow
+          required: false
+          secret: true
         - name: resource_client_id
           description: Resource client ID for the Todo0 sample resource authorization server
           required: true

@@ -8,7 +8,7 @@ description: "Configure the built-in xaa-dev provider profile and prove the samp
 keywords: "Generative AI, Cybersecurity, Tutorial, XAA, Cross App Access, ID-JAG, Providers, Sandbox"
 ---
 
-Use the built-in `xaa-dev` profile to exercise the sample 2-step Cross App Access flow backed by `xaa.dev`. OpenShell binds the logged-in user identity to a sandbox, exchanges that user `id_token` for an `ID-JAG`, exchanges the `ID-JAG` for a delegated resource token, and injects the delegated token into the sandbox for outbound API calls.
+Use the built-in `xaa-dev` profile to exercise the sample 2-step Cross App Access flow backed by `xaa.dev`. OpenShell captures the logged-in user's OIDC `id_token` during refresh configuration, exchanges that token for an `ID-JAG`, exchanges the `ID-JAG` for a delegated resource token, and injects the delegated token into the sandbox for outbound API calls.
 
 After completing this tutorial, you have:
 
@@ -65,20 +65,18 @@ openshell settings set --global --key providers_v2_enabled --value true
 
 ## Log In and Create a Sandbox
 
-Log in before creating the sandbox so OpenShell can bind the sandbox to the authenticated user's `id_token`:
+Log in before configuring refresh so OpenShell can capture the authenticated user's `id_token`:
 
 ```shell
 openshell gateway login <gateway-name>
 ```
 
-Create a sandbox and record its UUID:
+Create a sandbox:
 
 ```shell
 openshell sandbox create --name xaa-dev-sample
 openshell sandbox get xaa-dev-sample
 ```
-
-The `provider refresh configure` command needs the sandbox UUID, not just the sandbox name.
 
 ## Create the Sample Provider
 
@@ -92,7 +90,7 @@ openshell provider create \
 
 ## Configure the 2-Step XAA Refresh
 
-Configure the requesting-app and resource-app credentials:
+Configure the requesting-app and resource-app credentials. When this command runs while you are logged in, OpenShell stores the current OIDC `id_token` as secret refresh material for the provider:
 
 ```shell
 openshell provider refresh configure xaa-dev-runtime \
@@ -100,7 +98,6 @@ openshell provider refresh configure xaa-dev-runtime \
   --strategy okta-xaa \
   --material requesting_client_id="$XAA_DEV_REQUESTING_CLIENT_ID" \
   --material requesting_client_secret="$XAA_DEV_REQUESTING_CLIENT_SECRET" \
-  --material sandbox_id="<sandbox-uuid>" \
   --material resource_client_id="$XAA_DEV_RESOURCE_CLIENT_ID" \
   --material resource_client_secret="$XAA_DEV_RESOURCE_CLIENT_SECRET" \
   --material audience="https://auth.resource.xaa.dev" \

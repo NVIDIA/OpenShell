@@ -19,7 +19,6 @@ use std::sync::OnceLock;
 const BUILT_IN_PROFILE_YAMLS: &[&str] = &[
     include_str!("../../../providers/claude-code.yaml"),
     include_str!("../../../providers/github.yaml"),
-    include_str!("../../../providers/google-vertex-ai.yaml"),
     include_str!("../../../providers/nvidia.yaml"),
     include_str!("../../../providers/okta-obo.yaml"),
     include_str!("../../../providers/okta-xaa.yaml"),
@@ -310,25 +309,6 @@ impl ProviderTypeProfile {
         vars
     }
 
-    /// Whether this profile can be created without an initial access token because
-    /// the gateway can mint at least one credential immediately from refresh
-    /// material, and no required credential falls outside that gateway-mintable set.
-    #[must_use]
-    pub fn allows_gateway_refresh_bootstrap(&self) -> bool {
-        let mut has_gateway_mintable_credential = false;
-        for credential in &self.credentials {
-            let is_gateway_mintable = credential
-                .refresh
-                .as_ref()
-                .is_some_and(CredentialRefreshProfile::is_gateway_mintable);
-            if credential.required && !is_gateway_mintable {
-                return false;
-            }
-            has_gateway_mintable_credential |= is_gateway_mintable;
-        }
-        has_gateway_mintable_credential
-    }
-
     #[must_use]
     pub fn to_proto(&self) -> ProviderProfile {
         ProviderProfile {
@@ -365,18 +345,6 @@ impl ProviderTypeProfile {
             endpoints: self.endpoints.iter().map(endpoint_to_proto).collect(),
             binaries: self.binaries.iter().map(binary_to_proto).collect(),
         }
-    }
-}
-
-impl CredentialRefreshProfile {
-    #[must_use]
-    pub fn is_gateway_mintable(&self) -> bool {
-        matches!(
-            self.strategy,
-            ProviderCredentialRefreshStrategy::Oauth2RefreshToken
-                | ProviderCredentialRefreshStrategy::Oauth2ClientCredentials
-                | ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt
-        )
     }
 }
 
@@ -626,7 +594,6 @@ fn endpoint_to_proto(endpoint: &EndpointProfile) -> NetworkEndpoint {
         allow_encoded_slash: endpoint.allow_encoded_slash,
         websocket_credential_rewrite: endpoint.websocket_credential_rewrite,
         request_body_credential_rewrite: endpoint.request_body_credential_rewrite,
-        advisor_proposed: false,
         persisted_queries: endpoint.persisted_queries.clone(),
         graphql_persisted_queries: endpoint
             .graphql_persisted_queries
@@ -1220,15 +1187,15 @@ mod tests {
             refresh
                 .material
                 .iter()
-                .find(|material| material.name == "subject_token")
-                .is_some_and(|material| !material.required && material.secret)
+                .find(|material| material.name == "audience")
+                .is_some_and(|material| material.required)
         );
         assert!(
             refresh
                 .material
                 .iter()
-                .find(|material| material.name == "audience")
-                .is_some_and(|material| material.required)
+                .find(|material| material.name == "subject_token")
+                .is_some_and(|material| !material.required && material.secret)
         );
     }
 
@@ -1264,7 +1231,7 @@ mod tests {
             vec![
                 "requesting_client_id",
                 "requesting_client_secret",
-                "sandbox_id",
+                "subject_token",
                 "resource_client_id",
                 "resource_client_secret",
                 "audience",
@@ -1286,6 +1253,13 @@ mod tests {
                 .iter()
                 .find(|material| material.name == "resource_client_secret")
                 .is_some_and(|material| material.required && material.secret)
+        );
+        assert!(
+            refresh
+                .material
+                .iter()
+                .find(|material| material.name == "subject_token")
+                .is_some_and(|material| !material.required && material.secret)
         );
     }
 
@@ -1319,13 +1293,20 @@ mod tests {
             vec![
                 "requesting_client_id",
                 "requesting_client_secret",
-                "sandbox_id",
+                "subject_token",
                 "resource_client_id",
                 "resource_client_secret",
                 "audience",
                 "resource",
                 "resource_token_url",
             ]
+        );
+        assert!(
+            refresh
+                .material
+                .iter()
+                .find(|material| material.name == "subject_token")
+                .is_some_and(|material| !material.required && material.secret)
         );
         assert_eq!(profile.endpoints.len(), 3);
         assert_eq!(profile.endpoints[0].host, "idp.xaa.dev");
@@ -1341,89 +1322,6 @@ mod tests {
             profile.credential_env_vars(),
             vec!["ANTHROPIC_API_KEY", "CLAUDE_API_KEY"]
         );
-    }
-
-    #[test]
-    fn vertex_profile_declares_discovery_and_fallback_token_env_vars() {
-        let profile = get_default_profile("google-vertex-ai").expect("vertex profile");
-        let service_account_token = profile
-            .credentials
-            .iter()
-            .find(|credential| credential.name == "service_account_token")
-            .expect("vertex service-account token credential");
-        let adc_credential = profile
-            .credentials
-            .iter()
-            .find(|credential| credential.name == "gcloud_adc_token")
-            .expect("vertex ADC credential");
-
-        assert_eq!(
-            service_account_token.env_vars,
-            vec![
-                "GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN".to_string(),
-                "VERTEX_AI_SERVICE_ACCOUNT_TOKEN".to_string()
-            ]
-        );
-        assert_eq!(
-            adc_credential.env_vars,
-            vec![
-                "GOOGLE_VERTEX_AI_TOKEN".to_string(),
-                "VERTEX_AI_TOKEN".to_string()
-            ]
-        );
-        assert_eq!(
-            profile.discovery.credentials,
-            vec!["service_account_token", "gcloud_adc_token"]
-        );
-        assert!(
-            profile.allows_gateway_refresh_bootstrap(),
-            "Vertex profile should allow empty-create bootstrap via gateway-mintable credentials"
-        );
-    }
-
-    #[test]
-    fn refresh_bootstrap_requires_a_gateway_mintable_path_and_no_required_static_credentials() {
-        let optional_refresh_profile = parse_profile_yaml(
-            r"
-id: optional-refresh
-display_name: Optional Refresh
-credentials:
-  - name: access_token
-    required: false
-    refresh:
-      strategy: oauth2_refresh_token
-",
-        )
-        .expect("profile");
-        assert!(optional_refresh_profile.allows_gateway_refresh_bootstrap());
-
-        let mixed_required_profile = parse_profile_yaml(
-            r"
-id: mixed-required
-display_name: Mixed Required
-credentials:
-  - name: access_token
-    required: true
-    refresh:
-      strategy: oauth2_client_credentials
-  - name: static_key
-    required: true
-",
-        )
-        .expect("profile");
-        assert!(!mixed_required_profile.allows_gateway_refresh_bootstrap());
-
-        let static_only_profile = parse_profile_yaml(
-            r"
-id: static-only
-display_name: Static Only
-credentials:
-  - name: api_key
-    required: false
-",
-        )
-        .expect("profile");
-        assert!(!static_only_profile.allows_gateway_refresh_bootstrap());
     }
 
     #[test]

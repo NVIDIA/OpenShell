@@ -91,7 +91,7 @@ openshell provider create \
 
 ## Configure Token Exchange
 
-Configure the delegated credential refresh:
+Configure the delegated credential refresh. When this command runs while you are logged in with an OIDC gateway session, OpenShell captures the current user bearer token as secret refresh material.
 
 ```shell
 openshell provider refresh configure okta-obo-runtime \
