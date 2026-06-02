@@ -71,6 +71,8 @@
             rustToolchain
             # Required to find packages
             pkg-config
+            # Required for protobuf code generation.
+            protobuf
             # Required for bindgen generation.
             llvmPackages.libclang
             # system dependency for openshell-prover
