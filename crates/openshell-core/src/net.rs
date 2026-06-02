@@ -12,6 +12,16 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+/// Check if a hostname is a known cloud metadata hostname that resolves to an
+/// always-blocked metadata service.
+///
+/// This is intentionally a static name check. Do not perform DNS resolution in
+/// policy validation or proposal generation paths.
+pub fn is_known_metadata_hostname(host: &str) -> bool {
+    let normalized = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    matches!(normalized.as_str(), "metadata.google.internal")
+}
+
 /// Check if an IP address is link-local.
 ///
 /// Covers IPv4 `169.254.0.0/16`, IPv6 `fe80::/10`, and IPv4-mapped IPv6
@@ -212,6 +222,21 @@ fn is_internal_v4(v4: Ipv4Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- is_known_metadata_hostname --
+
+    #[test]
+    fn test_known_metadata_hostname_accepts_gcp_variants() {
+        assert!(is_known_metadata_hostname("metadata.google.internal"));
+        assert!(is_known_metadata_hostname("METADATA.GOOGLE.INTERNAL"));
+        assert!(is_known_metadata_hostname("metadata.google.internal."));
+    }
+
+    #[test]
+    fn test_known_metadata_hostname_rejects_public_hosts() {
+        assert!(!is_known_metadata_hostname("api.github.com"));
+        assert!(!is_known_metadata_hostname(""));
+    }
 
     // -- is_link_local_ip --
 

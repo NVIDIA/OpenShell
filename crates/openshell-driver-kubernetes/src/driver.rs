@@ -19,7 +19,7 @@ use openshell_core::driver_utils::{
 };
 use openshell_core::progress::{
     PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX, PROGRESS_STEP_STARTING_SANDBOX,
-    mark_progress_active, mark_progress_complete, mark_progress_detail,
+    format_bytes, mark_progress_active, mark_progress_complete, mark_progress_detail,
 };
 use openshell_core::proto::compute::v1::{
     DriverCondition as SandboxCondition, DriverPlatformEvent as PlatformEvent,
@@ -159,12 +159,11 @@ impl KubernetesComputeDriver {
         })
     }
 
-    pub async fn capabilities(&self) -> Result<GetCapabilitiesResponse, String> {
+    pub fn capabilities(&self) -> Result<GetCapabilitiesResponse, String> {
         Ok(openshell_core::driver_utils::build_capabilities_response(
             "kubernetes",
             openshell_core::VERSION,
             &self.config.default_image,
-            self.has_gpu_capacity().await.unwrap_or(false),
         ))
     }
 
@@ -317,6 +316,7 @@ impl KubernetesComputeDriver {
         let params = SandboxPodParams {
             default_image: &self.config.default_image,
             image_pull_policy: &self.config.image_pull_policy,
+            image_pull_secrets: &self.config.image_pull_secrets,
             supervisor_image: &self.config.supervisor_image,
             supervisor_image_pull_policy: &self.config.supervisor_image_pull_policy,
             supervisor_sideload_method: self.config.supervisor_sideload_method,
@@ -724,24 +724,6 @@ fn extract_image_size(message: &str) -> Option<u64> {
     rest[..end].parse().ok()
 }
 
-fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = 1024 * KB;
-    const GB: u64 = 1024 * MB;
-
-    if bytes >= GB {
-        #[allow(clippy::cast_precision_loss)]
-        let gb = bytes as f64 / GB as f64;
-        format!("{gb:.1} GB")
-    } else if bytes >= MB {
-        format!("{} MB", bytes / MB)
-    } else if bytes >= KB {
-        format!("{} KB", bytes / KB)
-    } else {
-        format!("{bytes} B")
-    }
-}
-
 /// Path where the supervisor binary is mounted inside the agent container.
 const SUPERVISOR_MOUNT_PATH: &str = "/opt/openshell/bin";
 
@@ -1046,6 +1028,7 @@ fn default_workspace_volume_claim_templates(storage_size: &str) -> serde_json::V
 struct SandboxPodParams<'a> {
     default_image: &'a str,
     image_pull_policy: &'a str,
+    image_pull_secrets: &'a [String],
     supervisor_image: &'a str,
     supervisor_image_pull_policy: &'a str,
     supervisor_sideload_method: SupervisorSideloadMethod,
@@ -1068,6 +1051,7 @@ impl Default for SandboxPodParams<'_> {
         Self {
             default_image: "",
             image_pull_policy: "",
+            image_pull_secrets: &[],
             supervisor_image: "",
             supervisor_image_pull_policy: "",
             supervisor_sideload_method: SupervisorSideloadMethod::default(),
@@ -1234,6 +1218,14 @@ fn sandbox_template_to_k8s(
         );
     }
 
+    let image_pull_secrets = image_pull_secret_refs(params.image_pull_secrets);
+    if !image_pull_secrets.is_empty() {
+        spec.insert(
+            "imagePullSecrets".to_string(),
+            serde_json::Value::Array(image_pull_secrets),
+        );
+    }
+
     // Disable service account token auto-mounting for security hardening.
     // Sandbox pods should not have access to the Kubernetes API by default.
     spec.insert(
@@ -1383,6 +1375,15 @@ fn sandbox_template_to_k8s(
     result
 }
 
+fn image_pull_secret_refs(secrets: &[String]) -> Vec<serde_json::Value> {
+    secrets
+        .iter()
+        .map(|secret| secret.trim())
+        .filter(|secret| !secret.is_empty())
+        .map(|secret| serde_json::json!({ "name": secret }))
+        .collect()
+}
+
 fn container_resources(template: &SandboxTemplate, gpu: bool) -> Option<serde_json::Value> {
     // Start from the raw resources passthrough in platform_config (preserves
     // custom resource types like GPU limits that users set via the public API
@@ -1497,6 +1498,11 @@ fn apply_required_env(
         env,
         openshell_core::sandbox_env::SANDBOX_COMMAND,
         "sleep infinity",
+    );
+    upsert_env(
+        env,
+        openshell_core::sandbox_env::TELEMETRY_ENABLED,
+        openshell_core::telemetry::enabled_env_value(),
     );
     if !ssh_socket_path.is_empty() {
         upsert_env(
@@ -1673,6 +1679,9 @@ mod tests {
         PROGRESS_COMPLETE_STEP_KEY,
     };
     use prost_types::{Struct, Value, value::Kind};
+
+    static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
     #[test]
     fn kube_pulling_event_adds_image_progress_metadata() {
@@ -2530,6 +2539,80 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_template_omits_empty_image_pull_secrets() {
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &SandboxPodParams::default(),
+        );
+
+        assert!(
+            pod_template["spec"]["imagePullSecrets"].is_null(),
+            "imagePullSecrets must be omitted when no secrets are configured"
+        );
+    }
+
+    #[test]
+    fn sandbox_template_renders_configured_image_pull_secrets() {
+        let secrets = vec![
+            "regcred".to_string(),
+            " backup-regcred ".to_string(),
+            String::new(),
+        ];
+        let params = SandboxPodParams {
+            image_pull_secrets: &secrets,
+            ..Default::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+
+        assert_eq!(
+            pod_template["spec"]["imagePullSecrets"],
+            serde_json::json!([
+                { "name": "regcred" },
+                { "name": "backup-regcred" }
+            ])
+        );
+    }
+
+    #[test]
+    fn sandbox_template_renders_image_pull_secrets_for_template_image() {
+        let secrets = vec!["regcred".to_string()];
+        let params = SandboxPodParams {
+            default_image: "default-image:latest",
+            image_pull_secrets: &secrets,
+            ..Default::default()
+        };
+        let template = SandboxTemplate {
+            image: "private.example.com/team/sandbox:v1".to_string(),
+            ..Default::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &template,
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+
+        assert_eq!(
+            pod_template["spec"]["containers"][0]["image"],
+            serde_json::json!("private.example.com/team/sandbox:v1")
+        );
+        assert_eq!(
+            pod_template["spec"]["imagePullSecrets"],
+            serde_json::json!([{ "name": "regcred" }])
+        );
+    }
+
+    #[test]
     fn platform_config_bool_extracts_value() {
         let template = SandboxTemplate {
             platform_config: Some(Struct {
@@ -2581,6 +2664,37 @@ mod tests {
                 .any(|e| e["name"] == "OPENSHELL_LOG_LEVEL" && e["value"] == "debug")
         );
         assert!(cr["spec"].get("logLevel").is_none());
+    }
+
+    #[test]
+    fn telemetry_toggle_propagates_from_driver_env_to_sandbox_pod() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        temp_env::with_vars(
+            [(
+                openshell_core::sandbox_env::TELEMETRY_ENABLED,
+                Some("false"),
+            )],
+            || {
+                let spec = SandboxSpec {
+                    environment: std::collections::HashMap::from([(
+                        openshell_core::sandbox_env::TELEMETRY_ENABLED.to_string(),
+                        "true".to_string(),
+                    )]),
+                    ..SandboxSpec::default()
+                };
+                let cr = sandbox_to_k8s_spec(Some(&spec), &SandboxPodParams::default());
+                let env = cr["spec"]["podTemplate"]["spec"]["containers"][0]["env"]
+                    .as_array()
+                    .unwrap();
+                let telemetry_entries = env
+                    .iter()
+                    .filter(|entry| entry["name"] == openshell_core::sandbox_env::TELEMETRY_ENABLED)
+                    .collect::<Vec<_>>();
+
+                assert_eq!(telemetry_entries.len(), 1);
+                assert_eq!(telemetry_entries[0]["value"], serde_json::json!("false"));
+            },
+        );
     }
 
     #[test]

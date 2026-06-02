@@ -442,6 +442,11 @@ where
 
             match principal {
                 Principal::User(ref user) => {
+                    if !crate::auth::method_authz::is_user_callable(&path) {
+                        return Ok(status_response(tonic::Status::permission_denied(
+                            "this method requires a sandbox principal",
+                        )));
+                    }
                     if let Some(ref policy) = authz_policy
                         && let Err(status) = policy.check(&user.identity, &path)
                     {
@@ -1199,6 +1204,54 @@ mod tests {
                 seen.lock().unwrap().as_ref(),
                 Some(Principal::Sandbox(_))
             ));
+        }
+
+        /// A user principal — even one carrying `openshell:all` and the
+        /// admin role — must not reach a `sandbox`-annotated method. The
+        /// router enforces this from the per-handler auth-mode declarations
+        /// independent of RBAC.
+        #[tokio::test]
+        async fn user_principal_is_denied_on_sandbox_only_methods() {
+            fn admin_user() -> Principal {
+                Principal::User(UserPrincipal {
+                    identity: Identity {
+                        subject: "admin".to_string(),
+                        display_name: None,
+                        roles: vec!["openshell-admin".to_string()],
+                        scopes: vec!["openshell:all".to_string()],
+                        provider: IdentityProvider::Oidc,
+                    },
+                })
+            }
+
+            let policy = AuthzPolicy {
+                admin_role: "openshell-admin".to_string(),
+                user_role: "openshell-user".to_string(),
+                scopes_enabled: true,
+            };
+
+            for path in [
+                "/openshell.v1.OpenShell/ReportPolicyStatus",
+                "/openshell.v1.OpenShell/PushSandboxLogs",
+                "/openshell.v1.OpenShell/SubmitPolicyAnalysis",
+                "/openshell.v1.OpenShell/GetSandboxProviderEnvironment",
+                "/openshell.v1.OpenShell/ConnectSupervisor",
+                "/openshell.v1.OpenShell/RelayStream",
+                "/openshell.v1.OpenShell/IssueSandboxToken",
+                "/openshell.v1.OpenShell/RefreshSandboxToken",
+                "/openshell.inference.v1.Inference/GetInferenceBundle",
+            ] {
+                let mock = Arc::new(MockAuthenticator::returning(Ok(Some(admin_user()))));
+                let chain = AuthenticatorChain::new(vec![mock]);
+                let (recorder, seen) = PrincipalRecorder::new();
+                let mut router = AuthGrpcRouter::new(recorder, Some(chain), Some(policy.clone()));
+
+                let res = router.call(empty_request(path)).await.unwrap();
+
+                assert!(seen.lock().unwrap().is_none(), "{path} reached handler");
+                // grpc-status=7 (PERMISSION_DENIED).
+                assert_eq!(grpc_status(&res).as_deref(), Some("7"), "{path}");
+            }
         }
 
         #[tokio::test]

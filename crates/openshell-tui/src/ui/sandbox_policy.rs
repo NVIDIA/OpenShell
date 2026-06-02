@@ -11,15 +11,17 @@ use crate::app::App;
 /// Draw the scrollable policy viewer pane (bottom ~80% of the sandbox screen).
 ///
 /// Always focused when visible (the metadata pane above is non-interactive).
-pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
+/// Stores the inner viewport height on `app.policy_viewport_height` for
+/// PageUp/PageDown key handling.
+pub fn draw(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let inner_height = area.height.saturating_sub(2) as usize;
+    app.policy_viewport_height = inner_height;
+
     let t = &app.theme;
     let version = app.sandbox_policy.as_ref().map_or(0, |p| p.version);
 
     let tab_title = super::sandbox_settings::draw_policy_tab_title(app);
     let version_hint = format!(" (v{version}) ");
-
-    // Calculate inner dimensions (borders + padding).
-    let inner_height = area.height.saturating_sub(2) as usize;
 
     if app.policy_lines.is_empty() {
         let lines = vec![Line::from(Span::styled("Loading...", t.muted))];

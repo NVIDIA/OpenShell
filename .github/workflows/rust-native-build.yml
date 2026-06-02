@@ -245,6 +245,10 @@ jobs:
           # Record linkage so image runtime drift is visible in logs.
           ldd --version
           ldd "$BIN" || true
+          if [[ "${{ inputs.component }}" == "gateway" ]] && ldd "$BIN" | grep -q 'libz3'; then
+            echo "gateway binary must not depend on shared libz3; enable bundled-z3 for image artifacts" >&2
+            exit 1
+          fi
 
       - name: Verify glibc symbol floor
         if: inputs.component == 'gateway'

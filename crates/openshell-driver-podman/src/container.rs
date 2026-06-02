@@ -283,6 +283,10 @@ fn build_env(
         openshell_core::sandbox_env::SANDBOX_COMMAND.into(),
         "sleep infinity".into(),
     );
+    env.insert(
+        openshell_core::sandbox_env::TELEMETRY_ENABLED.into(),
+        openshell_core::telemetry::enabled_env_value().into(),
+    );
 
     // 3. TLS client cert paths (when mTLS is enabled). These point to
     //    the container-side mount paths where the cert files are
@@ -537,10 +541,7 @@ pub fn build_container_spec_with_token(
         // Inject stable host aliases into /etc/hosts so sandbox containers can
         // reach services on the host. `host.openshell.internal` is the driver-
         // neutral alias used by policies and e2e tests.
-        hostadd: vec![
-            "host.containers.internal:host-gateway".into(),
-            "host.openshell.internal:host-gateway".into(),
-        ],
+        hostadd: hostadd_entries(config),
         netns: NetNS {
             nsmode: "bridge".to_string(),
         },
@@ -622,6 +623,21 @@ pub fn build_container_spec_with_token(
     serde_json::to_value(container_spec).expect("ContainerSpec serialization cannot fail")
 }
 
+fn hostadd_entries(config: &PodmanComputeConfig) -> Vec<String> {
+    let host_gateway_ip = config.host_gateway_ip.trim();
+    if host_gateway_ip.is_empty() {
+        return vec![
+            "host.containers.internal:host-gateway".into(),
+            "host.openshell.internal:host-gateway".into(),
+        ];
+    }
+
+    vec![
+        format!("host.containers.internal:{host_gateway_ip}"),
+        format!("host.openshell.internal:{host_gateway_ip}"),
+    ]
+}
+
 /// Parse a Kubernetes-style CPU quantity to cgroup quota microseconds
 /// (for a 100ms period).
 ///
@@ -679,6 +695,9 @@ fn parse_memory_to_bytes(quantity: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
     #[test]
     fn parse_cpu_millicore() {
@@ -967,6 +986,41 @@ mod tests {
     }
 
     #[test]
+    fn container_spec_telemetry_toggle_comes_from_driver_env() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        temp_env::with_vars(
+            [(
+                openshell_core::sandbox_env::TELEMETRY_ENABLED,
+                Some("false"),
+            )],
+            || {
+                let mut sandbox = test_sandbox("test-id", "legit-name");
+                sandbox.spec = Some(DriverSandboxSpec {
+                    environment: std::collections::HashMap::from([(
+                        openshell_core::sandbox_env::TELEMETRY_ENABLED.to_string(),
+                        "true".to_string(),
+                    )]),
+                    template: Some(DriverSandboxTemplate::default()),
+                    ..Default::default()
+                });
+
+                let spec = build_container_spec(&sandbox, &test_config());
+                let env_map = spec["env"].as_object().expect("env should be an object");
+
+                assert_eq!(
+                    env_map
+                        .get(openshell_core::sandbox_env::TELEMETRY_ENABLED)
+                        .and_then(|v| v.as_str()),
+                    Some("false"),
+                    "telemetry toggle must come from the deployment environment"
+                );
+            },
+        );
+    }
+
+    #[test]
     fn container_spec_required_labels_cannot_be_overridden() {
         use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
@@ -1071,6 +1125,7 @@ mod tests {
             socket_path: std::path::PathBuf::from("/tmp/test.sock"),
             default_image: "test-image:latest".to_string(),
             grpc_endpoint: "http://localhost:50051".to_string(),
+            host_gateway_ip: String::new(),
             sandbox_ssh_socket_path: "/run/openshell/test-ssh.sock".to_string(),
             ..PodmanComputeConfig::default()
         }
@@ -1106,6 +1161,34 @@ mod tests {
             vol["rw"].as_bool(),
             Some(false),
             "image volume should be read-only"
+        );
+    }
+
+    #[test]
+    fn container_spec_uses_configured_host_gateway_ip() {
+        let sandbox = test_sandbox("test-id", "test-name");
+        let mut config = test_config();
+        config.host_gateway_ip = "192.168.127.254".to_string();
+        let spec = build_container_spec(&sandbox, &config);
+
+        let hostadd: Vec<&str> = spec["hostadd"]
+            .as_array()
+            .expect("hostadd should be an array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+
+        assert!(
+            hostadd.contains(&"host.containers.internal:192.168.127.254"),
+            "missing Podman host alias with configured host gateway IP"
+        );
+        assert!(
+            hostadd.contains(&"host.openshell.internal:192.168.127.254"),
+            "missing OpenShell host alias with configured host gateway IP"
+        );
+        assert!(
+            !hostadd.contains(&"host.containers.internal:host-gateway"),
+            "configured host gateway IP should avoid Podman's host-gateway resolver"
         );
     }
 

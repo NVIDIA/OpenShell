@@ -68,11 +68,12 @@ metrics_bind_address  = "0.0.0.0:9090"
 
 log_level             = "info"
 
-# When empty the gateway auto-detects (Kubernetes -> Podman -> Docker). VM is
-# never auto-detected and requires an explicit entry here.
+# When empty, the gateway auto-detects Kubernetes, then Podman, then Docker.
+# VM is never auto-detected and requires an explicit entry here.
 compute_drivers       = ["kubernetes"]
 
 sandbox_namespace     = "openshell"
+ssh_session_ttl_secs  = 3600
 
 # Subject Alternative Names baked into the gateway server certificate.
 # Wildcard DNS SANs (e.g. "*.dev.openshell.localhost") also enable sandbox
@@ -81,17 +82,28 @@ server_sans                  = ["openshell", "*.dev.openshell.localhost"]
 # Allow plaintext HTTP routing for loopback sandbox service URLs.
 enable_loopback_service_http = true
 
-# Shared driver defaults — inherited into [openshell.drivers.<name>] tables
+# Set true only for local plaintext gateways or trusted TLS termination.
+disable_tls = false
+
+# Shared driver defaults. These inherit into [openshell.drivers.<name>] tables
 # when the driver-specific table does not override them.
-default_image          = "ghcr.io/nvidia/openshell/sandbox:latest"
-supervisor_image       = "ghcr.io/nvidia/openshell/supervisor:latest"
-client_tls_secret_name = "openshell-client-tls"
+default_image           = "ghcr.io/nvidia/openshell/sandbox:latest"
+supervisor_image        = "ghcr.io/nvidia/openshell/supervisor:latest"
+client_tls_secret_name  = "openshell-client-tls"
+service_account_name    = "openshell-sandbox"
+host_gateway_ip         = "10.0.0.1"
+enable_user_namespaces  = false
+sa_token_ttl_secs       = 3600
+guest_tls_ca            = "/etc/openshell/certs/ca.pem"
+guest_tls_cert          = "/etc/openshell/certs/client.pem"
+guest_tls_key           = "/etc/openshell/certs/client-key.pem"
 
 # Gateway listener TLS (distinct from the per-driver guest_tls_*).
 [openshell.gateway.tls]
 cert_path             = "/etc/openshell/certs/gateway.pem"
 key_path              = "/etc/openshell/certs/gateway-key.pem"
 client_ca_path        = "/etc/openshell/certs/client-ca.pem"
+require_client_auth   = false
 
 [openshell.gateway.gateway_jwt]
 signing_key_path = "/etc/openshell/jwt/signing.pem"
@@ -103,6 +115,9 @@ ttl_secs         = 3600
 [openshell.gateway.auth]
 allow_unauthenticated_users = false
 
+[openshell.gateway.mtls_auth]
+enabled = false
+
 [openshell.gateway.oidc]
 issuer        = "https://idp.example.com/realms/openshell"
 audience      = "openshell-cli"
@@ -110,19 +125,22 @@ jwks_ttl_secs = 3600
 roles_claim   = "realm_access.roles"
 admin_role    = "openshell-admin"
 user_role     = "openshell-user"
+scopes_claim  = ""
 ```
 
 Local Docker, Podman, and VM gateways can also set `[openshell.gateway.mtls_auth] enabled = true` to authenticate CLI callers from verified client certificates. Kubernetes deployments must leave this unset and use OIDC or a trusted access proxy; the Helm chart does not render this table.
 
 `[openshell.gateway.auth] allow_unauthenticated_users = true` is an unsafe local-development and trusted-proxy escape hatch. It accepts user-facing CLI/API calls without OIDC or mTLS credentials while sandbox supervisors still authenticate with gateway-minted sandbox JWTs. Leave it false for shared and production gateways.
 
-`image_pull_policy` is intentionally not a shared gateway key. Kubernetes uses `Always | IfNotPresent | Never` while Podman uses `always | missing | never | newer`. Set it inside the relevant driver table.
+`image_pull_policy` is intentionally not a shared gateway key. Kubernetes and Docker use `Always`, `IfNotPresent`, or `Never`. Podman uses `always`, `missing`, `never`, or `newer`. Set it inside the relevant driver table.
 
-## Per-Driver Examples
+## Driver References
+
+Each example is a complete TOML file for one compute driver. The examples repeat `[openshell]` and `[openshell.gateway]` so they stay copyable, and the driver tables list the accepted driver-specific keys. Driver-specific values override inherited gateway defaults. The gateway rejects unknown driver fields after inheritance is merged.
 
 ### Kubernetes
 
-The gateway runs as a Pod and creates sandbox Pods in another namespace. mTLS material for sandboxes is delivered via a Kubernetes Secret rather than host-side file paths.
+The gateway runs as a Pod and creates sandbox Pods in another namespace. mTLS material for sandboxes is delivered through a Kubernetes Secret rather than host-side file paths.
 
 ```toml
 [openshell]
@@ -135,23 +153,30 @@ metrics_bind_address  = "0.0.0.0:9090"
 log_level             = "info"
 compute_drivers       = ["kubernetes"]
 
-default_image          = "ghcr.io/nvidia/openshell/sandbox:latest"
-supervisor_image       = "ghcr.io/nvidia/openshell/supervisor:latest"
-client_tls_secret_name = "openshell-client-tls"
-
 [openshell.gateway.tls]
 cert_path      = "/etc/openshell-tls/server/tls.crt"
 key_path       = "/etc/openshell-tls/server/tls.key"
 client_ca_path = "/etc/openshell-tls/client-ca/ca.crt"
 
 [openshell.drivers.kubernetes]
-namespace                  = "agents"
-grpc_endpoint              = "https://openshell-gateway.agents.svc:8080"
-service_account_name       = "openshell-sandbox"
-image_pull_policy          = "IfNotPresent"
-# Use the image volume on K8s >= 1.35 (GA in 1.36); switch to "init-container"
+namespace                      = "agents"
+service_account_name           = "openshell-sandbox"
+default_image                  = "ghcr.io/nvidia/openshell/sandbox:latest"
+image_pull_policy              = "IfNotPresent"
+image_pull_secrets             = ["regcred"]
+supervisor_image               = "ghcr.io/nvidia/openshell/supervisor:latest"
+supervisor_image_pull_policy   = "IfNotPresent"
+# Use the image volume on Kubernetes >= 1.35 (GA in 1.36); switch to "init-container"
 # on older clusters or where the ImageVolume feature gate is off.
-supervisor_sideload_method = "image-volume"
+supervisor_sideload_method     = "image-volume"
+grpc_endpoint                  = "https://openshell-gateway.agents.svc:8080"
+ssh_socket_path                = "/run/openshell/ssh.sock"
+client_tls_secret_name         = "openshell-client-tls"
+host_gateway_ip                = "10.0.0.1"
+enable_user_namespaces         = false
+workspace_default_storage_size = "10Gi"
+# Kubelet clamps projected tokens below 600 seconds. The driver caps values at 86400.
+sa_token_ttl_secs              = 3600
 ```
 
 ### Docker
@@ -167,19 +192,24 @@ bind_address    = "127.0.0.1:17670"
 log_level       = "info"
 compute_drivers = ["docker"]
 
-supervisor_image = "ghcr.io/nvidia/openshell/supervisor:latest"
-guest_tls_ca     = "/etc/openshell/certs/ca.pem"
-guest_tls_cert   = "/etc/openshell/certs/client.pem"
-guest_tls_key    = "/etc/openshell/certs/client-key.pem"
-
 [openshell.drivers.docker]
-default_image    = "ghcr.io/nvidia/openshell/sandbox:latest"
-image_pull_policy = "IfNotPresent"
-sandbox_namespace = "docker-dev"
-grpc_endpoint    = "https://host.openshell.internal:17670"
-network_name     = "openshell-docker"
+default_image      = "ghcr.io/nvidia/openshell/sandbox:latest"
+# Docker vocabulary: Always | IfNotPresent | Never. Empty behaves like IfNotPresent.
+image_pull_policy  = "IfNotPresent"
+sandbox_namespace  = "docker-dev"
+# Empty auto-detects https://host.openshell.internal:<gateway-port> when guest TLS is set.
+grpc_endpoint      = "https://host.openshell.internal:17670"
 # Skip the image-pull-and-extract step by pointing at a locally built binary.
-supervisor_bin   = "/usr/local/libexec/openshell/openshell-sandbox"
+supervisor_bin     = "/usr/local/libexec/openshell/openshell-sandbox"
+supervisor_image   = "ghcr.io/nvidia/openshell/supervisor:latest"
+guest_tls_ca       = "/etc/openshell/certs/ca.pem"
+guest_tls_cert     = "/etc/openshell/certs/client.pem"
+guest_tls_key      = "/etc/openshell/certs/client-key.pem"
+network_name       = "openshell-docker"
+host_gateway_ip    = "172.17.0.1"
+ssh_socket_path    = "/run/openshell/ssh.sock"
+# Set to 0 to leave Docker's runtime default unchanged.
+sandbox_pids_limit = 2048
 ```
 
 ### Podman
@@ -195,18 +225,26 @@ bind_address    = "127.0.0.1:17670"
 log_level       = "info"
 compute_drivers = ["podman"]
 
-default_image     = "ghcr.io/nvidia/openshell/sandbox:latest"
-supervisor_image  = "ghcr.io/nvidia/openshell/supervisor:latest"
-guest_tls_ca      = "/etc/openshell/certs/ca.pem"
-guest_tls_cert    = "/etc/openshell/certs/client.pem"
-guest_tls_key     = "/etc/openshell/certs/client-key.pem"
-
 [openshell.drivers.podman]
 # Rootless socket path. For root Podman use /run/podman/podman.sock.
-socket_path       = "/run/user/1000/podman/podman.sock"
-network_name      = "openshell"
-stop_timeout_secs = 10
-image_pull_policy = "missing"   # Podman vocabulary: always | missing | never | newer
+socket_path             = "/run/user/1000/podman/podman.sock"
+default_image           = "ghcr.io/nvidia/openshell/sandbox:latest"
+image_pull_policy       = "missing"   # always | missing | never | newer
+grpc_endpoint           = "https://host.containers.internal:17670"
+# The gateway overwrites gateway_port from bind_address at runtime.
+gateway_port            = 17670
+network_name            = "openshell"
+# Omit for the platform default: empty on Linux, 192.168.127.254 on macOS Podman machine.
+# Set "" to force Podman's host-gateway resolver.
+# host_gateway_ip       = "192.168.127.254"
+sandbox_ssh_socket_path = "/run/openshell/ssh.sock"
+stop_timeout_secs       = 10
+supervisor_image        = "ghcr.io/nvidia/openshell/supervisor:latest"
+guest_tls_ca            = "/etc/openshell/certs/ca.pem"
+guest_tls_cert          = "/etc/openshell/certs/client.pem"
+guest_tls_key           = "/etc/openshell/certs/client-key.pem"
+# Set to 0 to leave Podman's runtime default unchanged.
+sandbox_pids_limit      = 2048
 ```
 
 ### MicroVM
@@ -223,17 +261,19 @@ log_level       = "info"
 # VM is never auto-detected; an explicit entry here is required.
 compute_drivers = ["vm"]
 
-default_image  = "ghcr.io/nvidia/openshell/sandbox:latest"
-guest_tls_ca   = "/var/lib/openshell/guest-tls/ca.pem"
-guest_tls_cert = "/var/lib/openshell/guest-tls/client.pem"
-guest_tls_key  = "/var/lib/openshell/guest-tls/client-key.pem"
-
 [openshell.drivers.vm]
-grpc_endpoint = "https://host.containers.internal:17670"
-state_dir      = "/var/lib/openshell/vm"
+state_dir        = "/var/lib/openshell/vm"
 # Where the gateway looks for the openshell-driver-vm subprocess binary.
-driver_dir     = "/usr/local/libexec/openshell"
-vcpus          = 2
-mem_mib        = 2048
-krun_log_level = 1
+driver_dir       = "/usr/local/libexec/openshell"
+default_image    = "ghcr.io/nvidia/openshell/sandbox:latest"
+grpc_endpoint    = "https://host.containers.internal:17670"
+# Empty falls back to default_image.
+bootstrap_image  = "ghcr.io/nvidia/openshell/sandbox:latest"
+krun_log_level   = 1
+vcpus            = 2
+mem_mib          = 2048
+overlay_disk_mib = 4096
+guest_tls_ca     = "/var/lib/openshell/guest-tls/ca.pem"
+guest_tls_cert   = "/var/lib/openshell/guest-tls/client.pem"
+guest_tls_key    = "/var/lib/openshell/guest-tls/client-key.pem"
 ```

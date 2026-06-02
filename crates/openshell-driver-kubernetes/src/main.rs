@@ -44,6 +44,13 @@ struct Args {
     #[arg(long, env = "OPENSHELL_SANDBOX_IMAGE_PULL_POLICY")]
     sandbox_image_pull_policy: Option<String>,
 
+    #[arg(
+        long,
+        env = "OPENSHELL_SANDBOX_IMAGE_PULL_SECRETS",
+        value_delimiter = ','
+    )]
+    sandbox_image_pull_secrets: Vec<String>,
+
     #[arg(long, env = "OPENSHELL_GRPC_ENDPOINT")]
     grpc_endpoint: Option<String>,
 
@@ -98,6 +105,7 @@ async fn main() -> Result<()> {
         service_account_name: args.sandbox_service_account,
         default_image: args.sandbox_image.unwrap_or_default(),
         image_pull_policy: args.sandbox_image_pull_policy.unwrap_or_default(),
+        image_pull_secrets: args.sandbox_image_pull_secrets,
         supervisor_image: args
             .supervisor_image
             .unwrap_or_else(|| openshell_core::config::DEFAULT_SUPERVISOR_IMAGE.to_string()),

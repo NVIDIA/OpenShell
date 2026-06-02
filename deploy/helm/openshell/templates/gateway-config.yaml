@@ -8,7 +8,9 @@ at startup. CLI flags and OPENSHELL_* env vars on the StatefulSet container
 still override anything in this file.
 
 One value is intentionally NOT rendered here:
-  - server.dbUrl              → passed via --db-url in the StatefulSet args
+  - server.dbUrl              → passed via OPENSHELL_DB_URL env var (from Secret)
+                                 when postgres.enabled=true or server.externalDbSecret
+                                 is set, otherwise --db-url arg for SQLite
 */}}
 apiVersion: v1
 kind: ConfigMap
@@ -103,6 +105,15 @@ data:
     sa_token_ttl_secs            = {{ .Values.server.sandboxJwt.k8sSaTokenTtlSecs | default 3600 }}
     {{- if .Values.server.sandboxImagePullPolicy }}
     image_pull_policy            = {{ .Values.server.sandboxImagePullPolicy | quote }}
+    {{- end }}
+    {{- $sandboxImagePullSecretNames := list -}}
+    {{- range .Values.server.sandboxImagePullSecrets }}
+    {{- if .name }}
+    {{- $sandboxImagePullSecretNames = append $sandboxImagePullSecretNames .name }}
+    {{- end }}
+    {{- end }}
+    {{- if $sandboxImagePullSecretNames }}
+    image_pull_secrets           = [{{- range $i, $name := $sandboxImagePullSecretNames }}{{ if $i }}, {{ end }}{{ $name | quote }}{{- end }}]
     {{- end }}
     {{- if .Values.server.workspaceDefaultStorageSize }}
     workspace_default_storage_size = {{ .Values.server.workspaceDefaultStorageSize | quote }}

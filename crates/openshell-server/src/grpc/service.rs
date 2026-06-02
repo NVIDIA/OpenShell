@@ -279,22 +279,19 @@ mod tests {
     use openshell_core::proto::SandboxPhase;
 
     async fn seed_sandbox(state: &Arc<ServerState>, name: &str) {
-        state
-            .store
-            .put_message(&Sandbox {
-                metadata: Some(ObjectMeta {
-                    id: format!("sandbox-{name}"),
-                    name: name.to_string(),
-                    created_at_ms: 1_000,
-                    labels: HashMap::new(),
-                    resource_version: 0,
-                }),
-                spec: Some(openshell_core::proto::SandboxSpec::default()),
-                phase: SandboxPhase::Ready as i32,
-                ..Default::default()
-            })
-            .await
-            .unwrap();
+        let mut sandbox = Sandbox {
+            metadata: Some(ObjectMeta {
+                id: format!("sandbox-{name}"),
+                name: name.to_string(),
+                created_at_ms: 1_000,
+                labels: HashMap::new(),
+                resource_version: 0,
+            }),
+            spec: Some(openshell_core::proto::SandboxSpec::default()),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        state.store.put_message(&sandbox).await.unwrap();
     }
 
     #[test]

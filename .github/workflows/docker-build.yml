@@ -162,7 +162,7 @@ jobs:
       cargo-version: ${{ inputs['cargo-version'] }}
       image-tag: ${{ needs.resolve.outputs.image_tag_base }}
       checkout-ref: ${{ inputs['checkout-ref'] }}
-      features: openshell-core/dev-settings
+      features: ${{ inputs.component == 'gateway' && 'openshell-core/dev-settings bundled-z3' || 'openshell-core/dev-settings' }}
       artifact-name: ${{ needs.resolve.outputs.artifact_prefix }}-linux-${{ matrix.arch }}
     secrets: inherit
 

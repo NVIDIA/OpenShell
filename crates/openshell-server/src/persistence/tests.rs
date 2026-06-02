@@ -1252,8 +1252,6 @@ async fn cas_update_message_cas_succeeds() {
         }),
         spec: None,
         status: None,
-        phase: 0,
-        current_policy_version: 0,
     };
 
     store.put_message(&sandbox).await.unwrap();
@@ -1261,14 +1259,14 @@ async fn cas_update_message_cas_succeeds() {
     // Update using CAS with expected_version = 0 (use current version)
     let updated = store
         .update_message_cas::<Sandbox, _>("test-id", 0, |s| {
-            s.phase = 2; // Set to Ready
-            s.current_policy_version = 42;
+            s.set_phase(2); // Set to Ready
+            s.set_current_policy_version(42);
         })
         .await
         .unwrap();
 
-    assert_eq!(updated.phase, 2);
-    assert_eq!(updated.current_policy_version, 42);
+    assert_eq!(updated.phase(), 2);
+    assert_eq!(updated.current_policy_version(), 42);
     assert_eq!(
         updated.metadata.as_ref().map_or(0, |m| m.resource_version),
         2
@@ -1293,8 +1291,6 @@ async fn cas_update_message_cas_conflicts_on_concurrent_updates() {
         }),
         spec: None,
         status: None,
-        phase: 0,
-        current_policy_version: 0,
     };
 
     store.put_message(&sandbox).await.unwrap();
@@ -1308,7 +1304,7 @@ async fn cas_update_message_cas_conflicts_on_concurrent_updates() {
         let handle = tokio::spawn(async move {
             store
                 .update_message_cas::<Sandbox, _>("test-id", 1, |s| {
-                    s.current_policy_version = i;
+                    s.set_current_policy_version(i);
                 })
                 .await
         });

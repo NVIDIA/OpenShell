@@ -275,6 +275,7 @@ fn inheritable_keys(driver: ComputeDriverKind) -> &'static [&'static str] {
         ComputeDriverKind::Podman => &[
             "default_image",
             "supervisor_image",
+            "host_gateway_ip",
             "guest_tls_ca",
             "guest_tls_cert",
             "guest_tls_key",
@@ -420,6 +421,26 @@ nonsense = true
     }
 
     #[test]
+    fn rejects_unknown_field_in_nested_gateway_jwt_table() {
+        // Regression guard for the class of silent-misconfig bug fixed in
+        // PR #1661: a key indented under the wrong table header (here,
+        // `sandbox_namespace` landing under `[openshell.gateway.gateway_jwt]`
+        // instead of `[openshell.gateway]`) must be rejected rather than
+        // silently ignored.
+        let toml = r#"
+[openshell.gateway.gateway_jwt]
+signing_key_path = "/tmp/jwt/signing.pem"
+public_key_path = "/tmp/jwt/public.pem"
+kid_path = "/tmp/jwt/kid"
+sandbox_namespace = "agents"
+"#;
+        let tmp = write_tmp(toml);
+        let err = load(tmp.path())
+            .expect_err("unknown field in nested gateway_jwt table must be rejected");
+        assert!(matches!(err, ConfigFileError::Parse { .. }));
+    }
+
+    #[test]
     fn rejects_removed_ssh_endpoint_fields() {
         let toml = r"
 [openshell.gateway]
@@ -495,6 +516,25 @@ version = 2
         assert_eq!(
             table.get("host_gateway_ip").and_then(|v| v.as_str()),
             Some("10.0.0.1")
+        );
+    }
+
+    #[test]
+    fn podman_driver_table_inherits_gateway_host_gateway_ip() {
+        let gateway = GatewayFileSection {
+            default_image: Some("ghcr.io/nvidia/openshell/sandbox:0.9".to_string()),
+            host_gateway_ip: Some("192.168.127.254".to_string()),
+            ..Default::default()
+        };
+        let merged = driver_table(ComputeDriverKind::Podman, &gateway, None);
+        let table = merged.as_table().expect("table");
+        assert_eq!(
+            table.get("default_image").and_then(|v| v.as_str()),
+            Some("ghcr.io/nvidia/openshell/sandbox:0.9")
+        );
+        assert_eq!(
+            table.get("host_gateway_ip").and_then(|v| v.as_str()),
+            Some("192.168.127.254")
         );
     }
 

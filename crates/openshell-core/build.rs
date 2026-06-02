@@ -40,11 +40,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     collect_proto_files(&proto_root, &mut proto_files)?;
     proto_files.sort();
 
+    let out_dir = PathBuf::from(env::var("OUT_DIR")?);
+    let descriptor_path = out_dir.join("openshell_descriptor.bin");
+
     // Configure tonic-build
     tonic_build::configure()
         .build_server(true)
         .build_client(true)
+        // Emit a binary FileDescriptorSet so the server can enumerate every
+        // RPC at runtime (used by the per-handler auth exhaustiveness test).
+        .file_descriptor_set_path(&descriptor_path)
         .compile_protos(&proto_files, &[proto_root.as_path()])?;
+
+    println!(
+        "cargo:rustc-env=OPENSHELL_DESCRIPTOR_PATH={}",
+        descriptor_path.display()
+    );
 
     Ok(())
 }

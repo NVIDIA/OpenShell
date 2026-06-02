@@ -91,7 +91,7 @@ fn check_runtime_pid_limit_status(
             if matches!(mode, RuntimePidLimitMode::Require) {
                 Err(miette::miette!(message))
             } else {
-                warn!("{message}");
+                tracing::warn!("{message}");
                 Ok(())
             }
         }
@@ -102,7 +102,7 @@ fn check_runtime_pid_limit_status(
             if matches!(mode, RuntimePidLimitMode::Require) {
                 Err(miette::miette!(message))
             } else {
-                warn!("{message}");
+                tracing::warn!("{message}");
                 Ok(())
             }
         }

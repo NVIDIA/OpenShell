@@ -15,6 +15,7 @@ use crate::sandbox_watch::SandboxWatchBus;
 use crate::supervisor_session::SupervisorSessionRegistry;
 use crate::tracing_bus::TracingLogBus;
 use futures::{Stream, StreamExt};
+use openshell_core::ComputeDriverKind;
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, DeleteSandboxRequest, DriverCondition, DriverPlatformEvent,
     DriverResourceRequirements, DriverSandbox, DriverSandboxSpec, DriverSandboxStatus,
@@ -219,6 +220,7 @@ impl ComputeDriver for RemoteComputeDriver {
 #[derive(Clone)]
 pub struct ComputeRuntime {
     driver: SharedComputeDriver,
+    driver_kind: Option<ComputeDriverKind>,
     shutdown_cleanup: Option<Arc<dyn ShutdownCleanup>>,
     startup_resume: Option<Arc<dyn StartupResume>>,
     _driver_process: Option<Arc<ManagedDriverProcess>>,
@@ -241,6 +243,7 @@ impl fmt::Debug for ComputeRuntime {
 impl ComputeRuntime {
     #[allow(clippy::too_many_arguments)]
     async fn from_driver(
+        driver_kind: ComputeDriverKind,
         driver: SharedComputeDriver,
         shutdown_cleanup: Option<Arc<dyn ShutdownCleanup>>,
         startup_resume: Option<Arc<dyn StartupResume>>,
@@ -261,6 +264,7 @@ impl ComputeRuntime {
             .default_image;
         Ok(Self {
             driver,
+            driver_kind: Some(driver_kind),
             shutdown_cleanup,
             startup_resume,
             _driver_process: driver_process,
@@ -304,6 +308,7 @@ impl ComputeRuntime {
         let startup_resume: Arc<dyn StartupResume> = driver.clone();
         let driver: SharedComputeDriver = driver;
         Self::from_driver(
+            ComputeDriverKind::Docker,
             driver,
             Some(shutdown_cleanup),
             Some(startup_resume),
@@ -332,6 +337,7 @@ impl ComputeRuntime {
             .map_err(|err| ComputeError::Message(err.to_string()))?;
         let driver: SharedComputeDriver = Arc::new(ComputeDriverService::new(driver));
         Self::from_driver(
+            ComputeDriverKind::Kubernetes,
             driver,
             None,
             None,
@@ -358,6 +364,7 @@ impl ComputeRuntime {
     ) -> Result<Self, ComputeError> {
         let driver: SharedComputeDriver = Arc::new(RemoteComputeDriver::new(channel));
         Self::from_driver(
+            ComputeDriverKind::Vm,
             driver,
             None,
             None,
@@ -386,6 +393,7 @@ impl ComputeRuntime {
             .map_err(|err| ComputeError::Message(err.to_string()))?;
         let driver: SharedComputeDriver = Arc::new(PodmanDriverService::new(driver));
         Self::from_driver(
+            ComputeDriverKind::Podman,
             driver,
             None,
             None,
@@ -404,6 +412,11 @@ impl ComputeRuntime {
     #[must_use]
     pub fn default_image(&self) -> &str {
         &self.default_image
+    }
+
+    #[must_use]
+    pub fn driver_kind(&self) -> Option<ComputeDriverKind> {
+        self.driver_kind
     }
 
     #[must_use]
@@ -507,6 +520,8 @@ impl ComputeRuntime {
     }
 
     pub async fn delete_sandbox(&self, name: &str) -> Result<bool, Status> {
+        let _guard = self.sync_lock.lock().await;
+
         // Resolve sandbox ID from name
         let sandbox = self
             .store
@@ -525,7 +540,7 @@ impl ComputeRuntime {
         let sandbox = self
             .store
             .update_message_cas::<Sandbox, _>(&id, 0, |s| {
-                s.phase = SandboxPhase::Deleting as i32;
+                s.set_phase(SandboxPhase::Deleting as i32);
             })
             .await
             .map_err(|e| {
@@ -608,7 +623,7 @@ impl ComputeRuntime {
                 }
             };
 
-            let phase = SandboxPhase::try_from(sandbox.phase).unwrap_or(SandboxPhase::Unknown);
+            let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
             if !sandbox_phase_should_be_running(phase) {
                 continue;
             }
@@ -682,7 +697,7 @@ impl ComputeRuntime {
         match self
             .store
             .update_message_cas::<Sandbox, _>(&sandbox_id, 0, |s| {
-                s.phase = SandboxPhase::Error as i32;
+                s.set_phase(SandboxPhase::Error as i32);
                 let name = s.object_name().to_string();
                 upsert_ready_condition(
                     &mut s.status,
@@ -860,21 +875,25 @@ impl ComputeRuntime {
             use crate::persistence::WriteCondition;
             let now_ms = openshell_core::time::now_ms();
 
-            let mut status = incoming.status.as_ref().map(public_status_from_driver);
-            rewrite_user_facing_conditions(&mut status, None);
-
             let session_connected = self.supervisor_sessions.has_session(&incoming.id);
             let mut phase = derive_phase(incoming.status.as_ref());
-
             let sandbox_name = incoming.name.clone();
-            if session_connected
-                && matches!(phase, SandboxPhase::Provisioning | SandboxPhase::Unknown)
-            {
-                ensure_supervisor_ready_status(&mut status, &sandbox_name);
+
+            let supervisor_promoted = session_connected
+                && matches!(phase, SandboxPhase::Provisioning | SandboxPhase::Unknown);
+            if supervisor_promoted {
                 phase = SandboxPhase::Ready;
             }
 
-            let sandbox = Sandbox {
+            let mut status = incoming
+                .status
+                .as_ref()
+                .map(|s| public_status_from_driver(s, phase, 0));
+            rewrite_user_facing_conditions(&mut status, None);
+            if supervisor_promoted {
+                ensure_supervisor_ready_status(&mut status, &sandbox_name);
+            }
+            let mut sandbox = Sandbox {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: incoming.id.clone(),
                     name: sandbox_name,
@@ -884,9 +903,8 @@ impl ComputeRuntime {
                 }),
                 spec: None,
                 status,
-                phase: phase as i32,
-                current_policy_version: 0,
             };
+            sandbox.set_phase(phase as i32);
 
             self.store
                 .put_if(
@@ -921,19 +939,35 @@ impl ComputeRuntime {
         let sandbox = self
             .store
             .update_message_cas::<Sandbox, _>(&incoming.id, 0, |sandbox| {
-                let mut status = incoming.status.as_ref().map(public_status_from_driver);
-                rewrite_user_facing_conditions(&mut status, sandbox.spec.as_ref());
-
-                let mut phase = derive_phase(incoming.status.as_ref());
-                if session_connected
-                    && matches!(phase, SandboxPhase::Provisioning | SandboxPhase::Unknown)
-                {
-                    ensure_supervisor_ready_status(&mut status, &sandbox_name);
+                let old_phase =
+                    SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
+                let mut phase = incoming
+                    .status
+                    .as_ref()
+                    .map_or(old_phase, |status| derive_phase(Some(status)));
+                let supervisor_promoted = session_connected
+                    && matches!(phase, SandboxPhase::Provisioning | SandboxPhase::Unknown);
+                if supervisor_promoted {
                     phase = SandboxPhase::Ready;
                 }
 
-                let old_phase =
-                    SandboxPhase::try_from(sandbox.phase).unwrap_or(SandboxPhase::Unknown);
+                let cpv = sandbox.current_policy_version();
+                let mut status = incoming
+                    .status
+                    .as_ref()
+                    .map(|s| public_status_from_driver(s, phase, cpv))
+                    .or_else(|| sandbox.status.clone());
+                rewrite_user_facing_conditions(&mut status, sandbox.spec.as_ref());
+                if supervisor_promoted {
+                    ensure_supervisor_ready_status(&mut status, &sandbox_name);
+                }
+
+                if let Some(s) = status.as_mut()
+                    && s.sandbox_name.is_empty()
+                {
+                    s.sandbox_name.clone_from(&sandbox_name);
+                }
+
                 if old_phase != phase {
                     info!(
                         sandbox_id = %incoming.id,
@@ -967,9 +1001,9 @@ impl ComputeRuntime {
                 if let Some(metadata) = sandbox.metadata.as_mut() {
                     metadata.name.clone_from(&sandbox_name);
                 }
-                // Note: namespace field removed from public Sandbox API - it remains internal to DriverSandbox
                 sandbox.status = status;
-                sandbox.phase = phase as i32;
+                sandbox.set_phase(phase as i32);
+                sandbox.set_current_policy_version(cpv);
             })
             .await
             .map_err(|e| match e {
@@ -1008,7 +1042,7 @@ impl ComputeRuntime {
             .store
             .update_message_cas::<Sandbox, _>(sandbox_id, 0, |sandbox| {
                 let current_phase =
-                    SandboxPhase::try_from(sandbox.phase).unwrap_or(SandboxPhase::Unknown);
+                    SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
 
                 // Skip if sandbox is in terminal state
                 if current_phase == SandboxPhase::Deleting || current_phase == SandboxPhase::Error {
@@ -1018,10 +1052,10 @@ impl ComputeRuntime {
                 let sandbox_name = sandbox.object_name().to_string();
                 if connected {
                     ensure_supervisor_ready_status(&mut sandbox.status, &sandbox_name);
-                    sandbox.phase = SandboxPhase::Ready as i32;
+                    sandbox.set_phase(SandboxPhase::Ready as i32);
                 } else if current_phase == SandboxPhase::Ready {
                     ensure_supervisor_not_ready_status(&mut sandbox.status, &sandbox_name);
-                    sandbox.phase = SandboxPhase::Provisioning as i32;
+                    sandbox.set_phase(SandboxPhase::Provisioning as i32);
                 }
             })
             .await;
@@ -1221,10 +1255,7 @@ fn driver_sandbox_from_public(sandbox: &Sandbox) -> DriverSandbox {
         name: sandbox.object_name().to_string(),
         namespace: String::new(), // Namespace is set by the driver based on its config
         spec: sandbox.spec.as_ref().map(driver_sandbox_spec_from_public),
-        status: sandbox
-            .status
-            .as_ref()
-            .map(|status| driver_status_from_public(status, sandbox.phase)),
+        status: sandbox.status.as_ref().map(driver_status_from_public),
     }
 }
 
@@ -1431,7 +1462,7 @@ fn build_platform_resources_config(
     }
 }
 
-fn driver_status_from_public(status: &SandboxStatus, phase: i32) -> DriverSandboxStatus {
+fn driver_status_from_public(status: &SandboxStatus) -> DriverSandboxStatus {
     DriverSandboxStatus {
         sandbox_name: status.sandbox_name.clone(),
         instance_id: status.agent_pod.clone(),
@@ -1442,7 +1473,7 @@ fn driver_status_from_public(status: &SandboxStatus, phase: i32) -> DriverSandbo
             .iter()
             .map(driver_condition_from_public)
             .collect(),
-        deleting: SandboxPhase::try_from(phase) == Ok(SandboxPhase::Deleting),
+        deleting: SandboxPhase::try_from(status.phase) == Ok(SandboxPhase::Deleting),
     }
 }
 
@@ -1474,7 +1505,11 @@ fn decode_sandbox_record(record: &ObjectRecord) -> Result<Sandbox, String> {
     Sandbox::decode(record.payload.as_slice()).map_err(|e| e.to_string())
 }
 
-fn public_status_from_driver(status: &DriverSandboxStatus) -> SandboxStatus {
+fn public_status_from_driver(
+    status: &DriverSandboxStatus,
+    phase: SandboxPhase,
+    current_policy_version: u32,
+) -> SandboxStatus {
     SandboxStatus {
         sandbox_name: status.sandbox_name.clone(),
         agent_pod: status.instance_id.clone(),
@@ -1485,6 +1520,8 @@ fn public_status_from_driver(status: &DriverSandboxStatus) -> SandboxStatus {
             .iter()
             .map(public_condition_from_driver)
             .collect(),
+        phase: phase as i32,
+        current_policy_version,
     }
 }
 
@@ -1523,10 +1560,7 @@ fn upsert_ready_condition(
 ) {
     let status = status.get_or_insert_with(|| SandboxStatus {
         sandbox_name: sandbox_name.to_string(),
-        agent_pod: String::new(),
-        agent_fd: String::new(),
-        sandbox_fd: String::new(),
-        conditions: Vec::new(),
+        ..Default::default()
     });
 
     if let Some(existing) = status
@@ -1650,8 +1684,6 @@ impl ComputeDriver for NoopTestDriver {
                 driver_name: "noop-test-driver".to_string(),
                 driver_version: "test".to_string(),
                 default_image: "openshell/sandbox:test".to_string(),
-                supports_gpu: false,
-                gpu_count: 0,
             },
         ))
     }
@@ -1730,6 +1762,7 @@ impl ComputeDriver for NoopTestDriver {
 pub async fn new_test_runtime(store: Arc<Store>) -> ComputeRuntime {
     ComputeRuntime {
         driver: Arc::new(NoopTestDriver),
+        driver_kind: None,
         shutdown_cleanup: None,
         startup_resume: None,
         _driver_process: None,
@@ -1799,8 +1832,6 @@ mod tests {
                 driver_name: "test-driver".to_string(),
                 driver_version: "test".to_string(),
                 default_image: "openshell/sandbox:test".to_string(),
-                supports_gpu: true,
-                gpu_count: 0,
             }))
         }
 
@@ -1897,6 +1928,7 @@ mod tests {
         let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
         ComputeRuntime {
             driver,
+            driver_kind: None,
             shutdown_cleanup: None,
             startup_resume,
             _driver_process: None,
@@ -1923,7 +1955,7 @@ mod tests {
     }
 
     fn sandbox_record(id: &str, name: &str, phase: SandboxPhase) -> Sandbox {
-        Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: id.to_string(),
                 name: name.to_string(),
@@ -1931,9 +1963,10 @@ mod tests {
                 labels: HashMap::new(),
                 resource_version: 0,
             }),
-            phase: phase as i32,
             ..Default::default()
-        }
+        };
+        sandbox.set_phase(phase as i32);
+        sandbox
     }
 
     fn ssh_session_record(id: &str, sandbox_id: &str) -> SshSession {
@@ -2212,8 +2245,6 @@ mod tests {
         let mut status = Some(SandboxStatus {
             sandbox_name: "test".to_string(),
             agent_pod: "test-pod".to_string(),
-            agent_fd: String::new(),
-            sandbox_fd: String::new(),
             conditions: vec![SandboxCondition {
                 r#type: "Ready".to_string(),
                 status: "False".to_string(),
@@ -2221,6 +2252,7 @@ mod tests {
                 message: "0/1 nodes are available: 1 Insufficient nvidia.com/gpu.".to_string(),
                 last_transition_time: String::new(),
             }],
+            ..Default::default()
         });
 
         rewrite_user_facing_conditions(
@@ -2244,8 +2276,6 @@ mod tests {
         let mut status = Some(SandboxStatus {
             sandbox_name: "test".to_string(),
             agent_pod: "test-pod".to_string(),
-            agent_fd: String::new(),
-            sandbox_fd: String::new(),
             conditions: vec![SandboxCondition {
                 r#type: "Ready".to_string(),
                 status: "False".to_string(),
@@ -2253,6 +2283,7 @@ mod tests {
                 message: original.to_string(),
                 last_transition_time: String::new(),
             }],
+            ..Default::default()
         });
 
         rewrite_user_facing_conditions(
@@ -2316,9 +2347,65 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            SandboxPhase::try_from(stored.phase).unwrap(),
+            SandboxPhase::try_from(stored.phase()).unwrap(),
             SandboxPhase::Ready
         );
+    }
+
+    #[tokio::test]
+    async fn apply_sandbox_update_without_status_preserves_existing_status() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        sandbox.status = Some(SandboxStatus {
+            sandbox_name: "sandbox-a".to_string(),
+            conditions: vec![SandboxCondition {
+                r#type: "Ready".to_string(),
+                status: "True".to_string(),
+                reason: "DependenciesReady".to_string(),
+                message: "Pod is Ready".to_string(),
+                last_transition_time: String::new(),
+            }],
+            current_policy_version: 7,
+            ..Default::default()
+        });
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        runtime
+            .apply_sandbox_update(DriverSandbox {
+                id: "sb-1".to_string(),
+                name: "sandbox-a".to_string(),
+                namespace: "default".to_string(),
+                spec: None,
+                status: None,
+            })
+            .await
+            .unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase()).unwrap(),
+            SandboxPhase::Ready
+        );
+        assert_eq!(stored.current_policy_version(), 7);
+        let ready = stored
+            .status
+            .as_ref()
+            .and_then(|status| {
+                status
+                    .conditions
+                    .iter()
+                    .find(|condition| condition.r#type == "Ready")
+            })
+            .unwrap();
+        assert_eq!(ready.status, "True");
+        assert_eq!(ready.reason, "DependenciesReady");
+        assert_eq!(ready.message, "Pod is Ready");
     }
 
     #[tokio::test]
@@ -2350,7 +2437,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            SandboxPhase::try_from(stored.phase).unwrap(),
+            SandboxPhase::try_from(stored.phase()).unwrap(),
             SandboxPhase::Ready
         );
         let ready = stored
@@ -2383,7 +2470,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            SandboxPhase::try_from(stored.phase).unwrap(),
+            SandboxPhase::try_from(stored.phase()).unwrap(),
             SandboxPhase::Ready
         );
     }
@@ -2394,9 +2481,6 @@ mod tests {
         let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
         sandbox.status = Some(SandboxStatus {
             sandbox_name: "sandbox-a".to_string(),
-            agent_pod: String::new(),
-            agent_fd: String::new(),
-            sandbox_fd: String::new(),
             conditions: vec![SandboxCondition {
                 r#type: "Ready".to_string(),
                 status: "True".to_string(),
@@ -2404,7 +2488,9 @@ mod tests {
                 message: "Supervisor session connected".to_string(),
                 last_transition_time: String::new(),
             }],
+            ..Default::default()
         });
+        sandbox.set_phase(SandboxPhase::Ready as i32);
         runtime.store.put_message(&sandbox).await.unwrap();
 
         runtime
@@ -2419,7 +2505,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            SandboxPhase::try_from(stored.phase).unwrap(),
+            SandboxPhase::try_from(stored.phase()).unwrap(),
             SandboxPhase::Provisioning
         );
         let ready = stored
@@ -2505,7 +2591,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            SandboxPhase::try_from(stored.phase).unwrap(),
+            SandboxPhase::try_from(stored.phase()).unwrap(),
             SandboxPhase::Ready
         );
         assert!(stored.spec.as_ref().is_some_and(|spec| spec.gpu));
@@ -2598,7 +2684,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            SandboxPhase::try_from(stored.phase).unwrap(),
+            SandboxPhase::try_from(stored.phase()).unwrap(),
             SandboxPhase::Ready
         );
     }
@@ -2761,7 +2847,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            SandboxPhase::try_from(stored.phase).unwrap(),
+            SandboxPhase::try_from(stored.phase()).unwrap(),
             SandboxPhase::Error
         );
         let ready = stored
@@ -2793,7 +2879,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            SandboxPhase::try_from(stored.phase).unwrap(),
+            SandboxPhase::try_from(stored.phase()).unwrap(),
             SandboxPhase::Error
         );
         let ready = stored
@@ -2820,7 +2906,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            SandboxPhase::try_from(stored.phase).unwrap(),
+            SandboxPhase::try_from(stored.phase()).unwrap(),
             SandboxPhase::Ready
         );
     }

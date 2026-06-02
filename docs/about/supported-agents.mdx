@@ -10,8 +10,8 @@ The following table summarizes the agents that run in OpenShell sandboxes. Most 
 
 | Agent | Source | Default Policy | Notes |
 |---|---|---|---|
-| [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | [`base`](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base) | Full coverage | Works out of the box. Requires `ANTHROPIC_API_KEY`. |
-| [OpenCode](https://opencode.ai/) | [`base`](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base) | Partial coverage | Pre-installed. Add `opencode.ai` endpoint and OpenCode binary paths to the policy for full functionality. |
+| [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | [`base`](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base) | Full coverage | Works out of the box. Requires `ANTHROPIC_API_KEY` for direct Anthropic access, or use `inference.local` with a configured provider (e.g. Vertex AI). |
+| [OpenCode](https://opencode.ai/) | [`base`](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base) | Partial coverage | Pre-installed. Use `ANTHROPIC_BASE_URL="https://inference.local/v1"` with a configured provider. Add `opencode.ai` endpoint and OpenCode binary paths to the policy for full functionality. |
 | [Codex](https://developers.openai.com/codex) | [`base`](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base) | No coverage | Pre-installed. Requires a custom policy with OpenAI endpoints and Codex binary paths. Requires `OPENAI_API_KEY`. |
 | [GitHub Copilot CLI](https://docs.github.com/en/copilot/github-copilot-in-the-cli) | [`base`](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base) | Full coverage | Pre-installed. Works out of the box. Requires `GITHUB_TOKEN` or `COPILOT_GITHUB_TOKEN`. |
 | [OpenClaw](https://openclaw.ai/) | [NemoClaw](https://github.com/NVIDIA/NemoClaw) | Blueprint-managed | Run OpenClaw more securely inside NVIDIA OpenShell with managed inference using NemoClaw. |

@@ -1,0 +1,133 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Snap Package
+
+on:
+  workflow_call:
+    inputs:
+      checkout-ref:
+        required: true
+        type: string
+      upload-channel:
+        required: true
+        type: string
+        description: "Snap Store channel to upload to (e.g., latest/edge, latest/candidate, latest/stable)"
+      github-environment:
+        required: true
+        type: string
+        description: "GitHub deployment environment for approval gates (e.g., latest/edge, latest/stable)"
+
+    secrets:
+      publish-credentials:
+        required: true
+        description: "Snap Store credentials (SNAPCRAFT_STORE_CREDENTIALS)"
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build-snap:
+    name: Build Snap (Linux ${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: linux-amd64-cpu8
+          - arch: arm64
+            runner: linux-arm64-cpu8
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    environment: ${{ inputs.github-environment }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ inputs.checkout-ref }}
+          fetch-depth: 0
+
+      - name: Install snapd
+        run: |
+          set -euo pipefail
+          if ! command -v snapd >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y snapd
+          fi
+          sudo systemctl enable --now snapd.socket
+          sudo systemctl start snapd
+          sudo snap wait system seed.loaded
+
+      - name: Install LXD
+        run: |
+          set -euo pipefail
+          sudo snap install lxd
+          sudo usermod -aG lxd "$USER"
+          sudo lxd waitready
+          sudo lxd init --auto
+          sudo iptables -P FORWARD ACCEPT
+          sudo chgrp lxd /var/snap/lxd/common/lxd/unix.socket
+          sudo chmod 660 /var/snap/lxd/common/lxd/unix.socket
+
+      - name: Install snapcraft
+        run: |
+          set -euo pipefail
+          sudo snap install snapcraft --classic
+
+      - name: Build snap
+        run: |
+          set -euo pipefail
+          runtime_dir="/run/user/$(id -u)"
+          sudo install -d -m 0700 -o "$(id -u)" -g "$(id -g)" "$runtime_dir"
+          export XDG_RUNTIME_DIR="$runtime_dir"
+          sg lxd -c "XDG_RUNTIME_DIR=${runtime_dir} snapcraft pack -v"
+
+      - name: Upload snapcraft logs on failure
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: snapcraft-logs
+          path: "~/.local/state/snapcraft/log/snapcraft-*.log"
+          retention-days: 7
+
+      - name: Capture snap filename
+        id: capture
+        run: |
+          set -euo pipefail
+          SNAP_FILE=$(ls -1 *.snap 2>/dev/null | head -1)
+          if [ -z "$SNAP_FILE" ]; then
+            echo "ERROR: No .snap file found after snapcraft pack"
+            exit 1
+          fi
+          echo "snap-file=${SNAP_FILE}" >> $GITHUB_OUTPUT
+          echo "Built snap: ${SNAP_FILE}"
+
+      - name: Upload snap artifact (${{ matrix.arch }})
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: snap-linux-${{ matrix.arch }}
+          path: |
+            ${{ steps.capture.outputs.snap-file }}
+            *.comp
+          retention-days: 5
+
+      - name: Upload snap to Snap Store
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.publish-credentials }}
+        run: |
+          set -euo pipefail
+          SNAP_FILE="${{ steps.capture.outputs.snap-file }}"
+          SNAP_NAME="${SNAP_FILE%.snap}"
+          SNAP_NAME="${SNAP_NAME%%_*}"
+
+          COMPONENT_ARGS=()
+          shopt -s nullglob
+          for comp in "${SNAP_NAME}"+*.comp; do
+            echo "Adding component: $comp"
+            COMPONENT_ARGS+=(--component "$comp")
+          done
+
+          echo "Uploading $SNAP_FILE to ${{ inputs.upload-channel }}"
+          snapcraft upload --release "${{ inputs.upload-channel }}" "$SNAP_FILE" "${COMPONENT_ARGS[@]}"

@@ -12,12 +12,16 @@ Run the full agent-driven policy loop end-to-end:
 3. The agent reads `/etc/openshell/skills/policy_advisor.md`, drafts the
    narrowest rule needed, and submits it to `http://policy.local/v1/proposals`.
    It saves the returned `chunk_id`.
-4. The agent calls `GET /v1/proposals/{chunk_id}/wait?timeout=300` — a single
+4. The gateway merges the proposed rule with the current sandbox policy, runs
+   the policy prover, and stores a concise `validation_result` on the pending
+   chunk. This is deterministic control-plane evidence, not agent prose.
+5. The agent calls `GET /v1/proposals/{chunk_id}/wait?timeout=300` — a single
    HTTP request that the supervisor holds open until the developer decides.
    This is the load-bearing UX point: the agent burns zero LLM tokens while
    it waits; it's literally sleeping on a socket.
-5. You approve the proposal from the host with one keystroke.
-6. The agent's `/wait` returns within ~1 second of the approval. The sandbox
+6. You approve the proposal from the host with one keystroke after seeing the
+   exact rule and the prover verdict in `openshell rule get`.
+7. The agent's `/wait` returns within ~1 second of the approval. The sandbox
    has hot-reloaded the merged policy; the agent retries the original PUT
    once and exits.
 
@@ -78,6 +82,8 @@ reject with `--reason "scope to docs/ paths only"` and the agent reads
 | `DEMO_KEEP_SANDBOX` | `0` (set `1` to inspect the sandbox after the demo) |
 | `DEMO_MANUAL_APPROVE` | `0` (set `1` to pause for host-side `rule approve` / `rule reject --reason`) |
 | `DEMO_APPROVAL_TIMEOUT_SECS` | `240` (auto), `1800` (manual mode) |
+| `DEMO_CODEX_MODEL` | `gpt-5.4-mini` (pinned for ChatGPT-account compatibility; override if your account supports a different model) |
+| `DEMO_CODEX_REASONING` | `low` (the demo task is mechanical; `medium`/`high` slow it down without changing outcomes) |
 | `OPENSHELL_BIN` | `target/debug/openshell` if present, else `openshell` on `PATH` |
 
 ## What the agent sees
@@ -99,12 +105,29 @@ with three parts, each with a different trust level:
 | `validation_result` (prover output) | gateway-side prover | trust signal — but this surface is in progress (see [RFC 0001](../../rfc/0001-agent-driven-policy-management.md)) |
 
 The MVP today shows the structured rule plus the agent's rationale in
-`openshell rule get` and the TUI inbox panel. The demo's `openshell rule
-approve-all` auto-approves to keep the loop short — in a real session a
-developer reviews the structured grant before pressing `a`. Prover-backed
-validation badges, computed reachability deltas, and a richer "this is what
-the rule actually permits" summary are the next phase. For now, **always
-approve based on the structured rule, not the agent's rationale.**
+`openshell rule get` and the TUI inbox panel. With prover validation wired
+into the gateway, `openshell rule get` also shows a `Validation:` line for
+agent-authored chunks. The value is the prover's verdict in OCSF-shorthand
+style — one short, scannable string per chunk:
+
+```text
+Validation: prover: no new findings
+```
+
+```text
+Validation: prover: 1 new finding
+              capability_expansion: PUT on api.github.com:443 via /usr/bin/curl
+```
+
+Other possible verdicts: `validation unavailable` (gateway-side prover infra
+issue — surfaces in the gateway log, not as proposal failure), `merge failed:
+…` (proposal won't merge into the current policy), and `policy invalid: …`
+(merged policy fails the structural safety check).
+
+Read the structured rule (Endpoints + Binary). Read the Validation line.
+Approve if both look right. The demo's `openshell rule approve-all`
+auto-approves to keep the loop short; in a real session a developer makes
+that judgment per chunk before pressing `a`.
 
 ## Going further
 

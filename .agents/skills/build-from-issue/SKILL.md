@@ -148,7 +148,8 @@ In the prompt, instruct the reviewer to:
    - **Medium**: Multiple files/components, some design decisions, but well-scoped
    - **High**: Cross-cutting changes, architectural decisions needed, significant unknowns
 8. Call out risks, unknowns, and decisions that need stakeholder input.
-9. Assess **LSM compatibility** — if the change touches process identity, `/proc` filesystem access, binary execution, or inter-process visibility, flag whether it will behave differently on hosts running SELinux (enforcing) or AppArmor. In particular, tests that fork+exec into system binaries will fail on SELinux-enforcing hosts due to cross-label `/proc/<pid>/exe` access restrictions.
+9. Assess **gateway config documentation impact** — if the change adds, removes, renames, or changes defaults for gateway TOML keys or driver-specific config options, the plan must include an update to `docs/reference/gateway-config.mdx`. If the change is surfaced through Helm or a compute-driver overview, also include `docs/reference/sandbox-compute-drivers.mdx` or the relevant deployment docs.
+10. Assess **LSM compatibility** — if the change touches process identity, `/proc` filesystem access, binary execution, or inter-process visibility, flag whether it will behave differently on hosts running SELinux (enforcing) or AppArmor. In particular, tests that fork+exec into system binaries will fail on SELinux-enforcing hosts due to cross-label `/proc/<pid>/exe` access restrictions.
 
 ### A2: Post the Plan Comment
 
@@ -435,6 +436,13 @@ Do not proceed to PR creation if E2E verification is not green.
 Review the documentation requirements in `AGENTS.md` and update any affected
 docs as part of the implementation. Keep documentation changes scoped to the
 behavior or subsystem that changed.
+
+If the implementation changes gateway TOML parsing, `[openshell.gateway]`
+fields, `[openshell.drivers.<name>]` fields, driver config defaults, or Helm
+rendering of `gateway.toml`, update `docs/reference/gateway-config.mdx` in the
+same branch. If the change affects user-facing compute-driver setup, also
+update `docs/reference/sandbox-compute-drivers.mdx` or the relevant deployment
+page.
 
 ### Step 12: Commit and Push
 

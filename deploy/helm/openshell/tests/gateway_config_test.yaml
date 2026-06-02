@@ -59,6 +59,27 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?service_account_name\s*=\s*"openshell-sandbox"'
 
+  - it: renders sandbox image pull secrets under [openshell.drivers.kubernetes]
+    template: templates/gateway-config.yaml
+    set:
+      server.sandboxImagePullSecrets:
+        - name: regcred
+        - name: backup-regcred
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?image_pull_secrets\s*=\s*\["regcred", "backup-regcred"\]'
+
+  - it: does not reuse gateway image pull secrets for sandbox pods
+    template: templates/gateway-config.yaml
+    set:
+      imagePullSecrets:
+        - name: gateway-regcred
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'image_pull_secrets\s*='
+
   - it: does not render local mTLS user auth for Kubernetes deployments
     template: templates/gateway-config.yaml
     asserts:
@@ -125,3 +146,131 @@ tests:
       - matchRegex:
           path: data["gateway.toml"]
           pattern: 'server_sans\s*=\s*\["openshell", "\*\.dev\.openshell\.localhost"\]'
+
+  - it: passes sqlite db-url via --db-url arg by default
+    template: templates/statefulset.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: "sqlite:/var/openshell/openshell.db"
+
+  - it: does not pass --db-url in args when postgres.enabled is true
+    template: templates/statefulset.yaml
+    set:
+      postgres.enabled: true
+      postgres.auth.password: test-pw
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: "--db-url"
+
+  - it: does not pass --db-url in args when externalDbSecret is set
+    template: templates/statefulset.yaml
+    set:
+      server.externalDbSecret: my-pg-secret
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: "--db-url"
+
+  - it: references Bitnami service-binding Secret when postgres.enabled is true
+    template: templates/statefulset.yaml
+    set:
+      postgres.enabled: true
+      postgres.auth.password: test-pw
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_DB_URL
+            valueFrom:
+              secretKeyRef:
+                name: openshell-postgres-svcbind-custom-user
+                key: uri
+
+  - it: respects postgres.fullnameOverride for bundled service-binding Secret
+    template: templates/statefulset.yaml
+    set:
+      postgres.enabled: true
+      postgres.auth.password: test-pw
+      postgres.fullnameOverride: my-pg
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_DB_URL
+            valueFrom:
+              secretKeyRef:
+                name: my-pg-svcbind-custom-user
+                key: uri
+
+  - it: respects postgres.nameOverride for bundled service-binding Secret
+    template: templates/statefulset.yaml
+    set:
+      postgres.enabled: true
+      postgres.auth.password: test-pw
+      postgres.nameOverride: pgdb
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_DB_URL
+            valueFrom:
+              secretKeyRef:
+                name: openshell-pgdb-svcbind-custom-user
+                key: uri
+
+  - it: fails when serviceBindings is disabled with bundled postgres
+    template: templates/statefulset.yaml
+    set:
+      postgres.enabled: true
+      postgres.serviceBindings.enabled: false
+    asserts:
+      - failedTemplate:
+          errorMessage: "postgres.serviceBindings.enabled must be true when using bundled PostgreSQL"
+
+  - it: allows serviceBindings disabled when externalDbSecret is set
+    template: templates/statefulset.yaml
+    set:
+      postgres.enabled: true
+      postgres.serviceBindings.enabled: false
+      server.externalDbSecret: my-external-secret
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_DB_URL
+            valueFrom:
+              secretKeyRef:
+                name: my-external-secret
+                key: uri
+
+  - it: references externalDbSecret when set without postgres.enabled
+    template: templates/statefulset.yaml
+    set:
+      server.externalDbSecret: my-pg-secret
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_DB_URL
+            valueFrom:
+              secretKeyRef:
+                name: my-pg-secret
+                key: uri
+
+  - it: externalDbSecret overrides bundled secret when both are set
+    template: templates/statefulset.yaml
+    set:
+      postgres.enabled: true
+      postgres.auth.password: test-pw
+      server.externalDbSecret: my-external-secret
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_DB_URL
+            valueFrom:
+              secretKeyRef:
+                name: my-external-secret
+                key: uri

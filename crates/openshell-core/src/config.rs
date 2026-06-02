@@ -39,6 +39,11 @@ pub const DEFAULT_SUPERVISOR_IMAGE: &str = "ghcr.io/nvidia/openshell/supervisor:
 /// CDI device identifier for requesting all NVIDIA GPUs.
 pub const CDI_GPU_DEVICE_ALL: &str = "nvidia.com/gpu=all";
 
+/// Default maximum number of processes (PIDs) allowed inside a sandbox container.
+///
+/// Shared by the Docker and Podman drivers; override via driver config.
+pub const DEFAULT_SANDBOX_PIDS_LIMIT: i64 = 2048;
+
 /// Compute backends the gateway can orchestrate sandboxes through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -167,22 +172,25 @@ fn is_unix_socket(path: &Path) -> bool {
 }
 
 /// Server configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Built programmatically in [`crate::Config::new`] and the gateway CLI from
+/// the parsed config file, env vars, and CLI flags. It is never deserialized
+/// directly; the on-disk config schema lives in the gateway's `config_file`
+/// module ([`crate::TlsConfig`] and the other nested tables carry their own
+/// `Deserialize` impls for that purpose).
+#[derive(Debug, Clone)]
 pub struct Config {
     /// Address to bind the server to.
-    #[serde(default = "default_bind_address")]
     pub bind_address: SocketAddr,
 
     /// Address to bind the unauthenticated health endpoint to.
     ///
     /// When `None`, the dedicated health listener is disabled.
-    #[serde(default)]
     pub health_bind_address: Option<SocketAddr>,
 
     /// Address to bind the Prometheus metrics endpoint to.
     ///
     /// When `None`, the dedicated metrics listener is disabled.
-    #[serde(default)]
     pub metrics_bind_address: Option<SocketAddr>,
 
     /// Additional bind addresses that serve the same multiplexed gRPC/HTTP
@@ -191,36 +199,30 @@ pub struct Config {
     /// Compute drivers may register extra listeners during startup so that
     /// sandbox workloads can call back into the gateway over an interface
     /// that the operator-supplied `bind_address` does not expose.
-    #[serde(default)]
     pub extra_bind_addresses: Vec<SocketAddr>,
 
     /// Log level (trace, debug, info, warn, error).
-    #[serde(default = "default_log_level")]
     pub log_level: String,
 
     /// TLS configuration.  When `None`, the server listens on plaintext HTTP.
     pub tls: Option<TlsConfig>,
 
     /// OIDC configuration. When `Some`, the server validates Bearer JWTs.
-    #[serde(default)]
     pub oidc: Option<OidcConfig>,
 
     /// Gateway user authentication behavior.
-    #[serde(default)]
     pub auth: GatewayAuthConfig,
 
     /// mTLS user authentication configuration. When enabled, a verified TLS
     /// client certificate can authenticate CLI/SDK callers as a
     /// `Principal::User`. This is for local single-user gateways only;
     /// sandbox identity is always carried by gateway-minted sandbox JWTs.
-    #[serde(default)]
     pub mtls_auth: MtlsAuthConfig,
 
     /// Gateway-minted sandbox JWT configuration. When `Some`, the gateway
     /// loads the signing key from disk and accepts gateway-issued sandbox
     /// JWTs as `Principal::Sandbox`. Required for the per-sandbox identity
     /// flow (issue #1354).
-    #[serde(default)]
     pub gateway_jwt: Option<GatewayJwtConfig>,
 
     /// Database URL for persistence.
@@ -231,29 +233,26 @@ pub struct Config {
     /// The config shape allows multiple drivers so the gateway can evolve
     /// toward multi-backend routing. Current releases require exactly one
     /// configured driver.
-    #[serde(default)]
     pub compute_drivers: Vec<ComputeDriverKind>,
 
     /// TTL for SSH session tokens, in seconds. 0 disables expiry.
-    #[serde(default = "default_ssh_session_ttl_secs")]
     pub ssh_session_ttl_secs: u64,
 
     /// Browser-facing sandbox service routing configuration.
-    #[serde(default)]
     pub service_routing: ServiceRoutingConfig,
 }
 
 /// Browser-facing sandbox service routing configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Part of the programmatically-built [`Config`]; never deserialized directly.
+#[derive(Debug, Clone)]
 pub struct ServiceRoutingConfig {
     /// Base domains accepted for `sandbox--service.<domain>` routes.
     /// The first domain is used when the gateway prints endpoint URLs.
-    #[serde(default = "default_service_routing_domains")]
     pub base_domains: Vec<String>,
 
     /// Enable TLS-enabled loopback gateway listeners to also accept plaintext
     /// HTTP for sandbox service hostnames.
-    #[serde(default = "default_enable_loopback_service_http")]
     pub enable_loopback_service_http: bool,
 }
 
@@ -269,6 +268,7 @@ pub struct ServiceRoutingConfig {
 /// In both modes, authentication is handled at the application layer
 /// (e.g. OIDC bearer tokens).  mTLS is an additional mechanism.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     /// Path to the TLS certificate file.
     pub cert_path: PathBuf,
@@ -299,6 +299,7 @@ pub struct TlsConfig {
 /// - Entra ID / Okta: `roles`
 /// - Custom: any dot-separated path into the JWT claims
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OidcConfig {
     /// OIDC issuer URL (e.g., `http://localhost:8180/realms/openshell`).
     pub issuer: String,
@@ -333,6 +334,7 @@ pub struct OidcConfig {
 
 /// mTLS user authentication for local, single-user gateways.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MtlsAuthConfig {
     /// When true, the gateway maps a verified TLS client certificate into a
     /// user principal. Keep disabled for Kubernetes deployments because
@@ -343,6 +345,7 @@ pub struct MtlsAuthConfig {
 
 /// Gateway user authentication settings.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GatewayAuthConfig {
     /// When true, unauthenticated user/CLI calls are accepted as a local
     /// developer principal. This is an unsafe local-development escape hatch
@@ -363,6 +366,7 @@ const fn default_jwks_ttl_secs() -> u64 {
 /// signing key never leaves the gateway process; the public key is loaded
 /// by the same gateway so it can validate its own tokens.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GatewayJwtConfig {
     /// Path to the Ed25519 signing key (PKCS#8 PEM).
     pub signing_key_path: PathBuf,

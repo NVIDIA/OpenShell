@@ -142,6 +142,7 @@ impl PodmanComputeDriver {
         // get a clear error instead of a silent fallback to plaintext HTTP.
         config.validate_tls_config()?;
         config.validate_runtime_limits()?;
+        config.validate_host_gateway_ip()?;
 
         let client = PodmanClient::new(config.socket_path.clone());
 
@@ -195,7 +196,7 @@ impl PodmanComputeDriver {
         // Rootless pre-flight: warn if subuid/subgid ranges look missing.
         // Not a hard error because some systems configure these via LDAP or
         // other mechanisms that /etc/subuid does not reflect.
-        if rustix::process::getuid().as_raw() != 0 {
+        if !cfg!(target_os = "macos") && rustix::process::getuid().as_raw() != 0 {
             check_subuid_range();
         }
 
@@ -257,7 +258,6 @@ impl PodmanComputeDriver {
             "podman",
             openshell_core::VERSION,
             &self.config.default_image,
-            Self::has_gpu_capacity(),
         ))
     }
 

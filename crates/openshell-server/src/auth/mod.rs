@@ -14,6 +14,7 @@ pub mod guard;
 mod http;
 pub mod identity;
 pub mod k8s_sa;
+pub mod method_authz;
 pub mod oidc;
 pub mod principal;
 pub mod sandbox_jwt;

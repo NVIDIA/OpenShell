@@ -58,6 +58,12 @@ struct Args {
     )]
     gateway_port: u16,
 
+    /// Host gateway IP used for sandbox host aliases.
+    ///
+    /// Empty uses Podman's `host-gateway` resolver.
+    #[arg(long, env = "OPENSHELL_PODMAN_HOST_GATEWAY_IP")]
+    host_gateway_ip: Option<String>,
+
     #[arg(
         long,
         env = "OPENSHELL_SANDBOX_SSH_SOCKET_PATH",
@@ -118,6 +124,9 @@ async fn main() -> Result<()> {
         image_pull_policy: args.sandbox_image_pull_policy,
         grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
         gateway_port: args.gateway_port,
+        host_gateway_ip: args
+            .host_gateway_ip
+            .unwrap_or_else(PodmanComputeConfig::default_host_gateway_ip),
         sandbox_ssh_socket_path: args.sandbox_ssh_socket_path,
         network_name: args.network_name,
         stop_timeout_secs: args.stop_timeout,

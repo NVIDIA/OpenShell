@@ -6,8 +6,11 @@
 instances:
   - url: openshell.docs.buildwithfern.com/openshell
     custom-domain: docs.nvidia.com/openshell
+    multi-source: true
 
 title: NVIDIA OpenShell
+
+global-theme: nvidia
 
 announcement:
   message: "🔔 NVIDIA OpenShell is <strong>alpha software</strong>. APIs and behavior may change without notice. Do not use in production."
@@ -43,10 +46,6 @@ logo:
 
 favicon: ./assets/NVIDIA_symbol.svg
 
-js:
-  - url: https://assets.adobedtm.com/5d4962a43b79/c1061d2c5e7b/launch-191c2462b890.min.js
-    strategy: beforeInteractive
-
 css:
   - ./main.css
 
@@ -57,7 +56,7 @@ navbar-links:
 experimental:
   mdx-components:
     - ../docs/_components
-  basepath-aware: true
+    - ./components
 
 versions:
   - display-name: Latest

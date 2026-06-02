@@ -45,16 +45,15 @@ service ComputeDriver {
 message GetCapabilitiesRequest {}
 
 message GetCapabilitiesResponse {
+  reserved 4, 5;
+  reserved "supports_gpu", "gpu_count";
+
   // Human-readable driver name.
   string driver_name = 1;
   // Driver implementation version string.
   string driver_version = 2;
   // Default sandbox image recommended by the driver.
   string default_image = 3;
-  // True when the driver can provision GPU-backed sandboxes.
-  bool supports_gpu = 4;
-  // Number of GPUs available for sandbox assignment.
-  uint32 gpu_count = 5;
 }
 
 // Driver-owned sandbox model used for create requests and platform observations.

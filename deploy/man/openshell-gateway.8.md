@@ -130,7 +130,11 @@ View logs:
 The unit runs **openshell-gateway generate-certs** as an **ExecStartPre**
 step on first start. This generates a self-signed PKI bundle for mTLS
 and sandbox JWT signing material, adding missing JWT files to older
-TLS-only installs when needed.
+TLS-only installs when needed. The packaged unit sets
+**OPENSHELL_LOCAL_TLS_DIR** to *~/.local/state/openshell/tls* and uses that
+same value for certificate generation and gateway startup. Override
+**OPENSHELL_LOCAL_TLS_DIR** in *~/.config/openshell/gateway.env* only if you
+need a custom bundle location.
 
 The gateway then starts from built-in defaults and reads
 *~/.config/openshell/gateway.toml* when that file exists.

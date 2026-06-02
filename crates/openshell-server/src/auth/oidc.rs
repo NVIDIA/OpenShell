@@ -25,18 +25,16 @@ use tokio::sync::RwLock;
 use tonic::Status;
 use tracing::{debug, info, warn};
 
-/// Truly unauthenticated methods — health probes and infrastructure.
-const UNAUTHENTICATED_METHODS: &[&str] = &[
-    "/openshell.v1.OpenShell/Health",
-    "/openshell.inference.v1.Inference/Health",
-];
-
 /// Path prefixes that bypass OIDC validation (gRPC reflection, health probes).
+///
+/// These are structural bypasses for gRPC infrastructure that doesn't map to a
+/// single RPC method. Per-method bypasses (e.g. `Health`) are declared at the
+/// handler with `#[rpc_auth(auth = "unauthenticated")]`.
 const UNAUTHENTICATED_PREFIXES: &[&str] = &["/grpc.reflection.", "/grpc.health."];
 
 /// Returns `true` if the method needs no authentication at all.
 pub fn is_unauthenticated_method(path: &str) -> bool {
-    UNAUTHENTICATED_METHODS.contains(&path)
+    super::method_authz::is_unauthenticated(path)
         || UNAUTHENTICATED_PREFIXES
             .iter()
             .any(|prefix| path.starts_with(prefix))

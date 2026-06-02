@@ -556,6 +556,52 @@ impl OpaEngine {
             .unwrap_or_default())
     }
 
+    /// Return true when the matched endpoint is an exact declared hostname.
+    ///
+    /// This intentionally excludes wildcard and hostless endpoints. The proxy
+    /// uses this as a narrow signal that the operator explicitly declared the
+    /// destination hostname, which can safely skip the default private-IP SSRF
+    /// denial while preserving separate handling for `allowed_ips` and advisor
+    /// proposals.
+    pub fn query_exact_declared_endpoint_host(&self, input: &NetworkInput) -> Result<bool> {
+        let ancestor_strs: Vec<String> = input
+            .ancestors
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let cmdline_strs: Vec<String> = input
+            .cmdline_paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let input_json = serde_json::json!({
+            "exec": {
+                "path": input.binary_path.to_string_lossy(),
+                "ancestors": ancestor_strs,
+                "cmdline_paths": cmdline_strs,
+            },
+            "network": {
+                "host": input.host,
+                "port": input.port,
+            }
+        });
+
+        let mut engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+
+        engine
+            .set_input_json(&input_json.to_string())
+            .map_err(|e| miette::miette!("{e}"))?;
+
+        let val = engine
+            .eval_rule("data.openshell.sandbox.exact_declared_endpoint_host".into())
+            .map_err(|e| miette::miette!("{e}"))?;
+
+        Ok(val == regorus::Value::from(true))
+    }
+
     /// Clone the inner regorus engine for per-tunnel L7 evaluation.
     ///
     /// With the `arc` feature enabled, this shares compiled policy via Arc
@@ -1012,6 +1058,9 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                     if !e.allowed_ips.is_empty() {
                         ep["allowed_ips"] = e.allowed_ips.clone().into();
                     }
+                    if e.advisor_proposed {
+                        ep["advisor_proposed"] = true.into();
+                    }
                     if !e.deny_rules.is_empty() {
                         let deny_rules: Vec<serde_json::Value> = e
                             .deny_rules
@@ -1097,9 +1146,20 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                 .binaries
                 .iter()
                 .flat_map(|b| {
-                    let mut entries = vec![serde_json::json!({"path": &b.path})];
+                    // The deprecated harness bit is ignored by policy YAML, but
+                    // advisor-generated proposals use it as internal provenance.
+                    #[allow(deprecated)]
+                    let advisor_proposed = b.harness;
+                    let binary_entry = |path: &str| {
+                        let mut entry = serde_json::json!({"path": path});
+                        if advisor_proposed {
+                            entry["advisor_proposed"] = true.into();
+                        }
+                        entry
+                    };
+                    let mut entries = vec![binary_entry(&b.path)];
                     if let Some(resolved) = resolve_binary_in_container(&b.path, entrypoint_pid) {
-                        entries.push(serde_json::json!({"path": resolved}));
+                        entries.push(binary_entry(&resolved));
                     }
                     entries
                 })
@@ -3435,6 +3495,13 @@ network_policies:
       - { host: api.github.com, port: 443 }
     binaries:
       - { path: /usr/bin/curl }
+  # Wildcard host endpoint should not count as an exact declared hostname.
+  wildcard_api:
+    name: wildcard_api
+    endpoints:
+      - { host: "*.corp.net", port: 443 }
+    binaries:
+      - { path: /usr/bin/curl }
 filesystem_policy:
   include_workdir: true
   read_only: []
@@ -3534,6 +3601,180 @@ process:
         };
         let ips = engine.query_allowed_ips(&input).unwrap();
         assert!(ips.is_empty(), "Mode 1 should return no allowed_ips");
+    }
+
+    #[test]
+    fn exact_declared_endpoint_host_true_for_l4_host_only() {
+        let engine = allowed_ips_engine();
+        let input = NetworkInput {
+            host: "api.github.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        assert!(engine.query_endpoint_config(&input).unwrap().is_none());
+        assert!(engine.query_exact_declared_endpoint_host(&input).unwrap());
+    }
+
+    #[test]
+    fn exact_declared_endpoint_host_true_for_host_with_allowed_ips() {
+        let engine = allowed_ips_engine();
+        let input = NetworkInput {
+            host: "my-service.corp.net".into(),
+            port: 8080,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        assert!(engine.query_exact_declared_endpoint_host(&input).unwrap());
+    }
+
+    #[test]
+    fn exact_declared_endpoint_host_false_for_hostless_allowed_ips() {
+        let engine = allowed_ips_engine();
+        let input = NetworkInput {
+            host: "anything.example.com".into(),
+            port: 9443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        assert!(!engine.query_exact_declared_endpoint_host(&input).unwrap());
+    }
+
+    #[test]
+    fn exact_declared_endpoint_host_false_for_wildcard_host() {
+        let engine = allowed_ips_engine();
+        let input = NetworkInput {
+            host: "api.corp.net".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        let decision = engine.evaluate_network(&input).unwrap();
+        assert!(decision.allowed, "wildcard endpoint should still allow");
+        assert!(!engine.query_exact_declared_endpoint_host(&input).unwrap());
+    }
+
+    #[test]
+    fn exact_declared_endpoint_host_false_for_advisor_proposed_binary() {
+        let mut network_policies = std::collections::HashMap::new();
+        let mut proposal_binary = NetworkBinary {
+            path: "/usr/bin/curl".to_string(),
+            ..Default::default()
+        };
+        #[allow(deprecated)]
+        {
+            proposal_binary.harness = true;
+        }
+        network_policies.insert(
+            "allow_mcp_internal_corp_example_com_8443".to_string(),
+            NetworkPolicyRule {
+                name: "allow_mcp_internal_corp_example_com_8443".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "mcp-internal.corp.example.com".to_string(),
+                    port: 8443,
+                    ..Default::default()
+                }],
+                binaries: vec![proposal_binary],
+            },
+        );
+        let proto = ProtoSandboxPolicy {
+            version: 1,
+            filesystem: Some(ProtoFs {
+                include_workdir: true,
+                read_only: vec![],
+                read_write: vec![],
+            }),
+            landlock: Some(openshell_core::proto::LandlockPolicy {
+                compatibility: "best_effort".to_string(),
+            }),
+            process: Some(ProtoProc {
+                run_as_user: "sandbox".to_string(),
+                run_as_group: "sandbox".to_string(),
+            }),
+            network_policies,
+        };
+        let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
+        let input = NetworkInput {
+            host: "mcp-internal.corp.example.com".into(),
+            port: 8443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        let decision = engine.evaluate_network(&input).unwrap();
+        assert!(
+            decision.allowed,
+            "advisor proposal should still allow at OPA L4"
+        );
+        assert!(!engine.query_exact_declared_endpoint_host(&input).unwrap());
+    }
+
+    #[test]
+    fn exact_declared_endpoint_host_false_for_advisor_proposed_endpoint() {
+        let mut network_policies = std::collections::HashMap::new();
+        network_policies.insert(
+            "app-api".to_string(),
+            NetworkPolicyRule {
+                name: "app-api".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "internal-admin.local".to_string(),
+                    port: 443,
+                    ports: vec![443],
+                    advisor_proposed: true,
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/python".to_string(),
+                    ..Default::default()
+                }],
+            },
+        );
+        let proto = ProtoSandboxPolicy {
+            version: 1,
+            filesystem: Some(ProtoFs {
+                include_workdir: true,
+                read_only: vec![],
+                read_write: vec![],
+            }),
+            landlock: Some(openshell_core::proto::LandlockPolicy {
+                compatibility: "best_effort".to_string(),
+            }),
+            process: Some(ProtoProc {
+                run_as_user: "sandbox".to_string(),
+                run_as_group: "sandbox".to_string(),
+            }),
+            network_policies,
+        };
+        let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
+        let input = NetworkInput {
+            host: "internal-admin.local".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/python"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        let decision = engine.evaluate_network(&input).unwrap();
+        assert!(decision.allowed, "policy should still allow at OPA L4");
+        assert!(
+            !engine.query_exact_declared_endpoint_host(&input).unwrap(),
+            "advisor endpoint provenance should block exact-host SSRF trust"
+        );
     }
 
     #[test]

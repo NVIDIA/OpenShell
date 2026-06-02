@@ -37,3 +37,24 @@ pub fn mark_progress_detail<S: BuildHasher>(
 ) {
     metadata.insert(PROGRESS_ACTIVE_DETAIL_KEY.to_string(), detail.into());
 }
+
+/// Format a byte count as a human-readable string (B / KB / MB / GB).
+///
+/// Used by compute drivers when reporting image pull progress.
+pub fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+
+    if bytes >= GB {
+        #[allow(clippy::cast_precision_loss)]
+        let gb = bytes as f64 / GB as f64;
+        format!("{gb:.1} GB")
+    } else if bytes >= MB {
+        format!("{} MB", bytes / MB)
+    } else if bytes >= KB {
+        format!("{} KB", bytes / KB)
+    } else {
+        format!("{bytes} B")
+    }
+}

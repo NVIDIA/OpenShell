@@ -3457,11 +3457,13 @@ dependencies = [
 name = "openshell-core"
 version = "0.0.0"
 dependencies = [
+ "chrono",
  "ipnet",
  "miette",
  "prost",
  "prost-types",
  "protobuf-src",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "tempfile",
@@ -3481,6 +3483,7 @@ dependencies = [
  "openshell-core",
  "serde",
  "tar",
+ "temp-env",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -3504,6 +3507,7 @@ dependencies = [
  "prost-types",
  "serde",
  "serde_json",
+ "temp-env",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -3559,6 +3563,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tar",
+ "temp-env",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -3718,8 +3723,10 @@ dependencies = [
  "openshell-driver-podman",
  "openshell-ocsf",
  "openshell-policy",
+ "openshell-prover",
  "openshell-providers",
  "openshell-router",
+ "openshell-server-macros",
  "petname",
  "pin-project-lite",
  "prost",
@@ -3751,6 +3758,15 @@ dependencies = [
  "uuid",
  "wiremock",
  "x509-parser",
+]
+
+[[package]]
+name = "openshell-server-macros"
+version = "0.0.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
