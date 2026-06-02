@@ -1560,7 +1560,9 @@ impl fmt::Display for SigV4PayloadMode {
 /// - `STREAMING-UNSIGNED-PAYLOAD-TRAILER` → `StreamingUnsignedTrailer`
 /// - `UNSIGNED-PAYLOAD` → `UnsignedPayload`
 /// - Hex hash → `SignBody` (buffer + hash, requires `Content-Length`)
-/// - `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` → rejected (per-chunk signing unsupported)
+/// - `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` → `StreamingUnsignedTrailer` (re-sign
+///   headers only; the proxy cannot reproduce per-chunk signatures, but the
+///   body streams through intact and AWS accepts unsigned streaming payloads)
 /// - Absent → `SignBody` if `Content-Length` present, else `UnsignedPayload`
 fn detect_payload_mode(headers: &str) -> Result<SigV4PayloadMode> {
     for line in headers.lines().skip(1) {
@@ -1568,14 +1570,13 @@ fn detect_payload_mode(headers: &str) -> Result<SigV4PayloadMode> {
         if lower.starts_with("x-amz-content-sha256:") {
             let val = lower.split_once(':').map_or("", |(_, v)| v.trim());
             return match val {
-                "streaming-unsigned-payload-trailer" => {
+                "streaming-unsigned-payload-trailer" | "streaming-aws4-hmac-sha256-payload" => {
                     Ok(SigV4PayloadMode::StreamingUnsignedTrailer)
                 }
                 "unsigned-payload" => Ok(SigV4PayloadMode::UnsignedPayload),
-                v if v.starts_with("streaming-") => Err(miette!(
-                    "SigV4 per-chunk streaming signing ({v}) is not supported; \
-                     use credential_signing: sigv4 (auto-detect) or sigv4:no_body"
-                )),
+                v if v.starts_with("streaming-") => {
+                    Ok(SigV4PayloadMode::StreamingUnsignedTrailer)
+                }
                 _ => Ok(SigV4PayloadMode::SignBody),
             };
         }
