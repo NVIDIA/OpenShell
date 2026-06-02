@@ -10,16 +10,32 @@ use aws_smithy_runtime_api::client::identity::Identity;
 use miette::{Result, miette};
 use std::time::SystemTime;
 
-/// Extract the AWS region from a standard AWS hostname.
-/// Pattern: `<service>.<region>.amazonaws.com` → `<region>`.
+/// Extract the AWS region from an AWS hostname.
+///
+/// Supports standard, dualstack, FIPS, virtual-hosted, and China partition
+/// hostnames. The region is the label immediately before `amazonaws.com`
+/// (or `amazonaws.com.cn`).
 pub fn extract_aws_region(host: &str) -> Option<String> {
     let parts: Vec<&str> = host.split('.').collect();
+    // China partition: *.amazonaws.com.cn
+    if parts.len() >= 5
+        && parts[parts.len() - 3] == "amazonaws"
+        && parts[parts.len() - 2] == "com"
+        && parts[parts.len() - 1] == "cn"
+    {
+        return Some(parts[parts.len() - 4].to_string());
+    }
+    // Standard/dualstack/FIPS/virtual-hosted: *.amazonaws.com
     if parts.len() >= 4 && parts[parts.len() - 2] == "amazonaws" && parts[parts.len() - 1] == "com"
     {
-        Some(parts[1].to_string())
-    } else {
-        None
+        let region = parts[parts.len() - 3];
+        // Skip "dualstack" — the region is one level further left
+        if region == "dualstack" && parts.len() >= 5 {
+            return Some(parts[parts.len() - 4].to_string());
+        }
+        return Some(region.to_string());
     }
+    None
 }
 
 /// Strip AWS auth headers from raw HTTP request bytes.
@@ -335,6 +351,30 @@ mod tests {
     #[test]
     fn global_endpoint_returns_none() {
         assert!(extract_aws_region("s3.amazonaws.com").is_none());
+    }
+
+    #[test]
+    fn extract_region_dualstack() {
+        let region = extract_aws_region("s3.dualstack.us-west-2.amazonaws.com").unwrap();
+        assert_eq!(region, "us-west-2");
+    }
+
+    #[test]
+    fn extract_region_fips() {
+        let region = extract_aws_region("bedrock-runtime-fips.us-east-1.amazonaws.com").unwrap();
+        assert_eq!(region, "us-east-1");
+    }
+
+    #[test]
+    fn extract_region_china() {
+        let region = extract_aws_region("s3.cn-north-1.amazonaws.com.cn").unwrap();
+        assert_eq!(region, "cn-north-1");
+    }
+
+    #[test]
+    fn extract_region_virtual_hosted_s3() {
+        let region = extract_aws_region("my-bucket.s3.us-east-2.amazonaws.com").unwrap();
+        assert_eq!(region, "us-east-2");
     }
 
     #[test]

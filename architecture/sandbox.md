@@ -76,9 +76,22 @@ plain tracing output.
 
 For AWS endpoints that require request-level signing, the proxy supports SigV4
 re-signing. When `credential_signing: sigv4` is set on an L7 endpoint, the proxy
-strips the client's placeholder-based AWS auth headers, buffers the request body,
-computes a fresh SigV4 signature using real credentials from the provider, and
-forwards the re-signed request upstream.
+strips the client's placeholder-based AWS auth headers, re-signs with real
+credentials from the provider, and forwards the request upstream. The signing
+mode is auto-detected from the client SDK's `x-amz-content-sha256` header:
+
+- **Signed body** (hex hash): buffers the request body, computes its SHA-256,
+  and includes the hash in the signature. Used by Bedrock and most AWS services.
+- **Streaming unsigned** (`STREAMING-UNSIGNED-PAYLOAD-TRAILER`): signs headers
+  only and streams the body through without buffering. Used by S3 uploads with
+  `aws-chunked` encoding.
+- **Unsigned payload** (`UNSIGNED-PAYLOAD`): signs headers only with no body
+  hash. Used by S3 over HTTPS for non-chunked requests.
+
+Two explicit overrides are available: `credential_signing: sigv4:body` (always
+buffer and hash) and `sigv4:no_body` (always unsigned). The `Expect:
+100-continue` header is handled within the SigV4 path so clients like boto3
+transmit the body before the proxy forwards to upstream.
 
 ## Connect and Logs
 
