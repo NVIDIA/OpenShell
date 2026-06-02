@@ -153,12 +153,16 @@ jobs:
     steps:
       - name: Install snapd
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y snapd
+          sudo systemctl enable --now snapd.socket
           sudo systemctl start snapd
+          sudo snap wait system seed.loaded
 
       - name: Install Docker snap
         run: |
+          set -euo pipefail
           sudo snap install docker
 
       - name: Download snap from release-dev artifacts
@@ -167,20 +171,28 @@ jobs:
           run-id: ${{ github.event.workflow_run.id }}
           pattern: snap-linux-amd64
           path: release/
+          merge-multiple: true
 
       - name: Install snap (dangerous — from release, not store)
         run: |
+          set -euo pipefail
           sudo snap install ./release/*.snap --dangerous
 
       - name: Connect interfaces
         run: |
+          set -euo pipefail
           sudo snap connect openshell:docker docker:docker-daemon
           sudo snap connect openshell:log-observe
           sudo snap connect openshell:system-observe
           sudo snap connect openshell:ssh-keys
 
-      - name: Check status
+      - name: Register snap gateway and check status
         run: |
+          set -euo pipefail
+          openshell --version
+          sudo snap services openshell
+          openshell gateway add http://127.0.0.1:17670 --local --name snap-docker
+          openshell gateway select snap-docker
           openshell status
 
   kubernetes:
