@@ -121,9 +121,9 @@ openshell inference get
 
 ```bash
 openshell sandbox create \
-  --policy examples/inference/sandbox-policy.yaml \
+  --policy examples/local-inference/sandbox-policy.yaml \
   --name inference-demo \
-  -- python examples/inference/inference.py
+  -- python examples/local-inference/inference.py
 ```
 
 The script targets `https://inference.local/v1` directly. OpenShell
@@ -142,7 +142,7 @@ content=NAV_OK
 ```bash
 openshell sandbox connect inference-demo
 # Inside the sandbox:
-python examples/inference/inference.py
+python examples/local-inference/inference.py
 ```
 
 #### 5. Cleanup
