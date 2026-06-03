@@ -45,4 +45,9 @@ endpoints:
     protocol: rest
     access: read-write
     enforcement: enforce
+  - host: files.openai.com
+    port: 443
+    protocol: rest
+    access: read-write
+    enforcement: enforce
 binaries: [/usr/bin/codex, /usr/local/bin/codex, /usr/lib/node_modules/@openai/**]

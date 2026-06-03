@@ -20,6 +20,15 @@ endpoints:
     protocol: rest
     enforcement: enforce
     rules:
+      - allow: { method: GET, path: /user }
+      - allow:
+          method: GET
+          path: /search/issues
+          query:
+            q:
+              any:
+                - "*repo:NVIDIA/OpenShell*"
+                - "*repo:NVIDIA/OpenShell-Community*"
       - allow: { method: GET, path: /repos/NVIDIA/OpenShell }
       - allow: { method: GET, path: /repos/NVIDIA/OpenShell/** }
       - allow: { method: POST, path: /repos/NVIDIA/OpenShell/issues/*/comments }
@@ -30,6 +39,7 @@ endpoints:
       - allow: { method: PATCH, path: /repos/NVIDIA/OpenShell/issues/* }
       - allow: { method: POST, path: /repos/NVIDIA/OpenShell/labels }
       - allow: { method: PATCH, path: /repos/NVIDIA/OpenShell/labels/* }
+      - allow: { method: POST, path: /repos/NVIDIA/OpenShell/pulls/*/comments }
       - allow: { method: POST, path: /repos/NVIDIA/OpenShell/pulls/*/reviews }
       - allow: { method: POST, path: /repos/NVIDIA/OpenShell/pulls/*/reviews/*/comments }
       - allow: { method: POST, path: /repos/NVIDIA/OpenShell/statuses/* }
@@ -43,6 +53,7 @@ endpoints:
       - allow: { method: PATCH, path: /repos/NVIDIA/OpenShell-Community/issues/* }
       - allow: { method: POST, path: /repos/NVIDIA/OpenShell-Community/labels }
       - allow: { method: PATCH, path: /repos/NVIDIA/OpenShell-Community/labels/* }
+      - allow: { method: POST, path: /repos/NVIDIA/OpenShell-Community/pulls/*/comments }
       - allow: { method: POST, path: /repos/NVIDIA/OpenShell-Community/pulls/*/reviews }
       - allow: { method: POST, path: /repos/NVIDIA/OpenShell-Community/pulls/*/reviews/*/comments }
       - allow: { method: POST, path: /repos/NVIDIA/OpenShell-Community/statuses/* }
@@ -57,6 +68,19 @@ endpoints:
       - allow: { method: GET, path: /NVIDIA/OpenShell-Community }
       - allow: { method: GET, path: /NVIDIA/OpenShell-Community/** }
       - allow: { method: POST, path: /NVIDIA/OpenShell-Community/**/git-upload-pack }
+  - host: codeload.github.com
+    port: 443
+    protocol: rest
+    enforcement: enforce
+    rules:
+      - allow: { method: GET, path: /NVIDIA/OpenShell/** }
+      - allow: { method: GET, path: /NVIDIA/OpenShell-Community/** }
+  - host: results-receiver.actions.githubusercontent.com
+    port: 443
+    protocol: rest
+    enforcement: enforce
+    rules:
+      - allow: { method: GET, path: /rest/runs/** }
 binaries:
   - /usr/bin/gh
   - /usr/local/bin/gh
