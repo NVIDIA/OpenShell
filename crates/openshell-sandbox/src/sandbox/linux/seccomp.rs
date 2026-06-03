@@ -217,8 +217,6 @@ fn build_filter_rules(allow_inet: bool) -> Result<BTreeMap<i64, Vec<SeccompRule>
     // --- Unconditional syscall blocks ---
     // These syscalls are blocked entirely (empty rule vec = unconditional EPERM).
 
-    // Fileless binary execution via memfd bypasses Landlock filesystem restrictions.
-    rules.entry(libc::SYS_memfd_create).or_default();
     // Cross-process memory inspection and code injection.
     rules.entry(libc::SYS_ptrace).or_default();
     // Kernel BPF program loading.
@@ -263,6 +261,14 @@ fn build_filter_rules(allow_inet: bool) -> Result<BTreeMap<i64, Vec<SeccompRule>
         4, // flags argument
         libc::AT_EMPTY_PATH as u64,
     )?;
+
+    // memfd_create is blocked unless MFD_NOEXEC_SEAL is set. A sealed-noexec memfd can
+    // never be made executable, so the fileless-execution vector that motivated blocking
+    // memfd_create stays closed (and is doubly covered by the execveat(AT_EMPTY_PATH) block
+    // above), while legitimate non-executable in-memory files are permitted. The NVIDIA
+    // CUDA driver requires memfd_create during initialization; blocking it unconditionally
+    // makes CUDA fail with cudaErrorOperatingSystem (304) inside the sandbox.
+    add_memfd_noexec_rule(&mut rules)?;
 
     // unshare with CLONE_NEWUSER allows creating user namespaces to escalate privileges.
     add_masked_arg_rule(
@@ -361,6 +367,31 @@ fn add_masked_arg_rule(
     Ok(())
 }
 
+/// Block `memfd_create` unless `MFD_NOEXEC_SEAL` is set in the flags argument.
+///
+/// `MFD_NOEXEC_SEAL` (Linux 6.3+) creates an anonymous file that can never be made
+/// executable, preserving the anti-fileless-execution intent of blocking `memfd_create`
+/// while allowing legitimate non-executable in-memory files (e.g. those the NVIDIA CUDA
+/// driver creates during initialization). Uses `MaskedEq(MFD_NOEXEC_SEAL) == 0`, which
+/// triggers EPERM when the flag is absent and allows the call when it is present.
+fn add_memfd_noexec_rule(rules: &mut BTreeMap<i64, Vec<SeccompRule>>) -> Result<()> {
+    // MFD_NOEXEC_SEAL is not exposed by all libc versions, so define it locally.
+    const MFD_NOEXEC_SEAL: u64 = 0x0008;
+    let condition = SeccompCondition::new(
+        1, // flags argument
+        SeccompCmpArgLen::Dword,
+        SeccompCmpOp::MaskedEq(MFD_NOEXEC_SEAL),
+        0,
+    )
+    .into_diagnostic()?;
+    let rule = SeccompRule::new(vec![condition]).into_diagnostic()?;
+    rules
+        .entry(libc::SYS_memfd_create)
+        .or_default()
+        .push(rule);
+    Ok(())
+}
+
 #[cfg(test)]
 // libc/syscall FFI requires unsafe; these tests fork children and exercise
 // blocked syscalls, so unsafe blocks/calls are pervasive.
@@ -421,7 +452,6 @@ mod tests {
 
         // Unconditional blocks have an empty Vec (no conditions = always match).
         let expected = [
-            libc::SYS_memfd_create,
             libc::SYS_ptrace,
             libc::SYS_bpf,
             libc::SYS_process_vm_readv,
@@ -463,6 +493,7 @@ mod tests {
         let filter_rules = build_filter_rules(true).unwrap();
 
         for syscall in [
+            libc::SYS_memfd_create,
             libc::SYS_execveat,
             libc::SYS_unshare,
             libc::SYS_clone,
