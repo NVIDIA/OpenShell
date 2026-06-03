@@ -669,6 +669,19 @@ impl VmDriver {
                 }
             };
 
+        // `build_vm_launch_plan` already allocated the QEMU subnet, so record
+        // it as allocated now — before the cancellable `configure_launch` /
+        // `before_launch` hooks run. If a delete aborts provisioning while
+        // one of those hooks is awaiting, the aborted future never runs its
+        // own release path, and the delete cleanup is gated on this flag; if
+        // the flag were still unset the subnet would leak.
+        if plan.backend == VmBackend::Qemu
+            && let Err(err) = self.mark_qemu_network_allocated(&sandbox.id).await
+        {
+            self.release_gpu_and_subnet(&sandbox.id);
+            return Err(err);
+        }
+
         if let Err(err) = self
             .lifecycle_extensions
             .configure_launch(&sandbox, &state_dir, &mut plan)
@@ -723,13 +736,6 @@ impl VmDriver {
                     LaunchAbortReason::BeforeLaunchHookFailed,
                 )
                 .await;
-            self.release_gpu_and_subnet(&sandbox.id);
-            return Err(err);
-        }
-
-        if plan.backend == VmBackend::Qemu
-            && let Err(err) = self.mark_qemu_network_allocated(&sandbox.id).await
-        {
             self.release_gpu_and_subnet(&sandbox.id);
             return Err(err);
         }
