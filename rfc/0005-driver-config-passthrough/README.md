@@ -153,6 +153,21 @@ message DriverSandboxTemplate {
 The driver receives only the selected driver's inner config block. It does not
 receive the full public envelope.
 
+Drivers may interpret the received `Struct` through driver-local typed schemas.
+For example, the Kubernetes driver may define a Kubernetes-specific protobuf
+message or Rust struct for its inner `driver_config` block and map the forwarded
+`Struct` into that type before validation and pod construction. That local typed
+decode is an implementation detail of the selected driver. It must not require
+the gateway to import Kubernetes-, Docker-, Podman-, or VM-specific config
+messages, and it must not change the public driver-keyed envelope contract.
+
+Driver-local typed config should be distinct from gateway process configuration
+such as `[openshell.drivers.<name>]` TOML structs. Gateway process configuration
+contains operator-owned settings like namespaces, gateway endpoints, service
+accounts, TLS material, default images, and runtime state paths. Caller-provided
+per-sandbox `driver_config` must use a narrower create-time schema that exposes
+only documented, caller-safe knobs for that driver.
+
 ### Gateway behavior
 
 The gateway handles only the top-level envelope:
@@ -317,8 +332,10 @@ surfaces include:
 
 - a schema URL in `GetCapabilitiesResponse`;
 - an inline schema in `GetCapabilitiesResponse`;
-- a dedicated `GetDriverConfigSchema` RPC; or
-- a schema identifier or version that maps to published documentation.
+- a dedicated `GetDriverConfigSchema` RPC;
+- a schema identifier or version that maps to published documentation; or
+- a driver-published protobuf descriptor or type identifier for drivers that
+  use protobuf messages to model their local config.
 
 Any schema discovery mechanism should preserve the ownership boundary:
 
@@ -327,6 +344,8 @@ Any schema discovery mechanism should preserve the ownership boundary:
   checks.
 - The gateway must not encode driver-specific schema knowledge directly.
 - Schema-based gateway checks must not replace driver-side validation.
+- A protobuf-backed schema does not imply a central `oneof` of all in-tree and
+  out-of-tree driver configs in the public API.
 
 Schema discovery is not required for the first implementation of this RFC, but
 the API design should not preclude adding it later.
@@ -441,9 +460,12 @@ outside this RFC.
    use cases.
 7. Implement driver-side validation for supported keys, malformed values,
    typed-field conflicts, protected invariants, and unsafe platform controls.
-8. Add examples and tests for documented Kubernetes `driver_config` keys,
+8. If a driver uses a local typed schema, map the selected inner `Struct` into
+   that driver-local type inside the driver before validation. Do not add
+   driver-specific config messages to the gateway translation layer.
+9. Add examples and tests for documented Kubernetes `driver_config` keys,
    including GPU extended resources and sidecar resource requests.
-9. Document built-in driver names, exact-match behavior, validation ownership,
+10. Document built-in driver names, exact-match behavior, validation ownership,
    lifecycle semantics, protected-field rules, schema evolution expectations,
    and supported Kubernetes keys.
 
@@ -475,6 +497,23 @@ forwarding logic.
 This keeps the public API strongly typed, but the gateway remains a bottleneck,
 the public API grows around driver-specific details, and new driver capabilities
 require coordinated releases.
+
+### Central public `oneof` for per-driver config protos
+
+The public API could replace the generic `Struct` envelope with a central
+`oneof` containing typed messages for every supported driver, or the internal
+driver API could require the gateway to translate the selected block into a
+driver-specific protobuf message before calling the driver.
+
+This gives generated types to clients and the gateway, but it moves schema
+ownership back into the shared API surface. Every new driver config key, and
+every out-of-tree driver config shape, would require gateway proto changes and
+coordinated releases. It also makes portability harder because clients must
+compile against all config message variants they want to carry.
+
+Driver-local protobuf messages remain compatible with this RFC when the gateway
+continues to forward only the selected inner `Struct` and the selected driver
+performs the typed decode and validation locally.
 
 ### Merge caller config into `platform_config`
 
