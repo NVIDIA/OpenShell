@@ -11,18 +11,24 @@ links:
 
 ## Summary
 
+This RFC describes a platform-managed Kubernetes usage pattern for OpenShell.
 An existing Kubernetes platform can own tenant onboarding, namespace creation,
 quotas, network policy, secret synchronization, policy compilation, scheduling
-and audit while delegating sandbox execution to OpenShell. A trusted platform
-controller calls OpenShell Gateway, and OpenShell authorizes that controller
-before provisioning a sandbox with platform-selected Kubernetes properties,
-supplied sandbox policy, approved credentials, ownership metadata and lifecycle
-reporting.
+and audit while delegating sandbox execution to OpenShell.
+
+The central requirement is not simply that OpenShell accepts more Kubernetes
+configuration. The central requirement is that OpenShell first has a
+control-plane authentication and authorization model that can safely support a
+trusted platform controller. Only after that controller is authenticated and
+authorized should OpenShell provision a sandbox with platform-selected
+Kubernetes properties, supplied sandbox policy, approved credential sources,
+ownership metadata and lifecycle reporting.
 
 The main requirements are:
 
 - a clear OpenShell control-plane authentication and authorization model for
-  trusted platform controllers;
+  trusted platform controllers, including sandbox ownership and operation
+  permissions;
 - support for platform-selected Kubernetes sandbox namespaces, separate from the
   OpenShell control-plane namespace;
 - Kubernetes-specific sandbox configuration hooks aligned with the
@@ -51,9 +57,11 @@ platform can own the enterprise control-plane responsibilities:
 
 OpenShell is a good fit as the sandbox execution plane behind that platform.
 The platform should decide tenant authorization, target namespace, final policy,
-approved secrets and runtime placement profile. OpenShell should then provision
-and operate the sandbox in the requested Kubernetes namespace with the supplied
-final policy and approved credential-source references.
+approved secrets and runtime placement profile. OpenShell should then
+authenticate and authorize the platform controller, verify that the requested
+namespace, credential sources, service account, driver configuration and
+sandbox operations are allowed for that controller, and provision the sandbox
+with the supplied final policy and approved credential-source references.
 
 This is different from a direct sandbox-as-a-service model where end users call
 OpenShell and do not know which control plane runs their sandboxes. In the
@@ -151,8 +159,12 @@ identity, such as:
 - another configured gateway identity suitable for platform automation.
 
 OpenShell then maps that authenticated caller to an authorization subject and
-checks the requested operation against configured scopes. At minimum, the
-authorization model needs to decide whether the caller can:
+checks the requested operation against configured scopes. This authorization
+step is what makes platform-selected Kubernetes fields safe. The gateway must
+not trust a namespace, Secret reference, service account, warm-pool reference
+or driver configuration value only because it is present in a request.
+
+At minimum, the authorization model needs to decide whether the caller can:
 
 - create a sandbox;
 - request a specific Kubernetes namespace or namespace pattern;
@@ -174,11 +186,75 @@ model are different but connected:
   credential use, driver configuration, sandbox connection rights and sandbox
   lifecycle operations.
 
+If OpenShell Gateway runs on Kubernetes, it may be possible to reuse some
+Kubernetes authorization primitives, such as ServiceAccount identity, token
+audiences, RBAC, SubjectAccessReview or namespace-scoped permissions. That
+should be explored, but the OpenShell authorization decision still needs to be
+explicit because OpenShell also runs outside Kubernetes and because OpenShell
+API permissions are not the same as Kubernetes API permissions. For example,
+Kubernetes RBAC may allow the gateway's own ServiceAccount to create a
+`Sandbox` resource, while OpenShell still needs to decide whether the calling
+platform-controller identity is allowed to request that namespace, attach that
+credential source, connect to that sandbox, stream its logs or delete it.
+
 In the platform-delegated model, the platform may be the only direct OpenShell
 caller. End-user access can remain mediated by the platform. OpenShell should
 still preserve tenant, owner, project, request and policy metadata so that
 sandbox ownership and audit remain visible to OpenShell, Kubernetes and the
 platform.
+
+This means the identity models are mapped rather than identical:
+
+- the platform authenticates and authorizes tenant users or tenant services;
+- the platform controller authenticates to OpenShell as a control-plane caller;
+- OpenShell authorizes that control-plane caller against OpenShell resource
+  scopes and sandbox operations; and
+- Kubernetes authorizes the gateway or driver identity to create the resulting
+  Kubernetes resources.
+
+The model should support both future usage patterns:
+
+- direct sandbox-as-a-service, where OpenShell authorizes end users directly;
+  and
+- platform-delegated sandbox execution, where OpenShell authorizes trusted
+  platform controllers and the platform mediates tenant users.
+
+This RFC focuses on the second usage pattern, but it should not require a
+separate or incompatible authorization model.
+
+### Authorization requirements
+
+Before platform-selected Kubernetes configuration is accepted, OpenShell needs
+an authorization surface that can express the allowed scope of a
+platform-controller identity.
+
+The required authorization checks include:
+
+- **create scope:** whether the caller can create a sandbox at all, and for
+  which tenant, project, profile or environment metadata;
+- **namespace scope:** which namespaces or namespace patterns the caller can
+  target, and whether the OpenShell control-plane namespace is excluded from
+  sandbox placement;
+- **credential scope:** which credential sources, Kubernetes Secret namespaces,
+  Secret names and Secret keys the caller can reference;
+- **service account scope:** which Kubernetes service accounts can be requested
+  for sandbox pods;
+- **driver configuration scope:** which Kubernetes `driver_config` fields can
+  be supplied by this caller, including `RuntimeClass`, resources, node
+  selectors, tolerations, direct `Sandbox` creation, `SandboxClaim` allocation,
+  template references and warm-pool references;
+- **policy attachment scope:** whether the caller can attach a supplied final
+  policy and how OpenShell records the policy identity or hash;
+- **sandbox ownership scope:** which tenant, owner, project and request metadata
+  must be attached to the sandbox; and
+- **operation scope:** who can connect to the sandbox, stream logs, execute
+  commands, read files, observe events, release the sandbox or delete it.
+
+The concrete authorization implementation is left open. It may be an
+OpenShell-native authorization policy, a Kubernetes-integrated authorization
+adapter, or a combination of both. The important requirement is that these
+checks happen in OpenShell before the Kubernetes driver acts on the requested
+namespace, credential references, service account or driver configuration.
 
 ### Control-plane model
 
@@ -204,8 +280,8 @@ OpenShell Gateway then:
 
 1. Authenticates the platform-controller identity.
 2. Authorizes the requested namespace, credential sources, service account,
-   Kubernetes `driver_config`, allocation mode, sandbox policy attachment and
-   sandbox operations.
+   Kubernetes `driver_config`, allocation mode, sandbox policy attachment,
+   ownership metadata and sandbox operations.
 3. Resolves approved credential sources as provider credential material.
 4. Provisions the sandbox in the requested namespace.
 5. Uses `SandboxClaim` when requested, optionally targeting a `SandboxWarmPool`.
@@ -270,6 +346,14 @@ review feedback points toward a split:
 The example below is illustrative. It shows the shape of information the
 platform needs to pass, not a final protobuf or CLI contract.
 
+The authorization decision for this request would be separate from the request
+body. For example, before acting on the request, OpenShell would need to verify
+that the authenticated platform-controller identity is allowed to create a
+sandbox for `tenant: team-a`, use the requested namespace, reference the
+credential source, request the Kubernetes service account and placement profile,
+attach the supplied policy, and later connect to or delete the resulting
+sandbox.
+
 Example shape:
 
 ```yaml
@@ -328,6 +412,12 @@ Sandbox resource it creates.
 OpenShell does not need to create the namespace in this RFC. The platform is
 responsible for creating and reconciling the namespace before the sandbox
 request.
+
+This namespace override is a trusted control-plane field, not an end-user
+field. In the platform-delegated model, tenant users do not call OpenShell and
+choose namespaces directly. The platform resolves the tenant and namespace,
+then OpenShell authorizes the platform-controller identity to use that
+namespace before provisioning.
 
 ### Kubernetes Secret-backed provider credentials
 
@@ -428,10 +518,15 @@ sequenced around design dependencies rather than final API changes.
 1. Define the OpenShell control-plane authorization model needed for this
    pattern:
    - platform-controller caller identity;
+   - how Kubernetes ServiceAccount/OIDC, mTLS or other identities map to
+     OpenShell authorization subjects;
+   - whether Kubernetes RBAC or SubjectAccessReview can be reused when the
+     gateway runs on Kubernetes;
    - allowed namespace scopes;
    - allowed credential-source scopes;
    - allowed service accounts;
    - allowed Kubernetes `driver_config` fields;
+   - allowed policy attachment behavior;
    - sandbox ownership and access rules; and
    - sandbox operation permissions for connect, logs, exec and delete.
 2. Align Kubernetes-specific request fields with #1589 so namespace,
@@ -461,6 +556,11 @@ when no authorized requested namespace is supplied.
   are added before the OpenShell authorization model is ready. This can be
   mitigated by keeping the RFC in draft until authz requirements are explicit
   and by routing Kubernetes-specific fields through `driver_config`.
+- Reusing Kubernetes RBAC alone may not be sufficient because Kubernetes API
+  authorization and OpenShell API authorization protect different operations.
+  This can be mitigated by treating Kubernetes RBAC as a possible input or
+  adapter for OpenShell authorization rather than as a complete replacement for
+  OpenShell sandbox ownership and operation checks.
 - Namespace selection creates a larger security boundary. OpenShell must not
   trust namespace values only because they are present in a request. It must
   authenticate the caller and authorize the requested namespace scope.
@@ -536,6 +636,24 @@ selection, driver configuration and sandbox operations are privileged actions.
 The RFC needs to define how OpenShell authenticates a platform controller and
 how it authorizes that identity to create, connect to, observe, execute against
 or delete specific sandboxes.
+
+The answer should cover both direct sandbox-as-a-service and platform-delegated
+usage. In the platform-delegated case, the tenant user is authorized by the
+platform, while OpenShell authorizes the platform-controller identity and the
+operations that identity can perform.
+
+### Kubernetes RBAC and OpenShell authorization
+
+When OpenShell Gateway runs on Kubernetes, should OpenShell reuse Kubernetes
+RBAC, SubjectAccessReview, ServiceAccount identities or token audiences for
+some authorization decisions, or should it use a separate OpenShell-native
+authorization policy?
+
+This matters because Kubernetes already has mature resource authorization, but
+OpenShell also needs to authorize OpenShell-specific operations such as sandbox
+ownership, connect, logs, exec, credential use, policy attachment and lifecycle
+events. The RFC should define which decisions can be delegated to Kubernetes
+and which must remain OpenShell control-plane decisions.
 
 ### OpenShell domain object above `Sandbox`
 
