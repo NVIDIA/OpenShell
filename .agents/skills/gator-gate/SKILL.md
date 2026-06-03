@@ -333,6 +333,8 @@ Provider V2 work is a supported high-traction area, but require all of the follo
 - Security boundary analysis for credential handling
 - Explanation of whether secrets remain hidden from the sandbox agent
 
+Provider additions and updates must use providers v2 through provider profiles. Treat any new or modified legacy `ProviderDiscoverySpec` entries as a blocking review finding unless a maintainer explicitly requests the legacy path. Do not ask contributors to update both systems for compatibility; the provider profile is the source of truth for new provider network policy, credentials, discovery, and refresh metadata.
+
 Be skeptical of changes that expose raw credentials to agents or weaken the credential proxy model, even if the user story is clear.
 
 ### Large or Cross-Cutting Work
@@ -396,6 +398,7 @@ Use the `principal-engineer-reviewer` sub-agent. Include:
 - PR title, body, linked issues, labels, and files
 - Full diff or enough chunked diff context to review all changes
 - Instruction to focus on correctness, regressions, security, maintainability, and missing tests
+- Instruction to check whether direct UX changes update the Fern docs under `docs/` and navigation when needed
 - Instruction not to rely on local test execution
 
 Post findings as a gator comment or a GitHub PR review:
@@ -405,6 +408,8 @@ Post findings as a gator comment or a GitHub PR review:
 - Do not nitpick style unless it affects maintainability or project conventions
 
 If findings require author changes, remain in `gator:in-review` or move to `gator:follow-up-needed` if the author must clarify the proposal before code review can continue.
+
+For validated PRs with direct user-facing UX changes, require Fern docs updates before moving to `gator:watch-pipeline`. Direct UX changes include CLI commands/flags/output, sandbox behavior visible to users, provider setup flows, gateway configuration fields, TUI screens, published API behavior, policy syntax, installation/packaging behavior, and documented workflows. Accept either relevant updates under `docs/` plus `docs/index.yml` navigation when needed, or a clear maintainer-authored explanation in the PR that docs are intentionally unnecessary. If docs are missing and no explanation exists, treat it as review feedback.
 
 If no blocking findings remain, decide whether E2E labels are needed, then move to `gator:watch-pipeline`.
 
@@ -550,6 +555,8 @@ Head SHA: `<sha>`
 Review findings:
 - <finding or "No blocking findings remain">
 
+Docs: <Fern docs updated / not needed because ... / missing for direct UX change>
+
 Next state: `<gator:in-review|gator:watch-pipeline|gator:follow-up-needed|gator:blocked>`
 ```
 
@@ -564,6 +571,7 @@ Gator validation and PR monitoring are complete.
 
 Validation: <summary>
 Review: <summary>
+Docs: <summary>
 Checks: <summary>
 E2E: <summary or N/A>
 

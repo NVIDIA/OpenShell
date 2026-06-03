@@ -12,7 +12,7 @@ SKILL_FILE="$ROOT_DIR/.agents/skills/gator-gate/SKILL.md"
 OPENSHELL_BIN="${OPENSHELL_BIN:-openshell}"
 GATEWAY="${GATOR_GATEWAY:-docker-dev}"
 SANDBOX_NAME="${GATOR_SANDBOX_NAME:-gator-$(date +%Y%m%d%H%M%S)}"
-SANDBOX_FROM="${GATOR_SANDBOX_FROM:-base}"
+SANDBOX_FROM="${GATOR_SANDBOX_FROM:-$GATOR_DIR}"
 GITHUB_PROVIDER="${GATOR_GITHUB_PROVIDER:-github-gator}"
 CODEX_PROVIDER="${GATOR_CODEX_PROVIDER:-codex}"
 CODEX_ACCESS_CREDENTIAL_KEY="${GATOR_CODEX_ACCESS_CREDENTIAL_KEY:-CODEX_AUTH_ACCESS_TOKEN}"
@@ -20,6 +20,7 @@ CODEX_MODEL="${CODEX_MODEL:-gpt-5.5}"
 CODEX_REASONING="${CODEX_REASONING:-high}"
 CODEX_LOCAL_BIN="${GATOR_CODEX_LOCAL_BIN:-}"
 BACKGROUND=0
+KEEP_SANDBOX=0
 
 usage() {
     cat <<'EOF'
@@ -28,12 +29,13 @@ Usage: openshell-agents/gator/run.sh [options] "gator prompt"
 Options:
   --gateway NAME          Gateway name to use (default: docker-dev)
   --name NAME             Sandbox name (default: gator-<timestamp>)
-  --from IMAGE            Sandbox source/image (default: base)
+  --from IMAGE            Sandbox source/image (default: openshell-agents/gator)
   --github-provider NAME  GitHub provider name (default: github-gator)
   --codex-provider NAME   Codex provider name (default: codex)
   --codex-access-key KEY  Codex access-token credential key (default: CODEX_AUTH_ACCESS_TOKEN)
   --codex-bin PATH        Upload this Codex executable into the sandbox
   --background            Run sandbox create in the background and write a log
+  --keep                  Keep the sandbox after Codex exits (default: delete on exit)
   -h, --help              Show this help
 EOF
 }
@@ -139,6 +141,10 @@ while [[ $# -gt 0 ]]; do
             BACKGROUND=1
             shift
             ;;
+        --keep)
+            KEEP_SANDBOX=1
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -227,17 +233,23 @@ openshell_cmd settings set --global --key providers_v2_enabled --value true --ye
 openshell_cmd settings set --global --key agent_policy_proposals_enabled --value true --yes >/dev/null
 openshell_cmd settings set --global --key proposal_approval_mode --value auto --yes >/dev/null
 
+KEEP_ARGS=()
+if [[ "$KEEP_SANDBOX" != "1" ]]; then
+    KEEP_ARGS+=(--no-keep)
+fi
+
 SANDBOX_CMD=(
+    env -u OPENSHELL_SANDBOX_POLICY
     "$OPENSHELL_BIN" --gateway "$GATEWAY" sandbox create
     --name "$SANDBOX_NAME"
     --from "$SANDBOX_FROM"
     --provider "$CODEX_PROVIDER"
     --provider "$GITHUB_PROVIDER"
-    --policy "$GATOR_DIR/policy.yaml"
     --upload "$PAYLOAD_DIR:/sandbox"
     --no-git-ignore
     --no-auto-providers
     --no-tty
+    "${KEEP_ARGS[@]}"
     -- env "CODEX_MODEL=$CODEX_MODEL" "CODEX_REASONING=$CODEX_REASONING" bash /sandbox/payload/sandbox-agent.sh
 )
 
