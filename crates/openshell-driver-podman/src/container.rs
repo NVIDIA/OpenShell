@@ -4,7 +4,7 @@
 //! Container spec construction for the Podman driver.
 
 use crate::config::PodmanComputeConfig;
-use openshell_core::gpu::{cdi_gpu_device_ids, driver_gpu_request};
+use openshell_core::gpu::{cdi_gpu_device_ids, driver_gpu_requirement};
 use openshell_core::proto::compute::v1::DriverSandbox;
 use serde::Serialize;
 use serde_json::Value;
@@ -379,7 +379,7 @@ fn podman_pids_limit(value: i64) -> Option<i64> {
 
 /// Build CDI GPU device list if GPU is requested.
 fn build_devices(sandbox: &DriverSandbox) -> Option<Vec<LinuxDevice>> {
-    let gpu = sandbox.spec.as_ref().and_then(driver_gpu_request);
+    let gpu = sandbox.spec.as_ref().and_then(driver_gpu_requirement);
     cdi_gpu_device_ids(gpu).map(|device_ids| {
         device_ids
             .into_iter()
@@ -699,6 +699,13 @@ mod tests {
     static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
+    fn default_gpu_request() -> openshell_core::proto::compute::v1::DriverGpuResourceRequirement {
+        openshell_core::proto::compute::v1::DriverGpuResourceRequirement {
+            device_ids: vec![],
+            count: None,
+        }
+    }
+
     #[test]
     fn parse_cpu_millicore() {
         assert_eq!(parse_cpu_to_microseconds("500m"), Some(50_000));
@@ -808,13 +815,14 @@ mod tests {
     #[test]
     fn container_spec_maps_empty_gpu_request_to_all_cdi_device() {
         use openshell_core::config::CDI_GPU_DEVICE_ALL;
-        use openshell_core::proto::compute::v1::{DriverSandboxSpec, GpuRequestSpec};
+        use openshell_core::proto::compute::v1::{
+            DriverSandboxResourceRequirements, DriverSandboxSpec,
+        };
 
         let mut sandbox = test_sandbox("test-id", "test-name");
         sandbox.spec = Some(DriverSandboxSpec {
-            gpu: Some(GpuRequestSpec {
-                device_id: vec![],
-                count: None,
+            resource_requirements: Some(DriverSandboxResourceRequirements {
+                gpu: Some(default_gpu_request()),
             }),
             ..Default::default()
         });
@@ -829,13 +837,17 @@ mod tests {
 
     #[test]
     fn container_spec_passes_explicit_cdi_device_id_through() {
-        use openshell_core::proto::compute::v1::{DriverSandboxSpec, GpuRequestSpec};
+        use openshell_core::proto::compute::v1::{
+            DriverGpuResourceRequirement, DriverSandboxResourceRequirements, DriverSandboxSpec,
+        };
 
         let mut sandbox = test_sandbox("test-id", "test-name");
         sandbox.spec = Some(DriverSandboxSpec {
-            gpu: Some(GpuRequestSpec {
-                device_id: vec!["nvidia.com/gpu=0".to_string()],
-                count: None,
+            resource_requirements: Some(DriverSandboxResourceRequirements {
+                gpu: Some(DriverGpuResourceRequirement {
+                    device_ids: vec!["nvidia.com/gpu=0".to_string()],
+                    count: None,
+                }),
             }),
             ..Default::default()
         });

@@ -307,9 +307,6 @@ message Sandbox {
 
 // Desired sandbox configuration provided through the public API.
 message SandboxSpec {
-  reserved 10, 11;
-  reserved "gpu_device", "proposal_approval_mode";
-
   // Log level exposed to processes running inside the sandbox.
   string log_level = 1;
   // Environment variables injected into the sandbox runtime.
@@ -320,18 +317,24 @@ message SandboxSpec {
   openshell.sandbox.v1.SandboxPolicy policy = 7;
   // Provider names to attach to this sandbox.
   repeated string providers = 8;
-  // Request GPU resources for this sandbox. Presence indicates a GPU request.
-  GpuRequestSpec gpu = 9;
+  // Portable resource requirements for this sandbox.
+  SandboxResourceRequirements resource_requirements = 9;
 }
 
-// Public GPU request details. Device identifiers are interpreted by the
-// selected compute driver.
-message GpuRequestSpec {
-  // Optional number of GPUs requested. Mutually exclusive with device_id.
+// Public resource requirements for the sandbox workload.
+message SandboxResourceRequirements {
+  // GPU requirement for the sandbox. Presence indicates a GPU request.
+  GpuResourceRequirement gpu = 1;
+}
+
+// Public GPU resource requirement. Device identifiers are interpreted by the
+// selected compute driver and are an interim compatibility surface.
+message GpuResourceRequirement {
+  // Optional number of GPUs requested. Mutually exclusive with device_ids.
   optional uint32 count = 1;
   // Optional driver-native device identifiers. Mutually exclusive with count.
   // Empty means the driver chooses its default GPU assignment behavior.
-  repeated string device_id = 2;
+  repeated string device_ids = 2;
 }
 
 // Public sandbox template mapped onto compute-driver template inputs.

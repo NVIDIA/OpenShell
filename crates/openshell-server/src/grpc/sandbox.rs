@@ -100,7 +100,9 @@ fn emit_sandbox_create_telemetry(
     };
     openshell_core::telemetry::emit_sandbox_create(
         outcome,
-        spec.gpu.is_some(),
+        spec.resource_requirements
+            .as_ref()
+            .is_some_and(|requirements| requirements.gpu.is_some()),
         spec.providers.len() as u64,
         spec.policy.is_some(),
         template_source,

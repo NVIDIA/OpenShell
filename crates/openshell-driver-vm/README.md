@@ -52,8 +52,9 @@ sudo -E env "PATH=$PATH" mise run gateway:vm -- --gpu
 ```
 
 GPU passthrough uses VFIO and requires host support for IOMMU, root privileges
-for bind/unbind operations, and a compatible sandbox image. The public GPU
-overview lives in the repository `README.md`.
+for bind/unbind operations, and a compatible sandbox image. Sandbox GPU requests
+arrive as `resource_requirements.gpu`; the VM driver accepts the default request,
+one explicit device ID, or a count of one.
 
 Point the CLI at the gateway with one of:
 

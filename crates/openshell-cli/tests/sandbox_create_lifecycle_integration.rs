@@ -788,6 +788,7 @@ async fn sandbox_create_keeps_command_sessions_by_default() {
         None,
         None,
         None,
+        None,
         &[],
         None,
         None,
@@ -907,6 +908,7 @@ async fn sandbox_create_sends_driver_config_json() {
         None,
         None,
         None,
+        None,
         Some(r#"{"kubernetes":{"pod":{"priority_class_name":"batch-low"}}}"#),
         None,
         &[],
@@ -982,6 +984,7 @@ async fn sandbox_create_sends_gpu_device_request_without_gpu_flag() {
         None,
         None,
         None,
+        None,
         &[],
         None,
         None,
@@ -999,10 +1002,11 @@ async fn sandbox_create_sends_gpu_device_request_without_gpu_flag() {
     let gpu = requests[0]
         .spec
         .as_ref()
-        .and_then(|spec| spec.gpu.as_ref())
+        .and_then(|spec| spec.resource_requirements.as_ref())
+        .and_then(|requirements| requirements.gpu.as_ref())
         .expect("GPU request should be sent");
 
-    assert_eq!(gpu.device_id, vec!["nvidia.com/gpu=0"]);
+    assert_eq!(gpu.device_ids, vec!["nvidia.com/gpu=0"]);
     assert_eq!(gpu.count, None);
 }
 
@@ -1020,11 +1024,12 @@ async fn sandbox_create_sends_gpu_count_request() {
         Some("gpu-count"),
         None,
         "openshell",
-        None,
+        &[],
         true,
         false,
         None,
         Some(2),
+        None,
         None,
         None,
         None,
@@ -1045,10 +1050,11 @@ async fn sandbox_create_sends_gpu_count_request() {
     let gpu = requests[0]
         .spec
         .as_ref()
-        .and_then(|spec| spec.gpu.as_ref())
+        .and_then(|spec| spec.resource_requirements.as_ref())
+        .and_then(|requirements| requirements.gpu.as_ref())
         .expect("GPU request should be sent");
 
-    assert!(gpu.device_id.is_empty());
+    assert!(gpu.device_ids.is_empty());
     assert_eq!(gpu.count, Some(2));
 }
 
@@ -1070,6 +1076,7 @@ async fn sandbox_create_does_not_infer_command_providers_when_v2_enabled() {
         &[],
         true,
         false,
+        None,
         None,
         None,
         None,
@@ -1133,6 +1140,7 @@ async fn sandbox_create_returns_vm_error_without_waiting_for_timeout() {
         None,
         None,
         None,
+        None,
         &[],
         None,
         None,
@@ -1187,6 +1195,7 @@ async fn sandbox_create_keeps_waiting_while_vm_progress_arrives() {
         None,
         None,
         None,
+        None,
         &[],
         None,
         None,
@@ -1233,6 +1242,7 @@ async fn sandbox_create_times_out_when_only_logs_arrive() {
         None,
         None,
         None,
+        None,
         &[],
         None,
         None,
@@ -1270,6 +1280,7 @@ async fn sandbox_create_deletes_command_sessions_with_no_keep() {
         &[],
         false,
         false,
+        None,
         None,
         None,
         None,
@@ -1321,6 +1332,7 @@ async fn sandbox_create_deletes_shell_sessions_with_no_keep() {
         None,
         None,
         None,
+        None,
         &[],
         None,
         None,
@@ -1367,6 +1379,7 @@ async fn sandbox_create_keeps_sandbox_with_hidden_keep_flag() {
         None,
         None,
         None,
+        None,
         &[],
         None,
         None,
@@ -1408,6 +1421,7 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
         &[],
         false,
         false,
+        None,
         None,
         None,
         None,

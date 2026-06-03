@@ -11,8 +11,10 @@ use crate::watcher::{
 };
 use openshell_core::ComputeDriverError;
 use openshell_core::driver_utils::supervisor_image_should_refresh;
-use openshell_core::gpu::driver_gpu_request;
-use openshell_core::proto::compute::v1::{DriverSandbox, GetCapabilitiesResponse, GpuRequestSpec};
+use openshell_core::gpu::driver_gpu_requirement;
+use openshell_core::proto::compute::v1::{
+    DriverGpuResourceRequirement, DriverSandbox, GetCapabilitiesResponse,
+};
 use std::path::PathBuf;
 use std::time::Duration;
 use tracing::{info, warn};
@@ -282,11 +284,13 @@ impl PodmanComputeDriver {
         &self,
         sandbox: &DriverSandbox,
     ) -> Result<(), ComputeDriverError> {
-        let gpu = sandbox.spec.as_ref().and_then(driver_gpu_request);
+        let gpu = sandbox.spec.as_ref().and_then(driver_gpu_requirement);
         Self::validate_gpu_request(gpu)
     }
 
-    fn validate_gpu_request(gpu: Option<&GpuRequestSpec>) -> Result<(), ComputeDriverError> {
+    fn validate_gpu_request(
+        gpu: Option<&DriverGpuResourceRequirement>,
+    ) -> Result<(), ComputeDriverError> {
         if gpu.is_some_and(|gpu| gpu.count.is_some()) {
             return Err(ComputeDriverError::Precondition(
                 "podman compute driver does not support GPU count requests".to_string(),
@@ -660,8 +664,8 @@ mod tests {
 
     #[test]
     fn validate_gpu_request_rejects_count() {
-        let err = PodmanComputeDriver::validate_gpu_request(Some(&GpuRequestSpec {
-            device_id: vec![],
+        let err = PodmanComputeDriver::validate_gpu_request(Some(&DriverGpuResourceRequirement {
+            device_ids: vec![],
             count: Some(2),
         }))
         .expect_err("GPU count should be rejected");

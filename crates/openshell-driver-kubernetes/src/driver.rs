@@ -17,17 +17,18 @@ use kube::{Client, Error as KubeError};
 use openshell_core::driver_utils::{
     LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, SUPERVISOR_IMAGE_BINARY_PATH,
 };
-use openshell_core::gpu::driver_gpu_request;
+use openshell_core::gpu::driver_gpu_requirement;
 use openshell_core::progress::{
     PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX, PROGRESS_STEP_STARTING_SANDBOX,
     format_bytes, mark_progress_active, mark_progress_complete, mark_progress_detail,
 };
 use openshell_core::proto::compute::v1::{
-    DriverCondition as SandboxCondition, DriverPlatformEvent as PlatformEvent,
-    DriverSandbox as Sandbox, DriverSandboxSpec as SandboxSpec,
-    DriverSandboxStatus as SandboxStatus, DriverSandboxTemplate as SandboxTemplate,
-    GetCapabilitiesResponse, GpuRequestSpec, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
-    WatchSandboxesPlatformEvent, WatchSandboxesSandboxEvent, watch_sandboxes_event,
+    DriverCondition as SandboxCondition, DriverGpuResourceRequirement,
+    DriverPlatformEvent as PlatformEvent, DriverSandbox as Sandbox,
+    DriverSandboxSpec as SandboxSpec, DriverSandboxStatus as SandboxStatus,
+    DriverSandboxTemplate as SandboxTemplate, GetCapabilitiesResponse, WatchSandboxesDeletedEvent,
+    WatchSandboxesEvent, WatchSandboxesPlatformEvent, WatchSandboxesSandboxEvent,
+    watch_sandboxes_event,
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -80,9 +81,23 @@ pub const SANDBOX_KIND: &str = "Sandbox";
 
 const GPU_RESOURCE_NAME: &str = "nvidia.com/gpu";
 const DEFAULT_GPU_COUNT: u32 = 1;
+const EXPLICIT_GPU_DEVICE_IDS_UNSUPPORTED_MESSAGE: &str =
+    "kubernetes compute driver does not support explicit GPU device IDs";
 
-fn gpu_has_explicit_device_ids(gpu: Option<&GpuRequestSpec>) -> bool {
-    gpu.is_some_and(|gpu| !gpu.device_id.is_empty())
+fn gpu_has_explicit_device_ids(gpu: Option<&DriverGpuResourceRequirement>) -> bool {
+    gpu.is_some_and(|gpu| !gpu.device_ids.is_empty())
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_gpu_request_shape(
+    gpu: Option<&DriverGpuResourceRequirement>,
+) -> Result<(), tonic::Status> {
+    if gpu_has_explicit_device_ids(gpu) {
+        return Err(tonic::Status::invalid_argument(
+            EXPLICIT_GPU_DEVICE_IDS_UNSUPPORTED_MESSAGE,
+        ));
+    }
+    Ok(())
 }
 
 // This POC treats the selected Struct as a driver-local typed schema. Once the
@@ -250,19 +265,15 @@ impl KubernetesComputeDriver {
     }
 
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), tonic::Status> {
-        let gpu = sandbox.spec.as_ref().and_then(driver_gpu_request);
+        let gpu = sandbox.spec.as_ref().and_then(driver_gpu_requirement);
         self.validate_gpu_request(gpu).await
     }
 
     async fn validate_gpu_request(
         &self,
-        gpu: Option<&GpuRequestSpec>,
+        gpu: Option<&DriverGpuResourceRequirement>,
     ) -> Result<(), tonic::Status> {
-        if gpu_has_explicit_device_ids(gpu) {
-            return Err(tonic::Status::invalid_argument(
-                "kubernetes compute driver does not support explicit GPU device IDs",
-            ));
-        }
+        validate_gpu_request_shape(gpu)?;
         if gpu.is_some()
             && !self.has_gpu_capacity().await.map_err(|err| {
                 tonic::Status::internal(format!("check GPU node capacity failed: {err}"))
@@ -355,11 +366,11 @@ impl KubernetesComputeDriver {
     }
 
     pub async fn create_sandbox(&self, sandbox: &Sandbox) -> Result<(), KubernetesDriverError> {
-        if let Some(gpu) = sandbox.spec.as_ref().and_then(driver_gpu_request)
+        if let Some(gpu) = sandbox.spec.as_ref().and_then(driver_gpu_requirement)
             && gpu_has_explicit_device_ids(Some(gpu))
         {
             return Err(KubernetesDriverError::Precondition(
-                "kubernetes compute driver does not support explicit GPU device IDs".to_string(),
+                EXPLICIT_GPU_DEVICE_IDS_UNSUPPORTED_MESSAGE.to_string(),
             ));
         }
 
@@ -1192,7 +1203,7 @@ fn sandbox_to_k8s_spec(
                 "podTemplate".to_string(),
                 sandbox_template_to_k8s(
                     template,
-                    driver_gpu_request(spec),
+                    driver_gpu_requirement(spec),
                     &pod_env,
                     inject_workspace,
                     params,
@@ -1228,7 +1239,7 @@ fn sandbox_to_k8s_spec(
             "podTemplate".to_string(),
             sandbox_template_to_k8s(
                 &SandboxTemplate::default(),
-                spec.and_then(|s| s.gpu.as_ref()),
+                spec.and_then(driver_gpu_requirement),
                 &pod_env,
                 inject_workspace,
                 params,
@@ -1243,7 +1254,7 @@ fn sandbox_to_k8s_spec(
 
 fn sandbox_template_to_k8s(
     template: &SandboxTemplate,
-    gpu: Option<&GpuRequestSpec>,
+    gpu: Option<&DriverGpuResourceRequirement>,
     spec_environment: &std::collections::HashMap<String, String>,
     inject_workspace: bool,
     params: &SandboxPodParams<'_>,
@@ -1581,7 +1592,7 @@ fn app_armor_profile_to_k8s(profile: &AppArmorProfile) -> serde_json::Value {
 
 fn container_resources(
     template: &SandboxTemplate,
-    gpu: Option<&GpuRequestSpec>,
+    gpu: Option<&DriverGpuResourceRequirement>,
 ) -> Option<serde_json::Value> {
     // Start from the raw resources passthrough in platform_config (preserves
     // custom resource types like GPU limits that users set via the public API
@@ -1942,11 +1953,29 @@ mod tests {
         assert!(config.containers.agent.resources.limits.is_empty());
     }
 
-    fn gpu_request(count: Option<u32>) -> GpuRequestSpec {
-        GpuRequestSpec {
-            device_id: vec![],
+    fn gpu_request(count: Option<u32>) -> DriverGpuResourceRequirement {
+        DriverGpuResourceRequirement {
+            device_ids: vec![],
             count,
         }
+    }
+
+    fn default_gpu_request() -> DriverGpuResourceRequirement {
+        gpu_request(None)
+    }
+
+    #[test]
+    fn validate_gpu_request_shape_rejects_explicit_device_ids() {
+        let gpu = DriverGpuResourceRequirement {
+            device_ids: vec!["nvidia.com/gpu=0".to_string()],
+            count: None,
+        };
+
+        let err = validate_gpu_request_shape(Some(&gpu))
+            .expect_err("explicit GPU device IDs should be rejected");
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert_eq!(err.message(), EXPLICIT_GPU_DEVICE_IDS_UNSUPPORTED_MESSAGE);
     }
 
     #[test]
@@ -2260,7 +2289,7 @@ mod tests {
             let params = SandboxPodParams::default();
             sandbox_template_to_k8s(
                 &SandboxTemplate::default(),
-                Some(&gpu_request(None)),
+                Some(&default_gpu_request()),
                 &std::collections::HashMap::new(),
                 true,
                 &params,
@@ -2297,21 +2326,6 @@ mod tests {
     }
 
     #[test]
-    fn gpu_has_explicit_device_ids_only_when_ids_are_present() {
-        use openshell_core::proto::compute::v1::GpuRequestSpec;
-
-        assert!(!gpu_has_explicit_device_ids(None));
-        assert!(!gpu_has_explicit_device_ids(Some(&GpuRequestSpec {
-            device_id: vec![],
-            count: None,
-        })));
-        assert!(gpu_has_explicit_device_ids(Some(&GpuRequestSpec {
-            device_id: vec!["nvidia.com/gpu=0".to_string()],
-            count: None,
-        })));
-    }
-
-    #[test]
     fn gpu_sandbox_uses_template_runtime_class_name_when_set() {
         let template = SandboxTemplate {
             platform_config: Some(Struct {
@@ -2330,7 +2344,7 @@ mod tests {
             let params = SandboxPodParams::default();
             sandbox_template_to_k8s(
                 &template,
-                Some(&gpu_request(None)),
+                Some(&default_gpu_request()),
                 &std::collections::HashMap::new(),
                 true,
                 &params,
@@ -2385,7 +2399,7 @@ mod tests {
             };
             sandbox_template_to_k8s(
                 &template,
-                false,
+                None,
                 &std::collections::HashMap::new(),
                 true,
                 &params,
@@ -2420,7 +2434,7 @@ mod tests {
             };
             sandbox_template_to_k8s(
                 &template,
-                false,
+                None,
                 &std::collections::HashMap::new(),
                 true,
                 &params,
@@ -2448,7 +2462,7 @@ mod tests {
             let params = SandboxPodParams::default();
             sandbox_template_to_k8s(
                 &template,
-                false,
+                None,
                 &std::collections::HashMap::new(),
                 true,
                 &params,
@@ -2479,7 +2493,7 @@ mod tests {
             };
             sandbox_template_to_k8s(
                 &template,
-                false,
+                None,
                 &std::collections::HashMap::new(),
                 true,
                 &params,
@@ -2516,7 +2530,7 @@ mod tests {
             let params = SandboxPodParams::default();
             sandbox_template_to_k8s(
                 &template,
-                false,
+                None,
                 &std::collections::HashMap::new(),
                 true,
                 &params,
@@ -2536,7 +2550,7 @@ mod tests {
             let params = SandboxPodParams::default();
             sandbox_template_to_k8s(
                 &template,
-                false,
+                None,
                 &std::collections::HashMap::new(),
                 true,
                 &params,
@@ -2564,7 +2578,7 @@ mod tests {
             let params = SandboxPodParams::default();
             sandbox_template_to_k8s(
                 &template,
-                Some(&gpu_request(None)),
+                Some(&default_gpu_request()),
                 &std::collections::HashMap::new(),
                 true,
                 &params,
@@ -2868,7 +2882,7 @@ mod tests {
         };
         let pod_template = sandbox_template_to_k8s(
             &SandboxTemplate::default(),
-            false,
+            None,
             &std::collections::HashMap::new(),
             true,
             &params,
@@ -2894,7 +2908,7 @@ mod tests {
         };
         let pod_template = sandbox_template_to_k8s(
             &SandboxTemplate::default(),
-            false,
+            None,
             &std::collections::HashMap::new(),
             true,
             &params,
@@ -3368,7 +3382,7 @@ mod tests {
 
         let pod_template = sandbox_template_to_k8s(
             &template,
-            false,
+            None,
             &std::collections::HashMap::new(),
             false,
             &SandboxPodParams::default(),

@@ -76,13 +76,26 @@ Request a specific number of GPUs with `--gpu-count`:
 openshell sandbox create --gpu-count 2 -- claude
 ```
 
+Request a specific GPU device with `--gpu-device`; this also requests GPU
+resources:
+
+```shell
+openshell sandbox create --gpu-device nvidia.com/gpu=0 -- claude
+```
+
+Support for `--gpu-count` and `--gpu-device` is driver-dependent:
+
+| Driver     | `--gpu` default request       | `--gpu-count`         | `--gpu-device`                             |
+| ---------- | ----------------------------- | --------------------- | ------------------------------------------ |
+| Docker     | All CDI GPU devices           | Not supported         | One CDI device ID, such as `nvidia.com/gpu=0` |
+| Podman     | All CDI GPU devices           | Not supported         | One CDI device ID, such as `nvidia.com/gpu=0` |
+| Kubernetes | One `nvidia.com/gpu` resource | Supported             | Not supported                              |
+| VM         | One GPU                       | Only `1` is supported | One PCI BDF or GPU index                   |
+
 For Docker-backed sandboxes, GPU injection uses Docker CDI. If you enable Docker
 CDI after the gateway starts, restart the gateway so OpenShell can detect the
-updated Docker daemon capability.
-
-Kubernetes gateways honor `--gpu-count` by setting the `nvidia.com/gpu` resource
-limit. Docker and Podman support explicit CDI device IDs through `--gpu-device`
-but do not support count-based selection yet. VM gateways accept only one GPU.
+updated Docker daemon capability. In the API, these flags populate
+`SandboxSpec.resource_requirements.gpu`.
 
 ### Custom Containers
 

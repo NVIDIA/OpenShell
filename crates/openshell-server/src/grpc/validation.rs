@@ -131,9 +131,9 @@ pub(super) fn validate_sandbox_spec(
         validate_sandbox_template(tmpl)?;
     }
 
-    // --- spec.gpu ---
-    if let Some(ref gpu) = spec.gpu {
-        validate_gpu_request(gpu)?;
+    // --- spec.resource_requirements ---
+    if let Some(ref requirements) = spec.resource_requirements {
+        validate_resource_requirements(requirements)?;
     }
 
     // --- spec.policy serialized size ---
@@ -149,14 +149,27 @@ pub(super) fn validate_sandbox_spec(
     Ok(())
 }
 
-fn validate_gpu_request(gpu: &openshell_core::proto::GpuRequestSpec) -> Result<(), Status> {
-    if gpu.count.is_some() && !gpu.device_id.is_empty() {
+fn validate_resource_requirements(
+    requirements: &openshell_core::proto::SandboxResourceRequirements,
+) -> Result<(), Status> {
+    if let Some(ref gpu) = requirements.gpu {
+        validate_gpu_requirement(gpu)?;
+    }
+    Ok(())
+}
+
+fn validate_gpu_requirement(
+    gpu: &openshell_core::proto::GpuResourceRequirement,
+) -> Result<(), Status> {
+    if gpu.count.is_some() && !gpu.device_ids.is_empty() {
         return Err(Status::invalid_argument(
-            "gpu.count is mutually exclusive with gpu.device_id",
+            "resource_requirements.gpu.count is mutually exclusive with resource_requirements.gpu.device_ids",
         ));
     }
     if gpu.count == Some(0) {
-        return Err(Status::invalid_argument("gpu.count must be greater than 0"));
+        return Err(Status::invalid_argument(
+            "resource_requirements.gpu.count must be greater than 0",
+        ));
     }
     Ok(())
 }
@@ -697,7 +710,7 @@ pub(super) fn level_matches(log_level: &str, min_level: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openshell_core::proto::{GpuRequestSpec, SandboxSpec};
+    use openshell_core::proto::{GpuResourceRequirement, SandboxResourceRequirements, SandboxSpec};
     use std::collections::HashMap;
     use tonic::Code;
 
@@ -723,9 +736,11 @@ mod tests {
     #[test]
     fn validate_sandbox_spec_accepts_gpu_flag() {
         let spec = SandboxSpec {
-            gpu: Some(GpuRequestSpec {
-                device_id: vec![],
-                count: None,
+            resource_requirements: Some(SandboxResourceRequirements {
+                gpu: Some(GpuResourceRequirement {
+                    device_ids: vec![],
+                    count: None,
+                }),
             }),
             ..Default::default()
         };
@@ -735,9 +750,11 @@ mod tests {
     #[test]
     fn validate_sandbox_spec_accepts_gpu_count() {
         let spec = SandboxSpec {
-            gpu: Some(GpuRequestSpec {
-                device_id: vec![],
-                count: Some(2),
+            resource_requirements: Some(SandboxResourceRequirements {
+                gpu: Some(GpuResourceRequirement {
+                    device_ids: vec![],
+                    count: Some(2),
+                }),
             }),
             ..Default::default()
         };
@@ -747,9 +764,11 @@ mod tests {
     #[test]
     fn validate_sandbox_spec_rejects_zero_gpu_count() {
         let spec = SandboxSpec {
-            gpu: Some(GpuRequestSpec {
-                device_id: vec![],
-                count: Some(0),
+            resource_requirements: Some(SandboxResourceRequirements {
+                gpu: Some(GpuResourceRequirement {
+                    device_ids: vec![],
+                    count: Some(0),
+                }),
             }),
             ..Default::default()
         };
@@ -763,9 +782,11 @@ mod tests {
     #[test]
     fn validate_sandbox_spec_rejects_gpu_count_with_device_id() {
         let spec = SandboxSpec {
-            gpu: Some(GpuRequestSpec {
-                device_id: vec!["nvidia.com/gpu=0".to_string()],
-                count: Some(1),
+            resource_requirements: Some(SandboxResourceRequirements {
+                gpu: Some(GpuResourceRequirement {
+                    device_ids: vec!["nvidia.com/gpu=0".to_string()],
+                    count: Some(1),
+                }),
             }),
             ..Default::default()
         };
