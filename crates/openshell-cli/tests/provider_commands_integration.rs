@@ -1108,6 +1108,7 @@ async fn okta_provider_refresh_cli_supports_runtime_refresh_shape() {
         "okta",
         false,
         &["OKTA_ACCESS_TOKEN=token".to_string()],
+        false,
         &[],
         &ts.tls,
     )

@@ -13,155 +13,11 @@
 //! authorization is a gateway concern.
 
 use super::identity::Identity;
+use super::method_authz::{self, Role};
 use tonic::Status;
 use tracing::debug;
-/// gRPC methods that require the admin role.
-/// All other authenticated methods require the user role.
-const ADMIN_METHODS: &[&str] = &[
-    // Provider management
-    "/openshell.v1.OpenShell/CreateProvider",
-    "/openshell.v1.OpenShell/UpdateProvider",
-    "/openshell.v1.OpenShell/DeleteProvider",
-    "/openshell.v1.OpenShell/ImportProviderProfiles",
-    "/openshell.v1.OpenShell/LintProviderProfiles",
-    "/openshell.v1.OpenShell/DeleteProviderProfile",
-    "/openshell.v1.OpenShell/ConfigureProviderRefresh",
-    "/openshell.v1.OpenShell/RotateProviderCredential",
-    "/openshell.v1.OpenShell/DeleteProviderRefresh",
-    // Global config and policy
-    "/openshell.v1.OpenShell/UpdateConfig",
-    // Draft policy approvals
-    "/openshell.v1.OpenShell/ApproveDraftChunk",
-    "/openshell.v1.OpenShell/ApproveAllDraftChunks",
-    "/openshell.v1.OpenShell/RejectDraftChunk",
-    "/openshell.v1.OpenShell/EditDraftChunk",
-    "/openshell.v1.OpenShell/UndoDraftChunk",
-    "/openshell.v1.OpenShell/ClearDraftChunks",
-    // Cluster inference write
-    "/openshell.inference.v1.Inference/SetClusterInference",
-];
 
-/// Exhaustive mapping of Bearer-authenticated gRPC methods to required scopes.
-/// Methods not listed here require `openshell:all` when scope enforcement is enabled.
-const SCOPED_METHODS: &[(&str, &str)] = &[
-    // sandbox:read
-    ("/openshell.v1.OpenShell/GetSandbox", "sandbox:read"),
-    ("/openshell.v1.OpenShell/ListSandboxes", "sandbox:read"),
-    (
-        "/openshell.v1.OpenShell/ListSandboxProviders",
-        "sandbox:read",
-    ),
-    ("/openshell.v1.OpenShell/WatchSandbox", "sandbox:read"),
-    ("/openshell.v1.OpenShell/GetSandboxLogs", "sandbox:read"),
-    ("/openshell.v1.OpenShell/GetService", "sandbox:read"),
-    ("/openshell.v1.OpenShell/ListServices", "sandbox:read"),
-    (
-        "/openshell.v1.OpenShell/GetSandboxPolicyStatus",
-        "sandbox:read",
-    ),
-    (
-        "/openshell.v1.OpenShell/ListSandboxPolicies",
-        "sandbox:read",
-    ),
-    // sandbox:write
-    ("/openshell.v1.OpenShell/CreateSandbox", "sandbox:write"),
-    ("/openshell.v1.OpenShell/DeleteSandbox", "sandbox:write"),
-    ("/openshell.v1.OpenShell/ExecSandbox", "sandbox:write"),
-    ("/openshell.v1.OpenShell/ForwardTcp", "sandbox:write"),
-    ("/openshell.v1.OpenShell/CreateSshSession", "sandbox:write"),
-    ("/openshell.v1.OpenShell/RevokeSshSession", "sandbox:write"),
-    ("/openshell.v1.OpenShell/ExposeService", "sandbox:write"),
-    ("/openshell.v1.OpenShell/DeleteService", "sandbox:write"),
-    (
-        "/openshell.v1.OpenShell/AttachSandboxProvider",
-        "sandbox:write",
-    ),
-    (
-        "/openshell.v1.OpenShell/DetachSandboxProvider",
-        "sandbox:write",
-    ),
-    // provider:read
-    ("/openshell.v1.OpenShell/GetProvider", "provider:read"),
-    ("/openshell.v1.OpenShell/ListProviders", "provider:read"),
-    (
-        "/openshell.v1.OpenShell/ListProviderProfiles",
-        "provider:read",
-    ),
-    (
-        "/openshell.v1.OpenShell/GetProviderProfile",
-        "provider:read",
-    ),
-    (
-        "/openshell.v1.OpenShell/GetProviderRefreshStatus",
-        "provider:read",
-    ),
-    // provider:write
-    ("/openshell.v1.OpenShell/CreateProvider", "provider:write"),
-    ("/openshell.v1.OpenShell/UpdateProvider", "provider:write"),
-    ("/openshell.v1.OpenShell/DeleteProvider", "provider:write"),
-    (
-        "/openshell.v1.OpenShell/ImportProviderProfiles",
-        "provider:write",
-    ),
-    (
-        "/openshell.v1.OpenShell/LintProviderProfiles",
-        "provider:write",
-    ),
-    (
-        "/openshell.v1.OpenShell/DeleteProviderProfile",
-        "provider:write",
-    ),
-    (
-        "/openshell.v1.OpenShell/ConfigureProviderRefresh",
-        "provider:write",
-    ),
-    (
-        "/openshell.v1.OpenShell/RotateProviderCredential",
-        "provider:write",
-    ),
-    (
-        "/openshell.v1.OpenShell/DeleteProviderRefresh",
-        "provider:write",
-    ),
-    // config:read
-    ("/openshell.v1.OpenShell/GetGatewayConfig", "config:read"),
-    ("/openshell.v1.OpenShell/GetSandboxConfig", "config:read"),
-    ("/openshell.v1.OpenShell/GetDraftPolicy", "config:read"),
-    ("/openshell.v1.OpenShell/GetDraftHistory", "config:read"),
-    // config:write
-    ("/openshell.v1.OpenShell/UpdateConfig", "config:write"),
-    ("/openshell.v1.OpenShell/ApproveDraftChunk", "config:write"),
-    (
-        "/openshell.v1.OpenShell/ApproveAllDraftChunks",
-        "config:write",
-    ),
-    ("/openshell.v1.OpenShell/RejectDraftChunk", "config:write"),
-    ("/openshell.v1.OpenShell/EditDraftChunk", "config:write"),
-    ("/openshell.v1.OpenShell/UndoDraftChunk", "config:write"),
-    ("/openshell.v1.OpenShell/ClearDraftChunks", "config:write"),
-    // inference:read
-    (
-        "/openshell.inference.v1.Inference/GetClusterInference",
-        "inference:read",
-    ),
-    // inference:write
-    (
-        "/openshell.inference.v1.Inference/SetClusterInference",
-        "inference:write",
-    ),
-];
 const SCOPE_ALL: &str = "openshell:all";
-
-fn required_role_is_admin(method: &str) -> bool {
-    ADMIN_METHODS.contains(&method)
-}
-
-fn required_scope(method: &str) -> &'static str {
-    SCOPED_METHODS
-        .iter()
-        .find_map(|(candidate, scope)| (*candidate == method).then_some(*scope))
-        .unwrap_or(SCOPE_ALL)
-}
 
 /// Authorization policy configuration.
 ///
@@ -208,10 +64,9 @@ impl AuthzPolicy {
     /// (authentication-only mode for providers like GitHub).
     #[allow(clippy::result_large_err)]
     pub fn check(&self, identity: &Identity, method: &str) -> Result<(), Status> {
-        let required = if required_role_is_admin(method) {
-            &self.admin_role
-        } else {
-            &self.user_role
+        let required = match method_authz::required_role(method) {
+            Some(Role::Admin) => &self.admin_role,
+            Some(Role::User) | None => &self.user_role,
         };
 
         // Empty role name = skip role check for this level (auth-only mode).
@@ -250,7 +105,7 @@ impl AuthzPolicy {
             return Ok(());
         }
 
-        let required_scope = required_scope(method);
+        let required_scope = method_authz::required_scope(method).unwrap_or(SCOPE_ALL);
 
         if identity.scopes.iter().any(|s| s == required_scope) {
             return Ok(());
@@ -599,6 +454,7 @@ mod tests {
         for method in [
             "/openshell.v1.OpenShell/ListProviderProfiles",
             "/openshell.v1.OpenShell/GetProviderProfile",
+            "/openshell.v1.OpenShell/LintProviderProfiles",
         ] {
             assert!(policy.check(&reader, method).is_ok(), "{method}");
         }
@@ -629,7 +485,6 @@ mod tests {
             identity_with_roles_and_scopes(&["openshell-admin"], &["provider:write"]);
         for method in [
             "/openshell.v1.OpenShell/ImportProviderProfiles",
-            "/openshell.v1.OpenShell/LintProviderProfiles",
             "/openshell.v1.OpenShell/DeleteProviderProfile",
         ] {
             assert!(policy.check(&admin_writer, method).is_ok(), "{method}");
