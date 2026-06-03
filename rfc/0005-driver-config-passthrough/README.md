@@ -21,8 +21,8 @@ constraints for its own config block. The gateway owns only the stable envelope,
 driver selection, and the separation between caller-provided `driver_config` and
 gateway-computed `platform_config`.
 
-Kubernetes is the first driver used to inform the nested config shape. The RFC
-does not finalize every Kubernetes key up front. Instead, it requires collecting
+Kubernetes is a primary proving driver for the nested config shape. The RFC does
+not finalize every Kubernetes key up front. Instead, it requires collecting
 representative Kubernetes use cases, such as pod scheduling controls, container
 resources, sidecar resources, and extended resources, before defining the first
 documented Kubernetes config shape.
@@ -60,6 +60,10 @@ not need first-class public API fields for each of those options.
 OpenShell needs a caller-provided, driver-owned configuration path that is
 distinct from the existing gateway-computed `platform_config`.
 
+This RFC scopes that path to sandbox compute drivers because sandbox creation
+already has a clear driver selection step, a `DriverSandboxTemplate` handoff,
+and driver-owned validation before any platform resource is created.
+
 ## Non-goals
 
 - Do not add first-class support for any specific GPU stack.
@@ -72,6 +76,10 @@ distinct from the existing gateway-computed `platform_config`.
 - Do not apply wildcard matching to driver config keys.
 - Do not make `driver_config` a dynamic update mechanism for existing
   sandboxes.
+- Do not define a generic extension mechanism for every top-level OpenShell
+  resource. Provider secrets, gateways, policies, and other resources may need
+  analogous extension points, but each should be designed around its own owner,
+  lifecycle, authorization, and security invariants.
 
 ## Proposal
 
@@ -167,6 +175,30 @@ selected driver config block.
 For the initial implementation, the gateway does not need a separate driver
 capability flag before forwarding a matching config block. Whether drivers
 should advertise support for `driver_config` is an open question.
+
+### Scope boundary
+
+`driver_config` is attached to sandbox creation requests because a sandbox has a
+single selected compute driver and a direct gateway-to-driver handoff. The
+selected compute driver can validate the nested config before it creates or
+modifies any underlying platform resources.
+
+Other top-level OpenShell resources may also be backed by subsystem-specific or
+platform-specific implementations, but they do not automatically share the same
+ownership boundary. For example, provider secret handling involves credential
+lifecycle and access-control rules rather than pod/container scheduling rules.
+Those resources should not reuse `SandboxTemplate.driver_config` or the compute
+driver key space by implication.
+
+If another resource needs a passthrough mechanism later, it should get a
+resource-specific design that answers:
+
+- which component owns the nested schema and validation;
+- which stable envelope identifies that owner;
+- whether the config is create-time only or updateable;
+- which fields are protected by the control plane; and
+- how authorization, secret handling, auditing, and compatibility work for that
+  resource.
 
 ### Driver validation
 
@@ -301,14 +333,23 @@ the API design should not preclude adding it later.
 
 ### Initial Kubernetes driver use cases
 
-Kubernetes should be the first driver used to inform the nested `driver_config`
-shape, but the nested Kubernetes schema should not be finalized from a single
-GPU resource example.
+Kubernetes should be a primary driver used to inform the nested `driver_config`
+shape. For all drivers, the following constraints should guide the nested shape:
+
+- `driver_config` must not bypass or override first-class resource requests
+  exposed by the public API, such as typed GPU, CPU, and memory fields.
+- Driver-specific resource config is still in scope when it represents
+  driver-owned detail, such as sidecar resource sizing, extended resources, or
+  platform-specific resource controls that the public API does not model.
+- API design should be informed by more than non-standard resource requests.
+  For Kubernetes, it should answer: which Kubernetes-specific properties could
+  a user want to set?
 
 The first step should collect a representative set of Kubernetes
 driver-specific use cases, including:
 
-- container resource requests and limits for the primary sandbox container;
+- additional container resource requests and limits for the primary sandbox
+  container that the public API does not model;
 - resource requests and limits for driver-owned sidecars such as a proxy
   container;
 - extended resources used by installed GPU stacks;
@@ -359,6 +400,15 @@ include a Kubernetes-native pod/container structure:
 ```
 
 This example is illustrative, not the final required schema.
+
+Note that the top-level `"kubernetes"` key represents a concrete driver name.
+This is important because it defines which driver is responsible for validating
+and interpreting the spec. This also allows multiple drivers to be supported --
+but not required -- in the future.
+
+Furthermore, keying the config by driver name and using a generic message
+payload allows out-of-tree drivers to be supported in the future without
+requiring coordinated deployment of gateway updates.
 
 The Kubernetes driver should prefer raw Kubernetes resource names and
 Kubernetes quantity strings where it exposes Kubernetes resource requests and
@@ -475,6 +525,21 @@ implementation scope and needs community input. Forwarding a matching block plus
 driver-side validation is sufficient for the initial passthrough mechanism. A
 schema discovery RPC or capability field can be added later without changing the
 core `driver_config` contract.
+
+### Generic passthrough for all top-level resources
+
+Every top-level OpenShell resource could receive a similarly shaped
+implementation-owned config block.
+
+This might make the model feel consistent across APIs, but it would obscure the
+owner and validation boundary. Sandbox compute drivers have a concrete selected
+driver and a creation-time driver template. Other resources may be owned by the
+gateway, provider backends, policy engines, identity systems, or external
+platform components. Their extension points need separate lifecycle,
+authorization, secret-handling, audit, and compatibility rules.
+
+This RFC should not block analogous resource-specific designs, but it should not
+turn the sandbox compute-driver mechanism into a global extension contract.
 
 ### Allow secrets or privileged platform controls
 
