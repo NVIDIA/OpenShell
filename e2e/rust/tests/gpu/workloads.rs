@@ -8,6 +8,7 @@ use openshell_e2e::harness::sandbox::SandboxGuard;
 
 const CUDA_WORKLOAD_IMAGE_ENV: &str = "OPENSHELL_E2E_GPU_CUDA_WORKLOAD_IMAGE";
 const GPU_WORKLOAD_SUCCESS_MARKER: &str = "OPENSHELL_GPU_WORKLOAD_SUCCESS";
+const GPU_WORKLOAD_BINARY: &str = "/usr/local/bin/openshell-gpu-workload";
 
 fn cuda_workload_image() -> Option<String> {
     std::env::var(CUDA_WORKLOAD_IMAGE_ENV)
@@ -17,17 +18,25 @@ fn cuda_workload_image() -> Option<String> {
 }
 
 #[tokio::test]
-async fn cuda_gpu_workload_validation_runs_with_default_image_command() {
+async fn cuda_gpu_workload_validation_runs_explicit_workload_binary() {
     let Some(image) = cuda_workload_image() else {
         eprintln!("skipping CUDA GPU workload validation: {CUDA_WORKLOAD_IMAGE_ENV} is not set");
         return;
     };
 
-    let mut guard = SandboxGuard::create(&["--gpu", "--from", image.as_str()])
-        .await
-        .unwrap_or_else(|err| {
-            panic!("CUDA GPU workload sandbox create failed for image {image}:\n{err}")
-        });
+    let mut guard = SandboxGuard::create(&[
+        "--gpu",
+        "--from",
+        image.as_str(),
+        "--",
+        GPU_WORKLOAD_BINARY,
+    ])
+    .await
+    .unwrap_or_else(|err| {
+        panic!(
+            "CUDA GPU workload sandbox create failed for image {image} with binary {GPU_WORKLOAD_BINARY}:\n{err}"
+        )
+    });
 
     let clean_output = strip_ansi(&guard.create_output);
     assert!(
