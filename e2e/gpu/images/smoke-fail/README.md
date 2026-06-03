@@ -11,7 +11,16 @@ The workload does not perform GPU-specific work. It prints
 Build it with:
 
 ```shell
-OPENSHELL_GPU_WORKLOAD_IMAGES=smoke-fail mise run e2e:gpu:images:build
+mise run e2e:workloads:build
+```
+
+That command also refreshes the local workload manifest at
+`e2e/gpu/images/.build/workloads.yaml`.
+
+To build only this workload locally, set:
+
+```shell
+OPENSHELL_GPU_WORKLOAD_IMAGES=smoke-fail mise run e2e:workloads:build
 ```
 
 Run it directly:
