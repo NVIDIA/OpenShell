@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-#![cfg(feature = "e2e-gpu")]
-
 //! GPU device selection e2e tests.
 //!
 //! Requires a GPU-backed gateway and a sandbox image containing `nvidia-smi`.

@@ -14,6 +14,10 @@ E2E_FEATURES="${OPENSHELL_E2E_DOCKER_FEATURES:-e2e,e2e-docker}"
 
 cargo build -p openshell-cli --features openshell-core/dev-settings
 
+if [ "${E2E_TEST}" = "gpu" ] && [ -z "${OPENSHELL_E2E_GPU_CUDA_WORKLOAD_IMAGE:-}" ]; then
+  echo "note: running GPU e2e without OPENSHELL_E2E_GPU_CUDA_WORKLOAD_IMAGE; CUDA workload validation will log an explicit skip"
+fi
+
 exec "${ROOT}/e2e/with-docker-gateway.sh" \
   cargo test --manifest-path "${ROOT}/e2e/rust/Cargo.toml" \
     --features "${E2E_FEATURES}" \
