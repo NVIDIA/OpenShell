@@ -178,6 +178,9 @@ client_tls_secret_name         = "openshell-client-tls"
 host_gateway_ip                = "10.0.0.1"
 enable_user_namespaces         = false
 workspace_default_storage_size = "10Gi"
+# Kubernetes RuntimeClass applied to sandbox pods when the API request does
+# not specify one. Empty (default) = omit the field, using the cluster default.
+# default_runtime_class_name   = "kata-containers"
 # Kubelet clamps projected tokens below 600 seconds. The driver caps values at 86400.
 sa_token_ttl_secs              = 3600
 ```

@@ -76,6 +76,10 @@ pub struct KubernetesComputeConfig {
     pub host_gateway_ip: String,
     pub enable_user_namespaces: bool,
     pub workspace_default_storage_size: String,
+    /// Default Kubernetes `runtimeClassName` for sandbox pods.
+    /// Applied when a `CreateSandbox` request does not specify one.
+    /// Empty string (default) = omit the field, using the cluster default.
+    pub default_runtime_class_name: String,
     /// Lifetime (seconds) of the projected `ServiceAccount` token kubelet
     /// writes into each sandbox pod. Used only for the one-shot
     /// `IssueSandboxToken` bootstrap exchange — the gateway-minted JWT
@@ -116,6 +120,7 @@ impl Default for KubernetesComputeConfig {
             host_gateway_ip: String::new(),
             enable_user_namespaces: false,
             workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE.to_string(),
+            default_runtime_class_name: String::new(),
             sa_token_ttl_secs: 3600,
         }
     }
@@ -174,6 +179,21 @@ mod tests {
         });
         let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
         assert_eq!(cfg.service_account_name, "openshell-sandbox");
+    }
+
+    #[test]
+    fn serde_override_default_runtime_class_name() {
+        let json = serde_json::json!({
+            "default_runtime_class_name": "nvidia"
+        });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.default_runtime_class_name, "nvidia");
+    }
+
+    #[test]
+    fn default_runtime_class_name_is_empty() {
+        let cfg = KubernetesComputeConfig::default();
+        assert!(cfg.default_runtime_class_name.is_empty());
     }
 
     #[test]

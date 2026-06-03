@@ -158,6 +158,12 @@ server:
   # Uses Kubernetes quantity syntax (e.g. "2Gi", "10Gi", "500Mi").
   # Empty = built-in default (2Gi).
   workspaceDefaultStorageSize: ""
+  # -- Default Kubernetes runtimeClassName for sandbox pods.
+  # Applied when a CreateSandbox request does not specify one.
+  # Empty (default) = omit the field, using the cluster's default RuntimeClass.
+  # Set to a RuntimeClass name (e.g. "kata-containers", "nvidia") to apply it
+  # to all sandboxes that don't explicitly override it.
+  defaultRuntimeClassName: ""
   # -- gRPC endpoint sandboxes call back into the gateway. Leave empty to derive
   # it from the chart fullname, release namespace, service port, and
   # disableTls flag, for example https://openshell.openshell.svc.cluster.local:8080.

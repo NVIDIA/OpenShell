@@ -329,6 +329,7 @@ impl KubernetesComputeDriver {
             host_gateway_ip: &self.config.host_gateway_ip,
             enable_user_namespaces: self.config.enable_user_namespaces,
             workspace_default_storage_size: &self.config.workspace_default_storage_size,
+            default_runtime_class_name: &self.config.default_runtime_class_name,
             sa_token_ttl_secs: self.config.effective_sa_token_ttl_secs(),
         };
         obj.data = sandbox_to_k8s_spec(sandbox.spec.as_ref(), &params);
@@ -1041,6 +1042,7 @@ struct SandboxPodParams<'a> {
     host_gateway_ip: &'a str,
     enable_user_namespaces: bool,
     workspace_default_storage_size: &'a str,
+    default_runtime_class_name: &'a str,
     /// Lifetime (seconds) of the projected `ServiceAccount` token used
     /// for the bootstrap `IssueSandboxToken` exchange.
     sa_token_ttl_secs: i64,
@@ -1064,6 +1066,7 @@ impl Default for SandboxPodParams<'_> {
             host_gateway_ip: "",
             enable_user_namespaces: false,
             workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE,
+            default_runtime_class_name: "",
             sa_token_ttl_secs: 3600,
         }
     }
@@ -1184,7 +1187,11 @@ fn sandbox_template_to_k8s(
     }
 
     let mut spec = serde_json::Map::new();
-    if let Some(runtime_class) = platform_config_string(template, "runtime_class_name") {
+    let runtime_class_name = platform_config_string(template, "runtime_class_name").or_else(|| {
+        (!params.default_runtime_class_name.is_empty())
+            .then(|| params.default_runtime_class_name.to_string())
+    });
+    if let Some(runtime_class) = runtime_class_name {
         spec.insert(
             "runtimeClassName".to_string(),
             serde_json::json!(runtime_class),
@@ -2072,6 +2079,84 @@ mod tests {
         assert_eq!(
             pod_template["spec"]["runtimeClassName"],
             serde_json::json!("kata-containers")
+        );
+    }
+
+    #[test]
+    fn default_runtime_class_name_applied_when_template_omits_it() {
+        let template = SandboxTemplate::default();
+        let pod_template = {
+            let params = SandboxPodParams {
+                default_runtime_class_name: "kata-containers",
+                ..SandboxPodParams::default()
+            };
+            sandbox_template_to_k8s(
+                &template,
+                false,
+                &std::collections::HashMap::new(),
+                true,
+                &params,
+            )
+        };
+
+        assert_eq!(
+            pod_template["spec"]["runtimeClassName"],
+            serde_json::json!("kata-containers")
+        );
+    }
+
+    #[test]
+    fn template_runtime_class_name_overrides_config_default() {
+        let template = SandboxTemplate {
+            platform_config: Some(Struct {
+                fields: std::iter::once((
+                    "runtime_class_name".to_string(),
+                    Value {
+                        kind: Some(Kind::StringValue("gvisor".to_string())),
+                    },
+                ))
+                .collect(),
+            }),
+            ..SandboxTemplate::default()
+        };
+
+        let pod_template = {
+            let params = SandboxPodParams {
+                default_runtime_class_name: "kata-containers",
+                ..SandboxPodParams::default()
+            };
+            sandbox_template_to_k8s(
+                &template,
+                false,
+                &std::collections::HashMap::new(),
+                true,
+                &params,
+            )
+        };
+
+        assert_eq!(
+            pod_template["spec"]["runtimeClassName"],
+            serde_json::json!("gvisor")
+        );
+    }
+
+    #[test]
+    fn runtime_class_name_omitted_when_both_template_and_default_empty() {
+        let template = SandboxTemplate::default();
+        let pod_template = {
+            let params = SandboxPodParams::default();
+            sandbox_template_to_k8s(
+                &template,
+                false,
+                &std::collections::HashMap::new(),
+                true,
+                &params,
+            )
+        };
+
+        assert_eq!(
+            pod_template["spec"]["runtimeClassName"],
+            serde_json::json!(null)
         );
     }
 
