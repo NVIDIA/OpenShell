@@ -1799,7 +1799,9 @@ pub async fn sandbox_create(
         }
         None => None,
     };
-    let requested_gpu = gpu || image.as_deref().is_some_and(image_requests_gpu);
+    let requested_gpu = gpu
+        || gpu_device.is_some_and(|device_id| !device_id.is_empty())
+        || image.as_deref().is_some_and(image_requests_gpu);
 
     let providers_v2_enabled = gateway_providers_v2_enabled(&mut client).await?;
     let inferred_types: Vec<String> = if providers_v2_enabled {
