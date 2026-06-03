@@ -6,14 +6,32 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use openshell_core::proto::compute::v1::DriverSandbox as Sandbox;
+use openshell_core::settings::parse_bool_like;
 
 use crate::runtime::VmBackend;
+
+/// Label-key prefix used to request a per-sandbox lifecycle extension.
+///
+/// A sandbox opts into an [`ExtensionActivation::OnRequest`] extension when
+/// its template carries a `{SANDBOX_EXTENSION_LABEL_PREFIX}{key}` label set
+/// to an enabled value. The label is policy-controlled (stamped by the
+/// gateway), so a guest cannot self-activate an extension. This contract
+/// lives with the lifecycle framework that consumes it rather than in the
+/// shared settings registry.
+pub const SANDBOX_EXTENSION_LABEL_PREFIX: &str = "openshell.io/extension.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaunchAbortReason {
     LauncherSpawnFailed,
     BeforeLaunchHookFailed,
     GuestPrepareFailed,
+    /// The VM helper process exited on its own *after* the launcher was
+    /// spawned (e.g. a guest crash or the hypervisor dying), rather than the
+    /// driver aborting during setup. The driver releases its own per-launch
+    /// allocations when this happens, so extensions are given the same
+    /// opportunity to release host resources they allocated in
+    /// [`LifecycleExtension::before_launch`].
+    ProcessExited,
 }
 
 #[derive(Debug, Clone)]
@@ -136,10 +154,15 @@ pub struct ExtensionCapabilities {
 /// [`LaunchPlan::require_backend_feature`] inside
 /// [`LifecycleExtension::configure_launch`] instead.
 ///
-/// A future PR will add a per-sandbox activation protocol so the driver
-/// can gate this merge on a sandbox spec field. Until that lands, the
-/// only knob is "declare in the descriptor (always merged) vs decide in
-/// the hook (per-sandbox)".
+/// Whether the descriptor requirements are merged for *every* sandbox or
+/// only for sandboxes that opted in is controlled by the extension's
+/// [`LifecycleExtension::activation`]: a [`ExtensionActivation::Global`]
+/// extension always participates, while an
+/// [`ExtensionActivation::OnRequest`] extension only participates when the
+/// sandbox carries the matching request label (see
+/// [`ExtensionActivation`]). Within an active extension, the
+/// "declare in the descriptor (merged) vs decide in the hook" knob still
+/// applies for finer-grained, spec-dependent behavior.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtensionDescriptor {
     pub name: String,
@@ -240,6 +263,29 @@ pub struct RestoreContext {
     pub state_dir: PathBuf,
 }
 
+/// When a registered lifecycle extension participates in a sandbox's
+/// lifecycle.
+///
+/// This gates *every* hook (configure/launch/cleanup/restore) for the
+/// extension, so an inactive extension is invisible to the sandbox: it
+/// contributes no descriptor requirements, runs no host-side side effects,
+/// and — crucially — its cleanup hooks are not invoked either (there is
+/// nothing to clean up because nothing ran).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtensionActivation {
+    /// The extension participates in every sandbox on this driver. This is
+    /// the default and matches the historical behavior where all registered
+    /// extensions ran unconditionally.
+    Global,
+    /// The extension participates only for sandboxes that explicitly
+    /// requested it via a `{SANDBOX_EXTENSION_LABEL_PREFIX}{key}` template
+    /// label set to an enabled value. The label is policy-controlled
+    /// (stamped by the gateway), so guests cannot self-activate an
+    /// extension. `key` must be a valid extension identifier (validated by
+    /// [`LifecycleExtensionRegistry::validate`]).
+    OnRequest { key: &'static str },
+}
+
 /// Lifecycle hooks an extension can implement to participate in VM sandbox
 /// provisioning, launch failure, deletion, and post-restart reconciliation.
 ///
@@ -264,6 +310,16 @@ pub struct RestoreContext {
 #[tonic::async_trait]
 pub trait LifecycleExtension: std::fmt::Debug + Send + Sync {
     fn name(&self) -> &str;
+
+    /// Declare when this extension participates in a sandbox's lifecycle.
+    ///
+    /// Defaults to [`ExtensionActivation::Global`] (runs for every sandbox).
+    /// Override and return [`ExtensionActivation::OnRequest`] for an opt-in
+    /// extension that should only run when the sandbox carries the matching
+    /// request label.
+    fn activation(&self) -> ExtensionActivation {
+        ExtensionActivation::Global
+    }
 
     fn descriptor(&self) -> ExtensionDescriptor {
         ExtensionDescriptor::new(self.name())
@@ -324,15 +380,25 @@ pub trait LifecycleExtension: std::fmt::Debug + Send + Sync {
 
     /// Release anything this extension allocated during
     /// [`configure_launch`](Self::configure_launch) or
-    /// [`before_launch`](Self::before_launch) when the launcher
-    /// could not be started or aborted before it became healthy.
+    /// [`before_launch`](Self::before_launch).
     ///
-    /// Invoked in reverse registration order. Errors are logged but do not
-    /// propagate; do best-effort cleanup and return [`Ok`] when possible.
-    /// This hook is invoked on every launcher failure, including failures
-    /// that happen during a persisted-sandbox restore (in that case
-    /// [`after_restore`](Self::after_restore) is *not*
-    /// invoked).
+    /// Invoked in reverse registration order with the reason in
+    /// [`LaunchAbortReason`]. This fires both when the launcher could not be
+    /// started / was aborted before it became healthy *and* when a
+    /// previously-running VM helper process exits on its own
+    /// ([`LaunchAbortReason::ProcessExited`]); in the latter case the driver
+    /// simultaneously releases its own per-launch allocations.
+    ///
+    /// Because [`LaunchAbortReason::ProcessExited`] cleanup runs while the
+    /// sandbox record still exists, this hook may later be followed by
+    /// [`after_delete`](Self::after_delete) for the same sandbox.
+    /// Implementations MUST therefore be idempotent: do best-effort cleanup,
+    /// treat already-released resources as success, and return [`Ok`] when
+    /// possible. Errors are logged but do not propagate.
+    ///
+    /// Invoked on every launcher failure, including failures that happen
+    /// during a persisted-sandbox restore (in that case
+    /// [`after_restore`](Self::after_restore) is *not* invoked).
     async fn after_launch_failed(
         &self,
         _sandbox: &Sandbox,
@@ -439,12 +505,31 @@ impl LifecycleExtensionRegistry {
         self.extensions.iter().map(|ext| ext.descriptor()).collect()
     }
 
+    /// Names of the extensions that are active for `sandbox`, in
+    /// registration order.
+    #[must_use]
+    pub fn active_names(&self, sandbox: &Sandbox) -> Vec<String> {
+        self.active_for(sandbox)
+            .into_iter()
+            .map(|ext| ext.name().to_string())
+            .collect()
+    }
+
     pub fn validate(&self) -> LifecycleResult<()> {
         let mut names = HashSet::new();
         for ext in &self.extensions {
             let descriptor = ext.descriptor();
             validate_extension_name(ext.name())?;
             validate_extension_name(&descriptor.name)?;
+            if let ExtensionActivation::OnRequest { key } = ext.activation() {
+                validate_extension_identifier(key).map_err(|err| {
+                    LifecycleError::new(format!(
+                        "lifecycle extension '{}' has invalid activation key '{}': {err}",
+                        ext.name(),
+                        key
+                    ))
+                })?;
+            }
             if descriptor.name != ext.name() {
                 return Err(LifecycleError::new(format!(
                     "lifecycle extension '{}' descriptor name does not match '{}'",
@@ -463,13 +548,30 @@ impl LifecycleExtensionRegistry {
         Ok(())
     }
 
+    /// Extensions active for `sandbox`, preserving registration order.
+    ///
+    /// [`ExtensionActivation::Global`] extensions are always included;
+    /// [`ExtensionActivation::OnRequest`] extensions are included only when
+    /// the sandbox carries the matching request label.
+    fn active_for<'a>(&'a self, sandbox: &Sandbox) -> Vec<&'a Arc<dyn LifecycleExtension>> {
+        self.extensions
+            .iter()
+            .filter(|ext| match ext.activation() {
+                ExtensionActivation::Global => true,
+                ExtensionActivation::OnRequest { key } => {
+                    sandbox_requested_extension(sandbox, key)
+                }
+            })
+            .collect()
+    }
+
     pub async fn configure_launch(
         &self,
         sandbox: &Sandbox,
         state_dir: &Path,
         plan: &mut LaunchPlan,
     ) -> LifecycleResult<()> {
-        for ext in &self.extensions {
+        for ext in self.active_for(sandbox) {
             let descriptor = ext.descriptor();
             for backend in descriptor.required_backends {
                 plan.require_backend(backend);
@@ -507,7 +609,7 @@ impl LifecycleExtensionRegistry {
         state_dir: &Path,
         plan: &mut LaunchPlan,
     ) -> LifecycleResult<()> {
-        for ext in &self.extensions {
+        for ext in self.active_for(sandbox) {
             ext.before_launch(sandbox, state_dir, plan).await?;
         }
         Ok(())
@@ -519,7 +621,7 @@ impl LifecycleExtensionRegistry {
         state_dir: &Path,
         reason: LaunchAbortReason,
     ) {
-        for ext in self.extensions.iter().rev() {
+        for ext in self.active_for(sandbox).into_iter().rev() {
             if let Err(err) = ext
                 .after_launch_failed(sandbox, state_dir, reason.clone())
                 .await
@@ -535,7 +637,7 @@ impl LifecycleExtensionRegistry {
     }
 
     pub async fn after_delete(&self, sandbox: &Sandbox, state_dir: &Path) {
-        for ext in self.extensions.iter().rev() {
+        for ext in self.active_for(sandbox).into_iter().rev() {
             if let Err(err) = ext.after_delete(sandbox, state_dir).await {
                 tracing::warn!(
                     extension = ext.name(),
@@ -551,14 +653,14 @@ impl LifecycleExtensionRegistry {
         &self,
         sandbox: &RestoreContext,
     ) -> LifecycleResult<()> {
-        for ext in &self.extensions {
+        for ext in self.active_for(&sandbox.sandbox) {
             ext.before_restore(sandbox).await?;
         }
         Ok(())
     }
 
     pub async fn after_restore(&self, sandbox: &RestoreContext) {
-        for ext in &self.extensions {
+        for ext in self.active_for(&sandbox.sandbox) {
             if let Err(err) = ext.after_restore(sandbox).await {
                 tracing::warn!(
                     extension = ext.name(),
@@ -569,6 +671,37 @@ impl LifecycleExtensionRegistry {
             }
         }
     }
+}
+
+/// Returns true when `sandbox` opted into the extension identified by
+/// `key` via a policy-stamped `{SANDBOX_EXTENSION_LABEL_PREFIX}{key}`
+/// template label set to an enabled value.
+fn sandbox_requested_extension(sandbox: &Sandbox, key: &str) -> bool {
+    let label_key = format!("{SANDBOX_EXTENSION_LABEL_PREFIX}{key}");
+    sandbox
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.template.as_ref())
+        .and_then(|template| template.labels.get(&label_key))
+        .is_some_and(|value| extension_label_enabled(value))
+}
+
+/// Interpret an extension request-label value. Accepts the explicit
+/// `enabled`/`requested` spellings as well as the common bool-like values
+/// understood by [`parse_bool_like`]; anything unrecognized is treated as
+/// "not requested" so a malformed label fails closed.
+fn extension_label_enabled(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    if matches!(
+        normalized.as_str(),
+        "enabled" | "enable" | "requested" | "request"
+    ) {
+        return true;
+    }
+    if matches!(normalized.as_str(), "disabled" | "disable") {
+        return false;
+    }
+    parse_bool_like(&normalized).unwrap_or(false)
 }
 
 fn warn_on_singleton_overwrite<T>(
@@ -655,8 +788,11 @@ fn validate_extension_identifier(value: &str) -> Result<(), &'static str> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Mutex;
+
+    use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
     use super::*;
 
@@ -665,6 +801,7 @@ mod tests {
         name: String,
         configure_should_fail: bool,
         before_should_fail: bool,
+        activation: ExtensionActivation,
         calls: Mutex<Vec<String>>,
     }
 
@@ -674,6 +811,17 @@ mod tests {
                 name: name.to_string(),
                 configure_should_fail: false,
                 before_should_fail: false,
+                activation: ExtensionActivation::Global,
+                calls: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn on_request(name: &str, key: &'static str) -> Arc<Self> {
+            Arc::new(Self {
+                name: name.to_string(),
+                configure_should_fail: false,
+                before_should_fail: false,
+                activation: ExtensionActivation::OnRequest { key },
                 calls: Mutex::new(Vec::new()),
             })
         }
@@ -683,6 +831,7 @@ mod tests {
                 name: name.to_string(),
                 configure_should_fail: false,
                 before_should_fail: true,
+                activation: ExtensionActivation::Global,
                 calls: Mutex::new(Vec::new()),
             })
         }
@@ -692,6 +841,7 @@ mod tests {
                 name: name.to_string(),
                 configure_should_fail: true,
                 before_should_fail: false,
+                activation: ExtensionActivation::Global,
                 calls: Mutex::new(Vec::new()),
             })
         }
@@ -705,6 +855,10 @@ mod tests {
     impl LifecycleExtension for RecordingExtension {
         fn name(&self) -> &str {
             &self.name
+        }
+
+        fn activation(&self) -> ExtensionActivation {
+            self.activation
         }
 
         fn descriptor(&self) -> ExtensionDescriptor {
@@ -820,6 +974,22 @@ mod tests {
         }
     }
 
+    fn sample_sandbox_with_extension(key: &str) -> Sandbox {
+        let label_key = format!("{SANDBOX_EXTENSION_LABEL_PREFIX}{key}");
+        Sandbox {
+            id: "sandbox-123".to_string(),
+            name: "sandbox-123".to_string(),
+            spec: Some(DriverSandboxSpec {
+                template: Some(DriverSandboxTemplate {
+                    labels: HashMap::from([(label_key, "enabled".to_string())]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
     fn as_extension<T>(extension: &Arc<T>) -> Arc<dyn LifecycleExtension>
     where
         T: LifecycleExtension + 'static,
@@ -881,6 +1051,70 @@ mod tests {
             ext_c.calls().is_empty(),
             "extensions after the failure must not be invoked"
         );
+    }
+
+    #[tokio::test]
+    async fn on_request_extension_only_runs_when_label_is_enabled() {
+        let ext_global = RecordingExtension::new("global");
+        let ext_requested = RecordingExtension::on_request("requested", "nemo-relay");
+        let registry = LifecycleExtensionRegistry::with(vec![
+            as_extension(&ext_global),
+            as_extension(&ext_requested),
+        ]);
+        let mut plan = sample_plan(VmBackend::Libkrun);
+
+        registry
+            .configure_launch(&sample_sandbox(), &PathBuf::from("/tmp/state"), &mut plan)
+            .await
+            .expect("configure_launch succeeds");
+
+        assert_eq!(ext_global.calls(), vec!["global:configure_launch"]);
+        assert!(
+            ext_requested.calls().is_empty(),
+            "on-request extension must stay inactive without the request label"
+        );
+
+        let mut requested_plan = sample_plan(VmBackend::Libkrun);
+        registry
+            .configure_launch(
+                &sample_sandbox_with_extension("nemo-relay"),
+                &PathBuf::from("/tmp/state"),
+                &mut requested_plan,
+            )
+            .await
+            .expect("configure_launch succeeds");
+
+        assert_eq!(
+            ext_requested.calls(),
+            vec!["requested:configure_launch"],
+            "on-request extension should run when the label is enabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn active_names_reflects_request_label() {
+        let registry = LifecycleExtensionRegistry::with(vec![
+            RecordingExtension::new("global"),
+            RecordingExtension::on_request("requested", "nemo-relay"),
+        ]);
+
+        assert_eq!(registry.active_names(&sample_sandbox()), vec!["global"]);
+        assert_eq!(
+            registry.active_names(&sample_sandbox_with_extension("nemo-relay")),
+            vec!["global", "requested"]
+        );
+    }
+
+    #[test]
+    fn validate_rejects_invalid_on_request_key() {
+        let registry = LifecycleExtensionRegistry::with(vec![RecordingExtension::on_request(
+            "bad-key",
+            "../escape",
+        )]);
+        let err = registry
+            .validate()
+            .expect_err("invalid activation key should fail validation");
+        assert!(err.message().contains("invalid activation key"));
     }
 
     #[tokio::test]

@@ -107,6 +107,14 @@ const GUEST_TLS_CERT_PATH: &str = "/opt/openshell/tls/tls.crt";
 const GUEST_TLS_KEY_PATH: &str = "/opt/openshell/tls/tls.key";
 const GUEST_SANDBOX_TOKEN_PATH: &str = "/opt/openshell/auth/sandbox.jwt";
 const GUEST_INIT_DROPIN_DIR: &str = "/opt/openshell/init.d";
+/// Guest path of the driver-authored manifest enumerating which
+/// `init.d` drop-ins the guest init script is allowed to execute.
+///
+/// The guest runs *only* the entries listed here (fail-closed): anything
+/// else found under `init.d` — e.g. files baked into a user-controlled
+/// guest image — is ignored. The driver writes this file into the overlay
+/// upperdir on every launch, so the image cannot forge or shadow it.
+const GUEST_INIT_DROPIN_MANIFEST: &str = "/opt/openshell/init.d.manifest";
 const IMAGE_CACHE_ROOT_DIR: &str = "images";
 const IMAGE_CACHE_ROOTFS_IMAGE: &str = "rootfs.ext4";
 const OVERLAY_TEMPLATE_CACHE_DIR: &str = "overlay-templates";
@@ -2775,12 +2783,30 @@ impl VmDriver {
                     sandbox_id.clone(),
                     platform_event("vm", "Warning", "ProcessExited", message),
                 );
-                let (has_gpu, has_qemu_network) = {
+                let (has_gpu, has_qemu_network, cleanup_ctx) = {
                     let registry = self.registry.lock().await;
-                    registry.get(&sandbox_id).map_or((false, false), |record| {
-                        (record.gpu_bdf.is_some(), record.qemu_network_allocated)
-                    })
+                    registry
+                        .get(&sandbox_id)
+                        .map_or((false, false, None), |record| {
+                            (
+                                record.gpu_bdf.is_some(),
+                                record.qemu_network_allocated,
+                                Some((record.snapshot.clone(), record.state_dir.clone())),
+                            )
+                        })
                 };
+                // Give lifecycle extensions a chance to release host
+                // resources they allocated in `before_launch` (e.g. device
+                // bindings, OVS flows). The driver releases its own
+                // allocations just below; without this, extension-owned
+                // resources would leak whenever a VM helper exits without an
+                // explicit delete. Cleanup is best-effort and idempotent, so
+                // a later delete that also fires `after_delete` is safe.
+                if let Some((sandbox, state_dir)) = cleanup_ctx {
+                    self.lifecycle_extensions
+                        .after_launch_failed(&sandbox, &state_dir, LaunchAbortReason::ProcessExited)
+                        .await;
+                }
                 self.release_allocations(&sandbox_id, has_gpu, has_qemu_network);
                 return;
             }
@@ -4502,6 +4528,45 @@ fn inject_guest_init_dropins(
             ))
         })?;
     }
+
+    // Write the allow-list manifest the guest runner consults. We write it
+    // unconditionally — including an empty manifest when no drop-ins were
+    // injected — so the guest always fails closed: only names the driver
+    // explicitly injected this launch are eligible to run, and a guest
+    // image cannot smuggle in extra `init.d` entries.
+    write_guest_init_dropin_manifest(overlay_disk, dropins)?;
+    Ok(())
+}
+
+/// Render the drop-in allow-list as newline-separated, ASCII-sorted,
+/// de-duplicated names. Names are already validated to be path-safe by
+/// [`validate_guest_init_dropins`].
+fn render_guest_init_dropin_manifest(dropins: &[GuestInitDropin]) -> Vec<u8> {
+    let mut names: Vec<&str> = dropins.iter().map(|d| d.name.as_str()).collect();
+    names.sort_unstable();
+    names.dedup();
+    let mut body = names.join("\n");
+    if !body.is_empty() {
+        body.push('\n');
+    }
+    body.into_bytes()
+}
+
+#[allow(clippy::result_large_err)]
+fn write_guest_init_dropin_manifest(
+    overlay_disk: &Path,
+    dropins: &[GuestInitDropin],
+) -> Result<(), Status> {
+    let guest_path = overlay_upper_path(GUEST_INIT_DROPIN_MANIFEST);
+    let contents = render_guest_init_dropin_manifest(dropins);
+    write_rootfs_image_file(overlay_disk, &guest_path, &contents).map_err(|err| {
+        Status::internal(format!("write VM guest init drop-in manifest failed: {err}"))
+    })?;
+    set_rootfs_image_file_mode(overlay_disk, &guest_path, 0o644).map_err(|err| {
+        Status::internal(format!(
+            "set VM guest init drop-in manifest mode failed: {err}"
+        ))
+    })?;
     Ok(())
 }
 
@@ -6549,6 +6614,25 @@ mod tests {
         ])
         .expect_err("duplicate drop-ins are rejected");
         assert!(err.contains("duplicate"));
+    }
+
+    #[test]
+    fn guest_init_dropin_manifest_lists_only_injected_names_sorted() {
+        let manifest = render_guest_init_dropin_manifest(&[
+            GuestInitDropin::new("50-vfio.sh", b"true\n".to_vec()),
+            GuestInitDropin::new("10-nemo.sh", b"true\n".to_vec()),
+        ]);
+        assert_eq!(
+            String::from_utf8(manifest).unwrap(),
+            "10-nemo.sh\n50-vfio.sh\n"
+        );
+    }
+
+    #[test]
+    fn guest_init_dropin_manifest_is_empty_when_no_dropins() {
+        // An empty manifest is the fail-closed signal that nothing under
+        // init.d should run.
+        assert!(render_guest_init_dropin_manifest(&[]).is_empty());
     }
 
     #[tokio::test]
