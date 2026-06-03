@@ -1,0 +1,621 @@
+---
+name: gator-gate
+description: Validate and monitor OpenShell GitHub issues and PRs using the gator:* state machine. Use when asked to triage issues/PRs for project validity, gate PRs, run gator, validate submissions, or monitor PRs toward merge readiness.
+---
+
+# Gator Gate
+
+Validate OpenShell GitHub issues and pull requests for project fit, then monitor valid PRs until they are ready for maintainer approval.
+
+This skill is a gating workflow. It can start from any issue or PR state, inspect the current `gator:*` label, and continue the correct next action.
+
+## Skill Location
+
+Codex and other agent harnesses should load this skill from the repository path `.agents/skills/gator-gate/SKILL.md`. After this branch is merged, the canonical GitHub location is <https://github.com/NVIDIA/OpenShell/blob/main/.agents/skills/gator-gate/SKILL.md>.
+
+## Prerequisites
+
+- The `gh` CLI must be authenticated (`gh auth status`)
+- You must be in the OpenShell repository root
+- GitHub write permissions are required to apply labels, comment, close issues/PRs, or post `/ok to test`
+
+## Authority Rules
+
+- Do not push commits to a contributor's PR branch by default.
+- You may push changes only when explicitly instructed by a GitHub comment from a maintainer or by a direct operator prompt.
+- Do not post `/ok to test <sha>` unless the current GitHub user has maintainer authority.
+- Code review is code-only. Do not run pre-commit, unit tests, or E2E locally as part of the initial PR review unless explicitly instructed.
+- Security vulnerabilities must not be triaged through public GitHub issues. Follow `SECURITY.md`.
+
+Maintainer authority means one of:
+
+- User is in the NVIDIA `openshell-maintainers` team
+- User is a CODEOWNER listed in `.github/CODEOWNERS`
+- Repository permission is `admin`, `maintain`, or `write` for maintainer-only actions such as `/ok to test`
+
+Use these checks where needed:
+
+```bash
+gh api user --jq '.login'
+gh api repos/NVIDIA/OpenShell/collaborators/<user>/permission --jq '{permission,role_name}'
+gh api orgs/NVIDIA/teams/openshell-maintainers/members --jq '.[].login'
+```
+
+If a permission or team-membership query fails due to API access, fall back to CODEOWNERS and repository permission where possible. If authority cannot be verified, do not perform maintainer-only actions.
+
+## Comment Marker
+
+All comments posted by this skill must begin with this marker:
+
+```markdown
+> **gator-agent**
+```
+
+Use one canonical gator comment per issue or PR when possible. Edit it for state summaries if practical; otherwise post a new marked comment for material transitions.
+
+## Labels
+
+There must be at most one `gator:*` label on an issue or PR at any time.
+
+| Label | Meaning |
+|-------|---------|
+| `gator:follow-up-needed` | Needs submitter or maintainer clarification; 48 business-hour TTL applies |
+| `gator:blocked` | Process blocker prevents validation or monitoring from progressing |
+| `gator:validated` | Issue is valid and ready for work; no active PR monitoring needed |
+| `gator:in-review` | PR is valid and in agent review or author-feedback loop |
+| `gator:watch-pipeline` | Review feedback is resolved; CI/CD monitoring is active |
+| `gator:approval-needed` | Agent work is complete; maintainer approval or merge decision remains |
+
+If labels are missing and you have permission to create them, create them with clear descriptions. Otherwise report the missing labels to the operator.
+
+```bash
+gh label create "gator:follow-up-needed" --description "Gator needs submitter or maintainer follow-up" --color "FBCA04"
+gh label create "gator:blocked" --description "Gator is blocked by process or repository gates" --color "BFD4F2"
+gh label create "gator:validated" --description "Gator validated this issue as ready for work" --color "0E8A16"
+gh label create "gator:in-review" --description "Gator is reviewing or awaiting PR review feedback" --color "1D76DB"
+gh label create "gator:watch-pipeline" --description "Gator is monitoring PR CI/CD status" --color "5319E7"
+gh label create "gator:approval-needed" --description "Gator completed review; maintainer approval needed" --color "C5DEF5"
+```
+
+When changing state, remove all existing `gator:*` labels first, then add the new one.
+
+```bash
+gh issue edit <number> --remove-label "gator:follow-up-needed" --remove-label "gator:blocked" --remove-label "gator:validated" --remove-label "gator:in-review" --remove-label "gator:watch-pipeline" --remove-label "gator:approval-needed"
+gh issue edit <number> --add-label "gator:<state>"
+```
+
+Pull requests are also GitHub issues for label operations, so `gh issue edit <pr-number>` is valid for PR labels.
+
+## Invocation Modes
+
+The user may provide:
+
+- A GitHub issue number
+- A GitHub PR number
+- Both an issue and a PR number
+- No number, with an instruction to process untriaged or active gator items
+
+Resolve PRs and issues carefully:
+
+```bash
+gh issue view <issue> --json number,title,body,state,author,labels,comments,createdAt,updatedAt,closedAt,url
+gh pr view <pr> --json number,title,body,state,author,labels,comments,reviews,closingIssuesReferences,files,isDraft,mergeStateStatus,reviewDecision,headRefOid,headRefName,baseRefName,url
+```
+
+For a PR-only input, derive linked issues from `closingIssuesReferences`, PR body references such as `Fixes #123`, and issue comments that mention the PR. If no linked issue exists, validate the PR directly.
+
+## State Machine
+
+```text
+No gator label
+  -> gator:follow-up-needed  missing why, UX path, repro, RFC/roadmap link, or author action
+  -> gator:blocked           process blocker prevents progress
+  -> gator:validated         issue is valid and ready for work
+  -> gator:in-review         PR is valid and enters monitoring
+  -> close not planned       invalid or out of project scope
+
+gator:follow-up-needed
+  -> gator:validated         issue clarified and valid
+  -> gator:in-review         PR clarified and valid
+  -> gator:blocked           process blocker discovered
+  -> close not planned       48 business-hour TTL expired
+
+gator:blocked
+  -> previous intended state blocker resolved
+  -> stay blocked            blocker still present
+  -> nudge responsible party blocker unchanged after 48 business hours
+  -> stop                    closed by vouch gate; wait for vouch and reopen
+
+gator:validated
+  -> stop                    issue is already ready for work, no new PR or comments
+  -> gator:in-review         linked PR appears and is valid
+  -> re-evaluate             new substantive comments or labels change scope
+
+gator:in-review
+  -> gator:watch-pipeline    review feedback resolved
+  -> nudge PR author         review feedback unanswered after 48 business hours
+  -> gator:follow-up-needed  author action needed
+  -> gator:blocked           draft, vouch, DCO, merge conflict, or authority blocker
+
+gator:watch-pipeline
+  -> gator:approval-needed   required checks are green
+  -> gator:in-review         new review feedback or code changes need attention
+  -> gator:follow-up-needed  author action needed for failures
+  -> gator:blocked           process blocker prevents test execution
+
+gator:approval-needed
+  -> stop                    human maintainers take over
+  -> nudge maintainers       no maintainer action after 48 business hours
+  -> gator:in-review         maintainer requests changes or author updates PR
+```
+
+## Step 1: Fetch Context
+
+Fetch issue, PR, comments, reviews, files, labels, and linked references. Also inspect existing gator state.
+
+For PRs, record:
+
+- PR number and URL
+- Head SHA from `headRefOid`
+- Linked issue numbers
+- Draft status
+- Merge state
+- Review decision
+- Changed files and affected subsystems
+- Existing `test:*` labels
+
+For issues, record:
+
+- Issue number and URL
+- Author and author association where available
+- Current labels
+- Whether a linked PR exists
+- Last human or maintainer comment after any gator follow-up request
+
+## Step 2: Recover From Current State
+
+If exactly one `gator:*` label exists, resume from that state in the state machine.
+
+If multiple `gator:*` labels exist:
+
+1. Treat this as label drift.
+2. Read recent comments and labels to infer the most advanced safe state.
+3. Comment with the correction.
+4. Remove all but the chosen `gator:*` label.
+
+If no `gator:*` label exists, begin validation.
+
+## Watch Loop Rules
+
+Every gator state is a watch state. On each invocation, determine the current state, inspect the latest issue/PR activity, and either advance to the next state, keep waiting, or post a TTL nudge.
+
+Do not stop after a one-shot check when a PR is in an active waiting state unless the operator explicitly asks for a one-shot status check. Enter a polling loop and state the interval and stop conditions before waiting.
+
+Default live-watch cadence:
+
+- Poll every 15 minutes for PRs in active states: `gator:in-review`, `gator:watch-pipeline`, `gator:approval-needed`, and `gator:blocked`.
+- Watch PRs indefinitely across gator state transitions until they close, merge, or the operator stops the session.
+- Poll every 60 minutes for issue-only `gator:follow-up-needed` or issue-only `gator:blocked` states until they progress, close, or reach a TTL threshold.
+- Stop immediately for issue-only `gator:validated` items that have no associated PR.
+- Do not stop PR monitoring just because the gator state changes, a human comments, or new commits arrive. Treat those as triggers to re-evaluate and continue from the new state.
+- Stop PR monitoring only when the PR closes, merges, the operator stops the session, or an unrecoverable process blocker prevents further agent action.
+
+Use a concise loop summary before waiting, for example: "Watching PR #123 every 15 minutes until it closes, merges, or the session is stopped; comments, commits, and gator state changes will trigger re-evaluation and continued monitoring."
+
+Use 48 business hours as the default inactivity threshold for states that are waiting on a person. Business hours are Monday through Friday; do not count Saturday or Sunday.
+
+State-specific monitoring:
+
+- `gator:follow-up-needed`: wait for submitter or maintainer clarification. If no substantive response arrives after 48 business hours, close as not planned or close the PR with a TTL-expired comment.
+- `gator:blocked`: re-check the blocker. If resolved, continue to the previous intended state. If still blocked after 48 business hours, nudge the responsible party unless the PR was auto-closed by the vouch system.
+- `gator:validated`: for an issue-only item with no associated PR, stop; the issue is ready for work. If an associated PR exists or appears during a later invocation, validate the PR and move it to `gator:in-review`. If new information changes the scope, re-run validation.
+- `gator:in-review`: watch for author commits, author responses, review comments, and unresolved gator findings. If feedback is addressed, move to E2E/test-label decision and then `gator:watch-pipeline`. If feedback is unanswered after 48 business hours, nudge the PR author. Continue watching after either action.
+- `gator:watch-pipeline`: watch checks until green, failed, or blocked. Move to `gator:approval-needed` only when required checks are green and no review feedback remains. Continue watching after the state transition because maintainer feedback can arrive later.
+- `gator:approval-needed`: watch for maintainer approval, merge, closure, new commits, author responses, or maintainer requested changes. If no maintainer action occurs after 48 business hours, nudge maintainers and CODEOWNERS. If humans request changes, move back to `gator:in-review` and continue watching author follow-up.
+
+When calculating a nudge TTL, use the latest relevant event for that state:
+
+- The first comment that entered the current state
+- The most recent gator comment in the current state
+- The most recent comment or review from the expected actor
+- The most recent commit pushed to the PR, when waiting on code changes
+
+Do not post repeated nudges more often than once per 48 business hours for the same state and actor.
+
+## Step 3: Check Process Blockers
+
+Before project-validity review, check blockers.
+
+Move to `gator:blocked` when any of these apply:
+
+- PR is draft and not ready for review
+- PR is blocked by the vouch system or was auto-closed for lack of vouch
+- DCO is missing or failing
+- PR has merge conflicts or `mergeStateStatus` indicates dirty/blocked for conflict reasons
+- Required `/ok to test <sha>` is needed and the current user lacks maintainer authority
+- Required CI cannot run because the copy-pr mirror is missing or stale and maintainer authority is unavailable
+
+For auto-closed vouch-gate PRs, do not treat the proposal as invalid. Comment only if useful, then stop and wait until the author is vouched and the PR is reopened.
+
+For blocked open PRs, post a concise gator comment that lists the blocker and the exact next human action. On later invocations, re-check the blocker and nudge the responsible party after 48 business hours if it remains unresolved.
+
+## Step 4: Duplicate Detection
+
+For newer issues and PRs, check for duplicates before deciding validity. Duplicate detection is a project-fit input, not a substitute for human judgment.
+
+Search for existing issues and PRs using the title, subsystem labels, changed files, key error strings, and important feature terms:
+
+```bash
+gh search issues --repo NVIDIA/OpenShell "<keywords>" --state open --json number,title,state,url,labels,updatedAt
+gh search issues --repo NVIDIA/OpenShell "<keywords>" --state closed --json number,title,state,url,labels,updatedAt
+gh search prs --repo NVIDIA/OpenShell "<keywords>" --state open --json number,title,state,url,labels,updatedAt
+gh search prs --repo NVIDIA/OpenShell "<keywords>" --state closed --json number,title,state,url,labels,updatedAt
+```
+
+Treat items as duplicate candidates when they share the same user-visible problem, requested capability, affected subsystem, or implementation approach. Do not rely on title similarity alone.
+
+If a submission is an exact duplicate of an open validated issue or active PR:
+
+1. Comment with the matching issue or PR.
+2. Apply `duplicate` if available.
+3. Close only when the duplicate relationship is clear and no extra author-specific context is needed.
+
+If a submission appears related but may contain new constraints, reproduction details, or a different use case:
+
+1. Move to `gator:follow-up-needed`.
+2. Link the duplicate candidates.
+3. Ask the author to explain what is different or whether the older issue/PR covers their need.
+4. Flag the candidate duplicate set for human review in the comment.
+
+If a PR duplicates another open PR or implements a feature already being reviewed elsewhere, move to `gator:follow-up-needed` unless a maintainer has already directed both PRs to proceed independently.
+
+## Step 5: Auto-Validation
+
+Auto-validate submissions from maintainers, but still review PR implementations.
+
+Auto-validation applies when the submitter is:
+
+- A CODEOWNER
+- In `@NVIDIA/openshell-maintainers`
+
+For maintainer-authored issues without PRs, move to `gator:validated` unless the issue is clearly security-sensitive and belongs outside GitHub.
+
+For maintainer-authored PRs, move to `gator:in-review` and start PR monitoring. Auto-validation means the change is project-valid; it does not mean the implementation is merge-ready.
+
+## Step 6: Validate Issues and PRs
+
+Apply the criteria below in order. If evaluating an issue/PR pair, validate both as one submission but set each object to its appropriate current state:
+
+- Issue without PR: `gator:validated`
+- PR with or without linked issue: `gator:in-review`
+- Issue linked to a valid active PR: `gator:validated` on the issue and `gator:in-review` on the PR
+
+### Already Validated Issue
+
+If a PR is mapped to an issue that is already valid for the same work, consider the PR project-valid and enter `gator:in-review` unless the PR clearly exceeds the issue scope.
+
+### RFCs
+
+For PRs that add or modify `rfc/**`, validate against `rfc/README.md` and `rfc/0000-template/README.md`:
+
+- RFC lives in `rfc/NNNN-short-name/README.md`
+- Front matter includes `authors`, `state`, and `links`
+- State is one of `draft`, `review`, `accepted`, `rejected`, `implemented`, `superseded`
+- RFC has summary, motivation, non-goals, proposal, implementation plan, risks, alternatives, prior art, and open questions
+- RFC is appropriate for cross-cutting, architectural, API, process, or multi-team decisions
+- Small bug fixes, small single-component features, docs, dependency updates, and interface-preserving refactors should not use RFCs
+
+Distinguish structural validity from acceptance. A structurally valid RFC PR can enter `gator:in-review`, but implementation work should not be considered ready until the RFC is accepted or an explicit maintainer says otherwise.
+
+### Small Concentrated Work
+
+Validate small and concentrated work when it has clear motivation and one of these shapes:
+
+- One subsystem: gateway, CLI, supervisor, drivers, network proxy, policy, sandbox, TUI, docs, build/release
+- Refactor that removes duplicate code or simplifies internals without UX or functional impact
+- Logical packaging refactor, such as splitting crates or separating proto/native schema boundaries
+- Test improvements for important code paths or features
+- Concentrated bug fix with reproducibility steps and a clear test path
+- TUI, CLI, or API quality-of-life improvement with a clear user path
+- Driver improvement that makes sandbox lifecycle management easier or more efficient
+- Documentation clarification, typo fix, errata, or missing documentation
+- CI/CD/build/release improvement, including Snap, package, release, or test harness work
+
+Documentation changes from non-maintainers must not reorder ToC items, change fundamental hierarchy, or restructure docs without a clear maintainer-approved reason.
+
+### Provider V2 and Credential Support
+
+Provider V2 work is a supported high-traction area, but require all of the following:
+
+- Clear UX path for how users configure and use the provider feature in OpenShell
+- Clear statement of why the change is important
+- Clear statement of who will use it
+- Security boundary analysis for credential handling
+- Explanation of whether secrets remain hidden from the sandbox agent
+
+Be skeptical of changes that expose raw credentials to agents or weaken the credential proxy model, even if the user story is clear.
+
+### Large or Cross-Cutting Work
+
+For larger changes that impact multiple subsystems, introduce major architecture changes, or touch high single-digit or double-digit file counts, require at least one:
+
+- Fits an existing `roadmap` issue
+- Directly follows an already validated issue or PR
+- Has an accepted or actively reviewed RFC for the design
+- Has explicit maintainer confirmation in the issue or PR thread
+
+If this evidence is missing, use `gator:follow-up-needed` and ask for roadmap/RFC/linkage or maintainer clarification.
+
+### Follow-Up Triggers
+
+Use `gator:follow-up-needed` when the submission:
+
+- Does not meet validation criteria yet
+- Lacks practical demonstration of why the author is submitting it
+- Lacks reproduction steps for a bug
+- Lacks a clear UX path for a user-facing feature
+- Supports a narrow upstream project convenience without showing why OpenShell should own it
+- Suggests swapping core OpenShell components for another project's technology without a strong OpenShell-specific reason
+- Introduces CLI/API/UX changes that only work for one driver implementation
+- Overlaps existing work and needs reconciliation with the linked issue/PR/RFC
+
+When requesting follow-up, ask only for the minimal missing information needed to validate.
+
+### Invalid or Out of Scope
+
+Close as not planned or wontfix when the submission is clearly outside OpenShell's scope, duplicates a resolved decision, weakens a project invariant without acceptable rationale, or remains unvalidated after the follow-up TTL.
+
+Comment before closing and include a concise reason. Apply `wontfix` if appropriate and available.
+
+## Step 7: Follow-Up TTL
+
+When applying `gator:follow-up-needed`, post a comment with:
+
+- What information is missing
+- Who needs to respond, usually the original submitter
+- That the item may be closed if no author or maintainer response arrives within 48 business hours
+
+Business hours are Monday through Friday. Do not count Saturday or Sunday toward the 48-hour TTL.
+
+Any substantive comment from the original submitter or a maintainer resets the clock. Maintainers may also manually change labels; respect the latest maintainer-applied state.
+
+Bot comments and gator-agent comments do not reset the clock.
+
+If TTL expires:
+
+1. Comment that the TTL elapsed.
+2. State that the issue or PR can be reopened or re-run through gator when the missing information is available.
+3. Close the issue as not planned or close the PR.
+
+## Step 8: PR Review Loop
+
+When a PR enters `gator:in-review`, run an independent code-only review.
+
+Use the `principal-engineer-reviewer` sub-agent. Include:
+
+- PR title, body, linked issues, labels, and files
+- Full diff or enough chunked diff context to review all changes
+- Instruction to focus on correctness, regressions, security, maintainability, and missing tests
+- Instruction not to rely on local test execution
+
+Post findings as a gator comment or a GitHub PR review:
+
+- Use inline comments for line-specific defects
+- Use a general comment for design concerns, missing tests, or summary feedback
+- Do not nitpick style unless it affects maintainability or project conventions
+
+If findings require author changes, remain in `gator:in-review` or move to `gator:follow-up-needed` if the author must clarify the proposal before code review can continue.
+
+If no blocking findings remain, decide whether E2E labels are needed, then move to `gator:watch-pipeline`.
+
+When resuming a PR already in `gator:in-review`, check whether gator review findings or maintainer review comments are still unanswered. If the PR author has pushed commits or replied after the latest feedback, re-review only the relevant changes and decide whether the feedback is resolved.
+
+If review feedback is waiting on the PR author for more than 48 business hours, post a single author nudge. Use the latest of these timestamps as the TTL start:
+
+- The gator review comment that requested changes
+- The latest maintainer review requesting changes
+- The latest gator author-nudge comment
+- The latest author commit or author response
+
+Do not move to `gator:watch-pipeline` until review feedback is addressed or explicitly waived by a maintainer.
+
+## Step 9: E2E and Test Label Decision
+
+Apply or recommend `test:*` labels based on changed files and behavior.
+
+Use `test:e2e` for changes that affect:
+
+- Sandbox lifecycle
+- Gateway/supervisor interaction
+- Policy enforcement
+- Network proxy behavior
+- Provider credential flow
+- Docker, Podman, VM, or Kubernetes driver behavior
+- Release packaging that needs a runtime smoke test
+
+Use `test:e2e-gpu` for GPU runtime, CDI, CUDA, GPU driver, or GPU policy behavior.
+
+Use `test:e2e-kubernetes` for Kubernetes HA, Helm, Agent Sandbox CRDs, Kubernetes scheduling, namespace, or controller behavior when the Kubernetes-specific suite is needed.
+
+After applying a `test:*` label, read the bot comment that is posted by the E2E Label Help workflow and follow its instructions.
+
+If a mirror is missing or stale and you have maintainer authority, post:
+
+```text
+/ok to test <sha>
+```
+
+If you do not have maintainer authority, move to `gator:blocked` and state that a maintainer must post `/ok to test <sha>`.
+
+## Step 10: Pipeline Watch Loop
+
+When in `gator:watch-pipeline`, monitor PR checks and workflow runs.
+
+Use:
+
+```bash
+gh pr checks <pr-number>
+gh run list --branch <head-branch>
+```
+
+Required gates include at least:
+
+- `OpenShell / Branch Checks`
+- `OpenShell / Helm Lint`
+- `OpenShell / E2E` when `test:e2e` is applied
+- `OpenShell / GPU E2E` when `test:e2e-gpu` is applied
+
+If checks are pending, wait a reasonable interval and re-check.
+
+If checks fail:
+
+- Inspect failed logs with `gh run view <run-id> --log-failed`
+- Determine whether the failure is PR-caused, flaky, or infrastructure-related
+- If author changes are required, comment and move to `gator:in-review` or `gator:follow-up-needed`
+- If maintainer action is required, move to `gator:blocked`
+- If explicitly authorized to push fixes, make the minimal fix and continue watching
+
+When all required checks are green and no review feedback remains, move to `gator:approval-needed`.
+
+## Step 11: Approval Needed
+
+When applying `gator:approval-needed`, post a concise handoff comment:
+
+- Validation summary
+- Review status
+- CI status
+- E2E labels and outcomes
+- Remaining action: maintainer approval/merge decision
+
+Do not approve or merge unless explicitly instructed and authorized.
+
+When resuming an item already in `gator:approval-needed`, check whether maintainer approval has been waiting for more than 48 business hours since the latest of:
+
+- The first `gator:approval-needed` handoff comment
+- The most recent maintainer comment or review
+- The most recent gator maintainer-nudge comment
+
+If more than 48 business hours have elapsed, post a single nudge comment tagging `@NVIDIA/openshell-maintainers` and any relevant CODEOWNERS. For PRs, derive relevant CODEOWNERS from `.github/CODEOWNERS` and the changed files; because OpenShell has broad ownership, include the broad owner set when no more specific owner exists.
+
+Do not post repeated nudges more often than once per 48 business hours. If the PR is no longer green, has new review feedback, or has changed materially, move it back to `gator:in-review` instead of nudging.
+
+## Comment Templates
+
+### Follow-Up Needed
+
+```markdown
+> **gator-agent**
+
+## Follow-Up Needed
+
+I cannot validate this submission yet because <specific missing information>.
+
+Please provide <minimal requested details>. If the original submitter or a maintainer does not respond within 48 business hours, this may be closed as not planned. Weekend hours do not count toward the TTL.
+```
+
+### Blocked
+
+```markdown
+> **gator-agent**
+
+## Blocked
+
+Gator is blocked by <blocker>.
+
+Next action: <specific human action>.
+```
+
+### Validated Issue
+
+```markdown
+> **gator-agent**
+
+## Validated
+
+This issue is valid for OpenShell because <reason>.
+
+Recommended next step: <create-spike/build-from-issue/human planning/other>.
+```
+
+### PR Review Handoff
+
+```markdown
+> **gator-agent**
+
+## PR Review Status
+
+Validation: <why this PR is project-valid>
+Head SHA: `<sha>`
+
+Review findings:
+- <finding or "No blocking findings remain">
+
+Next state: `<gator:in-review|gator:watch-pipeline|gator:follow-up-needed|gator:blocked>`
+```
+
+### Approval Needed
+
+```markdown
+> **gator-agent**
+
+## Maintainer Approval Needed
+
+Gator validation and PR monitoring are complete.
+
+Validation: <summary>
+Review: <summary>
+Checks: <summary>
+E2E: <summary or N/A>
+
+Human maintainer approval or merge decision is now required.
+```
+
+### Maintainer Nudge
+
+```markdown
+> **gator-agent**
+
+## Maintainer Review Nudge
+
+This PR has been in `gator:approval-needed` for more than 48 business hours with no maintainer approval or merge decision.
+
+@NVIDIA/openshell-maintainers <relevant CODEOWNER mentions>, can someone review and either approve, request changes, or close this out?
+```
+
+### Author Nudge
+
+```markdown
+> **gator-agent**
+
+## Author Follow-Up Nudge
+
+This PR has been in `gator:in-review` for more than 48 business hours with unresolved review feedback.
+
+@<author>, please respond to the review comments or push an update. If this is no longer planned, please say so and a maintainer can close it out.
+```
+
+### Blocker Nudge
+
+```markdown
+> **gator-agent**
+
+## Blocker Follow-Up Nudge
+
+This item is still blocked by <blocker> after more than 48 business hours.
+
+Next action: <specific responsible party and action>.
+```
+
+### Possible Duplicate
+
+```markdown
+> **gator-agent**
+
+## Possible Duplicate
+
+This looks related to existing work:
+
+- <issue-or-pr-link>: <why it may overlap>
+
+Please confirm whether this submission has different requirements or reproduction details. A maintainer should review the duplicate relationship before this proceeds.
+```
