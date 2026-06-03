@@ -1643,10 +1643,20 @@ fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig
     ]);
 
     if let Some(spec) = sandbox.spec.as_ref() {
+        let mut user_env = HashMap::new();
         if let Some(template) = spec.template.as_ref() {
-            environment.extend(template.environment.clone());
+            user_env.extend(template.environment.clone());
         }
-        environment.extend(spec.environment.clone());
+        user_env.extend(spec.environment.clone());
+        if !user_env.is_empty()
+            && let Ok(json) = serde_json::to_string(&user_env)
+        {
+            environment.insert(
+                openshell_core::sandbox_env::USER_ENVIRONMENT.to_string(),
+                json,
+            );
+        }
+        environment.extend(user_env);
     }
 
     environment.insert(

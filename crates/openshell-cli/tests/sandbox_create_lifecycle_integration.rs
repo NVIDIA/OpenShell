@@ -795,6 +795,7 @@ async fn sandbox_create_keeps_command_sessions_by_default() {
         Some(false),
         Some(false),
         &HashMap::new(),
+        &HashMap::new(),
         "manual",
         &tls,
     )
@@ -837,6 +838,7 @@ async fn sandbox_create_sends_cpu_and_memory_limits_only() {
         &["echo".to_string(), "OK".to_string()],
         Some(false),
         Some(false),
+        &HashMap::new(),
         &HashMap::new(),
         "manual",
         &tls,
@@ -989,6 +991,7 @@ async fn sandbox_create_does_not_infer_command_providers_when_v2_enabled() {
         Some(true),
         Some(false),
         &HashMap::new(),
+        &HashMap::new(),
         "manual",
         &tls,
     )
@@ -1047,6 +1050,7 @@ async fn sandbox_create_returns_vm_error_without_waiting_for_timeout() {
         Some(false),
         Some(false),
         &HashMap::new(),
+        &HashMap::new(),
         "manual",
         &tls,
     )
@@ -1101,6 +1105,7 @@ async fn sandbox_create_keeps_waiting_while_vm_progress_arrives() {
         Some(false),
         Some(false),
         &HashMap::new(),
+        &HashMap::new(),
         "manual",
         &tls,
     )
@@ -1147,6 +1152,7 @@ async fn sandbox_create_times_out_when_only_logs_arrive() {
         Some(false),
         Some(false),
         &HashMap::new(),
+        &HashMap::new(),
         "manual",
         &tls,
     )
@@ -1188,6 +1194,7 @@ async fn sandbox_create_deletes_command_sessions_with_no_keep() {
         &["echo".to_string(), "OK".to_string()],
         Some(false),
         Some(false),
+        &HashMap::new(),
         &HashMap::new(),
         "manual",
         &tls,
@@ -1235,6 +1242,7 @@ async fn sandbox_create_deletes_shell_sessions_with_no_keep() {
         Some(true),
         Some(false),
         &HashMap::new(),
+        &HashMap::new(),
         "manual",
         &tls,
     )
@@ -1280,6 +1288,7 @@ async fn sandbox_create_keeps_sandbox_with_hidden_keep_flag() {
         &["echo".to_string(), "OK".to_string()],
         Some(false),
         Some(false),
+        &HashMap::new(),
         &HashMap::new(),
         "manual",
         &tls,
@@ -1327,6 +1336,7 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
         Some(false),
         Some(false),
         &HashMap::new(),
+        &HashMap::new(),
         "manual",
         &tls,
     )
@@ -1334,4 +1344,71 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
     .expect("sandbox create with forward should succeed");
 
     assert!(deleted_names(&server).await.is_empty());
+}
+
+#[tokio::test]
+async fn sandbox_create_sends_environment_variables() {
+    let server = run_server().await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+
+    let mut env_map = HashMap::new();
+    env_map.insert("FOO".to_string(), "bar".to_string());
+    env_map.insert("BAZ".to_string(), "qux=with=equals".to_string());
+
+    run::sandbox_create(
+        &server.endpoint,
+        Some("env-test"),
+        None,
+        "openshell",
+        None,
+        true,
+        false,
+        None,
+        None,
+        None,
+        None,
+        &[],
+        None,
+        None,
+        &["echo".to_string(), "OK".to_string()],
+        Some(false),
+        Some(false),
+        &HashMap::new(),
+        &env_map,
+        "manual",
+        &tls,
+    )
+    .await
+    .expect("sandbox create should succeed");
+
+    let requests = create_requests(&server).await;
+    let environment = &requests[0]
+        .spec
+        .as_ref()
+        .expect("spec should be present")
+        .environment;
+    assert_eq!(environment.get("FOO").map(String::as_str), Some("bar"));
+    assert_eq!(
+        environment.get("BAZ").map(String::as_str),
+        Some("qux=with=equals")
+    );
+    assert_eq!(environment.len(), 2);
+}
+
+#[tokio::test]
+async fn sandbox_create_env_rejects_invalid_format() {
+    let err = run::parse_key_value_pairs(
+        &["VALID=ok".to_string(), "NOEQUALSSIGN".to_string()],
+        "--env",
+    )
+    .unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("--env") && msg.contains("NOEQUALSSIGN"),
+        "error should mention the flag and bad value, got: {msg}"
+    );
 }

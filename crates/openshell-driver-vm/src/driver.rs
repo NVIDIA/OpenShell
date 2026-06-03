@@ -3498,7 +3498,16 @@ fn build_guest_environment(
             ),
         ]));
     }
-    environment.extend(merged_environment(sandbox));
+    let user_env = merged_environment(sandbox);
+    if !user_env.is_empty()
+        && let Ok(json) = serde_json::to_string(&user_env)
+    {
+        environment.insert(
+            openshell_core::sandbox_env::USER_ENVIRONMENT.to_string(),
+            json,
+        );
+    }
+    environment.extend(user_env);
     environment.insert(
         openshell_core::sandbox_env::TELEMETRY_ENABLED.to_string(),
         openshell_core::telemetry::enabled_env_value().to_string(),

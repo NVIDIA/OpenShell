@@ -1756,6 +1756,7 @@ pub async fn sandbox_create(
     tty_override: Option<bool>,
     auto_providers_override: Option<bool>,
     labels: &HashMap<String, String>,
+    environment: &HashMap<String, String>,
     approval_mode: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
@@ -1836,6 +1837,7 @@ pub async fn sandbox_create(
         spec: Some(SandboxSpec {
             gpu: requested_gpu,
             gpu_device: gpu_device.unwrap_or_default().to_string(),
+            environment: environment.clone(),
             policy,
             providers: configured_providers,
             template,
@@ -2638,6 +2640,7 @@ const MAX_STDIN_PAYLOAD: usize = 4 * 1024 * 1024;
 /// Execute a command in a running sandbox via gRPC, streaming output to the terminal.
 ///
 /// Returns the remote command's exit code.
+#[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
 pub async fn sandbox_exec_grpc(
     server: &str,
     name: &str,
@@ -2645,6 +2648,7 @@ pub async fn sandbox_exec_grpc(
     workdir: Option<&str>,
     timeout_seconds: u32,
     tty_override: Option<bool>,
+    environment: &HashMap<String, String>,
     tls: &TlsOptions,
 ) -> Result<i32> {
     let mut client = grpc_client(server, tls).await?;
@@ -2699,8 +2703,15 @@ pub async fn sandbox_exec_grpc(
         .unwrap_or_else(|| std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
 
     if tty_override == Some(true) && std::io::stdin().is_terminal() {
-        return sandbox_exec_interactive_grpc(client, &sandbox, command, workdir, timeout_seconds)
-            .await;
+        return sandbox_exec_interactive_grpc(
+            client,
+            &sandbox,
+            command,
+            workdir,
+            timeout_seconds,
+            environment,
+        )
+        .await;
     }
 
     // Make the streaming gRPC call.
@@ -2709,7 +2720,7 @@ pub async fn sandbox_exec_grpc(
             sandbox_id: sandbox.object_id().to_string(),
             command: command.to_vec(),
             workdir: workdir.unwrap_or_default().to_string(),
-            environment: HashMap::new(),
+            environment: environment.clone(),
             timeout_seconds,
             stdin: stdin_payload,
             tty,
@@ -3055,6 +3066,7 @@ async fn sandbox_exec_interactive_grpc(
     command: &[String],
     workdir: Option<&str>,
     timeout_seconds: u32,
+    environment: &HashMap<String, String>,
 ) -> Result<i32> {
     use openshell_core::proto::{ExecSandboxInput, ExecSandboxWindowResize, exec_sandbox_input};
     use tokio_stream::wrappers::ReceiverStream;
@@ -3070,7 +3082,7 @@ async fn sandbox_exec_interactive_grpc(
                 sandbox_id: sandbox.object_id().to_string(),
                 command: command.to_vec(),
                 workdir: workdir.unwrap_or_default().to_string(),
-                environment: HashMap::new(),
+                environment: environment.clone(),
                 timeout_seconds,
                 stdin: Vec::new(),
                 tty: true,
@@ -3888,7 +3900,7 @@ async fn auto_create_provider(
     Ok(())
 }
 
-fn parse_key_value_pairs(items: &[String], flag: &str) -> Result<HashMap<String, String>> {
+pub fn parse_key_value_pairs(items: &[String], flag: &str) -> Result<HashMap<String, String>> {
     let mut map = HashMap::new();
 
     for item in items {

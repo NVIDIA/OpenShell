@@ -1625,6 +1625,13 @@ fn build_env_list(
     let mut env = existing_env.cloned().unwrap_or_default();
     apply_env_map(&mut env, template_environment);
     apply_env_map(&mut env, spec_environment);
+    let mut user_env = template_environment.clone();
+    user_env.extend(spec_environment.clone());
+    if !user_env.is_empty()
+        && let Ok(json) = serde_json::to_string(&user_env)
+    {
+        upsert_env(&mut env, openshell_core::sandbox_env::USER_ENVIRONMENT, &json);
+    }
     apply_required_env(
         &mut env,
         sandbox_id,

@@ -107,6 +107,7 @@ pub async fn run_ssh_server(
     proxy_url: Option<String>,
     ca_file_paths: Option<(PathBuf, PathBuf)>,
     provider_credentials: ProviderCredentialState,
+    user_environment: HashMap<String, String>,
 ) -> Result<()> {
     let (listener, config, ca_paths) = match ssh_server_init(&listen_path, &ca_file_paths) {
         Ok(v) => {
@@ -131,6 +132,7 @@ pub async fn run_ssh_server(
         let proxy_url = proxy_url.clone();
         let ca_paths = ca_paths.clone();
         let provider_credentials = provider_credentials.clone();
+        let user_environment = user_environment.clone();
 
         tokio::spawn(async move {
             if let Err(err) = handle_connection(
@@ -142,6 +144,7 @@ pub async fn run_ssh_server(
                 proxy_url,
                 ca_paths,
                 provider_credentials,
+                user_environment,
             )
             .await
             {
@@ -168,6 +171,7 @@ async fn handle_connection(
     proxy_url: Option<String>,
     ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
     provider_credentials: ProviderCredentialState,
+    user_environment: HashMap<String, String>,
 ) -> Result<()> {
     // Access is gated by the Unix-socket filesystem permissions (root-only),
     // not by an application-level preface. The supervisor bridges the
@@ -190,6 +194,7 @@ async fn handle_connection(
         proxy_url,
         ca_file_paths,
         provider_credentials,
+        user_environment,
     );
     russh::server::run_stream(config, stream, handler)
         .await
@@ -217,10 +222,12 @@ struct SshHandler {
     proxy_url: Option<String>,
     ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
     provider_credentials: ProviderCredentialState,
+    user_environment: HashMap<String, String>,
     channels: HashMap<ChannelId, ChannelState>,
 }
 
 impl SshHandler {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         policy: SandboxPolicy,
         workdir: Option<String>,
@@ -228,6 +235,7 @@ impl SshHandler {
         proxy_url: Option<String>,
         ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
         provider_credentials: ProviderCredentialState,
+        user_environment: HashMap<String, String>,
     ) -> Self {
         Self {
             policy,
@@ -236,6 +244,7 @@ impl SshHandler {
             proxy_url,
             ca_file_paths,
             provider_credentials,
+            user_environment,
             channels: HashMap::new(),
         }
     }
@@ -458,6 +467,7 @@ impl russh::server::Handler for SshHandler {
                 self.proxy_url.clone(),
                 self.ca_file_paths.clone(),
                 &self.provider_credentials.snapshot().child_env,
+                &self.user_environment,
             )?;
             let state = self.channels.get_mut(&channel).ok_or_else(|| {
                 anyhow::anyhow!("subsystem_request on unknown channel {channel:?}")
@@ -553,6 +563,7 @@ impl SshHandler {
                 self.proxy_url.clone(),
                 self.ca_file_paths.clone(),
                 &provider_snapshot.child_env,
+                &self.user_environment,
             )?;
             state.pty_master = Some(pty_master);
             state.input_sender = Some(input_sender);
@@ -570,6 +581,7 @@ impl SshHandler {
                 self.proxy_url.clone(),
                 self.ca_file_paths.clone(),
                 &provider_snapshot.child_env,
+                &self.user_environment,
             )?;
             state.input_sender = Some(input_sender);
         }
@@ -668,6 +680,7 @@ fn session_user_and_home(policy: &SandboxPolicy) -> (String, String) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_child_env(
     cmd: &mut Command,
     session_home: &str,
@@ -676,6 +689,7 @@ fn apply_child_env(
     proxy_url: Option<&str>,
     ca_file_paths: Option<&(PathBuf, PathBuf)>,
     provider_env: &HashMap<String, String>,
+    user_environment: &HashMap<String, String>,
 ) {
     let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into());
 
@@ -686,6 +700,10 @@ fn apply_child_env(
         .env("SHELL", "/bin/bash")
         .env("PATH", &path)
         .env("TERM", term);
+
+    for (key, value) in user_environment {
+        cmd.env(key, value);
+    }
 
     if let Some(url) = proxy_url {
         for (key, value) in child_env::proxy_env_vars(url) {
@@ -716,6 +734,7 @@ fn spawn_pty_shell(
     proxy_url: Option<String>,
     ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
     provider_env: &HashMap<String, String>,
+    user_environment: &HashMap<String, String>,
 ) -> anyhow::Result<(std::fs::File, mpsc::Sender<Vec<u8>>)> {
     let winsize = Winsize {
         ws_row: to_u16(pty.row_height.max(1)),
@@ -764,6 +783,7 @@ fn spawn_pty_shell(
         proxy_url.as_deref(),
         ca_file_paths.as_deref(),
         provider_env,
+        user_environment,
     );
     cmd.stdin(stdin).stdout(stdout).stderr(stderr);
 
@@ -879,6 +899,7 @@ fn spawn_pipe_exec(
     proxy_url: Option<String>,
     ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
     provider_env: &HashMap<String, String>,
+    user_environment: &HashMap<String, String>,
 ) -> anyhow::Result<mpsc::Sender<Vec<u8>>> {
     let mut cmd = command.map_or_else(
         || {
@@ -909,6 +930,7 @@ fn spawn_pipe_exec(
         proxy_url.as_deref(),
         ca_file_paths.as_deref(),
         provider_env,
+        user_environment,
     );
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())

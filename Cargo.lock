@@ -3482,6 +3482,7 @@ dependencies = [
  "futures",
  "openshell-core",
  "serde",
+ "serde_json",
  "tar",
  "temp-env",
  "tempfile",
