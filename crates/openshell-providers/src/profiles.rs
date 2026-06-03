@@ -22,6 +22,7 @@ const BUILT_IN_PROFILE_YAMLS: &[&str] = &[
     include_str!("../../../providers/copilot.yaml"),
     include_str!("../../../providers/cursor.yaml"),
     include_str!("../../../providers/github.yaml"),
+    include_str!("../../../providers/microsoft-agent-s2s.yaml"),
     include_str!("../../../providers/google-vertex-ai.yaml"),
     include_str!("../../../providers/nvidia.yaml"),
     include_str!("../../../providers/pypi.yaml"),
@@ -1174,6 +1175,23 @@ mod tests {
             "github profile endpoints should all be read-only"
         );
         assert_eq!(proto.binaries.len(), 4);
+    }
+
+    #[test]
+    fn microsoft_agent_s2s_profile_is_available() {
+        let profile =
+            get_default_profile("microsoft-agent-s2s").expect("microsoft-agent-s2s profile");
+        let proto = profile.to_proto();
+
+        assert_eq!(proto.id, "microsoft-agent-s2s");
+        assert_eq!(proto.category, ProviderProfileCategory::Agent as i32);
+        assert_eq!(proto.credentials.len(), 1);
+        assert_eq!(proto.credentials[0].name, "blueprint_client_secret");
+        assert_eq!(
+            proto.credentials[0].env_vars,
+            vec!["A365_BLUEPRINT_CLIENT_SECRET"]
+        );
+        assert!(proto.endpoints.is_empty());
     }
 
     #[test]

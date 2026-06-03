@@ -21,6 +21,7 @@ mod policy_local;
 mod process;
 pub mod procfs;
 mod provider_credentials;
+mod provider_tokens;
 pub mod proxy;
 mod sandbox;
 mod secrets;
@@ -417,12 +418,9 @@ pub async fn run_sandbox(
             )
         };
 
-    let provider_credentials = provider_credentials::ProviderCredentialState::from_environment(
-        provider_env_revision,
-        provider_env,
-        provider_credential_expires_at_ms,
-    );
-    let provider_env = provider_credentials.snapshot().child_env.clone();
+    let mut provider_env = provider_env;
+    let provider_token_resolver_port =
+        provider_tokens::microsoft_agent_s2s_resolver_port(&provider_env);
 
     // Create identity cache for SHA256 TOFU when OPA is active
     let identity_cache = opa_engine
@@ -560,7 +558,11 @@ pub async fn run_sandbox(
                     .as_ref()
                     .and_then(|p| p.http_addr)
                     .map_or(3128, |addr| addr.port());
-                if let Err(e) = ns.install_bypass_rules(proxy_port) {
+                let provider_token_ports = provider_token_resolver_port
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>();
+                if let Err(e) = ns.install_bypass_rules(proxy_port, &provider_token_ports) {
                     ocsf_emit!(
                         ConfigStateChangeBuilder::new(ocsf_ctx())
                             .severity(SeverityId::Medium)
@@ -590,6 +592,57 @@ pub async fn run_sandbox(
     #[cfg(not(target_os = "linux"))]
     #[allow(clippy::no_effect_underscore_binding)]
     let _netns: Option<()> = None;
+
+    #[cfg(target_os = "linux")]
+    let provider_token_resolver_bind_addr = {
+        let ip = netns.as_ref().map_or(
+            std::net::IpAddr::from([127, 0, 0, 1]),
+            NetworkNamespace::host_ip,
+        );
+        SocketAddr::new(ip, provider_token_resolver_port.unwrap_or(0))
+    };
+
+    #[cfg(not(target_os = "linux"))]
+    let provider_token_resolver_bind_addr =
+        SocketAddr::from(([127, 0, 0, 1], provider_token_resolver_port.unwrap_or(0)));
+
+    let prepared_provider_tokens = if let (Some(endpoint), Some(id)) =
+        (openshell_endpoint.as_deref(), sandbox_id.as_deref())
+    {
+        provider_tokens::prepare_microsoft_agent_s2s(
+            &mut provider_env,
+            provider_token_resolver_bind_addr,
+            endpoint,
+            id,
+        )
+        .await?
+    } else {
+        provider_tokens::strip_microsoft_agent_s2s_inputs(&mut provider_env);
+        provider_tokens::PreparedProviderTokenResolver {
+            environment: std::collections::HashMap::new(),
+            handle: None,
+        }
+    };
+    if !prepared_provider_tokens.environment.is_empty() {
+        ocsf_emit!(
+            ConfigStateChangeBuilder::new(ocsf_ctx())
+                .severity(SeverityId::Informational)
+                .status(StatusId::Success)
+                .state(StateId::Enabled, "enabled")
+                .message("Started microsoft-agent-s2s provider token resolver")
+                .build()
+        );
+    }
+    let provider_runtime_env = prepared_provider_tokens.environment;
+    let _provider_token_resolver = prepared_provider_tokens.handle;
+
+    let provider_credentials = provider_credentials::ProviderCredentialState::from_environment(
+        provider_env_revision,
+        provider_env,
+        provider_credential_expires_at_ms,
+    );
+    let mut provider_env = provider_credentials.snapshot().child_env.clone();
+    provider_env.extend(provider_runtime_env.clone());
 
     // Install the supervisor seccomp prelude after privileged startup helpers
     // (network namespace setup, nftables probes) complete, but before the SSH
@@ -806,6 +859,7 @@ pub async fn run_sandbox(
         let netns_fd = ssh_netns_fd;
         let ca_paths = ca_file_paths.clone();
         let provider_credentials_clone = provider_credentials.clone();
+        let provider_runtime_env_clone = provider_runtime_env.clone();
 
         let (ssh_ready_tx, ssh_ready_rx) = tokio::sync::oneshot::channel();
 
@@ -819,6 +873,7 @@ pub async fn run_sandbox(
                 proxy_url,
                 ca_paths,
                 provider_credentials_clone,
+                provider_runtime_env_clone,
             )
             .await
             {
@@ -983,6 +1038,7 @@ pub async fn run_sandbox(
         let poll_ocsf_enabled = ocsf_enabled.clone();
         let poll_pid = entrypoint_pid.clone();
         let poll_provider_credentials = provider_credentials.clone();
+        let poll_provider_runtime_env = provider_runtime_env.clone();
         let poll_policy_local = policy_local_ctx.clone();
         let poll_interval_secs: u64 = std::env::var("OPENSHELL_POLICY_POLL_INTERVAL_SECS")
             .ok()
@@ -996,6 +1052,7 @@ pub async fn run_sandbox(
             interval_secs: poll_interval_secs,
             ocsf_enabled: poll_ocsf_enabled,
             provider_credentials: poll_provider_credentials,
+            provider_runtime_env: poll_provider_runtime_env,
             policy_local_ctx: Some(poll_policy_local),
         };
 
@@ -2547,6 +2604,7 @@ struct PolicyPollLoopContext {
     interval_secs: u64,
     ocsf_enabled: Arc<std::sync::atomic::AtomicBool>,
     provider_credentials: provider_credentials::ProviderCredentialState,
+    provider_runtime_env: std::collections::HashMap<String, String>,
     policy_local_ctx: Option<Arc<policy_local::PolicyLocalContext>>,
 }
 
@@ -2618,12 +2676,13 @@ async fn run_policy_poll_loop(ctx: PolicyPollLoopContext) -> Result<()> {
 
         if provider_env_changed {
             match grpc_client::fetch_provider_environment(&ctx.endpoint, &ctx.sandbox_id).await {
-                Ok(env_result) => {
+                Ok(mut env_result) => {
+                    provider_tokens::strip_microsoft_agent_s2s_inputs(&mut env_result.environment);
                     let env_count = ctx.provider_credentials.install_environment(
                         env_result.provider_env_revision,
                         env_result.environment,
                         env_result.credential_expires_at_ms,
-                    );
+                    ) + ctx.provider_runtime_env.len();
                     current_provider_env_revision = env_result.provider_env_revision;
                     ocsf_emit!(
                         ConfigStateChangeBuilder::new(ocsf_ctx())

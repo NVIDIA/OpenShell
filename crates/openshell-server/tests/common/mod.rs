@@ -21,7 +21,8 @@ use openshell_core::proto::{
     GetSandboxConfigResponse, GetSandboxProviderEnvironmentRequest,
     GetSandboxProviderEnvironmentResponse, GetSandboxRequest, HealthRequest, HealthResponse,
     IssueSandboxTokenRequest, IssueSandboxTokenResponse, ListProvidersRequest,
-    ListProvidersResponse, ListSandboxesRequest, ListSandboxesResponse, ProviderResponse,
+    ListProvidersResponse, ListSandboxesRequest, ListSandboxesResponse,
+    MintSandboxProviderTokenRequest, MintSandboxProviderTokenResponse, ProviderResponse,
     RefreshSandboxTokenRequest, RefreshSandboxTokenResponse, RelayFrame, RevokeSshSessionRequest,
     RevokeSshSessionResponse, SandboxResponse, SandboxStreamEvent, ServiceStatus,
     SupervisorMessage, TcpForwardFrame, UpdateProviderRequest, WatchSandboxRequest,
@@ -433,6 +434,13 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<RefreshSandboxTokenRequest>,
     ) -> Result<Response<RefreshSandboxTokenResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn mint_sandbox_provider_token(
+        &self,
+        _request: tonic::Request<MintSandboxProviderTokenRequest>,
+    ) -> Result<Response<MintSandboxProviderTokenResponse>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
 

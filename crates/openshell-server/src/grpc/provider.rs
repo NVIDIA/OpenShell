@@ -525,6 +525,32 @@ pub(super) async fn resolve_provider_environment(
                     .or_insert_with(|| region.to_string());
             }
         }
+
+        if provider.r#type.trim() == "microsoft-agent-s2s" {
+            insert_supervisor_env(
+                &mut env,
+                name,
+                "OPENSHELL_MICROSOFT_AGENT_S2S_PROVIDER_NAME",
+                name,
+            );
+            for key in [
+                "AZURE_TENANT_ID",
+                "A365_BLUEPRINT_CLIENT_ID",
+                "A365_BLUEPRINT_CLIENT_SECRET",
+                "A365_RUNTIME_AGENT_ID",
+                "A365_ALLOWED_AUDIENCES",
+                "A365_OBSERVABILITY_RESOURCE",
+                "A365_REQUIRED_ROLES",
+            ] {
+                if let Some(value) = provider
+                    .credentials
+                    .get(key)
+                    .or_else(|| provider.config.get(key))
+                {
+                    insert_supervisor_env(&mut env, name, key, value);
+                }
+            }
+        }
     }
 
     Ok(ProviderEnvironment {
@@ -658,9 +684,28 @@ fn active_provider_credential_keys(provider: &Provider, now_ms: i64) -> Vec<Stri
 }
 
 fn is_non_injectable_provider_credential(provider: &Provider, key: &str) -> bool {
-    openshell_core::inference::normalize_inference_provider_type(&provider.r#type)
+    (openshell_core::inference::normalize_inference_provider_type(&provider.r#type)
         == Some("google-vertex-ai")
-        && key == "GOOGLE_SERVICE_ACCOUNT_KEY"
+        && key == "GOOGLE_SERVICE_ACCOUNT_KEY")
+        || (provider.r#type.trim() == "microsoft-agent-s2s" && key == "A365_BLUEPRINT_CLIENT_SECRET")
+}
+
+fn insert_supervisor_env(
+    env: &mut std::collections::HashMap<String, String>,
+    provider_name: &str,
+    key: &str,
+    value: &str,
+) {
+    if is_valid_env_key(key) {
+        env.entry(key.to_string())
+            .or_insert_with(|| value.to_string());
+    } else {
+        warn!(
+            provider_name = %provider_name,
+            key = %key,
+            "skipping credential with invalid env var key"
+        );
+    }
 }
 
 pub(super) fn is_valid_env_key(key: &str) -> bool {

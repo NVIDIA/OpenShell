@@ -118,6 +118,7 @@ impl ProviderRegistry {
         registry.register(providers::nvidia::SPEC);
         registry.register(providers::gitlab::SPEC);
         registry.register(providers::github::SPEC);
+        registry.register(providers::microsoft_agent_s2s::MicrosoftAgentS2sProvider);
         registry.register(providers::outlook::OutlookProvider);
         registry
     }
@@ -182,6 +183,7 @@ pub fn normalize_provider_type(input: &str) -> Option<&'static str> {
         "generic" => Some("generic"),
         "gitlab" | "glab" => Some("gitlab"),
         "github" | "gh" => Some("github"),
+        "microsoft-agent-s2s" => Some("microsoft-agent-s2s"),
         "outlook" => Some("outlook"),
         _ => None,
     }
@@ -221,6 +223,10 @@ mod tests {
         assert_eq!(
             normalize_provider_type("vertex-ai"),
             Some("google-vertex-ai")
+        );
+        assert_eq!(
+            normalize_provider_type("microsoft-agent-s2s"),
+            Some("microsoft-agent-s2s")
         );
         assert_eq!(normalize_provider_type("unknown"), None);
     }

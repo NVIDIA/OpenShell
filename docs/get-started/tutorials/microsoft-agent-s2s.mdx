@@ -1,0 +1,143 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Broker Microsoft Agent S2S Tokens with Providers v2"
+sidebar-title: "Microsoft Agent S2S Provider"
+slug: "get-started/tutorials/microsoft-agent-s2s"
+description: "Create a microsoft-agent-s2s provider, attach it to a sandbox, and verify that the workload receives a brokered runtime token URL instead of the Microsoft secret."
+keywords: "Generative AI, Cybersecurity, Tutorial, Providers, Microsoft, A365, Agent 365, S2S, Token Broker"
+---
+
+Use Providers v2 to keep Microsoft Agent service-to-service identity material at the gateway while sandboxed workloads request short-lived tokens on demand. Instead of injecting a static bearer token or the blueprint client secret into the sandbox, OpenShell injects a sandbox-local token provider URL and brokers Microsoft tokens for approved audiences at runtime.
+
+After completing this tutorial, you have:
+
+- A `microsoft-agent-s2s` provider instance on your gateway.
+- A sandbox with the provider attached.
+- A concrete example of the runtime contract the workload receives: `A365_TOKEN_PROVIDER_URL`.
+
+<Warning>
+Do not commit Microsoft client secrets, local `.env` files, or emitted bearer tokens. The commands below pass secret material to the gateway; they are not examples of values to store in source control.
+</Warning>
+
+<Steps toc={true}>
+
+## Prerequisites
+
+- A working OpenShell installation with an active gateway. Complete the [Quickstart](/get-started/quickstart) before proceeding.
+- Providers v2 enabled on the active gateway.
+- A Microsoft setup that already provides:
+  - `AZURE_TENANT_ID`
+  - `A365_BLUEPRINT_CLIENT_ID`
+  - `A365_BLUEPRINT_CLIENT_SECRET`
+  - `A365_RUNTIME_AGENT_ID`
+  - `A365_ALLOWED_AUDIENCES`
+
+`A365_ALLOWED_AUDIENCES` is a comma-separated list of downstream audiences that the sandboxed workload may request tokens for.
+
+## Enable Providers v2
+
+Enable provider profile policy composition on the active gateway:
+
+```shell
+openshell settings set --global --key providers_v2_enabled --value true --yes
+```
+
+## Inspect the Built-in Profile
+
+Export the built-in `microsoft-agent-s2s` profile:
+
+```shell
+openshell provider profile export microsoft-agent-s2s -o yaml
+```
+
+The built-in profile intentionally does not include default network policy. It defines the provider type and discovery shape only.
+
+## Create the Provider
+
+Create a provider instance from the Microsoft S2S inputs:
+
+```shell
+openshell provider create \
+  --name microsoft-a365 \
+  --type microsoft-agent-s2s \
+  --credential A365_BLUEPRINT_CLIENT_SECRET="$A365_BLUEPRINT_CLIENT_SECRET" \
+  --config AZURE_TENANT_ID="$AZURE_TENANT_ID" \
+  --config A365_BLUEPRINT_CLIENT_ID="$A365_BLUEPRINT_CLIENT_ID" \
+  --config A365_RUNTIME_AGENT_ID="$A365_RUNTIME_AGENT_ID" \
+  --config A365_ALLOWED_AUDIENCES="$A365_ALLOWED_AUDIENCES"
+```
+
+The provider stores:
+
+- `A365_BLUEPRINT_CLIENT_SECRET` as the secret credential
+- `AZURE_TENANT_ID`, `A365_BLUEPRINT_CLIENT_ID`, `A365_RUNTIME_AGENT_ID`, and `A365_ALLOWED_AUDIENCES` as provider config
+
+Unlike a normal placeholder provider, the sandbox does not receive `A365_BLUEPRINT_CLIENT_SECRET` directly.
+
+## Launch a Sandbox
+
+Launch a simple sandbox with the provider attached:
+
+```shell
+openshell sandbox create \
+  --name microsoft-a365-demo \
+  --keep \
+  --provider microsoft-a365 \
+  --no-auto-providers \
+  -- /bin/sh
+```
+
+This tutorial uses `/bin/sh` so you can inspect the runtime contract directly. Substitute your own A365 workload image or startup command later.
+
+## Verify the Runtime Contract
+
+Inside the sandbox, inspect the injected token broker metadata:
+
+```shell
+env | grep '^A365_TOKEN_PROVIDER_URL\|^OPENSHELL_MICROSOFT_AGENT_S2S'
+```
+
+You should see a local token provider URL and related metadata, for example:
+
+```text
+A365_TOKEN_PROVIDER_URL=http://<sandbox-local-resolver>/v1/microsoft-agent-s2s/token/<provider-id>
+OPENSHELL_MICROSOFT_AGENT_S2S_TOKEN_PROVIDER_URL=http://<sandbox-local-resolver>/v1/microsoft-agent-s2s/token/<provider-id>
+OPENSHELL_MICROSOFT_AGENT_S2S_TOKEN_URL=http://<sandbox-local-resolver>/v1/microsoft-agent-s2s/token/<provider-id>
+OPENSHELL_MICROSOFT_AGENT_S2S_DEFAULT_AUDIENCE=<audience>
+```
+
+The important difference from placeholder providers is that the sandbox receives a token URL rather than the blueprint client secret.
+
+## Request a Token from the Local Broker
+
+If your workload knows the audience it wants, it can call the broker URL directly. For example, from inside the sandbox:
+
+```shell
+curl -sS "${A365_TOKEN_PROVIDER_URL}?audience=${OPENSHELL_MICROSOFT_AGENT_S2S_DEFAULT_AUDIENCE}"
+```
+
+The exact response shape depends on the workload-side adapter, but the flow is always the same:
+
+1. the workload calls the sandbox-local token URL
+2. the gateway checks that the sandbox has the provider attached
+3. the gateway verifies that the requested audience is allowed
+4. the gateway returns a short-lived Microsoft bearer token
+
+OpenShell keeps the blueprint secret and the Microsoft token exchange at the gateway boundary.
+
+## Use the Contract from a Workload
+
+Workloads that already support a token callback can consume the broker directly. For example, the NAT/A365 integration we validated uses this shape:
+
+```yaml
+authentication:
+  a365_auth:
+    _type: openshell_bearer_token
+    token_url: ${A365_TOKEN_PROVIDER_URL}
+    audience: "<audience>"
+```
+
+A non-NAT Microsoft agent can use the same OpenShell provider as long as it can request tokens from a callback or token-provider URL instead of requiring a static bearer token or direct access to the Microsoft secret material.
+
+</Steps>
