@@ -25,10 +25,14 @@ use openshell_core::proto::{
     RefreshSandboxTokenRequest, RefreshSandboxTokenResponse, RelayFrame, RevokeSshSessionRequest,
     RevokeSshSessionResponse, SandboxResponse, SandboxStreamEvent, ServiceStatus,
     SupervisorMessage, TcpForwardFrame, UpdateProviderRequest, WatchSandboxRequest,
+    open_shell_client::OpenShellClient,
     open_shell_server::{OpenShell, OpenShellServer},
 };
 use openshell_server::{MultiplexedService, Store, TlsAcceptor, health_router};
 use rcgen::{CertificateParams, IsCa, KeyPair};
+use rustls::RootCertStore;
+use rustls::pki_types::CertificateDer;
+use rustls_pemfile::certs;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -36,6 +40,7 @@ use tempfile::tempdir;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use tonic::{Response, Status};
 
 // ---------------------------------------------------------------------------
@@ -619,4 +624,38 @@ pub async fn test_health_store() -> Arc<Store> {
             .await
             .expect("connect in-memory sqlite store for tests"),
     )
+}
+
+/// Parse PEM cert bytes into a `RootCertStore`.
+pub fn build_tls_root(cert_pem: &[u8]) -> RootCertStore {
+    let mut roots = RootCertStore::empty();
+    let mut cursor = std::io::Cursor::new(cert_pem);
+    let parsed = certs(&mut cursor)
+        .collect::<Result<Vec<CertificateDer<'static>>, _>>()
+        .expect("failed to parse cert pem");
+    for cert in parsed {
+        roots.add(cert).expect("failed to add cert");
+    }
+    roots
+}
+
+/// Build a gRPC client with mTLS (CA + client cert).
+pub async fn grpc_client_mtls(
+    addr: SocketAddr,
+    ca_pem: Vec<u8>,
+    client_cert_pem: Vec<u8>,
+    client_key_pem: Vec<u8>,
+) -> OpenShellClient<Channel> {
+    let ca_cert = tonic::transport::Certificate::from_pem(ca_pem);
+    let identity = tonic::transport::Identity::from_pem(client_cert_pem, client_key_pem);
+    let tls = ClientTlsConfig::new()
+        .ca_certificate(ca_cert)
+        .identity(identity)
+        .domain_name("localhost");
+    let endpoint = Endpoint::from_shared(format!("https://localhost:{}", addr.port()))
+        .expect("invalid endpoint")
+        .tls_config(tls)
+        .expect("failed to set tls");
+    let channel = endpoint.connect().await.expect("failed to connect");
+    OpenShellClient::new(channel)
 }

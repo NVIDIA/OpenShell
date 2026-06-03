@@ -934,9 +934,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     async fn test_store() -> Store {
-        Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .expect("in-memory SQLite store should connect")
+        crate::persistence::test_store().await
     }
 
     fn test_user_principal() -> Principal {

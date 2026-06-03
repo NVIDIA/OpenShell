@@ -823,11 +823,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn test_store() -> Arc<Store> {
-        Arc::new(
-            Store::connect("sqlite::memory:?cache=shared")
-                .await
-                .expect("in-memory SQLite store should connect"),
-        )
+        Arc::new(crate::persistence::test_store().await)
     }
 
     /// Returns a shutdown sender with its receiver immediately dropped. Tests

@@ -39,7 +39,7 @@ pub(super) async fn handle_expose_service(
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
 
-    let now = super::current_time_ms();
+    let now = crate::persistence::current_time_ms();
     let key = service_routing::endpoint_key(&req.sandbox, &req.service);
 
     // Fetch existing endpoint to determine create vs. update path

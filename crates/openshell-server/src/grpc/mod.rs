@@ -153,10 +153,6 @@ enum StoredSettingValue {
 // Utility
 // ---------------------------------------------------------------------------
 
-fn current_time_ms() -> i64 {
-    openshell_core::time::now_ms()
-}
-
 /// Validate that object metadata is present and contains required fields.
 ///
 /// This is a crate-level helper that wraps the validation module's implementation.

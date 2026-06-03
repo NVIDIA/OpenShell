@@ -1604,12 +1604,7 @@ mod tests {
     use super::*;
     use crate::grpc::MAX_MAP_KEY_LEN;
     use crate::grpc::test_support::test_server_state;
-
-    async fn test_store() -> Store {
-        Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .expect("in-memory SQLite store should connect")
-    }
+    use crate::persistence::test_store;
     use openshell_core::proto::{
         DeleteProviderProfileRequest, GetProviderProfileRequest, ImportProviderProfilesRequest,
         L7Allow, L7Rule, LintProviderProfilesRequest, ListProviderProfilesRequest, NetworkBinary,

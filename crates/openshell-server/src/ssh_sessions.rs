@@ -84,9 +84,7 @@ mod tests {
     use std::collections::HashMap;
 
     async fn test_store() -> Store {
-        Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .expect("in-memory SQLite store should connect")
+        crate::persistence::test_store().await
     }
 
     fn make_session(id: &str, sandbox_id: &str, expires_at_ms: i64, revoked: bool) -> SshSession {

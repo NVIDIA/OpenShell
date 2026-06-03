@@ -5,7 +5,8 @@ mod common;
 
 use bytes::Bytes;
 use common::{
-    PkiBundle, generate_pki, generate_rogue_pki, install_rustls_provider, start_test_server,
+    PkiBundle, build_tls_root, generate_pki, generate_rogue_pki, grpc_client_mtls,
+    install_rustls_provider, start_test_server,
 };
 use http_body_util::Empty;
 use hyper::Request;
@@ -13,43 +14,9 @@ use hyper::StatusCode;
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use openshell_core::proto::{HealthRequest, ServiceStatus, open_shell_client::OpenShellClient};
-use rustls::RootCertStore;
 use rustls::pki_types::CertificateDer;
 use rustls_pemfile::certs;
-use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
-
-fn build_tls_root(cert_pem: &[u8]) -> RootCertStore {
-    let mut roots = RootCertStore::empty();
-    let mut cursor = std::io::Cursor::new(cert_pem);
-    let parsed = certs(&mut cursor)
-        .collect::<Result<Vec<CertificateDer<'static>>, _>>()
-        .expect("failed to parse cert pem");
-    for cert in parsed {
-        roots.add(cert).expect("failed to add cert");
-    }
-    roots
-}
-
-/// Build a gRPC client with mTLS (CA + client cert).
-async fn grpc_client_mtls(
-    addr: std::net::SocketAddr,
-    ca_pem: Vec<u8>,
-    client_cert_pem: Vec<u8>,
-    client_key_pem: Vec<u8>,
-) -> OpenShellClient<Channel> {
-    let ca_cert = tonic::transport::Certificate::from_pem(ca_pem);
-    let identity = tonic::transport::Identity::from_pem(client_cert_pem, client_key_pem);
-    let tls = ClientTlsConfig::new()
-        .ca_certificate(ca_cert)
-        .identity(identity)
-        .domain_name("localhost");
-    let endpoint = Endpoint::from_shared(format!("https://localhost:{}", addr.port()))
-        .expect("invalid endpoint")
-        .tls_config(tls)
-        .expect("failed to set tls");
-    let channel = endpoint.connect().await.expect("failed to connect");
-    OpenShellClient::new(channel)
-}
+use tonic::transport::{ClientTlsConfig, Endpoint};
 
 /// Build an HTTPS client with mTLS (CA trust + client cert/key).
 fn https_client_mtls(

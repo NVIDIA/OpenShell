@@ -72,7 +72,8 @@ use tracing::{debug, info, warn};
 use super::validation::{
     level_matches, source_matches, validate_policy_safety, validate_static_fields_unchanged,
 };
-use super::{MAX_PAGE_SIZE, StoredSettingValue, StoredSettings, clamp_limit, current_time_ms};
+use super::{MAX_PAGE_SIZE, StoredSettingValue, StoredSettings, clamp_limit};
+use crate::persistence::current_time_ms;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -3853,15 +3854,10 @@ mod tests {
         Principal, SandboxIdentitySource, SandboxPrincipal, UserPrincipal,
     };
     use crate::grpc::test_support::test_server_state;
+    use crate::persistence::test_store;
     use std::collections::HashMap;
     use std::sync::Arc;
     use tonic::Code;
-
-    async fn test_store() -> Store {
-        Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .expect("in-memory SQLite store should connect")
-    }
 
     /// Wrap a request with a user `Principal` so handler scope guards treat
     /// the test caller as a CLI user. Most handler tests exercise

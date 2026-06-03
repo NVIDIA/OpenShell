@@ -49,7 +49,8 @@ use super::validation::{
     level_matches, source_matches, validate_exec_request_fields, validate_policy_safety,
     validate_sandbox_spec,
 };
-use super::{MAX_PAGE_SIZE, MAX_PROVIDERS, clamp_limit, current_time_ms};
+use super::{MAX_PAGE_SIZE, MAX_PROVIDERS, clamp_limit};
+use crate::persistence::current_time_ms;
 
 const TCP_FORWARD_CHUNK_SIZE: usize = 64 * 1024;
 
@@ -117,8 +118,6 @@ async fn handle_create_sandbox_inner(
     state: &Arc<ServerState>,
     request: Request<CreateSandboxRequest>,
 ) -> Result<Response<SandboxResponse>, Status> {
-    use crate::persistence::current_time_ms;
-
     let request = request.into_inner();
     let spec = request
         .spec

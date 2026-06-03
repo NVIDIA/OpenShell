@@ -1,16 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{ObjectType, PersistenceError, Store, generate_name};
+use super::{ObjectType, PersistenceError, Store, generate_name, test_store};
 use crate::policy_store::PolicyStoreExt;
 use openshell_core::proto::{ObjectForTest, SandboxPolicy};
 use prost::Message;
-
-async fn test_store() -> Store {
-    Store::connect("sqlite::memory:?cache=shared")
-        .await
-        .expect("in-memory SQLite store should connect")
-}
 
 #[tokio::test]
 async fn sqlite_put_get_round_trip() {
