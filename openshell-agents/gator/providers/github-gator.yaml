@@ -1,0 +1,67 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+id: github-gator
+display_name: GitHub Gator
+description: Repo-scoped GitHub access for the OpenShell gator gate agent
+category: source_control
+credentials:
+  - name: GITHUB_TOKEN
+    description: GitHub token used by the gator gate agent
+    env_vars: [GITHUB_TOKEN, GH_TOKEN]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [GITHUB_TOKEN]
+endpoints:
+  - host: api.github.com
+    port: 443
+    protocol: rest
+    enforcement: enforce
+    rules:
+      - allow: { method: GET, path: /repos/NVIDIA/OpenShell }
+      - allow: { method: GET, path: /repos/NVIDIA/OpenShell/** }
+      - allow: { method: POST, path: /repos/NVIDIA/OpenShell/issues/*/comments }
+      - allow: { method: PATCH, path: /repos/NVIDIA/OpenShell/issues/comments/* }
+      - allow: { method: POST, path: /repos/NVIDIA/OpenShell/issues/*/labels }
+      - allow: { method: PUT, path: /repos/NVIDIA/OpenShell/issues/*/labels }
+      - allow: { method: DELETE, path: /repos/NVIDIA/OpenShell/issues/*/labels/* }
+      - allow: { method: PATCH, path: /repos/NVIDIA/OpenShell/issues/* }
+      - allow: { method: POST, path: /repos/NVIDIA/OpenShell/labels }
+      - allow: { method: PATCH, path: /repos/NVIDIA/OpenShell/labels/* }
+      - allow: { method: POST, path: /repos/NVIDIA/OpenShell/pulls/*/reviews }
+      - allow: { method: POST, path: /repos/NVIDIA/OpenShell/pulls/*/reviews/*/comments }
+      - allow: { method: POST, path: /repos/NVIDIA/OpenShell/statuses/* }
+      - allow: { method: GET, path: /repos/NVIDIA/OpenShell-Community }
+      - allow: { method: GET, path: /repos/NVIDIA/OpenShell-Community/** }
+      - allow: { method: POST, path: /repos/NVIDIA/OpenShell-Community/issues/*/comments }
+      - allow: { method: PATCH, path: /repos/NVIDIA/OpenShell-Community/issues/comments/* }
+      - allow: { method: POST, path: /repos/NVIDIA/OpenShell-Community/issues/*/labels }
+      - allow: { method: PUT, path: /repos/NVIDIA/OpenShell-Community/issues/*/labels }
+      - allow: { method: DELETE, path: /repos/NVIDIA/OpenShell-Community/issues/*/labels/* }
+      - allow: { method: PATCH, path: /repos/NVIDIA/OpenShell-Community/issues/* }
+      - allow: { method: POST, path: /repos/NVIDIA/OpenShell-Community/labels }
+      - allow: { method: PATCH, path: /repos/NVIDIA/OpenShell-Community/labels/* }
+      - allow: { method: POST, path: /repos/NVIDIA/OpenShell-Community/pulls/*/reviews }
+      - allow: { method: POST, path: /repos/NVIDIA/OpenShell-Community/pulls/*/reviews/*/comments }
+      - allow: { method: POST, path: /repos/NVIDIA/OpenShell-Community/statuses/* }
+  - host: github.com
+    port: 443
+    protocol: rest
+    enforcement: enforce
+    rules:
+      - allow: { method: GET, path: /NVIDIA/OpenShell }
+      - allow: { method: GET, path: /NVIDIA/OpenShell/** }
+      - allow: { method: POST, path: /NVIDIA/OpenShell/**/git-upload-pack }
+      - allow: { method: GET, path: /NVIDIA/OpenShell-Community }
+      - allow: { method: GET, path: /NVIDIA/OpenShell-Community/** }
+      - allow: { method: POST, path: /NVIDIA/OpenShell-Community/**/git-upload-pack }
+binaries:
+  - /usr/bin/gh
+  - /usr/local/bin/gh
+  - /usr/bin/git
+  - /usr/local/bin/git
+  - /usr/bin/codex
+  - /usr/local/bin/codex
+  - /usr/lib/node_modules/@openai/**
