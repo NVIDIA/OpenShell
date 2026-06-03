@@ -21,8 +21,6 @@ impl TelemetryState {
 
     pub fn sandbox_session_disconnected(&self, _sandbox_id: &str) {}
 
-    pub fn end_sandbox_session(&self, _sandbox_id: &str) {}
-
     pub fn record_network_activity(&self, sandbox_id: &str, summary: &NetworkActivitySummary) {
         if sandbox_id.is_empty() || !openshell_core::telemetry::enabled() {
             return;
@@ -99,6 +97,5 @@ mod tests {
         let telemetry = TelemetryState::new();
         telemetry.sandbox_session_connected("sb-1");
         telemetry.sandbox_session_disconnected("sb-1");
-        telemetry.end_sandbox_session("sb-1");
     }
 }

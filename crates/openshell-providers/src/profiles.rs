@@ -19,6 +19,7 @@ use std::sync::OnceLock;
 const BUILT_IN_PROFILE_YAMLS: &[&str] = &[
     include_str!("../../../providers/claude-code.yaml"),
     include_str!("../../../providers/github.yaml"),
+    include_str!("../../../providers/google-vertex-ai.yaml"),
     include_str!("../../../providers/nvidia.yaml"),
     include_str!("../../../providers/okta-obo.yaml"),
     include_str!("../../../providers/okta-xaa.yaml"),
@@ -309,6 +310,25 @@ impl ProviderTypeProfile {
         vars
     }
 
+    /// Whether this profile can be created without an initial access token because
+    /// the gateway can mint at least one credential immediately from refresh
+    /// material, and no required credential falls outside that gateway-mintable set.
+    #[must_use]
+    pub fn allows_gateway_refresh_bootstrap(&self) -> bool {
+        let mut has_gateway_mintable_credential = false;
+        for credential in &self.credentials {
+            let is_gateway_mintable = credential
+                .refresh
+                .as_ref()
+                .is_some_and(CredentialRefreshProfile::is_gateway_mintable);
+            if credential.required && !is_gateway_mintable {
+                return false;
+            }
+            has_gateway_mintable_credential |= is_gateway_mintable;
+        }
+        has_gateway_mintable_credential
+    }
+
     #[must_use]
     pub fn to_proto(&self) -> ProviderProfile {
         ProviderProfile {
@@ -345,6 +365,20 @@ impl ProviderTypeProfile {
             endpoints: self.endpoints.iter().map(endpoint_to_proto).collect(),
             binaries: self.binaries.iter().map(binary_to_proto).collect(),
         }
+    }
+}
+
+impl CredentialRefreshProfile {
+    #[must_use]
+    pub fn is_gateway_mintable(&self) -> bool {
+        matches!(
+            self.strategy,
+            ProviderCredentialRefreshStrategy::Oauth2RefreshToken
+                | ProviderCredentialRefreshStrategy::Oauth2ClientCredentials
+                | ProviderCredentialRefreshStrategy::Oauth2TokenExchange
+                | ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt
+                | ProviderCredentialRefreshStrategy::OktaXaa
+        )
     }
 }
 
@@ -602,6 +636,7 @@ fn endpoint_to_proto(endpoint: &EndpointProfile) -> NetworkEndpoint {
             .collect(),
         graphql_max_body_bytes: endpoint.graphql_max_body_bytes,
         path: endpoint.path.clone(),
+        advisor_proposed: false,
     }
 }
 

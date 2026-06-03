@@ -974,25 +974,49 @@ pub async fn gateway_add(
         eprintln!("  {} oidc", "Auth:".dimmed());
         eprintln!();
 
-        match crate::oidc_auth::oidc_browser_auth_flow(
-            issuer,
-            oidc_client_id,
-            oidc_audience,
-            oidc_scopes,
-            gateway_insecure,
-        )
-        .await
-        {
-            Ok(bundle) => {
-                openshell_bootstrap::oidc_token::store_oidc_token(name, &bundle)?;
-                eprintln!("{} Authenticated successfully", "✓".green().bold());
+        // Check for client_credentials env var (CI mode).
+        if std::env::var("OPENSHELL_OIDC_CLIENT_SECRET").is_ok() {
+            match crate::oidc_auth::oidc_client_credentials_flow(
+                issuer,
+                oidc_client_id,
+                oidc_audience,
+                oidc_scopes,
+                gateway_insecure,
+            )
+            .await
+            {
+                Ok(bundle) => {
+                    openshell_bootstrap::oidc_token::store_oidc_token(name, &bundle)?;
+                    eprintln!(
+                        "{} Authenticated via client credentials",
+                        "✓".green().bold()
+                    );
+                }
+                Err(e) => {
+                    eprintln!("{} Authentication failed: {e}", "!".yellow());
+                }
             }
-            Err(e) => {
-                eprintln!("{} Authentication skipped: {e}", "!".yellow());
-                eprintln!(
-                    "  Authenticate later with: {}",
-                    "openshell gateway login".dimmed(),
-                );
+        } else {
+            match crate::oidc_auth::oidc_browser_auth_flow(
+                issuer,
+                oidc_client_id,
+                oidc_audience,
+                oidc_scopes,
+                gateway_insecure,
+            )
+            .await
+            {
+                Ok(bundle) => {
+                    openshell_bootstrap::oidc_token::store_oidc_token(name, &bundle)?;
+                    eprintln!("{} Authenticated successfully", "✓".green().bold());
+                }
+                Err(e) => {
+                    eprintln!("{} Authentication skipped: {e}", "!".yellow());
+                    eprintln!(
+                        "  Authenticate later with: {}",
+                        "openshell gateway login".dimmed(),
+                    );
+                }
             }
         }
 
@@ -1177,14 +1201,25 @@ pub async fn gateway_login(name: &str, gateway_insecure: bool) -> Result<()> {
             let audience = metadata.oidc_audience.as_deref();
             let scopes = metadata.oidc_scopes.as_deref();
 
-            let bundle = crate::oidc_auth::oidc_browser_auth_flow(
-                issuer,
-                client_id,
-                audience,
-                scopes,
-                gateway_insecure,
-            )
-            .await?;
+            let bundle = if std::env::var("OPENSHELL_OIDC_CLIENT_SECRET").is_ok() {
+                crate::oidc_auth::oidc_client_credentials_flow(
+                    issuer,
+                    client_id,
+                    audience,
+                    scopes,
+                    gateway_insecure,
+                )
+                .await?
+            } else {
+                crate::oidc_auth::oidc_browser_auth_flow(
+                    issuer,
+                    client_id,
+                    audience,
+                    scopes,
+                    gateway_insecure,
+                )
+                .await?
+            };
 
             let username = jwt_preferred_username(&bundle.access_token);
             openshell_bootstrap::oidc_token::store_oidc_token(name, &bundle)?;
