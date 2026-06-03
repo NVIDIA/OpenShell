@@ -253,7 +253,8 @@ message IssueSandboxTokenRequest {}
 message IssueSandboxTokenResponse {
   // Gateway-minted JWT bound to the calling sandbox's UUID.
   string token = 1;
-  // Absolute expiry of the issued token, milliseconds since the epoch.
+  // Absolute expiry of the issued token, milliseconds since the epoch. 0 means
+  // the token is non-expiring.
   int64 expires_at_ms = 2;
 }
 
@@ -267,7 +268,8 @@ message RefreshSandboxTokenRequest {}
 message RefreshSandboxTokenResponse {
   // Fresh gateway-minted JWT bound to the same sandbox UUID.
   string token = 1;
-  // Absolute expiry of the new token, milliseconds since the epoch.
+  // Absolute expiry of the new token, milliseconds since the epoch. 0 means
+  // the token is non-expiring.
   int64 expires_at_ms = 2;
 }
 

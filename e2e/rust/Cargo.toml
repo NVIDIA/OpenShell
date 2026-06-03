@@ -47,6 +47,11 @@ path = "tests/gateway_resume.rs"
 required-features = ["e2e-docker"]
 
 [[test]]
+name = "local_driver_token_restart"
+path = "tests/local_driver_token_restart.rs"
+required-features = ["e2e"]
+
+[[test]]
 name = "podman_gateway_resume"
 path = "tests/podman_gateway_resume.rs"
 required-features = ["e2e-podman"]
@@ -97,6 +102,7 @@ bytes = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+prost = "0.13"
 tokio = { version = "1.43", features = ["full"] }
 tempfile = "3"
 sha1 = "0.10"

@@ -389,7 +389,7 @@ async fn refresh_token_loop(
 /// Compute the next refresh delay: 80 % of the time remaining until the
 /// current token's `exp`, plus up to 10 % jitter, with a small lower bound
 /// for already-expired tokens and capped at 12 h. If the token can't be parsed
-/// (legacy/non-JWT bearer)
+/// (legacy/non-JWT bearer) or carries the `exp = 0` non-expiring sentinel,
 /// default to 6 h.
 fn compute_refresh_delay(slot: &TokenSlot) -> Duration {
     let token = slot
@@ -404,11 +404,16 @@ fn compute_refresh_delay(slot: &TokenSlot) -> Duration {
             .map_or(0, |d| d.as_millis()),
     )
     .unwrap_or(i64::MAX);
-    let remaining_ms = parse_jwt_exp_ms(bearer).map_or(21_600_000, |exp| exp - now_ms); // 6 h fallback
-    let mut delay_ms = if remaining_ms <= 0 {
-        1_000
-    } else {
-        (remaining_ms * 8 / 10).clamp(1_000, 43_200_000)
+    let mut delay_ms = match parse_jwt_exp_ms(bearer) {
+        Some(0) | None => 21_600_000,
+        Some(exp) => {
+            let remaining_ms = exp - now_ms;
+            if remaining_ms <= 0 {
+                1_000
+            } else {
+                (remaining_ms * 8 / 10).clamp(1_000, 43_200_000)
+            }
+        }
     };
     // Up to 10 % jitter, derived deterministically from token bytes so
     // unit tests are reproducible without injecting an RNG.
@@ -492,6 +497,20 @@ mod auth_tests {
         let slot: TokenSlot = Arc::new(RwLock::new(bearer));
         let delay = compute_refresh_delay(&slot);
         assert!((1..60).contains(&delay.as_secs()));
+    }
+
+    #[test]
+    fn compute_refresh_delay_treats_exp_zero_as_non_expiring() {
+        use base64::Engine as _;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"exp":0}"#);
+        let token = format!("h.{payload}.s");
+        let bearer = AsciiMetadataValue::try_from(format!("Bearer {token}")).unwrap();
+        let slot: TokenSlot = Arc::new(RwLock::new(bearer));
+        let delay = compute_refresh_delay(&slot);
+        assert!(
+            (6 * 60 * 60..=7 * 60 * 60).contains(&delay.as_secs()),
+            "non-expiring tokens should use the fallback refresh delay, got {delay:?}"
+        );
     }
 
     #[test]

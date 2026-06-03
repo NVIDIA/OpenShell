@@ -31,6 +31,7 @@ use tracing::{debug, warn};
 /// reuse the same subject namespace without breaking handler equality
 /// checks.
 const SPIFFE_SUBJECT_PREFIX: &str = "spiffe://openshell/sandbox/";
+const SANDBOX_JWT_EXP_LEEWAY_SECS: i64 = 60;
 
 /// JWT claim set serialized in every gateway-minted sandbox token.
 #[derive(Debug, Serialize, Deserialize)]
@@ -100,7 +101,11 @@ impl SandboxJwtIssuer {
     #[allow(clippy::result_large_err)] // `tonic::Status` is the natural error here
     pub fn mint(&self, sandbox_id: &str) -> Result<MintedToken, Status> {
         let now = now_secs();
-        let exp = now + i64::try_from(self.ttl.as_secs()).unwrap_or(3_600);
+        let exp = if self.ttl.is_zero() {
+            0
+        } else {
+            now.saturating_add(i64::try_from(self.ttl.as_secs()).unwrap_or(3_600))
+        };
         let claims = SandboxJwtClaims {
             sub: format!("{SPIFFE_SUBJECT_PREFIX}{sandbox_id}"),
             iss: self.issuer.clone(),
@@ -178,6 +183,7 @@ impl SandboxJwtAuthenticator {
         validation.set_issuer(&[&self.issuer]);
         validation.set_audience(&[&self.audience]);
         validation.set_required_spec_claims(&["iss", "aud", "exp", "sub"]);
+        validation.validate_exp = false;
 
         let data =
             decode::<SandboxJwtClaims>(token, &self.decoding_key, &validation).map_err(|e| {
@@ -186,6 +192,7 @@ impl SandboxJwtAuthenticator {
             })?;
 
         let claims = data.claims;
+        validate_exp(claims.exp)?;
         Ok(Some(Principal::Sandbox(SandboxPrincipal {
             sandbox_id: claims.sandbox_id,
             source: SandboxIdentitySource::BootstrapJwt { issuer: claims.iss },
@@ -212,6 +219,20 @@ impl Authenticator for SandboxJwtAuthenticator {
     }
 }
 
+#[allow(clippy::result_large_err)]
+fn validate_exp(exp: i64) -> Result<(), Status> {
+    if exp == 0 {
+        return Ok(());
+    }
+
+    if exp < now_secs().saturating_sub(SANDBOX_JWT_EXP_LEEWAY_SECS) {
+        debug!("sandbox JWT expired");
+        return Err(Status::unauthenticated("invalid token: ExpiredSignature"));
+    }
+
+    Ok(())
+}
+
 fn now_secs() -> i64 {
     i64::try_from(
         SystemTime::now()
@@ -236,12 +257,16 @@ mod tests {
     }
 
     fn pair() -> (SandboxJwtIssuer, SandboxJwtAuthenticator) {
+        pair_with_ttl(Duration::from_secs(3600))
+    }
+
+    fn pair_with_ttl(ttl: Duration) -> (SandboxJwtIssuer, SandboxJwtAuthenticator) {
         let mat = generate_jwt_key().expect("jwt key");
         let issuer = SandboxJwtIssuer::from_pem(
             mat.signing_key_pem.as_bytes(),
             mat.kid.clone(),
             "test-gateway",
-            Duration::from_secs(3600),
+            ttl,
         )
         .unwrap();
         let auth = SandboxJwtAuthenticator::from_pem(
@@ -274,6 +299,30 @@ mod tests {
             }
             _ => panic!("expected Sandbox principal"),
         }
+    }
+
+    #[tokio::test]
+    async fn ttl_zero_mints_non_expiring_token() {
+        let (issuer, auth) = pair_with_ttl(Duration::ZERO);
+        let minted = issuer.mint("sandbox-never").unwrap();
+        assert_eq!(minted.expires_at_ms, 0);
+
+        let principal = auth
+            .authenticate(&header_map_with_bearer(&minted.token), "/anything")
+            .await
+            .unwrap()
+            .expect("exp=0 token should authenticate");
+        assert!(matches!(principal, Principal::Sandbox(_)));
+
+        let mut validation = Validation::new(Algorithm::EdDSA);
+        validation.algorithms = vec![Algorithm::EdDSA];
+        validation.set_issuer(&["openshell-gateway:test-gateway"]);
+        validation.set_audience(&["openshell-gateway:test-gateway"]);
+        validation.set_required_spec_claims(&["iss", "aud", "exp", "sub"]);
+        validation.validate_exp = false;
+        let decoded = decode::<SandboxJwtClaims>(&minted.token, &auth.decoding_key, &validation)
+            .expect("token should decode");
+        assert_eq!(decoded.claims.exp, 0);
     }
 
     #[tokio::test]

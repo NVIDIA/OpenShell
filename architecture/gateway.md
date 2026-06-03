@@ -60,8 +60,11 @@ checks the returned pod binding against the live pod UID, and verifies the pod's
 controlling `Sandbox` ownerReference against the live Sandbox CR UID and
 sandbox-id label before minting the gateway JWT. Supervisors renew gateway JWTs
 in memory before expiry only while the sandbox record still exists. Older tokens
-are not server-revoked; deployments bound replay exposure with short
-`gateway_jwt.ttl_secs` lifetimes.
+are not server-revoked; shared deployments bound replay exposure with short
+`gateway_jwt.ttl_secs` lifetimes. The config default is
+`gateway_jwt.ttl_secs = 0` for local single-player Docker, Podman, and VM
+gateways; those tokens carry `exp = 0` and do not expire. Kubernetes and other
+shared deployments should set a positive TTL.
 
 Gateway JWT signing-key rotation is currently an offline operator action. The
 runtime loads one active signing key and one matching public verification key

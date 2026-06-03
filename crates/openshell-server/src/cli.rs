@@ -618,6 +618,13 @@ fn effective_single_driver(args: &RunArgs) -> Option<ComputeDriverKind> {
     }
 }
 
+fn is_singleplayer_driver(args: &RunArgs) -> bool {
+    matches!(
+        effective_single_driver(args),
+        Some(ComputeDriverKind::Docker | ComputeDriverKind::Podman | ComputeDriverKind::Vm)
+    )
+}
+
 fn resolve_mtls_auth_enabled(
     args: &RunArgs,
     matches: &ArgMatches,
@@ -634,10 +641,7 @@ fn resolve_mtls_auth_enabled(
         return false;
     }
 
-    matches!(
-        effective_single_driver(args),
-        Some(ComputeDriverKind::Docker | ComputeDriverKind::Podman | ComputeDriverKind::Vm)
-    )
+    is_singleplayer_driver(args)
 }
 
 /// Build [`VmComputeConfig`] from the `[openshell.drivers.vm]` table
@@ -1374,6 +1378,41 @@ ssh_session_ttl_secs = 1234
 ",
         );
         assert_eq!(file.openshell.gateway.ssh_session_ttl_secs, Some(1234));
+    }
+
+    #[test]
+    fn singleplayer_driver_matches_only_one_local_driver() {
+        for driver in ["docker", "podman", "vm"] {
+            let (args, _) = parse_with_args(&[
+                "openshell-gateway",
+                "--db-url",
+                "sqlite::memory:",
+                "--drivers",
+                driver,
+            ]);
+            assert!(
+                super::is_singleplayer_driver(&args),
+                "{driver} should be singleplayer"
+            );
+        }
+
+        let (k8s, _) = parse_with_args(&[
+            "openshell-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--drivers",
+            "kubernetes",
+        ]);
+        assert!(!super::is_singleplayer_driver(&k8s));
+
+        let (multi, _) = parse_with_args(&[
+            "openshell-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--drivers",
+            "docker,podman",
+        ]);
+        assert!(!super::is_singleplayer_driver(&multi));
     }
 
     #[test]

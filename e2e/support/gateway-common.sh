@@ -65,6 +65,10 @@ e2e_preserve_mise_dirs() {
       *) export MISE_CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/mise" ;;
     esac
   fi
+
+  if [ -z "${MISE_STATE_DIR:-}" ]; then
+    export MISE_STATE_DIR="${XDG_STATE_HOME:-${HOME}/.local/state}/mise"
+  fi
 }
 
 e2e_align_docker_host_with_cli_context() {
@@ -153,7 +157,9 @@ e2e_write_gateway_jwt_config() {
   printf 'public_key_path = %s\n'  "$(e2e_toml_string "${jwt_dir}/public.pem")"
   printf 'kid_path = %s\n'         "$(e2e_toml_string "${jwt_dir}/kid")"
   printf 'gateway_id = %s\n'       "$(e2e_toml_string "${gateway_id}")"
-  printf 'ttl_secs = 3600\n\n'
+  # Local Docker/Podman e2e gateways exercise the single-player default:
+  # sandbox JWTs identify the supervisor and do not expire.
+  printf 'ttl_secs = 0\n\n'
 }
 
 e2e_write_gateway_mtls_auth_config() {

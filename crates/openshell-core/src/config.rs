@@ -504,7 +504,8 @@ pub struct GatewayJwtConfig {
     /// hostname-or-`openshell` placeholder if unset.
     #[serde(default = "default_gateway_id")]
     pub gateway_id: String,
-    /// Token lifetime in seconds. Defaults to 1 hour.
+    /// Token lifetime in seconds. A value of 0 disables expiration and is
+    /// intended only for local single-player deployments.
     #[serde(default = "default_sandbox_token_ttl_secs")]
     pub ttl_secs: u64,
 }
@@ -514,7 +515,7 @@ fn default_gateway_id() -> String {
 }
 
 const fn default_sandbox_token_ttl_secs() -> u64 {
-    3_600
+    0
 }
 
 fn default_roles_claim() -> String {
@@ -726,7 +727,7 @@ mod tests {
     #[cfg(unix)]
     use super::is_reachable_unix_socket;
     use super::{
-        ComputeDriverKind, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, detect_driver,
+        ComputeDriverKind, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, GatewayJwtConfig, detect_driver,
         docker_host_unix_socket_path, is_unix_socket, podman_socket_candidates_from_env,
         podman_socket_responds,
     };
@@ -779,6 +780,18 @@ mod tests {
     fn config_disables_unauthenticated_users_by_default() {
         let cfg = Config::new(None);
         assert!(!cfg.auth.allow_unauthenticated_users);
+    }
+
+    #[test]
+    fn gateway_jwt_ttl_defaults_to_non_expiring() {
+        let cfg: GatewayJwtConfig = serde_json::from_value(serde_json::json!({
+            "signing_key_path": "/tmp/signing.pem",
+            "public_key_path": "/tmp/public.pem",
+            "kid_path": "/tmp/kid"
+        }))
+        .expect("gateway JWT config should deserialize with default ttl");
+
+        assert_eq!(cfg.ttl_secs, 0);
     }
 
     #[test]
