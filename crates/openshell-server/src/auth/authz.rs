@@ -13,7 +13,7 @@
 //! authorization is a gateway concern.
 
 use super::identity::Identity;
-use super::method_authz::Role;
+use super::method_authz::{self, Role};
 use tonic::Status;
 use tracing::debug;
 
@@ -275,10 +275,10 @@ impl AuthzPolicy {
     #[allow(clippy::result_large_err)]
     pub fn check(&self, identity: &Identity, method: &str) -> Result<(), Status> {
         let permission = method_permission(method);
-        let required = if permission.requires_admin {
-            &self.admin_role
-        } else {
-            &self.user_role
+        let required = match method_authz::required_role(method) {
+            Some(Role::Admin) => &self.admin_role,
+            None if permission.requires_admin => &self.admin_role,
+            Some(Role::User) | None => &self.user_role,
         };
 
         // Empty role name = skip role check for this level (auth-only mode).
@@ -322,7 +322,7 @@ impl AuthzPolicy {
         if identity.scopes.iter().any(|s| s == SCOPE_ALL) {
             return Ok(());
         }
-        let required_scope = permission.scope;
+        let required_scope = method_authz::required_scope(method).unwrap_or(permission.scope);
 
         if identity.scopes.iter().any(|s| s == required_scope) {
             return Ok(());
