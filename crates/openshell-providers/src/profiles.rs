@@ -373,6 +373,7 @@ impl CredentialRefreshProfile {
             self.strategy,
             ProviderCredentialRefreshStrategy::Oauth2RefreshToken
                 | ProviderCredentialRefreshStrategy::Oauth2ClientCredentials
+                | ProviderCredentialRefreshStrategy::Oauth2TokenExchange
                 | ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt
         )
     }
@@ -1277,19 +1278,24 @@ mod tests {
 
     #[test]
     fn refresh_bootstrap_requires_a_gateway_mintable_path_and_no_required_static_credentials() {
-        let optional_refresh_profile = parse_profile_yaml(
-            r"
-id: optional-refresh
-display_name: Optional Refresh
+        for (required, strategy) in [
+            (false, "oauth2_refresh_token"),
+            (true, "oauth2_token_exchange"),
+        ] {
+            let profile = parse_profile_yaml(&format!(
+                r"
+id: refresh-profile
+display_name: Refresh Profile
 credentials:
   - name: access_token
-    required: false
+    required: {required}
     refresh:
-      strategy: oauth2_refresh_token
-",
-        )
-        .expect("profile");
-        assert!(optional_refresh_profile.allows_gateway_refresh_bootstrap());
+      strategy: {strategy}
+"
+            ))
+            .expect("profile");
+            assert!(profile.allows_gateway_refresh_bootstrap());
+        }
 
         let mixed_required_profile = parse_profile_yaml(
             r"

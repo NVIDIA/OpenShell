@@ -6,9 +6,8 @@
 //! These traits provide uniform access to `ObjectMeta` fields across all resource types.
 
 use crate::proto::{
-    InferenceRoute, ObjectForTest, Provider, Sandbox, ServiceEndpoint, SshSession,
+    InferenceRoute, ObjectForTest, Provider, Sandbox, SandboxStatus, ServiceEndpoint, SshSession,
     StoredProviderCredentialRefreshState, StoredProviderProfile,
-    SandboxStatus,
 };
 use std::collections::HashMap;
 

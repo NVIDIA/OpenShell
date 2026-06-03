@@ -1120,13 +1120,18 @@ async fn provider_refresh_cli_supports_oauth2_token_exchange_strategy() {
                             ..Default::default()
                         },
                         openshell_core::proto::ProviderCredentialRefreshMaterial {
-                            name: "sandbox_id".to_string(),
+                            name: "audience".to_string(),
                             required: true,
                             ..Default::default()
                         },
                         openshell_core::proto::ProviderCredentialRefreshMaterial {
-                            name: "audience".to_string(),
-                            required: true,
+                            name: "client_secret".to_string(),
+                            secret: true,
+                            ..Default::default()
+                        },
+                        openshell_core::proto::ProviderCredentialRefreshMaterial {
+                            name: "subject_token".to_string(),
+                            secret: true,
                             ..Default::default()
                         },
                     ],
@@ -1144,6 +1149,7 @@ async fn provider_refresh_cli_supports_oauth2_token_exchange_strategy() {
         "okta-obo",
         false,
         &[],
+        false,
         &[],
         &ts.tls,
     )
@@ -1158,8 +1164,8 @@ async fn provider_refresh_cli_supports_oauth2_token_exchange_strategy() {
             strategy: "oauth2_token_exchange",
             material: &[
                 "client_id=client-id".to_string(),
-                "sandbox_id=sandbox-123".to_string(),
                 "audience=api://downstream".to_string(),
+                "subject_token=user-token".to_string(),
                 "scope=api:access:read".to_string(),
             ],
             secret_material_keys: &["client_secret".to_string()],
