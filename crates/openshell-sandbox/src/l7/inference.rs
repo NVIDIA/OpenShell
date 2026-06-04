@@ -39,6 +39,12 @@ pub fn default_patterns() -> Vec<InferenceApiPattern> {
         },
         InferenceApiPattern {
             method: "POST".to_string(),
+            path_glob: "/v1/embeddings".to_string(),
+            protocol: "openai_embeddings".to_string(),
+            kind: "embeddings".to_string(),
+        },
+        InferenceApiPattern {
+            method: "POST".to_string(),
             path_glob: "/v1/messages".to_string(),
             protocol: "anthropic_messages".to_string(),
             kind: "messages".to_string(),
@@ -80,6 +86,21 @@ pub fn detect_inference_pattern<'a>(
 
         path_only == p.path_glob
     })
+}
+
+/// Whether a detected inference protocol returns a single buffered JSON body
+/// rather than a Server-Sent Events token stream.
+///
+/// SSE-capable protocols (chat completions, completions, responses, Anthropic
+/// messages) are served through the chunked streaming path so tokens reach the
+/// client incrementally. Embeddings always return one JSON object, so they must
+/// be framed with an accurate `Content-Length`. Streaming a buffered body would
+/// let a mid-body truncation (the streaming size cap or idle timeout) append a
+/// [`format_sse_error`] event to a payload the client parses as a single JSON
+/// object, silently corrupting it. Add future non-streaming protocols here.
+#[must_use]
+pub fn protocol_returns_buffered_body(protocol: &str) -> bool {
+    matches!(protocol, "openai_embeddings")
 }
 
 /// A parsed HTTP request from the intercepted tunnel.
@@ -267,20 +288,37 @@ fn find_crlf(buf: &[u8], start: usize) -> Option<usize> {
         .map(|offset| start + offset)
 }
 
+/// Reason phrase for an HTTP status code used on the inference proxy path.
+///
+/// Covers the statuses produced by the router error mapping (400/401/403/500/
+/// 502/503) and the upstream codes an inference backend can pass through
+/// verbatim (404/405 on unknown model or method, 422 on malformed embeddings
+/// input, 429 on rate limit). Unknown codes fall back to `"Unknown"` so the
+/// status line is still well-formed.
+fn http_status_text(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        411 => "Length Required",
+        413 => "Payload Too Large",
+        422 => "Unprocessable Entity",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        _ => "Unknown",
+    }
+}
+
 /// Format an HTTP/1.1 response from status, headers, and body.
 pub fn format_http_response(status: u16, headers: &[(String, String)], body: &[u8]) -> Vec<u8> {
     use std::fmt::Write;
 
-    let status_text = match status {
-        200 => "OK",
-        400 => "Bad Request",
-        403 => "Forbidden",
-        411 => "Length Required",
-        413 => "Payload Too Large",
-        500 => "Internal Server Error",
-        502 => "Bad Gateway",
-        _ => "Unknown",
-    };
+    let status_text = http_status_text(status);
 
     let mut response = format!("HTTP/1.1 {status} {status_text}\r\n");
     let mut has_content_length = false;
@@ -310,17 +348,7 @@ pub fn format_http_response(status: u16, headers: &[(String, String)], body: &[u
 pub fn format_http_response_header(status: u16, headers: &[(String, String)]) -> Vec<u8> {
     use std::fmt::Write;
 
-    let status_text = match status {
-        200 => "OK",
-        400 => "Bad Request",
-        403 => "Forbidden",
-        411 => "Length Required",
-        413 => "Payload Too Large",
-        500 => "Internal Server Error",
-        502 => "Bad Gateway",
-        503 => "Service Unavailable",
-        _ => "Unknown",
-    };
+    let status_text = http_status_text(status);
 
     let mut response = format!("HTTP/1.1 {status} {status_text}\r\n");
     for (name, value) in headers {
@@ -439,10 +467,13 @@ mod tests {
     }
 
     #[test]
-    fn no_match_for_embeddings() {
+    fn detect_openai_embeddings() {
         let patterns = default_patterns();
         let result = detect_inference_pattern("POST", "/v1/embeddings", &patterns);
-        assert!(result.is_none());
+        assert!(result.is_some());
+        let pattern = result.unwrap();
+        assert_eq!(pattern.protocol, "openai_embeddings");
+        assert_eq!(pattern.kind, "embeddings");
     }
 
     #[test]

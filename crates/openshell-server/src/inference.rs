@@ -1284,6 +1284,7 @@ mod tests {
                 "openai_chat_completions".to_string(),
                 "openai_completions".to_string(),
                 "openai_responses".to_string(),
+                "openai_embeddings".to_string(),
                 "model_discovery".to_string(),
             ]
         );

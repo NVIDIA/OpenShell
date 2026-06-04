@@ -1666,6 +1666,34 @@ async fn route_inference_request(
             return Ok(true);
         }
 
+        // Non-streaming protocols (embeddings) return a single JSON object, not
+        // an SSE token stream. Serve them buffered with an accurate
+        // Content-Length: the streaming path would append an SSE error frame to
+        // the body on a size-cap or idle-timeout truncation, corrupting a
+        // payload the client parses as one JSON object.
+        if crate::l7::inference::protocol_returns_buffered_body(&pattern.protocol) {
+            match ctx
+                .router
+                .proxy_with_candidates(
+                    &pattern.protocol,
+                    &request.method,
+                    &normalized_path,
+                    request.headers.clone(),
+                    bytes::Bytes::from(request.body.clone()),
+                    &routes,
+                )
+                .await
+            {
+                Ok(resp) => {
+                    let resp_headers = sanitize_inference_response_headers(resp.headers);
+                    let response = format_http_response(resp.status, &resp_headers, &resp.body);
+                    write_all(tls_client, &response).await?;
+                }
+                Err(e) => write_inference_router_error(tls_client, &e).await?,
+            }
+            return Ok(true);
+        }
+
         match ctx
             .router
             .proxy_with_candidates_streaming(
@@ -1760,29 +1788,7 @@ async fn route_inference_request(
                 // Terminate the chunked stream.
                 write_all(tls_client, format_chunk_terminator()).await?;
             }
-            Err(e) => {
-                {
-                    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
-                        .activity(ActivityId::Fail)
-                        .severity(SeverityId::Low)
-                        .status(StatusId::Failure)
-                        .dst_endpoint(Endpoint::from_domain(INFERENCE_LOCAL_HOST, 443))
-                        .message(format!(
-                            "inference endpoint detected but upstream service failed: {e}"
-                        ))
-                        .build();
-                    ocsf_emit!(event);
-                }
-                let (status, msg) = router_error_to_http(&e);
-                let body = serde_json::json!({"error": msg});
-                let body_bytes = body.to_string();
-                let response = format_http_response(
-                    status,
-                    &[("content-type".to_string(), "application/json".to_string())],
-                    body_bytes.as_bytes(),
-                );
-                write_all(tls_client, &response).await?;
-            }
+            Err(e) => write_inference_router_error(tls_client, &e).await?,
         }
         Ok(true)
     } else {
@@ -1814,11 +1820,42 @@ async fn route_inference_request(
     }
 }
 
+/// Emit an OCSF failure event and write a buffered JSON error response for a
+/// router error hit while proxying an inference request.
+///
+/// Shared by the streaming and buffered routing paths so both surface upstream
+/// failures with the same status mapping and the same audit record.
+async fn write_inference_router_error(
+    tls_client: &mut (impl tokio::io::AsyncWrite + Unpin),
+    err: &openshell_router::RouterError,
+) -> Result<()> {
+    use crate::l7::inference::format_http_response;
+
+    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+        .activity(ActivityId::Fail)
+        .severity(SeverityId::Low)
+        .status(StatusId::Failure)
+        .dst_endpoint(Endpoint::from_domain(INFERENCE_LOCAL_HOST, 443))
+        .message(format!(
+            "inference endpoint detected but upstream service failed: {err}"
+        ))
+        .build();
+    ocsf_emit!(event);
+
+    let (status, msg) = router_error_to_http(err);
+    let body = serde_json::json!({ "error": msg }).to_string();
+    let response = format_http_response(
+        status,
+        &[("content-type".to_string(), "application/json".to_string())],
+        body.as_bytes(),
+    );
+    write_all(tls_client, &response).await
+}
+
 /// Map router errors to HTTP status codes and sanitized messages.
 ///
-/// Returns generic error messages instead of verbatim internal details.
-/// Full error context (upstream URLs, hostnames, TLS details) is logged
-/// server-side by the caller at `warn` level for debugging.
+/// Returns generic, client-safe messages instead of verbatim internal details;
+/// the full error is recorded in the OCSF failure event by the caller.
 fn router_error_to_http(err: &openshell_router::RouterError) -> (u16, String) {
     use openshell_router::RouterError;
     match err {
@@ -5431,6 +5468,102 @@ network_policies:
             model_in_path: false,
             request_path_override: None,
         }
+    }
+
+    fn embeddings_inference_route(endpoint: String) -> openshell_router::config::ResolvedRoute {
+        openshell_router::config::ResolvedRoute {
+            name: "inference.local".to_string(),
+            endpoint,
+            model: "text-embedding-3-small".to_string(),
+            api_key: "test-api-key".to_string(),
+            protocols: vec!["openai_embeddings".to_string()],
+            auth: openshell_router::config::AuthHeader::Bearer,
+            default_headers: vec![],
+            passthrough_headers: vec![],
+            timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
+            model_in_path: false,
+            request_path_override: None,
+        }
+    }
+
+    /// Embeddings responses are a single buffered JSON object, not an SSE
+    /// stream. They must be framed with `Content-Length` and must never be sent
+    /// through the chunked streaming path, whose truncation handlers would
+    /// append an SSE `proxy_stream_error` frame into the JSON body.
+    #[tokio::test]
+    async fn inference_embeddings_served_buffered_with_content_length() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        let upstream_body = r#"{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1,0.2]}],"model":"text-embedding-3-small"}"#;
+        let upstream_task = tokio::spawn(async move {
+            let (mut upstream, _) = listener.accept().await.unwrap();
+            read_forwarded_inference_request(&mut upstream).await;
+            // Buffered upstream response with Content-Length (no chunked TE).
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                upstream_body.len(),
+                upstream_body,
+            );
+            upstream.write_all(resp.as_bytes()).await.unwrap();
+        });
+
+        let router = openshell_router::Router::new().unwrap();
+        let patterns = crate::l7::inference::default_patterns();
+        let ctx = InferenceContext::new(
+            patterns,
+            router,
+            vec![embeddings_inference_route(format!(
+                "http://{upstream_addr}"
+            ))],
+            vec![],
+        );
+
+        let body = r#"{"model":"text-embedding-3-small","input":"hello"}"#;
+        let request = format!(
+            "POST /v1/embeddings HTTP/1.1\r\n\
+             Host: inference.local\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\r\n{}",
+            body.len(),
+            body,
+        );
+
+        let (client, mut server) = tokio::io::duplex(65536);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        let server_task =
+            tokio::spawn(async move { process_inference_keepalive(&mut server, &ctx, 443).await });
+
+        client_write.write_all(request.as_bytes()).await.unwrap();
+        client_write.shutdown().await.unwrap();
+
+        let mut response = Vec::new();
+        client_read.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+
+        server_task.await.unwrap().unwrap();
+        upstream_task.await.unwrap();
+
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK\r\n"),
+            "expected buffered 200 response, got: {response}"
+        );
+        let lower = response.to_ascii_lowercase();
+        assert!(
+            lower.contains("content-length:"),
+            "embeddings response must be Content-Length framed, got: {response}"
+        );
+        assert!(
+            !lower.contains("transfer-encoding: chunked"),
+            "embeddings response must NOT be chunked, got: {response}"
+        );
+        assert!(
+            !response.contains("proxy_stream_error"),
+            "embeddings response must not carry an SSE error frame, got: {response}"
+        );
+        assert!(
+            response.contains(r#""object":"list""#),
+            "embeddings JSON body must be forwarded intact, got: {response}"
+        );
     }
 
     async fn read_forwarded_inference_request<S: AsyncRead + Unpin>(stream: &mut S) {

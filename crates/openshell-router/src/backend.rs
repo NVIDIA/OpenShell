@@ -381,6 +381,22 @@ fn validation_probe(route: &ResolvedRoute) -> Result<ValidationProbe, Validation
         });
     }
 
+    // Checked last: a route that also speaks a chat/completion protocol prefers
+    // those probes above, but an embeddings-only backend must still validate
+    // against its single writable endpoint instead of failing as unprobeable.
+    if route
+        .protocols
+        .iter()
+        .any(|protocol| protocol == "openai_embeddings")
+    {
+        return Ok(ValidationProbe {
+            path: "/v1/embeddings",
+            protocol: "openai_embeddings",
+            body: bytes::Bytes::from_static(br#"{"input":"ping"}"#),
+            fallback_body: None,
+        });
+    }
+
     Err(ValidationFailure {
         kind: ValidationFailureKind::RequestShape,
         details: format!(

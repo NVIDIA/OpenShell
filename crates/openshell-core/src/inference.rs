@@ -56,6 +56,7 @@ const OPENAI_PROTOCOLS: &[&str] = &[
     "openai_chat_completions",
     "openai_completions",
     "openai_responses",
+    "openai_embeddings",
     "model_discovery",
 ];
 
@@ -303,6 +304,17 @@ mod tests {
         assert!(profile_for("anthropic").is_some());
         assert!(profile_for("nvidia").is_some());
         assert!(profile_for("OpenAI").is_some()); // case insensitive
+    }
+
+    #[test]
+    fn openai_compatible_profiles_include_embeddings() {
+        for provider_type in ["openai", "nvidia"] {
+            let profile = profile_for(provider_type).expect("provider profile should exist");
+            assert!(
+                profile.protocols.contains(&"openai_embeddings"),
+                "{provider_type} should route OpenAI-compatible embeddings"
+            );
+        }
     }
 
     #[test]

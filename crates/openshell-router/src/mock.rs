@@ -32,6 +32,7 @@ pub fn mock_response(route: &ResolvedRoute, source_protocol: &str) -> ProxyRespo
     let body = match protocol {
         "openai_chat_completions" => openai_chat_completion_body(&route.model),
         "openai_completions" => openai_completion_body(&route.model),
+        "openai_embeddings" => openai_embeddings_body(&route.model),
         "anthropic_messages" => anthropic_messages_body(&route.model),
         _ => generic_body(&route.model),
     };
@@ -85,6 +86,26 @@ fn openai_completion_body(model: &str) -> Vec<u8> {
             "prompt_tokens": 1,
             "completion_tokens": 5,
             "total_tokens": 6
+        }
+    }))
+    .expect("static JSON must serialize")
+}
+
+fn openai_embeddings_body(model: &str) -> Vec<u8> {
+    // Shape must match the OpenAI embeddings response (`object: "list"` with a
+    // `data` array of `{object, index, embedding}`) so callers that deserialize
+    // into an embeddings type get a structurally valid — if canned — vector.
+    serde_json::to_vec(&serde_json::json!({
+        "object": "list",
+        "data": [{
+            "object": "embedding",
+            "index": 0,
+            "embedding": [0.0_f32, 0.0_f32, 0.0_f32]
+        }],
+        "model": model,
+        "usage": {
+            "prompt_tokens": 1,
+            "total_tokens": 1
         }
     }))
     .expect("static JSON must serialize")
@@ -193,6 +214,26 @@ mod tests {
         assert_eq!(
             body["content"][0]["text"],
             "Hello from openshell mock backend"
+        );
+    }
+
+    #[test]
+    fn mock_openai_embeddings() {
+        let route = make_route(
+            "mock://test",
+            &["openai_embeddings"],
+            "text-embedding-3-small",
+        );
+        let resp = mock_response(&route, "openai_embeddings");
+        assert_eq!(resp.status, 200);
+
+        let body: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(body["object"], "list");
+        assert_eq!(body["model"], "text-embedding-3-small");
+        assert_eq!(body["data"][0]["object"], "embedding");
+        assert!(
+            body["data"][0]["embedding"].is_array(),
+            "embedding must be a numeric array, got: {body}"
         );
     }
 
