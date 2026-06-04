@@ -51,7 +51,7 @@ This RFC uses the following terms with specific meanings.
 - **Built-in middleware.** A middleware that ships inside the supervisor binary and is served in-process over the same gRPC contract, with no network hop and no gateway registration. Built-in names are reserved with the `openshell-` prefix.
 - **Hook.** A defined point in the supervisor proxy flow where the supervisor invokes a middleware. This version defines a single hook, `request.before_upstream`, which runs after network and L7 policy admit a request and before credential injection and upstream forwarding. The design allows more hooks later.
 - **Middleware config.** The service-specific configuration fragment a policy supplies to a middleware. OpenShell does not interpret it; it passes the fragment to the middleware and relies on `ValidateConfig` to check it.
-- **Capabilities.** The self-description a middleware returns from `GetCapabilities`: its identity and version, the hooks it implements, and operational limits such as maximum body size and timeout. OpenShell validates that a registered middleware's capabilities support every policy that references it.
+- **Capabilities.** The self-description a middleware returns from `GetCapabilities`: its identity and version, the contract version it implements, and the hooks it supports. OpenShell validates that a registered middleware's capabilities support every policy that references it.
 - **Decision.** The allow-or-deny outcome a middleware returns for a request. `allow` lets the request proceed (possibly transformed); `deny` short-circuits it. This vocabulary matches the rest of the OpenShell policy system.
 - **Transformation.** A middleware returning replacement content, and any allowed header mutations, that the supervisor forwards in place of the original request. A later middleware in a chain sees the previous stage's transformed content.
 - **Finding.** A structured, audit-safe observation a middleware reports about a request, such as a label, count, and confidence. A finding never carries raw matched values, redacted spans, or the original sensitive content.
@@ -124,7 +124,7 @@ The contract has two parts: a configuration-time handshake and a request-time ho
 
 Configuration-time:
 
-- `GetCapabilities` reports the service identity and version, the hook stages it implements, and operational limits such as max body size and timeout.
+- `GetCapabilities` reports the service identity and version, the contract version it implements, and the hook stages it supports.
 - `ValidateConfig` lets the service validate its own service-specific configuration fragment.
 
 Request-time:
@@ -135,7 +135,7 @@ Request-time:
 A simplified sketch of the gRPC contract:
 
 ```protobuf
-service Middleware {
+service ProxyMiddleware {
   // Configuration-time
   rpc GetCapabilities(CapabilitiesRequest) returns (Capabilities);
   rpc ValidateConfig(ValidateConfigRequest) returns (ValidateConfigResponse);
@@ -147,11 +147,10 @@ service Middleware {
 
 message Capabilities {
   string name = 1;
-  string version = 2;
-  repeated string hooks = 3;            // e.g. "request.before_upstream"
-  uint64 max_body_bytes = 4;
-  uint32 timeout_ms = 5;
-  repeated string metadata_namespaces = 6;
+  string version = 2;                   // service implementation version
+  string contract_version = 3;          // middleware contract major version, e.g. "v1"
+  repeated string hooks = 4;            // e.g. "request.before_upstream"
+  repeated string metadata_namespaces = 5;
 }
 
 // Context plus body as two top-level fields, so the body is cleanly separable.
@@ -186,6 +185,12 @@ message Outcome {
 
 The interface is gRPC. The hot-path RPC is declared as a bidirectional stream, but v1 exchanges exactly one `ProcessRequest` and one `ProcessResponse` over it: the supervisor buffers the bounded body and the middleware replies once. Declaring it as a stream now is deliberate, because gRPC method cardinality cannot change compatibly. It lets a later version chunk large payloads without altering the method signature. Possible extensions (chunked streaming, additional hooks, semantic context) are collected in the [protocol-extensions appendix](appendices/protocol-extensions.md), including what streaming does and does not buy. The baseline middleware ships in the supervisor and is served in-process over the same gRPC contract, with no network hop. The exact field set is settled during implementation; the sketch above is the contract shape this RFC asks reviewers to evaluate.
 
+### Contract versioning
+
+The middleware gRPC contract lives under a major-versioned protobuf package (`openshell.middleware.v1`), the same convention the compute-driver contract uses in [RFC 0001](../0001-core-architecture/README.md). Within a major version, changes stay additive and backward compatible - new fields, RPCs, hook stages, and capability fields can be added - while breaking wire or semantic changes require a new major version.
+
+`GetCapabilities` doubles as the version handshake. A middleware reports its own implementation version and the contract major version it implements, and the supervisor only invokes a middleware whose contract major version it supports. A mismatch is treated like any other capability-validation failure: it fails the gateway config load when a policy references the middleware, and is fail-closed at runtime. This keeps first-party and third-party middleware on one uniform contract and gives the protocol a stable path to evolve.
+
 ### Registration and delivery
 
 The operator registers middleware in the gateway configuration: each entry is a name and an endpoint. This preserves the trust boundary. The endpoint sees raw payloads and is operator-owned infrastructure, so declaring one is an administrative action, while policy authors can only reference middleware by a registered name rather than point traffic at an arbitrary endpoint. In single-player mode one person holds both roles, but the split still holds in shared deployments.
@@ -209,6 +214,10 @@ During the research preview, a plaintext `http://` endpoint must be paired with 
 Built-in middleware ships in the supervisor binary and needs no registration. Built-in names are prefixed `openshell-` (for example `openshell-secrets`), and that prefix is reserved so user-defined middleware cannot use it.
 
 Supervisors receive the effective configuration over the same authenticated config path they already use for policy, provider, and inference config. Because the registered endpoint is reachable from both the gateway and the supervisors, capability validation runs at the gateway (at config load and when a policy references a middleware) and again at the supervisor before traffic flows; a validation failure fails the load rather than silently disabling the middleware. This gateway-side reachability is a property of the service deployment mode - a future sidecar mode would shift validation entirely to the supervisor.
+
+Middleware registration lives in gateway configuration, which is not hot-reloaded ([RFC 0003](../0003-gateway-configuration/README.md) lists this as a non-goal): changing the registered set requires restarting the gateway. On restart, supervisors re-sync the effective configuration over their existing connection, so running sandboxes pick up a newly added middleware rather than only newly created sandboxes seeing it - there is no per-sandbox snapshot of the registered set.
+
+Removal is the hazardous direction. Because a policy references a middleware by name and validation fails the load on a dangling reference, the gateway rejects a configuration that drops a middleware an active policy still references, rather than letting those sandboxes silently begin to fail closed. An operator therefore removes a middleware by first removing the policy references, then the registration. A registered middleware that instead becomes unavailable at runtime (its process is down, or the network is partitioned) is a runtime failure governed by `on_error` (fail-closed by default), not a registration change.
 
 ### Policy integration
 
@@ -349,3 +358,4 @@ Calling an external service from a proxy to inspect, transform, or block in-flig
 - **Two-selector overlap.** A middleware can be attached both through its own `requests:` selector and through a policy's `middleware: [...]` list. Are both surfaces needed, or should one win? This redundancy needs resolving before the policy schema is fixed.
 - **Metadata namespacing.** How are metadata keys namespaced to avoid collisions between middleware? Current leaning: derive the namespace from the middleware name, deferred until a consumer (the model router) exists.
 - **Compressed and chunked bodies.** How gzip-compressed request bodies and chunked or slow "drip" uploads interact with buffering, the size cap (encoded vs decoded bytes), and the call timeout is unresolved. It builds on the request buffering the proxy already does for credential rewriting and is settled during implementation.
+- **API maturity qualifier.** Is it worth starting the contract at `v1alpha1` rather than `v1`? Proposal: no. The whole project is in an alpha stage, so its APIs are assumed alpha throughout, and a separate per-contract alpha qualifier adds little.

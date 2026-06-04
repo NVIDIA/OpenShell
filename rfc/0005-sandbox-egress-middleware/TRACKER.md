@@ -72,12 +72,14 @@ Prefer Mermaid diagrams in the main RFC when they clarify the core proposal. Mov
 - [done] Gateway configuration: operators register middleware via `[[openshell.proxy.middleware]]` (name + endpoint). Auth material and timeout defaults not yet fully specified.
 - [partial] Supervisor configuration delivery: README says it reuses the existing authenticated config path. Exact delivery shape still open - extend `GetSandboxConfig` / `SandboxPolicy` or add a `GetInferenceBundle`-style bundle RPC (see open question below).
 - [done] Middleware capability discovery: `GetCapabilities` + simplified proto sketch in the contract section.
-- [partial] Capability response fields: sketch covers name, version, hooks, max body, timeout, metadata namespaces. Full field list settled during implementation (request-response-contract appendix dropped).
+- [partial] Capability response fields: sketch covers name, version, contract_version, hooks, metadata namespaces. `max_body_bytes` and `timeout_ms` deferred to implementation (removed from the sketch). Full field list settled during implementation (request-response-contract appendix dropped).
 - [done] Middleware inspection RPC: `ProcessRequestBeforeUpstream` request/response sketched (bidi stream, single-message v1, `{context, body}` / `{outcome, body}`).
 - [done] Policy shape + middleware section: top-level `network_middlewares` list referenced by `middleware: [...]` on network policies; chains; `on_error`.
 - [done] Failure behavior: `on_error` per middleware, fail-closed by default; capability validation fails the config load.
 - [done] Audit/logging: OCSF categories (HttpActivity, DetectionFinding, ConfigStateChange) + safety rules. Field mappings are an implementation detail (failure-and-audit appendix dropped).
 - [done] Model routing handoff: metadata section; router out of scope (#1734).
+- [done] Contract versioning: `openshell.middleware.v1` package, `ProxyMiddleware` service, additive-within-major, `GetCapabilities` version handshake (`contract_version`). Mirrors RFC 0001 driver versioning. Alpha-qualifier left as an open question.
+- [done] Registration reload/removal semantics: gateway restart required (RFC 0003), running sandboxes re-sync on restart, removal of a referenced middleware rejected at config load, runtime unavailability -> `on_error`.
 
 ## Decisions
 
@@ -94,6 +96,10 @@ Prefer Mermaid diagrams in the main RFC when they clarify the core proposal. Mov
 - Capability validation runs at gateway config load, on policy reference, and at supervisor startup; failure fails the load.
 - Findings become structured, namespaced metadata for a future model router; router out of scope (#1734).
 - Model routing tracked separately: https://github.com/NVIDIA/OpenShell/issues/1734.
+- Contract versioning: major-versioned protobuf package `openshell.middleware.v1` (flat `openshell.<area>.v1`, matching the six existing proto packages; not `openshell.proxy.middleware.v1` - the `proxy` nesting is a TOML-config choice, not a proto-package one). Additive-only within a major version; breaking changes require a new major. `GetCapabilities` reports the service's implementation version and the contract major version; supervisor only invokes a middleware whose contract major version it supports; mismatch is a capability-validation failure (fails config load / fail-closed at runtime). Added `contract_version` to the `Capabilities` sketch.
+- gRPC service is named `ProxyMiddleware` (not `Middleware`), leaving room for other middleware kinds under the same `openshell.middleware` package later.
+- API maturity qualifier: stay at `v1` rather than `v1alpha1`. Rationale: the whole project is alpha, so APIs are assumed alpha throughout; a per-contract alpha qualifier adds little. Captured as an open question for reviewers (K8s-style `v1alpha1 -> v1` ladder was considered).
+- Registration reload semantics: gateway config is not hot-reloaded (RFC 0003 non-goal), so changing the registered middleware set requires a gateway restart. On restart, supervisors re-sync effective config, so running sandboxes pick up additions (no per-sandbox snapshot). Removing a middleware still referenced by an active policy is rejected at config load (dangling reference fails validation) rather than silently breaking sandboxes; operators remove references first, then the registration. Runtime unavailability of a registered middleware is governed by `on_error` (fail-closed), not a registration change.
 
 ## Open Drafting Questions
 
@@ -111,6 +117,7 @@ Still open:
 - Exact metadata namespacing scheme (leaning: derive from middleware name) - deferred until a consumer exists.
 - Is the two-selector surface (`requests:` on a middleware entry vs the per-policy `middleware: [...]`) both needed, or should one win?
 - Should middleware capability discovery be strictly mandatory before accepting referencing policy? (Leaning yes.)
+- Is it worth starting the contract at `v1alpha1` rather than `v1`? (Proposal: no - the whole project is alpha, so APIs are assumed alpha throughout.)
 
 ## Drafting Queue (next)
 
