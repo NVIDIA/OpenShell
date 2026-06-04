@@ -7,7 +7,9 @@
 
 mod activity_aggregator;
 mod denial_aggregator;
+mod google_cloud_metadata;
 mod mechanistic_mapper;
+mod metadata_server;
 
 use miette::Result;
 use std::future::Future;
@@ -63,6 +65,7 @@ use openshell_supervisor_network::opa::OpaEngine;
 pub use openshell_supervisor_process::process::{ProcessHandle, ProcessStatus};
 use openshell_supervisor_process::skills;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::time::timeout;
 
 /// Run a command in the sandbox.
 ///
@@ -194,7 +197,8 @@ pub async fn run_sandbox(
         provider_credential_expires_at_ms,
         dynamic_credentials,
     );
-    let provider_env = provider_credentials.snapshot().child_env.clone();
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+    let mut provider_env = provider_credentials.child_env_with_gcp_resolved();
 
     // Initialize the agent-proposals feature flag. Default false until the
     // initial settings fetch (or the poll loop) tells us otherwise. The flag
@@ -396,6 +400,45 @@ pub async fn run_sandbox(
                 );
             }
         });
+    }
+
+    // Start GCE metadata loopback server inside the network namespace so
+    // Go's cloud.google.com/go/compute/metadata (which bypasses HTTP_PROXY)
+    // can reach it via direct TCP. Must start before the process leaf so SSH
+    // sessions also see corrected env vars on bind failure.
+    #[cfg(target_os = "linux")]
+    if let Some(ns) = netns.as_ref()
+        && provider_credentials
+            .snapshot()
+            .child_env
+            .contains_key("GCE_METADATA_HOST")
+    {
+        let ctx = google_cloud_metadata::MetadataContext::new(provider_credentials.clone());
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        match ns
+            .bind_tcp_in_netns(openshell_core::google_cloud::METADATA_LOOPBACK_ADDR)
+            .await
+        {
+            Ok(listener) => {
+                tokio::spawn(metadata_server::run(listener, ctx, ready_tx));
+                if let Ok(Ok(addr)) = timeout(Duration::from_secs(5), ready_rx).await {
+                    info!(addr = %addr, "GCE metadata loopback server ready");
+                } else {
+                    warn!("GCE metadata server failed to become ready, removing metadata env vars");
+                    provider_env.remove("GCE_METADATA_HOST");
+                    provider_env.remove("GCE_METADATA_IP");
+                    provider_env.remove("METADATA_SERVER_DETECTION");
+                    provider_credentials.remove_env_key("GCE_METADATA_HOST");
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "GCE metadata server bind failed, Go SDK may not discover credentials");
+                provider_env.remove("GCE_METADATA_HOST");
+                provider_env.remove("GCE_METADATA_IP");
+                provider_env.remove("METADATA_SERVER_DETECTION");
+                provider_credentials.remove_env_key("GCE_METADATA_HOST");
+            }
+        }
     }
 
     let exit_code = if process_enabled {

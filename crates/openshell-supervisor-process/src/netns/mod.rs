@@ -338,6 +338,43 @@ impl NetworkNamespace {
 
         Ok(())
     }
+
+    /// Bind a TCP listener inside this network namespace on a dedicated thread.
+    ///
+    /// Spawns a short-lived OS thread that enters the namespace via `setns`,
+    /// binds a `std::net::TcpListener`, then exits. The listener fd is handed
+    /// back as a non-blocking `tokio::net::TcpListener`. Using a dedicated
+    /// thread (not `spawn_blocking`) avoids contaminating the tokio thread
+    /// pool's namespace state.
+    ///
+    /// Returns `Err` if the namespace has no fd, `setns` fails, or bind fails.
+    pub async fn bind_tcp_in_netns(&self, addr: &str) -> std::io::Result<tokio::net::TcpListener> {
+        let ns_fd = self
+            .ns_fd
+            .ok_or_else(|| std::io::Error::other("no namespace fd available for bind"))?;
+        let addr = addr.to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let result = (|| -> std::io::Result<std::net::TcpListener> {
+                // SAFETY: setns is safe to call; this is a dedicated thread
+                // that exits after binding. The thread's namespace state does
+                // not contaminate any thread pool.
+                #[allow(unsafe_code)]
+                let rc = unsafe { libc::setns(ns_fd, libc::CLONE_NEWNET) };
+                if rc != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                std::net::TcpListener::bind(&addr)
+            })();
+            let _ = tx.send(result);
+        });
+
+        let std_listener = rx
+            .await
+            .map_err(|_| std::io::Error::other("netns bind thread panicked"))??;
+        std_listener.set_nonblocking(true)?;
+        tokio::net::TcpListener::from_std(std_listener)
+    }
 }
 
 impl Drop for NetworkNamespace {
