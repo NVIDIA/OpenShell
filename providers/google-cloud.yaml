@@ -1,0 +1,64 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+id: google-cloud
+display_name: Google Cloud (GCP APIs)
+description: Native GCP SDK credentials for sandboxes via metadata emulator
+category: other
+inference_capable: false
+
+credentials:
+  # Service account JWT flow: gateway signs a JWT and exchanges it for an
+  # access token. Configure with `openshell provider refresh configure`.
+  - name: service_account_token
+    description: GCP access token minted from service account JWT
+    env_vars: [GCP_SA_ACCESS_TOKEN]
+    required: false
+    auth_style: bearer
+    header_name: authorization
+    refresh:
+      strategy: google_service_account_jwt
+      token_url: https://oauth2.googleapis.com/token
+      scopes: [https://www.googleapis.com/auth/cloud-platform]
+      refresh_before_seconds: 300
+      max_lifetime_seconds: 3600
+      material:
+        - name: client_email
+          description: Service account email address
+          required: true
+        - name: private_key
+          description: Service account RSA private key (PEM)
+          required: true
+          secret: true
+        - name: subject
+          description: Email for domain-wide delegation (optional)
+
+  # ADC OAuth2 flow: gateway exchanges a gcloud ADC refresh token for an
+  # access token. Configure with `openshell provider refresh configure`.
+  - name: adc_token
+    description: GCP access token from gcloud application default credentials
+    env_vars: [GCP_ADC_ACCESS_TOKEN]
+    required: false
+    auth_style: bearer
+    header_name: authorization
+    refresh:
+      strategy: oauth2_refresh_token
+      token_url: https://oauth2.googleapis.com/token
+      scopes: [https://www.googleapis.com/auth/cloud-platform]
+      refresh_before_seconds: 300
+      max_lifetime_seconds: 3600
+      material:
+        - name: client_id
+          description: OAuth2 client ID from ADC JSON
+          required: true
+        - name: client_secret
+          description: OAuth2 client secret from ADC JSON
+          required: true
+          secret: true
+        - name: refresh_token
+          description: OAuth2 refresh token from ADC JSON
+          required: true
+          secret: true
+
+discovery:
+  credentials: [service_account_token, adc_token]

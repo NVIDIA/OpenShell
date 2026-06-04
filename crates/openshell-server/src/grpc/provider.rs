@@ -434,6 +434,7 @@ pub(super) async fn resolve_provider_environment(
     let mut expires = std::collections::HashMap::new();
     let now_ms = crate::persistence::current_time_ms();
     validate_provider_environment_keys_unique_at(store, provider_names, None, now_ms).await?;
+    let registry = openshell_providers::ProviderRegistry::new();
 
     for name in provider_names {
         let provider = store
@@ -479,52 +480,7 @@ pub(super) async fn resolve_provider_environment(
             }
         }
 
-        // For Vertex AI providers, inject agent-specific config env vars so that
-        // Claude Code, Goose, and OpenCode inside the sandbox can reach Vertex AI
-        // without additional configuration. Credentials from the loop above take
-        // precedence via entry().or_insert(), and sandbox --env overrides are
-        // applied at the process level after this environment is installed, so
-        // they naturally shadow these values.
-        if openshell_core::inference::normalize_inference_provider_type(&provider.r#type)
-            == Some("google-vertex-ai")
-        {
-            let project_id = provider
-                .config
-                .get(openshell_core::inference::VERTEX_AI_PROJECT_ID_KEY)
-                .map(String::as_str)
-                .unwrap_or_default()
-                .trim();
-            let region = provider
-                .config
-                .get(openshell_core::inference::VERTEX_AI_REGION_KEY)
-                .map(String::as_str)
-                .unwrap_or_default()
-                .trim();
-
-            // Static flags -- always present for Vertex AI providers.
-            env.entry("GOOSE_PROVIDER".to_string())
-                .or_insert_with(|| "gcp_vertex_ai".to_string());
-
-            // Project ID derived vars.
-            if !project_id.is_empty() {
-                env.entry("ANTHROPIC_VERTEX_PROJECT_ID".to_string())
-                    .or_insert_with(|| project_id.to_string());
-                env.entry("GCP_PROJECT_ID".to_string())
-                    .or_insert_with(|| project_id.to_string());
-                env.entry("GOOGLE_CLOUD_PROJECT".to_string())
-                    .or_insert_with(|| project_id.to_string());
-            }
-
-            // Region derived vars.
-            if !region.is_empty() {
-                env.entry("CLOUD_ML_REGION".to_string())
-                    .or_insert_with(|| region.to_string());
-                env.entry("GCP_LOCATION".to_string())
-                    .or_insert_with(|| region.to_string());
-                env.entry("VERTEX_LOCATION".to_string())
-                    .or_insert_with(|| region.to_string());
-            }
-        }
+        registry.inject_env(&provider, &mut env);
     }
 
     Ok(ProviderEnvironment {
@@ -1819,6 +1775,7 @@ mod tests {
                 "copilot",
                 "cursor",
                 "github",
+                "google-cloud",
                 "google-vertex-ai",
                 "nvidia",
                 "pypi"
@@ -4591,5 +4548,129 @@ mod tests {
             .filter(|i| final_provider.credentials.contains_key(&format!("KEY_{i}")))
             .count();
         assert_eq!(new_keys_count, 1);
+    }
+
+    fn google_cloud_provider(config: HashMap<String, String>) -> Provider {
+        Provider {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: String::new(),
+                name: "my-google-cloud".to_string(),
+                created_at_ms: 0,
+                labels: HashMap::new(),
+                resource_version: 0,
+            }),
+            r#type: "google-cloud".to_string(),
+            credentials: HashMap::new(),
+            config,
+            credential_expires_at_ms: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn inject_gcp_env_sets_metadata_host() {
+        use openshell_core::google_cloud;
+        let provider = google_cloud_provider(HashMap::new());
+        let mut env = HashMap::new();
+        openshell_providers::ProviderRegistry::new().inject_env(&provider, &mut env);
+        assert_eq!(
+            env.get("GCE_METADATA_HOST").map(String::as_str),
+            Some(google_cloud::METADATA_HOST),
+        );
+        assert!(
+            !env.contains_key("CLAUDE_CODE_USE_VERTEX"),
+            "CLAUDE_CODE_USE_VERTEX is synthetic, should not be injected here"
+        );
+    }
+
+    #[test]
+    fn inject_gcp_env_propagates_project_id() {
+        use openshell_core::google_cloud;
+        let provider = google_cloud_provider(HashMap::from([(
+            "project_id".to_string(),
+            "my-project".to_string(),
+        )]));
+        let mut env = HashMap::new();
+        openshell_providers::ProviderRegistry::new().inject_env(&provider, &mut env);
+        for var in google_cloud::PROJECT_ID_ENV_VARS {
+            assert_eq!(
+                env.get(*var).map(String::as_str),
+                Some("my-project"),
+                "{var} should be set to project_id config value"
+            );
+        }
+    }
+
+    #[test]
+    fn inject_gcp_env_propagates_region() {
+        use openshell_core::google_cloud;
+        let provider = google_cloud_provider(HashMap::from([(
+            "region".to_string(),
+            "us-central1".to_string(),
+        )]));
+        let mut env = HashMap::new();
+        openshell_providers::ProviderRegistry::new().inject_env(&provider, &mut env);
+        for var in google_cloud::REGION_ENV_VARS {
+            assert_eq!(
+                env.get(*var).map(String::as_str),
+                Some("us-central1"),
+                "{var} should be set to region config value"
+            );
+        }
+    }
+
+    #[test]
+    fn inject_gcp_env_propagates_service_account_email() {
+        use openshell_core::google_cloud;
+        let provider = google_cloud_provider(HashMap::from([(
+            "service_account_email".to_string(),
+            "sa@proj.iam.gserviceaccount.com".to_string(),
+        )]));
+        let mut env = HashMap::new();
+        openshell_providers::ProviderRegistry::new().inject_env(&provider, &mut env);
+        for var in google_cloud::SERVICE_ACCOUNT_EMAIL_ENV_VARS {
+            assert_eq!(
+                env.get(*var).map(String::as_str),
+                Some("sa@proj.iam.gserviceaccount.com"),
+                "{var} should be set to service_account_email config value"
+            );
+        }
+    }
+
+    #[test]
+    fn inject_gcp_env_does_not_overwrite_existing_values() {
+        let provider = google_cloud_provider(HashMap::from([(
+            "project_id".to_string(),
+            "from-config".to_string(),
+        )]));
+        let mut env = HashMap::from([("GCP_PROJECT_ID".to_string(), "user-override".to_string())]);
+        openshell_providers::ProviderRegistry::new().inject_env(&provider, &mut env);
+        assert_eq!(
+            env.get("GCP_PROJECT_ID").map(String::as_str),
+            Some("user-override"),
+            "user-provided value should not be overwritten"
+        );
+    }
+
+    #[test]
+    fn inject_non_gcp_provider_does_nothing() {
+        let provider = Provider {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: String::new(),
+                name: "github".to_string(),
+                created_at_ms: 0,
+                labels: HashMap::new(),
+                resource_version: 0,
+            }),
+            r#type: "github".to_string(),
+            credentials: HashMap::new(),
+            config: HashMap::from([("project_id".to_string(), "should-be-ignored".to_string())]),
+            credential_expires_at_ms: HashMap::new(),
+        };
+        let mut env = HashMap::new();
+        openshell_providers::ProviderRegistry::new().inject_env(&provider, &mut env);
+        assert!(
+            env.is_empty(),
+            "non-GCP provider should not inject any env vars"
+        );
     }
 }
