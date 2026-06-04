@@ -23,8 +23,8 @@ use openshell_core::proto::{
     ListSandboxProvidersResponse, ListSandboxesRequest, ListSandboxesResponse, PlatformEvent,
     ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, Sandbox, SandboxCondition,
     SandboxLogLine, SandboxPhase, SandboxResponse, SandboxStatus, SandboxStreamEvent,
-    ServiceStatus, SupervisorMessage, UpdateProviderRequest, WatchSandboxRequest,
-    sandbox_stream_event,
+    ServiceStatus, SettingValue, SupervisorMessage, UpdateProviderRequest, WatchSandboxRequest,
+    sandbox_stream_event, setting_value,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -46,6 +46,7 @@ struct SandboxState {
     vm_error_after_started: Arc<AtomicBool>,
     vm_slow_progress_before_ready: Arc<AtomicBool>,
     vm_log_churn_before_ready: Arc<AtomicBool>,
+    global_settings: Arc<Mutex<HashMap<String, SettingValue>>>,
 }
 
 #[derive(Clone, Default)]
@@ -78,18 +79,19 @@ impl OpenShell for TestOpenShell {
             name
         };
 
-        Ok(Response::new(SandboxResponse {
-            sandbox: Some(Sandbox {
-                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
-                    id: format!("id-{sandbox_name}"),
-                    name: sandbox_name,
-                    created_at_ms: 0,
-                    labels: HashMap::new(),
-                    resource_version: 0,
-                }),
-                phase: SandboxPhase::Provisioning as i32,
-                ..Sandbox::default()
+        let mut sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: format!("id-{sandbox_name}"),
+                name: sandbox_name,
+                created_at_ms: 0,
+                labels: HashMap::new(),
+                resource_version: 0,
             }),
+            ..Sandbox::default()
+        };
+        sandbox.set_phase(SandboxPhase::Provisioning as i32);
+        Ok(Response::new(SandboxResponse {
+            sandbox: Some(sandbox),
         }))
     }
 
@@ -98,18 +100,19 @@ impl OpenShell for TestOpenShell {
         request: tonic::Request<GetSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
         let name = request.into_inner().name;
-        Ok(Response::new(SandboxResponse {
-            sandbox: Some(Sandbox {
-                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
-                    id: format!("id-{name}"),
-                    name,
-                    created_at_ms: 0,
-                    labels: HashMap::new(),
-                    resource_version: 0,
-                }),
-                phase: SandboxPhase::Ready as i32,
-                ..Sandbox::default()
+        let mut sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: format!("id-{name}"),
+                name,
+                created_at_ms: 0,
+                labels: HashMap::new(),
+                resource_version: 0,
             }),
+            ..Sandbox::default()
+        };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        Ok(Response::new(SandboxResponse {
+            sandbox: Some(sandbox),
         }))
     }
 
@@ -165,7 +168,10 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<GetGatewayConfigRequest>,
     ) -> Result<Response<GetGatewayConfigResponse>, Status> {
-        Ok(Response::new(GetGatewayConfigResponse::default()))
+        Ok(Response::new(GetGatewayConfigResponse {
+            settings: self.state.global_settings.lock().await.clone(),
+            settings_revision: 1,
+        }))
     }
 
     async fn get_sandbox_provider_environment(
@@ -347,7 +353,7 @@ impl OpenShell for TestOpenShell {
         let vm_log_churn_before_ready = self.state.vm_log_churn_before_ready.load(Ordering::SeqCst);
 
         tokio::spawn(async move {
-            let provisioning = Sandbox {
+            let mut provisioning = Sandbox {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: sandbox_id.clone(),
                     name: sandbox_id.trim_start_matches("id-").to_string(),
@@ -355,16 +361,12 @@ impl OpenShell for TestOpenShell {
                     labels: HashMap::new(),
                     resource_version: 0,
                 }),
-                phase: SandboxPhase::Provisioning as i32,
                 ..Sandbox::default()
             };
-            let error = Sandbox {
-                phase: SandboxPhase::Error as i32,
+            provisioning.set_phase(SandboxPhase::Provisioning as i32);
+            let mut error = Sandbox {
                 status: Some(SandboxStatus {
                     sandbox_name: sandbox_id.trim_start_matches("id-").to_string(),
-                    agent_pod: String::new(),
-                    agent_fd: String::new(),
-                    sandbox_fd: String::new(),
                     conditions: vec![SandboxCondition {
                         r#type: "Ready".to_string(),
                         status: "False".to_string(),
@@ -372,13 +374,13 @@ impl OpenShell for TestOpenShell {
                         message: "VM process exited with status 0".to_string(),
                         last_transition_time: String::new(),
                     }],
+                    ..Default::default()
                 }),
                 ..provisioning.clone()
             };
-            let ready = Sandbox {
-                phase: SandboxPhase::Ready as i32,
-                ..provisioning.clone()
-            };
+            error.set_phase(SandboxPhase::Error as i32);
+            let mut ready = provisioning.clone();
+            ready.set_phase(SandboxPhase::Ready as i32);
 
             let _ = tx
                 .send(Ok(SandboxStreamEvent {
@@ -604,6 +606,20 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("not implemented in test"))
     }
 
+    async fn issue_sandbox_token(
+        &self,
+        _request: tonic::Request<openshell_core::proto::IssueSandboxTokenRequest>,
+    ) -> Result<Response<openshell_core::proto::IssueSandboxTokenResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn refresh_sandbox_token(
+        &self,
+        _request: tonic::Request<openshell_core::proto::RefreshSandboxTokenRequest>,
+    ) -> Result<Response<openshell_core::proto::RefreshSandboxTokenResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
     async fn connect_supervisor(
         &self,
         _request: tonic::Request<tonic::Streaming<SupervisorMessage>>,
@@ -737,6 +753,15 @@ async fn create_requests(server: &TestServer) -> Vec<CreateSandboxRequest> {
     server.openshell.state.create_requests.lock().await.clone()
 }
 
+async fn enable_providers_v2(server: &TestServer) {
+    server.openshell.state.global_settings.lock().await.insert(
+        openshell_core::settings::PROVIDERS_V2_ENABLED_KEY.to_string(),
+        SettingValue {
+            value: Some(setting_value::Value::BoolValue(true)),
+        },
+    );
+}
+
 fn test_tls(server: &TestServer) -> TlsOptions {
     server.tls.with_gateway_name("openshell")
 }
@@ -755,7 +780,7 @@ async fn sandbox_create_keeps_command_sessions_by_default() {
         Some("default-command"),
         None,
         "openshell",
-        None,
+        &[],
         true,
         false,
         None,
@@ -769,6 +794,7 @@ async fn sandbox_create_keeps_command_sessions_by_default() {
         Some(false),
         Some(false),
         &HashMap::new(),
+        "manual",
         &tls,
     )
     .await
@@ -796,7 +822,7 @@ async fn sandbox_create_sends_cpu_and_memory_limits_only() {
         Some("resources"),
         None,
         "openshell",
-        None,
+        &[],
         true,
         false,
         None,
@@ -810,6 +836,7 @@ async fn sandbox_create_sends_cpu_and_memory_limits_only() {
         Some(false),
         Some(false),
         &HashMap::new(),
+        "manual",
         &tls,
     )
     .await
@@ -858,6 +885,54 @@ async fn sandbox_create_sends_cpu_and_memory_limits_only() {
 }
 
 #[tokio::test]
+async fn sandbox_create_does_not_infer_command_providers_when_v2_enabled() {
+    let server = run_server().await;
+    enable_providers_v2(&server).await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+
+    run::sandbox_create(
+        &server.endpoint,
+        Some("v2-no-inferred-provider"),
+        None,
+        "openshell",
+        &[],
+        true,
+        false,
+        None,
+        None,
+        None,
+        None,
+        &[],
+        None,
+        None,
+        &["claude".to_string(), "--version".to_string()],
+        Some(true),
+        Some(false),
+        &HashMap::new(),
+        "manual",
+        &tls,
+    )
+    .await
+    .expect("sandbox create should succeed without inferred provider");
+
+    let requests = create_requests(&server).await;
+    let providers = requests[0]
+        .spec
+        .as_ref()
+        .expect("sandbox spec should be sent")
+        .providers
+        .clone();
+    assert!(
+        providers.is_empty(),
+        "providers v2 should not infer command providers, got {providers:?}"
+    );
+}
+
+#[tokio::test]
 async fn sandbox_create_returns_vm_error_without_waiting_for_timeout() {
     let server = run_server().await;
     server
@@ -881,7 +956,7 @@ async fn sandbox_create_returns_vm_error_without_waiting_for_timeout() {
         Some("vm-error"),
         None,
         "openshell",
-        None,
+        &[],
         true,
         false,
         None,
@@ -895,6 +970,7 @@ async fn sandbox_create_returns_vm_error_without_waiting_for_timeout() {
         Some(false),
         Some(false),
         &HashMap::new(),
+        "manual",
         &tls,
     )
     .await
@@ -933,7 +1009,7 @@ async fn sandbox_create_keeps_waiting_while_vm_progress_arrives() {
         Some("vm-slow-progress"),
         None,
         "openshell",
-        None,
+        &[],
         true,
         false,
         None,
@@ -947,6 +1023,7 @@ async fn sandbox_create_keeps_waiting_while_vm_progress_arrives() {
         Some(false),
         Some(false),
         &HashMap::new(),
+        "manual",
         &tls,
     )
     .await
@@ -977,7 +1054,7 @@ async fn sandbox_create_times_out_when_only_logs_arrive() {
         Some("vm-log-churn"),
         None,
         "openshell",
-        None,
+        &[],
         true,
         false,
         None,
@@ -991,6 +1068,7 @@ async fn sandbox_create_times_out_when_only_logs_arrive() {
         Some(false),
         Some(false),
         &HashMap::new(),
+        "manual",
         &tls,
     )
     .await
@@ -1017,7 +1095,7 @@ async fn sandbox_create_deletes_command_sessions_with_no_keep() {
         Some("ephemeral-command"),
         None,
         "openshell",
-        None,
+        &[],
         false,
         false,
         None,
@@ -1031,6 +1109,7 @@ async fn sandbox_create_deletes_command_sessions_with_no_keep() {
         Some(false),
         Some(false),
         &HashMap::new(),
+        "manual",
         &tls,
     )
     .await
@@ -1061,7 +1140,7 @@ async fn sandbox_create_deletes_shell_sessions_with_no_keep() {
         Some("ephemeral-shell"),
         None,
         "openshell",
-        None,
+        &[],
         false,
         false,
         None,
@@ -1075,6 +1154,7 @@ async fn sandbox_create_deletes_shell_sessions_with_no_keep() {
         Some(true),
         Some(false),
         &HashMap::new(),
+        "manual",
         &tls,
     )
     .await
@@ -1105,7 +1185,7 @@ async fn sandbox_create_keeps_sandbox_with_hidden_keep_flag() {
         Some("persistent-keep"),
         None,
         "openshell",
-        None,
+        &[],
         true,
         false,
         None,
@@ -1119,6 +1199,7 @@ async fn sandbox_create_keeps_sandbox_with_hidden_keep_flag() {
         Some(false),
         Some(false),
         &HashMap::new(),
+        "manual",
         &tls,
     )
     .await
@@ -1149,7 +1230,7 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
         Some("persistent-forward"),
         None,
         "openshell",
-        None,
+        &[],
         false,
         false,
         None,
@@ -1163,6 +1244,7 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
         Some(false),
         Some(false),
         &HashMap::new(),
+        "manual",
         &tls,
     )
     .await

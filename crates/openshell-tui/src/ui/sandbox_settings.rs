@@ -6,6 +6,7 @@ use ratatui::layout::{Constraint, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Padding, Paragraph, Row, Table};
 
+use super::draw_empty_message;
 use crate::app::{App, SandboxPolicyTab, SettingScope};
 
 pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -83,14 +84,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
     frame.render_widget(table, area);
 
     if app.sandbox_settings.is_empty() {
-        let inner = Rect {
-            x: area.x + 2,
-            y: area.y + 2,
-            width: area.width.saturating_sub(4),
-            height: area.height.saturating_sub(3),
-        };
-        let msg = Paragraph::new(Span::styled(" No settings available.", t.muted));
-        frame.render_widget(msg, inner);
+        draw_empty_message(frame, area, " No settings available.", t.muted);
     }
 
     // Overlays.

@@ -157,9 +157,13 @@ filesystem_policy:
         assert_eq!(sandbox_count, 1);
     }
 
-    // 6. End-to-end: git push bypass findings detected (uses embedded registry).
+    // 6. End-to-end: testdata policy with a github credential in scope and a
+    // bypass-L7 binary (git) emits an `l7_bypass_credentialed` finding.
+    // The prover output is categorical, not severity-graded.
     #[test]
-    fn test_git_push_bypass_findings() {
+    fn test_findings_for_github_policy() {
+        use finding::category;
+
         let policy_path = testdata_dir().join("policy.yaml");
         let creds_path = testdata_dir().join("credentials.yaml");
 
@@ -170,23 +174,102 @@ filesystem_policy:
         let z3_model = build_model(pol, cred_set, bin_reg);
         let findings = run_all_queries(&z3_model);
 
-        let query_types: std::collections::HashSet<&str> =
+        let categories: std::collections::HashSet<&str> =
             findings.iter().map(|f| f.query.as_str()).collect();
         assert!(
-            query_types.contains("data_exfiltration"),
-            "expected data_exfiltration finding"
+            categories.contains(category::L7_BYPASS_CREDENTIALED),
+            "expected l7_bypass_credentialed finding for bypass-L7 binary with credential in scope; \
+             got categories: {categories:?}"
         );
-        assert!(
-            query_types.contains("write_bypass"),
-            "expected write_bypass finding"
-        );
-        assert!(
-            findings.iter().any(|f| matches!(
-                f.risk,
-                finding::RiskLevel::Critical | finding::RiskLevel::High
-            )),
-            "expected at least one critical/high finding"
-        );
+        // Every emitted category must be one of the four v1 categories.
+        let allowed: std::collections::HashSet<&str> = [
+            category::LINK_LOCAL_REACH,
+            category::L7_BYPASS_CREDENTIALED,
+            category::CREDENTIAL_REACH_EXPANSION,
+            category::CAPABILITY_EXPANSION,
+        ]
+        .into_iter()
+        .collect();
+        for c in &categories {
+            assert!(
+                allowed.contains(*c),
+                "unexpected category {c} emitted by the prover"
+            );
+        }
+    }
+
+    #[test]
+    fn test_wildcard_endpoint_covering_credential_host_emits_credential_reach() {
+        use finding::{FindingPath, category};
+
+        let policy = policy::parse_policy_str(
+            r#"
+version: 1
+network_policies:
+  github_wildcard:
+    name: github-wildcard
+    endpoints:
+      - host: "*.github.com"
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        access: read-write
+    binaries:
+      - path: /usr/bin/curl
+"#,
+        )
+        .expect("parse policy");
+        let cred_set =
+            credentials::load_credential_set_embedded(&testdata_dir().join("credentials.yaml"))
+                .expect("load creds");
+        let bin_reg = registry::load_embedded_binary_registry().expect("load registry");
+
+        let z3_model = build_model(policy, cred_set, bin_reg);
+        let findings = run_all_queries(&z3_model);
+
+        let reach = findings
+            .iter()
+            .find(|finding| finding.query == category::CREDENTIAL_REACH_EXPANSION)
+            .expect("wildcard host covering api.github.com must be credentialed");
+        assert!(reach.paths.iter().any(|path| matches!(
+            path,
+            FindingPath::Exfil(exfil)
+                if exfil.endpoint_host == "*.github.com" && exfil.binary == "/usr/bin/curl"
+        )));
+    }
+
+    #[test]
+    fn test_known_metadata_hostname_emits_link_local_finding() {
+        use finding::{FindingPath, category};
+
+        let policy = policy::parse_policy_str(
+            r"
+version: 1
+network_policies:
+  metadata:
+    name: metadata
+    endpoints:
+      - host: metadata.google.internal
+        port: 80
+    binaries:
+      - path: /usr/bin/curl
+",
+        )
+        .expect("parse policy");
+        let bin_reg = registry::load_embedded_binary_registry().expect("load registry");
+
+        let z3_model = build_model(policy, credentials::CredentialSet::default(), bin_reg);
+        let findings = run_all_queries(&z3_model);
+
+        let link_local = findings
+            .iter()
+            .find(|finding| finding.query == category::LINK_LOCAL_REACH)
+            .expect("known metadata hostname must emit link-local/metadata finding");
+        assert!(link_local.paths.iter().any(|path| matches!(
+            path,
+            FindingPath::Exfil(exfil)
+                if exfil.endpoint_host == "metadata.google.internal"
+        )));
     }
 
     // 7. Empty policy produces no findings.

@@ -23,6 +23,10 @@ use openshell_core::proto::{
     TcpRelayTarget, WatchSandboxRequest, relay_open, tcp_forward_init,
 };
 use openshell_core::proto::{Sandbox, SandboxPhase, SandboxTemplate, SshSession};
+use openshell_core::telemetry::{
+    LifecycleOperation, LifecycleResource, SandboxTemplateSource, TelemetryComputeDriver,
+    TelemetryOutcome,
+};
 use openshell_core::{ObjectId, ObjectName};
 use prost::Message;
 use std::net::IpAddr;
@@ -30,7 +34,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::{debug, info, warn};
@@ -45,7 +49,8 @@ use super::validation::{
     level_matches, source_matches, validate_exec_request_fields, validate_policy_safety,
     validate_sandbox_spec,
 };
-use super::{MAX_PAGE_SIZE, MAX_PROVIDERS, clamp_limit, current_time_ms};
+use super::{MAX_PAGE_SIZE, MAX_PROVIDERS, clamp_limit};
+use crate::persistence::current_time_ms;
 
 const TCP_FORWARD_CHUNK_SIZE: usize = 64 * 1024;
 
@@ -57,8 +62,62 @@ pub(super) async fn handle_create_sandbox(
     state: &Arc<ServerState>,
     request: Request<CreateSandboxRequest>,
 ) -> Result<Response<SandboxResponse>, Status> {
-    use crate::persistence::current_time_ms;
+    let create_request = request.get_ref().clone();
+    let result = handle_create_sandbox_inner(state, request).await;
+    emit_sandbox_create_telemetry(
+        state,
+        &create_request,
+        TelemetryOutcome::from_success(result.is_ok()),
+    );
+    result
+}
 
+fn emit_sandbox_create_telemetry(
+    state: &Arc<ServerState>,
+    request: &CreateSandboxRequest,
+    outcome: TelemetryOutcome,
+) {
+    let compute_driver = telemetry_compute_driver(state.compute.driver_kind());
+    let Some(spec) = request.spec.as_ref() else {
+        openshell_core::telemetry::emit_sandbox_create(
+            outcome,
+            false,
+            0,
+            false,
+            SandboxTemplateSource::Undefined,
+            compute_driver,
+        );
+        return;
+    };
+    let template_source = if spec
+        .template
+        .as_ref()
+        .is_some_and(|template| !template.image.trim().is_empty())
+    {
+        SandboxTemplateSource::Image
+    } else {
+        SandboxTemplateSource::Default
+    };
+    openshell_core::telemetry::emit_sandbox_create(
+        outcome,
+        spec.gpu,
+        spec.providers.len() as u64,
+        spec.policy.is_some(),
+        template_source,
+        compute_driver,
+    );
+}
+
+fn telemetry_compute_driver(
+    driver_kind: Option<openshell_core::ComputeDriverKind>,
+) -> TelemetryComputeDriver {
+    TelemetryComputeDriver::from_driver_kind(driver_kind)
+}
+
+async fn handle_create_sandbox_inner(
+    state: &Arc<ServerState>,
+    request: Request<CreateSandboxRequest>,
+) -> Result<Response<SandboxResponse>, Status> {
     let request = request.into_inner();
     let spec = request
         .spec
@@ -107,7 +166,7 @@ pub(super) async fn handle_create_sandbox(
 
     let now_ms = current_time_ms();
 
-    let sandbox = Sandbox {
+    let mut sandbox = Sandbox {
         metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
             id: id.clone(),
             name: name.clone(),
@@ -117,9 +176,8 @@ pub(super) async fn handle_create_sandbox(
         }),
         spec: Some(spec),
         status: None,
-        phase: SandboxPhase::Provisioning as i32,
-        current_policy_version: 0,
     };
+    sandbox.set_phase(SandboxPhase::Provisioning as i32);
 
     // Ensure metadata is valid (defense in depth - should always be true for server-constructed metadata)
     super::validation::validate_object_metadata(sandbox.metadata.as_ref(), "sandbox")?;
@@ -133,7 +191,27 @@ pub(super) async fn handle_create_sandbox(
             status
         })?;
 
-    let sandbox = state.compute.create_sandbox(sandbox).await?;
+    // Mint the gateway JWT for singleplayer drivers. K8s sandboxes skip
+    // this mint and bootstrap via `IssueSandboxToken` at supervisor
+    // startup; identifying "is this K8s?" lives in the compute layer, so
+    // we mint unconditionally here when the issuer is configured and let
+    // the K8s driver simply ignore the field.
+    let sandbox_token = state.sandbox_jwt_issuer.as_ref().map(|issuer| {
+        issuer.mint(&id).map(|minted| {
+            tracing::info!(
+                sandbox_id = %id,
+                "minted sandbox JWT"
+            );
+            minted.token
+        })
+    });
+    let sandbox_token = match sandbox_token {
+        Some(Ok(token)) => Some(token),
+        Some(Err(status)) => return Err(status),
+        None => None,
+    };
+
+    let sandbox = state.compute.create_sandbox(sandbox, sandbox_token).await?;
 
     info!(
         sandbox_id = %id,
@@ -393,12 +471,39 @@ pub(super) async fn handle_delete_sandbox(
     state: &Arc<ServerState>,
     request: Request<DeleteSandboxRequest>,
 ) -> Result<Response<DeleteSandboxResponse>, Status> {
+    let result = handle_delete_sandbox_inner(state, request).await;
+    let outcome = match &result {
+        Ok(response) if response.get_ref().deleted => TelemetryOutcome::Success,
+        _ => TelemetryOutcome::Failure,
+    };
+    openshell_core::telemetry::emit_lifecycle(
+        LifecycleResource::Sandbox,
+        LifecycleOperation::Delete,
+        outcome,
+    );
+    result
+}
+
+async fn handle_delete_sandbox_inner(
+    state: &Arc<ServerState>,
+    request: Request<DeleteSandboxRequest>,
+) -> Result<Response<DeleteSandboxResponse>, Status> {
     let name = request.into_inner().name;
     if name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
 
+    let sandbox_id = state
+        .store
+        .get_message_by_name::<Sandbox>(&name)
+        .await
+        .ok()
+        .flatten()
+        .map(|sandbox| sandbox.object_id().to_string());
     let deleted = state.compute.delete_sandbox(&name).await?;
+    if deleted && let Some(sandbox_id) = sandbox_id {
+        state.telemetry.end_sandbox_session(&sandbox_id);
+    }
     info!(sandbox_name = %name, "DeleteSandbox request completed successfully");
     Ok(Response::new(DeleteSandboxResponse { deleted }))
 }
@@ -540,7 +645,7 @@ pub(super) async fn handle_watch_sandbox(
 
                 if stop_on_terminal {
                     let phase =
-                        SandboxPhase::try_from(sandbox.phase).unwrap_or(SandboxPhase::Unknown);
+                        SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
                     if phase == SandboxPhase::Ready {
                         return;
                     }
@@ -610,7 +715,7 @@ pub(super) async fn handle_watch_sandbox(
                                         return;
                                     }
                                     if stop_on_terminal {
-                                        let phase = SandboxPhase::try_from(sandbox.phase).unwrap_or(SandboxPhase::Unknown);
+                                        let phase = SandboxPhase::try_from(sandbox.phase()).unwrap_or(SandboxPhase::Unknown);
                                         if phase == SandboxPhase::Ready {
                                             return;
                                         }
@@ -713,7 +818,7 @@ pub(super) async fn handle_exec_sandbox(
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
 
-    if SandboxPhase::try_from(sandbox.phase).ok() != Some(SandboxPhase::Ready) {
+    if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
         return Err(Status::failed_precondition("sandbox is not ready"));
     }
 
@@ -737,29 +842,10 @@ pub(super) async fn handle_exec_sandbox(
     let (tx, rx) = mpsc::channel::<Result<ExecSandboxEvent, Status>>(256);
     tokio::spawn(async move {
         // Wait for the supervisor's reverse CONNECT to deliver the relay stream.
-        let relay_stream = match tokio::time::timeout(std::time::Duration::from_secs(10), relay_rx)
-            .await
-        {
-            Ok(Ok(Ok(stream))) => stream,
-            Ok(Ok(Err(status))) => {
-                warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, error = %status.message(), "ExecSandbox: relay target open failed");
-                let _ = tx.send(Err(status)).await;
-                return;
-            }
-            Ok(Err(_)) => {
-                warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, "ExecSandbox: relay channel dropped");
-                let _ = tx
-                    .send(Err(Status::unavailable("relay channel dropped")))
-                    .await;
-                return;
-            }
-            Err(_) => {
-                warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, "ExecSandbox: relay open timed out");
-                let _ = tx
-                    .send(Err(Status::deadline_exceeded("relay open timed out")))
-                    .await;
-                return;
-            }
+        let Some(relay_stream) =
+            await_relay_stream(relay_rx, &tx, &sandbox_id, &channel_id, "ExecSandbox").await
+        else {
+            return;
         };
 
         if let Err(err) = stream_exec_over_relay(
@@ -780,6 +866,41 @@ pub(super) async fn handle_exec_sandbox(
     });
 
     Ok(Response::new(ReceiverStream::new(rx)))
+}
+
+/// Wait for the supervisor's reverse CONNECT to deliver a relay stream.
+///
+/// Returns `Some(stream)` on success. On any failure the error is sent on `tx`
+/// and `None` is returned; the caller should then `return` immediately.
+async fn await_relay_stream<T: Send + 'static>(
+    relay_rx: oneshot::Receiver<Result<tokio::io::DuplexStream, Status>>,
+    tx: &mpsc::Sender<Result<T, Status>>,
+    sandbox_id: &str,
+    channel_id: &str,
+    context: &str,
+) -> Option<tokio::io::DuplexStream> {
+    match tokio::time::timeout(std::time::Duration::from_secs(10), relay_rx).await {
+        Ok(Ok(Ok(stream))) => Some(stream),
+        Ok(Ok(Err(status))) => {
+            warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, error = %status.message(), "{context}: relay target open failed");
+            let _ = tx.send(Err(status)).await;
+            None
+        }
+        Ok(Err(_)) => {
+            warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, "{context}: relay channel dropped");
+            let _ = tx
+                .send(Err(Status::unavailable("relay channel dropped")))
+                .await;
+            None
+        }
+        Err(_) => {
+            warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, "{context}: relay open timed out");
+            let _ = tx
+                .send(Err(Status::deadline_exceeded("relay open timed out")))
+                .await;
+            None
+        }
+    }
 }
 
 pub(super) async fn handle_forward_tcp(
@@ -811,7 +932,7 @@ pub(super) async fn handle_forward_tcp(
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
 
-    if SandboxPhase::try_from(sandbox.phase).ok() != Some(SandboxPhase::Ready) {
+    if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
         return Err(Status::failed_precondition("sandbox is not ready"));
     }
 
@@ -831,29 +952,10 @@ pub(super) async fn handle_forward_tcp(
     let (tx, rx) = mpsc::channel::<Result<TcpForwardFrame, Status>>(256);
     tokio::spawn(async move {
         let _connection_guard = connection_guard;
-        let relay_stream = match tokio::time::timeout(std::time::Duration::from_secs(10), relay_rx)
-            .await
-        {
-            Ok(Ok(Ok(stream))) => stream,
-            Ok(Ok(Err(status))) => {
-                warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, error = %status.message(), "ForwardTcp: relay target open failed");
-                let _ = tx.send(Err(status)).await;
-                return;
-            }
-            Ok(Err(_)) => {
-                warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, "ForwardTcp: relay channel dropped");
-                let _ = tx
-                    .send(Err(Status::unavailable("relay channel dropped")))
-                    .await;
-                return;
-            }
-            Err(_) => {
-                warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, "ForwardTcp: relay open timed out");
-                let _ = tx
-                    .send(Err(Status::deadline_exceeded("relay open timed out")))
-                    .await;
-                return;
-            }
+        let Some(relay_stream) =
+            await_relay_stream(relay_rx, &tx, &sandbox_id, &channel_id, "ForwardTcp").await
+        else {
+            return;
         };
 
         bridge_forward_tcp_stream(inbound, relay_stream, tx, &sandbox_id, &channel_id).await;
@@ -1159,7 +1261,7 @@ pub(super) async fn handle_exec_sandbox_interactive(
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
 
-    if SandboxPhase::try_from(sandbox.phase).ok() != Some(SandboxPhase::Ready) {
+    if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
         return Err(Status::failed_precondition("sandbox is not ready"));
     }
 
@@ -1179,29 +1281,16 @@ pub(super) async fn handle_exec_sandbox_interactive(
 
     let (tx, rx) = mpsc::channel::<Result<ExecSandboxEvent, Status>>(256);
     tokio::spawn(async move {
-        let relay_stream = match tokio::time::timeout(std::time::Duration::from_secs(10), relay_rx)
-            .await
-        {
-            Ok(Ok(Ok(stream))) => stream,
-            Ok(Ok(Err(status))) => {
-                warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, error = %status.message(), "ExecSandboxInteractive: relay target open failed");
-                let _ = tx.send(Err(status)).await;
-                return;
-            }
-            Ok(Err(_)) => {
-                warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, "ExecSandboxInteractive: relay channel dropped");
-                let _ = tx
-                    .send(Err(Status::unavailable("relay channel dropped")))
-                    .await;
-                return;
-            }
-            Err(_) => {
-                warn!(sandbox_id = %sandbox_id, channel_id = %channel_id, "ExecSandboxInteractive: relay open timed out");
-                let _ = tx
-                    .send(Err(Status::deadline_exceeded("relay open timed out")))
-                    .await;
-                return;
-            }
+        let Some(relay_stream) = await_relay_stream(
+            relay_rx,
+            &tx,
+            &sandbox_id,
+            &channel_id,
+            "ExecSandboxInteractive",
+        )
+        .await
+        else {
+            return;
         };
 
         if let Err(err) = stream_interactive_exec_over_relay(
@@ -1245,7 +1334,7 @@ pub(super) async fn handle_create_ssh_session(
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
 
-    if SandboxPhase::try_from(sandbox.phase).ok() != Some(SandboxPhase::Ready) {
+    if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
         return Err(Status::failed_precondition("sandbox is not ready"));
     }
 
@@ -1855,6 +1944,30 @@ mod tests {
     // ---- shell_escape ----
 
     #[test]
+    fn telemetry_compute_driver_uses_resolved_driver_kind() {
+        assert_eq!(
+            telemetry_compute_driver(Some(openshell_core::ComputeDriverKind::Docker)),
+            TelemetryComputeDriver::Docker
+        );
+        assert_eq!(
+            telemetry_compute_driver(Some(openshell_core::ComputeDriverKind::Kubernetes)),
+            TelemetryComputeDriver::Kubernetes
+        );
+        assert_eq!(
+            telemetry_compute_driver(Some(openshell_core::ComputeDriverKind::Podman)),
+            TelemetryComputeDriver::Podman
+        );
+        assert_eq!(
+            telemetry_compute_driver(Some(openshell_core::ComputeDriverKind::Vm)),
+            TelemetryComputeDriver::Vm
+        );
+        assert_eq!(
+            telemetry_compute_driver(None),
+            TelemetryComputeDriver::Unknown
+        );
+    }
+
+    #[test]
     fn shell_escape_safe_chars_pass_through() {
         assert_eq!(shell_escape("ls").unwrap(), "ls");
         assert_eq!(shell_escape("/usr/bin/python").unwrap(), "/usr/bin/python");
@@ -2087,7 +2200,7 @@ mod tests {
     }
 
     fn test_sandbox(name: &str, providers: Vec<String>) -> Sandbox {
-        Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(ObjectMeta {
                 id: format!("sandbox-{name}"),
                 name: name.to_string(),
@@ -2101,10 +2214,11 @@ mod tests {
                 providers,
                 ..Default::default()
             }),
-            phase: SandboxPhase::Ready as i32,
-            current_policy_version: 7,
             ..Default::default()
-        }
+        };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        sandbox.set_current_policy_version(7);
+        sandbox
     }
 
     #[tokio::test]
@@ -2140,11 +2254,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(sandbox.phase(), SandboxPhase::Ready as i32);
+        assert_eq!(sandbox.current_policy_version(), 7);
         let spec = sandbox.spec.unwrap();
         assert_eq!(spec.providers, vec!["work-github"]);
         assert_eq!(spec.log_level, "debug");
-        assert_eq!(sandbox.phase, SandboxPhase::Ready as i32);
-        assert_eq!(sandbox.current_policy_version, 7);
     }
 
     #[tokio::test]
@@ -2425,7 +2539,7 @@ mod tests {
     async fn interactive_exec_rejects_sandbox_not_ready() {
         let state = test_server_state().await;
         let mut sandbox = test_sandbox("not-ready", Vec::new());
-        sandbox.phase = SandboxPhase::Provisioning as i32;
+        sandbox.set_phase(SandboxPhase::Provisioning as i32);
         state.store.put_message(&sandbox).await.unwrap();
 
         let stored = state
@@ -2435,7 +2549,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_ne!(
-            SandboxPhase::try_from(stored.phase).ok(),
+            SandboxPhase::try_from(stored.phase()).ok(),
             Some(SandboxPhase::Ready)
         );
     }

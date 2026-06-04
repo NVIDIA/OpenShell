@@ -50,6 +50,7 @@ const VOLUME_PREFIX: &str = "openshell-sandbox-";
 const TLS_CA_MOUNT_PATH: &str = "/etc/openshell/tls/client/ca.crt";
 const TLS_CERT_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.crt";
 const TLS_KEY_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.key";
+const SANDBOX_TOKEN_MOUNT_PATH: &str = "/etc/openshell/auth/sandbox.jwt";
 
 /// Build a Podman container name from the sandbox name.
 #[must_use]
@@ -182,6 +183,8 @@ struct HealthConfig {
 struct ResourceLimits {
     cpu: CpuLimits,
     memory: MemoryLimits,
+    #[serde(rename = "PidsLimit", skip_serializing_if = "Option::is_none")]
+    pids_limit: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -280,6 +283,10 @@ fn build_env(
         openshell_core::sandbox_env::SANDBOX_COMMAND.into(),
         "sleep infinity".into(),
     );
+    env.insert(
+        openshell_core::sandbox_env::TELEMETRY_ENABLED.into(),
+        openshell_core::telemetry::enabled_env_value().into(),
+    );
 
     // 3. TLS client cert paths (when mTLS is enabled). These point to
     //    the container-side mount paths where the cert files are
@@ -296,6 +303,20 @@ fn build_env(
         env.insert(
             openshell_core::sandbox_env::TLS_KEY.into(),
             TLS_KEY_MOUNT_PATH.into(),
+        );
+    }
+
+    env.remove(openshell_core::sandbox_env::SANDBOX_TOKEN);
+    env.remove(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE);
+
+    // 4. Gateway-minted sandbox JWT. Keep the raw bearer out of container
+    //    metadata; the supervisor reads it from a driver-owned bind mount.
+    if let Some(s) = spec
+        && !s.sandbox_token.is_empty()
+    {
+        env.insert(
+            openshell_core::sandbox_env::SANDBOX_TOKEN_FILE.into(),
+            SANDBOX_TOKEN_MOUNT_PATH.into(),
         );
     }
 
@@ -325,7 +346,7 @@ fn build_labels(sandbox: &DriverSandbox) -> BTreeMap<String, String> {
 }
 
 /// Parse resource limits from the sandbox template, falling back to defaults.
-fn build_resource_limits(sandbox: &DriverSandbox) -> ResourceLimits {
+fn build_resource_limits(sandbox: &DriverSandbox, config: &PodmanComputeConfig) -> ResourceLimits {
     let resources = sandbox
         .spec
         .as_ref()
@@ -348,7 +369,12 @@ fn build_resource_limits(sandbox: &DriverSandbox) -> ResourceLimits {
             period: DEFAULT_CPU_PERIOD,
         },
         memory: MemoryLimits { limit: mem_bytes },
+        pids_limit: podman_pids_limit(config.sandbox_pids_limit),
     }
+}
+
+fn podman_pids_limit(value: i64) -> Option<i64> {
+    if value > 0 { Some(value) } else { None }
 }
 
 /// Build CDI GPU device list if GPU is requested.
@@ -363,15 +389,25 @@ fn build_devices(sandbox: &DriverSandbox) -> Option<Vec<LinuxDevice>> {
 }
 
 /// Build the Podman container creation JSON spec.
+#[cfg(test)]
 #[must_use]
 pub fn build_container_spec(sandbox: &DriverSandbox, config: &PodmanComputeConfig) -> Value {
+    build_container_spec_with_token(sandbox, config, None)
+}
+
+#[must_use]
+pub fn build_container_spec_with_token(
+    sandbox: &DriverSandbox,
+    config: &PodmanComputeConfig,
+    token_host_path: Option<&std::path::Path>,
+) -> Value {
     let image = resolve_image(sandbox, config);
     let name = container_name(&sandbox.name);
     let vol = volume_name(&sandbox.id);
 
     let env = build_env(sandbox, config, image);
     let labels = build_labels(sandbox);
-    let resource_limits = build_resource_limits(sandbox);
+    let resource_limits = build_resource_limits(sandbox, config);
     let devices = build_devices(sandbox);
 
     // Network configuration -- always bridge mode.
@@ -505,10 +541,7 @@ pub fn build_container_spec(sandbox: &DriverSandbox, config: &PodmanComputeConfi
         // Inject stable host aliases into /etc/hosts so sandbox containers can
         // reach services on the host. `host.openshell.internal` is the driver-
         // neutral alias used by policies and e2e tests.
-        hostadd: vec![
-            "host.containers.internal:host-gateway".into(),
-            "host.openshell.internal:host-gateway".into(),
-        ],
+        hostadd: hostadd_entries(config),
         netns: NetNS {
             nsmode: "bridge".to_string(),
         },
@@ -563,6 +596,18 @@ pub fn build_container_spec(sandbox: &DriverSandbox, config: &PodmanComputeConfi
                     options: ro,
                 });
             }
+            if let Some(path) = token_host_path {
+                let mut ro = vec!["ro".into(), "rbind".into()];
+                if is_selinux_enabled() {
+                    ro.push("z".into());
+                }
+                m.push(Mount {
+                    kind: "bind".into(),
+                    source: path.display().to_string(),
+                    destination: SANDBOX_TOKEN_MOUNT_PATH.into(),
+                    options: ro,
+                });
+            }
             m
         },
         // Publish the SSH port with host_port=0 to get an ephemeral host port.
@@ -576,6 +621,21 @@ pub fn build_container_spec(sandbox: &DriverSandbox, config: &PodmanComputeConfi
     };
 
     serde_json::to_value(container_spec).expect("ContainerSpec serialization cannot fail")
+}
+
+fn hostadd_entries(config: &PodmanComputeConfig) -> Vec<String> {
+    let host_gateway_ip = config.host_gateway_ip.trim();
+    if host_gateway_ip.is_empty() {
+        return vec![
+            "host.containers.internal:host-gateway".into(),
+            "host.openshell.internal:host-gateway".into(),
+        ];
+    }
+
+    vec![
+        format!("host.containers.internal:{host_gateway_ip}"),
+        format!("host.openshell.internal:{host_gateway_ip}"),
+    ]
 }
 
 /// Parse a Kubernetes-style CPU quantity to cgroup quota microseconds
@@ -635,6 +695,9 @@ fn parse_memory_to_bytes(quantity: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
     #[test]
     fn parse_cpu_millicore() {
@@ -698,6 +761,20 @@ mod tests {
             spec["resource_limits"]["memory"]["limit"].as_u64(),
             Some(2 * 1024 * 1024 * 1024)
         );
+        assert_eq!(
+            spec["resource_limits"]["PidsLimit"].as_i64(),
+            Some(crate::config::DEFAULT_SANDBOX_PIDS_LIMIT)
+        );
+    }
+
+    #[test]
+    fn container_spec_can_inherit_runtime_pids_limit() {
+        let sandbox = test_sandbox("test-id", "test-name");
+        let mut config = test_config();
+        config.sandbox_pids_limit = 0;
+        let spec = build_container_spec(&sandbox, &config);
+
+        assert!(spec["resource_limits"].get("PidsLimit").is_none());
     }
 
     #[test]
@@ -909,6 +986,41 @@ mod tests {
     }
 
     #[test]
+    fn container_spec_telemetry_toggle_comes_from_driver_env() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        temp_env::with_vars(
+            [(
+                openshell_core::sandbox_env::TELEMETRY_ENABLED,
+                Some("false"),
+            )],
+            || {
+                let mut sandbox = test_sandbox("test-id", "legit-name");
+                sandbox.spec = Some(DriverSandboxSpec {
+                    environment: std::collections::HashMap::from([(
+                        openshell_core::sandbox_env::TELEMETRY_ENABLED.to_string(),
+                        "true".to_string(),
+                    )]),
+                    template: Some(DriverSandboxTemplate::default()),
+                    ..Default::default()
+                });
+
+                let spec = build_container_spec(&sandbox, &test_config());
+                let env_map = spec["env"].as_object().expect("env should be an object");
+
+                assert_eq!(
+                    env_map
+                        .get(openshell_core::sandbox_env::TELEMETRY_ENABLED)
+                        .and_then(|v| v.as_str()),
+                    Some("false"),
+                    "telemetry toggle must come from the deployment environment"
+                );
+            },
+        );
+    }
+
+    #[test]
     fn container_spec_required_labels_cannot_be_overridden() {
         use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
@@ -1013,6 +1125,7 @@ mod tests {
             socket_path: std::path::PathBuf::from("/tmp/test.sock"),
             default_image: "test-image:latest".to_string(),
             grpc_endpoint: "http://localhost:50051".to_string(),
+            host_gateway_ip: String::new(),
             sandbox_ssh_socket_path: "/run/openshell/test-ssh.sock".to_string(),
             ..PodmanComputeConfig::default()
         }
@@ -1048,6 +1161,34 @@ mod tests {
             vol["rw"].as_bool(),
             Some(false),
             "image volume should be read-only"
+        );
+    }
+
+    #[test]
+    fn container_spec_uses_configured_host_gateway_ip() {
+        let sandbox = test_sandbox("test-id", "test-name");
+        let mut config = test_config();
+        config.host_gateway_ip = "192.168.127.254".to_string();
+        let spec = build_container_spec(&sandbox, &config);
+
+        let hostadd: Vec<&str> = spec["hostadd"]
+            .as_array()
+            .expect("hostadd should be an array")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+
+        assert!(
+            hostadd.contains(&"host.containers.internal:192.168.127.254"),
+            "missing Podman host alias with configured host gateway IP"
+        );
+        assert!(
+            hostadd.contains(&"host.openshell.internal:192.168.127.254"),
+            "missing OpenShell host alias with configured host gateway IP"
+        );
+        assert!(
+            !hostadd.contains(&"host.containers.internal:host-gateway"),
+            "configured host gateway IP should avoid Podman's host-gateway resolver"
         );
     }
 
@@ -1113,6 +1254,43 @@ mod tests {
             is_selinux_enabled(),
             "TLS bind mounts should include 'z' option iff SELinux is enabled"
         );
+    }
+
+    #[test]
+    fn container_spec_uses_token_file_mount_without_raw_token_env() {
+        use openshell_core::proto::compute::v1::DriverSandboxSpec;
+
+        let mut sandbox = test_sandbox("token-id", "token-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            sandbox_token: "secret.jwt.value".to_string(),
+            ..Default::default()
+        });
+        let config = test_config();
+        let token_path = std::path::Path::new("/host/token.jwt");
+
+        let spec = build_container_spec_with_token(&sandbox, &config, Some(token_path));
+
+        let env_map = spec["env"].as_object().expect("env should be an object");
+        assert_eq!(
+            env_map
+                .get(openshell_core::sandbox_env::SANDBOX_TOKEN)
+                .and_then(|v| v.as_str()),
+            None
+        );
+        assert_eq!(
+            env_map
+                .get(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE)
+                .and_then(|v| v.as_str()),
+            Some("/etc/openshell/auth/sandbox.jwt")
+        );
+        let mounts = spec["mounts"]
+            .as_array()
+            .expect("mounts should be an array");
+        assert!(mounts.iter().any(|m| {
+            m["type"].as_str() == Some("bind")
+                && m["source"].as_str() == Some("/host/token.jwt")
+                && m["destination"].as_str() == Some("/etc/openshell/auth/sandbox.jwt")
+        }));
     }
 
     #[test]

@@ -2,11 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use openshell_core::config::{DEFAULT_STOP_TIMEOUT_SECS, DEFAULT_SUPERVISOR_IMAGE};
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 
 /// Default Podman bridge network name.
 pub const DEFAULT_NETWORK_NAME: &str = "openshell";
+pub const MACOS_PODMAN_MACHINE_HOST_GATEWAY_IP: &str = "192.168.127.254";
+
+// Re-export the shared default so existing imports inside this crate keep working.
+pub use openshell_core::config::DEFAULT_SANDBOX_PIDS_LIMIT;
 
 /// Image pull policy for sandbox and supervisor images.
 ///
@@ -89,6 +94,13 @@ pub struct PodmanComputeConfig {
     /// Name of the Podman bridge network.
     /// Created automatically if it does not exist.
     pub network_name: String,
+    /// Host gateway IP used for sandbox host aliases.
+    ///
+    /// Empty uses Podman's `host-gateway` resolver. macOS defaults to
+    /// gvproxy's host-loopback IP because stale Podman machines may fail to
+    /// resolve `host-gateway` while still serving `host.containers.internal`
+    /// through gvproxy.
+    pub host_gateway_ip: String,
     /// Container stop timeout in seconds (SIGTERM → SIGKILL).
     pub stop_timeout_secs: u32,
     /// OCI image containing the openshell-sandbox supervisor binary.
@@ -106,6 +118,10 @@ pub struct PodmanComputeConfig {
     pub guest_tls_cert: Option<PathBuf>,
     /// Host path to the client private key for sandbox mTLS.
     pub guest_tls_key: Option<PathBuf>,
+    /// Container cgroup PID limit for Podman-managed sandboxes.
+    ///
+    /// Set to `0` to leave Podman's runtime/default PID limit unchanged.
+    pub sandbox_pids_limit: i64,
 }
 
 impl PodmanComputeConfig {
@@ -149,6 +165,43 @@ impl PodmanComputeConfig {
         )))
     }
 
+    /// Validate runtime resource-limit configuration.
+    pub fn validate_runtime_limits(&self) -> Result<(), crate::client::PodmanApiError> {
+        if self.sandbox_pids_limit < 0 {
+            return Err(crate::client::PodmanApiError::InvalidInput(
+                "sandbox_pids_limit must be zero or greater".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validate optional host gateway override.
+    pub fn validate_host_gateway_ip(&self) -> Result<(), crate::client::PodmanApiError> {
+        let trimmed = self.host_gateway_ip.trim();
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+
+        trimmed.parse::<IpAddr>().map(|_| ()).map_err(|err| {
+            crate::client::PodmanApiError::InvalidInput(format!(
+                "invalid host_gateway_ip value '{trimmed}': {err}"
+            ))
+        })
+    }
+
+    /// Resolve the default host gateway override for the current platform.
+    #[must_use]
+    pub fn default_host_gateway_ip() -> String {
+        #[cfg(target_os = "macos")]
+        {
+            MACOS_PODMAN_MACHINE_HOST_GATEWAY_IP.to_string()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            String::new()
+        }
+    }
+
     /// Resolve the default socket path from the environment.
     ///
     /// - **macOS**: `$HOME/.local/share/containers/podman/machine/podman.sock`
@@ -167,7 +220,7 @@ impl PodmanComputeConfig {
         {
             std::env::var("XDG_RUNTIME_DIR").map_or_else(
                 |_| {
-                    let uid = nix::unistd::getuid();
+                    let uid = rustix::process::getuid().as_raw();
                     PathBuf::from(format!("/run/user/{uid}/podman/podman.sock"))
                 },
                 |xdg| PathBuf::from(xdg).join("podman/podman.sock"),
@@ -186,11 +239,13 @@ impl Default for PodmanComputeConfig {
             gateway_port: openshell_core::config::DEFAULT_SERVER_PORT,
             sandbox_ssh_socket_path: "/run/openshell/ssh.sock".to_string(),
             network_name: DEFAULT_NETWORK_NAME.to_string(),
+            host_gateway_ip: Self::default_host_gateway_ip(),
             stop_timeout_secs: DEFAULT_STOP_TIMEOUT_SECS,
             supervisor_image: DEFAULT_SUPERVISOR_IMAGE.to_string(),
             guest_tls_ca: None,
             guest_tls_cert: None,
             guest_tls_key: None,
+            sandbox_pids_limit: DEFAULT_SANDBOX_PIDS_LIMIT,
         }
     }
 }
@@ -205,11 +260,13 @@ impl std::fmt::Debug for PodmanComputeConfig {
             .field("gateway_port", &self.gateway_port)
             .field("sandbox_ssh_socket_path", &self.sandbox_ssh_socket_path)
             .field("network_name", &self.network_name)
+            .field("host_gateway_ip", &self.host_gateway_ip)
             .field("stop_timeout_secs", &self.stop_timeout_secs)
             .field("supervisor_image", &self.supervisor_image)
             .field("guest_tls_ca", &self.guest_tls_ca)
             .field("guest_tls_cert", &self.guest_tls_cert)
             .field("guest_tls_key", &self.guest_tls_key)
+            .field("sandbox_pids_limit", &self.sandbox_pids_limit)
             .finish()
     }
 }
@@ -243,12 +300,55 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         temp_env::with_vars([("XDG_RUNTIME_DIR", None::<&str>)], || {
             let path = PodmanComputeConfig::default_socket_path();
-            let uid = nix::unistd::getuid();
+            let uid = rustix::process::getuid().as_raw();
             assert_eq!(
                 path,
                 PathBuf::from(format!("/run/user/{uid}/podman/podman.sock"))
             );
         });
+    }
+
+    #[test]
+    fn default_config_sets_driver_owned_pids_limit() {
+        let cfg = PodmanComputeConfig::default();
+        assert_eq!(cfg.sandbox_pids_limit, DEFAULT_SANDBOX_PIDS_LIMIT);
+        assert!(cfg.validate_runtime_limits().is_ok());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn default_config_uses_gvproxy_host_gateway_ip_on_macos() {
+        let cfg = PodmanComputeConfig::default();
+        assert_eq!(cfg.host_gateway_ip, MACOS_PODMAN_MACHINE_HOST_GATEWAY_IP);
+        assert!(cfg.validate_host_gateway_ip().is_ok());
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn default_config_leaves_host_gateway_ip_empty_off_macos() {
+        let cfg = PodmanComputeConfig::default();
+        assert!(cfg.host_gateway_ip.is_empty());
+        assert!(cfg.validate_host_gateway_ip().is_ok());
+    }
+
+    #[test]
+    fn host_gateway_ip_validation_rejects_invalid_values() {
+        let cfg = PodmanComputeConfig {
+            host_gateway_ip: "not-an-ip".to_string(),
+            ..PodmanComputeConfig::default()
+        };
+        let err = cfg.validate_host_gateway_ip().unwrap_err();
+        assert!(err.to_string().contains("host_gateway_ip"));
+    }
+
+    #[test]
+    fn runtime_limit_validation_rejects_negative_pids_limit() {
+        let cfg = PodmanComputeConfig {
+            sandbox_pids_limit: -1,
+            ..PodmanComputeConfig::default()
+        };
+        let err = cfg.validate_runtime_limits().unwrap_err();
+        assert!(err.to_string().contains("sandbox_pids_limit"));
     }
 
     #[test]

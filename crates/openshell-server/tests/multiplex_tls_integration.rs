@@ -4,51 +4,19 @@
 mod common;
 
 use bytes::Bytes;
-use common::{PkiBundle, generate_pki, install_rustls_provider, start_test_server};
+use common::{
+    PkiBundle, build_tls_root, generate_pki, generate_rogue_pki, grpc_client_mtls,
+    install_rustls_provider, start_test_server,
+};
 use http_body_util::Empty;
 use hyper::Request;
 use hyper::StatusCode;
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use openshell_core::proto::{HealthRequest, ServiceStatus, open_shell_client::OpenShellClient};
-use rcgen::{CertificateParams, IsCa, KeyPair};
-use rustls::RootCertStore;
 use rustls::pki_types::CertificateDer;
 use rustls_pemfile::certs;
-use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
-
-fn build_tls_root(cert_pem: &[u8]) -> RootCertStore {
-    let mut roots = RootCertStore::empty();
-    let mut cursor = std::io::Cursor::new(cert_pem);
-    let parsed = certs(&mut cursor)
-        .collect::<Result<Vec<CertificateDer<'static>>, _>>()
-        .expect("failed to parse cert pem");
-    for cert in parsed {
-        roots.add(cert).expect("failed to add cert");
-    }
-    roots
-}
-
-/// Build a gRPC client with mTLS (CA + client cert).
-async fn grpc_client_mtls(
-    addr: std::net::SocketAddr,
-    ca_pem: Vec<u8>,
-    client_cert_pem: Vec<u8>,
-    client_key_pem: Vec<u8>,
-) -> OpenShellClient<Channel> {
-    let ca_cert = tonic::transport::Certificate::from_pem(ca_pem);
-    let identity = tonic::transport::Identity::from_pem(client_cert_pem, client_key_pem);
-    let tls = ClientTlsConfig::new()
-        .ca_certificate(ca_cert)
-        .identity(identity)
-        .domain_name("localhost");
-    let endpoint = Endpoint::from_shared(format!("https://localhost:{}", addr.port()))
-        .expect("invalid endpoint")
-        .tls_config(tls)
-        .expect("failed to set tls");
-    let channel = endpoint.connect().await.expect("failed to connect");
-    OpenShellClient::new(channel)
-}
+use tonic::transport::{ClientTlsConfig, Endpoint};
 
 /// Build an HTTPS client with mTLS (CA trust + client cert/key).
 fn https_client_mtls(
@@ -240,33 +208,12 @@ async fn mtls_wrong_ca_client_cert_rejected() {
     let (addr, server) = start_test_server(tls_acceptor).await;
 
     // Generate a rogue CA + client cert not signed by the server's CA.
-    let mut rogue_ca_params =
-        CertificateParams::new(Vec::<String>::new()).expect("failed to create rogue CA params");
-    rogue_ca_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    rogue_ca_params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, "rogue-ca");
-    let rogue_ca_key = KeyPair::generate().expect("failed to generate rogue CA key");
-    let rogue_ca_cert = rogue_ca_params
-        .self_signed(&rogue_ca_key)
-        .expect("failed to sign rogue CA cert");
-
-    let mut rogue_client_params =
-        CertificateParams::new(Vec::<String>::new()).expect("failed to create rogue client params");
-    rogue_client_params
-        .distinguished_name
-        .push(rcgen::DnType::CommonName, "rogue-client");
-    let rogue_client_key = KeyPair::generate().expect("failed to generate rogue client key");
-    let rogue_client_cert = rogue_client_params
-        .signed_by(&rogue_client_key, &rogue_ca_cert, &rogue_ca_key)
-        .expect("failed to sign rogue client cert");
+    let rogue = generate_rogue_pki();
 
     // Connect with rogue client cert -- server should reject it.
     let ca_cert = tonic::transport::Certificate::from_pem(pki.ca_cert_pem.clone());
-    let identity = tonic::transport::Identity::from_pem(
-        rogue_client_cert.pem(),
-        rogue_client_key.serialize_pem(),
-    );
+    let identity =
+        tonic::transport::Identity::from_pem(rogue.client_cert_pem, rogue.client_key_pem);
     let tls = ClientTlsConfig::new()
         .ca_certificate(ca_cert)
         .identity(identity)

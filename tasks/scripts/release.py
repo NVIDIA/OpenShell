@@ -299,12 +299,16 @@ class Openshell < Formula
       docker_tls_dir="${{HOME}}/.local/state/openshell/homebrew/tls"
       mkdir -p "${{docker_tls_dir}}/server"
       mkdir -p "${{docker_tls_dir}}/client"
-      chmod 700 "${{docker_tls_dir}}" "${{docker_tls_dir}}/server" "${{docker_tls_dir}}/client"
+      mkdir -p "${{docker_tls_dir}}/jwt"
+      chmod 700 "${{docker_tls_dir}}" "${{docker_tls_dir}}/server" "${{docker_tls_dir}}/client" "${{docker_tls_dir}}/jwt"
       /usr/bin/install -m 0644 "#{{var}}/openshell/tls/ca.crt" "${{docker_tls_dir}}/ca.crt"
       /usr/bin/install -m 0644 "#{{var}}/openshell/tls/server/tls.crt" "${{docker_tls_dir}}/server/tls.crt"
       /usr/bin/install -m 0600 "#{{var}}/openshell/tls/server/tls.key" "${{docker_tls_dir}}/server/tls.key"
       /usr/bin/install -m 0644 "#{{var}}/openshell/tls/client/tls.crt" "${{docker_tls_dir}}/client/tls.crt"
       /usr/bin/install -m 0600 "#{{var}}/openshell/tls/client/tls.key" "${{docker_tls_dir}}/client/tls.key"
+      /usr/bin/install -m 0600 "#{{var}}/openshell/tls/jwt/signing.pem" "${{docker_tls_dir}}/jwt/signing.pem"
+      /usr/bin/install -m 0644 "#{{var}}/openshell/tls/jwt/public.pem" "${{docker_tls_dir}}/jwt/public.pem"
+      /usr/bin/install -m 0644 "#{{var}}/openshell/tls/jwt/kid" "${{docker_tls_dir}}/jwt/kid"
       export OPENSHELL_LOCAL_TLS_DIR="${{OPENSHELL_LOCAL_TLS_DIR:-${{docker_tls_dir}}}}"
 
       xdg_gateway_config="${{xdg_config_home}}/openshell/gateway.toml"
@@ -394,7 +398,7 @@ def generate_homebrew_formula(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="OpenClaw release tooling.")
+    parser = argparse.ArgumentParser(description="OpenShell release tooling.")
     sub = parser.add_subparsers(dest="command", required=True)
 
     get_version_parser = sub.add_parser("get-version", help="Print computed version.")

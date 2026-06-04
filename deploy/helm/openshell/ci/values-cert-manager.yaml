@@ -7,8 +7,5 @@
 server:
   disableTls: false
 
-pkiInitJob:
-  enabled: false
-
 certManager:
   enabled: true

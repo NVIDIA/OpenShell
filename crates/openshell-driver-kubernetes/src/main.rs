@@ -10,8 +10,8 @@ use tracing_subscriber::EnvFilter;
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_driver_kubernetes::{
-    ComputeDriverService, KubernetesComputeConfig, KubernetesComputeDriver,
-    SupervisorSideloadMethod,
+    ComputeDriverService, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, KubernetesComputeConfig,
+    KubernetesComputeDriver, SupervisorSideloadMethod,
 };
 
 #[derive(Parser, Debug)]
@@ -31,11 +31,25 @@ struct Args {
     #[arg(long, env = "OPENSHELL_SANDBOX_NAMESPACE", default_value = "default")]
     sandbox_namespace: String,
 
+    #[arg(
+        long,
+        env = "OPENSHELL_K8S_SANDBOX_SERVICE_ACCOUNT",
+        default_value = DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME
+    )]
+    sandbox_service_account: String,
+
     #[arg(long, env = "OPENSHELL_SANDBOX_IMAGE")]
     sandbox_image: Option<String>,
 
     #[arg(long, env = "OPENSHELL_SANDBOX_IMAGE_PULL_POLICY")]
     sandbox_image_pull_policy: Option<String>,
+
+    #[arg(
+        long,
+        env = "OPENSHELL_SANDBOX_IMAGE_PULL_SECRETS",
+        value_delimiter = ','
+    )]
+    sandbox_image_pull_secrets: Vec<String>,
 
     #[arg(long, env = "OPENSHELL_GRPC_ENDPOINT")]
     grpc_endpoint: Option<String>,
@@ -68,6 +82,13 @@ struct Args {
 
     #[arg(long, env = "OPENSHELL_ENABLE_USER_NAMESPACES")]
     enable_user_namespaces: bool,
+
+    /// Lifetime (seconds) of the projected `ServiceAccount` token
+    /// kubelet writes into each sandbox pod for the `IssueSandboxToken`
+    /// bootstrap exchange. Kubelet enforces a minimum of 600s; the
+    /// gateway clamps values outside `[600, 86400]`. Default 3600.
+    #[arg(long, env = "OPENSHELL_K8S_SA_TOKEN_TTL_SECS", default_value_t = 3600)]
+    sa_token_ttl_secs: i64,
 }
 
 #[tokio::main]
@@ -81,8 +102,10 @@ async fn main() -> Result<()> {
 
     let driver = KubernetesComputeDriver::new(KubernetesComputeConfig {
         namespace: args.sandbox_namespace,
+        service_account_name: args.sandbox_service_account,
         default_image: args.sandbox_image.unwrap_or_default(),
         image_pull_policy: args.sandbox_image_pull_policy.unwrap_or_default(),
+        image_pull_secrets: args.sandbox_image_pull_secrets,
         supervisor_image: args
             .supervisor_image
             .unwrap_or_else(|| openshell_core::config::DEFAULT_SUPERVISOR_IMAGE.to_string()),
@@ -99,6 +122,9 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| {
             openshell_driver_kubernetes::DEFAULT_WORKSPACE_STORAGE_SIZE.to_string()
         }),
+        default_runtime_class_name: std::env::var("OPENSHELL_K8S_DEFAULT_RUNTIME_CLASS_NAME")
+            .unwrap_or_default(),
+        sa_token_ttl_secs: args.sa_token_ttl_secs,
     })
     .await
     .into_diagnostic()?;

@@ -3,14 +3,25 @@
 
 use super::*;
 use openshell_core::config::{CDI_GPU_DEVICE_ALL, DEFAULT_SERVER_PORT};
+use openshell_core::driver_utils::{
+    LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
+    LABEL_SANDBOX_NAMESPACE,
+};
+use openshell_core::progress::{
+    PROGRESS_ACTIVE_DETAIL_KEY, PROGRESS_ACTIVE_STEP_KEY, PROGRESS_COMPLETE_LABEL_KEY,
+    PROGRESS_COMPLETE_STEP_KEY, PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX,
+    PROGRESS_STEP_STARTING_SANDBOX,
+};
 use openshell_core::proto::compute::v1::{
     DriverResourceRequirements, DriverSandboxSpec, DriverSandboxTemplate,
 };
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::{LazyLock, Mutex};
 use tempfile::TempDir;
 
 const TLS_MOUNT_DIR: &str = "/etc/openshell/tls/client";
+static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 fn test_sandbox() -> DriverSandbox {
     // Mirrors the gateway-supplied request: the public `Sandbox` API no
@@ -33,6 +44,7 @@ fn test_sandbox() -> DriverSandbox {
             }),
             gpu: false,
             gpu_device: String::new(),
+            sandbox_token: String::new(),
         }),
         status: None,
     }
@@ -63,6 +75,7 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         }),
         daemon_version: "28.0.0".to_string(),
         supports_gpu: false,
+        sandbox_pids_limit: DEFAULT_SANDBOX_PIDS_LIMIT,
     }
 }
 
@@ -263,11 +276,12 @@ fn docker_gateway_route_uses_bridge_gateway_for_linux_docker() {
         ..Default::default()
     };
 
-    let route = docker_gateway_route(
+    let route = docker_gateway_route_for_host(
         &info,
         IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
         DEFAULT_SERVER_PORT,
         None,
+        false,
     );
 
     assert_eq!(
@@ -283,6 +297,25 @@ fn docker_gateway_route_uses_bridge_gateway_for_linux_docker() {
             "host.docker.internal:172.18.0.1".to_string(),
             "host.openshell.internal:172.18.0.1".to_string()
         ]
+    );
+}
+
+#[test]
+fn docker_gateway_route_uses_host_gateway_when_host_runtime_requires_it() {
+    let info = SystemInfo {
+        operating_system: Some("Ubuntu 24.04 LTS".to_string()),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        docker_gateway_route_for_host(
+            &info,
+            IpAddr::V4(Ipv4Addr::new(10, 89, 10, 1)),
+            DEFAULT_SERVER_PORT,
+            None,
+            true,
+        ),
+        DockerGatewayRoute::HostGateway
     );
 }
 
@@ -387,6 +420,23 @@ fn docker_resource_limits_applies_cpu_and_memory_limits() {
 }
 
 #[test]
+fn docker_pids_limit_uses_driver_default_and_allows_runtime_inherit() {
+    assert_eq!(
+        docker_pids_limit(DEFAULT_SANDBOX_PIDS_LIMIT).unwrap(),
+        Some(DEFAULT_SANDBOX_PIDS_LIMIT)
+    );
+    assert_eq!(docker_pids_limit(0).unwrap(), None);
+    assert!(docker_pids_limit(-1).is_err());
+}
+
+#[test]
+fn container_create_body_sets_driver_owned_pids_limit() {
+    let body = build_container_create_body(&test_sandbox(), &runtime_config()).unwrap();
+    let host_config = body.host_config.expect("host config");
+    assert_eq!(host_config.pids_limit, Some(DEFAULT_SANDBOX_PIDS_LIMIT));
+}
+
+#[test]
 fn build_environment_sets_docker_tls_paths() {
     let env = build_environment(&test_sandbox(), &runtime_config());
     assert!(env.contains(&format!("OPENSHELL_TLS_CA={TLS_CA_MOUNT_PATH}")));
@@ -421,8 +471,43 @@ fn build_environment_keeps_path_driver_controlled() {
 }
 
 #[test]
+fn build_environment_keeps_telemetry_toggle_driver_controlled() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    temp_env::with_vars(
+        [(
+            openshell_core::sandbox_env::TELEMETRY_ENABLED,
+            Some("false"),
+        )],
+        || {
+            let mut sandbox = test_sandbox();
+            sandbox.spec.as_mut().unwrap().environment.insert(
+                openshell_core::sandbox_env::TELEMETRY_ENABLED.to_string(),
+                "true".to_string(),
+            );
+
+            let env = build_environment(&sandbox, &runtime_config());
+            let telemetry_entries = env
+                .iter()
+                .filter(|entry| {
+                    entry.starts_with(&format!(
+                        "{}=",
+                        openshell_core::sandbox_env::TELEMETRY_ENABLED
+                    ))
+                })
+                .collect::<Vec<_>>();
+
+            assert_eq!(telemetry_entries.len(), 1);
+            assert_eq!(
+                telemetry_entries[0],
+                &format!("{}=false", openshell_core::sandbox_env::TELEMETRY_ENABLED)
+            );
+        },
+    );
+}
+
+#[test]
 fn build_binds_uses_docker_tls_directory() {
-    let binds = build_binds(&runtime_config());
+    let binds = build_binds(&test_sandbox(), &runtime_config()).unwrap();
     let targets = binds
         .iter()
         .filter_map(|bind| bind.split(':').nth(1).map(String::from))
@@ -439,14 +524,35 @@ fn build_binds_uses_docker_tls_directory() {
 }
 
 #[test]
+fn build_environment_uses_token_file_without_raw_token_env() {
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    spec.sandbox_token = "secret.jwt.value".to_string();
+    spec.environment.insert(
+        openshell_core::sandbox_env::SANDBOX_TOKEN.to_string(),
+        "user-provided-token".to_string(),
+    );
+
+    let env = build_environment(&sandbox, &runtime_config());
+
+    assert!(!env.iter().any(|entry| {
+        entry.starts_with(&format!("{}=", openshell_core::sandbox_env::SANDBOX_TOKEN))
+    }));
+    assert!(env.contains(&format!(
+        "{}={SANDBOX_TOKEN_MOUNT_PATH}",
+        openshell_core::sandbox_env::SANDBOX_TOKEN_FILE
+    )));
+}
+
+#[test]
 fn managed_container_label_filters_include_gateway_namespace() {
     let filters =
-        managed_container_label_filters("tenant-a", [format!("{SANDBOX_ID_LABEL_KEY}=sbx-123")]);
+        managed_container_label_filters("tenant-a", [format!("{LABEL_SANDBOX_ID}=sbx-123")]);
     let labels = filters.get("label").unwrap();
 
-    assert!(labels.contains(&format!("{MANAGED_BY_LABEL_KEY}={MANAGED_BY_LABEL_VALUE}")));
-    assert!(labels.contains(&format!("{SANDBOX_NAMESPACE_LABEL_KEY}=tenant-a")));
-    assert!(labels.contains(&format!("{SANDBOX_ID_LABEL_KEY}=sbx-123")));
+    assert!(labels.contains(&format!("{LABEL_MANAGED_BY}={LABEL_MANAGED_BY_VALUE}")));
+    assert!(labels.contains(&format!("{LABEL_SANDBOX_NAMESPACE}=tenant-a")));
+    assert!(labels.contains(&format!("{LABEL_SANDBOX_ID}=sbx-123")));
 }
 
 #[test]
@@ -462,7 +568,7 @@ fn build_container_create_body_clears_inherited_cmd() {
         create_body
             .labels
             .as_ref()
-            .and_then(|labels| labels.get(SANDBOX_NAMESPACE_LABEL_KEY)),
+            .and_then(|labels| labels.get(LABEL_SANDBOX_NAMESPACE)),
         Some(&"default".to_string())
     );
     let host_config = create_body.host_config.as_ref().unwrap();
@@ -505,6 +611,28 @@ fn validate_sandbox_rejects_gpu_when_cdi_unavailable() {
 
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     assert!(err.message().contains("Docker CDI"));
+}
+
+#[test]
+fn validate_sandbox_auth_requires_gateway_token() {
+    let mut sandbox = test_sandbox();
+    sandbox.spec.as_mut().unwrap().sandbox_token.clear();
+
+    let err = DockerComputeDriver::validate_sandbox_auth(&sandbox).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        err.message(),
+        "docker sandboxes require gateway JWT auth; configure [openshell.gateway.gateway_jwt]"
+    );
+}
+
+#[test]
+fn validate_sandbox_auth_accepts_gateway_token() {
+    let mut sandbox = test_sandbox();
+    sandbox.spec.as_mut().unwrap().sandbox_token = "secret.jwt.value".to_string();
+
+    DockerComputeDriver::validate_sandbox_auth(&sandbox).unwrap();
 }
 
 #[test]
@@ -606,7 +734,7 @@ fn build_container_create_body_uses_runtime_namespace_label() {
     let labels = create_body.labels.expect("labels are populated");
 
     assert_eq!(
-        labels.get(SANDBOX_NAMESPACE_LABEL_KEY),
+        labels.get(LABEL_SANDBOX_NAMESPACE),
         Some(&"tenant-a".to_string()),
         "namespace label must reflect the driver's runtime config"
     );
@@ -618,12 +746,9 @@ fn driver_status_keeps_running_sandboxes_provisioning_with_stable_message() {
         id: Some("cid".to_string()),
         names: Some(vec!["/openshell-demo".to_string()]),
         labels: Some(HashMap::from([
-            (SANDBOX_ID_LABEL_KEY.to_string(), "sbx-1".to_string()),
-            (SANDBOX_NAME_LABEL_KEY.to_string(), "demo".to_string()),
-            (
-                SANDBOX_NAMESPACE_LABEL_KEY.to_string(),
-                "default".to_string(),
-            ),
+            (LABEL_SANDBOX_ID.to_string(), "sbx-1".to_string()),
+            (LABEL_SANDBOX_NAME.to_string(), "demo".to_string()),
+            (LABEL_SANDBOX_NAMESPACE.to_string(), "default".to_string()),
         ])),
         state: Some(ContainerSummaryStateEnum::RUNNING),
         status: Some("Up 2 seconds".to_string()),
@@ -675,12 +800,9 @@ fn driver_status_marks_restarting_sandboxes_as_error() {
         id: Some("cid".to_string()),
         names: Some(vec!["/openshell-demo".to_string()]),
         labels: Some(HashMap::from([
-            (SANDBOX_ID_LABEL_KEY.to_string(), "sbx-1".to_string()),
-            (SANDBOX_NAME_LABEL_KEY.to_string(), "demo".to_string()),
-            (
-                SANDBOX_NAMESPACE_LABEL_KEY.to_string(),
-                "default".to_string(),
-            ),
+            (LABEL_SANDBOX_ID.to_string(), "sbx-1".to_string()),
+            (LABEL_SANDBOX_NAME.to_string(), "demo".to_string()),
+            (LABEL_SANDBOX_NAMESPACE.to_string(), "default".to_string()),
         ])),
         state: Some(ContainerSummaryStateEnum::RESTARTING),
         status: Some("Restarting (1) 2 seconds ago".to_string()),
@@ -694,6 +816,123 @@ fn driver_status_marks_restarting_sandboxes_as_error() {
         status.conditions[0].message,
         "Container is restarting after a failure"
     );
+}
+
+#[test]
+fn docker_scheduled_event_adds_progress_metadata() {
+    let mut metadata = HashMap::from([(
+        "image_ref".to_string(),
+        "ghcr.io/acme/sandbox:latest".to_string(),
+    )]);
+
+    attach_docker_progress_metadata(
+        &mut metadata,
+        "Scheduled",
+        "Docker sandbox accepted for image \"ghcr.io/acme/sandbox:latest\"",
+    );
+
+    assert_eq!(
+        metadata.get(PROGRESS_COMPLETE_STEP_KEY).map(String::as_str),
+        Some(PROGRESS_STEP_REQUESTING_SANDBOX)
+    );
+    assert_eq!(
+        metadata
+            .get(PROGRESS_COMPLETE_LABEL_KEY)
+            .map(String::as_str),
+        Some("Sandbox allocated")
+    );
+    assert_eq!(
+        metadata.get(PROGRESS_ACTIVE_STEP_KEY).map(String::as_str),
+        Some(PROGRESS_STEP_PULLING_IMAGE)
+    );
+    assert_eq!(
+        metadata.get(PROGRESS_ACTIVE_DETAIL_KEY).map(String::as_str),
+        Some("ghcr.io/acme/sandbox:latest")
+    );
+}
+
+#[test]
+fn docker_pulled_event_advances_to_starting_progress() {
+    let mut metadata = HashMap::new();
+
+    attach_docker_progress_metadata(
+        &mut metadata,
+        "Pulled",
+        "Pulled Docker image \"ghcr.io/acme/sandbox:latest\"",
+    );
+
+    assert_eq!(
+        metadata.get(PROGRESS_COMPLETE_STEP_KEY).map(String::as_str),
+        Some(PROGRESS_STEP_PULLING_IMAGE)
+    );
+    assert_eq!(
+        metadata
+            .get(PROGRESS_COMPLETE_LABEL_KEY)
+            .map(String::as_str),
+        Some("Image pulled")
+    );
+    assert_eq!(
+        metadata.get(PROGRESS_ACTIVE_STEP_KEY).map(String::as_str),
+        Some(PROGRESS_STEP_STARTING_SANDBOX)
+    );
+}
+
+#[test]
+fn docker_pull_progress_event_adds_layer_detail_metadata() {
+    let event = docker_pull_progress_event(
+        "ghcr.io/acme/sandbox:latest",
+        &CreateImageInfo {
+            id: Some("layer-1".to_string()),
+            status: Some("Downloading".to_string()),
+            progress_detail: Some(ProgressDetail {
+                current: Some(42 * 1024 * 1024),
+                total: Some(84 * 1024 * 1024),
+            }),
+            ..Default::default()
+        },
+    )
+    .expect("pull progress event");
+
+    assert_eq!(event.source, "docker");
+    assert_eq!(event.reason, "PullingLayer");
+    assert_eq!(
+        event
+            .metadata
+            .get(PROGRESS_ACTIVE_STEP_KEY)
+            .map(String::as_str),
+        Some(PROGRESS_STEP_PULLING_IMAGE)
+    );
+    assert_eq!(
+        event
+            .metadata
+            .get(PROGRESS_ACTIVE_DETAIL_KEY)
+            .map(String::as_str),
+        Some("Downloading layer-1 (42 MB/84 MB)")
+    );
+}
+
+#[test]
+fn pending_sandbox_snapshot_uses_docker_namespace_and_starting_condition() {
+    let sandbox = test_sandbox();
+
+    let snapshot =
+        pending_sandbox_snapshot(&sandbox, "docker-dev", provisioning_condition(), false);
+
+    assert_eq!(snapshot.id, "sbx-123");
+    assert_eq!(snapshot.name, "demo");
+    assert_eq!(snapshot.namespace, "docker-dev");
+    assert!(snapshot.spec.is_none());
+    assert!(pending_sandbox_matches(&snapshot, "sbx-123", ""));
+    assert!(pending_sandbox_matches(&snapshot, "", "demo"));
+
+    let status = snapshot.status.expect("status");
+    assert!(!status.deleting);
+    assert_eq!(status.sandbox_name, "demo");
+    assert_eq!(status.conditions.len(), 1);
+    assert_eq!(status.conditions[0].r#type, "Ready");
+    assert_eq!(status.conditions[0].status, "False");
+    assert_eq!(status.conditions[0].reason, "Starting");
+    assert_eq!(status.conditions[0].message, "Docker container is starting");
 }
 
 #[test]
@@ -861,6 +1100,25 @@ fn docker_supervisor_image_tag_sanitizes_build_metadata_for_docker() {
         ),
         "0.0.37-dev.156-g1d3b741ee",
     );
+}
+
+#[test]
+fn docker_supervisor_image_refreshes_mutable_tags_only() {
+    assert!(supervisor_image_should_refresh(
+        "ghcr.io/nvidia/openshell/supervisor:dev"
+    ));
+    assert!(supervisor_image_should_refresh(
+        "ghcr.io/nvidia/openshell/supervisor:latest"
+    ));
+    assert!(supervisor_image_should_refresh(
+        "ghcr.io/nvidia/openshell/supervisor"
+    ));
+    assert!(!supervisor_image_should_refresh(
+        "ghcr.io/nvidia/openshell/supervisor:0.0.47-dev.13-g57b71c68f"
+    ));
+    assert!(!supervisor_image_should_refresh(
+        "ghcr.io/nvidia/openshell/supervisor@sha256:abc123"
+    ));
 }
 
 #[test]

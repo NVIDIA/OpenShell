@@ -29,12 +29,11 @@ helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <vers
 # Precreate the openshell namespace so we can create the SCC cluster role
 oc create ns openshell
 
-# Sandboxes are deployed into the openshell namespace and use the default service account for now
-oc adm policy add-scc-to-user privileged -z default -n openshell
+# Sandboxes are deployed into the openshell namespace and use the openshell-sandbox service account
+oc adm policy add-scc-to-user privileged -z openshell-sandbox -n openshell
 
 # Deploy openshell with overrides to allow SCC assignment of fsGroup and runAsUser for the gateway
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> -n openshell \
-  --set pkiInitJob.enabled=false \
   --set server.disableTls=true \
   --set podSecurityContext.fsGroup=null \
   --set securityContext.runAsUser=null
@@ -57,23 +56,72 @@ See [`values.yaml`](values.yaml) for source defaults. Selected overlays:
 - [`ci/values-gateway.yaml`](ci/values-gateway.yaml) - gateway-only configuration
 - [`ci/values-cert-manager.yaml`](ci/values-cert-manager.yaml) - cert-manager integration
 - [`ci/values-keycloak.yaml`](ci/values-keycloak.yaml) - Keycloak OIDC integration
+- [`ci/values-high-availability.yaml`](ci/values-high-availability.yaml) - HA gateway test overlay with bundled PostgreSQL
 
-## PKI bootstrap
+### Database backend
+
+By default, OpenShell uses SQLite:
+
+```yaml
+server:
+  dbUrl: "sqlite:/var/openshell/openshell.db"
+postgres:
+  enabled: false
+```
+
+#### External PostgreSQL
+
+Create a Secret containing the PostgreSQL connection URI if one does not
+already exist:
+
+```bash
+kubectl create secret generic my-pg-credentials -n openshell \
+  --from-literal=uri="postgresql://user:pass@host:5432/dbname"
+```
+
+Then install the chart pointing at that Secret:
+
+```bash
+helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
+  -n openshell \
+  --set server.externalDbSecret=my-pg-credentials
+```
+
+#### Bundled PostgreSQL
+
+Deploy a PostgreSQL instance alongside the gateway using the bundled
+Bitnami subchart. A random password is generated automatically:
+
+```bash
+helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
+  --set postgres.enabled=true
+```
+
+To set an explicit password, add `--set postgres.auth.password=my-secret-password`.
+
+#### OpenShift
+
+Append these flags to any of the PostgreSQL commands above for OpenShift:
+
+```
+--set server.disableTls=true \
+--set podSecurityContext.fsGroup=null \
+--set securityContext.runAsUser=null
+```
+
+## Secret bootstrap
 
 By default, a pre-install/pre-upgrade hook Job runs `openshell-gateway generate-certs`
-to create the gateway's server and client mTLS Secrets. The Job uses the gateway image
-itself, so air-gapped environments only need to mirror that one image (no separate
-openssl/alpine sidecar).
+to create the gateway's server/client mTLS Secrets and sandbox JWT signing Secret.
+The Job uses the gateway image itself, so air-gapped environments only need to
+mirror that one image (no separate openssl/alpine sidecar).
 
-The Job is idempotent:
-
-- Both target Secrets exist: log and exit 0.
-- Exactly one exists: fail with `kubectl delete secret -n <ns> <server> <client>` recovery hint.
-- Neither exists: generate a CA, server cert, and client cert; POST both `kubernetes.io/tls` Secrets (`tls.crt`, `tls.key`, `ca.crt`).
-
-Disable with `--set pkiInitJob.enabled=false` when bringing your own PKI (cert-manager,
-external CA, or pre-created Secrets). See `certManager.*` in `values.yaml` for the
-cert-manager alternative.
+When `certManager.enabled=true`, cert-manager owns the TLS Secrets and the chart
+runs the same hook in JWT-only mode because cert-manager does not create the
+sandbox JWT signing Secret. This precedence applies even if
+`pkiInitJob.enabled` remains true. Set `pkiInitJob.enabled=false` only when an
+external non-cert-manager TLS source manages TLS and you pre-create the sandbox
+JWT signing Secret.
 
 ## Values
 
@@ -84,7 +132,7 @@ cert-manager alternative.
 | certManager.certificateDuration | string | `"8760h"` | Duration for cert-manager-issued certificates. |
 | certManager.certificateRenewBefore | string | `"720h"` | Renewal window for cert-manager-issued certificates. |
 | certManager.clientCaFromServerTlsSecret | bool | `true` | Mount gateway client CA from the server TLS secret's ca.crt (populated by cert-manager for certs issued by a CA Issuer). Avoids a separate openshell-server-client-ca Secret. |
-| certManager.enabled | bool | `false` | Create cert-manager Issuer and Certificate resources instead of using the PKI bootstrap Job. |
+| certManager.enabled | bool | `false` | Create cert-manager Issuer and Certificate resources. When enabled, cert-manager owns TLS and the chart runs a JWT-only certgen hook to create the sandbox JWT signing Secret that cert-manager does not manage. |
 | certManager.serverDnsNames | list | `["openshell","openshell.openshell.svc","openshell.openshell.svc.cluster.local","localhost","openshell.localhost","*.openshell.localhost","host.docker.internal"]` | DNS SANs on the cert-manager-issued server certificate. |
 | certManager.serverIpAddresses | list | `["127.0.0.1"]` | IP SANs on the cert-manager-issued server certificate. |
 | fullnameOverride | string | `""` | Override the full generated resource name. |
@@ -104,13 +152,19 @@ cert-manager alternative.
 | nameOverride | string | `"openshell"` | Override the chart name used in generated resource names. |
 | networkPolicy.enabled | bool | `true` | Create a NetworkPolicy restricting SSH ingress on sandbox pods to the gateway. |
 | nodeSelector | object | `{}` | Node selector for the gateway pod. |
-| pkiInitJob.enabled | bool | `true` | Run a pre-install/pre-upgrade Job that creates gateway and client mTLS Secrets. |
+| pkiInitJob.enabled | bool | `true` | Run a pre-install/pre-upgrade Job that creates gateway and client mTLS Secrets. When certManager.enabled=true, cert-manager owns TLS and this same hook runs in JWT-only mode even if pkiInitJob.enabled remains true. |
 | pkiInitJob.serverDnsNames | list | `[]` | Extra DNS SANs to append to the server certificate. |
 | pkiInitJob.serverIpAddresses | list | `[]` | Extra IP SANs to append to the server certificate. |
 | podAnnotations | object | `{}` | Extra annotations to add to the gateway pod. |
 | podLabels | object | `{}` | Extra labels to add to the gateway pod. |
 | podLifecycle.terminationGracePeriodSeconds | int | `5` | Grace period, in seconds, before Kubernetes terminates the gateway pod. |
 | podSecurityContext.fsGroup | int | `1000` | fsGroup assigned to the gateway pod. |
+| postgres.auth.database | string | `"openshell"` |  |
+| postgres.auth.password | string | `""` |  |
+| postgres.auth.username | string | `"openshell"` |  |
+| postgres.enabled | bool | `false` | Deploy the bundled Bitnami PostgreSQL subchart. |
+| postgres.primary.persistence.enabled | bool | `true` |  |
+| postgres.serviceBindings.enabled | bool | `true` |  |
 | probes.liveness.failureThreshold | int | `3` | Liveness probe failure threshold before the container is restarted. |
 | probes.liveness.initialDelaySeconds | int | `2` | Liveness probe initial delay, in seconds. |
 | probes.liveness.periodSeconds | int | `5` | Liveness probe period, in seconds. |
@@ -124,14 +178,20 @@ cert-manager alternative.
 | probes.startup.timeoutSeconds | int | `1` | Startup probe timeout, in seconds. |
 | replicaCount | int | `1` | Number of OpenShell gateway replicas. |
 | resources | object | `{}` | Gateway pod resource requests and limits. |
+| sandboxServiceAccount.annotations | object | `{}` | Annotations to add to the generated sandbox service account. |
+| sandboxServiceAccount.create | bool | `true` | Create a service account for sandbox pods. |
+| sandboxServiceAccount.name | string | `""` | Existing service account name for sandbox pods when sandboxServiceAccount.create is false. |
 | securityContext.allowPrivilegeEscalation | bool | `false` | Whether the gateway container can gain additional privileges. |
 | securityContext.capabilities.drop | list | `["ALL"]` | Linux capabilities dropped from the gateway container. |
 | securityContext.runAsNonRoot | bool | `true` | Require the gateway container to run as a non-root user. |
 | securityContext.runAsUser | int | `1000` | UID assigned to the gateway container. |
-| server.dbUrl | string | `"sqlite:/var/openshell/openshell.db"` | Gateway database URL. |
+| server.auth.allowUnauthenticatedUsers | bool | `false` | UNSAFE: accept unauthenticated CLI/user requests as a local developer principal. Intended only for trusted local Skaffold/k3d development or a fully trusted fronting proxy. Leave false for shared or production clusters. |
+| server.dbUrl | string | `"sqlite:/var/openshell/openshell.db"` | Gateway database URL (used for the default SQLite backend). |
+| server.defaultRuntimeClassName | string | `""` | Default Kubernetes runtimeClassName for sandbox pods. Applied when a CreateSandbox request does not specify one. Empty (default) = omit the field, using the cluster's default RuntimeClass. Set to a RuntimeClass name (e.g. "kata-containers", "nvidia") to apply it to all sandboxes that don't explicitly override it. |
 | server.disableTls | bool | `false` | Disable TLS entirely - the server listens on plaintext HTTP. Set to true when a reverse proxy / tunnel terminates TLS at the edge. |
 | server.enableLoopbackServiceHttp | bool | `true` | Enable plaintext HTTP routing for loopback sandbox service URLs on TLS-enabled gateways. |
 | server.enableUserNamespaces | bool | `false` | Enable Kubernetes user namespace isolation (hostUsers: false) for sandbox pods. Requires Kubernetes 1.33+ with user namespace support available (beta through 1.35, GA in 1.36+), plus a supporting container runtime and Linux 5.12+. When enabled, container UID 0 maps to an unprivileged host UID and capabilities become namespaced. |
+| server.externalDbSecret | string | `""` | Name of a pre-existing Opaque Secret containing a PostgreSQL connection URI (key: uri). When set, the gateway reads OPENSHELL_DB_URL from this Secret instead of using dbUrl. The Secret must contain a `uri` key, e.g. postgresql://user:pass@host:5432/dbname. |
 | server.grpcEndpoint | string | `""` | gRPC endpoint sandboxes call back into the gateway. Leave empty to derive it from the chart fullname, release namespace, service port, and disableTls flag, for example https://openshell.openshell.svc.cluster.local:8080. Override only when sandboxes must reach the gateway via a different hostname (e.g. an external ingress or a host alias). |
 | server.hostGatewayIP | string | `""` | Host gateway IP for sandbox pod hostAliases. When set, sandbox pods get hostAliases entries mapping host.docker.internal and host.openshell.internal to this IP, allowing them to reach services running on the Docker host. Auto-detected by the cluster entrypoint script. |
 | server.logLevel | string | `"info"` | Gateway log level. |
@@ -145,6 +205,12 @@ cert-manager alternative.
 | server.oidc.userRole | string | `""` | Role name for standard user access. |
 | server.sandboxImage | string | `"ghcr.io/nvidia/openshell-community/sandboxes/base:latest"` | Default sandbox image used when requests do not specify one. |
 | server.sandboxImagePullPolicy | string | `""` | Kubernetes imagePullPolicy for sandbox pods. Empty = Kubernetes default (Always for :latest, IfNotPresent otherwise). Set to "Always" for dev clusters so new images are picked up without manual eviction. |
+| server.sandboxImagePullSecrets | list | `[]` | Image pull secrets attached to sandbox pods. Referenced Secrets must exist in the sandbox namespace. |
+| server.sandboxJwt.gatewayId | string | `""` | Stable gateway identity embedded in iss/aud of every minted token. Defaults to the release name so HA replicas share identity. |
+| server.sandboxJwt.k8sSaTokenTtlSecs | int | `3600` | Lifetime (seconds) of the projected ServiceAccount token kubelet writes into each sandbox pod for the IssueSandboxToken bootstrap exchange. Kubelet enforces a minimum of 600s; the driver clamps values outside [600, 86400]. Default 3600 — generous, since the supervisor consumes the token within seconds of pod start. |
+| server.sandboxJwt.secretDefaultMode | string | `""` | File mode for the mounted JWT signing key Secret. Default 0400 (owner-read only). Override to 0440 or 0444 if the container UID does not match the volume file owner. |
+| server.sandboxJwt.signingSecretName | string | `""` | Name of the Opaque Secret holding the signing key material. Empty falls back to the chart fullname with "-jwt-keys" appended. |
+| server.sandboxJwt.ttlSecs | int | `3600` | Token TTL in seconds. Defaults to 3600 (1h). |
 | server.sandboxNamespace | string | `""` | Namespace where sandbox pods are created. Defaults to the Helm release namespace (.Release.Namespace) when left empty. |
 | server.tls.certSecretName | string | `"openshell-server-tls"` | K8s secret (type kubernetes.io/tls) with tls.crt and tls.key for the server. |
 | server.tls.clientCaSecretName | string | `"openshell-server-client-ca"` | K8s secret with ca.crt for client certificate verification (mTLS). Set to "" to disable mTLS and run HTTPS-only (use OIDC for auth instead). |

@@ -9,7 +9,7 @@ use openshell_core::proto::{
     GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule, NetworkBinary, NetworkEndpoint,
     NetworkPolicyRule, ProviderCredentialRefresh, ProviderCredentialRefreshMaterial,
     ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileCategory,
-    ProviderProfileCredential,
+    ProviderProfileCredential, ProviderProfileDiscovery,
 };
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
@@ -18,8 +18,13 @@ use std::sync::OnceLock;
 
 const BUILT_IN_PROFILE_YAMLS: &[&str] = &[
     include_str!("../../../providers/claude-code.yaml"),
+    include_str!("../../../providers/codex.yaml"),
+    include_str!("../../../providers/copilot.yaml"),
+    include_str!("../../../providers/cursor.yaml"),
     include_str!("../../../providers/github.yaml"),
+    include_str!("../../../providers/google-vertex-ai.yaml"),
     include_str!("../../../providers/nvidia.yaml"),
+    include_str!("../../../providers/pypi.yaml"),
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -112,6 +117,12 @@ pub struct CredentialRefreshMaterialProfile {
     pub required: bool,
     #[serde(default)]
     pub secret: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DiscoveryProfile {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credentials: Vec<String>,
 }
 
 // These YAML/JSON DTOs mirror the network policy protos intentionally. Keep
@@ -242,6 +253,8 @@ pub struct ProviderTypeProfile {
     pub binaries: Vec<BinaryProfile>,
     #[serde(default)]
     pub inference_capable: bool,
+    #[serde(default, skip_serializing_if = "discovery_is_empty")]
+    pub discovery: DiscoveryProfile,
 }
 
 // Provider profile import/export is expected to be lossless for the network
@@ -277,6 +290,11 @@ impl ProviderTypeProfile {
             endpoints: profile.endpoints.iter().map(endpoint_from_proto).collect(),
             binaries: profile.binaries.iter().map(binary_from_proto).collect(),
             inference_capable: profile.inference_capable,
+            discovery: profile
+                .discovery
+                .as_ref()
+                .map(discovery_from_proto)
+                .unwrap_or_default(),
         }
     }
 
@@ -291,6 +309,25 @@ impl ProviderTypeProfile {
             }
         }
         vars
+    }
+
+    /// Whether this profile can be created without an initial access token because
+    /// the gateway can mint at least one credential immediately from refresh
+    /// material, and no required credential falls outside that gateway-mintable set.
+    #[must_use]
+    pub fn allows_gateway_refresh_bootstrap(&self) -> bool {
+        let mut has_gateway_mintable_credential = false;
+        for credential in &self.credentials {
+            let is_gateway_mintable = credential
+                .refresh
+                .as_ref()
+                .is_some_and(CredentialRefreshProfile::is_gateway_mintable);
+            if credential.required && !is_gateway_mintable {
+                return false;
+            }
+            has_gateway_mintable_credential |= is_gateway_mintable;
+        }
+        has_gateway_mintable_credential
     }
 
     #[must_use]
@@ -317,6 +354,8 @@ impl ProviderTypeProfile {
             endpoints: self.endpoints.iter().map(endpoint_to_proto).collect(),
             binaries: self.binaries.iter().map(binary_to_proto).collect(),
             inference_capable: self.inference_capable,
+            discovery: (!discovery_is_empty(&self.discovery))
+                .then(|| discovery_to_proto(&self.discovery)),
         }
     }
 
@@ -328,6 +367,22 @@ impl ProviderTypeProfile {
             binaries: self.binaries.iter().map(binary_to_proto).collect(),
         }
     }
+}
+
+impl CredentialRefreshProfile {
+    #[must_use]
+    pub fn is_gateway_mintable(&self) -> bool {
+        matches!(
+            self.strategy,
+            ProviderCredentialRefreshStrategy::Oauth2RefreshToken
+                | ProviderCredentialRefreshStrategy::Oauth2ClientCredentials
+                | ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt
+        )
+    }
+}
+
+fn discovery_is_empty(discovery: &DiscoveryProfile) -> bool {
+    discovery.credentials.is_empty()
 }
 
 impl Serialize for BinaryProfile {
@@ -541,6 +596,18 @@ fn credential_refresh_to_proto(refresh: &CredentialRefreshProfile) -> ProviderCr
     }
 }
 
+fn discovery_from_proto(discovery: &ProviderProfileDiscovery) -> DiscoveryProfile {
+    DiscoveryProfile {
+        credentials: discovery.credentials.clone(),
+    }
+}
+
+fn discovery_to_proto(discovery: &DiscoveryProfile) -> ProviderProfileDiscovery {
+    ProviderProfileDiscovery {
+        credentials: discovery.credentials.clone(),
+    }
+}
+
 fn endpoint_to_proto(endpoint: &EndpointProfile) -> NetworkEndpoint {
     NetworkEndpoint {
         host: endpoint.host.clone(),
@@ -556,6 +623,7 @@ fn endpoint_to_proto(endpoint: &EndpointProfile) -> NetworkEndpoint {
         allow_encoded_slash: endpoint.allow_encoded_slash,
         websocket_credential_rewrite: endpoint.websocket_credential_rewrite,
         request_body_credential_rewrite: endpoint.request_body_credential_rewrite,
+        advisor_proposed: false,
         persisted_queries: endpoint.persisted_queries.clone(),
         graphql_persisted_queries: endpoint
             .graphql_persisted_queries
@@ -875,6 +943,33 @@ pub fn validate_profile_set(
             }
         }
 
+        let mut discovery_credentials = HashSet::new();
+        for (index, credential_name) in profile.discovery.credentials.iter().enumerate() {
+            let credential_name = credential_name.trim();
+            if credential_name.is_empty() {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    format!("discovery.credentials[{index}]"),
+                    "discovery credential name must not be empty",
+                ));
+            } else if !discovery_credentials.insert(credential_name.to_string()) {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    format!("discovery.credentials[{index}]"),
+                    format!("duplicate discovery credential: {credential_name}"),
+                ));
+            } else if !credential_names.contains(credential_name) {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    format!("discovery.credentials[{index}]"),
+                    format!("unknown discovery credential: {credential_name}"),
+                ));
+            }
+        }
+
         let mut env_vars = HashSet::new();
         for credential in &profile.credentials {
             for env_var in &credential.env_vars {
@@ -1035,7 +1130,7 @@ mod tests {
     use openshell_core::proto::ProviderProfileCategory;
 
     use super::{
-        ProfileError, ProviderTypeProfile, default_profiles, get_default_profile,
+        DiscoveryProfile, ProfileError, ProviderTypeProfile, default_profiles, get_default_profile,
         normalize_profile_id, parse_profile_catalog_yamls, parse_profile_json, parse_profile_yaml,
         profile_to_json, profile_to_yaml, validate_profile_set,
     };
@@ -1061,7 +1156,23 @@ mod tests {
             proto.category,
             ProviderProfileCategory::SourceControl as i32
         );
-        assert_eq!(proto.endpoints.len(), 2);
+        assert_eq!(proto.endpoints.len(), 3);
+        assert!(
+            proto.endpoints.iter().any(|endpoint| {
+                endpoint.host == "api.github.com"
+                    && endpoint.protocol == "graphql"
+                    && endpoint.path == "/graphql"
+                    && endpoint.access == "read-only"
+            }),
+            "github profile should include read-only GraphQL endpoint"
+        );
+        assert!(
+            proto
+                .endpoints
+                .iter()
+                .all(|endpoint| endpoint.access == "read-only"),
+            "github profile endpoints should all be read-only"
+        );
         assert_eq!(proto.binaries.len(), 4);
     }
 
@@ -1072,6 +1183,89 @@ mod tests {
             profile.credential_env_vars(),
             vec!["ANTHROPIC_API_KEY", "CLAUDE_API_KEY"]
         );
+    }
+
+    #[test]
+    fn vertex_profile_declares_discovery_and_fallback_token_env_vars() {
+        let profile = get_default_profile("google-vertex-ai").expect("vertex profile");
+        let service_account_token = profile
+            .credentials
+            .iter()
+            .find(|credential| credential.name == "service_account_token")
+            .expect("vertex service-account token credential");
+        let adc_credential = profile
+            .credentials
+            .iter()
+            .find(|credential| credential.name == "gcloud_adc_token")
+            .expect("vertex ADC credential");
+
+        assert_eq!(
+            service_account_token.env_vars,
+            vec![
+                "GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN".to_string(),
+                "VERTEX_AI_SERVICE_ACCOUNT_TOKEN".to_string()
+            ]
+        );
+        assert_eq!(
+            adc_credential.env_vars,
+            vec![
+                "GOOGLE_VERTEX_AI_TOKEN".to_string(),
+                "VERTEX_AI_TOKEN".to_string()
+            ]
+        );
+        assert_eq!(
+            profile.discovery.credentials,
+            vec!["service_account_token", "gcloud_adc_token"]
+        );
+        assert!(
+            profile.allows_gateway_refresh_bootstrap(),
+            "Vertex profile should allow empty-create bootstrap via gateway-mintable credentials"
+        );
+    }
+
+    #[test]
+    fn refresh_bootstrap_requires_a_gateway_mintable_path_and_no_required_static_credentials() {
+        let optional_refresh_profile = parse_profile_yaml(
+            r"
+id: optional-refresh
+display_name: Optional Refresh
+credentials:
+  - name: access_token
+    required: false
+    refresh:
+      strategy: oauth2_refresh_token
+",
+        )
+        .expect("profile");
+        assert!(optional_refresh_profile.allows_gateway_refresh_bootstrap());
+
+        let mixed_required_profile = parse_profile_yaml(
+            r"
+id: mixed-required
+display_name: Mixed Required
+credentials:
+  - name: access_token
+    required: true
+    refresh:
+      strategy: oauth2_client_credentials
+  - name: static_key
+    required: true
+",
+        )
+        .expect("profile");
+        assert!(!mixed_required_profile.allows_gateway_refresh_bootstrap());
+
+        let static_only_profile = parse_profile_yaml(
+            r"
+id: static-only
+display_name: Static Only
+credentials:
+  - name: api_key
+    required: false
+",
+        )
+        .expect("profile");
+        assert!(!static_only_profile.allows_gateway_refresh_bootstrap());
     }
 
     #[test]
@@ -1090,6 +1284,29 @@ credentials:
         assert_eq!(profile.id, "example");
         assert_eq!(profile.category, ProviderProfileCategory::Other);
         assert_eq!(profile.credential_env_vars(), vec!["EXAMPLE_API_KEY"]);
+    }
+
+    #[test]
+    fn profile_discovery_metadata_round_trips_through_proto_and_yaml() {
+        let profile = parse_profile_yaml(
+            r"
+id: example
+display_name: Example
+credentials:
+  - name: api_key
+    env_vars: [EXAMPLE_API_KEY]
+discovery:
+  credentials: [api_key]
+",
+        )
+        .expect("profile should parse");
+
+        assert_eq!(profile.discovery.credentials, vec!["api_key"]);
+        let from_proto = ProviderTypeProfile::from_proto(&profile.to_proto());
+        assert_eq!(from_proto.discovery.credentials, vec!["api_key"]);
+        let exported = profile_to_yaml(&from_proto).expect("yaml");
+        assert!(exported.contains("discovery:"));
+        assert!(exported.contains("api_key"));
     }
 
     #[test]
@@ -1241,6 +1458,8 @@ credentials:
   - name: api_key
     env_vars: [BROKEN_TOKEN, ""]
     auth_style: unknown
+discovery:
+  credentials: [api_key, missing_key]
 endpoints:
   - host: ""
     port: 0
@@ -1260,6 +1479,7 @@ binaries: ["", /usr/bin/broken]
         assert!(messages.contains(&"credential env var must not be empty"));
         assert!(messages.contains(&"query_param is required for query auth"));
         assert!(messages.contains(&"unsupported auth_style: unknown"));
+        assert!(messages.contains(&"unknown discovery credential: missing_key"));
         assert!(
             messages
                 .iter()
@@ -1282,6 +1502,7 @@ binaries: ["", /usr/bin/broken]
                     endpoints: Vec::new(),
                     binaries: Vec::new(),
                     inference_capable: false,
+                    discovery: DiscoveryProfile::default(),
                 },
             ),
             (
@@ -1295,6 +1516,7 @@ binaries: ["", /usr/bin/broken]
                     endpoints: Vec::new(),
                     binaries: Vec::new(),
                     inference_capable: false,
+                    discovery: DiscoveryProfile::default(),
                 },
             ),
             (
@@ -1308,6 +1530,7 @@ binaries: ["", /usr/bin/broken]
                     endpoints: Vec::new(),
                     binaries: Vec::new(),
                     inference_capable: false,
+                    discovery: DiscoveryProfile::default(),
                 },
             ),
         ];

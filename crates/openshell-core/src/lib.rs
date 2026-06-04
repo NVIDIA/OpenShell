@@ -24,9 +24,13 @@ pub mod progress;
 pub mod proto;
 pub mod sandbox_env;
 pub mod settings;
+pub mod telemetry;
 pub mod time;
 
-pub use config::{ComputeDriverKind, Config, OidcConfig, TlsConfig};
+pub use config::{
+    ComputeDriverKind, Config, GatewayAuthConfig, GatewayJwtConfig, MtlsAuthConfig, OidcConfig,
+    TlsConfig,
+};
 pub use error::{ComputeDriverError, Error, Result};
 pub use metadata::{GetResourceVersion, ObjectId, ObjectLabels, ObjectName, SetResourceVersion};
 
@@ -40,3 +44,10 @@ pub const VERSION: &str = match option_env!("OPENSHELL_GIT_VERSION") {
     Some(v) => v,
     None => env!("CARGO_PKG_VERSION"),
 };
+
+/// Encoded protobuf `FileDescriptorSet` for every proto in `proto/`.
+///
+/// Emitted by `build.rs` via `tonic_build::configure().file_descriptor_set_path(...)`.
+/// Used by tests in `openshell-server` to enumerate every RPC and verify that
+/// each one has an `#[rpc_auth(...)]` declaration on its handler.
+pub const FILE_DESCRIPTOR_SET: &[u8] = include_bytes!(env!("OPENSHELL_DESCRIPTOR_PATH"));

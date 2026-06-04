@@ -45,16 +45,15 @@ service ComputeDriver {
 message GetCapabilitiesRequest {}
 
 message GetCapabilitiesResponse {
+  reserved 4, 5;
+  reserved "supports_gpu", "gpu_count";
+
   // Human-readable driver name.
   string driver_name = 1;
   // Driver implementation version string.
   string driver_version = 2;
   // Default sandbox image recommended by the driver.
   string default_image = 3;
-  // True when the driver can provision GPU-backed sandboxes.
-  bool supports_gpu = 4;
-  // Number of GPUs available for sandbox assignment.
-  uint32 gpu_count = 5;
 }
 
 // Driver-owned sandbox model used for create requests and platform observations.
@@ -90,6 +89,13 @@ message DriverSandboxSpec {
   // (e.g. "0", "1"). When empty with gpu=true, the driver assigns the
   // first available GPU.
   string gpu_device = 10;
+  // Gateway-minted JWT identifying this sandbox to the gateway. Set by
+  // the gateway on create; the driver materialises it via its native
+  // secret mechanism (Docker/Podman/VM bind-mount a per-sandbox file;
+  // the Kubernetes driver ignores this field and relies on its projected
+  // ServiceAccount token bootstrap instead). Never echoed to the public
+  // Sandbox proto.
+  string sandbox_token = 11;
 }
 
 // Driver-owned runtime template consumed by the compute platform.

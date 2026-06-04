@@ -9,6 +9,9 @@ use crate::persistence::{
     ObjectId, ObjectLabels, ObjectName, ObjectType, Store, WriteCondition, generate_name,
 };
 use openshell_core::proto::{Provider, Sandbox};
+use openshell_core::telemetry::{
+    LifecycleOperation, ProviderProfile as TelemetryProviderProfile, TelemetryOutcome,
+};
 use prost::Message;
 use tonic::Status;
 use tracing::warn;
@@ -299,12 +302,17 @@ pub(super) async fn delete_provider_record(store: &Store, name: &str) -> Result<
         .map_err(|e| Status::internal(format!("delete provider failed: {e}")))
 }
 
-async fn sandboxes_using_provider(
-    store: &Store,
-    provider_name: &str,
-) -> Result<Vec<String>, Status> {
-    let mut blocking = Vec::new();
-    let mut offset = 0;
+/// Iterate over every `Sandbox` in the store and collect items produced by
+/// `f`.  `f` receives each decoded sandbox; returning `Some(T)` includes the
+/// value in the output, `None` skips it.
+///
+/// This is the shared pagination kernel used by all sandbox-scan helpers.
+async fn scan_sandboxes<T, F>(store: &Store, mut f: F) -> Result<Vec<T>, Status>
+where
+    F: FnMut(Sandbox) -> Option<T>,
+{
+    let mut out = Vec::new();
+    let mut offset = 0u32;
     loop {
         let records = store
             .list(Sandbox::object_type(), 1000, offset)
@@ -319,56 +327,50 @@ async fn sandboxes_using_provider(
                     .map_err(|_| Status::internal("sandbox page size exceeded u32"))?,
             )
             .ok_or_else(|| Status::internal("sandbox pagination offset overflow"))?;
-
         for record in records {
             let sandbox = Sandbox::decode(record.payload.as_slice())
                 .map_err(|e| Status::internal(format!("decode sandbox failed: {e}")))?;
-            let Some(spec) = sandbox.spec.as_ref() else {
-                continue;
-            };
-            if spec.providers.iter().any(|name| name == provider_name) {
-                blocking.push(sandbox.object_name().to_string());
+            if let Some(item) = f(sandbox) {
+                out.push(item);
             }
         }
     }
-    blocking.sort();
-    blocking.dedup();
-    Ok(blocking)
+    Ok(out)
+}
+
+async fn sandboxes_using_provider(
+    store: &Store,
+    provider_name: &str,
+) -> Result<Vec<String>, Status> {
+    let provider_name = provider_name.to_string();
+    let mut names = scan_sandboxes(store, |sandbox| {
+        let spec = sandbox.spec.as_ref()?;
+        if spec.providers.iter().any(|n| n == &provider_name) {
+            Some(sandbox.object_name().to_string())
+        } else {
+            None
+        }
+    })
+    .await?;
+    names.sort();
+    names.dedup();
+    Ok(names)
 }
 
 async fn sandboxes_using_provider_records(
     store: &Store,
     provider_name: &str,
 ) -> Result<Vec<Sandbox>, Status> {
-    let mut sandboxes = Vec::new();
-    let mut offset = 0;
-    loop {
-        let records = store
-            .list(Sandbox::object_type(), 1000, offset)
-            .await
-            .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?;
-        if records.is_empty() {
-            break;
+    let provider_name = provider_name.to_string();
+    scan_sandboxes(store, |sandbox| {
+        let spec = sandbox.spec.as_ref()?;
+        if spec.providers.iter().any(|n| n == &provider_name) {
+            Some(sandbox)
+        } else {
+            None
         }
-        offset = offset
-            .checked_add(
-                u32::try_from(records.len())
-                    .map_err(|_| Status::internal("sandbox page size exceeded u32"))?,
-            )
-            .ok_or_else(|| Status::internal("sandbox pagination offset overflow"))?;
-
-        for record in records {
-            let sandbox = Sandbox::decode(record.payload.as_slice())
-                .map_err(|e| Status::internal(format!("decode sandbox failed: {e}")))?;
-            let Some(spec) = sandbox.spec.as_ref() else {
-                continue;
-            };
-            if spec.providers.iter().any(|name| name == provider_name) {
-                sandboxes.push(sandbox);
-            }
-        }
-    }
-    Ok(sandboxes)
+    })
+    .await
 }
 
 /// Merge an incoming map into an existing map.
@@ -441,6 +443,14 @@ pub(super) async fn resolve_provider_environment(
             .ok_or_else(|| Status::failed_precondition(format!("provider '{name}' not found")))?;
 
         for (key, value) in &provider.credentials {
+            if is_non_injectable_provider_credential(&provider, key) {
+                warn!(
+                    provider_name = %name,
+                    key = %key,
+                    "skipping non-injectable provider credential"
+                );
+                continue;
+            }
             if is_valid_env_key(key) {
                 let expires_at_ms = provider
                     .credential_expires_at_ms
@@ -466,6 +476,53 @@ pub(super) async fn resolve_provider_environment(
                     key = %key,
                     "skipping credential with invalid env var key"
                 );
+            }
+        }
+
+        // For Vertex AI providers, inject agent-specific config env vars so that
+        // Claude Code, Goose, and OpenCode inside the sandbox can reach Vertex AI
+        // without additional configuration. Credentials from the loop above take
+        // precedence via entry().or_insert(), and sandbox --env overrides are
+        // applied at the process level after this environment is installed, so
+        // they naturally shadow these values.
+        if openshell_core::inference::normalize_inference_provider_type(&provider.r#type)
+            == Some("google-vertex-ai")
+        {
+            let project_id = provider
+                .config
+                .get(openshell_core::inference::VERTEX_AI_PROJECT_ID_KEY)
+                .map(String::as_str)
+                .unwrap_or_default()
+                .trim();
+            let region = provider
+                .config
+                .get(openshell_core::inference::VERTEX_AI_REGION_KEY)
+                .map(String::as_str)
+                .unwrap_or_default()
+                .trim();
+
+            // Static flags -- always present for Vertex AI providers.
+            env.entry("GOOSE_PROVIDER".to_string())
+                .or_insert_with(|| "gcp_vertex_ai".to_string());
+
+            // Project ID derived vars.
+            if !project_id.is_empty() {
+                env.entry("ANTHROPIC_VERTEX_PROJECT_ID".to_string())
+                    .or_insert_with(|| project_id.to_string());
+                env.entry("GCP_PROJECT_ID".to_string())
+                    .or_insert_with(|| project_id.to_string());
+                env.entry("GOOGLE_CLOUD_PROJECT".to_string())
+                    .or_insert_with(|| project_id.to_string());
+            }
+
+            // Region derived vars.
+            if !region.is_empty() {
+                env.entry("CLOUD_ML_REGION".to_string())
+                    .or_insert_with(|| region.to_string());
+                env.entry("GCP_LOCATION".to_string())
+                    .or_insert_with(|| region.to_string());
+                env.entry("VERTEX_LOCATION".to_string())
+                    .or_insert_with(|| region.to_string());
             }
         }
     }
@@ -588,6 +645,7 @@ fn active_provider_credential_keys(provider: &Provider, now_ms: i64) -> Vec<Stri
     provider
         .credentials
         .keys()
+        .filter(|key| !is_non_injectable_provider_credential(provider, key))
         .filter(|key| is_valid_env_key(key))
         .filter(|key| {
             provider
@@ -597,6 +655,12 @@ fn active_provider_credential_keys(provider: &Provider, now_ms: i64) -> Vec<Stri
         })
         .cloned()
         .collect()
+}
+
+fn is_non_injectable_provider_credential(provider: &Provider, key: &str) -> bool {
+    openshell_core::inference::normalize_inference_provider_type(&provider.r#type)
+        == Some("google-vertex-ai")
+        && key == "GOOGLE_SERVICE_ACCOUNT_KEY"
 }
 
 pub(super) fn is_valid_env_key(key: &str) -> bool {
@@ -640,7 +704,7 @@ use openshell_core::proto::{
 };
 use openshell_providers::{
     CredentialRefreshProfile, ProfileValidationDiagnostic, ProviderTypeProfile, default_profiles,
-    get_default_profile, normalize_profile_id, validate_profile_set,
+    get_default_profile, normalize_profile_id, normalize_provider_type, validate_profile_set,
 };
 use std::sync::Arc;
 use tonic::{Request, Response};
@@ -650,14 +714,36 @@ pub(super) async fn handle_create_provider(
     request: Request<CreateProviderRequest>,
 ) -> Result<Response<ProviderResponse>, Status> {
     let req = request.into_inner();
-    let provider = req
-        .provider
-        .ok_or_else(|| Status::invalid_argument("provider is required"))?;
-    let provider = create_provider_record(state.store.as_ref(), provider).await?;
-
-    Ok(Response::new(ProviderResponse {
-        provider: Some(provider),
-    }))
+    let Some(provider) = req.provider else {
+        emit_provider_lifecycle(
+            "custom",
+            LifecycleOperation::Create,
+            TelemetryOutcome::Failure,
+        );
+        return Err(Status::invalid_argument("provider is required"));
+    };
+    let provider_type = provider.r#type.clone();
+    let result = create_provider_record(state.store.as_ref(), provider).await;
+    match result {
+        Ok(provider) => {
+            emit_provider_lifecycle(
+                &provider.r#type,
+                LifecycleOperation::Create,
+                TelemetryOutcome::Success,
+            );
+            Ok(Response::new(ProviderResponse {
+                provider: Some(provider),
+            }))
+        }
+        Err(err) => {
+            emit_provider_lifecycle(
+                &provider_type,
+                LifecycleOperation::Create,
+                TelemetryOutcome::Failure,
+            );
+            Err(err)
+        }
+    }
 }
 
 pub(super) async fn handle_get_provider(
@@ -894,17 +980,7 @@ async fn provider_type_allows_empty_credentials_for_refresh(
     let Some(profile) = get_provider_type_profile(store, provider_type).await? else {
         return Ok(false);
     };
-    let required_credentials = profile
-        .credentials
-        .iter()
-        .filter(|credential| credential.required)
-        .collect::<Vec<_>>();
-    Ok(!required_credentials.is_empty()
-        && required_credentials.iter().all(|credential| {
-            credential.refresh.as_ref().is_some_and(|refresh| {
-                crate::provider_refresh::is_gateway_mintable_strategy(refresh.strategy)
-            })
-        }))
+    Ok(profile.allows_gateway_refresh_bootstrap())
 }
 
 async fn merged_provider_profiles(store: &Store) -> Result<Vec<ProviderTypeProfile>, Status> {
@@ -1045,41 +1121,31 @@ fn has_errors(diagnostics: &[ProfileValidationDiagnostic]) -> bool {
 }
 
 async fn sandboxes_using_profile(store: &Store, profile_id: &str) -> Result<Vec<String>, Status> {
-    let mut blocking = Vec::new();
-    let mut offset = 0;
-    loop {
-        let records = store
-            .list(Sandbox::object_type(), 1000, offset)
-            .await
-            .map_err(|e| Status::internal(format!("list sandboxes failed: {e}")))?;
-        if records.is_empty() {
-            break;
-        }
-        offset = offset
-            .checked_add(
-                u32::try_from(records.len())
-                    .map_err(|_| Status::internal("sandbox page size exceeded u32"))?,
-            )
-            .ok_or_else(|| Status::internal("sandbox pagination offset overflow"))?;
+    // Collect all sandboxes that reference at least one provider — pagination
+    // is handled by `scan_sandboxes`; the async provider lookup happens below.
+    let candidates = scan_sandboxes(store, |sandbox| {
+        let has_providers = sandbox
+            .spec
+            .as_ref()
+            .is_some_and(|s| !s.providers.is_empty());
+        has_providers.then_some(sandbox)
+    })
+    .await?;
 
-        for record in records {
-            let sandbox = Sandbox::decode(record.payload.as_slice())
-                .map_err(|e| Status::internal(format!("decode sandbox failed: {e}")))?;
-            let Some(spec) = sandbox.spec.as_ref() else {
+    let mut blocking = Vec::new();
+    for sandbox in candidates {
+        let spec = sandbox.spec.as_ref().expect("filtered by scan_sandboxes");
+        for provider_name in &spec.providers {
+            let Some(provider) = store
+                .get_message_by_name::<Provider>(provider_name)
+                .await
+                .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
+            else {
                 continue;
             };
-            for provider_name in &spec.providers {
-                let Some(provider) = store
-                    .get_message_by_name::<Provider>(provider_name)
-                    .await
-                    .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
-                else {
-                    continue;
-                };
-                if normalize_profile_id(&provider.r#type).as_deref() == Some(profile_id) {
-                    blocking.push(sandbox.object_name().to_string());
-                    break;
-                }
+            if normalize_profile_id(&provider.r#type).as_deref() == Some(profile_id) {
+                blocking.push(sandbox.object_name().to_string());
+                break;
             }
         }
     }
@@ -1093,17 +1159,39 @@ pub(super) async fn handle_update_provider(
     request: Request<UpdateProviderRequest>,
 ) -> Result<Response<ProviderResponse>, Status> {
     let req = request.into_inner();
-    let mut provider = req
-        .provider
-        .ok_or_else(|| Status::invalid_argument("provider is required"))?;
+    let Some(mut provider) = req.provider else {
+        emit_provider_lifecycle(
+            "custom",
+            LifecycleOperation::Update,
+            TelemetryOutcome::Failure,
+        );
+        return Err(Status::invalid_argument("provider is required"));
+    };
+    let provider_type = provider.r#type.clone();
     provider
         .credential_expires_at_ms
         .extend(req.credential_expires_at_ms);
-    let provider = update_provider_record(state.store.as_ref(), provider).await?;
-
-    Ok(Response::new(ProviderResponse {
-        provider: Some(provider),
-    }))
+    let result = update_provider_record(state.store.as_ref(), provider).await;
+    match result {
+        Ok(provider) => {
+            emit_provider_lifecycle(
+                &provider.r#type,
+                LifecycleOperation::Update,
+                TelemetryOutcome::Success,
+            );
+            Ok(Response::new(ProviderResponse {
+                provider: Some(provider),
+            }))
+        }
+        Err(err) => {
+            emit_provider_lifecycle(
+                &provider_type,
+                LifecycleOperation::Update,
+                TelemetryOutcome::Failure,
+            );
+            Err(err)
+        }
+    }
 }
 
 pub(super) async fn handle_get_provider_refresh_status(
@@ -1442,9 +1530,69 @@ pub(super) async fn handle_delete_provider(
     request: Request<DeleteProviderRequest>,
 ) -> Result<Response<DeleteProviderResponse>, Status> {
     let name = request.into_inner().name;
-    let deleted = delete_provider_record(state.store.as_ref(), &name).await?;
+    let provider_profile = provider_profile_for_name(state.store.as_ref(), &name).await;
+    let result = delete_provider_record(state.store.as_ref(), &name).await;
+    match result {
+        Ok(deleted) => {
+            let outcome = TelemetryOutcome::from_success(deleted);
+            emit_provider_profile_lifecycle(
+                provider_profile.unwrap_or(TelemetryProviderProfile::Custom),
+                LifecycleOperation::Delete,
+                outcome,
+            );
+            Ok(Response::new(DeleteProviderResponse { deleted }))
+        }
+        Err(err) => {
+            emit_provider_profile_lifecycle(
+                provider_profile.unwrap_or(TelemetryProviderProfile::Custom),
+                LifecycleOperation::Delete,
+                TelemetryOutcome::Failure,
+            );
+            Err(err)
+        }
+    }
+}
 
-    Ok(Response::new(DeleteProviderResponse { deleted }))
+fn emit_provider_lifecycle(
+    provider_type: &str,
+    operation: LifecycleOperation,
+    outcome: TelemetryOutcome,
+) {
+    let provider_profile = telemetry_provider_profile(provider_type);
+    emit_provider_profile_lifecycle(provider_profile, operation, outcome);
+}
+
+fn emit_provider_profile_lifecycle(
+    provider_profile: TelemetryProviderProfile,
+    operation: LifecycleOperation,
+    outcome: TelemetryOutcome,
+) {
+    openshell_core::telemetry::emit_provider_lifecycle(operation, outcome, provider_profile);
+}
+
+async fn provider_profile_for_name(store: &Store, name: &str) -> Option<TelemetryProviderProfile> {
+    store
+        .get_message_by_name::<Provider>(name)
+        .await
+        .ok()
+        .flatten()
+        .map(|provider| telemetry_provider_profile(&provider.r#type))
+}
+
+fn telemetry_provider_profile(provider_type: &str) -> TelemetryProviderProfile {
+    match normalize_provider_type(provider_type) {
+        Some("anthropic") => TelemetryProviderProfile::Anthropic,
+        Some("claude" | "claude-code") => TelemetryProviderProfile::Claude,
+        Some("codex") => TelemetryProviderProfile::Codex,
+        Some("copilot") => TelemetryProviderProfile::Copilot,
+        Some("github") => TelemetryProviderProfile::Github,
+        Some("gitlab") => TelemetryProviderProfile::Gitlab,
+        Some("nvidia") => TelemetryProviderProfile::Nvidia,
+        Some("openai") => TelemetryProviderProfile::Openai,
+        Some("opencode") => TelemetryProviderProfile::Opencode,
+        Some("outlook") => TelemetryProviderProfile::Outlook,
+        _ => TelemetryProviderProfile::Custom,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1456,6 +1604,7 @@ mod tests {
     use super::*;
     use crate::grpc::MAX_MAP_KEY_LEN;
     use crate::grpc::test_support::test_server_state;
+    use crate::persistence::test_store;
     use openshell_core::proto::{
         DeleteProviderProfileRequest, GetProviderProfileRequest, ImportProviderProfilesRequest,
         L7Allow, L7Rule, LintProviderProfilesRequest, ListProviderProfilesRequest, NetworkBinary,
@@ -1482,6 +1631,46 @@ mod tests {
         assert!(!is_valid_env_key("BAD KEY"));
         assert!(!is_valid_env_key("X=Y"));
         assert!(!is_valid_env_key("X;rm -rf /"));
+    }
+
+    #[test]
+    fn telemetry_provider_profile_maps_unknown_to_custom() {
+        assert_eq!(
+            telemetry_provider_profile("CLAUDE"),
+            TelemetryProviderProfile::Claude
+        );
+        assert_eq!(
+            telemetry_provider_profile("github"),
+            TelemetryProviderProfile::Github
+        );
+        assert_eq!(
+            telemetry_provider_profile("gh"),
+            TelemetryProviderProfile::Github
+        );
+        assert_eq!(
+            telemetry_provider_profile("glab"),
+            TelemetryProviderProfile::Gitlab
+        );
+        assert_eq!(
+            telemetry_provider_profile("outlook"),
+            TelemetryProviderProfile::Outlook
+        );
+        assert_eq!(
+            telemetry_provider_profile("generic"),
+            TelemetryProviderProfile::Custom
+        );
+        assert_eq!(
+            telemetry_provider_profile("unknown-private"),
+            TelemetryProviderProfile::Custom
+        );
+        assert_eq!(
+            telemetry_provider_profile("acme-internal"),
+            TelemetryProviderProfile::Custom
+        );
+        assert_eq!(
+            telemetry_provider_profile("corp-llm-prod"),
+            TelemetryProviderProfile::Custom
+        );
     }
 
     fn provider_with_values(name: &str, provider_type: &str) -> Provider {
@@ -1520,6 +1709,7 @@ mod tests {
             endpoints: Vec::new(),
             binaries: Vec::new(),
             inference_capable: false,
+            discovery: None,
         }
     }
 
@@ -1621,7 +1811,19 @@ mod tests {
             .iter()
             .map(|profile| profile.id.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(ids, vec!["claude-code", "github", "nvidia"]);
+        assert_eq!(
+            ids,
+            vec![
+                "claude-code",
+                "codex",
+                "copilot",
+                "cursor",
+                "github",
+                "google-vertex-ai",
+                "nvidia",
+                "pypi"
+            ]
+        );
 
         let github = response
             .profiles
@@ -1742,13 +1944,15 @@ mod tests {
 
     #[tokio::test]
     async fn import_provider_profile_allows_legacy_provider_type_ids_without_built_in_profiles() {
+        // Use an ID that is not a built-in profile to test legacy import.
+        // "custom-llm" is not registered as a built-in and never will be.
         let state = test_server_state().await;
         let response = handle_import_provider_profiles(
             &state,
             Request::new(ImportProviderProfilesRequest {
                 profiles: vec![ProviderProfileImportItem {
-                    profile: Some(custom_profile("codex")),
-                    source: "codex.yaml".to_string(),
+                    profile: Some(custom_profile("custom-llm")),
+                    source: "custom-llm.yaml".to_string(),
                 }],
             }),
         )
@@ -1762,15 +1966,15 @@ mod tests {
         let imported = handle_get_provider_profile(
             &state,
             Request::new(GetProviderProfileRequest {
-                id: "codex".to_string(),
+                id: "custom-llm".to_string(),
             }),
         )
         .await
         .unwrap()
         .into_inner()
         .profile
-        .expect("codex profile should be returned");
-        assert_eq!(imported.id, "codex");
+        .expect("custom-llm profile should be returned");
+        assert_eq!(imported.id, "custom-llm");
     }
 
     #[tokio::test]
@@ -1930,6 +2134,7 @@ mod tests {
                             harness: true,
                         }],
                         inference_capable: false,
+                        discovery: None,
                     }),
                     source: "advanced-api.yaml".to_string(),
                 }],
@@ -2184,6 +2389,68 @@ mod tests {
             !provider_after_delete
                 .credential_expires_at_ms
                 .contains_key("MS_GRAPH_ACCESS_TOKEN")
+        );
+    }
+
+    #[tokio::test]
+    async fn configure_provider_refresh_accepts_vertex_service_account_token_key() {
+        let state = test_server_state().await;
+        create_provider_record(
+            state.store.as_ref(),
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "vertex-sa".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                r#type: "google-vertex-ai".to_string(),
+                credentials: std::iter::once((
+                    "GOOGLE_SERVICE_ACCOUNT_KEY".to_string(),
+                    "{\"type\":\"service_account\"}".to_string(),
+                ))
+                .collect(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let response = handle_configure_provider_refresh(
+            &state,
+            Request::new(ConfigureProviderRefreshRequest {
+                provider: "vertex-sa".to_string(),
+                credential_key: "GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN".to_string(),
+                strategy: ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt as i32,
+                material: HashMap::from([
+                    (
+                        "client_email".to_string(),
+                        "sa@test-project.iam.gserviceaccount.com".to_string(),
+                    ),
+                    (
+                        "private_key".to_string(),
+                        "-----BEGIN PRIVATE KEY-----\nkey\n-----END PRIVATE KEY-----".to_string(),
+                    ),
+                ]),
+                secret_material_keys: vec!["private_key".to_string()],
+                expires_at_ms: None,
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+        .status
+        .expect("status");
+
+        assert_eq!(
+            response.credential_key,
+            "GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN"
+        );
+        assert_eq!(
+            response.strategy,
+            ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt as i32
         );
     }
 
@@ -2623,9 +2890,7 @@ mod tests {
 
     #[tokio::test]
     async fn provider_crud_round_trip_and_semantics() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
 
         let created = provider_with_values("gitlab-local", "gitlab");
         let persisted = create_provider_record(&store, created.clone())
@@ -2717,9 +2982,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_provider_removes_scoped_refresh_states() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
 
         let provider = create_provider_record(
             &store,
@@ -2766,9 +3029,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_provider_rejects_attached_provider() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
 
         create_provider_record(&store, provider_with_values("gitlab-local", "gitlab"))
             .await
@@ -2804,9 +3065,7 @@ mod tests {
 
     #[tokio::test]
     async fn provider_create_and_update_return_correct_resource_version() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
 
         // Create provider and verify resource_version: 1 in response
         let created = provider_with_values("test-provider", "openai");
@@ -2964,6 +3223,7 @@ mod tests {
                         endpoints: vec![],
                         binaries: vec![],
                         inference_capable: false,
+                        discovery: None,
                     }),
                     source: "delegated-refresh-api.yaml".to_string(),
                 }],
@@ -3063,6 +3323,26 @@ mod tests {
         .unwrap();
         assert!(optional_static_empty.credentials.is_empty());
 
+        let vertex_empty = create_provider_record(
+            store,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "vertex-no-token-yet".to_string(),
+                    created_at_ms: 1_000_000,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                r#type: "google-vertex-ai".to_string(),
+                credentials: HashMap::new(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(vertex_empty.credentials.is_empty());
+
         let get_err = get_provider_record(store, "").await.unwrap_err();
         assert_eq!(get_err.code(), Code::InvalidArgument);
 
@@ -3092,9 +3372,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_provider_empty_maps_is_noop() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
 
         let created = provider_with_values("noop-test", "nvidia");
         let persisted = create_provider_record(&store, created).await.unwrap();
@@ -3141,9 +3419,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_provider_empty_value_deletes_key() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
 
         let created = provider_with_values("delete-key-test", "openai");
         create_provider_record(&store, created).await.unwrap();
@@ -3194,9 +3470,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_provider_empty_type_preserves_existing() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
 
         let created = provider_with_values("type-preserve-test", "anthropic");
         create_provider_record(&store, created).await.unwrap();
@@ -3225,9 +3499,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_provider_rejects_type_change() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
 
         let created = provider_with_values("type-change-test", "nvidia");
         create_provider_record(&store, created).await.unwrap();
@@ -3257,9 +3529,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_provider_validates_merged_result() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
 
         let created = provider_with_values("validate-merge-test", "gitlab");
         create_provider_record(&store, created).await.unwrap();
@@ -3289,14 +3559,14 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_provider_env_empty_list_returns_empty() {
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
         let result = resolve_provider_environment(&store, &[]).await.unwrap();
         assert!(result.is_empty());
     }
 
     #[tokio::test]
     async fn resolve_provider_env_injects_credentials() {
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
         let provider = Provider {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: String::new(),
@@ -3331,7 +3601,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_provider_env_skips_expired_credentials_and_returns_expiry_metadata() {
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
         let now_ms = crate::persistence::current_time_ms();
         let provider = Provider {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
@@ -3371,7 +3641,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_provider_env_unknown_name_returns_error() {
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
         let err = resolve_provider_environment(&store, &["nonexistent".to_string()])
             .await
             .unwrap_err();
@@ -3381,7 +3651,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_provider_env_skips_invalid_credential_keys() {
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
         let provider = Provider {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: String::new(),
@@ -3413,7 +3683,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_provider_env_multiple_providers_merge() {
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
         create_provider_record(
             &store,
             Provider {
@@ -3468,7 +3738,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_provider_env_rejects_duplicate_credential_keys() {
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
         create_provider_record(
             &store,
             Provider {
@@ -3524,8 +3794,259 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_provider_env_injects_vertex_agent_config() {
+        let store = test_store().await;
+        create_provider_record(
+            &store,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "vertex-local".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                r#type: "google-vertex-ai".to_string(),
+                credentials: std::iter::once((
+                    "GOOGLE_VERTEX_AI_TOKEN".to_string(),
+                    "ya29.token".to_string(),
+                ))
+                .collect(),
+                config: [
+                    (
+                        "VERTEX_AI_PROJECT_ID".to_string(),
+                        "my-gcp-project".to_string(),
+                    ),
+                    ("VERTEX_AI_REGION".to_string(), "us-central1".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+                credential_expires_at_ms: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let result = resolve_provider_environment(&store, &["vertex-local".to_string()])
+            .await
+            .unwrap();
+
+        // Credential still injected.
+        assert_eq!(
+            result.get("GOOGLE_VERTEX_AI_TOKEN"),
+            Some(&"ya29.token".to_string())
+        );
+        // Static flags.
+        assert!(!result.contains_key("CLAUDE_CODE_USE_VERTEX"));
+        assert_eq!(
+            result.get("GOOSE_PROVIDER"),
+            Some(&"gcp_vertex_ai".to_string())
+        );
+        // Project ID derived vars.
+        assert_eq!(
+            result.get("ANTHROPIC_VERTEX_PROJECT_ID"),
+            Some(&"my-gcp-project".to_string())
+        );
+        assert_eq!(
+            result.get("GCP_PROJECT_ID"),
+            Some(&"my-gcp-project".to_string())
+        );
+        assert_eq!(
+            result.get("GOOGLE_CLOUD_PROJECT"),
+            Some(&"my-gcp-project".to_string())
+        );
+        // Region derived vars.
+        assert_eq!(
+            result.get("CLOUD_ML_REGION"),
+            Some(&"us-central1".to_string())
+        );
+        assert_eq!(result.get("GCP_LOCATION"), Some(&"us-central1".to_string()));
+        assert_eq!(
+            result.get("VERTEX_LOCATION"),
+            Some(&"us-central1".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_env_vertex_never_injects_service_account_key() {
+        let store = test_store().await;
+        create_provider_record(
+            &store,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "vertex-bootstrap".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                r#type: "google-vertex-ai".to_string(),
+                credentials: [
+                    (
+                        "GOOGLE_SERVICE_ACCOUNT_KEY".to_string(),
+                        r#"{"type":"service_account","private_key":"secret"}"#.to_string(),
+                    ),
+                    (
+                        "GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN".to_string(),
+                        "ya29.short-lived".to_string(),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let result = resolve_provider_environment(&store, &["vertex-bootstrap".to_string()])
+            .await
+            .unwrap();
+
+        assert!(!result.contains_key("GOOGLE_SERVICE_ACCOUNT_KEY"));
+        assert_eq!(
+            result.get("GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN"),
+            Some(&"ya29.short-lived".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_env_vertex_omits_agent_config_when_project_and_region_absent() {
+        let store = test_store().await;
+        create_provider_record(
+            &store,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "vertex-no-config".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                r#type: "google-vertex-ai".to_string(),
+                credentials: std::iter::once((
+                    "GOOGLE_VERTEX_AI_TOKEN".to_string(),
+                    "ya29.token".to_string(),
+                ))
+                .collect(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let result = resolve_provider_environment(&store, &["vertex-no-config".to_string()])
+            .await
+            .unwrap();
+
+        // Static flags still present.
+        assert!(!result.contains_key("CLAUDE_CODE_USE_VERTEX"));
+        assert_eq!(
+            result.get("GOOSE_PROVIDER"),
+            Some(&"gcp_vertex_ai".to_string())
+        );
+        // Project ID and region derived vars are absent.
+        assert!(!result.contains_key("ANTHROPIC_VERTEX_PROJECT_ID"));
+        assert!(!result.contains_key("GCP_PROJECT_ID"));
+        assert!(!result.contains_key("GOOGLE_CLOUD_PROJECT"));
+        assert!(!result.contains_key("CLOUD_ML_REGION"));
+        assert!(!result.contains_key("GCP_LOCATION"));
+        assert!(!result.contains_key("VERTEX_LOCATION"));
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_env_vertex_credential_wins_over_agent_config_key() {
+        // If a credential happens to share a name with one of the injected agent
+        // config keys, the credential value takes precedence because the credential
+        // loop runs first and entry().or_insert() does not overwrite.
+        let store = test_store().await;
+        create_provider_record(
+            &store,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "vertex-collision".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                r#type: "google-vertex-ai".to_string(),
+                credentials: [
+                    (
+                        "GOOGLE_VERTEX_AI_TOKEN".to_string(),
+                        "ya29.token".to_string(),
+                    ),
+                    // Same key as an injected static flag.
+                    ("GOOSE_PROVIDER".to_string(), "custom-value".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+                config: [
+                    ("VERTEX_AI_PROJECT_ID".to_string(), "my-project".to_string()),
+                    ("VERTEX_AI_REGION".to_string(), "us-east1".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+                credential_expires_at_ms: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let result = resolve_provider_environment(&store, &["vertex-collision".to_string()])
+            .await
+            .unwrap();
+
+        // Credential value wins over the injected static value.
+        assert_eq!(
+            result.get("GOOSE_PROVIDER"),
+            Some(&"custom-value".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_env_non_vertex_provider_does_not_inject_agent_config() {
+        let store = test_store().await;
+        create_provider_record(
+            &store,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: "openai-local".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                r#type: "openai".to_string(),
+                credentials: std::iter::once(("OPENAI_API_KEY".to_string(), "sk-test".to_string()))
+                    .collect(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let result = resolve_provider_environment(&store, &["openai-local".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(result.get("OPENAI_API_KEY"), Some(&"sk-test".to_string()));
+        assert!(!result.contains_key("CLAUDE_CODE_USE_VERTEX"));
+        assert!(!result.contains_key("GOOSE_PROVIDER"));
+        assert!(!result.contains_key("ANTHROPIC_VERTEX_PROJECT_ID"));
+        assert!(!result.contains_key("GCP_PROJECT_ID"));
+        assert!(!result.contains_key("GOOGLE_CLOUD_PROJECT"));
+        assert!(!result.contains_key("CLOUD_ML_REGION"));
+        assert!(!result.contains_key("GCP_LOCATION"));
+        assert!(!result.contains_key("VERTEX_LOCATION"));
+    }
+
+    #[tokio::test]
     async fn update_provider_rejects_credential_key_collision_for_attached_sandbox() {
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
         create_provider_record(
             &store,
             Provider {
@@ -3618,7 +4139,7 @@ mod tests {
     async fn handler_flow_resolves_credentials_from_sandbox_providers() {
         use openshell_core::proto::{Sandbox, SandboxPhase, SandboxSpec};
 
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
 
         create_provider_record(
             &store,
@@ -3643,7 +4164,7 @@ mod tests {
         .await
         .unwrap();
 
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sandbox-001".to_string(),
                 name: "test-sandbox".to_string(),
@@ -3656,9 +4177,8 @@ mod tests {
                 ..SandboxSpec::default()
             }),
             status: None,
-            phase: SandboxPhase::Ready as i32,
-            ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
         store.put_message(&sandbox).await.unwrap();
 
         let loaded = store
@@ -3678,9 +4198,9 @@ mod tests {
     async fn handler_flow_returns_empty_when_no_providers() {
         use openshell_core::proto::{Sandbox, SandboxPhase, SandboxSpec};
 
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
 
-        let sandbox = Sandbox {
+        let mut sandbox = Sandbox {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sandbox-002".to_string(),
                 name: "empty-sandbox".to_string(),
@@ -3690,9 +4210,8 @@ mod tests {
             }),
             spec: Some(SandboxSpec::default()),
             status: None,
-            phase: SandboxPhase::Ready as i32,
-            ..Default::default()
         };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
         store.put_message(&sandbox).await.unwrap();
 
         let loaded = store
@@ -3712,14 +4231,14 @@ mod tests {
     async fn handler_flow_returns_none_for_unknown_sandbox() {
         use openshell_core::proto::Sandbox;
 
-        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let store = test_store().await;
         let result = store.get_message::<Sandbox>("nonexistent").await.unwrap();
         assert!(result.is_none());
     }
 
     #[tokio::test]
     async fn update_provider_validates_before_write() {
-        let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
+        let store = Arc::new(test_store().await);
 
         // Create a valid provider
         let provider = provider_with_values("test-validate-provider", "test-type");
@@ -3791,11 +4310,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_create_provider_rejects_duplicate() {
-        let store = Arc::new(
-            Store::connect("sqlite::memory:?cache=shared")
-                .await
-                .unwrap(),
-        );
+        let store = Arc::new(test_store().await);
 
         let provider = provider_with_values("test-concurrent-provider", "test-type");
 

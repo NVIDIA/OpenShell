@@ -52,6 +52,42 @@ async fn create_with_upload_directory_preserves_source_basename() {
     guard.cleanup().await;
 }
 
+/// Two `--upload` specs in a single `sandbox create` call should both land in
+/// the sandbox before the command runs.
+#[tokio::test]
+async fn create_with_multiple_uploads() {
+    let tmpdir = tempfile::tempdir().expect("create tmpdir");
+
+    let dir_a = tmpdir.path().join("alpha");
+    let dir_b = tmpdir.path().join("beta");
+    fs::create_dir_all(&dir_a).expect("create alpha");
+    fs::create_dir_all(&dir_b).expect("create beta");
+    fs::write(dir_a.join("a.txt"), "content-alpha").expect("write a.txt");
+    fs::write(dir_b.join("b.txt"), "content-beta").expect("write b.txt");
+
+    let spec_a = dir_a.to_str().expect("alpha path is UTF-8");
+    let spec_b = dir_b.to_str().expect("beta path is UTF-8");
+
+    let mut guard = SandboxGuard::create_with_uploads(
+        &[(spec_a, "/sandbox/alpha"), (spec_b, "/sandbox/beta")],
+        &["sh", "-c", "cat /sandbox/alpha/alpha/a.txt /sandbox/beta/beta/b.txt"],
+    )
+    .await
+    .expect("sandbox create with multiple --upload flags");
+
+    let clean = strip_ansi(&guard.create_output);
+    assert!(
+        clean.contains("content-alpha"),
+        "expected alpha content in output:\n{clean}"
+    );
+    assert!(
+        clean.contains("content-beta"),
+        "expected beta content in output:\n{clean}"
+    );
+
+    guard.cleanup().await;
+}
+
 /// `--upload` with a single file (not a directory) should work.
 #[tokio::test]
 async fn create_with_upload_single_file() {

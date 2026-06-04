@@ -264,7 +264,7 @@ async fn proxy_to_endpoint(
             return Err(route_err);
         }
     };
-    if SandboxPhase::try_from(sandbox.phase).ok() != Some(SandboxPhase::Ready) {
+    if SandboxPhase::try_from(sandbox.phase()).ok() != Some(SandboxPhase::Ready) {
         let err = ServiceRouteError::sandbox_not_ready();
         emit_service_http_failure(
             &state,

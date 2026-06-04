@@ -123,6 +123,19 @@ struct RunArgs {
     #[arg(long, env = "OPENSHELL_OIDC_ISSUER")]
     oidc_issuer: Option<String>,
 
+    /// Enable mTLS client certificate authentication for local single-user gateways.
+    ///
+    /// When unset, this defaults on for Docker, Podman, and VM gateways that
+    /// have client certificate verification configured and no OIDC issuer.
+    /// Kubernetes deployments must use OIDC or fronting-proxy auth instead.
+    #[arg(
+        long = "enable-mtls-auth",
+        env = "OPENSHELL_ENABLE_MTLS_AUTH",
+        default_value_t = false,
+        action = ArgAction::Set
+    )]
+    enable_mtls_auth: bool,
+
     /// Expected OIDC audience claim (typically the client ID).
     #[arg(long, env = "OPENSHELL_OIDC_AUDIENCE", default_value = "openshell-cli")]
     oidc_audience: String,
@@ -216,6 +229,7 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
     }
 
     let local_tls = apply_runtime_defaults(&mut args)?;
+    let local_jwt = defaults::complete_local_jwt_config()?;
 
     let tracing_log_bus = TracingLogBus::new();
     tracing_log_bus.install_subscriber(
@@ -226,10 +240,31 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
 
     let has_client_ca = args.tls_client_ca.is_some();
     let has_oidc = args.oidc_issuer.is_some();
+    let mtls_auth_enabled = resolve_mtls_auth_enabled(&args, &matches, file.as_ref());
 
     if args.disable_tls && has_client_ca {
         return Err(miette::miette!(
-            "--disable-tls and --tls-client-ca are mutually exclusive.  Client mTLS authentication requires that TLS be enabled."
+            "--disable-tls and --tls-client-ca are mutually exclusive. Client certificate verification requires that TLS be enabled."
+        ));
+    }
+    if mtls_auth_enabled && args.disable_tls {
+        return Err(miette::miette!(
+            "mTLS user authentication requires TLS. Remove --disable-tls or disable --enable-mtls-auth."
+        ));
+    }
+    if mtls_auth_enabled && !has_client_ca {
+        return Err(miette::miette!(
+            "mTLS user authentication requires --tls-client-ca so client certificates can be verified."
+        ));
+    }
+    if mtls_auth_enabled
+        && matches!(
+            effective_single_driver(&args),
+            Some(ComputeDriverKind::Kubernetes)
+        )
+    {
+        return Err(miette::miette!(
+            "mTLS user authentication is not supported with the Kubernetes compute driver. Configure OIDC or a trusted fronting proxy for user authentication."
         ));
     }
 
@@ -260,6 +295,10 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
     let mut config = openshell_core::Config::new(tls)
         .with_bind_address(bind)
         .with_log_level(&args.log_level);
+    if let Some(auth) = file.as_ref().and_then(|f| f.openshell.gateway.auth.clone()) {
+        config.auth = auth;
+    }
+    config.mtls_auth.enabled = mtls_auth_enabled;
 
     // Listener addresses for the health and metrics endpoints. The file may
     // pin a different interface than the main listener (e.g. health on
@@ -336,6 +375,19 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
         });
     }
 
+    // `gateway_jwt` is configured through TOML in cluster deployments. Local
+    // package-managed starts also auto-detect the JWT bundle written next to
+    // the generated TLS bundle so upgrades pick up sandbox auth without a
+    // user-authored config file.
+    if let Some(jwt) = file
+        .as_ref()
+        .and_then(|f| f.openshell.gateway.gateway_jwt.clone())
+    {
+        config.gateway_jwt = Some(jwt);
+    } else if let Some(jwt) = local_jwt {
+        config.gateway_jwt = Some(jwt);
+    }
+
     let vm_config = build_vm_config(
         file.as_ref(),
         local_tls.as_ref(),
@@ -351,15 +403,27 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
     }
 
     if has_client_ca {
-        info!("mTLS authentication enabled");
+        info!("TLS client certificate verification enabled");
+    }
+    if config.mtls_auth.enabled {
+        info!("mTLS user authentication enabled");
     }
     if has_oidc {
         info!("OIDC authentication enabled");
     }
-
-    if !has_client_ca && !has_oidc {
+    if config.auth.allow_unauthenticated_users {
         warn!(
-            "Neither mTLS (--tls-client-ca) nor OIDC (--oidc-issuer) is configured — \
+            "Unauthenticated user access enabled — only use this for trusted local development or a fully trusted fronting proxy"
+        );
+    }
+
+    if !config.auth.allow_unauthenticated_users
+        && !config.mtls_auth.enabled
+        && !has_oidc
+        && config.gateway_jwt.is_none()
+    {
+        warn!(
+            "Neither mTLS user auth nor OIDC nor sandbox JWT auth is configured — \
              the gateway has no authentication mechanism"
         );
     }
@@ -498,6 +562,11 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
     {
         args.enable_loopback_service_http = enabled;
     }
+    if let Some(mtls_auth) = &file.mtls_auth
+        && arg_defaulted(matches, "enable_mtls_auth")
+    {
+        args.enable_mtls_auth = mtls_auth.enabled;
+    }
     if let Some(disabled) = file.disable_tls
         && arg_defaulted(matches, "disable_tls")
     {
@@ -539,6 +608,40 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
             args.oidc_scopes_claim.clone_from(&oidc.scopes_claim);
         }
     }
+}
+
+fn effective_single_driver(args: &RunArgs) -> Option<ComputeDriverKind> {
+    match args.drivers.as_slice() {
+        [] => openshell_core::config::detect_driver(),
+        [driver] => Some(*driver),
+        _ => None,
+    }
+}
+
+fn is_singleplayer_driver(args: &RunArgs) -> bool {
+    matches!(
+        effective_single_driver(args),
+        Some(ComputeDriverKind::Docker | ComputeDriverKind::Podman | ComputeDriverKind::Vm)
+    )
+}
+
+fn resolve_mtls_auth_enabled(
+    args: &RunArgs,
+    matches: &ArgMatches,
+    file: Option<&ConfigFile>,
+) -> bool {
+    let file_configured = file
+        .and_then(|f| f.openshell.gateway.mtls_auth.as_ref())
+        .is_some();
+    if file_configured || !arg_defaulted(matches, "enable_mtls_auth") {
+        return args.enable_mtls_auth;
+    }
+
+    if args.disable_tls || args.tls_client_ca.is_none() || args.oidc_issuer.is_some() {
+        return false;
+    }
+
+    is_singleplayer_driver(args)
 }
 
 /// Build [`VmComputeConfig`] from the `[openshell.drivers.vm]` table
@@ -625,11 +728,9 @@ fn apply_guest_tls_defaults(
 #[cfg(test)]
 mod tests {
     use super::{Cli, command};
+    use crate::TEST_ENV_LOCK as ENV_LOCK;
     use clap::Parser;
     use std::net::{IpAddr, Ipv4Addr};
-    use std::sync::{LazyLock, Mutex};
-
-    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     struct EnvVarGuard {
         key: &'static str,
@@ -780,6 +881,19 @@ mod tests {
     }
 
     #[test]
+    fn command_reads_mtls_auth_from_env() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = EnvVarGuard::set("OPENSHELL_ENABLE_MTLS_AUTH", "true");
+
+        let cli =
+            Cli::try_parse_from(["openshell-gateway", "--db-url", "sqlite::memory:"]).unwrap();
+
+        assert!(cli.run.enable_mtls_auth);
+    }
+
+    #[test]
     fn command_rejects_removed_driver_flags() {
         let err = command()
             .try_get_matches_from([
@@ -832,6 +946,8 @@ mod tests {
             "openshell-server-tls",
             "--client-secret-name",
             "openshell-client-tls",
+            "--jwt-secret-name",
+            "openshell-jwt-keys",
             "--server-san",
             "openshell.example.com",
             "--server-san",
@@ -860,6 +976,31 @@ mod tests {
             "/tmp/openshell-certgen",
         ])
         .expect("--output-dir should make namespace/secret-name flags optional");
+
+        assert!(matches!(
+            cli.command,
+            Some(super::Commands::GenerateCerts(_))
+        ));
+    }
+
+    #[test]
+    fn generate_certs_jwt_only_parses_without_tls_secret_names() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g1 = EnvVarGuard::remove("OPENSHELL_DB_URL");
+        let _g2 = EnvVarGuard::remove("POD_NAMESPACE");
+
+        let cli = Cli::try_parse_from([
+            "openshell-gateway",
+            "generate-certs",
+            "--namespace",
+            "openshell",
+            "--jwt-only",
+            "--jwt-secret-name",
+            "openshell-jwt-keys",
+        ])
+        .expect("--jwt-only should make TLS secret-name flags optional");
 
         assert!(matches!(
             cli.command,
@@ -995,6 +1136,90 @@ mod tests {
         assert_eq!(args.tls_key, Some(tls.path().join("server/tls.key")));
         assert_eq!(args.tls_client_ca, Some(tls.path().join("ca.crt")));
         assert_eq!(local_tls.client_cert, tls.path().join("client/tls.crt"));
+    }
+
+    #[test]
+    fn mtls_auth_auto_defaults_for_local_tls_driver() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = EnvVarGuard::remove("OPENSHELL_ENABLE_MTLS_AUTH");
+
+        let (args, matches) = parse_with_args(&[
+            "openshell-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--drivers",
+            "docker",
+            "--tls-cert",
+            "/tmp/server.crt",
+            "--tls-key",
+            "/tmp/server.key",
+            "--tls-client-ca",
+            "/tmp/ca.crt",
+        ]);
+
+        assert!(super::resolve_mtls_auth_enabled(&args, &matches, None));
+    }
+
+    #[test]
+    fn mtls_auth_does_not_auto_default_for_kubernetes_driver() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = EnvVarGuard::remove("OPENSHELL_ENABLE_MTLS_AUTH");
+
+        let (args, matches) = parse_with_args(&[
+            "openshell-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--drivers",
+            "kubernetes",
+            "--tls-cert",
+            "/tmp/server.crt",
+            "--tls-key",
+            "/tmp/server.key",
+            "--tls-client-ca",
+            "/tmp/ca.crt",
+        ]);
+
+        assert!(!super::resolve_mtls_auth_enabled(&args, &matches, None));
+    }
+
+    #[test]
+    fn file_mtls_auth_value_overrides_local_auto_default() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = EnvVarGuard::remove("OPENSHELL_ENABLE_MTLS_AUTH");
+
+        let (mut args, matches) = parse_with_args(&[
+            "openshell-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--drivers",
+            "docker",
+            "--tls-cert",
+            "/tmp/server.crt",
+            "--tls-key",
+            "/tmp/server.key",
+            "--tls-client-ca",
+            "/tmp/ca.crt",
+        ]);
+        let file = config_file_from_toml(
+            r"
+[openshell.gateway.mtls_auth]
+enabled = false
+",
+        );
+
+        merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+
+        assert!(!super::resolve_mtls_auth_enabled(
+            &args,
+            &matches,
+            Some(&file)
+        ));
     }
 
     #[test]
@@ -1178,6 +1403,41 @@ ssh_session_ttl_secs = 1234
 ",
         );
         assert_eq!(file.openshell.gateway.ssh_session_ttl_secs, Some(1234));
+    }
+
+    #[test]
+    fn singleplayer_driver_matches_only_one_local_driver() {
+        for driver in ["docker", "podman", "vm"] {
+            let (args, _) = parse_with_args(&[
+                "openshell-gateway",
+                "--db-url",
+                "sqlite::memory:",
+                "--drivers",
+                driver,
+            ]);
+            assert!(
+                super::is_singleplayer_driver(&args),
+                "{driver} should be singleplayer"
+            );
+        }
+
+        let (k8s, _) = parse_with_args(&[
+            "openshell-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--drivers",
+            "kubernetes",
+        ]);
+        assert!(!super::is_singleplayer_driver(&k8s));
+
+        let (multi, _) = parse_with_args(&[
+            "openshell-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--drivers",
+            "docker,podman",
+        ]);
+        assert!(!super::is_singleplayer_driver(&multi));
     }
 
     #[test]

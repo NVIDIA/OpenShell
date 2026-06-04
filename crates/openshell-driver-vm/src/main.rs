@@ -294,7 +294,7 @@ fn prepare_compute_driver_socket(socket_path: &Path) -> std::result::Result<(), 
 }
 
 fn current_euid() -> u32 {
-    nix::unistd::Uid::effective().as_raw()
+    rustix::process::geteuid().as_raw()
 }
 
 fn prepare_private_socket_dir(

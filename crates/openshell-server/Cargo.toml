@@ -22,8 +22,10 @@ openshell-driver-kubernetes = { path = "../openshell-driver-kubernetes" }
 openshell-driver-podman = { path = "../openshell-driver-podman" }
 openshell-ocsf = { path = "../openshell-ocsf" }
 openshell-policy = { path = "../openshell-policy" }
+openshell-prover = { path = "../openshell-prover" }
 openshell-providers = { path = "../openshell-providers" }
 openshell-router = { path = "../openshell-router" }
+openshell-server-macros = { path = "../openshell-server-macros" }
 
 # Kubernetes client (used by the `generate-certs` subcommand)
 kube = { workspace = true }
@@ -82,17 +84,21 @@ uuid = { workspace = true }
 hmac = "0.12"
 sha2 = { workspace = true }
 jsonwebtoken = { workspace = true }
+async-trait = "0.1"
+url = { workspace = true }
 hex = "0.4"
 russh = "0.57"
 rand = { workspace = true }
 petname = "2"
 ipnet = "2"
 tempfile = "3"
-nix = { workspace = true }
+rustix = { workspace = true }
 x509-parser = "0.16"
 
 [features]
+bundled-z3 = ["openshell-prover/bundled-z3"]
 dev-settings = ["openshell-core/dev-settings"]
+test-support = []
 
 [dev-dependencies]
 hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "ring", "webpki-tokio"] }

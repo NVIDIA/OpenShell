@@ -44,8 +44,9 @@ use openshell_core::proto::{
     HealthRequest, ServiceStatus, open_shell_client::OpenShellClient,
     open_shell_server::OpenShellServer,
 };
-use openshell_server::{MultiplexedService, health_router};
+use openshell_server::{MultiplexedService, Store, health_router};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite;
@@ -289,7 +290,7 @@ async fn start_grpc_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let addr = listener.local_addr().unwrap();
 
     let grpc_service = OpenShellServer::new(TestOpenShell);
-    let http_service = health_router();
+    let http_service = health_router(test_health_store().await);
     let service = MultiplexedService::new(grpc_service, http_service);
 
     let handle = tokio::spawn(async move {
@@ -317,7 +318,7 @@ async fn start_ws_tunnel_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let addr = listener.local_addr().unwrap();
 
     let grpc_service = OpenShellServer::new(TestOpenShell);
-    let http_service = health_router();
+    let http_service = health_router(test_health_store().await);
     let app = test_ws_tunnel_router(MultiplexedService::new(grpc_service, http_service));
 
     let handle = tokio::spawn(async move {
@@ -546,4 +547,14 @@ async fn ws_tunnel_graceful_close() {
     }
 
     stack.abort();
+}
+
+/// Build an in-memory store sufficient for wiring `health_router` in tests
+/// where the persistence layer itself is not under test.
+async fn test_health_store() -> Arc<Store> {
+    Arc::new(
+        Store::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite store for tests"),
+    )
 }

@@ -11,7 +11,9 @@ use tracing_subscriber::EnvFilter;
 use openshell_core::VERSION;
 use openshell_core::config::DEFAULT_STOP_TIMEOUT_SECS;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
-use openshell_driver_podman::config::{DEFAULT_NETWORK_NAME, ImagePullPolicy};
+use openshell_driver_podman::config::{
+    DEFAULT_NETWORK_NAME, DEFAULT_SANDBOX_PIDS_LIMIT, ImagePullPolicy,
+};
 use openshell_driver_podman::{ComputeDriverService, PodmanComputeConfig, PodmanComputeDriver};
 
 #[derive(Parser)]
@@ -56,6 +58,12 @@ struct Args {
     )]
     gateway_port: u16,
 
+    /// Host gateway IP used for sandbox host aliases.
+    ///
+    /// Empty uses Podman's `host-gateway` resolver.
+    #[arg(long, env = "OPENSHELL_PODMAN_HOST_GATEWAY_IP")]
+    host_gateway_ip: Option<String>,
+
     #[arg(
         long,
         env = "OPENSHELL_SANDBOX_SSH_SOCKET_PATH",
@@ -70,6 +78,15 @@ struct Args {
     /// Container stop timeout in seconds (SIGTERM → SIGKILL).
     #[arg(long, env = "OPENSHELL_STOP_TIMEOUT", default_value_t = DEFAULT_STOP_TIMEOUT_SECS)]
     stop_timeout: u32,
+
+    /// Container cgroup PID limit for sandbox containers. Set 0 to inherit
+    /// Podman's runtime/default PID limit.
+    #[arg(
+        long,
+        env = "OPENSHELL_SANDBOX_PIDS_LIMIT",
+        default_value_t = DEFAULT_SANDBOX_PIDS_LIMIT
+    )]
+    sandbox_pids_limit: i64,
 
     /// OCI image containing the openshell-sandbox supervisor binary.
     #[arg(long, env = "OPENSHELL_SUPERVISOR_IMAGE")]
@@ -107,6 +124,9 @@ async fn main() -> Result<()> {
         image_pull_policy: args.sandbox_image_pull_policy,
         grpc_endpoint: args.grpc_endpoint.unwrap_or_default(),
         gateway_port: args.gateway_port,
+        host_gateway_ip: args
+            .host_gateway_ip
+            .unwrap_or_else(PodmanComputeConfig::default_host_gateway_ip),
         sandbox_ssh_socket_path: args.sandbox_ssh_socket_path,
         network_name: args.network_name,
         stop_timeout_secs: args.stop_timeout,
@@ -114,6 +134,7 @@ async fn main() -> Result<()> {
         guest_tls_ca: args.podman_tls_ca,
         guest_tls_cert: args.podman_tls_cert,
         guest_tls_key: args.podman_tls_key,
+        sandbox_pids_limit: args.sandbox_pids_limit,
     })
     .await
     .into_diagnostic()?;

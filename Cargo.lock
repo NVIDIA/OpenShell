@@ -3395,6 +3395,7 @@ dependencies = [
  "rcgen",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tar",
  "tempfile",
  "tokio",
@@ -3456,11 +3457,13 @@ dependencies = [
 name = "openshell-core"
 version = "0.0.0"
 dependencies = [
+ "chrono",
  "ipnet",
  "miette",
  "prost",
  "prost-types",
  "protobuf-src",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "tempfile",
@@ -3480,6 +3483,7 @@ dependencies = [
  "openshell-core",
  "serde",
  "tar",
+ "temp-env",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -3503,6 +3507,7 @@ dependencies = [
  "prost-types",
  "serde",
  "serde_json",
+ "temp-env",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -3523,6 +3528,7 @@ dependencies = [
  "miette",
  "nix",
  "openshell-core",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "temp-env",
@@ -3552,10 +3558,12 @@ dependencies = [
  "polling",
  "prost",
  "prost-types",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tar",
+ "temp-env",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -3584,6 +3592,7 @@ dependencies = [
  "miette",
  "openshell-core",
  "serde",
+ "serde_json",
  "serde_yml",
 ]
 
@@ -3656,6 +3665,7 @@ dependencies = [
  "rcgen",
  "regorus",
  "russh",
+ "rustix 1.1.4",
  "rustls",
  "rustls-pemfile",
  "seccompiler",
@@ -3684,6 +3694,7 @@ name = "openshell-server"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum 0.8.9",
  "bytes",
  "clap",
@@ -3704,7 +3715,6 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "miette",
- "nix",
  "openshell-bootstrap",
  "openshell-core",
  "openshell-driver-docker",
@@ -3712,8 +3722,10 @@ dependencies = [
  "openshell-driver-podman",
  "openshell-ocsf",
  "openshell-policy",
+ "openshell-prover",
  "openshell-providers",
  "openshell-router",
+ "openshell-server-macros",
  "petname",
  "pin-project-lite",
  "prost",
@@ -3722,6 +3734,7 @@ dependencies = [
  "rcgen",
  "reqwest 0.12.28",
  "russh",
+ "rustix 1.1.4",
  "rustls",
  "rustls-pemfile",
  "serde",
@@ -3740,9 +3753,19 @@ dependencies = [
  "tower-http 0.6.8",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
  "wiremock",
  "x509-parser",
+]
+
+[[package]]
+name = "openshell-server-macros"
+version = "0.0.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]

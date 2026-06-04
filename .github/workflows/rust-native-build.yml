@@ -6,7 +6,9 @@ name: Rust Image Binary Build (openshell-gateway / openshell-sandbox)
 # Build Rust binaries per Linux architecture before the Docker image build
 # consumes them as prebuilt artifacts. Gateway images use GNU-linked binaries
 # for the NVIDIA distroless C/C++ runtime; supervisor images use musl/static
-# binaries so the final image can remain scratch.
+# binaries so the final image can remain scratch. Gateway GNU binaries are
+# built with an explicit glibc 2.31 floor so image, package, and tarball
+# artifacts share the same host portability contract.
 
 on:
   workflow_call:
@@ -95,6 +97,11 @@ jobs:
       - name: Fetch tags
         run: git fetch --tags --force
 
+      - name: Configure GHA sccache backend
+        # Exposes ACTIONS_CACHE_URL / ACTIONS_RUNTIME_TOKEN before `mise install`
+        # compiles cargo-installed tools through RUSTC_WRAPPER=sccache.
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+
       - name: Install tools
         run: mise install --locked
 
@@ -127,6 +134,7 @@ jobs:
                 zig_target=x86_64-linux-musl
               else
                 target=x86_64-unknown-linux-gnu
+                zig_target=x86_64-unknown-linux-gnu.2.31
               fi
               ;;
             arm64)
@@ -135,6 +143,7 @@ jobs:
                 zig_target=aarch64-linux-musl
               else
                 target=aarch64-unknown-linux-gnu
+                zig_target=aarch64-unknown-linux-gnu.2.31
               fi
               ;;
             *)
@@ -149,11 +158,6 @@ jobs:
             echo "target=$target"
             echo "zig_target=$zig_target"
           } >> "$GITHUB_OUTPUT"
-
-      - name: Configure GHA sccache backend
-        # Exposes ACTIONS_CACHE_URL / ACTIONS_RUNTIME_TOKEN so sccache (wrapped
-        # around rustc via mise's RUSTC_WRAPPER) can initialize the GHA cache.
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
 
       - name: Cache Rust target and registry
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2
@@ -202,7 +206,7 @@ jobs:
           echo "CARGO_TARGET_${TARGET_ENV_UPPER}_LINKER=/tmp/zig-musl/cc" >> "$GITHUB_ENV"
           echo "CARGO_TARGET_${TARGET_ENV_UPPER}_RUSTFLAGS=-Clink-self-contained=no" >> "$GITHUB_ENV"
 
-      - name: Build ${{ steps.target.outputs.binary }} (${{ steps.target.outputs.target }})
+      - name: Build ${{ steps.target.outputs.binary }} (${{ steps.target.outputs.zig_target || steps.target.outputs.target }})
         env:
           # Preserve the release-codegen setting used by the old Dockerfile
           # Rust build path so image artifacts keep the same release profile.
@@ -211,9 +215,15 @@ jobs:
         run: |
           set -euo pipefail
           mise x -- rustup target add "${{ steps.target.outputs.target }}"
+          cargo_cmd=(cargo build)
+          build_target="${{ steps.target.outputs.target }}"
+          if [[ "${{ inputs.component }}" == "gateway" ]]; then
+            cargo_cmd=(cargo zigbuild)
+            build_target="${{ steps.target.outputs.zig_target }}"
+          fi
           args=(
             --release
-            --target "${{ steps.target.outputs.target }}"
+            --target "$build_target"
             -p "${{ steps.target.outputs.crate }}"
             --bin "${{ steps.target.outputs.binary }}"
           )
@@ -223,7 +233,7 @@ jobs:
           if [[ -n "${{ steps.version.outputs.cargo_version }}" ]]; then
             export GIT_DIR=/nonexistent
           fi
-          mise x -- cargo build "${args[@]}"
+          mise x -- "${cargo_cmd[@]}" "${args[@]}"
 
       - name: Verify packaged binary
         run: |
@@ -235,6 +245,17 @@ jobs:
           # Record linkage so image runtime drift is visible in logs.
           ldd --version
           ldd "$BIN" || true
+          if [[ "${{ inputs.component }}" == "gateway" ]] && ldd "$BIN" | grep -q 'libz3'; then
+            echo "gateway binary must not depend on shared libz3; enable bundled-z3 for image artifacts" >&2
+            exit 1
+          fi
+
+      - name: Verify glibc symbol floor
+        if: inputs.component == 'gateway'
+        run: |
+          set -euo pipefail
+          BIN="target/${{ steps.target.outputs.target }}/release/${{ steps.target.outputs.binary }}"
+          tasks/scripts/verify-glibc-symbols.sh 2.31 "$BIN"
 
       - name: Stage binary for prebuilt layout
         run: |

@@ -1,76 +1,66 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-
-name: Branch Kubernetes E2E
+name: Kubernetes E2E Test
 
 on:
-  push:
-    branches:
-      - "pull-request/[0-9]+"
-  workflow_dispatch: {}
+  workflow_call:
+    inputs:
+      image-tag:
+        description: "Image tag to test (typically the commit SHA)"
+        required: true
+        type: string
+      runner:
+        description: "GitHub Actions runner label"
+        required: false
+        type: string
+        default: "linux-amd64-cpu8"
+      checkout-ref:
+        description: "Git ref to check out for test inputs (defaults to the workflow SHA)"
+        required: false
+        type: string
+        default: ""
+      job-name:
+        description: "Display name for the Kubernetes e2e job"
+        required: false
+        type: string
+        default: "Kubernetes E2E (Rust smoke)"
+      extra-helm-values:
+        description: "Colon-separated Helm values files to layer on the Kubernetes e2e chart install"
+        required: false
+        type: string
+        default: ""
+      mise-version:
+        description: "mise version to install on the bare Kubernetes e2e runner"
+        required: false
+        type: string
+        default: "v2026.4.25"
 
-permissions: {}
+permissions:
+  contents: read
+  packages: read
 
 jobs:
-  pr_metadata:
-    name: Resolve PR metadata
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: read
-    outputs:
-      should_run: ${{ steps.gate.outputs.should_run }}
-    steps:
-      - uses: actions/checkout@v6
-
-      - id: gate
-        uses: ./.github/actions/pr-gate
-        with:
-          required_label: test:e2e-kubernetes
-
-  build-gateway:
-    needs: [pr_metadata]
-    if: needs.pr_metadata.outputs.should_run == 'true'
-    permissions:
-      contents: read
-      packages: write
-    uses: ./.github/workflows/docker-build.yml
-    with:
-      component: gateway
-      platform: linux/amd64
-
-  build-supervisor:
-    needs: [pr_metadata]
-    if: needs.pr_metadata.outputs.should_run == 'true'
-    permissions:
-      contents: read
-      packages: write
-    uses: ./.github/workflows/docker-build.yml
-    with:
-      component: supervisor
-      platform: linux/amd64
-
-  kubernetes-e2e:
-    name: Kubernetes E2E (Rust smoke)
-    needs: [pr_metadata, build-gateway, build-supervisor]
-    if: needs.pr_metadata.outputs.should_run == 'true'
+  e2e-kubernetes:
+    name: ${{ inputs.job-name }}
     # Bare runner: running kind-in-container hits nested-Docker / kubeconfig
     # complications. The runner has Docker; mise installs helm, kubectl, and
     # the Rust toolchain.
-    runs-on: linux-amd64-cpu8
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 60
     permissions:
       contents: read
       packages: read
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Keep bare-runner installs aligned with the project CI image.
+      MISE_VERSION: ${{ inputs.mise-version }}
       KIND_CLUSTER_NAME: kube-e2e-${{ github.run_id }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ inputs['checkout-ref'] || github.sha }}
 
       - name: Install mise
         run: |
-          curl https://mise.run | sh
+          curl https://mise.run | MISE_VERSION=v2026.4.25 sh
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           echo "$HOME/.local/share/mise/shims" >> "$GITHUB_PATH"
 
@@ -91,14 +81,14 @@ jobs:
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Create kind cluster
-        uses: helm/kind-action@v1
+        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc # v1.14.0
         with:
           cluster_name: ${{ env.KIND_CLUSTER_NAME }}
           wait: 120s
 
       # mise.toml sets KUBECONFIG="{{config_root}}/kubeconfig"; helm/kind-action
       # writes to ~/.kube/config. Materialize the kind context at the mise path
-      # so `mise run e2e:kubernetes` (and the wrapper's `kubectl --context=…`)
+      # so `mise run e2e:kubernetes` (and the wrapper's `kubectl --context=...`)
       # finds the kind cluster.
       - name: Export kind kubeconfig to mise path
         run: |
@@ -106,21 +96,21 @@ jobs:
           kind get kubeconfig --name "$KIND_CLUSTER_NAME" > "$GITHUB_WORKSPACE/kubeconfig"
           chmod 600 "$GITHUB_WORKSPACE/kubeconfig"
 
-      # Pre-pull and side-load: kind nodes don't have ghcr credentials, and
-      # tagging IMAGE_TAG to a SHA means the chart's IfNotPresent pull policy
-      # is satisfied once the image is loaded into the node's containerd.
       - name: Load gateway and supervisor images into kind
         run: |
           set -euo pipefail
           for component in gateway supervisor; do
-            image="ghcr.io/nvidia/openshell/${component}:${{ github.sha }}"
-            docker pull "$image"
-            kind load docker-image "$image" --name "$KIND_CLUSTER_NAME"
+            image="ghcr.io/nvidia/openshell/${component}:${{ inputs.image-tag }}"
+            archive="${RUNNER_TEMP:-/tmp}/openshell-${component}-linux-amd64.tar"
+            docker pull --platform linux/amd64 "$image"
+            docker image save --platform linux/amd64 --output "$archive" "$image"
+            kind load image-archive "$archive" --name "$KIND_CLUSTER_NAME"
           done
 
       - name: Run Kubernetes E2E (Rust smoke)
         env:
           OPENSHELL_E2E_KUBE_CONTEXT: kind-${{ env.KIND_CLUSTER_NAME }}
-          IMAGE_TAG: ${{ github.sha }}
+          OPENSHELL_E2E_KUBE_EXTRA_VALUES: ${{ inputs.extra-helm-values }}
+          IMAGE_TAG: ${{ inputs.image-tag }}
           OPENSHELL_REGISTRY: ghcr.io/nvidia/openshell
         run: mise run --no-deps --skip-deps e2e:kubernetes

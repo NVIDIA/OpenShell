@@ -8,21 +8,8 @@ pub const SPEC: ProviderDiscoverySpec = ProviderDiscoverySpec {
     credential_env_vars: &["NVIDIA_API_KEY"],
 };
 
-#[cfg(test)]
-mod tests {
-    use super::SPEC;
-    use crate::discover_with_spec;
-    use crate::test_helpers::MockDiscoveryContext;
-
-    #[test]
-    fn discovers_nvidia_env_credentials() {
-        let ctx = MockDiscoveryContext::new().with_env("NVIDIA_API_KEY", "nvapi-123");
-        let discovered = discover_with_spec(&SPEC, &ctx)
-            .expect("discovery")
-            .expect("provider");
-        assert_eq!(
-            discovered.credentials.get("NVIDIA_API_KEY"),
-            Some(&"nvapi-123".to_string())
-        );
-    }
-}
+test_discovers_env_credential!(
+    discovers_nvidia_env_credentials,
+    "NVIDIA_API_KEY",
+    "nvapi-123"
+);

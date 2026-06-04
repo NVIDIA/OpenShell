@@ -122,9 +122,9 @@ fn resolve_gateway_name(gateway_flag: &Option<String>) -> Option<String> {
 
 /// Apply authentication token from local storage based on gateway auth mode.
 ///
-/// Handles both Cloudflare Access (`edge_token`) and OIDC (`oidc_token`)
-/// auth modes by loading the stored token and setting it on `TlsOptions`.
-/// For OIDC, automatically refreshes the token if it's near expiry.
+/// Handles Cloudflare Access and OIDC auth modes by loading the stored token
+/// and setting it on `TlsOptions`. For OIDC, automatically refreshes the token
+/// if it's near expiry.
 fn apply_auth(tls: &mut TlsOptions, gateway_name: &str) {
     let Some(meta) = get_gateway_metadata(gateway_name) else {
         return;
@@ -141,11 +141,14 @@ fn apply_auth(tls: &mut TlsOptions, gateway_name: &str) {
                 return;
             };
             if openshell_bootstrap::oidc_token::is_token_expired(&bundle) {
+                let insecure = std::env::var("OPENSHELL_GATEWAY_INSECURE")
+                    .is_ok_and(|v| !v.is_empty() && v != "0" && v != "false");
                 // Try to refresh the token in-place using block_in_place
                 // so the async refresh can run within the sync apply_auth call.
                 match tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current()
-                        .block_on(openshell_cli::oidc_auth::oidc_refresh_token(&bundle))
+                    tokio::runtime::Handle::current().block_on(
+                        openshell_cli::oidc_auth::oidc_refresh_token(&bundle, insecure),
+                    )
                 }) {
                     Ok(refreshed) => {
                         let _ = openshell_bootstrap::oidc_token::store_oidc_token(
@@ -181,7 +184,7 @@ fn resolve_sandbox_name(name: Option<String>, gateway: &str) -> Result<String> {
     let last = load_last_sandbox(gateway).ok_or_else(|| {
         miette::miette!(
             "No sandbox name provided and no last-used sandbox.\n\
-             Specify a sandbox name or connect to one first: nav sandbox connect <name>"
+             Specify a sandbox name or connect to one first: openshell sandbox connect <name>"
         )
     })?;
     eprintln!("{} Using sandbox '{}' (last used)", "→".bold(), last.bold());
@@ -681,6 +684,21 @@ impl OutputFormat {
 }
 
 #[derive(Clone, Debug, ValueEnum)]
+enum PolicyGetOutput {
+    Table,
+    Json,
+}
+
+impl PolicyGetOutput {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Table => "table",
+            Self::Json => "json",
+        }
+    }
+}
+
+#[derive(Clone, Debug, ValueEnum)]
 enum CliEditor {
     Vscode,
     Cursor,
@@ -698,7 +716,7 @@ impl From<CliEditor> for openshell_cli::ssh::Editor {
 #[derive(Subcommand, Debug)]
 enum ProviderCommands {
     /// Create a provider config.
-    #[command(group = clap::ArgGroup::new("cred_source").required(true).args(["from_existing", "credentials"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    #[command(group = clap::ArgGroup::new("cred_source").required(true).args(["from_existing", "credentials", "from_gcloud_adc"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Create {
         /// Provider name.
         #[arg(long)]
@@ -709,16 +727,22 @@ enum ProviderCommands {
         provider_type: String,
 
         /// Load provider credentials/config from existing local state.
-        #[arg(long, conflicts_with = "credentials")]
+        #[arg(long, conflicts_with_all = ["credentials", "from_gcloud_adc"])]
         from_existing: bool,
 
         /// Provider credential pair (`KEY=VALUE`) or env lookup key (`KEY`).
         #[arg(
             long = "credential",
             value_name = "KEY[=VALUE]",
-            conflicts_with = "from_existing"
+            conflicts_with_all = ["from_existing", "from_gcloud_adc"]
         )]
         credentials: Vec<String>,
+
+        /// Configure credentials from gcloud Application Default Credentials
+        /// (`~/.config/gcloud/application_default_credentials.json`).
+        /// Only valid for google-vertex-ai providers.
+        #[arg(long, group = "cred_source", conflicts_with_all = ["from_existing", "credentials"])]
+        from_gcloud_adc: bool,
 
         /// Provider config key/value pair.
         #[arg(long = "config", value_name = "KEY=VALUE")]
@@ -1039,7 +1063,11 @@ enum GatewayCommands {
     /// Prints a table of all registered gateways with their endpoint, type,
     /// and authentication mode. The active gateway is marked with `*`.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
-    List,
+    List {
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table)]
+        output: OutputFormat,
+    },
 }
 
 // -----------------------------------------------------------------------
@@ -1126,6 +1154,11 @@ enum DoctorCommands {
 }
 
 #[derive(Subcommand, Debug)]
+// `Create` carries enough optional fields to be ~3x larger than the next
+// variant; boxing it would obscure the clap derive ergonomics for one
+// (rare) enum allocation per parse, which isn't worth the readability
+// cost.
+#[allow(clippy::large_enum_variant)]
 enum SandboxCommands {
     /// Create a sandbox.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
@@ -1134,7 +1167,7 @@ enum SandboxCommands {
         #[arg(long, add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
 
-        /// Sandbox source: a community sandbox name (e.g., `openclaw`), a path
+        /// Sandbox source: a community sandbox name (e.g., `ollama`), a path
         /// to a Dockerfile or directory containing one, or a full container
         /// image reference (e.g., `myregistry.com/img:tag`).
         ///
@@ -1155,7 +1188,7 @@ enum SandboxCommands {
         /// `.gitignore` rules are applied by default; use `--no-git-ignore` to
         /// upload everything.
         #[arg(long, value_hint = ValueHint::AnyPath, help_heading = "UPLOAD FLAGS")]
-        upload: Option<String>,
+        upload: Vec<String>,
 
         /// Disable `.gitignore` filtering for `--upload`.
         #[arg(long, requires = "upload", help_heading = "UPLOAD FLAGS")]
@@ -1233,6 +1266,18 @@ enum SandboxCommands {
         /// Attach labels to the sandbox (key=value format, repeatable).
         #[arg(long = "label")]
         labels: Vec<String>,
+
+        /// Approval mode for agent-authored policy proposals.
+        ///
+        /// `manual` (default): every proposal lands in the draft inbox for
+        /// human review, regardless of the prover verdict.
+        ///
+        /// `auto`: proposals whose prover delta is empty are approved
+        /// automatically; proposals with findings still require human
+        /// approval. Auto mode is an explicit opt-in — `OpenShell`'s
+        /// default-deny posture is preserved unless you choose otherwise.
+        #[arg(long, value_parser = ["manual", "auto"], default_value = "manual")]
+        approval_mode: String,
 
         /// Command to run after "--" (defaults to an interactive shell).
         #[arg(last = true, allow_hyphen_values = true)]
@@ -1576,20 +1621,24 @@ enum PolicyCommands {
         timeout: u64,
     },
 
-    /// Show current active policy for a sandbox or the global policy.
+    /// Show current effective policy for a sandbox or a stored global policy.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Get {
         /// Sandbox name (defaults to last-used sandbox). Ignored with --global.
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
 
-        /// Show a specific policy revision (default: latest).
+        /// Show a specific stored policy revision. Default shows the current effective policy.
         #[arg(long = "rev", default_value_t = 0)]
         rev: u32,
 
-        /// Print the full policy as YAML.
+        /// Include the full policy payload.
         #[arg(long)]
         full: bool,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = PolicyGetOutput::Table)]
+        output: PolicyGetOutput,
 
         /// Show the global policy revision.
         #[arg(long)]
@@ -1894,6 +1943,7 @@ async fn main() -> Result<()> {
                     &oidc_client_id,
                     oidc_audience.as_deref(),
                     oidc_scopes.as_deref(),
+                    cli.gateway_insecure,
                 )
                 .await?;
             }
@@ -1919,7 +1969,7 @@ async fn main() -> Result<()> {
                              Or set one with: openshell gateway select <name>"
                         )
                     })?;
-                run::gateway_login(&name).await?;
+                run::gateway_login(&name, cli.gateway_insecure).await?;
             }
             GatewayCommands::Logout { name } => {
                 let name = name
@@ -1942,8 +1992,8 @@ async fn main() -> Result<()> {
                     .unwrap_or_else(|| "openshell".to_string());
                 run::gateway_admin_info(&name)?;
             }
-            GatewayCommands::List => {
-                run::gateway_list(&cli.gateway)?;
+            GatewayCommands::List { output } => {
+                run::gateway_list(&cli.gateway, output.as_str())?;
             }
         },
 
@@ -2267,13 +2317,29 @@ async fn main() -> Result<()> {
                     name,
                     rev,
                     full,
+                    output,
                     global,
                 } => {
                     if global {
-                        run::sandbox_policy_get_global(&ctx.endpoint, rev, full, &tls).await?;
+                        run::sandbox_policy_get_global(
+                            &ctx.endpoint,
+                            rev,
+                            full,
+                            output.as_str(),
+                            &tls,
+                        )
+                        .await?;
                     } else {
                         let name = resolve_sandbox_name(name, &ctx.name)?;
-                        run::sandbox_policy_get(&ctx.endpoint, &name, rev, full, &tls).await?;
+                        run::sandbox_policy_get(
+                            &ctx.endpoint,
+                            &name,
+                            rev,
+                            full,
+                            output.as_str(),
+                            &tls,
+                        )
+                        .await?;
                     }
                 }
                 PolicyCommands::List {
@@ -2483,6 +2549,7 @@ async fn main() -> Result<()> {
                     auto_providers,
                     no_auto_providers,
                     labels,
+                    approval_mode,
                     command,
                 } => {
                     // Resolve --tty / --no-tty into an Option<bool> override.
@@ -2516,11 +2583,22 @@ async fn main() -> Result<()> {
                         labels_map.insert(parts[0].to_string(), parts[1].to_string());
                     }
 
-                    // Parse --upload spec into (local_path, sandbox_path, git_ignore).
-                    let upload_spec = upload.as_deref().map(|s| {
-                        let (local, remote) = parse_upload_spec(s);
-                        (local, remote, !no_git_ignore)
-                    });
+                    // Parse --upload specs into [(local_path, sandbox_path, git_ignore)].
+                    let upload_specs: Vec<(String, Option<String>, bool)> = upload
+                        .iter()
+                        .map(|s| {
+                            let (local, remote) = parse_upload_spec(s);
+                            (local, remote, !no_git_ignore)
+                        })
+                        .collect();
+
+                    // Validate all local paths before creating the sandbox so failures are
+                    // fast and have no side effects.
+                    for (local, _, _) in &upload_specs {
+                        if std::fs::symlink_metadata(local).is_err() {
+                            return Err(miette::miette!("local path does not exist: {}", local));
+                        }
+                    }
 
                     let editor = editor.map(Into::into);
                     let forward = forward
@@ -2537,7 +2615,7 @@ async fn main() -> Result<()> {
                         name.as_deref(),
                         from.as_deref(),
                         &ctx.name,
-                        upload_spec.as_ref(),
+                        &upload_specs,
                         keep,
                         gpu,
                         gpu_device.as_deref(),
@@ -2551,6 +2629,7 @@ async fn main() -> Result<()> {
                         tty_override,
                         auto_providers_override,
                         &labels_map,
+                        &approval_mode,
                         &tls,
                     ))
                     .await?;
@@ -2724,6 +2803,7 @@ async fn main() -> Result<()> {
                     provider_type,
                     from_existing,
                     credentials,
+                    from_gcloud_adc,
                     config,
                 } => {
                     run::provider_create(
@@ -2732,6 +2812,7 @@ async fn main() -> Result<()> {
                         provider_type.as_str(),
                         from_existing,
                         &credentials,
+                        from_gcloud_adc,
                         &config,
                         &tls,
                     )
@@ -3415,6 +3496,43 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_create_upload_flag_accepts_multiple_values() {
+        let result = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--upload",
+            "./src:/workspace/src",
+            "--upload",
+            "./config:/workspace/config",
+        ]);
+        assert!(
+            result.is_ok(),
+            "--upload should be repeatable, got: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn sandbox_create_upload_flag_accepts_zero_values() {
+        let result = Cli::try_parse_from(["openshell", "sandbox", "create"]);
+        assert!(
+            result.is_ok(),
+            "sandbox create with no --upload should succeed, got: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn sandbox_create_no_git_ignore_requires_upload() {
+        let result = Cli::try_parse_from(["openshell", "sandbox", "create", "--no-git-ignore"]);
+        assert!(
+            result.is_err(),
+            "--no-git-ignore without --upload should be rejected"
+        );
+    }
+
+    #[test]
     fn resolve_sandbox_name_returns_explicit_name() {
         // When a name is provided, it should be returned regardless of any
         // stored last-sandbox state.
@@ -3439,7 +3557,7 @@ mod tests {
             let err = resolve_sandbox_name(None, "unknown-gateway").unwrap_err();
             let msg = err.to_string();
             assert!(
-                msg.contains("nav sandbox connect"),
+                msg.contains("openshell sandbox connect"),
                 "expected helpful hint in error, got: {msg}"
             );
         });
@@ -3687,6 +3805,51 @@ mod tests {
     }
 
     #[test]
+    fn gateway_list_default_output_is_table() {
+        let cli = Cli::try_parse_from(["openshell", "gateway", "list"])
+            .expect("gateway list should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Gateway {
+                command: Some(GatewayCommands::List {
+                    output: OutputFormat::Table,
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn gateway_list_accepts_output_json() {
+        let cli = Cli::try_parse_from(["openshell", "gateway", "list", "-o", "json"])
+            .expect("gateway list -o json should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Gateway {
+                command: Some(GatewayCommands::List {
+                    output: OutputFormat::Json,
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn gateway_list_accepts_output_yaml() {
+        let cli = Cli::try_parse_from(["openshell", "gateway", "list", "-o", "yaml"])
+            .expect("gateway list -o yaml should parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Gateway {
+                command: Some(GatewayCommands::List {
+                    output: OutputFormat::Yaml,
+                })
+            })
+        ));
+    }
+
+    #[test]
     fn provider_create_accepts_custom_profile_type_ids() {
         let cli = Cli::try_parse_from([
             "openshell",
@@ -3717,6 +3880,47 @@ mod tests {
             }
             other => panic!("expected provider create command, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn provider_create_rejects_from_gcloud_adc_with_from_existing() {
+        let err = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "create",
+            "--name",
+            "vertex-local",
+            "--type",
+            "google-vertex-ai",
+            "--from-existing",
+            "--from-gcloud-adc",
+        ])
+        .expect_err("clap should reject conflicting credential sources");
+
+        let msg = err.to_string();
+        assert!(msg.contains("--from-existing"));
+        assert!(msg.contains("--from-gcloud-adc"));
+    }
+
+    #[test]
+    fn provider_create_rejects_from_gcloud_adc_with_credential() {
+        let err = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "create",
+            "--name",
+            "vertex-local",
+            "--type",
+            "google-vertex-ai",
+            "--from-gcloud-adc",
+            "--credential",
+            "GOOGLE_VERTEX_AI_TOKEN=token",
+        ])
+        .expect_err("clap should reject conflicting credential sources");
+
+        let msg = err.to_string();
+        assert!(msg.contains("--credential"));
+        assert!(msg.contains("--from-gcloud-adc"));
     }
 
     #[test]
@@ -3920,6 +4124,34 @@ mod tests {
     }
 
     #[test]
+    fn policy_get_json_output_parses() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "policy",
+            "get",
+            "my-sandbox",
+            "--full",
+            "-o",
+            "json",
+        ])
+        .expect("policy get -o json should parse");
+
+        match cli.command {
+            Some(Commands::Policy {
+                command:
+                    Some(PolicyCommands::Get {
+                        name, full, output, ..
+                    }),
+            }) => {
+                assert_eq!(name.as_deref(), Some("my-sandbox"));
+                assert!(full);
+                assert!(matches!(output, PolicyGetOutput::Json));
+            }
+            other => panic!("expected policy get command, got: {other:?}"),
+        }
+    }
+
+    #[test]
     fn policy_delete_global_parses() {
         let cli = Cli::try_parse_from(["openshell", "policy", "delete", "--global", "--yes"])
             .expect("policy delete --global should parse");
@@ -4013,6 +4245,60 @@ mod tests {
                 panic!("expected SandboxCommands::Create");
             }
         }
+    }
+
+    /// `sandbox create` defaults `--approval-mode` to `"manual"`. The CLI
+    /// always sends an explicit value so the wire form is human-readable
+    /// (the gateway treats `""` as `"manual"` too, but the CLI's job is to
+    /// be unambiguous).
+    #[test]
+    fn sandbox_create_approval_mode_defaults_to_manual() {
+        let cli = Cli::try_parse_from(["openshell", "sandbox", "create"])
+            .expect("sandbox create with no flags should parse");
+        match cli.command {
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { approval_mode, .. }),
+                ..
+            }) => {
+                assert_eq!(approval_mode, "manual");
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    /// `--approval-mode auto` parses through.
+    #[test]
+    fn sandbox_create_approval_mode_accepts_auto() {
+        let cli =
+            Cli::try_parse_from(["openshell", "sandbox", "create", "--approval-mode", "auto"])
+                .expect("--approval-mode auto should parse");
+        match cli.command {
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { approval_mode, .. }),
+                ..
+            }) => {
+                assert_eq!(approval_mode, "auto");
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    /// `--approval-mode <bogus>` is rejected by clap's value parser, so the
+    /// CLI can't smuggle through a future-mode value that the gateway
+    /// doesn't yet know about.
+    #[test]
+    fn sandbox_create_approval_mode_rejects_unknown_value() {
+        let result = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--approval-mode",
+            "auto_on_low_risk",
+        ]);
+        assert!(
+            result.is_err(),
+            "--approval-mode auto_on_low_risk should be rejected until added to the value parser"
+        );
     }
 
     #[test]

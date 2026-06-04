@@ -133,6 +133,8 @@ mod tests {
             default_headers: Vec::new(),
             passthrough_headers: Vec::new(),
             timeout: crate::config::DEFAULT_ROUTE_TIMEOUT,
+            model_in_path: false,
+            request_path_override: None,
         }
     }
 

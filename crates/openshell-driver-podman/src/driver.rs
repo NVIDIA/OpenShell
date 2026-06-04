@@ -10,7 +10,10 @@ use crate::watcher::{
     self, WatchStream, driver_sandbox_from_inspect, driver_sandbox_from_list_entry,
 };
 use openshell_core::ComputeDriverError;
+use openshell_core::driver_utils::supervisor_image_should_refresh;
 use openshell_core::proto::compute::v1::{DriverSandbox, GetCapabilitiesResponse};
+use std::path::PathBuf;
+use std::time::Duration;
 use tracing::{info, warn};
 
 impl From<PodmanApiError> for ComputeDriverError {
@@ -54,9 +57,71 @@ fn validated_container_name(sandbox_name: &str) -> Result<String, ComputeDriverE
     Ok(name)
 }
 
+fn sandbox_token_host_path(sandbox_id: &str) -> Result<PathBuf, ComputeDriverError> {
+    openshell_core::driver_utils::sandbox_token_path("podman-sandbox-tokens", None, sandbox_id)
+        .map_err(|err| ComputeDriverError::Message(format!("resolve state dir failed: {err}")))
+}
+
+async fn write_sandbox_token_file(
+    sandbox: &DriverSandbox,
+) -> Result<Option<PathBuf>, ComputeDriverError> {
+    let Some(spec) = sandbox.spec.as_ref() else {
+        return Ok(None);
+    };
+    if spec.sandbox_token.is_empty() {
+        return Ok(None);
+    }
+    let path = sandbox_token_host_path(&sandbox.id)?;
+    if let Some(parent) = path.parent() {
+        openshell_core::paths::create_dir_restricted(parent).map_err(|err| {
+            ComputeDriverError::Message(format!(
+                "create sandbox token directory {} failed: {err}",
+                parent.display()
+            ))
+        })?;
+    }
+    tokio::fs::write(&path, format!("{}\n", spec.sandbox_token))
+        .await
+        .map_err(|err| {
+            ComputeDriverError::Message(format!(
+                "write sandbox token file {} failed: {err}",
+                path.display()
+            ))
+        })?;
+    openshell_core::paths::set_file_owner_only(&path).map_err(|err| {
+        ComputeDriverError::Message(format!(
+            "restrict sandbox token file {} failed: {err}",
+            path.display()
+        ))
+    })?;
+    Ok(Some(path))
+}
+
+fn cleanup_sandbox_token_file(sandbox_id: &str) {
+    let Ok(path) = sandbox_token_host_path(sandbox_id) else {
+        return;
+    };
+    if let Err(err) = std::fs::remove_file(&path)
+        && err.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(
+            sandbox_id = %sandbox_id,
+            path = %path.display(),
+            error = %err,
+            "Failed to remove Podman sandbox token file"
+        );
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::remove_dir(dir);
+    }
+}
+
 impl PodmanComputeDriver {
     /// Create a new driver, verifying the Podman socket is reachable.
     pub async fn new(mut config: PodmanComputeConfig) -> Result<Self, PodmanApiError> {
+        const MAX_PING_RETRIES: u32 = 5;
+        const PING_RETRY_DELAY: Duration = Duration::from_secs(2);
+
         if !config.socket_path.exists() {
             if cfg!(target_os = "macos") {
                 warn!(
@@ -77,11 +142,32 @@ impl PodmanComputeDriver {
         // (e.g. CA set but cert/key missing) are rejected early so operators
         // get a clear error instead of a silent fallback to plaintext HTTP.
         config.validate_tls_config()?;
+        config.validate_runtime_limits()?;
+        config.validate_host_gateway_ip()?;
 
         let client = PodmanClient::new(config.socket_path.clone());
 
-        // Verify connectivity.
-        client.ping().await?;
+        // Verify connectivity, retrying briefly to tolerate transient socket
+        // unavailability (e.g. podman.socket restarting after a package
+        // upgrade). The systemd unit uses Wants=podman.socket (not Requires),
+        // so the gateway may start while the socket is briefly re-activating.
+        let mut attempts = 0;
+        loop {
+            match client.ping().await {
+                Ok(()) => break,
+                Err(e) if attempts < MAX_PING_RETRIES => {
+                    attempts += 1;
+                    warn!(
+                        attempt = attempts,
+                        max_retries = MAX_PING_RETRIES,
+                        error = %e,
+                        "Podman socket not ready, retrying"
+                    );
+                    tokio::time::sleep(PING_RETRY_DELAY).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
 
         // Verify cgroups v2, detect rootless mode, and log system info.
         match client.system_info().await {
@@ -111,7 +197,7 @@ impl PodmanComputeDriver {
         // Rootless pre-flight: warn if subuid/subgid ranges look missing.
         // Not a hard error because some systems configure these via LDAP or
         // other mechanisms that /etc/subuid does not reflect.
-        if nix::unistd::getuid().as_raw() != 0 {
+        if !cfg!(target_os = "macos") && rustix::process::getuid().as_raw() != 0 {
             check_subuid_range();
         }
 
@@ -169,14 +255,11 @@ impl PodmanComputeDriver {
 
     /// Report driver capabilities.
     pub fn capabilities(&self) -> Result<GetCapabilitiesResponse, ComputeDriverError> {
-        let supports_gpu = Self::has_gpu_capacity();
-        Ok(GetCapabilitiesResponse {
-            driver_name: "podman".to_string(),
-            driver_version: openshell_core::VERSION.to_string(),
-            default_image: self.config.default_image.clone(),
-            supports_gpu,
-            gpu_count: 0,
-        })
+        Ok(openshell_core::driver_utils::build_capabilities_response(
+            "podman",
+            openshell_core::VERSION,
+            &self.config.default_image,
+        ))
     }
 
     #[must_use]
@@ -240,15 +323,16 @@ impl PodmanComputeDriver {
 
         // 1a. Pull the supervisor image if needed. The supervisor binary
         //     is shipped in a standalone OCI image and mounted into sandbox
-        //     containers via Podman's type=image mount. Using "missing"
-        //     policy so the image is only pulled once and then cached.
+        //     containers via Podman's type=image mount. Refresh mutable tags
+        //     like latest/dev, but avoid registry checks for pinned images.
+        let supervisor_pull_policy = supervisor_image_pull_policy(&self.config.supervisor_image);
         info!(
             image = %self.config.supervisor_image,
-            policy = "missing",
+            policy = supervisor_pull_policy,
             "Ensuring supervisor image"
         );
         self.client
-            .pull_image(&self.config.supervisor_image, "missing")
+            .pull_image(&self.config.supervisor_image, supervisor_pull_policy)
             .await
             .map_err(ComputeDriverError::from)?;
 
@@ -272,9 +356,20 @@ impl PodmanComputeDriver {
         if let Err(e) = self.client.create_volume(&vol_name).await {
             return Err(ComputeDriverError::from(e));
         }
+        let token_host_path = match write_sandbox_token_file(sandbox).await {
+            Ok(path) => path,
+            Err(e) => {
+                let _ = self.client.remove_volume(&vol_name).await;
+                return Err(e);
+            }
+        };
 
         // 3. Create container.
-        let spec = container::build_container_spec(sandbox, &self.config);
+        let spec = container::build_container_spec_with_token(
+            sandbox,
+            &self.config,
+            token_host_path.as_deref(),
+        );
         match self.client.create_container(&spec).await {
             Ok(_) => {}
             Err(PodmanApiError::Conflict(_)) => {
@@ -283,10 +378,12 @@ impl PodmanComputeDriver {
                 // has the same name but a different ID), so it would be
                 // orphaned otherwise.
                 let _ = self.client.remove_volume(&vol_name).await;
+                cleanup_sandbox_token_file(&sandbox.id);
                 return Err(ComputeDriverError::AlreadyExists);
             }
             Err(e) => {
                 let _ = self.client.remove_volume(&vol_name).await;
+                cleanup_sandbox_token_file(&sandbox.id);
                 return Err(ComputeDriverError::from(e));
             }
         }
@@ -300,6 +397,7 @@ impl PodmanComputeDriver {
             );
             let _ = self.client.remove_container(&name).await;
             let _ = self.client.remove_volume(&vol_name).await;
+            cleanup_sandbox_token_file(&sandbox.id);
             return Err(ComputeDriverError::from(e));
         }
 
@@ -397,6 +495,7 @@ impl PodmanComputeDriver {
                 "Failed to remove workspace volume"
             );
         }
+        cleanup_sandbox_token_file(sandbox_id);
 
         Ok(container_existed)
     }
@@ -483,6 +582,14 @@ impl PodmanComputeDriver {
             config,
             network_gateway_ip: None,
         }
+    }
+}
+
+fn supervisor_image_pull_policy(image: &str) -> &'static str {
+    if supervisor_image_should_refresh(image) {
+        "newer"
+    } else {
+        "missing"
     }
 }
 
@@ -614,6 +721,32 @@ mod tests {
             cfg.grpc_endpoint = format!("{scheme}://host.containers.internal:{}", cfg.gateway_port);
         }
         assert_eq!(cfg.grpc_endpoint, "https://gateway.internal:9000");
+    }
+
+    #[test]
+    fn supervisor_pull_policy_refreshes_mutable_tags_only() {
+        assert_eq!(
+            supervisor_image_pull_policy("ghcr.io/nvidia/openshell/supervisor:dev"),
+            "newer"
+        );
+        assert_eq!(
+            supervisor_image_pull_policy("ghcr.io/nvidia/openshell/supervisor:latest"),
+            "newer"
+        );
+        assert_eq!(
+            supervisor_image_pull_policy("ghcr.io/nvidia/openshell/supervisor"),
+            "newer"
+        );
+        assert_eq!(
+            supervisor_image_pull_policy(
+                "ghcr.io/nvidia/openshell/supervisor:0.0.47-dev.13-g57b71c68f"
+            ),
+            "missing"
+        );
+        assert_eq!(
+            supervisor_image_pull_policy("ghcr.io/nvidia/openshell/supervisor@sha256:abc123"),
+            "missing"
+        );
     }
 
     fn test_driver(socket_path: PathBuf) -> PodmanComputeDriver {

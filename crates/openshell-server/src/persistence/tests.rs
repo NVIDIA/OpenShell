@@ -1,16 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{ObjectType, PersistenceError, Store, generate_name};
+use super::{ObjectType, PersistenceError, Store, generate_name, test_store};
 use crate::policy_store::PolicyStoreExt;
 use openshell_core::proto::{ObjectForTest, SandboxPolicy};
 use prost::Message;
 
 #[tokio::test]
 async fn sqlite_put_get_round_trip() {
-    let store = Store::connect("sqlite::memory:?cache=shared")
-        .await
-        .unwrap();
+    let store = test_store().await;
 
     store
         .put("sandbox", "abc", "my-sandbox", b"payload", None)
@@ -26,9 +24,7 @@ async fn sqlite_put_get_round_trip() {
 
 #[tokio::test]
 async fn sqlite_connect_runs_embedded_migrations() {
-    let store = Store::connect("sqlite::memory:?cache=shared")
-        .await
-        .unwrap();
+    let store = test_store().await;
 
     let records = store.list("sandbox", 10, 0).await.unwrap();
     assert!(records.is_empty());
@@ -213,9 +209,7 @@ async fn restrict_db_file_permissions_handles_real_sqlite_wal_files() {
 
 #[tokio::test]
 async fn sqlite_updates_timestamp() {
-    let store = Store::connect("sqlite::memory:?cache=shared")
-        .await
-        .unwrap();
+    let store = test_store().await;
 
     store
         .put("sandbox", "abc", "my-sandbox", b"payload", None)
@@ -236,9 +230,7 @@ async fn sqlite_updates_timestamp() {
 
 #[tokio::test]
 async fn sqlite_list_paging() {
-    let store = Store::connect("sqlite::memory:?cache=shared")
-        .await
-        .unwrap();
+    let store = test_store().await;
 
     for idx in 0..5 {
         let id = format!("id-{idx}");
@@ -258,9 +250,7 @@ async fn sqlite_list_paging() {
 
 #[tokio::test]
 async fn sqlite_delete_behavior() {
-    let store = Store::connect("sqlite::memory:?cache=shared")
-        .await
-        .unwrap();
+    let store = test_store().await;
 
     store
         .put("sandbox", "abc", "my-sandbox", b"payload", None)
@@ -276,9 +266,7 @@ async fn sqlite_delete_behavior() {
 
 #[tokio::test]
 async fn sqlite_protobuf_round_trip() {
-    let store = Store::connect("sqlite::memory:?cache=shared")
-        .await
-        .unwrap();
+    let store = test_store().await;
 
     let object = ObjectForTest {
         id: "abc".to_string(),
@@ -301,9 +289,7 @@ async fn sqlite_protobuf_round_trip() {
 
 #[tokio::test]
 async fn sqlite_get_by_name() {
-    let store = Store::connect("sqlite::memory:?cache=shared")
-        .await
-        .unwrap();
+    let store = test_store().await;
 
     store
         .put("sandbox", "id-1", "my-sandbox", b"payload", None)
@@ -325,9 +311,7 @@ async fn sqlite_get_by_name() {
 
 #[tokio::test]
 async fn sqlite_get_message_by_name() {
-    let store = Store::connect("sqlite::memory:?cache=shared")
-        .await
-        .unwrap();
+    let store = test_store().await;
 
     let object = ObjectForTest {
         id: "uid-1".to_string(),
@@ -355,9 +339,7 @@ async fn sqlite_get_message_by_name() {
 
 #[tokio::test]
 async fn sqlite_delete_by_name() {
-    let store = Store::connect("sqlite::memory:?cache=shared")
-        .await
-        .unwrap();
+    let store = test_store().await;
 
     store
         .put("sandbox", "id-1", "my-sandbox", b"payload", None)
@@ -376,9 +358,7 @@ async fn sqlite_delete_by_name() {
 
 #[tokio::test]
 async fn sqlite_name_unique_per_object_type() {
-    let store = Store::connect("sqlite::memory:?cache=shared")
-        .await
-        .unwrap();
+    let store = test_store().await;
 
     store
         .put("sandbox", "id-1", "shared-name", b"payload1", None)
@@ -408,9 +388,7 @@ async fn sqlite_name_unique_per_object_type() {
 
 #[tokio::test]
 async fn sqlite_id_globally_unique() {
-    let store = Store::connect("sqlite::memory:?cache=shared")
-        .await
-        .unwrap();
+    let store = test_store().await;
 
     store
         .put("sandbox", "same-id", "name-a", b"payload1", None)
@@ -458,9 +436,7 @@ impl ObjectType for ObjectForTest {
 
 #[tokio::test]
 async fn labels_round_trip() {
-    let store = Store::connect("sqlite::memory:?cache=shared")
-        .await
-        .unwrap();
+    let store = test_store().await;
 
     let labels = r#"{"env":"production","team":"platform"}"#;
     store
@@ -480,9 +456,7 @@ async fn labels_round_trip() {
 
 #[tokio::test]
 async fn label_selector_single_match() {
-    let store = Store::connect("sqlite::memory:?cache=shared")
-        .await
-        .unwrap();
+    let store = test_store().await;
 
     store
         .put("sandbox", "id-1", "s1", b"p1", Some(r#"{"env":"prod"}"#))
@@ -516,9 +490,7 @@ async fn label_selector_single_match() {
 
 #[tokio::test]
 async fn label_selector_multiple_labels() {
-    let store = Store::connect("sqlite::memory:?cache=shared")
-        .await
-        .unwrap();
+    let store = test_store().await;
 
     store
         .put(
@@ -562,9 +534,7 @@ async fn label_selector_multiple_labels() {
 
 #[tokio::test]
 async fn label_selector_no_match() {
-    let store = Store::connect("sqlite::memory:?cache=shared")
-        .await
-        .unwrap();
+    let store = test_store().await;
 
     store
         .put("sandbox", "id-1", "s1", b"p1", Some(r#"{"env":"prod"}"#))
@@ -581,9 +551,7 @@ async fn label_selector_no_match() {
 
 #[tokio::test]
 async fn label_selector_respects_paging() {
-    let store = Store::connect("sqlite::memory:?cache=shared")
-        .await
-        .unwrap();
+    let store = test_store().await;
 
     for idx in 0..5 {
         let id = format!("id-{idx}");
@@ -615,9 +583,7 @@ async fn label_selector_respects_paging() {
 
 #[tokio::test]
 async fn empty_labels_not_matched_by_selector() {
-    let store = Store::connect("sqlite::memory:?cache=shared")
-        .await
-        .unwrap();
+    let store = test_store().await;
 
     store
         .put("sandbox", "id-1", "s1", b"p1", None)
@@ -643,9 +609,7 @@ async fn empty_labels_not_matched_by_selector() {
 
 #[tokio::test]
 async fn policy_put_and_get_latest() {
-    let store = Store::connect("sqlite::memory:?cache=shared")
-        .await
-        .unwrap();
+    let store = test_store().await;
 
     let policy_v1 = SandboxPolicy::default().encode_to_vec();
     store
@@ -677,9 +641,7 @@ async fn policy_put_and_get_latest() {
 
 #[tokio::test]
 async fn policy_get_by_version() {
-    let store = Store::connect("sqlite::memory:?cache=shared")
-        .await
-        .unwrap();
+    let store = test_store().await;
 
     let policy_v1 = SandboxPolicy::default().encode_to_vec();
     let policy_v2 = SandboxPolicy {
@@ -718,9 +680,7 @@ async fn policy_get_by_version() {
 
 #[tokio::test]
 async fn policy_update_status_and_get_loaded() {
-    let store = Store::connect("sqlite::memory:?cache=shared")
-        .await
-        .unwrap();
+    let store = test_store().await;
 
     let payload = SandboxPolicy::default().encode_to_vec();
     store
@@ -751,9 +711,7 @@ async fn policy_update_status_and_get_loaded() {
 
 #[tokio::test]
 async fn policy_status_failed_with_error() {
-    let store = Store::connect("sqlite::memory:?cache=shared")
-        .await
-        .unwrap();
+    let store = test_store().await;
 
     let payload = SandboxPolicy::default().encode_to_vec();
     store
@@ -777,9 +735,7 @@ async fn policy_status_failed_with_error() {
 
 #[tokio::test]
 async fn policy_supersede_older() {
-    let store = Store::connect("sqlite::memory:?cache=shared")
-        .await
-        .unwrap();
+    let store = test_store().await;
 
     let payload = SandboxPolicy::default().encode_to_vec();
     store
@@ -832,9 +788,7 @@ async fn policy_supersede_older() {
 
 #[tokio::test]
 async fn policy_list_ordered_by_version_desc() {
-    let store = Store::connect("sqlite::memory:?cache=shared")
-        .await
-        .unwrap();
+    let store = test_store().await;
 
     let payload = SandboxPolicy::default().encode_to_vec();
     store
@@ -865,9 +819,7 @@ async fn policy_list_ordered_by_version_desc() {
 
 #[tokio::test]
 async fn policy_isolation_between_sandboxes() {
-    let store = Store::connect("sqlite::memory:?cache=shared")
-        .await
-        .unwrap();
+    let store = test_store().await;
 
     let policy_s1 = SandboxPolicy::default().encode_to_vec();
     let policy_s2 = SandboxPolicy {
@@ -971,9 +923,7 @@ fn parse_label_selector_handles_whitespace() {
 async fn cas_put_if_must_create_succeeds() {
     use super::WriteCondition;
 
-    let store = Store::connect("sqlite::memory:?cache=shared")
-        .await
-        .unwrap();
+    let store = test_store().await;
 
     let result = store
         .put_if(
@@ -998,9 +948,7 @@ async fn cas_put_if_must_create_succeeds() {
 async fn cas_put_if_must_create_fails_on_duplicate() {
     use super::{PersistenceError, WriteCondition};
 
-    let store = Store::connect("sqlite::memory:?cache=shared")
-        .await
-        .unwrap();
+    let store = test_store().await;
 
     // First insert succeeds
     store
@@ -1037,9 +985,7 @@ async fn cas_put_if_must_create_fails_on_duplicate() {
 async fn cas_put_if_match_version_succeeds() {
     use super::WriteCondition;
 
-    let store = Store::connect("sqlite::memory:?cache=shared")
-        .await
-        .unwrap();
+    let store = test_store().await;
 
     // Create initial object
     store
@@ -1078,9 +1024,7 @@ async fn cas_put_if_match_version_succeeds() {
 async fn cas_put_if_match_version_fails_on_mismatch() {
     use super::{PersistenceError, WriteCondition};
 
-    let store = Store::connect("sqlite::memory:?cache=shared")
-        .await
-        .unwrap();
+    let store = test_store().await;
 
     // Create initial object
     store
@@ -1124,9 +1068,7 @@ async fn cas_put_if_match_version_fails_on_mismatch() {
 async fn cas_delete_if_succeeds_with_correct_version() {
     use super::WriteCondition;
 
-    let store = Store::connect("sqlite::memory:?cache=shared")
-        .await
-        .unwrap();
+    let store = test_store().await;
 
     store
         .put_if(
@@ -1151,9 +1093,7 @@ async fn cas_delete_if_succeeds_with_correct_version() {
 async fn cas_delete_if_fails_with_wrong_version() {
     use super::{PersistenceError, WriteCondition};
 
-    let store = Store::connect("sqlite::memory:?cache=shared")
-        .await
-        .unwrap();
+    let store = test_store().await;
 
     store
         .put_if(
@@ -1184,9 +1124,7 @@ async fn cas_delete_if_fails_with_wrong_version() {
 async fn cas_resource_version_increments() {
     use super::WriteCondition;
 
-    let store = Store::connect("sqlite::memory:?cache=shared")
-        .await
-        .unwrap();
+    let store = test_store().await;
 
     // Create
     let r1 = store
@@ -1239,11 +1177,7 @@ async fn cas_concurrent_updates_one_succeeds() {
     use super::WriteCondition;
     use std::sync::Arc;
 
-    let store = Arc::new(
-        Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap(),
-    );
+    let store = Arc::new(test_store().await);
 
     // Create initial object
     store
@@ -1299,9 +1233,7 @@ async fn cas_concurrent_updates_one_succeeds() {
 async fn cas_update_message_cas_succeeds() {
     use openshell_core::proto::Sandbox;
 
-    let store = Store::connect("sqlite::memory:?cache=shared")
-        .await
-        .unwrap();
+    let store = test_store().await;
 
     // Create a sandbox
     let sandbox = Sandbox {
@@ -1314,8 +1246,6 @@ async fn cas_update_message_cas_succeeds() {
         }),
         spec: None,
         status: None,
-        phase: 0,
-        current_policy_version: 0,
     };
 
     store.put_message(&sandbox).await.unwrap();
@@ -1323,14 +1253,14 @@ async fn cas_update_message_cas_succeeds() {
     // Update using CAS with expected_version = 0 (use current version)
     let updated = store
         .update_message_cas::<Sandbox, _>("test-id", 0, |s| {
-            s.phase = 2; // Set to Ready
-            s.current_policy_version = 42;
+            s.set_phase(2); // Set to Ready
+            s.set_current_policy_version(42);
         })
         .await
         .unwrap();
 
-    assert_eq!(updated.phase, 2);
-    assert_eq!(updated.current_policy_version, 42);
+    assert_eq!(updated.phase(), 2);
+    assert_eq!(updated.current_policy_version(), 42);
     assert_eq!(
         updated.metadata.as_ref().map_or(0, |m| m.resource_version),
         2
@@ -1342,11 +1272,7 @@ async fn cas_update_message_cas_conflicts_on_concurrent_updates() {
     use openshell_core::proto::Sandbox;
     use std::sync::Arc;
 
-    let store = Arc::new(
-        Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap(),
-    );
+    let store = Arc::new(test_store().await);
 
     // Create a sandbox
     let sandbox = Sandbox {
@@ -1359,8 +1285,6 @@ async fn cas_update_message_cas_conflicts_on_concurrent_updates() {
         }),
         spec: None,
         status: None,
-        phase: 0,
-        current_policy_version: 0,
     };
 
     store.put_message(&sandbox).await.unwrap();
@@ -1374,7 +1298,7 @@ async fn cas_update_message_cas_conflicts_on_concurrent_updates() {
         let handle = tokio::spawn(async move {
             store
                 .update_message_cas::<Sandbox, _>("test-id", 1, |s| {
-                    s.current_policy_version = i;
+                    s.set_current_policy_version(i);
                 })
                 .await
         });

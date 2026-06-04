@@ -1,0 +1,116 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: certgen hook
+templates:
+  - templates/certgen.yaml
+release:
+  name: openshell
+  namespace: my-namespace
+
+tests:
+  - it: renders combined TLS and JWT certgen hook by default
+    template: templates/certgen.yaml
+    asserts:
+      - hasDocuments:
+          count: 4
+      - equal:
+          path: kind
+          value: Job
+        documentIndex: 3
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: "--server-secret-name=openshell-server-tls"
+        documentIndex: 3
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: "--client-secret-name=openshell-client-tls"
+        documentIndex: 3
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: "--jwt-secret-name=openshell-jwt-keys"
+        documentIndex: 3
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: "--jwt-only"
+        documentIndex: 3
+
+  - it: renders JWT-only certgen hook when cert-manager owns TLS
+    template: templates/certgen.yaml
+    set:
+      certManager.enabled: true
+      pkiInitJob.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 4
+      - equal:
+          path: kind
+          value: Job
+        documentIndex: 3
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: "--jwt-only"
+        documentIndex: 3
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: "--jwt-secret-name=openshell-jwt-keys"
+        documentIndex: 3
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: "--server-secret-name=openshell-server-tls"
+        documentIndex: 3
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: "--client-secret-name=openshell-client-tls"
+        documentIndex: 3
+
+  - it: uses the configured sandbox JWT secret name
+    template: templates/certgen.yaml
+    set:
+      server.sandboxJwt.signingSecretName: custom-jwt-keys
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: "--jwt-secret-name=custom-jwt-keys"
+        documentIndex: 3
+
+  - it: renders JWT-only hook when cert-manager is enabled even if pkiInitJob remains enabled
+    template: templates/certgen.yaml
+    set:
+      certManager.enabled: true
+      pkiInitJob.enabled: true
+      pkiInitJob.serverDnsNames:
+        - extra.example.test
+      pkiInitJob.serverIpAddresses:
+        - 192.0.2.10
+    asserts:
+      - hasDocuments:
+          count: 4
+      - equal:
+          path: kind
+          value: Job
+        documentIndex: 3
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: "--jwt-only"
+        documentIndex: 3
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: "--jwt-secret-name=openshell-jwt-keys"
+        documentIndex: 3
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: "--server-secret-name=openshell-server-tls"
+        documentIndex: 3
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: "--client-secret-name=openshell-client-tls"
+        documentIndex: 3
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: "--server-san=extra.example.test"
+        documentIndex: 3
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: "--server-san=192.0.2.10"
+        documentIndex: 3

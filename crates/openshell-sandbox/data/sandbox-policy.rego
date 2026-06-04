@@ -34,12 +34,16 @@ deny_reason := reason if {
 	input.network
 	input.exec
 	not network_policy_for_request
-	endpoint_misses := [r |
-		some name
-		policy := data.network_policies[name]
-		not endpoint_allowed(policy, input.network)
-		r := sprintf("endpoint %s:%d not in policy '%s'", [input.network.host, input.network.port, name])
-	]
+	not endpoint_policy_for_request
+	count(data.network_policies) > 0
+	reason := sprintf("endpoint %s:%d is not allowed by any policy", [input.network.host, input.network.port])
+}
+
+deny_reason := reason if {
+	input.network
+	input.exec
+	not network_policy_for_request
+	endpoint_policy_for_request
 	ancestors_str := concat(" -> ", input.exec.ancestors)
 	cmdline_str := concat(", ", input.exec.cmdline_paths)
 	binary_misses := [r |
@@ -49,9 +53,8 @@ deny_reason := reason if {
 		not binary_allowed(policy, input.exec)
 		r := sprintf("binary '%s' not allowed in policy '%s' (ancestors: [%s], cmdline: [%s]). SYMLINK HINT: the binary path is the kernel-resolved target from /proc/<pid>/exe, not the symlink. If your policy specifies a symlink (e.g., /usr/bin/python3) but the actual binary is /usr/bin/python3.11, either: (1) use the canonical path in your policy (run 'readlink -f /usr/bin/python3' inside the sandbox), or (2) ensure symlink resolution is working (check sandbox logs for 'Cannot access container filesystem')", [input.exec.path, name, ancestors_str, cmdline_str])
 	]
-	all_reasons := array.concat(endpoint_misses, binary_misses)
-	count(all_reasons) > 0
-	reason := concat("; ", all_reasons)
+	count(binary_misses) > 0
+	reason := concat("; ", binary_misses)
 }
 
 deny_reason := "network connections not allowed by policy" if {
@@ -89,6 +92,12 @@ network_policy_for_request if {
 	data.network_policies[name]
 	endpoint_allowed(data.network_policies[name], input.network)
 	binary_allowed(data.network_policies[name], input.exec)
+}
+
+endpoint_policy_for_request if {
+	some name
+	data.network_policies[name]
+	endpoint_allowed(data.network_policies[name], input.network)
 }
 
 # Endpoint matching: exact host (case-insensitive) + port in ports list.
@@ -146,6 +155,32 @@ binary_allowed(policy, exec) if {
 # spoofable via execve and must not be used as a grant-access signal.
 binary_allowed(policy, exec) if {
 	some b in policy.binaries
+	contains(b.path, "*")
+	all_paths := array.concat([exec.path], exec.ancestors)
+	some p in all_paths
+	glob.match(b.path, ["/"], p)
+}
+
+user_declared_binary_allowed(policy, exec) if {
+	some b
+	b := policy.binaries[_]
+	not object.get(b, "advisor_proposed", false)
+	not contains(b.path, "*")
+	b.path == exec.path
+}
+
+user_declared_binary_allowed(policy, exec) if {
+	some b
+	b := policy.binaries[_]
+	not object.get(b, "advisor_proposed", false)
+	not contains(b.path, "*")
+	ancestor := exec.ancestors[_]
+	b.path == ancestor
+}
+
+user_declared_binary_allowed(policy, exec) if {
+	some b in policy.binaries
+	not object.get(b, "advisor_proposed", false)
 	contains(b.path, "*")
 	all_paths := array.concat([exec.path], exec.ancestors)
 	some p in all_paths
@@ -636,6 +671,22 @@ _matching_endpoint_configs := [cfg |
 
 matched_endpoint_config := _matching_endpoint_configs[0] if {
 	count(_matching_endpoint_configs) > 0
+}
+
+_policy_has_exact_declared_endpoint(policy) if {
+	some ep
+	ep := policy.endpoints[_]
+	not object.get(ep, "advisor_proposed", false)
+	not contains(ep.host, "*")
+	lower(ep.host) == lower(input.network.host)
+	ep.ports[_] == input.network.port
+}
+
+exact_declared_endpoint_host if {
+	some pname
+	policy := data.network_policies[pname]
+	user_declared_binary_allowed(policy, input.exec)
+	_policy_has_exact_declared_endpoint(policy)
 }
 
 # Hosted endpoint: exact host match + port in ports list.

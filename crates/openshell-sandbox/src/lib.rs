@@ -5,8 +5,10 @@
 //!
 //! This crate provides process sandboxing and monitoring capabilities.
 
+mod activity_aggregator;
 pub mod bypass_monitor;
 mod child_env;
+pub mod debug_rpc;
 pub mod denial_aggregator;
 mod grpc_client;
 mod identity;
@@ -237,6 +239,23 @@ fn route_refresh_interval_secs() -> u64 {
     }
 }
 
+type ActivityCollectionChannels = (
+    Option<activity_aggregator::ActivitySender>,
+    Option<tokio::sync::mpsc::Receiver<activity_aggregator::ActivityEvent>>,
+    Option<activity_aggregator::ActivitySender>,
+);
+
+fn activity_collection_channels(sandbox_id: Option<&str>) -> ActivityCollectionChannels {
+    if sandbox_id.is_some() && openshell_core::telemetry::enabled() {
+        let (tx, rx) =
+            tokio::sync::mpsc::channel(activity_aggregator::ACTIVITY_EVENT_QUEUE_CAPACITY);
+        let bypass_tx = tx.clone();
+        (Some(tx), Some(rx), Some(bypass_tx))
+    } else {
+        (None, None, None)
+    }
+}
+
 #[cfg(target_os = "linux")]
 static MANAGED_CHILDREN: LazyLock<Mutex<HashSet<i32>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
@@ -413,6 +432,16 @@ pub async fn run_sandbox(
     // Prepare filesystem: create and chown read_write directories
     prepare_filesystem(&policy)?;
 
+    #[cfg(target_os = "linux")]
+    {
+        let pid_limit_mode = if std::env::var_os("OPENSHELL_REQUIRE_RUNTIME_PID_LIMIT").is_some() {
+            process::RuntimePidLimitMode::Require
+        } else {
+            process::RuntimePidLimitMode::Warn
+        };
+        process::check_runtime_pid_limit(pid_limit_mode)?;
+    }
+
     // Initialize the agent-proposals feature flag. Default false until the
     // initial settings fetch (or the poll loop) tells us otherwise. The flag
     // gates the skill install, the policy.local route handler, and the L7
@@ -571,66 +600,79 @@ pub async fn run_sandbox(
     // the entrypoint process's /proc/net/tcp for identity binding.
     let entrypoint_pid = Arc::new(AtomicU32::new(0));
 
-    let (_proxy, denial_rx, bypass_denial_tx) = if matches!(policy.network.mode, NetworkMode::Proxy)
-    {
-        let proxy_policy = policy.network.proxy.as_ref().ok_or_else(|| {
-            miette::miette!("Network mode is set to proxy but no proxy configuration was provided")
-        })?;
+    let (_proxy, denial_rx, bypass_denial_tx, activity_rx, bypass_activity_tx) =
+        if matches!(policy.network.mode, NetworkMode::Proxy) {
+            let proxy_policy = policy.network.proxy.as_ref().ok_or_else(|| {
+                miette::miette!(
+                    "Network mode is set to proxy but no proxy configuration was provided"
+                )
+            })?;
 
-        let engine = opa_engine.clone().ok_or_else(|| {
-            miette::miette!("Proxy mode requires an OPA engine (--rego-policy and --rego-data)")
-        })?;
+            let engine = opa_engine.clone().ok_or_else(|| {
+                miette::miette!("Proxy mode requires an OPA engine (--rego-policy and --rego-data)")
+            })?;
 
-        let cache = identity_cache.clone().ok_or_else(|| {
-            miette::miette!("Proxy mode requires an identity cache (OPA engine must be configured)")
-        })?;
+            let cache = identity_cache.clone().ok_or_else(|| {
+                miette::miette!(
+                    "Proxy mode requires an identity cache (OPA engine must be configured)"
+                )
+            })?;
 
-        // If we have a network namespace, bind to the veth host IP so sandboxed
-        // processes can reach the proxy via TCP.
-        #[cfg(target_os = "linux")]
-        let bind_addr = netns.as_ref().map(|ns| {
-            let port = proxy_policy.http_addr.map_or(3128, |addr| addr.port());
-            SocketAddr::new(ns.host_ip(), port)
-        });
+            // If we have a network namespace, bind to the veth host IP so sandboxed
+            // processes can reach the proxy via TCP.
+            #[cfg(target_os = "linux")]
+            let bind_addr = netns.as_ref().map(|ns| {
+                let port = proxy_policy.http_addr.map_or(3128, |addr| addr.port());
+                SocketAddr::new(ns.host_ip(), port)
+            });
 
-        #[cfg(not(target_os = "linux"))]
-        let bind_addr: Option<SocketAddr> = None;
+            #[cfg(not(target_os = "linux"))]
+            let bind_addr: Option<SocketAddr> = None;
 
-        // Build inference context for local routing of intercepted inference calls.
-        let inference_ctx = build_inference_context(
-            sandbox_id.as_deref(),
-            openshell_endpoint_for_proxy.as_deref(),
-            inference_routes.as_deref(),
-        )
-        .await?;
+            // Build inference context for local routing of intercepted inference calls.
+            let inference_ctx = build_inference_context(
+                sandbox_id.as_deref(),
+                openshell_endpoint_for_proxy.as_deref(),
+                inference_routes.as_deref(),
+            )
+            .await?;
 
-        // Create denial aggregator channel if in gRPC mode (sandbox_id present).
-        // Clone the sender for the bypass monitor before passing to the proxy.
-        let (denial_tx, denial_rx, bypass_denial_tx) = if sandbox_id.is_some() {
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            let bypass_tx = tx.clone();
-            (Some(tx), Some(rx), Some(bypass_tx))
+            // Create denial aggregator channel if in gRPC mode (sandbox_id present).
+            // Clone the sender for the bypass monitor before passing to the proxy.
+            let (denial_tx, denial_rx, bypass_denial_tx) = if sandbox_id.is_some() {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                let bypass_tx = tx.clone();
+                (Some(tx), Some(rx), Some(bypass_tx))
+            } else {
+                (None, None, None)
+            };
+            let (activity_tx, activity_rx, bypass_activity_tx) =
+                activity_collection_channels(sandbox_id.as_deref());
+
+            let proxy_handle = ProxyHandle::start_with_bind_addr(
+                proxy_policy,
+                bind_addr,
+                engine,
+                cache,
+                entrypoint_pid.clone(),
+                tls_state,
+                inference_ctx,
+                Some(provider_credentials.clone()),
+                Some(policy_local_ctx.clone()),
+                denial_tx,
+                activity_tx,
+            )
+            .await?;
+            (
+                Some(proxy_handle),
+                denial_rx,
+                bypass_denial_tx,
+                activity_rx,
+                bypass_activity_tx,
+            )
         } else {
-            (None, None, None)
+            (None, None, None, None, None)
         };
-
-        let proxy_handle = ProxyHandle::start_with_bind_addr(
-            proxy_policy,
-            bind_addr,
-            engine,
-            cache,
-            entrypoint_pid.clone(),
-            tls_state,
-            inference_ctx,
-            Some(provider_credentials.clone()),
-            Some(policy_local_ctx.clone()),
-            denial_tx,
-        )
-        .await?;
-        (Some(proxy_handle), denial_rx, bypass_denial_tx)
-    } else {
-        (None, None, None)
-    };
 
     // Spawn bypass detection monitor (Linux only, proxy mode only).
     // Reads /dev/kmsg for nftables log entries and emits structured
@@ -641,12 +683,15 @@ pub async fn run_sandbox(
             ns.name().to_string(),
             entrypoint_pid.clone(),
             bypass_denial_tx,
+            bypass_activity_tx,
         )
     });
 
     // On non-Linux, bypass_denial_tx is unused (no /dev/kmsg).
     #[cfg(not(target_os = "linux"))]
     drop(bypass_denial_tx);
+    #[cfg(not(target_os = "linux"))]
+    drop(bypass_activity_tx);
 
     // Compute the proxy URL and netns fd for SSH sessions.
     // SSH shell processes need both to enforce network policy:
@@ -996,6 +1041,32 @@ pub async fn run_sandbox(
                     .await;
             });
         }
+        if let Some(rx) = activity_rx {
+            let agg_name = sandbox_name_for_agg.clone().unwrap_or_else(|| id.clone());
+            let agg_endpoint = endpoint.clone();
+            let flush_interval_secs = activity_aggregator::activity_flush_interval_secs_from_env(
+                std::env::var("OPENSHELL_ACTIVITY_FLUSH_INTERVAL_SECS")
+                    .ok()
+                    .as_deref(),
+            );
+            let aggregator = activity_aggregator::ActivityAggregator::new(rx, flush_interval_secs);
+
+            tokio::spawn(async move {
+                aggregator
+                    .run(move |summary| {
+                        let endpoint = agg_endpoint.clone();
+                        let sandbox_name = agg_name.clone();
+                        async move {
+                            if let Err(e) =
+                                flush_activity_to_gateway(&endpoint, &sandbox_name, summary).await
+                            {
+                                warn!(error = %e, "Failed to flush activity summary to gateway");
+                            }
+                        }
+                    })
+                    .await;
+            });
+        }
     }
 
     // Wait for process with optional timeout
@@ -1260,7 +1331,7 @@ pub(crate) fn bundle_to_resolved_routes(
         .iter()
         .map(|r| {
             let (auth, default_headers, passthrough_headers) =
-                openshell_core::inference::route_headers_for_provider_type(&r.provider_type);
+                openshell_core::inference::route_headers_for_route(&r.provider_type, &r.protocols);
             let timeout = if r.timeout_secs == 0 {
                 openshell_router::config::DEFAULT_ROUTE_TIMEOUT
             } else {
@@ -1276,6 +1347,8 @@ pub(crate) fn bundle_to_resolved_routes(
                 default_headers,
                 passthrough_headers,
                 timeout,
+                model_in_path: r.model_in_path,
+                request_path_override: r.request_path_override.clone(),
             }
         })
         .collect()
@@ -1450,22 +1523,39 @@ fn enumerate_gpu_device_nodes() -> Vec<String> {
     paths
 }
 
-/// Collect all baseline paths for enrichment: proxy defaults + GPU (if present).
-/// Returns `(read_only, read_write)` as owned `String` vecs.
-fn baseline_enrichment_paths() -> (Vec<String>, Vec<String>) {
-    let mut ro: Vec<String> = PROXY_BASELINE_READ_ONLY
-        .iter()
-        .map(|&s| s.to_string())
-        .collect();
-    let mut rw: Vec<String> = PROXY_BASELINE_READ_WRITE
-        .iter()
-        .map(|&s| s.to_string())
-        .collect();
+fn push_unique(paths: &mut Vec<String>, path: String) {
+    if !paths.iter().any(|p| p == &path) {
+        paths.push(path);
+    }
+}
 
-    if has_gpu_devices() {
-        ro.extend(GPU_BASELINE_READ_ONLY.iter().map(|&s| s.to_string()));
-        rw.extend(GPU_BASELINE_READ_WRITE.iter().map(|&s| s.to_string()));
-        rw.extend(enumerate_gpu_device_nodes());
+fn collect_baseline_enrichment_paths(
+    include_proxy: bool,
+    include_gpu: bool,
+    gpu_device_nodes: Vec<String>,
+) -> (Vec<String>, Vec<String>) {
+    let mut ro = Vec::new();
+    let mut rw = Vec::new();
+
+    if include_proxy {
+        for &path in PROXY_BASELINE_READ_ONLY {
+            push_unique(&mut ro, path.to_string());
+        }
+        for &path in PROXY_BASELINE_READ_WRITE {
+            push_unique(&mut rw, path.to_string());
+        }
+    }
+
+    if include_gpu {
+        for &path in GPU_BASELINE_READ_ONLY {
+            push_unique(&mut ro, path.to_string());
+        }
+        for &path in GPU_BASELINE_READ_WRITE {
+            push_unique(&mut rw, path.to_string());
+        }
+        for path in gpu_device_nodes {
+            push_unique(&mut rw, path);
+        }
     }
 
     // A path promoted to read_write (e.g. /proc for GPU) should not also
@@ -1476,14 +1566,33 @@ fn baseline_enrichment_paths() -> (Vec<String>, Vec<String>) {
     (ro, rw)
 }
 
-/// Ensure a proto `SandboxPolicy` includes the baseline filesystem paths
-/// required for proxy-mode sandboxes.  Paths are only added if missing;
-/// user-specified paths are never removed.
-///
-/// Returns `true` if the policy was modified (caller may want to sync back).
-fn enrich_proto_baseline_paths(proto: &mut openshell_core::proto::SandboxPolicy) -> bool {
-    // Only enrich if network_policies are present (proxy mode indicator).
-    if proto.network_policies.is_empty() {
+fn active_baseline_enrichment_paths(include_proxy: bool) -> (Vec<String>, Vec<String>) {
+    let include_gpu = has_gpu_devices();
+    let gpu_device_nodes = if include_gpu {
+        enumerate_gpu_device_nodes()
+    } else {
+        Vec::new()
+    };
+    collect_baseline_enrichment_paths(include_proxy, include_gpu, gpu_device_nodes)
+}
+
+/// Collect all active baseline paths for tests and diagnostics.
+/// Returns `(read_only, read_write)` as owned `String` vecs.
+#[cfg(test)]
+fn baseline_enrichment_paths() -> (Vec<String>, Vec<String>) {
+    active_baseline_enrichment_paths(true)
+}
+
+fn enrich_proto_baseline_paths_with<F>(
+    proto: &mut openshell_core::proto::SandboxPolicy,
+    ro: &[String],
+    rw: &[String],
+    path_exists: F,
+) -> bool
+where
+    F: Fn(&str) -> bool,
+{
+    if ro.is_empty() && rw.is_empty() {
         return false;
     }
 
@@ -1494,17 +1603,10 @@ fn enrich_proto_baseline_paths(proto: &mut openshell_core::proto::SandboxPolicy)
             ..Default::default()
         });
 
-    let (ro, rw) = baseline_enrichment_paths();
-
-    // Baseline paths are system-injected, not user-specified.  Skip paths
-    // that do not exist in this container image to avoid noisy warnings from
-    // Landlock and, more critically, to prevent a single missing baseline
-    // path from abandoning the entire Landlock ruleset under best-effort
-    // mode (see issue #664).
     let mut modified = false;
-    for path in &ro {
+    for path in ro {
         if !fs.read_only.iter().any(|p| p == path) && !fs.read_write.iter().any(|p| p == path) {
-            if !std::path::Path::new(path).exists() {
+            if !path_exists(path) {
                 debug!(
                     path,
                     "Baseline read-only path does not exist, skipping enrichment"
@@ -1515,20 +1617,52 @@ fn enrich_proto_baseline_paths(proto: &mut openshell_core::proto::SandboxPolicy)
             modified = true;
         }
     }
-    for path in &rw {
-        if fs.read_only.iter().any(|p| p == path) || fs.read_write.iter().any(|p| p == path) {
+    for path in rw {
+        if fs.read_write.iter().any(|p| p == path) {
             continue;
         }
-        if !std::path::Path::new(path).exists() {
+        if !path_exists(path) {
             debug!(
                 path,
                 "Baseline read-write path does not exist, skipping enrichment"
             );
             continue;
         }
+        if fs.read_only.iter().any(|p| p == path) {
+            if path == "/proc" {
+                info!(
+                    path,
+                    "Promoting /proc from read-only to read-write for GPU runtime compatibility"
+                );
+                fs.read_only.retain(|p| p != path);
+                fs.read_write.push(path.clone());
+                modified = true;
+            }
+            continue;
+        }
         fs.read_write.push(path.clone());
         modified = true;
     }
+
+    modified
+}
+
+/// Ensure a proto `SandboxPolicy` includes the baseline filesystem paths
+/// required by proxy-mode sandboxes and GPU runtimes. Paths are only added if
+/// missing; user-specified paths are never removed.
+///
+/// Returns `true` if the policy was modified (caller may want to sync back).
+fn enrich_proto_baseline_paths(proto: &mut openshell_core::proto::SandboxPolicy) -> bool {
+    let (ro, rw) = active_baseline_enrichment_paths(!proto.network_policies.is_empty());
+
+    // Baseline paths are system-injected, not user-specified.  Skip paths
+    // that do not exist in this container image to avoid noisy warnings from
+    // Landlock and, more critically, to prevent a single missing baseline
+    // path from abandoning the entire Landlock ruleset under best-effort
+    // mode (see issue #664).
+    let modified = enrich_proto_baseline_paths_with(proto, &ro, &rw, |path| {
+        std::path::Path::new(path).exists()
+    });
 
     if modified {
         ocsf_emit!(
@@ -1545,20 +1679,26 @@ fn enrich_proto_baseline_paths(proto: &mut openshell_core::proto::SandboxPolicy)
 }
 
 /// Ensure a `SandboxPolicy` (Rust type) includes the baseline filesystem
-/// paths required for proxy-mode sandboxes.  Used for the local-file code
-/// path where no proto is available.
-fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
-    if !matches!(policy.network.mode, NetworkMode::Proxy) {
-        return;
+/// paths required by proxy-mode sandboxes and GPU runtimes. Used for the
+/// local-file code path where no proto is available.
+fn enrich_sandbox_baseline_paths_with<F>(
+    policy: &mut SandboxPolicy,
+    ro: &[String],
+    rw: &[String],
+    path_exists: F,
+) -> bool
+where
+    F: Fn(&std::path::Path) -> bool,
+{
+    if ro.is_empty() && rw.is_empty() {
+        return false;
     }
 
-    let (ro, rw) = baseline_enrichment_paths();
-
     let mut modified = false;
-    for path in &ro {
+    for path in ro {
         let p = std::path::PathBuf::from(path);
         if !policy.filesystem.read_only.contains(&p) && !policy.filesystem.read_write.contains(&p) {
-            if !p.exists() {
+            if !path_exists(&p) {
                 debug!(
                     path,
                     "Baseline read-only path does not exist, skipping enrichment"
@@ -1569,12 +1709,12 @@ fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
             modified = true;
         }
     }
-    for path in &rw {
+    for path in rw {
         let p = std::path::PathBuf::from(path);
         if policy.filesystem.read_only.contains(&p) || policy.filesystem.read_write.contains(&p) {
             continue;
         }
-        if !p.exists() {
+        if !path_exists(&p) {
             debug!(
                 path,
                 "Baseline read-write path does not exist, skipping enrichment"
@@ -1584,6 +1724,14 @@ fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
         policy.filesystem.read_write.push(p);
         modified = true;
     }
+
+    modified
+}
+
+fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
+    let (ro, rw) =
+        active_baseline_enrichment_paths(matches!(policy.network.mode, NetworkMode::Proxy));
+    let modified = enrich_sandbox_baseline_paths_with(policy, &ro, &rw, std::path::Path::exists);
 
     if modified {
         ocsf_emit!(
@@ -1709,6 +1857,39 @@ mod baseline_tests {
     }
 
     #[test]
+    fn proto_gpu_enrichment_promotes_proc_without_network_policy() {
+        let mut policy = openshell_policy::restrictive_default_policy();
+        assert!(
+            policy.network_policies.is_empty(),
+            "regression setup must exercise the no-network default path"
+        );
+        let (ro, rw) =
+            collect_baseline_enrichment_paths(false, true, vec!["/dev/nvidia0".to_string()]);
+
+        let enriched = enrich_proto_baseline_paths_with(&mut policy, &ro, &rw, |path| {
+            matches!(path, "/proc" | "/dev/nvidia0")
+        });
+
+        let filesystem = policy.filesystem.expect("filesystem policy");
+        assert!(
+            enriched,
+            "GPU enrichment should not require network policies"
+        );
+        assert!(
+            filesystem.read_write.contains(&"/dev/nvidia0".to_string()),
+            "GPU enrichment should add enumerated device nodes without network policies"
+        );
+        assert!(
+            !filesystem.read_only.contains(&"/proc".to_string()),
+            "GPU enrichment should remove /proc from read_only"
+        );
+        assert!(
+            filesystem.read_write.contains(&"/proc".to_string()),
+            "GPU enrichment should promote /proc to read_write"
+        );
+    }
+
+    #[test]
     fn gpu_baseline_read_write_contains_dxg() {
         // /dev/dxg must be present so WSL2 sandboxes get the Landlock
         // read-write rule for the CDI-injected DXG device.  The existence
@@ -1716,6 +1897,42 @@ mod baseline_tests {
         assert!(
             GPU_BASELINE_READ_WRITE.contains(&"/dev/dxg"),
             "/dev/dxg must be in GPU_BASELINE_READ_WRITE for WSL2 support"
+        );
+    }
+
+    #[test]
+    fn local_gpu_enrichment_adds_devices_without_proxy_mode() {
+        let mut policy = SandboxPolicy {
+            version: 1,
+            filesystem: FilesystemPolicy {
+                read_only: vec![],
+                read_write: vec![],
+                include_workdir: false,
+            },
+            network: NetworkPolicy {
+                mode: NetworkMode::Block,
+                proxy: None,
+            },
+            landlock: LandlockPolicy::default(),
+            process: ProcessPolicy::default(),
+        };
+        let (ro, rw) =
+            collect_baseline_enrichment_paths(false, true, vec!["/dev/nvidia0".to_string()]);
+
+        let enriched = enrich_sandbox_baseline_paths_with(&mut policy, &ro, &rw, |path| {
+            path == std::path::Path::new("/proc") || path == std::path::Path::new("/dev/nvidia0")
+        });
+
+        assert!(
+            enriched,
+            "GPU enrichment should not require proxy network mode"
+        );
+        assert!(
+            policy
+                .filesystem
+                .read_write
+                .contains(&std::path::PathBuf::from("/dev/nvidia0")),
+            "GPU enrichment should add enumerated device nodes without proxy mode"
         );
     }
 
@@ -2278,9 +2495,42 @@ async fn flush_proposals_to_gateway(
     );
 
     client
-        .submit_policy_analysis(sandbox_name, proto_summaries, proposals, "mechanistic")
+        .submit_policy_analysis(
+            sandbox_name,
+            proto_summaries,
+            proposals,
+            vec![],
+            "mechanistic",
+        )
         .await?;
 
+    Ok(())
+}
+
+async fn flush_activity_to_gateway(
+    endpoint: &str,
+    sandbox_name: &str,
+    summary: activity_aggregator::FlushableActivitySummary,
+) -> Result<()> {
+    use crate::grpc_client::CachedOpenShellClient;
+    use openshell_core::proto::{DenialGroupCount, NetworkActivitySummary};
+
+    let client = CachedOpenShellClient::connect(endpoint).await?;
+    let summary = NetworkActivitySummary {
+        network_activity_count: summary.network_activity_count,
+        denied_action_count: summary.denied_action_count,
+        denials_by_group: summary
+            .denials_by_group
+            .into_iter()
+            .map(|(deny_group, denied_count)| DenialGroupCount {
+                deny_group,
+                denied_count,
+            })
+            .collect(),
+    };
+    client
+        .submit_policy_analysis(sandbox_name, vec![], vec![], vec![summary], "telemetry")
+        .await?;
     Ok(())
 }
 
@@ -2651,15 +2901,30 @@ mod tests {
                     ],
                     provider_type: "openai".to_string(),
                     timeout_secs: 0,
+                    model_in_path: false,
+                    request_path_override: None,
                 },
                 openshell_core::proto::ResolvedRoute {
-                    name: "local".to_string(),
-                    base_url: "http://vllm:8000/v1".to_string(),
-                    api_key: "local-key".to_string(),
-                    model_id: "llama-3".to_string(),
-                    protocols: vec!["openai_chat_completions".to_string()],
-                    provider_type: String::new(),
+                    name: "vertex".to_string(),
+                    base_url: "https://us-east5-aiplatform.googleapis.com/v1/projects/my-project/locations/us-east5/publishers/anthropic/models".to_string(),
+                    api_key: "ya29.vertex".to_string(),
+                    model_id: "claude-3-5-sonnet@20241022".to_string(),
+                    protocols: vec!["anthropic_messages".to_string()],
+                    provider_type: "google-vertex-ai".to_string(),
                     timeout_secs: 120,
+                    model_in_path: true,
+                    request_path_override: Some(":rawPredict".to_string()),
+                },
+                openshell_core::proto::ResolvedRoute {
+                    name: "vertex-gemini".to_string(),
+                    base_url: "https://us-central1-aiplatform.googleapis.com/v1beta1/projects/my-project/locations/us-central1/endpoints/openapi".to_string(),
+                    api_key: "ya29.gemini".to_string(),
+                    model_id: "gemini-2.0-flash-001".to_string(),
+                    protocols: vec!["openai_chat_completions".to_string()],
+                    provider_type: "google-vertex-ai".to_string(),
+                    timeout_secs: 0,
+                    model_in_path: false,
+                    request_path_override: Some("/chat/completions".to_string()),
                 },
             ],
             revision: "abc123".to_string(),
@@ -2668,7 +2933,7 @@ mod tests {
 
         let routes = bundle_to_resolved_routes(&bundle);
 
-        assert_eq!(routes.len(), 2);
+        assert_eq!(routes.len(), 3);
         assert_eq!(routes[0].endpoint, "https://api.example.com/v1");
         assert_eq!(routes[0].model, "gpt-4");
         assert_eq!(routes[0].api_key, "sk-test-key");
@@ -2685,15 +2950,48 @@ mod tests {
             openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
             "timeout_secs=0 should map to default"
         );
-        assert_eq!(routes[1].endpoint, "http://vllm:8000/v1");
+        assert_eq!(
+            routes[0].passthrough_headers,
+            vec!["openai-organization".to_string(), "x-model-id".to_string()]
+        );
+        assert_eq!(
+            routes[1].endpoint,
+            "https://us-east5-aiplatform.googleapis.com/v1/projects/my-project/locations/us-east5/publishers/anthropic/models"
+        );
         assert_eq!(
             routes[1].auth,
             openshell_core::inference::AuthHeader::Bearer
+        );
+        assert_eq!(routes[1].model, "claude-3-5-sonnet@20241022");
+        assert_eq!(routes[1].protocols, vec!["anthropic_messages"]);
+        assert!(routes[1].model_in_path);
+        assert_eq!(
+            routes[1].passthrough_headers,
+            vec!["anthropic-beta".to_string()]
+        );
+        assert_eq!(
+            routes[1].request_path_override,
+            Some(":rawPredict".to_string())
         );
         assert_eq!(
             routes[1].timeout,
             Duration::from_secs(120),
             "timeout_secs=120 should map to 120s"
+        );
+        assert_eq!(
+            routes[2].endpoint,
+            "https://us-central1-aiplatform.googleapis.com/v1beta1/projects/my-project/locations/us-central1/endpoints/openapi"
+        );
+        assert_eq!(routes[2].model, "gemini-2.0-flash-001");
+        assert_eq!(routes[2].protocols, vec!["openai_chat_completions"]);
+        assert!(!routes[2].model_in_path);
+        assert_eq!(
+            routes[2].request_path_override,
+            Some("/chat/completions".to_string())
+        );
+        assert!(
+            routes[2].passthrough_headers.is_empty(),
+            "Vertex Gemini routes must not inherit Anthropic passthrough headers"
         );
     }
 
@@ -2720,6 +3018,8 @@ mod tests {
                 protocols: vec!["openai_chat_completions".to_string()],
                 provider_type: "openai".to_string(),
                 timeout_secs: 0,
+                model_in_path: false,
+                request_path_override: None,
             }],
             revision: "rev".to_string(),
             generated_at_ms: 0,
@@ -2742,6 +3042,8 @@ mod tests {
                 default_headers: vec![],
                 passthrough_headers: vec![],
                 timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
+                model_in_path: false,
+                request_path_override: None,
             },
             openshell_router::config::ResolvedRoute {
                 name: "sandbox-system".to_string(),
@@ -2753,6 +3055,8 @@ mod tests {
                 default_headers: vec![],
                 passthrough_headers: vec![],
                 timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
+                model_in_path: false,
+                request_path_override: None,
             },
         ];
 
@@ -3028,6 +3332,32 @@ filesystem_policy:
         );
     }
 
+    #[test]
+    fn telemetry_opt_out_disables_activity_collection_and_flush_channel() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        with_vars([("OPENSHELL_TELEMETRY_ENABLED", Some("false"))], || {
+            let (activity_tx, activity_rx, bypass_activity_tx) =
+                activity_collection_channels(Some("sb-1"));
+
+            assert!(activity_tx.is_none());
+            assert!(activity_rx.is_none());
+            assert!(bypass_activity_tx.is_none());
+        });
+    }
+
+    #[test]
+    fn telemetry_enabled_creates_activity_collection_and_flush_channel() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        with_vars([("OPENSHELL_TELEMETRY_ENABLED", Some("true"))], || {
+            let (activity_tx, activity_rx, bypass_activity_tx) =
+                activity_collection_channels(Some("sb-1"));
+
+            assert!(activity_tx.is_some());
+            assert!(activity_rx.is_some());
+            assert!(bypass_activity_tx.is_some());
+        });
+    }
+
     #[tokio::test]
     async fn route_cache_preserves_content_when_not_written() {
         use std::sync::Arc;
@@ -3043,6 +3373,8 @@ filesystem_policy:
             default_headers: vec![],
             passthrough_headers: vec![],
             timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
+            model_in_path: false,
+            request_path_override: None,
         }];
 
         let cache = Arc::new(RwLock::new(routes));

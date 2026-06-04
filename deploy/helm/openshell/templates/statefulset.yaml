@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-
+{{- if and .Values.postgres.enabled (not .Values.postgres.serviceBindings.enabled) (not .Values.server.externalDbSecret) }}
+{{- fail "postgres.serviceBindings.enabled must be true when using bundled PostgreSQL" }}
+{{- end }}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -54,9 +56,18 @@ spec:
           args:
             - --config
             - /etc/openshell/gateway.toml
+            {{- if not (or .Values.postgres.enabled .Values.server.externalDbSecret) }}
             - --db-url
             - {{ .Values.server.dbUrl | quote }}
+            {{- end }}
           env:
+            {{- if or .Values.postgres.enabled .Values.server.externalDbSecret }}
+            - name: OPENSHELL_DB_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "openshell.dbSecretName" . }}
+                  key: uri
+            {{- end }}
             # All gateway settings live in the ConfigMap-backed TOML file
             # mounted at /etc/openshell/gateway.toml. The only env var below
             # is a process-level setting consumed by libraries outside
@@ -75,20 +86,23 @@ spec:
             - name: gateway-config
               mountPath: /etc/openshell
               readOnly: true
+            - name: sandbox-jwt
+              mountPath: /etc/openshell-jwt
+              readOnly: true
             {{- if not .Values.server.disableTls }}
             - name: tls-cert
               mountPath: /etc/openshell-tls/server
               readOnly: true
-            {{- if or .Values.server.tls.clientCaSecretName .Values.pkiInitJob.enabled (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) }}
+            {{- if or .Values.server.tls.clientCaSecretName (and .Values.pkiInitJob.enabled (not .Values.certManager.enabled)) (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) }}
             - name: tls-client-ca
               mountPath: /etc/openshell-tls/client-ca
               readOnly: true
+            {{- end }}
             {{- end }}
             {{- if and .Values.server.oidc.issuer .Values.server.oidc.caConfigMapName }}
             - name: oidc-ca
               mountPath: /etc/openshell-tls/oidc-ca
               readOnly: true
-            {{- end }}
             {{- end }}
           ports:
             - name: grpc
@@ -131,14 +145,18 @@ spec:
         - name: gateway-config
           configMap:
             name: {{ include "openshell.fullname" . }}-config
+        - name: sandbox-jwt
+          secret:
+            secretName: {{ include "openshell.sandboxJwtSecretName" . }}
+            defaultMode: {{ .Values.server.sandboxJwt.secretDefaultMode | default 0400 }}
         {{- if not .Values.server.disableTls }}
         - name: tls-cert
           secret:
             secretName: {{ .Values.server.tls.certSecretName }}
-        {{- if or .Values.server.tls.clientCaSecretName .Values.pkiInitJob.enabled (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) }}
+        {{- if or .Values.server.tls.clientCaSecretName (and .Values.pkiInitJob.enabled (not .Values.certManager.enabled)) (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) }}
         - name: tls-client-ca
           secret:
-            {{- if or .Values.pkiInitJob.enabled (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) }}
+            {{- if or (and .Values.pkiInitJob.enabled (not .Values.certManager.enabled)) (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) }}
             secretName: {{ .Values.server.tls.certSecretName }}
             items:
               - key: ca.crt
@@ -147,11 +165,11 @@ spec:
             secretName: {{ .Values.server.tls.clientCaSecretName }}
             {{- end }}
         {{- end }}
+        {{- end }}
         {{- if and .Values.server.oidc.issuer .Values.server.oidc.caConfigMapName }}
         - name: oidc-ca
           configMap:
             name: {{ .Values.server.oidc.caConfigMapName }}
-        {{- end }}
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

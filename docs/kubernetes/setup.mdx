@@ -97,9 +97,9 @@ kubectl -n openshell port-forward svc/openshell 8080:8080
 The port-forward is for local evaluation only. For shared environments, expose the gateway through your ingress controller or access proxy. Refer to [Ingress](/kubernetes/ingress) for an external access option.
 </Warning>
 
-## Install the client mTLS certificate
+## Install the TLS client bundle
 
-The default installation runs with mTLS enabled by default. The CLI needs the client certificate, key, and CA that the chart's PKI hook generated. Extract them from the `openshell-client-tls` secret and place them where the CLI expects them for a gateway named `k8s`:
+The chart generates an mTLS bundle for transport security. Kubernetes deployments do not use that bundle as user authentication; configure OIDC or a trusted access proxy as described in [Access Control](/kubernetes/access-control). For local port-forwarded access, copy the generated bundle so the CLI can verify the gateway certificate:
 
 ```shell
 mkdir -p ~/.config/openshell/gateways/k8s/mtls
@@ -115,10 +115,12 @@ The server certificate SANs include `localhost` and `127.0.0.1`, so hostname ver
 
 ## Register with the CLI
 
-In another terminal, register the gateway and verify it is reachable:
+In another terminal, register the gateway with the user authentication mode you configured and verify it is reachable. For example, with OIDC:
 
 ```shell
-openshell gateway add https://127.0.0.1:8080 --local --name k8s
+openshell gateway add https://127.0.0.1:8080 --local --name k8s \
+  --oidc-issuer https://your-idp.example.com/realms/openshell \
+  --oidc-client-id openshell-cli
 openshell status
 ```
 
@@ -133,8 +135,10 @@ The most commonly changed values are:
 | `image.repository` / `image.tag` | Gateway container image. Defaults to `ghcr.io/nvidia/openshell/gateway:latest`. |
 | `server.sandboxNamespace` | Namespace where sandbox pods are created. Defaults to the Helm release namespace when left empty. |
 | `server.sandboxImage` | Default sandbox image used when a sandbox does not specify one. |
+| `server.sandboxImagePullSecrets` | Image pull secrets attached to sandbox pods. Referenced Secrets must exist in the sandbox namespace. |
 | `server.grpcEndpoint` | Endpoint that sandbox supervisors use to call back to the gateway. Must be reachable from inside the cluster. |
 | `server.disableTls` | Run the gateway over plaintext HTTP. Use only behind a trusted transport. |
+| `server.auth.allowUnauthenticatedUsers` | Accept user-facing calls without OIDC or mTLS credentials. Use only for trusted local development or a fully trusted access proxy. |
 | `server.enableLoopbackServiceHttp` | Enable local plaintext HTTP for loopback sandbox service URLs. Defaults to `true`. |
 | `pkiInitJob.serverDnsNames` / `certManager.serverDnsNames` | Additional gateway server DNS SANs. Wildcard SANs also enable sandbox service URLs under that domain. |
 | `supervisor.sideloadMethod` | How the supervisor binary is delivered into sandbox pods. Leave empty to auto-detect based on cluster version: clusters running Kubernetes 1.35 or later use `image-volume` (ImageVolume GA in 1.36); older clusters use `init-container`. Set explicitly to `image-volume` on Kubernetes 1.33 or 1.34 with the ImageVolume feature gate enabled, or to `init-container` to force the legacy path on any version. |
@@ -148,6 +152,69 @@ helm upgrade --install openshell \
   --namespace openshell \
   --values my-values.yaml
 ```
+
+To use private sandbox images, create a `kubernetes.io/dockerconfigjson` Secret
+in the sandbox namespace and reference its name:
+
+```shell
+kubectl -n openshell create secret docker-registry regcred \
+  --docker-server=registry.example.com \
+  --docker-username="$REGISTRY_USER" \
+  --docker-password="$REGISTRY_TOKEN"
+```
+
+```yaml
+server:
+  sandboxImage: registry.example.com/team/openshell-sandbox:latest
+  sandboxImagePullSecrets:
+    - name: regcred
+```
+
+## RBAC
+
+The chart creates the following RBAC resources in the release namespace:
+
+| Resource | Scope | Name |
+|---|---|---|
+| ServiceAccount | Namespace | `openshell` |
+| ServiceAccount | Namespace | `openshell-sandbox` (for sandbox pods) |
+| Role + RoleBinding | Namespace | `openshell-sandbox` |
+| ClusterRole + ClusterRoleBinding | Cluster | `openshell-node-reader` |
+
+The namespaced Role covers sandbox lifecycle and identity:
+
+| API Group | Resource | Verbs |
+|---|---|---|
+| `agents.x-k8s.io` | `sandboxes`, `sandboxes/status` | create, delete, get, list, patch, update, watch |
+| `""` | `events` | get, list, watch |
+| `""` | `pods` | get |
+
+The ClusterRole grants node inspection and token validation:
+
+| API Group | Resource | Verbs |
+|---|---|---|
+| `authentication.k8s.io` | `tokenreviews` | create |
+| `""` | `nodes` | get, list, watch |
+
+To use an existing ServiceAccount instead of creating one, set `serviceAccount.create=false` and supply its name:
+
+```shell
+helm upgrade --install openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  --set serviceAccount.create=false \
+  --set serviceAccount.name=my-existing-sa
+```
+
+The ServiceAccount must already have the Role and ClusterRole bindings described above.
+
+## Probes
+
+The gateway exposes `/healthz` for process liveness and `/readyz` for dependency-aware readiness on the health port. The Helm chart wires both into Kubernetes probes:
+
+- `startupProbe` and `livenessProbe` use `/healthz`.
+- `readinessProbe` uses `/readyz`, which reflects the latest result of an in-process background database check.
 
 ## Next Steps
 

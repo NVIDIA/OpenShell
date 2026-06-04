@@ -27,6 +27,10 @@ K3D_CLUSTER_NAME_MAX=32
 # Host port forwarded to port 80 via the k3d load balancer.
 # Used by Envoy Gateway's LoadBalancer service (values-gateway.yaml).
 HOST_LB_PORT="${HELM_K3S_LB_HOST_PORT:-8080}"
+# Preload the default community sandbox image so the first sandbox create does
+# not pay the full registry pull cost inside the cluster.
+DEFAULT_SANDBOX_PRELOAD_IMAGE="ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+PRELOAD_SANDBOX_IMAGE="${HELM_K3S_PRELOAD_SANDBOX_IMAGE-${DEFAULT_SANDBOX_PRELOAD_IMAGE}}"
 
 default_kubeconfig="${ROOT}/kubeconfig"
 if [[ -n "${HELM_K3S_KUBECONFIG:-}" ]]; then
@@ -52,6 +56,9 @@ Environment:
                                Override to share a single cluster across worktrees.
   HELM_K3S_KUBECONFIG          kubeconfig file to write/merge (default: repo kubeconfig or \$KUBECONFIG)
   HELM_K3S_LB_HOST_PORT        Host port mapped to load balancer port 80 (default: 8080)
+  HELM_K3S_PRELOAD_SANDBOX_IMAGE
+                               Sandbox image to docker pull and import into k3d
+                               (default: ${DEFAULT_SANDBOX_PRELOAD_IMAGE}; set empty to skip)
 
 macOS uses k3d from mise (Docker required). Linux can use this flow only when
 k3d is installed explicitly; otherwise use kind or an existing cluster context.
@@ -142,9 +149,9 @@ configure_ghcr_credentials() {
   registries_content="$(printf 'configs:\n  "ghcr.io":\n    auth:\n      username: %s\n      password: %s\n' \
     "${GITHUB_USERNAME}" "${GITHUB_PAT}")"
 
-  local -a nodes
-  mapfile -t nodes < <(docker ps --format '{{.Names}}' \
-    --filter "name=k3d-${CLUSTER_NAME}-server" 2>/dev/null || true)
+  local -a nodes=()
+  while IFS= read -r _node; do nodes+=("$_node"); done < <(docker ps --format '{{.Names}}' \
+    --filter "name=k3d-${CLUSTER_NAME}-server-" 2>/dev/null || true)
 
   if [[ ${#nodes[@]} -eq 0 ]]; then
     echo "warning: no server nodes found for cluster '${CLUSTER_NAME}', skipping ghcr.io credential setup." >&2
@@ -157,6 +164,79 @@ configure_ghcr_credentials() {
     docker exec "${node}" kill -SIGHUP 1
     echo "  Configured ghcr.io credentials on ${node}"
   done
+}
+
+cluster_has_image() {
+  local image="$1"
+  local -a nodes=()
+  while IFS= read -r _node; do nodes+=("$_node"); done < <(docker ps --format '{{.Names}}' \
+    --filter "name=k3d-${CLUSTER_NAME}-server-" 2>/dev/null || true)
+
+  for node in "${nodes[@]}"; do
+    if docker exec "${node}" sh -c 'ctr -n k8s.io images list -q | grep -Fxq "$1"' sh "${image}"; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+cluster_image_platform() {
+  local -a nodes=()
+  while IFS= read -r _node; do nodes+=("$_node"); done < <(docker ps --format '{{.Names}}' \
+    --filter "name=k3d-${CLUSTER_NAME}-server-" 2>/dev/null || true)
+
+  if [[ ${#nodes[@]} -gt 0 ]]; then
+    local platform
+    platform="$(docker inspect \
+      --format '{{.ImageManifestDescriptor.platform.os}}/{{.ImageManifestDescriptor.platform.architecture}}' \
+      "${nodes[0]}" 2>/dev/null || true)"
+    if [[ "${platform}" != "/" && -n "${platform}" ]]; then
+      echo "${platform}"
+      return 0
+    fi
+  fi
+
+  case "$(uname -m)" in
+    arm64 | aarch64) echo "linux/arm64" ;;
+    x86_64 | amd64) echo "linux/amd64" ;;
+    *) echo "linux/$(uname -m)" ;;
+  esac
+}
+
+preload_sandbox_image() {
+  if [[ -z "${PRELOAD_SANDBOX_IMAGE}" ]]; then
+    echo "Skipping sandbox image preload."
+    return 0
+  fi
+
+  if cluster_has_image "${PRELOAD_SANDBOX_IMAGE}"; then
+    echo "Sandbox image already present in cluster: ${PRELOAD_SANDBOX_IMAGE}"
+    return 0
+  fi
+
+  local platform tmp
+  platform="$(cluster_image_platform)"
+  echo "Preloading sandbox image into k3d cluster: ${PRELOAD_SANDBOX_IMAGE}"
+  echo "Sandbox image platform: ${platform}"
+  if ! docker image inspect "${PRELOAD_SANDBOX_IMAGE}" >/dev/null 2>&1; then
+    echo "Pulling sandbox image..."
+    docker pull --platform "${platform}" "${PRELOAD_SANDBOX_IMAGE}"
+  fi
+
+  tmp="$(mktemp "${TMPDIR:-/tmp}/openshell-sandbox-image.XXXXXX")"
+  if ! docker image save --platform "${platform}" -o "${tmp}" "${PRELOAD_SANDBOX_IMAGE}"; then
+    echo "Pulling sandbox image for ${platform}..."
+    docker pull --platform "${platform}" "${PRELOAD_SANDBOX_IMAGE}"
+    docker image save --platform "${platform}" -o "${tmp}" "${PRELOAD_SANDBOX_IMAGE}"
+  fi
+
+  if ! k3d image import "${tmp}" --cluster "${CLUSTER_NAME}"; then
+    rm -f "${tmp}"
+    return 1
+  fi
+
+  rm -f "${tmp}"
 }
 
 cmd_create() {
@@ -189,6 +269,7 @@ EOF
   merge_kubeconfig
   apply_base_manifests
   configure_ghcr_credentials
+  preload_sandbox_image
   echo "Active context: $(k3d_context_name)"
   echo "Kubeconfig: ${KUBECONFIG_TARGET}"
   echo "Envoy Gateway LoadBalancer (port 80):  http://127.0.0.1:${HOST_LB_PORT}"

@@ -26,6 +26,7 @@ build:
       context: ../../..
       custom:
         buildCommand: |
+          CONTAINER_ENGINE=docker \
           IMAGE_NAME="${IMAGE%:*}" \
           IMAGE_TAG="${IMAGE##*:}" \
           tasks/scripts/docker-build-image.sh gateway
@@ -42,6 +43,7 @@ build:
       context: ../../..
       custom:
         buildCommand: |
+          CONTAINER_ENGINE=docker \
           IMAGE_NAME="${IMAGE%:*}" \
           IMAGE_TAG="${IMAGE##*:}" \
           tasks/scripts/docker-build-image.sh supervisor
@@ -58,7 +60,7 @@ deploy:
   helm:
     releases:
       # cert-manager — comment this in and add values-cert-manager.yaml below
-      # when you want cert-manager to manage the PKI instead of pkiInitJob.
+      # when you want cert-manager to manage TLS while certgen handles JWT.
       # Requires cert-manager CRDs to be installed in the cluster first.
       #- name: cert-manager
       #  repo: https://charts.jetstack.io
@@ -87,7 +89,7 @@ deploy:
           - values.yaml
           - ci/values-skaffold.yaml
           # Add ci/values-cert-manager.yaml here (and uncomment the cert-manager
-          # release above) to switch from pkiInitJob to cert-manager for PKI.
+          # release above) to switch TLS generation to cert-manager.
           #- ci/values-cert-manager.yaml
           # To enable OIDC with a local Keycloak instance, run the one-time
           # setup task first, then uncomment the line below:
@@ -95,6 +97,8 @@ deploy:
           #- ci/values-keycloak.yaml
           # To enable the Gateway API HTTPRoute (requires Envoy Gateway above):
           #- ci/values-gateway.yaml
+          # To test HA gateway behavior with bundled PostgreSQL:
+          #- ci/values-high-availability.yaml
         setValueTemplates:
           image.repository: '{{.IMAGE_REPO_openshell_gateway}}'
           image.tag: '{{.IMAGE_TAG_openshell_gateway}}'

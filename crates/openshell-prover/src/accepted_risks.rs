@@ -80,23 +80,12 @@ pub fn load_accepted_risks(path: &Path) -> Result<Vec<AcceptedRisk>> {
 
 /// Check if a single finding path matches an accepted risk.
 fn path_matches_risk(path: &FindingPath, risk: &AcceptedRisk) -> bool {
-    if !risk.binary.is_empty() {
-        let path_binary = match path {
-            FindingPath::Exfil(p) => &p.binary,
-            FindingPath::WriteBypass(p) => &p.binary,
-        };
-        if path_binary != &risk.binary {
-            return false;
-        }
+    let FindingPath::Exfil(p) = path;
+    if !risk.binary.is_empty() && p.binary != risk.binary {
+        return false;
     }
-    if !risk.endpoint.is_empty() {
-        let endpoint_host = match path {
-            FindingPath::Exfil(p) => &p.endpoint_host,
-            FindingPath::WriteBypass(p) => &p.endpoint_host,
-        };
-        if endpoint_host != &risk.endpoint {
-            return false;
-        }
+    if !risk.endpoint.is_empty() && p.endpoint_host != risk.endpoint {
+        return false;
     }
     true
 }

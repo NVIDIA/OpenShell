@@ -5,7 +5,17 @@
 
 [test]
 description = "Run all tests (Rust + Python)"
-depends = ["test:rust", "test:python"]
+depends = ["test:rust", "test:python", "test:install-sh", "test:packaging-assets"]
+
+["test:install-sh"]
+description = "Run focused install.sh shell tests"
+run = "tasks/scripts/test-install-sh.sh"
+hide = true
+
+["test:packaging-assets"]
+description = "Run static packaging asset tests"
+run = "tasks/scripts/test-packaging-assets.sh"
+hide = true
 
 [e2e]
 description = "Run all end-to-end tests (Rust + Python)"
@@ -21,7 +31,12 @@ depends = ["e2e:python:gpu"]
 
 ["test:rust"]
 description = "Run Rust tests"
-run = "cargo test --workspace"
+run = [
+  # Run the workspace once without openshell-server so we can run that crate
+  # with test-only helpers enabled.
+  "cargo test --workspace --exclude openshell-server",
+  "cargo test -p openshell-server --features test-support",
+]
 hide = true
 
 ["test:python"]
@@ -61,6 +76,10 @@ run = "e2e/with-docker-gateway.sh uv run pytest -o python_files='test_*.py' -m g
 description = "Run Rust CLI e2e tests against a Podman-backed gateway"
 run = "e2e/rust/e2e-podman.sh"
 
+["e2e:podman:rootless"]
+description = "Run Rust CLI e2e tests against a rootless Podman-backed gateway"
+run = "e2e/rust/e2e-podman-rootless.sh"
+
 ["e2e:podman:gpu"]
 description = "Run GPU e2e against a standalone gateway with the Podman compute driver"
 env = { OPENSHELL_E2E_PODMAN_GPU = "1", OPENSHELL_E2E_PODMAN_TEST = "gpu_device_selection", OPENSHELL_E2E_PODMAN_FEATURES = "e2e-podman-gpu" }
@@ -68,6 +87,11 @@ run = "e2e/rust/e2e-podman.sh"
 
 ["e2e:kubernetes"]
 description = "Run Rust CLI e2e tests against an OpenShell gateway deployed on Kubernetes via Helm (set OPENSHELL_E2E_KUBE_CONTEXT to reuse a cluster; otherwise creates a local k3d cluster when k3d is installed; set OPENSHELL_E2E_KUBE_TEST=<name> to scope to one test)"
+run = "e2e/rust/e2e-kubernetes.sh"
+
+["e2e:kubernetes:db"]
+description = "Run Kubernetes e2e with all database backend scenarios (SQLite, bundled PostgreSQL, external PostgreSQL with existingSecret)"
+env = { OPENSHELL_E2E_KUBE_DB_SCENARIOS = "1" }
 run = "e2e/rust/e2e-kubernetes.sh"
 
 ["e2e:vm"]
@@ -78,7 +102,18 @@ run = "e2e/rust/e2e-vm.sh"
 description = "Run smoke e2e against a standalone gateway with the Docker compute driver"
 run = "e2e/rust/e2e-docker.sh"
 
+["e2e:mechanistic-smoke"]
+description = "Run mechanistic L4 smoke against a Docker-backed gateway"
+run = [
+  "cargo build -p openshell-cli --features openshell-core/dev-settings",
+  "e2e/with-docker-gateway.sh bash -lc 'target/debug/openshell settings set --global --key agent_policy_proposals_enabled --value true --yes && OPENSHELL_BIN=$PWD/target/debug/openshell bash e2e/policy-advisor/mechanistic-smoke.sh'",
+]
+
 ["e2e:docker:gpu"]
 description = "Run GPU e2e against a standalone gateway with the Docker compute driver"
 env = { OPENSHELL_E2E_DOCKER_GPU = "1", OPENSHELL_E2E_DOCKER_TEST = "gpu_device_selection", OPENSHELL_E2E_DOCKER_FEATURES = "e2e-docker-gpu" }
 run = "e2e/rust/e2e-docker.sh"
+
+["e2e:openshift"]
+description = "Run OpenShift database-backend integration scenarios against a live cluster (requires oc CLI authenticated to an OpenShift cluster)"
+run = "e2e/rust/e2e-openshift.sh"

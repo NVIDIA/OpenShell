@@ -3,16 +3,20 @@
 
 use std::ffi::OsStr;
 use std::future::Future;
-use std::time::Duration;
 
 use clap_complete::engine::CompletionCandidate;
+use openshell_bootstrap::edge_token::load_edge_token;
+use openshell_bootstrap::oidc_token::{is_token_expired, load_oidc_token, store_oidc_token};
 use openshell_bootstrap::{list_gateways, load_active_gateway, load_gateway_metadata};
 use openshell_core::ObjectName;
+use openshell_core::auth::EdgeAuthInterceptor;
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::{ListProvidersRequest, ListSandboxesRequest};
-use tonic::transport::{Channel, Endpoint};
+use tonic::service::interceptor::InterceptedService;
+use tonic::transport::Channel;
 
-use crate::tls::{TlsOptions, build_tonic_tls_config, require_tls_materials};
+use crate::oidc_auth::oidc_refresh_token;
+use crate::tls::{TlsOptions, build_channel};
 
 /// Complete gateway names from local metadata files (no network call).
 pub fn complete_gateway_names(_prefix: &OsStr) -> Vec<CompletionCandidate> {
@@ -84,17 +88,46 @@ fn resolve_active_gateway() -> Option<(String, String)> {
 async fn completion_grpc_client(
     server: &str,
     gateway_name: &str,
-) -> Option<OpenShellClient<Channel>> {
-    let tls_opts = TlsOptions::default().with_gateway_name(gateway_name);
-    let materials = require_tls_materials(server, &tls_opts).ok()?;
-    let tls_config = build_tonic_tls_config(&materials);
-    let endpoint = Endpoint::from_shared(server.to_string())
-        .ok()?
-        .connect_timeout(Duration::from_secs(2))
-        .tls_config(tls_config)
-        .ok()?;
-    let channel = endpoint.connect().await.ok()?;
-    Some(OpenShellClient::new(channel))
+) -> Option<OpenShellClient<InterceptedService<Channel, EdgeAuthInterceptor>>> {
+    let mut tls_opts = TlsOptions::default().with_gateway_name(gateway_name);
+    tls_opts.gateway_insecure = std::env::var("OPENSHELL_GATEWAY_INSECURE")
+        .is_ok_and(|v| !v.is_empty() && v != "0" && v != "false");
+
+    if let Ok(meta) = load_gateway_metadata(gateway_name) {
+        match meta.auth_mode.as_deref() {
+            Some("oidc") => {
+                if let Some(bundle) = load_oidc_token(gateway_name) {
+                    if is_token_expired(&bundle) {
+                        match oidc_refresh_token(&bundle, tls_opts.gateway_insecure).await {
+                            Ok(refreshed) => {
+                                let _ = store_oidc_token(gateway_name, &refreshed);
+                                tls_opts.oidc_token = Some(refreshed.access_token);
+                            }
+                            Err(_) => {
+                                tls_opts.oidc_token = Some(bundle.access_token);
+                            }
+                        }
+                    } else {
+                        tls_opts.oidc_token = Some(bundle.access_token);
+                    }
+                }
+            }
+            Some("cloudflare_jwt") => {
+                if let Some(token) = load_edge_token(gateway_name) {
+                    tls_opts.edge_token = Some(token);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let channel = build_channel(server, &tls_opts).await.ok()?;
+    let interceptor = EdgeAuthInterceptor::new(
+        tls_opts.oidc_token.as_deref(),
+        tls_opts.edge_token.as_deref(),
+    )
+    .ok()?;
+    Some(OpenShellClient::with_interceptor(channel, interceptor))
 }
 
 /// Run an async future on a dedicated thread to avoid nested tokio runtime panics.

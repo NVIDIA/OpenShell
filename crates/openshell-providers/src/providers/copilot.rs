@@ -8,21 +8,8 @@ pub const SPEC: ProviderDiscoverySpec = ProviderDiscoverySpec {
     credential_env_vars: &["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"],
 };
 
-#[cfg(test)]
-mod tests {
-    use super::SPEC;
-    use crate::discover_with_spec;
-    use crate::test_helpers::MockDiscoveryContext;
-
-    #[test]
-    fn discovers_copilot_env_credentials() {
-        let ctx = MockDiscoveryContext::new().with_env("COPILOT_GITHUB_TOKEN", "ghp-copilot-token");
-        let discovered = discover_with_spec(&SPEC, &ctx)
-            .expect("discovery")
-            .expect("provider");
-        assert_eq!(
-            discovered.credentials.get("COPILOT_GITHUB_TOKEN"),
-            Some(&"ghp-copilot-token".to_string())
-        );
-    }
-}
+test_discovers_env_credential!(
+    discovers_copilot_env_credentials,
+    "COPILOT_GITHUB_TOKEN",
+    "ghp-copilot-token"
+);

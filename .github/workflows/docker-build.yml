@@ -47,6 +47,11 @@ on:
         required: false
         type: string
         default: "ghcr.io/nvidia/openshell"
+      publish-manifest:
+        description: "Push the bare-SHA manifest. Set false for single-arch branch workflows."
+        required: false
+        type: boolean
+        default: true
 
 env:
   MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -162,7 +167,7 @@ jobs:
       cargo-version: ${{ inputs['cargo-version'] }}
       image-tag: ${{ needs.resolve.outputs.image_tag_base }}
       checkout-ref: ${{ inputs['checkout-ref'] }}
-      features: openshell-core/dev-settings
+      features: ${{ inputs.component == 'gateway' && 'openshell-core/dev-settings bundled-z3' || 'openshell-core/dev-settings' }}
       artifact-name: ${{ needs.resolve.outputs.artifact_prefix }}-linux-${{ matrix.arch }}
     secrets: inherit
 
@@ -186,7 +191,7 @@ jobs:
         # inside the container so setup-buildx can read it.
         - /etc/buildkit:/etc/buildkit:ro
     env:
-      IMAGE_TAG: ${{ needs.resolve.outputs.platform_count == '1' && needs.resolve.outputs.image_tag_base || format('{0}-{1}', needs.resolve.outputs.image_tag_base, matrix.arch) }}
+      IMAGE_TAG: ${{ format('{0}-{1}', needs.resolve.outputs.image_tag_base, matrix.arch) }}
       IMAGE_REGISTRY: ${{ inputs['image-registry'] }}
       DOCKER_PUSH: ${{ inputs.push && '1' || '0' }}
       DOCKER_PLATFORM: ${{ matrix.platform }}
@@ -269,7 +274,7 @@ jobs:
   merge:
     name: Merge ${{ inputs.component }} manifest
     needs: [resolve, build]
-    if: ${{ inputs.push && needs.resolve.outputs.platform_count != '1' }}
+    if: ${{ inputs.push && inputs['publish-manifest'] }}
     runs-on: linux-amd64-cpu8
     timeout-minutes: 10
     container:

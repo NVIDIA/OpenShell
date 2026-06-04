@@ -52,6 +52,11 @@ pub struct ResolvedRoute {
     pub passthrough_headers: Vec<String>,
     /// Per-request timeout for proxied inference calls.
     pub timeout: Duration,
+    /// When true, the model identifier is embedded in the URL path (e.g. Vertex AI).
+    pub model_in_path: bool,
+    /// Optional override for the request path. When set, replaces the protocol-derived path.
+    /// An empty string means POST directly to `base_url/model_id` with no additional path.
+    pub request_path_override: Option<String>,
 }
 
 impl std::fmt::Debug for ResolvedRoute {
@@ -66,6 +71,8 @@ impl std::fmt::Debug for ResolvedRoute {
             .field("default_headers", &self.default_headers)
             .field("passthrough_headers", &self.passthrough_headers)
             .field("timeout", &self.timeout)
+            .field("model_in_path", &self.model_in_path)
+            .field("request_path_override", &self.request_path_override)
             .finish()
     }
 }
@@ -129,7 +136,7 @@ impl RouteConfig {
         }
 
         let (auth, default_headers, passthrough_headers) =
-            route_headers_from_provider_type(self.provider_type.as_deref());
+            route_headers_from_provider_type(self.provider_type.as_deref(), &protocols);
 
         Ok(ResolvedRoute {
             name: self.name.clone(),
@@ -141,6 +148,8 @@ impl RouteConfig {
             default_headers,
             passthrough_headers,
             timeout: DEFAULT_ROUTE_TIMEOUT,
+            model_in_path: false,
+            request_path_override: None,
         })
     }
 }
@@ -152,8 +161,9 @@ impl RouteConfig {
 /// which uses the centralized `InferenceProviderProfile` registry.
 fn route_headers_from_provider_type(
     provider_type: Option<&str>,
+    protocols: &[String],
 ) -> (AuthHeader, Vec<(String, String)>, Vec<String>) {
-    openshell_core::inference::route_headers_for_provider_type(provider_type.unwrap_or(""))
+    openshell_core::inference::route_headers_for_route(provider_type.unwrap_or(""), protocols)
 }
 
 #[cfg(test)]
@@ -274,6 +284,8 @@ routes:
             default_headers: Vec::new(),
             passthrough_headers: Vec::new(),
             timeout: DEFAULT_ROUTE_TIMEOUT,
+            model_in_path: false,
+            request_path_override: None,
         };
         let debug_output = format!("{route:?}");
         assert!(
@@ -288,8 +300,10 @@ routes:
 
     #[test]
     fn auth_from_anthropic_provider_uses_custom_header() {
-        let (auth, headers, passthrough_headers) =
-            route_headers_from_provider_type(Some("anthropic"));
+        let (auth, headers, passthrough_headers) = route_headers_from_provider_type(
+            Some("anthropic"),
+            &["anthropic_messages".to_string()],
+        );
         assert_eq!(auth, AuthHeader::Custom("x-api-key"));
         assert!(headers.iter().any(|(k, _)| k == "anthropic-version"));
         assert!(
@@ -301,7 +315,10 @@ routes:
 
     #[test]
     fn auth_from_openai_provider_uses_bearer() {
-        let (auth, headers, passthrough_headers) = route_headers_from_provider_type(Some("openai"));
+        let (auth, headers, passthrough_headers) = route_headers_from_provider_type(
+            Some("openai"),
+            &["openai_chat_completions".to_string()],
+        );
         assert_eq!(auth, AuthHeader::Bearer);
         assert!(headers.is_empty());
         assert!(
@@ -313,9 +330,19 @@ routes:
 
     #[test]
     fn auth_from_none_defaults_to_bearer() {
-        let (auth, headers, passthrough_headers) = route_headers_from_provider_type(None);
+        let (auth, headers, passthrough_headers) = route_headers_from_provider_type(None, &[]);
         assert_eq!(auth, AuthHeader::Bearer);
         assert!(headers.is_empty());
         assert!(passthrough_headers.is_empty());
+    }
+
+    #[test]
+    fn vertex_anthropic_route_forwards_beta_only() {
+        let (_, headers, passthrough_headers) = route_headers_from_provider_type(
+            Some("google-vertex-ai"),
+            &["anthropic_messages".to_string()],
+        );
+        assert!(headers.is_empty());
+        assert_eq!(passthrough_headers, vec!["anthropic-beta".to_string()]);
     }
 }

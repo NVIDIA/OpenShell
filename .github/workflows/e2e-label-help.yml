@@ -1,6 +1,6 @@
 name: E2E Label Help
 
-# When a `test:e2e*` label is applied, post a PR comment
+# When an E2E label is applied, post a PR comment
 # telling the maintainer the next manual step. We don't dispatch the workflow
 # ourselves: a workflow_dispatch-triggered run does not surface in the PR's
 # Checks tab, so we'd lose in-progress visibility. Instead we point the
@@ -37,10 +37,24 @@ jobs:
         run: |
           set -euo pipefail
 
+          workflow_file=branch-e2e.yml
+          workflow_name="Branch E2E Checks"
           case "$LABEL_NAME" in
-            test:e2e) workflow_file=branch-e2e.yml; workflow_name="Branch E2E Checks" ;;
-            test:e2e-gpu) workflow_file=test-gpu.yml; workflow_name="GPU Test" ;;
-            test:e2e-kubernetes) workflow_file=branch-kubernetes-e2e.yml; workflow_name="Branch Kubernetes E2E" ;;
+            test:e2e)
+              suite_summary="the standard E2E suite"
+              build_summary="gateway and supervisor images"
+              status_summary="The matching required CI gate status on this PR will flip green automatically once the run finishes."
+              ;;
+            test:e2e-gpu)
+              suite_summary="GPU E2E"
+              build_summary="supervisor image"
+              status_summary="The matching required CI gate status on this PR will flip green automatically once the run finishes."
+              ;;
+            test:e2e-kubernetes)
+              suite_summary="Kubernetes HA E2E"
+              build_summary="gateway and supervisor images"
+              status_summary="This is an optional proof-of-life suite; failures are visible in the workflow run but do not publish a required CI gate status."
+              ;;
             *) echo "Unrecognized label $LABEL_NAME"; exit 1 ;;
           esac
 
@@ -62,7 +76,7 @@ jobs:
               workflow_link="[$workflow_name](https://github.com/$GH_REPO/actions/workflows/$workflow_file)"
               instructions="Open $workflow_link, find the run for commit \`$short_pr\`, and click **Re-run all jobs** to execute with the label set."
             fi
-            body="Label \`$LABEL_NAME\` applied for \`$short_pr\`. $instructions The matching required CI gate status on this PR will flip green automatically once the run finishes."
+            body="Label \`$LABEL_NAME\` applied for \`$short_pr\`. $instructions The run will execute $suite_summary after building the required $build_summary once. $status_summary"
           fi
 
           gh pr comment "$PR_NUMBER" --body "$body"

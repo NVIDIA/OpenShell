@@ -60,6 +60,17 @@ Create the name of the service account to use
 {{- end }}
 
 {{/*
+Create the name of the service account assigned to sandbox pods
+*/}}
+{{- define "openshell.sandboxServiceAccountName" -}}
+{{- if .Values.sandboxServiceAccount.create }}
+{{- default (printf "%s-sandbox" (include "openshell.fullname" .) | trunc 63 | trimSuffix "-") .Values.sandboxServiceAccount.name }}
+{{- else }}
+{{- default "default" .Values.sandboxServiceAccount.name }}
+{{- end }}
+{{- end }}
+
+{{/*
 Gateway image reference. Uses image.tag when set; falls back to .Chart.AppVersion
 so a released chart automatically pulls the matching image without extra overrides.
 */}}
@@ -89,6 +100,44 @@ Namespace where sandbox pods are created. An explicit
 */}}
 {{- define "openshell.sandboxNamespace" -}}
 {{- .Values.server.sandboxNamespace | default .Release.Namespace -}}
+{{- end }}
+
+{{/*
+Fully qualified name of the PostgreSQL subchart, mirroring the Bitnami
+common.names.fullname template so we stay in sync when users set
+postgres.fullnameOverride or postgres.nameOverride.
+*/}}
+{{- define "openshell.postgresFullname" -}}
+{{- if .Values.postgres.fullnameOverride -}}
+{{- .Values.postgres.fullnameOverride | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- $name := default "postgres" .Values.postgres.nameOverride -}}
+{{- if contains $name .Release.Name -}}
+{{- .Release.Name | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- printf "%s-%s" .Release.Name $name | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Name of the Secret holding the PostgreSQL connection URI.
+- server.externalDbSecret set: use it verbatim (always wins)
+- postgres.enabled=true: derive from Bitnami service-binding naming convention
+*/}}
+{{- define "openshell.dbSecretName" -}}
+{{- if .Values.server.externalDbSecret -}}
+{{- .Values.server.externalDbSecret -}}
+{{- else -}}
+{{- printf "%s-svcbind-custom-user" (include "openshell.postgresFullname" .) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Name of the Secret holding gateway-minted sandbox JWT signing material.
+*/}}
+{{- define "openshell.sandboxJwtSecretName" -}}
+{{- .Values.server.sandboxJwt.signingSecretName | default (printf "%s-jwt-keys" (include "openshell.fullname" .)) -}}
 {{- end }}
 
 {{/*

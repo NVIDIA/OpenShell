@@ -81,11 +81,13 @@ jobs:
           - arch: arm64
             runner: linux-arm64-cpu8
             target: aarch64-unknown-linux-gnu
+            zig_target: aarch64-unknown-linux-gnu.2.31
             platform: linux-aarch64
             guest_arch: aarch64
           - arch: amd64
             runner: linux-amd64-cpu8
             target: x86_64-unknown-linux-gnu
+            zig_target: x86_64-unknown-linux-gnu.2.31
             platform: linux-x86_64
             guest_arch: x86_64
     runs-on: ${{ matrix.runner }}
@@ -163,18 +165,24 @@ jobs:
           set -euo pipefail
           sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${{ inputs['cargo-version'] }}"'"/}' Cargo.toml
 
-      - name: Build openshell-driver-vm
+      - name: Build openshell-driver-vm with glibc 2.31 floor
         run: |
           set -euo pipefail
+          mise x -- rustup target add ${{ matrix.target }}
           OPENSHELL_VM_RUNTIME_COMPRESSED_DIR="${PWD}/target/vm-runtime-compressed" \
-            mise x -- cargo build --release -p openshell-driver-vm
+            mise x -- cargo zigbuild --release --target ${{ matrix.zig_target }} -p openshell-driver-vm --bin openshell-driver-vm
+          mkdir -p artifacts/bin
+          install -m 0755 target/${{ matrix.target }}/release/openshell-driver-vm artifacts/bin/openshell-driver-vm
 
       - name: Verify packaged binary
         run: |
           set -euo pipefail
-          OUTPUT="$(target/release/openshell-driver-vm --version)"
+          OUTPUT="$(artifacts/bin/openshell-driver-vm --version)"
           echo "$OUTPUT"
           grep -q '^openshell-driver-vm ' <<<"$OUTPUT"
+
+      - name: Verify glibc symbol floor
+        run: tasks/scripts/verify-glibc-symbols.sh 2.31 artifacts/bin/openshell-driver-vm
 
       - name: sccache stats
         if: always()
@@ -185,7 +193,7 @@ jobs:
           set -euo pipefail
           mkdir -p artifacts
           tar -czf "artifacts/openshell-driver-vm-${{ matrix.target }}.tar.gz" \
-            -C target/release openshell-driver-vm
+            -C artifacts/bin openshell-driver-vm
 
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

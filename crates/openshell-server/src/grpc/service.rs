@@ -39,7 +39,7 @@ pub(super) async fn handle_expose_service(
         .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
         .ok_or_else(|| Status::not_found("sandbox not found"))?;
 
-    let now = super::current_time_ms();
+    let now = crate::persistence::current_time_ms();
     let key = service_routing::endpoint_key(&req.sandbox, &req.service);
 
     // Fetch existing endpoint to determine create vs. update path
@@ -275,44 +275,23 @@ fn is_dns_label(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::grpc::test_support::test_server_state;
     use openshell_core::proto::SandboxPhase;
 
-    async fn test_server_state() -> Arc<ServerState> {
-        let store = Arc::new(
-            crate::persistence::Store::connect("sqlite::memory:?cache=shared")
-                .await
-                .unwrap(),
-        );
-        let compute = crate::compute::new_test_runtime(store.clone()).await;
-        Arc::new(ServerState::new(
-            openshell_core::Config::new(None).with_database_url("sqlite::memory:?cache=shared"),
-            store,
-            compute,
-            crate::sandbox_index::SandboxIndex::new(),
-            crate::sandbox_watch::SandboxWatchBus::new(),
-            crate::tracing_bus::TracingLogBus::new(),
-            Arc::new(crate::supervisor_session::SupervisorSessionRegistry::new()),
-            None,
-        ))
-    }
-
     async fn seed_sandbox(state: &Arc<ServerState>, name: &str) {
-        state
-            .store
-            .put_message(&Sandbox {
-                metadata: Some(ObjectMeta {
-                    id: format!("sandbox-{name}"),
-                    name: name.to_string(),
-                    created_at_ms: 1_000,
-                    labels: HashMap::new(),
-                    resource_version: 0,
-                }),
-                spec: Some(openshell_core::proto::SandboxSpec::default()),
-                phase: SandboxPhase::Ready as i32,
-                ..Default::default()
-            })
-            .await
-            .unwrap();
+        let mut sandbox = Sandbox {
+            metadata: Some(ObjectMeta {
+                id: format!("sandbox-{name}"),
+                name: name.to_string(),
+                created_at_ms: 1_000,
+                labels: HashMap::new(),
+                resource_version: 0,
+            }),
+            spec: Some(openshell_core::proto::SandboxSpec::default()),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        state.store.put_message(&sandbox).await.unwrap();
     }
 
     #[test]

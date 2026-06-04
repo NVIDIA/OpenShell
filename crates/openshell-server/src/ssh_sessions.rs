@@ -5,6 +5,7 @@
 
 use openshell_core::ObjectId;
 use openshell_core::proto::SshSession;
+use openshell_core::time::now_ms;
 use prost::Message;
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,7 +34,7 @@ pub fn spawn_session_reaper(store: Arc<Store>, interval: Duration) {
 }
 
 async fn reap_expired_sessions(store: &Store) -> Result<(), String> {
-    let now_ms = unix_epoch_millis();
+    let now_ms = now_ms();
 
     let records = store
         .list(SshSession::object_type(), 1000, 0)
@@ -68,20 +69,14 @@ async fn reap_expired_sessions(store: &Store) -> Result<(), String> {
     Ok(())
 }
 
-fn unix_epoch_millis() -> i64 {
-    i64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis(),
-    )
-    .unwrap_or(i64::MAX)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    async fn test_store() -> Store {
+        crate::persistence::test_store().await
+    }
 
     fn make_session(id: &str, sandbox_id: &str, expires_at_ms: i64, revoked: bool) -> SshSession {
         SshSession {
@@ -99,15 +94,9 @@ mod tests {
         }
     }
 
-    fn now_ms() -> i64 {
-        unix_epoch_millis()
-    }
-
     #[tokio::test]
     async fn reaper_deletes_expired_sessions() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
 
         let expired = make_session("expired1", "sbx1", now_ms() - 60_000, false);
         store.put_message(&expired).await.unwrap();
@@ -137,9 +126,7 @@ mod tests {
 
     #[tokio::test]
     async fn reaper_deletes_revoked_sessions() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
 
         let revoked = make_session("revoked1", "sbx1", 0, true);
         store.put_message(&revoked).await.unwrap();
@@ -169,9 +156,7 @@ mod tests {
 
     #[tokio::test]
     async fn reaper_preserves_zero_expiry_sessions() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
 
         let no_expiry = make_session("noexpiry1", "sbx1", 0, false);
         store.put_message(&no_expiry).await.unwrap();

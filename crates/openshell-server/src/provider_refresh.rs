@@ -776,7 +776,7 @@ mod tests {
         refresh_provider_credential, refresh_state_name, refresh_strategy_name,
         run_refresh_worker_tick, seconds_until_ms,
     };
-    use crate::persistence::Store;
+    use crate::persistence::test_store;
     use openshell_core::ObjectId;
     use openshell_core::proto::datamodel::v1::ObjectMeta;
     use openshell_core::proto::{
@@ -846,9 +846,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
         let provider = provider("my-graph", "outlook");
         store.put_message(&provider).await.unwrap();
         let before_refresh_ms = crate::persistence::current_time_ms();
@@ -909,9 +907,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
         let mut provider_a = provider("existing-graph", "outlook");
         provider_a.credentials.insert(
             "MS_GRAPH_ACCESS_TOKEN".to_string(),
@@ -1002,9 +998,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
         let provider = provider("my-delegated-graph", "outlook");
         store.put_message(&provider).await.unwrap();
         let state = new_refresh_state(
@@ -1083,9 +1077,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
         let provider = provider("my-drive", "google-drive");
         store.put_message(&provider).await.unwrap();
         let state = new_refresh_state(
@@ -1131,9 +1123,7 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_worker_skips_non_gateway_mintable_strategies() {
-        let store = Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .unwrap();
+        let store = test_store().await;
         let provider = provider("my-external", "outlook");
         store.put_message(&provider).await.unwrap();
         let state = new_refresh_state(

@@ -22,6 +22,10 @@ drive client provisioning UI, the driver attaches the shared
 clients to parse Kubernetes reasons, VM cache states, or other driver-local
 reason strings.
 
+The capability RPC reports driver identity, version, and the default sandbox
+image used by the gateway. GPU availability stays driver-local and is validated
+when a sandbox create request asks for GPU resources.
+
 ## Runtime Summary
 
 | Runtime | Best fit | Sandbox boundary | Notes |

@@ -13,6 +13,8 @@ credentials:
     required: true
     auth_style: bearer
     header_name: authorization
+discovery:
+  credentials: [api_key]
 endpoints:
   - host: integrate.api.nvidia.com
     port: 443

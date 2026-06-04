@@ -12,8 +12,7 @@ description: |
   LLM inference routing.
 
 base: core24
-# TODO: this prevents publishing a snap to latest/stable.
-grade: devel
+grade: stable
 confinement: strict
 license: Apache-2.0
 website: https://docs.nvidia.com/openshell/latest/index.html
@@ -31,6 +30,14 @@ platforms:
 apps:
   openshell:
     command: bin/openshell
+    plugs:
+      - home
+      - network
+      - ssh-keys
+      - system-observe
+  term:
+    command: bin/openshell term
+    desktop: meta/gui/term.desktop
     plugs:
       - home
       - network
@@ -74,7 +81,7 @@ parts:
       set -euo pipefail
 
       cargo build --release --locked -p openshell-cli --features bundled-z3
-      cargo build --release --locked -p openshell-server --bin openshell-gateway
+      cargo build --release --locked -p openshell-server --bin openshell-gateway --features bundled-z3
       cargo build --release --locked -p openshell-sandbox --bin openshell-sandbox
 
       install -D -m 0755 "$CRAFT_PART_BUILD/target/release/openshell" \
@@ -85,6 +92,10 @@ parts:
         "$CRAFT_PART_INSTALL/bin/openshell-sandbox"
       install -D -m 0755 "$CRAFT_PROJECT_DIR/deploy/snap/bin/openshell-gateway-wrapper" \
         "$CRAFT_PART_INSTALL/bin/openshell-gateway-wrapper"
+      install -D -m 0644 "$CRAFT_PROJECT_DIR/snap/local/term.desktop" \
+        "$CRAFT_PART_INSTALL/meta/gui/term.desktop"
+      install -D -m 0644 "$CRAFT_PROJECT_DIR/snap/local/icon.png" \
+        "$CRAFT_PART_INSTALL/meta/gui/icon.png"
       install -D -m 0644 "$CRAFT_PROJECT_DIR/LICENSE" \
         "$CRAFT_PART_INSTALL/usr/share/doc/openshell/LICENSE"
       install -D -m 0644 "$CRAFT_PROJECT_DIR/README.md" \

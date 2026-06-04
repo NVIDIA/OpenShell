@@ -71,7 +71,10 @@ client certificate for all API connections and listens on
 On first start, the systemd user service runs
 `openshell-gateway generate-certs --output-dir ~/.local/state/openshell/tls --server-san host.openshell.internal`
 to generate certificates with `rcgen` (the same routine the CLI uses for
-local mTLS bundles):
+local mTLS bundles). The unit sets `OPENSHELL_LOCAL_TLS_DIR` to that path and
+uses the same value for certificate generation and gateway startup. To use a
+custom bundle location, set `OPENSHELL_LOCAL_TLS_DIR` in
+`~/.config/openshell/gateway.env` before starting the service.
 
 | File | Purpose | Location |
 |------|---------|----------|
@@ -194,6 +197,11 @@ On SELinux-enabled systems, the Podman driver automatically applies the
 configuration is required.
 
 ## Configuration reference
+
+> **Upgrading from a previous release?** See the
+> ["Migrating from gateway.env"](TROUBLESHOOTING.md#migrating-from-gatewayenv)
+> section in TROUBLESHOOTING.md for the env-to-TOML mapping and notes on
+> the default port, bind address, and database path changes.
 
 Gateway and driver settings have local runtime defaults. The gateway reads
 `~/.config/openshell/gateway.toml` when that file exists. Set

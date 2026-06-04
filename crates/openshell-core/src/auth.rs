@@ -7,9 +7,9 @@ use miette::Result;
 
 /// Interceptor that injects authentication headers into every outgoing gRPC request.
 ///
-/// Supports OIDC Bearer tokens (standard `authorization` header) and
-/// Cloudflare Access tokens (custom headers). When no token is set, acts
-/// as a no-op. OIDC takes precedence over edge tokens.
+/// Supports application-layer Bearer tokens (standard `authorization`
+/// header) and Cloudflare Access tokens (custom headers). When no token is
+/// set, acts as a no-op. OIDC takes precedence over edge tokens.
 #[derive(Clone)]
 #[allow(clippy::struct_field_names)]
 pub struct EdgeAuthInterceptor {
@@ -21,14 +21,14 @@ pub struct EdgeAuthInterceptor {
 impl EdgeAuthInterceptor {
     /// Create an interceptor from optional token strings.
     ///
-    /// OIDC bearer token takes precedence over edge token. Returns a no-op
-    /// interceptor when neither token is provided.
+    /// OIDC bearer tokens take precedence over edge tokens. Returns a no-op
+    /// interceptor when no token is provided.
     pub fn new(oidc_token: Option<&str>, edge_token: Option<&str>) -> Result<Self> {
         if let Some(token) = oidc_token {
             let bearer: tonic::metadata::MetadataValue<tonic::metadata::Ascii> =
                 format!("Bearer {token}")
                     .parse()
-                    .map_err(|_| miette::miette!("invalid OIDC token value"))?;
+                    .map_err(|_| miette::miette!("invalid bearer token value"))?;
             return Ok(Self {
                 bearer_value: Some(bearer),
                 header_value: None,

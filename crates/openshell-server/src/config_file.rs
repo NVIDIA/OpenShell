@@ -25,7 +25,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use openshell_core::config::ComputeDriverKind;
-use openshell_core::{OidcConfig, TlsConfig};
+use openshell_core::{GatewayAuthConfig, GatewayJwtConfig, MtlsAuthConfig, OidcConfig, TlsConfig};
 use serde::{Deserialize, Serialize};
 
 /// Latest schema version this build understands.
@@ -112,9 +112,16 @@ pub struct GatewayFileSection {
     #[serde(default)]
     pub client_tls_secret_name: Option<String>,
     #[serde(default)]
+    pub service_account_name: Option<String>,
+    #[serde(default)]
     pub host_gateway_ip: Option<String>,
     #[serde(default)]
     pub enable_user_namespaces: Option<bool>,
+    /// Lifetime (seconds) of the projected `ServiceAccount` token kubelet
+    /// writes for the `IssueSandboxToken` bootstrap exchange. Driver
+    /// clamps to `[600, 86400]`.
+    #[serde(default)]
+    pub sa_token_ttl_secs: Option<i64>,
     #[serde(default)]
     pub guest_tls_ca: Option<PathBuf>,
     #[serde(default)]
@@ -133,6 +140,12 @@ pub struct GatewayFileSection {
     pub tls: Option<TlsConfig>,
     #[serde(default)]
     pub oidc: Option<OidcConfig>,
+    #[serde(default)]
+    pub auth: Option<GatewayAuthConfig>,
+    #[serde(default)]
+    pub mtls_auth: Option<MtlsAuthConfig>,
+    #[serde(default)]
+    pub gateway_jwt: Option<GatewayJwtConfig>,
 
     // ── Disallowed-in-file fields ────────────────────────────────────────
     //
@@ -245,8 +258,10 @@ fn inheritable_keys(driver: ComputeDriverKind) -> &'static [&'static str] {
             "default_image",
             "supervisor_image",
             "client_tls_secret_name",
+            "service_account_name",
             "host_gateway_ip",
             "enable_user_namespaces",
+            "sa_token_ttl_secs",
         ],
         ComputeDriverKind::Docker => &[
             "sandbox_namespace",
@@ -260,6 +275,7 @@ fn inheritable_keys(driver: ComputeDriverKind) -> &'static [&'static str] {
         ComputeDriverKind::Podman => &[
             "default_image",
             "supervisor_image",
+            "host_gateway_ip",
             "guest_tls_ca",
             "guest_tls_cert",
             "guest_tls_key",
@@ -279,8 +295,10 @@ fn gateway_inherited_value(g: &GatewayFileSection, key: &str) -> Option<toml::Va
         "default_image" => g.default_image.as_deref().map(string_value),
         "supervisor_image" => g.supervisor_image.as_deref().map(string_value),
         "client_tls_secret_name" => g.client_tls_secret_name.as_deref().map(string_value),
+        "service_account_name" => g.service_account_name.as_deref().map(string_value),
         "host_gateway_ip" => g.host_gateway_ip.as_deref().map(string_value),
         "enable_user_namespaces" => g.enable_user_namespaces.map(toml::Value::Boolean),
+        "sa_token_ttl_secs" => g.sa_token_ttl_secs.map(toml::Value::Integer),
         "guest_tls_ca" => g.guest_tls_ca.as_deref().map(path_value),
         "guest_tls_cert" => g.guest_tls_cert.as_deref().map(path_value),
         "guest_tls_key" => g.guest_tls_key.as_deref().map(path_value),
@@ -334,6 +352,7 @@ sandbox_namespace = "agents"
 default_image = "ghcr.io/nvidia/openshell/sandbox:latest"
 supervisor_image = "ghcr.io/nvidia/openshell/supervisor:latest"
 client_tls_secret_name = "openshell-sandbox-tls"
+service_account_name = "openshell-sandbox"
 
 [openshell.gateway.tls]
 cert_path = "/etc/openshell/certs/gateway.pem"
@@ -362,6 +381,18 @@ grpc_endpoint = "https://openshell-gateway.agents.svc:8080"
     }
 
     #[test]
+    fn parses_gateway_auth_config() {
+        let toml = r"
+[openshell.gateway.auth]
+allow_unauthenticated_users = true
+";
+        let tmp = write_tmp(toml);
+        let file = load(tmp.path()).expect("valid auth config parses");
+        let auth = file.openshell.gateway.auth.expect("auth config");
+        assert!(auth.allow_unauthenticated_users);
+    }
+
+    #[test]
     fn rejects_database_url_in_file() {
         let toml = r#"
 [openshell.gateway]
@@ -386,6 +417,26 @@ nonsense = true
 ";
         let tmp = write_tmp(toml);
         let err = load(tmp.path()).expect_err("unknown field must be rejected");
+        assert!(matches!(err, ConfigFileError::Parse { .. }));
+    }
+
+    #[test]
+    fn rejects_unknown_field_in_nested_gateway_jwt_table() {
+        // Regression guard for the class of silent-misconfig bug fixed in
+        // PR #1661: a key indented under the wrong table header (here,
+        // `sandbox_namespace` landing under `[openshell.gateway.gateway_jwt]`
+        // instead of `[openshell.gateway]`) must be rejected rather than
+        // silently ignored.
+        let toml = r#"
+[openshell.gateway.gateway_jwt]
+signing_key_path = "/tmp/jwt/signing.pem"
+public_key_path = "/tmp/jwt/public.pem"
+kid_path = "/tmp/jwt/kid"
+sandbox_namespace = "agents"
+"#;
+        let tmp = write_tmp(toml);
+        let err = load(tmp.path())
+            .expect_err("unknown field in nested gateway_jwt table must be rejected");
         assert!(matches!(err, ConfigFileError::Parse { .. }));
     }
 
@@ -465,6 +516,25 @@ version = 2
         assert_eq!(
             table.get("host_gateway_ip").and_then(|v| v.as_str()),
             Some("10.0.0.1")
+        );
+    }
+
+    #[test]
+    fn podman_driver_table_inherits_gateway_host_gateway_ip() {
+        let gateway = GatewayFileSection {
+            default_image: Some("ghcr.io/nvidia/openshell/sandbox:0.9".to_string()),
+            host_gateway_ip: Some("192.168.127.254".to_string()),
+            ..Default::default()
+        };
+        let merged = driver_table(ComputeDriverKind::Podman, &gateway, None);
+        let table = merged.as_table().expect("table");
+        assert_eq!(
+            table.get("default_image").and_then(|v| v.as_str()),
+            Some("ghcr.io/nvidia/openshell/sandbox:0.9")
+        );
+        assert_eq!(
+            table.get("host_gateway_ip").and_then(|v| v.as_str()),
+            Some("192.168.127.254")
         );
     }
 

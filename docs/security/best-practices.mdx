@@ -16,7 +16,7 @@ For the full policy YAML schema, refer to the [Policy Schema](/reference/policy-
 For the architecture of each enforcement layer, refer to [How OpenShell Works](/about/how-it-works).
 
 <Note>
-If you use [NemoClaw](https://github.com/NVIDIA/NemoClaw) to run OpenClaw assistants, its [Security Best Practices](https://docs.nvidia.com/nemoclaw/latest/security/best-practices.html) guide covers additional entrypoint-level controls, policy presets, provider trust tiers, and posture profiles specific to the NemoClaw blueprint.
+If you use [NemoClaw](https://github.com/NVIDIA/NemoClaw), its [Security Best Practices](https://docs.nvidia.com/nemoclaw/latest/security/best-practices.html) guide covers additional entrypoint-level controls, policy presets, provider trust tiers, and posture profiles specific to the NemoClaw blueprint.
 
 </Note>
 
@@ -127,14 +127,14 @@ This enables credential injection and L7 inspection without explicit configurati
 
 ### SSRF Protection
 
-After OPA policy allows a connection, the proxy resolves DNS and rejects connections where the resolved IP is internal (loopback, link-local, or RFC 1918 private).
+After OPA policy allows a connection, the proxy resolves DNS and rejects undeclared internal destinations.
 
 | Aspect | Detail |
 |---|---|
-| Default | The proxy blocks all private IPs. Loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), and unspecified (`0.0.0.0`) addresses are always blocked and cannot be overridden with `allowed_ips`. |
-| What you can change | Add `allowed_ips` (CIDR notation) to an endpoint to permit connections to specific private IP ranges. On Linux, the proxy consults the sandbox's `/etc/hosts` before DNS, so Kubernetes `hostAliases` can make LAN-only hostnames resolvable. Policies with `allowed_ips` entries that overlap loopback, link-local, or unspecified addresses fail to load with a clear validation error. |
+| Default | The proxy blocks private IPs for undeclared, wildcard, hostless, and policy-advisor-proposed endpoints. Exact hostnames declared in user policy may resolve to private RFC 1918 addresses. Loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), and unspecified (`0.0.0.0`) addresses are always blocked and cannot be overridden with `allowed_ips`. |
+| What you can change | Declare a known internal service as an exact `host` endpoint, or add `allowed_ips` (CIDR notation) to an endpoint to permit specific private IP ranges for wildcard or hostless policies. On Linux, the proxy consults the sandbox's `/etc/hosts` before DNS, so Kubernetes `hostAliases` can make LAN-only hostnames resolvable. Policies with `allowed_ips` entries that overlap loopback, link-local, or unspecified addresses fail to load with a clear validation error. |
 | Risk if relaxed | Without SSRF protection, a misconfigured policy could allow the agent to reach cloud metadata services (`169.254.169.254`), internal databases, or other infrastructure endpoints through DNS rebinding. |
-| Recommendation | Use `allowed_ips` only for known internal services. Scope the CIDR as narrowly as possible (for example, `10.0.5.20/32` for a single host). Loopback, link-local, and unspecified addresses are always blocked regardless of `allowed_ips`. `hostAliases` change resolution, not authorization: `host: searxng.local` with `/etc/hosts` mapping to `192.168.1.105` still needs `allowed_ips: ["192.168.1.105/32"]`. The policy advisor does not propose rules for always-blocked destinations. |
+| Recommendation | Prefer exact hostname endpoints for stable internal services. Use `allowed_ips` when you need hostless or wildcard authorization, and scope the CIDR as narrowly as possible (for example, `10.0.5.20/32` for a single host). Loopback, link-local, and unspecified addresses are always blocked regardless of `allowed_ips`. `hostAliases` change resolution, not authorization: `host: searxng.local` with `/etc/hosts` mapping to `192.168.1.105` is trusted only when that exact hostname is declared by user policy. The policy advisor does not propose rules for always-blocked destinations and still requires a separate `allowed_ips` edit for private-IP endpoints. |
 
 ### Operator Approval
 
@@ -213,7 +213,7 @@ OpenShell applies seccomp in two phases. A narrow supervisor-startup prelude run
 | Aspect | Detail |
 |---|---|
 | Startup prelude | After privileged bootstrap helpers complete, the supervisor sets `PR_SET_NO_NEW_PRIVS` and synchronizes a seccomp filter across all runtime threads that blocks `mount`, the new mount API syscalls, `pivot_root`, `umount2`, `bpf`, `perf_event_open`, `userfaultfd`, module-loading syscalls, and kexec. This closes the long-lived privileged remount and kernel-surface window while leaving required setup syscalls such as `setns` available. |
-| Socket domains | The filter allows `AF_INET` and `AF_INET6` (for proxy communication) and blocks `AF_NETLINK`, `AF_PACKET`, `AF_BLUETOOTH`, and `AF_VSOCK` with `EPERM`. |
+| Socket domains | The filter allows `AF_INET` and `AF_INET6` (for proxy communication) and blocks `AF_PACKET`, `AF_BLUETOOTH`, and `AF_VSOCK` with `EPERM`. `AF_NETLINK` is partially allowed: only `NETLINK_ROUTE` (protocol 0) is permitted so that `getifaddrs(3)` works; all other netlink protocols are blocked. Write operations via `NETLINK_ROUTE` still require `CAP_NET_ADMIN`, which the sandbox does not grant. |
 | Runtime unconditional syscall blocks | `memfd_create`, `ptrace`, `bpf`, `process_vm_readv`, `process_vm_writev`, `pidfd_open`, `pidfd_getfd`, `pidfd_send_signal`, `io_uring_setup`, `mount`, `fsopen`, `fsconfig`, `fsmount`, `fspick`, `move_mount`, `open_tree`, `setns`, `umount2`, `pivot_root`, `userfaultfd`, `perf_event_open`. |
 | Conditional syscall blocks | `execveat` with `AT_EMPTY_PATH`, `unshare` and `clone` with `CLONE_NEWUSER`, and `seccomp(SECCOMP_SET_MODE_FILTER)` are denied with `EPERM`. |
 | What you can change | This is not a user-facing knob. OpenShell enforces it automatically. |
@@ -256,19 +256,18 @@ The gateway secures communication between the CLI, sandbox workloads, and extern
 
 ### mTLS
 
-Communication between the CLI, sandbox workloads, and the gateway is secured by mutual TLS.
-For Helm deployments, provide a CA and certificate bundle through the Kubernetes secrets consumed by the chart.
+Gateway transport uses TLS, with client certificate checks available where the deployment provides a client CA. Local single-user Docker, Podman, and VM gateways can use the verified client certificate as user authentication. Kubernetes deployments use the certificate bundle for transport and sandbox supervisor connectivity only; configure OIDC or a trusted access proxy for user authentication.
 
 | Aspect | Detail |
 |---|---|
-| Default | mTLS required for gateway APIs and sandbox callbacks. TLS-enabled loopback gateways also accept plaintext HTTP for sandbox service hostnames by default. |
-| What you can change | Enable dual-auth mode (`allow_unauthenticated=true`) for Cloudflare Tunnel deployments, disable TLS entirely for trusted reverse-proxy setups, or disable loopback service HTTP with `--enable-loopback-service-http=false`. |
-| Risk if relaxed | Dual-auth mode accepts clients without certificates and defers authentication to the HTTP layer (Cloudflare JWT). Disabling TLS removes transport-level authentication entirely. Loopback service HTTP is local-only and rejects cross-origin browser requests, but any local process can still reach exposed service URLs directly. |
-| Recommendation | Use mTLS (the default) unless deploying behind Cloudflare or a trusted reverse proxy. |
+| Default | Local TLS bundles enable mTLS user authentication for single-user local gateways. Helm deployments generate mTLS certificates for transport, while sandbox supervisors authenticate API calls with gateway-minted sandbox JWTs. TLS-enabled loopback gateways also accept plaintext HTTP for sandbox service hostnames by default. |
+| What you can change | Configure OIDC or a trusted access proxy for multi-user gateways, set `OPENSHELL_ENABLE_MTLS_AUTH=true` for local single-user gateways, enable `server.auth.allowUnauthenticatedUsers=true` only for trusted local Kubernetes development or a fully trusted proxy, disable TLS only for trusted reverse-proxy setups, or disable loopback service HTTP with `--enable-loopback-service-http=false`. |
+| Risk if relaxed | Disabling TLS removes transport-level protection entirely. Allowing unauthenticated users removes the gateway user-auth boundary and must not be exposed to shared or public networks. Treating transport certificates as shared user identity in Kubernetes would collapse user and sandbox trust boundaries. Loopback service HTTP is local-only and rejects cross-origin browser requests, but any local process can still reach exposed service URLs directly. |
+| Recommendation | Use local mTLS user authentication only for single-user Docker, Podman, and VM gateways. Use OIDC or a trusted access proxy for Kubernetes and shared deployments. |
 
 ### SSH Tunnel Authentication
 
-SSH connections to sandboxes travel through the gateway over the sandbox's existing mTLS session. On top of the gateway's transport authentication (mTLS by default), each SSH connect call also carries a short-lived session token scoped to a specific sandbox. The sandbox never exposes an SSH port on the network. Its SSH daemon listens on a local Unix socket that only the sandbox's own supervisor process can reach.
+SSH connections to sandboxes travel through the gateway over the sandbox supervisor's authenticated control path. Each SSH connect call also carries a short-lived session token scoped to a specific sandbox. The sandbox never exposes an SSH port on the network. Its SSH daemon listens on a local Unix socket that only the sandbox's own supervisor process can reach.
 
 | Aspect | Detail |
 |---|---|

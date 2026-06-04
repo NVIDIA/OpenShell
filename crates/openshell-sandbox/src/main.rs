@@ -24,6 +24,15 @@ use openshell_sandbox::run_sandbox;
 /// performs the copy in pure Rust.
 const COPY_SELF_SUBCOMMAND: &str = "copy-self";
 
+/// Subcommand for one-shot debug RPCs from inside a sandbox container.
+///
+/// Reads the same token sources as the supervisor (env, file, K8s SA
+/// bootstrap) and issues a single gRPC call against the gateway. Useful
+/// for end-to-end verification: e.g. `docker exec` into a sandbox, then
+/// run `openshell-sandbox debug-rpc get-sandbox-config --sandbox-id <other>`
+/// to confirm the cross-sandbox IDOR guard fires.
+const DEBUG_RPC_SUBCOMMAND: &str = "debug-rpc";
+
 /// `OpenShell` Sandbox - process isolation and monitoring.
 #[derive(Parser, Debug)]
 #[command(name = "openshell-sandbox")]
@@ -148,6 +157,20 @@ fn main() -> Result<()> {
             miette::miette!("usage: openshell-sandbox {COPY_SELF_SUBCOMMAND} <DEST>")
         })?;
         return copy_self(dest);
+    }
+
+    // Handle `debug-rpc <subcommand> [args]` before clap. Uses a small
+    // dedicated runtime so we don't pay the supervisor's full startup cost.
+    if raw_args.get(1).map(String::as_str) == Some(DEBUG_RPC_SUBCOMMAND) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .into_diagnostic()?;
+        return runtime.block_on(async move {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let exit = openshell_sandbox::debug_rpc::run(&raw_args[2..]).await?;
+            std::process::exit(exit);
+        });
     }
 
     let args = Args::parse();

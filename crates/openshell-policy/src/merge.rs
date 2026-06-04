@@ -392,17 +392,36 @@ fn add_rule(
         incoming_rule.name = rule_name.to_string();
     }
 
+    // Endpoint-overlap fallback: when a chunk arrives with a new rule_name
+    // that doesn't already exist, fold it into a same-host/port rule if one
+    // is present. This is intentional for user-authored policies (incremental
+    // refinements live under one rule name).
+    //
+    // Provider-injected rules (`_provider_*` — see `compose.rs::provider_rule_name`)
+    // are deliberately EXCLUDED from this fallback. Provider profiles supply a
+    // baseline layer that should stay separate from agent/user contributions;
+    // merging an agent's narrow proposal into a provider's broad rule would
+    // (a) expand the provider rule's `access` shorthand into wildcard
+    // `path: "**"` rules at the prover's input, masking the agent's narrow
+    // scope behind the existing broad coverage, and (b) silently widen the
+    // provider rule's binary list. The agent's contribution is kept on its
+    // own rule key, the prover sees the actual narrow proposal, and the
+    // reviewer gets honest signal about what's being added.
     let target_key = if policy.network_policies.contains_key(rule_name) {
         Some(rule_name.to_string())
     } else {
         let mut keys: Vec<_> = policy.network_policies.keys().cloned().collect();
         keys.sort();
-        keys.into_iter().find(|key| {
-            policy
-                .network_policies
-                .get(key)
-                .is_some_and(|existing_rule| rules_share_endpoint(existing_rule, &incoming_rule))
-        })
+        keys.into_iter()
+            .filter(|k| !k.starts_with("_provider_"))
+            .find(|key| {
+                policy
+                    .network_policies
+                    .get(key)
+                    .is_some_and(|existing_rule| {
+                        rules_share_endpoint(existing_rule, &incoming_rule)
+                    })
+            })
     };
 
     if let Some(key) = target_key {
@@ -537,6 +556,7 @@ fn merge_endpoint(
     existing.allow_encoded_slash |= incoming.allow_encoded_slash;
     existing.websocket_credential_rewrite |= incoming.websocket_credential_rewrite;
     existing.request_body_credential_rewrite |= incoming.request_body_credential_rewrite;
+    existing.advisor_proposed |= incoming.advisor_proposed;
     normalize_endpoint(existing);
     Ok(())
 }
@@ -619,15 +639,28 @@ fn find_endpoint_mut<'a>(
     host: &str,
     port: u32,
 ) -> Option<&'a mut NetworkEndpoint> {
+    // `_provider_*` rules are excluded from this lookup for the same reason
+    // they're excluded from `add_rule`'s endpoint-overlap fallback: callers
+    // (`AddAllowRules`, `AddDenyRules`) must not mutate provider-injected
+    // rules in place. If the operation should target a provider rule, the
+    // caller should reference it by its exact name through the merge ops
+    // that take a `rule_name`. Defense-in-depth: even if a future caller
+    // accidentally passes a composed policy here, `AddAllowRules` would no
+    // longer be able to expand a provider rule's `access` shorthand into
+    // wildcard `path: "**"` rules (which would mask the prover's narrowness
+    // verdict on agent contributions).
     let mut keys: Vec<_> = policy.network_policies.keys().cloned().collect();
     keys.sort();
-    let target_key = keys.into_iter().find(|key| {
-        policy.network_policies.get(key).is_some_and(|rule| {
-            rule.endpoints
-                .iter()
-                .any(|endpoint| endpoint_matches_host_port(endpoint, host, port))
-        })
-    })?;
+    let target_key = keys
+        .into_iter()
+        .filter(|k| !k.starts_with("_provider_"))
+        .find(|key| {
+            policy.network_policies.get(key).is_some_and(|rule| {
+                rule.endpoints
+                    .iter()
+                    .any(|endpoint| endpoint_matches_host_port(endpoint, host, port))
+            })
+        })?;
 
     policy
         .network_policies
@@ -723,6 +756,12 @@ fn expand_access_preset(protocol: &str, access: &str) -> Option<Vec<L7Rule>> {
 fn append_unique_binaries(existing: &mut Vec<NetworkBinary>, incoming: &[NetworkBinary]) {
     let mut seen: HashSet<String> = existing.iter().map(|binary| binary.path.clone()).collect();
     for binary in incoming {
+        if let Some(existing_binary) = existing.iter_mut().find(|item| item.path == binary.path) {
+            if !is_advisor_proposed_binary(binary) {
+                mark_user_declared_binary(existing_binary);
+            }
+            continue;
+        }
         if seen.insert(binary.path.clone()) {
             existing.push(binary.clone());
         }
@@ -778,8 +817,30 @@ fn dedup_strings(values: &mut Vec<String>) {
 }
 
 fn dedup_binaries(values: &mut Vec<NetworkBinary>) {
-    let mut seen = HashSet::new();
-    values.retain(|binary| seen.insert(binary.path.clone()));
+    let mut deduped: Vec<NetworkBinary> = Vec::with_capacity(values.len());
+    for binary in std::mem::take(values) {
+        if let Some(existing) = deduped.iter_mut().find(|item| item.path == binary.path) {
+            if !is_advisor_proposed_binary(&binary) {
+                mark_user_declared_binary(existing);
+            }
+        } else {
+            deduped.push(binary);
+        }
+    }
+    *values = deduped;
+}
+
+fn is_advisor_proposed_binary(binary: &NetworkBinary) -> bool {
+    #[allow(deprecated)]
+    let advisor_proposed = binary.harness;
+    advisor_proposed
+}
+
+fn mark_user_declared_binary(binary: &mut NetworkBinary) {
+    #[allow(deprecated)]
+    {
+        binary.harness = false;
+    }
 }
 
 fn dedup_l7_rules(values: &mut Vec<L7Rule>) {
@@ -878,6 +939,18 @@ mod tests {
         }
     }
 
+    fn advisor_binary(path: &str) -> NetworkBinary {
+        let mut binary = NetworkBinary {
+            path: path.to_string(),
+            ..Default::default()
+        };
+        #[allow(deprecated)]
+        {
+            binary.harness = true;
+        }
+        binary
+    }
+
     fn rest_rule(method: &str, path: &str) -> L7Rule {
         L7Rule {
             allow: Some(L7Allow {
@@ -947,6 +1020,131 @@ mod tests {
         assert_eq!(endpoint.enforcement, "enforce");
         assert_eq!(endpoint.rules.len(), 1);
         assert_eq!(rule.binaries.len(), 2);
+    }
+
+    #[test]
+    fn add_rule_user_binary_clears_advisor_marker_for_same_path() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "existing".to_string(),
+            NetworkPolicyRule {
+                name: "existing".to_string(),
+                endpoints: vec![endpoint("api.github.com", 443)],
+                binaries: vec![advisor_binary("/usr/bin/curl")],
+            },
+        );
+
+        let incoming = NetworkPolicyRule {
+            name: "incoming".to_string(),
+            endpoints: vec![endpoint("api.github.com", 443)],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        let result = merge_policy(
+            policy,
+            &[PolicyMergeOp::AddRule {
+                rule_name: "existing".to_string(),
+                rule: incoming,
+            }],
+        )
+        .expect("merge should succeed");
+
+        let rule = &result.policy.network_policies["existing"];
+        assert_eq!(rule.binaries.len(), 1);
+        #[allow(deprecated)]
+        {
+            assert!(!rule.binaries[0].harness);
+        }
+    }
+
+    #[test]
+    fn add_rule_duplicate_binaries_prefer_user_declared_marker() {
+        let incoming = NetworkPolicyRule {
+            name: "incoming".to_string(),
+            endpoints: vec![endpoint("api.github.com", 443)],
+            binaries: vec![
+                advisor_binary("/usr/bin/curl"),
+                NetworkBinary {
+                    path: "/usr/bin/curl".to_string(),
+                    ..Default::default()
+                },
+            ],
+        };
+
+        let result = merge_policy(
+            restrictive_default_policy(),
+            &[PolicyMergeOp::AddRule {
+                rule_name: "github".to_string(),
+                rule: incoming,
+            }],
+        )
+        .expect("merge should succeed");
+
+        let rule = &result.policy.network_policies["github"];
+        assert_eq!(rule.binaries.len(), 1);
+        #[allow(deprecated)]
+        {
+            assert!(!rule.binaries[0].harness);
+        }
+    }
+
+    #[test]
+    fn add_rule_preserves_advisor_endpoint_marker_when_binary_is_deduped() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "app-api".to_string(),
+            NetworkPolicyRule {
+                name: "app-api".to_string(),
+                endpoints: vec![endpoint("api.example.com", 443)],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/python".to_string(),
+                    ..Default::default()
+                }],
+            },
+        );
+
+        let incoming = NetworkPolicyRule {
+            name: "app-api".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "internal-admin.local".to_string(),
+                port: 443,
+                ports: vec![443],
+                advisor_proposed: true,
+                ..Default::default()
+            }],
+            binaries: vec![advisor_binary("/usr/bin/python")],
+        };
+
+        let result = merge_policy(
+            policy,
+            &[PolicyMergeOp::AddRule {
+                rule_name: "app-api".to_string(),
+                rule: incoming,
+            }],
+        )
+        .expect("merge should succeed");
+
+        let rule = &result.policy.network_policies["app-api"];
+        assert_eq!(rule.binaries.len(), 1, "binary should still dedupe");
+        #[allow(deprecated)]
+        {
+            assert!(
+                !rule.binaries[0].harness,
+                "existing user binary provenance should be retained"
+            );
+        }
+        let internal_endpoint = rule
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.host == "internal-admin.local")
+            .expect("advisor endpoint should be appended");
+        assert!(
+            internal_endpoint.advisor_proposed,
+            "endpoint provenance must survive merge even when binary provenance is deduped"
+        );
     }
 
     #[test]
@@ -1569,6 +1767,161 @@ mod tests {
                 .policy
                 .network_policies
                 .contains_key("allow_api_example_com_443")
+        );
+    }
+
+    /// Provider-injected rules (`_provider_*`) are excluded from the
+    /// endpoint-overlap fallback: an agent chunk for the same `(host, port)`
+    /// as a provider rule lands as its own key instead of being merged into
+    /// the provider's rule. This keeps agent contributions honestly narrow
+    /// (no silent expansion via the provider rule's `access` shorthand) and
+    /// preserves binary-list separation.
+    #[test]
+    fn add_rule_does_not_merge_agent_chunk_into_provider_rule() {
+        use crate::compose::{ProviderPolicyLayer, compose_effective_policy};
+        use openshell_core::proto::SandboxPolicy;
+
+        // Compose a policy where the github provider profile contributes a
+        // `_provider_*` rule for api.github.com with `access: read-write`
+        // and gh/git binaries.
+        let provider_rule = NetworkPolicyRule {
+            name: "_provider_work_github".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "api.github.com".to_string(),
+                port: 443,
+                protocol: "rest".to_string(),
+                enforcement: "enforce".to_string(),
+                access: "read-write".to_string(),
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/gh".to_string(),
+                ..Default::default()
+            }],
+        };
+        let composed = compose_effective_policy(
+            &SandboxPolicy::default(),
+            &[ProviderPolicyLayer {
+                rule_name: "_provider_work_github".to_string(),
+                rule: provider_rule,
+            }],
+        );
+        assert!(
+            composed
+                .network_policies
+                .contains_key("_provider_work_github"),
+            "precondition: provider rule must be present in baseline"
+        );
+
+        // Agent submits a narrow PUT rule targeting the same host/port via
+        // curl. Without the filter, this would merge into the provider rule.
+        let agent_rule = NetworkPolicyRule {
+            name: "github_contents_put".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "api.github.com".to_string(),
+                port: 443,
+                protocol: "rest".to_string(),
+                enforcement: "enforce".to_string(),
+                rules: vec![rest_rule("PUT", "/repos/owner/repo/contents/file.md")],
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+        let result = merge_policy(
+            composed,
+            &[PolicyMergeOp::AddRule {
+                rule_name: "github_contents_put".to_string(),
+                rule: agent_rule,
+            }],
+        )
+        .expect("merge should succeed");
+
+        // The agent's chunk lands as its own rule key.
+        assert!(
+            result
+                .policy
+                .network_policies
+                .contains_key("github_contents_put"),
+            "agent chunk must land as a separate rule (not merged into the provider rule); \
+             got keys: {:?}",
+            result.policy.network_policies.keys().collect::<Vec<_>>()
+        );
+
+        // The provider rule is unchanged: still has only gh as a binary
+        // (no silent broadening), still has the read-write shorthand
+        // intact (no preset expansion into wildcard paths).
+        let provider_rule_after = result
+            .policy
+            .network_policies
+            .get("_provider_work_github")
+            .expect("provider rule must still be present");
+        assert_eq!(
+            provider_rule_after.binaries.len(),
+            1,
+            "provider rule's binary list must NOT have been merged with the agent's binaries"
+        );
+        assert_eq!(provider_rule_after.binaries[0].path, "/usr/bin/gh");
+        assert_eq!(
+            provider_rule_after.endpoints[0].access, "read-write",
+            "provider rule's `access` shorthand must remain intact"
+        );
+        assert!(
+            provider_rule_after.endpoints[0].rules.is_empty(),
+            "provider rule must NOT have had its access expanded into explicit wildcard rules"
+        );
+
+        // The agent's rule retains its narrow scope.
+        let agent_rule_after = &result.policy.network_policies["github_contents_put"];
+        assert_eq!(agent_rule_after.binaries[0].path, "/usr/bin/curl");
+        assert_eq!(agent_rule_after.endpoints[0].rules.len(), 1);
+    }
+
+    /// Non-provider rules still merge by endpoint overlap when the incoming
+    /// `rule_name` doesn't match an existing key. This preserves the
+    /// long-standing behavior for user-authored and mechanistic chunks.
+    #[test]
+    fn add_rule_still_merges_user_chunk_into_user_rule_by_endpoint_overlap() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "custom_github".to_string(),
+            rule_with_endpoint("custom_github", "api.github.com", 443),
+        );
+
+        let incoming = NetworkPolicyRule {
+            name: "ignored_when_merging".to_string(),
+            endpoints: vec![endpoint("api.github.com", 443)],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+        let result = merge_policy(
+            policy,
+            &[PolicyMergeOp::AddRule {
+                rule_name: "different_name".to_string(),
+                rule: incoming,
+            }],
+        )
+        .expect("merge should succeed");
+
+        // No new rule entry was created — the chunk merged into the
+        // existing user rule via endpoint overlap.
+        assert!(
+            !result
+                .policy
+                .network_policies
+                .contains_key("different_name"),
+            "user-authored rule overlap should still merge (no new key); \
+             got keys: {:?}",
+            result.policy.network_policies.keys().collect::<Vec<_>>()
+        );
+        let merged = &result.policy.network_policies["custom_github"];
+        assert!(
+            merged.binaries.iter().any(|b| b.path == "/usr/bin/curl"),
+            "user rule should have absorbed the incoming curl binary"
         );
     }
 }

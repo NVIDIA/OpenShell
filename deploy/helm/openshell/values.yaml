@@ -48,6 +48,14 @@ serviceAccount:
   # -- Existing service account name to use when serviceAccount.create is false.
   name: ""
 
+sandboxServiceAccount:
+  # -- Create a service account for sandbox pods.
+  create: true
+  # -- Annotations to add to the generated sandbox service account.
+  annotations: {}
+  # -- Existing service account name for sandbox pods when sandboxServiceAccount.create is false.
+  name: ""
+
 # -- Extra annotations to add to the gateway pod.
 podAnnotations: {}
 # -- Extra labels to add to the gateway pod.
@@ -130,18 +138,32 @@ server:
   # -- Namespace where sandbox pods are created. Defaults to the Helm release
   # namespace (.Release.Namespace) when left empty.
   sandboxNamespace: ""
-  # -- Gateway database URL.
+  # -- Gateway database URL (used for the default SQLite backend).
   dbUrl: "sqlite:/var/openshell/openshell.db"
+  # -- Name of a pre-existing Opaque Secret containing a PostgreSQL
+  # connection URI (key: uri). When set, the gateway reads OPENSHELL_DB_URL
+  # from this Secret instead of using dbUrl. The Secret must contain a
+  # `uri` key, e.g. postgresql://user:pass@host:5432/dbname.
+  externalDbSecret: ""
   # -- Default sandbox image used when requests do not specify one.
   sandboxImage: "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
   # -- Kubernetes imagePullPolicy for sandbox pods. Empty = Kubernetes default
   # (Always for :latest, IfNotPresent otherwise). Set to "Always" for dev
   # clusters so new images are picked up without manual eviction.
   sandboxImagePullPolicy: ""
+  # -- Image pull secrets attached to sandbox pods. Referenced Secrets must exist
+  # in the sandbox namespace.
+  sandboxImagePullSecrets: []
   # -- Default storage size for the workspace PVC in sandbox pods.
   # Uses Kubernetes quantity syntax (e.g. "2Gi", "10Gi", "500Mi").
   # Empty = built-in default (2Gi).
   workspaceDefaultStorageSize: ""
+  # -- Default Kubernetes runtimeClassName for sandbox pods.
+  # Applied when a CreateSandbox request does not specify one.
+  # Empty (default) = omit the field, using the cluster's default RuntimeClass.
+  # Set to a RuntimeClass name (e.g. "kata-containers", "nvidia") to apply it
+  # to all sandboxes that don't explicitly override it.
+  defaultRuntimeClassName: ""
   # -- gRPC endpoint sandboxes call back into the gateway. Leave empty to derive
   # it from the chart fullname, release namespace, service port, and
   # disableTls flag, for example https://openshell.openshell.svc.cluster.local:8080.
@@ -167,6 +189,11 @@ server:
   # -- Enable plaintext HTTP routing for loopback sandbox service URLs on
   # TLS-enabled gateways.
   enableLoopbackServiceHttp: true
+  auth:
+    # -- UNSAFE: accept unauthenticated CLI/user requests as a local developer
+    # principal. Intended only for trusted local Skaffold/k3d development or a
+    # fully trusted fronting proxy. Leave false for shared or production clusters.
+    allowUnauthenticatedUsers: false
   tls:
     # -- K8s secret (type kubernetes.io/tls) with tls.crt and tls.key for the server.
     certSecretName: openshell-server-tls
@@ -175,6 +202,30 @@ server:
     clientCaSecretName: openshell-server-client-ca
     # -- K8s secret mounted into sandbox pods for mTLS to the server.
     clientTlsSecretName: openshell-client-tls
+  # Gateway-minted sandbox JWT signing keys. The certgen hook generates an
+  # Ed25519 keypair and writes it to a secret containing signing.pem (PKCS#8),
+  # public.pem (SPKI), and kid (plain text). The hook runs in full PKI mode when
+  # pkiInitJob.enabled=true unless certManager.enabled=true, which takes
+  # precedence and runs the hook in JWT-only mode.
+  sandboxJwt:
+    # -- Name of the Opaque Secret holding the signing key material. Empty
+    # falls back to the chart fullname with "-jwt-keys" appended.
+    signingSecretName: ""
+    # -- Stable gateway identity embedded in iss/aud of every minted token.
+    # Defaults to the release name so HA replicas share identity.
+    gatewayId: ""
+    # -- Token TTL in seconds. Defaults to 3600 (1h).
+    ttlSecs: 3600
+    # -- Lifetime (seconds) of the projected ServiceAccount token kubelet
+    # writes into each sandbox pod for the IssueSandboxToken bootstrap
+    # exchange. Kubelet enforces a minimum of 600s; the driver clamps
+    # values outside [600, 86400]. Default 3600 — generous, since the
+    # supervisor consumes the token within seconds of pod start.
+    k8sSaTokenTtlSecs: 3600
+    # -- File mode for the mounted JWT signing key Secret. Default 0400
+    # (owner-read only). Override to 0440 or 0444 if the container UID
+    # does not match the volume file owner.
+    secretDefaultMode: ""
   # OIDC (OpenID Connect) configuration for JWT-based authentication.
   # When issuer is set, the server validates Bearer tokens on gRPC requests.
   oidc:
@@ -200,12 +251,34 @@ server:
     # issuer uses a non-public CA (e.g. OpenShift ingress, private PKI).
     caConfigMapName: ""
 
+# Bundled PostgreSQL backing store (Bitnami subchart).
+# Set enabled=true to deploy a PostgreSQL instance alongside the gateway.
+# For external PostgreSQL, leave enabled=false and set server.externalDbSecret
+# to a pre-existing Secret containing a `uri` key.
+postgres:
+  # -- Deploy the bundled Bitnami PostgreSQL subchart.
+  enabled: false
+  # Values below configure the bundled Bitnami PostgreSQL subchart
+  # (aliased as "postgres" in Chart.yaml). The subchart uses these to
+  # initialise the PostgreSQL instance.
+  auth:
+    username: openshell
+    password: ""
+    database: openshell
+  # Bitnami service-binding Secrets — must stay true. The gateway reads
+  # the connection URI from the subchart-managed Secret.
+  serviceBindings:
+    enabled: true
+  primary:
+    persistence:
+      enabled: true
+
 # NetworkPolicy restricting SSH ingress on sandbox pods to the gateway only.
 networkPolicy:
   # -- Create a NetworkPolicy restricting SSH ingress on sandbox pods to the gateway.
   enabled: true
 
-# PKI bootstrap via a pre-install/pre-upgrade hook Job.
+# Built-in TLS PKI bootstrap via a pre-install/pre-upgrade hook Job.
 # Runs `openshell-gateway generate-certs` to create the server and client TLS
 # Secrets in-cluster. Key material is written directly to K8s Secrets and
 # never appears in Helm release history. Idempotent: existing secrets are
@@ -220,7 +293,9 @@ networkPolicy:
 # that domain, for example `*.apps.example.com` enables
 # `<sandbox>--<service>.apps.example.com`.
 pkiInitJob:
-  # -- Run a pre-install/pre-upgrade Job that creates gateway and client mTLS Secrets.
+  # -- Run a pre-install/pre-upgrade Job that creates gateway and client mTLS
+  # Secrets. When certManager.enabled=true, cert-manager owns TLS and this same
+  # hook runs in JWT-only mode even if pkiInitJob.enabled remains true.
   enabled: true
   # -- Extra DNS SANs to append to the server certificate.
   serverDnsNames: []
@@ -230,7 +305,9 @@ pkiInitJob:
 # cert-manager Certificate/Issuer resources (requires cert-manager CRDs in-cluster).
 # Uses namespaced Issuers only (no ClusterIssuer). Does not install cert-manager itself.
 certManager:
-  # -- Create cert-manager Issuer and Certificate resources instead of using the PKI bootstrap Job.
+  # -- Create cert-manager Issuer and Certificate resources. When enabled,
+  # cert-manager owns TLS and the chart runs a JWT-only certgen hook to create
+  # the sandbox JWT signing Secret that cert-manager does not manage.
   enabled: false
   # -- Secret created for the intermediate CA (Certificate with isCA: true).
   caSecretName: openshell-ca-tls

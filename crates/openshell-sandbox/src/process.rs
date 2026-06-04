@@ -29,48 +29,104 @@ fn inject_provider_env(cmd: &mut Command, provider_env: &HashMap<String, String>
 }
 
 #[cfg(unix)]
-#[allow(unsafe_code, clippy::borrow_as_ptr)]
 pub fn harden_child_process() -> Result<()> {
-    let core_limit = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    let rc = unsafe { libc::setrlimit(libc::RLIMIT_CORE, &raw const core_limit) };
-    if rc != 0 {
-        return Err(miette::miette!(
-            "Failed to disable core dumps: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
+    use rustix::process::{Resource, Rlimit, setrlimit};
 
-    // Limit process creation to prevent fork bombs. 512 processes per UID is
-    // sufficient for typical agent workloads (shell, compilers, language servers)
-    // while preventing runaway forking. Set as a hard limit so the sandbox user
-    // cannot raise it after privilege drop.
-    let nproc_limit = libc::rlimit {
-        rlim_cur: 512,
-        rlim_max: 512,
-    };
-    let rc = unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &raw const nproc_limit) };
-    if rc != 0 {
-        return Err(miette::miette!(
-            "Failed to set RLIMIT_NPROC: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
+    setrlimit(
+        Resource::Core,
+        Rlimit {
+            current: Some(0),
+            maximum: Some(0),
+        },
+    )
+    .map_err(|e| miette::miette!("Failed to disable core dumps: {e}"))?;
 
     #[cfg(target_os = "linux")]
     {
-        let rc = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
-        if rc != 0 {
-            return Err(miette::miette!(
-                "Failed to set PR_SET_DUMPABLE=0: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
+        use rustix::process::{DumpableBehavior, set_dumpable_behavior};
+        set_dumpable_behavior(DumpableBehavior::NotDumpable)
+            .map_err(|e| miette::miette!("Failed to set PR_SET_DUMPABLE=0: {e}"))?;
     }
 
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+const CGROUP_PIDS_MAX_PATH: &str = "/sys/fs/cgroup/pids.max";
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimePidLimitStatus {
+    Limited(u64),
+    Unlimited,
+    Unavailable(String),
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimePidLimitMode {
+    Warn,
+    Require,
+}
+
+#[cfg(target_os = "linux")]
+pub fn check_runtime_pid_limit(mode: RuntimePidLimitMode) -> Result<()> {
+    check_runtime_pid_limit_status(runtime_pid_limit_status(), mode)
+}
+
+#[cfg(target_os = "linux")]
+fn check_runtime_pid_limit_status(
+    status: RuntimePidLimitStatus,
+    mode: RuntimePidLimitMode,
+) -> Result<()> {
+    match status {
+        RuntimePidLimitStatus::Limited(limit) => {
+            debug!(pids_max = limit, "runtime PID limit detected");
+            Ok(())
+        }
+        RuntimePidLimitStatus::Unlimited => {
+            let message = "runtime cgroup pids.max is unlimited; configure the compute driver or container runtime to enforce a PID limit";
+            if matches!(mode, RuntimePidLimitMode::Require) {
+                Err(miette::miette!(message))
+            } else {
+                tracing::warn!("{message}");
+                Ok(())
+            }
+        }
+        RuntimePidLimitStatus::Unavailable(reason) => {
+            let message = format!(
+                "runtime cgroup pids.max is unavailable ({reason}); configure the compute driver or container runtime to enforce a PID limit"
+            );
+            if matches!(mode, RuntimePidLimitMode::Require) {
+                Err(miette::miette!(message))
+            } else {
+                tracing::warn!("{message}");
+                Ok(())
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn runtime_pid_limit_status() -> RuntimePidLimitStatus {
+    match std::fs::read_to_string(CGROUP_PIDS_MAX_PATH) {
+        Ok(contents) => parse_pids_max(&contents),
+        Err(err) => RuntimePidLimitStatus::Unavailable(err.to_string()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_pids_max(contents: &str) -> RuntimePidLimitStatus {
+    let raw = contents.trim();
+    if raw.eq_ignore_ascii_case("max") {
+        return RuntimePidLimitStatus::Unlimited;
+    }
+    match raw.parse::<u64>() {
+        Ok(limit) => RuntimePidLimitStatus::Limited(limit),
+        Err(err) => {
+            RuntimePidLimitStatus::Unavailable(format!("invalid pids.max value {raw:?}: {err}"))
+        }
+    }
 }
 
 /// Handle to a running process.
@@ -154,6 +210,15 @@ impl ProcessHandle {
             .stderr(Stdio::inherit())
             .kill_on_drop(true)
             .env(openshell_core::sandbox_env::SANDBOX, "1");
+
+        // Strip supervisor-only credentials from the entrypoint's inherited
+        // environment. The entrypoint drops to the sandbox user before
+        // `exec`; without this strip, anything running as the sandbox user
+        // (e.g. an SSH-spawned shell) could read /proc/<entrypoint_pid>/environ
+        // and recover the gateway-minted JWT. Issue #1354.
+        cmd.env_remove(openshell_core::sandbox_env::SANDBOX_TOKEN)
+            .env_remove(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE)
+            .env_remove(openshell_core::sandbox_env::K8S_SA_TOKEN_FILE);
 
         inject_provider_env(&mut cmd, provider_env);
 
@@ -280,6 +345,15 @@ impl ProcessHandle {
             .stderr(Stdio::inherit())
             .kill_on_drop(true)
             .env(openshell_core::sandbox_env::SANDBOX, "1");
+
+        // Strip supervisor-only credentials from the entrypoint's inherited
+        // environment. The entrypoint drops to the sandbox user before
+        // `exec`; without this strip, anything running as the sandbox user
+        // (e.g. an SSH-spawned shell) could read /proc/<entrypoint_pid>/environ
+        // and recover the gateway-minted JWT. Issue #1354.
+        cmd.env_remove(openshell_core::sandbox_env::SANDBOX_TOKEN)
+            .env_remove(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE)
+            .env_remove(openshell_core::sandbox_env::K8S_SA_TOKEN_FILE);
 
         inject_provider_env(&mut cmd, provider_env);
 
@@ -794,6 +868,52 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn harden_child_process_marks_process_nondumpable() {
         assert_eq!(probe_hardened_child(dumpable_flag_probe), 0);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn parse_pids_max_detects_limited_runtime() {
+        assert_eq!(
+            parse_pids_max("2048\n"),
+            RuntimePidLimitStatus::Limited(2048)
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn parse_pids_max_detects_unlimited_runtime() {
+        assert_eq!(parse_pids_max("max\n"), RuntimePidLimitStatus::Unlimited);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn parse_pids_max_reports_invalid_values() {
+        let status = parse_pids_max("not-a-number\n");
+        assert!(matches!(status, RuntimePidLimitStatus::Unavailable(_)));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn pid_limit_require_mode_rejects_missing_guardrail_statuses() {
+        for status in [
+            RuntimePidLimitStatus::Unlimited,
+            RuntimePidLimitStatus::Unavailable("missing".to_string()),
+        ] {
+            let result = check_runtime_pid_limit_status(status, RuntimePidLimitMode::Require);
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn pid_limit_warn_mode_accepts_missing_guardrail_statuses() {
+        for status in [
+            RuntimePidLimitStatus::Unlimited,
+            RuntimePidLimitStatus::Unavailable("missing".to_string()),
+        ] {
+            let result = check_runtime_pid_limit_status(status, RuntimePidLimitMode::Warn);
+            assert!(result.is_ok());
+        }
     }
 
     #[tokio::test]

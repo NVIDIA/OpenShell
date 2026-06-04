@@ -8,11 +8,21 @@ use std::path::{Path, PathBuf};
 
 const SKILLS_RELATIVE_DIR: &str = "etc/openshell/skills";
 const POLICY_ADVISOR_FILE: &str = "policy_advisor.md";
+const POLICY_ADVISOR_SKILL_DIR: &str = "policy-advisor";
+const POLICY_ADVISOR_SKILL_FILE: &str = "SKILL.md";
 const POLICY_ADVISOR_CONTENT: &str = include_str!("skills/policy_advisor.md");
+const POLICY_ADVISOR_SKILL_CONTENT: &str = include_str!("skills/policy-advisor/SKILL.md");
+const AGENTS_FILE: &str = "AGENTS.md";
+const AGENTS_CONTENT: &str = r"# OpenShell Sandbox Guidance
+
+When you see `policy_denied`, do not treat it as final if the user task still needs that request. Read `/etc/openshell/skills/policy_advisor.md` and use `http://policy.local` to submit the narrowest policy proposal, then wait for approval before retrying.
+";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledSkills {
     pub policy_advisor: PathBuf,
+    pub policy_advisor_skill: PathBuf,
+    pub agents: Option<PathBuf>,
 }
 
 pub fn install_static_skills() -> Result<InstalledSkills> {
@@ -24,17 +34,43 @@ fn install_static_skills_at(root: &Path) -> Result<InstalledSkills> {
     std::fs::create_dir_all(&skills_dir).into_diagnostic()?;
 
     let policy_advisor = skills_dir.join(POLICY_ADVISOR_FILE);
-    std::fs::write(&policy_advisor, POLICY_ADVISOR_CONTENT).into_diagnostic()?;
+    write_readonly(&policy_advisor, POLICY_ADVISOR_CONTENT)?;
+
+    let policy_advisor_skill_dir = skills_dir.join(POLICY_ADVISOR_SKILL_DIR);
+    std::fs::create_dir_all(&policy_advisor_skill_dir).into_diagnostic()?;
+    let policy_advisor_skill = policy_advisor_skill_dir.join(POLICY_ADVISOR_SKILL_FILE);
+    write_readonly(&policy_advisor_skill, POLICY_ADVISOR_SKILL_CONTENT)?;
+
+    let agents = install_optional_agents_pointer(root);
+
+    Ok(InstalledSkills {
+        policy_advisor,
+        policy_advisor_skill,
+        agents,
+    })
+}
+
+fn write_readonly(path: &Path, contents: &str) -> Result<()> {
+    std::fs::write(path, contents).into_diagnostic()?;
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
 
-        std::fs::set_permissions(&policy_advisor, std::fs::Permissions::from_mode(0o444))
-            .into_diagnostic()?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o444)).into_diagnostic()?;
     }
+    Ok(())
+}
 
-    Ok(InstalledSkills { policy_advisor })
+fn install_optional_agents_pointer(root: &Path) -> Option<PathBuf> {
+    let agents_path = root.join(AGENTS_FILE);
+    match std::fs::symlink_metadata(&agents_path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            write_readonly(&agents_path, AGENTS_CONTENT).ok()?;
+            Some(agents_path)
+        }
+        Ok(_) | Err(_) => None,
+    }
 }
 
 #[cfg(test)]
@@ -55,7 +91,7 @@ mod tests {
             .join("policy_advisor.md");
         assert_eq!(installed.policy_advisor, expected);
 
-        let content = std::fs::read_to_string(expected).unwrap();
+        let content = std::fs::read_to_string(&expected).unwrap();
         assert!(content.contains("# OpenShell Policy Advisor"));
         assert!(content.contains("policy.local"));
         assert!(content.contains("addRule"));
@@ -71,5 +107,56 @@ mod tests {
         // and re-runs into policy_denied.
         assert!(content.contains("`policy_reloaded: true`"));
         assert!(content.contains("`policy_reloaded: false`"));
+
+        let skill_file = dir
+            .path()
+            .join("etc")
+            .join("openshell")
+            .join("skills")
+            .join("policy-advisor")
+            .join("SKILL.md");
+        assert_eq!(installed.policy_advisor_skill, skill_file);
+        let skill_content = std::fs::read_to_string(&skill_file).unwrap();
+        assert!(skill_content.contains("policy_denied"));
+        assert!(skill_content.contains("policy.local"));
+        assert!(skill_content.contains("/etc/openshell/skills/policy_advisor.md"));
+
+        let agents = installed.agents.expect("AGENTS.md should be installed");
+        assert_eq!(agents, dir.path().join("AGENTS.md"));
+        let agents_content = std::fs::read_to_string(agents).unwrap();
+        assert!(agents_content.contains("policy_denied"));
+        assert!(agents_content.contains("policy.local"));
+    }
+
+    #[test]
+    fn install_static_skills_at_does_not_overwrite_existing_agents_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = dir.path().join("AGENTS.md");
+        std::fs::write(&agents, "keep me").unwrap();
+
+        let installed = install_static_skills_at(dir.path()).unwrap();
+
+        assert_eq!(installed.agents, None);
+        assert_eq!(std::fs::read_to_string(agents).unwrap(), "keep me");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_static_skills_at_treats_broken_agents_symlink_as_existing() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let agents = dir.path().join("AGENTS.md");
+        symlink(dir.path().join("missing-target"), &agents).unwrap();
+
+        let installed = install_static_skills_at(dir.path()).unwrap();
+
+        assert_eq!(installed.agents, None);
+        assert!(
+            std::fs::symlink_metadata(agents)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
     }
 }

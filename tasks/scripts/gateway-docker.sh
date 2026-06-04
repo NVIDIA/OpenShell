@@ -127,6 +127,14 @@ echo "Building openshell-gateway..."
 cargo build ${CARGO_BUILD_JOBS_ARG[@]+"${CARGO_BUILD_JOBS_ARG[@]}"} \
   -p openshell-server --bin openshell-gateway
 
+TLS_DIR="${STATE_DIR}/tls"
+echo "Generating local gateway credentials..."
+"${GATEWAY_BIN}" generate-certs \
+  --output-dir "${TLS_DIR}" \
+  --server-san "127.0.0.1" \
+  --server-san "localhost" \
+  --server-san "host.openshell.internal"
+
 echo "Building openshell-sandbox for ${SUPERVISOR_TARGET}..."
 if [[ "${HOST_OS}" == "Linux" && "${HOST_ARCH}" == "${DAEMON_ARCH}" ]]; then
   # Native Linux build — no cross-toolchain required.
@@ -164,6 +172,16 @@ version = 1
 [openshell.gateway]
 compute_drivers = ["docker"]
 disable_tls = true
+
+[openshell.gateway.auth]
+allow_unauthenticated_users = true
+
+[openshell.gateway.gateway_jwt]
+signing_key_path = "${TLS_DIR}/jwt/signing.pem"
+public_key_path = "${TLS_DIR}/jwt/public.pem"
+kid_path = "${TLS_DIR}/jwt/kid"
+gateway_id = "${GATEWAY_NAME}"
+ttl_secs = 3600
 
 [openshell.drivers.docker]
 default_image = "${SANDBOX_IMAGE}"

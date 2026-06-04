@@ -6,6 +6,55 @@
 //! Each event class has a builder that takes a `SandboxContext` reference
 //! and provides chainable methods for setting event fields.
 
+/// Generate the shared `severity`, `status`, and `message` setter methods that
+/// appear identically on every OCSF event builder in this crate.
+///
+/// # Usage
+/// ```ignore
+/// impl_builder_setters!(MyBuilder);            // severity + status + message
+/// impl_builder_setters!(MyBuilder, no_status); // severity + message only
+/// ```
+macro_rules! impl_builder_setters {
+    ($builder:ident) => {
+        impl<'a> $builder<'a> {
+            /// Set the event severity.
+            #[must_use]
+            pub fn severity(mut self, id: $crate::enums::SeverityId) -> Self {
+                self.severity = id;
+                self
+            }
+            /// Set the overall event status.
+            #[must_use]
+            pub fn status(mut self, id: $crate::enums::StatusId) -> Self {
+                self.status = Some(id);
+                self
+            }
+            /// Set a human-readable event message.
+            #[must_use]
+            pub fn message(mut self, msg: impl Into<String>) -> Self {
+                self.message = Some(msg.into());
+                self
+            }
+        }
+    };
+    ($builder:ident, no_status) => {
+        impl<'a> $builder<'a> {
+            /// Set the event severity.
+            #[must_use]
+            pub fn severity(mut self, id: $crate::enums::SeverityId) -> Self {
+                self.severity = id;
+                self
+            }
+            /// Set a human-readable event message.
+            #[must_use]
+            pub fn message(mut self, msg: impl Into<String>) -> Self {
+                self.message = Some(msg.into());
+                self
+            }
+        }
+    };
+}
+
 mod base;
 mod config;
 mod finding;
@@ -27,6 +76,8 @@ pub use ssh::SshActivityBuilder;
 use std::net::IpAddr;
 
 use crate::OCSF_VERSION;
+use crate::enums::StatusId;
+use crate::events::base_event::BaseEventData;
 use crate::objects::{Container, Device, Endpoint, Image, Metadata, Product};
 
 /// Immutable context created once at sandbox startup.
@@ -86,6 +137,24 @@ impl SandboxContext {
     #[must_use]
     pub fn proxy_endpoint(&self) -> Endpoint {
         Endpoint::from_ip(self.proxy_ip, self.proxy_port)
+    }
+
+    /// Apply the fields common to every builder's `build()` method onto `base`:
+    /// optional status, optional message, device info, and container info.
+    pub fn apply_common_fields(
+        &self,
+        base: &mut BaseEventData,
+        status: Option<StatusId>,
+        message: Option<String>,
+    ) {
+        if let Some(s) = status {
+            base.set_status(s);
+        }
+        if let Some(m) = message {
+            base.set_message(m);
+        }
+        base.set_device(self.device());
+        base.set_container(self.container());
     }
 }
 

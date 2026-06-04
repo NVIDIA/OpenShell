@@ -28,7 +28,6 @@ use openshell_ocsf::{
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
-use tonic::transport::Channel;
 use tracing::{debug, warn};
 
 use crate::grpc_client;
@@ -371,7 +370,7 @@ fn handle_gateway_message(
     sandbox_id: &str,
     ssh_socket_path: &std::path::Path,
     netns_fd: Option<i32>,
-    channel: &Channel,
+    channel: &grpc_client::AuthedChannel,
     tx: &mpsc::Sender<SupervisorMessage>,
 ) {
     match &msg.payload {
@@ -436,7 +435,7 @@ async fn handle_relay_open(
     relay_open: RelayOpen,
     ssh_socket_path: &std::path::Path,
     netns_fd: Option<i32>,
-    channel: Channel,
+    channel: grpc_client::AuthedChannel,
     tx: mpsc::Sender<SupervisorMessage>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let channel_id = relay_open.channel_id.clone();

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=OpenShell
+Comment=OpenShell terminal UI for managing sandboxes and gateways
+Exec=openshell.term
+Icon=${SNAP}/meta/gui/icon.png
+Terminal=true
+Type=Application
+Categories=Development;
+StartupNotify=true

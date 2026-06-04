@@ -4,6 +4,7 @@
 //! Runtime defaults for local gateway installs.
 
 use miette::Result;
+use openshell_core::GatewayJwtConfig;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +35,28 @@ impl LocalTlsPaths {
             &self.client_cert,
             &self.client_key,
         ]
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalJwtPaths {
+    pub signing_key: PathBuf,
+    pub public_key: PathBuf,
+    pub kid: PathBuf,
+}
+
+impl LocalJwtPaths {
+    fn resolve(dir: &Path) -> Self {
+        let jwt = dir.join("jwt");
+        Self {
+            signing_key: jwt.join("signing.pem"),
+            public_key: jwt.join("public.pem"),
+            kid: jwt.join("kid"),
+        }
+    }
+
+    fn files(&self) -> [&Path; 3] {
+        [&self.signing_key, &self.public_key, &self.kid]
     }
 }
 
@@ -70,12 +93,30 @@ pub fn complete_local_tls_paths() -> Result<Option<LocalTlsPaths>> {
     }
 }
 
+pub fn complete_local_jwt_config() -> Result<Option<GatewayJwtConfig>> {
+    let dir = default_local_tls_dir()?;
+    let paths = LocalJwtPaths::resolve(&dir);
+    let present = paths.files().iter().filter(|path| path.is_file()).count();
+    match present {
+        0 => Ok(None),
+        3 => Ok(Some(GatewayJwtConfig {
+            signing_key_path: paths.signing_key,
+            public_key_path: paths.public_key,
+            kid_path: paths.kid,
+            gateway_id: "openshell".to_string(),
+            ttl_secs: 0,
+        })),
+        _ => Err(miette::miette!(
+            "partial local sandbox JWT state in {}: expected jwt/signing.pem, jwt/public.pem, and jwt/kid",
+            dir.display()
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{LazyLock, Mutex};
-
-    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+    use crate::TEST_ENV_LOCK as ENV_LOCK;
 
     struct EnvVarGuard {
         key: &'static str,
@@ -151,5 +192,51 @@ mod tests {
         assert_eq!(paths.ca, tmp.path().join("ca.crt"));
         assert_eq!(paths.server_cert, tmp.path().join("server/tls.crt"));
         assert_eq!(paths.client_key, tmp.path().join("client/tls.key"));
+    }
+
+    #[test]
+    fn complete_local_jwt_config_returns_none_when_bundle_absent() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = EnvVarGuard::set("OPENSHELL_LOCAL_TLS_DIR", tmp.path());
+
+        assert!(complete_local_jwt_config().unwrap().is_none());
+    }
+
+    #[test]
+    fn complete_local_jwt_config_rejects_partial_bundle() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = EnvVarGuard::set("OPENSHELL_LOCAL_TLS_DIR", tmp.path());
+        std::fs::create_dir_all(tmp.path().join("jwt")).unwrap();
+        std::fs::write(tmp.path().join("jwt/signing.pem"), "key").unwrap();
+
+        let err = complete_local_jwt_config().unwrap_err();
+        assert!(err.to_string().contains("partial local sandbox JWT state"));
+    }
+
+    #[test]
+    fn complete_local_jwt_config_returns_full_bundle() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = EnvVarGuard::set("OPENSHELL_LOCAL_TLS_DIR", tmp.path());
+        std::fs::create_dir_all(tmp.path().join("jwt")).unwrap();
+        for rel in ["jwt/signing.pem", "jwt/public.pem", "jwt/kid"] {
+            std::fs::write(tmp.path().join(rel), "pem").unwrap();
+        }
+
+        let config = complete_local_jwt_config().unwrap().unwrap();
+
+        assert_eq!(config.signing_key_path, tmp.path().join("jwt/signing.pem"));
+        assert_eq!(config.public_key_path, tmp.path().join("jwt/public.pem"));
+        assert_eq!(config.kid_path, tmp.path().join("jwt/kid"));
+        assert_eq!(config.gateway_id, "openshell");
+        assert_eq!(config.ttl_secs, 0);
     }
 }

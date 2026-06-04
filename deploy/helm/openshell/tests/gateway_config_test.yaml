@@ -18,6 +18,25 @@ tests:
       - exists:
           path: spec.template.metadata.annotations["checksum/gateway-config"]
 
+  - it: mounts the OIDC CA bundle when TLS is disabled
+    template: templates/statefulset.yaml
+    set:
+      server.disableTls: true
+      server.oidc.issuer: https://issuer.example.com
+      server.oidc.caConfigMapName: openshell-oidc-ca
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].volumeMounts[3].name
+          value: oidc-ca
+      - equal:
+          path: spec.template.spec.containers[0].volumeMounts[3].mountPath
+          value: /etc/openshell-tls/oidc-ca
+      - equal:
+          path: spec.template.spec.volumes[2].name
+          value: oidc-ca
+      - equal:
+          path: spec.template.spec.volumes[2].configMap.name
+          value: openshell-oidc-ca
 
   # Regression for the P1 bug Drew flagged: grpc_endpoint MUST live in the
   # Kubernetes driver table, not in [openshell.gateway]. The gateway-side
@@ -32,6 +51,67 @@ tests:
       - notMatchRegex:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.gateway\][^\[]*?grpc_endpoint'
+
+  - it: renders the sandbox service account name under [openshell.drivers.kubernetes]
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?service_account_name\s*=\s*"openshell-sandbox"'
+
+  - it: renders sandbox image pull secrets under [openshell.drivers.kubernetes]
+    template: templates/gateway-config.yaml
+    set:
+      server.sandboxImagePullSecrets:
+        - name: regcred
+        - name: backup-regcred
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?image_pull_secrets\s*=\s*\["regcred", "backup-regcred"\]'
+
+  - it: does not reuse gateway image pull secrets for sandbox pods
+    template: templates/gateway-config.yaml
+    set:
+      imagePullSecrets:
+        - name: gateway-regcred
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'image_pull_secrets\s*='
+
+  - it: does not render local mTLS user auth for Kubernetes deployments
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.gateway\.mtls_auth\]'
+
+  - it: does not allow unauthenticated users by default
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.gateway\.auth\]'
+
+  - it: renders explicit unauthenticated user dev mode when enabled
+    template: templates/gateway-config.yaml
+    set:
+      server.auth.allowUnauthenticatedUsers: true
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\.auth\].*?allow_unauthenticated_users\s*=\s*true'
+
+  - it: uses the configured existing sandbox service account name
+    template: templates/gateway-config.yaml
+    set:
+      sandboxServiceAccount.create: false
+      sandboxServiceAccount.name: precreated-sandbox
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?service_account_name\s*=\s*"precreated-sandbox"'
 
   - it: omits server_sans when no DNS SANs are configured
     template: templates/gateway-config.yaml
@@ -66,3 +146,131 @@ tests:
       - matchRegex:
           path: data["gateway.toml"]
           pattern: 'server_sans\s*=\s*\["openshell", "\*\.dev\.openshell\.localhost"\]'
+
+  - it: passes sqlite db-url via --db-url arg by default
+    template: templates/statefulset.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: "sqlite:/var/openshell/openshell.db"
+
+  - it: does not pass --db-url in args when postgres.enabled is true
+    template: templates/statefulset.yaml
+    set:
+      postgres.enabled: true
+      postgres.auth.password: test-pw
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: "--db-url"
+
+  - it: does not pass --db-url in args when externalDbSecret is set
+    template: templates/statefulset.yaml
+    set:
+      server.externalDbSecret: my-pg-secret
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: "--db-url"
+
+  - it: references Bitnami service-binding Secret when postgres.enabled is true
+    template: templates/statefulset.yaml
+    set:
+      postgres.enabled: true
+      postgres.auth.password: test-pw
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_DB_URL
+            valueFrom:
+              secretKeyRef:
+                name: openshell-postgres-svcbind-custom-user
+                key: uri
+
+  - it: respects postgres.fullnameOverride for bundled service-binding Secret
+    template: templates/statefulset.yaml
+    set:
+      postgres.enabled: true
+      postgres.auth.password: test-pw
+      postgres.fullnameOverride: my-pg
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_DB_URL
+            valueFrom:
+              secretKeyRef:
+                name: my-pg-svcbind-custom-user
+                key: uri
+
+  - it: respects postgres.nameOverride for bundled service-binding Secret
+    template: templates/statefulset.yaml
+    set:
+      postgres.enabled: true
+      postgres.auth.password: test-pw
+      postgres.nameOverride: pgdb
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_DB_URL
+            valueFrom:
+              secretKeyRef:
+                name: openshell-pgdb-svcbind-custom-user
+                key: uri
+
+  - it: fails when serviceBindings is disabled with bundled postgres
+    template: templates/statefulset.yaml
+    set:
+      postgres.enabled: true
+      postgres.serviceBindings.enabled: false
+    asserts:
+      - failedTemplate:
+          errorMessage: "postgres.serviceBindings.enabled must be true when using bundled PostgreSQL"
+
+  - it: allows serviceBindings disabled when externalDbSecret is set
+    template: templates/statefulset.yaml
+    set:
+      postgres.enabled: true
+      postgres.serviceBindings.enabled: false
+      server.externalDbSecret: my-external-secret
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_DB_URL
+            valueFrom:
+              secretKeyRef:
+                name: my-external-secret
+                key: uri
+
+  - it: references externalDbSecret when set without postgres.enabled
+    template: templates/statefulset.yaml
+    set:
+      server.externalDbSecret: my-pg-secret
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_DB_URL
+            valueFrom:
+              secretKeyRef:
+                name: my-pg-secret
+                key: uri
+
+  - it: externalDbSecret overrides bundled secret when both are set
+    template: templates/statefulset.yaml
+    set:
+      postgres.enabled: true
+      postgres.auth.password: test-pw
+      server.externalDbSecret: my-external-secret
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_DB_URL
+            valueFrom:
+              secretKeyRef:
+                name: my-external-secret
+                key: uri

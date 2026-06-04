@@ -3,6 +3,7 @@
 
 //! HTTP CONNECT proxy with OPA policy evaluation and process-identity binding.
 
+use crate::activity_aggregator::{ActivitySender, try_record_activity};
 use crate::denial_aggregator::DenialEvent;
 use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::ProxyTlsState;
@@ -187,6 +188,7 @@ impl ProxyHandle {
         provider_credentials: Option<ProviderCredentialState>,
         policy_local_ctx: Option<Arc<PolicyLocalContext>>,
         denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
+        activity_tx: Option<ActivitySender>,
     ) -> Result<Self> {
         // Use override bind_addr, fall back to policy http_addr, then default
         // to loopback:3128.  The default allows the proxy to function when no
@@ -247,6 +249,7 @@ impl ProxyHandle {
                             .as_ref()
                             .and_then(ProviderCredentialState::resolver);
                         let dtx = denial_tx.clone();
+                        let atx = activity_tx.clone();
                         tokio::spawn(async move {
                             if let Err(err) = handle_tcp_connection(
                                 stream,
@@ -259,6 +262,7 @@ impl ProxyHandle {
                                 gw,
                                 resolver,
                                 dtx,
+                                atx,
                             )
                             .await
                             {
@@ -421,6 +425,43 @@ impl Drop for ProxyHandle {
     }
 }
 
+fn emit_activity(tx: &Option<ActivitySender>, denied: bool, deny_group: &'static str) {
+    if let Some(tx) = tx {
+        let _ = try_record_activity(tx, denied, deny_group);
+    }
+}
+
+fn l7_inspection_active(l7_route: Option<&L7RouteSnapshot>) -> bool {
+    l7_route.is_some_and(|route| !route.configs.is_empty())
+}
+
+fn emit_connect_activity_if_l4_only(
+    tx: &Option<ActivitySender>,
+    l7_route: Option<&L7RouteSnapshot>,
+) {
+    if !l7_inspection_active(l7_route) {
+        emit_activity(tx, false, "unknown");
+    }
+}
+
+fn emit_activity_simple(tx: Option<&ActivitySender>, denied: bool, deny_group: &'static str) {
+    if let Some(tx) = tx {
+        let _ = try_record_activity(tx, denied, deny_group);
+    }
+}
+
+fn emit_forward_success_activity(tx: Option<&ActivitySender>, l7_activity_pending: bool) {
+    emit_activity_simple(
+        tx,
+        false,
+        if l7_activity_pending {
+            "l7_policy"
+        } else {
+            "unknown"
+        },
+    );
+}
+
 /// Emit a denial event to the aggregator channel (if configured).
 /// Used by `handle_tcp_connection` which owns `Option<Sender>`.
 fn emit_denial(
@@ -494,6 +535,7 @@ async fn handle_tcp_connection(
     trusted_host_gateway: Arc<Option<IpAddr>>,
     secret_resolver: Option<Arc<SecretResolver>>,
     denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
+    activity_tx: Option<ActivitySender>,
 ) -> Result<()> {
     let mut buf = vec![0u8; MAX_HEADER_BYTES];
     let mut used = 0usize;
@@ -540,6 +582,7 @@ async fn handle_tcp_connection(
             trusted_host_gateway,
             secret_resolver,
             denial_tx.as_ref(),
+            activity_tx.as_ref(),
         )
         .await;
     }
@@ -558,6 +601,7 @@ async fn handle_tcp_connection(
         )
         .await?;
         if let InferenceOutcome::Denied { reason } = outcome {
+            emit_activity(&activity_tx, true, "forward_policy");
             let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
                 .activity(ActivityId::Open)
                 .action(ActionId::Denied)
@@ -662,6 +706,7 @@ async fn handle_tcp_connection(
             &deny_reason,
             "connect",
         );
+        emit_activity(&activity_tx, true, "connect_policy");
         respond(
             &mut client,
             &build_json_error_response(
@@ -682,10 +727,14 @@ async fn handle_tcp_connection(
     // allowlist instead of blanket-blocking all private IPs.
     // When the policy host is already a literal IP address, treat it as
     // implicitly allowed — the user explicitly declared the destination.
+    // Exact declared hostnames also skip the private-IP blanket block below,
+    // while keeping loopback/link-local/unspecified addresses denied.
     let mut raw_allowed_ips = query_allowed_ips(&opa_engine, &decision, &host_lc, port);
     if raw_allowed_ips.is_empty() {
         raw_allowed_ips = implicit_allowed_ips_for_ip_host(&host);
     }
+    let exact_declared_endpoint_host =
+        query_exact_declared_endpoint_host(&opa_engine, &decision, &host_lc, port);
 
     // Defense-in-depth: resolve DNS and reject connections to internal IPs.
     let dns_connect_start = std::time::Instant::now();
@@ -735,6 +784,7 @@ async fn handle_tcp_connection(
                     &reason,
                     "ssrf",
                 );
+                emit_activity(&activity_tx, true, "ssrf");
                 respond(
                     &mut client,
                     &build_json_error_response(
@@ -790,6 +840,7 @@ async fn handle_tcp_connection(
                             &reason,
                             "ssrf",
                         );
+                        emit_activity(&activity_tx, true, "ssrf");
                         respond(
                             &mut client,
                             &build_json_error_response(
@@ -837,6 +888,7 @@ async fn handle_tcp_connection(
                     &reason,
                     "ssrf",
                 );
+                emit_activity(&activity_tx, true, "ssrf");
                 respond(
                     &mut client,
                     &build_json_error_response(
@@ -844,6 +896,61 @@ async fn handle_tcp_connection(
                         "Forbidden",
                         "ssrf_denied",
                         &format!("CONNECT {host_lc}:{port} blocked: invalid allowed_ips in policy"),
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+    } else if exact_declared_endpoint_host {
+        // Exact declared hostname mode: the operator explicitly allowed this
+        // host:port, so private IP resolution is permitted without duplicating
+        // the resolved IP in allowed_ips. Always-blocked addresses and
+        // control-plane ports remain denied.
+        match resolve_and_check_declared_endpoint(&host, port, sandbox_entrypoint_pid).await {
+            Ok(addrs) => TcpStream::connect(addrs.as_slice())
+                .await
+                .into_diagnostic()?,
+            Err(reason) => {
+                {
+                    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                        .activity(ActivityId::Open)
+                        .action(ActionId::Denied)
+                        .disposition(DispositionId::Blocked)
+                        .severity(SeverityId::Medium)
+                        .status(StatusId::Failure)
+                        .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                        .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+                        .actor_process(
+                            Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
+                                .with_cmd_line(&cmdline_str),
+                        )
+                        .firewall_rule("-", "ssrf")
+                        .message(format!(
+                            "CONNECT blocked: declared endpoint check failed for {host_lc}:{port}"
+                        ))
+                        .status_detail(&reason)
+                        .build();
+                    ocsf_emit!(event);
+                }
+                emit_denial(
+                    &denial_tx,
+                    &host_lc,
+                    port,
+                    &binary_str,
+                    &decision,
+                    &reason,
+                    "ssrf",
+                );
+                respond(
+                    &mut client,
+                    &build_json_error_response(
+                        403,
+                        "Forbidden",
+                        "ssrf_denied",
+                        &format!(
+                            "CONNECT {host_lc}:{port} blocked: declared endpoint check failed"
+                        ),
                     ),
                 )
                 .await?;
@@ -887,6 +994,7 @@ async fn handle_tcp_connection(
                     &reason,
                     "ssrf",
                 );
+                emit_activity(&activity_tx, true, "ssrf");
                 respond(
                     &mut client,
                     &build_json_error_response(
@@ -912,13 +1020,11 @@ async fn handle_tcp_connection(
     // Check if endpoint has L7 config for protocol-aware inspection, and
     // retain the generation for HTTP passthrough keep-alive tunnels.
     let l7_route = query_l7_route_snapshot(&opa_engine, &decision, &host_lc, port);
+    let should_inspect_l7 = l7_inspection_active(l7_route.as_ref());
 
     // Log the allowed CONNECT — use CONNECT_L7 when L7 inspection follows,
     // so log consumers can distinguish L4-only decisions from tunnel lifecycle events.
-    let connect_msg = if l7_route
-        .as_ref()
-        .is_some_and(|route| !route.configs.is_empty())
-    {
+    let connect_msg = if should_inspect_l7 {
         "CONNECT_L7"
     } else {
         "CONNECT"
@@ -941,6 +1047,7 @@ async fn handle_tcp_connection(
             .build();
         ocsf_emit!(event);
     }
+    emit_connect_activity_if_l4_only(&activity_tx, l7_route.as_ref());
 
     // Determine effective TLS mode. Check the raw endpoint config for
     // `tls: skip` independently of L7 config (which requires `protocol`).
@@ -968,6 +1075,7 @@ async fn handle_tcp_connection(
             .map(|p| p.to_string_lossy().into_owned())
             .collect(),
         secret_resolver: secret_resolver.clone(),
+        activity_tx: activity_tx.clone(),
     };
 
     if effective_tls_skip {
@@ -2353,6 +2461,36 @@ fn validate_allowed_ips_for_resolved_addrs(
     Ok(())
 }
 
+fn validate_declared_endpoint_resolved_addrs(
+    host: &str,
+    port: u16,
+    addrs: &[SocketAddr],
+) -> std::result::Result<(), String> {
+    if addrs.is_empty() {
+        return Err(format!(
+            "DNS resolution returned no addresses for {}",
+            normalize_host_lookup_key(host)
+        ));
+    }
+
+    if BLOCKED_CONTROL_PLANE_PORTS.contains(&port) {
+        return Err(format!(
+            "port {port} is a blocked control-plane port, connection rejected"
+        ));
+    }
+
+    for addr in addrs {
+        if is_always_blocked_ip(addr.ip()) {
+            return Err(format!(
+                "{host} resolves to always-blocked address {}, connection rejected",
+                addr.ip()
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// Resolve a host:port using sandbox `/etc/hosts` first (when available), then
 /// reject if any resolved address is internal.
 ///
@@ -2384,6 +2522,21 @@ async fn resolve_and_check_allowed_ips(
 ) -> std::result::Result<Vec<SocketAddr>, String> {
     let addrs = resolve_socket_addrs(host, port, entrypoint_pid).await?;
     validate_allowed_ips_for_resolved_addrs(host, port, &addrs, allowed_ips)?;
+    Ok(addrs)
+}
+
+/// Resolve a host:port that was explicitly declared by hostname in policy.
+///
+/// Exact declared hostnames are the operator's trust signal, so RFC1918 and
+/// other private ranges are allowed without a duplicated `allowed_ips` entry.
+/// Loopback, link-local, unspecified, and control-plane ports remain blocked.
+async fn resolve_and_check_declared_endpoint(
+    host: &str,
+    port: u16,
+    entrypoint_pid: u32,
+) -> std::result::Result<Vec<SocketAddr>, String> {
+    let addrs = resolve_socket_addrs(host, port, entrypoint_pid).await?;
+    validate_declared_endpoint_resolved_addrs(host, port, &addrs)?;
     Ok(addrs)
 }
 
@@ -2507,6 +2660,46 @@ fn query_allowed_ips(
                 .build();
             ocsf_emit!(event);
             vec![]
+        }
+    }
+}
+
+/// Query whether the matched endpoint was declared as this exact hostname.
+fn query_exact_declared_endpoint_host(
+    engine: &OpaEngine,
+    decision: &ConnectDecision,
+    host: &str,
+    port: u16,
+) -> bool {
+    let has_policy = match &decision.action {
+        NetworkAction::Allow { matched_policy } => matched_policy.is_some(),
+        NetworkAction::Deny { .. } => false,
+    };
+    if !has_policy {
+        return false;
+    }
+
+    let input = crate::opa::NetworkInput {
+        host: host.to_string(),
+        port,
+        binary_path: decision.binary.clone().unwrap_or_default(),
+        binary_sha256: String::new(),
+        ancestors: decision.ancestors.clone(),
+        cmdline_paths: decision.cmdline_paths.clone(),
+    };
+
+    match engine.query_exact_declared_endpoint_host(&input) {
+        Ok(is_exact_declared) => is_exact_declared,
+        Err(e) => {
+            let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                .activity(ActivityId::Fail)
+                .severity(SeverityId::Low)
+                .status(StatusId::Failure)
+                .dst_endpoint(Endpoint::from_domain(host, port))
+                .message(format!("Failed to query exact declared endpoint host: {e}"))
+                .build();
+            ocsf_emit!(event);
+            false
         }
     }
 }
@@ -2822,6 +3015,7 @@ async fn handle_forward_proxy(
     trusted_host_gateway: Arc<Option<IpAddr>>,
     secret_resolver: Option<Arc<SecretResolver>>,
     denial_tx: Option<&mpsc::UnboundedSender<DenialEvent>>,
+    activity_tx: Option<&ActivitySender>,
 ) -> Result<()> {
     // 1. Parse the absolute-form URI. `path` is marked `mut` so that, when an
     //    L7 config applies, the canonicalized form produced below replaces it
@@ -2984,6 +3178,7 @@ async fn handle_forward_proxy(
                 reason,
                 "forward",
             );
+            emit_activity_simple(activity_tx, true, "forward_policy");
             respond(
                 client,
                 &build_json_error_response(
@@ -3003,6 +3198,7 @@ async fn handle_forward_proxy(
         Ok(guard) => guard,
         Err(e) => {
             emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
+            emit_activity_simple(activity_tx, true, "policy_stale");
             respond(
                 client,
                 &build_json_error_response(
@@ -3046,7 +3242,9 @@ async fn handle_forward_proxy(
             .map(|p| p.to_string_lossy().into_owned())
             .collect(),
         secret_resolver: secret_resolver.clone(),
+        activity_tx: activity_tx.cloned(),
     };
+    let mut l7_activity_pending = false;
 
     // 4b. If the endpoint has L7 config, evaluate the request against
     //     L7 policy.  The forward proxy handles exactly one request per
@@ -3064,6 +3262,7 @@ async fn handle_forward_proxy(
                     route.generation,
                 ),
             );
+            emit_activity_simple(activity_tx, true, "policy_stale");
             respond(
                 client,
                 &build_json_error_response(
@@ -3080,6 +3279,7 @@ async fn handle_forward_proxy(
             Ok(engine) => engine,
             Err(e) => {
                 emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
+                emit_activity_simple(activity_tx, true, "policy_stale");
                 respond(
                     client,
                     &build_json_error_response(
@@ -3136,6 +3336,7 @@ async fn handle_forward_proxy(
                         ))
                         .build();
                     ocsf_emit!(event);
+                    emit_activity_simple(activity_tx, true, "l7_parse_rejection");
                     respond(
                         client,
                         &build_json_error_response(
@@ -3150,6 +3351,7 @@ async fn handle_forward_proxy(
                 }
             };
         let Some(l7_config) = select_l7_config_for_path(&route.configs, &path) else {
+            emit_activity_simple(activity_tx, true, "l7_policy");
             respond(
                 client,
                 &build_json_error_response(
@@ -3202,6 +3404,7 @@ async fn handle_forward_proxy(
                         .message(format!("FORWARD_GRAPHQL_L7 request rejected: {e}"))
                         .build();
                     ocsf_emit!(event);
+                    emit_activity_simple(activity_tx, true, "l7_parse_rejection");
                     respond(
                         client,
                         &build_json_error_response(
@@ -3309,6 +3512,7 @@ async fn handle_forward_proxy(
             || (!allowed && l7_config.config.enforcement == crate::l7::EnforcementMode::Enforce);
 
         if effectively_denied {
+            emit_activity_simple(activity_tx, true, "l7_policy");
             emit_denial_simple(
                 denial_tx,
                 &host_lc,
@@ -3330,6 +3534,7 @@ async fn handle_forward_proxy(
             .await?;
             return Ok(());
         }
+        l7_activity_pending = true;
         forward_tunnel_engine = Some(tunnel_engine);
     }
 
@@ -3338,13 +3543,17 @@ async fn handle_forward_proxy(
     //      tiers and validate only against the trusted gateway IP.
     //    - If allowed_ips is set: validate resolved IPs against the allowlist
     //      (this is the SSRF override for private IP destinations).
-    //    - If allowed_ips is empty: reject internal IPs, allow public IPs through.
+    //    - If the endpoint is an exact declared hostname: allow private IPs,
+    //      but still reject always-blocked addresses and control-plane ports.
+    //    - Otherwise: reject internal IPs, allow public IPs through.
     //    When the policy host is already a literal IP address, treat it as
     //    implicitly allowed — the user explicitly declared the destination.
     let mut raw_allowed_ips = query_allowed_ips(&opa_engine, &decision, &host_lc, port);
     if raw_allowed_ips.is_empty() {
         raw_allowed_ips = implicit_allowed_ips_for_ip_host(&host);
     }
+    let exact_declared_endpoint_host =
+        query_exact_declared_endpoint_host(&opa_engine, &decision, &host_lc, port);
 
     // The trusted-gateway branch is the first path; reading it before the
     // allowed_ips and default branches matches the policy decision narrative.
@@ -3390,6 +3599,7 @@ async fn handle_forward_proxy(
                     &reason,
                     "ssrf",
                 );
+                emit_activity_simple(activity_tx, true, "ssrf");
                 respond(
                     client,
                     &build_json_error_response(
@@ -3446,6 +3656,7 @@ async fn handle_forward_proxy(
                             &reason,
                             "ssrf",
                         );
+                        emit_activity_simple(activity_tx, true, "ssrf");
                         respond(
                             client,
                             &build_json_error_response(
@@ -3497,6 +3708,7 @@ async fn handle_forward_proxy(
                     &reason,
                     "ssrf",
                 );
+                emit_activity_simple(activity_tx, true, "ssrf");
                 respond(
                     client,
                     &build_json_error_response(
@@ -3505,6 +3717,62 @@ async fn handle_forward_proxy(
                         "ssrf_denied",
                         &format!(
                             "{method} {host_lc}:{port} blocked: invalid allowed_ips in policy"
+                        ),
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+    } else if exact_declared_endpoint_host {
+        // Exact declared hostname mode mirrors CONNECT: private resolved
+        // addresses are allowed for this operator-declared host:port, while
+        // always-blocked addresses and control-plane ports remain denied.
+        match resolve_and_check_declared_endpoint(&host, port, sandbox_entrypoint_pid).await {
+            Ok(addrs) => addrs,
+            Err(reason) => {
+                {
+                    let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+                        .activity(ActivityId::Other)
+                        .action(ActionId::Denied)
+                        .disposition(DispositionId::Blocked)
+                        .severity(SeverityId::Medium)
+                        .status(StatusId::Failure)
+                        .http_request(HttpRequest::new(
+                            method,
+                            OcsfUrl::new("http", &host_lc, &path, port),
+                        ))
+                        .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                        .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
+                        .actor_process(
+                            Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
+                                .with_cmd_line(&cmdline_str),
+                        )
+                        .firewall_rule(policy_str, "ssrf")
+                        .message(format!(
+                            "FORWARD blocked: declared endpoint check failed for {host_lc}:{port}"
+                        ))
+                        .status_detail(&reason)
+                        .build();
+                    ocsf_emit!(event);
+                }
+                emit_denial_simple(
+                    denial_tx,
+                    &host_lc,
+                    port,
+                    &binary_str,
+                    &decision,
+                    &reason,
+                    "ssrf",
+                );
+                respond(
+                    client,
+                    &build_json_error_response(
+                        403,
+                        "Forbidden",
+                        "ssrf_denied",
+                        &format!(
+                            "{method} {host_lc}:{port} blocked: declared endpoint check failed"
                         ),
                     ),
                 )
@@ -3551,6 +3819,7 @@ async fn handle_forward_proxy(
                     &reason,
                     "ssrf",
                 );
+                emit_activity_simple(activity_tx, true, "ssrf");
                 respond(
                     client,
                     &build_json_error_response(
@@ -3568,6 +3837,7 @@ async fn handle_forward_proxy(
 
     if let Err(e) = forward_generation_guard.ensure_current() {
         emit_l7_tunnel_close_after_policy_change(&host_lc, port, e);
+        emit_activity_simple(activity_tx, true, "policy_stale");
         respond(
             client,
             &build_json_error_response(
@@ -3641,6 +3911,7 @@ async fn handle_forward_proxy(
             .build();
         ocsf_emit!(event);
     }
+    emit_forward_success_activity(activity_tx, l7_activity_pending);
 
     // 9. Rewrite request and forward to upstream
     let rewritten = match rewrite_forward_request(
@@ -3825,6 +4096,83 @@ mod tests {
         }
     }
 
+    #[test]
+    fn connect_activity_is_skipped_when_l7_will_count_the_request() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let activity_tx = Some(tx);
+        let l7_route = L7RouteSnapshot {
+            configs: vec![L7ConfigSnapshot {
+                config: websocket_l7_config(crate::l7::L7Protocol::Rest, false),
+            }],
+            generation: 1,
+        };
+        let l4_route = L7RouteSnapshot {
+            configs: Vec::new(),
+            generation: 1,
+        };
+
+        emit_connect_activity_if_l4_only(&activity_tx, Some(&l7_route));
+        assert!(
+            rx.try_recv().is_err(),
+            "L7-inspected CONNECT should not emit an extra L4 activity event"
+        );
+
+        emit_connect_activity_if_l4_only(&activity_tx, Some(&l4_route));
+        let event = rx.try_recv().expect("L4-only CONNECT should emit activity");
+        assert!(!event.denied);
+        assert_eq!(event.deny_group, "unknown");
+
+        emit_connect_activity_if_l4_only(&activity_tx, None);
+        let event = rx
+            .try_recv()
+            .expect("CONNECT without an L7 route should emit activity");
+        assert!(!event.denied);
+        assert_eq!(event.deny_group, "unknown");
+    }
+
+    #[test]
+    fn forward_l7_allowed_activity_is_deferred_until_after_ssrf() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let activity_tx = Some(tx);
+
+        let l7_activity_pending = true;
+        assert!(
+            rx.try_recv().is_err(),
+            "allowed L7 evaluation must not emit activity before SSRF succeeds"
+        );
+
+        emit_activity_simple(activity_tx.as_ref(), true, "ssrf");
+        let event = rx
+            .try_recv()
+            .expect("SSRF denial should emit the request activity");
+        assert!(event.denied);
+        assert_eq!(event.deny_group, "ssrf");
+        assert!(
+            rx.try_recv().is_err(),
+            "SSRF-denied forward request must not also emit allowed L7 activity"
+        );
+
+        emit_forward_success_activity(activity_tx.as_ref(), l7_activity_pending);
+        let event = rx
+            .try_recv()
+            .expect("L7 activity should emit after SSRF succeeds");
+        assert!(!event.denied);
+        assert_eq!(event.deny_group, "l7_policy");
+    }
+
+    #[test]
+    fn forward_success_activity_uses_unknown_without_l7() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let activity_tx = Some(tx);
+
+        emit_forward_success_activity(activity_tx.as_ref(), false);
+        let event = rx
+            .try_recv()
+            .expect("non-L7 forward success should emit activity");
+        assert!(!event.denied);
+        assert_eq!(event.deny_group, "unknown");
+    }
+
     fn forward_test_guard() -> PolicyGenerationGuard {
         let policy = include_str!("../data/sandbox-policy.rego");
         let policy_data = "network_policies: {}\n";
@@ -3951,6 +4299,7 @@ mod tests {
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
+            activity_tx: None,
         };
         (config, tunnel_engine, ctx)
     }
@@ -4116,6 +4465,7 @@ mod tests {
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: resolver,
+            activity_tx: None,
         };
         let query_params = std::collections::HashMap::new();
 
@@ -4156,6 +4506,7 @@ mod tests {
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
+            activity_tx: None,
         };
         let query_params = std::collections::HashMap::new();
         let config = websocket_l7_config(crate::l7::L7Protocol::Rest, false);
@@ -4531,6 +4882,59 @@ network_policies:
         let nets = parse_allowed_ips(&["192.168.1.105/32".to_string()]).unwrap();
         assert!(
             validate_allowed_ips_for_resolved_addrs("searxng.local", 8080, &addrs, &nets).is_ok()
+        );
+    }
+
+    #[test]
+    fn test_declared_endpoint_private_hosts_file_resolution_allowed() {
+        let addrs = resolve_from_hosts_file_contents(
+            "192.168.1.105 searxng.local\n",
+            "searxng.local",
+            8080,
+        );
+
+        assert!(validate_declared_endpoint_resolved_addrs("searxng.local", 8080, &addrs).is_ok());
+    }
+
+    #[test]
+    fn test_declared_endpoint_loopback_stays_blocked() {
+        let addrs =
+            resolve_from_hosts_file_contents("127.0.0.1 loopback.local\n", "loopback.local", 80);
+
+        let err =
+            validate_declared_endpoint_resolved_addrs("loopback.local", 80, &addrs).unwrap_err();
+        assert!(
+            err.contains("always-blocked"),
+            "expected loopback to stay blocked: {err}"
+        );
+    }
+
+    #[test]
+    fn test_declared_endpoint_link_local_stays_blocked() {
+        let addrs = resolve_from_hosts_file_contents(
+            "169.254.169.254 metadata.local\n",
+            "metadata.local",
+            80,
+        );
+
+        let err =
+            validate_declared_endpoint_resolved_addrs("metadata.local", 80, &addrs).unwrap_err();
+        assert!(
+            err.contains("always-blocked"),
+            "expected link-local to stay blocked: {err}"
+        );
+    }
+
+    #[test]
+    fn test_declared_endpoint_blocks_control_plane_ports() {
+        let addrs =
+            resolve_from_hosts_file_contents("10.0.0.5 kube-api.local\n", "kube-api.local", 6443);
+
+        let err =
+            validate_declared_endpoint_resolved_addrs("kube-api.local", 6443, &addrs).unwrap_err();
+        assert!(
+            err.contains("blocked control-plane port"),
+            "expected control-plane port to stay blocked: {err}"
         );
     }
 
@@ -5089,6 +5493,8 @@ network_policies:
                     "x-model-id".to_string(),
                 ],
                 timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
+                model_in_path: false,
+                request_path_override: None,
             }],
             vec![],
         );
@@ -5145,6 +5551,8 @@ network_policies:
             default_headers: vec![],
             passthrough_headers: vec![],
             timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
+            model_in_path: false,
+            request_path_override: None,
         }
     }
 
@@ -6638,6 +7046,10 @@ network_policies:
 
     #[cfg(target_os = "linux")]
     #[test]
+    // TODO: exec'ing /bin/sleep (SELinux label bin_t) from a user_home_t test
+    // binary causes /proc/<pid>/exe readlink to return ENOENT on
+    // SELinux-enforcing hosts.  Fix by building a test-sleep-helper binary in
+    // the same crate so it inherits the user_home_t label.
     fn resolve_process_identity_denies_fork_exec_shared_socket_ambiguity() {
         use crate::identity::BinaryIdentityCache;
         use std::ffi::CString;
@@ -6645,8 +7057,29 @@ network_policies:
         use std::os::fd::AsRawFd;
         use std::time::{Duration, Instant};
 
+        struct ChildGuard(libc::pid_t);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                #[allow(unsafe_code)]
+                unsafe {
+                    libc::kill(self.0, libc::SIGKILL);
+                    libc::waitpid(self.0, std::ptr::null_mut(), 0);
+                }
+            }
+        }
+
         if !std::path::Path::new("/bin/sleep").exists() {
             eprintln!("skipping: /bin/sleep not available");
+            return;
+        }
+
+        if std::process::Command::new("getenforce")
+            .output()
+            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "Enforcing")
+        {
+            eprintln!(
+                "skipping: SELinux is enforcing — cross-label /proc/<pid>/exe readlink fails"
+            );
             return;
         }
 
@@ -6690,7 +7123,10 @@ network_policies:
             }
         }
 
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let _guard = ChildGuard(child_pid);
+        let entrypoint_pid = std::process::id();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             if let Ok(link) = std::fs::read_link(format!("/proc/{child_pid}/exe"))
                 && link.to_string_lossy().contains("sleep")
@@ -6699,36 +7135,34 @@ network_policies:
             }
             assert!(
                 Instant::now() < deadline,
-                "child pid {child_pid} did not exec into sleep within 2s"
+                "child pid {child_pid} did not exec into sleep within 5s"
             );
             std::thread::sleep(Duration::from_millis(20));
         }
 
         let cache = BinaryIdentityCache::new();
 
-        // Resolve with a brief retry loop — under heavy CI load the child's
-        // procfs entry can momentarily fail to resolve even though the loop
-        // above just verified `/proc/<pid>/exe` pointed at `sleep`.  Retry a
-        // few times before declaring failure so the test is not flaky.
-        let mut result = resolve_process_identity(std::process::id(), peer_port, &cache);
-        for _ in 0..5 {
+        let mut result = resolve_process_identity(entrypoint_pid, peer_port, &cache);
+        for _ in 0..10 {
             match &result {
                 Err(err)
                     if err.reason.contains("No such file or directory")
                         || err.reason.contains("os error 2") =>
                 {
+                    // /proc/<pid>/fd scan transiently failed; give procfs time to settle.
                     std::thread::sleep(Duration::from_millis(50));
-                    result = resolve_process_identity(std::process::id(), peer_port, &cache);
+                    result = resolve_process_identity(entrypoint_pid, peer_port, &cache);
+                }
+                Ok(_) => {
+                    // On arm64 under heavy CI load the /proc fd scan can transiently
+                    // miss the parent process's socket fd, making the scan return only
+                    // the child as owner and yielding a spurious Ok.  Retry to give
+                    // both owners time to appear consistently in /proc/<pid>/fd.
+                    std::thread::sleep(Duration::from_millis(50));
+                    result = resolve_process_identity(entrypoint_pid, peer_port, &cache);
                 }
                 _ => break,
             }
-        }
-
-        // libc/syscall FFI requires unsafe
-        #[allow(unsafe_code)]
-        unsafe {
-            libc::kill(child_pid, libc::SIGKILL);
-            libc::waitpid(child_pid, std::ptr::null_mut(), 0);
         }
 
         match result {
@@ -6743,7 +7177,7 @@ network_policies:
                     err.reason
                 );
                 assert!(
-                    err.reason.contains(&std::process::id().to_string()),
+                    err.reason.contains(&entrypoint_pid.to_string()),
                     "error should include parent PID; got: {}",
                     err.reason
                 );

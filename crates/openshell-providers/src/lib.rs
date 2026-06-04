@@ -16,7 +16,7 @@ use std::path::Path;
 pub use openshell_core::proto::Provider;
 
 pub use context::{DiscoveryContext, RealDiscoveryContext};
-pub use discovery::discover_with_spec;
+pub use discovery::{discover_from_profile, discover_with_spec};
 pub use profiles::{
     CredentialRefreshProfile, ProfileError, ProfileValidationDiagnostic, ProviderTypeProfile,
     default_profiles, get_default_profile, normalize_profile_id, parse_profile_json,
@@ -28,6 +28,13 @@ pub use profiles::{
 pub enum ProviderError {
     #[error("unsupported provider type: {0}")]
     UnsupportedProvider(String),
+    #[error(
+        "provider profile '{profile_id}' discovery references unknown credential '{credential_name}'"
+    )]
+    UnknownDiscoveryCredential {
+        profile_id: String,
+        credential_name: String,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -161,6 +168,11 @@ impl ProviderRegistry {
 
 #[must_use]
 pub fn normalize_provider_type(input: &str) -> Option<&'static str> {
+    // Inference provider aliases are canonicalized in openshell-core so that
+    // openshell-server and openshell-providers agree on the same mapping.
+    if let Some(canonical) = openshell_core::inference::normalize_inference_provider_type(input) {
+        return Some(canonical);
+    }
     let normalized = input.trim().to_ascii_lowercase();
     match normalized.as_str() {
         "claude" | "claude-code" | "claude_code" => Some("claude-code"),
@@ -168,9 +180,6 @@ pub fn normalize_provider_type(input: &str) -> Option<&'static str> {
         "copilot" => Some("copilot"),
         "opencode" => Some("opencode"),
         "generic" => Some("generic"),
-        "openai" => Some("openai"),
-        "anthropic" => Some("anthropic"),
-        "nvidia" => Some("nvidia"),
         "gitlab" | "glab" => Some("gitlab"),
         "github" | "gh" => Some("github"),
         "outlook" => Some("outlook"),
@@ -204,6 +213,15 @@ mod tests {
         assert_eq!(normalize_provider_type("anthropic"), Some("anthropic"));
         assert_eq!(normalize_provider_type("nvidia"), Some("nvidia"));
         assert_eq!(normalize_provider_type("copilot"), Some("copilot"));
+        assert_eq!(
+            normalize_provider_type("google-vertex-ai"),
+            Some("google-vertex-ai")
+        );
+        assert_eq!(normalize_provider_type("vertex"), Some("google-vertex-ai"));
+        assert_eq!(
+            normalize_provider_type("vertex-ai"),
+            Some("google-vertex-ai")
+        );
         assert_eq!(normalize_provider_type("unknown"), None);
     }
 
