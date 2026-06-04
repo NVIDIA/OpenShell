@@ -45,6 +45,8 @@ Beyond redaction, middleware also produces structured findings and metadata abou
 
 The first version makes egress middleware concrete without prematurely standardizing every future deployment model. The chosen path is an externally managed middleware service: the operator runs the service, OpenShell routes selected egress through it, and the middleware returns a decision plus optional transformed content and metadata. This keeps the first iteration focused on the contract, failure behavior, and sandbox integration while leaving other deployment shapes open (see [appendices/deployment-options.md](appendices/deployment-options.md)).
 
+The research preview does not define production authentication between the supervisor and middleware service. Unauthenticated plaintext middleware calls are allowed only as an explicit insecure mode for trusted local or isolated development environments; TLS, mTLS, invocation tokens, and middleware identity binding are deferred to a follow-up auth design. See [appendices/protocol-extensions.md](appendices/protocol-extensions.md#middleware-authentication).
+
 ### Architecture
 
 Three components participate:
@@ -182,12 +184,16 @@ The portable transport is gRPC over TCP/TLS, reachable from every supervisor acr
 ```toml
 [[openshell.proxy.middleware]]
 name = "anonymizer"
-grpc_endpoint = "https://127.0.0.1:1234"
+grpc_endpoint = "http://127.0.0.1:1234"
+allow_insecure = true   # research preview: plaintext gRPC, no auth (see appendix)
 
 [[openshell.proxy.middleware]]
 name = "agent-traces-exporter"
-grpc_endpoint = "https://127.0.0.1:1235"
+grpc_endpoint = "http://127.0.0.1:1235"
+allow_insecure = true
 ```
+
+During the research preview, a plaintext `http://` endpoint must be paired with an explicit `allow_insecure = true` on the same entry; OpenShell otherwise rejects a non-TLS endpoint rather than silently sending inspected content in the clear. This keeps the insecure choice deliberate and auditable in gateway configuration while production auth is deferred (see [appendices/protocol-extensions.md](appendices/protocol-extensions.md#middleware-authentication)).
 
 Built-in middleware ships in the supervisor binary and needs no registration. Built-in names are prefixed `openshell-` (for example `openshell-secrets`), and that prefix is reserved so user-defined middleware cannot use it.
 

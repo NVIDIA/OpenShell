@@ -61,3 +61,15 @@ A future version can introduce named capabilities (a portable contract a policy 
 ## Header mutation rules
 
 v1 lets a middleware set a constrained set of response headers, subject to an OpenShell allow-list. Future work can formalize exactly which headers a middleware may mutate, and whether credential-bearing headers are ever in scope (today they are not; credential injection runs after the hook).
+
+## Middleware authentication
+
+The research preview intentionally does not define production authentication between the supervisor and an external middleware service. The initial implementation may support unauthenticated plaintext gRPC only when the operator explicitly enables an insecure mode on the middleware entry (for example `allow_insecure = true`). A plaintext `http://` endpoint without this opt-in is rejected, so insecure operation is always a deliberate, auditable choice rather than an implicit consequence of the URL scheme.
+
+This mode is suitable only for trusted local development, loopback services, Unix-socket-like deployment shapes, or isolated research environments where the middleware endpoint is not reachable by untrusted clients. It is not suitable for shared clusters, multi-tenant deployments, public networks, or any environment where inspected request content needs transport confidentiality.
+
+Without middleware authentication and transport security, network observers can read inspected request content, active attackers can impersonate the middleware service, and unauthorized clients can call the middleware directly if it is reachable. Because the middleware can allow, deny, or transform egress, service impersonation is a policy-enforcement bypass, not just an observability risk.
+
+The v1 protocol shape should not bake unauthenticated plaintext into the stable contract. A follow-up auth design should define TLS trust configuration, optional mTLS, gateway-signed invocation tokens or equivalent bearer metadata, certificate or key rotation, middleware identity binding, and how the supervisor receives auth material from gateway configuration.
+
+Even in the insecure research-preview mode, the hook should stay before provider credential injection, and OpenShell should not forward original `Authorization`, `Cookie`, or credential-bearing headers to middleware by default. That preserves the intended separation between content inspection and upstream credential injection while production middleware auth is deferred.
