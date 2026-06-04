@@ -60,7 +60,7 @@ A future version can introduce named capabilities (a portable contract a policy 
 
 ## Header mutation rules
 
-v1 lets a middleware set a constrained set of response headers, subject to an OpenShell allow-list. Future work can formalize exactly which headers a middleware may mutate, and whether credential-bearing headers are ever in scope (today they are not; credential injection runs after the hook).
+v1 lets a middleware set a constrained set of request headers, subject to an OpenShell allow-list. Future work can formalize exactly which headers a middleware may mutate, and whether credential-bearing headers are ever in scope (today they are not; credential injection runs after the hook).
 
 ## Middleware authentication
 

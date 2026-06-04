@@ -30,11 +30,11 @@ Privacy Guard is the motivating use case for this RFC. It is middleware that ins
 
 Consider an agent configured with a cloud model. The operator wants uploaded images to never reach that model. With egress middleware, they configure Privacy Guard on requests bound for the model endpoint. When the agent uploads an image and asks the model about it, the middleware inspects the request content, detects the image, and redacts it -- replacing it with a placeholder (for example, `image upload is disabled for this model`) before the request leaves the sandbox.
 
-Beyond redaction, middleware also produces structured findings and metadata about a request. This metadata is intended to be stable enough for a future model router to consume - for example, to route sensitive requests to a local model instead.
+Beyond redaction, middleware also produces structured findings and string metadata about a request. That metadata is only an annotation surface in v1; the model-router work will define any routing-grade typed contract later.
 
 ## Non-goals
 
-- **Model routing.** This RFC defines the metadata that middleware emits, but not the component that consumes it to pick a model. Routing a request to a different model based on findings is a separate concern tracked in [#1734](https://github.com/NVIDIA/OpenShell/issues/1734). Here we only ensure the metadata contract is stable enough for a future router to build on.
+- **Model routing.** This RFC defines the v1 string metadata that middleware can emit, but not the component that consumes findings or metadata to pick a model. Routing a request to a different model based on findings is a separate concern tracked in [#1734](https://github.com/NVIDIA/OpenShell/issues/1734). Here we only avoid blocking a future routing contract.
 - **A general-purpose middleware framework.** The first version targets outbound request processing in the supervisor proxy flow. It is not an arbitrary plugin system for every extension point in OpenShell, and it does not cover response inspection or non-egress hooks. Those are possible future extensions, not part of this contract.
 - **Constraining or sandboxing the middleware itself.** A middleware gets raw access to request content. OpenShell routes payloads to a service the operator chose to trust; it does not sandbox the middleware, verify its behavior, or prevent a malicious one from mishandling the data it inspects. Initially, trust is the operator's responsibility, the same way it is for sandbox images. Stronger guarantees, such as mutual authentication between the supervisor and the middleware or running the middleware in its own sandbox, will follow but are out of scope here.
 - **Runtime management of middleware.** Middleware is declared in gateway configuration. A runtime CLI or API to add, list, or validate middleware is deferred.
@@ -55,7 +55,7 @@ This RFC uses the following terms with specific meanings.
 - **Decision.** The allow-or-deny outcome a middleware returns for a request. `allow` lets the request proceed (possibly transformed); `deny` short-circuits it. This vocabulary matches the rest of the OpenShell policy system.
 - **Transformation.** A middleware returning replacement content, and any allowed header mutations, that the supervisor forwards in place of the original request. A later middleware in a chain sees the previous stage's transformed content.
 - **Finding.** A structured, audit-safe observation a middleware reports about a request, such as a label, count, and confidence. A finding never carries raw matched values, redacted spans, or the original sensitive content.
-- **Metadata.** Namespaced key/value annotations a middleware emits into a request-local bag for downstream consumers, such as a future model router. Metadata uses stable primitive types, never carries raw sensitive values, and is marked for where it may be used (audit, routing, or internal-only).
+- **Metadata.** Namespaced string key/value annotations a middleware emits into a request-local bag. V1 metadata never carries raw sensitive values. Routing-grade typed metadata, including usage markers such as audit-safe, routing-safe, or internal-only, is deferred until a component consumes it.
 - **Chain.** The ordered set of middleware that applies to a single request. Each middleware runs in turn, a later stage sees the previous stage's transformed content, a `deny` short-circuits the remaining stages, and each middleware runs at most once per request.
 
 ## Proposal
@@ -111,7 +111,7 @@ This ordering is deliberate:
 
 - Network and L7 policy run first, so OpenShell never sends already-denied traffic to a middleware service.
 - Middleware runs before credential injection, so a middleware never receives OpenShell-managed upstream credentials.
-- Routing runs after the hook, so route selection (for example, choosing a model for a logical endpoint such as `inference.local`) can use metadata the middleware emitted.
+- Routing runs after the hook, so later model-router work has a clear handoff point for any middleware findings or metadata it chooses to consume.
 - The upstream call stays owned by the supervisor, never the middleware.
 
 The hook operates on a parsed L7 request, so it runs only on traffic OpenShell introspects at L7 (HTTP today). Opaque TCP or TLS passthrough carries no parsed request for a middleware to act on and is outside the scope of the hook. Because OpenShell fails closed when a required middleware cannot process a request, attaching middleware to traffic implies that traffic must be L7-introspected; this RFC may require that explicitly so a policy cannot silently bypass a middleware by falling back to L4.
@@ -129,7 +129,7 @@ Configuration-time:
 
 Request-time:
 
-- `ProcessRequestBeforeUpstream` carries the request plus context: request identity, endpoint and header context, the bounded body, and the middleware's configuration from policy.
+- `ProcessRequestBeforeUpstream` carries the request plus context: request identity, endpoint and header context, the originating process (the binary, pid, and ancestor chain OpenShell already resolves for network policy and audit), the bounded body, and the middleware's configuration from policy.
 - The response is a decision OpenShell can apply directly: `allow` or `deny`, optional replacement content and allowed header mutations, findings (labels, counts, confidence, never raw matched values), and namespaced metadata.
 
 A simplified sketch of the gRPC contract:
@@ -166,6 +166,14 @@ message RequestContext {
   Endpoint endpoint = 3;                // scheme, host, port, method, path
   map<string, string> headers = 4;      // safe subset
   google.protobuf.Struct config = 5;    // service-specific, from policy
+  Process actor = 6;                    // originating process (per-connection)
+}
+
+// Mirrors the actor process OpenShell already resolves for network policy and OCSF audit.
+message Process {
+  string binary = 1;                    // resolved binary path
+  uint32 pid = 2;
+  repeated string ancestors = 3;        // ancestor binary paths from the process-tree walk
 }
 
 // Outcome plus optional replacement body.
@@ -185,17 +193,19 @@ message Outcome {
 
 The interface is gRPC. The hot-path RPC is declared as a bidirectional stream, but v1 exchanges exactly one `ProcessRequest` and one `ProcessResponse` over it: the supervisor buffers the bounded body and the middleware replies once. Declaring it as a stream now is deliberate, because gRPC method cardinality cannot change compatibly. It lets a later version chunk large payloads without altering the method signature. Possible extensions (chunked streaming, additional hooks, semantic context) are collected in the [protocol-extensions appendix](appendices/protocol-extensions.md), including what streaming does and does not buy. The baseline middleware ships in the supervisor and is served in-process over the same gRPC contract, with no network hop. The exact field set is settled during implementation; the sketch above is the contract shape this RFC asks reviewers to evaluate.
 
+The `actor` process is the same identity OpenShell already resolves on the egress path - the binary, pid, and ancestor chain it uses for binary-scoped network policy and OCSF audit. It is resolved when the connection is established, so it is per-connection rather than strictly per-request: over a reused or pooled connection it identifies the process that opened the connection, which a middleware should not over-trust for per-request attribution.
+
 ### Contract versioning
 
 The middleware gRPC contract lives under a major-versioned protobuf package (`openshell.middleware.v1`), the same convention the compute-driver contract uses in [RFC 0001](../0001-core-architecture/README.md). Within a major version, changes stay additive and backward compatible - new fields, RPCs, hook stages, and capability fields can be added - while breaking wire or semantic changes require a new major version.
 
-`GetCapabilities` doubles as the version handshake. A middleware reports its own implementation version and the contract major version it implements, and the supervisor only invokes a middleware whose contract major version it supports. A mismatch is treated like any other capability-validation failure: it fails the gateway config load when a policy references the middleware, and is fail-closed at runtime. This keeps first-party and third-party middleware on one uniform contract and gives the protocol a stable path to evolve.
+`GetCapabilities` doubles as the version handshake. A middleware reports its own implementation version and the contract major version it implements, and the supervisor only invokes a middleware whose contract major version it supports. Capability validation is mandatory: if OpenShell cannot fetch capabilities, the service reports an unsupported contract, or the policy asks for an unsupported hook or config, the gateway config load or policy update fails before traffic can depend on that middleware. Runtime validation failures are handled through `on_error` and fail closed by default. This keeps first-party and third-party middleware on one uniform contract and gives the protocol a stable path to evolve.
 
 ### Registration and delivery
 
 The operator registers middleware in the gateway configuration: each entry is a name and an endpoint. This preserves the trust boundary. The endpoint sees raw payloads and is operator-owned infrastructure, so declaring one is an administrative action, while policy authors can only reference middleware by a registered name rather than point traffic at an arbitrary endpoint. In single-player mode one person holds both roles, but the split still holds in shared deployments.
 
-The portable transport is gRPC over TCP/TLS, reachable from every supervisor across Docker, Podman, VM, and Kubernetes drivers (Unix sockets are not, so they are not a baseline). A loopback endpoint such as `127.0.0.1:1234` is translated to `host.openshell.internal` so a supervisor can reach a service running on the gateway host.
+The portable transport is gRPC over TCP/TLS, reachable from every supervisor across Docker, Podman, VM, and Kubernetes drivers (Unix sockets are not, so they are not a baseline). In local single-player deployments, a loopback endpoint such as `127.0.0.1:1234` may be translated to `host.openshell.internal` so a supervisor can reach a service running on the local host. That loopback shorthand is not an HA deployment model: Kubernetes and other shared deployments should register a routable service DNS name or address that every supervisor can reach directly.
 
 ```toml
 [[openshell.proxy.middleware]]
@@ -213,7 +223,7 @@ During the research preview, a plaintext `http://` endpoint must be paired with 
 
 Built-in middleware ships in the supervisor binary and needs no registration. Built-in names are prefixed `openshell-` (for example `openshell-secrets`), and that prefix is reserved so user-defined middleware cannot use it.
 
-Supervisors receive the effective configuration over the same authenticated config path they already use for policy, provider, and inference config. Because the registered endpoint is reachable from both the gateway and the supervisors, capability validation runs at the gateway (at config load and when a policy references a middleware) and again at the supervisor before traffic flows; a validation failure fails the load rather than silently disabling the middleware. This gateway-side reachability is a property of the service deployment mode - a future sidecar mode would shift validation entirely to the supervisor.
+Supervisors receive the effective configuration over the same authenticated control-plane gRPC channel they already use for policy, provider, and inference config. The exact delivery shape is still open: it can extend the existing sandbox config response (`GetSandboxConfig` / `SandboxPolicy`) or use a dedicated bundle RPC in the style of `GetInferenceBundle`. Because the registered endpoint is reachable from both the gateway and the supervisors in the external-service deployment mode, capability validation runs at the gateway (at config load and when a policy references a middleware) and again at the supervisor before traffic flows; a validation failure fails the load rather than silently disabling the middleware. A future sidecar mode would shift validation entirely to the supervisor.
 
 Middleware registration lives in gateway configuration, which is not hot-reloaded ([RFC 0003](../0003-gateway-configuration/README.md) lists this as a non-goal): changing the registered set requires restarting the gateway. On restart, supervisors re-sync the effective configuration over their existing connection, so running sandboxes pick up a newly added middleware rather than only newly created sandboxes seeing it - there is no per-sandbox snapshot of the registered set.
 
@@ -226,6 +236,8 @@ Policy decides which middleware runs for which traffic, how it is configured, an
 A middleware entry references a registered middleware (or a built-in by its `openshell-` name), supplies its service-specific configuration, sets failure behavior (`on_error`, fail-closed by default when processing is required), and selects which requests it applies to. OpenShell does not interpret the configuration; it passes it to the middleware and relies on `ValidateConfig` to check it.
 
 Network endpoints attach one or more middleware as an ordered chain: each runs in turn, a later stage sees the previous stage's transformed content, a `deny` short-circuits the chain, and metadata accumulates in namespaced buckets. Policy validation combines OpenShell structural checks (the referenced middleware exists, the hook is supported, limits are in bounds, selectors are well-formed) with the service's own `ValidateConfig`. If validation fails, sandbox creation or policy update fails before any traffic reaches the hook. Middleware layers on top of the existing policy evaluation rather than replacing it: network and L7 decisions are made as they are today, and middleware runs only on requests that evaluation has already admitted.
+
+Implementation-wise, the hook is a new supervisor-side Rust enforcement stage selected by policy data, not a Rego rule. Existing Rego evaluation remains the metadata gate: L4 policy admits the connection, L7 policy admits the parsed request, then Rust buffers the bounded body, calls the configured middleware chain, and applies the returned decision or transformation. Request bodies do not become Rego input in v1. A later design may add a declarative pass over middleware findings, but v1 applies middleware outcomes directly.
 
 ```yaml
 network_middlewares:
@@ -282,7 +294,7 @@ For example, if `openshell-secrets` includes `*.github.com` globally and the pol
 
 ### Metadata and downstream routing
 
-Beyond allow/deny and transformation, middleware emits namespaced metadata (for example `request.modalities`, `privacy.sensitivity`, `privacy.requires_local_model`) into a request-local metadata bag. Metadata uses stable primitive types, never carries raw sensitive values, and is marked for where it may be used: audit, routing, or internal-only. This is the seam a future model router consumes; the router itself is out of scope ([#1734](https://github.com/NVIDIA/OpenShell/issues/1734)).
+Beyond allow/deny and transformation, middleware emits namespaced string metadata (for example `request.modalities = "text,image"`, `privacy.sensitivity = "restricted"`, `privacy.requires_local_model = "true"`) into a request-local metadata bag. V1 metadata is intentionally string-only and never carries raw sensitive values. This gives early middleware a safe annotation surface while deferring routing-grade typed metadata and usage markings to the model-router work; the router itself is out of scope ([#1734](https://github.com/NVIDIA/OpenShell/issues/1734)).
 
 How metadata keys are namespaced to avoid collisions between middleware is left open. One natural option is to derive the namespace from the middleware name (for example `anonymizer.sensitivity`), which prevents conflicts without a central key registry. Because nothing consumes middleware metadata in v1, this RFC defers the exact namespacing scheme to the work that introduces a consumer.
 
@@ -307,7 +319,7 @@ Egress middleware stays opt-in throughout: until a policy references a middlewar
 
 **Phase 1 - in-process middleware.** Define the `Middleware` gRPC contract (`GetCapabilities`, `ValidateConfig`, `ProcessRequestBeforeUpstream`), implement its server side in the supervisor, and ship one built-in middleware (for example `openshell-secrets`) behind the reserved `openshell-` prefix. The supervisor invokes the `request.before_upstream` hook in the L7 relay's per-request path - after policy admits the request and before credential injection - buffering the bounded body, enforcing the decision, applying transformation, running a chain in order, applying `on_error`, and accumulating metadata. Policy gains the top-level `network_middlewares` list and the per-policy `middleware: [...]` attachment, and decisions are recorded as the OCSF events described above. This exercises the whole contract, policy integration, and hot-path enforcement end to end with no external dependencies.
 
-**Phase 2 - external middleware service.** Open the same contract to operator-run services. The gateway gains the `[openshell.proxy]` configuration table (name, gRPC endpoint, `allow_insecure`), runs capability validation at config load and on policy reference, and delivers the effective middleware configuration to supervisors over the existing authenticated config path, where it is re-validated before traffic flows. This phase adds the registration trust boundary, the insecure research-preview mode, and the deployment guidance in [appendices/deployment-options.md](appendices/deployment-options.md) - none of which Phase 1 requires.
+**Phase 2 - external middleware service.** Open the same contract to operator-run services. The gateway gains the `[openshell.proxy]` configuration table (name, gRPC endpoint, `allow_insecure`), runs capability validation at config load and on policy reference, and delivers the effective middleware configuration to supervisors over the existing authenticated control-plane gRPC channel, where it is re-validated before traffic flows. This phase adds the registration trust boundary, the insecure research-preview mode, and the deployment guidance in [appendices/deployment-options.md](appendices/deployment-options.md) - none of which Phase 1 requires.
 
 ### Backwards compatibility and migration
 
@@ -354,7 +366,6 @@ Calling an external service from a proxy to inspect, transform, or block in-flig
 
 - **HTTP scope of v1.** Should the hook target all L7-introspected HTTP egress, only model-bound HTTP egress, or any relay-supported protocol? Current leaning: all L7-introspected HTTP.
 - **Config delivery path.** Deliver the effective middleware configuration by extending the existing sandbox config response (`GetSandboxConfig` / `SandboxPolicy`), or by adding a dedicated bundle RPC in the style of `GetInferenceBundle`? Undecided.
-- **Mandatory capability discovery.** Must `GetCapabilities` succeed before a policy that references a middleware is accepted, or can validation be deferred to the supervisor? Current leaning: strictly mandatory at policy reference.
 - **Two-selector overlap.** A middleware can be attached both through its own `requests:` selector and through a policy's `middleware: [...]` list. Are both surfaces needed, or should one win? This redundancy needs resolving before the policy schema is fixed.
 - **Metadata namespacing.** How are metadata keys namespaced to avoid collisions between middleware? Current leaning: derive the namespace from the middleware name, deferred until a consumer (the model router) exists.
 - **Compressed and chunked bodies.** How gzip-compressed request bodies and chunked or slow "drip" uploads interact with buffering, the size cap (encoded vs decoded bytes), and the call timeout is unresolved. It builds on the request buffering the proxy already does for credential rewriting and is settled during implementation.
