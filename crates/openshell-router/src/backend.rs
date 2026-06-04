@@ -70,6 +70,19 @@ enum StreamingBody {
 /// See: <https://cloud.google.com/vertex-ai/generative-ai/docs/partner-models/use-claude>
 const VERTEX_ANTHROPIC_VERSION: &str = "vertex-2023-10-16";
 
+/// Request body fields that are Anthropic SDK extension features not
+/// supported by Vertex AI rawPredict endpoints. These cause HTTP 400
+/// "Extra inputs are not permitted" if forwarded to Vertex AI.
+///
+/// Add new fields here as Claude Code and other Anthropic SDK clients
+/// introduce new extension-only body fields.
+const VERTEX_INCOMPATIBLE_BODY_FIELDS: &[&str] = &[
+    // Claude Code 2.1.x context management feature (USE_API_CONTEXT_MANAGEMENT).
+    // Disabled in clients by CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1.
+    // Vertex AI schema does not include this field; it causes HTTP 400.
+    "context_management",
+];
+
 const COMMON_INFERENCE_REQUEST_HEADERS: [&str; 4] =
     ["content-type", "accept", "accept-encoding", "user-agent"];
 
@@ -243,6 +256,13 @@ fn prepare_backend_request(
                     // in the body; strip it so Vertex AI does not reject the
                     // request with "Extra inputs are not permitted".
                     obj.remove("model");
+                    // Strip Anthropic SDK extension body fields not supported by Vertex AI rawPredict.
+                    // Vertex AI schema-validates the request body and rejects unknown fields with
+                    // HTTP 400 "Extra inputs are not permitted". Header-level betas are already
+                    // stripped above (`strip_anthropic_beta`); this handles the body-field equivalent.
+                    for field in VERTEX_INCOMPATIBLE_BODY_FIELDS {
+                        obj.remove(*field);
+                    }
                 } else {
                     obj.insert(
                         "model".to_string(),
@@ -1616,6 +1636,141 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("gemini-pro"),
             "Vertex Gemini route must still rewrite the model field, got: {received_body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn vertex_ai_body_strips_context_management_field() {
+        // Claude Code 2.1.x sends "context_management" in the request body when
+        // USE_API_CONTEXT_MANAGEMENT is active. Vertex AI rawPredict rejects this
+        // with HTTP 400 "Extra inputs are not permitted". The router must strip it.
+        let mock_server = MockServer::start().await;
+
+        let base_path = "/v1/projects/my-project/locations/us-east5/publishers/anthropic/models";
+        let route = ResolvedRoute {
+            name: "vertex-anthropic".to_string(),
+            endpoint: format!("{}{base_path}", mock_server.uri()),
+            model: "claude-sonnet-4-6".to_string(),
+            api_key: "ya29.token".to_string(),
+            protocols: vec!["anthropic_messages".to_string()],
+            auth: AuthHeader::Bearer,
+            default_headers: Vec::new(),
+            passthrough_headers: Vec::new(),
+            timeout: DEFAULT_ROUTE_TIMEOUT,
+            model_in_path: true,
+            request_path_override: Some(":rawPredict".to_string()),
+        };
+
+        Mock::given(method("POST"))
+            .and(path(format!("{base_path}/claude-sonnet-4-6:rawPredict")))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "msg_1"})),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client = reqwest::Client::builder().build().unwrap();
+        let body = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "claude-sonnet-4-6",
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 32,
+                "context_management": {
+                    "enabled": true,
+                    "strategy": "auto"
+                }
+            }))
+            .unwrap(),
+        );
+        let headers = vec![("content-type".to_string(), "application/json".to_string())];
+
+        let (builder, _url) = super::prepare_backend_request(
+            &client,
+            &route,
+            "POST",
+            "/v1/messages",
+            &headers,
+            body,
+            false,
+        )
+        .unwrap();
+
+        let response = builder.send().await.unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        let received = mock_server.received_requests().await.unwrap();
+        let received_body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+        assert!(
+            !received_body
+                .as_object()
+                .unwrap()
+                .contains_key("context_management"),
+            "context_management must be stripped from Vertex AI rawPredict body, got: {received_body}"
+        );
+        assert!(
+            !received_body.as_object().unwrap().contains_key("model"),
+            "model must also be stripped from Vertex AI rawPredict body, got: {received_body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_anthropic_preserves_context_management_field() {
+        // context_management must only be stripped for Vertex AI rawPredict routes.
+        // Direct Anthropic API routes must forward it intact.
+        let mock_server = MockServer::start().await;
+
+        let route = ResolvedRoute {
+            name: "direct-anthropic".to_string(),
+            endpoint: mock_server.uri(),
+            model: "claude-sonnet-4-6".to_string(),
+            api_key: "sk-ant-test".to_string(),
+            protocols: vec!["anthropic_messages".to_string()],
+            auth: AuthHeader::Custom("x-api-key"),
+            default_headers: vec![("anthropic-version".to_string(), "2023-06-01".to_string())],
+            passthrough_headers: vec!["anthropic-beta".to_string()],
+            timeout: DEFAULT_ROUTE_TIMEOUT,
+            model_in_path: false,
+            request_path_override: None,
+        };
+
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "msg_1"})),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client = reqwest::Client::builder().build().unwrap();
+        let body = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": "claude-sonnet-4-6",
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 32,
+                "context_management": {"enabled": true}
+            }))
+            .unwrap(),
+        );
+        let headers = vec![("content-type".to_string(), "application/json".to_string())];
+
+        let (builder, _url) = super::prepare_backend_request(
+            &client,
+            &route,
+            "POST",
+            "/v1/messages",
+            &headers,
+            body,
+            false,
+        )
+        .unwrap();
+
+        let _ = builder.send().await.unwrap();
+        let received = mock_server.received_requests().await.unwrap();
+        let received_body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+        assert!(
+            received_body
+                .as_object()
+                .unwrap()
+                .contains_key("context_management"),
+            "context_management must be preserved for direct Anthropic API routes, got: {received_body}"
         );
     }
 }
