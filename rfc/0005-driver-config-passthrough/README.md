@@ -133,6 +133,26 @@ This RFC does not introduce DNS-qualified driver namespaces. A future driver
 identity cleanup may add namespaced aliases or rename in-tree drivers, but that
 should not block the `driver_config` mechanism.
 
+### Future driver identity
+
+The built-in driver names listed above are reserved by OpenShell. Out-of-tree
+drivers should not assume that short, unqualified names are collision-safe as the
+driver ecosystem grows.
+
+A future driver identity design should allow a driver to advertise a canonical
+`driver_config` key and, if needed, compatibility aliases. For example, an
+external driver may eventually prefer a DNS-qualified key such as
+`vendor.example/driver` while an in-tree driver continues to use `kubernetes`,
+`docker`, `podman`, or `vm`.
+
+Any future identity design must preserve the ownership boundary in this RFC:
+
+- matching remains exact against a known active driver identity or alias;
+- wildcard matching does not gain special meaning;
+- the gateway does not infer nested schema ownership from partial names; and
+- the selected driver remains the only component that validates the selected
+  inner config block.
+
 ### Driver API
 
 Keep the existing gateway-computed `platform_config` separate from
@@ -180,6 +200,11 @@ The gateway handles only the top-level envelope:
 - If no matching block exists, the gateway forwards no driver config.
 - The matching block, when present, must be a Struct value.
 - Non-selected driver blocks are ignored by the gateway and are not validated.
+
+Future gateway implementations may emit a non-fatal warning when a non-empty
+envelope contains no top-level key matching any active driver name. That warning
+is a usability aid for likely typos. It must not change the portability rule:
+non-selected driver blocks remain tolerated and unvalidated by the gateway.
 
 After selecting the matching block, the gateway forwards only that inner Struct
 to `DriverSandboxTemplate.driver_config`.
@@ -243,6 +268,19 @@ Examples:
 
 This can be relaxed later to a documented merge rule if a real use case
 requires it.
+
+Prototype implementations may temporarily accept a narrower subset of this
+behavior while the nested driver schema is being explored. For example, a POC may
+ignore unknown Kubernetes keys so that representative scheduling and resource
+examples can be demonstrated before the final schema is settled. Such behavior
+must be documented as experimental and must not be treated as the final contract.
+
+Before a driver config key is documented as stable, the selected driver should
+define its validation behavior for unknown keys, malformed values, typed-field
+conflicts, protected invariants, and unsafe platform controls. The default
+expectation for stable documented schemas is to reject unknown or malformed
+fields unless the driver explicitly documents an extension bag or pass-through
+subtree.
 
 ### Protected fields and security constraints
 
@@ -326,9 +364,17 @@ migration guidance where possible.
 The initial implementation can rely on driver documentation plus validation
 errors from `ValidateSandboxCreate`.
 
-Longer term, drivers may expose machine-readable `driver_config` schemas so
-CLIs, TUIs, templates, and gateways can help users earlier. Possible discovery
-surfaces include:
+Longer term, driver config should have a machine-readable discovery surface so
+CLIs, TUIs, templates, and gateways can help users earlier without hard-coding
+driver-specific schemas. A discovery surface should let a driver report at
+least:
+
+- the canonical `driver_config` key and compatibility aliases it accepts;
+- whether the driver supports caller-provided `driver_config`;
+- the schema identifier, version, or URL for the selected config shape; and
+- the driver's documented unknown-field behavior.
+
+Possible discovery surfaces include:
 
 - a schema URL in `GetCapabilitiesResponse`;
 - an inline schema in `GetCapabilitiesResponse`;
@@ -467,7 +513,10 @@ outside this RFC.
    including GPU extended resources and sidecar resource requests.
 10. Document built-in driver names, exact-match behavior, validation ownership,
    lifecycle semantics, protected-field rules, schema evolution expectations,
-   and supported Kubernetes keys.
+   POC-versus-stable validation behavior, and supported Kubernetes keys.
+11. Track follow-up design work for canonical driver identity and aliases,
+   machine-readable schema discovery, and non-fatal warnings when no envelope
+   key matches an active driver.
 
 ## Risks
 
@@ -615,11 +664,12 @@ RFC 0004 intentionally left out of scope.
 
 ## Open questions
 
-- Should drivers advertise `driver_config` support in `GetCapabilitiesResponse`,
-  or is forwarding a matching block sufficient?
-- Should drivers expose machine-readable schemas for `driver_config`, and if so
-  should that be a schema URL, inline schema, dedicated RPC, or schema version
-  identifier?
+- What driver identity format and alias rules should out-of-tree drivers use if
+  OpenShell later introduces DNS-qualified driver names?
+- Which schema discovery surface should carry the canonical config key,
+  compatibility aliases, support signal, schema identity, and unknown-field
+  behavior?
+- Should no-match warnings be emitted by the gateway, CLI/TUI tooling, or both?
 - What Kubernetes nested config shape best covers representative pod-level and
   container-level use cases without exposing unsafe override paths?
 - Should Kubernetes config use driver-owned role names such as `sandbox` and
