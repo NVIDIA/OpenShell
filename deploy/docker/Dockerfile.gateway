@@ -28,6 +28,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     libssl-dev \
     ca-certificates \
+    clang \
+    libclang-dev \
+    python3 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
@@ -40,7 +43,7 @@ COPY providers/ providers/
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
     cargo build --release \
-        --features "openshell-core/dev-settings" \
+        --features "openshell-core/dev-settings bundled-z3" \
         --bin openshell-gateway \
     && mkdir -p /out \
     && install -m 0755 target/release/openshell-gateway /out/openshell-gateway

@@ -12,7 +12,7 @@ image:
   # -- Gateway image pull policy.
   pullPolicy: IfNotPresent
   # -- Gateway image tag. Defaults to the chart appVersion when empty.
-  tag: "20260512"
+  tag: "20260604"
 
 # Supervisor image - provides the openshell-sandbox binary injected into sandbox
 # pods. tag defaults to appVersion (same as the gateway image) so both stay in
@@ -20,11 +20,11 @@ image:
 supervisor:
   image:
     # -- Supervisor image repository.
-    repository: ghcr.io/nvidia/openshell/supervisor
+    repository: docker.io/aible/openshell-supervisor
     # -- Supervisor image pull policy. Defaults to the gateway image pull policy when empty.
     pullPolicy: ""
     # -- Supervisor image tag. Defaults to the chart appVersion when empty.
-    tag: ""
+    tag: "20260604"
   # -- How the supervisor binary is delivered into sandbox pods.
   # Empty (default) = auto-detect from cluster version:
   #   K8s >= v1.35 -> "image-volume" (ImageVolume enabled by default; GA in v1.36)
