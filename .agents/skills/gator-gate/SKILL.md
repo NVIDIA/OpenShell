@@ -401,6 +401,8 @@ Use the `principal-engineer-reviewer` sub-agent. Include:
 - Instruction to check whether direct UX changes update the Fern docs under `docs/` and navigation when needed
 - Instruction not to rely on local test execution
 
+When running inside the `openshell-agents/gator` sandbox launcher, invoke the reviewer with `bash /sandbox/payload/reviewer-agent.sh < review-task.md`. Put the PR metadata, linked issue context, and diff/file context in `review-task.md`, save the reviewer output, and use it as the independent review result. The main gator process remains responsible for labels, comments, docs gates, and CI monitoring.
+
 Post findings as a gator comment or a GitHub PR review:
 
 - Use inline comments for line-specific defects

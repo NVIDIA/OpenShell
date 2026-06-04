@@ -30,6 +30,7 @@ The launcher:
 - Enables `providers_v2_enabled`, `agent_policy_proposals_enabled`, and `proposal_approval_mode=auto` at gateway scope.
 - Uses the gator image policy copied to `/etc/openshell/policy.yaml`.
 - Uploads the current `.agents/skills/gator-gate/SKILL.md` into the sandbox payload.
+- Uploads `.claude/agents/principal-engineer-reviewer.md` and `reviewer-agent.sh` so `gator-gate` can run a deterministic independent reviewer Codex execution.
 - Optionally uploads a host Codex executable as `/sandbox/payload/codex`.
 - Starts `codex exec` without a TTY.
 - Deletes the sandbox automatically after Codex exits. Pass `--keep` to preserve it for debugging.

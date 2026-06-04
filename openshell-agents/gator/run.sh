@@ -8,6 +8,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 GATOR_DIR="$ROOT_DIR/openshell-agents/gator"
 SKILL_FILE="$ROOT_DIR/.agents/skills/gator-gate/SKILL.md"
+REVIEWER_AGENT_FILE="$ROOT_DIR/.claude/agents/principal-engineer-reviewer.md"
 
 OPENSHELL_BIN="${OPENSHELL_BIN:-openshell}"
 GATEWAY="${GATOR_GATEWAY:-docker-dev}"
@@ -169,6 +170,7 @@ require_cmd gh
 require_cmd jq
 require_cmd "$OPENSHELL_BIN"
 [[ -f "$SKILL_FILE" ]] || fail "missing gator skill: $SKILL_FILE"
+[[ -f "$REVIEWER_AGENT_FILE" ]] || fail "missing reviewer agent: $REVIEWER_AGENT_FILE"
 [[ -f "$HOME/.codex/auth.json" ]] || fail "missing local Codex auth; run: codex login"
 
 CODEX_AUTH_ACCESS_TOKEN="$(jq -r '.tokens.access_token // empty' "$HOME/.codex/auth.json")"
@@ -196,9 +198,13 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "$PAYLOAD_DIR/.agents/skills/gator-gate"
+mkdir -p "$PAYLOAD_DIR/.claude/agents"
 cp "$SKILL_FILE" "$PAYLOAD_DIR/.agents/skills/gator-gate/SKILL.md"
+cp "$REVIEWER_AGENT_FILE" "$PAYLOAD_DIR/.claude/agents/principal-engineer-reviewer.md"
 cp "$GATOR_DIR/sandbox-agent.sh" "$PAYLOAD_DIR/sandbox-agent.sh"
+cp "$GATOR_DIR/reviewer-agent.sh" "$PAYLOAD_DIR/reviewer-agent.sh"
 chmod +x "$PAYLOAD_DIR/sandbox-agent.sh"
+chmod +x "$PAYLOAD_DIR/reviewer-agent.sh"
 if [[ -n "$CODEX_LOCAL_BIN" ]]; then
     [[ -x "$CODEX_LOCAL_BIN" ]] || fail "--codex-bin is not executable: $CODEX_LOCAL_BIN"
     cp "$CODEX_LOCAL_BIN" "$PAYLOAD_DIR/codex"
@@ -218,6 +224,7 @@ Important sandbox constraints:
 - Keep watching active PRs until they close, merge, or the operator stops the sandbox.
 - Do not push to contributor branches unless the operator explicitly instructs you to do so.
 - If you receive 403 errors from the sandbox proxy, inspect the JSON response and propose a policy update to allow the requested action if the response contains a structured error message.
+- When the gator skill requires the \`principal-engineer-reviewer\` sub-agent, run a bounded independent review with \`bash /sandbox/payload/reviewer-agent.sh < review-task.md\`. Include PR metadata and full diff/file context in \`review-task.md\`, save the output, and use it as the independent reviewer result while the main gator process continues labels, comments, docs, and CI gating.
 
 Operator request:
 
