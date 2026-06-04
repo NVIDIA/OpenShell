@@ -452,6 +452,8 @@ If a mirror is missing or stale and you have maintainer authority, post:
 /ok to test <sha>
 ```
 
+The `/ok to test <sha>` comment must contain only that command. Do not include the `> **gator-agent**` marker, explanations, Markdown fences, or any other text in the same comment.
+
 If you do not have maintainer authority, move to `gator:blocked` and state that a maintainer must post `/ok to test <sha>`.
 
 ## Step 10: Pipeline Watch Loop
