@@ -73,6 +73,41 @@ const VERTEX_ANTHROPIC_VERSION: &str = "vertex-2023-10-16";
 const COMMON_INFERENCE_REQUEST_HEADERS: [&str; 4] =
     ["content-type", "accept", "accept-encoding", "user-agent"];
 
+/// Top-level request body fields accepted by Vertex AI's rawPredict endpoint
+/// for Anthropic Claude models. The gateway strips `anthropic-beta` headers
+/// for Vertex routes, but clients (e.g. Claude Code) may also send beta
+/// feature fields in the body (e.g. `context_management`). Vertex AI rejects
+/// unknown body fields with "Extra inputs are not permitted", so we strip any
+/// field not in this allowlist.
+///
+/// This list mirrors the stable Anthropic Messages API parameters plus the
+/// `anthropic_version` field required by Vertex. The `model` field is
+/// intentionally excluded — it is encoded in the URL path for Vertex routes
+/// and stripped separately. When Anthropic promotes a beta feature to the
+/// stable API, add it here.
+///
+/// See: <https://docs.anthropic.com/en/api/messages>
+const VERTEX_ANTHROPIC_ALLOWED_BODY_FIELDS: &[&str] = &[
+    "anthropic_version",
+    "cache_control",
+    "container",
+    "inference_geo",
+    "max_tokens",
+    "messages",
+    "metadata",
+    "output_config",
+    "service_tier",
+    "stop_sequences",
+    "stream",
+    "system",
+    "temperature",
+    "thinking",
+    "tool_choice",
+    "tools",
+    "top_k",
+    "top_p",
+];
+
 impl StreamingProxyResponse {
     /// Create from a fully-buffered [`ProxyResponse`] (for mock routes).
     pub fn from_buffered(resp: ProxyResponse) -> Self {
@@ -243,6 +278,16 @@ fn prepare_backend_request(
                     // in the body; strip it so Vertex AI does not reject the
                     // request with "Extra inputs are not permitted".
                     obj.remove("model");
+
+                    // Strip body fields not accepted by Vertex AI. The gateway
+                    // already strips the `anthropic-beta` header, but clients
+                    // also send matching body fields for enabled betas (e.g.
+                    // `context_management`). Vertex AI rejects these as extra
+                    // inputs. Remove any top-level field not in the stable
+                    // Anthropic Messages API allowlist.
+                    obj.retain(|key, _| {
+                        VERTEX_ANTHROPIC_ALLOWED_BODY_FIELDS.contains(&key.as_str())
+                    });
                 } else {
                     obj.insert(
                         "model".to_string(),
@@ -1616,6 +1661,160 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("gemini-pro"),
             "Vertex Gemini route must still rewrite the model field, got: {received_body}"
+        );
+    }
+
+    /// Vertex AI rawPredict routes must strip body fields that are not part of
+    /// the stable Anthropic Messages API. Clients like Claude Code send beta
+    /// feature fields (e.g. `context_management`) alongside the `anthropic-beta`
+    /// header. The gateway strips the header, but the body fields also need to
+    /// be removed — Vertex AI rejects them with "Extra inputs are not permitted".
+    #[tokio::test]
+    async fn vertex_ai_body_strips_beta_feature_fields() {
+        let mock_server = MockServer::start().await;
+
+        let base_path = "/v1/projects/my-project/locations/us-east5/publishers/anthropic/models";
+        let route = ResolvedRoute {
+            name: "vertex-anthropic".to_string(),
+            endpoint: format!("{}{base_path}", mock_server.uri()),
+            model: "claude-sonnet-4-6@20250514".to_string(),
+            api_key: "ya29.token".to_string(),
+            protocols: vec!["anthropic_messages".to_string()],
+            auth: AuthHeader::Bearer,
+            default_headers: Vec::new(),
+            passthrough_headers: vec!["anthropic-beta".to_string()],
+            timeout: DEFAULT_ROUTE_TIMEOUT,
+            model_in_path: true,
+            request_path_override: Some(":rawPredict".to_string()),
+        };
+
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "{base_path}/claude-sonnet-4-6@20250514:rawPredict"
+            )))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "msg_1"})),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client = reqwest::Client::builder().build().unwrap();
+        let body = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 32,
+                "context_management": {"type": "auto"},
+                "interleaved_thinking": {"budget_tokens": 1024},
+            }))
+            .unwrap(),
+        );
+        let headers = vec![
+            ("content-type".to_string(), "application/json".to_string()),
+            (
+                "anthropic-beta".to_string(),
+                "context-management-2025-06-27,interleaved-thinking-2025-05-14".to_string(),
+            ),
+        ];
+
+        let (builder, _url) = super::prepare_backend_request(
+            &client,
+            &route,
+            "POST",
+            "/v1/messages",
+            &headers,
+            body,
+            false,
+        )
+        .unwrap();
+
+        let response = builder.send().await.unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        let received = mock_server.received_requests().await.unwrap();
+        let received_body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+        let obj = received_body.as_object().unwrap();
+        assert!(
+            !obj.contains_key("context_management"),
+            "context_management must be stripped from Vertex AI body, got: {received_body}"
+        );
+        assert!(
+            !obj.contains_key("interleaved_thinking"),
+            "interleaved_thinking must be stripped from Vertex AI body, got: {received_body}"
+        );
+        assert!(
+            obj.contains_key("messages"),
+            "stable API fields must be preserved, got: {received_body}"
+        );
+        assert!(
+            obj.contains_key("max_tokens"),
+            "stable API fields must be preserved, got: {received_body}"
+        );
+    }
+
+    /// Standard Anthropic routes must NOT strip beta body fields.
+    #[tokio::test]
+    async fn standard_anthropic_body_preserves_beta_feature_fields() {
+        let mock_server = MockServer::start().await;
+
+        let route = ResolvedRoute {
+            name: "anthropic-direct".to_string(),
+            endpoint: mock_server.uri(),
+            model: "claude-sonnet-4-6".to_string(),
+            api_key: "sk-ant-test".to_string(),
+            protocols: vec!["anthropic_messages".to_string()],
+            auth: AuthHeader::Custom("x-api-key"),
+            default_headers: Vec::new(),
+            passthrough_headers: vec!["anthropic-beta".to_string()],
+            timeout: DEFAULT_ROUTE_TIMEOUT,
+            model_in_path: false,
+            request_path_override: None,
+        };
+
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "msg_1"})),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client = reqwest::Client::builder().build().unwrap();
+        let body = bytes::Bytes::from(
+            serde_json::to_vec(&serde_json::json!({
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 32,
+                "context_management": {"type": "auto"},
+            }))
+            .unwrap(),
+        );
+        let headers = vec![
+            ("content-type".to_string(), "application/json".to_string()),
+            (
+                "anthropic-beta".to_string(),
+                "context-management-2025-06-27".to_string(),
+            ),
+        ];
+
+        let (builder, _url) = super::prepare_backend_request(
+            &client,
+            &route,
+            "POST",
+            "/v1/messages",
+            &headers,
+            body,
+            false,
+        )
+        .unwrap();
+
+        builder.send().await.unwrap();
+
+        let received = mock_server.received_requests().await.unwrap();
+        let received_body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+        assert!(
+            received_body
+                .as_object()
+                .unwrap()
+                .contains_key("context_management"),
+            "standard Anthropic route must preserve beta body fields, got: {received_body}"
         );
     }
 }
