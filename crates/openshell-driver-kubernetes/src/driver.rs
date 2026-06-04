@@ -1210,7 +1210,7 @@ fn sandbox_template_to_k8s(
     inject_workspace: bool,
     params: &SandboxPodParams<'_>,
 ) -> serde_json::Value {
-    let _driver_config = kubernetes_driver_config(template);
+    let driver_config = kubernetes_driver_config(template);
 
     let mut metadata = serde_json::Map::new();
     if !template.labels.is_empty() {
@@ -1258,6 +1258,7 @@ fn sandbox_template_to_k8s(
     if let Some(tolerations) = platform_config_struct(template, "tolerations") {
         spec.insert("tolerations".to_string(), tolerations);
     }
+    apply_pod_driver_config(&mut spec, &driver_config.pod);
 
     // Per-sandbox platform_config.host_users overrides the cluster-wide default.
     let use_user_namespaces = platform_config_bool(template, "host_users")
@@ -1369,6 +1370,7 @@ fn sandbox_template_to_k8s(
     if let Some(resources) = container_resources(template, gpu) {
         container.insert("resources".to_string(), resources);
     }
+    apply_agent_driver_resources(&mut container, &driver_config.containers.agent.resources);
     spec.insert(
         "containers".to_string(),
         serde_json::Value::Array(vec![serde_json::Value::Object(container)]),
@@ -1436,6 +1438,83 @@ fn sandbox_template_to_k8s(
     }
 
     result
+}
+
+fn apply_pod_driver_config(
+    spec: &mut serde_json::Map<String, serde_json::Value>,
+    config: &KubernetesPodDriverConfig,
+) {
+    if !config.node_selector.is_empty() {
+        let node_selector = spec
+            .entry("nodeSelector".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        merge_string_map(node_selector, &config.node_selector);
+    }
+
+    if !config.priority_class_name.is_empty() {
+        spec.entry("priorityClassName".to_string())
+            .or_insert_with(|| serde_json::json!(config.priority_class_name));
+    }
+
+    if !config.tolerations.is_empty() {
+        let tolerations = spec
+            .entry("tolerations".to_string())
+            .or_insert_with(|| serde_json::json!([]));
+        if let Some(existing) = tolerations.as_array_mut() {
+            existing.extend(config.tolerations.iter().cloned());
+        } else {
+            *tolerations = serde_json::Value::Array(config.tolerations.clone());
+        }
+    }
+}
+
+fn apply_agent_driver_resources(
+    container: &mut serde_json::Map<String, serde_json::Value>,
+    resources: &KubernetesContainerResourceConfig,
+) {
+    if resources.requests.is_empty() && resources.limits.is_empty() {
+        return;
+    }
+
+    let target = container
+        .entry("resources".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    apply_resource_quantity_map(target, "requests", &resources.requests);
+    apply_resource_quantity_map(target, "limits", &resources.limits);
+}
+
+fn merge_string_map(target: &mut serde_json::Value, values: &BTreeMap<String, String>) {
+    if !target.is_object() {
+        *target = serde_json::json!({});
+    }
+    let target = target
+        .as_object_mut()
+        .expect("target was converted to object");
+    for (key, value) in values {
+        target
+            .entry(key.clone())
+            .or_insert_with(|| serde_json::json!(value));
+    }
+}
+
+fn apply_resource_quantity_map(
+    target: &mut serde_json::Value,
+    section: &str,
+    values: &BTreeMap<String, String>,
+) {
+    if values.is_empty() {
+        return;
+    }
+    if !target.is_object() {
+        *target = serde_json::json!({});
+    }
+    let target = target
+        .as_object_mut()
+        .expect("target was converted to object");
+    let section_value = target
+        .entry(section.to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    merge_string_map(section_value, values);
 }
 
 fn image_pull_secret_refs(secrets: &[String]) -> Vec<serde_json::Value> {
@@ -3070,6 +3149,67 @@ mod tests {
         assert_eq!(tolerations[0]["key"], "nvidia.com/gpu");
         assert_eq!(tolerations[0]["operator"], "Exists");
         assert_eq!(tolerations[0]["effect"], "NoSchedule");
+    }
+
+    #[test]
+    fn driver_config_applies_pod_scheduling_and_agent_resources() {
+        let template = SandboxTemplate {
+            driver_config: Some(json_struct(serde_json::json!({
+                "pod": {
+                    "node_selector": {
+                        "accelerator": "nvidia"
+                    },
+                    "priority_class_name": "gpu-workload",
+                    "tolerations": [{
+                        "key": "nvidia.com/gpu",
+                        "operator": "Exists",
+                        "effect": "NoSchedule"
+                    }]
+                },
+                "containers": {
+                    "agent": {
+                        "resources": {
+                            "requests": {
+                                "vendor.example/gpu-memory": "8Gi"
+                            },
+                            "limits": {
+                                "vendor.example/gpu-slices": "1"
+                            }
+                        }
+                    }
+                }
+            }))),
+            ..SandboxTemplate::default()
+        };
+
+        let pod_template = sandbox_template_to_k8s(
+            &template,
+            false,
+            &std::collections::HashMap::new(),
+            false,
+            &SandboxPodParams::default(),
+        );
+
+        assert_eq!(
+            pod_template["spec"]["nodeSelector"]["accelerator"],
+            serde_json::json!("nvidia")
+        );
+        assert_eq!(
+            pod_template["spec"]["priorityClassName"],
+            serde_json::json!("gpu-workload")
+        );
+        assert_eq!(
+            pod_template["spec"]["tolerations"][0]["key"],
+            serde_json::json!("nvidia.com/gpu")
+        );
+        assert_eq!(
+            pod_template["spec"]["containers"][0]["resources"]["requests"]["vendor.example/gpu-memory"],
+            serde_json::json!("8Gi")
+        );
+        assert_eq!(
+            pod_template["spec"]["containers"][0]["resources"]["limits"]["vendor.example/gpu-slices"],
+            serde_json::json!("1")
+        );
     }
 
     #[test]

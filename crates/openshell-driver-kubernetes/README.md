@@ -65,3 +65,33 @@ When a sandbox requests GPU support, the driver checks node allocatable capacity
 for `nvidia.com/gpu` and requests one GPU resource in the workload spec. The
 sandbox image must provide the user-space libraries needed by the agent
 workload.
+
+## Driver Config POC
+
+The RFC 0005 POC accepts the selected `SandboxTemplate.driver_config.kubernetes`
+block as `DriverSandboxTemplate.driver_config`. The Kubernetes driver owns the
+nested schema and currently accepts:
+
+- `pod.node_selector`
+- `pod.tolerations`
+- `pod.priority_class_name`
+- `containers.agent.resources.requests`
+- `containers.agent.resources.limits`
+
+Nested keys inside the `kubernetes` block use snake_case. The top-level
+`driver_config` envelope is keyed by driver names, so `kubernetes` is not part
+of the nested schema.
+
+Set this through the CLI with the public driver-keyed envelope. The gateway
+forwards only the `kubernetes` object to this driver:
+
+```shell
+openshell sandbox create \
+  --driver-config-json '{"kubernetes":{"pod":{"node_selector":{"pool":"gpu"}}}}' \
+  -- claude
+```
+
+Resource keys use native Kubernetes resource names and quantity strings. The
+POC parser renders the keys listed above and ignores unknown fields. Use the
+public `gpu` flag for the default GPU request and `driver_config` only for
+additional driver-owned resource details.
