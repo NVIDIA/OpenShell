@@ -355,6 +355,11 @@ message SandboxTemplate {
   // available (beta through 1.35, GA in 1.36+) and a supporting runtime.
   // When unset, the cluster-wide default is used.
   optional bool user_namespaces = 10;
+  // Driver-keyed opaque config envelope supplied by the caller.
+  // The gateway selects the block matching the active compute driver and
+  // forwards only that inner Struct to DriverSandboxTemplate.driver_config.
+  // The selected driver owns nested schema validation.
+  google.protobuf.Struct driver_config = 11;
 }
 
 // User-facing sandbox status derived by the gateway from compute-driver observations.

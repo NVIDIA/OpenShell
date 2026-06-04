@@ -121,6 +121,10 @@ message DriverSandboxTemplate {
   // For the Kubernetes driver this carries fields such as runtimeClassName,
   // annotations, and volumeClaimTemplates.
   google.protobuf.Struct platform_config = 11;
+  // Caller-provided config for the selected driver only.
+  // This is the inner block selected from public SandboxTemplate.driver_config.
+  // The selected driver owns nested schema validation.
+  google.protobuf.Struct driver_config = 12;
 }
 
 // Typed compute-resource requirements.

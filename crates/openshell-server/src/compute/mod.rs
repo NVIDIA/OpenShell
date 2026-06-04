@@ -425,7 +425,8 @@ impl ComputeRuntime {
     }
 
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), Status> {
-        let driver_sandbox = driver_sandbox_from_public(sandbox);
+        let driver_sandbox =
+            driver_sandbox_from_public(sandbox, self.driver_kind).map_err(|status| *status)?;
         self.driver
             .validate_sandbox_create(Request::new(ValidateSandboxCreateRequest {
                 sandbox: Some(driver_sandbox),
@@ -440,6 +441,8 @@ impl ComputeRuntime {
         sandbox_token: Option<String>,
     ) -> Result<Sandbox, Status> {
         let sandbox_id = sandbox.object_id().to_string();
+        let mut driver_sandbox =
+            driver_sandbox_from_public(&sandbox, self.driver_kind).map_err(|status| *status)?;
 
         // Create with MustCreate condition to prevent duplicate creation race
         self.sandbox_index.update_from_sandbox(&sandbox);
@@ -469,7 +472,6 @@ impl ComputeRuntime {
                 }
             })?;
 
-        let mut driver_sandbox = driver_sandbox_from_public(&sandbox);
         if let Some(token) = sandbox_token
             && let Some(spec) = driver_sandbox.spec.as_mut()
         {
@@ -551,12 +553,11 @@ impl ComputeRuntime {
         self.sandbox_watch_bus.notify(&id);
         self.cleanup_sandbox_owned_records(&sandbox).await;
 
-        let driver_sandbox = driver_sandbox_from_public(&sandbox);
         let deleted = self
             .driver
             .delete_sandbox(Request::new(DeleteSandboxRequest {
-                sandbox_id: driver_sandbox.id,
-                sandbox_name: driver_sandbox.name,
+                sandbox_id: sandbox.object_id().to_string(),
+                sandbox_name: sandbox.object_name().to_string(),
             }))
             .await
             .map(|response| response.into_inner().deleted)
@@ -1249,38 +1250,75 @@ impl ComputeRuntime {
     }
 }
 
-fn driver_sandbox_from_public(sandbox: &Sandbox) -> DriverSandbox {
-    DriverSandbox {
+fn driver_sandbox_from_public(
+    sandbox: &Sandbox,
+    driver_kind: Option<ComputeDriverKind>,
+) -> Result<DriverSandbox, Box<Status>> {
+    Ok(DriverSandbox {
         id: sandbox.object_id().to_string(),
         name: sandbox.object_name().to_string(),
         namespace: String::new(), // Namespace is set by the driver based on its config
-        spec: sandbox.spec.as_ref().map(driver_sandbox_spec_from_public),
+        spec: sandbox
+            .spec
+            .as_ref()
+            .map(|spec| driver_sandbox_spec_from_public(spec, driver_kind))
+            .transpose()?,
         status: sandbox.status.as_ref().map(driver_status_from_public),
-    }
+    })
 }
 
-fn driver_sandbox_spec_from_public(spec: &SandboxSpec) -> DriverSandboxSpec {
-    DriverSandboxSpec {
+fn driver_sandbox_spec_from_public(
+    spec: &SandboxSpec,
+    driver_kind: Option<ComputeDriverKind>,
+) -> Result<DriverSandboxSpec, Box<Status>> {
+    Ok(DriverSandboxSpec {
         log_level: spec.log_level.clone(),
         environment: spec.environment.clone(),
         template: spec
             .template
             .as_ref()
-            .map(driver_sandbox_template_from_public),
+            .map(|template| driver_sandbox_template_from_public(template, driver_kind))
+            .transpose()?,
         gpu: spec.gpu,
         gpu_device: spec.gpu_device.clone(),
         sandbox_token: String::new(),
-    }
+    })
 }
 
-fn driver_sandbox_template_from_public(template: &SandboxTemplate) -> DriverSandboxTemplate {
-    DriverSandboxTemplate {
+fn driver_sandbox_template_from_public(
+    template: &SandboxTemplate,
+    driver_kind: Option<ComputeDriverKind>,
+) -> Result<DriverSandboxTemplate, Box<Status>> {
+    Ok(DriverSandboxTemplate {
         image: template.image.clone(),
         agent_socket_path: template.agent_socket.clone(),
         labels: template.labels.clone(),
         environment: template.environment.clone(),
         resources: extract_typed_resources(&template.resources),
         platform_config: build_platform_config(template),
+        driver_config: select_driver_config(&template.driver_config, driver_kind)?,
+    })
+}
+
+fn select_driver_config(
+    config: &Option<prost_types::Struct>,
+    driver_kind: Option<ComputeDriverKind>,
+) -> Result<Option<prost_types::Struct>, Box<Status>> {
+    let Some(config) = config else {
+        return Ok(None);
+    };
+    let Some(driver_kind) = driver_kind else {
+        return Ok(None);
+    };
+    let driver_name = driver_kind.as_str();
+    let Some(value) = config.fields.get(driver_name) else {
+        return Ok(None);
+    };
+    match value.kind.as_ref() {
+        Some(prost_types::value::Kind::StructValue(inner)) => Ok(Some(inner.clone())),
+        _ => Err(Box::new(Status::invalid_argument(format!(
+            "template.driver_config.{driver_name} must be an object"
+        )))),
     }
 }
 
@@ -1817,6 +1855,61 @@ mod tests {
                     .collect(),
             })),
         }
+    }
+
+    #[test]
+    fn select_driver_config_forwards_only_matching_driver_block() {
+        let config = prost_types::Struct {
+            fields: [
+                (
+                    "kubernetes".to_string(),
+                    struct_value([("node", string_value("gpu"))]),
+                ),
+                (
+                    "docker".to_string(),
+                    struct_value([("network_mode", string_value("bridge"))]),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        };
+
+        let selected =
+            select_driver_config(&Some(config), Some(ComputeDriverKind::Kubernetes)).unwrap();
+        let selected = selected.expect("kubernetes config should be selected");
+
+        assert!(selected.fields.contains_key("node"));
+        assert!(!selected.fields.contains_key("network_mode"));
+    }
+
+    #[test]
+    fn select_driver_config_ignores_non_matching_driver_blocks() {
+        let config = prost_types::Struct {
+            fields: std::iter::once((
+                "docker".to_string(),
+                struct_value([("network_mode", string_value("bridge"))]),
+            ))
+            .collect(),
+        };
+
+        let selected =
+            select_driver_config(&Some(config), Some(ComputeDriverKind::Kubernetes)).unwrap();
+
+        assert!(selected.is_none());
+    }
+
+    #[test]
+    fn select_driver_config_rejects_non_object_matching_driver_block() {
+        let config = prost_types::Struct {
+            fields: std::iter::once(("kubernetes".to_string(), string_value("not-an-object")))
+                .collect(),
+        };
+
+        let err =
+            select_driver_config(&Some(config), Some(ComputeDriverKind::Kubernetes)).unwrap_err();
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("template.driver_config.kubernetes"));
     }
 
     #[derive(Debug, Default)]
