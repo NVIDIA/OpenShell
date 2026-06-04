@@ -4,8 +4,9 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Padding, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Borders, Cell, Padding, Row, Table};
 
+use super::draw_empty_message;
 use crate::app::{App, Focus, MiddlePaneTab};
 
 pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -118,13 +119,6 @@ fn draw_gateway_list(frame: &mut Frame<'_>, app: &App, area: Rect) {
     frame.render_widget(table, area);
 
     if app.gateways.is_empty() {
-        let inner = Rect {
-            x: area.x + 2,
-            y: area.y + 2,
-            width: area.width.saturating_sub(4),
-            height: area.height.saturating_sub(3),
-        };
-        let msg = Paragraph::new(Span::styled(" No gateways found.", t.muted));
-        frame.render_widget(msg, inner);
+        draw_empty_message(frame, area, " No gateways found.", t.muted);
     }
 }
