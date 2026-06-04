@@ -80,6 +80,12 @@ pub const SANDBOX_KIND: &str = "Sandbox";
 const GPU_RESOURCE_NAME: &str = "nvidia.com/gpu";
 const GPU_RESOURCE_QUANTITY: &str = "1";
 
+// This POC treats the selected Struct as a driver-local typed schema. Once the
+// Kubernetes shape stabilizes, these serde structs may move to driver-local
+// protobuf definitions, but the typed decode should stay inside this driver.
+// Do not promote Kubernetes config messages into the public API or gateway
+// translation layer; the RFC boundary is Struct at the gateway, typed config in
+// the selected driver.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 struct KubernetesSandboxDriverConfig {
