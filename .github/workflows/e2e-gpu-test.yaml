@@ -55,7 +55,7 @@ jobs:
       # probe below and by the e2e tests in e2e/rust/tests/gpu_device_selection.rs.
       OPENSHELL_E2E_GPU_PROBE_IMAGE: "nvcr.io/nvidia/base/ubuntu:noble-20251013"
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
