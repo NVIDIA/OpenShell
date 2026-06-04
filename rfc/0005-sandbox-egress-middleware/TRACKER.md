@@ -43,7 +43,7 @@ The main `README.md` should stay relatively high-level. It should explain the pr
 - [done] Proposal: architecture, hooks/placement, contract (+ proto sketch), registration/delivery, policy integration, ordering, metadata, audit/logging.
 - [done] Prior art (kept inline in the README, not a separate appendix).
 - [done] Terminology.
-- [todo] Implementation plan.
+- [done] Implementation plan.
 - [todo] Risks.
 - [todo] Alternatives.
 - [todo] Open questions.
@@ -70,7 +70,7 @@ Prefer Mermaid diagrams in the main RFC when they clarify the core proposal. Mov
 
 - [done] Terminology: defines `egress` (OpenShell-specific: admitted, parsed request, not raw packets), `middleware`, `registered middleware`, `built-in middleware`, `hook`, `middleware config`, `capabilities`, `decision`, `transformation`, `finding`, `metadata`, `chain`. Placed between Non-goals and Proposal.
 - [done] Gateway configuration: operators register middleware via `[[openshell.proxy.middleware]]` (name + endpoint). Auth material and timeout defaults not yet fully specified.
-- [partial] Supervisor configuration delivery: README says it reuses the existing authenticated config path. The `GetSandboxBundle` question is not yet explicitly resolved.
+- [partial] Supervisor configuration delivery: README says it reuses the existing authenticated config path. Exact delivery shape still open - extend `GetSandboxConfig` / `SandboxPolicy` or add a `GetInferenceBundle`-style bundle RPC (see open question below).
 - [done] Middleware capability discovery: `GetCapabilities` + simplified proto sketch in the contract section.
 - [partial] Capability response fields: sketch covers name, version, hooks, max body, timeout, metadata namespaces. Full field list deferred to the request-response-contract appendix.
 - [done] Middleware inspection RPC: `ProcessRequestBeforeUpstream` request/response sketched (bidi stream, single-message v1, `{context, body}` / `{verdict, body}`).
@@ -107,14 +107,14 @@ Resolved this round:
 Still open:
 
 - Should v1 target all HTTP egress, only model-bound HTTP egress, or any relay-supported protocol? (Currently: all L7-introspected HTTP.)
-- Is `GetSandboxBundle` the right delivery path, or a separate API?
+- Delivery path: extend the existing sandbox config response (`GetSandboxConfig` / `SandboxPolicy`), or add a dedicated bundle RPC in the style of `GetInferenceBundle`? (Note: there is no `GetSandboxBundle` RPC today; earlier notes naming it were inaccurate.)
 - Exact metadata namespacing scheme (leaning: derive from middleware name) - deferred until a consumer exists.
 - Is the two-selector surface (`requests:` on a middleware entry vs the per-policy `middleware: [...]`) both needed, or should one win?
 - Should middleware capability discovery be strictly mandatory before accepting referencing policy? (Leaning yes.)
 
 ## Drafting Queue (next)
 
-- Write Implementation plan, Risks, Alternatives, Open questions sections.
+- Write Risks, Alternatives, Open questions sections.
 - Fill the pipeline-placement appendix from the real supervisor relay path.
 - Expand the request-response-contract and policy-integration appendices beyond the README sketches.
 - Write the failure-and-audit appendix (OCSF field mappings).
