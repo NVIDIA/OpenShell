@@ -16,6 +16,7 @@ mod splash;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
@@ -472,6 +473,21 @@ fn draw_command_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
     let bar = Paragraph::new(line).block(Block::default().borders(Borders::NONE));
     frame.render_widget(bar, area);
+}
+
+/// Render an empty-state message inside a bordered panel.
+///
+/// Calculates an inset [`Rect`] that clears the panel border and renders
+/// `text` with the given `style`.  Use this whenever a table or list has no
+/// rows to display.
+pub fn draw_empty_message(frame: &mut Frame<'_>, area: Rect, text: &str, style: Style) {
+    let inner = Rect {
+        x: area.x + 2,
+        y: area.y + 2,
+        width: area.width.saturating_sub(4),
+        height: area.height.saturating_sub(3),
+    };
+    frame.render_widget(Paragraph::new(Span::styled(text, style)), inner);
 }
 
 /// Center a popup rectangle within `area` using absolute width and height (in

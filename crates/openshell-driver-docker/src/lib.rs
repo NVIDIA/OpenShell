@@ -23,7 +23,7 @@ use openshell_core::config::{
 };
 use openshell_core::driver_utils::{
     LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
-    LABEL_SANDBOX_NAMESPACE, SUPERVISOR_IMAGE_BINARY_PATH,
+    LABEL_SANDBOX_NAMESPACE, SUPERVISOR_IMAGE_BINARY_PATH, supervisor_image_should_refresh,
 };
 use openshell_core::gpu::cdi_gpu_device_ids;
 use openshell_core::progress::{
@@ -2570,23 +2570,6 @@ async fn extract_supervisor_bin_from_image(docker: &Docker, image: &str) -> Core
     write_cache_binary_atomic(&cache_path, &binary_bytes)?;
     validate_linux_elf_binary(&cache_path)?;
     Ok(cache_path)
-}
-
-fn supervisor_image_should_refresh(image: &str) -> bool {
-    matches!(supervisor_image_tag(image), Some("dev" | "latest"))
-}
-
-fn supervisor_image_tag(image: &str) -> Option<&str> {
-    if image.contains('@') {
-        return None;
-    }
-
-    let image_name = image.rsplit('/').next().unwrap_or(image);
-    image_name
-        .rsplit_once(':')
-        .map_or(Some("latest"), |(_, tag)| {
-            if tag.is_empty() { None } else { Some(tag) }
-        })
 }
 
 async fn pull_supervisor_image(docker: &Docker, image: &str) -> CoreResult<()> {
