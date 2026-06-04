@@ -6,29 +6,25 @@
 This directory defines workload test images currently used by the OpenShell GPU
 e2e suite.
 
-The image definitions live here first so the OpenShell e2e harness can iterate
-against a concrete workload manifest. The long-term image ownership should move
-to `NVIDIA/OpenShell-Community`; OpenShell should then keep the manifest
-contract, local build task, and tests that consume published image refs.
-
 ## Contract
 
 Each workload image must:
 
-- Use the OpenShell community base image as its final-stage base.
-- Install the workload at `/usr/local/bin/openshell-gpu-workload`.
+- Use the standard OpenShell sandbox base image as its final-stage base or
+  ensure that the requirements for a sandbox image are met.
+- Provide a manifest command that runs the workload inside the sandbox image.
 - Run the same workload as the image default entrypoint for direct
   container-engine validation.
 - Require no network access after the image is pulled.
 - Print `OPENSHELL_GPU_WORKLOAD_SUCCESS` only when validation succeeds.
 - Print `OPENSHELL_GPU_WORKLOAD_FAILURE` and exit non-zero when validation
   fails.
-- Be usable as an OpenShell sandbox image when OpenShell invokes
-  `/usr/local/bin/openshell-gpu-workload` explicitly.
+- Be usable as an OpenShell sandbox image when OpenShell invokes the manifest
+  command explicitly.
 
 OpenShell sandbox creation replaces the image entrypoint with the supervisor and
 does not run the OCI image `CMD`. E2e tests that use these images through
-OpenShell should run `/usr/local/bin/openshell-gpu-workload` explicitly.
+OpenShell run the command from each manifest entry explicitly.
 
 The test harness is manifest-driven. Each workload entry carries:
 
@@ -153,15 +149,10 @@ mise run e2e:workloads:build
 
 or to set `OPENSHELL_E2E_WORKLOAD_MANIFEST` to an external manifest.
 
-Each manifest entry supplies the sandbox image and command. OpenShell runs:
-
-```text
-/usr/local/bin/openshell-gpu-workload
-```
-
-through `openshell sandbox create --gpu --from <image> -- <command>`. The test
-runner iterates all GPU-tagged workload entries and enforces each entry's
-declared expectation:
+Each manifest entry supplies the sandbox image and command. OpenShell runs that
+command through `openshell sandbox create --gpu --from <image> -- <command>`.
+The test runner iterates all GPU-tagged workload entries and enforces each
+entry's declared expectation:
 
 - `expect: pass` requires `OPENSHELL_GPU_WORKLOAD_SUCCESS`
 - `expect: fail` requires `OPENSHELL_GPU_WORKLOAD_FAILURE`
@@ -181,15 +172,5 @@ with:
 export OPENSHELL_E2E_WORKLOAD_MANIFEST=/abs/path/to/workloads.yaml
 ```
 
-That lets partner-supplied or published workload manifests use the same test
-runner without introducing per-workload env vars.
-## Publish Guidance
-
-Published tests should reference immutable image refs:
-
-```shell
-OPENSHELL_E2E_WORKLOAD_MANIFEST=/abs/path/to/published-workloads.yaml
-```
-
-The published manifest should use immutable image refs such as digests or
-release tags once the images are published from OpenShell-Community.
+That lets alternate workload manifests use the same test runner without
+introducing per-workload env vars.
