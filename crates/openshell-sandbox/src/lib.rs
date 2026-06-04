@@ -424,12 +424,11 @@ pub async fn run_sandbox(
     );
     let provider_env = provider_credentials.snapshot().child_env.clone();
 
-    let user_environment: std::collections::HashMap<String, String> = std::env::var(
-        openshell_core::sandbox_env::USER_ENVIRONMENT,
-    )
-    .ok()
-    .and_then(|json| serde_json::from_str(&json).ok())
-    .unwrap_or_default();
+    let user_environment: std::collections::HashMap<String, String> =
+        std::env::var(openshell_core::sandbox_env::USER_ENVIRONMENT)
+            .ok()
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .unwrap_or_default();
 
     // Create identity cache for SHA256 TOFU when OPA is active
     let identity_cache = opa_engine

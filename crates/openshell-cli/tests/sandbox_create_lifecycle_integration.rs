@@ -1412,3 +1412,14 @@ async fn sandbox_create_env_rejects_invalid_format() {
         "error should mention the flag and bad value, got: {msg}"
     );
 }
+
+#[tokio::test]
+async fn sandbox_create_env_rejects_reserved_prefix() {
+    let err = run::parse_env_pairs(&["VALID=ok".to_string(), "OPENSHELL_SECRET=bad".to_string()])
+        .unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("OPENSHELL_") && msg.contains("reserved"),
+        "error should mention reserved prefix, got: {msg}"
+    );
+}

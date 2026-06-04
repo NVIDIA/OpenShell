@@ -1630,7 +1630,11 @@ fn build_env_list(
     if !user_env.is_empty()
         && let Ok(json) = serde_json::to_string(&user_env)
     {
-        upsert_env(&mut env, openshell_core::sandbox_env::USER_ENVIRONMENT, &json);
+        upsert_env(
+            &mut env,
+            openshell_core::sandbox_env::USER_ENVIRONMENT,
+            &json,
+        );
     }
     apply_required_env(
         &mut env,

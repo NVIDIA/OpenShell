@@ -3450,55 +3450,10 @@ fn build_guest_environment(
         || guest_visible_openshell_endpoint(&config.openshell_endpoint),
         String::from,
     );
-    let mut environment = HashMap::from([
-        ("HOME".to_string(), "/root".to_string()),
-        (
-            "PATH".to_string(),
-            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
-        ),
-        ("TERM".to_string(), "xterm".to_string()),
-        (
-            openshell_core::sandbox_env::ENDPOINT.to_string(),
-            openshell_endpoint,
-        ),
-        (
-            openshell_core::sandbox_env::SANDBOX_ID.to_string(),
-            sandbox.id.clone(),
-        ),
-        (
-            openshell_core::sandbox_env::SANDBOX.to_string(),
-            sandbox.name.clone(),
-        ),
-        (
-            openshell_core::sandbox_env::SSH_SOCKET_PATH.to_string(),
-            GUEST_SSH_SOCKET_PATH.to_string(),
-        ),
-        (
-            openshell_core::sandbox_env::SANDBOX_COMMAND.to_string(),
-            "tail -f /dev/null".to_string(),
-        ),
-        (
-            openshell_core::sandbox_env::LOG_LEVEL.to_string(),
-            openshell_core::driver_utils::sandbox_log_level(sandbox, &config.log_level),
-        ),
-    ]);
-    if config.requires_tls_materials() {
-        environment.extend(HashMap::from([
-            (
-                openshell_core::sandbox_env::TLS_CA.to_string(),
-                GUEST_TLS_CA_PATH.to_string(),
-            ),
-            (
-                openshell_core::sandbox_env::TLS_CERT.to_string(),
-                GUEST_TLS_CERT_PATH.to_string(),
-            ),
-            (
-                openshell_core::sandbox_env::TLS_KEY.to_string(),
-                GUEST_TLS_KEY_PATH.to_string(),
-            ),
-        ]));
-    }
+    // 1. User-supplied environment (lowest priority).
     let user_env = merged_environment(sandbox);
+    let mut environment: HashMap<String, String> = HashMap::new();
+    environment.extend(user_env.clone());
     if !user_env.is_empty()
         && let Ok(json) = serde_json::to_string(&user_env)
     {
@@ -3507,7 +3462,52 @@ fn build_guest_environment(
             json,
         );
     }
-    environment.extend(user_env);
+
+    // 2. Required driver vars (highest priority -- always overwrite).
+    environment.insert("HOME".to_string(), "/root".to_string());
+    environment.insert(
+        "PATH".to_string(),
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
+    );
+    environment.insert("TERM".to_string(), "xterm".to_string());
+    environment.insert(
+        openshell_core::sandbox_env::ENDPOINT.to_string(),
+        openshell_endpoint,
+    );
+    environment.insert(
+        openshell_core::sandbox_env::SANDBOX_ID.to_string(),
+        sandbox.id.clone(),
+    );
+    environment.insert(
+        openshell_core::sandbox_env::SANDBOX.to_string(),
+        sandbox.name.clone(),
+    );
+    environment.insert(
+        openshell_core::sandbox_env::SSH_SOCKET_PATH.to_string(),
+        GUEST_SSH_SOCKET_PATH.to_string(),
+    );
+    environment.insert(
+        openshell_core::sandbox_env::SANDBOX_COMMAND.to_string(),
+        "tail -f /dev/null".to_string(),
+    );
+    environment.insert(
+        openshell_core::sandbox_env::LOG_LEVEL.to_string(),
+        openshell_core::driver_utils::sandbox_log_level(sandbox, &config.log_level),
+    );
+    if config.requires_tls_materials() {
+        environment.insert(
+            openshell_core::sandbox_env::TLS_CA.to_string(),
+            GUEST_TLS_CA_PATH.to_string(),
+        );
+        environment.insert(
+            openshell_core::sandbox_env::TLS_CERT.to_string(),
+            GUEST_TLS_CERT_PATH.to_string(),
+        );
+        environment.insert(
+            openshell_core::sandbox_env::TLS_KEY.to_string(),
+            GUEST_TLS_KEY_PATH.to_string(),
+        );
+    }
     environment.insert(
         openshell_core::sandbox_env::TELEMETRY_ENABLED.to_string(),
         openshell_core::telemetry::enabled_env_value().to_string(),

@@ -2776,7 +2776,7 @@ async fn main() -> Result<()> {
                             } else {
                                 None // auto-detect
                             };
-                            let env_map = run::parse_key_value_pairs(&envs, "--env")?;
+                            let env_map = run::parse_env_pairs(&envs)?;
                             let exit_code = run::sandbox_exec_grpc(
                                 endpoint,
                                 &name,

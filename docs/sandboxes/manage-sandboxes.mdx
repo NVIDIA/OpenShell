@@ -153,6 +153,27 @@ OpenShell allocates a TTY automatically when both stdin and stdout are terminals
 | `--timeout`    | Command timeout in seconds. `0` disables the timeout.    |
 | `--tty`        | Force TTY allocation.                                    |
 | `--no-tty`     | Disable TTY allocation even when attached to a terminal. |
+| `--env`        | Set an environment variable for the command (`KEY=VALUE`, repeatable). |
+
+## Set Environment Variables
+
+Inject environment variables into the sandbox at creation time:
+
+```shell
+openshell sandbox create --env API_KEY=sk-test --env DEBUG=1 -- my-agent
+```
+
+Variables set with `--env` are available to all processes in the sandbox, including interactive shells and exec commands.
+
+You can also set per-command environment variables with `sandbox exec`:
+
+```shell
+openshell sandbox exec -n my-sandbox --env MY_VAR=hello -- printenv MY_VAR
+```
+
+Per-command variables override the sandbox-level environment for that command only.
+
+Environment variable names starting with `OPENSHELL_` are reserved and rejected by the CLI.
 
 ## Label a Sandbox
 

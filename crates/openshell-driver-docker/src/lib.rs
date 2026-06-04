@@ -1648,6 +1648,7 @@ fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig
             user_env.extend(template.environment.clone());
         }
         user_env.extend(spec.environment.clone());
+        environment.extend(user_env.clone());
         if !user_env.is_empty()
             && let Ok(json) = serde_json::to_string(&user_env)
         {
@@ -1656,7 +1657,6 @@ fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig
                 json,
             );
         }
-        environment.extend(user_env);
     }
 
     environment.insert(

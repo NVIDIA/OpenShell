@@ -3919,6 +3919,18 @@ pub fn parse_key_value_pairs(items: &[String], flag: &str) -> Result<HashMap<Str
     Ok(map)
 }
 
+pub fn parse_env_pairs(items: &[String]) -> Result<HashMap<String, String>> {
+    let map = parse_key_value_pairs(items, "--env")?;
+    for key in map.keys() {
+        if key.starts_with("OPENSHELL_") {
+            return Err(miette::miette!(
+                "--env keys starting with OPENSHELL_ are reserved; got '{key}'"
+            ));
+        }
+    }
+    Ok(map)
+}
+
 fn parse_credential_pairs(items: &[String]) -> Result<HashMap<String, String>> {
     let mut map = HashMap::new();
 

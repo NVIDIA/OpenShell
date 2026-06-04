@@ -702,7 +702,9 @@ fn apply_child_env(
         .env("TERM", term);
 
     for (key, value) in user_environment {
-        cmd.env(key, value);
+        if !key.starts_with("OPENSHELL_") {
+            cmd.env(key, value);
+        }
     }
 
     if let Some(url) = proxy_url {
