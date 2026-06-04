@@ -8,7 +8,10 @@
 use crate::persistence::{
     ObjectId, ObjectLabels, ObjectName, ObjectType, Store, WriteCondition, generate_name,
 };
-use openshell_core::proto::{Provider, Sandbox};
+use openshell_core::proto::{
+    Provider, ProviderCredentialTokenGrantAudienceOverride, ProviderProfile,
+    ProviderProfileCredential, Sandbox,
+};
 use prost::Message;
 use tonic::Status;
 use tracing::warn;
@@ -33,10 +36,11 @@ fn redact_provider_credentials(mut provider: Provider) -> Provider {
     provider
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(super) struct ProviderEnvironment {
     pub environment: std::collections::HashMap<String, String>,
     pub credential_expires_at_ms: std::collections::HashMap<String, i64>,
+    pub dynamic_credentials: std::collections::HashMap<String, ProviderProfileCredential>,
 }
 
 impl ProviderEnvironment {
@@ -472,7 +476,218 @@ pub(super) async fn resolve_provider_environment(
     Ok(ProviderEnvironment {
         environment: env,
         credential_expires_at_ms: expires,
+        dynamic_credentials: resolve_dynamic_credentials(store, provider_names).await?,
     })
+}
+
+/// Resolve dynamic credentials (token grants) from provider profiles.
+///
+/// Returns a map of endpoint-bound keys to credential metadata for credentials
+/// that have `token_grant` configuration. Keys are internal supervisor metadata:
+/// host, port, endpoint path, and provider credential identity.
+pub(super) async fn resolve_dynamic_credentials(
+    store: &Store,
+    provider_names: &[String],
+) -> Result<std::collections::HashMap<String, ProviderProfileCredential>, Status> {
+    if provider_names.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    let mut dynamic_creds = std::collections::HashMap::new();
+
+    for provider_name in provider_names {
+        let provider = store
+            .get_message_by_name::<Provider>(provider_name)
+            .await
+            .map_err(|e| {
+                Status::internal(format!("failed to fetch provider '{provider_name}': {e}"))
+            })?
+            .ok_or_else(|| {
+                Status::failed_precondition(format!("provider '{provider_name}' not found"))
+            })?;
+
+        let profile_id = openshell_providers::normalize_provider_type(&provider.r#type)
+            .unwrap_or(provider.r#type.as_str());
+        let Some(profile) = get_provider_type_profile(store, profile_id).await? else {
+            continue;
+        };
+
+        insert_dynamic_credentials_for_profile(
+            &mut dynamic_creds,
+            &profile.to_proto(),
+            provider_name,
+        );
+    }
+
+    Ok(dynamic_creds)
+}
+
+fn insert_dynamic_credentials_for_profile(
+    dynamic_creds: &mut std::collections::HashMap<String, ProviderProfileCredential>,
+    profile: &ProviderProfile,
+    provider_name: &str,
+) {
+    for credential in &profile.credentials {
+        if credential.token_grant.is_none() {
+            continue;
+        }
+        for endpoint in &profile.endpoints {
+            for port in endpoint_ports(endpoint.port, &endpoint.ports) {
+                insert_dynamic_credentials_for_endpoint(
+                    dynamic_creds,
+                    &endpoint.host,
+                    port,
+                    &endpoint.path,
+                    provider_name,
+                    &credential.name,
+                    credential,
+                );
+            }
+        }
+    }
+}
+
+fn endpoint_ports(port: u32, ports: &[u32]) -> Vec<u32> {
+    if ports.is_empty() {
+        if port == 0 { Vec::new() } else { vec![port] }
+    } else {
+        ports.iter().copied().filter(|port| *port != 0).collect()
+    }
+}
+
+fn dynamic_credential_key(
+    host: &str,
+    port: u32,
+    path: &str,
+    provider_name: &str,
+    credential_name: &str,
+) -> String {
+    format!(
+        "{}\t{port}\t{}\t{}:{}",
+        host.to_ascii_lowercase(),
+        path,
+        provider_name,
+        credential_name
+    )
+}
+
+fn insert_dynamic_credentials_for_endpoint(
+    dynamic_creds: &mut std::collections::HashMap<String, ProviderProfileCredential>,
+    endpoint_host: &str,
+    endpoint_port: u32,
+    endpoint_path: &str,
+    provider_name: &str,
+    credential_name: &str,
+    credential: &ProviderProfileCredential,
+) {
+    let default_key = dynamic_credential_key(
+        endpoint_host,
+        endpoint_port,
+        endpoint_path,
+        provider_name,
+        credential_name,
+    );
+    dynamic_creds.insert(default_key, resolved_dynamic_credential(credential, None));
+
+    let Some(token_grant) = credential.token_grant.as_ref() else {
+        return;
+    };
+
+    for override_config in &token_grant.audience_overrides {
+        if !token_grant_override_matches_endpoint(override_config, endpoint_host, endpoint_port) {
+            continue;
+        }
+
+        let override_host = if override_config.host.is_empty() {
+            endpoint_host
+        } else {
+            override_config.host.as_str()
+        };
+        let override_port = if override_config.port == 0 {
+            endpoint_port
+        } else {
+            override_config.port
+        };
+        let override_path = if override_config.path.is_empty() {
+            endpoint_path
+        } else {
+            override_config.path.as_str()
+        };
+        let override_key = dynamic_credential_key(
+            override_host,
+            override_port,
+            override_path,
+            provider_name,
+            credential_name,
+        );
+        dynamic_creds.insert(
+            override_key,
+            resolved_dynamic_credential(credential, Some(override_config)),
+        );
+    }
+}
+
+fn resolved_dynamic_credential(
+    credential: &ProviderProfileCredential,
+    override_config: Option<&ProviderCredentialTokenGrantAudienceOverride>,
+) -> ProviderProfileCredential {
+    let mut credential = credential.clone();
+    if let Some(token_grant) = credential.token_grant.as_mut() {
+        if let Some(override_config) = override_config {
+            if !override_config.audience.is_empty() {
+                token_grant.audience.clone_from(&override_config.audience);
+            }
+            if !override_config.scopes.is_empty() {
+                token_grant.scopes.clone_from(&override_config.scopes);
+            }
+        }
+        token_grant.audience_overrides.clear();
+    }
+    credential
+}
+
+fn token_grant_override_matches_endpoint(
+    override_config: &ProviderCredentialTokenGrantAudienceOverride,
+    endpoint_host: &str,
+    endpoint_port: u32,
+) -> bool {
+    let host_matches = override_config.host.is_empty()
+        || host_pattern_matches(&override_config.host, endpoint_host)
+        || host_pattern_matches(endpoint_host, &override_config.host);
+    let port_matches = override_config.port == 0 || override_config.port == endpoint_port;
+    host_matches && port_matches
+}
+
+fn host_pattern_matches(pattern: &str, host: &str) -> bool {
+    let pattern = pattern.to_ascii_lowercase();
+    let host = host.to_ascii_lowercase();
+    if pattern == host {
+        return true;
+    }
+    if !pattern.contains('*') {
+        return false;
+    }
+
+    let pattern_labels: Vec<&str> = pattern.split('.').collect();
+    let host_labels: Vec<&str> = host.split('.').collect();
+    host_pattern_labels_match(&pattern_labels, &host_labels)
+}
+
+fn host_pattern_labels_match(pattern: &[&str], host: &[&str]) -> bool {
+    match pattern.split_first() {
+        None => host.is_empty(),
+        Some((label, rest)) if *label == "**" => {
+            host_pattern_labels_match(rest, host)
+                || (!host.is_empty() && host_pattern_labels_match(pattern, &host[1..]))
+        }
+        Some((label, rest)) if *label == "*" => {
+            !host.is_empty() && host_pattern_labels_match(rest, &host[1..])
+        }
+        Some((literal, rest)) => {
+            host.first().is_some_and(|label| label == literal)
+                && host_pattern_labels_match(rest, &host[1..])
+        }
+    }
 }
 
 pub async fn validate_provider_environment_keys_unique(
@@ -632,10 +847,9 @@ use openshell_core::proto::{
     GetProviderRequest, ImportProviderProfilesRequest, ImportProviderProfilesResponse,
     LintProviderProfilesRequest, LintProviderProfilesResponse, ListProviderProfilesRequest,
     ListProviderProfilesResponse, ListProvidersRequest, ListProvidersResponse,
-    ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileDiagnostic,
-    ProviderProfileImportItem, ProviderProfileResponse, ProviderResponse,
-    RotateProviderCredentialRequest, RotateProviderCredentialResponse, StoredProviderProfile,
-    UpdateProviderRequest,
+    ProviderCredentialRefreshStrategy, ProviderProfileDiagnostic, ProviderProfileImportItem,
+    ProviderProfileResponse, ProviderResponse, RotateProviderCredentialRequest,
+    RotateProviderCredentialResponse, StoredProviderProfile, UpdateProviderRequest,
 };
 use openshell_providers::{
     CredentialRefreshProfile, ProfileValidationDiagnostic, ProviderTypeProfile, default_profiles,
@@ -1455,6 +1669,7 @@ mod tests {
         DeleteProviderProfileRequest, GetProviderProfileRequest, ImportProviderProfilesRequest,
         L7Allow, L7Rule, LintProviderProfilesRequest, ListProviderProfilesRequest, NetworkBinary,
         NetworkEndpoint, ProviderCredentialRefresh, ProviderCredentialRefreshMaterial,
+        ProviderCredentialTokenGrant, ProviderCredentialTokenGrantAudienceOverride,
         ProviderProfile, ProviderProfileCategory, ProviderProfileCredential,
         ProviderProfileImportItem, Sandbox, SandboxSpec,
     };
@@ -1477,6 +1692,76 @@ mod tests {
         assert!(!is_valid_env_key("BAD KEY"));
         assert!(!is_valid_env_key("X=Y"));
         assert!(!is_valid_env_key("X;rm -rf /"));
+    }
+
+    #[test]
+    fn dynamic_credentials_expand_endpoint_audience_overrides() {
+        let service_audiences = [
+            ("alpha.default.svc.cluster.local", "alpha"),
+            ("beta.default.svc.cluster.local", "beta"),
+            ("gamma.default.svc.cluster.local", "gamma"),
+            ("delta.default.svc.cluster.local", "delta"),
+        ];
+        let credential = ProviderProfileCredential {
+            name: "access_token".to_string(),
+            description: String::new(),
+            env_vars: Vec::new(),
+            required: false,
+            auth_style: "bearer".to_string(),
+            header_name: "Authorization".to_string(),
+            query_param: String::new(),
+            refresh: None,
+            token_grant: Some(ProviderCredentialTokenGrant {
+                token_endpoint: "http://keycloak/realms/openshell/protocol/openid-connect/token"
+                    .to_string(),
+                audience: "api://default".to_string(),
+                jwt_svid_audience: "http://keycloak/realms/openshell".to_string(),
+                scopes: vec!["openid".to_string()],
+                cache_ttl_seconds: 300,
+                audience_overrides: service_audiences
+                    .iter()
+                    .map(
+                        |(host, audience)| ProviderCredentialTokenGrantAudienceOverride {
+                            host: (*host).to_string(),
+                            port: 80,
+                            path: String::new(),
+                            audience: (*audience).to_string(),
+                            scopes: vec![(*audience).to_string()],
+                        },
+                    )
+                    .collect(),
+            }),
+        };
+        let profile = ProviderProfile {
+            id: "keycloak-sso".to_string(),
+            display_name: "Keycloak SSO".to_string(),
+            description: String::new(),
+            category: ProviderProfileCategory::Other as i32,
+            credentials: vec![credential],
+            endpoints: service_audiences
+                .iter()
+                .map(|(host, _)| NetworkEndpoint {
+                    host: (*host).to_string(),
+                    port: 80,
+                    ..Default::default()
+                })
+                .collect(),
+            binaries: Vec::new(),
+            inference_capable: false,
+            discovery: None,
+        };
+
+        let mut dynamic_creds = HashMap::new();
+        insert_dynamic_credentials_for_profile(&mut dynamic_creds, &profile, "keycloak");
+
+        assert_eq!(dynamic_creds.len(), 4);
+        for (host, audience) in service_audiences {
+            let key = dynamic_credential_key(host, 80, "", "keycloak", "access_token");
+            let grant = dynamic_creds[&key].token_grant.as_ref().unwrap();
+            assert_eq!(grant.audience, audience);
+            assert_eq!(grant.scopes, vec![audience.to_string()]);
+            assert!(grant.audience_overrides.is_empty());
+        }
     }
 
     fn provider_with_values(name: &str, provider_type: &str) -> Provider {
@@ -1559,6 +1844,7 @@ mod tests {
                     },
                 ],
             }),
+            token_grant: None,
         }
     }
 
@@ -1595,6 +1881,7 @@ mod tests {
             header_name: "authorization".to_string(),
             query_param: String::new(),
             refresh: None,
+            token_grant: None,
         }
     }
 
@@ -2949,6 +3236,7 @@ mod tests {
                                     },
                                 ],
                             }),
+                            token_grant: None,
                         }],
                         endpoints: vec![],
                         binaries: vec![],
@@ -3307,6 +3595,24 @@ mod tests {
         assert_eq!(result.get("ANTHROPIC_API_KEY"), Some(&"sk-abc".to_string()));
         assert_eq!(result.get("CLAUDE_API_KEY"), Some(&"sk-abc".to_string()));
         assert!(!result.contains_key("endpoint"));
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_env_allows_static_provider_without_profile() {
+        let store = test_store().await;
+        create_provider_record(
+            &store,
+            provider_with_values("static-provider", "unprofiled-static-api"),
+        )
+        .await
+        .unwrap();
+
+        let result = resolve_provider_environment(&store, &["static-provider".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(result.get("API_TOKEN"), Some(&"token-123".to_string()));
+        assert!(result.dynamic_credentials.is_empty());
     }
 
     #[tokio::test]

@@ -27,6 +27,8 @@ Set `server.spiffe.enabled=true` to use SPIFFE JWT-SVIDs instead. In this mode, 
 
 SPIFFE mode requires a SPIFFE implementation such as SPIRE and a `ClusterSPIFFEID` that assigns per-sandbox IDs from the pod's `openshell.io/sandbox-id` annotation.
 
+The same sandbox Workload API socket is also used by dynamic provider token grants. Provider profiles with `token_grant` metadata cause the sandbox supervisor to request JWT-SVIDs and exchange them for upstream OAuth2 access tokens.
+
 ## OIDC User Authentication
 
 Set `server.oidc.issuer` to enable OIDC. The gateway validates the `Authorization: Bearer <token>` header on every request against the issuer's JWKS endpoint.

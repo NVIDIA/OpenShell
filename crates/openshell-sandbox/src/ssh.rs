@@ -1095,7 +1095,7 @@ mod unsafe_pty {
                     netns_fd,
                     &policy,
                     #[cfg(target_os = "linux")]
-                    supervisor_identity_mount.as_ref(),
+                    supervisor_identity_mount,
                     #[cfg(target_os = "linux")]
                     prepared.take(),
                 )
@@ -1135,7 +1135,7 @@ mod unsafe_pty {
                     netns_fd,
                     &policy,
                     #[cfg(target_os = "linux")]
-                    supervisor_identity_mount.as_ref(),
+                    supervisor_identity_mount,
                     #[cfg(target_os = "linux")]
                     prepared.take(),
                 )

@@ -122,7 +122,7 @@ This enables credential injection and L7 inspection without explicit configurati
 |---|---|
 | Default | Auto-detect and terminate. OpenShell generates the sandbox CA at startup and injects it into the process trust stores (`NODE_EXTRA_CA_CERTS`, `DENO_CERT`, `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`). |
 | What you can change | Set `tls: skip` on an endpoint to disable TLS detection and termination for that endpoint. Use this for client-certificate mTLS to upstream or non-standard binary protocols. |
-| Risk if relaxed | `tls: skip` disables credential injection and L7 inspection for that endpoint. The proxy relays encrypted traffic without seeing the contents. |
+| Risk if relaxed | `tls: skip` disables placeholder credential rewriting, dynamic token grant injection, and L7 inspection for that endpoint. The proxy relays encrypted traffic without seeing the contents. |
 | Recommendation | Use auto-detect (the default) for most endpoints. Use `tls: skip` only when the upstream requires the client's own TLS certificate (mTLS) or uses a non-HTTP protocol. |
 
 ### SSRF Protection
@@ -286,7 +286,7 @@ The following patterns weaken security without providing meaningful benefit.
 | Using `access: full` when finer rules would suffice | `access: full` with `protocol: rest` or `protocol: websocket` enables inspection but allows all methods and paths for that protocol. | Use `access: read-only` or explicit `rules` to restrict what the agent can do at the L7 level. |
 | Adding endpoints permanently when operator approval would suffice | Adding endpoints to the policy YAML makes them permanently reachable across all instances. | Use operator approval. Approved endpoints persist within the sandbox instance but reset on re-creation. |
 | Using broad binary globs | A glob like `/**` allows any binary to reach the endpoint, defeating binary-scoped enforcement. | Scope globs to specific directories (for example, `/sandbox/.vscode-server/**`). |
-| Skipping TLS termination on HTTPS APIs | Setting `tls: skip` disables credential injection and L7 inspection. | Use the default auto-detect behavior unless the upstream requires client-certificate mTLS. |
+| Skipping TLS termination on HTTPS APIs | Setting `tls: skip` disables placeholder credential rewriting, dynamic token grant injection, and L7 inspection. | Use the default auto-detect behavior unless the upstream requires client-certificate mTLS. |
 | Setting `enforcement: enforce` before auditing | Jumping to `enforce` without first running in `audit` mode risks breaking the agent's workflow. | Start with `audit`, review the logs, and switch to `enforce` after you validate the rules. |
 
 ## Related Topics

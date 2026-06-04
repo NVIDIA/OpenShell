@@ -53,6 +53,7 @@ webpki-roots = { workspace = true }
 
 # HTTP
 bytes = { workspace = true }
+reqwest = { workspace = true }
 
 # UUID
 uuid = { workspace = true }

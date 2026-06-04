@@ -801,6 +801,8 @@ network_policies:
             ancestors: Vec::new(),
             cmdline_paths: Vec::new(),
             secret_resolver: None,
+            dynamic_credentials: None,
+            token_grant_resolver: None,
         };
         let request_info = crate::l7::L7RequestInfo {
             action: req.action,

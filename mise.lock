@@ -35,6 +35,7 @@ url_api = "https://api.github.com/repos/anchore/syft/releases/assets/410001182"
 checksum = "sha256:0e91737aee2b5baf1d255b959630194a302335d848ff97bb07921eb6205b5f5a"
 url = "https://github.com/anchore/syft/releases/download/v1.44.0/syft_1.44.0_linux_amd64.tar.gz"
 url_api = "https://api.github.com/repos/anchore/syft/releases/assets/410001183"
+provenance = "github-attestations"
 
 [tools."github:anchore/syft"."platforms.macos-arm64"]
 checksum = "sha256:24e4d34078ae81da7c82539616f0ccac3e226cf4f74a38ce6fb3463619e50a55"
@@ -213,6 +214,7 @@ backend = "aqua:GoogleContainerTools/skaffold"
 url = "https://storage.googleapis.com/skaffold/releases/v2.20.0/skaffold-linux-arm64"
 
 [tools.skaffold."platforms.linux-x64"]
+checksum = "blake3:4de6b14984ff1c7e5f107dd12d15890feb4b6600032d61158162c243a81d9156"
 url = "https://storage.googleapis.com/skaffold/releases/v2.20.0/skaffold-linux-amd64"
 
 [tools.skaffold."platforms.macos-arm64"]

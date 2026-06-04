@@ -44,7 +44,7 @@ openshell settings delete --global --key providers_v2_enabled
 ```
 
 <Note>
-The feature flag controls provider-derived policy layers. It does not change the current credential injection model. OpenShell still injects placeholder environment variables into sandbox processes and resolves those placeholders in outbound HTTP traffic.
+The feature flag controls provider-derived policy layers. OpenShell still supports placeholder environment variables for provider credentials, and provider profiles can also declare dynamic token grants that the sandbox proxy resolves on demand for matching HTTP endpoints.
 </Note>
 
 ## Available Features
@@ -60,6 +60,7 @@ Providers v2 currently includes these user-facing features:
 - Runtime sandbox provider lifecycle commands under `openshell sandbox provider list|attach|detach`.
 - Credential refresh configuration with `openshell provider refresh status|configure|rotate|delete`.
 - Credential expiry metadata with `openshell provider update --credential-expires-at`; values accept Unix epoch milliseconds or ISO/RFC3339 timestamps.
+- Dynamic token grants that use the sandbox's SPIFFE JWT-SVID as an OAuth2 client assertion and inject a short-lived `Authorization: Bearer` token for matching profile endpoints.
 
 ## Roadmap
 
@@ -67,8 +68,8 @@ The following Providers v2 design items are not part of the current behavior:
 
 | Roadmap item | Current behavior |
 |---|---|
-| Profile-driven explicit credential injection | Profile `auth_style`, `header_name`, and `query_param` fields are stored and validated, but runtime injection still depends on environment placeholders generated from provider credentials. |
-| Endpoint and binary scoped credential injection | Provider profile endpoints and binaries affect policy composition. They do not yet restrict which outbound requests can receive credential injection. |
+| General profile-driven credential placement | Static `auth_style`, `header_name`, and `query_param` placement metadata is stored and validated, but static credential injection still depends on environment placeholders generated from provider credentials. Dynamic `token_grant` credentials inject bearer tokens for matching HTTP endpoints. |
+| Endpoint and binary scoped credential injection | Provider profile endpoints and binaries affect policy composition. Dynamic token grants are endpoint-scoped. Static placeholder injection is not yet restricted by profile endpoint or binary metadata. |
 | Credential verification on create | `openshell provider create` does not yet probe provider verification endpoints or expose `--no-verify`. |
 | Automatic credential scope extraction | OpenShell does not yet inspect upstream provider responses to discover credential scopes. |
 | Inference mounting from attached providers | `inference_capable` is profile metadata. Attaching an inference-capable provider does not yet create `inference.local` routes. |
@@ -154,8 +155,8 @@ credentials:
     required: true
 
     # Accepted values: basic, bearer, header, query.
-    # These fields describe the intended credential placement.
-    # Runtime injection still uses env placeholder resolution today.
+    # These fields describe static credential placement.
+    # Static runtime injection still uses env placeholder resolution.
     auth_style: bearer
     header_name: authorization
     query_param: api_key
@@ -178,6 +179,23 @@ credentials:
           description: OAuth client secret
           required: true
           secret: true
+
+    # Optional dynamic credential. The sandbox supervisor requests a
+    # SPIFFE JWT-SVID, exchanges it at token_endpoint, caches the returned
+    # access token, and injects it as Authorization: Bearer for matching
+    # endpoint traffic.
+    token_grant:
+      token_endpoint: https://login.example.com/realms/custom/protocol/openid-connect/token
+      audience: api://custom-api
+      jwt_svid_audience: https://login.example.com/realms/custom
+      scopes: [api.read, api.write]
+      cache_ttl_seconds: 300
+      audience_overrides:
+        - host: api.example.com
+          port: 443
+          path: /v1/projects/**
+          audience: api://custom-projects
+          scopes: [projects.read]
 
 discovery:
   credentials: [api_token]
@@ -234,7 +252,7 @@ binaries:
 
 `category` groups profiles in `openshell provider list-profiles`. Use one of the values in the category enum.
 
-`credentials` declares the credential names, environment variables, auth metadata, and optional refresh metadata for the provider type. The current runtime still exposes configured credential keys as placeholder environment variables and resolves placeholders in outbound HTTP requests.
+`credentials` declares the credential names, environment variables, auth metadata, optional refresh metadata, and optional dynamic token grant metadata for the provider type. Static credentials are exposed as placeholder environment variables and resolved in outbound HTTP requests. Dynamic token grants are resolved by the sandbox proxy on demand for matching profile endpoints.
 
 `discovery` controls what `--from-existing` scans when
 `providers_v2_enabled=true`. Each entry in `discovery.credentials` must name a
@@ -273,6 +291,23 @@ Gateway-managed refresh strategies use these material keys:
 | `google_service_account_jwt` | `client_email`, `private_key`, optional `subject` or `sub`. |
 
 OpenShell keeps token endpoints profile-owned. Refresh material cannot override `token_url` or `token_uri` during refresh configuration.
+
+### Dynamic Token Grants
+
+`token_grant` belongs to one credential declaration. When a sandbox with the provider attached sends HTTP traffic to a matching profile endpoint, the supervisor requests a SPIFFE JWT-SVID from the local Workload API, exchanges it at `token_endpoint`, caches the returned access token, and injects `Authorization: Bearer <token>` before forwarding the request upstream.
+
+Token grant fields:
+
+| Field | Required | Behavior |
+|---|---|---|
+| `token_endpoint` | Yes | OAuth2 token endpoint that accepts a SPIFFE JWT-SVID client assertion. |
+| `audience` | No | Resource audience requested from the token service. |
+| `jwt_svid_audience` | No | Audience used when requesting the JWT-SVID. When omitted, OpenShell derives an issuer-style audience from Keycloak token endpoint paths or falls back to the full token endpoint URL. |
+| `scopes` | No | OAuth2 scopes sent as a space-separated `scope` parameter. |
+| `cache_ttl_seconds` | No | Token cache TTL override. When omitted or `0`, OpenShell uses the token response `expires_in`, or five minutes if the response does not include an expiry. |
+| `audience_overrides` | No | Endpoint-specific `audience` and `scopes` overrides selected by host, port, and path. |
+
+Token grants require the sandbox supervisor to have access to a SPIFFE Workload API socket. They apply to HTTP traffic that the proxy can inspect. Endpoints with `tls: skip` bypass TLS termination and cannot receive dynamic token grant injection for HTTPS traffic.
 
 ## Provider Instances
 

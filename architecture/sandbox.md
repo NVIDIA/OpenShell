@@ -78,6 +78,11 @@ Credential placeholders in proxied HTTP requests can be resolved by the proxy
 when policy allows the target endpoint. Secrets must not be logged in OCSF or
 plain tracing output.
 
+Provider profiles can also declare dynamic token grants. For matching HTTP
+endpoints, the supervisor obtains a SPIFFE JWT-SVID from the local Workload API,
+exchanges it for an OAuth2 access token, caches the token, and injects it as an
+`Authorization: Bearer` header before forwarding the request.
+
 ## Connect and Logs
 
 The supervisor runs an SSH server on a Unix socket inside the sandbox. The

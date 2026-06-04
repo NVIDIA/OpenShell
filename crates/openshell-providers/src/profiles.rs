@@ -81,6 +81,36 @@ pub struct CredentialProfile {
     pub query_param: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh: Option<CredentialRefreshProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_grant: Option<TokenGrantProfile>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TokenGrantProfile {
+    pub token_endpoint: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub audience: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub jwt_svid_audience: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub cache_ttl_seconds: i64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub audience_overrides: Vec<TokenGrantAudienceOverrideProfile>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct TokenGrantAudienceOverrideProfile {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub host: String,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub port: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub path: String,
+    pub audience: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -280,6 +310,7 @@ impl ProviderTypeProfile {
                         .refresh
                         .as_ref()
                         .map(credential_refresh_from_proto),
+                    token_grant: credential.token_grant.as_ref().map(token_grant_from_proto),
                 })
                 .collect(),
             endpoints: profile.endpoints.iter().map(endpoint_from_proto).collect(),
@@ -325,6 +356,7 @@ impl ProviderTypeProfile {
                     header_name: credential.header_name.clone(),
                     query_param: credential.query_param.clone(),
                     refresh: credential.refresh.as_ref().map(credential_refresh_to_proto),
+                    token_grant: credential.token_grant.as_ref().map(token_grant_to_proto),
                 })
                 .collect(),
             endpoints: self.endpoints.iter().map(endpoint_to_proto).collect(),
@@ -557,6 +589,64 @@ fn credential_refresh_to_proto(refresh: &CredentialRefreshProfile) -> ProviderCr
                 secret: material.secret,
             })
             .collect(),
+    }
+}
+
+fn token_grant_from_proto(
+    token_grant: &openshell_core::proto::ProviderCredentialTokenGrant,
+) -> TokenGrantProfile {
+    TokenGrantProfile {
+        token_endpoint: token_grant.token_endpoint.clone(),
+        audience: token_grant.audience.clone(),
+        jwt_svid_audience: token_grant.jwt_svid_audience.clone(),
+        scopes: token_grant.scopes.clone(),
+        cache_ttl_seconds: token_grant.cache_ttl_seconds,
+        audience_overrides: token_grant
+            .audience_overrides
+            .iter()
+            .map(token_grant_audience_override_from_proto)
+            .collect(),
+    }
+}
+
+fn token_grant_to_proto(
+    token_grant: &TokenGrantProfile,
+) -> openshell_core::proto::ProviderCredentialTokenGrant {
+    openshell_core::proto::ProviderCredentialTokenGrant {
+        token_endpoint: token_grant.token_endpoint.clone(),
+        audience: token_grant.audience.clone(),
+        jwt_svid_audience: token_grant.jwt_svid_audience.clone(),
+        scopes: token_grant.scopes.clone(),
+        cache_ttl_seconds: token_grant.cache_ttl_seconds,
+        audience_overrides: token_grant
+            .audience_overrides
+            .iter()
+            .map(token_grant_audience_override_to_proto)
+            .collect(),
+    }
+}
+
+fn token_grant_audience_override_from_proto(
+    override_config: &openshell_core::proto::ProviderCredentialTokenGrantAudienceOverride,
+) -> TokenGrantAudienceOverrideProfile {
+    TokenGrantAudienceOverrideProfile {
+        host: override_config.host.clone(),
+        port: override_config.port,
+        path: override_config.path.clone(),
+        audience: override_config.audience.clone(),
+        scopes: override_config.scopes.clone(),
+    }
+}
+
+fn token_grant_audience_override_to_proto(
+    override_config: &TokenGrantAudienceOverrideProfile,
+) -> openshell_core::proto::ProviderCredentialTokenGrantAudienceOverride {
+    openshell_core::proto::ProviderCredentialTokenGrantAudienceOverride {
+        host: override_config.host.clone(),
+        port: override_config.port,
+        path: override_config.path.clone(),
+        audience: override_config.audience.clone(),
+        scopes: override_config.scopes.clone(),
     }
 }
 
@@ -1229,6 +1319,62 @@ credentials:
         let exported = profile_to_yaml(&from_proto).expect("yaml");
         assert!(exported.contains("oauth2_client_credentials"));
         assert!(exported.contains("client_secret"));
+    }
+
+    #[test]
+    fn token_grant_audience_overrides_round_trip_through_proto() {
+        let profile = parse_profile_yaml(
+            r"
+id: keycloak-example
+display_name: Keycloak Example
+credentials:
+  - name: access_token
+    auth_style: bearer
+    header_name: Authorization
+    token_grant:
+      token_endpoint: http://keycloak/realms/openshell/protocol/openid-connect/token
+      jwt_svid_audience: http://keycloak/realms/openshell
+      audience: api://default
+      scopes: [openid]
+      cache_ttl_seconds: 300
+      audience_overrides:
+        - host: alpha.default.svc.cluster.local
+          port: 80
+          audience: api://alpha
+        - host: beta.default.svc.cluster.local
+          port: 80
+          path: /v1/**
+          audience: api://beta
+          scopes: [beta.read]
+",
+        )
+        .expect("profile should parse");
+
+        let token_grant = profile.credentials[0]
+            .token_grant
+            .as_ref()
+            .expect("token grant should parse");
+        assert_eq!(
+            token_grant.jwt_svid_audience,
+            "http://keycloak/realms/openshell"
+        );
+        assert_eq!(token_grant.audience_overrides.len(), 2);
+        assert_eq!(token_grant.audience_overrides[1].path, "/v1/**");
+        assert_eq!(token_grant.audience_overrides[1].scopes, vec!["beta.read"]);
+
+        let reparsed = ProviderTypeProfile::from_proto(&profile.to_proto());
+        let reparsed_token_grant = reparsed.credentials[0]
+            .token_grant
+            .as_ref()
+            .expect("token grant should round trip");
+        assert_eq!(
+            reparsed_token_grant.jwt_svid_audience,
+            token_grant.jwt_svid_audience
+        );
+        assert_eq!(
+            reparsed_token_grant.audience_overrides,
+            token_grant.audience_overrides
+        );
     }
 
     #[test]

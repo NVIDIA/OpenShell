@@ -5,9 +5,11 @@
 global:
   spire:
     clusterName: openshell-dev
+    jwtIssuer: https://spire-spiffe-oidc-discovery-provider.spire.svc.cluster.local
     trustDomain: openshell.local
 
 spire-server:
+  defaultJwtSvidTTL: 5m
   controllerManager:
     identities:
       clusterSPIFFEIDs:

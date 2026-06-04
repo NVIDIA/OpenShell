@@ -99,7 +99,7 @@ static SUPERVISOR_IDENTITY_MOUNT_NS: OnceLock<Option<SupervisorIdentityMountName
     OnceLock::new();
 
 #[cfg(target_os = "linux")]
-pub(crate) struct SupervisorIdentityMountNamespace {
+pub struct SupervisorIdentityMountNamespace {
     fd: OwnedFd,
 }
 
@@ -117,13 +117,13 @@ impl SupervisorIdentityMountNamespace {
         }))
     }
 
-    pub(crate) fn enter_for_child(&self) -> std::io::Result<()> {
+    pub fn enter_for_child(&self) -> std::io::Result<()> {
         set_mount_namespace(self.fd.as_raw_fd())
     }
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn prepare_supervisor_identity_mount_namespace_from_env() -> Result<()> {
+pub fn prepare_supervisor_identity_mount_namespace_from_env() -> Result<()> {
     if SUPERVISOR_IDENTITY_MOUNT_NS.get().is_some() {
         return Ok(());
     }
@@ -139,7 +139,7 @@ pub(crate) fn prepare_supervisor_identity_mount_namespace_from_env() -> Result<(
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn supervisor_identity_mount_from_env() -> Result<Option<SupervisorIdentityNsRef>> {
+pub fn supervisor_identity_mount_from_env() -> Result<Option<SupervisorIdentityNsRef>> {
     let Some(namespace) = SUPERVISOR_IDENTITY_MOUNT_NS.get() else {
         if std::env::var(openshell_core::sandbox_env::SPIFFE_WORKLOAD_API_SOCKET)
             .is_ok_and(|socket_path| !socket_path.trim().is_empty())
@@ -244,11 +244,12 @@ fn private_mount_namespace() -> std::io::Result<()> {
 
     #[allow(unsafe_code)]
     let rc = unsafe {
+        let flags: libc::c_ulong = libc::MS_REC | libc::MS_PRIVATE;
         libc::mount(
             std::ptr::null(),
             c"/".as_ptr(),
             std::ptr::null(),
-            (libc::MS_REC | libc::MS_PRIVATE) as libc::c_ulong,
+            flags,
             std::ptr::null(),
         )
     };
@@ -278,11 +279,13 @@ fn set_mount_namespace(fd: RawFd) -> std::io::Result<()> {
 fn mount_empty_tmpfs(target: &CString) -> std::io::Result<()> {
     #[allow(unsafe_code)]
     let rc = unsafe {
+        let flags: libc::c_ulong =
+            libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC | libc::MS_RDONLY;
         libc::mount(
             c"tmpfs".as_ptr(),
             target.as_ptr(),
             c"tmpfs".as_ptr(),
-            (libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC | libc::MS_RDONLY) as libc::c_ulong,
+            flags,
             c"mode=0555,size=4k".as_ptr().cast(),
         )
     };
@@ -448,8 +451,6 @@ impl ProcessHandle {
             // pre_exec is only called once (after fork, before exec).
             #[cfg(target_os = "linux")]
             let mut prepared_sandbox = Some(prepared_sandbox);
-            #[cfg(target_os = "linux")]
-            let supervisor_identity_mount = supervisor_identity_mount;
             #[allow(unsafe_code)]
             unsafe {
                 cmd.pre_exec(move || {

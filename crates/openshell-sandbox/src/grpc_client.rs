@@ -373,7 +373,7 @@ fn spiffe_token_source_from_env() -> Result<Option<SpiffeTokenSource>> {
 }
 
 async fn fetch_spiffe_jwt_svid(source: &SpiffeTokenSource) -> Result<String> {
-    let endpoint = spiffe_workload_api_endpoint(&source.socket_path);
+    let endpoint = crate::spiffe_endpoint::workload_api_endpoint(&source.socket_path);
     let client = WorkloadApiClient::connect_to(&endpoint)
         .await
         .into_diagnostic()
@@ -392,15 +392,6 @@ async fn fetch_spiffe_jwt_svid(source: &SpiffeTokenSource) -> Result<String> {
         .await
         .into_diagnostic()
         .wrap_err("SPIFFE FetchJWTSVID failed")
-}
-
-fn spiffe_workload_api_endpoint(path: &std::path::Path) -> String {
-    let path = path.to_string_lossy();
-    if path.starts_with("unix:") || path.starts_with("tcp:") {
-        path.into_owned()
-    } else {
-        format!("unix:{path}")
-    }
 }
 
 /// Build an authenticated channel for direct external use (e.g. the
@@ -784,6 +775,7 @@ pub async fn fetch_provider_environment(
         environment: inner.environment,
         provider_env_revision: inner.provider_env_revision,
         credential_expires_at_ms: inner.credential_expires_at_ms,
+        dynamic_credentials: inner.dynamic_credentials,
     })
 }
 
@@ -814,6 +806,7 @@ pub struct ProviderEnvironmentResult {
     pub environment: HashMap<String, String>,
     pub provider_env_revision: u64,
     pub credential_expires_at_ms: HashMap<String, i64>,
+    pub dynamic_credentials: HashMap<String, openshell_core::proto::ProviderProfileCredential>,
 }
 
 impl CachedOpenShellClient {
