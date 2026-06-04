@@ -11,7 +11,6 @@ require_env() {
 }
 
 require_env CODEX_AUTH_ACCESS_TOKEN
-require_env CODEX_AUTH_REFRESH_TOKEN
 require_env CODEX_AUTH_ACCOUNT_ID
 require_env GITHUB_TOKEN
 
@@ -41,9 +40,9 @@ fs.writeFileSync(path, JSON.stringify({
   auth_mode: "chatgpt",
   OPENAI_API_KEY: null,
   tokens: {
-    id_token: fallbackIdToken,
+    id_token: process.env.CODEX_AUTH_ID_TOKEN || fallbackIdToken,
     access_token: process.env.CODEX_AUTH_ACCESS_TOKEN,
-    refresh_token: process.env.CODEX_AUTH_REFRESH_TOKEN,
+    refresh_token: process.env.CODEX_AUTH_REFRESH_TOKEN || "gateway-managed-refresh-token",
     account_id: process.env.CODEX_AUTH_ACCOUNT_ID,
   },
   last_refresh: new Date().toISOString(),

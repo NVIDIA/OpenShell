@@ -6,7 +6,7 @@ Launch a headless sandbox harness that runs the `gator-gate` skill against OpenS
 
 - `gh` is authenticated on the host and has access to `NVIDIA/OpenShell` and `NVIDIA/OpenShell-Community`.
 - For `--harness codex`, `codex login` has created `$HOME/.codex/auth.json`.
-- For `--harness codex`, the active gateway has the default `codex` provider profile available.
+- For `--harness codex`, local Codex auth must include an access token, refresh token, and account ID.
 - A local gateway is available when using the default local Dockerfile source.
 
 ## Usage
@@ -29,8 +29,8 @@ The launcher:
 - Imports `providers/github-gator.yaml`.
 - Creates or updates the `github-gator` provider from `gh auth token`.
 - Selects the requested harness and uploads its scripts from `harnesses/<name>/` into the sandbox payload.
-- For `--harness codex`, creates or updates the default `codex` provider from `$HOME/.codex/auth.json` using profile-backed `--from-existing` discovery.
-- For `--harness codex`, requests a gateway refresh for the Codex access-token credential when refresh metadata is configured.
+- For `--harness codex`, imports `providers/codex-gator.yaml`, creates or updates the `codex-gator` provider from `$HOME/.codex/auth.json`, and stores the refresh token as gateway-only refresh material.
+- For `--harness codex`, configures gateway-managed refresh for `CODEX_AUTH_ACCESS_TOKEN` and rotates it before launching the sandbox.
 - Enables `providers_v2_enabled`, `agent_policy_proposals_enabled`, and `proposal_approval_mode=auto` at gateway scope.
 - Uses the gator image policy copied to `/etc/openshell/policy.yaml`.
 - Uploads the current `.agents/skills/gator-gate/SKILL.md` into the sandbox payload.
@@ -41,4 +41,4 @@ The launcher:
 
 The GitHub provider profile intentionally does not allow GraphQL because OpenShell's GraphQL policy can constrain operation fields but not repository arguments. The sandbox prompt instructs the agent to use REST via `gh api` for the two allowed repositories.
 
-Set `GATOR_CODEX_ACCESS_CREDENTIAL_KEY` or pass `--codex-access-key` if the default Codex provider uses a credential key other than `CODEX_AUTH_ACCESS_TOKEN` for the short-lived access token.
+Set `GATOR_CODEX_ACCESS_CREDENTIAL_KEY` or pass `--codex-access-key` if the gator Codex profile uses a credential key other than `CODEX_AUTH_ACCESS_TOKEN` for the short-lived access token.

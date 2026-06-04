@@ -16,8 +16,11 @@ SANDBOX_NAME="${GATOR_SANDBOX_NAME:-gator-$(date +%Y%m%d%H%M%S)}"
 SANDBOX_FROM="${GATOR_SANDBOX_FROM:-$GATOR_DIR}"
 HARNESS="${GATOR_HARNESS:-codex}"
 GITHUB_PROVIDER="${GATOR_GITHUB_PROVIDER:-github-gator}"
-CODEX_PROVIDER="${GATOR_CODEX_PROVIDER:-codex}"
+CODEX_PROVIDER="${GATOR_CODEX_PROVIDER:-codex-gator}"
+CODEX_PROVIDER_PROFILE="${GATOR_CODEX_PROVIDER_PROFILE:-codex-gator}"
 CODEX_ACCESS_CREDENTIAL_KEY="${GATOR_CODEX_ACCESS_CREDENTIAL_KEY:-CODEX_AUTH_ACCESS_TOKEN}"
+# Upstream Codex OAuth client ID from codex-rs/login/src/auth/manager.rs.
+CODEX_OAUTH_CLIENT_ID="${GATOR_CODEX_OAUTH_CLIENT_ID:-app_EMoamEEZ73f0CkXaXp7hrann}"
 CODEX_MODEL="${CODEX_MODEL:-gpt-5.5}"
 CODEX_REASONING="${CODEX_REASONING:-high}"
 CODEX_LOCAL_BIN="${GATOR_CODEX_LOCAL_BIN:-}"
@@ -34,7 +37,7 @@ Options:
   --from IMAGE            Sandbox source/image (default: openshell-agents/gator)
   --harness NAME          Agent harness to run (default: codex; supported: codex)
   --github-provider NAME  GitHub provider name (default: github-gator)
-  --codex-provider NAME   Codex provider name (default: codex)
+  --codex-provider NAME   Codex provider name (default: codex-gator)
   --codex-access-key KEY  Codex access-token credential key (default: CODEX_AUTH_ACCESS_TOKEN)
   --codex-bin PATH        Upload this Codex executable into the sandbox
   --background            Run sandbox create in the background and write a log
@@ -68,29 +71,15 @@ upsert_provider() {
     fi
 }
 
-refresh_provider_if_configured() {
-    local provider="$1"
-    local credential_key="$2"
-    local status_output
-
-    status_output="$(openshell_cmd provider refresh status "$provider" --credential-key "$credential_key")"
-    if [[ "$status_output" == No\ refresh\ configuration* ]]; then
-        echo "No refresh metadata for $provider/$credential_key; using the currently stored credential."
-        return 0
-    fi
-
-    openshell_cmd provider refresh rotate "$provider" --credential-key "$credential_key" >/dev/null
-    echo "Requested gateway refresh for $provider/$credential_key."
-}
-
 import_provider_profile() {
-    local profile_file="$1"
+    local profile_id="$1"
+    local profile_file="$2"
     local import_output
 
     # Custom profile import is create-only. Replace it when possible so repeat
     # runs track this checkout, but keep going if a live sandbox is still using
     # the already-imported profile.
-    openshell_cmd provider profile delete github-gator >/dev/null 2>&1 || true
+    openshell_cmd provider profile delete "$profile_id" >/dev/null 2>&1 || true
     if import_output="$(openshell_cmd provider profile import --file "$profile_file" 2>&1)"; then
         return 0
     fi
@@ -101,6 +90,18 @@ import_provider_profile() {
 
     printf '%s\n' "$import_output" >&2
     return 1
+}
+
+configure_codex_refresh() {
+    openshell_cmd provider refresh configure "$CODEX_PROVIDER" \
+        --credential-key "$CODEX_ACCESS_CREDENTIAL_KEY" \
+        --strategy oauth2_refresh_token \
+        --material "client_id=$CODEX_OAUTH_CLIENT_ID" \
+        --material "refresh_token=$CODEX_AUTH_REFRESH_TOKEN" \
+        --secret-material-key refresh_token >/dev/null
+    openshell_cmd provider refresh rotate "$CODEX_PROVIDER" \
+        --credential-key "$CODEX_ACCESS_CREDENTIAL_KEY" >/dev/null
+    echo "Configured gateway refresh for $CODEX_PROVIDER/$CODEX_ACCESS_CREDENTIAL_KEY."
 }
 
 while [[ $# -gt 0 ]]; do
@@ -199,7 +200,6 @@ case "$HARNESS" in
         [[ -n "$CODEX_AUTH_ACCOUNT_ID" ]] || fail "Codex auth is missing tokens.account_id"
 
         export CODEX_AUTH_ACCESS_TOKEN
-        export CODEX_AUTH_REFRESH_TOKEN
         export CODEX_AUTH_ACCOUNT_ID
         export CODEX_AUTH_ID_TOKEN
         HARNESS_PROVIDER_ARGS=(--provider "$CODEX_PROVIDER")
@@ -258,18 +258,19 @@ Operator request:
 $USER_PROMPT
 EOF
 
-import_provider_profile "$GATOR_DIR/providers/github-gator.yaml"
-upsert_provider "$GITHUB_PROVIDER" github-gator --credential GITHUB_TOKEN
-case "$HARNESS" in
-    codex)
-        upsert_provider "$CODEX_PROVIDER" codex --from-existing
-        refresh_provider_if_configured "$CODEX_PROVIDER" "$CODEX_ACCESS_CREDENTIAL_KEY"
-        ;;
-esac
-
 openshell_cmd settings set --global --key providers_v2_enabled --value true --yes >/dev/null
 openshell_cmd settings set --global --key agent_policy_proposals_enabled --value true --yes >/dev/null
 openshell_cmd settings set --global --key proposal_approval_mode --value auto --yes >/dev/null
+
+import_provider_profile github-gator "$GATOR_DIR/providers/github-gator.yaml"
+upsert_provider "$GITHUB_PROVIDER" github-gator --credential GITHUB_TOKEN
+case "$HARNESS" in
+    codex)
+        import_provider_profile "$CODEX_PROVIDER_PROFILE" "$GATOR_DIR/providers/$CODEX_PROVIDER_PROFILE.yaml"
+        upsert_provider "$CODEX_PROVIDER" "$CODEX_PROVIDER_PROFILE" --from-existing
+        configure_codex_refresh
+        ;;
+esac
 
 KEEP_ARGS=()
 if [[ "$KEEP_SANDBOX" != "1" ]]; then
