@@ -107,7 +107,7 @@ fn system_gateway_metadata_path(name: &str) -> PathBuf {
 
 fn resolve_gateway_metadata_path(name: &str) -> Result<Option<(PathBuf, GatewayMetadataSource)>> {
     let user = user_gateway_metadata_path(name)?;
-    if user.exists() {
+    if user_entry_shadows_system(&user) {
         return Ok(Some((user, GatewayMetadataSource::User)));
     }
 
@@ -127,6 +127,10 @@ fn parse_gateway_metadata(path: &Path) -> Result<GatewayMetadata> {
         .into_diagnostic()
         .wrap_err("failed to parse gateway metadata")
 }
+fn user_entry_shadows_system(metadata_path: &Path) -> bool {
+    metadata_path.try_exists().unwrap_or(true)
+}
+
 /// Extract the hostname from an SSH destination string.
 ///
 /// Handles formats like:
@@ -291,34 +295,63 @@ pub fn list_gateways_with_source() -> Result<Vec<ListedGateway>> {
     let mut gateways = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    let mut scan = |dir: PathBuf, source: GatewayMetadataSource| -> Result<()> {
-        if !dir.exists() {
-            return Ok(());
-        }
-        let entries = std::fs::read_dir(&dir)
+    let user_dir = user_gateways_dir()?;
+    if user_dir.exists() {
+        let entries = std::fs::read_dir(&user_dir)
             .into_diagnostic()
-            .wrap_err_with(|| format!("failed to read directory {}", dir.display()))?;
+            .wrap_err_with(|| format!("failed to read directory {}", user_dir.display()))?;
         for entry in entries {
             let entry = entry.into_diagnostic()?;
             let path = entry.path();
             if !path.is_dir() {
                 continue;
             }
+
+            let metadata_path = path.join("metadata.json");
+            if !user_entry_shadows_system(&metadata_path) {
+                continue;
+            }
+
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !seen.insert(name) {
+                continue;
+            }
+
+            if let Ok(metadata) = parse_gateway_metadata(&metadata_path) {
+                gateways.push(ListedGateway {
+                    metadata,
+                    source: GatewayMetadataSource::User,
+                });
+            }
+        }
+    }
+
+    let system_dir = system_gateways_dir();
+    if system_dir.exists() {
+        let entries = std::fs::read_dir(&system_dir)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to read directory {}", system_dir.display()))?;
+        for entry in entries {
+            let entry = entry.into_diagnostic()?;
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+
             let name = entry.file_name().to_string_lossy().to_string();
             if seen.contains(&name) {
                 continue;
             }
+
             let metadata_path = path.join("metadata.json");
             if let Ok(metadata) = parse_gateway_metadata(&metadata_path) {
-                seen.insert(name);
-                gateways.push(ListedGateway { metadata, source });
+                gateways.push(ListedGateway {
+                    metadata,
+                    source: GatewayMetadataSource::System,
+                });
             }
         }
-        Ok(())
-    };
-
-    scan(user_gateways_dir()?, GatewayMetadataSource::User)?;
-    scan(system_gateways_dir(), GatewayMetadataSource::System)?;
+    }
 
     gateways.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
     Ok(gateways)
@@ -728,6 +761,51 @@ mod tests {
                 "https://user-override"
             );
             assert_eq!(gateways[0].source, GatewayMetadataSource::User);
+        });
+    }
+
+    #[test]
+    fn list_gateways_invalid_user_entry_still_shadows_system() {
+        let user = tempfile::tempdir().unwrap();
+        let system = tempfile::tempdir().unwrap();
+        with_tmp_xdg_and_system(user.path(), system.path(), || {
+            let user_metadata_path = user_gateway_metadata_path("shared").unwrap();
+            std::fs::create_dir_all(user_metadata_path.parent().unwrap()).unwrap();
+            std::fs::write(&user_metadata_path, "{not-json").unwrap();
+
+            write_system_metadata(&system.path().join("gateways"), "shared", "https://system");
+
+            let gateways = list_gateways_with_source().unwrap();
+            assert!(gateways.is_empty());
+        });
+    }
+    #[test]
+    fn list_gateways_empty_user_dir_does_not_hide_system() {
+        let user = tempfile::tempdir().unwrap();
+        let system = tempfile::tempdir().unwrap();
+        with_tmp_xdg_and_system(user.path(), system.path(), || {
+            let user_meta = GatewayMetadata {
+                name: "shared".to_string(),
+                gateway_endpoint: "https://user".to_string(),
+                ..Default::default()
+            };
+            store_gateway_metadata("shared", &user_meta).unwrap();
+            remove_gateway_metadata("shared").unwrap();
+
+            let user_gateway_dir = user_gateway_metadata_path("shared")
+                .unwrap()
+                .parent()
+                .unwrap()
+                .to_path_buf();
+            assert!(user_gateway_dir.is_dir());
+            assert!(!user_gateway_dir.join("metadata.json").exists());
+
+            write_system_metadata(&system.path().join("gateways"), "shared", "https://system");
+
+            let gateways = list_gateways_with_source().unwrap();
+            assert_eq!(gateways.len(), 1);
+            assert_eq!(gateways[0].metadata.gateway_endpoint, "https://system");
+            assert_eq!(gateways[0].source, GatewayMetadataSource::System);
         });
     }
 }
