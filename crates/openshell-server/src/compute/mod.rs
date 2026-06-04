@@ -1643,11 +1643,16 @@ fn rewrite_user_facing_conditions(status: &mut Option<SandboxStatus>, spec: Opti
 /// Phases for which a sandbox should have a running compute resource.
 /// `Deleting` and `Error` are intentionally excluded: deletion is in
 /// progress, or the sandbox has already failed and should not be
-/// silently revived.
+/// silently revived. `Unspecified` is included because it is the proto
+/// default value; persisted rows with that value should be reconciled
+/// from the live driver state rather than skipped forever.
 fn sandbox_phase_should_be_running(phase: SandboxPhase) -> bool {
     matches!(
         phase,
-        SandboxPhase::Provisioning | SandboxPhase::Ready | SandboxPhase::Unknown
+        SandboxPhase::Unspecified
+            | SandboxPhase::Provisioning
+            | SandboxPhase::Ready
+            | SandboxPhase::Unknown
     )
 }
 
@@ -2799,6 +2804,7 @@ mod tests {
             test_runtime_with_resume(Arc::new(TestDriver::default()), Some(resume.clone())).await;
 
         for (id, name, phase) in [
+            ("sb-unspecified", "unspecified", SandboxPhase::Unspecified),
             ("sb-prov", "prov", SandboxPhase::Provisioning),
             ("sb-ready", "ready", SandboxPhase::Ready),
             ("sb-unknown", "unknown", SandboxPhase::Unknown),
@@ -2824,6 +2830,7 @@ mod tests {
                 "sb-prov".to_string(),
                 "sb-ready".to_string(),
                 "sb-unknown".to_string(),
+                "sb-unspecified".to_string(),
             ]
         );
     }
