@@ -6,8 +6,8 @@
 # Gator sandbox image.
 #
 # This mirrors the OpenShell Community base image's core system and developer
-# tooling, but keeps the agent surface focused on Codex + GitHub tooling for the
-# gator-gate workflow.
+# tooling, but keeps the initial agent surface focused on Codex + GitHub tooling
+# for the gator-gate workflow.
 
 FROM nvcr.io/nvidia/base/ubuntu:noble-20251013 AS system
 
@@ -65,7 +65,7 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     apt-get update && apt-get install -y --no-install-recommends gh && \
     rm -rf /var/lib/apt/lists/*
 
-COPY scripts/install-codex.sh /usr/local/bin/install-codex.sh
+COPY harnesses/codex/install-codex.sh /usr/local/bin/install-codex.sh
 ARG CODEX_VERSION=latest
 RUN chmod 755 /usr/local/bin/install-codex.sh && \
     /usr/local/bin/install-codex.sh "$CODEX_VERSION"

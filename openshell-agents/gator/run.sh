@@ -14,6 +14,7 @@ OPENSHELL_BIN="${OPENSHELL_BIN:-openshell}"
 GATEWAY="${GATOR_GATEWAY:-docker-dev}"
 SANDBOX_NAME="${GATOR_SANDBOX_NAME:-gator-$(date +%Y%m%d%H%M%S)}"
 SANDBOX_FROM="${GATOR_SANDBOX_FROM:-$GATOR_DIR}"
+HARNESS="${GATOR_HARNESS:-codex}"
 GITHUB_PROVIDER="${GATOR_GITHUB_PROVIDER:-github-gator}"
 CODEX_PROVIDER="${GATOR_CODEX_PROVIDER:-codex}"
 CODEX_ACCESS_CREDENTIAL_KEY="${GATOR_CODEX_ACCESS_CREDENTIAL_KEY:-CODEX_AUTH_ACCESS_TOKEN}"
@@ -31,12 +32,13 @@ Options:
   --gateway NAME          Gateway name to use (default: docker-dev)
   --name NAME             Sandbox name (default: gator-<timestamp>)
   --from IMAGE            Sandbox source/image (default: openshell-agents/gator)
+  --harness NAME          Agent harness to run (default: codex; supported: codex)
   --github-provider NAME  GitHub provider name (default: github-gator)
   --codex-provider NAME   Codex provider name (default: codex)
   --codex-access-key KEY  Codex access-token credential key (default: CODEX_AUTH_ACCESS_TOKEN)
   --codex-bin PATH        Upload this Codex executable into the sandbox
   --background            Run sandbox create in the background and write a log
-  --keep                  Keep the sandbox after Codex exits (default: delete on exit)
+  --keep                  Keep the sandbox after the harness exits (default: delete on exit)
   -h, --help              Show this help
 EOF
 }
@@ -118,6 +120,11 @@ while [[ $# -gt 0 ]]; do
             SANDBOX_FROM="$2"
             shift 2
             ;;
+        --harness)
+            [[ $# -ge 2 ]] || fail "--harness requires a value"
+            HARNESS="$2"
+            shift 2
+            ;;
         --github-provider)
             [[ $# -ge 2 ]] || fail "--github-provider requires a value"
             GITHUB_PROVIDER="$2"
@@ -167,27 +174,45 @@ done
 USER_PROMPT="$*"
 
 require_cmd gh
-require_cmd jq
 require_cmd "$OPENSHELL_BIN"
 [[ -f "$SKILL_FILE" ]] || fail "missing gator skill: $SKILL_FILE"
 [[ -f "$REVIEWER_AGENT_FILE" ]] || fail "missing reviewer agent: $REVIEWER_AGENT_FILE"
-[[ -f "$HOME/.codex/auth.json" ]] || fail "missing local Codex auth; run: codex login"
 
-CODEX_AUTH_ACCESS_TOKEN="$(jq -r '.tokens.access_token // empty' "$HOME/.codex/auth.json")"
-CODEX_AUTH_REFRESH_TOKEN="$(jq -r '.tokens.refresh_token // empty' "$HOME/.codex/auth.json")"
-CODEX_AUTH_ACCOUNT_ID="$(jq -r '.tokens.account_id // empty' "$HOME/.codex/auth.json")"
-CODEX_AUTH_ID_TOKEN="$(jq -r '.tokens.id_token // empty' "$HOME/.codex/auth.json")"
-[[ -n "$CODEX_AUTH_ACCESS_TOKEN" ]] || fail "Codex auth is missing tokens.access_token"
-[[ -n "$CODEX_AUTH_REFRESH_TOKEN" ]] || fail "Codex auth is missing tokens.refresh_token"
-[[ -n "$CODEX_AUTH_ACCOUNT_ID" ]] || fail "Codex auth is missing tokens.account_id"
+HARNESS_DIR="$GATOR_DIR/harnesses/$HARNESS"
+HARNESS_ENTRYPOINT="/sandbox/payload/harnesses/$HARNESS/sandbox-agent.sh"
+HARNESS_REVIEWER_COMMAND="bash /sandbox/payload/harnesses/$HARNESS/reviewer-agent.sh < review-task.md"
+HARNESS_PROVIDER_ARGS=()
+HARNESS_ENV_ARGS=()
+
+case "$HARNESS" in
+    codex)
+        require_cmd jq
+        [[ -d "$HARNESS_DIR" ]] || fail "missing harness directory: $HARNESS_DIR"
+        [[ -f "$HOME/.codex/auth.json" ]] || fail "missing local Codex auth; run: codex login"
+
+        CODEX_AUTH_ACCESS_TOKEN="$(jq -r '.tokens.access_token // empty' "$HOME/.codex/auth.json")"
+        CODEX_AUTH_REFRESH_TOKEN="$(jq -r '.tokens.refresh_token // empty' "$HOME/.codex/auth.json")"
+        CODEX_AUTH_ACCOUNT_ID="$(jq -r '.tokens.account_id // empty' "$HOME/.codex/auth.json")"
+        CODEX_AUTH_ID_TOKEN="$(jq -r '.tokens.id_token // empty' "$HOME/.codex/auth.json")"
+        [[ -n "$CODEX_AUTH_ACCESS_TOKEN" ]] || fail "Codex auth is missing tokens.access_token"
+        [[ -n "$CODEX_AUTH_REFRESH_TOKEN" ]] || fail "Codex auth is missing tokens.refresh_token"
+        [[ -n "$CODEX_AUTH_ACCOUNT_ID" ]] || fail "Codex auth is missing tokens.account_id"
+
+        export CODEX_AUTH_ACCESS_TOKEN
+        export CODEX_AUTH_REFRESH_TOKEN
+        export CODEX_AUTH_ACCOUNT_ID
+        export CODEX_AUTH_ID_TOKEN
+        HARNESS_PROVIDER_ARGS=(--provider "$CODEX_PROVIDER")
+        HARNESS_ENV_ARGS=("CODEX_MODEL=$CODEX_MODEL" "CODEX_REASONING=$CODEX_REASONING")
+        ;;
+    *)
+        fail "unsupported harness: $HARNESS (supported: codex)"
+        ;;
+esac
 
 GITHUB_TOKEN="$(gh auth token)"
 [[ -n "$GITHUB_TOKEN" ]] || fail "gh auth token returned empty output"
 
-export CODEX_AUTH_ACCESS_TOKEN
-export CODEX_AUTH_REFRESH_TOKEN
-export CODEX_AUTH_ACCOUNT_ID
-export CODEX_AUTH_ID_TOKEN
 export GITHUB_TOKEN
 
 PAYLOAD_PARENT="$(mktemp -d "${TMPDIR:-/tmp}/openshell-gator.XXXXXX")"
@@ -199,19 +224,21 @@ trap cleanup EXIT
 
 mkdir -p "$PAYLOAD_DIR/.agents/skills/gator-gate"
 mkdir -p "$PAYLOAD_DIR/.claude/agents"
+mkdir -p "$PAYLOAD_DIR/harnesses"
 cp "$SKILL_FILE" "$PAYLOAD_DIR/.agents/skills/gator-gate/SKILL.md"
 cp "$REVIEWER_AGENT_FILE" "$PAYLOAD_DIR/.claude/agents/principal-engineer-reviewer.md"
-cp "$GATOR_DIR/sandbox-agent.sh" "$PAYLOAD_DIR/sandbox-agent.sh"
-cp "$GATOR_DIR/reviewer-agent.sh" "$PAYLOAD_DIR/reviewer-agent.sh"
-chmod +x "$PAYLOAD_DIR/sandbox-agent.sh"
-chmod +x "$PAYLOAD_DIR/reviewer-agent.sh"
+cp -R "$HARNESS_DIR" "$PAYLOAD_DIR/harnesses/$HARNESS"
+chmod +x "$PAYLOAD_DIR/harnesses/$HARNESS"/*.sh
 if [[ -n "$CODEX_LOCAL_BIN" ]]; then
     [[ -x "$CODEX_LOCAL_BIN" ]] || fail "--codex-bin is not executable: $CODEX_LOCAL_BIN"
-    cp "$CODEX_LOCAL_BIN" "$PAYLOAD_DIR/codex"
-    chmod +x "$PAYLOAD_DIR/codex"
+    [[ "$HARNESS" == "codex" ]] || fail "--codex-bin is only valid with --harness codex"
+    cp "$CODEX_LOCAL_BIN" "$PAYLOAD_DIR/harnesses/codex/codex"
+    chmod +x "$PAYLOAD_DIR/harnesses/codex/codex"
 fi
 cat > "$PAYLOAD_DIR/gator-prompt.md" <<EOF
 You are running inside an OpenShell sandbox as the gator gate agent.
+
+Active harness: $HARNESS.
 
 Load and follow this skill exactly:
 
@@ -224,7 +251,7 @@ Important sandbox constraints:
 - Keep watching active PRs until they close, merge, or the operator stops the sandbox.
 - Do not push to contributor branches unless the operator explicitly instructs you to do so.
 - If you receive 403 errors from the sandbox proxy, inspect the JSON response and propose a policy update to allow the requested action if the response contains a structured error message.
-- When the gator skill requires the \`principal-engineer-reviewer\` sub-agent, run a bounded independent review with \`bash /sandbox/payload/reviewer-agent.sh < review-task.md\`. Include PR metadata and full diff/file context in \`review-task.md\`, save the output, and use it as the independent reviewer result while the main gator process continues labels, comments, docs, and CI gating.
+- When the gator skill requires the \`principal-engineer-reviewer\` sub-agent, run a bounded independent review with \`$HARNESS_REVIEWER_COMMAND\`. Include PR metadata and full diff/file context in \`review-task.md\`, save the output, and use it as the independent reviewer result while the main gator process continues labels, comments, docs, and CI gating.
 
 Operator request:
 
@@ -233,8 +260,12 @@ EOF
 
 import_provider_profile "$GATOR_DIR/providers/github-gator.yaml"
 upsert_provider "$GITHUB_PROVIDER" github-gator --credential GITHUB_TOKEN
-upsert_provider "$CODEX_PROVIDER" codex --from-existing
-refresh_provider_if_configured "$CODEX_PROVIDER" "$CODEX_ACCESS_CREDENTIAL_KEY"
+case "$HARNESS" in
+    codex)
+        upsert_provider "$CODEX_PROVIDER" codex --from-existing
+        refresh_provider_if_configured "$CODEX_PROVIDER" "$CODEX_ACCESS_CREDENTIAL_KEY"
+        ;;
+esac
 
 openshell_cmd settings set --global --key providers_v2_enabled --value true --yes >/dev/null
 openshell_cmd settings set --global --key agent_policy_proposals_enabled --value true --yes >/dev/null
@@ -250,14 +281,14 @@ SANDBOX_CMD=(
     "$OPENSHELL_BIN" --gateway "$GATEWAY" sandbox create
     --name "$SANDBOX_NAME"
     --from "$SANDBOX_FROM"
-    --provider "$CODEX_PROVIDER"
     --provider "$GITHUB_PROVIDER"
+    "${HARNESS_PROVIDER_ARGS[@]}"
     --upload "$PAYLOAD_DIR:/sandbox"
     --no-git-ignore
     --no-auto-providers
     --no-tty
     "${KEEP_ARGS[@]}"
-    -- env "CODEX_MODEL=$CODEX_MODEL" "CODEX_REASONING=$CODEX_REASONING" bash /sandbox/payload/sandbox-agent.sh
+    -- env "${HARNESS_ENV_ARGS[@]}" bash "$HARNESS_ENTRYPOINT"
 )
 
 echo "Launching gator sandbox '$SANDBOX_NAME' on gateway '$GATEWAY'..."
