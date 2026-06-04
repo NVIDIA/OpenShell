@@ -55,8 +55,8 @@ WORK="$(mktemp -d)"
 cd "$WORK"
 
 CODEX_BIN="${CODEX_BIN:-codex}"
-if [[ -x /sandbox/payload/codex ]]; then
-    CODEX_BIN=/sandbox/payload/codex
+if [[ -x /sandbox/payload/harnesses/codex/codex ]]; then
+    CODEX_BIN=/sandbox/payload/harnesses/codex/codex
 fi
 CODEX_MODEL="${CODEX_MODEL:-gpt-5.5}"
 CODEX_REASONING="${CODEX_REASONING:-high}"
