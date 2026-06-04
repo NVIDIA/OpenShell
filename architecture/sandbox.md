@@ -71,8 +71,10 @@ override template values so sandbox images cannot spoof identity, callback, or
 relay settings.
 
 Credential placeholders in proxied HTTP requests can be resolved by the proxy
-when policy allows the target endpoint. Secrets must not be logged in OCSF or
-plain tracing output.
+when policy allows the target endpoint. For GCP providers, a loopback metadata
+server inside the network namespace serves placeholders to SDKs that bypass the
+proxy (e.g. Go's `cloud.google.com/go/compute/metadata`). Secrets must not be
+logged in OCSF or plain tracing output.
 
 ## Connect and Logs
 
