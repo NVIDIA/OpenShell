@@ -39,8 +39,7 @@ fn test_sandbox() -> DriverSandbox {
                 agent_socket_path: String::new(),
                 labels: HashMap::new(),
                 environment: HashMap::from([("TEMPLATE_ENV".to_string(), "template".to_string())]),
-                resources: None,
-                platform_config: None,
+                ..Default::default()
             }),
             gpu: false,
             gpu_device: String::new(),
@@ -391,7 +390,7 @@ fn docker_resource_limits_rejects_requests() {
             memory_request: String::new(),
             memory_limit: String::new(),
         }),
-        platform_config: None,
+        ..Default::default()
     };
 
     let err = docker_resource_limits(&template).unwrap_err();
@@ -411,7 +410,7 @@ fn docker_resource_limits_applies_cpu_and_memory_limits() {
             memory_limit: "2Gi".to_string(),
             ..Default::default()
         }),
-        platform_config: None,
+        ..Default::default()
     };
 
     let limits = docker_resource_limits(&template).unwrap();
