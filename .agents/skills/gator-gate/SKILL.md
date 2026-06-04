@@ -393,6 +393,8 @@ If TTL expires:
 
 When a PR enters `gator:in-review`, run an independent code-only review.
 
+For PRs authored by `dependabot[bot]`, the primary gator responsibility is dependency-update validation, not normal feature review. Do a quick sanity check for suspicious changes outside expected dependency manifests or lockfiles, then ensure the full required test suite runs, including E2E, and watch for breakages caused by the update.
+
 Use the `principal-engineer-reviewer` sub-agent. Include:
 
 - PR title, body, linked issues, labels, and files
@@ -429,6 +431,8 @@ Do not move to `gator:watch-pipeline` until review feedback is addressed or expl
 ## Step 9: E2E and Test Label Decision
 
 Apply or recommend `test:*` labels based on changed files and behavior.
+
+Always apply or require `test:e2e` for PRs authored by `dependabot[bot]`. Dependabot PRs must run the full required test suite, including E2E, even when the dependency update appears isolated to manifests or lockfiles.
 
 Use `test:e2e` for changes that affect:
 
