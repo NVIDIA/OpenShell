@@ -32,7 +32,7 @@ contract:
 | `apparmor=unconfined` | Avoids Docker's default profile blocking required mount operations. |
 | `restart_policy = unless-stopped` | Keeps managed sandboxes resumable across daemon or gateway restarts. |
 | `PidsLimit` | Enforces the sandbox PID budget at the Docker cgroup layer. Set `[openshell.drivers.docker].sandbox_pids_limit = 0` to inherit the Docker/runtime default. |
-| CDI GPU request | Uses `driver_config.cdi_devices` when set; otherwise requests all NVIDIA GPUs when the sandbox spec asks for GPU support and daemon CDI support is detected. |
+| CDI GPU request | Uses `driver_config.cdi_devices` when set; otherwise selects one concrete NVIDIA CDI GPU when the sandbox spec asks for GPU support and daemon CDI support is detected. Docker daemon `/info` can permit `nvidia.com/gpu=all` as a WSL2 all-only compatibility fallback. |
 
 The agent child process does not retain these supervisor privileges.
 

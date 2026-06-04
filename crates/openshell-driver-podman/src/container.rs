@@ -477,7 +477,10 @@ fn podman_pids_limit(value: i64) -> Option<i64> {
 }
 
 /// Build CDI GPU device list if GPU is requested.
-fn build_devices(sandbox: &DriverSandbox) -> Result<Option<Vec<LinuxDevice>>, ComputeDriverError> {
+fn build_devices(
+    sandbox: &DriverSandbox,
+    selected_default_device: Option<&str>,
+) -> Result<Option<Vec<LinuxDevice>>, ComputeDriverError> {
     let Some(spec) = sandbox.spec.as_ref() else {
         return Ok(None);
     };
@@ -490,14 +493,16 @@ fn build_devices(sandbox: &DriverSandbox) -> Result<Option<Vec<LinuxDevice>>, Co
         ));
     }
 
-    Ok(
-        cdi_gpu_device_ids(spec.gpu, &cdi_devices).map(|device_ids| {
-            device_ids
-                .into_iter()
-                .map(|path| LinuxDevice { path })
-                .collect()
-        }),
-    )
+    cdi_gpu_device_ids(spec.gpu, &cdi_devices, selected_default_device)
+        .map(|device_ids| {
+            device_ids.map(|device_ids| {
+                device_ids
+                    .into_iter()
+                    .map(|path| LinuxDevice { path })
+                    .collect()
+            })
+        })
+        .map_err(|err| ComputeDriverError::Precondition(err.to_string()))
 }
 
 pub fn podman_driver_volume_mount_sources(
@@ -784,10 +789,20 @@ pub fn build_container_spec_with_token(
         .expect("container spec should be valid")
 }
 
+#[cfg(test)]
 pub fn try_build_container_spec_with_token(
     sandbox: &DriverSandbox,
     config: &PodmanComputeConfig,
     token_host_path: Option<&Path>,
+) -> Result<Value, ComputeDriverError> {
+    build_container_spec_with_token_and_gpu_default(sandbox, config, token_host_path, None)
+}
+
+pub fn build_container_spec_with_token_and_gpu_default(
+    sandbox: &DriverSandbox,
+    config: &PodmanComputeConfig,
+    token_host_path: Option<&Path>,
+    selected_default_device: Option<&str>,
 ) -> Result<Value, ComputeDriverError> {
     let image = resolve_image(sandbox, config);
     let name = container_name(&sandbox.name);
@@ -796,9 +811,9 @@ pub fn try_build_container_spec_with_token(
     let env = build_env(sandbox, config, image);
     let labels = build_labels(sandbox);
     let resource_limits = build_resource_limits(sandbox, config);
-    let devices = build_devices(sandbox)?;
     let user_mounts = podman_user_mounts(sandbox, config.enable_bind_mounts)
         .map_err(ComputeDriverError::InvalidArgument)?;
+    let devices = build_devices(sandbox, selected_default_device)?;
 
     // Network configuration -- always bridge mode.
     // Matches libpod's network spec format `{name: {opts}}`; the unit-struct
@@ -1240,8 +1255,7 @@ mod tests {
     }
 
     #[test]
-    fn container_spec_maps_empty_gpu_request_to_all_cdi_device() {
-        use openshell_core::config::CDI_GPU_DEVICE_ALL;
+    fn container_spec_maps_empty_gpu_request_to_selected_default_cdi_device() {
         use openshell_core::proto::compute::v1::DriverSandboxSpec;
 
         let mut sandbox = test_sandbox("test-id", "test-name");
@@ -1250,12 +1264,36 @@ mod tests {
             ..Default::default()
         });
         let config = test_config();
-        let spec = build_container_spec(&sandbox, &config);
+        let spec = build_container_spec_with_token_and_gpu_default(
+            &sandbox,
+            &config,
+            None,
+            Some("nvidia.com/gpu=1"),
+        )
+        .unwrap();
 
         assert_eq!(
             spec["devices"][0]["path"].as_str(),
-            Some(CDI_GPU_DEVICE_ALL)
+            Some("nvidia.com/gpu=1")
         );
+    }
+
+    #[test]
+    fn container_spec_rejects_missing_default_cdi_device() {
+        use openshell_core::proto::compute::v1::DriverSandboxSpec;
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            gpu: true,
+            ..Default::default()
+        });
+        let config = test_config();
+
+        let err = build_container_spec_with_token_and_gpu_default(&sandbox, &config, None, None)
+            .unwrap_err();
+
+        assert!(matches!(err, ComputeDriverError::Precondition(_)));
+        assert!(err.to_string().contains("selected default CDI GPU device"));
     }
 
     #[test]
