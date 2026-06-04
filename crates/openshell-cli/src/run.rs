@@ -1289,28 +1289,8 @@ pub fn gateway_list(gateway_flag: &Option<String>, output: &str) -> Result<()> {
     let gateways = list_gateways()?;
     let active = gateway_flag.clone().or_else(load_active_gateway);
 
-    match output {
-        "json" => {
-            let items: Vec<serde_json::Value> = gateways
-                .iter()
-                .map(|g| gateway_to_json(g, &active))
-                .collect();
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&items).into_diagnostic()?
-            );
-            return Ok(());
-        }
-        "yaml" => {
-            let items: Vec<serde_json::Value> = gateways
-                .iter()
-                .map(|g| gateway_to_json(g, &active))
-                .collect();
-            print!("{}", serde_yml::to_string(&items).into_diagnostic()?);
-            return Ok(());
-        }
-        "table" => {}
-        _ => return Err(miette!("unsupported output format: {output}")),
+    if crate::output::print_output_collection(output, &gateways, |g| gateway_to_json(g, &active))? {
+        return Ok(());
     }
 
     if gateways.is_empty() {
@@ -3182,22 +3162,8 @@ pub async fn sandbox_list(
 
     let sandboxes = response.into_inner().sandboxes;
 
-    match output {
-        "json" => {
-            let items: Vec<serde_json::Value> = sandboxes.iter().map(sandbox_to_json).collect();
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&items).into_diagnostic()?
-            );
-            return Ok(());
-        }
-        "yaml" => {
-            let items: Vec<serde_json::Value> = sandboxes.iter().map(sandbox_to_json).collect();
-            print!("{}", serde_yml::to_string(&items).into_diagnostic()?);
-            return Ok(());
-        }
-        "table" => {}
-        _ => return Err(miette!("unsupported output format: {output}")),
+    if crate::output::print_output_collection(output, &sandboxes, sandbox_to_json)? {
+        return Ok(());
     }
 
     if sandboxes.is_empty() {
@@ -4697,17 +4663,12 @@ pub async fn provider_list_profiles(server: &str, output: &str, tls: &TlsOptions
         .map(ProviderTypeProfile::from_proto)
         .collect::<Vec<_>>();
 
-    match output {
-        "yaml" => {
-            print!("{}", profiles_to_yaml(&dto_profiles).into_diagnostic()?);
-            return Ok(());
-        }
-        "json" => {
-            println!("{}", profiles_to_json(&dto_profiles).into_diagnostic()?);
-            return Ok(());
-        }
-        "table" => {}
-        _ => return Err(miette!("unsupported output format: {output}")),
+    if crate::output::print_output_direct(
+        output,
+        || profiles_to_json(&dto_profiles).into_diagnostic(),
+        || profiles_to_yaml(&dto_profiles).into_diagnostic(),
+    )? {
+        return Ok(());
     }
 
     if profiles.is_empty() {
@@ -4748,15 +4709,14 @@ pub async fn provider_profile_export(
         .ok_or_else(|| miette!("provider profile '{id}' not found"))?;
     let profile = ProviderTypeProfile::from_proto(&profile);
 
-    match output {
-        "yaml" => print!("{}", profile_to_yaml(&profile).into_diagnostic()?),
-        "json" => println!("{}", profile_to_json(&profile).into_diagnostic()?),
-        "table" => {
-            return Err(miette!(
-                "profile export supports '-o yaml' and '-o json'; table output is not supported"
-            ));
-        }
-        _ => return Err(miette!("unsupported output format: {output}")),
+    if !crate::output::print_output_direct(
+        output,
+        || profile_to_json(&profile).into_diagnostic(),
+        || profile_to_yaml(&profile).into_diagnostic(),
+    )? {
+        return Err(miette!(
+            "profile export supports '-o yaml' and '-o json'; table output is not supported"
+        ));
     }
     Ok(())
 }
