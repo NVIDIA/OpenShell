@@ -507,6 +507,12 @@ pub(super) async fn resolve_provider_environment(
 
             // Project ID derived vars.
             if !project_id.is_empty() {
+                warn!(
+                    provider = %provider.metadata.as_ref().map_or("?", |m| m.name.as_str()),
+                    "injecting ANTHROPIC_VERTEX_PROJECT_ID into sandbox; if using inference.local, \
+                     ensure ANTHROPIC_BASE_URL=https://inference.local is set to prevent Anthropic \
+                     SDK from routing directly to Vertex AI"
+                );
                 env.entry("ANTHROPIC_VERTEX_PROJECT_ID".to_string())
                     .or_insert_with(|| project_id.to_string());
                 env.entry("GCP_PROJECT_ID".to_string())
