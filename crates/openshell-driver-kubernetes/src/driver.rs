@@ -28,6 +28,7 @@ use openshell_core::proto::compute::v1::{
     GetCapabilitiesResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
     WatchSandboxesPlatformEvent, WatchSandboxesSandboxEvent, watch_sandboxes_event,
 };
+use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::time::Duration;
@@ -78,6 +79,40 @@ pub const SANDBOX_KIND: &str = "Sandbox";
 
 const GPU_RESOURCE_NAME: &str = "nvidia.com/gpu";
 const GPU_RESOURCE_QUANTITY: &str = "1";
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct KubernetesSandboxDriverConfig {
+    pod: KubernetesPodDriverConfig,
+    containers: KubernetesDriverContainersConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct KubernetesPodDriverConfig {
+    node_selector: BTreeMap<String, String>,
+    tolerations: Vec<serde_json::Value>,
+    priority_class_name: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct KubernetesDriverContainersConfig {
+    agent: KubernetesContainerDriverConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct KubernetesContainerDriverConfig {
+    resources: KubernetesContainerResourceConfig,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct KubernetesContainerResourceConfig {
+    requests: BTreeMap<String, String>,
+    limits: BTreeMap<String, String>,
+}
 
 // ---------------------------------------------------------------------------
 // Default workspace persistence (temporary — will be replaced by snapshotting)
@@ -1086,6 +1121,21 @@ fn spec_pod_env(spec: Option<&SandboxSpec>) -> std::collections::HashMap<String,
     env
 }
 
+fn kubernetes_driver_config(template: &SandboxTemplate) -> KubernetesSandboxDriverConfig {
+    let Some(config) = template.driver_config.as_ref() else {
+        return KubernetesSandboxDriverConfig::default();
+    };
+
+    let json = serde_json::Value::Object(proto_struct_to_json_object(config));
+    match serde_json::from_value(json) {
+        Ok(config) => config,
+        Err(err) => {
+            warn!(error = %err, "Ignoring invalid Kubernetes driver_config");
+            KubernetesSandboxDriverConfig::default()
+        }
+    }
+}
+
 fn sandbox_to_k8s_spec(
     spec: Option<&SandboxSpec>,
     params: &SandboxPodParams<'_>,
@@ -1160,6 +1210,8 @@ fn sandbox_template_to_k8s(
     inject_workspace: bool,
     params: &SandboxPodParams<'_>,
 ) -> serde_json::Value {
+    let _driver_config = kubernetes_driver_config(template);
+
     let mut metadata = serde_json::Map::new();
     if !template.labels.is_empty() {
         metadata.insert("labels".to_string(), serde_json::json!(template.labels));
@@ -1607,6 +1659,16 @@ fn platform_config_struct(template: &SandboxTemplate, key: &str) -> Option<serde
     }
 }
 
+fn proto_struct_to_json_object(
+    config: &prost_types::Struct,
+) -> serde_json::Map<String, serde_json::Value> {
+    config
+        .fields
+        .iter()
+        .map(|(key, value)| (key.clone(), proto_value_to_json(value)))
+        .collect()
+}
+
 fn proto_value_to_json(value: &prost_types::Value) -> serde_json::Value {
     match value.kind.as_ref() {
         Some(prost_types::value::Kind::NumberValue(num)) => serde_json::Number::from_f64(*num)
@@ -1703,6 +1765,57 @@ mod tests {
 
     static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
+    fn json_struct(value: serde_json::Value) -> Struct {
+        match json_value(value).kind {
+            Some(Kind::StructValue(value)) => value,
+            _ => panic!("expected JSON object"),
+        }
+    }
+
+    fn json_value(value: serde_json::Value) -> Value {
+        match value {
+            serde_json::Value::Null => Value { kind: None },
+            serde_json::Value::Bool(value) => Value {
+                kind: Some(Kind::BoolValue(value)),
+            },
+            serde_json::Value::Number(value) => Value {
+                kind: value.as_f64().map(Kind::NumberValue),
+            },
+            serde_json::Value::String(value) => Value {
+                kind: Some(Kind::StringValue(value)),
+            },
+            serde_json::Value::Array(values) => Value {
+                kind: Some(Kind::ListValue(prost_types::ListValue {
+                    values: values.into_iter().map(json_value).collect(),
+                })),
+            },
+            serde_json::Value::Object(values) => Value {
+                kind: Some(Kind::StructValue(Struct {
+                    fields: values
+                        .into_iter()
+                        .map(|(key, value)| (key, json_value(value)))
+                        .collect(),
+                })),
+            },
+        }
+    }
+
+    #[test]
+    fn driver_config_ignores_invalid_shape() {
+        let template = SandboxTemplate {
+            driver_config: Some(json_struct(serde_json::json!({
+                "pod": "not-an-object"
+            }))),
+            ..SandboxTemplate::default()
+        };
+
+        let config = kubernetes_driver_config(&template);
+
+        assert!(config.pod.node_selector.is_empty());
+        assert!(config.containers.agent.resources.requests.is_empty());
+        assert!(config.containers.agent.resources.limits.is_empty());
+    }
 
     #[test]
     fn kube_pulling_event_adds_image_progress_metadata() {
