@@ -40,6 +40,11 @@ template resource limits. Docker and Podman apply them as runtime limits.
 Kubernetes mirrors each limit into the matching request. VM accepts the fields
 but currently ignores them.
 
+Kubernetes deployments may set an AppArmor profile on sandbox agent containers
+through the driver configuration. The Helm chart defaults sandbox agents to
+`Unconfined` so runtime/default AppArmor profiles do not block supervisor
+network namespace setup on AppArmor-enabled nodes.
+
 VM runtime state paths are derived only from driver-validated sandbox IDs
 matching `[A-Za-z0-9._-]{1,128}`. The gateway-owned VM driver socket uses a
 private `run/` directory plus Unix peer UID/PID checks. Standalone

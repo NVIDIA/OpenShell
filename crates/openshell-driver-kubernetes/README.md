@@ -47,6 +47,18 @@ bootstrap exchange.
 The gateway uses the supervisor relay for connect, exec, and file sync. Sandbox
 pods do not need direct external ingress for SSH.
 
+## Container Security Context
+
+The driver grants the sandbox agent container the Linux capabilities the
+supervisor needs for namespace setup and policy enforcement. It can also request
+a Kubernetes AppArmor profile through `app_armor_profile`.
+
+Supported values are `Unconfined`, `RuntimeDefault`, and
+`Localhost/<profile-name>`. An empty or unset value omits
+`securityContext.appArmorProfile`. Helm deployments default sandbox agent
+containers to `Unconfined` because runtime/default AppArmor profiles can block
+the supervisor's network namespace mount setup on AppArmor-enabled nodes.
+
 ## GPU Support
 
 When a sandbox requests GPU support, the driver checks node allocatable capacity

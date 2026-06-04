@@ -4,8 +4,8 @@
 //! Kubernetes compute driver.
 
 use crate::config::{
-    DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_WORKSPACE_STORAGE_SIZE, KubernetesComputeConfig,
-    SupervisorSideloadMethod,
+    AppArmorProfile, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, DEFAULT_WORKSPACE_STORAGE_SIZE,
+    KubernetesComputeConfig, SupervisorSideloadMethod,
 };
 use futures::{Stream, StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::{Event as KubeEventObj, Node};
@@ -328,6 +328,7 @@ impl KubernetesComputeDriver {
             client_tls_secret_name: &self.config.client_tls_secret_name,
             host_gateway_ip: &self.config.host_gateway_ip,
             enable_user_namespaces: self.config.enable_user_namespaces,
+            app_armor_profile: self.config.app_armor_profile.as_ref(),
             workspace_default_storage_size: &self.config.workspace_default_storage_size,
             default_runtime_class_name: &self.config.default_runtime_class_name,
             sa_token_ttl_secs: self.config.effective_sa_token_ttl_secs(),
@@ -1041,6 +1042,7 @@ struct SandboxPodParams<'a> {
     client_tls_secret_name: &'a str,
     host_gateway_ip: &'a str,
     enable_user_namespaces: bool,
+    app_armor_profile: Option<&'a AppArmorProfile>,
     workspace_default_storage_size: &'a str,
     default_runtime_class_name: &'a str,
     /// Lifetime (seconds) of the projected `ServiceAccount` token used
@@ -1065,6 +1067,7 @@ impl Default for SandboxPodParams<'_> {
             client_tls_secret_name: "",
             host_gateway_ip: "",
             enable_user_namespaces: false,
+            app_armor_profile: None,
             workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE,
             default_runtime_class_name: "",
             sa_token_ttl_secs: 3600,
@@ -1280,14 +1283,15 @@ fn sandbox_template_to_k8s(
         // for process identity resolution in network policy enforcement.
         capabilities.extend(["SETUID", "SETGID", "DAC_READ_SEARCH"]);
     }
-    container.insert(
-        "securityContext".to_string(),
-        serde_json::json!({
-            "capabilities": {
-                "add": capabilities
-            }
-        }),
-    );
+    let mut security_context = serde_json::json!({
+        "capabilities": {
+            "add": capabilities
+        }
+    });
+    if let Some(profile) = params.app_armor_profile {
+        security_context["appArmorProfile"] = app_armor_profile_to_k8s(profile);
+    }
+    container.insert("securityContext".to_string(), security_context);
 
     // Mount client TLS secret for mTLS to the server, plus the projected
     // ServiceAccount token used to bootstrap the sandbox's gateway JWT
@@ -1389,6 +1393,16 @@ fn image_pull_secret_refs(secrets: &[String]) -> Vec<serde_json::Value> {
         .filter(|secret| !secret.is_empty())
         .map(|secret| serde_json::json!({ "name": secret }))
         .collect()
+}
+
+fn app_armor_profile_to_k8s(profile: &AppArmorProfile) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "type": profile.to_k8s_type()
+    });
+    if let Some(localhost_profile) = profile.localhost_profile() {
+        value["localhostProfile"] = serde_json::json!(localhost_profile);
+    }
+    value
 }
 
 fn container_resources(template: &SandboxTemplate, gpu: bool) -> Option<serde_json::Value> {
@@ -2459,6 +2473,65 @@ mod tests {
             true,
             &params,
         )
+    }
+
+    #[test]
+    fn app_armor_profile_omitted_by_default() {
+        let pod_template = default_template_to_k8s(false);
+        assert!(
+            pod_template["spec"]["containers"][0]["securityContext"]["appArmorProfile"].is_null(),
+            "appArmorProfile must be omitted when no profile is configured"
+        );
+    }
+
+    #[test]
+    fn app_armor_profile_renders_unconfined() {
+        let profile = AppArmorProfile::Unconfined;
+        let params = SandboxPodParams {
+            app_armor_profile: Some(&profile),
+            ..Default::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+
+        assert_eq!(
+            pod_template["spec"]["containers"][0]["securityContext"]["appArmorProfile"],
+            serde_json::json!({ "type": "Unconfined" })
+        );
+        assert_eq!(
+            pod_template["spec"]["containers"][0]["securityContext"]["capabilities"]["add"][0],
+            serde_json::json!("SYS_ADMIN"),
+            "AppArmor rendering must preserve required capabilities"
+        );
+    }
+
+    #[test]
+    fn app_armor_profile_renders_localhost_profile() {
+        let profile = AppArmorProfile::Localhost("openshell-supervisor".to_string());
+        let params = SandboxPodParams {
+            app_armor_profile: Some(&profile),
+            ..Default::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+
+        assert_eq!(
+            pod_template["spec"]["containers"][0]["securityContext"]["appArmorProfile"],
+            serde_json::json!({
+                "type": "Localhost",
+                "localhostProfile": "openshell-supervisor"
+            })
+        );
     }
 
     #[test]

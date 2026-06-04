@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use openshell_core::config::DEFAULT_SUPERVISOR_IMAGE;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use std::str::FromStr;
 
 /// Default Kubernetes namespace for sandbox resources.
 pub const DEFAULT_K8S_NAMESPACE: &str = "openshell";
@@ -36,7 +37,7 @@ impl std::fmt::Display for SupervisorSideloadMethod {
     }
 }
 
-impl std::str::FromStr for SupervisorSideloadMethod {
+impl FromStr for SupervisorSideloadMethod {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -47,6 +48,98 @@ impl std::str::FromStr for SupervisorSideloadMethod {
                 "unknown supervisor sideload method '{other}'; expected 'image-volume' or 'init-container'"
             )),
         }
+    }
+}
+
+/// Kubernetes `AppArmor` profile requested for the sandbox agent container.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppArmorProfile {
+    RuntimeDefault,
+    Unconfined,
+    Localhost(String),
+}
+
+impl AppArmorProfile {
+    #[must_use]
+    pub fn to_k8s_type(&self) -> &'static str {
+        match self {
+            Self::RuntimeDefault => "RuntimeDefault",
+            Self::Unconfined => "Unconfined",
+            Self::Localhost(_) => "Localhost",
+        }
+    }
+
+    #[must_use]
+    pub fn localhost_profile(&self) -> Option<&str> {
+        match self {
+            Self::Localhost(profile) => Some(profile),
+            Self::RuntimeDefault | Self::Unconfined => None,
+        }
+    }
+}
+
+impl std::fmt::Display for AppArmorProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RuntimeDefault => f.write_str("RuntimeDefault"),
+            Self::Unconfined => f.write_str("Unconfined"),
+            Self::Localhost(profile) => write!(f, "Localhost/{profile}"),
+        }
+    }
+}
+
+impl FromStr for AppArmorProfile {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "RuntimeDefault" => Ok(Self::RuntimeDefault),
+            "Unconfined" => Ok(Self::Unconfined),
+            other => match other.strip_prefix("Localhost/") {
+                Some("") => Err(
+                    "invalid AppArmor profile 'Localhost/'; expected non-empty profile name"
+                        .to_string(),
+                ),
+                Some(profile) => Ok(Self::Localhost(profile.to_string())),
+                None => Err(format!(
+                    "unknown AppArmor profile '{other}'; expected 'RuntimeDefault', 'Unconfined', or 'Localhost/<profile-name>'"
+                )),
+            },
+        }
+    }
+}
+
+impl Serialize for AppArmorProfile {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for AppArmorProfile {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::from_str(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+fn deserialize_optional_app_armor_profile<'de, D>(
+    deserializer: D,
+) -> Result<Option<AppArmorProfile>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    match value.as_deref() {
+        None | Some("") => Ok(None),
+        Some(value) => AppArmorProfile::from_str(value)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
     }
 }
 
@@ -75,6 +168,14 @@ pub struct KubernetesComputeConfig {
     pub client_tls_secret_name: String,
     pub host_gateway_ip: String,
     pub enable_user_namespaces: bool,
+    /// Kubernetes `AppArmor` profile requested for the sandbox agent container.
+    /// Empty/None omits the `appArmorProfile` field from sandbox pod specs.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_app_armor_profile"
+    )]
+    pub app_armor_profile: Option<AppArmorProfile>,
     pub workspace_default_storage_size: String,
     /// Default Kubernetes `runtimeClassName` for sandbox pods.
     /// Applied when a `CreateSandbox` request does not specify one.
@@ -119,6 +220,7 @@ impl Default for KubernetesComputeConfig {
             client_tls_secret_name: String::new(),
             host_gateway_ip: String::new(),
             enable_user_namespaces: false,
+            app_armor_profile: None,
             workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE.to_string(),
             default_runtime_class_name: String::new(),
             sa_token_ttl_secs: 3600,
@@ -194,6 +296,62 @@ mod tests {
     fn default_runtime_class_name_is_empty() {
         let cfg = KubernetesComputeConfig::default();
         assert!(cfg.default_runtime_class_name.is_empty());
+    }
+
+    #[test]
+    fn default_app_armor_profile_is_none() {
+        let cfg = KubernetesComputeConfig::default();
+        assert!(cfg.app_armor_profile.is_none());
+    }
+
+    #[test]
+    fn serde_override_app_armor_profile_unconfined() {
+        let json = serde_json::json!({
+            "app_armor_profile": "Unconfined"
+        });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.app_armor_profile, Some(AppArmorProfile::Unconfined));
+    }
+
+    #[test]
+    fn serde_override_app_armor_profile_runtime_default() {
+        let json = serde_json::json!({
+            "app_armor_profile": "RuntimeDefault"
+        });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.app_armor_profile, Some(AppArmorProfile::RuntimeDefault));
+    }
+
+    #[test]
+    fn serde_override_app_armor_profile_localhost() {
+        let json = serde_json::json!({
+            "app_armor_profile": "Localhost/openshell-supervisor"
+        });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            cfg.app_armor_profile,
+            Some(AppArmorProfile::Localhost(
+                "openshell-supervisor".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn serde_empty_app_armor_profile_disables_field() {
+        let json = serde_json::json!({
+            "app_armor_profile": ""
+        });
+        let cfg: KubernetesComputeConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.app_armor_profile, None);
+    }
+
+    #[test]
+    fn serde_rejects_invalid_app_armor_profile() {
+        let json = serde_json::json!({
+            "app_armor_profile": "runtime/default"
+        });
+        let err = serde_json::from_value::<KubernetesComputeConfig>(json).unwrap_err();
+        assert!(err.to_string().contains("unknown AppArmor profile"));
     }
 
     #[test]

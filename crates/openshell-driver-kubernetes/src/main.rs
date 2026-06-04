@@ -10,8 +10,8 @@ use tracing_subscriber::EnvFilter;
 use openshell_core::VERSION;
 use openshell_core::proto::compute::v1::compute_driver_server::ComputeDriverServer;
 use openshell_driver_kubernetes::{
-    ComputeDriverService, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME, KubernetesComputeConfig,
-    KubernetesComputeDriver, SupervisorSideloadMethod,
+    AppArmorProfile, ComputeDriverService, DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
+    KubernetesComputeConfig, KubernetesComputeDriver, SupervisorSideloadMethod,
 };
 
 #[derive(Parser, Debug)]
@@ -83,6 +83,9 @@ struct Args {
     #[arg(long, env = "OPENSHELL_ENABLE_USER_NAMESPACES")]
     enable_user_namespaces: bool,
 
+    #[arg(long, env = "OPENSHELL_K8S_APP_ARMOR_PROFILE")]
+    app_armor_profile: Option<AppArmorProfile>,
+
     /// Lifetime (seconds) of the projected `ServiceAccount` token
     /// kubelet writes into each sandbox pod for the `IssueSandboxToken`
     /// bootstrap exchange. Kubelet enforces a minimum of 600s; the
@@ -116,6 +119,7 @@ async fn main() -> Result<()> {
         client_tls_secret_name: args.client_tls_secret_name.unwrap_or_default(),
         host_gateway_ip: args.host_gateway_ip.unwrap_or_default(),
         enable_user_namespaces: args.enable_user_namespaces,
+        app_armor_profile: args.app_armor_profile,
         workspace_default_storage_size: std::env::var(
             "OPENSHELL_K8S_WORKSPACE_DEFAULT_STORAGE_SIZE",
         )

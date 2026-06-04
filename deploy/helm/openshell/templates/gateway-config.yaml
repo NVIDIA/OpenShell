@@ -121,6 +121,9 @@ data:
     {{- if .Values.server.defaultRuntimeClassName }}
     default_runtime_class_name   = {{ .Values.server.defaultRuntimeClassName | quote }}
     {{- end }}
+    {{- if .Values.server.appArmorProfile }}
+    app_armor_profile            = {{ .Values.server.appArmorProfile | quote }}
+    {{- end }}
     {{- if .Values.supervisor.image.pullPolicy }}
     supervisor_image_pull_policy = {{ .Values.supervisor.image.pullPolicy | quote }}
     {{- end }}

@@ -183,6 +183,12 @@ server:
   # Linux 5.12+. When enabled, container UID 0 maps to an unprivileged host
   # UID and capabilities become namespaced.
   enableUserNamespaces: false
+  # -- Kubernetes AppArmor profile requested for sandbox agent containers.
+  # Default Unconfined avoids runtime/default AppArmor blocking the supervisor's
+  # network namespace mount setup on AppArmor-enabled nodes. Set to "" to omit
+  # the field, "RuntimeDefault" to force the runtime default profile, or
+  # "Localhost/profile-name" for an operator-managed localhost profile.
+  appArmorProfile: "Unconfined"
   # -- Disable TLS entirely - the server listens on plaintext HTTP.
   # Set to true when a reverse proxy / tunnel terminates TLS at the edge.
   disableTls: false

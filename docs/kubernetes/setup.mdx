@@ -140,6 +140,7 @@ The most commonly changed values are:
 | `server.sandboxImage` | Default sandbox image used when a sandbox does not specify one. |
 | `server.sandboxImagePullSecrets` | Image pull secrets attached to sandbox pods. Referenced Secrets must exist in the sandbox namespace. |
 | `server.grpcEndpoint` | Endpoint that sandbox supervisors use to call back to the gateway. Must be reachable from inside the cluster. |
+| `server.appArmorProfile` | AppArmor profile requested for sandbox agent containers. Defaults to `Unconfined`. |
 | `server.disableTls` | Run the gateway over plaintext HTTP. Use only behind a trusted transport. |
 | `server.auth.allowUnauthenticatedUsers` | Accept user-facing calls without OIDC or mTLS credentials. Use only for trusted local development or a fully trusted access proxy. |
 | `server.enableLoopbackServiceHttp` | Enable local plaintext HTTP for loopback sandbox service URLs. Defaults to `true`. |
@@ -155,6 +156,13 @@ helm upgrade --install openshell \
   --namespace openshell \
   --values my-values.yaml
 ```
+
+The chart defaults `server.appArmorProfile` to `Unconfined` because
+runtime/default AppArmor profiles can block the supervisor's network namespace
+mount setup on AppArmor-enabled nodes. Set `server.appArmorProfile` to an empty
+string to omit the field, `RuntimeDefault` to force the runtime default, or
+`Localhost/<profile-name>` when you load and manage a localhost profile on each
+node.
 
 To use private sandbox images, create a `kubernetes.io/dockerconfigjson` Secret
 in the sandbox namespace and reference its name:
