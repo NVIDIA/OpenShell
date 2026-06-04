@@ -15,6 +15,7 @@ pub mod driver_mounts;
 pub mod driver_utils;
 pub mod error;
 pub mod forward;
+pub mod google_cloud;
 pub mod gpu;
 pub mod image;
 pub mod inference;
