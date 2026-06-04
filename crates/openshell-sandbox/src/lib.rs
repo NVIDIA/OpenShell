@@ -10,11 +10,13 @@ pub mod bypass_monitor;
 mod child_env;
 pub mod debug_rpc;
 pub mod denial_aggregator;
+mod google_cloud_metadata;
 mod grpc_client;
 mod identity;
 pub mod l7;
 pub mod log_push;
 pub mod mechanistic_mapper;
+mod metadata_server;
 pub mod opa;
 mod policy;
 mod policy_local;
@@ -422,7 +424,8 @@ pub async fn run_sandbox(
         provider_env,
         provider_credential_expires_at_ms,
     );
-    let provider_env = provider_credentials.snapshot().child_env.clone();
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+    let mut provider_env = provider_credentials.child_env_resolved();
 
     // Create identity cache for SHA256 TOFU when OPA is active
     let identity_cache = opa_engine
@@ -797,6 +800,45 @@ pub async fn run_sandbox(
             }
         }
     });
+
+    // Start GCE metadata loopback server inside the network namespace so
+    // Go's cloud.google.com/go/compute/metadata (which bypasses HTTP_PROXY)
+    // can reach it via direct TCP. Must start before SSH handler so SSH
+    // sessions also see corrected env vars on bind failure.
+    #[cfg(target_os = "linux")]
+    if let Some(ns_fd) = ssh_netns_fd
+        && provider_credentials
+            .snapshot()
+            .child_env
+            .contains_key("GCE_METADATA_HOST")
+    {
+        let ctx = google_cloud_metadata::MetadataContext::new(provider_credentials.clone());
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        match metadata_server::bind_in_netns(
+            openshell_core::google_cloud::METADATA_LOOPBACK_ADDR,
+            ns_fd,
+        )
+        .await
+        {
+            Ok(listener) => {
+                tokio::spawn(metadata_server::run(listener, ctx, ready_tx));
+                match timeout(Duration::from_secs(5), ready_rx).await {
+                    Ok(Ok(addr)) => {
+                        info!(addr = %addr, "GCE metadata loopback server ready");
+                    }
+                    Ok(Err(_)) => warn!("GCE metadata server readiness channel dropped"),
+                    Err(_) => warn!("GCE metadata server readiness timeout"),
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "GCE metadata server bind failed, Go SDK may not discover credentials");
+                provider_env.remove("GCE_METADATA_HOST");
+                provider_env.remove("GCE_METADATA_IP");
+                provider_env.remove("METADATA_SERVER_DETECTION");
+                provider_credentials.remove_env_key("GCE_METADATA_HOST");
+            }
+        }
+    }
 
     let ssh_socket_path: Option<std::path::PathBuf> = ssh_socket_path.map(std::path::PathBuf::from);
     if let Some(listen_path) = ssh_socket_path.clone() {

@@ -239,6 +239,12 @@ impl SecretResolver {
         }
     }
 
+    pub(crate) fn expires_at_ms_for_placeholder(&self, placeholder: &str) -> Option<i64> {
+        self.by_placeholder
+            .get(placeholder)
+            .map(|s| s.expires_at_ms)
+    }
+
     pub(crate) fn rewrite_header_value(
         &self,
         value: &str,

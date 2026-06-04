@@ -457,7 +457,7 @@ impl russh::server::Handler for SshHandler {
                 self.netns_fd,
                 self.proxy_url.clone(),
                 self.ca_file_paths.clone(),
-                &self.provider_credentials.snapshot().child_env,
+                &self.provider_credentials.child_env_resolved(),
             )?;
             let state = self.channels.get_mut(&channel).ok_or_else(|| {
                 anyhow::anyhow!("subsystem_request on unknown channel {channel:?}")
@@ -534,7 +534,7 @@ impl SshHandler {
         handle: Handle,
         command: Option<String>,
     ) -> anyhow::Result<()> {
-        let provider_snapshot = self.provider_credentials.snapshot();
+        let provider_env = self.provider_credentials.child_env_resolved();
         let state = self
             .channels
             .get_mut(&channel)
@@ -552,7 +552,7 @@ impl SshHandler {
                 self.netns_fd,
                 self.proxy_url.clone(),
                 self.ca_file_paths.clone(),
-                &provider_snapshot.child_env,
+                &provider_env,
             )?;
             state.pty_master = Some(pty_master);
             state.input_sender = Some(input_sender);
@@ -569,7 +569,7 @@ impl SshHandler {
                 self.netns_fd,
                 self.proxy_url.clone(),
                 self.ca_file_paths.clone(),
-                &provider_snapshot.child_env,
+                &provider_env,
             )?;
             state.input_sender = Some(input_sender);
         }
