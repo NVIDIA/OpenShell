@@ -25,7 +25,7 @@ Use `--harness codex` to select Codex explicitly. Other harness names are reject
 
 Use `--codex-bin "$(command -v codex)"` only when the host executable is compatible with the sandbox OS and architecture.
 
-The manifest-driven launcher at `openshell-agents/run.sh` reads `agent.yaml`, which defines the agent prompt template, provider profile IDs, provider credential sources, gateway settings, skills, subagents, sandbox defaults, and harness defaults. The shared sandbox entrypoint at `openshell-agents/runtime/entrypoint.sh` dispatches to the selected harness adapter.
+The manifest-driven launcher at `openshell-agents/run.sh` reads `agent.yaml`, which defines the agent prompt template, provider profile IDs, provider credential sources, gateway settings, skills, subagents, sandbox defaults, runtime mode, and harness defaults. The shared sandbox entrypoint at `openshell-agents/runtime/entrypoint.sh` starts the in-sandbox supervisor, which invokes the selected harness adapter for bounded cycles.
 
 The launcher:
 
@@ -40,8 +40,11 @@ The launcher:
 - Uploads `.claude/agents/principal-engineer-reviewer.md` so the selected harness can run a deterministic independent reviewer execution through `/sandbox/payload/runtime/subagent.sh principal-engineer-reviewer < task.md`.
 - For `--harness codex`, optionally uploads a host Codex executable as `/sandbox/payload/runtime/harnesses/codex/codex`.
 - Starts the selected harness without a TTY.
-- Deletes the sandbox automatically after the harness exits. Pass `--keep` to preserve it for debugging.
+- Runs gator in `watch` mode by default. The sandbox stays alive while the supervisor sleeps between bounded Codex cycles, so Codex is not connected during passive PR waits.
+- Deletes the sandbox automatically after the supervisor exits. Pass `--keep` to preserve it for debugging.
 
 The GitHub provider profile allows read-only GraphQL queries on `api.github.com/graphql` so `gh` read paths can use GraphQL when needed. Write operations remain REST-only and scoped to the two allowed repositories.
 
 Set `GATOR_CODEX_ACCESS_CREDENTIAL_KEY` or pass `--codex-access-key` if the gator Codex profile uses a credential key other than `CODEX_AUTH_ACCESS_TOKEN` for the short-lived access token.
+
+Use `--once` for a single reconciliation cycle. Use `--poll-interval <seconds>` to change the default 15-minute watch cadence.

@@ -18,6 +18,11 @@ harness:
       model: gpt-5.5
       reasoning: high
 
+runtime:
+  mode: watch
+  poll_interval_seconds: 900
+  max_transient_failures: 5
+
 profile_paths:
   - providers
 
