@@ -77,6 +77,9 @@ const VERTEX_ANTHROPIC_VERSION: &str = "vertex-2023-10-16";
 /// Add new fields here as Claude Code and other Anthropic SDK clients
 /// introduce new extension-only body fields.
 const VERTEX_INCOMPATIBLE_BODY_FIELDS: &[&str] = &[
+    // Vertex AI rawPredict encodes the model in the URL path, not the request body.
+    // Clients using the standard Anthropic API always send "model" in the body; strip it.
+    "model",
     // Claude Code 2.1.x context management feature (USE_API_CONTEXT_MANAGEMENT).
     // Disabled in clients by CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1.
     // Vertex AI schema does not include this field; it causes HTTP 400.
@@ -250,13 +253,7 @@ fn prepare_backend_request(
                 // Anthropic publisher endpoints, not for arbitrary model-in-path routes.
                 let needs_vertex_anthropic_version = is_vertex_anthropic_rawpredict_route(route);
                 if needs_vertex_anthropic_version {
-                    // Vertex AI rawPredict encodes the model in the URL path, not
-                    // the request body. Clients using the standard Anthropic API
-                    // (e.g. Claude Code via inference.local) always send "model"
-                    // in the body; strip it so Vertex AI does not reject the
-                    // request with "Extra inputs are not permitted".
-                    obj.remove("model");
-                    // Strip Anthropic SDK extension body fields not supported by Vertex AI rawPredict.
+                    // Strip body fields not supported by Vertex AI rawPredict.
                     // Vertex AI schema-validates the request body and rejects unknown fields with
                     // HTTP 400 "Extra inputs are not permitted". Header-level betas are already
                     // stripped above (`strip_anthropic_beta`); this handles the body-field equivalent.
