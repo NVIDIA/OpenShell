@@ -139,6 +139,8 @@ struct NetworkEndpointDef {
     credential_signing: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     signing_service: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    signing_region: String,
 }
 
 // Signature dictated by serde's `skip_serializing_if`, which requires `&T`.
@@ -353,6 +355,7 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                             graphql_max_body_bytes: e.graphql_max_body_bytes,
                             credential_signing: e.credential_signing,
                             signing_service: e.signing_service,
+                            signing_region: e.signing_region,
                         }
                     })
                     .collect(),
@@ -520,6 +523,7 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                             graphql_max_body_bytes: e.graphql_max_body_bytes,
                             credential_signing: e.credential_signing.clone(),
                             signing_service: e.signing_service.clone(),
+                            signing_region: e.signing_region.clone(),
                         }
                     })
                     .collect(),
@@ -710,6 +714,8 @@ pub enum PolicyViolation {
         host: String,
         value: String,
     },
+    /// `credential_signing` and `request_body_credential_rewrite` are both set.
+    CredentialSigningWithBodyRewrite { policy_name: String, host: String },
 }
 
 impl fmt::Display for PolicyViolation {
@@ -762,6 +768,13 @@ impl fmt::Display for PolicyViolation {
                     f,
                     "network policy '{policy_name}': endpoint '{host}' has unrecognized \
                      credential_signing value '{value}' (expected sigv4, sigv4:body, or sigv4:no_body)"
+                )
+            }
+            Self::CredentialSigningWithBodyRewrite { policy_name, host } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': endpoint '{host}' has both credential_signing \
+                     and request_body_credential_rewrite set; these options are mutually exclusive"
                 )
             }
         }
@@ -882,6 +895,12 @@ pub fn validate_sandbox_policy(
             }
             if !ep.credential_signing.is_empty() && ep.signing_service.is_empty() {
                 violations.push(PolicyViolation::MissingSigningService {
+                    policy_name: name.clone(),
+                    host: ep.host.clone(),
+                });
+            }
+            if !ep.credential_signing.is_empty() && ep.request_body_credential_rewrite {
+                violations.push(PolicyViolation::CredentialSigningWithBodyRewrite {
                     policy_name: name.clone(),
                     host: ep.host.clone(),
                 });
@@ -1577,6 +1596,32 @@ network_policies:
             violations
                 .iter()
                 .any(|v| matches!(v, PolicyViolation::UnknownCredentialSigning { .. }))
+        );
+    }
+
+    #[test]
+    fn validate_rejects_credential_signing_with_body_rewrite() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "aws".into(),
+            NetworkPolicyRule {
+                name: "bedrock".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "bedrock-runtime.us-east-1.amazonaws.com".into(),
+                    port: 443,
+                    credential_signing: "sigv4".into(),
+                    signing_service: "bedrock".into(),
+                    request_body_credential_rewrite: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::CredentialSigningWithBodyRewrite { .. }))
         );
     }
 

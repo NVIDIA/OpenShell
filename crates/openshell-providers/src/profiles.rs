@@ -173,6 +173,8 @@ pub struct EndpointProfile {
     pub credential_signing: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub signing_service: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub signing_region: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -644,6 +646,7 @@ fn endpoint_to_proto(endpoint: &EndpointProfile) -> NetworkEndpoint {
         path: endpoint.path.clone(),
         credential_signing: endpoint.credential_signing.clone(),
         signing_service: endpoint.signing_service.clone(),
+        signing_region: endpoint.signing_region.clone(),
     }
 }
 
@@ -676,6 +679,7 @@ fn endpoint_from_proto(endpoint: &NetworkEndpoint) -> EndpointProfile {
         path: endpoint.path.clone(),
         credential_signing: endpoint.credential_signing.clone(),
         signing_service: endpoint.signing_service.clone(),
+        signing_region: endpoint.signing_region.clone(),
     }
 }
 
