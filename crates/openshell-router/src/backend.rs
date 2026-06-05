@@ -6,6 +6,13 @@ use crate::config::{AuthHeader, ResolvedRoute};
 use crate::mock;
 use std::collections::HashSet;
 
+/// Maximum buffered inference response body, in bytes. The buffered path
+/// reads the whole response into memory; the route timeout bounds time, not
+/// memory, so without this cap an oversized upstream could force unbounded
+/// allocation. Mirrors the sandbox streaming byte cap. Over-cap responses fail
+/// as an upstream protocol error.
+const MAX_BUFFERED_RESPONSE_BODY: usize = 32 * 1024 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedEndpoint {
     pub url: String,
@@ -556,16 +563,56 @@ pub async fn proxy_to_backend(
 ) -> Result<ProxyResponse, RouterError> {
     let response = send_backend_request(client, route, method, path, headers, body).await?;
     let (status, resp_headers) = extract_response_metadata(&response);
-    let resp_body = response
-        .bytes()
-        .await
-        .map_err(|e| RouterError::UpstreamProtocol(format!("failed to read response body: {e}")))?;
+    let body = read_capped_response_body(response, MAX_BUFFERED_RESPONSE_BODY).await?;
 
     Ok(ProxyResponse {
         status,
         headers: resp_headers,
-        body: resp_body,
+        body,
     })
+}
+
+/// Read a response body fully into memory, rejecting anything over `max` bytes.
+///
+/// Used by the buffered proxy path so a misbehaving upstream cannot force
+/// unbounded allocation. The `Content-Length` check is a fast early-out; the
+/// chunk loop is the real guard and bounds an absent, chunked, or
+/// under-reported length. The cap counts the bytes reqwest yields: with no
+/// decompression features enabled (see `Cargo.toml`) those are wire bytes, so
+/// enabling a compression feature later would change what the cap measures.
+/// Over-cap responses fail as `UpstreamProtocol` and are never partially
+/// returned.
+async fn read_capped_response_body(
+    mut response: reqwest::Response,
+    max: usize,
+) -> Result<bytes::Bytes, RouterError> {
+    if let Some(len) = response.content_length()
+        && len > max as u64
+    {
+        return Err(RouterError::UpstreamProtocol(format!(
+            "inference response body of {len} bytes exceeds the {max} byte cap"
+        )));
+    }
+
+    // Preallocate to the advertised length when it is within the cap; the loop
+    // still enforces the bound for an absent or under-reported length.
+    let mut body: Vec<u8> = match response.content_length() {
+        Some(len) if len <= max as u64 => Vec::with_capacity(usize::try_from(len).unwrap_or(max)),
+        _ => Vec::new(),
+    };
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| RouterError::UpstreamProtocol(format!("failed to read response body: {e}")))?
+    {
+        if body.len() + chunk.len() > max {
+            return Err(RouterError::UpstreamProtocol(format!(
+                "inference response body exceeds the {max} byte cap"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(bytes::Bytes::from(body))
 }
 
 /// Forward a raw HTTP request to the backend, returning response headers
@@ -737,6 +784,100 @@ mod tests {
             model_in_path: false,
             request_path_override: None,
         }
+    }
+
+    /// The buffered path must reject an over-cap upstream response rather than
+    /// buffer it. Guards the DoS/OOM exposure of reading the body unbounded.
+    #[tokio::test]
+    async fn proxy_to_backend_rejects_over_cap_response_body() {
+        use super::{MAX_BUFFERED_RESPONSE_BODY, proxy_to_backend};
+
+        let mock_server = MockServer::start().await;
+        // One byte over the cap. wiremock sets an accurate Content-Length, so
+        // the size check rejects before the body is buffered.
+        let oversized = vec![b'a'; MAX_BUFFERED_RESPONSE_BODY + 1];
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(oversized))
+            .mount(&mock_server)
+            .await;
+
+        let route = test_route(&mock_server.uri(), &["model_discovery"], AuthHeader::Bearer);
+        let client = reqwest::Client::new();
+        let result = proxy_to_backend(
+            &client,
+            &route,
+            "model_discovery",
+            "GET",
+            "/v1/models",
+            vec![],
+            bytes::Bytes::new(),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(crate::RouterError::UpstreamProtocol(_))),
+            "over-cap response must fail as UpstreamProtocol, got: {result:?}"
+        );
+    }
+
+    /// Spawn a one-shot HTTP/1.1 upstream that replies with a chunked body and
+    /// no `Content-Length`, so the buffered read cannot pre-check a length and
+    /// must enforce the cap inside the chunk loop.
+    async fn spawn_chunked_upstream(chunks: &'static [&'static str]) -> std::net::SocketAddr {
+        use std::fmt::Write as _;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf).await;
+            let mut resp = String::from(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n",
+            );
+            for c in chunks {
+                let _ = write!(resp, "{:x}\r\n{c}\r\n", c.len());
+            }
+            resp.push_str("0\r\n\r\n");
+            sock.write_all(resp.as_bytes()).await.unwrap();
+        });
+        addr
+    }
+
+    /// The chunk-accumulation guard (not the `Content-Length` pre-check) must
+    /// reject an over-cap body when the response advertises no length.
+    #[tokio::test]
+    async fn read_capped_response_body_rejects_over_cap_chunked() {
+        let addr = spawn_chunked_upstream(&["aaaa", "bbbb", "cccc"]).await;
+        let response = reqwest::Client::new()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            response.content_length().is_none(),
+            "chunked response should advertise no Content-Length"
+        );
+        let result = super::read_capped_response_body(response, 8).await;
+        assert!(
+            matches!(result, Err(crate::RouterError::UpstreamProtocol(_))),
+            "over-cap chunked body must be rejected by the loop, got: {result:?}"
+        );
+    }
+
+    /// A body exactly at the cap is accepted (inclusive bound) and returned
+    /// intact through the chunk loop.
+    #[tokio::test]
+    async fn read_capped_response_body_accepts_body_at_cap() {
+        let addr = spawn_chunked_upstream(&["aaaa", "bbbb"]).await;
+        let response = reqwest::Client::new()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap();
+        let body = super::read_capped_response_body(response, 8).await.unwrap();
+        assert_eq!(&body[..], b"aaaabbbb");
     }
 
     #[test]
