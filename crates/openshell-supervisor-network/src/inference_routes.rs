@@ -325,6 +325,8 @@ pub fn bundle_to_resolved_routes(
                 default_headers,
                 passthrough_headers,
                 timeout,
+                model_in_path: r.model_in_path,
+                request_path_override: r.request_path_override.clone(),
             }
         })
         .collect()
@@ -425,6 +427,8 @@ mod tests {
                     ],
                     provider_type: "openai".to_string(),
                     timeout_secs: 0,
+                    model_in_path: false,
+                    request_path_override: None,
                 },
                 openshell_core::proto::ResolvedRoute {
                     name: "local".to_string(),
@@ -434,6 +438,8 @@ mod tests {
                     protocols: vec!["openai_chat_completions".to_string()],
                     provider_type: String::new(),
                     timeout_secs: 120,
+                    model_in_path: false,
+                    request_path_override: None,
                 },
             ],
             revision: "abc123".to_string(),
@@ -494,6 +500,8 @@ mod tests {
                 protocols: vec!["openai_chat_completions".to_string()],
                 provider_type: "openai".to_string(),
                 timeout_secs: 0,
+                model_in_path: false,
+                request_path_override: None,
             }],
             revision: "rev".to_string(),
             generated_at_ms: 0,
@@ -516,6 +524,8 @@ mod tests {
                 default_headers: vec![],
                 passthrough_headers: vec![],
                 timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
+                model_in_path: false,
+                request_path_override: None,
             },
             openshell_router::config::ResolvedRoute {
                 name: "sandbox-system".to_string(),
@@ -527,6 +537,8 @@ mod tests {
                 default_headers: vec![],
                 passthrough_headers: vec![],
                 timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
+                model_in_path: false,
+                request_path_override: None,
             },
         ];
 
@@ -723,6 +735,8 @@ routes:
             default_headers: vec![],
             passthrough_headers: vec![],
             timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
+            model_in_path: false,
+            request_path_override: None,
         }];
 
         let cache = Arc::new(RwLock::new(routes));

@@ -75,11 +75,18 @@ cleanup() {
   e2e_stop_gateway "${GATEWAY_PID}" "${GATEWAY_PID_FILE}"
 
   local sandbox_ids=""
-  if [ -n "${E2E_NAMESPACE}" ] && command -v podman >/dev/null 2>&1; then
-    sandbox_ids="$(podman_cmd ps -aq \
-      --filter "label=openshell.managed=true" \
-      --filter "label=openshell.sandbox-namespace=${E2E_NAMESPACE}" \
-      2>/dev/null || true)"
+  if command -v podman >/dev/null 2>&1; then
+    if [ -n "${PODMAN_NETWORK_NAME}" ]; then
+      sandbox_ids="$(podman_cmd ps -aq \
+        --filter "label=openshell.managed=true" \
+        --filter "network=${PODMAN_NETWORK_NAME}" \
+        2>/dev/null || true)"
+    elif [ -n "${E2E_NAMESPACE}" ]; then
+      sandbox_ids="$(podman_cmd ps -aq \
+        --filter "label=openshell.managed=true" \
+        --filter "label=openshell.sandbox-namespace=${E2E_NAMESPACE}" \
+        2>/dev/null || true)"
+    fi
   fi
 
   if [ "${exit_code}" -ne 0 ] && [ -n "${sandbox_ids}" ]; then

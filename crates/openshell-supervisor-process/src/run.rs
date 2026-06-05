@@ -27,6 +27,8 @@ use openshell_core::policy::{NetworkMode, SandboxPolicy};
 use openshell_core::provider_credentials::ProviderCredentialState;
 
 #[cfg(target_os = "linux")]
+use openshell_core::activity::ActivitySender;
+#[cfg(target_os = "linux")]
 use openshell_core::denial::DenialEvent;
 
 #[cfg(target_os = "linux")]
@@ -63,6 +65,7 @@ pub async fn run_process(
     #[cfg(target_os = "linux")] bypass_denial_tx: Option<
         tokio::sync::mpsc::UnboundedSender<DenialEvent>,
     >,
+    #[cfg(target_os = "linux")] bypass_activity_tx: Option<ActivitySender>,
 ) -> Result<i32> {
     // Validate that the sandbox user exists in the image. All sandbox images
     // must include a "sandbox" user for privilege dropping; failing fast here
@@ -99,6 +102,7 @@ pub async fn run_process(
             ns.name().to_string(),
             entrypoint_pid.clone(),
             bypass_denial_tx,
+            bypass_activity_tx,
         )
     });
 

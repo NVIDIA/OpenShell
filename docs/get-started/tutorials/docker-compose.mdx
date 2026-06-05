@@ -1,0 +1,204 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Run the Gateway with Docker Compose"
+sidebar-title: "Docker Compose Setup"
+slug: "get-started/tutorials/docker-compose"
+description: "Run the OpenShell gateway as a Docker Compose service and create agent sandboxes including OpenClaw."
+keywords: "Generative AI, Docker Compose, Gateway, Sandbox, OpenClaw, Docker, Installation"
+---
+
+This tutorial shows how to run the OpenShell gateway as a Docker Compose service on a Linux host or on a machine running Docker Desktop (Windows or macOS).
+
+After completing this tutorial you have:
+
+- An OpenShell gateway running as a Compose service.
+- The `openshell` CLI registered against that gateway.
+- An AI provider configured with your API key.
+- A running OpenClaw sandbox.
+
+## Prerequisites
+
+- Docker Desktop (Windows or macOS) or Docker Engine with the Compose plugin (Linux).
+- The `openshell` CLI installed on your workstation. See [Install the CLI](#install-the-cli) below.
+- Port 8080 available on the host.
+
+## Compose files
+
+The Compose configuration lives at [`deploy/docker/`](https://github.com/NVIDIA/OpenShell/tree/main/deploy/docker) in the repository.
+
+| File | Purpose |
+|---|---|
+| `docker-compose.yml` | Gateway service, volumes, and environment variables |
+| `gateway.toml` | TOML reference for release builds with config-file support |
+
+## Port note
+
+The Docker compute driver injects `host.openshell.internal:<gateway-port>` into every sandbox container as its callback address. The gateway listens on port 8080 inside the container, so **port 8080 must be published at the same number on the Docker host**. Publishing it as a different host port (for example `18080:8080`) causes sandbox containers to call back to the wrong port and remain stuck in the `Provisioning` phase.
+
+If port 8080 is taken, change `OPENSHELL_SERVER_PORT` and update the port mapping to `<your-port>:8080`, then set `OPENSHELL_PORT=<your-port>` in an `.env` file.
+
+## Data directory
+
+The gateway extracts the `openshell-sandbox` supervisor binary from `ghcr.io/nvidia/openshell/supervisor:latest` on first start and caches it at:
+
+```text
+/var/lib/openshell/openshell/docker-supervisor/<digest>/openshell-sandbox
+```
+
+This path is used as a bind-mount source when Docker creates sandbox containers.
+Docker resolves bind-mount sources against the **host filesystem**, not the container filesystem, so the data directory must be bind-mounted at the **same absolute path** in both the host and the container.
+
+The Compose file uses `/var/lib/openshell` for this purpose and sets `create_host_path: true` so Docker creates it on first run.
+
+## Start the gateway
+
+```shell
+cd deploy/docker
+docker compose up -d
+```
+
+Verify the gateway is healthy:
+
+```shell
+curl -sf http://localhost:8080/healthz
+```
+
+## Install the CLI
+
+**Binary (recommended — macOS / Linux / WSL):**
+
+```shell
+curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
+```
+
+**From PyPI (any platform with [uv](https://docs.astral.sh/uv/)):**
+
+```shell
+uv tool install -U openshell
+```
+
+<Note>
+On Windows without WSL, install the CLI inside a WSL 2 distribution (for example AlmaLinux or Ubuntu) and run all `openshell` commands from that distribution.
+</Note>
+
+## Register the gateway
+
+Run this once after the gateway starts:
+
+```shell
+openshell gateway add http://localhost:8080 --name openshell-docker
+```
+
+Verify the connection:
+
+```shell
+openshell status
+```
+
+The output should show `Status: Connected`.
+
+## Configure an AI provider
+
+Set your API key as an environment variable and create a provider:
+
+<Tabs>
+<Tab title="Anthropic (Claude)">
+
+```shell
+ANTHROPIC_API_KEY=sk-ant-... \
+  openshell provider create --name anthropic --type anthropic --from-existing
+```
+
+</Tab>
+<Tab title="OpenAI">
+
+```shell
+OPENAI_API_KEY=sk-... \
+  openshell provider create --name openai --type openai --from-existing
+```
+
+</Tab>
+</Tabs>
+
+Confirm the provider was stored:
+
+```shell
+openshell provider list
+```
+
+## Pre-pull sandbox images (optional)
+
+Sandbox images are pulled automatically on first use, but the initial pull can take several minutes for large images. Pre-pull to avoid long waits at sandbox creation time:
+
+```shell
+# Base image — includes Claude Code, OpenCode, Codex, and Copilot
+docker pull ghcr.io/nvidia/openshell-community/sandboxes/base:latest
+
+# OpenClaw image
+docker pull ghcr.io/nvidia/openshell-community/sandboxes/openclaw:latest
+```
+
+## Create a sandbox
+
+<Tabs>
+<Tab title="OpenClaw">
+
+```shell
+openshell sandbox create --from openclaw
+```
+
+OpenClaw launches directly. The first run pulls the image if it is not cached.
+
+</Tab>
+<Tab title="Claude Code">
+
+```shell
+openshell sandbox create -- claude
+```
+
+</Tab>
+<Tab title="OpenCode">
+
+```shell
+openshell sandbox create -- opencode
+```
+
+</Tab>
+</Tabs>
+
+Wait for the phase to change from `Provisioning` to `Ready`:
+
+```shell
+openshell sandbox list
+```
+
+Then connect:
+
+```shell
+openshell sandbox connect <sandbox-name>
+```
+
+## Manage the gateway
+
+| Command | Purpose |
+|---|---|
+| `docker compose up -d` | Start or restart the gateway |
+| `docker compose down` | Stop the gateway and remove the container |
+| `docker compose logs -f` | Tail gateway logs |
+| `docker compose pull` | Pull a new gateway image version |
+
+## Linux notes
+
+On Linux, `host.docker.internal` and `host.openshell.internal` are not automatically resolvable from containers. Add the following under the `gateway` service in `docker-compose.yml`:
+
+```yaml
+extra_hosts:
+  - "host.docker.internal:host-gateway"
+  - "host.openshell.internal:host-gateway"
+```
+
+## Next steps
+
+- [First Network Policy](/get-started/tutorials/first-network-policy) — apply L7 policies to your sandbox.
+- [GitHub Push Access](/get-started/tutorials/github-sandbox) — grant a sandbox scoped GitHub access.

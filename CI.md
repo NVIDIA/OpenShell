@@ -10,13 +10,15 @@ PR CI that runs on NVIDIA self-hosted runners uses NVIDIA's copy-pr-bot. The bot
 
 `Branch Checks` run automatically after copy-pr-bot mirrors the PR. `Required CI Gates` posts PR-head statuses that verify the mirror exists, is current, and ran the expected push-based workflows. E2E suites are opt-in because they are more expensive and publish temporary images.
 
-Two opt-in labels enable the long-running E2E suites:
+Three opt-in labels enable the long-running E2E suites:
 
 - `test:e2e` runs the standard E2E suite in `Branch E2E Checks`
 - `test:e2e-gpu` runs GPU E2E in `Branch E2E Checks`
+- `test:e2e-kubernetes` runs Kubernetes E2E with the HA Helm overlay
+  (`replicaCount: 2` and bundled PostgreSQL) in `Branch E2E Checks`
 
-When both labels are present, `Branch E2E Checks` builds the shared gateway and supervisor images once and fans out all enabled suites in parallel.
-The `OpenShell / E2E` and `OpenShell / GPU E2E` required statuses are evaluated from separate suite result jobs inside that workflow, so the expensive GPU suite stays independently gated.
+When multiple labels are present, `Branch E2E Checks` builds the shared gateway and supervisor images once and fans out all enabled suites in parallel.
+The `OpenShell / E2E` and `OpenShell / GPU E2E` required statuses are evaluated from separate suite result jobs inside that workflow. `test:e2e-kubernetes` is optional while HA behavior is under active iteration: failures are visible in the workflow run but do not publish a required CI gate status.
 
 The GitHub ruleset should require the `OpenShell / ...` statuses published by `Required CI Gates`, not the push-triggered workflow jobs directly.
 
@@ -69,7 +71,7 @@ Flow:
 
 1. Open the PR. copy-pr-bot mirrors it to `pull-request/<N>` automatically.
 2. The mirror push runs `Branch Checks` automatically. `Required CI Gates` keeps the PR blocked until the mirror exists, matches the PR head SHA, and the required push-based workflow succeeds. The first `Branch E2E Checks` run only resolves metadata and skips expensive jobs unless an E2E label is already set.
-3. A maintainer applies `test:e2e` and/or `test:e2e-gpu`. `E2E Label Help` posts a comment with a link to the existing gated workflow run.
+3. A maintainer applies `test:e2e`, `test:e2e-gpu`, and/or `test:e2e-kubernetes`. `E2E Label Help` posts a comment with a link to the existing gated workflow run.
 4. The maintainer opens that link and clicks **Re-run all jobs**. This time `pr_metadata` sees the label and the build/E2E jobs run.
 5. When the run finishes, the matching `OpenShell / ...` gate status flips to green automatically.
 6. New commits push to the mirror automatically and re-trigger `Branch Checks` plus any labeled E2E jobs in `Branch E2E Checks`.
@@ -108,7 +110,7 @@ The bot's full administrator documentation is internal to NVIDIA. The only comma
 | File | Role |
 |---|---|
 | `.github/workflows/branch-checks.yml` | Required non-E2E PR checks. Triggers on `push: pull-request/[0-9]+`. |
-| `.github/workflows/branch-e2e.yml` | Opt-in standard and GPU E2E. Triggers on `push: pull-request/[0-9]+` and runs jobs selected by `test:e2e` / `test:e2e-gpu`. |
+| `.github/workflows/branch-e2e.yml` | Opt-in standard, GPU, and Kubernetes HA E2E. Triggers on `push: pull-request/[0-9]+` and runs jobs selected by `test:e2e`, `test:e2e-gpu`, or `test:e2e-kubernetes`. |
 | `.github/workflows/helm-lint.yml` | Helm chart validation. Triggers on `push: pull-request/[0-9]+` and skips lint jobs unless Helm inputs changed. |
 | `.github/actions/pr-gate/action.yml` | Composite action that resolves PR metadata and verifies the required label is set. |
 | `.github/actions/pr-merge-base/action.yml` | Composite action that resolves and fetches the merge-base commit for `pull-request/<N>` push workflows. |

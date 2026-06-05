@@ -151,10 +151,19 @@ server:
   # (Always for :latest, IfNotPresent otherwise). Set to "Always" for dev
   # clusters so new images are picked up without manual eviction.
   sandboxImagePullPolicy: ""
+  # -- Image pull secrets attached to sandbox pods. Referenced Secrets must exist
+  # in the sandbox namespace.
+  sandboxImagePullSecrets: []
   # -- Default storage size for the workspace PVC in sandbox pods.
   # Uses Kubernetes quantity syntax (e.g. "2Gi", "10Gi", "500Mi").
   # Empty = built-in default (2Gi).
   workspaceDefaultStorageSize: ""
+  # -- Default Kubernetes runtimeClassName for sandbox pods.
+  # Applied when a CreateSandbox request does not specify one.
+  # Empty (default) = omit the field, using the cluster's default RuntimeClass.
+  # Set to a RuntimeClass name (e.g. "kata-containers", "nvidia") to apply it
+  # to all sandboxes that don't explicitly override it.
+  defaultRuntimeClassName: ""
   # -- gRPC endpoint sandboxes call back into the gateway. Leave empty to derive
   # it from the chart fullname, release namespace, service port, and
   # disableTls flag, for example https://openshell.openshell.svc.cluster.local:8080.
@@ -174,6 +183,12 @@ server:
   # Linux 5.12+. When enabled, container UID 0 maps to an unprivileged host
   # UID and capabilities become namespaced.
   enableUserNamespaces: false
+  # -- Kubernetes AppArmor profile requested for sandbox agent containers.
+  # Default Unconfined avoids runtime/default AppArmor blocking the supervisor's
+  # network namespace mount setup on AppArmor-enabled nodes. Set to "" to omit
+  # the field, "RuntimeDefault" to force the runtime default profile, or
+  # "Localhost/profile-name" for an operator-managed localhost profile.
+  appArmorProfile: "Unconfined"
   # -- Disable TLS entirely - the server listens on plaintext HTTP.
   # Set to true when a reverse proxy / tunnel terminates TLS at the edge.
   disableTls: false
@@ -193,9 +208,11 @@ server:
     clientCaSecretName: openshell-server-client-ca
     # -- K8s secret mounted into sandbox pods for mTLS to the server.
     clientTlsSecretName: openshell-client-tls
-  # Gateway-minted sandbox JWT signing keys. The pre-install certgen hook
-  # generates an Ed25519 keypair and writes it to a secret containing
-  # signing.pem (PKCS#8), public.pem (SPKI), and kid (plain text).
+  # Gateway-minted sandbox JWT signing keys. The certgen hook generates an
+  # Ed25519 keypair and writes it to a secret containing signing.pem (PKCS#8),
+  # public.pem (SPKI), and kid (plain text). The hook runs in full PKI mode when
+  # pkiInitJob.enabled=true unless certManager.enabled=true, which takes
+  # precedence and runs the hook in JWT-only mode.
   sandboxJwt:
     # -- Name of the Opaque Secret holding the signing key material. Empty
     # falls back to the chart fullname with "-jwt-keys" appended.
@@ -267,7 +284,7 @@ networkPolicy:
   # -- Create a NetworkPolicy restricting SSH ingress on sandbox pods to the gateway.
   enabled: true
 
-# PKI bootstrap via a pre-install/pre-upgrade hook Job.
+# Built-in TLS PKI bootstrap via a pre-install/pre-upgrade hook Job.
 # Runs `openshell-gateway generate-certs` to create the server and client TLS
 # Secrets in-cluster. Key material is written directly to K8s Secrets and
 # never appears in Helm release history. Idempotent: existing secrets are
@@ -282,7 +299,9 @@ networkPolicy:
 # that domain, for example `*.apps.example.com` enables
 # `<sandbox>--<service>.apps.example.com`.
 pkiInitJob:
-  # -- Run a pre-install/pre-upgrade Job that creates gateway and client mTLS Secrets.
+  # -- Run a pre-install/pre-upgrade Job that creates gateway and client mTLS
+  # Secrets. When certManager.enabled=true, cert-manager owns TLS and this same
+  # hook runs in JWT-only mode even if pkiInitJob.enabled remains true.
   enabled: true
   # -- Extra DNS SANs to append to the server certificate.
   serverDnsNames: []
@@ -292,7 +311,9 @@ pkiInitJob:
 # cert-manager Certificate/Issuer resources (requires cert-manager CRDs in-cluster).
 # Uses namespaced Issuers only (no ClusterIssuer). Does not install cert-manager itself.
 certManager:
-  # -- Create cert-manager Issuer and Certificate resources instead of using the PKI bootstrap Job.
+  # -- Create cert-manager Issuer and Certificate resources. When enabled,
+  # cert-manager owns TLS and the chart runs a JWT-only certgen hook to create
+  # the sandbox JWT signing Secret that cert-manager does not manage.
   enabled: false
   # -- Secret created for the intermediate CA (Certificate with isCA: true).
   caSecretName: openshell-ca-tls

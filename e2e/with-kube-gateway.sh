@@ -16,6 +16,10 @@
 # Helm e2e currently uses plaintext gateway traffic (ci/values-skaffold.yaml).
 # The certgen hook still runs so the gateway has sandbox JWT signing keys.
 #
+# Set OPENSHELL_E2E_KUBE_EXTRA_VALUES to one or more colon-separated Helm values
+# files, relative to the repository root or absolute, to layer additional chart
+# configuration on top of ci/values-skaffold.yaml.
+#
 # Image source:
 #   - Ephemeral k3d mode builds local `openshell/{gateway,supervisor}:${IMAGE_TAG}`
 #     images by default, imports them into k3d, then installs the chart. This
@@ -40,6 +44,10 @@ fi
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=e2e/support/gateway-common.sh
 source "${ROOT}/e2e/support/gateway-common.sh"
+
+# Upstream agent-sandbox release. Bump in lockstep with the supported Sandbox
+# field set in crates/openshell-driver-kubernetes (see sandbox_to_k8s_spec).
+AGENT_SANDBOX_VERSION="${AGENT_SANDBOX_VERSION:-v0.4.6}"
 
 e2e_preserve_mise_dirs
 e2e_align_docker_host_with_cli_context
@@ -241,7 +249,7 @@ run_scenario() {
 
   helmctl install "${RELEASE_NAME}" "${ROOT}/deploy/helm/openshell" \
     --namespace "${NAMESPACE}" --create-namespace \
-    --values "${ROOT}/deploy/helm/openshell/ci/values-skaffold.yaml" \
+    "${helm_values_args[@]}" \
     --set "fullnameOverride=openshell" \
     --set "image.repository=${REGISTRY_VALUE}/gateway" \
     --set "image.tag=${IMAGE_TAG_VALUE}" \
@@ -525,14 +533,29 @@ fi
 # The Kubernetes compute driver creates and watches Sandbox CRs reconciled
 # by the upstream agent-sandbox-controller. Without the CRD + controller,
 # every gateway K8s call 404s and CreateSandbox never produces a Pod.
-echo "Installing agent-sandbox CRDs and controller..."
-kctl apply -f "${ROOT}/deploy/kube/manifests/agent-sandbox.yaml"
+echo "Installing agent-sandbox CRDs and controller (${AGENT_SANDBOX_VERSION})..."
+_agent_sandbox_base="https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${AGENT_SANDBOX_VERSION}"
+kctl apply -f "${_agent_sandbox_base}/manifest.yaml"
 kctl wait --for=condition=Established crd/sandboxes.agents.x-k8s.io --timeout=120s
-kctl -n agent-sandbox-system rollout status statefulset/agent-sandbox-controller --timeout=300s
+kctl -n agent-sandbox-system rollout status deployment/agent-sandbox-controller --timeout=300s
 
 helm_extra_args=()
 if [ -n "${HOST_GATEWAY_IP}" ]; then
   helm_extra_args+=(--set "server.hostGatewayIP=${HOST_GATEWAY_IP}")
+fi
+
+helm_values_args=(--values "${ROOT}/deploy/helm/openshell/ci/values-skaffold.yaml")
+helm_extra_values_enabled=0
+if [ -n "${OPENSHELL_E2E_KUBE_EXTRA_VALUES:-}" ]; then
+  IFS=':' read -r -a extra_values_files <<< "${OPENSHELL_E2E_KUBE_EXTRA_VALUES}"
+  for values_file in "${extra_values_files[@]}"; do
+    [ -n "${values_file}" ] || continue
+    if [[ "${values_file}" != /* ]]; then
+      values_file="${ROOT}/${values_file}"
+    fi
+    helm_values_args+=(--values "${values_file}")
+    helm_extra_values_enabled=1
+  done
 fi
 
 if [ "${OPENSHELL_E2E_KUBE_DB_SCENARIOS:-0}" = "1" ]; then
@@ -573,11 +596,18 @@ if [ "${OPENSHELL_E2E_KUBE_DB_SCENARIOS:-0}" = "1" ]; then
   fi
 else
   # --- Single-install mode (default, existing behavior) ---
-  chart_dir="$(chart_without_dependencies)"
+  helm_dependency_args=()
+  if [ "${helm_extra_values_enabled}" = "1" ]; then
+    chart_dir="${ROOT}/deploy/helm/openshell"
+    helm_dependency_args=(--dependency-update)
+  else
+    chart_dir="$(chart_without_dependencies)"
+  fi
   echo "Installing Helm chart (release=${RELEASE_NAME}, namespace=${NAMESPACE}, tag=${IMAGE_TAG_VALUE})..."
   helmctl install "${RELEASE_NAME}" "${chart_dir}" \
     --namespace "${NAMESPACE}" --create-namespace \
-    --values "${ROOT}/deploy/helm/openshell/ci/values-skaffold.yaml" \
+    "${helm_dependency_args[@]}" \
+    "${helm_values_args[@]}" \
     --set "fullnameOverride=openshell" \
     --set "image.repository=${REGISTRY_VALUE}/gateway" \
     --set "image.tag=${IMAGE_TAG_VALUE}" \

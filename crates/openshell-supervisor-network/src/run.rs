@@ -24,6 +24,7 @@ use openshell_ocsf::{
     ConfigStateChangeBuilder, SeverityId, StateId, StatusId, ctx::ctx as ocsf_ctx, ocsf_emit,
 };
 
+use openshell_core::activity::ActivitySender;
 use openshell_core::denial::DenialEvent;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -83,6 +84,7 @@ pub async fn run_networking(
     openshell_endpoint: Option<&str>,
     inference_routes: Option<&str>,
     denial_tx: Option<UnboundedSender<DenialEvent>>,
+    activity_tx: Option<ActivitySender>,
 ) -> Result<Networking> {
     // Build the policy-local route context. The orchestrator's policy poll
     // loop also holds an `Arc` clone (via `Networking::policy_local_ctx`) so
@@ -276,6 +278,7 @@ pub async fn run_networking(
             Some(provider_credentials.clone()),
             Some(policy_local_ctx.clone()),
             denial_tx,
+            activity_tx,
         )
         .await?;
         Some(proxy_handle)

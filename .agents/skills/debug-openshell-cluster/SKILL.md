@@ -138,6 +138,15 @@ kubectl -n openshell rollout status statefulset/openshell
 
 Look for failed installs, unexpected values, missing namespace, wrong image tag, TLS settings that do not match the registered endpoint, and scheduling failures.
 
+For HA or PostgreSQL-backed installs, also check the service-binding Secret and
+bundled PostgreSQL workload:
+
+```bash
+kubectl -n openshell get secret -l app.kubernetes.io/instance=openshell
+kubectl -n openshell get statefulset,pod,pvc -l app.kubernetes.io/instance=openshell
+kubectl -n openshell logs statefulset/openshell-postgres --tail=200
+```
+
 Check required Helm deployment secrets:
 
 ```bash
@@ -147,6 +156,15 @@ kubectl -n openshell get secret \
   openshell-client-tls \
   openshell-jwt-keys
 ```
+
+In cert-manager installs, `certManager.enabled=true` makes cert-manager own TLS
+generation. The Helm chart should still render the `openshell-certgen`
+pre-install/pre-upgrade hook in JWT-only mode to create `openshell-jwt-keys`,
+even if `pkiInitJob.enabled` remains true.
+If the gateway pod is pending with `MountVolume.SetUp failed for volume
+"sandbox-jwt"` and `openshell-jwt-keys` is absent, inspect the rendered
+`templates/certgen.yaml` output and the hook Job logs; cert-manager creates TLS
+Secrets but does not create the sandbox JWT signing Secret.
 
 If the gateway exits with `failed to read sandbox JWT signing key from
 /etc/openshell-jwt/signing.pem`, verify that `openshell-jwt-keys` contains

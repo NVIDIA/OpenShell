@@ -109,6 +109,11 @@ message ResolvedRoute {
   string provider_type = 6;
   // Per-route request timeout in seconds. 0 means use default (60s).
   uint64 timeout_secs = 7;
+  // When true, the model identifier is embedded in the URL path (e.g. Vertex AI).
+  bool model_in_path = 8;
+  // Optional override for the request path. When set, replaces the protocol-derived path.
+  // An empty string means POST directly to base_url/model_id with no additional path.
+  optional string request_path_override = 9;
 }
 
 message GetInferenceBundleResponse {

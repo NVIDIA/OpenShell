@@ -1,0 +1,85 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+suite: statefulset client CA volume
+templates:
+  - templates/gateway-config.yaml
+  - templates/statefulset.yaml
+release:
+  name: openshell
+  namespace: my-namespace
+
+tests:
+  - it: mounts the server TLS secret ca.crt as client CA for built-in PKI
+    template: templates/statefulset.yaml
+    set:
+      pkiInitJob.enabled: true
+      certManager.enabled: false
+    asserts:
+      - equal:
+          path: spec.template.spec.volumes[3].name
+          value: tls-client-ca
+      - equal:
+          path: spec.template.spec.volumes[3].secret.secretName
+          value: openshell-server-tls
+      - equal:
+          path: spec.template.spec.volumes[3].secret.items[0].key
+          value: ca.crt
+
+  - it: shares the cert-manager server TLS ca.crt when clientCaFromServerTlsSecret is true
+    template: templates/statefulset.yaml
+    set:
+      certManager.enabled: true
+      certManager.clientCaFromServerTlsSecret: true
+    asserts:
+      - equal:
+          path: spec.template.spec.volumes[3].name
+          value: tls-client-ca
+      - equal:
+          path: spec.template.spec.volumes[3].secret.secretName
+          value: openshell-server-tls
+      - equal:
+          path: spec.template.spec.volumes[3].secret.items[0].key
+          value: ca.crt
+
+  # Regression: with cert-manager enabled and pkiInitJob left at its default
+  # `true`, the client CA condition must honor certManager precedence and NOT
+  # treat pkiInitJob.enabled as built-in TLS. With clientCaFromServerTlsSecret=false
+  # the gateway must mount the separate clientCaSecretName, not the server TLS
+  # cert secret.
+  - it: uses clientCaSecretName under cert-manager even when pkiInitJob stays enabled
+    template: templates/statefulset.yaml
+    set:
+      certManager.enabled: true
+      certManager.clientCaFromServerTlsSecret: false
+      pkiInitJob.enabled: true
+    asserts:
+      - equal:
+          path: spec.template.spec.volumes[3].name
+          value: tls-client-ca
+      - equal:
+          path: spec.template.spec.volumes[3].secret.secretName
+          value: openshell-server-client-ca
+      - notExists:
+          path: spec.template.spec.volumes[3].secret.items
+
+  # When cert-manager owns TLS, does not share its CA, and no separate client CA
+  # secret is configured, there is no client CA to mount: the volume must not
+  # render rather than mounting an empty secret name.
+  - it: omits the client CA volume when cert-manager owns TLS and no client CA secret is set
+    template: templates/statefulset.yaml
+    set:
+      certManager.enabled: true
+      certManager.clientCaFromServerTlsSecret: false
+      pkiInitJob.enabled: true
+      server.tls.clientCaSecretName: ""
+    asserts:
+      - lengthEqual:
+          path: spec.template.spec.volumes
+          count: 3
+      - notContains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: tls-client-ca
+            mountPath: /etc/openshell-tls/client-ca
+            readOnly: true

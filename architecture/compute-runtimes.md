@@ -22,6 +22,10 @@ drive client provisioning UI, the driver attaches the shared
 clients to parse Kubernetes reasons, VM cache states, or other driver-local
 reason strings.
 
+The capability RPC reports driver identity, version, and the default sandbox
+image used by the gateway. GPU availability stays driver-local and is validated
+when a sandbox create request asks for GPU resources.
+
 ## Runtime Summary
 
 | Runtime | Best fit | Sandbox boundary | Notes |
@@ -35,6 +39,11 @@ Per-sandbox CPU and memory values currently enter the driver layer through
 template resource limits. Docker and Podman apply them as runtime limits.
 Kubernetes mirrors each limit into the matching request. VM accepts the fields
 but currently ignores them.
+
+Kubernetes deployments may set an AppArmor profile on sandbox agent containers
+through the driver configuration. The Helm chart defaults sandbox agents to
+`Unconfined` so runtime/default AppArmor profiles do not block supervisor
+network namespace setup on AppArmor-enabled nodes.
 
 VM runtime state paths are derived only from driver-validated sandbox IDs
 matching `[A-Za-z0-9._-]{1,128}`. The gateway-owned VM driver socket uses a

@@ -659,6 +659,8 @@ pub async fn handle_connect_supervisor(
             error = %err,
             "supervisor session: failed to mark sandbox ready"
         );
+    } else {
+        state.telemetry.sandbox_session_connected(&sandbox_id);
     }
 
     // Step 4: Spawn the session loop that reads inbound messages.
@@ -679,6 +681,9 @@ pub async fn handle_connect_supervisor(
             .remove_if_current(&sandbox_id_clone, &session_id);
         if still_ours {
             info!(sandbox_id = %sandbox_id_clone, session_id = %session_id, "supervisor session: ended");
+            state_clone
+                .telemetry
+                .sandbox_session_disconnected(&sandbox_id_clone);
             if let Err(err) = state_clone
                 .compute
                 .supervisor_session_disconnected(&sandbox_id_clone)
@@ -818,11 +823,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn test_store() -> Arc<Store> {
-        Arc::new(
-            Store::connect("sqlite::memory:?cache=shared")
-                .await
-                .expect("in-memory SQLite store should connect"),
-        )
+        Arc::new(crate::persistence::test_store().await)
     }
 
     /// Returns a shutdown sender with its receiver immediately dropped. Tests

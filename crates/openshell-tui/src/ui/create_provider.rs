@@ -483,16 +483,22 @@ pub fn draw_detail(frame: &mut Frame<'_>, app: &App, area: Rect) {
         return;
     };
 
-    let modal_width = 55u16.min(area.width.saturating_sub(4));
-    // name(1) + type(1) + spacer(1) + cred_key(1) + masked(1) + spacer(1) + hint(1)
-    let content_height = 7;
+    let modal_width = 84u16.min(area.width.saturating_sub(4));
+    let content_height = 24u16;
     let modal_height = (content_height + 4).min(area.height.saturating_sub(2));
     let popup_area = centered_rect(modal_width, modal_height, area);
 
     frame.render_widget(Clear, popup_area);
 
+    let title = if detail.show_raw_provider {
+        " Provider Object YAML "
+    } else if detail.show_raw_profile {
+        " Provider Profile YAML "
+    } else {
+        " Provider Detail "
+    };
     let block = Block::default()
-        .title(Span::styled(" Provider Detail ", t.heading))
+        .title(Span::styled(title, t.heading))
         .borders(Borders::ALL)
         .border_style(t.accent)
         .padding(Padding::new(2, 2, 1, 1));
@@ -500,57 +506,153 @@ pub fn draw_detail(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let inner = block.inner(popup_area);
     frame.render_widget(block, popup_area);
 
+    if detail.show_raw_provider {
+        draw_raw_yaml(
+            frame,
+            &detail.raw_provider_yaml,
+            detail.raw_provider_scroll,
+            "Summary",
+            "o",
+            inner,
+            t,
+        );
+        return;
+    }
+
+    if detail.show_raw_profile {
+        draw_raw_yaml(
+            frame,
+            detail
+                .raw_profile_yaml
+                .as_deref()
+                .unwrap_or("No provider profile is available for this provider."),
+            detail.raw_profile_scroll,
+            "Summary",
+            "y",
+            inner,
+            t,
+        );
+        return;
+    }
+
+    let mut lines = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("Name: ", t.muted),
+        Span::styled(&detail.name, t.heading),
+        Span::styled("  Type: ", t.muted),
+        Span::styled(&detail.provider_type, t.text),
+    ]));
+    if !detail.provider_id.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("Id: ", t.muted),
+            Span::styled(&detail.provider_id, t.muted),
+            Span::styled("  Resource version: ", t.muted),
+            Span::styled(detail.resource_version.to_string(), t.muted),
+        ]));
+    }
+    if let Some(profile_name) = &detail.profile_name {
+        lines.push(Line::from(vec![
+            Span::styled("Profile: ", t.muted),
+            Span::styled(profile_name, t.text),
+            Span::styled("  Category: ", t.muted),
+            Span::styled(
+                detail.profile_category.as_deref().unwrap_or("other"),
+                t.muted,
+            ),
+        ]));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "Profile: <none> (legacy/unprofiled provider)",
+            t.status_warn,
+        )));
+    }
+    if let Some(description) = &detail.profile_description {
+        lines.push(Line::from(vec![
+            Span::styled("Description: ", t.muted),
+            Span::styled(description, t.text),
+        ]));
+    }
+    push_section(&mut lines, "Credentials", &detail.credential_lines, t);
+    push_section(&mut lines, "Config Keys", &detail.config_lines, t);
+    push_section(&mut lines, "Policy", &detail.policy_lines, t);
+    push_section(&mut lines, "Discovery", &detail.discovery_lines, t);
+    push_section(&mut lines, "Refresh", &detail.refresh_lines, t);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1), // name
-            Constraint::Length(1), // type
-            Constraint::Length(1), // spacer
-            Constraint::Length(1), // cred key
-            Constraint::Length(1), // masked value
-            Constraint::Length(1), // spacer
-            Constraint::Length(1), // hint
-            Constraint::Min(0),
-        ])
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
         .split(inner);
-
+    let total = lines.len();
+    let scroll = detail.summary_scroll.min(total.saturating_sub(1));
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("Name: ", t.muted),
-            Span::styled(&detail.name, t.heading),
-        ])),
+        Paragraph::new(lines).scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)),
         chunks[0],
     );
-
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("Type: ", t.muted),
-            Span::styled(&detail.provider_type, t.text),
-        ])),
-        chunks[1],
-    );
-
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("Credential: ", t.muted),
-            Span::styled(&detail.credential_key, t.text),
-        ])),
-        chunks[3],
-    );
-
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("Value: ", t.muted),
-            Span::styled(&detail.masked_value, t.muted),
-        ])),
-        chunks[4],
-    );
-
-    let hint = Line::from(vec![
+    let position = (scroll + 1).min(total.max(1));
+    let mut hint_spans = vec![
+        Span::styled("[j/k]", t.key_hint),
+        Span::styled(" Scroll  ", t.muted),
+        Span::styled("[o]", t.key_hint),
+        Span::styled(" Object YAML  ", t.muted),
+    ];
+    if detail.raw_profile_yaml.is_some() {
+        hint_spans.extend([
+            Span::styled("[y]", t.key_hint),
+            Span::styled(" Profile YAML  ", t.muted),
+        ]);
+    }
+    hint_spans.extend([
         Span::styled("[Esc]", t.key_hint),
-        Span::styled(" Close", t.muted),
+        Span::styled(" Close  ", t.muted),
+        Span::styled(format!("[{position}/{total}]"), t.muted),
     ]);
-    frame.render_widget(Paragraph::new(hint), chunks[6]);
+    frame.render_widget(Paragraph::new(Line::from(hint_spans)), chunks[1]);
+}
+
+fn draw_raw_yaml(
+    frame: &mut Frame<'_>,
+    raw: &str,
+    scroll: usize,
+    toggle_label: &'static str,
+    toggle_key: &'static str,
+    area: Rect,
+    t: &crate::theme::Theme,
+) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(1)])
+        .split(area);
+    frame.render_widget(
+        Paragraph::new(raw).scroll((u16::try_from(scroll).unwrap_or(u16::MAX), 0)),
+        chunks[0],
+    );
+    let total = raw.lines().count();
+    let position = (scroll + 1).min(total.max(1));
+    let hint = Line::from(vec![
+        Span::styled("[j/k]", t.key_hint),
+        Span::styled(" Scroll  ", t.muted),
+        Span::styled(format!("[{toggle_key}]"), t.key_hint),
+        Span::styled(format!(" {toggle_label}  "), t.muted),
+        Span::styled("[Esc]", t.key_hint),
+        Span::styled(" Close  ", t.muted),
+        Span::styled(format!("[{position}/{total}]"), t.muted),
+    ]);
+    frame.render_widget(Paragraph::new(hint), chunks[1]);
+}
+
+fn push_section(
+    lines: &mut Vec<Line<'_>>,
+    title: &'static str,
+    values: &[String],
+    t: &crate::theme::Theme,
+) {
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(title, t.heading)));
+    for value in values {
+        lines.push(Line::from(vec![
+            Span::styled("  - ", t.muted),
+            Span::styled(value.clone(), t.text),
+        ]));
+    }
 }
 
 // ---------------------------------------------------------------------------

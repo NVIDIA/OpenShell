@@ -5,12 +5,16 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
+#[cfg(unix)]
+use std::io::{Read, Write};
 use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
+#[cfg(unix)]
+use std::time::Duration;
 
 // ── Public default constants ────────────────────────────────────────────
 //
@@ -38,6 +42,11 @@ pub const DEFAULT_SUPERVISOR_IMAGE: &str = "ghcr.io/nvidia/openshell/supervisor:
 
 /// CDI device identifier for requesting all NVIDIA GPUs.
 pub const CDI_GPU_DEVICE_ALL: &str = "nvidia.com/gpu=all";
+
+/// Default maximum number of processes (PIDs) allowed inside a sandbox container.
+///
+/// Shared by the Docker and Podman drivers; override via driver config.
+pub const DEFAULT_SANDBOX_PIDS_LIMIT: i64 = 2048;
 
 /// Compute backends the gateway can orchestrate sandboxes through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,8 +105,8 @@ pub fn detect_driver() -> Option<ComputeDriverKind> {
         return Some(ComputeDriverKind::Kubernetes);
     }
 
-    // Podman: check if podman binary is available
-    if is_binary_available("podman") {
+    // Podman: check for a reachable local API socket.
+    if is_podman_available() {
         return Some(ComputeDriverKind::Podman);
     }
 
@@ -115,6 +124,54 @@ fn is_binary_available(name: &str) -> bool {
         .arg("--version")
         .output()
         .is_ok_and(|output| output.status.success())
+}
+
+fn is_podman_available() -> bool {
+    podman_socket_candidates()
+        .iter()
+        .any(|path| podman_socket_responds(path))
+}
+
+fn podman_socket_candidates() -> Vec<PathBuf> {
+    let socket = std::env::var("OPENSHELL_PODMAN_SOCKET")
+        .ok()
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from);
+    podman_socket_candidates_from_env(
+        socket,
+        std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
+}
+
+fn podman_socket_candidates_from_env(
+    socket: Option<PathBuf>,
+    runtime_dir: Option<PathBuf>,
+    home: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+
+    if let Some(path) = socket {
+        candidates.push(path);
+    }
+
+    if let Some(runtime_dir) = runtime_dir {
+        candidates.push(runtime_dir.join("podman/podman.sock"));
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        candidates.push(PathBuf::from(format!(
+            "/run/user/{}/podman/podman.sock",
+            current_uid()
+        )));
+    }
+
+    if let Some(home) = home {
+        candidates.push(home.join(".local/share/containers/podman/machine/podman.sock"));
+    }
+
+    candidates
 }
 
 fn is_docker_available() -> bool {
@@ -160,29 +217,106 @@ fn is_unix_socket(path: &Path) -> bool {
         .is_ok_and(|metadata| metadata.file_type().is_socket())
 }
 
+#[cfg(unix)]
+fn podman_socket_responds(path: &Path) -> bool {
+    unix_socket_http_ping(path, |response| {
+        http_response_is_success(response) && contains_ascii(response, b"Libpod-Api-Version:")
+    })
+}
+
+#[cfg(unix)]
+fn unix_socket_http_ping(path: &Path, accepts_response: impl FnOnce(&[u8]) -> bool) -> bool {
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+    const PING_REQUEST: &[u8] =
+        b"GET /_ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+
+    if !is_unix_socket(path) {
+        return false;
+    }
+
+    let Ok(mut stream) = std::os::unix::net::UnixStream::connect(path) else {
+        return false;
+    };
+    if stream.set_read_timeout(Some(PROBE_TIMEOUT)).is_err()
+        || stream.set_write_timeout(Some(PROBE_TIMEOUT)).is_err()
+        || stream.write_all(PING_REQUEST).is_err()
+    {
+        return false;
+    }
+
+    let mut response = [0_u8; 512];
+    let mut total = 0;
+    while total < response.len() {
+        let Ok(n) = stream.read(&mut response[total..]) else {
+            return false;
+        };
+        if n == 0 {
+            break;
+        }
+        total += n;
+        if contains_ascii(&response[..total], b"\r\n\r\n") {
+            break;
+        }
+    }
+    total > 0 && accepts_response(&response[..total])
+}
+
+#[cfg(unix)]
+fn http_response_is_success(response: &[u8]) -> bool {
+    response.starts_with(b"HTTP/1.1 200") || response.starts_with(b"HTTP/1.0 200")
+}
+
+#[cfg(unix)]
+fn contains_ascii(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
+#[cfg(all(unix, test))]
+fn is_reachable_unix_socket(path: &Path) -> bool {
+    is_unix_socket(path) && std::os::unix::net::UnixStream::connect(path).is_ok()
+}
+
+#[cfg(all(unix, target_os = "linux"))]
+fn current_uid() -> u32 {
+    use std::os::unix::fs::MetadataExt;
+
+    std::fs::metadata("/proc/self").map_or(0, |metadata| metadata.uid())
+}
+
 #[cfg(not(unix))]
 fn is_unix_socket(path: &Path) -> bool {
     let _ = path;
     false
 }
 
+#[cfg(not(unix))]
+fn podman_socket_responds(path: &Path) -> bool {
+    let _ = path;
+    false
+}
+
 /// Server configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Built programmatically in [`crate::Config::new`] and the gateway CLI from
+/// the parsed config file, env vars, and CLI flags. It is never deserialized
+/// directly; the on-disk config schema lives in the gateway's `config_file`
+/// module ([`crate::TlsConfig`] and the other nested tables carry their own
+/// `Deserialize` impls for that purpose).
+#[derive(Debug, Clone)]
 pub struct Config {
     /// Address to bind the server to.
-    #[serde(default = "default_bind_address")]
     pub bind_address: SocketAddr,
 
     /// Address to bind the unauthenticated health endpoint to.
     ///
     /// When `None`, the dedicated health listener is disabled.
-    #[serde(default)]
     pub health_bind_address: Option<SocketAddr>,
 
     /// Address to bind the Prometheus metrics endpoint to.
     ///
     /// When `None`, the dedicated metrics listener is disabled.
-    #[serde(default)]
     pub metrics_bind_address: Option<SocketAddr>,
 
     /// Additional bind addresses that serve the same multiplexed gRPC/HTTP
@@ -191,36 +325,30 @@ pub struct Config {
     /// Compute drivers may register extra listeners during startup so that
     /// sandbox workloads can call back into the gateway over an interface
     /// that the operator-supplied `bind_address` does not expose.
-    #[serde(default)]
     pub extra_bind_addresses: Vec<SocketAddr>,
 
     /// Log level (trace, debug, info, warn, error).
-    #[serde(default = "default_log_level")]
     pub log_level: String,
 
     /// TLS configuration.  When `None`, the server listens on plaintext HTTP.
     pub tls: Option<TlsConfig>,
 
     /// OIDC configuration. When `Some`, the server validates Bearer JWTs.
-    #[serde(default)]
     pub oidc: Option<OidcConfig>,
 
     /// Gateway user authentication behavior.
-    #[serde(default)]
     pub auth: GatewayAuthConfig,
 
     /// mTLS user authentication configuration. When enabled, a verified TLS
     /// client certificate can authenticate CLI/SDK callers as a
     /// `Principal::User`. This is for local single-user gateways only;
     /// sandbox identity is always carried by gateway-minted sandbox JWTs.
-    #[serde(default)]
     pub mtls_auth: MtlsAuthConfig,
 
     /// Gateway-minted sandbox JWT configuration. When `Some`, the gateway
     /// loads the signing key from disk and accepts gateway-issued sandbox
     /// JWTs as `Principal::Sandbox`. Required for the per-sandbox identity
     /// flow (issue #1354).
-    #[serde(default)]
     pub gateway_jwt: Option<GatewayJwtConfig>,
 
     /// Database URL for persistence.
@@ -231,29 +359,26 @@ pub struct Config {
     /// The config shape allows multiple drivers so the gateway can evolve
     /// toward multi-backend routing. Current releases require exactly one
     /// configured driver.
-    #[serde(default)]
     pub compute_drivers: Vec<ComputeDriverKind>,
 
     /// TTL for SSH session tokens, in seconds. 0 disables expiry.
-    #[serde(default = "default_ssh_session_ttl_secs")]
     pub ssh_session_ttl_secs: u64,
 
     /// Browser-facing sandbox service routing configuration.
-    #[serde(default)]
     pub service_routing: ServiceRoutingConfig,
 }
 
 /// Browser-facing sandbox service routing configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Part of the programmatically-built [`Config`]; never deserialized directly.
+#[derive(Debug, Clone)]
 pub struct ServiceRoutingConfig {
     /// Base domains accepted for `sandbox--service.<domain>` routes.
     /// The first domain is used when the gateway prints endpoint URLs.
-    #[serde(default = "default_service_routing_domains")]
     pub base_domains: Vec<String>,
 
     /// Enable TLS-enabled loopback gateway listeners to also accept plaintext
     /// HTTP for sandbox service hostnames.
-    #[serde(default = "default_enable_loopback_service_http")]
     pub enable_loopback_service_http: bool,
 }
 
@@ -269,6 +394,7 @@ pub struct ServiceRoutingConfig {
 /// In both modes, authentication is handled at the application layer
 /// (e.g. OIDC bearer tokens).  mTLS is an additional mechanism.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     /// Path to the TLS certificate file.
     pub cert_path: PathBuf,
@@ -299,6 +425,7 @@ pub struct TlsConfig {
 /// - Entra ID / Okta: `roles`
 /// - Custom: any dot-separated path into the JWT claims
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OidcConfig {
     /// OIDC issuer URL (e.g., `http://localhost:8180/realms/openshell`).
     pub issuer: String,
@@ -333,6 +460,7 @@ pub struct OidcConfig {
 
 /// mTLS user authentication for local, single-user gateways.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MtlsAuthConfig {
     /// When true, the gateway maps a verified TLS client certificate into a
     /// user principal. Keep disabled for Kubernetes deployments because
@@ -343,6 +471,7 @@ pub struct MtlsAuthConfig {
 
 /// Gateway user authentication settings.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GatewayAuthConfig {
     /// When true, unauthenticated user/CLI calls are accepted as a local
     /// developer principal. This is an unsafe local-development escape hatch
@@ -363,6 +492,7 @@ const fn default_jwks_ttl_secs() -> u64 {
 /// signing key never leaves the gateway process; the public key is loaded
 /// by the same gateway so it can validate its own tokens.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GatewayJwtConfig {
     /// Path to the Ed25519 signing key (PKCS#8 PEM).
     pub signing_key_path: PathBuf,
@@ -374,7 +504,8 @@ pub struct GatewayJwtConfig {
     /// hostname-or-`openshell` placeholder if unset.
     #[serde(default = "default_gateway_id")]
     pub gateway_id: String,
-    /// Token lifetime in seconds. Defaults to 1 hour.
+    /// Token lifetime in seconds. A value of 0 disables expiration and is
+    /// intended only for local single-player deployments.
     #[serde(default = "default_sandbox_token_ttl_secs")]
     pub ttl_secs: u64,
 }
@@ -384,7 +515,7 @@ fn default_gateway_id() -> String {
 }
 
 const fn default_sandbox_token_ttl_secs() -> u64 {
-    3_600
+    0
 }
 
 fn default_roles_claim() -> String {
@@ -593,10 +724,15 @@ const fn default_ssh_session_ttl_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use super::is_reachable_unix_socket;
     use super::{
-        ComputeDriverKind, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, detect_driver,
-        docker_host_unix_socket_path, is_unix_socket,
+        ComputeDriverKind, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, GatewayJwtConfig, detect_driver,
+        docker_host_unix_socket_path, is_unix_socket, podman_socket_candidates_from_env,
+        podman_socket_responds,
     };
+    #[cfg(unix)]
+    use std::io::{Read as _, Write as _};
     use std::net::SocketAddr;
     #[cfg(unix)]
     use std::os::unix::net::UnixListener;
@@ -644,6 +780,18 @@ mod tests {
     fn config_disables_unauthenticated_users_by_default() {
         let cfg = Config::new(None);
         assert!(!cfg.auth.allow_unauthenticated_users);
+    }
+
+    #[test]
+    fn gateway_jwt_ttl_defaults_to_non_expiring() {
+        let cfg: GatewayJwtConfig = serde_json::from_value(serde_json::json!({
+            "signing_key_path": "/tmp/signing.pem",
+            "public_key_path": "/tmp/public.pem",
+            "kid_path": "/tmp/kid"
+        }))
+        .expect("gateway JWT config should deserialize with default ttl");
+
+        assert_eq!(cfg.ttl_secs, 0);
     }
 
     #[test]
@@ -700,9 +848,10 @@ mod tests {
     }
 
     #[test]
-    fn detect_driver_returns_none_without_k8s_env_or_binaries() {
-        // When KUBERNETES_SERVICE_HOST is not set and no docker/podman binaries
-        // or Docker socket are available, detect_driver should return None.
+    fn detect_driver_returns_none_without_k8s_env_or_local_runtime() {
+        // When KUBERNETES_SERVICE_HOST is not set, no Docker binary/socket is
+        // available, and no Podman API socket is available, detect_driver
+        // should return None.
         // This test may pass or fail depending on the test environment,
         // but it documents the expected behavior.
         let _ = detect_driver(); // Returns Some or None based on environment
@@ -726,10 +875,73 @@ mod tests {
         let _listener = UnixListener::bind(&socket_path).expect("bind unix socket");
 
         assert!(is_unix_socket(&socket_path));
+        assert!(is_reachable_unix_socket(&socket_path));
 
         let regular_file = temp_dir.path().join("not-a-socket");
         std::fs::write(&regular_file, b"not a socket").expect("write regular file");
         assert!(!is_unix_socket(&regular_file));
+        assert!(!is_reachable_unix_socket(&regular_file));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn podman_socket_probe_accepts_successful_ping_response() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let socket_path = temp_dir.path().join("podman.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind podman socket");
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept podman probe");
+            let mut request = [0_u8; 128];
+            let n = stream.read(&mut request).expect("read podman probe");
+            assert!(request[..n].starts_with(b"GET /_ping HTTP/1.1\r\n"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nLibpod-Api-Version: 5.8.2\r\nContent-Length: 2\r\n\r\nOK",
+                )
+                .expect("write podman ping response");
+        });
+
+        assert!(podman_socket_responds(&socket_path));
+        handle.join().expect("probe server exits");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn podman_socket_probe_rejects_docker_ping_response() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let socket_path = temp_dir.path().join("podman.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind podman socket");
+
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept podman probe");
+            let mut request = [0_u8; 128];
+            let n = stream.read(&mut request).expect("read podman probe");
+            assert!(request[..n].starts_with(b"GET /_ping HTTP/1.1\r\n"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nServer: Docker/29.2.1\r\nContent-Length: 2\r\n\r\nOK",
+                )
+                .expect("write docker ping response");
+        });
+
+        assert!(!podman_socket_responds(&socket_path));
+        handle.join().expect("probe server exits");
+    }
+
+    #[test]
+    fn podman_socket_candidates_include_env_runtime_and_home_paths() {
+        let candidates = podman_socket_candidates_from_env(
+            Some(PathBuf::from("/tmp/custom-podman.sock")),
+            Some(PathBuf::from("/tmp/runtime")),
+            Some(PathBuf::from("/tmp/home")),
+        );
+
+        assert!(candidates.contains(&PathBuf::from("/tmp/custom-podman.sock")));
+        assert!(candidates.contains(&PathBuf::from("/tmp/runtime/podman/podman.sock")));
+        assert!(candidates.contains(&PathBuf::from(
+            "/tmp/home/.local/share/containers/podman/machine/podman.sock"
+        )));
     }
 
     #[test]

@@ -12,6 +12,7 @@ use crate::l7::rest::WebSocketExtensionMode;
 use crate::l7::{EnforcementMode, L7EndpointConfig, L7Protocol, L7RequestInfo};
 use crate::opa::{PolicyGenerationGuard, TunnelPolicyEngine};
 use miette::{IntoDiagnostic, Result, miette};
+use openshell_core::activity::{ActivitySender, try_record_activity};
 use openshell_core::secrets::{self, SecretResolver};
 use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, Endpoint, HttpActivityBuilder, HttpRequest,
@@ -37,6 +38,8 @@ pub struct L7EvalContext {
     pub cmdline_paths: Vec<String>,
     /// Supervisor-only placeholder resolver for outbound headers.
     pub(crate) secret_resolver: Option<Arc<SecretResolver>>,
+    /// Anonymous activity counter channel.
+    pub(crate) activity_tx: Option<ActivitySender>,
 }
 
 #[derive(Default)]
@@ -119,6 +122,7 @@ fn emit_parse_rejection(ctx: &L7EvalContext, detail: &str, engine_type: &str) {
         .status_detail(detail)
         .build();
     ocsf_emit!(event);
+    emit_activity(ctx, true, "l7_parse_rejection");
 }
 
 /// Run protocol-aware L7 inspection on a tunnel.
@@ -448,6 +452,13 @@ fn emit_l7_request_log(
         ))
         .build();
     ocsf_emit!(event);
+    emit_activity(ctx, decision_str == "deny", "l7_policy");
+}
+
+fn emit_activity(ctx: &L7EvalContext, denied: bool, deny_group: &'static str) {
+    if let Some(tx) = &ctx.activity_tx {
+        let _ = try_record_activity(tx, denied, deny_group);
+    }
 }
 
 /// Handle an upgraded connection (101 Switching Protocols).
@@ -1371,6 +1382,7 @@ network_policies:
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
+            activity_tx: None,
         };
         let request = L7RequestInfo {
             action: "WEBSOCKET_TEXT".into(),
@@ -1426,6 +1438,7 @@ network_policies:
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
+            activity_tx: None,
         };
 
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
@@ -1530,6 +1543,7 @@ network_policies:
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: resolver.map(Arc::new),
+            activity_tx: None,
         };
 
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
@@ -1647,6 +1661,7 @@ network_policies:
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: resolver.map(Arc::new),
+            activity_tx: None,
         };
 
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
@@ -1817,6 +1832,7 @@ network_policies:
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
+            activity_tx: None,
         };
 
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
@@ -1904,6 +1920,7 @@ network_policies:
             ancestors: vec![],
             cmdline_paths: vec![],
             secret_resolver: None,
+            activity_tx: None,
         };
 
         let (mut app, mut relay_client) = tokio::io::duplex(8192);

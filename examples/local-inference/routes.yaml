@@ -5,10 +5,10 @@
 #
 # Usage:
 #   openshell-sandbox \
-#     --inference-routes examples/inference/routes.yaml \
+#     --inference-routes examples/local-inference/routes.yaml \
 #     --policy-rules policy.rego \
-#     --policy-data examples/inference/sandbox-policy.yaml \
-#     -- python examples/inference/inference.py
+#     --policy-data examples/local-inference/sandbox-policy.yaml \
+#     -- python examples/local-inference/inference.py
 
 routes:
   - name: inference.local

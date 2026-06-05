@@ -509,7 +509,7 @@ async fn submit_proposal(ctx: &PolicyLocalContext, body: &[u8]) -> (u16, serde_j
     let audit_summaries: Vec<String> = chunks.iter().map(summarize_chunk_for_audit).collect();
 
     let response = match client
-        .submit_policy_analysis(sandbox_name, vec![], chunks, "agent_authored")
+        .submit_policy_analysis(sandbox_name, vec![], chunks, vec![], "agent_authored")
         .await
     {
         Ok(response) => response,

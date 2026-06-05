@@ -30,14 +30,17 @@ Make sure the following are in place before you install.
 
 OpenShell uses the [Agent Sandbox](https://agent-sandbox.sigs.k8s.io) Kubernetes SIG project to provision sandbox pods. Install the Agent Sandbox controller and its CRDs on your cluster before installing the OpenShell Helm chart.
 
-Fetch the latest release tag and apply the manifest:
+Apply the latest release manifest:
 
 ```shell
-VERSION=$(curl -s https://api.github.com/repos/kubernetes-sigs/agent-sandbox/releases/latest | jq -r '.tag_name')
-kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${VERSION}/manifest.yaml
+kubectl apply -f https://github.com/kubernetes-sigs/agent-sandbox/releases/latest/download/manifest.yaml
 ```
 
-This creates the `agent-sandbox-system` namespace, installs the CRDs, and starts the controller.
+This creates the `agent-sandbox-system` namespace, installs the `sandboxes.agents.x-k8s.io` CRD, and starts the controller.
+
+<Note>
+**Air-gapped clusters:** mirror the manifest above and the `registry.k8s.io/agent-sandbox/agent-sandbox-controller` image referenced inside it to your internal registry, then point the manifest's image reference at your mirror before applying. You will also need to mirror the OpenShell gateway and sandbox images — see the chart's `image.repository` value for the gateway and `server.sandboxImage` / `server.supervisorImage` for the sandbox runtime.
+</Note>
 
 Confirm the controller pod is running before proceeding:
 
@@ -135,7 +138,9 @@ The most commonly changed values are:
 | `image.repository` / `image.tag` | Gateway container image. Defaults to `ghcr.io/nvidia/openshell/gateway:latest`. |
 | `server.sandboxNamespace` | Namespace where sandbox pods are created. Defaults to the Helm release namespace when left empty. |
 | `server.sandboxImage` | Default sandbox image used when a sandbox does not specify one. |
+| `server.sandboxImagePullSecrets` | Image pull secrets attached to sandbox pods. Referenced Secrets must exist in the sandbox namespace. |
 | `server.grpcEndpoint` | Endpoint that sandbox supervisors use to call back to the gateway. Must be reachable from inside the cluster. |
+| `server.appArmorProfile` | AppArmor profile requested for sandbox agent containers. Defaults to `Unconfined`. |
 | `server.disableTls` | Run the gateway over plaintext HTTP. Use only behind a trusted transport. |
 | `server.auth.allowUnauthenticatedUsers` | Accept user-facing calls without OIDC or mTLS credentials. Use only for trusted local development or a fully trusted access proxy. |
 | `server.enableLoopbackServiceHttp` | Enable local plaintext HTTP for loopback sandbox service URLs. Defaults to `true`. |
@@ -150,6 +155,30 @@ helm upgrade --install openshell \
   --version <version> \
   --namespace openshell \
   --values my-values.yaml
+```
+
+The chart defaults `server.appArmorProfile` to `Unconfined` because
+runtime/default AppArmor profiles can block the supervisor's network namespace
+mount setup on AppArmor-enabled nodes. Set `server.appArmorProfile` to an empty
+string to omit the field, `RuntimeDefault` to force the runtime default, or
+`Localhost/<profile-name>` when you load and manage a localhost profile on each
+node.
+
+To use private sandbox images, create a `kubernetes.io/dockerconfigjson` Secret
+in the sandbox namespace and reference its name:
+
+```shell
+kubectl -n openshell create secret docker-registry regcred \
+  --docker-server=registry.example.com \
+  --docker-username="$REGISTRY_USER" \
+  --docker-password="$REGISTRY_TOKEN"
+```
+
+```yaml
+server:
+  sandboxImage: registry.example.com/team/openshell-sandbox:latest
+  sandboxImagePullSecrets:
+    - name: regcred
 ```
 
 ## RBAC

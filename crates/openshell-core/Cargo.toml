@@ -23,6 +23,8 @@ tracing = { workspace = true }
 url = { workspace = true }
 ipnet = "2"
 base64 = { workspace = true }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+reqwest = { workspace = true, features = ["blocking", "rustls-tls-webpki-roots"] }
 
 [features]
 ## Include test-only settings (dummy_bool, dummy_int) in the registry.

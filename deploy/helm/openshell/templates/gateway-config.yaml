@@ -106,8 +106,23 @@ data:
     {{- if .Values.server.sandboxImagePullPolicy }}
     image_pull_policy            = {{ .Values.server.sandboxImagePullPolicy | quote }}
     {{- end }}
+    {{- $sandboxImagePullSecretNames := list -}}
+    {{- range .Values.server.sandboxImagePullSecrets }}
+    {{- if .name }}
+    {{- $sandboxImagePullSecretNames = append $sandboxImagePullSecretNames .name }}
+    {{- end }}
+    {{- end }}
+    {{- if $sandboxImagePullSecretNames }}
+    image_pull_secrets           = [{{- range $i, $name := $sandboxImagePullSecretNames }}{{ if $i }}, {{ end }}{{ $name | quote }}{{- end }}]
+    {{- end }}
     {{- if .Values.server.workspaceDefaultStorageSize }}
     workspace_default_storage_size = {{ .Values.server.workspaceDefaultStorageSize | quote }}
+    {{- end }}
+    {{- if .Values.server.defaultRuntimeClassName }}
+    default_runtime_class_name   = {{ .Values.server.defaultRuntimeClassName | quote }}
+    {{- end }}
+    {{- if .Values.server.appArmorProfile }}
+    app_armor_profile            = {{ .Values.server.appArmorProfile | quote }}
     {{- end }}
     {{- if .Values.supervisor.image.pullPolicy }}
     supervisor_image_pull_policy = {{ .Values.supervisor.image.pullPolicy | quote }}

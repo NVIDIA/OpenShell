@@ -104,7 +104,7 @@ pub fn complete_local_jwt_config() -> Result<Option<GatewayJwtConfig>> {
             public_key_path: paths.public_key,
             kid_path: paths.kid,
             gateway_id: "openshell".to_string(),
-            ttl_secs: 3_600,
+            ttl_secs: 0,
         })),
         _ => Err(miette::miette!(
             "partial local sandbox JWT state in {}: expected jwt/signing.pem, jwt/public.pem, and jwt/kid",
@@ -237,6 +237,6 @@ mod tests {
         assert_eq!(config.public_key_path, tmp.path().join("jwt/public.pem"));
         assert_eq!(config.kid_path, tmp.path().join("jwt/kid"));
         assert_eq!(config.gateway_id, "openshell");
-        assert_eq!(config.ttl_secs, 3_600);
+        assert_eq!(config.ttl_secs, 0);
     }
 }

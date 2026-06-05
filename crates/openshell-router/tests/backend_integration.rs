@@ -17,6 +17,8 @@ fn mock_candidates(base_url: &str) -> Vec<ResolvedRoute> {
         default_headers: Vec::new(),
         passthrough_headers: vec!["openai-organization".to_string(), "x-model-id".to_string()],
         timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
+        model_in_path: false,
+        request_path_override: None,
     }]
 }
 
@@ -121,6 +123,8 @@ async fn proxy_no_compatible_route_returns_error() {
         default_headers: Vec::new(),
         passthrough_headers: Vec::new(),
         timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
+        model_in_path: false,
+        request_path_override: None,
     }];
 
     let err = router
@@ -217,6 +221,8 @@ async fn proxy_mock_route_returns_canned_response() {
         default_headers: Vec::new(),
         passthrough_headers: Vec::new(),
         timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
+        model_in_path: false,
+        request_path_override: None,
     }];
 
     let body = serde_json::to_vec(&serde_json::json!({
@@ -356,6 +362,8 @@ async fn proxy_uses_x_api_key_for_anthropic_route() {
             "anthropic-beta".to_string(),
         ],
         timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
+        model_in_path: false,
+        request_path_override: None,
     }];
 
     let body = serde_json::to_vec(&serde_json::json!({
@@ -419,6 +427,8 @@ async fn proxy_anthropic_does_not_send_bearer_auth() {
             "anthropic-beta".to_string(),
         ],
         timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
+        model_in_path: false,
+        request_path_override: None,
     }];
 
     let response = router
@@ -468,6 +478,8 @@ async fn proxy_forwards_client_anthropic_version_header() {
             "anthropic-beta".to_string(),
         ],
         timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
+        model_in_path: false,
+        request_path_override: None,
     }];
 
     let body = serde_json::to_vec(&serde_json::json!({
@@ -497,6 +509,220 @@ async fn proxy_forwards_client_anthropic_version_header() {
     assert_eq!(
         response.status, 200,
         "upstream should have received anthropic-version header"
+    );
+}
+
+#[tokio::test]
+async fn proxy_vertex_gemini_route_uses_chat_completions_override() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path(
+            "/v1beta1/projects/my-project/locations/us-central1/endpoints/openapi/chat/completions",
+        ))
+        .and(bearer_token("ya29.test-token"))
+        .and(body_partial_json(serde_json::json!({
+            "model": "gemini-2.0-flash-001",
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-vertex",
+            "object": "chat.completion",
+            "created": 1_700_000_000_i64,
+            "model": "gemini-2.0-flash-001",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "pong" },
+                "finish_reason": "stop"
+            }]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let router = Router::new().unwrap();
+    let candidates = vec![ResolvedRoute {
+        name: "inference.local".to_string(),
+        endpoint: format!(
+            "{}/v1beta1/projects/my-project/locations/us-central1/endpoints/openapi",
+            mock_server.uri()
+        ),
+        model: "gemini-2.0-flash-001".to_string(),
+        api_key: "ya29.test-token".to_string(),
+        protocols: vec!["openai_chat_completions".to_string()],
+        auth: AuthHeader::Bearer,
+        default_headers: Vec::new(),
+        passthrough_headers: Vec::new(),
+        timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
+        model_in_path: false,
+        request_path_override: Some("/chat/completions".to_string()),
+    }];
+
+    let body = serde_json::to_vec(&serde_json::json!({
+        "model": "client-model",
+        "messages": [{"role": "user", "content": "ping"}]
+    }))
+    .unwrap();
+
+    let response = router
+        .proxy_with_candidates(
+            "openai_chat_completions",
+            "POST",
+            "/v1/chat/completions",
+            vec![("content-type".to_string(), "application/json".to_string())],
+            bytes::Bytes::from(body),
+            &candidates,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status, 200);
+}
+
+#[tokio::test]
+async fn proxy_vertex_anthropic_route_uses_model_path_suffix() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path(
+            "/v1/projects/my-project/locations/us-east5/publishers/anthropic/models/claude-3-5-sonnet@20241022:rawPredict",
+        ))
+        .and(bearer_token("ya29.vertex-token"))
+        .and(body_partial_json(serde_json::json!({
+            "anthropic_version": "vertex-2023-10-16",
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "msg_vertex_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-3-5-sonnet@20241022",
+            "content": [{"type": "text", "text": "pong"}]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let router = Router::new().unwrap();
+    let candidates = vec![ResolvedRoute {
+        name: "inference.local".to_string(),
+        endpoint: format!(
+            "{}/v1/projects/my-project/locations/us-east5/publishers/anthropic/models",
+            mock_server.uri()
+        ),
+        model: "claude-3-5-sonnet@20241022".to_string(),
+        api_key: "ya29.vertex-token".to_string(),
+        protocols: vec!["anthropic_messages".to_string()],
+        auth: AuthHeader::Bearer,
+        default_headers: Vec::new(),
+        passthrough_headers: vec!["anthropic-beta".to_string()],
+        timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
+        model_in_path: true,
+        request_path_override: Some(":rawPredict".to_string()),
+    }];
+
+    // Include "model" in the body, as Claude Code and other Anthropic SDK
+    // clients always do. The router must strip it for Vertex AI rawPredict.
+    let body = serde_json::to_vec(&serde_json::json!({
+        "model": "claude-3-5-sonnet-20241022",
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 32
+    }))
+    .unwrap();
+
+    let response = router
+        .proxy_with_candidates(
+            "anthropic_messages",
+            "POST",
+            "/v1/messages",
+            vec![
+                ("content-type".to_string(), "application/json".to_string()),
+                ("anthropic-beta".to_string(), "tools-2024-05-16".to_string()),
+                ("anthropic-version".to_string(), "2023-06-01".to_string()),
+            ],
+            bytes::Bytes::from(body),
+            &candidates,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status, 200);
+    let received = mock_server.received_requests().await.unwrap();
+    assert_eq!(received.len(), 1);
+    let received_body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+    assert_eq!(
+        received_body["anthropic_version"],
+        serde_json::json!("vertex-2023-10-16")
+    );
+    // "model" must be stripped: Vertex AI encodes the model in the URL path
+    // and rejects "model" in the body with "Extra inputs are not permitted".
+    assert!(
+        received_body.get("model").is_none(),
+        "Vertex Anthropic requests must not have model in the body, got: {received_body}"
+    );
+    // anthropic-beta must be stripped: Vertex AI rejects unknown beta values
+    // with HTTP 400 (e.g. prompt-caching-scope-2026-01-05).
+    assert!(
+        !received[0].headers.contains_key("anthropic-beta"),
+        "anthropic-beta must not reach the Vertex AI backend"
+    );
+    assert!(
+        !received[0].headers.contains_key("anthropic-version"),
+        "anthropic-version must be converted to body anthropic_version, not forwarded as a header"
+    );
+}
+
+#[tokio::test]
+async fn proxy_vertex_anthropic_streaming_route_uses_stream_rawpredict() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path(
+            "/v1/projects/my-project/locations/us-east5/publishers/anthropic/models/claude-3-5-sonnet@20241022:streamRawPredict",
+        ))
+        .and(bearer_token("ya29.vertex-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{\"id\":\"msg_vertex_stream\"}"))
+        .mount(&mock_server)
+        .await;
+
+    let router = Router::new().unwrap();
+    let candidates = vec![ResolvedRoute {
+        name: "inference.local".to_string(),
+        endpoint: format!(
+            "{}/v1/projects/my-project/locations/us-east5/publishers/anthropic/models",
+            mock_server.uri()
+        ),
+        model: "claude-3-5-sonnet@20241022".to_string(),
+        api_key: "ya29.vertex-token".to_string(),
+        protocols: vec!["anthropic_messages".to_string()],
+        auth: AuthHeader::Bearer,
+        default_headers: Vec::new(),
+        passthrough_headers: vec!["anthropic-beta".to_string()],
+        timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
+        model_in_path: true,
+        request_path_override: Some(":rawPredict".to_string()),
+    }];
+
+    let body = serde_json::to_vec(&serde_json::json!({
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 32,
+        "stream": true
+    }))
+    .unwrap();
+
+    let mut response = router
+        .proxy_with_candidates_streaming(
+            "anthropic_messages",
+            "POST",
+            "/v1/messages",
+            vec![("content-type".to_string(), "application/json".to_string())],
+            bytes::Bytes::from(body),
+            &candidates,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status, 200);
+    let first_chunk = response.next_chunk().await.unwrap();
+    assert!(
+        first_chunk.is_some(),
+        "streaming response should yield a body chunk"
     );
 }
 
@@ -561,6 +787,8 @@ async fn streaming_proxy_completes_despite_exceeding_route_timeout() {
         // Route timeout shorter than the backend delay — streaming must
         // NOT be constrained by this.
         timeout: Duration::from_secs(1),
+        model_in_path: false,
+        request_path_override: None,
     }];
 
     let body = serde_json::to_vec(&serde_json::json!({
@@ -623,6 +851,8 @@ async fn buffered_proxy_enforces_route_timeout() {
         default_headers: Vec::new(),
         passthrough_headers: Vec::new(),
         timeout: Duration::from_secs(1),
+        model_in_path: false,
+        request_path_override: None,
     }];
 
     let body = serde_json::to_vec(&serde_json::json!({

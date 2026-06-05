@@ -35,6 +35,14 @@ apps:
       - network
       - ssh-keys
       - system-observe
+  term:
+    command: bin/openshell term
+    desktop: meta/gui/term.desktop
+    plugs:
+      - home
+      - network
+      - ssh-keys
+      - system-observe
   gateway:
     command: bin/openshell-gateway-wrapper
     daemon: simple
@@ -84,6 +92,10 @@ parts:
         "$CRAFT_PART_INSTALL/bin/openshell-sandbox"
       install -D -m 0755 "$CRAFT_PROJECT_DIR/deploy/snap/bin/openshell-gateway-wrapper" \
         "$CRAFT_PART_INSTALL/bin/openshell-gateway-wrapper"
+      install -D -m 0644 "$CRAFT_PROJECT_DIR/snap/local/term.desktop" \
+        "$CRAFT_PART_INSTALL/meta/gui/term.desktop"
+      install -D -m 0644 "$CRAFT_PROJECT_DIR/snap/local/icon.png" \
+        "$CRAFT_PART_INSTALL/meta/gui/icon.png"
       install -D -m 0644 "$CRAFT_PROJECT_DIR/LICENSE" \
         "$CRAFT_PART_INSTALL/usr/share/doc/openshell/LICENSE"
       install -D -m 0644 "$CRAFT_PROJECT_DIR/README.md" \

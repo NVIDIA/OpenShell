@@ -57,21 +57,93 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: linux-amd64-cpu8
     timeout-minutes: 20
-    container:
-      image: fedora:latest
-      options: --privileged
+    env:
+      FEDORA_CANARY_CONTAINER: openshell-fedora-canary-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
-      - name: Ensure Podman
+      - name: Start Fedora systemd container and root user manager
         run: |
-          dnf install -y curl podman
-          mkdir -p "${HOME}/.config/openshell"
-          printf 'OPENSHELL_DRIVERS=podman\n' > "${HOME}/.config/openshell/gateway.env"
-          podman info
+          set -euo pipefail
+
+          docker run --detach \
+            --name "${FEDORA_CANARY_CONTAINER}" \
+            --privileged \
+            --cgroupns=host \
+            --tmpfs /run \
+            --tmpfs /tmp \
+            --volume /sys/fs/cgroup:/sys/fs/cgroup:rw \
+            fedora:latest \
+            bash -lc 'dnf install -y curl dbus-daemon podman systemd && exec /usr/sbin/init'
+
+          for _ in $(seq 1 120); do
+            if docker exec "${FEDORA_CANARY_CONTAINER}" systemctl list-units --no-pager >/dev/null 2>&1; then
+              break
+            fi
+            if [ "$(docker inspect -f '{{.State.Running}}' "${FEDORA_CANARY_CONTAINER}")" != "true" ]; then
+              echo "::error::Fedora systemd container exited before systemd became reachable"
+              docker logs "${FEDORA_CANARY_CONTAINER}" >&2 || true
+              exit 1
+            fi
+            sleep 1
+          done
+
+          if ! docker exec "${FEDORA_CANARY_CONTAINER}" systemctl list-units --no-pager >/dev/null 2>&1; then
+            echo "::error::Fedora systemd container did not become reachable within 120s"
+            docker logs "${FEDORA_CANARY_CONTAINER}" >&2 || true
+            exit 1
+          fi
+
+          docker exec --interactive "${FEDORA_CANARY_CONTAINER}" env \
+            HOME=/root \
+            XDG_RUNTIME_DIR=/run/user/0 \
+            DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus \
+            bash -s <<'EOF'
+          set -euo pipefail
+          # install.sh manages the RPM gateway as a systemd user unit. This
+          # container is booted with systemd as PID 1, but it still has no
+          # login session. Start root's user manager explicitly so the
+          # installer can test service restart and gateway registration
+          # instead of its "restart later" fallback.
+          mkdir -p "${XDG_RUNTIME_DIR}"
+          chmod 700 "${XDG_RUNTIME_DIR}"
+          systemctl start user-runtime-dir@0.service || true
+          systemctl start user@0.service
+
+          for _ in $(seq 1 30); do
+            if systemctl --user daemon-reload; then
+              break
+            fi
+            sleep 1
+          done
+          if ! systemctl --user daemon-reload; then
+            systemctl status user@0.service --no-pager >&2 || true
+            journalctl -u user@0.service --no-pager -n 80 >&2 || true
+            systemctl --user status --no-pager >&2 || true
+            exit 1
+          fi
+          EOF
 
       - name: Install and check status
         run: |
-          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh | sh
+          set -euo pipefail
+
+          docker exec --interactive "${FEDORA_CANARY_CONTAINER}" env \
+            HOME=/root \
+            XDG_RUNTIME_DIR=/run/user/0 \
+            DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/0/bus \
+            INSTALL_SH_URL="https://raw.githubusercontent.com/NVIDIA/OpenShell/${{ github.event.workflow_run.head_sha || github.sha }}/install.sh" \
+            bash -s <<'EOF'
+          set -euo pipefail
+          mkdir -p "${HOME}/.config/openshell"
+          printf 'OPENSHELL_DRIVERS=podman\n' > "${HOME}/.config/openshell/gateway.env"
+          podman info
+          curl -LsSf "${INSTALL_SH_URL}" | sh
           openshell status
+          EOF
+
+      - name: Stop Fedora systemd container
+        if: always()
+        run: |
+          docker rm -f "${FEDORA_CANARY_CONTAINER}" >/dev/null 2>&1 || true
 
   ubuntu-snap:
     name: Ubuntu Snap
@@ -81,34 +153,47 @@ jobs:
     steps:
       - name: Install snapd
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y snapd
+          sudo systemctl enable --now snapd.socket
           sudo systemctl start snapd
+          sudo snap wait system seed.loaded
 
       - name: Install Docker snap
         run: |
+          set -euo pipefail
           sudo snap install docker
 
       - name: Download snap from release-dev artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
+          github-token: ${{ github.token }}
           run-id: ${{ github.event.workflow_run.id }}
           pattern: snap-linux-amd64
           path: release/
+          merge-multiple: true
 
       - name: Install snap (dangerous — from release, not store)
         run: |
+          set -euo pipefail
           sudo snap install ./release/*.snap --dangerous
 
       - name: Connect interfaces
         run: |
+          set -euo pipefail
           sudo snap connect openshell:docker docker:docker-daemon
           sudo snap connect openshell:log-observe
           sudo snap connect openshell:system-observe
           sudo snap connect openshell:ssh-keys
 
-      - name: Check status
+      - name: Register snap gateway and check status
         run: |
+          set -euo pipefail
+          openshell --version
+          sudo snap services openshell
+          openshell gateway add http://127.0.0.1:17670 --local --name snap-docker
+          openshell gateway select snap-docker
           openshell status
 
   kubernetes:

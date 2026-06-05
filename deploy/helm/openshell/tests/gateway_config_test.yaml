@@ -59,6 +59,43 @@ tests:
           path: data["gateway.toml"]
           pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?service_account_name\s*=\s*"openshell-sandbox"'
 
+  - it: renders sandbox image pull secrets under [openshell.drivers.kubernetes]
+    template: templates/gateway-config.yaml
+    set:
+      server.sandboxImagePullSecrets:
+        - name: regcred
+        - name: backup-regcred
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?image_pull_secrets\s*=\s*\["regcred", "backup-regcred"\]'
+
+  - it: renders the default sandbox AppArmor profile under [openshell.drivers.kubernetes]
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.drivers\.kubernetes\].*?app_armor_profile\s*=\s*"Unconfined"'
+
+  - it: omits sandbox AppArmor profile when disabled
+    template: templates/gateway-config.yaml
+    set:
+      server.appArmorProfile: ""
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'app_armor_profile\s*='
+
+  - it: does not reuse gateway image pull secrets for sandbox pods
+    template: templates/gateway-config.yaml
+    set:
+      imagePullSecrets:
+        - name: gateway-regcred
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'image_pull_secrets\s*='
+
   - it: does not render local mTLS user auth for Kubernetes deployments
     template: templates/gateway-config.yaml
     asserts:

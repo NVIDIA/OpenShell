@@ -8,8 +8,10 @@ use std::str::FromStr;
 
 /// Default Podman bridge network name.
 pub const DEFAULT_NETWORK_NAME: &str = "openshell";
-pub const DEFAULT_SANDBOX_PIDS_LIMIT: i64 = 2048;
 pub const MACOS_PODMAN_MACHINE_HOST_GATEWAY_IP: &str = "192.168.127.254";
+
+// Re-export the shared default so existing imports inside this crate keep working.
+pub use openshell_core::config::DEFAULT_SANDBOX_PIDS_LIMIT;
 
 /// Image pull policy for sandbox and supervisor images.
 ///

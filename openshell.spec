@@ -172,8 +172,10 @@ Type=exec
 ExecStartPre=/bin/sh -c 'test -f %%E/openshell/gateway.toml || install -Dm644 /usr/share/openshell-gateway/gateway.toml.default %%E/openshell/gateway.toml'
 
 # Auto-generate PKI on first start if not present.
-# %%S expands to $XDG_STATE_HOME (~/.local/state) in user units.
-ExecStartPre=/usr/bin/openshell-gateway generate-certs --output-dir %%S/openshell/tls --server-san host.openshell.internal
+# The default local TLS dir uses %%h because %%S resolves differently across
+# systemd user-manager versions. gateway.env may override this path.
+Environment=OPENSHELL_LOCAL_TLS_DIR=%%h/.local/state/openshell/tls
+ExecStartPre=/usr/bin/openshell-gateway generate-certs --output-dir ${OPENSHELL_LOCAL_TLS_DIR} --server-san host.openshell.internal
 
 # gateway.env is honored for backward compatibility with pre-1415 installs.
 # New installs use runtime defaults; create gateway.toml to override.

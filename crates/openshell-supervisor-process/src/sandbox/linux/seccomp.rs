@@ -11,6 +11,27 @@
 //! 3. **Conditional syscall blocks** -- block dangerous flag combinations on otherwise
 //!    needed syscalls (`execveat+AT_EMPTY_PATH`, `unshare+CLONE_NEWUSER`,
 //!    `seccomp+SET_MODE_FILTER`)
+//!
+//! ## `AF_NETLINK` policy
+//!
+//! `AF_NETLINK` sockets are allowed **only** for the `NETLINK_ROUTE` protocol
+//! (protocol value 0). All other netlink protocols are blocked with `EPERM`.
+//!
+//! `NETLINK_ROUTE` is required by `getifaddrs(3)` on Linux (used by Node.js,
+//! Python, Go, and many HTTP/gRPC client libraries during startup). Without it
+//! those runtimes fail to enumerate network interfaces even when they have no
+//! intent to modify them.
+//!
+//! The risk is contained by existing sandbox layers:
+//! - **Privilege drop**: `CAP_NET_ADMIN` is not granted, so all write operations
+//!   (add/delete routes, addresses, interfaces) fail with `EPERM` regardless.
+//! - **Network namespace**: the sandboxed process sees only `lo` and one veth;
+//!   no host interfaces are visible.
+//! - **nftables bypass rules**: all non-proxy traffic is rejected at the
+//!   netfilter level regardless of what the sandbox learns about its interfaces.
+//!
+//! Every other netlink protocol (`NETLINK_SOCK_DIAG`, `NETLINK_NETFILTER`,
+//! `NETLINK_AUDIT`, `NETLINK_XFRM`, `NETLINK_GENERIC`, etc.) remains blocked.
 
 use miette::{IntoDiagnostic, Result};
 use openshell_core::policy::{NetworkMode, SandboxPolicy};
@@ -168,7 +189,8 @@ fn build_filter_rules(allow_inet: bool) -> Result<BTreeMap<i64, Vec<SeccompRule>
         libc::AF_PACKET,
         libc::AF_BLUETOOTH,
         libc::AF_VSOCK,
-        libc::AF_NETLINK,
+        // AF_NETLINK is handled separately below: NETLINK_ROUTE (protocol 0)
+        // is allowed for getifaddrs(3); all other netlink protocols are blocked.
     ];
     if !allow_inet {
         blocked_domains.push(libc::AF_INET);
@@ -179,6 +201,18 @@ fn build_filter_rules(allow_inet: bool) -> Result<BTreeMap<i64, Vec<SeccompRule>
         debug!(domain, "Blocking socket domain via seccomp");
         add_socket_domain_rule(&mut rules, domain)?;
     }
+
+    // Allow AF_NETLINK only for NETLINK_ROUTE (protocol 0).
+    //
+    // NETLINK_ROUTE is needed by getifaddrs(3) which is called by Node.js,
+    // Python, Go, and many HTTP/gRPC client libraries during startup to
+    // enumerate local network interfaces. Blocking it causes runtime errors
+    // such as "getifaddrs returned an error" in tools like Claude Code.
+    //
+    // The rule blocks socket(AF_NETLINK, *, protocol) for any protocol != 0.
+    // Write operations via NETLINK_ROUTE still require CAP_NET_ADMIN, which
+    // the sandbox does not grant, so interface/route modification is not possible.
+    add_netlink_non_route_rule(&mut rules)?;
 
     // --- Unconditional syscall blocks ---
     // These syscalls are blocked entirely (empty rule vec = unconditional EPERM).
@@ -268,6 +302,39 @@ fn add_socket_domain_rule(rules: &mut BTreeMap<i64, Vec<SeccompRule>>, domain: i
             .into_diagnostic()?;
 
     let rule = SeccompRule::new(vec![condition]).into_diagnostic()?;
+    rules.entry(libc::SYS_socket).or_default().push(rule);
+    Ok(())
+}
+
+/// Block `socket(AF_NETLINK, *, protocol)` for every protocol except
+/// `NETLINK_ROUTE` (protocol 0).
+///
+/// Two AND'd conditions are required:
+/// - arg0 == `AF_NETLINK`  (domain)
+/// - arg2 != 0           (protocol is not `NETLINK_ROUTE`)
+///
+/// A seccomp rule fires (and returns EPERM) only when **all** conditions
+/// match, so this rule is triggered for any `socket(AF_NETLINK, *, non-zero)`
+/// call while leaving `socket(AF_NETLINK, *, 0)` (`NETLINK_ROUTE`) through.
+#[allow(clippy::cast_sign_loss)]
+fn add_netlink_non_route_rule(rules: &mut BTreeMap<i64, Vec<SeccompRule>>) -> Result<()> {
+    let domain_condition = SeccompCondition::new(
+        0, // domain argument
+        SeccompCmpArgLen::Dword,
+        SeccompCmpOp::Eq,
+        libc::AF_NETLINK as u64,
+    )
+    .into_diagnostic()?;
+
+    let protocol_condition = SeccompCondition::new(
+        2, // protocol argument
+        SeccompCmpArgLen::Dword,
+        SeccompCmpOp::Ne,
+        0, // NETLINK_ROUTE = 0
+    )
+    .into_diagnostic()?;
+
+    let rule = SeccompRule::new(vec![domain_condition, protocol_condition]).into_diagnostic()?;
     rules.entry(libc::SYS_socket).or_default().push(rule);
     Ok(())
 }
@@ -410,6 +477,27 @@ mod tests {
                 "syscall {syscall} should have conditional rules"
             );
         }
+    }
+
+    #[test]
+    fn netlink_socket_rules_are_conditional_not_unconditional() {
+        // SYS_socket must appear in the rules map (for domain blocks and the
+        // AF_NETLINK+non-ROUTE filter), but it must NOT be an unconditional block
+        // (empty Vec). An empty Vec would block ALL socket() calls, including
+        // socket(AF_NETLINK, *, NETLINK_ROUTE=0) which getifaddrs(3) needs.
+        let filter_rules = build_filter_rules(true).unwrap();
+
+        assert!(
+            filter_rules.contains_key(&libc::SYS_socket),
+            "SYS_socket should be in the rules map (domain blocks present)"
+        );
+
+        // The Vec<SeccompRule> for SYS_socket must be non-empty (rules are
+        // conditional), which is the opposite of an unconditional block.
+        assert!(
+            !filter_rules[&libc::SYS_socket].is_empty(),
+            "SYS_socket should have conditional rules, not an unconditional block"
+        );
     }
 
     #[test]
@@ -677,6 +765,77 @@ mod tests {
         assert!(
             unsafe { libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 },
             "additional seccomp filter installation should be blocked after startup"
+        );
+    }
+
+    #[test]
+    fn behavioral_netlink_route_allowed() {
+        // socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE=0) must succeed (not blocked).
+        // This is the call getifaddrs(3) makes on Linux to enumerate interfaces.
+        let filter = build_filter(true).unwrap();
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe {
+                libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+                apply_filter(&filter).expect("apply_filter");
+                // NETLINK_ROUTE = 0
+                let fd = libc::socket(libc::AF_NETLINK, libc::SOCK_RAW, 0);
+                if fd >= 0 {
+                    libc::close(fd);
+                    libc::_exit(0);
+                } else {
+                    let errno = *libc::__errno_location();
+                    let msg = format!(
+                        "socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE): expected success, got errno={errno}\n"
+                    );
+                    libc::write(2, msg.as_ptr().cast(), msg.len());
+                    libc::_exit(1);
+                }
+            }
+        }
+        let mut status: libc::c_int = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert!(
+            unsafe { libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 },
+            "socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE) should be allowed for getifaddrs(3)"
+        );
+    }
+
+    #[test]
+    fn behavioral_netlink_non_route_blocked() {
+        // socket(AF_NETLINK, SOCK_RAW, NETLINK_SOCK_DIAG=4) must be blocked.
+        // NETLINK_SOCK_DIAG is representative of non-ROUTE netlink protocols
+        // that have no legitimate use inside the sandbox.
+        let filter = build_filter(true).unwrap();
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe {
+                libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+                apply_filter(&filter).expect("apply_filter");
+                // NETLINK_SOCK_DIAG = 4
+                let fd = libc::socket(libc::AF_NETLINK, libc::SOCK_RAW, 4);
+                let errno = *libc::__errno_location();
+                if fd == -1 && errno == libc::EPERM {
+                    libc::_exit(0);
+                } else {
+                    if fd >= 0 {
+                        libc::close(fd);
+                    }
+                    let msg = format!(
+                        "socket(AF_NETLINK, SOCK_RAW, NETLINK_SOCK_DIAG): expected EPERM, got fd={fd} errno={errno}\n"
+                    );
+                    libc::write(2, msg.as_ptr().cast(), msg.len());
+                    libc::_exit(1);
+                }
+            }
+        }
+        let mut status: libc::c_int = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert!(
+            unsafe { libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 },
+            "socket(AF_NETLINK, SOCK_RAW, NETLINK_SOCK_DIAG) should be blocked with EPERM"
         );
     }
 }

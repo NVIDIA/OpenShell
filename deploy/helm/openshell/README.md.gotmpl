@@ -56,6 +56,7 @@ See [`values.yaml`](values.yaml) for source defaults. Selected overlays:
 - [`ci/values-gateway.yaml`](ci/values-gateway.yaml) - gateway-only configuration
 - [`ci/values-cert-manager.yaml`](ci/values-cert-manager.yaml) - cert-manager integration
 - [`ci/values-keycloak.yaml`](ci/values-keycloak.yaml) - Keycloak OIDC integration
+- [`ci/values-high-availability.yaml`](ci/values-high-availability.yaml) - HA gateway test overlay with bundled PostgreSQL
 
 ### Database backend
 
@@ -108,22 +109,19 @@ Append these flags to any of the PostgreSQL commands above for OpenShift:
 --set securityContext.runAsUser=null
 ```
 
-## PKI bootstrap
+## Secret bootstrap
 
 By default, a pre-install/pre-upgrade hook Job runs `openshell-gateway generate-certs`
-to create the gateway's server and client mTLS Secrets. The Job uses the gateway image
-itself, so air-gapped environments only need to mirror that one image (no separate
-openssl/alpine sidecar).
+to create the gateway's server/client mTLS Secrets and sandbox JWT signing Secret.
+The Job uses the gateway image itself, so air-gapped environments only need to
+mirror that one image (no separate openssl/alpine sidecar).
 
-The Job is idempotent:
-
-- Both target Secrets exist: log and exit 0.
-- Exactly one exists: fail with `kubectl delete secret -n <ns> <server> <client>` recovery hint.
-- Neither exists: generate a CA, server cert, and client cert; POST both `kubernetes.io/tls` Secrets (`tls.crt`, `tls.key`, `ca.crt`).
-
-Disable with `--set pkiInitJob.enabled=false` when bringing your own PKI (cert-manager,
-external CA, or pre-created Secrets). See `certManager.*` in `values.yaml` for the
-cert-manager alternative.
+When `certManager.enabled=true`, cert-manager owns the TLS Secrets and the chart
+runs the same hook in JWT-only mode because cert-manager does not create the
+sandbox JWT signing Secret. This precedence applies even if
+`pkiInitJob.enabled` remains true. Set `pkiInitJob.enabled=false` only when an
+external non-cert-manager TLS source manages TLS and you pre-create the sandbox
+JWT signing Secret.
 
 {{ template "chart.valuesSection" . }}
 {{ template "helm-docs.versionFooter" . }}

@@ -776,7 +776,7 @@ mod tests {
         refresh_provider_credential, refresh_state_name, refresh_strategy_name,
         run_refresh_worker_tick, seconds_until_ms,
     };
-    use crate::persistence::Store;
+    use crate::persistence::test_store;
     use openshell_core::ObjectId;
     use openshell_core::proto::datamodel::v1::ObjectMeta;
     use openshell_core::proto::{
@@ -785,12 +785,6 @@ mod tests {
     use std::collections::HashMap;
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    async fn test_store() -> Store {
-        Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .expect("in-memory SQLite store should connect")
-    }
 
     #[test]
     fn refresh_state_name_preserves_distinct_credential_keys() {

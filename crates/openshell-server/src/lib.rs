@@ -38,6 +38,7 @@ mod sandbox_watch;
 mod service_routing;
 mod ssh_sessions;
 pub mod supervisor_session;
+mod telemetry;
 mod tls;
 pub mod tracing_bus;
 mod ws_tunnel;
@@ -90,6 +91,9 @@ pub struct ServerState {
 
     /// In-memory bus for server process logs.
     pub tracing_log_bus: TracingLogBus,
+
+    /// In-memory anonymous telemetry accounting for active sandbox sessions.
+    pub(crate) telemetry: telemetry::TelemetryState,
 
     /// Active SSH tunnel connection counts per session token.
     pub ssh_connections_by_token: Mutex<HashMap<String, u32>>,
@@ -167,6 +171,7 @@ impl ServerState {
             sandbox_index,
             sandbox_watch_bus,
             tracing_log_bus,
+            telemetry: telemetry::TelemetryState::new(),
             ssh_connections_by_token: Mutex::new(HashMap::new()),
             ssh_connections_by_sandbox: Mutex::new(HashMap::new()),
             settings_mutex: tokio::sync::Mutex::new(()),
@@ -700,6 +705,7 @@ async fn build_compute_runtime(
 ) -> Result<ComputeRuntime> {
     let driver = configured_compute_driver(config)?;
     info!(driver = %driver, "Using compute driver");
+    warn_if_kubernetes_sandbox_jwt_expiry_disabled(config, driver);
 
     match driver {
         ComputeDriverKind::Kubernetes => {
@@ -873,13 +879,30 @@ fn configured_compute_driver(config: &Config) -> Result<ComputeDriverKind> {
     }
 }
 
+fn kubernetes_sandbox_jwt_expiry_disabled(config: &Config, driver: ComputeDriverKind) -> bool {
+    matches!(driver, ComputeDriverKind::Kubernetes)
+        && config
+            .gateway_jwt
+            .as_ref()
+            .is_some_and(|jwt| jwt.ttl_secs == 0)
+}
+
+fn warn_if_kubernetes_sandbox_jwt_expiry_disabled(config: &Config, driver: ComputeDriverKind) {
+    if kubernetes_sandbox_jwt_expiry_disabled(config, driver) {
+        warn!(
+            "Kubernetes gateway configured with non-expiring sandbox JWTs (gateway_jwt.ttl_secs = 0); set ttl_secs > 0 for shared Kubernetes deployments"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         ConnectionProtocol, MultiplexService, ServerState, TlsAcceptor,
         allow_plaintext_service_http, classify_initial_bytes, configured_compute_driver,
         gateway_listener_addresses, is_benign_tls_handshake_failure,
-        kubernetes_config_for_k8s_sa_bootstrap, serve_gateway_listener,
+        kubernetes_config_for_k8s_sa_bootstrap, kubernetes_sandbox_jwt_expiry_disabled,
+        serve_gateway_listener,
     };
     use openshell_core::{
         ComputeDriverKind, Config,
@@ -1281,6 +1304,38 @@ mod tests {
             configured_compute_driver(&config).unwrap(),
             ComputeDriverKind::Docker
         );
+    }
+
+    #[test]
+    fn kubernetes_sandbox_jwt_expiry_disabled_warns_only_for_kubernetes_zero_ttl() {
+        fn config_with_jwt_ttl(ttl_secs: u64) -> Config {
+            let mut config = Config::new(None);
+            config.gateway_jwt = Some(openshell_core::GatewayJwtConfig {
+                signing_key_path: "/tmp/signing.pem".into(),
+                public_key_path: "/tmp/public.pem".into(),
+                kid_path: "/tmp/kid".into(),
+                gateway_id: "openshell".to_string(),
+                ttl_secs,
+            });
+            config
+        }
+
+        assert!(kubernetes_sandbox_jwt_expiry_disabled(
+            &config_with_jwt_ttl(0),
+            ComputeDriverKind::Kubernetes
+        ));
+        assert!(!kubernetes_sandbox_jwt_expiry_disabled(
+            &config_with_jwt_ttl(3600),
+            ComputeDriverKind::Kubernetes
+        ));
+        assert!(!kubernetes_sandbox_jwt_expiry_disabled(
+            &config_with_jwt_ttl(0),
+            ComputeDriverKind::Docker
+        ));
+        assert!(!kubernetes_sandbox_jwt_expiry_disabled(
+            &Config::new(None),
+            ComputeDriverKind::Kubernetes
+        ));
     }
 
     #[test]

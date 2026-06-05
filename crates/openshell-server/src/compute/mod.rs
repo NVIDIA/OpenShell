@@ -15,6 +15,7 @@ use crate::sandbox_watch::SandboxWatchBus;
 use crate::supervisor_session::SupervisorSessionRegistry;
 use crate::tracing_bus::TracingLogBus;
 use futures::{Stream, StreamExt};
+use openshell_core::ComputeDriverKind;
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, DeleteSandboxRequest, DriverCondition, DriverPlatformEvent,
     DriverResourceRequirements, DriverSandbox, DriverSandboxSpec, DriverSandboxStatus,
@@ -219,6 +220,7 @@ impl ComputeDriver for RemoteComputeDriver {
 #[derive(Clone)]
 pub struct ComputeRuntime {
     driver: SharedComputeDriver,
+    driver_kind: Option<ComputeDriverKind>,
     shutdown_cleanup: Option<Arc<dyn ShutdownCleanup>>,
     startup_resume: Option<Arc<dyn StartupResume>>,
     _driver_process: Option<Arc<ManagedDriverProcess>>,
@@ -241,6 +243,7 @@ impl fmt::Debug for ComputeRuntime {
 impl ComputeRuntime {
     #[allow(clippy::too_many_arguments)]
     async fn from_driver(
+        driver_kind: ComputeDriverKind,
         driver: SharedComputeDriver,
         shutdown_cleanup: Option<Arc<dyn ShutdownCleanup>>,
         startup_resume: Option<Arc<dyn StartupResume>>,
@@ -261,6 +264,7 @@ impl ComputeRuntime {
             .default_image;
         Ok(Self {
             driver,
+            driver_kind: Some(driver_kind),
             shutdown_cleanup,
             startup_resume,
             _driver_process: driver_process,
@@ -304,6 +308,7 @@ impl ComputeRuntime {
         let startup_resume: Arc<dyn StartupResume> = driver.clone();
         let driver: SharedComputeDriver = driver;
         Self::from_driver(
+            ComputeDriverKind::Docker,
             driver,
             Some(shutdown_cleanup),
             Some(startup_resume),
@@ -332,6 +337,7 @@ impl ComputeRuntime {
             .map_err(|err| ComputeError::Message(err.to_string()))?;
         let driver: SharedComputeDriver = Arc::new(ComputeDriverService::new(driver));
         Self::from_driver(
+            ComputeDriverKind::Kubernetes,
             driver,
             None,
             None,
@@ -358,6 +364,7 @@ impl ComputeRuntime {
     ) -> Result<Self, ComputeError> {
         let driver: SharedComputeDriver = Arc::new(RemoteComputeDriver::new(channel));
         Self::from_driver(
+            ComputeDriverKind::Vm,
             driver,
             None,
             None,
@@ -386,6 +393,7 @@ impl ComputeRuntime {
             .map_err(|err| ComputeError::Message(err.to_string()))?;
         let driver: SharedComputeDriver = Arc::new(PodmanDriverService::new(driver));
         Self::from_driver(
+            ComputeDriverKind::Podman,
             driver,
             None,
             None,
@@ -404,6 +412,11 @@ impl ComputeRuntime {
     #[must_use]
     pub fn default_image(&self) -> &str {
         &self.default_image
+    }
+
+    #[must_use]
+    pub fn driver_kind(&self) -> Option<ComputeDriverKind> {
+        self.driver_kind
     }
 
     #[must_use]
@@ -1630,11 +1643,16 @@ fn rewrite_user_facing_conditions(status: &mut Option<SandboxStatus>, spec: Opti
 /// Phases for which a sandbox should have a running compute resource.
 /// `Deleting` and `Error` are intentionally excluded: deletion is in
 /// progress, or the sandbox has already failed and should not be
-/// silently revived.
+/// silently revived. `Unspecified` is included because it is the proto
+/// default value; persisted rows with that value should be reconciled
+/// from the live driver state rather than skipped forever.
 fn sandbox_phase_should_be_running(phase: SandboxPhase) -> bool {
     matches!(
         phase,
-        SandboxPhase::Provisioning | SandboxPhase::Ready | SandboxPhase::Unknown
+        SandboxPhase::Unspecified
+            | SandboxPhase::Provisioning
+            | SandboxPhase::Ready
+            | SandboxPhase::Unknown
     )
 }
 
@@ -1671,8 +1689,6 @@ impl ComputeDriver for NoopTestDriver {
                 driver_name: "noop-test-driver".to_string(),
                 driver_version: "test".to_string(),
                 default_image: "openshell/sandbox:test".to_string(),
-                supports_gpu: false,
-                gpu_count: 0,
             },
         ))
     }
@@ -1751,6 +1767,7 @@ impl ComputeDriver for NoopTestDriver {
 pub async fn new_test_runtime(store: Arc<Store>) -> ComputeRuntime {
     ComputeRuntime {
         driver: Arc::new(NoopTestDriver),
+        driver_kind: None,
         shutdown_cleanup: None,
         startup_resume: None,
         _driver_process: None,
@@ -1820,8 +1837,6 @@ mod tests {
                 driver_name: "test-driver".to_string(),
                 driver_version: "test".to_string(),
                 default_image: "openshell/sandbox:test".to_string(),
-                supports_gpu: true,
-                gpu_count: 0,
             }))
         }
 
@@ -1918,6 +1933,7 @@ mod tests {
         let store = Arc::new(Store::connect("sqlite::memory:").await.unwrap());
         ComputeRuntime {
             driver,
+            driver_kind: None,
             shutdown_cleanup: None,
             startup_resume,
             _driver_process: None,
@@ -2788,6 +2804,7 @@ mod tests {
             test_runtime_with_resume(Arc::new(TestDriver::default()), Some(resume.clone())).await;
 
         for (id, name, phase) in [
+            ("sb-unspecified", "unspecified", SandboxPhase::Unspecified),
             ("sb-prov", "prov", SandboxPhase::Provisioning),
             ("sb-ready", "ready", SandboxPhase::Ready),
             ("sb-unknown", "unknown", SandboxPhase::Unknown),
@@ -2813,6 +2830,7 @@ mod tests {
                 "sb-prov".to_string(),
                 "sb-ready".to_string(),
                 "sb-unknown".to_string(),
+                "sb-unspecified".to_string(),
             ]
         );
     }

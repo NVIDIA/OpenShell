@@ -216,16 +216,23 @@ impl SandboxGuard {
         upload_dest: &str,
         command: &[&str],
     ) -> Result<Self, String> {
-        let upload_spec = format!("{upload_local}:{upload_dest}");
+        Self::create_with_uploads(&[(upload_local, upload_dest)], command).await
+    }
 
+    /// Create a sandbox with multiple `--upload` specs.
+    ///
+    /// Each element of `uploads` is a `(local_path, sandbox_dest)` pair.
+    /// `--no-git-ignore` is applied to all uploads.
+    pub async fn create_with_uploads(
+        uploads: &[(&str, &str)],
+        command: &[&str],
+    ) -> Result<Self, String> {
         let mut cmd = openshell_cmd();
-        cmd.arg("sandbox")
-            .arg("create")
-            .arg("--upload")
-            .arg(&upload_spec)
-            .arg("--no-git-ignore")
-            .arg("--")
-            .args(command);
+        cmd.arg("sandbox").arg("create");
+        for (local, dest) in uploads {
+            cmd.arg("--upload").arg(format!("{local}:{dest}"));
+        }
+        cmd.arg("--no-git-ignore").arg("--").args(command);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         let output = timeout(SANDBOX_READY_TIMEOUT, cmd.output())

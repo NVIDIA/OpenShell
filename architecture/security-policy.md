@@ -21,6 +21,13 @@ For the field-by-field YAML reference, use
 Filesystem and process policy are startup-time controls. Network policy is
 dynamic and can be hot-reloaded when the new policy validates successfully.
 
+Before applying Landlock, the supervisor enriches baseline filesystem paths that
+the runtime needs. Missing baseline paths are skipped so one absent runtime path
+does not weaken the whole ruleset. When GPU devices are present, GPU baseline
+enrichment adds existing GPU device nodes as read-write paths and promotes
+`/proc` to read-write because CUDA workloads write thread metadata under
+`/proc/<pid>/task/<tid>/comm`.
+
 ## Network Decisions
 
 Ordinary network traffic follows this order:
@@ -74,9 +81,12 @@ protocols remain raw passthrough.
 
 ## Live Updates
 
-The gateway stores policy revisions and exposes effective sandbox configuration.
-The supervisor polls for config revisions and attempts to load new dynamic
-policy into the in-process OPA engine.
+The gateway stores sandbox-authored policy revisions separately from derived
+effective sandbox configuration. Effective configuration can include
+gateway-global policy overrides and provider-profile policy layers. The
+supervisor polls for config revisions and attempts to load new dynamic policy
+into the in-process OPA engine; CLI reads of the latest sandbox policy use the
+same effective configuration path.
 
 If a new policy fails validation or loading, the supervisor reports the failure
 and keeps the last-known-good policy. Static controls, such as filesystem

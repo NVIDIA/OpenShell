@@ -283,6 +283,10 @@ fn build_env(
         openshell_core::sandbox_env::SANDBOX_COMMAND.into(),
         "sleep infinity".into(),
     );
+    env.insert(
+        openshell_core::sandbox_env::TELEMETRY_ENABLED.into(),
+        openshell_core::telemetry::enabled_env_value().into(),
+    );
 
     // 3. TLS client cert paths (when mTLS is enabled). These point to
     //    the container-side mount paths where the cert files are
@@ -692,6 +696,9 @@ fn parse_memory_to_bytes(quantity: &str) -> Option<u64> {
 mod tests {
     use super::*;
 
+    static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
     #[test]
     fn parse_cpu_millicore() {
         assert_eq!(parse_cpu_to_microseconds("500m"), Some(50_000));
@@ -975,6 +982,41 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("/run/openshell/test-ssh.sock"),
             "OPENSHELL_SSH_SOCKET_PATH must not be overridden by user env"
+        );
+    }
+
+    #[test]
+    fn container_spec_telemetry_toggle_comes_from_driver_env() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        temp_env::with_vars(
+            [(
+                openshell_core::sandbox_env::TELEMETRY_ENABLED,
+                Some("false"),
+            )],
+            || {
+                let mut sandbox = test_sandbox("test-id", "legit-name");
+                sandbox.spec = Some(DriverSandboxSpec {
+                    environment: std::collections::HashMap::from([(
+                        openshell_core::sandbox_env::TELEMETRY_ENABLED.to_string(),
+                        "true".to_string(),
+                    )]),
+                    template: Some(DriverSandboxTemplate::default()),
+                    ..Default::default()
+                });
+
+                let spec = build_container_spec(&sandbox, &test_config());
+                let env_map = spec["env"].as_object().expect("env should be an object");
+
+                assert_eq!(
+                    env_map
+                        .get(openshell_core::sandbox_env::TELEMETRY_ENABLED)
+                        .and_then(|v| v.as_str()),
+                    Some("false"),
+                    "telemetry toggle must come from the deployment environment"
+                );
+            },
         );
     }
 

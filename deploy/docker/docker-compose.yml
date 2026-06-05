@@ -1,0 +1,133 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# OpenShell gateway — docker-compose setup (Docker compute driver)
+#
+# Prerequisites:
+#   - Docker Desktop (Windows / macOS) or Docker Engine + Compose plugin (Linux)
+#   - The openshell CLI installed on your workstation
+#
+# Quick start:
+#
+#   1. Start the gateway:
+#        docker compose up -d
+#
+#   2. Register the gateway with the CLI (one-time):
+#        openshell gateway add http://localhost:8080 --name openshell-docker
+#
+#   3. Configure an AI provider (example: Anthropic):
+#        ANTHROPIC_API_KEY=sk-ant-... \
+#          openshell provider create --type anthropic --from-existing
+#
+#   4. Create a sandboxed agent — Claude Code or OpenClaw:
+#        openshell sandbox create -- claude
+#        openshell sandbox create --from openclaw
+#
+# Sandbox containers are managed by the gateway, not by this Compose file.
+# Each `openshell sandbox create` call launches a fresh container; the gateway
+# tracks their lifecycle.
+#
+# Configuration:
+#   All gateway and driver settings live in gateway.toml in this directory.
+#   Three values cannot be expressed in the TOML file and remain as env vars:
+#     - OPENSHELL_DB_URL  (explicitly blocked from the config file to prevent
+#                          secrets from being committed to VCS)
+#     - XDG_DATA_HOME / HOME  (OS-level path-resolution vars outside the
+#                               gateway config schema)
+#
+# command: [] note:
+#   The gateway image's default CMD is ["--bind-address", "0.0.0.0", "--port",
+#   "8080"].  CLI flags beat TOML in the merge order, so without clearing the
+#   CMD the TOML's bind_address = "127.0.0.1:8080" is silently ignored and the
+#   gateway binds 0.0.0.0.  Setting command: [] lets the TOML file own all
+#   gateway settings.
+#
+# Data directory note:
+#   /var/lib/openshell is bind-mounted at the SAME absolute path in both the
+#   host and the container.  This is required so that the supervisor binary
+#   extracted from the supervisor image can be passed to Docker as a host-side
+#   bind-mount source when sandbox containers are created.  Named volumes
+#   cannot be used here because Docker resolves bind-mount sources against the
+#   host filesystem, not the container filesystem.
+#
+# Linux note:
+#   host.docker.internal and host.openshell.internal are not automatically
+#   added on Linux Docker.  Add the following under the gateway service:
+#     extra_hosts:
+#       - "host.docker.internal:host-gateway"
+#       - "host.openshell.internal:host-gateway"
+
+services:
+  gateway:
+    image: ghcr.io/nvidia/openshell/gateway:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+
+    # Clear the default CMD so gateway.toml owns all settings (see note above).
+    command: []
+
+    # This setup is Docker-outside-of-Docker (DooD), not Docker-in-Docker (DinD).
+    # The gateway uses the host's Docker socket to create sibling containers on the
+    # host, rather than running a nested Docker daemon.  DooD does NOT require
+    # --privileged; it only needs read/write access to /var/run/docker.sock.
+    #
+    # Run as UID 0 so the gateway can:
+    #   - write the extracted supervisor binary to /var/lib/openshell
+    #   - access /var/run/docker.sock (typically owned by root or the docker group)
+    # Distroless images have no /etc/passwd, so the numeric UID must be used.
+    # This is appropriate for local development.  Production deployments
+    # should use a dedicated non-root UID with explicit docker-group membership.
+    user: "0"
+
+    ports:
+      # gRPC / control-plane API  (used by the openshell CLI and sandbox callbacks)
+      # The Docker driver injects host.openshell.internal:<gateway-port> into sandbox
+      # containers as the callback endpoint.  The gateway's internal port is 8080, so
+      # host port 8080 must be published at the same number so that
+      # host.openshell.internal:8080 routes to the gateway container.
+      # gateway.toml binds to 127.0.0.1 — the Docker driver adds the bridge listener
+      # automatically so sandbox containers can reach the gateway without 0.0.0.0.
+      - "127.0.0.1:${OPENSHELL_PORT:-8080}:8080"
+      # Health endpoint  (GET /healthz, GET /readyz)
+      - "127.0.0.1:${OPENSHELL_HEALTH_PORT:-8081}:8081"
+
+    volumes:
+      # Docker socket — lets the gateway create and manage sandbox containers.
+      - /var/run/docker.sock:/var/run/docker.sock
+
+      # Data directory — must be a bind-mount with source == target so that
+      # paths written inside the container are resolvable by Docker when it
+      # creates sandbox containers (see note above).
+      # /var/lib/openshell is intentionally not namespaced to a sub-path
+      # (e.g. /var/lib/openshell/gateway): the path must match exactly on
+      # both the host and inside the container, and a single gateway per host
+      # is the expected topology.
+      - type: bind
+        source: /var/lib/openshell
+        target: /var/lib/openshell
+        bind:
+          create_host_path: true
+
+      # TOML config — all gateway and driver settings live here.
+      # Docker Compose resolves ./ relative to the directory that contains this
+      # docker-compose.yml file (deploy/docker/), not the CWD of the caller.
+      - type: bind
+        source: ./gateway.toml
+        target: /etc/openshell/gateway.toml
+        read_only: true
+
+    environment:
+      # Point the gateway at the TOML config file mounted above.
+      OPENSHELL_GATEWAY_CONFIG: /etc/openshell/gateway.toml
+
+      # Database URL cannot be set in the TOML config file — it is explicitly
+      # blocked there to prevent credential-bearing URLs (e.g. postgresql://user:pass@host/db)
+      # from being committed to VCS.  A plain SQLite path contains no credentials, so it
+      # is safe to include here.  Swap this for a real DSN via an env file or secret if
+      # you switch to an external database.
+      OPENSHELL_DB_URL: "sqlite:/var/lib/openshell/gateway.db?mode=rwc"
+
+      # XDG path variables are OS-level; they are not part of the gateway config
+      # schema.  Setting them ensures the extracted supervisor binary lands in the
+      # bind-mounted directory so its path is resolvable by the host Docker daemon.
+      XDG_DATA_HOME: /var/lib/openshell
+      HOME: /var/lib/openshell

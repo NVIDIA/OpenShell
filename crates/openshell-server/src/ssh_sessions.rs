@@ -5,6 +5,7 @@
 
 use openshell_core::ObjectId;
 use openshell_core::proto::SshSession;
+use openshell_core::time::now_ms;
 use prost::Message;
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,7 +34,7 @@ pub fn spawn_session_reaper(store: Arc<Store>, interval: Duration) {
 }
 
 async fn reap_expired_sessions(store: &Store) -> Result<(), String> {
-    let now_ms = unix_epoch_millis();
+    let now_ms = now_ms();
 
     let records = store
         .list(SshSession::object_type(), 1000, 0)
@@ -68,25 +69,13 @@ async fn reap_expired_sessions(store: &Store) -> Result<(), String> {
     Ok(())
 }
 
-fn unix_epoch_millis() -> i64 {
-    i64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis(),
-    )
-    .unwrap_or(i64::MAX)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
 
     async fn test_store() -> Store {
-        Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .expect("in-memory SQLite store should connect")
+        crate::persistence::test_store().await
     }
 
     fn make_session(id: &str, sandbox_id: &str, expires_at_ms: i64, revoked: bool) -> SshSession {
@@ -103,10 +92,6 @@ mod tests {
             expires_at_ms,
             revoked,
         }
-    }
-
-    fn now_ms() -> i64 {
-        unix_epoch_millis()
     }
 
     #[tokio::test]

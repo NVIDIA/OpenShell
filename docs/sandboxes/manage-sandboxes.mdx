@@ -309,7 +309,12 @@ The CLI only allows sandbox-side sources that resolve inside the writable worksp
 
 <Note>
 You can also upload files at creation time with the `--upload` flag on
-`openshell sandbox create`.
+`openshell sandbox create`. Pass `--upload` multiple times to upload
+several paths in a single command:
+
+```shell
+openshell sandbox create --upload ./src:/workspace/src --upload ./config:/workspace/config -- claude
+```
 
 </Note>
 

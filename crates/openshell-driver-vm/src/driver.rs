@@ -26,7 +26,7 @@ use oci_client::secrets::RegistryAuth;
 use oci_client::{Reference, RegistryOperation};
 use openshell_core::progress::{
     PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX, PROGRESS_STEP_STARTING_SANDBOX,
-    mark_progress_active, mark_progress_complete, mark_progress_detail,
+    format_bytes, mark_progress_active, mark_progress_complete, mark_progress_detail,
 };
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
@@ -373,17 +373,10 @@ impl VmDriver {
 
     #[must_use]
     pub fn capabilities(&self) -> GetCapabilitiesResponse {
-        let gpu_count = self
-            .gpu_inventory
-            .as_ref()
-            .and_then(|inv| inv.lock().ok())
-            .map_or(0, |inv| inv.gpu_count());
         GetCapabilitiesResponse {
             driver_name: DRIVER_NAME.to_string(),
             driver_version: openshell_core::VERSION.to_string(),
             default_image: self.config.default_image.clone(),
-            supports_gpu: self.gpu_inventory.is_some(),
-            gpu_count,
         }
     }
 
@@ -3506,6 +3499,10 @@ fn build_guest_environment(
         ]));
     }
     environment.extend(merged_environment(sandbox));
+    environment.insert(
+        openshell_core::sandbox_env::TELEMETRY_ENABLED.to_string(),
+        openshell_core::telemetry::enabled_env_value().to_string(),
+    );
     environment.remove(openshell_core::sandbox_env::SANDBOX_TOKEN);
     environment.remove(openshell_core::sandbox_env::SANDBOX_TOKEN_FILE);
     if sandbox
@@ -4406,24 +4403,6 @@ fn pulling_layer_detail(metadata: &HashMap<String, String>) -> Option<String> {
     ))
 }
 
-fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = 1024 * KB;
-    const GB: u64 = 1024 * MB;
-
-    if bytes >= GB {
-        #[allow(clippy::cast_precision_loss)]
-        let gb = bytes as f64 / GB as f64;
-        format!("{gb:.1} GB")
-    } else if bytes >= MB {
-        format!("{} MB", bytes / MB)
-    } else if bytes >= KB {
-        format!("{} KB", bytes / KB)
-    } else {
-        format!("{bytes} B")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4441,6 +4420,9 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tonic::Code;
+
+    static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
     #[test]
     fn vm_pulling_layer_event_adds_progress_detail_metadata() {
@@ -5044,6 +5026,52 @@ mod tests {
             "{}={GUEST_SANDBOX_TOKEN_PATH}",
             openshell_core::sandbox_env::SANDBOX_TOKEN_FILE
         )));
+    }
+
+    #[test]
+    fn build_guest_environment_uses_deployment_telemetry_toggle() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        temp_env::with_vars(
+            [(
+                openshell_core::sandbox_env::TELEMETRY_ENABLED,
+                Some("false"),
+            )],
+            || {
+                let config = VmDriverConfig {
+                    openshell_endpoint: "http://127.0.0.1:8080".to_string(),
+                    ..Default::default()
+                };
+                let sandbox = Sandbox {
+                    id: "sandbox-123".to_string(),
+                    name: "sandbox-123".to_string(),
+                    spec: Some(SandboxSpec {
+                        environment: HashMap::from([(
+                            openshell_core::sandbox_env::TELEMETRY_ENABLED.to_string(),
+                            "true".to_string(),
+                        )]),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+
+                let env = build_guest_environment(&sandbox, &config, None);
+                let telemetry_entries = env
+                    .iter()
+                    .filter(|entry| {
+                        entry.starts_with(&format!(
+                            "{}=",
+                            openshell_core::sandbox_env::TELEMETRY_ENABLED
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+
+                assert_eq!(telemetry_entries.len(), 1);
+                assert_eq!(
+                    telemetry_entries[0],
+                    &format!("{}=false", openshell_core::sandbox_env::TELEMETRY_ENABLED)
+                );
+            },
+        );
     }
 
     #[test]

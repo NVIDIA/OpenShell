@@ -37,12 +37,6 @@ health, metrics, or tunnel routes. The plaintext service router also rejects
 browser requests whose Fetch Metadata, Origin, or Referer headers indicate a
 cross-origin or sibling-subdomain request.
 
-Dedicated health listeners expose `/healthz` (process liveness only) and
-`/readyz` (dependency-aware readiness). Readiness reflects the latest result
-of an in-process background task that pings the persistence layer on a
-fixed cadence; the handler reads a cached state, so responses are
-sub-millisecond and never race the kubelet probe timeout.
-
 Supported auth modes:
 
 | Mode | Use |
@@ -66,8 +60,11 @@ checks the returned pod binding against the live pod UID, and verifies the pod's
 controlling `Sandbox` ownerReference against the live Sandbox CR UID and
 sandbox-id label before minting the gateway JWT. Supervisors renew gateway JWTs
 in memory before expiry only while the sandbox record still exists. Older tokens
-are not server-revoked; deployments bound replay exposure with short
-`gateway_jwt.ttl_secs` lifetimes.
+are not server-revoked; shared deployments bound replay exposure with short
+`gateway_jwt.ttl_secs` lifetimes. The config default is
+`gateway_jwt.ttl_secs = 0` for local single-player Docker, Podman, and VM
+gateways; those tokens carry `exp = 0` and do not expire. Kubernetes and other
+shared deployments should set a positive TTL.
 
 Gateway JWT signing-key rotation is currently an offline operator action. The
 runtime loads one active signing key and one matching public verification key
@@ -151,8 +148,12 @@ not readable by other local users on shared hosts. The same restriction is
 reapplied to the `<db>-wal` and `<db>-shm` sidecars (created by SQLite's
 default WAL journal mode), which mirror the same sensitive contents.
 
-Persisted state includes sandboxes, providers, SSH sessions, policy revisions,
-settings, inference configuration, and deployment records.
+Persisted state includes sandboxes, providers, provider credential refresh
+state, SSH sessions, policy revisions, settings, inference configuration, and
+deployment records. Provider refresh material is stored as a separate object
+scoped to the provider instance through `objects.scope`; the provider record
+keeps only the current injectable credential values and optional per-credential
+expiry timestamps.
 
 ### Optimistic Concurrency (CAS)
 
@@ -245,6 +246,75 @@ config path. A gateway-global policy can override sandbox-scoped policy. The
 sandbox supervisor polls for config revisions and hot-reloads dynamic policy
 when the policy engine accepts the update.
 
+Provider credential expiry is enforced during gateway-to-sandbox credential
+resolution and again by the sandbox placeholder resolver. This keeps expired
+credentials from resolving even when a running sandbox still has retained
+placeholder generations from an earlier provider credential snapshot.
+
+## Inference Resolution
+
+Cluster inference routes store only `provider_name`, `model_id`, and optional
+timeout. The gateway resolves endpoint URLs, protocols, credentials, auth
+style, and route-shaping metadata from the provider record when supervisors call
+`GetInferenceBundle`. Supported provider types for cluster inference are
+`openai`, `anthropic`, `nvidia`, and `google-vertex-ai`.
+
+The bundle carries enough information for sandbox-local routers to construct
+upstream URLs without re-deriving provider-specific routing logic. Each resolved
+route may include:
+
+| Field | Meaning |
+|---|---|
+| `model_in_path` | When true, the model identifier is part of the upstream URL path, not only the request body. |
+| `request_path_override` | Path override or suffix. With `model_in_path=false`, replaces the protocol-derived path; with `model_in_path=true`, appended after the model ID. |
+
+For standard providers these fields stay unset and the sandbox router uses default
+protocol paths. Vertex AI is model-aware: the gateway constructs the base URL
+from provider config (`VERTEX_AI_PROJECT_ID`, `VERTEX_AI_REGION`, optional
+`VERTEX_AI_PUBLISHER`) and emits route-shaping metadata so the sandbox router
+stays provider-agnostic.
+
+Host selection follows the configured region:
+
+| Region value | Vertex host |
+|---|---|
+| `global` | `aiplatform.googleapis.com` |
+| `us` or `eu` | `aiplatform.{region}.rep.googleapis.com` |
+| Any other (e.g. `us-central1`) | `{region}-aiplatform.googleapis.com` |
+
+Route shaping by publisher:
+
+- **Anthropic (Claude)** — `model_in_path=true`, base path under
+  `publishers/anthropic/models`, protocol `anthropic_messages` only. The gateway
+  resolves `request_path_override=:rawPredict`; the sandbox router keeps
+  `:rawPredict` for buffered requests and upgrades to `:streamRawPredict` only
+  for streaming proxy calls.
+- **All other models** (Gemini, third-party, unknown) — OpenAI-compatible
+  `.../endpoints/openapi` base with `request_path_override=/chat/completions`;
+  protocol `openai_chat_completions`.
+
+Callers may supply `GOOGLE_VERTEX_AI_BASE_URL` or `VERTEX_AI_BASE_URL` only for
+non-Anthropic routes. Anthropic base URL overrides are rejected because they
+cannot safely preserve model-path shaping and `anthropic_version` body
+adaptation. Overrides still pin `request_path_override=/chat/completions` and
+must use `https` with an official Vertex AI hostname (`aiplatform.googleapis.com`,
+`aiplatform.{us,eu}.rep.googleapis.com`, or `{region}-aiplatform.googleapis.com`).
+
+Header passthrough is protocol-dependent. Vertex Claude rawPredict routes strip
+client `anthropic-beta` headers; `anthropic-version` is not forwarded because
+the sandbox router injects `anthropic_version` into the request body for Vertex
+rawPredict. Non-Anthropic Vertex routes do not inherit Anthropic passthrough
+headers.
+
+For `google-vertex-ai` providers created with CLI `--from-gcloud-adc`, the CLI
+calls gateway `ConfigureProviderRefresh` with OAuth2 refresh material from gcloud
+ADC, then `RotateProviderCredential` to mint the first access token before
+reporting success. ADC-backed providers mint into `GOOGLE_VERTEX_AI_TOKEN`. A
+successful create therefore yields an immediately usable provider; failures roll
+back the provider record. Service-account JSON and private keys are gateway-side
+refresh bootstrap material only; sandbox runtime inference receives minted
+access tokens, not raw service-account material.
+
 ## Supervisor Relay
 
 Sandbox workloads maintain an outbound supervisor session to the gateway. This
@@ -296,29 +366,39 @@ requested for that relay.
 
 ## PKI Bootstrap
 
-`openshell-gateway generate-certs` is the one place mTLS materials are
-created. Both deployment paths use it:
+`openshell-gateway generate-certs` is the one place local mTLS materials and
+sandbox JWT signing material are created. Deployment paths use it as follows:
 
 | Output mode | Selector | Layout |
 |---|---|---|
-| Kubernetes Secrets | (default) `--namespace`, `--server-secret-name`, `--client-secret-name` | Two `kubernetes.io/tls` Secrets with `tls.crt` / `tls.key` / `ca.crt`. |
-| Filesystem | `--output-dir <DIR>` | `<dir>/{ca.crt, ca.key, server/tls.{crt,key}, client/tls.{crt,key}}`. Also copies client materials to `$XDG_CONFIG_HOME/openshell/gateways/openshell/mtls/` for CLI auto-discovery. |
+| Kubernetes Secrets | (default) `--namespace`, `--server-secret-name`, `--client-secret-name`, `--jwt-secret-name` | Two `kubernetes.io/tls` Secrets with `tls.crt` / `tls.key` / `ca.crt` plus one Opaque sandbox JWT Secret with `signing.pem` / `public.pem` / `kid`. |
+| Kubernetes JWT-only Secret | `--namespace`, `--jwt-only`, `--jwt-secret-name` | One Opaque sandbox JWT Secret with `signing.pem` / `public.pem` / `kid`. |
+| Filesystem | `--output-dir <DIR>` | `<dir>/{ca.crt, ca.key, server/tls.{crt,key}, client/tls.{crt,key}, jwt/{signing.pem,public.pem,kid}}`. Also copies client materials to `$XDG_CONFIG_HOME/openshell/gateways/openshell/mtls/` for CLI auto-discovery. |
 
 On Kubernetes, the Helm chart runs the command via a pre-install/pre-upgrade
 hook Job using the gateway image itself -- no separate cert-generation image,
-no extra mirror burden in air-gapped environments. On the RPM gateway, the
-same command runs from the systemd unit's `ExecStartPre` to bootstrap PKI
-into the user's state directory on first start.
+no extra mirror burden in air-gapped environments. In the default built-in PKI
+path the hook creates TLS and sandbox JWT Secrets. When cert-manager is enabled,
+cert-manager owns TLS Secrets and the hook runs with `--jwt-only` so the
+required sandbox JWT Secret still exists before the gateway StatefulSet mounts
+it, even if `pkiInitJob.enabled` remains true. On package-managed local
+gateways, the same command runs from the systemd
+unit's `ExecStartPre` to bootstrap PKI into the configured local TLS directory
+on first start. The Linux package unit defaults that directory to
+`~/.local/state/openshell/tls` through `OPENSHELL_LOCAL_TLS_DIR` so certificate
+generation and runtime auto-detection use the same path across systemd
+versions.
 
-Both modes share the same idempotency contract: all targets present -> skip;
-partial state -> fail with a recovery hint; nothing present -> generate and
-write. This guards mTLS continuity across restarts and upgrades while still
-recovering cleanly if an operator deletes everything and starts over.
+The bootstrap paths share the same idempotency contract: all requested targets
+present -> skip; partial requested state -> fail with a recovery hint; nothing
+requested present -> generate and write. This guards continuity across restarts
+and upgrades while still recovering cleanly if an operator deletes everything
+and starts over.
 
-Operators who manage PKI externally (cert-manager, an enterprise CA, or
-pre-created Secrets) disable the Helm hook via `pkiInitJob.enabled=false`.
-The chart also ships a `certManager.*` path that produces equivalent Secrets
-through cert-manager `Issuer`/`Certificate` resources.
+Operators who manage TLS PKI with cert-manager enable `certManager.enabled`;
+cert-manager takes precedence over built-in TLS generation and the chart still
+renders the JWT-only hook. Operators who pre-create all TLS and JWT Secrets can
+disable both `pkiInitJob.enabled` and `certManager.enabled`.
 
 ## Configuration
 

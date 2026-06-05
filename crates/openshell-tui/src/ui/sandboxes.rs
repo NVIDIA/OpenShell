@@ -4,7 +4,7 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Padding, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Borders, Cell, Padding, Row, Table};
 
 use crate::app::App;
 
@@ -102,13 +102,6 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
     frame.render_widget(table, area);
 
     if app.sandbox_count == 0 {
-        let inner = Rect {
-            x: area.x + 2,
-            y: area.y + 2,
-            width: area.width.saturating_sub(4),
-            height: area.height.saturating_sub(3),
-        };
-        let msg = Paragraph::new(Span::styled(" No sandboxes. Press [c] to create.", t.muted));
-        frame.render_widget(msg, inner);
+        super::draw_empty_message(frame, area, " No sandboxes. Press [c] to create.", t.muted);
     }
 }

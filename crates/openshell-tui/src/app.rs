@@ -377,9 +377,103 @@ pub struct CreateProviderForm {
 
 pub struct ProviderDetailView {
     pub name: String,
+    pub provider_id: String,
     pub provider_type: String,
-    pub credential_key: String,
-    pub masked_value: String,
+    pub resource_version: u64,
+    pub summary_scroll: usize,
+    pub show_raw_profile: bool,
+    pub show_raw_provider: bool,
+    pub raw_profile_scroll: usize,
+    pub raw_provider_scroll: usize,
+    pub raw_profile_yaml: Option<String>,
+    pub raw_provider_yaml: String,
+    pub profile_name: Option<String>,
+    pub profile_category: Option<String>,
+    pub profile_description: Option<String>,
+    pub credential_lines: Vec<String>,
+    pub config_lines: Vec<String>,
+    pub policy_lines: Vec<String>,
+    pub discovery_lines: Vec<String>,
+    pub refresh_lines: Vec<String>,
+}
+
+#[derive(Clone)]
+pub struct ProviderV2Entry {
+    pub provider: openshell_core::proto::Provider,
+    pub profile: Option<openshell_core::proto::ProviderProfile>,
+}
+
+impl ProviderV2Entry {
+    pub fn name(&self) -> &str {
+        provider_name(&self.provider)
+    }
+
+    pub fn profile_label(&self) -> String {
+        self.profile.as_ref().map_or_else(
+            || format!("{} (unprofiled)", self.provider.r#type),
+            |profile| {
+                if profile.display_name.is_empty() {
+                    profile.id.clone()
+                } else {
+                    profile.display_name.clone()
+                }
+            },
+        )
+    }
+
+    pub fn category_label(&self) -> &'static str {
+        self.profile.as_ref().map_or("legacy", |profile| {
+            provider_category_label(profile.category)
+        })
+    }
+
+    pub fn credential_summary(&self) -> String {
+        let stored = self.provider.credentials.len();
+        self.profile.as_ref().map_or_else(
+            || format!("{stored} key{}", plural(stored)),
+            |profile| {
+                let required = profile
+                    .credentials
+                    .iter()
+                    .filter(|credential| credential.required)
+                    .count();
+                let required_present = profile
+                    .credentials
+                    .iter()
+                    .filter(|credential| credential.required)
+                    .filter(|credential| {
+                        credential
+                            .env_vars
+                            .iter()
+                            .any(|key| self.provider.credentials.contains_key(key))
+                    })
+                    .count();
+                format!(
+                    "{required_present}/{required} req, {stored} key{}",
+                    plural(stored)
+                )
+            },
+        )
+    }
+
+    pub fn policy_summary(&self) -> String {
+        self.profile.as_ref().map_or_else(
+            || "no profile".to_string(),
+            |profile| {
+                let endpoints = profile.endpoints.len();
+                let binaries = profile.binaries.len();
+                let mut summary = format!(
+                    "{endpoints} endpoint{}, {binaries} bin{}",
+                    plural(endpoints),
+                    plural(binaries)
+                );
+                if profile.inference_capable {
+                    summary.push_str(", inference");
+                }
+                summary
+            },
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -424,6 +518,8 @@ pub struct App {
     pub pending_gateway_switch: Option<String>,
 
     // Provider list
+    pub providers_v2_enabled: bool,
+    pub provider_entries: Vec<ProviderV2Entry>,
     pub provider_names: Vec<String>,
     pub provider_types: Vec<String>,
     pub provider_cred_keys: Vec<String>,
@@ -495,6 +591,8 @@ pub struct App {
     pub sandbox_providers_list: Vec<String>,
     pub policy_lines: Vec<ratatui::text::Line<'static>>,
     pub policy_scroll: usize,
+    /// Visible line count in the policy pane, set during draw for PageUp/PageDown.
+    pub policy_viewport_height: usize,
 
     // Create sandbox modal
     pub create_form: Option<CreateSandboxForm>,
@@ -579,6 +677,163 @@ pub fn format_labels(labels: &HashMap<String, String>) -> String {
         .join(",")
 }
 
+pub fn provider_name(provider: &openshell_core::proto::Provider) -> &str {
+    provider
+        .metadata
+        .as_ref()
+        .map_or("", |metadata| metadata.name.as_str())
+}
+
+fn provider_id(provider: &openshell_core::proto::Provider) -> &str {
+    provider
+        .metadata
+        .as_ref()
+        .map_or("", |metadata| metadata.id.as_str())
+}
+
+fn provider_resource_version(provider: &openshell_core::proto::Provider) -> u64 {
+    provider
+        .metadata
+        .as_ref()
+        .map_or(0, |metadata| metadata.resource_version)
+}
+
+pub fn provider_category_label(category: i32) -> &'static str {
+    match openshell_core::proto::ProviderProfileCategory::try_from(category)
+        .unwrap_or(openshell_core::proto::ProviderProfileCategory::Other)
+    {
+        openshell_core::proto::ProviderProfileCategory::Inference => "inference",
+        openshell_core::proto::ProviderProfileCategory::Agent => "agent",
+        openshell_core::proto::ProviderProfileCategory::SourceControl => "source_control",
+        openshell_core::proto::ProviderProfileCategory::Messaging => "messaging",
+        openshell_core::proto::ProviderProfileCategory::Data => "data",
+        openshell_core::proto::ProviderProfileCategory::Knowledge => "knowledge",
+        openshell_core::proto::ProviderProfileCategory::Other
+        | openshell_core::proto::ProviderProfileCategory::Unspecified => "other",
+    }
+}
+
+fn plural(count: usize) -> &'static str {
+    if count == 1 { "" } else { "s" }
+}
+
+fn refresh_strategy_label(strategy: i32) -> &'static str {
+    match openshell_core::proto::ProviderCredentialRefreshStrategy::try_from(strategy)
+        .unwrap_or(openshell_core::proto::ProviderCredentialRefreshStrategy::Unspecified)
+    {
+        openshell_core::proto::ProviderCredentialRefreshStrategy::Static => "static",
+        openshell_core::proto::ProviderCredentialRefreshStrategy::External => "external",
+        openshell_core::proto::ProviderCredentialRefreshStrategy::Oauth2RefreshToken => {
+            "oauth2_refresh_token"
+        }
+        openshell_core::proto::ProviderCredentialRefreshStrategy::Oauth2ClientCredentials => {
+            "oauth2_client_credentials"
+        }
+        openshell_core::proto::ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => {
+            "google_service_account_jwt"
+        }
+        openshell_core::proto::ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
+    }
+}
+
+fn mask_secret(value: &str) -> String {
+    let len = value.chars().count();
+    if len <= 4 {
+        "****".to_string()
+    } else {
+        let start: String = value.chars().take(2).collect();
+        let end: String = value.chars().skip(len - 2).collect();
+        format!("{start}{}…{end}", "*".repeat(len.saturating_sub(4).min(20)))
+    }
+}
+
+fn provider_to_redacted_yaml(provider: &openshell_core::proto::Provider) -> String {
+    let mut out = String::new();
+    out.push_str("name: ");
+    out.push_str(&yaml_scalar(provider_name(provider)));
+    out.push('\n');
+    out.push_str("type: ");
+    out.push_str(&yaml_scalar(&provider.r#type));
+    out.push('\n');
+
+    out.push_str("credentials:");
+    if provider.credentials.is_empty() {
+        out.push_str(" {}\n");
+    } else {
+        out.push('\n');
+        let mut keys = provider.credentials.keys().collect::<Vec<_>>();
+        keys.sort();
+        for key in keys {
+            out.push_str("  ");
+            out.push_str(key);
+            out.push_str(": \"<redacted>\"\n");
+        }
+    }
+
+    out.push_str("config:");
+    if provider.config.is_empty() {
+        out.push_str(" {}\n");
+    } else {
+        out.push('\n');
+        let mut entries = provider.config.iter().collect::<Vec<_>>();
+        entries.sort_by_key(|(key, _)| *key);
+        for (key, value) in entries {
+            out.push_str("  ");
+            out.push_str(key);
+            out.push_str(": ");
+            out.push_str(&yaml_scalar(value));
+            out.push('\n');
+        }
+    }
+
+    if !provider.credential_expires_at_ms.is_empty() {
+        out.push_str("credential_expires_at_ms:\n");
+        let mut entries = provider.credential_expires_at_ms.iter().collect::<Vec<_>>();
+        entries.sort_by_key(|(key, _)| *key);
+        for (key, value) in entries {
+            out.push_str("  ");
+            out.push_str(key);
+            out.push_str(": ");
+            out.push_str(&value.to_string());
+            out.push('\n');
+        }
+    }
+
+    if let Some(metadata) = &provider.metadata {
+        out.push_str("metadata:\n");
+        out.push_str("  id: ");
+        out.push_str(&yaml_scalar(&metadata.id));
+        out.push('\n');
+        out.push_str("  resource_version: ");
+        out.push_str(&metadata.resource_version.to_string());
+        out.push('\n');
+        if !metadata.labels.is_empty() {
+            out.push_str("  labels:\n");
+            let mut labels = metadata.labels.iter().collect::<Vec<_>>();
+            labels.sort_by_key(|(key, _)| *key);
+            for (key, value) in labels {
+                out.push_str("    ");
+                out.push_str(key);
+                out.push_str(": ");
+                out.push_str(&yaml_scalar(value));
+                out.push('\n');
+            }
+        }
+    }
+
+    out
+}
+
+fn yaml_scalar(value: &str) -> String {
+    let escaped = value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t");
+    format!("\"{escaped}\"")
+}
+
 impl App {
     #[allow(clippy::large_types_passed_by_value)] // Theme is Copy; one-shot ctor
     pub fn new(
@@ -613,6 +868,8 @@ impl App {
             confirm_setting_delete: None,
             pending_setting_set: false,
             pending_setting_delete: false,
+            providers_v2_enabled: false,
+            provider_entries: Vec::new(),
             provider_names: Vec::new(),
             provider_types: Vec::new(),
             provider_cred_keys: Vec::new(),
@@ -656,6 +913,7 @@ impl App {
             sandbox_providers_list: Vec::new(),
             policy_lines: Vec::new(),
             policy_scroll: 0,
+            policy_viewport_height: 0,
             create_form: None,
             pending_create_sandbox: false,
             pending_forward_ports: Vec::new(),
@@ -696,6 +954,16 @@ impl App {
         revision: u64,
     ) {
         self.global_settings_revision = revision;
+        self.providers_v2_enabled = settings
+            .get(settings::PROVIDERS_V2_ENABLED_KEY)
+            .and_then(|value| value.value.as_ref())
+            .and_then(|value| match value {
+                setting_value::Value::BoolValue(value) => Some(*value),
+                setting_value::Value::StringValue(value) => settings::parse_bool_like(value),
+                setting_value::Value::IntValue(value) => Some(*value != 0),
+                setting_value::Value::BytesValue(_) => None,
+            })
+            .unwrap_or(false);
         self.global_settings = settings::REGISTERED_SETTINGS
             .iter()
             .map(|reg| {
@@ -908,7 +1176,7 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => {
                 self.provider_selected = self.provider_selected.saturating_sub(1);
             }
-            KeyCode::Char('c') => {
+            KeyCode::Char('c') if !self.providers_v2_enabled => {
                 self.open_create_provider_form();
             }
             // Fetch and show provider detail.
@@ -916,10 +1184,10 @@ impl App {
                 self.pending_provider_get = true;
             }
             // Open update form for the selected provider.
-            KeyCode::Char('u') if self.provider_count > 0 => {
+            KeyCode::Char('u') if self.provider_count > 0 && !self.providers_v2_enabled => {
                 self.open_update_provider_form();
             }
-            KeyCode::Char('d') if self.provider_count > 0 => {
+            KeyCode::Char('d') if self.provider_count > 0 && !self.providers_v2_enabled => {
                 self.confirm_provider_delete = true;
             }
             KeyCode::Char('h' | 'l') | KeyCode::Left | KeyCode::Right => {
@@ -1155,9 +1423,21 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => {
                 self.scroll_policy(-1);
             }
+            // Page-scroll by one viewport height.
+            KeyCode::PageDown => {
+                let delta = self.policy_viewport_height.max(1).cast_signed();
+                self.scroll_policy(delta);
+            }
+            KeyCode::PageUp => {
+                let delta = self.policy_viewport_height.max(1).cast_signed();
+                self.scroll_policy(-delta);
+            }
             KeyCode::Char('G') => {
-                // Scroll to bottom.
-                self.policy_scroll = self.policy_lines.len().saturating_sub(1);
+                // Scroll to bottom, keeping a full viewport visible.
+                self.policy_scroll = self
+                    .policy_lines
+                    .len()
+                    .saturating_sub(self.policy_viewport_height.max(1));
             }
             KeyCode::Char('g') => {
                 self.policy_scroll = 0;
@@ -1426,6 +1706,21 @@ impl App {
                     self.draft_scroll -= 1;
                 }
             }
+            // Page-scroll by one viewport height, clamping the cursor to
+            // stay within the visible range.
+            KeyCode::PageDown if total > 0 => {
+                let page = vh.max(1);
+                let max_scroll = total.saturating_sub(vh.min(total));
+                self.draft_scroll = (self.draft_scroll + page).min(max_scroll);
+                let visible = total.saturating_sub(self.draft_scroll).min(vh);
+                self.draft_selected = self.draft_selected.min(visible.saturating_sub(1));
+            }
+            KeyCode::PageUp if total > 0 => {
+                let page = vh.max(1);
+                self.draft_scroll = self.draft_scroll.saturating_sub(page);
+                let visible = total.saturating_sub(self.draft_scroll).min(vh);
+                self.draft_selected = self.draft_selected.min(visible.saturating_sub(1));
+            }
             KeyCode::Char('g') => {
                 self.draft_scroll = 0;
                 self.draft_selected = 0;
@@ -1490,16 +1785,15 @@ impl App {
     }
 
     /// Scroll policy pane by a delta (positive = down, negative = up).
+    ///
+    /// Clamps so at least one viewport of content remains visible.
     pub fn scroll_policy(&mut self, delta: isize) {
-        let max = self.policy_lines.len().saturating_sub(1);
-        if delta < 0 {
-            self.policy_scroll = self.policy_scroll.saturating_sub(delta.unsigned_abs());
-        } else {
-            #[allow(clippy::cast_sign_loss)]
-            {
-                self.policy_scroll = (self.policy_scroll + delta as usize).min(max);
-            }
-        }
+        self.policy_scroll = clamped_scroll(
+            self.policy_scroll,
+            delta,
+            self.policy_lines.len(),
+            self.policy_viewport_height,
+        );
     }
 
     fn handle_logs_key(&mut self, key: KeyEvent) {
@@ -1606,6 +1900,17 @@ impl App {
                 } else if self.sandbox_log_scroll > 0 {
                     self.sandbox_log_scroll -= 1;
                 }
+                self.log_autoscroll = false;
+            }
+            // Page-scroll by one viewport height.
+            KeyCode::PageDown => {
+                let delta = vh.max(1).cast_signed();
+                self.scroll_logs(delta);
+                self.log_autoscroll = false;
+            }
+            KeyCode::PageUp => {
+                let delta = vh.max(1).cast_signed();
+                self.scroll_logs(-delta);
                 self.log_autoscroll = false;
             }
             KeyCode::Char('G' | 'f') => {
@@ -2030,9 +2335,49 @@ impl App {
     // ------------------------------------------------------------------
 
     fn handle_provider_detail_key(&mut self, key: KeyEvent) {
+        let Some(detail) = self.provider_detail.as_mut() else {
+            return;
+        };
         match key.code {
+            KeyCode::Esc if detail.show_raw_profile || detail.show_raw_provider => {
+                detail.show_raw_profile = false;
+                detail.show_raw_provider = false;
+            }
             KeyCode::Esc | KeyCode::Enter => {
                 self.provider_detail = None;
+            }
+            KeyCode::Char('y') if detail.raw_profile_yaml.is_some() => {
+                detail.show_raw_profile = !detail.show_raw_profile;
+                detail.show_raw_provider = false;
+                detail.raw_profile_scroll = 0;
+            }
+            KeyCode::Char('o') => {
+                detail.show_raw_provider = !detail.show_raw_provider;
+                detail.show_raw_profile = false;
+                detail.raw_provider_scroll = 0;
+            }
+            KeyCode::Char('j') | KeyCode::Down if detail.show_raw_profile => {
+                let max_scroll = detail
+                    .raw_profile_yaml
+                    .as_ref()
+                    .map_or(0, |raw| raw.lines().count().saturating_sub(1));
+                detail.raw_profile_scroll = (detail.raw_profile_scroll + 1).min(max_scroll);
+            }
+            KeyCode::Char('k') | KeyCode::Up if detail.show_raw_profile => {
+                detail.raw_profile_scroll = detail.raw_profile_scroll.saturating_sub(1);
+            }
+            KeyCode::Char('j') | KeyCode::Down if detail.show_raw_provider => {
+                let max_scroll = detail.raw_provider_yaml.lines().count().saturating_sub(1);
+                detail.raw_provider_scroll = (detail.raw_provider_scroll + 1).min(max_scroll);
+            }
+            KeyCode::Char('k') | KeyCode::Up if detail.show_raw_provider => {
+                detail.raw_provider_scroll = detail.raw_provider_scroll.saturating_sub(1);
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                detail.summary_scroll = detail.summary_scroll.saturating_add(1);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                detail.summary_scroll = detail.summary_scroll.saturating_sub(1);
             }
             _ => {}
         }
@@ -2168,6 +2513,209 @@ impl App {
             .map(String::as_str)
     }
 
+    pub fn provider_detail_from_provider(
+        &self,
+        provider: &openshell_core::proto::Provider,
+    ) -> ProviderDetailView {
+        let profile = self
+            .provider_entries
+            .iter()
+            .find(|entry| provider_name(&entry.provider) == provider_name(provider))
+            .and_then(|entry| entry.profile.as_ref());
+
+        let mut credential_keys = provider.credentials.keys().cloned().collect::<Vec<_>>();
+        credential_keys.sort();
+        let credential_lines = profile.map_or_else(
+            || {
+                if credential_keys.is_empty() {
+                    return vec!["<none>".to_string()];
+                }
+                credential_keys
+                    .iter()
+                    .map(|key| {
+                        let masked = provider
+                            .credentials
+                            .get(key)
+                            .map_or_else(|| "-".to_string(), |value| mask_secret(value));
+                        let expiry = provider
+                            .credential_expires_at_ms
+                            .get(key)
+                            .copied()
+                            .filter(|value| *value > 0)
+                            .map_or_else(String::new, |value| format!(" expires={value}"));
+                        format!("{key}: {masked}{expiry}")
+                    })
+                    .collect()
+            },
+            |profile| {
+                profile
+                    .credentials
+                    .iter()
+                    .map(|credential| {
+                        let present_key = credential
+                            .env_vars
+                            .iter()
+                            .find(|key| provider.credentials.contains_key(*key));
+                        let status = present_key.map_or("missing", |_| "present");
+                        let required = if credential.required {
+                            "required"
+                        } else {
+                            "optional"
+                        };
+                        let env_vars = if credential.env_vars.is_empty() {
+                            "<none>".to_string()
+                        } else {
+                            credential.env_vars.join(", ")
+                        };
+                        let expiry = present_key
+                            .and_then(|key| provider.credential_expires_at_ms.get(key))
+                            .copied()
+                            .filter(|value| *value > 0)
+                            .map_or_else(String::new, |value| format!(" expires={value}"));
+                        format!(
+                            "{} ({required}) env=[{env_vars}] {status}{expiry}",
+                            credential.name
+                        )
+                    })
+                    .collect()
+            },
+        );
+
+        let mut config_lines = provider.config.keys().cloned().collect::<Vec<_>>();
+        config_lines.sort();
+        if config_lines.is_empty() {
+            config_lines.push("<none>".to_string());
+        }
+
+        let policy_lines = profile.map_or_else(
+            || vec!["No provider profile found; no v2 policy metadata.".to_string()],
+            |profile| {
+                let mut lines = profile
+                    .endpoints
+                    .iter()
+                    .map(|endpoint| {
+                        let protocol = if endpoint.protocol.is_empty() {
+                            "l4"
+                        } else {
+                            endpoint.protocol.as_str()
+                        };
+                        let access = if endpoint.access.is_empty() {
+                            if endpoint.rules.is_empty() {
+                                "custom"
+                            } else {
+                                "rules"
+                            }
+                        } else {
+                            endpoint.access.as_str()
+                        };
+                        let path = if endpoint.path.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" path={}", endpoint.path)
+                        };
+                        format!(
+                            "{}:{} {protocol} {access}{path}",
+                            endpoint.host, endpoint.port
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                if lines.is_empty() {
+                    lines.push("No profile endpoints.".to_string());
+                }
+                if !profile.binaries.is_empty() {
+                    lines.push(format!("Binaries: {}", profile.binaries.len()));
+                    lines.extend(
+                        profile
+                            .binaries
+                            .iter()
+                            .take(4)
+                            .map(|binary| format!("  {}", binary.path)),
+                    );
+                    if profile.binaries.len() > 4 {
+                        lines.push(format!("  ... {} more", profile.binaries.len() - 4));
+                    }
+                }
+                lines
+            },
+        );
+
+        let discovery_lines = profile.map_or_else(
+            || vec!["<none>".to_string()],
+            |profile| {
+                if let Some(discovery) = &profile.discovery
+                    && !discovery.credentials.is_empty()
+                {
+                    discovery.credentials.clone()
+                } else {
+                    vec!["<none>".to_string()]
+                }
+            },
+        );
+
+        let refresh_lines = profile.map_or_else(
+            || vec!["No profile refresh metadata.".to_string()],
+            |profile| {
+                let lines = profile
+                    .credentials
+                    .iter()
+                    .filter_map(|credential| {
+                        credential.refresh.as_ref().map(|refresh| {
+                            format!(
+                                "{}: {} scopes=[{}] material={} key{}",
+                                credential.name,
+                                refresh_strategy_label(refresh.strategy),
+                                refresh.scopes.join(", "),
+                                refresh.material.len(),
+                                plural(refresh.material.len())
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                if lines.is_empty() {
+                    vec!["No refresh metadata in profile.".to_string()]
+                } else {
+                    lines
+                }
+            },
+        );
+
+        let raw_profile_yaml = profile.and_then(|profile| {
+            let dto = openshell_providers::ProviderTypeProfile::from_proto(profile);
+            openshell_providers::profile_to_yaml(&dto).ok()
+        });
+
+        ProviderDetailView {
+            name: provider_name(provider).to_string(),
+            provider_id: provider_id(provider).to_string(),
+            provider_type: provider.r#type.clone(),
+            resource_version: provider_resource_version(provider),
+            summary_scroll: 0,
+            show_raw_profile: false,
+            show_raw_provider: false,
+            raw_profile_scroll: 0,
+            raw_provider_scroll: 0,
+            raw_profile_yaml,
+            raw_provider_yaml: provider_to_redacted_yaml(provider),
+            profile_name: profile.map(|profile| {
+                if profile.display_name.is_empty() {
+                    profile.id.clone()
+                } else {
+                    profile.display_name.clone()
+                }
+            }),
+            profile_category: profile
+                .map(|profile| provider_category_label(profile.category).to_string()),
+            profile_description: profile.and_then(|profile| {
+                (!profile.description.is_empty()).then(|| profile.description.clone())
+            }),
+            credential_lines,
+            config_lines,
+            policy_lines,
+            discovery_lines,
+            refresh_lines,
+        }
+    }
+
     pub fn log_autoscroll_offset(&self) -> usize {
         const BOTTOM_PAD: usize = 3;
         let filtered_len = self.filtered_log_lines().len();
@@ -2220,6 +2768,8 @@ impl App {
         self.policy_lines.clear();
         self.policy_scroll = 0;
         // Reset provider state too.
+        self.providers_v2_enabled = false;
+        self.provider_entries.clear();
         self.provider_names.clear();
         self.provider_types.clear();
         self.provider_cred_keys.clear();
@@ -2246,4 +2796,95 @@ fn unique_provider_name(base: &str, existing: &[String]) -> String {
         }
     }
     base.to_string()
+}
+
+/// Compute a new scroll position after applying `delta`, clamped so the last
+/// viewport of content remains visible.
+///
+/// * `current` - current scroll offset
+/// * `delta`   - lines to scroll (positive = down, negative = up)
+/// * `total`   - total number of lines/items
+/// * `viewport` - visible line count (0 before first draw, treated as 1)
+fn clamped_scroll(current: usize, delta: isize, total: usize, viewport: usize) -> usize {
+    let max = total.saturating_sub(viewport.max(1));
+    if delta < 0 {
+        current.saturating_sub(delta.unsigned_abs())
+    } else {
+        #[allow(clippy::cast_sign_loss)]
+        let stepped = current + delta as usize;
+        stepped.min(max)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- clamped_scroll -------------------------------------------------
+
+    #[test]
+    fn scroll_empty_content() {
+        // No lines at all: scroll should stay at 0 regardless of delta.
+        assert_eq!(clamped_scroll(0, 1, 0, 10), 0);
+        assert_eq!(clamped_scroll(0, -1, 0, 10), 0);
+        assert_eq!(clamped_scroll(0, 20, 0, 10), 0);
+    }
+
+    #[test]
+    fn scroll_content_shorter_than_viewport() {
+        // 5 lines in a 10-line viewport: max scroll is 0.
+        assert_eq!(clamped_scroll(0, 1, 5, 10), 0);
+        assert_eq!(clamped_scroll(0, 5, 5, 10), 0);
+    }
+
+    #[test]
+    fn scroll_content_equals_viewport() {
+        // Exactly 10 lines in a 10-line viewport: max scroll is 0.
+        assert_eq!(clamped_scroll(0, 1, 10, 10), 0);
+        assert_eq!(clamped_scroll(0, -1, 10, 10), 0);
+    }
+
+    #[test]
+    fn scroll_down_one() {
+        // 100 lines, viewport 20, start at 0: scroll to 1.
+        assert_eq!(clamped_scroll(0, 1, 100, 20), 1);
+    }
+
+    #[test]
+    fn scroll_page_down() {
+        // 100 lines, viewport 20, start at 0: scroll to 20.
+        assert_eq!(clamped_scroll(0, 20, 100, 20), 20);
+    }
+
+    #[test]
+    fn scroll_page_down_clamps_at_bottom() {
+        // 100 lines, viewport 20: max scroll = 80.
+        assert_eq!(clamped_scroll(75, 20, 100, 20), 80);
+        assert_eq!(clamped_scroll(80, 20, 100, 20), 80);
+    }
+
+    #[test]
+    fn scroll_page_up_from_middle() {
+        assert_eq!(clamped_scroll(40, -20, 100, 20), 20);
+    }
+
+    #[test]
+    fn scroll_page_up_clamps_at_top() {
+        // Scrolling up past 0 saturates to 0.
+        assert_eq!(clamped_scroll(5, -20, 100, 20), 0);
+        assert_eq!(clamped_scroll(0, -1, 100, 20), 0);
+    }
+
+    #[test]
+    fn scroll_viewport_zero_before_first_draw() {
+        // viewport=0 is treated as 1 (the .max(1) fallback).
+        // 100 lines, viewport 0 -> max = 99.
+        assert_eq!(clamped_scroll(0, 1, 100, 0), 1);
+        assert_eq!(clamped_scroll(98, 5, 100, 0), 99);
+    }
+
+    #[test]
+    fn scroll_up_one() {
+        assert_eq!(clamped_scroll(10, -1, 100, 20), 9);
+    }
 }

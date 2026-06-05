@@ -62,6 +62,8 @@ Raw streams are connection-scoped and outside L7 live-reload guarantees. This in
 
 When a sandbox runs in proxy mode (the default), OpenShell automatically adds baseline filesystem paths required for the sandbox child process to function: `/usr`, `/lib`, `/etc`, `/var/log` (read-only) and `/sandbox`, `/tmp` (read-write). Paths like `/app` are included in the baseline set but are only added if they exist in the container image.
 
+For GPU sandboxes, OpenShell also adds existing GPU device nodes as read-write paths. CUDA workloads require write access to procfs for thread metadata, so GPU baseline enrichment moves `/proc` from read-only to read-write when GPU devices are present.
+
 This filtering prevents a missing baseline path from degrading Landlock enforcement. Without it, a single missing path could cause the entire Landlock ruleset to fail, leaving the sandbox with no filesystem restrictions at all.
 
 User-specified paths in your policy YAML are not pre-filtered. If you list a path that does not exist:
@@ -138,11 +140,13 @@ The following steps outline the hot-reload policy update workflow.
 
    `--add-allow` and `--add-deny` target existing `protocol: rest` or `protocol: websocket` endpoints. If you pass multiple update flags in one command, OpenShell applies them as one atomic merge batch and persists at most one new revision.
 
-4. For larger edits, pull the current policy and edit the YAML directly. Strip the metadata header (Version, Hash, Status) before reusing the file.
+4. For larger edits, pull the current effective policy and edit the YAML directly. Before reusing the file, strip the metadata header above the `---` line. If the sandbox has attached Providers v2 providers, remove generated `_provider_*` entries before reapplying the policy; those entries are derived from provider profiles.
 
    ```shell
    openshell policy get <name> --full > current-policy.yaml
    ```
+
+   To inspect a stored sandbox-authored revision instead of the current effective policy, pass `--rev <version>`.
 
 5. Edit the YAML: add or adjust `network_policies` entries, binaries, `access`, or `rules`.
 

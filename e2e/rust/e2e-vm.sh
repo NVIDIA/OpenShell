@@ -219,7 +219,9 @@ signing_key_path = "${JWT_DIR}/signing.pem"
 public_key_path = "${JWT_DIR}/public.pem"
 kid_path = "${JWT_DIR}/kid"
 gateway_id = "${GATEWAY_NAME}"
-ttl_secs = 3600
+# Local VM e2e gateways exercise the single-player default: sandbox JWTs
+# identify the supervisor and do not expire.
+ttl_secs = 0
 
 [openshell.drivers.vm]
 grpc_endpoint = "https://host.openshell.internal:${HOST_PORT}"
@@ -282,6 +284,7 @@ e2e_register_mtls_gateway \
 export OPENSHELL_GATEWAY_ENDPOINT="${CLI_GATEWAY_ENDPOINT}"
 export OPENSHELL_E2E_EXPECT_VM_OVERLAY=1
 export OPENSHELL_E2E_DRIVER="vm"
+export OPENSHELL_E2E_VM_STATE_DIR="${RUN_STATE_DIR}"
 e2e_export_gateway_restart_metadata \
   "${GATEWAY_BIN}" \
   "${GATEWAY_ARGS_FILE}" \

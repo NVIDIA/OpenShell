@@ -421,6 +421,26 @@ nonsense = true
     }
 
     #[test]
+    fn rejects_unknown_field_in_nested_gateway_jwt_table() {
+        // Regression guard for the class of silent-misconfig bug fixed in
+        // PR #1661: a key indented under the wrong table header (here,
+        // `sandbox_namespace` landing under `[openshell.gateway.gateway_jwt]`
+        // instead of `[openshell.gateway]`) must be rejected rather than
+        // silently ignored.
+        let toml = r#"
+[openshell.gateway.gateway_jwt]
+signing_key_path = "/tmp/jwt/signing.pem"
+public_key_path = "/tmp/jwt/public.pem"
+kid_path = "/tmp/jwt/kid"
+sandbox_namespace = "agents"
+"#;
+        let tmp = write_tmp(toml);
+        let err = load(tmp.path())
+            .expect_err("unknown field in nested gateway_jwt table must be rejected");
+        assert!(matches!(err, ConfigFileError::Parse { .. }));
+    }
+
+    #[test]
     fn rejects_removed_ssh_endpoint_fields() {
         let toml = r"
 [openshell.gateway]

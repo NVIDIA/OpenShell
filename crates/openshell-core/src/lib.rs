@@ -9,6 +9,7 @@
 //! - Common error types
 //! - Build version metadata
 
+pub mod activity;
 pub mod auth;
 pub mod config;
 pub mod denial;
@@ -30,6 +31,7 @@ pub mod provider_credentials;
 pub mod sandbox_env;
 pub mod secrets;
 pub mod settings;
+pub mod telemetry;
 pub mod time;
 
 pub use config::{

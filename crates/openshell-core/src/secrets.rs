@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::time::now_ms;
 use base64::Engine as _;
 use std::collections::HashMap;
 use std::fmt;
@@ -24,13 +25,6 @@ fn is_alias_token_char(b: u8) -> bool {
 
 fn contains_raw_reserved_marker(value: &str) -> bool {
     value.contains(PLACEHOLDER_PREFIX) || value.contains(PROVIDER_ALIAS_MARKER)
-}
-
-fn current_time_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
-        .unwrap_or_default()
 }
 
 pub fn contains_reserved_credential_marker(value: &str) -> bool {
@@ -225,7 +219,7 @@ impl SecretResolver {
             let canonical = placeholder_for_env_key(key);
             self.by_placeholder.get(&canonical)?
         };
-        if secret.expires_at_ms > 0 && secret.expires_at_ms <= current_time_ms() {
+        if secret.expires_at_ms > 0 && secret.expires_at_ms <= now_ms() {
             tracing::warn!(
                 location = "resolve_placeholder",
                 "credential resolution rejected: credential is expired"

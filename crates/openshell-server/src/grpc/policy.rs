@@ -37,6 +37,9 @@ use openshell_core::proto::{
     L7DenyRule, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, Provider, Sandbox,
     SandboxPolicy as ProtoSandboxPolicy,
 };
+use openshell_core::telemetry::{
+    LifecycleOperation, LifecycleResource, PolicyDecisionOperation, TelemetryOutcome,
+};
 use openshell_core::{
     VERSION,
     settings::{self, SettingValueKind},
@@ -69,7 +72,8 @@ use tracing::{debug, info, warn};
 use super::validation::{
     level_matches, source_matches, validate_policy_safety, validate_static_fields_unchanged,
 };
-use super::{MAX_PAGE_SIZE, StoredSettingValue, StoredSettings, clamp_limit, current_time_ms};
+use super::{MAX_PAGE_SIZE, StoredSettingValue, StoredSettings, clamp_limit};
+use crate::persistence::current_time_ms;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -86,6 +90,58 @@ const POLICY_SETTING_KEY: &str = "policy";
 const GLOBAL_POLICY_SANDBOX_ID: &str = "__global__";
 /// Maximum number of optimistic retry attempts for policy version conflicts.
 const MERGE_RETRY_LIMIT: usize = 5;
+
+fn emit_sandbox_policy_update_success() {
+    openshell_core::telemetry::emit_lifecycle(
+        LifecycleResource::SandboxPolicy,
+        LifecycleOperation::Update,
+        TelemetryOutcome::Success,
+    );
+}
+
+fn emit_sandbox_policy_update_failure() {
+    openshell_core::telemetry::emit_lifecycle(
+        LifecycleResource::SandboxPolicy,
+        LifecycleOperation::Update,
+        TelemetryOutcome::Failure,
+    );
+}
+
+fn should_emit_config_update_policy_telemetry(sandbox_caller: bool) -> bool {
+    !sandbox_caller
+}
+
+fn emit_config_update_policy_success(sandbox_caller: bool) {
+    if should_emit_config_update_policy_telemetry(sandbox_caller) {
+        emit_sandbox_policy_update_success();
+    }
+}
+
+fn should_emit_full_policy_update_telemetry(sandbox_caller: bool, next_version: i64) -> bool {
+    !sandbox_caller && next_version > 1
+}
+
+fn emit_full_policy_update_success(sandbox_caller: bool, next_version: i64) {
+    if should_emit_full_policy_update_telemetry(sandbox_caller, next_version) {
+        emit_sandbox_policy_update_success();
+    }
+}
+
+fn emit_policy_decision_success(operation: PolicyDecisionOperation, rule_count: u64) {
+    openshell_core::telemetry::emit_policy_decision(
+        operation,
+        TelemetryOutcome::Success,
+        rule_count,
+    );
+}
+
+fn emit_policy_decision_failure(operation: PolicyDecisionOperation, rule_count: u64) {
+    openshell_core::telemetry::emit_policy_decision(
+        operation,
+        TelemetryOutcome::Failure,
+        rule_count,
+    );
+}
 
 fn emit_gateway_policy_audit_log(
     sandbox_id: &str,
@@ -1346,6 +1402,22 @@ pub(super) async fn handle_update_config(
 ) -> Result<Response<UpdateConfigResponse>, Status> {
     let principal = request.extensions().get::<Principal>().cloned();
     let sandbox_caller = matches!(principal, Some(Principal::Sandbox(_)));
+    let update = request.get_ref();
+    let should_emit_policy_failure = should_emit_config_update_policy_telemetry(sandbox_caller)
+        && (update.policy.is_some() || !update.merge_operations.is_empty());
+    let result = handle_update_config_inner(state, request, principal, sandbox_caller).await;
+    if result.is_err() && should_emit_policy_failure {
+        emit_sandbox_policy_update_failure();
+    }
+    result
+}
+
+async fn handle_update_config_inner(
+    state: &Arc<ServerState>,
+    request: Request<UpdateConfigRequest>,
+    principal: Option<Principal>,
+    sandbox_caller: bool,
+) -> Result<Response<UpdateConfigResponse>, Status> {
     let req = request.into_inner();
     if sandbox_caller {
         validate_sandbox_caller_update(&req)?;
@@ -1676,6 +1748,7 @@ pub(super) async fn handle_update_config(
             operation_count = merge_ops.len(),
             "UpdateConfig: merged incremental policy operations"
         );
+        emit_config_update_policy_success(sandbox_caller);
 
         return Ok(Response::new(UpdateConfigResponse {
             version: u32::try_from(version).unwrap_or(0),
@@ -1775,6 +1848,7 @@ pub(super) async fn handle_update_config(
         policy_hash = %hash,
         "UpdateConfig: new policy version persisted"
     );
+    emit_full_policy_update_success(sandbox_caller, next_version);
 
     Ok(Response::new(UpdateConfigResponse {
         version: u32::try_from(next_version).unwrap_or(0),
@@ -2086,6 +2160,23 @@ pub(super) async fn handle_submit_policy_analysis(
     let sandbox =
         resolve_sandbox_by_name_for_principal(state.store.as_ref(), &principal, &req.name).await?;
     let sandbox_id = sandbox.object_id().to_string();
+    for summary in &req.network_activity_summaries {
+        state
+            .telemetry
+            .record_network_activity(&sandbox_id, summary);
+    }
+    if req.proposed_chunks.is_empty()
+        && req.summaries.is_empty()
+        && !req.network_activity_summaries.is_empty()
+    {
+        return Ok(Response::new(SubmitPolicyAnalysisResponse {
+            accepted_chunks: 0,
+            rejected_chunks: 0,
+            rejection_reasons: Vec::new(),
+            accepted_chunk_ids: Vec::new(),
+        }));
+    }
+
     // `current_policy` is captured ONCE at the top of the batch and frozen
     // for every chunk's delta computation, even if an earlier chunk in the
     // batch auto-approves and merges. This is intentional v1 behavior:
@@ -2380,6 +2471,17 @@ pub(super) async fn handle_approve_draft_chunk(
     state: &Arc<ServerState>,
     request: Request<ApproveDraftChunkRequest>,
 ) -> Result<Response<ApproveDraftChunkResponse>, Status> {
+    let result = handle_approve_draft_chunk_inner(state, request).await;
+    if result.is_err() {
+        emit_policy_decision_failure(PolicyDecisionOperation::Approve, 1);
+    }
+    result
+}
+
+async fn handle_approve_draft_chunk_inner(
+    state: &Arc<ServerState>,
+    request: Request<ApproveDraftChunkRequest>,
+) -> Result<Response<ApproveDraftChunkResponse>, Status> {
     let req = request.into_inner();
     if req.name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
@@ -2456,6 +2558,8 @@ pub(super) async fn handle_approve_draft_chunk(
         policy_hash = %hash,
         "ApproveDraftChunk: rule merged successfully"
     );
+    emit_sandbox_policy_update_success();
+    emit_policy_decision_success(PolicyDecisionOperation::Approve, 1);
 
     Ok(Response::new(ApproveDraftChunkResponse {
         policy_version: u32::try_from(version).unwrap_or(0),
@@ -2464,6 +2568,17 @@ pub(super) async fn handle_approve_draft_chunk(
 }
 
 pub(super) async fn handle_reject_draft_chunk(
+    state: &Arc<ServerState>,
+    request: Request<RejectDraftChunkRequest>,
+) -> Result<Response<RejectDraftChunkResponse>, Status> {
+    let result = handle_reject_draft_chunk_inner(state, request).await;
+    if result.is_err() {
+        emit_policy_decision_failure(PolicyDecisionOperation::Reject, 1);
+    }
+    result
+}
+
+async fn handle_reject_draft_chunk_inner(
     state: &Arc<ServerState>,
     request: Request<RejectDraftChunkRequest>,
 ) -> Result<Response<RejectDraftChunkResponse>, Status> {
@@ -2525,6 +2640,7 @@ pub(super) async fn handle_reject_draft_chunk(
             version,
             &hash,
         );
+        emit_sandbox_policy_update_success();
     }
 
     let now_ms = current_time_ms();
@@ -2543,11 +2659,23 @@ pub(super) async fn handle_reject_draft_chunk(
         .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
 
     state.sandbox_watch_bus.notify(&sandbox_id);
+    emit_policy_decision_success(PolicyDecisionOperation::Reject, 1);
 
     Ok(Response::new(RejectDraftChunkResponse {}))
 }
 
 pub(super) async fn handle_approve_all_draft_chunks(
+    state: &Arc<ServerState>,
+    request: Request<ApproveAllDraftChunksRequest>,
+) -> Result<Response<ApproveAllDraftChunksResponse>, Status> {
+    let result = handle_approve_all_draft_chunks_inner(state, request).await;
+    if result.is_err() {
+        emit_policy_decision_failure(PolicyDecisionOperation::ApproveAll, 0);
+    }
+    result
+}
+
+async fn handle_approve_all_draft_chunks_inner(
     state: &Arc<ServerState>,
     request: Request<ApproveAllDraftChunksRequest>,
 ) -> Result<Response<ApproveAllDraftChunksResponse>, Status> {
@@ -2632,6 +2760,7 @@ pub(super) async fn handle_approve_all_draft_chunks(
             &last_hash,
         );
         chunks_approved += 1;
+        emit_sandbox_policy_update_success();
     }
 
     state.sandbox_watch_bus.notify(&sandbox_id);
@@ -2653,6 +2782,10 @@ pub(super) async fn handle_approve_all_draft_chunks(
         version = last_version,
         policy_hash = %last_hash,
         "ApproveAllDraftChunks: bulk approval complete"
+    );
+    emit_policy_decision_success(
+        PolicyDecisionOperation::ApproveAll,
+        u64::from(chunks_approved),
     );
 
     Ok(Response::new(ApproveAllDraftChunksResponse {
@@ -2717,6 +2850,17 @@ pub(super) async fn handle_edit_draft_chunk(
 }
 
 pub(super) async fn handle_undo_draft_chunk(
+    state: &Arc<ServerState>,
+    request: Request<UndoDraftChunkRequest>,
+) -> Result<Response<UndoDraftChunkResponse>, Status> {
+    let result = handle_undo_draft_chunk_inner(state, request).await;
+    if result.is_err() {
+        emit_policy_decision_failure(PolicyDecisionOperation::Undo, 1);
+    }
+    result
+}
+
+async fn handle_undo_draft_chunk_inner(
     state: &Arc<ServerState>,
     request: Request<UndoDraftChunkRequest>,
 ) -> Result<Response<UndoDraftChunkResponse>, Status> {
@@ -2792,6 +2936,8 @@ pub(super) async fn handle_undo_draft_chunk(
         policy_hash = %hash,
         "UndoDraftChunk: rule removed, chunk reverted to pending"
     );
+    emit_sandbox_policy_update_success();
+    emit_policy_decision_success(PolicyDecisionOperation::Undo, 1);
 
     Ok(Response::new(UndoDraftChunkResponse {
         policy_version: u32::try_from(version).unwrap_or(0),
@@ -3708,15 +3854,10 @@ mod tests {
         Principal, SandboxIdentitySource, SandboxPrincipal, UserPrincipal,
     };
     use crate::grpc::test_support::test_server_state;
+    use crate::persistence::test_store;
     use std::collections::HashMap;
     use std::sync::Arc;
     use tonic::Code;
-
-    async fn test_store() -> Store {
-        Store::connect("sqlite::memory:?cache=shared")
-            .await
-            .expect("in-memory SQLite store should connect")
-    }
 
     /// Wrap a request with a user `Principal` so handler scope guards treat
     /// the test caller as a CLI user. Most handler tests exercise
@@ -4070,6 +4211,19 @@ mod tests {
             .expect_err("missing sandbox must not validate");
 
         assert_eq!(err.code(), Code::NotFound);
+    }
+
+    #[test]
+    fn sandbox_caller_policy_sync_does_not_emit_policy_update_telemetry() {
+        assert!(!should_emit_config_update_policy_telemetry(true));
+        assert!(should_emit_config_update_policy_telemetry(false));
+    }
+
+    #[test]
+    fn first_policy_revision_does_not_emit_policy_update_telemetry() {
+        assert!(!should_emit_full_policy_update_telemetry(false, 1));
+        assert!(!should_emit_full_policy_update_telemetry(true, 2));
+        assert!(should_emit_full_policy_update_telemetry(false, 2));
     }
 
     // ---- Sandbox without policy ----

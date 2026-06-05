@@ -5,6 +5,7 @@
 //!
 //! This crate provides process sandboxing and monitoring capabilities.
 
+mod activity_aggregator;
 mod denial_aggregator;
 mod mechanistic_mapper;
 
@@ -234,6 +235,21 @@ pub async fn run_sandbox(
     #[cfg(not(target_os = "linux"))]
     drop(bypass_denial_tx);
 
+    // Anonymous activity channel: same orchestrator-owned pattern as the
+    // denial channel. The proxy and the bypass monitor both emit per-event
+    // activity records; the orchestrator-side aggregator drains, sanitizes,
+    // and flushes anonymous summaries to the gateway.
+    let (activity_tx, activity_rx, bypass_activity_tx) = if sandbox_id.is_some() {
+        let (tx, rx) =
+            tokio::sync::mpsc::channel(openshell_core::activity::ACTIVITY_EVENT_QUEUE_CAPACITY);
+        let bypass_tx = tx.clone();
+        (Some(tx), Some(rx), Some(bypass_tx))
+    } else {
+        (None, None, None)
+    };
+    #[cfg(not(target_os = "linux"))]
+    drop(bypass_activity_tx);
+
     let networking = if network_enabled {
         #[cfg(target_os = "linux")]
         let proxy_bind_ip = netns
@@ -255,6 +271,7 @@ pub async fn run_sandbox(
                 openshell_endpoint_for_proxy.as_deref(),
                 inference_routes.as_deref(),
                 denial_tx,
+                activity_tx,
             )
             .await?,
         )
@@ -290,6 +307,40 @@ pub async fn run_sandbox(
                             flush_proposals_to_gateway(&endpoint, &sandbox_name, summaries).await
                         {
                             warn!(error = %e, "Failed to flush denial summaries to gateway");
+                        }
+                    }
+                })
+                .await;
+        });
+    }
+
+    // Spawn the activity-aggregator flush task. The aggregator drains
+    // anonymous activity events from the proxy, sanitizes deny groups,
+    // and ships periodic summaries to the gateway.
+    if let (Some(rx), Some(endpoint)) = (activity_rx, openshell_endpoint_for_proxy.as_deref()) {
+        let agg_name = sandbox_name_for_agg
+            .clone()
+            .or_else(|| sandbox_id.clone())
+            .unwrap_or_default();
+        let agg_endpoint = endpoint.to_string();
+        let flush_interval_secs = activity_aggregator::activity_flush_interval_secs_from_env(
+            std::env::var("OPENSHELL_ACTIVITY_FLUSH_INTERVAL_SECS")
+                .ok()
+                .as_deref(),
+        );
+
+        let aggregator = activity_aggregator::ActivityAggregator::new(rx, flush_interval_secs);
+
+        tokio::spawn(async move {
+            aggregator
+                .run(move |summary| {
+                    let endpoint = agg_endpoint.clone();
+                    let sandbox_name = agg_name.clone();
+                    async move {
+                        if let Err(e) =
+                            flush_activity_to_gateway(&endpoint, &sandbox_name, summary).await
+                        {
+                            warn!(error = %e, "Failed to flush activity summary to gateway");
                         }
                     }
                 })
@@ -360,6 +411,8 @@ pub async fn run_sandbox(
             netns.as_ref(),
             #[cfg(target_os = "linux")]
             bypass_denial_tx,
+            #[cfg(target_os = "linux")]
+            bypass_activity_tx,
         )
         .await?
     } else {
@@ -466,7 +519,57 @@ async fn flush_proposals_to_gateway(
     );
 
     client
-        .submit_policy_analysis(sandbox_name, proto_summaries, proposals, "mechanistic")
+        .submit_policy_analysis(
+            sandbox_name,
+            proto_summaries,
+            proposals,
+            Vec::new(),
+            "mechanistic",
+        )
+        .await?;
+
+    Ok(())
+}
+
+/// Flush an anonymous activity summary to the gateway via `SubmitPolicyAnalysis`.
+async fn flush_activity_to_gateway(
+    endpoint: &str,
+    sandbox_name: &str,
+    summary: activity_aggregator::FlushableActivitySummary,
+) -> Result<()> {
+    use openshell_core::grpc_client::CachedOpenShellClient;
+    use openshell_core::proto::{DenialGroupCount, NetworkActivitySummary};
+
+    let client = CachedOpenShellClient::connect(endpoint).await?;
+
+    let proto_summary = NetworkActivitySummary {
+        network_activity_count: summary.network_activity_count,
+        denied_action_count: summary.denied_action_count,
+        denials_by_group: summary
+            .denials_by_group
+            .into_iter()
+            .map(|(group, count)| DenialGroupCount {
+                deny_group: group,
+                denied_count: count,
+            })
+            .collect(),
+    };
+
+    info!(
+        sandbox_name = %sandbox_name,
+        network_activity_count = proto_summary.network_activity_count,
+        denied_action_count = proto_summary.denied_action_count,
+        "Flushed activity summary to gateway"
+    );
+
+    client
+        .submit_policy_analysis(
+            sandbox_name,
+            Vec::new(),
+            Vec::new(),
+            vec![proto_summary],
+            "activity",
+        )
         .await?;
 
     Ok(())

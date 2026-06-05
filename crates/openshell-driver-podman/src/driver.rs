@@ -10,6 +10,7 @@ use crate::watcher::{
     self, WatchStream, driver_sandbox_from_inspect, driver_sandbox_from_list_entry,
 };
 use openshell_core::ComputeDriverError;
+use openshell_core::driver_utils::supervisor_image_should_refresh;
 use openshell_core::proto::compute::v1::{DriverSandbox, GetCapabilitiesResponse};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -258,7 +259,6 @@ impl PodmanComputeDriver {
             "podman",
             openshell_core::VERSION,
             &self.config.default_image,
-            Self::has_gpu_capacity(),
         ))
     }
 
@@ -591,23 +591,6 @@ fn supervisor_image_pull_policy(image: &str) -> &'static str {
     } else {
         "missing"
     }
-}
-
-fn supervisor_image_should_refresh(image: &str) -> bool {
-    matches!(supervisor_image_tag(image), Some("dev" | "latest"))
-}
-
-fn supervisor_image_tag(image: &str) -> Option<&str> {
-    if image.contains('@') {
-        return None;
-    }
-
-    let image_name = image.rsplit('/').next().unwrap_or(image);
-    image_name
-        .rsplit_once(':')
-        .map_or(Some("latest"), |(_, tag)| {
-            if tag.is_empty() { None } else { Some(tag) }
-        })
 }
 
 /// Check whether the current user has subuid/subgid ranges configured.

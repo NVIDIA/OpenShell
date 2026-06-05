@@ -63,20 +63,16 @@ pub fn sandbox_token_path(
 /// Build a [`GetCapabilitiesResponse`] from the common driver capability fields.
 ///
 /// Every compute driver constructs this response with the same fields. Shared
-/// here to avoid repeating the struct literal (and the always-zero `gpu_count`
-/// default) in each driver crate.
+/// here to avoid repeating the struct literal in each driver crate.
 pub fn build_capabilities_response(
     driver_name: &str,
     driver_version: impl Into<String>,
     default_image: impl Into<String>,
-    supports_gpu: bool,
 ) -> GetCapabilitiesResponse {
     GetCapabilitiesResponse {
         driver_name: driver_name.to_string(),
         driver_version: driver_version.into(),
         default_image: default_image.into(),
-        supports_gpu,
-        gpu_count: 0,
     }
 }
 
@@ -92,4 +88,39 @@ pub fn sandbox_log_level(sandbox: &DriverSandbox, default_level: &str) -> String
         .filter(|level| !level.is_empty())
         .unwrap_or(default_level)
         .to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Supervisor image helpers (shared by Docker and Podman drivers)
+// ---------------------------------------------------------------------------
+
+/// Return the tag portion of a supervisor image reference, or `None` if the
+/// reference uses a digest (`@sha256:...`).
+///
+/// Examples:
+/// - `"ghcr.io/org/image:1.2.3"` → `Some("1.2.3")`
+/// - `"ghcr.io/org/image:latest"` → `Some("latest")`
+/// - `"ghcr.io/org/image"` → `Some("latest")`  (implied tag)
+/// - `"ghcr.io/org/image@sha256:abc"` → `None`  (pinned by digest)
+/// - `"ghcr.io/org/image:"` → `None`  (empty tag)
+pub fn supervisor_image_tag(image: &str) -> Option<&str> {
+    if image.contains('@') {
+        return None;
+    }
+
+    let image_name = image.rsplit('/').next().unwrap_or(image);
+    image_name
+        .rsplit_once(':')
+        .map_or(Some("latest"), |(_, tag)| {
+            if tag.is_empty() { None } else { Some(tag) }
+        })
+}
+
+/// Return `true` if the supervisor image should be refreshed before each use.
+///
+/// Mutable tags (`dev`, `latest`) are always re-pulled so that the running
+/// container tracks the latest pushed version.  Digest-pinned references and
+/// all other versioned tags are treated as immutable and pulled at most once.
+pub fn supervisor_image_should_refresh(image: &str) -> bool {
+    matches!(supervisor_image_tag(image), Some("dev" | "latest"))
 }

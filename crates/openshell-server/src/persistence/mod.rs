@@ -688,4 +688,11 @@ impl Store {
 }
 
 #[cfg(test)]
+pub async fn test_store() -> Store {
+    Store::connect("sqlite::memory:?cache=shared")
+        .await
+        .expect("in-memory SQLite store should connect")
+}
+
+#[cfg(test)]
 mod tests;
