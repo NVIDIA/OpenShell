@@ -1515,9 +1515,7 @@ ssh_session_ttl_secs = 1234
         let (args, _) = parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
         assert_eq!(
             args.compute_driver_socket.as_deref(),
-            Some(std::path::Path::new(
-                "/var/run/openshell/external.sock"
-            ))
+            Some(std::path::Path::new("/var/run/openshell/external.sock"))
         );
     }
 

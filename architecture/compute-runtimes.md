@@ -34,6 +34,7 @@ when a sandbox create request asks for GPU resources.
 | Podman | Rootless or single-machine deployments. | Container plus nested sandbox namespace. | Uses the Podman REST API, OCI image volumes, and CDI GPU devices when available. |
 | Kubernetes | Cluster deployment through Helm. | Pod plus nested sandbox namespace. | Uses Kubernetes API objects, service accounts, secrets, PVC-backed workspace storage, and GPU resources. |
 | VM | Experimental microVM isolation. | Per-sandbox libkrun VM. | Gateway spawns `openshell-driver-vm` as a subprocess over a private, state-local Unix socket. The VM driver boots a cached bootstrap `rootfs.ext4`, prepares requested OCI images inside a bootstrap VM with `umoci`, attaches the prepared image disk read-only, and gives each sandbox a writable `overlay.ext4` for merged-root changes and runtime material. The driver persists each accepted launch request beside the overlay and restarts those VMs on driver startup without recreating the overlay. |
+| External | Out-of-tree drivers operated alongside the gateway. | Whatever boundary the driver implements. | Activated by `--compute-driver-socket=<path>` (env `OPENSHELL_COMPUTE_DRIVER_SOCKET`). The gateway connects to a UDS the operator already provisioned, runs `GetCapabilities`, logs the advertised `driver_name`, and dispatches all sandbox lifecycle calls through the same `compute_driver.proto` surface as the in-tree drivers. The driver process and socket lifecycle are operator-owned; the gateway does not spawn, supervise, or remove the driver. The trust boundary is the socket's filesystem permissions — the operator must ensure only the gateway uid can read/write it. |
 
 Per-sandbox CPU and memory values currently enter the driver layer through
 template resource limits. Docker and Podman apply them as runtime limits.
@@ -68,6 +69,7 @@ The supervisor must be available inside each sandbox workload:
 | Podman | Read-only OCI image volume containing the supervisor binary. |
 | Kubernetes | Sandbox pod image or pod template configuration. |
 | VM | Embedded in the guest rootfs bundle. |
+| External | Defined by the out-of-tree driver. |
 
 Driver-controlled environment variables must override sandbox image or template
 values for sandbox ID, sandbox name, gateway endpoint, relay socket path, TLS
