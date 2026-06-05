@@ -111,6 +111,16 @@ struct RunArgs {
     )]
     drivers: Vec<ComputeDriverKind>,
 
+    /// Path to a Unix domain socket served by an out-of-tree compute driver
+    /// implementing `compute_driver.proto`.
+    ///
+    /// When set, the gateway dispatches sandbox lifecycle to that driver
+    /// instead of one of the in-tree backends, skipping both the `--drivers`
+    /// list and the auto-detection probe. The driver name advertised in
+    /// `GetCapabilities` is logged for diagnostics.
+    #[arg(long, env = "OPENSHELL_COMPUTE_DRIVER_SOCKET")]
+    compute_driver_socket: Option<PathBuf>,
+
     /// Disable TLS entirely — listen on plaintext HTTP.
     /// Use this when the gateway sits behind a reverse proxy or tunnel
     /// (e.g. Cloudflare Tunnel) that terminates TLS at the edge.
@@ -353,6 +363,7 @@ async fn run_from_args(mut args: RunArgs, matches: ArgMatches) -> Result<()> {
     config = config
         .with_database_url(db_url)
         .with_compute_drivers(args.drivers.clone())
+        .with_external_compute_driver_socket(args.compute_driver_socket.clone())
         .with_server_sans(args.server_sans.clone())
         .with_loopback_service_http(args.enable_loopback_service_http);
 
@@ -611,6 +622,12 @@ fn merge_file_into_args(args: &mut RunArgs, file: &GatewayFileSection, matches: 
 }
 
 fn effective_single_driver(args: &RunArgs) -> Option<ComputeDriverKind> {
+    // An external-driver socket pins dispatch to the out-of-tree path and
+    // bypasses both the `--drivers` list and auto-detection probe; callers
+    // that key off the in-tree `ComputeDriverKind` get `None` here.
+    if args.compute_driver_socket.is_some() {
+        return None;
+    }
     match args.drivers.as_slice() {
         [] => openshell_core::config::detect_driver(),
         [driver] => Some(*driver),
@@ -1438,6 +1455,70 @@ ssh_session_ttl_secs = 1234
             "docker,podman",
         ]);
         assert!(!super::is_singleplayer_driver(&multi));
+    }
+
+    #[test]
+    fn compute_driver_socket_flag_populates_run_args() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = EnvVarGuard::remove("OPENSHELL_COMPUTE_DRIVER_SOCKET");
+
+        let (args, _) = parse_with_args(&[
+            "openshell-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--compute-driver-socket",
+            "/run/openshell/external.sock",
+        ]);
+        assert_eq!(
+            args.compute_driver_socket.as_deref(),
+            Some(std::path::Path::new("/run/openshell/external.sock"))
+        );
+        // External socket pins dispatch off the in-tree enum, so the
+        // single-driver helper must return None even when no --drivers given.
+        assert!(super::effective_single_driver(&args).is_none());
+    }
+
+    #[test]
+    fn compute_driver_socket_overrides_drivers_flag() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = EnvVarGuard::remove("OPENSHELL_COMPUTE_DRIVER_SOCKET");
+
+        let (args, _) = parse_with_args(&[
+            "openshell-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--drivers",
+            "docker",
+            "--compute-driver-socket",
+            "/run/openshell/external.sock",
+        ]);
+        assert!(
+            super::effective_single_driver(&args).is_none(),
+            "external socket must short-circuit --drivers"
+        );
+    }
+
+    #[test]
+    fn compute_driver_socket_reads_from_env_var() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = EnvVarGuard::set(
+            "OPENSHELL_COMPUTE_DRIVER_SOCKET",
+            "/var/run/openshell/external.sock",
+        );
+
+        let (args, _) = parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
+        assert_eq!(
+            args.compute_driver_socket.as_deref(),
+            Some(std::path::Path::new(
+                "/var/run/openshell/external.sock"
+            ))
+        );
     }
 
     #[test]
