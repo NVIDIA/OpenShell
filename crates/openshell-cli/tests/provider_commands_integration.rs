@@ -2123,8 +2123,7 @@ async fn provider_create_from_gcloud_adc_rejects_wrong_provider_type_before_cred
     .expect_err("wrong provider type should fail before generic credential validation");
 
     assert!(
-        err.to_string()
-            .contains("--from-gcloud-adc is only valid for google-vertex-ai providers"),
+        err.to_string().contains("--from-gcloud-adc"),
         "unexpected error: {err}"
     );
     assert!(ts.state.providers.lock().await.is_empty());

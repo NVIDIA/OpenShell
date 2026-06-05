@@ -740,7 +740,7 @@ enum ProviderCommands {
 
         /// Configure credentials from gcloud Application Default Credentials
         /// (`~/.config/gcloud/application_default_credentials.json`).
-        /// Only valid for google-vertex-ai providers.
+        /// Valid for providers whose profile declares an ADC-compatible credential.
         #[arg(long, group = "cred_source", conflicts_with_all = ["from_existing", "credentials"])]
         from_gcloud_adc: bool,
 

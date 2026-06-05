@@ -101,12 +101,6 @@ pub const VERTEX_AI_CREDENTIAL_KEY_NAMES: &[&str] = &[
     "VERTEX_AI_TOKEN",
 ];
 
-/// The credential key used for tokens minted from gcloud Application Default Credentials.
-///
-/// This is the key written by the gateway's `OAuth2` refresh worker when using the
-/// `--from-gcloud-adc` CLI flow. It must match `VERTEX_AI_CREDENTIAL_KEY_NAMES[2]`.
-pub const VERTEX_AI_ADC_TOKEN_KEY: &str = "GOOGLE_VERTEX_AI_TOKEN";
-
 /// GCP project ID config key for Vertex AI providers.
 pub const VERTEX_AI_PROJECT_ID_KEY: &str = "VERTEX_AI_PROJECT_ID";
 

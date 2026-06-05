@@ -331,6 +331,25 @@ impl ProviderTypeProfile {
         has_gateway_mintable_credential
     }
 
+    /// Returns the credential suitable for `--from-gcloud-adc` bootstrap, if any.
+    ///
+    /// A credential qualifies when its refresh strategy is `Oauth2RefreshToken`
+    /// and its material declares the three gcloud ADC keys (`client_id`,
+    /// `client_secret`, `refresh_token`).
+    #[must_use]
+    pub fn adc_credential(&self) -> Option<&CredentialProfile> {
+        const ADC_MATERIAL_KEYS: &[&str] = &["client_id", "client_secret", "refresh_token"];
+
+        self.credentials.iter().find(|cred| {
+            cred.refresh.as_ref().is_some_and(|refresh| {
+                refresh.strategy == ProviderCredentialRefreshStrategy::Oauth2RefreshToken
+                    && ADC_MATERIAL_KEYS
+                        .iter()
+                        .all(|key| refresh.material.iter().any(|m| m.name == *key))
+            })
+        })
+    }
+
     #[must_use]
     pub fn to_proto(&self) -> ProviderProfile {
         ProviderProfile {
@@ -1267,6 +1286,73 @@ credentials:
         )
         .expect("profile");
         assert!(!static_only_profile.allows_gateway_refresh_bootstrap());
+    }
+
+    #[test]
+    fn adc_credential_returns_oauth2_refresh_token_credential_with_adc_material() {
+        let profile = get_default_profile("google-cloud").expect("google-cloud profile");
+        let adc = profile
+            .adc_credential()
+            .expect("google-cloud should have an ADC credential");
+        assert_eq!(adc.env_vars[0], "GCP_ADC_ACCESS_TOKEN");
+
+        let profile = get_default_profile("google-vertex-ai").expect("vertex profile");
+        let adc = profile
+            .adc_credential()
+            .expect("vertex should have an ADC credential");
+        assert_eq!(adc.env_vars[0], "GOOGLE_VERTEX_AI_TOKEN");
+    }
+
+    #[test]
+    fn adc_credential_returns_none_for_profiles_without_adc() {
+        let profile = get_default_profile("github").expect("github profile");
+        assert!(profile.adc_credential().is_none());
+
+        let profile = get_default_profile("claude-code").expect("claude-code profile");
+        assert!(profile.adc_credential().is_none());
+    }
+
+    #[test]
+    fn adc_credential_rejects_service_account_jwt_strategy() {
+        let profile = parse_profile_yaml(
+            r"
+id: sa-only
+display_name: SA Only
+credentials:
+  - name: sa_token
+    env_vars: [SA_TOKEN]
+    refresh:
+      strategy: google_service_account_jwt
+      material:
+        - name: client_email
+        - name: private_key
+",
+        )
+        .expect("profile");
+        assert!(profile.adc_credential().is_none());
+    }
+
+    #[test]
+    fn adc_credential_requires_all_three_material_keys() {
+        let profile = parse_profile_yaml(
+            r"
+id: partial-material
+display_name: Partial Material
+credentials:
+  - name: token
+    env_vars: [TOKEN]
+    refresh:
+      strategy: oauth2_refresh_token
+      material:
+        - name: client_id
+        - name: client_secret
+",
+        )
+        .expect("profile");
+        assert!(
+            profile.adc_credential().is_none(),
+            "missing refresh_token material should not qualify"
+        );
     }
 
     #[test]
