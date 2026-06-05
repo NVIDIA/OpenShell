@@ -37,7 +37,6 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 tracing = { workspace = true }
-url = { workspace = true }
 uuid = { workspace = true }
 webpki-roots = { workspace = true }
 

@@ -3773,7 +3773,6 @@ dependencies = [
  "tokio-rustls",
  "tokio-tungstenite 0.26.2",
  "tracing",
- "url",
  "uuid",
  "webpki-roots 1.0.7",
 ]
