@@ -1574,9 +1574,7 @@ fn detect_payload_mode(headers: &str) -> Result<SigV4PayloadMode> {
                     Ok(SigV4PayloadMode::StreamingUnsignedTrailer)
                 }
                 "unsigned-payload" => Ok(SigV4PayloadMode::UnsignedPayload),
-                v if v.starts_with("streaming-") => {
-                    Ok(SigV4PayloadMode::StreamingUnsignedTrailer)
-                }
+                v if v.starts_with("streaming-") => Ok(SigV4PayloadMode::StreamingUnsignedTrailer),
                 _ => Ok(SigV4PayloadMode::SignBody),
             };
         }
