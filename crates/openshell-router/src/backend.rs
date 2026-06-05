@@ -642,7 +642,11 @@ fn build_provider_url(
 
 fn build_backend_url(endpoint: &str, path: &str) -> String {
     let base = endpoint.trim_end_matches('/');
-    if base.ends_with("/v1") && (path == "/v1" || path.starts_with("/v1/")) {
+    // Strip the /v1 prefix from the request path when the base URL already
+    // contains a /v1 segment — either ending with it (e.g. openai, nvidia)
+    // or containing it internally (e.g. deepinfra: /v1/openai).
+    let base_has_v1 = base.ends_with("/v1") || base.contains("/v1/");
+    if base_has_v1 && (path == "/v1" || path.starts_with("/v1/")) {
         return format!("{base}{}", &path[3..]);
     }
 
@@ -701,6 +705,19 @@ mod tests {
         assert_eq!(
             build_backend_url("https://api.openai.com/v1", "/v1"),
             "https://api.openai.com/v1"
+        );
+    }
+
+    #[test]
+    fn build_backend_url_dedupes_v1_for_base_with_v1_subpath() {
+        // DeepInfra base URL contains /v1/ internally — /v1 in the request
+        // path must still be stripped so chat/completions is not doubled.
+        assert_eq!(
+            build_backend_url(
+                "https://api.deepinfra.com/v1/openai",
+                "/v1/chat/completions"
+            ),
+            "https://api.deepinfra.com/v1/openai/chat/completions"
         );
     }
 

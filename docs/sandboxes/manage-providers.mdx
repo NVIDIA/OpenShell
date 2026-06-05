@@ -253,6 +253,7 @@ The following provider types are supported.
 | `generic` | User-defined | Any service with custom credentials |
 | `github` | `GITHUB_TOKEN`, `GH_TOKEN` | GitHub API and `gh` CLI. Refer to [GitHub Sandbox](/get-started/tutorials/github-sandbox). |
 | `gitlab` | `GITLAB_TOKEN`, `GLAB_TOKEN`, `CI_JOB_TOKEN` | GitLab API, `glab` CLI |
+| `deepinfra` | `DEEPINFRA_API_KEY` | DeepInfra inference API |
 | `nvidia` | `NVIDIA_API_KEY` | NVIDIA API Catalog |
 | `openai` | `OPENAI_API_KEY` | Any OpenAI-compatible endpoint. Set `--config OPENAI_BASE_URL` to point to the provider. Refer to [Inference Routing](/sandboxes/inference-routing). |
 | `opencode` | `OPENCODE_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY` | OpenCode |
@@ -278,7 +279,7 @@ The following providers have been tested with `inference.local`. Any provider th
 | Google Vertex AI | `vertex-prod` | `google-vertex-ai` | Regional, global, or multi-region Vertex endpoint | `GOOGLE_VERTEX_AI_TOKEN` or `GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN` |
 | Baseten | `baseten` | `openai` | `https://inference.baseten.co/v1` | `OPENAI_API_KEY` |
 | Bitdeer AI | `bitdeer` | `openai` | `https://api-inference.bitdeer.ai/v1` | `OPENAI_API_KEY` |
-| Deepinfra | `deepinfra` | `openai` | `https://api.deepinfra.com/v1/openai` | `OPENAI_API_KEY` |
+| DeepInfra | `deepinfra` | `deepinfra` | `https://api.deepinfra.com/v1/openai` | `DEEPINFRA_API_KEY` |
 | Groq | `groq` | `openai` | `https://api.groq.com/openai/v1` | `OPENAI_API_KEY` |
 | Ollama (local) | `ollama` | `openai` | `http://host.openshell.internal:11434/v1` | `OPENAI_API_KEY` |
 | LM Studio (local) | `lmstudio` | `openai` | `http://host.openshell.internal:1234/v1` | `OPENAI_API_KEY` |

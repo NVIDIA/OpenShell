@@ -154,6 +154,17 @@ static NVIDIA_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
     passthrough_headers: &["x-model-id"],
 };
 
+static DEEPINFRA_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
+    provider_type: "deepinfra",
+    default_base_url: "https://api.deepinfra.com/v1/openai",
+    protocols: OPENAI_PROTOCOLS,
+    credential_key_names: &["DEEPINFRA_API_KEY"],
+    base_url_config_keys: &["DEEPINFRA_BASE_URL"],
+    auth: AuthHeader::Bearer,
+    default_headers: &[],
+    passthrough_headers: &["x-model-id"],
+};
+
 /// Canonicalize an inference provider type string to a well-known identifier.
 ///
 /// Returns `Some(canonical_name)` for recognized inference providers,
@@ -166,6 +177,7 @@ pub fn normalize_inference_provider_type(input: &str) -> Option<&'static str> {
         "openai" => Some("openai"),
         "anthropic" => Some("anthropic"),
         "nvidia" => Some("nvidia"),
+        "deepinfra" => Some("deepinfra"),
         "google-vertex-ai" | "vertex" | "vertex-ai" | "google-vertex" | "gcp-vertex" => {
             Some("google-vertex-ai")
         }
@@ -182,6 +194,7 @@ pub fn profile_for(provider_type: &str) -> Option<&'static InferenceProviderProf
         "openai" => Some(&OPENAI_PROFILE),
         "anthropic" => Some(&ANTHROPIC_PROFILE),
         "nvidia" => Some(&NVIDIA_PROFILE),
+        "deepinfra" => Some(&DEEPINFRA_PROFILE),
         "google-vertex-ai" => Some(&VERTEX_AI_PROFILE),
         _ => None,
     }
@@ -302,7 +315,19 @@ mod tests {
         assert!(profile_for("openai").is_some());
         assert!(profile_for("anthropic").is_some());
         assert!(profile_for("nvidia").is_some());
+        assert!(profile_for("deepinfra").is_some());
         assert!(profile_for("OpenAI").is_some()); // case insensitive
+    }
+
+    #[test]
+    fn profile_for_deepinfra() {
+        let profile = profile_for("deepinfra").expect("deepinfra profile should exist");
+        assert_eq!(profile.provider_type, "deepinfra");
+        assert_eq!(
+            profile.default_base_url,
+            "https://api.deepinfra.com/v1/openai"
+        );
+        assert_eq!(profile.auth, AuthHeader::Bearer);
     }
 
     #[test]

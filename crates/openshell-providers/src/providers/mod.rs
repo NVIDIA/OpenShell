@@ -33,6 +33,7 @@ macro_rules! test_discovers_env_credential {
 pub mod anthropic;
 pub mod claude;
 pub mod codex;
+pub mod deepinfra;
 pub mod copilot;
 pub mod generic;
 pub mod github;
