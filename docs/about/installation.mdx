@@ -84,7 +84,7 @@ sudo snap install openshell --classic
 ```
 
 The snap defines two apps: the `openshell` CLI and the `openshell.gateway`
-systemd-style service. The gateway listens on `https://127.0.0.1:17670` and
+systemd service. The gateway listens on `https://127.0.0.1:17670` and
 stores its database at `$SNAP_COMMON/gateway.db` (typically
 `/var/snap/openshell/common/gateway.db`). Create `$SNAP_COMMON/gateway.toml`
 when you need to override gateway settings.
