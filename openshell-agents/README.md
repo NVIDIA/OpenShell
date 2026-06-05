@@ -11,7 +11,8 @@ and execution live in `runtime/harnesses/<name>/`.
 openshell-agents/
   run.sh                    # Generic manifest-driven launcher
   runtime/                  # Shared in-sandbox runtime
-    entrypoint.sh           # Dispatches to the selected harness adapter
+    entrypoint.sh           # Starts the in-sandbox supervisor
+    supervisor.sh           # Runs bounded harness cycles in once/watch mode
     subagent.sh             # Generic subagent dispatcher
     harnesses/
       codex/                # Codex install and execution adapter
@@ -37,6 +38,8 @@ sections:
   and background log directory.
 - `harness`: default harness and per-harness settings such as model and
   reasoning effort.
+- `runtime`: in-sandbox run mode (`once` or `watch`), watch poll interval, and
+  transient failure retry limit.
 - `profile_paths`: ordered directories to scan for provider profile YAML files.
 - `settings`: gateway settings to apply before launch.
 - `providers`: provider instances to create or update, credential sources, and
@@ -67,7 +70,8 @@ Manifest paths support these prefixes:
    `--codex-bin` is supplied.
 7. Copy manifest-declared skills and subagents into the payload.
 8. Render the prompt template with runtime values such as `{{HARNESS}}`,
-   `{{SUBAGENT_COMMAND}}`, and `{{USER_PROMPT}}`.
+   `{{RUN_MODE}}`, `{{POLL_INTERVAL_SECONDS}}`, `{{SUBAGENT_COMMAND}}`, and
+   `{{USER_PROMPT}}`.
 9. Apply manifest-declared gateway settings.
 10. Resolve provider profile IDs by scanning `profile_paths` in order.
 11. Import each provider profile into the gateway. If an active profile already
@@ -81,10 +85,39 @@ Manifest paths support these prefixes:
 15. Run `openshell sandbox create` with the rendered payload uploaded to
     `/sandbox`.
 16. Inside the sandbox, run `/sandbox/payload/runtime/entrypoint.sh`.
-17. The runtime entrypoint dispatches to
-    `/sandbox/payload/runtime/harnesses/<harness>/exec.sh`.
-18. Harness adapters prepare harness-local auth/config and execute the agent
+17. The runtime entrypoint starts `/sandbox/payload/runtime/supervisor.sh`.
+18. The supervisor invokes `/sandbox/payload/runtime/harnesses/<harness>/exec.sh`
+    as a bounded child execution.
+19. Harness adapters prepare harness-local auth/config and execute the agent
     prompt headlessly.
+
+## Runtime Modes
+
+Agents can run in `once` or `watch` mode. In `once` mode the supervisor runs one
+harness cycle and exits with the harness result unless the agent emits an
+`OPENSHELL_AGENT_RESULT` sentinel.
+
+In `watch` mode the sandbox stays alive while the supervisor repeatedly runs
+bounded harness cycles. The harness must not sleep or poll indefinitely. Instead,
+it performs one reconciliation cycle, then prints a final-line sentinel:
+
+```text
+OPENSHELL_AGENT_RESULT {"status":"waiting","next_poll_seconds":900,"reason":"checks_pending"}
+```
+
+Supported statuses are `complete`, `waiting`, `blocked`, `transient_failure`, and
+`terminal_failure`. The supervisor sleeps between `waiting` or `blocked` cycles
+without keeping the harness connected, then launches a fresh harness cycle inside
+the same sandbox. This keeps long-lived agents resilient to harness transport
+disconnects while leaving durable state ownership to the agent domain.
+
+The shared runtime does not prescribe the durable state store. Gator uses GitHub
+labels, comments, reviews, and checks. Other agents can use a repository branch,
+issue tracker, object store, database, or another domain-specific store as long
+as each cycle can reconcile from that state.
+
+Use `--once` or `--watch` to override the manifest default. Use
+`--poll-interval <seconds>` to override the watch sleep interval.
 
 ## Subagents
 

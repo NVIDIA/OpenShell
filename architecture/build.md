@@ -24,7 +24,11 @@ agent launchers use manifest files under `openshell-agents/<agent>/` to describe
 agent intent, provider profile IDs, prompt templates, skills, subagents, and
 harness defaults. Agent directories do not own harness implementations. The
 shared runtime under `openshell-agents/runtime/` provides the sandbox entrypoint,
-harness install helpers, and harness-specific execution adapters.
+harness install helpers, an in-sandbox supervisor, and harness-specific execution
+adapters. The supervisor supports one-shot execution and long-lived watch mode:
+watch mode keeps the sandbox alive but runs harnesses as bounded child cycles,
+sleeping between cycles without holding a model transport connection open. Agent
+durable state remains domain-specific rather than stored in the sandbox runtime.
 
 ## Linux Runtime Environments
 

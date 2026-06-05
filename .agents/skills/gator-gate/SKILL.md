@@ -189,7 +189,15 @@ If no `gator:*` label exists, begin validation.
 
 Every gator state is a watch state. On each invocation, determine the current state, inspect the latest issue/PR activity, and either advance to the next state, keep waiting, or post a TTL nudge.
 
-Do not stop after a one-shot check when a PR is in an active waiting state unless the operator explicitly asks for a one-shot status check. Enter a polling loop and state the interval and stop conditions before waiting.
+When `OPENSHELL_AGENT_RUN_MODE=watch`, the OpenShell agent supervisor owns the sleep/relaunch loop. In that mode, perform exactly one reconciliation cycle, do not run `sleep 900` or an unbounded polling loop inside the harness, and finish with a single final-line result sentinel:
+
+```text
+OPENSHELL_AGENT_RESULT {"status":"waiting","next_poll_seconds":900,"reason":"checks_pending"}
+```
+
+Use `status=waiting` for routine CI/PR activity waits, `status=blocked` for human or process blockers, `status=complete` for closed/merged/terminal items, `status=terminal_failure` for unrecoverable errors, and `status=transient_failure` only when the supervisor should retry soon. The supervisor will sleep and invoke the harness again with fresh GitHub state.
+
+When not running under supervised watch mode, do not stop after a one-shot check when a PR is in an active waiting state unless the operator explicitly asks for a one-shot status check. Enter a polling loop and state the interval and stop conditions before waiting.
 
 Default live-watch cadence:
 

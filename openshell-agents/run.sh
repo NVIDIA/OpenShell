@@ -19,6 +19,9 @@ CODEX_PROVIDER_OVERRIDE="${GATOR_CODEX_PROVIDER:-}"
 CODEX_PROVIDER_PROFILE_OVERRIDE="${GATOR_CODEX_PROVIDER_PROFILE:-}"
 CODEX_ACCESS_KEY_OVERRIDE="${GATOR_CODEX_ACCESS_CREDENTIAL_KEY:-}"
 CODEX_LOCAL_BIN="${GATOR_CODEX_LOCAL_BIN:-}"
+RUN_MODE_OVERRIDE="${OPENSHELL_AGENT_RUN_MODE:-}"
+POLL_INTERVAL_OVERRIDE="${OPENSHELL_AGENT_POLL_INTERVAL_SECONDS:-}"
+MAX_TRANSIENT_FAILURES_OVERRIDE="${OPENSHELL_AGENT_MAX_TRANSIENT_FAILURES:-}"
 BACKGROUND=0
 KEEP_SANDBOX=0
 
@@ -36,6 +39,9 @@ Options:
   --codex-provider NAME   Override the codex-gator provider instance name
   --codex-access-key KEY  Override the Codex access-token credential key
   --codex-bin PATH        Upload this Codex executable into the sandbox
+  --once                  Run one bounded agent cycle
+  --watch                 Keep the sandbox alive and re-run bounded cycles
+  --poll-interval SECONDS Sleep duration between watch cycles
   --background            Run sandbox create in the background and write a log
   --keep                  Keep the sandbox after the harness exits
   -h, --help              Show this help
@@ -96,6 +102,19 @@ while [[ $# -gt 0 ]]; do
         --codex-bin)
             [[ $# -ge 2 ]] || fail "--codex-bin requires a value"
             CODEX_LOCAL_BIN="$2"
+            shift 2
+            ;;
+        --once)
+            RUN_MODE_OVERRIDE="once"
+            shift
+            ;;
+        --watch)
+            RUN_MODE_OVERRIDE="watch"
+            shift
+            ;;
+        --poll-interval)
+            [[ $# -ge 2 ]] || fail "--poll-interval requires a value"
+            POLL_INTERVAL_OVERRIDE="$2"
             shift 2
             ;;
         --background)
@@ -180,6 +199,11 @@ emit "GATEWAY_DEFAULT", manifest.dig("sandbox", "gateway") || "docker-dev"
 emit "BACKGROUND_LOG_DIR", manifest.dig("sandbox", "background_log_dir") || "logs"
 emit "PROMPT_TEMPLATE", manifest.fetch("prompt_template")
 emit_array "PROFILE_PATHS", manifest.fetch("profile_paths", [])
+
+runtime = manifest.fetch("runtime", {})
+emit "RUNTIME_MODE", runtime.fetch("mode", "once")
+emit "RUNTIME_POLL_INTERVAL_SECONDS", runtime.fetch("poll_interval_seconds", 900)
+emit "RUNTIME_MAX_TRANSIENT_FAILURES", runtime.fetch("max_transient_failures", 5)
 
 settings = manifest.fetch("settings", [])
 emit "SETTING_COUNT", settings.length
@@ -433,6 +457,17 @@ configure_provider_refresh() {
 GATEWAY="${GATEWAY_OVERRIDE:-${GATOR_GATEWAY:-$GATEWAY_DEFAULT}}"
 SANDBOX_NAME="${SANDBOX_NAME_OVERRIDE:-${GATOR_SANDBOX_NAME:-$SANDBOX_NAME_PREFIX-$(date +%Y%m%d%H%M%S)}}"
 SANDBOX_FROM="${SANDBOX_FROM_OVERRIDE:-${GATOR_SANDBOX_FROM:-$(resolve_manifest_path "$SANDBOX_FROM_DEFAULT")}}"
+RUN_MODE="${RUN_MODE_OVERRIDE:-$RUNTIME_MODE}"
+POLL_INTERVAL_SECONDS="${POLL_INTERVAL_OVERRIDE:-$RUNTIME_POLL_INTERVAL_SECONDS}"
+MAX_TRANSIENT_FAILURES="${MAX_TRANSIENT_FAILURES_OVERRIDE:-$RUNTIME_MAX_TRANSIENT_FAILURES}"
+
+case "$RUN_MODE" in
+    once|watch) ;;
+    *) fail "unsupported runtime mode: $RUN_MODE" ;;
+esac
+[[ "$POLL_INTERVAL_SECONDS" =~ ^[0-9]+$ ]] || fail "--poll-interval must be an integer number of seconds"
+[[ "$MAX_TRANSIENT_FAILURES" =~ ^[0-9]+$ ]] || fail "max_transient_failures must be an integer"
+[[ "$POLL_INTERVAL_SECONDS" -gt 0 ]] || fail "--poll-interval must be greater than zero"
 
 for ((provider_index = 0; provider_index < PROVIDER_COUNT; provider_index++)); do
     profile_var="PROVIDER_${provider_index}_PROFILE"
@@ -482,11 +517,13 @@ done
 SUBAGENT_COMMAND="bash /sandbox/payload/runtime/subagent.sh principal-engineer-reviewer < task.md"
 PROMPT_TEMPLATE_PATH="$(resolve_manifest_path "$PROMPT_TEMPLATE")"
 [[ -f "$PROMPT_TEMPLATE_PATH" ]] || fail "missing prompt template: $PROMPT_TEMPLATE_PATH"
-ruby - "$PROMPT_TEMPLATE_PATH" "$PAYLOAD_DIR/agent-prompt.md" "$HARNESS" "$SUBAGENT_COMMAND" "$USER_PROMPT" <<'RUBY'
-template_path, output_path, harness, subagent_command, user_prompt = ARGV
+ruby - "$PROMPT_TEMPLATE_PATH" "$PAYLOAD_DIR/agent-prompt.md" "$HARNESS" "$SUBAGENT_COMMAND" "$RUN_MODE" "$POLL_INTERVAL_SECONDS" "$USER_PROMPT" <<'RUBY'
+template_path, output_path, harness, subagent_command, run_mode, poll_interval_seconds, user_prompt = ARGV
 values = {
   "HARNESS" => harness,
   "SUBAGENT_COMMAND" => subagent_command,
+  "RUN_MODE" => run_mode,
+  "POLL_INTERVAL_SECONDS" => poll_interval_seconds,
   "USER_PROMPT" => user_prompt,
 }
 template = File.read(template_path)
@@ -564,6 +601,9 @@ fi
 HARNESS_ENV_ARGS=(
     "OPENSHELL_AGENT_ID=$AGENT_ID"
     "OPENSHELL_AGENT_HARNESS=$HARNESS"
+    "OPENSHELL_AGENT_RUN_MODE=$RUN_MODE"
+    "OPENSHELL_AGENT_POLL_INTERVAL_SECONDS=$POLL_INTERVAL_SECONDS"
+    "OPENSHELL_AGENT_MAX_TRANSIENT_FAILURES=$MAX_TRANSIENT_FAILURES"
 )
 
 case "$HARNESS" in

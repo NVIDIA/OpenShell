@@ -12,10 +12,8 @@ require_env() {
 
 require_env OPENSHELL_AGENT_HARNESS
 
-PROMPT_FILE="${OPENSHELL_AGENT_PROMPT:-/sandbox/payload/agent-prompt.md}"
-ADAPTER="/sandbox/payload/runtime/harnesses/$OPENSHELL_AGENT_HARNESS/exec.sh"
+SUPERVISOR="/sandbox/payload/runtime/supervisor.sh"
 
-[[ -f "$PROMPT_FILE" ]] || { echo "missing agent prompt: $PROMPT_FILE" >&2; exit 1; }
-[[ -x "$ADAPTER" ]] || { echo "missing harness adapter: $ADAPTER" >&2; exit 1; }
+[[ -x "$SUPERVISOR" ]] || { echo "missing agent supervisor: $SUPERVISOR" >&2; exit 1; }
 
-exec bash "$ADAPTER" "$PROMPT_FILE"
+exec bash "$SUPERVISOR"
