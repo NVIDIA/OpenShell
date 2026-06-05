@@ -18,9 +18,10 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
 
-use crate::app::{self, App, Focus, InputMode, Screen};
+use crate::app::{self, App, Focus, InputMode, Screen, SettingEditState};
+use crate::theme::Theme;
 
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     // Splash screen is a full-screen takeover — no chrome.
@@ -510,6 +511,62 @@ pub fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
         ])
         .split(vert[1]);
     horiz[1]
+}
+
+// ---------------------------------------------------------------------------
+// Shared setting-edit overlay (used by both global and sandbox settings panes)
+// ---------------------------------------------------------------------------
+
+/// Render the generic setting-edit text-input overlay.
+///
+/// Both the global-settings and sandbox-settings panes show the same editor
+/// overlay — an input box with the setting key/type in the title, an error
+/// line when validation fails, and `[Enter]`/`[Esc]` hints.  This function
+/// is the single implementation; each pane resolves its own entry and then
+/// delegates here.
+fn draw_setting_edit_overlay(
+    frame: &mut Frame<'_>,
+    key: &str,
+    kind: openshell_core::settings::SettingValueKind,
+    edit: &SettingEditState,
+    area: Rect,
+    theme: &Theme,
+) {
+    let t = theme;
+    let title = format!(" Edit: {} ({}) ", key, kind.as_str());
+    let mut lines = vec![
+        Line::from(Span::styled(&title, t.heading)),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Value: ", t.muted),
+            Span::styled(&edit.input, t.text),
+            Span::styled("_", t.accent),
+        ]),
+    ];
+
+    if let Some(ref err) = edit.error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(err.as_str(), t.status_err)));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("[Enter]", t.key_hint),
+        Span::styled(" Confirm  ", t.muted),
+        Span::styled("[Esc]", t.key_hint),
+        Span::styled(" Cancel", t.muted),
+    ]));
+
+    let popup_height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
+    let popup = centered_popup(50, popup_height, area);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(t.border_focused)
+        .padding(Padding::horizontal(1));
+
+    frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
 /// Center a popup rectangle within `area` using percentage-based width and
