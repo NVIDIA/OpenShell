@@ -194,13 +194,6 @@ Configure VM driver values such as `grpc_endpoint`, `driver_dir`, `state_dir`, `
 
 The gateway starts `openshell-driver-vm` over a private Unix socket and passes its process ID so the driver can reject unexpected local clients. The driver's standalone TCP listener is disabled unless `--allow-unauthenticated-tcp` is set for local development.
 
-### VM Driver Config Mounts
-
-The VM driver does not currently support user-supplied mounts through
-`--driver-config-json`. Each sandbox VM boots from a cached read-only image disk
-plus a per-sandbox writable overlay disk, and the driver owns the guest mount
-layout.
-
 ### Local image resolution
 
 The VM driver resolves sandbox images from a local container engine before falling back to registry pulls. It tries Docker first, then falls back to the Podman socket (Docker-compatible API). On Linux with Podman, enable the API socket so the driver can find local images:
@@ -241,18 +234,6 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 | `sa_token_ttl_secs` | `server.sandboxJwt.k8sSaTokenTtlSecs` | Set the projected ServiceAccount token TTL used for the bootstrap token exchange. |
 
 The Kubernetes driver creates namespaced `agents.x-k8s.io/v1alpha1` `Sandbox` resources from the Kubernetes SIG Apps [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) project. The Agent Sandbox controller turns those resources into sandbox pods and related storage.
-
-### Kubernetes Driver Config Mounts
-
-The Kubernetes driver does not currently support Docker or Podman-style
-`mounts` entries in `--driver-config-json`. Kubernetes driver config is limited
-to pod scheduling and agent resource fields such as `pod.node_selector`,
-`pod.tolerations`, `pod.runtime_class_name`, `pod.priority_class_name`,
-`containers.agent.resources.requests`, and `containers.agent.resources.limits`.
-
-Kubernetes sandbox workspace storage uses Agent Sandbox
-`volumeClaimTemplates`. The gateway injects the default workspace claim when the
-template does not provide one.
 
 <Note>
 `Sandbox.spec.volumeClaimTemplates` is immutable after creation. To change storage configuration, delete the sandbox and create a new one with the updated spec.
