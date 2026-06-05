@@ -16,9 +16,15 @@ OpenShell builds these main artifacts:
 | Supervisor container image | `deploy/docker/Dockerfile.supervisor` |
 | Helm chart | `deploy/helm/openshell` |
 | VM driver/runtime assets | `crates/openshell-driver-vm` |
+| Agent sandbox launchers | `openshell-agents/` manifests, images, and shared runtime adapters |
 | Published docs site | `docs/` rendered by Fern config in `fern/` |
 
-Sandbox community images are built outside this repository.
+Sandbox community images are built outside this repository. Repository-owned
+agent launchers use manifest files under `openshell-agents/<agent>/` to describe
+agent intent, provider profile IDs, prompt templates, skills, subagents, and
+harness defaults. Agent directories do not own harness implementations. The
+shared runtime under `openshell-agents/runtime/` provides the sandbox entrypoint,
+harness install helpers, and harness-specific execution adapters.
 
 ## Linux Runtime Environments
 

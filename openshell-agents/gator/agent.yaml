@@ -1,0 +1,85 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+id: gator
+display_name: Gator Gate Agent
+description: Validate and monitor OpenShell GitHub issues and pull requests through the gator state machine.
+
+sandbox:
+  name_prefix: gator
+  from: agent://../Dockerfile.gator
+  gateway: docker-dev
+  background_log_dir: logs
+
+harness:
+  default: codex
+  supported:
+    codex:
+      model: gpt-5.5
+      reasoning: high
+
+profile_paths:
+  - providers
+
+settings:
+  - key: providers_v2_enabled
+    value: true
+  - key: agent_policy_proposals_enabled
+    value: true
+  - key: proposal_approval_mode
+    value: auto
+
+providers:
+  - id: github
+    name: github-gator
+    profile: github-gator
+    credential_mode: explicit
+    credentials:
+      - env: GITHUB_TOKEN
+        source:
+          kind: host_command
+          command: gh auth token
+        export: true
+
+  - id: codex
+    name: codex-gator
+    profile: codex-gator
+    harness: codex
+    credential_mode: from_existing
+    credentials:
+      - env: CODEX_AUTH_ACCESS_TOKEN
+        source:
+          kind: file_json
+          path: ~/.codex/auth.json
+          query: tokens.access_token
+        export: true
+      - env: CODEX_AUTH_ACCOUNT_ID
+        source:
+          kind: file_json
+          path: ~/.codex/auth.json
+          query: tokens.account_id
+        export: true
+    refresh:
+      credential_key: CODEX_AUTH_ACCESS_TOKEN
+      strategy: oauth2-refresh-token
+      materials:
+        - name: client_id
+          value: app_EMoamEEZ73f0CkXaXp7hrann
+        - name: refresh_token
+          secret: true
+          source:
+            kind: file_json
+            path: ~/.codex/auth.json
+            query: tokens.refresh_token
+
+skills:
+  - id: gator-gate
+    source: repo://.agents/skills/gator-gate/SKILL.md
+    destination: .agents/skills/gator-gate/SKILL.md
+
+subagents:
+  - id: principal-engineer-reviewer
+    source: repo://.claude/agents/principal-engineer-reviewer.md
+    destination: subagents/principal-engineer-reviewer.md
+
+prompt_template: prompts/gator.md

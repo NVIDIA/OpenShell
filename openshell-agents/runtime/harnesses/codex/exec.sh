@@ -5,6 +5,11 @@
 
 set -euo pipefail
 
+if [[ $# -ne 1 ]]; then
+    echo "usage: exec.sh <prompt-file>" >&2
+    exit 2
+fi
+
 require_env() {
     local name="$1"
     [[ -n "${!name:-}" ]] || { echo "missing required env: $name" >&2; exit 1; }
@@ -14,6 +19,7 @@ require_env CODEX_AUTH_ACCESS_TOKEN
 require_env CODEX_AUTH_ACCOUNT_ID
 require_env GITHUB_TOKEN
 
+PROMPT_FILE="$1"
 export GH_TOKEN="$GITHUB_TOKEN"
 export HOME=/sandbox/home
 
@@ -28,8 +34,8 @@ const fallbackIdToken = [
   b64u({
     iss: "https://auth.openai.com",
     aud: "codex",
-    sub: "openshell-gator",
-    email: "gator@openshell.local",
+    sub: "openshell-agent",
+    email: "agent@openshell.local",
     iat: now,
     exp: now + 3600,
   }),
@@ -54,8 +60,8 @@ WORK="$(mktemp -d)"
 cd "$WORK"
 
 CODEX_BIN="${CODEX_BIN:-codex}"
-if [[ -x /sandbox/payload/harnesses/codex/codex ]]; then
-    CODEX_BIN=/sandbox/payload/harnesses/codex/codex
+if [[ -x /sandbox/payload/runtime/harnesses/codex/codex ]]; then
+    CODEX_BIN=/sandbox/payload/runtime/harnesses/codex/codex
 fi
 CODEX_MODEL="${CODEX_MODEL:-gpt-5.5}"
 CODEX_REASONING="${CODEX_REASONING:-high}"
@@ -77,4 +83,4 @@ fi
 exec "$CODEX_BIN" "${CODEX_EXEC_ARGS[@]}" \
     -c "model=\"${CODEX_MODEL}\"" \
     -c "model_reasoning_effort=\"${CODEX_REASONING}\"" \
-    "$(cat /sandbox/payload/gator-prompt.md)"
+    "$(<"$PROMPT_FILE")"

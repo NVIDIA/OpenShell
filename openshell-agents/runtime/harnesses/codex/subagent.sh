@@ -5,15 +5,21 @@
 
 set -euo pipefail
 
-REVIEWER_PROMPT="${REVIEWER_PROMPT:-/sandbox/payload/.claude/agents/principal-engineer-reviewer.md}"
-[[ -f "$REVIEWER_PROMPT" ]] || {
-    echo "missing reviewer prompt: $REVIEWER_PROMPT" >&2
+if [[ $# -ne 1 ]]; then
+    echo "usage: subagent.sh <subagent-id> < task.md" >&2
+    exit 2
+fi
+
+SUBAGENT_ID="$1"
+SUBAGENT_PROMPT="/sandbox/payload/subagents/$SUBAGENT_ID.md"
+[[ -f "$SUBAGENT_PROMPT" ]] || {
+    echo "missing subagent prompt: $SUBAGENT_PROMPT" >&2
     exit 1
 }
 
 CODEX_BIN="${CODEX_BIN:-codex}"
-if [[ -x /sandbox/payload/harnesses/codex/codex ]]; then
-    CODEX_BIN=/sandbox/payload/harnesses/codex/codex
+if [[ -x /sandbox/payload/runtime/harnesses/codex/codex ]]; then
+    CODEX_BIN=/sandbox/payload/runtime/harnesses/codex/codex
 fi
 
 CODEX_MODEL="${CODEX_MODEL:-gpt-5.5}"
@@ -29,12 +35,11 @@ trap cleanup EXIT
 cat >"$TASK_FILE"
 
 {
-    printf '%s\n\n' 'You are running as the principal-engineer-reviewer sub-agent for OpenShell gator-gate.'
+    printf '%s\n\n' "You are running as the $SUBAGENT_ID sub-agent inside an OpenShell sandbox."
     printf '%s\n\n' 'Follow this agent definition exactly:'
-    cat "$REVIEWER_PROMPT"
-    printf '\n%s\n\n' 'Reviewer task:'
+    cat "$SUBAGENT_PROMPT"
+    printf '\n%s\n\n' 'Task:'
     cat "$TASK_FILE"
-    printf '\n%s\n' 'Return the review only. Do not mutate repository state, labels, comments, or PRs.'
 } >"$PROMPT_FILE"
 
 CODEX_EXEC_ARGS=(
@@ -54,4 +59,4 @@ fi
 exec "$CODEX_BIN" "${CODEX_EXEC_ARGS[@]}" \
     -c "model=\"${CODEX_MODEL}\"" \
     -c "model_reasoning_effort=\"${CODEX_REASONING}\"" \
-    "$(cat "$PROMPT_FILE")"
+    - <"$PROMPT_FILE"

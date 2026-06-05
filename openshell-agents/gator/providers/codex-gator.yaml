@@ -30,11 +30,8 @@ credentials:
     description: Codex account identifier
     env_vars: [CODEX_AUTH_ACCOUNT_ID]
     required: true
-  - name: id_token
-    description: Codex OAuth ID token
-    env_vars: [CODEX_AUTH_ID_TOKEN]
 discovery:
-  credentials: [access_token, account_id, id_token]
+  credentials: [access_token, account_id]
 endpoints:
   - host: api.openai.com
     port: 443
