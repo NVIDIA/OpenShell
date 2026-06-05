@@ -124,6 +124,8 @@ pub enum ComputeDriverKind {
     Vm,
     Docker,
     Podman,
+    /// Microsoft MXC isolation session (Windows only).
+    Mxc,
 }
 
 impl ComputeDriverKind {
@@ -134,6 +136,7 @@ impl ComputeDriverKind {
             Self::Vm => "vm",
             Self::Docker => "docker",
             Self::Podman => "podman",
+            Self::Mxc => "mxc",
         }
     }
 }
@@ -174,8 +177,9 @@ impl FromStr for ComputeDriverKind {
             "vm" => Ok(Self::Vm),
             "docker" => Ok(Self::Docker),
             "podman" => Ok(Self::Podman),
+            "mxc" => Ok(Self::Mxc),
             other => Err(format!(
-                "unsupported compute driver '{other}'. expected one of: kubernetes, vm, docker, podman"
+                "unsupported compute driver '{other}'. expected one of: kubernetes, vm, docker, podman, mxc"
             )),
         }
     }
