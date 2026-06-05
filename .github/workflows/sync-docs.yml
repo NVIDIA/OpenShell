@@ -1,0 +1,136 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Sync Docs Website
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: "Whether to sync or remove a docs snapshot"
+        required: true
+        default: sync
+        type: choice
+        options:
+          - sync
+          - remove
+      channel:
+        description: "Docs channel to update or remove"
+        required: true
+        type: choice
+        options:
+          - dev
+          - latest
+          - version
+      source_ref:
+        description: "Source commit SHA, branch, or tag to snapshot when operation=sync"
+        required: false
+        type: string
+      version_slug:
+        description: "Version slug when channel=version, e.g. v0.0.36"
+        required: false
+        type: string
+      display_name:
+        description: "Optional version selector display name"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: docs-website
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout automation
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          path: automation
+
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          if [[ "${{ inputs.operation }}" == "sync" && -z "${{ inputs.source_ref }}" ]]; then
+            echo "source_ref is required when operation=sync" >&2
+            exit 1
+          fi
+          if [[ "${{ inputs.channel }}" == "version" && -z "${{ inputs.version_slug }}" ]]; then
+            echo "version_slug is required when channel=version" >&2
+            exit 1
+          fi
+
+      - name: Checkout source docs
+        if: ${{ inputs.operation == 'sync' }}
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 0
+          path: source
+
+      - name: Checkout docs website branch
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: docs-website
+          fetch-depth: 0
+          path: docs-website
+
+      - name: Install uv
+        run: python3 -m pip install "uv==0.10.12"
+
+      - name: Update docs snapshot
+        run: |
+          uv run automation/tasks/scripts/sync_docs_website.py \
+            --operation "${{ inputs.operation }}" \
+            --source-root source \
+            --docs-website-root docs-website \
+            --channel "${{ inputs.channel }}" \
+            --source-ref "${{ inputs.source_ref }}" \
+            --version-slug "${{ inputs.version_slug }}" \
+            --display-name "${{ inputs.display_name }}"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: "24"
+
+      - name: Install Fern CLI
+        working-directory: docs-website
+        run: |
+          FERN_VERSION=$(node -p "require('./fern/fern.config.json').version")
+          npm install -g "fern-api@${FERN_VERSION}"
+
+      - name: Validate docs website
+        working-directory: docs-website/fern
+        run: fern check
+
+      - name: Commit docs website changes
+        working-directory: docs-website
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          # https://api.github.com/users/github-actions%5Bbot%5D
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .
+          if git diff --cached --quiet; then
+            echo "No docs website changes to commit."
+            exit 0
+          fi
+          target="${{ inputs.version_slug }}"
+          if [[ -z "${target}" ]]; then
+            target="${{ inputs.channel }}"
+          fi
+          if [[ "${{ inputs.operation }}" == "sync" ]]; then
+            git commit -m "docs(website): sync ${target} docs from ${{ inputs.source_ref }}"
+          else
+            git commit -m "docs(website): remove ${target} docs"
+          fi
+          git push origin HEAD:docs-website

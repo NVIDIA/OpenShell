@@ -1,0 +1,73 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Publish Docs Website
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Fern publish mode"
+        required: true
+        default: preview
+        type: choice
+        options:
+          - preview
+          - production
+      preview_id:
+        description: "Optional Fern preview id when mode=preview"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-website
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout docs website branch
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: docs-website
+
+      - name: Setup Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: "24"
+
+      - name: Install Fern CLI
+        run: |
+          FERN_VERSION=$(node -p "require('./fern/fern.config.json').version")
+          npm install -g "fern-api@${FERN_VERSION}"
+
+      - name: Validate docs website
+        working-directory: ./fern
+        run: fern check
+
+      - name: Generate Fern preview
+        if: ${{ inputs.mode == 'preview' }}
+        env:
+          FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
+          INPUT_PREVIEW_ID: ${{ inputs.preview_id }}
+        working-directory: ./fern
+        run: |
+          set -euo pipefail
+          PREVIEW_ID="${INPUT_PREVIEW_ID:-docs-website-${{ github.run_id }}}"
+          fern generate --docs --preview --id "$PREVIEW_ID"
+
+      - name: Publish Fern docs
+        if: ${{ inputs.mode == 'production' }}
+        env:
+          FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
+        working-directory: ./fern
+        run: fern generate --docs
