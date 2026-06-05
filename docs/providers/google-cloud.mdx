@@ -14,31 +14,23 @@ on loopback provides credential placeholders that the
 sandbox proxy resolves to real tokens at request time. The sandbox process
 never holds a real GCP credential.
 
-## Quick Start (Manual Token)
+## Quick Start
 
-If you already have `gcloud` configured, you can create a provider with a
-short-lived access token from Application Default Credentials. This is the
-fastest way to test GCP access in a sandbox.
+If you already have `gcloud` configured with Application Default Credentials,
+create a provider with automatic credential refresh in one command:
 
 ```shell
-export GCP_ADC_ACCESS_TOKEN="$(gcloud auth application-default print-access-token)"
-
 openshell provider create \
   --name my-gcp \
   --type google-cloud \
-  --from-existing \
+  --from-gcloud-adc \
   --config project_id="$(gcloud config get-value project)" \
   --config region=global
 ```
 
-<Note>
-The token from `gcloud auth application-default print-access-token` expires
-after approximately 60 minutes. To keep the provider alive beyond that,
-configure credential refresh using the
-[Application Default Credentials](#application-default-credentials-gcloud-adc)
-flow below. The manual token bootstraps the provider; the refresh config
-keeps it running.
-</Note>
+`--from-gcloud-adc` reads your ADC file, configures OAuth2 refresh on the
+gateway, and mints the first access token before the command returns. The
+gateway rotates the token automatically — no manual refresh needed.
 
 ## Authentication Flows
 
