@@ -27,6 +27,9 @@ use openshell_core::policy::SandboxPolicy;
 use openshell_core::provider_credentials::ProviderCredentialState;
 
 #[cfg(target_os = "linux")]
+use openshell_core::denial::DenialEvent;
+
+#[cfg(target_os = "linux")]
 use crate::managed_children;
 use crate::process::ProcessHandle;
 
@@ -59,6 +62,9 @@ pub async fn run_process(
     ssh_netns_fd: Option<i32>,
     ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
     #[cfg(target_os = "linux")] netns: Option<&NetworkNamespace>,
+    #[cfg(target_os = "linux")] bypass_denial_tx: Option<
+        tokio::sync::mpsc::UnboundedSender<DenialEvent>,
+    >,
 ) -> Result<i32> {
     // Validate that the sandbox user exists in the image. All sandbox images
     // must include a "sandbox" user for privilege dropping; failing fast here
@@ -83,6 +89,20 @@ pub async fn run_process(
     // helpers (network namespace setup, nftables probes via run_networking),
     // and the SSH listener and entrypoint child have not been exposed yet.
     crate::sandbox::apply_supervisor_startup_hardening()?;
+
+    // Spawn the bypass detection monitor. It tails dmesg for nftables LOG
+    // entries fired by rules installed on the workload's network namespace
+    // and reports direct connection attempts that would have bypassed the
+    // proxy. Spawn it before the entrypoint child so the first packets are
+    // not missed. Best-effort: returns None when dmesg is unavailable.
+    #[cfg(target_os = "linux")]
+    let _bypass_handle = netns.and_then(|ns| {
+        crate::bypass_monitor::spawn(
+            ns.name().to_string(),
+            entrypoint_pid.clone(),
+            bypass_denial_tx,
+        )
+    });
 
     // Verify the runtime PID limit can accommodate the policy's pid_max.
     #[cfg(target_os = "linux")]

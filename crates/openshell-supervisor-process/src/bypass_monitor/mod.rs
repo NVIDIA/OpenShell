@@ -16,7 +16,9 @@
 //! the monitor logs a one-time warning and returns. The nftables reject rules
 //! still provide fast-fail UX — the monitor only adds diagnostic visibility.
 
-use crate::denial::DenialEvent;
+mod procfs;
+
+use openshell_core::denial::DenialEvent;
 use openshell_ocsf::{
     ActionId, ActivityId, ConfidenceId, DetectionFindingBuilder, DispositionId, Endpoint,
     FindingInfo, NetworkActivityBuilder, Process, SeverityId, ocsf_emit,
@@ -293,86 +295,75 @@ pub fn spawn(
 /// Returns `(binary_path, pid, ancestors)` as display strings.
 /// Falls back to `("-", "-", "-")` on any failure (race condition, etc.).
 fn resolve_process_identity(entrypoint_pid: u32, src_port: u16) -> (String, String, String) {
-    #[cfg(target_os = "linux")]
-    {
-        use crate::procfs;
-
-        match procfs::resolve_tcp_peer_socket_owners(entrypoint_pid, src_port) {
-            Ok(socket_owners) => {
-                let mut identities = Vec::new();
-                for owner in &socket_owners.owners {
-                    let Ok(binary_path) = procfs::binary_path(owner.pid.cast_signed()) else {
-                        continue;
-                    };
-                    let ancestors = procfs::collect_ancestor_binaries(owner.pid, entrypoint_pid);
-                    identities.push((owner.pid, binary_path, ancestors));
-                }
-
-                if identities.is_empty() {
-                    return ("-".to_string(), "-".to_string(), "-".to_string());
-                }
-
-                identities.sort_by_key(|(pid, _, _)| *pid);
-                let first_identity = (identities[0].1.clone(), identities[0].2.clone());
-                let ambiguous = identities
-                    .iter()
-                    .skip(1)
-                    .any(|(_, binary_path, ancestors)| {
-                        binary_path != &first_identity.0 || ancestors != &first_identity.1
-                    });
-
-                if ambiguous {
-                    let pids = identities
-                        .iter()
-                        .map(|(pid, _, _)| pid.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let owner_summary = identities
-                        .iter()
-                        .map(|(pid, binary_path, ancestors)| {
-                            let ancestors_str = if ancestors.is_empty() {
-                                "-".to_string()
-                            } else {
-                                ancestors
-                                    .iter()
-                                    .map(|p| p.display().to_string())
-                                    .collect::<Vec<_>>()
-                                    .join(" -> ")
-                            };
-                            format!(
-                                "pid={pid} binary={} ancestors=[{ancestors_str}]",
-                                binary_path.display()
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("; ");
-                    return ("ambiguous".to_string(), pids, owner_summary);
-                }
-
-                let (pid, binary_path, ancestors) = identities.remove(0);
-                let ancestors_str = if ancestors.is_empty() {
-                    "-".to_string()
-                } else {
-                    ancestors
-                        .iter()
-                        .map(|p| p.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join(" -> ")
+    match procfs::resolve_tcp_peer_socket_owners(entrypoint_pid, src_port) {
+        Ok(socket_owners) => {
+            let mut identities = Vec::new();
+            for owner in &socket_owners.owners {
+                let Ok(binary_path) = procfs::binary_path(owner.pid.cast_signed()) else {
+                    continue;
                 };
-                (
-                    binary_path.display().to_string(),
-                    pid.to_string(),
-                    ancestors_str,
-                )
+                let ancestors = procfs::collect_ancestor_binaries(owner.pid, entrypoint_pid);
+                identities.push((owner.pid, binary_path, ancestors));
             }
-            Err(_) => ("-".to_string(), "-".to_string(), "-".to_string()),
-        }
-    }
 
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (entrypoint_pid, src_port);
-        ("-".to_string(), "-".to_string(), "-".to_string())
+            if identities.is_empty() {
+                return ("-".to_string(), "-".to_string(), "-".to_string());
+            }
+
+            identities.sort_by_key(|(pid, _, _)| *pid);
+            let first_identity = (identities[0].1.clone(), identities[0].2.clone());
+            let ambiguous = identities
+                .iter()
+                .skip(1)
+                .any(|(_, binary_path, ancestors)| {
+                    binary_path != &first_identity.0 || ancestors != &first_identity.1
+                });
+
+            if ambiguous {
+                let pids = identities
+                    .iter()
+                    .map(|(pid, _, _)| pid.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let owner_summary = identities
+                    .iter()
+                    .map(|(pid, binary_path, ancestors)| {
+                        let ancestors_str = if ancestors.is_empty() {
+                            "-".to_string()
+                        } else {
+                            ancestors
+                                .iter()
+                                .map(|p| p.display().to_string())
+                                .collect::<Vec<_>>()
+                                .join(" -> ")
+                        };
+                        format!(
+                            "pid={pid} binary={} ancestors=[{ancestors_str}]",
+                            binary_path.display()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return ("ambiguous".to_string(), pids, owner_summary);
+            }
+
+            let (pid, binary_path, ancestors) = identities.remove(0);
+            let ancestors_str = if ancestors.is_empty() {
+                "-".to_string()
+            } else {
+                ancestors
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(" -> ")
+            };
+            (
+                binary_path.display().to_string(),
+                pid.to_string(),
+                ancestors_str,
+            )
+        }
+        Err(_) => ("-".to_string(), "-".to_string(), "-".to_string()),
     }
 }
 
@@ -492,7 +483,6 @@ mod tests {
         assert!(hint_for_event(&event).contains("UDP"));
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn resolve_process_identity_surfaces_ambiguous_shared_socket() {
         use std::ffi::CString;

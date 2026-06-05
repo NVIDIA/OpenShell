@@ -4,9 +4,9 @@
 //! Networking stack startup for the sandbox.
 //!
 //! Builds the network namespace (Linux), the CONNECT proxy with TLS L7
-//! interception, the bypass monitor, the inference context, and the
-//! denial-event channel. Returns a [`Networking`] handle whose RAII fields
-//! keep the proxy and bypass-monitor tasks alive for the lifetime of the
+//! interception, the inference context, and wires the proxy to the
+//! caller-supplied denial-event channel. Returns a [`Networking`] handle
+//! whose RAII fields keep the proxy task alive for the lifetime of the
 //! sandbox supervisor.
 
 use std::net::SocketAddr;
@@ -26,7 +26,9 @@ use openshell_ocsf::{
     ConfigStateChangeBuilder, SeverityId, StateId, StatusId, ctx::ctx as ocsf_ctx, ocsf_emit,
 };
 
-use crate::denial::DenialEvent;
+use openshell_core::denial::DenialEvent;
+use tokio::sync::mpsc::UnboundedSender;
+
 use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::{
     CertCache, ProxyTlsState, SandboxCa, build_upstream_client_config, read_system_ca_bundle,
@@ -35,7 +37,6 @@ use crate::l7::tls::{
 use crate::opa::OpaEngine;
 use crate::policy_local::PolicyLocalContext;
 use crate::proxy::ProxyHandle;
-use tokio::sync::mpsc::UnboundedSender;
 
 /// Create the workload's network namespace and install bypass detection
 /// rules. Returns `None` when the policy is not in proxy mode. Linux-only.
@@ -91,14 +92,12 @@ pub fn create_netns_for_proxy(policy: &SandboxPolicy) -> Result<Option<NetworkNa
 /// Handles and values produced by [`run_networking`] that the rest of
 /// `run_sandbox` consumes.
 ///
-/// The `proxy` / `bypass_monitor` fields are RAII handles whose drop
-/// tears down the proxy and bypass-monitor tasks. They must remain alive for
-/// the duration of the sandbox wait loop, which is achieved by holding the
-/// returned `Networking` value in `run_sandbox`'s frame.
+/// The `proxy` field is an RAII handle whose drop tears down the proxy
+/// task. It must remain alive for the duration of the sandbox wait loop,
+/// which is achieved by holding the returned `Networking` value in
+/// `run_sandbox`'s frame.
 pub struct Networking {
     pub proxy: Option<ProxyHandle>,
-    #[cfg(target_os = "linux")]
-    pub bypass_monitor: Option<tokio::task::JoinHandle<()>>,
 
     pub ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
     pub ssh_proxy_url: Option<String>,
@@ -110,11 +109,16 @@ pub struct Networking {
 }
 
 /// Set up the networking stack: ephemeral CA + TLS state, proxy server,
-/// bypass monitor, and the SSH-side proxy URL / netns FD.
+/// and the SSH-side proxy URL / netns FD.
 ///
 /// The network namespace is created by `run_sandbox` and borrowed in here —
-/// it is shared infrastructure used by both the proxy (bind address, bypass
-/// monitor) and the workload child (entered via `setns()` in `pre_exec`).
+/// it is shared infrastructure used by both the proxy (bind address) and
+/// the workload child (entered via `setns()` in `pre_exec`).
+///
+/// `denial_tx` and `denial_rx` are owned by the caller. The proxy uses the
+/// sender; the aggregator owns the receiver. The caller is also responsible
+/// for cloning `denial_tx` for the bypass monitor (which lives in
+/// `openshell-supervisor-process`).
 ///
 /// # Errors
 ///
@@ -306,25 +310,13 @@ pub async fn run_networking(
             inference_ctx,
             Some(provider_credentials.clone()),
             Some(policy_local_ctx.clone()),
-            denial_tx.clone(),
+            denial_tx,
         )
         .await?;
         Some(proxy_handle)
     } else {
         None
     };
-
-    // Spawn bypass detection monitor (Linux only, proxy mode only).
-    // Reads /dev/kmsg for nftables log entries and emits structured
-    // tracing events for direct connection attempts that bypass the proxy.
-    #[cfg(target_os = "linux")]
-    let bypass_monitor_handle = netns.and_then(|ns| {
-        crate::bypass_monitor::spawn(ns.name().to_string(), entrypoint_pid.clone(), denial_tx)
-    });
-
-    // On non-Linux, denial_tx is unused (no /dev/kmsg).
-    #[cfg(not(target_os = "linux"))]
-    drop(denial_tx);
 
     // Compute the proxy URL and netns fd for SSH sessions.
     // SSH shell processes need both to enforce network policy:
@@ -366,8 +358,6 @@ pub async fn run_networking(
 
     Ok(Networking {
         proxy: proxy_handle,
-        #[cfg(target_os = "linux")]
-        bypass_monitor: bypass_monitor_handle,
         ca_file_paths,
         ssh_proxy_url,
         ssh_netns_fd,

@@ -8,8 +8,6 @@
 //! owned by the orchestrator; this crate produces denials but does not
 //! aggregate them.
 
-pub mod bypass_monitor;
-pub mod denial;
 pub mod identity;
 pub mod inference_routes;
 pub mod l7;

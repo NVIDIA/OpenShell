@@ -55,9 +55,9 @@ pub(crate) use openshell_ocsf::ctx::ctx as ocsf_ctx;
 /// guard (see `policy_local::tests::ProposalsFlagGuard`).
 pub(crate) use openshell_core::proposals::AGENT_PROPOSALS_ENABLED;
 
+use openshell_core::denial::DenialEvent;
 use openshell_core::policy::{NetworkMode, NetworkPolicy, ProxyPolicy, SandboxPolicy};
 use openshell_core::provider_credentials::ProviderCredentialState;
-use openshell_supervisor_network::denial::DenialEvent;
 use openshell_supervisor_network::opa::OpaEngine;
 pub use openshell_supervisor_process::process::{ProcessHandle, ProcessStatus};
 use openshell_supervisor_process::skills;
@@ -215,17 +215,24 @@ pub async fn run_sandbox(
         None
     };
 
-    // Denial channel: orchestrator owns both ends. The proxy and (eventually)
-    // the bypass monitor are pure producers — they receive `tx` clones via
-    // their respective leaf entry points. The aggregator drains `rx` here
-    // and ships summaries to the gateway via SubmitPolicyAnalysis.
-    let (denial_tx, denial_rx): (Option<UnboundedSender<DenialEvent>>, _) = if sandbox_id.is_some()
-    {
+    // The denial channel is owned by the orchestrator: the proxy (in the
+    // networking leaf) and the bypass monitor (in the process leaf) both
+    // produce DenialEvents that the denial aggregator (orchestrator-side)
+    // consumes via the matching receiver. Both leaves are pure producers;
+    // the orchestrator owns the consumer task spawned below.
+    let (denial_tx, denial_rx, bypass_denial_tx): (
+        Option<UnboundedSender<DenialEvent>>,
+        _,
+        Option<UnboundedSender<DenialEvent>>,
+    ) = if sandbox_id.is_some() {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        (Some(tx), Some(rx))
+        let bypass_tx = tx.clone();
+        (Some(tx), Some(rx), Some(bypass_tx))
     } else {
-        (None, None)
+        (None, None, None)
     };
+    #[cfg(not(target_os = "linux"))]
+    drop(bypass_denial_tx);
 
     let mut networking = if network_enabled {
         Some(
@@ -250,9 +257,8 @@ pub async fn run_sandbox(
     };
 
     // Spawn the denial-aggregator flush task. The aggregator drains denial
-    // events from the proxy (and, post-relocation, the bypass monitor),
-    // batches them, and ships summaries to the gateway via
-    // `SubmitPolicyAnalysis`.
+    // events from the proxy + bypass monitor, batches them, and ships
+    // summaries to the gateway via `SubmitPolicyAnalysis`.
     if let (Some(rx), Some(endpoint)) = (denial_rx, openshell_endpoint_for_proxy.as_deref()) {
         // SubmitPolicyAnalysis resolves by sandbox *name*, not UUID — fall
         // back to the ID when the name isn't set.
@@ -355,6 +361,8 @@ pub async fn run_sandbox(
             ca_file_paths,
             #[cfg(target_os = "linux")]
             netns.as_ref(),
+            #[cfg(target_os = "linux")]
+            bypass_denial_tx,
         )
         .await?
     } else {

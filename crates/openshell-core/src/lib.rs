@@ -11,6 +11,7 @@
 
 pub mod auth;
 pub mod config;
+pub mod denial;
 pub mod driver_utils;
 pub mod error;
 pub mod forward;

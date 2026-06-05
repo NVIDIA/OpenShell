@@ -18,3 +18,6 @@ pub mod sandbox;
 pub mod skills;
 pub mod ssh;
 pub mod supervisor_session;
+
+#[cfg(target_os = "linux")]
+pub mod bypass_monitor;
