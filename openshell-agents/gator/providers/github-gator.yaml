@@ -57,6 +57,14 @@ endpoints:
       - allow: { method: POST, path: /repos/NVIDIA/OpenShell-Community/pulls/*/reviews }
       - allow: { method: POST, path: /repos/NVIDIA/OpenShell-Community/pulls/*/reviews/*/comments }
       - allow: { method: POST, path: /repos/NVIDIA/OpenShell-Community/statuses/* }
+  - host: api.github.com
+    port: 443
+    path: /graphql
+    protocol: graphql
+    enforcement: enforce
+    rules:
+      - allow:
+          operation_type: query
   - host: github.com
     port: 443
     protocol: rest
@@ -64,10 +72,14 @@ endpoints:
     rules:
       - allow: { method: GET, path: /NVIDIA/OpenShell }
       - allow: { method: GET, path: /NVIDIA/OpenShell/** }
+      - allow: { method: GET, path: /NVIDIA/OpenShell.git/** }
       - allow: { method: POST, path: /NVIDIA/OpenShell/**/git-upload-pack }
+      - allow: { method: POST, path: /NVIDIA/OpenShell.git/**/git-upload-pack }
       - allow: { method: GET, path: /NVIDIA/OpenShell-Community }
       - allow: { method: GET, path: /NVIDIA/OpenShell-Community/** }
+      - allow: { method: GET, path: /NVIDIA/OpenShell-Community.git/** }
       - allow: { method: POST, path: /NVIDIA/OpenShell-Community/**/git-upload-pack }
+      - allow: { method: POST, path: /NVIDIA/OpenShell-Community.git/**/git-upload-pack }
   - host: codeload.github.com
     port: 443
     protocol: rest
