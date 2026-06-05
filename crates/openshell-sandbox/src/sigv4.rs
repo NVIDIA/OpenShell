@@ -120,20 +120,6 @@ struct RequestParts<'a> {
 /// transport modifies unsigned-by-convention headers (Connection,
 /// Accept-Encoding, etc.) between signing and delivery.
 fn parse_request_parts(header_str: &str) -> RequestParts<'_> {
-    let lines: Vec<&str> = header_str.split("\r\n").collect();
-
-    let (method, path, request_line) =
-        lines
-            .first()
-            .map_or(("GET", "/", "GET / HTTP/1.1"), |first_line| {
-                let parts: Vec<&str> = first_line.splitn(3, ' ').collect();
-                if parts.len() >= 2 {
-                    (parts[0], parts[1], *first_line)
-                } else {
-                    ("GET", "/", *first_line)
-                }
-            });
-
     // Headers stripped entirely — the SDK re-generates auth headers, and
     // `Expect` is handled by the proxy before forwarding.
     const STRIP_HEADERS: &[&str] = &[
@@ -153,6 +139,20 @@ fn parse_request_parts(header_str: &str) -> RequestParts<'_> {
         "amz-sdk-invocation-id",
         "amz-sdk-request",
     ];
+
+    let lines: Vec<&str> = header_str.split("\r\n").collect();
+
+    let (method, path, request_line) =
+        lines
+            .first()
+            .map_or(("GET", "/", "GET / HTTP/1.1"), |first_line| {
+                let parts: Vec<&str> = first_line.splitn(3, ' ').collect();
+                if parts.len() >= 2 {
+                    (parts[0], parts[1], *first_line)
+                } else {
+                    ("GET", "/", *first_line)
+                }
+            });
 
     let mut headers_to_sign: Vec<(String, String)> = Vec::new();
     let mut all_headers: Vec<(String, String)> = Vec::new();
@@ -314,6 +314,7 @@ pub fn apply_sigv4_headers_only(
 /// `StreamingUnsignedPayloadTrailer`).
 ///
 /// Returns signed headers ending with `\r\n\r\n`.
+#[allow(clippy::too_many_arguments)]
 pub fn apply_sigv4_headers_only_with_body(
     raw_headers: &[u8],
     host: &str,

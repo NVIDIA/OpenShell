@@ -1,0 +1,148 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "AWS SigV4 Credential Signing"
+sidebar-title: "AWS SigV4"
+description: "Configure proxy-side AWS SigV4 request signing so sandbox agents can reach AWS services through CONNECT tunnels without holding real credentials."
+keywords: "Generative AI, Cybersecurity, AI Agents, AWS, SigV4, Bedrock, S3, Credential Signing, Sandbox"
+---
+
+AWS SigV4 credential signing lets sandbox agents call AWS services (Bedrock, S3, STS, and others) through the proxy's CONNECT tunnel. The proxy intercepts outbound requests, strips the sandbox client's placeholder `Authorization` header, and re-signs the request with real AWS credentials from the provider. The sandbox never sees the real credentials.
+
+## Prerequisites
+
+- A provider with `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` credentials configured. Optionally include `AWS_SESSION_TOKEN` for STS temporary credentials.
+- A sandbox policy with `credential_signing` enabled on the target endpoint.
+
+## Provider Setup
+
+Create a provider with AWS credentials:
+
+```shell
+openshell provider create \
+  --name aws-prod \
+  --credential AWS_ACCESS_KEY_ID=AKIA... \
+  --credential AWS_SECRET_ACCESS_KEY=wJalr...
+```
+
+For STS temporary credentials, include the session token:
+
+```shell
+openshell provider create \
+  --name aws-sts \
+  --credential AWS_ACCESS_KEY_ID=ASIA... \
+  --credential AWS_SECRET_ACCESS_KEY=secret... \
+  --credential AWS_SESSION_TOKEN=FwoGZX...
+```
+
+## Policy Configuration
+
+Enable SigV4 signing on a per-endpoint basis using three policy fields:
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `credential_signing` | string | Yes | Signing mode: `sigv4`, `sigv4:body`, or `sigv4:no_body`. |
+| `signing_service` | string | Yes | AWS service name for the SigV4 signature (e.g. `bedrock`, `s3`, `sts`). |
+| `signing_region` | string | No | AWS region override. When omitted, extracted from the endpoint hostname. Required for non-standard endpoints. |
+
+### Bedrock Example
+
+```yaml
+network_policies:
+  aws_bedrock:
+    endpoints:
+      - host: bedrock-runtime.us-east-1.amazonaws.com
+        port: 443
+        protocol: rest
+        access: allow
+        credential_signing: sigv4
+        signing_service: bedrock
+        rules:
+          - allow:
+              method: POST
+              path: /model/*/invoke
+```
+
+### S3 Example
+
+```yaml
+network_policies:
+  aws_s3:
+    endpoints:
+      - host: "*.s3.us-east-1.amazonaws.com"
+        port: 443
+        protocol: rest
+        access: allow
+        credential_signing: sigv4
+        signing_service: s3
+```
+
+### STS Example
+
+```yaml
+network_policies:
+  aws_sts:
+    endpoints:
+      - host: sts.us-east-1.amazonaws.com
+        port: 443
+        protocol: rest
+        access: allow
+        credential_signing: sigv4
+        signing_service: sts
+```
+
+## Signing Modes
+
+The `credential_signing` field accepts three values:
+
+| Value | Behavior | Use When |
+|---|---|---|
+| `sigv4` | Auto-detect payload mode from the client SDK's `x-amz-content-sha256` header. | Default. Works for most AWS services. |
+| `sigv4:body` | Always buffer the request body and include its SHA-256 hash in the signature. Maximum body size: 10 MiB. | Services that require body signing (Bedrock). |
+| `sigv4:no_body` | Sign headers only with `UNSIGNED-PAYLOAD`. Stream the body through without buffering. | Large uploads (S3 PutObject), chunked transfers, or any case where body buffering is impractical. |
+
+In `sigv4` auto-detect mode, the proxy inspects the `x-amz-content-sha256` header sent by the client SDK:
+
+- Hex hash → buffer body and sign it (same as `sigv4:body`).
+- `UNSIGNED-PAYLOAD` → sign headers only (same as `sigv4:no_body`).
+- `STREAMING-UNSIGNED-PAYLOAD-TRAILER` → sign headers only, stream body through.
+- Absent → sign body if `Content-Length` is present, otherwise use unsigned payload.
+
+<Note>
+Chunk-signed streaming modes like `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` are not supported. The proxy cannot reproduce per-chunk signatures. If your client SDK sends chunk-signed requests, use `sigv4:no_body` instead.
+</Note>
+
+## Region Detection
+
+The proxy extracts the AWS region from the endpoint hostname automatically. It supports standard, dualstack, FIPS, virtual-hosted, GovCloud, and China partition hostnames.
+
+For endpoints where the region cannot be inferred from the hostname, set `signing_region` explicitly:
+
+```yaml
+endpoints:
+  - host: custom-vpc-endpoint.example.com
+    port: 443
+    protocol: rest
+    access: allow
+    credential_signing: sigv4
+    signing_service: s3
+    signing_region: us-west-2
+```
+
+## Restrictions
+
+- `credential_signing` and `request_body_credential_rewrite` are mutually exclusive on the same endpoint. The policy validator rejects policies that set both.
+- The `sigv4:body` mode buffers at most 10 MiB. Requests with larger bodies are rejected. Use `sigv4:no_body` or `sigv4` (auto-detect) for large payloads.
+- The proxy requires `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` in the provider. If either is missing, the request fails with an error.
+
+## Use from a Sandbox
+
+Inside a sandbox, configure the AWS SDK with placeholder credentials. The proxy replaces them with real credentials during re-signing:
+
+```shell
+export AWS_ACCESS_KEY_ID=placeholder
+export AWS_SECRET_ACCESS_KEY=placeholder
+export AWS_DEFAULT_REGION=us-east-1
+```
+
+Then use any AWS SDK or CLI normally. The proxy transparently re-signs requests before forwarding to AWS.
