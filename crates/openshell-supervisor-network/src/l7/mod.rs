@@ -114,6 +114,9 @@ pub struct L7EndpointConfig {
     /// AWS signing service name (e.g. `"bedrock"`). Required when
     /// `credential_signing` is `SigV4`.
     pub signing_service: String,
+    /// AWS region override for `SigV4` signing. When set, takes precedence
+    /// over hostname-based region extraction.
+    pub signing_region: String,
 }
 
 /// Result of an L7 policy decision for a single request.
@@ -196,7 +199,7 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
         Some("sigv4:body") => CredentialSigning::SigV4Body,
         Some("sigv4:no_body") => CredentialSigning::SigV4NoBody,
         Some(other) if !other.is_empty() => {
-            let event = openshell_ocsf::NetworkActivityBuilder::new(crate::ocsf_ctx())
+            let event = openshell_ocsf::NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
                 .activity(openshell_ocsf::ActivityId::Other)
                 .severity(openshell_ocsf::SeverityId::High)
                 .message(format!(
@@ -210,9 +213,10 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
     };
 
     let signing_service = get_object_str(val, "signing_service").unwrap_or_default();
+    let signing_region = get_object_str(val, "signing_region").unwrap_or_default();
 
     if credential_signing.is_sigv4() && signing_service.is_empty() {
-        let event = openshell_ocsf::NetworkActivityBuilder::new(crate::ocsf_ctx())
+        let event = openshell_ocsf::NetworkActivityBuilder::new(openshell_ocsf::ctx::ctx())
             .activity(openshell_ocsf::ActivityId::Other)
             .severity(openshell_ocsf::SeverityId::High)
             .message("rejecting endpoint: credential_signing requires signing_service".to_string())
@@ -233,6 +237,7 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
         websocket_graphql_policy,
         credential_signing,
         signing_service,
+        signing_region,
     })
 }
 

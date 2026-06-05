@@ -135,6 +135,9 @@ message NetworkEndpoint {
   // AWS signing service name override. Required when credential_signing is
   // "sigv4" — e.g. "bedrock" for bedrock-runtime endpoints.
   string signing_service = 20;
+  // AWS region override for SigV4 signing. When set, takes precedence over
+  // hostname-based region extraction. Required for non-standard endpoints.
+  string signing_region = 21;
 }
 
 // Trusted GraphQL operation classification.

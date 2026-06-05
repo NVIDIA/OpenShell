@@ -94,18 +94,32 @@ strips the client's placeholder-based AWS auth headers, re-signs with real
 credentials from the provider, and forwards the request upstream. The signing
 mode is auto-detected from the client SDK's `x-amz-content-sha256` header:
 
-- **Signed body** (hex hash): buffers the request body, computes its SHA-256,
-  and includes the hash in the signature. Used by Bedrock and most AWS services.
+- **Signed body** (hex hash): buffers the request body (up to 10 MiB), computes
+  its SHA-256, and includes the hash in the signature. Used by Bedrock and most
+  AWS services.
 - **Streaming unsigned** (`STREAMING-UNSIGNED-PAYLOAD-TRAILER`): signs headers
   only and streams the body through without buffering. Used by S3 uploads with
   `aws-chunked` encoding.
 - **Unsigned payload** (`UNSIGNED-PAYLOAD`): signs headers only with no body
   hash. Used by S3 over HTTPS for non-chunked requests.
 
+Chunk-signed streaming modes (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD` and other
+`STREAMING-*` variants) are rejected — the proxy cannot reproduce per-chunk
+signatures. Use `sigv4:no_body` for those clients.
+
 Two explicit overrides are available: `credential_signing: sigv4:body` (always
 buffer and hash) and `sigv4:no_body` (always unsigned). The `Expect:
 100-continue` header is handled within the SigV4 path so clients like boto3
 transmit the body before the proxy forwards to upstream.
+
+The AWS region is extracted from the endpoint hostname. For non-standard
+endpoints (VPC endpoints, custom proxies), set `signing_region` in the policy
+endpoint to provide an explicit override. The proxy rejects requests when
+neither hostname extraction nor `signing_region` yields a region.
+
+`credential_signing` and `request_body_credential_rewrite` are mutually
+exclusive on the same endpoint. The policy validator rejects policies that
+set both.
 
 ## Connect and Logs
 

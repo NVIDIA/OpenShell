@@ -250,6 +250,7 @@ impl ProxyHandle {
                         let dtx = denial_tx.clone();
                         let atx = activity_tx.clone();
                         tokio::spawn(async move {
+                            #[allow(clippy::large_futures)]
                             if let Err(err) = handle_tcp_connection(
                                 stream,
                                 opa,
@@ -2924,7 +2925,9 @@ where
             request_body_credential_rewrite: options.request_body_credential_rewrite,
             credential_signing: crate::l7::CredentialSigning::None,
             signing_service: "",
+            signing_region: "",
             host: "",
+            port: 0,
         },
     )
     .await
@@ -4101,6 +4104,7 @@ mod tests {
             websocket_graphql_policy: false,
             credential_signing: crate::l7::CredentialSigning::None,
             signing_service: String::new(),
+            signing_region: String::new(),
         }
     }
 
@@ -4702,6 +4706,7 @@ network_policies:
                     websocket_graphql_policy: false,
                     credential_signing: crate::l7::CredentialSigning::None,
                     signing_service: String::new(),
+                    signing_region: String::new(),
                 },
             },
             L7ConfigSnapshot {
@@ -4717,6 +4722,7 @@ network_policies:
                     websocket_graphql_policy: false,
                     credential_signing: crate::l7::CredentialSigning::None,
                     signing_service: String::new(),
+                    signing_region: String::new(),
                 },
             },
         ];
