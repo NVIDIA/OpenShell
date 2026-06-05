@@ -56,6 +56,7 @@ pub(super) fn validate_exec_request_fields(req: &ExecSandboxRequest) -> Result<(
         }
         reject_control_chars(value, &format!("environment value for '{key}'"))?;
     }
+    reject_reserved_env_keys(&req.environment, "environment")?;
     if !req.workdir.is_empty() {
         if req.workdir.len() > MAX_EXEC_WORKDIR_LEN {
             return Err(Status::invalid_argument(format!(
@@ -125,10 +126,12 @@ pub(super) fn validate_sandbox_spec(
         MAX_MAP_VALUE_LEN,
         "spec.environment",
     )?;
+    reject_reserved_env_keys(&spec.environment, "spec.environment")?;
 
     // --- spec.template ---
     if let Some(ref tmpl) = spec.template {
         validate_sandbox_template(tmpl)?;
+        reject_reserved_env_keys(&tmpl.environment, "spec.template.environment")?;
     }
 
     // --- spec.policy serialized size ---
@@ -237,6 +240,20 @@ pub(super) fn validate_string_map(
             return Err(Status::invalid_argument(format!(
                 "{field_name} value exceeds maximum length ({} > {max_value_len})",
                 value.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn reject_reserved_env_keys(
+    map: &std::collections::HashMap<String, String>,
+    field_name: &str,
+) -> Result<(), Status> {
+    for key in map.keys() {
+        if key.starts_with("OPENSHELL_") {
+            return Err(Status::invalid_argument(format!(
+                "{field_name} keys starting with OPENSHELL_ are reserved; got '{key}'"
             )));
         }
     }
@@ -892,6 +909,59 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_sandbox_spec("my-sandbox", &spec).is_ok());
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_reserved_env_key() {
+        let spec = SandboxSpec {
+            environment: std::iter::once(("OPENSHELL_SECRET".to_string(), "val".to_string()))
+                .collect(),
+            ..Default::default()
+        };
+        let err = validate_sandbox_spec("s", &spec).unwrap_err();
+        assert!(
+            err.message().contains("OPENSHELL_") && err.message().contains("reserved"),
+            "expected reserved key error, got: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_reserved_template_env_key() {
+        let spec = SandboxSpec {
+            template: Some(SandboxTemplate {
+                environment: std::iter::once((
+                    "OPENSHELL_ENDPOINT".to_string(),
+                    "evil".to_string(),
+                ))
+                .collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = validate_sandbox_spec("s", &spec).unwrap_err();
+        assert!(
+            err.message().contains("OPENSHELL_") && err.message().contains("reserved"),
+            "expected reserved key error, got: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn validate_exec_request_rejects_reserved_env_key() {
+        let req = ExecSandboxRequest {
+            sandbox_id: "id".to_string(),
+            command: vec!["echo".to_string()],
+            environment: std::iter::once(("OPENSHELL_SANDBOX_ID".to_string(), "evil".to_string()))
+                .collect(),
+            ..Default::default()
+        };
+        let err = validate_exec_request_fields(&req).unwrap_err();
+        assert!(
+            err.message().contains("OPENSHELL_") && err.message().contains("reserved"),
+            "expected reserved key error, got: {}",
+            err.message()
+        );
     }
 
     // ---- Provider field validation ----

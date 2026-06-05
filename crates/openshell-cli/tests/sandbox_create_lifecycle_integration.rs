@@ -1364,7 +1364,7 @@ async fn sandbox_create_sends_environment_variables() {
         Some("env-test"),
         None,
         "openshell",
-        None,
+        &[],
         true,
         false,
         None,
