@@ -234,7 +234,7 @@ pub async fn run_sandbox(
     #[cfg(not(target_os = "linux"))]
     drop(bypass_denial_tx);
 
-    let mut networking = if network_enabled {
+    let networking = if network_enabled {
         Some(
             openshell_supervisor_network::run::run_networking(
                 &policy,
@@ -334,10 +334,7 @@ pub async fn run_sandbox(
     }
 
     let exit_code = if process_enabled {
-        let (ssh_proxy_url, ca_file_paths) = match networking.as_mut() {
-            Some(n) => (n.ssh_proxy_url.take(), n.ca_file_paths.clone()),
-            None => (None, None),
-        };
+        let ca_file_paths = networking.as_ref().and_then(|n| n.ca_file_paths.clone());
 
         openshell_supervisor_process::run::run_process(
             program,
@@ -352,7 +349,6 @@ pub async fn run_sandbox(
             entrypoint_pid,
             provider_credentials,
             provider_env,
-            ssh_proxy_url,
             ca_file_paths,
             #[cfg(target_os = "linux")]
             netns.as_ref(),

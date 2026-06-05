@@ -23,7 +23,7 @@ use openshell_ocsf::{
 
 #[cfg(target_os = "linux")]
 use openshell_core::netns::NetworkNamespace;
-use openshell_core::policy::SandboxPolicy;
+use openshell_core::policy::{NetworkMode, SandboxPolicy};
 use openshell_core::provider_credentials::ProviderCredentialState;
 
 #[cfg(target_os = "linux")]
@@ -58,7 +58,6 @@ pub async fn run_process(
     entrypoint_pid: Arc<AtomicU32>,
     provider_credentials: ProviderCredentialState,
     provider_env: std::collections::HashMap<String, String>,
-    ssh_proxy_url: Option<String>,
     ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
     #[cfg(target_os = "linux")] netns: Option<&NetworkNamespace>,
     #[cfg(target_os = "linux")] bypass_denial_tx: Option<
@@ -190,6 +189,36 @@ pub async fn run_process(
     let ssh_netns_fd = netns.and_then(NetworkNamespace::ns_fd);
     #[cfg(not(target_os = "linux"))]
     let ssh_netns_fd: Option<i32> = None;
+
+    // SSH-spawned shells get http_proxy=http://<host_ip>:<port> exported into
+    // their env so cooperative tools (curl, npm, Node) route through the
+    // CONNECT proxy. Linux uses the netns host_ip; on other targets fall back
+    // to the policy-declared http_addr directly.
+    let ssh_proxy_url = if matches!(policy.network.mode, NetworkMode::Proxy) {
+        #[cfg(target_os = "linux")]
+        {
+            netns.map(|ns| {
+                let port = policy
+                    .network
+                    .proxy
+                    .as_ref()
+                    .and_then(|p| p.http_addr)
+                    .map_or(3128, |addr| addr.port());
+                format!("http://{}:{port}", ns.host_ip())
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            policy
+                .network
+                .proxy
+                .as_ref()
+                .and_then(|p| p.http_addr)
+                .map(|addr| format!("http://{addr}"))
+        }
+    } else {
+        None
+    };
 
     let ssh_socket_path: Option<std::path::PathBuf> = ssh_socket_path.map(std::path::PathBuf::from);
     if let Some(listen_path) = ssh_socket_path.clone() {

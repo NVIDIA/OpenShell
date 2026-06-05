@@ -100,7 +100,6 @@ pub struct Networking {
     pub proxy: Option<ProxyHandle>,
 
     pub ca_file_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
-    pub ssh_proxy_url: Option<String>,
     /// Policy-local route context: shared with the orchestrator's policy poll
     /// loop so it can publish updated `SandboxPolicy` snapshots that the
     /// `policy.local` route handler returns to the workload.
@@ -317,41 +316,9 @@ pub async fn run_networking(
         None
     };
 
-    // Compute the proxy URL for SSH sessions.
-    // SSH shell processes need a proxy URL so cooperative tools (curl, npm,
-    // Node) route through the CONNECT proxy via env vars. Hard enforcement
-    // (entering the network namespace via setns()) is materialized inside
-    // run_process from the borrowed NetworkNamespace handle.
-    let ssh_proxy_url = if matches!(policy.network.mode, NetworkMode::Proxy) {
-        #[cfg(target_os = "linux")]
-        {
-            netns.map(|ns| {
-                let port = policy
-                    .network
-                    .proxy
-                    .as_ref()
-                    .and_then(|p| p.http_addr)
-                    .map_or(3128, |addr| addr.port());
-                format!("http://{}:{port}", ns.host_ip())
-            })
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            policy
-                .network
-                .proxy
-                .as_ref()
-                .and_then(|p| p.http_addr)
-                .map(|addr| format!("http://{addr}"))
-        }
-    } else {
-        None
-    };
-
     Ok(Networking {
         proxy: proxy_handle,
         ca_file_paths,
-        ssh_proxy_url,
         policy_local_ctx,
     })
 }
