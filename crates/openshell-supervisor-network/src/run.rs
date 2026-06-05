@@ -9,7 +9,7 @@
 //! whose RAII fields keep the proxy task alive for the lifetime of the
 //! sandbox supervisor.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -126,7 +126,7 @@ pub struct Networking {
 #[allow(clippy::too_many_arguments)]
 pub async fn run_networking(
     policy: &SandboxPolicy,
-    #[cfg(target_os = "linux")] netns: Option<&NetworkNamespace>,
+    proxy_bind_ip: Option<IpAddr>,
     opa_engine: Option<&Arc<OpaEngine>>,
     retained_proto: Option<&ProtoSandboxPolicy>,
     entrypoint_pid: Arc<AtomicU32>,
@@ -279,16 +279,15 @@ pub async fn run_networking(
             miette::miette!("Proxy mode requires an identity cache (OPA engine must be configured)")
         })?;
 
-        // If we have a network namespace, bind to the veth host IP so sandboxed
-        // processes can reach the proxy via TCP.
-        #[cfg(target_os = "linux")]
-        let bind_addr = netns.map(|ns| {
+        // If the orchestrator gave us a proxy bind IP (the host-side veth IP
+        // from the workload's netns on Linux), use it so only traffic
+        // originating inside the namespace can reach the proxy. Otherwise the
+        // proxy falls back to the policy-declared http_addr (loopback in
+        // tests, etc.).
+        let bind_addr = proxy_bind_ip.map(|ip| {
             let port = proxy_policy.http_addr.map_or(3128, |addr| addr.port());
-            SocketAddr::new(ns.host_ip(), port)
+            SocketAddr::new(ip, port)
         });
-
-        #[cfg(not(target_os = "linux"))]
-        let bind_addr: Option<SocketAddr> = None;
 
         // Build inference context for local routing of intercepted inference calls.
         let inference_ctx = crate::inference_routes::build_inference_context(

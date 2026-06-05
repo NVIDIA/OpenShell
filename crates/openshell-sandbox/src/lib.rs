@@ -235,11 +235,17 @@ pub async fn run_sandbox(
     drop(bypass_denial_tx);
 
     let networking = if network_enabled {
+        #[cfg(target_os = "linux")]
+        let proxy_bind_ip = netns
+            .as_ref()
+            .map(openshell_core::netns::NetworkNamespace::host_ip);
+        #[cfg(not(target_os = "linux"))]
+        let proxy_bind_ip: Option<std::net::IpAddr> = None;
+
         Some(
             openshell_supervisor_network::run::run_networking(
                 &policy,
-                #[cfg(target_os = "linux")]
-                netns.as_ref(),
+                proxy_bind_ip,
                 opa_engine.as_ref(),
                 retained_proto.as_ref(),
                 entrypoint_pid.clone(),
