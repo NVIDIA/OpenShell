@@ -1648,10 +1648,34 @@ endpoints:
         assert_eq!(aws_s3.display_name, "AWS S3");
         assert!(!aws_s3.endpoints.is_empty());
         assert!(
+            !aws_s3
+                .endpoints
+                .iter()
+                .any(|e| e.host == "**.amazonaws.com")
+        );
+        assert!(
             aws_s3
                 .endpoints
                 .iter()
-                .any(|e| e.host.contains("amazonaws.com"))
+                .any(|e| e.host == "*.s3.*.amazonaws.com")
+        );
+        assert!(
+            aws_s3
+                .endpoints
+                .iter()
+                .any(|e| e.host == "s3.*.amazonaws.com")
+        );
+        assert!(
+            aws_s3
+                .endpoints
+                .iter()
+                .any(|e| e.host == "*.s3.dualstack.*.amazonaws.com")
+        );
+        assert!(
+            aws_s3
+                .endpoints
+                .iter()
+                .any(|e| e.host == "s3.dualstack.*.amazonaws.com")
         );
     }
 }

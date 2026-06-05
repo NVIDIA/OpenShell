@@ -48,12 +48,33 @@ credentials:
     env_vars: [AWS_SESSION_TOKEN]
     required: true
 endpoints:
-  # S3 uses virtual-hosted URLs like bucket.s3.region.amazonaws.com.
-  # The host wildcard validator only allows wildcards in the first DNS
-  # label, so we cannot write *.s3.**.amazonaws.com. Using **.amazonaws.com
-  # is broader than S3; use the generic 'aws' profile with a custom policy
-  # if you need tighter host scoping.
-  - host: "**.amazonaws.com"
+  # S3 regional endpoints. `*` matches exactly one DNS label, so the region
+  # wildcard does not cover extra labels like dualstack unless listed.
+  - host: "*.s3.*.amazonaws.com"
+    port: 443
+    protocol: rest
+    tls: terminate
+    access: read-write
+    enforcement: enforce
+    credential_signing: sigv4
+    signing_service: s3
+  - host: "s3.*.amazonaws.com"
+    port: 443
+    protocol: rest
+    tls: terminate
+    access: read-write
+    enforcement: enforce
+    credential_signing: sigv4
+    signing_service: s3
+  - host: "*.s3.dualstack.*.amazonaws.com"
+    port: 443
+    protocol: rest
+    tls: terminate
+    access: read-write
+    enforcement: enforce
+    credential_signing: sigv4
+    signing_service: s3
+  - host: "s3.dualstack.*.amazonaws.com"
     port: 443
     protocol: rest
     tls: terminate
