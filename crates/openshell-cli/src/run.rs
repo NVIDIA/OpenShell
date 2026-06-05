@@ -5803,6 +5803,7 @@ fn sandbox_upload_plan(local_path: &Path, git_ignore: bool) -> Result<SandboxUpl
     if git_ignore
         && !metadata.file_type().is_symlink()
         && let Ok((base_dir, files)) = git_sync_files(local_path)
+        && !files.is_empty()
     {
         return Ok(SandboxUploadPlan::GitAware { base_dir, files });
     }
@@ -8362,6 +8363,25 @@ mod tests {
             .expect("symlink upload should be planned");
 
         assert_eq!(plan, super::SandboxUploadPlan::Regular);
+    }
+
+    #[test]
+    fn sandbox_upload_plan_falls_back_when_all_files_gitignored() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let repo = tmpdir.path().join("repo");
+        fs::create_dir_all(repo.join("runs")).expect("create repo");
+        init_git_repo(&repo);
+        fs::write(repo.join(".gitignore"), "runs/\n").expect("write .gitignore");
+        fs::write(repo.join("runs/test.json"), r#"{"key":"value"}"#).expect("write test.json");
+
+        let plan =
+            sandbox_upload_plan(&repo.join("runs"), true).expect("upload plan should succeed");
+
+        assert_eq!(
+            plan,
+            super::SandboxUploadPlan::Regular,
+            "gitignored directory should fall back to regular upload"
+        );
     }
 
     #[test]
