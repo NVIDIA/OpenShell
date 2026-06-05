@@ -1,0 +1,192 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: token-issuer
+  namespace: default
+  labels:
+    app: token-issuer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: token-issuer
+  template:
+    metadata:
+      labels:
+        app: token-issuer
+    spec:
+      containers:
+        - name: token-issuer
+          image: node:22-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["node", "/demo/token-issuer.js"]
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: NODE_TLS_REJECT_UNAUTHORIZED
+              value: "0"
+            - name: ACCESS_TOKEN_SECRET
+              value: openshell-demo-secret
+            - name: ACCESS_TOKEN_ISSUER
+              value: http://token-issuer.default.svc.cluster.local
+            - name: SPIRE_JWKS_URI
+              value: https://spire-spiffe-oidc-discovery-provider.spire.svc.cluster.local/keys
+            - name: SPIRE_ISSUER
+              value: https://spire-spiffe-oidc-discovery-provider.spire.svc.cluster.local
+            - name: JWT_SVID_AUDIENCE
+              value: http://token-issuer.default.svc.cluster.local
+            - name: TRUST_DOMAIN_PREFIX
+              value: spiffe://openshell.local/openshell/sandbox/
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          volumeMounts:
+            - name: scripts
+              mountPath: /demo
+              readOnly: true
+      volumes:
+        - name: scripts
+          configMap:
+            name: openshell-spiffe-token-demo-scripts
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: token-issuer
+  namespace: default
+spec:
+  selector:
+    app: token-issuer
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alpha
+  namespace: default
+  labels:
+    app: alpha
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alpha
+  template:
+    metadata:
+      labels:
+        app: alpha
+    spec:
+      containers:
+        - name: alpha
+          image: node:22-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["node", "/demo/protected-service.js"]
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: SERVICE_NAME
+              value: alpha
+            - name: EXPECTED_AUDIENCE
+              value: alpha
+            - name: EXPECTED_SCOPE
+              value: alpha
+            - name: ACCESS_TOKEN_SECRET
+              value: openshell-demo-secret
+            - name: ACCESS_TOKEN_ISSUER
+              value: http://token-issuer.default.svc.cluster.local
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          volumeMounts:
+            - name: scripts
+              mountPath: /demo
+              readOnly: true
+      volumes:
+        - name: scripts
+          configMap:
+            name: openshell-spiffe-token-demo-scripts
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alpha
+  namespace: default
+spec:
+  selector:
+    app: alpha
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: beta
+  namespace: default
+  labels:
+    app: beta
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: beta
+  template:
+    metadata:
+      labels:
+        app: beta
+    spec:
+      containers:
+        - name: beta
+          image: node:22-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["node", "/demo/protected-service.js"]
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: SERVICE_NAME
+              value: beta
+            - name: EXPECTED_AUDIENCE
+              value: beta
+            - name: EXPECTED_SCOPE
+              value: beta
+            - name: ACCESS_TOKEN_SECRET
+              value: openshell-demo-secret
+            - name: ACCESS_TOKEN_ISSUER
+              value: http://token-issuer.default.svc.cluster.local
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          volumeMounts:
+            - name: scripts
+              mountPath: /demo
+              readOnly: true
+      volumes:
+        - name: scripts
+          configMap:
+            name: openshell-spiffe-token-demo-scripts
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: beta
+  namespace: default
+spec:
+  selector:
+    app: beta
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

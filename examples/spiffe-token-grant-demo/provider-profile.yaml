@@ -1,0 +1,48 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+id: spiffe-token-demo
+display_name: SPIFFE token grant demo
+description: Dynamic token grant for alpha/beta demo services using SPIFFE JWT-SVID authentication
+category: other
+credentials:
+  - name: access_token
+    description: Access token obtained via SPIFFE JWT client assertion grant
+    required: false
+    auth_style: bearer
+    header_name: Authorization
+    token_grant:
+      token_endpoint: http://token-issuer.default.svc.cluster.local/token
+      audience: demo-default
+      jwt_svid_audience: http://token-issuer.default.svc.cluster.local
+      scopes: [demo]
+      cache_ttl_seconds: 60
+      audience_overrides:
+        - host: alpha.default.svc.cluster.local
+          port: 80
+          audience: alpha
+          scopes: [alpha]
+        - host: beta.default.svc.cluster.local
+          port: 80
+          audience: beta
+          scopes: [beta]
+endpoints:
+  - host: alpha.default.svc.cluster.local
+    port: 80
+    protocol: rest
+    tls: none
+    access: read-write
+    enforcement: enforce
+    allowed_ips:
+      - 10.43.0.0/16
+  - host: beta.default.svc.cluster.local
+    port: 80
+    protocol: rest
+    tls: none
+    access: read-write
+    enforcement: enforce
+    allowed_ips:
+      - 10.43.0.0/16
+binaries:
+  - /usr/bin/curl
+  - /usr/local/bin/curl
