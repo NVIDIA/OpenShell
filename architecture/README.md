@@ -161,7 +161,6 @@ that crate's `README.md`.
 
 | Document | Purpose |
 |---|---|
-| [CLI](cli.md) | CLI architecture, command implementations, and output formatting patterns. |
 | [Gateway](gateway.md) | Gateway control plane, auth, APIs, persistence, settings, and relay coordination. |
 | [Sandbox](sandbox.md) | Sandbox supervisor, child process isolation, proxy, credentials, inference, connect, and logs. |
 | [Security Policy](security-policy.md) | Policy model, enforcement layers, policy updates, policy advisor, and security logging. |

@@ -329,7 +329,7 @@ mod tests {
         // Note: This test doesn't capture stdout, but verifies the function returns Ok(true)
         let result = print_output_collection("json", &items, test_item_to_json);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
     }
 
     #[test]
@@ -341,7 +341,7 @@ mod tests {
 
         let result = print_output_collection("yaml", &items, test_item_to_json);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
     }
 
     #[test]
@@ -353,7 +353,7 @@ mod tests {
 
         let result = print_output_collection("table", &items, test_item_to_json);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), false); // Should return false for table
+        assert!(result.unwrap()); // Should return false for table
     }
 
     #[test]
@@ -379,7 +379,7 @@ mod tests {
 
         let result = print_output_collection("json", &items, test_item_to_json);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
     }
 
     #[test]
@@ -391,7 +391,7 @@ mod tests {
 
         let result = print_output_single("json", &item, test_item_to_json);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
     }
 
     #[test]
@@ -403,7 +403,7 @@ mod tests {
 
         let result = print_output_single("yaml", &item, test_item_to_json);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
     }
 
     #[test]
@@ -413,7 +413,7 @@ mod tests {
 
         let result = print_output_direct("json", json_fn, yaml_fn);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
     }
 
     #[test]
@@ -423,7 +423,7 @@ mod tests {
 
         let result = print_output_direct("yaml", json_fn, yaml_fn);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
     }
 
     #[test]
@@ -447,7 +447,7 @@ mod tests {
         let result =
             print_output_collection_to_writer("json", &mut buffer, &items, test_item_to_json);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
 
         let output = String::from_utf8(buffer).unwrap();
         assert!(output.contains("\"id\": 1"));
@@ -465,7 +465,7 @@ mod tests {
         let result =
             print_output_collection_to_writer("yaml", &mut buffer, &items, test_item_to_json);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
 
         let output = String::from_utf8(buffer).unwrap();
         assert!(output.contains("id: 1"));
@@ -482,7 +482,7 @@ mod tests {
 
         let result = print_output_single_to_writer("json", &mut buffer, &item, test_item_to_json);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
 
         let output = String::from_utf8(buffer).unwrap();
         assert!(output.contains("\"id\": 42"));
@@ -497,7 +497,7 @@ mod tests {
 
         let result = print_output_direct_to_writer("json", &mut buffer, json_fn, yaml_fn);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
 
         let output = String::from_utf8(buffer).unwrap();
         assert!(output.contains(r#"{"test": true}"#));
