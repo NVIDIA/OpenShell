@@ -173,6 +173,24 @@ If the gateway exits with `failed to read sandbox JWT signing key from
 `sandbox-jwt` secret at `/etc/openshell-jwt`. The sandbox JWT mount is required
 even when local Helm values disable TLS.
 
+If `server.providerTokenGrants.spiffe.enabled=true`, the gateway should still
+render `[openshell.gateway.gateway_jwt]` and mount the `sandbox-jwt` Secret.
+SPIRE is used only by sandbox pods for dynamic provider token grants. Verify
+that SPIRE is installed, the CSI driver is available, and the Kubernetes driver
+config includes `provider_spiffe_workload_api_socket_path`:
+
+```bash
+helm -n openshell get values openshell | grep -E 'providerTokenGrants|workloadApiSocketPath'
+kubectl get pods -A | grep -E 'spire|spiffe'
+kubectl -n openshell get configmap openshell-config -o yaml | grep provider_spiffe_workload_api_socket_path
+```
+
+Sandbox pods using provider token grants should have an
+`openshell.io/sandbox-id` annotation, an `openshell.ai/managed-by=openshell`
+label, supervisor env vars `OPENSHELL_K8S_SA_TOKEN_FILE` and
+`OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET`, plus both the projected
+`openshell-sa-token` volume and the `spiffe-workload-api` CSI volume.
+
 Check the image references currently used by the gateway deployment:
 
 ```bash

@@ -216,6 +216,7 @@ backend = "aqua:GoogleContainerTools/skaffold"
 url = "https://storage.googleapis.com/skaffold/releases/v2.20.0/skaffold-linux-arm64"
 
 [tools.skaffold."platforms.linux-x64"]
+checksum = "blake3:4de6b14984ff1c7e5f107dd12d15890feb4b6600032d61158162c243a81d9156"
 url = "https://storage.googleapis.com/skaffold/releases/v2.20.0/skaffold-linux-amd64"
 
 [tools.skaffold."platforms.macos-arm64"]

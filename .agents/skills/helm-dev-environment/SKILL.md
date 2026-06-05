@@ -178,6 +178,23 @@ To remove Keycloak:
 mise run keycloak:k8s:teardown
 ```
 
+### SPIRE / SPIFFE Provider Token Grants
+
+Skaffold can install SPIRE with the SPIFFE hardened Helm charts. To activate
+SPIFFE JWT-SVIDs for dynamic provider token grants:
+
+1. Uncomment the `spire-crds` and `spire` releases in `deploy/helm/openshell/skaffold.yaml`
+2. Uncomment `#- ci/values-spire.yaml` in the OpenShell release values files
+3. Redeploy: `mise run helm:skaffold:run`
+
+`ci/values-spire-stack.yaml` configures the local SPIRE trust domain as
+`openshell.local` and adds a `ClusterSPIFFEID` that maps sandbox pod
+annotations to `spiffe://openshell.local/openshell/sandbox/<sandbox-id>`.
+OpenShell mounts the SPIFFE CSI Workload API socket at
+`/spiffe-workload-api/spire-agent.sock` into sandbox pods for provider token
+grants. Supervisor-to-gateway authentication remains on the Kubernetes
+ServiceAccount bootstrap and gateway-minted sandbox JWT path.
+
 ---
 
 ## Cluster Lifecycle (suspend/resume)
@@ -206,6 +223,8 @@ mise run helm:k3s:status
 | `deploy/helm/openshell/ci/values-gateway.yaml` | Envoy Gateway GRPCRoute + Gateway overlay |
 | `deploy/helm/openshell/ci/values-high-availability.yaml` | HA test overlay (`replicaCount: 2` with external PostgreSQL Secret) |
 | `deploy/helm/openshell/ci/values-keycloak.yaml` | Keycloak OIDC overlay |
+| `deploy/helm/openshell/ci/values-spire.yaml` | SPIFFE/SPIRE provider token grant overlay |
+| `deploy/helm/openshell/ci/values-spire-stack.yaml` | SPIRE hardened chart values for local dev |
 | `deploy/helm/openshell/ci/values-tls-disabled.yaml` | Lint-only: TLS + auth disabled (reverse-proxy edge termination) |
 | `deploy/kube/manifests/envoy-gateway-openshell.yaml` | GatewayClass for Envoy Gateway (`mise run helm:gateway:apply`) |
 | `tasks/scripts/helm-k3s-local.sh` | k3d cluster create/delete/start/stop/status |

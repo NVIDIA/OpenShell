@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# SPIRE hardened chart values for the local Helm dev environment.
+global:
+  spire:
+    clusterName: openshell-dev
+    jwtIssuer: https://spire-spiffe-oidc-discovery-provider.spire.svc.cluster.local
+    trustDomain: openshell.local
+
+spire-server:
+  defaultJwtSvidTTL: 5m
+  controllerManager:
+    identities:
+      clusterSPIFFEIDs:
+        openshell-sandboxes:
+          enabled: true
+          spiffeIDTemplate: 'spiffe://{{ .TrustDomain }}/openshell/sandbox/{{ index .PodMeta.Annotations "openshell.io/sandbox-id" }}'
+          namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: openshell
+          podSelector:
+            matchLabels:
+              openshell.ai/managed-by: openshell

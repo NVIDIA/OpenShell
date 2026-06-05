@@ -242,6 +242,11 @@ impl ProxyHandle {
                         let resolver = provider_credentials
                             .as_ref()
                             .and_then(ProviderCredentialState::resolver);
+                        let dynamic_credentials = provider_credentials.as_ref().map(|state| {
+                            Arc::new(std::sync::RwLock::new(
+                                state.snapshot().dynamic_credentials.clone(),
+                            ))
+                        });
                         let dtx = denial_tx.clone();
                         let atx = activity_tx.clone();
                         tokio::spawn(async move {
@@ -255,6 +260,7 @@ impl ProxyHandle {
                                 policy_local,
                                 gw,
                                 resolver,
+                                dynamic_credentials,
                                 dtx,
                                 atx,
                             )
@@ -411,6 +417,13 @@ async fn handle_tcp_connection(
     policy_local_ctx: Option<Arc<PolicyLocalContext>>,
     trusted_host_gateway: Arc<Option<IpAddr>>,
     secret_resolver: Option<Arc<SecretResolver>>,
+    dynamic_credentials: Option<
+        Arc<
+            std::sync::RwLock<
+                std::collections::HashMap<String, openshell_core::proto::ProviderProfileCredential>,
+            >,
+        >,
+    >,
     denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
     activity_tx: Option<ActivitySender>,
 ) -> Result<()> {
@@ -458,6 +471,7 @@ async fn handle_tcp_connection(
             policy_local_ctx,
             trusted_host_gateway,
             secret_resolver,
+            dynamic_credentials,
             denial_tx.as_ref(),
             activity_tx.as_ref(),
         )
@@ -953,6 +967,10 @@ async fn handle_tcp_connection(
             .collect(),
         secret_resolver: secret_resolver.clone(),
         activity_tx: activity_tx.clone(),
+        dynamic_credentials: dynamic_credentials.clone(),
+        token_grant_resolver: dynamic_credentials
+            .as_ref()
+            .map(|_| crate::l7::token_grant_injection::default_resolver()),
     };
 
     if effective_tls_skip {
@@ -2908,6 +2926,33 @@ where
     .await
 }
 
+async fn inject_token_grant_for_forward_request(
+    method: &str,
+    upstream_target: &str,
+    forward_request_bytes: Vec<u8>,
+    l7_ctx: &crate::l7::relay::L7EvalContext,
+) -> Result<Vec<u8>> {
+    let header_end = forward_request_bytes
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map_or(forward_request_bytes.len(), |p| p + 4);
+    let header_str = std::str::from_utf8(&forward_request_bytes[..header_end])
+        .into_diagnostic()
+        .map_err(|_| miette::miette!("Forward HTTP headers contain invalid UTF-8"))?;
+    let body_length = crate::l7::rest::parse_body_length(header_str)?;
+    let forward_request_for_token_grant = crate::l7::provider::L7Request {
+        action: method.to_string(),
+        target: upstream_target.to_string(),
+        query_params: std::collections::HashMap::new(),
+        raw_header: forward_request_bytes,
+        body_length,
+    };
+
+    crate::l7::token_grant_injection::inject_if_needed(forward_request_for_token_grant, l7_ctx)
+        .await
+        .map(|req| req.raw_header)
+}
+
 /// Handle a plain HTTP forward proxy request (non-CONNECT).
 ///
 /// Public IPs are allowed through when the endpoint passes OPA evaluation.
@@ -2929,6 +2974,13 @@ async fn handle_forward_proxy(
     policy_local_ctx: Option<Arc<PolicyLocalContext>>,
     trusted_host_gateway: Arc<Option<IpAddr>>,
     secret_resolver: Option<Arc<SecretResolver>>,
+    dynamic_credentials: Option<
+        Arc<
+            std::sync::RwLock<
+                std::collections::HashMap<String, openshell_core::proto::ProviderProfileCredential>,
+            >,
+        >,
+    >,
     denial_tx: Option<&mpsc::UnboundedSender<DenialEvent>>,
     activity_tx: Option<&ActivitySender>,
 ) -> Result<()> {
@@ -3158,6 +3210,10 @@ async fn handle_forward_proxy(
             .collect(),
         secret_resolver: secret_resolver.clone(),
         activity_tx: activity_tx.cloned(),
+        dynamic_credentials: dynamic_credentials.clone(),
+        token_grant_resolver: dynamic_credentials
+            .as_ref()
+            .map(|_| crate::l7::token_grant_injection::default_resolver()),
     };
     let mut l7_activity_pending = false;
 
@@ -3828,6 +3884,36 @@ async fn handle_forward_proxy(
     }
     emit_forward_success_activity(activity_tx, l7_activity_pending);
 
+    forward_request_bytes = match inject_token_grant_for_forward_request(
+        method,
+        &upstream_target,
+        forward_request_bytes,
+        &l7_ctx,
+    )
+    .await
+    {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            warn!(
+                dst_host = %host_lc,
+                dst_port = port,
+                error = %e,
+                "token grant failed in forward proxy"
+            );
+            respond(
+                client,
+                &build_json_error_response(
+                    502,
+                    "Bad Gateway",
+                    "token_grant_failed",
+                    "dynamic token grant failed",
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+
     // 9. Rewrite request and forward to upstream
     let rewritten = match rewrite_forward_request(
         &forward_request_bytes,
@@ -4174,6 +4260,53 @@ mod tests {
             .map_err(|e| miette::miette!("upstream task failed: {e}"))
     }
 
+    fn forward_token_grant_context(
+        resolver_response: std::result::Result<&str, &str>,
+    ) -> (
+        crate::l7::relay::L7EvalContext,
+        crate::l7::token_grant_injection::test_support::TokenGrantTestFixture,
+    ) {
+        let provider_key = "api.example.test\t8080\t/v1/**\tprovider:access_token";
+        let fixture = match resolver_response {
+            Ok(token) => {
+                crate::l7::token_grant_injection::test_support::TokenGrantTestFixture::success(
+                    provider_key,
+                    token,
+                )
+            }
+            Err(error) => {
+                crate::l7::token_grant_injection::test_support::TokenGrantTestFixture::failure(
+                    provider_key,
+                    error,
+                )
+            }
+        };
+        let ctx = crate::l7::relay::L7EvalContext {
+            host: "api.example.test".into(),
+            port: 8080,
+            policy_name: "rest_api".into(),
+            binary_path: "/usr/bin/curl".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: None,
+            activity_tx: None,
+            dynamic_credentials: Some(fixture.dynamic_credentials()),
+            token_grant_resolver: Some(fixture.resolver()),
+        };
+
+        (ctx, fixture)
+    }
+
+    fn authorization_header_count(headers: &str) -> usize {
+        headers
+            .lines()
+            .filter(|line| {
+                line.split_once(':')
+                    .is_some_and(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            })
+            .count()
+    }
+
     fn forward_websocket_policy_parts(
         data: &str,
         host: &str,
@@ -4215,6 +4348,8 @@ mod tests {
             cmdline_paths: vec![],
             secret_resolver: None,
             activity_tx: None,
+            dynamic_credentials: None,
+            token_grant_resolver: None,
         };
         (config, tunnel_engine, ctx)
     }
@@ -4381,6 +4516,8 @@ mod tests {
             cmdline_paths: vec![],
             secret_resolver: resolver,
             activity_tx: None,
+            dynamic_credentials: None,
+            token_grant_resolver: None,
         };
         let query_params = std::collections::HashMap::new();
 
@@ -4422,6 +4559,8 @@ mod tests {
             cmdline_paths: vec![],
             secret_resolver: None,
             activity_tx: None,
+            dynamic_credentials: None,
+            token_grant_resolver: None,
         };
         let query_params = std::collections::HashMap::new();
         let config = websocket_l7_config(crate::l7::L7Protocol::Rest, false);
@@ -6490,6 +6629,40 @@ network_policies:
     }
 
     // --- rewrite_forward_request tests ---
+
+    #[tokio::test]
+    async fn forward_proxy_injects_token_grant_before_rewriting_request() {
+        let (ctx, fixture) = forward_token_grant_context(Ok("grant-token"));
+        let raw = b"GET http://api.example.test:8080/v1/projects HTTP/1.1\r\nHost: api.example.test:8080\r\nAuthorization: Bearer stale-token\r\nConnection: close\r\n\r\n".to_vec();
+
+        let with_token = inject_token_grant_for_forward_request("GET", "/v1/projects", raw, &ctx)
+            .await
+            .expect("forward token grant should inject");
+        let rewritten =
+            rewrite_forward_request(&with_token, with_token.len(), "/v1/projects", None, false)
+                .expect("forward request should rewrite");
+        let rewritten = String::from_utf8_lossy(&rewritten);
+
+        assert!(rewritten.starts_with("GET /v1/projects HTTP/1.1\r\n"));
+        assert!(rewritten.contains("Authorization: Bearer grant-token\r\n"));
+        assert!(!rewritten.contains("stale-token"));
+        assert_eq!(authorization_header_count(&rewritten), 1);
+        fixture.assert_one_request("api.example.test\t8080\t/v1/**\tprovider:access_token");
+    }
+
+    #[tokio::test]
+    async fn forward_proxy_token_grant_failure_returns_error_before_rewrite() {
+        let (ctx, fixture) = forward_token_grant_context(Err("oauth unavailable"));
+        let raw = b"GET http://api.example.test:8080/v1/projects HTTP/1.1\r\nHost: api.example.test:8080\r\nConnection: close\r\n\r\n".to_vec();
+
+        let err = inject_token_grant_for_forward_request("GET", "/v1/projects", raw, &ctx)
+            .await
+            .expect_err("forward token grant failure should stop request rewriting");
+
+        assert!(err.to_string().contains("Token grant failed"));
+        assert!(err.to_string().contains("oauth unavailable"));
+        fixture.assert_one_request("api.example.test\t8080\t/v1/**\tprovider:access_token");
+    }
 
     #[test]
     fn test_rewrite_get_request() {

@@ -190,6 +190,10 @@ pub struct KubernetesComputeConfig {
     /// this token within a few seconds of pod start, so any value at
     /// the floor is sufficient. Default 3600.
     pub sa_token_ttl_secs: i64,
+    /// SPIFFE Workload API socket path mounted into sandbox pods for dynamic
+    /// provider token grants. Empty disables provider token-grant SPIFFE
+    /// material.
+    pub provider_spiffe_workload_api_socket_path: String,
 }
 
 /// Lower bound enforced by kubelet for projected SA tokens.
@@ -224,6 +228,7 @@ impl Default for KubernetesComputeConfig {
             workspace_default_storage_size: DEFAULT_WORKSPACE_STORAGE_SIZE.to_string(),
             default_runtime_class_name: String::new(),
             sa_token_ttl_secs: 3600,
+            provider_spiffe_workload_api_socket_path: String::new(),
         }
     }
 }
@@ -240,6 +245,14 @@ impl KubernetesComputeConfig {
             self.sa_token_ttl_secs
                 .clamp(MIN_SA_TOKEN_TTL_SECS, MAX_SA_TOKEN_TTL_SECS)
         }
+    }
+
+    #[must_use]
+    pub fn provider_spiffe_enabled(&self) -> bool {
+        !self
+            .provider_spiffe_workload_api_socket_path
+            .trim()
+            .is_empty()
     }
 }
 

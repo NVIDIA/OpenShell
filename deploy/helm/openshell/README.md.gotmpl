@@ -57,6 +57,8 @@ See [`values.yaml`](values.yaml) for source defaults. Selected overlays:
 - [`ci/values-cert-manager.yaml`](ci/values-cert-manager.yaml) - cert-manager integration
 - [`ci/values-keycloak.yaml`](ci/values-keycloak.yaml) - Keycloak OIDC integration
 - [`ci/values-high-availability.yaml`](ci/values-high-availability.yaml) - CI overlay for multi-replica external PostgreSQL testing
+- [`ci/values-spire.yaml`](ci/values-spire.yaml) - SPIFFE/SPIRE provider token grants
+- [`ci/values-spire-stack.yaml`](ci/values-spire-stack.yaml) - SPIRE hardened chart values for local development
 
 ### Database backend
 
@@ -113,6 +115,17 @@ sandbox JWT signing Secret. This precedence applies even if
 `pkiInitJob.enabled` remains true. Set `pkiInitJob.enabled=false` only when an
 external non-cert-manager TLS source manages TLS and you pre-create the sandbox
 JWT signing Secret.
+
+## SPIFFE/SPIRE provider token grants
+
+Set `server.providerTokenGrants.spiffe.enabled=true` to let sandbox supervisors
+use SPIFFE JWT-SVIDs for dynamic provider token grants. The chart keeps
+supervisor-to-gateway authentication on gateway-minted sandbox JWTs and passes
+the SPIFFE Workload API socket path to the Kubernetes driver so sandbox pods can
+mount the SPIFFE CSI socket.
+
+For local development, uncomment the SPIRE Helm releases in `skaffold.yaml` and
+add `ci/values-spire.yaml` to the OpenShell release values files.
 
 {{ template "chart.valuesSection" . }}
 {{ template "helm-docs.versionFooter" . }}

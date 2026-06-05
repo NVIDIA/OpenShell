@@ -4,8 +4,8 @@
 //! gRPC client for fetching sandbox policy, provider environment, and inference
 //! route bundles from `OpenShell` server.
 //!
-//! Every request carries a gateway-minted JWT in the `Authorization` header.
-//! The token is resolved at startup from one of three sources:
+//! Every request carries a sandbox bearer credential in the `Authorization`
+//! header. The token is resolved at startup from one of three sources:
 //!
 //! 1. `OPENSHELL_SANDBOX_TOKEN` — raw JWT in the env (test harness path).
 //! 2. `OPENSHELL_SANDBOX_TOKEN_FILE` — file containing the JWT (Docker /
@@ -15,7 +15,7 @@
 //!    supervisor exchanges it for a gateway JWT via `IssueSandboxToken`
 //!    once at startup.
 //!
-//! The resolved gateway JWT is held in process memory thereafter and
+//! The resolved bearer credential is held in process memory thereafter and
 //! injected on every outbound call by [`AuthInterceptor`].
 
 use std::collections::HashMap;
@@ -54,18 +54,12 @@ enum TokenSource {
     K8sServiceAccount,
 }
 
-#[derive(Debug)]
-struct AcquiredToken {
-    token: String,
-    source: TokenSource,
-}
-
 /// Process-wide token slot. Initialized by the first [`connect_channel`]
 /// call and shared with every subsequent client and the renewal loop.
 static TOKEN_SLOT: OnceLock<TokenSlot> = OnceLock::new();
 
-/// Source used to acquire the process-wide token slot.
-static TOKEN_SOURCE: OnceLock<TokenSource> = OnceLock::new();
+/// Refresh strategy used by the process-wide token slot.
+static TOKEN_REFRESH_MODE: OnceLock<RefreshMode> = OnceLock::new();
 
 /// Serializes the first token acquisition. Several supervisor subsystems
 /// connect during startup; without this guard they can all observe an empty
@@ -74,6 +68,17 @@ static TOKEN_INIT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new((
 
 /// One-shot guard so the renewal loop spawns at most once per process.
 static REFRESH_SPAWNED: OnceLock<()> = OnceLock::new();
+
+#[derive(Clone, Debug)]
+enum RefreshMode {
+    GatewayJwt(TokenSource),
+}
+
+#[derive(Debug)]
+struct AcquiredToken {
+    token: String,
+    refresh_mode: RefreshMode,
+}
 
 fn install_token_slot(token: &str) -> Result<TokenSlot> {
     let bearer = AsciiMetadataValue::try_from(format!("Bearer {token}"))
@@ -189,10 +194,11 @@ async fn build_plain_channel(endpoint: &str) -> Result<Channel> {
 /// spawned once per process via [`REFRESH_SPAWNED`].
 async fn connect_channel(endpoint: &str) -> Result<AuthedChannel> {
     let channel = build_plain_channel(endpoint).await?;
-    let (slot, source) = token_slot(endpoint, &channel).await?;
+    let (slot, refresh_mode) = token_slot(endpoint, &channel).await?;
     let plain_channel = channel.clone();
     let intercepted = InterceptedService::new(channel, AuthInterceptor::new(slot.clone()));
     if REFRESH_SPAWNED.set(()).is_ok() {
+        let RefreshMode::GatewayJwt(source) = refresh_mode;
         let refresh_channel = intercepted.clone();
         let endpoint = endpoint.to_string();
         tokio::spawn(async move {
@@ -202,23 +208,29 @@ async fn connect_channel(endpoint: &str) -> Result<AuthedChannel> {
     Ok(intercepted)
 }
 
-async fn token_slot(endpoint: &str, plain_channel: &Channel) -> Result<(TokenSlot, TokenSource)> {
+async fn token_slot(endpoint: &str, plain_channel: &Channel) -> Result<(TokenSlot, RefreshMode)> {
     if let Some(existing) = TOKEN_SLOT.get() {
-        let source = TOKEN_SOURCE.get().copied().unwrap_or(TokenSource::Env);
-        return Ok((existing.clone(), source));
+        let refresh_mode = TOKEN_REFRESH_MODE
+            .get()
+            .cloned()
+            .unwrap_or(RefreshMode::GatewayJwt(TokenSource::Env));
+        return Ok((existing.clone(), refresh_mode));
     }
 
     let _guard = TOKEN_INIT_LOCK.lock().await;
 
     if let Some(existing) = TOKEN_SLOT.get() {
-        let source = TOKEN_SOURCE.get().copied().unwrap_or(TokenSource::Env);
-        return Ok((existing.clone(), source));
+        let refresh_mode = TOKEN_REFRESH_MODE
+            .get()
+            .cloned()
+            .unwrap_or(RefreshMode::GatewayJwt(TokenSource::Env));
+        return Ok((existing.clone(), refresh_mode));
     }
 
     let acquired = acquire_sandbox_token(endpoint, plain_channel).await?;
     let slot = install_token_slot(&acquired.token)?;
-    let _ = TOKEN_SOURCE.set(acquired.source);
-    Ok((slot, acquired.source))
+    let _ = TOKEN_REFRESH_MODE.set(acquired.refresh_mode.clone());
+    Ok((slot, acquired.refresh_mode))
 }
 
 /// Resolve the sandbox JWT used to authenticate every outbound RPC.
@@ -234,7 +246,7 @@ async fn acquire_sandbox_token(endpoint: &str, plain_channel: &Channel) -> Resul
         debug!(source = "env", "loaded sandbox token");
         return Ok(AcquiredToken {
             token: t,
-            source: TokenSource::Env,
+            refresh_mode: RefreshMode::GatewayJwt(TokenSource::Env),
         });
     }
 
@@ -247,7 +259,7 @@ async fn acquire_sandbox_token(endpoint: &str, plain_channel: &Channel) -> Resul
         debug!(source = "file", path = %path, "loaded sandbox token");
         return Ok(AcquiredToken {
             token: contents.trim().to_string(),
-            source: TokenSource::File,
+            refresh_mode: RefreshMode::GatewayJwt(TokenSource::File),
         });
     }
 
@@ -256,7 +268,7 @@ async fn acquire_sandbox_token(endpoint: &str, plain_channel: &Channel) -> Resul
     {
         return Ok(AcquiredToken {
             token: acquire_k8s_sandbox_token(endpoint, plain_channel, &sa_path).await?,
-            source: TokenSource::K8sServiceAccount,
+            refresh_mode: RefreshMode::GatewayJwt(TokenSource::K8sServiceAccount),
         });
     }
 
@@ -674,6 +686,7 @@ pub async fn fetch_provider_environment(
         environment: inner.environment,
         provider_env_revision: inner.provider_env_revision,
         credential_expires_at_ms: inner.credential_expires_at_ms,
+        dynamic_credentials: inner.dynamic_credentials,
     })
 }
 
@@ -704,6 +717,7 @@ pub struct ProviderEnvironmentResult {
     pub environment: HashMap<String, String>,
     pub provider_env_revision: u64,
     pub credential_expires_at_ms: HashMap<String, i64>,
+    pub dynamic_credentials: HashMap<String, openshell_core::proto::ProviderProfileCredential>,
 }
 
 impl CachedOpenShellClient {

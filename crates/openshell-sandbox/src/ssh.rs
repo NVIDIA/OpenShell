@@ -5,7 +5,7 @@
 
 use crate::child_env;
 use crate::policy::SandboxPolicy;
-use crate::process::drop_privileges;
+use crate::process::{drop_privileges, is_supervisor_only_env_var};
 use crate::provider_credentials::ProviderCredentialState;
 use crate::sandbox;
 #[cfg(target_os = "linux")]
@@ -720,6 +720,9 @@ fn apply_child_env(
     }
 
     for (key, value) in provider_env {
+        if is_supervisor_only_env_var(key) {
+            continue;
+        }
         cmd.env(key, value);
     }
 }
@@ -812,7 +815,7 @@ fn spawn_pty_shell(
             netns_fd,
             #[cfg(target_os = "linux")]
             prepared_sandbox,
-        );
+        )?;
     }
 
     let mut child = cmd.spawn()?;
@@ -960,7 +963,7 @@ fn spawn_pipe_exec(
             netns_fd,
             #[cfg(target_os = "linux")]
             prepared_sandbox,
-        );
+        )?;
     }
 
     let mut child = cmd.spawn()?;
@@ -1083,6 +1086,13 @@ mod unsafe_pty {
     }
 
     #[allow(unsafe_code)]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(
+            clippy::unnecessary_wraps,
+            reason = "Linux pre_exec setup can fail while non-Linux setup cannot."
+        )
+    )]
     pub fn install_pre_exec(
         cmd: &mut Command,
         policy: SandboxPolicy,
@@ -1090,11 +1100,16 @@ mod unsafe_pty {
         slave_fd: RawFd,
         netns_fd: Option<RawFd>,
         #[cfg(target_os = "linux")] prepared: crate::sandbox::linux::PreparedSandbox,
-    ) {
+    ) -> anyhow::Result<()> {
         // Wrap in Option so we can .take() it out of the FnMut closure.
         // pre_exec is only called once (after fork, before exec).
         #[cfg(target_os = "linux")]
         let mut prepared = Some(prepared);
+        #[cfg(target_os = "linux")]
+        let supervisor_identity_mount = crate::process::supervisor_identity_mount_from_env()
+            .map_err(|err| {
+                anyhow::anyhow!("failed to prepare supervisor identity isolation: {err}")
+            })?;
         unsafe {
             cmd.pre_exec(move || {
                 setsid().map_err(|err| std::io::Error::other(err.to_string()))?;
@@ -1104,40 +1119,61 @@ mod unsafe_pty {
                     netns_fd,
                     &policy,
                     #[cfg(target_os = "linux")]
+                    supervisor_identity_mount,
+                    #[cfg(target_os = "linux")]
                     prepared.take(),
                 )
             });
         }
+        Ok(())
     }
 
     /// Pre-exec hook for pipe-based (non-PTY) exec.
     ///
     /// Skips `setsid` and `TIOCSCTTY` since there is no controlling terminal.
     #[allow(unsafe_code)]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(
+            clippy::unnecessary_wraps,
+            reason = "Linux pre_exec setup can fail while non-Linux setup cannot."
+        )
+    )]
     pub fn install_pre_exec_no_pty(
         cmd: &mut Command,
         policy: SandboxPolicy,
         _workdir: Option<String>,
         netns_fd: Option<RawFd>,
         #[cfg(target_os = "linux")] prepared: crate::sandbox::linux::PreparedSandbox,
-    ) {
+    ) -> anyhow::Result<()> {
         #[cfg(target_os = "linux")]
         let mut prepared = Some(prepared);
+        #[cfg(target_os = "linux")]
+        let supervisor_identity_mount = crate::process::supervisor_identity_mount_from_env()
+            .map_err(|err| {
+                anyhow::anyhow!("failed to prepare supervisor identity isolation: {err}")
+            })?;
         unsafe {
             cmd.pre_exec(move || {
                 enter_netns_and_sandbox(
                     netns_fd,
                     &policy,
                     #[cfg(target_os = "linux")]
+                    supervisor_identity_mount,
+                    #[cfg(target_os = "linux")]
                     prepared.take(),
                 )
             });
         }
+        Ok(())
     }
 
     fn enter_netns_and_sandbox(
         netns_fd: Option<RawFd>,
         policy: &SandboxPolicy,
+        #[cfg(target_os = "linux")] supervisor_identity_mount: Option<
+            &crate::process::SupervisorIdentityMountNamespace,
+        >,
         #[cfg(target_os = "linux")] prepared: Option<crate::sandbox::linux::PreparedSandbox>,
     ) -> std::io::Result<()> {
         // Enter network namespace before dropping privileges.
@@ -1155,6 +1191,11 @@ mod unsafe_pty {
 
         #[cfg(not(target_os = "linux"))]
         let _ = netns_fd;
+
+        #[cfg(target_os = "linux")]
+        if let Some(mount) = supervisor_identity_mount {
+            mount.enter_for_child()?;
+        }
 
         // Drop privileges. initgroups/setgid/setuid need /etc/group and
         // /etc/passwd which would be blocked if Landlock were already enforced.
@@ -1541,7 +1582,8 @@ mod tests {
                 None,
             )
             .expect("prepare should succeed in test environment"),
-        );
+        )
+        .expect("install pre_exec should succeed");
 
         let output = cmd
             .spawn()

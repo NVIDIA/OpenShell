@@ -122,7 +122,7 @@ This enables credential injection and L7 inspection without explicit configurati
 |---|---|
 | Default | Auto-detect and terminate. OpenShell generates the sandbox CA at startup and injects it into the process trust stores (`NODE_EXTRA_CA_CERTS`, `DENO_CERT`, `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`). |
 | What you can change | Set `tls: skip` on an endpoint to disable TLS detection and termination for that endpoint. Use this for client-certificate mTLS to upstream or non-standard binary protocols. |
-| Risk if relaxed | `tls: skip` disables credential injection and L7 inspection for that endpoint. The proxy relays encrypted traffic without seeing the contents. |
+| Risk if relaxed | `tls: skip` disables placeholder credential rewriting, dynamic token grant injection, and L7 inspection for that endpoint. The proxy relays encrypted traffic without seeing the contents. |
 | Recommendation | Use auto-detect (the default) for most endpoints. Use `tls: skip` only when the upstream requires the client's own TLS certificate (mTLS) or uses a non-HTTP protocol. |
 
 ### SSRF Protection
@@ -212,7 +212,7 @@ OpenShell applies seccomp in two phases. A narrow supervisor-startup prelude run
 
 | Aspect | Detail |
 |---|---|
-| Startup prelude | After privileged bootstrap helpers complete, the supervisor sets `PR_SET_NO_NEW_PRIVS` and synchronizes a seccomp filter across all runtime threads that blocks `mount`, the new mount API syscalls, `pivot_root`, `umount2`, `bpf`, `perf_event_open`, `userfaultfd`, module-loading syscalls, and kexec. This closes the long-lived privileged remount and kernel-surface window while leaving required setup syscalls such as `setns` available. |
+| Startup prelude | After privileged bootstrap helpers complete, including network setup and provider-token SPIFFE child mount-namespace preparation, the supervisor sets `PR_SET_NO_NEW_PRIVS` and synchronizes a seccomp filter across all runtime threads that blocks `mount`, the new mount API syscalls, `pivot_root`, `umount2`, `bpf`, `perf_event_open`, `userfaultfd`, module-loading syscalls, and kexec. This closes the long-lived privileged remount and kernel-surface window while leaving required setup syscalls such as `setns` available. |
 | Socket domains | The filter allows `AF_INET` and `AF_INET6` (for proxy communication) and blocks `AF_PACKET`, `AF_BLUETOOTH`, and `AF_VSOCK` with `EPERM`. `AF_NETLINK` is partially allowed: only `NETLINK_ROUTE` (protocol 0) is permitted so that `getifaddrs(3)` works; all other netlink protocols are blocked. Write operations via `NETLINK_ROUTE` still require `CAP_NET_ADMIN`, which the sandbox does not grant. |
 | Runtime unconditional syscall blocks | `memfd_create`, `ptrace`, `bpf`, `process_vm_readv`, `process_vm_writev`, `pidfd_open`, `pidfd_getfd`, `pidfd_send_signal`, `io_uring_setup`, `mount`, `fsopen`, `fsconfig`, `fsmount`, `fspick`, `move_mount`, `open_tree`, `setns`, `umount2`, `pivot_root`, `userfaultfd`, `perf_event_open`. |
 | Conditional syscall blocks | `execveat` with `AT_EMPTY_PATH`, `unshare` and `clone` with `CLONE_NEWUSER`, and `seccomp(SECCOMP_SET_MODE_FILTER)` are denied with `EPERM`. |
@@ -225,9 +225,9 @@ OpenShell applies seccomp in two phases. A narrow supervisor-startup prelude run
 The sandbox supervisor applies enforcement in a specific order during process startup.
 This ordering is intentional: named network-namespace setup still relies on privileged helpers, and privilege dropping still needs `/etc/group` and `/etc/passwd`, which Landlock subsequently restricts.
 
-1. Privileged supervisor bootstrap helpers, including network-namespace setup and optional `nft` probes.
+1. Privileged supervisor bootstrap helpers, including network-namespace setup, provider-token SPIFFE child mount-namespace setup, and optional `nft` probes.
 2. Supervisor startup prelude seccomp (`PR_SET_NO_NEW_PRIVS` plus the early syscall denylist) synchronized across runtime threads.
-3. Network namespace entry (`setns`) in child `pre_exec`.
+3. Network and child-only mount namespace entry (`setns`) in child `pre_exec`.
 4. Privilege drop (`initgroups` + `setgid` + `setuid`).
 5. Core-dump hardening (`RLIMIT_CORE=0`, plus `PR_SET_DUMPABLE=0` on Linux).
 6. Landlock filesystem restrictions.
@@ -286,7 +286,7 @@ The following patterns weaken security without providing meaningful benefit.
 | Using `access: full` when finer rules would suffice | `access: full` with `protocol: rest` or `protocol: websocket` enables inspection but allows all methods and paths for that protocol. | Use `access: read-only` or explicit `rules` to restrict what the agent can do at the L7 level. |
 | Adding endpoints permanently when operator approval would suffice | Adding endpoints to the policy YAML makes them permanently reachable across all instances. | Use operator approval. Approved endpoints persist within the sandbox instance but reset on re-creation. |
 | Using broad binary globs | A glob like `/**` allows any binary to reach the endpoint, defeating binary-scoped enforcement. | Scope globs to specific directories (for example, `/sandbox/.vscode-server/**`). |
-| Skipping TLS termination on HTTPS APIs | Setting `tls: skip` disables credential injection and L7 inspection. | Use the default auto-detect behavior unless the upstream requires client-certificate mTLS. |
+| Skipping TLS termination on HTTPS APIs | Setting `tls: skip` disables placeholder credential rewriting, dynamic token grant injection, and L7 inspection. | Use the default auto-detect behavior unless the upstream requires client-certificate mTLS. |
 | Setting `enforcement: enforce` before auditing | Jumping to `enforce` without first running in `audit` mode risks breaking the agent's workflow. | Start with `audit`, review the logs, and switch to `enforce` after you validate the rules. |
 
 ## Related Topics

@@ -35,7 +35,7 @@ k8s-openapi = { workspace = true }
 tokio = { workspace = true }
 
 # gRPC
-tonic = { workspace = true, features = ["channel", "tls"] }
+tonic = { workspace = true, features = ["channel", "tls-native-roots"] }
 prost = { workspace = true }
 prost-types = { workspace = true }
 

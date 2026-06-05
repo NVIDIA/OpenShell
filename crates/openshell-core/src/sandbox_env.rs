@@ -63,3 +63,11 @@ pub const USER_ENVIRONMENT: &str = "OPENSHELL_USER_ENVIRONMENT";
 /// writes and rotates this file; the supervisor exchanges its contents
 /// for a gateway JWT at startup and on refresh.
 pub const K8S_SA_TOKEN_FILE: &str = "OPENSHELL_K8S_SA_TOKEN_FILE";
+
+/// Filesystem path to the SPIFFE Workload API UNIX socket used for provider
+/// token grants.
+///
+/// When set, the supervisor can fetch JWT-SVIDs for upstream provider token
+/// exchanges without using SPIFFE for gateway authentication.
+pub const PROVIDER_SPIFFE_WORKLOAD_API_SOCKET: &str =
+    "OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET";

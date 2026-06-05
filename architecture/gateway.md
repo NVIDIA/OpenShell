@@ -47,9 +47,13 @@ Supported auth modes:
 | Cloudflare JWT | Edge-authenticated deployments where Cloudflare Access supplies identity. |
 | OIDC | Bearer-token auth for users, with browser PKCE or client credentials login. |
 
-Sandbox supervisor RPCs authenticate with gateway-minted sandbox JWTs when that
-authenticator is configured; mTLS does not grant sandbox identity. User-facing
-mutations are authorized by role policy when OIDC or edge identity is enabled.
+Sandbox supervisor RPCs authenticate with explicit sandbox credentials; mTLS
+does not grant sandbox identity. Kubernetes deployments use the
+gateway-minted JWT bootstrap path: the supervisor starts with a projected
+ServiceAccount token, exchanges it for a gateway-minted sandbox JWT, and uses
+that JWT on subsequent gateway RPCs.
+User-facing mutations are authorized by role policy when OIDC or edge identity
+is enabled.
 
 Sandbox secrets are gateway-signed JWTs bound to a single sandbox ID. Docker,
 Podman, and VM drivers deliver the initial token through supervisor-only

@@ -225,3 +225,26 @@ tests:
               secretKeyRef:
                 name: openshell-ha-pg
                 key: uri
+  - it: renders provider SPIFFE token grants while keeping gateway JWT auth
+    set:
+      server.providerTokenGrants.spiffe.enabled: true
+    template: templates/gateway-config.yaml
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.gateway\.gateway_jwt\]'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: 'provider_spiffe_workload_api_socket_path\s*=\s*"/spiffe-workload-api/spire-agent\.sock"'
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: '\[openshell\.gateway\.spiffe\]'
+
+  - it: keeps the gateway sandbox JWT secret mounted when provider SPIFFE grants are enabled
+    set:
+      server.providerTokenGrants.spiffe.enabled: true
+    template: templates/statefulset.yaml
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.volumes[1].name
+          pattern: '^sandbox-jwt$'

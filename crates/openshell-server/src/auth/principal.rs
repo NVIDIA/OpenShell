@@ -6,7 +6,7 @@
 //! A `Principal` is the result of running the [`super::authenticator::Authenticator`]
 //! chain on an inbound request. It generalizes over the kinds of callers the
 //! gateway recognizes — human users (OIDC), sandbox supervisors (gateway-minted
-//! JWT, future SPIFFE), and anonymous callers (truly unauthenticated methods
+//! JWT), and anonymous callers (truly unauthenticated methods
 //! like health probes).
 //!
 //! Handlers read the principal from the gRPC `Request` extensions and gate
@@ -52,8 +52,8 @@ pub struct SandboxPrincipal {
     /// How this principal was verified — used for audit logs and method-specific
     /// authorization checks.
     pub source: SandboxIdentitySource,
-    /// SPIFFE trust domain. Populated when the credential is SPIFFE-shaped;
-    /// reserved for future per-sandbox cert / SPIRE authenticators.
+    /// Optional namespace component parsed from sandbox identity credentials.
+    /// Gateway-minted sandbox JWTs currently use an identity-shaped subject.
     pub trust_domain: Option<String>,
 }
 
@@ -70,8 +70,6 @@ pub enum SandboxIdentitySource {
     /// Per-sandbox client certificate. Reserved for channel-bound sandbox
     /// identity.
     BootstrapCert { fingerprint: String },
-    /// SPIRE-issued SVID. Reserved for SPIFFE/SPIRE sandbox identity.
-    SpiffeSvid { spiffe_id: String },
     /// K8s `ServiceAccount` token used to bootstrap a gateway-minted JWT
     /// via `IssueSandboxToken`. Populated only on that one RPC path.
     K8sServiceAccount { pod_name: String, pod_uid: String },

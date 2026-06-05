@@ -24,8 +24,9 @@ openshell-router = { path = "../openshell-router" }
 tokio = { workspace = true }
 
 # gRPC
-tonic = { workspace = true, features = ["channel", "tls"] }
+tonic = { workspace = true, features = ["channel", "tls-native-roots"] }
 tokio-stream = { workspace = true }
+spiffe = { workspace = true }
 
 # CLI
 clap = { workspace = true }
@@ -52,6 +53,7 @@ webpki-roots = { workspace = true }
 
 # HTTP
 bytes = { workspace = true }
+reqwest = { workspace = true }
 
 # UUID
 uuid = { workspace = true }

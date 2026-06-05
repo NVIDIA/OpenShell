@@ -97,6 +97,7 @@ mod tests {
                     query_param: String::new(),
                     refresh: None,
                     path_template: String::new(),
+                    token_grant: None,
                 },
                 CredentialProfile {
                     name: "secondary".to_string(),
@@ -108,6 +109,7 @@ mod tests {
                     query_param: String::new(),
                     refresh: None,
                     path_template: String::new(),
+                    token_grant: None,
                 },
             ],
             endpoints: Vec::new(),

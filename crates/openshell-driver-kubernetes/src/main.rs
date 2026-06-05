@@ -92,6 +92,9 @@ struct Args {
     /// gateway clamps values outside `[600, 86400]`. Default 3600.
     #[arg(long, env = "OPENSHELL_K8S_SA_TOKEN_TTL_SECS", default_value_t = 3600)]
     sa_token_ttl_secs: i64,
+
+    #[arg(long, env = "OPENSHELL_PROVIDER_SPIFFE_WORKLOAD_API_SOCKET")]
+    provider_spiffe_workload_api_socket_path: Option<String>,
 }
 
 #[tokio::main]
@@ -129,6 +132,9 @@ async fn main() -> Result<()> {
         default_runtime_class_name: std::env::var("OPENSHELL_K8S_DEFAULT_RUNTIME_CLASS_NAME")
             .unwrap_or_default(),
         sa_token_ttl_secs: args.sa_token_ttl_secs,
+        provider_spiffe_workload_api_socket_path: args
+            .provider_spiffe_workload_api_socket_path
+            .unwrap_or_default(),
     })
     .await
     .into_diagnostic()?;

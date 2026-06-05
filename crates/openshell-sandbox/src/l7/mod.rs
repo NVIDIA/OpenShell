@@ -15,6 +15,7 @@ pub mod provider;
 pub mod relay;
 pub mod rest;
 pub mod tls;
+pub(crate) mod token_grant_injection;
 pub(crate) mod websocket;
 
 /// Application-layer protocol for L7 inspection.
