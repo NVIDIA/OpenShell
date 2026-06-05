@@ -97,6 +97,7 @@ struct KubernetesSandboxDriverConfig {
 #[serde(default)]
 struct KubernetesPodDriverConfig {
     node_selector: BTreeMap<String, String>,
+    runtime_class_name: String,
     tolerations: Vec<serde_json::Value>,
     priority_class_name: String,
 }
@@ -1248,10 +1249,15 @@ fn sandbox_template_to_k8s(
     }
 
     let mut spec = serde_json::Map::new();
-    let runtime_class_name = platform_config_string(template, "runtime_class_name").or_else(|| {
-        (!params.default_runtime_class_name.is_empty())
-            .then(|| params.default_runtime_class_name.to_string())
-    });
+    let runtime_class_name = platform_config_string(template, "runtime_class_name")
+        .or_else(|| {
+            (!driver_config.pod.runtime_class_name.is_empty())
+                .then(|| driver_config.pod.runtime_class_name.clone())
+        })
+        .or_else(|| {
+            (!params.default_runtime_class_name.is_empty())
+                .then(|| params.default_runtime_class_name.to_string())
+        });
     if let Some(runtime_class) = runtime_class_name {
         spec.insert(
             "runtimeClassName".to_string(),
@@ -2353,6 +2359,102 @@ mod tests {
     }
 
     #[test]
+    fn driver_config_runtime_class_name_applies_to_pod_spec() {
+        let template = SandboxTemplate {
+            driver_config: Some(json_struct(serde_json::json!({
+                "pod": {
+                    "runtime_class_name": "kata-containers"
+                }
+            }))),
+            ..SandboxTemplate::default()
+        };
+
+        let pod_template = {
+            let params = SandboxPodParams::default();
+            sandbox_template_to_k8s(
+                &template,
+                false,
+                &std::collections::HashMap::new(),
+                true,
+                &params,
+            )
+        };
+
+        assert_eq!(
+            pod_template["spec"]["runtimeClassName"],
+            serde_json::json!("kata-containers")
+        );
+    }
+
+    #[test]
+    fn driver_config_runtime_class_name_overrides_config_default() {
+        let template = SandboxTemplate {
+            driver_config: Some(json_struct(serde_json::json!({
+                "pod": {
+                    "runtime_class_name": "kata-containers"
+                }
+            }))),
+            ..SandboxTemplate::default()
+        };
+
+        let pod_template = {
+            let params = SandboxPodParams {
+                default_runtime_class_name: "gvisor",
+                ..SandboxPodParams::default()
+            };
+            sandbox_template_to_k8s(
+                &template,
+                false,
+                &std::collections::HashMap::new(),
+                true,
+                &params,
+            )
+        };
+
+        assert_eq!(
+            pod_template["spec"]["runtimeClassName"],
+            serde_json::json!("kata-containers")
+        );
+    }
+
+    #[test]
+    fn template_runtime_class_name_overrides_driver_config() {
+        let template = SandboxTemplate {
+            platform_config: Some(Struct {
+                fields: std::iter::once((
+                    "runtime_class_name".to_string(),
+                    Value {
+                        kind: Some(Kind::StringValue("gvisor".to_string())),
+                    },
+                ))
+                .collect(),
+            }),
+            driver_config: Some(json_struct(serde_json::json!({
+                "pod": {
+                    "runtime_class_name": "kata-containers"
+                }
+            }))),
+            ..SandboxTemplate::default()
+        };
+
+        let pod_template = {
+            let params = SandboxPodParams::default();
+            sandbox_template_to_k8s(
+                &template,
+                false,
+                &std::collections::HashMap::new(),
+                true,
+                &params,
+            )
+        };
+
+        assert_eq!(
+            pod_template["spec"]["runtimeClassName"],
+            serde_json::json!("gvisor")
+        );
+    }
+
+    #[test]
     fn runtime_class_name_omitted_when_both_template_and_default_empty() {
         let template = SandboxTemplate::default();
         let pod_template = {
@@ -3165,6 +3267,7 @@ mod tests {
                     "node_selector": {
                         "accelerator": "nvidia"
                     },
+                    "runtime_class_name": "kata-containers",
                     "priority_class_name": "gpu-workload",
                     "tolerations": [{
                         "key": "nvidia.com/gpu",
@@ -3203,6 +3306,10 @@ mod tests {
         assert_eq!(
             pod_template["spec"]["priorityClassName"],
             serde_json::json!("gpu-workload")
+        );
+        assert_eq!(
+            pod_template["spec"]["runtimeClassName"],
+            serde_json::json!("kata-containers")
         );
         assert_eq!(
             pod_template["spec"]["tolerations"][0]["key"],

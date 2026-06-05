@@ -74,6 +74,7 @@ nested schema and currently accepts:
 
 - `pod.node_selector`
 - `pod.tolerations`
+- `pod.runtime_class_name`
 - `pod.priority_class_name`
 - `containers.agent.resources.requests`
 - `containers.agent.resources.limits`
@@ -87,11 +88,14 @@ forwards only the `kubernetes` object to this driver:
 
 ```shell
 openshell sandbox create \
-  --driver-config-json '{"kubernetes":{"pod":{"node_selector":{"pool":"gpu"}}}}' \
+  --driver-config-json '{"kubernetes":{"pod":{"runtime_class_name":"kata-containers","node_selector":{"pool":"gpu"}}}}' \
   -- claude
 ```
 
 Resource keys use native Kubernetes resource names and quantity strings. The
-POC parser renders the keys listed above and ignores unknown fields. Use the
+POC parser renders the keys listed above and ignores unknown fields.
+`pod.runtime_class_name` maps to PodSpec `runtimeClassName` and overrides the
+driver's configured `default_runtime_class_name`; the typed public
+`SandboxTemplate.runtime_class_name` still takes precedence when set. Use the
 public `gpu` flag for the default GPU request and `driver_config` only for
 additional driver-owned resource details.
