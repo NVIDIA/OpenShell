@@ -147,15 +147,20 @@ async fn run_push_loop(
         let stream = tokio_stream::wrappers::ReceiverStream::new(push_rx);
 
         // Spawn the gRPC streaming call. When the call ends (success or error),
-        // `rpc_done_tx` fires so the batch loop below knows to reconnect.
-        let (rpc_done_tx, mut rpc_done_rx) = mpsc::channel::<()>(1);
+        // `rpc_done_tx` fires so the batch loop below knows whether to retry.
+        let (rpc_done_tx, mut rpc_done_rx) = mpsc::channel::<bool>(1);
         tokio::spawn({
             let mut nav_client = client.raw_client();
             async move {
-                if let Err(e) = nav_client.push_sandbox_logs(stream).await {
-                    eprintln!("openshell: log push RPC failed: {e}");
-                }
-                let _ = rpc_done_tx.send(()).await;
+                let fatal_auth = match nav_client.push_sandbox_logs(stream).await {
+                    Ok(_) => false,
+                    Err(e) => {
+                        let fatal_auth = e.code() == tonic::Code::Unauthenticated;
+                        eprintln!("openshell: log push RPC failed: {e}");
+                        fatal_auth
+                    }
+                };
+                let _ = rpc_done_tx.send(fatal_auth).await;
             }
         });
 
@@ -181,6 +186,7 @@ async fn run_push_loop(
         let mut timer = tokio::time::interval(flush_interval);
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        let mut fatal_auth = false;
         let stream_broken = loop {
             tokio::select! {
                 line = rx.recv() => {
@@ -218,17 +224,23 @@ async fn run_push_loop(
                         }
                     }
                 }
-                _ = rpc_done_rx.recv() => {
+                rpc_done = rpc_done_rx.recv() => {
                     // The gRPC streaming call ended (server closed / error).
+                    fatal_auth = rpc_done.unwrap_or(false);
                     break true;
                 }
             }
         };
 
+        if fatal_auth {
+            eprintln!("openshell: log push disabled after authentication failure");
+            return;
+        }
+
         if stream_broken {
-            eprintln!("openshell: log push stream lost, reconnecting...");
-            backoff = INITIAL_BACKOFF;
-            // Loop back to reconnect.
+            eprintln!("openshell: log push stream lost, reconnecting after backoff...");
+            drain_during_backoff(&mut rx, &mut batch, backoff).await;
+            backoff = (backoff * 2).min(MAX_BACKOFF);
         }
     }
 }
