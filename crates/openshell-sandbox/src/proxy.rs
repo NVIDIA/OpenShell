@@ -1666,12 +1666,13 @@ async fn route_inference_request(
             return Ok(true);
         }
 
-        // Non-streaming protocols (embeddings) return a single JSON object, not
-        // an SSE token stream. Serve them buffered with an accurate
+        // Buffered protocols (embeddings, model discovery) return a single JSON
+        // object, not an SSE token stream. Serve them buffered with an accurate
         // Content-Length: the streaming path would append an SSE error frame to
         // the body on a size-cap or idle-timeout truncation, corrupting a
-        // payload the client parses as one JSON object.
-        if crate::l7::inference::protocol_returns_buffered_body(&pattern.protocol) {
+        // payload the client parses as one JSON object. Framing is declared per
+        // protocol on the matched pattern.
+        if pattern.is_buffered() {
             match ctx
                 .router
                 .proxy_with_candidates(
@@ -5566,6 +5567,217 @@ network_policies:
         );
     }
 
+    fn model_discovery_inference_route(
+        endpoint: String,
+    ) -> openshell_router::config::ResolvedRoute {
+        openshell_router::config::ResolvedRoute {
+            name: "inference.local".to_string(),
+            endpoint,
+            model: "text-embedding-3-small".to_string(),
+            api_key: "test-api-key".to_string(),
+            protocols: vec!["model_discovery".to_string()],
+            auth: openshell_router::config::AuthHeader::Bearer,
+            default_headers: vec![],
+            passthrough_headers: vec![],
+            timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
+            model_in_path: false,
+            request_path_override: None,
+        }
+    }
+
+    /// `GET /v1/models` (model discovery) returns one JSON object — a model
+    /// list — exactly like embeddings. It must be served buffered with
+    /// `Content-Length`, never through the chunked streaming path whose
+    /// truncation handlers would append an SSE `proxy_stream_error` frame into
+    /// the JSON body. This guards the framing classification for the protocol.
+    #[tokio::test]
+    async fn inference_model_discovery_served_buffered_with_content_length() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        let upstream_body =
+            r#"{"object":"list","data":[{"id":"text-embedding-3-small","object":"model"}]}"#;
+        let upstream_task = tokio::spawn(async move {
+            let (mut upstream, _) = listener.accept().await.unwrap();
+            read_forwarded_inference_request(&mut upstream).await;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                upstream_body.len(),
+                upstream_body,
+            );
+            upstream.write_all(resp.as_bytes()).await.unwrap();
+        });
+
+        let router = openshell_router::Router::new().unwrap();
+        let patterns = crate::l7::inference::default_patterns();
+        let ctx = InferenceContext::new(
+            patterns,
+            router,
+            vec![model_discovery_inference_route(format!(
+                "http://{upstream_addr}"
+            ))],
+            vec![],
+        );
+
+        // GET model discovery carries no request body.
+        let request = "GET /v1/models HTTP/1.1\r\n\
+             Host: inference.local\r\n\
+             Content-Length: 0\r\n\r\n"
+            .to_string();
+
+        let (client, mut server) = tokio::io::duplex(65536);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        let server_task =
+            tokio::spawn(async move { process_inference_keepalive(&mut server, &ctx, 443).await });
+
+        client_write.write_all(request.as_bytes()).await.unwrap();
+        client_write.shutdown().await.unwrap();
+
+        let mut response = Vec::new();
+        client_read.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+
+        server_task.await.unwrap().unwrap();
+        upstream_task.await.unwrap();
+
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK\r\n"),
+            "expected buffered 200 response, got: {response}"
+        );
+        let lower = response.to_ascii_lowercase();
+        assert!(
+            lower.contains("content-length:"),
+            "model discovery response must be Content-Length framed, got: {response}"
+        );
+        assert!(
+            !lower.contains("transfer-encoding: chunked"),
+            "model discovery response must NOT be chunked, got: {response}"
+        );
+        assert!(
+            !response.contains("proxy_stream_error"),
+            "model discovery response must not carry an SSE error frame, got: {response}"
+        );
+        assert!(
+            response.contains(r#""object":"list""#),
+            "model discovery JSON body must be forwarded intact, got: {response}"
+        );
+    }
+
+    /// `GET /v1/models/{id}` (model discovery glob) must forward the model id in
+    /// the path through the buffered path with the id intact, never streamed.
+    #[tokio::test]
+    async fn inference_model_discovery_glob_path_served_buffered() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        let upstream_body = r#"{"id":"gpt-4.1","object":"model"}"#;
+        let upstream_task = tokio::spawn(async move {
+            let (mut upstream, _) = listener.accept().await.unwrap();
+            let forwarded = read_forwarded_request_line(&mut upstream).await;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                upstream_body.len(),
+                upstream_body,
+            );
+            upstream.write_all(resp.as_bytes()).await.unwrap();
+            forwarded
+        });
+
+        let router = openshell_router::Router::new().unwrap();
+        let patterns = crate::l7::inference::default_patterns();
+        let ctx = InferenceContext::new(
+            patterns,
+            router,
+            vec![model_discovery_inference_route(format!(
+                "http://{upstream_addr}"
+            ))],
+            vec![],
+        );
+
+        let request = "GET /v1/models/gpt-4.1 HTTP/1.1\r\n\
+             Host: inference.local\r\n\
+             Content-Length: 0\r\n\r\n"
+            .to_string();
+        let (client, mut server) = tokio::io::duplex(65536);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        let server_task =
+            tokio::spawn(async move { process_inference_keepalive(&mut server, &ctx, 443).await });
+        client_write.write_all(request.as_bytes()).await.unwrap();
+        client_write.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        client_read.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        server_task.await.unwrap().unwrap();
+        let (method, forwarded_path) = upstream_task.await.unwrap();
+
+        assert_eq!(method, "GET");
+        assert_eq!(
+            forwarded_path, "/v1/models/gpt-4.1",
+            "the model id in the glob path must be forwarded intact"
+        );
+        let lower = response.to_ascii_lowercase();
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK\r\n")
+                && lower.contains("content-length:")
+                && !lower.contains("transfer-encoding: chunked")
+                && !response.contains("proxy_stream_error"),
+            "glob model discovery must be buffered and Content-Length framed, got: {response}"
+        );
+    }
+
+    /// A failed model-discovery upstream must produce a buffered, Content-Length
+    /// framed JSON error, never a chunked SSE `proxy_stream_error` frame.
+    #[tokio::test]
+    async fn inference_model_discovery_error_served_buffered() {
+        // A port with no listener so the upstream connection is refused.
+        let dead_addr = {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            drop(listener);
+            addr
+        };
+
+        let router = openshell_router::Router::new().unwrap();
+        let patterns = crate::l7::inference::default_patterns();
+        let ctx = InferenceContext::new(
+            patterns,
+            router,
+            vec![model_discovery_inference_route(format!(
+                "http://{dead_addr}"
+            ))],
+            vec![],
+        );
+
+        let request = "GET /v1/models HTTP/1.1\r\n\
+             Host: inference.local\r\n\
+             Content-Length: 0\r\n\r\n"
+            .to_string();
+        let (client, mut server) = tokio::io::duplex(65536);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        let server_task =
+            tokio::spawn(async move { process_inference_keepalive(&mut server, &ctx, 443).await });
+        client_write.write_all(request.as_bytes()).await.unwrap();
+        client_write.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        client_read.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        server_task.await.unwrap().unwrap();
+
+        let lower = response.to_ascii_lowercase();
+        assert!(
+            response.starts_with("HTTP/1.1 5"),
+            "a refused upstream should yield a 5xx, got: {response}"
+        );
+        assert!(
+            lower.contains("content-length:")
+                && !lower.contains("transfer-encoding: chunked")
+                && !response.contains("proxy_stream_error"),
+            "buffered model-discovery error must be Content-Length framed JSON, got: {response}"
+        );
+        assert!(
+            response.contains("error"),
+            "error response should carry a JSON error body, got: {response}"
+        );
+    }
+
     async fn read_forwarded_inference_request<S: AsyncRead + Unpin>(stream: &mut S) {
         use crate::l7::inference::{ParseResult, try_parse_http_request};
 
@@ -5578,6 +5790,28 @@ network_policies:
 
             match try_parse_http_request(&buf) {
                 ParseResult::Complete(_, _) => return,
+                ParseResult::Incomplete => continue,
+                ParseResult::Invalid(reason) => {
+                    panic!("forwarded request should parse cleanly: {reason}");
+                }
+            }
+        }
+    }
+
+    /// Like [`read_forwarded_inference_request`] but returns the forwarded
+    /// request line (method, path) so a test can assert the upstream URL path.
+    async fn read_forwarded_request_line<S: AsyncRead + Unpin>(stream: &mut S) -> (String, String) {
+        use crate::l7::inference::{ParseResult, try_parse_http_request};
+
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "upstream request closed before completion");
+            buf.extend_from_slice(&chunk[..n]);
+
+            match try_parse_http_request(&buf) {
+                ParseResult::Complete(req, _) => return (req.method, req.path),
                 ParseResult::Incomplete => continue,
                 ParseResult::Invalid(reason) => {
                     panic!("forwarded request should parse cleanly: {reason}");

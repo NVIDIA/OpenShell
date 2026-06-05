@@ -7,6 +7,38 @@
 //! HTTP request is a known inference API call and routes it through the local
 //! sandbox router.
 
+/// How an inference protocol delivers its response to the sandboxed client.
+///
+/// `Streaming` protocols (chat completions, completions, responses, Anthropic
+/// messages) emit a Server-Sent Events token stream and are served through the
+/// chunked transfer-encoding path so tokens reach the client incrementally.
+///
+/// `Buffered` protocols (embeddings, model discovery) return a single JSON
+/// object the client parses whole. They must be served in one piece with an
+/// accurate `Content-Length`. Sending them through the streaming path is
+/// unsafe: a mid-body truncation (the streaming size cap or idle timeout)
+/// appends an SSE error event to bytes the client decodes as one JSON object,
+/// silently corrupting it.
+///
+/// Framing is a property of the protocol, declared once per pattern in
+/// [`default_patterns`], so the streaming-vs-buffered decision cannot drift
+/// across the dispatch sites that consume it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseFraming {
+    /// SSE token stream, served via chunked transfer-encoding.
+    ///
+    /// The `OpenAI` completion-style protocols are classified streaming
+    /// unconditionally. They are dual-mode (a `stream: false` request returns
+    /// one buffered JSON object), but the dispatch keys framing off the
+    /// protocol alone and does not inspect the request body, so they are
+    /// streamed defensively. Their buffered responses tolerate chunked framing;
+    /// only the embeddings and model-discovery shapes (no streaming mode at
+    /// all) must be served buffered.
+    Streaming,
+    /// Single JSON object, served buffered with an accurate `Content-Length`.
+    Buffered,
+}
+
 /// An inference API pattern for detecting inference calls in intercepted traffic.
 #[derive(Debug, Clone)]
 pub struct InferenceApiPattern {
@@ -14,6 +46,18 @@ pub struct InferenceApiPattern {
     pub path_glob: String,
     pub protocol: String,
     pub kind: String,
+    /// Response delivery mode for this protocol. Selects the buffered or
+    /// streaming proxy path; see [`ResponseFraming`].
+    pub framing: ResponseFraming,
+}
+
+impl InferenceApiPattern {
+    /// Whether this protocol's response must be served buffered (one JSON
+    /// object framed with an accurate `Content-Length`) rather than streamed.
+    #[must_use]
+    pub fn is_buffered(&self) -> bool {
+        matches!(self.framing, ResponseFraming::Buffered)
+    }
 }
 
 /// Default patterns for known inference APIs (`OpenAI`, Anthropic).
@@ -24,42 +68,51 @@ pub fn default_patterns() -> Vec<InferenceApiPattern> {
             path_glob: "/v1/chat/completions".to_string(),
             protocol: "openai_chat_completions".to_string(),
             kind: "chat_completion".to_string(),
+            framing: ResponseFraming::Streaming,
         },
         InferenceApiPattern {
             method: "POST".to_string(),
             path_glob: "/v1/completions".to_string(),
             protocol: "openai_completions".to_string(),
             kind: "completion".to_string(),
+            framing: ResponseFraming::Streaming,
         },
         InferenceApiPattern {
             method: "POST".to_string(),
             path_glob: "/v1/responses".to_string(),
             protocol: "openai_responses".to_string(),
             kind: "responses".to_string(),
+            framing: ResponseFraming::Streaming,
         },
         InferenceApiPattern {
             method: "POST".to_string(),
             path_glob: "/v1/embeddings".to_string(),
             protocol: "openai_embeddings".to_string(),
             kind: "embeddings".to_string(),
+            framing: ResponseFraming::Buffered,
         },
         InferenceApiPattern {
             method: "POST".to_string(),
             path_glob: "/v1/messages".to_string(),
             protocol: "anthropic_messages".to_string(),
             kind: "messages".to_string(),
+            framing: ResponseFraming::Streaming,
         },
+        // Model discovery returns one JSON object (a model list), never an SSE
+        // stream, so it is served buffered for the same reason as embeddings.
         InferenceApiPattern {
             method: "GET".to_string(),
             path_glob: "/v1/models".to_string(),
             protocol: "model_discovery".to_string(),
             kind: "models_list".to_string(),
+            framing: ResponseFraming::Buffered,
         },
         InferenceApiPattern {
             method: "GET".to_string(),
             path_glob: "/v1/models/*".to_string(),
             protocol: "model_discovery".to_string(),
             kind: "models_get".to_string(),
+            framing: ResponseFraming::Buffered,
         },
     ]
 }
@@ -86,21 +139,6 @@ pub fn detect_inference_pattern<'a>(
 
         path_only == p.path_glob
     })
-}
-
-/// Whether a detected inference protocol returns a single buffered JSON body
-/// rather than a Server-Sent Events token stream.
-///
-/// SSE-capable protocols (chat completions, completions, responses, Anthropic
-/// messages) are served through the chunked streaming path so tokens reach the
-/// client incrementally. Embeddings always return one JSON object, so they must
-/// be framed with an accurate `Content-Length`. Streaming a buffered body would
-/// let a mid-body truncation (the streaming size cap or idle timeout) append a
-/// [`format_sse_error`] event to a payload the client parses as a single JSON
-/// object, silently corrupting it. Add future non-streaming protocols here.
-#[must_use]
-pub fn protocol_returns_buffered_body(protocol: &str) -> bool {
-    matches!(protocol, "openai_embeddings")
 }
 
 /// A parsed HTTP request from the intercepted tunnel.
@@ -455,7 +493,11 @@ mod tests {
         let patterns = default_patterns();
         let result = detect_inference_pattern("GET", "/v1/models", &patterns);
         assert!(result.is_some());
-        assert_eq!(result.unwrap().protocol, "model_discovery");
+        let pattern = result.unwrap();
+        assert_eq!(pattern.protocol, "model_discovery");
+        // A model list is one JSON object; it must be served buffered, never
+        // through the SSE streaming path that could append an error frame.
+        assert!(pattern.is_buffered());
     }
 
     #[test]
@@ -463,7 +505,9 @@ mod tests {
         let patterns = default_patterns();
         let result = detect_inference_pattern("GET", "/v1/models/gpt-4.1", &patterns);
         assert!(result.is_some());
-        assert_eq!(result.unwrap().protocol, "model_discovery");
+        let pattern = result.unwrap();
+        assert_eq!(pattern.protocol, "model_discovery");
+        assert!(pattern.is_buffered());
     }
 
     #[test]
@@ -474,6 +518,29 @@ mod tests {
         let pattern = result.unwrap();
         assert_eq!(pattern.protocol, "openai_embeddings");
         assert_eq!(pattern.kind, "embeddings");
+        assert!(pattern.is_buffered());
+    }
+
+    /// Every default pattern must declare framing consistent with how its
+    /// protocol actually responds: single-JSON-object protocols buffered,
+    /// SSE token streams streaming. A wrong classification routes a response
+    /// through the path that can corrupt or stall it.
+    #[test]
+    fn protocol_framing_classification() {
+        let patterns = default_patterns();
+        for pattern in &patterns {
+            let expected_buffered = matches!(
+                pattern.protocol.as_str(),
+                "model_discovery" | "openai_embeddings"
+            );
+            assert_eq!(
+                pattern.is_buffered(),
+                expected_buffered,
+                "{} ({}) has wrong framing",
+                pattern.protocol,
+                pattern.path_glob
+            );
+        }
     }
 
     #[test]
