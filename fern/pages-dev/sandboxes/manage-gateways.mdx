@@ -1,0 +1,167 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Manage Gateways"
+sidebar-title: "Gateways"
+description: "Register OpenShell gateways, switch between environments, inspect gateway status, and troubleshoot gateway access."
+keywords: "Generative AI, Cybersecurity, Gateway, Docker, Podman, Kubernetes, MicroVM, CLI"
+position: 2
+---
+
+The gateway is the control plane for OpenShell. All control-plane traffic between the CLI and running sandboxes flows through the gateway.
+
+The gateway is responsible for:
+
+- Provisioning and managing sandboxes, including creation, deletion, and status monitoring.
+- Storing provider credentials and delivering them to sandboxes at startup.
+- Delivering network and filesystem policies to sandboxes. Policy enforcement itself happens inside each sandbox through the proxy, OPA, Landlock, and seccomp.
+- Managing inference configuration and serving inference bundles so sandboxes can route requests to the correct backend.
+- Providing the SSH tunnel endpoint so you can connect to sandboxes without exposing them directly.
+
+OpenShell separates gateway access from the compute driver that runs sandboxes. Use [Installation](/about/installation) to install OpenShell, choose a compute driver, and start a gateway. This page covers working with gateway entries after a gateway exists.
+
+## Gateway Compute Drivers
+
+A gateway provisions sandboxes through the compute driver configured for that gateway.
+
+| Compute Driver | Where sandboxes run | Best for |
+|---|---|---|
+| Docker | Containers on the gateway host. | Solo development, quick iteration, and single-machine gateways. |
+| Podman | Rootless containers on the gateway host. | Workstations that avoid a rootful Docker daemon. |
+| Kubernetes | Pods in an operator-managed cluster. | Shared clusters and cloud environments. |
+| MicroVM | VM-backed sandboxes. | Workflows that need VM-backed isolation. |
+
+All compute drivers expose the same gateway API surface. Sandboxes, policies, and providers work the same after the CLI registers the gateway endpoint. The difference is how the gateway creates sandbox workloads and how operators expose the gateway to users.
+
+<Tip>
+For driver setup, including Docker, Podman, MicroVM, and Kubernetes paths, refer to [Installation](/about/installation).
+
+</Tip>
+
+## Configure Service Forwarding
+
+Sandbox service routing is enabled for gateways by default. Users expose long-running sandbox services with `openshell service expose`, and the gateway routes browser traffic from the printed service URL to the loopback port inside the sandbox.
+
+Loopback gateways use `openshell.localhost` service URLs. OpenShell prints a URL in the form `http://<sandbox>.openshell.localhost:<port>/` or `http://<sandbox>--<service>.openshell.localhost:<port>/` when a service name is provided.
+
+Browser traffic enters the same gateway listener as mTLS-protected gRPC, but plaintext HTTP is accepted only from loopback clients and only for sandbox service hostnames. Gateway APIs, auth routes, health endpoints, and non-service hostnames remain unavailable over plaintext HTTP. Cross-origin and sibling-subdomain browser requests are rejected before reaching the sandbox service.
+
+Disable the local browser path with `--enable-loopback-service-http=false` or `OPENSHELL_ENABLE_LOOPBACK_SERVICE_HTTP=false`.
+
+Custom HTTPS service domains use the gateway server SAN configuration. Add a wildcard DNS SAN such as `*.apps.example.com` to the gateway certificate and pass the same SAN to the gateway with `--server-san` or `OPENSHELL_SERVER_SAN`.
+
+For remote or non-loopback gateways, browser service URLs remain HTTPS and require normal gateway authentication.
+
+## Register an Existing Gateway
+
+Use `openshell gateway add` to register any reachable gateway endpoint so the CLI can target it.
+
+Register a plaintext local endpoint, such as a trusted port-forward:
+
+```shell
+openshell gateway add http://127.0.0.1:8080 --local --name local
+```
+
+Register a gateway behind an authenticated reverse proxy:
+
+```shell
+openshell gateway add https://gateway.example.com --name production
+```
+
+This opens your browser for the proxy's login flow when the gateway uses edge authentication. If the token expires later, re-authenticate with:
+
+```shell
+openshell gateway login production
+```
+
+For direct mTLS endpoints, place the CLI client certificate bundle in the gateway credential directory described in [Gateway Authentication](/reference/gateway-auth), then register or select that gateway name.
+
+## Manage Multiple Gateways
+
+One gateway is always the active gateway. All CLI commands target it by default. `gateway add` sets the new gateway as active.
+
+The active gateway is the persisted default. The `-g` flag and the `OPENSHELL_GATEWAY` environment variable override it when commands resolve a gateway. If `OPENSHELL_GATEWAY` is set to a different gateway, `openshell gateway select <name>` still saves the new default and warns that the current shell continues to use the environment value until you unset or update it.
+
+List all registered gateways:
+
+```shell
+openshell gateway list
+```
+
+Switch the active gateway:
+
+```shell
+openshell gateway select production
+```
+
+Override the active gateway for a single command with `-g`:
+
+```shell
+openshell status -g staging
+```
+
+## Inspect Gateway Status
+
+Use `openshell status` for a quick health check:
+
+```shell
+openshell status
+```
+
+Use `openshell gateway info` when you need the registered endpoint, gateway metadata, or compute driver details:
+
+```shell
+openshell gateway info
+openshell gateway info --name production
+```
+
+Remove a local CLI registration without stopping the gateway service:
+
+```shell
+openshell gateway remove production
+```
+
+## Troubleshoot
+
+Check gateway health:
+
+```shell
+openshell status
+openshell gateway info
+```
+
+For Docker-backed local gateways, inspect Docker and the gateway process or container started by your local workflow:
+
+```shell
+openshell doctor check
+openshell gateway info
+```
+
+For Kubernetes gateways, inspect the gateway workload and cluster events:
+
+```shell
+kubectl -n openshell get pods
+kubectl -n openshell logs statefulset/openshell
+kubectl -n openshell get events --sort-by=.lastTimestamp
+```
+
+For Podman or MicroVM gateways managed by systemd, inspect the user service and logs:
+
+```shell
+systemctl --user status openshell-gateway
+journalctl --user -u openshell-gateway --no-pager -n 50
+```
+
+For sandbox startup failures, inspect the selected compute driver:
+
+| Compute Driver | What to check |
+|---|---|
+| Docker | Docker daemon health, image availability, gateway logs, and sandbox container state. |
+| Podman | Podman socket availability, rootless networking, image availability, and sandbox container state. |
+| Kubernetes | Events and sandbox pods in the namespace configured by `server.sandboxNamespace`. |
+| MicroVM | VM driver logs, rootfs availability, and gateway logs. |
+
+## Next Steps
+
+- To install OpenShell and choose a compute driver, refer to [Installation](/about/installation).
+- To create a sandbox using the gateway, refer to [Manage Sandboxes](/sandboxes/manage-sandboxes).

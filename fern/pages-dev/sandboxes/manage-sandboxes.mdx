@@ -1,0 +1,370 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Manage Sandboxes"
+sidebar-title: "Sandboxes"
+description: "Create sandboxes, understand sandbox isolation, and manage the full sandbox lifecycle."
+keywords: "Generative AI, Cybersecurity, Gateway, Sandboxing, AI Agents, Sandbox Management, CLI"
+position: 1
+---
+
+A sandbox is the OpenShell data plane: a safe, private execution environment where an AI agent runs. Each sandbox combines runtime isolation with OpenShell policy controls that prevent unauthorized data access, credential exposure, and network exfiltration.
+
+<Info>You need an active gateway before creating a sandbox.</Info>
+
+## Create a Sandbox
+
+Create a sandbox with a single command. For example, to create a sandbox with Claude, run:
+
+```shell
+openshell sandbox create -- claude
+```
+
+Every sandbox requires a gateway. Register or select one before running sandbox commands:
+
+```shell
+openshell gateway add http://127.0.0.1:18080 --local --name local
+openshell gateway select local
+```
+
+### CPU and Memory
+
+Set per-sandbox CPU and memory amounts with `--cpu` and `--memory`:
+
+```shell
+openshell sandbox create --cpu 2 --memory 4Gi -- claude
+```
+
+CPU values use Kubernetes-style quantities such as `500m`, `1`, or `2.5`.
+Memory values use byte quantities such as `512Mi`, `4Gi`, or `8G`.
+
+Docker and Podman apply these values as runtime limits. Kubernetes applies each
+value as both the request and the limit so the scheduler reserves the same
+amount the sandbox can use. The VM driver currently accepts these flags but
+does not change VM allocation.
+
+### Driver-Specific Configuration
+
+Pass experimental driver-owned settings with `--driver-config-json`. The value
+must be a JSON object keyed by driver name. The gateway forwards only the block
+for its configured compute driver:
+
+Nested keys inside each driver block use snake_case. The top-level envelope keys
+are driver names, such as `kubernetes`, and are not part of the nested schema.
+
+```shell
+openshell sandbox create \
+  --driver-config-json '{"kubernetes":{"pod":{"runtime_class_name":"kata-containers","node_selector":{"pool":"gpu"}}}}' \
+  -- claude
+```
+
+Use this only for driver-specific fields that do not have a stable CLI flag.
+Prefer stable flags such as `--cpu`, `--memory`, and `--gpu` when they cover
+the same behavior.
+
+### GPU Resources
+
+To request GPU resources, add `--gpu`:
+
+```shell
+openshell sandbox create --gpu -- claude
+```
+
+For Docker-backed sandboxes, GPU injection uses Docker CDI. If you enable Docker
+CDI after the gateway starts, restart the gateway so OpenShell can detect the
+updated Docker daemon capability.
+
+### Custom Containers
+
+Use `--from` to create a sandbox from the base image, another pre-built sandbox name, a local directory, or a container image:
+
+```shell
+openshell sandbox create --from base
+openshell sandbox create --from ollama
+openshell sandbox create --from ./my-sandbox-dir
+openshell sandbox create --from my-registry.example.com/my-image:latest
+```
+
+Bare names such as `base` and `ollama` resolve to images under `ghcr.io/nvidia/openshell-community/sandboxes`. Set `OPENSHELL_COMMUNITY_REGISTRY` when you need to use an internal mirror.
+
+Local directories and Dockerfiles require a local gateway because the CLI builds
+through the local Docker daemon. Use a registry image reference for remote
+gateways.
+
+## Base Sandbox Container
+
+The `base` sandbox container is the default runtime image for standard OpenShell sandboxes unless the gateway overrides its default sandbox image. It is published as `ghcr.io/nvidia/openshell-community/sandboxes/base:latest` and maintained in the [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base) repository.
+
+The base container includes common development tooling, supported agent CLIs, and the default sandbox policy. Use it when you want a general-purpose agent environment without a workflow-specific image:
+
+```shell
+openshell sandbox create --from base
+```
+
+For default policy coverage by agent, refer to [Default Policy](/reference/default-policy). For the supported agent list, refer to [Supported Agents](/about/supported-agents).
+
+## Connect to a Sandbox
+
+Open an SSH session into a running sandbox:
+
+```shell
+openshell sandbox connect my-sandbox
+```
+
+Launch VS Code or Cursor directly into the sandbox workspace:
+
+```shell
+openshell sandbox create --editor vscode --name my-sandbox
+openshell sandbox connect my-sandbox --editor cursor
+```
+
+When `--editor` is used, OpenShell keeps the sandbox alive and installs an
+OpenShell-managed SSH include file instead of cluttering your main
+`~/.ssh/config` with generated host blocks.
+
+## Execute a Command in a Sandbox
+
+Run a one-shot command inside a running sandbox without opening an interactive shell:
+
+```shell
+openshell sandbox exec -n my-sandbox -- ls -la /workspace
+```
+
+Pipe stdin into the command:
+
+```shell
+echo "hello" | openshell sandbox exec -n my-sandbox -- cat
+```
+
+The command's exit code is propagated to the CLI, so `exec` works in scripts that check return codes.
+
+Run an interactive shell with a TTY:
+
+```shell
+openshell sandbox exec -n my-sandbox --tty -- /bin/bash
+```
+
+OpenShell allocates a TTY automatically when both stdin and stdout are terminals. Force the behavior with `--tty` or disable it with `--no-tty`.
+
+| Flag           | Purpose                                                  |
+| -------------- | -------------------------------------------------------- |
+| `-n`, `--name` | Sandbox to target.                                       |
+| `--workdir`    | Working directory for the command inside the sandbox.    |
+| `--timeout`    | Command timeout in seconds. `0` disables the timeout.    |
+| `--tty`        | Force TTY allocation.                                    |
+| `--no-tty`     | Disable TTY allocation even when attached to a terminal. |
+
+## Label a Sandbox
+
+Attach labels when you create a sandbox to track ownership, environment, or workflow grouping:
+
+```shell
+openshell sandbox create --label env=dev --label team=platform -- claude
+```
+
+List only the sandboxes that match a label selector:
+
+```shell
+openshell sandbox list --selector env=dev
+openshell sandbox list --selector env=dev,team=platform
+```
+
+## Expose Long Running Services
+
+Service forwarding makes a long-running process inside a sandbox reachable through a gateway-managed URL. Use it for development servers, notebooks, dashboards, or other services that keep listening after the sandbox starts. Run the service on loopback inside the sandbox, expose its port, then open the URL printed by OpenShell.
+
+Expose a service that listens on loopback inside the sandbox:
+
+```shell
+openshell service expose my-sandbox 8080
+```
+
+Pass an optional service name to create a named service URL:
+
+```shell
+openshell service expose my-sandbox 8080 web
+```
+
+List exposed endpoints:
+
+```shell
+openshell service list
+```
+
+List endpoints for one sandbox:
+
+```shell
+openshell service list my-sandbox
+```
+
+Show or delete one endpoint:
+
+```shell
+openshell service get my-sandbox web
+openshell service delete my-sandbox web
+```
+
+Omit the service name to manage the unnamed endpoint:
+
+```shell
+openshell service get my-sandbox
+openshell service delete my-sandbox
+```
+
+<Note>
+Loopback gateways return local `openshell.localhost` URLs. Remote gateways return HTTPS URLs that require normal gateway authentication. For gateway service-domain configuration, refer to [Manage Gateways](/sandboxes/manage-gateways#configure-service-forwarding).
+</Note>
+
+## Monitor and Debug
+
+List all sandboxes:
+
+```shell
+openshell sandbox list
+```
+
+Filter the list by labels when you want a narrower view:
+
+```shell
+openshell sandbox list --selector team=platform
+```
+
+Use `-o json` or `-o yaml` for machine-readable output:
+
+```shell
+openshell sandbox list -o json
+openshell sandbox list -o yaml
+```
+
+Get detailed information about a specific sandbox. The output lists **Policy source** (`sandbox` or `global`), **Revision** (the active policy’s row version for that source), and the formatted active policy YAML:
+
+```shell
+openshell sandbox get my-sandbox
+```
+
+Print only that policy YAML for scripting (same effective policy, no metadata):
+
+```shell
+openshell sandbox get my-sandbox --policy-only
+```
+
+Stream sandbox logs to monitor agent activity and diagnose policy decisions:
+
+```shell
+openshell logs my-sandbox
+```
+
+| Flag       | Purpose                      | Example                            |
+| ---------- | ---------------------------- | ---------------------------------- |
+| `--tail`   | Stream logs in real time     | `openshell logs my-sandbox --tail` |
+| `--source` | Filter by log source         | `--source sandbox`                 |
+| `--level`  | Filter by severity           | `--level warn`                     |
+| `--since`  | Show logs from a time window | `--since 5m`                       |
+
+OpenShell Terminal combines sandbox status and live logs in a single real-time dashboard:
+
+```shell
+openshell term
+```
+
+Use the terminal to spot blocked connections marked `action=deny` and inference-related proxy activity. If a connection is blocked unexpectedly, add the host to your network policy. Refer to [Policies](/sandboxes/policies) for the workflow.
+
+## Port Forwarding
+
+Forward a local port to a running sandbox to access services inside it, such as a web server or database:
+
+```shell
+openshell forward start 8000 my-sandbox
+openshell forward start 8000 my-sandbox -d    # run in background
+```
+
+List and stop active forwards:
+
+```shell
+openshell forward list
+openshell forward stop 8000 my-sandbox
+```
+
+<Tip>
+You can also forward a port at creation time with `--forward`:
+
+```shell
+openshell sandbox create --forward 8000 -- claude
+```
+
+</Tip>
+
+## SSH Config
+
+Generate an SSH config entry for a sandbox so tools like VS Code Remote-SSH can connect directly:
+
+```shell
+openshell sandbox ssh-config my-sandbox
+```
+
+Append the output to `~/.ssh/config` or use `--editor` on `sandbox create`/`sandbox connect` for automatic setup.
+
+## Transfer Files
+
+Upload files from your host into the sandbox:
+
+```shell
+openshell sandbox upload my-sandbox ./src /sandbox/src
+```
+
+When the local path is a named directory, OpenShell preserves that basename at the destination, matching `scp -r` and `cp -r`. The example above creates `/sandbox/src/src`.
+
+OpenShell preserves symlinks during upload. A symlink arrives in the sandbox as a symlink with the same target path instead of an expanded copy of the target file or directory. Dangling symlinks are also preserved.
+
+Download files from the sandbox to your host:
+
+```shell
+openshell sandbox download my-sandbox /sandbox/output ./local
+```
+
+When the sandbox-side source is a single file, the destination follows `cp`-style placement: if the destination already exists as a directory or ends with `/`, the file lands inside it as `<dest>/<basename>`; otherwise the file is written at the exact destination path.
+
+The CLI only allows sandbox-side sources that resolve inside the writable workspace (`/sandbox`). Paths that escape lexically (`/etc/passwd`, `/sandbox/../etc/passwd`) and paths that escape through a symlink (`/sandbox/etc-link` pointing at `/etc`) are both refused before any data is transferred.
+
+<Note>
+You can also upload files at creation time with the `--upload` flag on
+`openshell sandbox create`. Pass `--upload` multiple times to upload
+several paths in a single command:
+
+```shell
+openshell sandbox create --upload ./src:/workspace/src --upload ./config:/workspace/config -- claude
+```
+
+</Note>
+
+## Delete Sandboxes
+
+Deleting a sandbox stops all processes, releases resources, and purges injected credentials.
+
+```shell
+openshell sandbox delete my-sandbox
+```
+
+## Sandbox Lifecycle
+
+Every sandbox moves through a defined set of phases:
+
+| Phase        | Description                                                                                                                            |
+| ------------ | -------------------------------------------------------------------------------------------------------------------------------------- |
+| Provisioning | The runtime is setting up the sandbox environment, injecting credentials, and applying your policy.                                    |
+| Ready        | The sandbox is running. The agent process is active and all isolation layers are enforced. You can connect, sync files, and view logs. |
+| Error        | Something went wrong during provisioning or execution. Check logs with `openshell logs` for details.                                   |
+| Deleting     | The sandbox is being torn down. The system releases resources and purges credentials.                                                  |
+
+## Sandbox Compute Drivers
+
+The gateway's configured compute driver determines how OpenShell creates each sandbox. The CLI workflow stays the same across drivers: you create, connect to, inspect, and delete sandboxes through the gateway API.
+
+For Docker, Podman, MicroVM, and Kubernetes behavior, refer to [Sandbox Compute Drivers](/reference/sandbox-compute-drivers).
+
+## Next Steps
+
+- To follow a complete end-to-end example, refer to the [GitHub Sandbox](/get-started/tutorials/github-sandbox) tutorial.
+- To supply API keys or tokens, refer to [Manage Providers](/sandboxes/manage-providers).
+- To control what the agent can access, refer to [Policies](/sandboxes/policies).
+- To use the default runtime image, refer to [Base Sandbox Container](#base-sandbox-container).

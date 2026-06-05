@@ -1,0 +1,24 @@
+landing-page:
+  page: Home
+  path: ../pages-v0.0.36/index.mdx
+navigation:
+- folder: ../pages-v0.0.36/about
+  title: About NVIDIA OpenShell
+- section: Get Started
+  slug: get-started
+  contents:
+  - page: Quickstart
+    path: ../pages-v0.0.36/get-started/quickstart.mdx
+  - folder: ../pages-v0.0.36/get-started/tutorials
+    skip-slug: true
+- folder: ../pages-v0.0.36/sandboxes
+- folder: ../pages-v0.0.36/inference
+  title: Inference Routing
+- folder: ../pages-v0.0.36/observability
+  title: Observability
+- folder: ../pages-v0.0.36/reference
+  title: Reference
+- folder: ../pages-v0.0.36/security
+  title: Security
+- folder: ../pages-v0.0.36/resources
+  title: Resources

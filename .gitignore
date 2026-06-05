@@ -1,0 +1,5 @@
+.fern-cache/
+.cache/
+.idea/
+.venv/
+fern/.fern-cache/

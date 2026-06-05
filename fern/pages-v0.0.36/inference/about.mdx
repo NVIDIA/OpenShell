@@ -1,0 +1,68 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "About Inference Routing"
+sidebar-title: "About Inference Routing"
+description: "Understand how OpenShell routes inference traffic through external endpoints and the local privacy router."
+keywords: "Generative AI, Cybersecurity, Inference Routing, Privacy, AI Agents, LLM"
+position: 1
+---
+
+NVIDIA OpenShell handles inference traffic through two endpoints: `inference.local` and external endpoints.
+The following table summarizes how OpenShell handles inference traffic.
+
+| Path | How It Works |
+|---|---|
+| External endpoints | Traffic to hosts like `api.openai.com` or `api.anthropic.com` is treated like any other outbound request, allowed or denied by `network_policies`. Refer to [Policies](/sandboxes/policies). |
+| `inference.local` | A special endpoint exposed inside every sandbox for routing inference traffic locally, preserving privacy and security. The [privacy router](/about/architecture) strips the original credentials, forwards only approved inference headers, injects the configured backend credentials, and forwards to the managed model endpoint. |
+
+## How `inference.local` Works
+
+When code inside a sandbox calls `https://inference.local`, the privacy router routes the request to the configured backend for that gateway. The configured model is applied to generation requests, provider credentials are supplied by OpenShell rather than by code inside the sandbox, and only approved inference headers are forwarded upstream.
+
+If code calls an external inference host directly, that traffic is evaluated only by `network_policies`.
+
+| Property | Detail |
+|---|---|
+| Credentials | No sandbox API keys needed. Credentials come from the configured provider record. The router strips caller-supplied `Authorization` before forwarding the request. |
+| Header forwarding | `inference.local` forwards only a per-provider header allowlist. OpenAI routes allow `openai-organization` and `x-model-id`. Anthropic routes allow `anthropic-version` and `anthropic-beta`. NVIDIA routes allow `x-model-id`. All other caller headers are stripped. |
+| Configuration | One provider and one model define sandbox inference for the active gateway. Every sandbox on that gateway sees the same `inference.local` backend. |
+| Provider support | NVIDIA, any OpenAI-compatible provider, and Anthropic all work through the same endpoint. |
+| Streaming reliability | The router tolerates idle gaps of up to 120 seconds between streamed chunks so long reasoning responses are not cut off mid-stream. |
+| Hot-refresh | OpenShell picks up provider credential changes and inference updates without recreating sandboxes. Changes propagate within about 5 seconds by default. |
+
+## Supported API Patterns
+
+Supported request patterns depend on the provider configured for `inference.local`.
+
+<Tabs>
+<Tab title="OpenAI-compatible">
+
+| Pattern | Method | Path |
+|---|---|---|
+| Chat Completions | `POST` | `/v1/chat/completions` |
+| Completions | `POST` | `/v1/completions` |
+| Responses | `POST` | `/v1/responses` |
+| Model Discovery | `GET` | `/v1/models` |
+| Model Discovery | `GET` | `/v1/models/*` |
+
+</Tab>
+
+<Tab title="Anthropic-compatible">
+
+| Pattern | Method | Path |
+|---|---|---|
+| Messages | `POST` | `/v1/messages` |
+
+</Tab>
+
+</Tabs>
+
+Requests to `inference.local` that do not match the configured provider's supported patterns are denied.
+
+## Next Steps
+
+Continue with one of the following:
+
+- To set up the backend behind `inference.local`, refer to [Configure](/inference/configure).
+- To control external endpoints, refer to [Policies](/sandboxes/policies).

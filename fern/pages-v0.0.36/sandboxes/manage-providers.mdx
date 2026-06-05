@@ -1,0 +1,194 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Providers"
+sidebar-title: "Providers"
+description: "Create and manage credential providers that inject API keys and tokens into OpenShell sandboxes."
+keywords: "Generative AI, Cybersecurity, Providers, Credentials, API Keys, Sandbox, Security"
+position: 4
+---
+
+AI agents typically need credentials to access external services: an API key for the AI model provider, a token for GitHub or GitLab, and so on. OpenShell manages these credentials as first-class entities called *providers*.
+
+Create and manage providers that supply credentials to sandboxes.
+
+## Create a Provider
+
+Providers can be created from local environment variables or with explicit credential values.
+
+### From Local Credentials
+
+The fastest way to create a provider is to let the CLI discover credentials from
+your shell environment:
+
+```shell
+openshell provider create --name my-claude --type claude --from-existing
+```
+
+This reads `ANTHROPIC_API_KEY` or `CLAUDE_API_KEY` from your current environment
+and stores them in the provider.
+
+### With Explicit Credentials
+
+Supply a credential value directly:
+
+```shell
+openshell provider create --name my-api --type generic --credential API_KEY=sk-abc123
+```
+
+### Bare Key Form
+
+Pass a key name without a value to read the value from the environment variable
+of that name:
+
+```shell
+openshell provider create --name my-api --type generic --credential API_KEY
+```
+
+This looks up the current value of `$API_KEY` in your shell and stores it.
+
+## Manage Providers
+
+List, inspect, update, and delete providers from the active cluster.
+
+List all providers:
+
+```shell
+openshell provider list
+```
+
+Inspect a provider:
+
+```shell
+openshell provider get my-claude
+```
+
+Update a provider's credentials:
+
+```shell
+openshell provider update my-claude --type claude --from-existing
+```
+
+Delete a provider:
+
+```shell
+openshell provider delete my-claude
+```
+
+## Attach Providers to Sandboxes
+
+Pass one or more `--provider` flags when creating a sandbox:
+
+```shell
+openshell sandbox create --provider my-claude --provider my-github -- claude
+```
+
+Each `--provider` flag attaches one provider. The sandbox receives all
+credentials from every attached provider at runtime.
+
+<Warning>
+Providers cannot be added to a running sandbox. If you need to attach an
+additional provider, delete the sandbox and recreate it with all required
+providers specified.
+
+</Warning>
+
+### Auto-Discovery Shortcut
+
+When the trailing command in `openshell sandbox create` is a recognized tool name (`claude`, `codex`, or `opencode`), the CLI auto-creates the required
+provider from your local credentials if one does not already exist. You do not
+need to create the provider separately:
+
+```shell
+openshell sandbox create -- claude
+```
+
+This detects `claude` as a known tool, finds your `ANTHROPIC_API_KEY`, creates
+a provider, attaches it to the sandbox, and launches Claude Code.
+
+## How Credential Injection Works
+
+The agent process inside the sandbox never sees real credential values. At startup, the proxy replaces each credential with an opaque placeholder token in the agent's environment. When the agent sends an HTTP request containing a placeholder, the proxy resolves it to the real credential before forwarding upstream.
+
+This resolution requires the proxy to see plaintext HTTP. Endpoints must use `protocol: rest` in the policy (which auto-terminates TLS) or explicit `tls: terminate`. Endpoints without TLS termination pass traffic through as an opaque stream, and credential placeholders are forwarded unresolved.
+
+### Supported injection locations
+
+The proxy resolves credential placeholders in the following parts of an HTTP request:
+
+| Location | How the agent uses it | Example |
+|---|---|---|
+| Header value | Agent reads `$API_KEY` from env and places it in a header. | `Authorization: Bearer <placeholder>` |
+| Header value (Basic auth) | Agent base64-encodes `user:<placeholder>` in an `Authorization: Basic` header. The proxy decodes, resolves, and re-encodes. | `Authorization: Basic <base64>` |
+| Query parameter value | Agent places the placeholder in a URL query parameter. | `GET /api?key=<placeholder>` |
+| URL path segment | Agent builds a URL with the placeholder in the path. Supports concatenated patterns. | `POST /bot<placeholder>/sendMessage` |
+
+The proxy does not modify request bodies, cookies, or response content.
+
+### Fail-closed behavior
+
+If the proxy detects a credential placeholder in a request but cannot resolve it, it rejects the request with HTTP 500 instead of forwarding the raw placeholder to the upstream server. This prevents accidental credential leakage in server logs or error responses.
+
+### Example: Telegram Bot API (path-based credential)
+
+Create a provider with the Telegram bot token:
+
+```shell
+openshell provider create --name telegram --type generic --credential TELEGRAM_BOT_TOKEN=123456:ABC-DEF
+```
+
+The agent reads `TELEGRAM_BOT_TOKEN` from its environment and builds a request like `POST /bot<placeholder>/sendMessage`. The proxy resolves the placeholder in the URL path and forwards `POST /bot123456:ABC-DEF/sendMessage` to the upstream.
+
+### Example: Google API (query parameter credential)
+
+```shell
+openshell provider create --name google --type generic --credential YOUTUBE_API_KEY=AIzaSy-secret
+```
+
+The agent sends `GET /youtube/v3/search?part=snippet&key=<placeholder>`. The proxy resolves the placeholder in the query parameter value and percent-encodes the result before forwarding.
+
+## Supported Provider Types
+
+The following provider types are supported.
+
+| Type | Environment Variables Injected | Typical Use |
+|---|---|---|
+| `claude` | `ANTHROPIC_API_KEY`, `CLAUDE_API_KEY` | Claude Code, Anthropic API |
+| `codex` | `OPENAI_API_KEY` | OpenAI Codex |
+| `generic` | User-defined | Any service with custom credentials |
+| `github` | `GITHUB_TOKEN`, `GH_TOKEN` | GitHub API, `gh` CLI — refer to [Github Sandbox](/tutorials/github-sandbox) |
+| `gitlab` | `GITLAB_TOKEN`, `GLAB_TOKEN`, `CI_JOB_TOKEN` | GitLab API, `glab` CLI |
+| `nvidia` | `NVIDIA_API_KEY` | NVIDIA API Catalog |
+| `openai` | `OPENAI_API_KEY` | Any OpenAI-compatible endpoint. Set `--config OPENAI_BASE_URL` to point to the provider. Refer to [Configure](/inference/configure). |
+| `opencode` | `OPENCODE_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY` | opencode tool |
+
+<Tip>
+Use the `generic` type for any service not listed above. You define the
+environment variable names and values yourself with `--credential`.
+
+</Tip>
+
+## Supported Inference Providers
+
+The following providers have been tested with `inference.local`. Any provider that exposes an OpenAI-compatible API works with the `openai` type. Set `--config OPENAI_BASE_URL` to the provider's base URL and `--credential OPENAI_API_KEY` to your API key.
+
+| Provider | Name | Type | Base URL | API Key Variable |
+|---|---|---|---|---|
+| NVIDIA API Catalog | `nvidia-prod` | `nvidia` | `https://integrate.api.nvidia.com/v1` | `NVIDIA_API_KEY` |
+| Anthropic | `anthropic-prod` | `anthropic` | `https://api.anthropic.com` | `ANTHROPIC_API_KEY` |
+| Baseten | `baseten` | `openai` | `https://inference.baseten.co/v1` | `OPENAI_API_KEY` |
+| Bitdeer AI | `bitdeer` | `openai` | `https://api-inference.bitdeer.ai/v1` | `OPENAI_API_KEY` |
+| Deepinfra | `deepinfra` | `openai` | `https://api.deepinfra.com/v1/openai` | `OPENAI_API_KEY` |
+| Groq | `groq` | `openai` | `https://api.groq.com/openai/v1` | `OPENAI_API_KEY` |
+| Ollama (local) | `ollama` | `openai` | `http://host.openshell.internal:11434/v1` | `OPENAI_API_KEY` |
+| LM Studio (local) | `lmstudio` | `openai` | `http://host.openshell.internal:1234/v1` | `OPENAI_API_KEY` |
+
+Refer to your provider's documentation for the correct base URL, available models, and API key setup. To configure inference routing, refer to [Configure](/inference/configure).
+
+## Next Steps
+
+Explore related topics:
+
+- To control what the agent can access, refer to [Policies](/sandboxes/policies).
+- To use a pre-built environment, refer to the [Community Sandboxes](/sandboxes/community-sandboxes) catalog.
+- To view the complete field reference for the policy YAML, refer to the [Policy Schema Reference](/reference/policy-schema).

@@ -1,0 +1,98 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Support Matrix"
+description: ""
+position: 5
+---
+
+This page lists the host platform, compute driver, software, runtime, and kernel requirements for running OpenShell.
+
+## Supported Platforms
+
+OpenShell publishes multi-architecture gateway images for `linux/amd64` and `linux/arm64`. The CLI, package-managed gateway, and standalone gateway binary are supported on the following host platforms:
+
+| Platform                         | Architecture          | Status    |
+| -------------------------------- | --------------------- | --------- |
+| Linux (Debian/Ubuntu)            | x86_64 (amd64)        | Supported |
+| Linux (Debian/Ubuntu)            | aarch64 (arm64)       | Supported |
+| macOS (Docker Desktop)           | Apple Silicon (arm64) | Supported |
+| Windows (WSL 2 + Docker Desktop) | x86_64                | Experimental  |
+
+On Linux, the `openshell` CLI is a static musl binary and does not require glibc at runtime.
+
+## Standalone Gateway Binary
+
+OpenShell publishes standalone `openshell-gateway` release assets for manual download on these platforms:
+
+| Platform              | Artifact pattern                               |
+| --------------------- | ---------------------------------------------- |
+| Linux x86_64 (amd64)  | `openshell-gateway-x86_64-unknown-linux-gnu`   |
+| Linux aarch64 (arm64) | `openshell-gateway-aarch64-unknown-linux-gnu`  |
+| macOS Apple Silicon   | `openshell-gateway-aarch64-apple-darwin`       |
+
+These artifacts are attached to GitHub releases. Kubernetes deployments should use the Helm chart and the published gateway image.
+
+On Linux, `openshell-gateway` requires glibc 2.31 or newer. Compatible systems include, for example, Ubuntu 20.04+, RHEL 9+, Amazon Linux 2023+, and Fedora 32+.
+
+## Compute Drivers
+
+The gateway can manage sandboxes through several compute drivers.
+
+| Compute Driver | Status | Notes |
+|---|---|---|
+| Docker | Supported for local development and single-machine gateways. | Requires Docker Desktop or Docker Engine on the gateway host. |
+| Podman | Supported for rootless local and workstation workflows. | Requires a Podman-compatible socket and rootless networking setup. |
+| Kubernetes | Supported through the [OpenShell Helm chart](https://github.com/NVIDIA/OpenShell/blob/main/deploy/helm/openshell/README.md). | Requires a Kubernetes cluster supplied by the operator. |
+| MicroVM | Supported for VM-backed sandboxes. | Uses the VM compute driver and libkrun-based runtime. |
+
+## Software Prerequisites
+
+Install the software for the compute driver you use:
+
+| Component | Minimum Version | Notes |
+|---|---|---|
+| Docker Desktop or Docker Engine | 28.04 | Required for Docker-backed gateways, local image builds, and Docker development workflows. |
+| Podman | 5.x | Required for Podman-backed gateways. |
+| Kubernetes | 1.29 | Required for Helm deployments and Kubernetes sandbox scheduling. |
+| Helm | 3.x | Required to install `deploy/helm/openshell`. |
+| kubectl | Compatible with your cluster | Required for Kubernetes operational inspection and secret creation. |
+| Host virtualization | Host dependent | Required for MicroVM-backed gateways. MicroVM uses Hypervisor.framework on macOS and KVM on Linux. |
+
+## Sandbox Runtime Versions
+
+Sandbox container images are maintained in the [openshell-community](https://github.com/nvidia/openshell-community) repository. Refer to that repository for the current list of installed components and their versions.
+
+## Container Images
+
+OpenShell publishes the gateway image for `linux/amd64` and `linux/arm64`.
+
+| Image | Reference | Pulled When |
+|---|---|---|
+| Gateway | `ghcr.io/nvidia/openshell/gateway:latest` | Helm chart install or upgrade, or standalone container deployment |
+
+The Helm chart in `deploy/helm/openshell` deploys the gateway StatefulSet, service account, service, persistent storage, and network policy for Kubernetes.
+
+Sandbox images are maintained separately in the [openshell-community](https://github.com/nvidia/openshell-community) repository.
+
+To override the default image references, use Helm values:
+
+| Helm value | Purpose |
+|---|---|
+| `image.repository` / `image.tag` | Override the gateway image reference. |
+| `server.sandboxImage` | Override the default sandbox image. |
+
+## Kernel Requirements
+
+OpenShell enforces sandbox isolation through two Linux kernel security modules:
+
+| Module                                                         | Requirement | Details                                                                                                                                                                                                                                          |
+| -------------------------------------------------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| [Landlock LSM](https://docs.kernel.org/security/landlock.html) | Recommended | Enforces filesystem access restrictions at the kernel level. The `best_effort` compatibility mode uses the highest Landlock ABI the host kernel supports. The `hard_requirement` mode fails sandbox creation if the required ABI is unavailable. |
+| seccomp                                                        | Required    | Filters dangerous system calls. Available on all modern Linux kernels (3.17+).                                                                                                                                                                   |
+
+On macOS, these kernel modules run inside the Docker Desktop Linux VM, not on the host kernel.
+
+## Agent Compatibility
+
+For the full list of supported agents and their default policy coverage, refer to the [Supported Agents](/about/supported-agents) page.

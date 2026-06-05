@@ -1,0 +1,71 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# OpenShell mise configuration
+# See https://mise.jdx.dev/ for documentation
+#
+# Tasks are defined in tasks/*.toml — run `mise tasks` to list them all.
+
+# NOTE: keep this version in sync with what CI uses in Dockerfile.ci
+min_version = { soft = "2026.4.25" }
+
+redactions = ["*_TOKEN", "*_PASSWORD"]
+
+[settings]
+experimental = true
+python.precompiled_flavor = "install_only_stripped"
+
+lockfile = true
+lockfile_platforms = ["linux-x64", "linux-arm64", "macos-arm64"]
+
+[tools]
+python = "3.14.5"
+rust = "1.95.0"
+node = "24.15.0"
+kubectl = "1.36.1"
+uv = "0.10.12"
+protoc = "29.6"
+helm = "4.2.0"
+helm-docs = "1.14.2"
+skaffold = "2.20.0"
+# Keep k3d out of Linux CI images until upstream ships a release rebuilt with
+# patched Go/container dependencies. Linux Kubernetes E2E uses kind or an
+# externally provided cluster context.
+k3d = { version = "5.8.3", os = ["macos"] }
+"github:anchore/syft" = { version = "1.44.0" }
+"github:EmbarkStudios/cargo-about" = { version = "0.8.4", version_prefix = "" }
+zig = "0.14.1"
+"github:rust-cross/cargo-zigbuild" = "0.22.3"
+"npm:markdownlint-cli2" = "0.22.0"
+
+[tools."github:mozilla/sccache"]
+version = "0.14.0"
+
+[tools."github:mozilla/sccache".platforms]
+# NOTE: this override is necessary only for linux-x64, otherwise it selects an invalid artifact (sccache-dist-vx.y.z-x86_64-unknown-linux-musl.tar.gz)
+linux-x64 = { asset_pattern = "sccache-v*x86_64*linux*.tar.gz" }
+
+[env]
+_.path = ["{{config_root}}/scripts/bin"]
+_.python.venv = { path = ".venv", create = true }
+_.file = [".env"]
+
+KUBECONFIG = "{{config_root}}/kubeconfig"
+UV_CACHE_DIR = "{{config_root}}/.cache/uv"
+
+# Enable sccache for faster Rust builds.
+# Local builds use a disk cache (SCCACHE_DIR); CI sets SCCACHE_MEMCACHED_ENDPOINT
+# via repository variables to use a shared memcached backend instead.
+RUSTC_WRAPPER = "sccache"
+SCCACHE_DIR = "{{config_root}}/.cache/sccache"
+
+# Shared build constants (overridable via environment).
+# DOCKER_BUILDKIT enables BuildKit for Docker; ignored by podman.
+DOCKER_BUILDKIT = "1"
+
+[vars]
+# Python paths to include in formatting/linting
+python_paths = "python/ tasks/scripts/*.py deploy/sbom/*.py"
+
+[task_config]
+includes = ["tasks/*.toml"]

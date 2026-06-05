@@ -1,0 +1,66 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Managing Certificates"
+sidebar-title: "Managing Certificates"
+description: "Configure the OpenShell Helm chart to use cert-manager for mTLS certificate issuance and automatic renewal."
+keywords: "Generative AI, Cybersecurity, Kubernetes, cert-manager, PKI, TLS, mTLS, Certificates"
+position: 2
+---
+
+The OpenShell gateway uses mTLS certificates for transport between the gateway and sandbox supervisors. These certificates are not Kubernetes user authentication; configure OIDC or a trusted access proxy for user access. The Helm chart supports two ways to provision and manage the certificate bundle:
+
+| Mode | When to use |
+|---|---|
+| Built-in `pkiInitJob` (default) | The default path. A pre-install Kubernetes Job generates a self-signed CA and certificates during installation. No additional dependencies. |
+| cert-manager | Production deployments that need automatic certificate rotation managed by a running controller. |
+
+The rest of this page covers switching to cert-manager. The built-in mode requires no configuration.
+
+<Note>
+When `certManager.enabled=true`, cert-manager owns TLS certificate generation.
+The chart still runs a JWT-only initialization hook because cert-manager does
+not create the sandbox JWT signing Secret required by the gateway. This
+cert-manager precedence applies even if `pkiInitJob.enabled` remains true.
+</Note>
+
+## Install cert-manager
+
+Add the Jetstack Helm repository and install cert-manager with CRD support enabled:
+
+```shell
+helm repo add jetstack https://charts.jetstack.io
+helm repo update
+helm upgrade --install cert-manager jetstack/cert-manager \
+  --namespace cert-manager \
+  --create-namespace \
+  --set crds.enabled=true \
+  --wait
+```
+
+Verify the cert-manager pods are running:
+
+```shell
+kubectl -n cert-manager get pods
+```
+
+## Install OpenShell with cert-manager PKI
+
+Pass the cert-manager values override when installing or upgrading the chart:
+
+```shell
+helm upgrade --install openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  --set certManager.enabled=true
+```
+
+The chart creates a self-signed CA, issues server and client certificates from it, and cert-manager handles renewal before expiry.
+The chart also runs a pre-install hook in JWT-only mode to create the gateway's
+sandbox JWT signing Secret. That Secret is separate from the cert-manager TLS
+certificate Secrets and is mounted at `/etc/openshell-jwt`.
+
+## Next Steps
+
+Return to [Setup](/kubernetes/setup) to complete the installation.

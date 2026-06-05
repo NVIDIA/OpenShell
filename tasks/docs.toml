@@ -1,0 +1,37 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Documentation build, serve, and check tasks
+
+["docs"]
+description = "Validate Fern documentation"
+depends = ["docs:build:strict"]
+
+["docs:deps"]
+description = "Resolve Fern CLI for docs tasks"
+run = """
+FERN_VERSION=$(node -p "require('./fern/fern.config.json').version")
+npx --yes "fern-api@${FERN_VERSION}" --version
+"""
+
+["docs:build:strict"]
+description = "Validate docs config and links"
+depends = ["docs:deps"]
+run = """
+FERN_VERSION=$(node -p "require('./fern/fern.config.json').version")
+cd fern
+npx --yes "fern-api@${FERN_VERSION}" check
+"""
+
+["docs:serve"]
+description = "Serve Fern docs locally"
+depends = ["docs:deps"]
+run = """
+FERN_VERSION=$(node -p "require('./fern/fern.config.json').version")
+cd fern
+npx --yes "fern-api@${FERN_VERSION}" docs dev
+"""
+
+["docs:clean"]
+description = "Remove local Fern docs cache"
+run = "rm -rf .fern-cache fern/.fern-cache"

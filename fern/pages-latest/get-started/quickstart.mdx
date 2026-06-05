@@ -1,0 +1,107 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Quickstart"
+description: "Install the OpenShell CLI, connect to a gateway, and create your first sandboxed AI agent."
+keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Installation, Quickstart, Gateway, Docker, Kubernetes, Podman"
+position: 1
+---
+
+This page gets you from a reachable OpenShell gateway to a running, policy-enforced sandbox.
+
+## Prerequisites
+
+Before you begin, make sure you have:
+
+- A reachable OpenShell gateway.
+- At least one compute driver configured for the gateway: Kubernetes, Docker, Podman, or MicroVM.
+- The OpenShell CLI installed on your workstation.
+
+For a complete list of requirements, refer to [Support Matrix](/reference/support-matrix).
+If you have not chosen a compute driver yet, refer to [Installation](/about/installation).
+
+## Install the OpenShell CLI
+
+Run the install script:
+
+```shell
+curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
+```
+
+The install script uses Homebrew, RPM, or a Debian package based on your machine. It starts the local gateway server after installation.
+
+If you prefer [uv](https://docs.astral.sh/uv/):
+
+```shell
+uv tool install -U openshell
+```
+
+After installing the CLI, run `openshell --help` in your terminal to view the full CLI reference.
+
+<Tip>
+You can also clone the [NVIDIA OpenShell GitHub repository](https://github.com/NVIDIA/OpenShell) and use the `/openshell-cli` skill to load the CLI reference into your agent.
+</Tip>
+
+## Create Your First OpenShell Sandbox
+
+Create a sandbox and launch an agent inside it.
+Choose the tab that matches your agent:
+
+<Tabs>
+<Tab title="Claude Code">
+
+Run the following command to create a sandbox with Claude Code:
+
+```shell
+openshell sandbox create -- claude
+```
+
+The CLI prompts you to create a provider from local credentials.
+Type `yes` to continue.
+If `ANTHROPIC_API_KEY` is set in your environment, the CLI picks it up automatically.
+If not, you can configure it from inside the sandbox after it launches.
+
+<Note>
+`ANTHROPIC_API_KEY` is an API key from [console.anthropic.com](https://console.anthropic.com), not a subscription token. Subscription users must generate a separate API key.
+</Note>
+</Tab>
+
+<Tab title="OpenCode">
+
+Run the following command to create a sandbox with OpenCode:
+
+```shell
+openshell sandbox create -- opencode
+```
+
+The CLI prompts you to create a provider from local credentials.
+Type `yes` to continue.
+If `OPENAI_API_KEY` or `OPENROUTER_API_KEY` is set in your environment, the CLI picks it up automatically.
+If not, you can configure it from inside the sandbox after it launches.
+</Tab>
+
+<Tab title="Codex">
+
+Run the following command to create a sandbox with Codex:
+
+```shell
+openshell sandbox create -- codex
+```
+
+The CLI prompts you to create a provider from local credentials.
+Type `yes` to continue.
+If `OPENAI_API_KEY` is set in your environment, the CLI picks it up automatically.
+If not, you can configure it from inside the sandbox after it launches.
+</Tab>
+
+<Tab title="Base Sandbox">
+
+Use the `--from` flag to create a sandbox from the base container:
+
+```shell
+openshell sandbox create --from base
+```
+
+</Tab>
+
+</Tabs>

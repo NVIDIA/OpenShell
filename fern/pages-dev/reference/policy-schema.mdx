@@ -1,0 +1,396 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Policy Schema Reference"
+sidebar-title: "Policy Schema"
+description: "Complete field reference for the sandbox policy YAML including static and dynamic sections."
+keywords: "Generative AI, Cybersecurity, Policy, Schema, YAML, Reference, Security"
+position: 3
+---
+
+Complete field reference for the sandbox policy YAML. Each field is documented with its type, whether it is required, and whether it is static (locked at sandbox creation) or dynamic (hot-reloadable on a running sandbox).
+
+## Top-Level Structure
+
+A policy YAML file contains the following top-level fields:
+
+```yaml showLineNumbers={false}
+version: 1
+filesystem_policy: { ... }
+landlock: { ... }
+process: { ... }
+network_policies: { ... }
+```
+
+| Field | Type | Required | Category | Description |
+|---|---|---|---|---|
+| `version` | integer | Yes | -- | Policy schema version. Must be `1`. |
+| `filesystem_policy` | object | No | Static | Controls which directories the agent can read and write. |
+| `landlock` | object | No | Static | Configures Landlock LSM enforcement behavior. |
+| `process` | object | No | Static | Sets the user and group the agent process runs as. |
+| `network_policies` | map | No | Dynamic | Declares which binaries can reach which network endpoints. |
+
+Static fields are set at sandbox creation time. Changing them requires destroying and recreating the sandbox. Dynamic fields can be updated on a running sandbox with `openshell policy update` for incremental merges or `openshell policy set` for full replacement, and take effect without restarting.
+
+## Version
+
+The version field identifies which schema the policy uses:
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `version` | integer | Yes | Schema version number. Currently must be `1`. |
+
+## Filesystem Policy
+
+**Category:** Static
+
+Controls filesystem access inside the sandbox. Paths not listed in either `read_only` or `read_write` are inaccessible.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `include_workdir` | bool | No | When `true`, automatically adds the agent's working directory to `read_write`. |
+| `read_only` | list of strings | No | Paths the agent can read but not modify. Typically system directories like `/usr`, `/lib`, `/etc`. |
+| `read_write` | list of strings | No | Paths the agent can read and write. Typically `/sandbox` (working directory) and `/tmp`. |
+
+**Validation constraints:**
+
+- Every path must be absolute (start with `/`).
+- Paths must not contain `..` traversal components. The server normalizes paths before storage, but rejects policies where traversal would escape the intended scope.
+- Read-write paths must not be overly broad (for example, `/` alone is rejected).
+- Each individual path must not exceed 4096 characters.
+- The combined total of `read_only` and `read_write` paths must not exceed 256.
+
+Policies that violate these constraints are rejected with `INVALID_ARGUMENT` at creation or update time. Disk-loaded YAML policies that fail validation fall back to a restrictive default.
+
+Example:
+
+```yaml showLineNumbers={false}
+filesystem_policy:
+  include_workdir: true
+  read_only:
+    - /usr
+    - /lib
+    - /proc
+    - /dev/urandom
+    - /etc
+  read_write:
+    - /sandbox
+    - /tmp
+    - /dev/null
+```
+
+## Landlock
+
+**Category:** Static
+
+Configures [Landlock LSM](https://docs.kernel.org/security/landlock.html) enforcement at the kernel level. Landlock provides mandatory filesystem access control below what UNIX permissions allow.
+
+| Field | Type | Required | Values | Description |
+|---|---|---|---|---|
+| `compatibility` | string | No | `best_effort`, `hard_requirement` | How OpenShell handles Landlock failures. Refer to the behavior table below. |
+
+**Compatibility modes:**
+
+| Value | Kernel ABI unavailable | Individual path inaccessible | All paths inaccessible |
+|---|---|---|---|
+| `best_effort` | Warns and continues without Landlock. | Skips the path, applies remaining rules. | Warns and continues without Landlock (refuses to apply an empty ruleset). |
+| `hard_requirement` | Aborts sandbox startup. | Aborts sandbox startup. | Aborts sandbox startup. |
+
+`best_effort` (the default) is appropriate for most deployments. It handles missing paths gracefully. For example, `/app` might not exist in every container image but is included in the baseline path set for containers that do have it. Individual missing paths are skipped while the remaining filesystem rules are still enforced.
+
+`hard_requirement` is for environments where any gap in filesystem isolation is unacceptable. If a listed path cannot be opened for any reason (missing, permission denied, symlink loop), sandbox startup fails immediately rather than running with reduced protection.
+
+When a path is skipped under `best_effort`, the sandbox logs a warning that includes the path, the specific error, and a human-readable reason (for example, "path does not exist" or "permission denied").
+
+Example:
+
+```yaml showLineNumbers={false}
+landlock:
+  compatibility: best_effort
+```
+
+## Process
+
+**Category:** Static
+
+Sets the OS-level identity for the agent process inside the sandbox.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `run_as_user` | string | No | The user name or UID the agent process runs as. Default: `sandbox`. |
+| `run_as_group` | string | No | The group name or GID the agent process runs as. Default: `sandbox`. |
+
+**Validation constraint:** Neither `run_as_user` nor `run_as_group` can be set to `root` or `0`. Policies that request root process identity are rejected at creation or update time.
+
+Example:
+
+```yaml showLineNumbers={false}
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+```
+
+## Network Policies
+
+**Category:** Dynamic
+
+A map of named network policy entries. Each entry declares a set of endpoints and a set of binaries. Only the listed binaries are permitted to connect to the listed endpoints. The map key is a logical identifier. The `name` field inside the entry is the display name used in logs.
+
+### Network Policy Entry
+
+Each entry in the `network_policies` map has the following fields:
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `name` | string | No | Display name for the policy entry. Used in log output. Defaults to the map key. |
+| `endpoints` | list of endpoint objects | Yes | Hosts and ports this entry permits. |
+| `binaries` | list of binary objects | Yes | Executables allowed to connect to these endpoints. |
+
+### Endpoint Object
+
+Each endpoint defines a reachable destination and optional inspection rules.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `host` | string | Yes | Hostname or IP address. Supports a `*` wildcard inside the first DNS label only: `*.example.com`, `**.example.com`, and intra-label patterns like `*-aiplatform.googleapis.com` are accepted; bare `*`/`**`, TLD wildcards (`*.com`), and wildcards outside the first label are rejected at load time. |
+| `port` | integer | Yes | TCP port number. |
+| `path` | string | No | Optional HTTP path glob used to select between L7 endpoints that share the same host and port. Empty means all paths. Use this when REST and GraphQL live under the same host, such as `/repos/**` and `/graphql`. |
+| `protocol` | string | No | Set to `rest` for HTTP method/path inspection, `websocket` for RFC 6455 upgrade and client text-message inspection, or `graphql` for GraphQL-over-HTTP operation inspection. WebSocket endpoints can also use GraphQL operation rules for GraphQL-over-WebSocket traffic. Omit for TCP passthrough. |
+| `tls` | string | No | TLS handling mode. The proxy auto-detects TLS by peeking the first bytes of each connection and terminates it for inspected HTTPS traffic, so this field is optional in most cases. Set to `skip` to disable auto-detection for edge cases such as client-certificate mTLS or non-standard protocols. The values `terminate` and `passthrough` are deprecated and log a warning; they are still accepted for backward compatibility but have no effect on behavior. |
+| `enforcement` | string | No | `enforce` actively blocks disallowed requests. `audit` logs violations but allows traffic through. |
+| `access` | string | No | Access preset. One of `read-only`, `read-write`, or `full`. Mutually exclusive with `rules`. |
+| `rules` | list of rule objects | No | Fine-grained protocol-specific allow rules. Mutually exclusive with `access`. |
+| `deny_rules` | list of deny rule objects | No | L7 deny rules that block specific requests even when allowed by `access` or `rules`. Deny rules take precedence over allow rules. |
+| `allowed_ips` | list of string | No | CIDR or IP allowlist for SSRF override. Exact user-declared hostname endpoints may resolve to RFC 1918 private addresses without this field, but wildcard, hostless, and policy-advisor-proposed endpoints still require `allowed_ips` for private resolved IPs. Entries overlapping loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), or unspecified (`0.0.0.0`) are rejected at load time. |
+| `allow_encoded_slash` | bool | No | When `true`, L7 request parsing preserves `%2F` inside path segments instead of rejecting it. Use this for registries and APIs such as npm scoped packages (`/@scope%2Fname`). Defaults to `false`. |
+| `websocket_credential_rewrite` | bool | No | When `true` on a `protocol: rest` or `protocol: websocket` endpoint, OpenShell rewrites credential placeholders in client-to-server WebSocket text messages after an allowed HTTP `101` upgrade. Binary frames are relayed but not rewritten. Defaults to `false`. |
+| `request_body_credential_rewrite` | bool | No | When `true` on a `protocol: rest` endpoint, OpenShell rewrites credential placeholders in UTF-8 `application/json`, `application/x-www-form-urlencoded`, and `text/*` request bodies before forwarding upstream. The proxy buffers at most 256 KiB and updates `Content-Length` after rewriting. Defaults to `false`. |
+| `persisted_queries` | string | No | GraphQL hash-only behavior for `protocol: graphql` and GraphQL-over-WebSocket operation policy. Default is `deny`; use `allow_registered` only with `graphql_persisted_queries`. |
+| `graphql_persisted_queries` | map | No | Trusted GraphQL persisted-query registry keyed by hash or saved-query ID. Values contain `operation_type`, optional `operation_name`, and optional root `fields`. |
+| `graphql_max_body_bytes` | integer | No | Maximum GraphQL-over-HTTP request body bytes buffered for inspection. Defaults to `65536`. |
+
+Credential rewrite recognizes the canonical `openshell:resolve:env:KEY` placeholder form and whole-token provider-shaped aliases such as `provider-OPENSHELL-RESOLVE-ENV-API_TOKEN` when the referenced environment key exists in the configured provider credentials.
+
+#### Access Levels
+
+The `access` field accepts one of the following values:
+
+| Value | REST expansion | WebSocket expansion | GraphQL expansion |
+|---|---|---|---|
+| `full` | All methods and paths. | WebSocket upgrade and all inspected client text-message paths. | All operation types. |
+| `read-only` | `GET`, `HEAD`, `OPTIONS`. | WebSocket upgrade handshake only. | `query` operations. |
+| `read-write` | `GET`, `HEAD`, `OPTIONS`, `POST`, `PUT`, `PATCH`. | WebSocket upgrade handshake and client text messages. | `query` and `mutation` operations. |
+
+#### Allow Rule Objects
+
+Used when `access` is not set. Each entry in `rules` contains an `allow` object. The tables below list the fields inside that `allow` object.
+
+##### REST Allow Rule (`protocol: rest`)
+
+REST allow rules match HTTP requests by method, path, and optional query parameters.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `method` | string | Yes | HTTP method to allow (for example, `GET`, `POST`). `*` matches any method. |
+| `path` | string | Yes | URL path pattern. Supports `*` and `**` glob syntax. |
+| `query` | map | No | Query parameter matchers keyed by decoded param name. Matcher value can be a glob string (`tag: "foo-*"`) or an object with `any` (`tag: { any: ["foo-*", "bar-*"] }`). |
+
+Example REST allow rules:
+
+```yaml showLineNumbers={false}
+rules:
+  - allow:
+      method: GET
+      path: /**/info/refs*
+      query:
+        service: "git-*"
+  - allow:
+      method: POST
+      path: /**/git-upload-pack
+      query:
+        tag:
+          any: ["v1.*", "v2.*"]
+```
+
+##### WebSocket Allow Rule (`protocol: websocket`)
+
+WebSocket allow rules match the RFC 6455 HTTP upgrade by path and match client-to-server text messages on the same upgraded connection with the synthetic `WEBSOCKET_TEXT` method. Binary frames are relayed but are not rewritten.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `method` | string | Yes | `GET` allows the upgrade handshake, `WEBSOCKET_TEXT` allows client text messages after upgrade, and `*` matches both inspected actions. |
+| `path` | string | Yes | URL path pattern from the original upgrade request. Supports `*` and `**` glob syntax. |
+| `query` | map | No | Query parameter matchers from the original upgrade request. Matcher syntax is the same as REST allow rules. |
+
+Example WebSocket allow rules:
+
+```yaml showLineNumbers={false}
+rules:
+  - allow:
+      method: GET
+      path: /v1/realtime/**
+  - allow:
+      method: WEBSOCKET_TEXT
+      path: /v1/realtime/**
+```
+
+##### GraphQL Allow Rule (`protocol: graphql` or GraphQL-over-WebSocket)
+
+GraphQL allow rules match parsed GraphQL operations by operation type, optional operation name, and optional root fields. On `protocol: graphql`, they apply to GraphQL-over-HTTP `GET` and `POST` requests. On `protocol: websocket`, include a separate `GET` allow rule for the RFC 6455 upgrade, then use GraphQL allow rules for client operation messages using the `graphql-transport-ws` `subscribe` message type or the legacy `graphql-ws` `start` message type.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `operation_type` | string | Yes | GraphQL operation type: `query`, `mutation`, `subscription`, or `*`. |
+| `operation_name` | string | No | GraphQL operation-name glob. Omit to match any operation name. |
+| `fields` | list of string | No | GraphQL root-field globs. Every selected root field must match one configured glob. Omit to match all root fields. |
+
+Example GraphQL allow rules:
+
+```yaml showLineNumbers={false}
+rules:
+  - allow:
+      operation_type: query
+      fields: [viewer, repository]
+  - allow:
+      operation_type: mutation
+      operation_name: Issue*
+      fields: [createIssue]
+```
+
+Example GraphQL-over-WebSocket allow rules:
+
+```yaml showLineNumbers={false}
+rules:
+  - allow:
+      method: GET
+      path: /graphql
+  - allow:
+      operation_type: subscription
+      fields: [messageAdded]
+  - allow:
+      operation_type: query
+      fields: [viewer]
+```
+
+Do not combine `method`, `path`, or `query` with `operation_type`, `operation_name`, or `fields` inside the same WebSocket rule. When a WebSocket endpoint has GraphQL operation policy, use GraphQL rules for client messages instead of a raw `WEBSOCKET_TEXT` allow rule.
+
+#### Deny Rule Objects
+
+Blocks specific operations on endpoints that otherwise have broad access. Deny rules are evaluated after allow rules and take precedence: if a request matches any deny rule, it is blocked regardless of what the allow rules or access preset permit.
+
+##### REST Deny Rule (`protocol: rest`)
+
+REST deny rules use the same field names as REST allow rules, but they appear directly under each `deny_rules` entry instead of under an `allow` wrapper.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `method` | string | Yes | HTTP method to deny (for example, `POST`, `DELETE`). `*` matches any method. |
+| `path` | string | Yes | URL path pattern. Same glob syntax as allow rules. Use `**` to match any path. |
+| `query` | map | No | Query parameter matchers. Same syntax as allow rule `query`. |
+
+Example REST deny rules:
+
+```yaml showLineNumbers={false}
+endpoints:
+  - host: api.github.com
+    port: 443
+    protocol: rest
+    enforcement: enforce
+    access: read-write
+    deny_rules:
+      - method: POST
+        path: "/repos/*/pulls/*/reviews"
+      - method: PUT
+        path: "/repos/*/branches/*/protection"
+      - method: "*"
+        path: "/repos/*/rulesets"
+```
+
+##### WebSocket Deny Rule (`protocol: websocket`)
+
+WebSocket deny rules use the same field names as WebSocket allow rules, but they appear directly under each `deny_rules` entry instead of under an `allow` wrapper.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `method` | string | Yes | `GET` denies matching upgrade handshakes, `WEBSOCKET_TEXT` denies matching client text messages after upgrade, and `*` matches both inspected actions. |
+| `path` | string | Yes | URL path pattern from the original upgrade request. Same glob syntax as allow rules. |
+| `query` | map | No | Query parameter matchers from the original upgrade request. Same syntax as allow rule `query`. |
+
+Example WebSocket deny rules:
+
+```yaml showLineNumbers={false}
+endpoints:
+  - host: realtime.example.com
+    port: 443
+    protocol: websocket
+    enforcement: enforce
+    access: read-write
+    deny_rules:
+      - method: WEBSOCKET_TEXT
+        path: "/v1/admin/**"
+```
+
+##### GraphQL Deny Rule (`protocol: graphql` or GraphQL-over-WebSocket)
+
+GraphQL deny rules use the same field names as GraphQL allow rules, but they appear directly under each `deny_rules` entry instead of under an `allow` wrapper. On WebSocket GraphQL endpoints, they apply only to classified GraphQL operation messages; protocol lifecycle messages such as `connection_init`, `ping`, `pong`, and `complete` are allowed as WebSocket control-plane messages and are not payload-logged.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `operation_type` | string | Yes | GraphQL operation type to deny: `query`, `mutation`, `subscription`, or `*`. |
+| `operation_name` | string | No | GraphQL operation-name glob. |
+| `fields` | list of string | No | GraphQL root-field globs. Any matching root field blocks the request. Omit to deny every operation that matches `operation_type` and `operation_name`. |
+
+Example GraphQL deny rules:
+
+```yaml showLineNumbers={false}
+endpoints:
+  - host: api.github.com
+    port: 443
+    protocol: graphql
+    enforcement: enforce
+    access: read-write
+    deny_rules:
+      - operation_type: mutation
+        fields: [deleteRepository]
+      - operation_type: mutation
+        operation_name: Admin*
+```
+
+### Binary Object
+
+Identifies an executable that is permitted to use the associated endpoints.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `path` | string | Yes | Filesystem path to the executable. Supports glob patterns with `*` and `**`. For example, `/sandbox/.vscode-server/**` matches any executable under that directory tree. |
+
+### Full Example
+
+The following policy grants read-only GitHub API access and npm registry access:
+
+```yaml showLineNumbers={false}
+network_policies:
+  github_rest_api:
+    name: github-rest-api
+    endpoints:
+      - host: api.github.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        access: read-only
+    binaries:
+      - path: /usr/local/bin/claude
+      - path: /usr/bin/node
+      - path: /usr/bin/gh
+  npm_registry:
+    name: npm-registry
+    endpoints:
+      - host: registry.npmjs.org
+        port: 443
+        protocol: rest
+        access: read-only
+        allow_encoded_slash: true
+    binaries:
+      - path: /usr/bin/npm
+      - path: /usr/bin/node
+```

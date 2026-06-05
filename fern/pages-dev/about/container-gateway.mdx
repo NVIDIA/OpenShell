@@ -1,0 +1,202 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Running the Gateway as a Container"
+sidebar-title: "Container Gateway"
+description: "Run the OpenShell gateway using docker run or docker-compose without the installer."
+keywords: "Generative AI, Cybersecurity, AI Agents, Sandboxing, Docker, Podman, docker-compose, container, immutable OS, bootc, rpm-ostree"
+position: 4
+---
+
+Use this approach when you want to run the OpenShell gateway as a container instead of installing it with the system package manager. This is useful on immutable OS distributions (Fedora CoreOS, bootc-based images, Silverblue) where the standard installer is not appropriate, or anywhere you prefer a container-first workflow.
+
+The gateway image is published at `ghcr.io/nvidia/openshell/gateway`.
+
+## Prerequisites for the Docker Driver
+
+When the gateway runs as a container and creates Docker-backed sandboxes, the gateway container
+communicates with the host Docker daemon via the mounted socket. This requires three things beyond
+a basic `docker run`:
+
+1. **Docker socket access.** The gateway process must be able to read and write the Docker socket.
+   Add the `docker` group (or the GID of `/var/run/docker.sock`) so the socket is accessible
+   without running as root.
+
+2. **gRPC endpoint.** Sandbox containers call back to the gateway over the `OPENSHELL_GRPC_ENDPOINT`
+   address. The Docker driver substitutes `host.openshell.internal` as the host and the gateway's
+   own bind port as the port — only the **scheme** (`http` or `https`) is preserved. Use
+   `http://host.openshell.internal:8080` when TLS is disabled and `https://host.openshell.internal:8080`
+   when mTLS is enabled. The docker driver automatically binds the gateway to the bridge network
+   interface so sandbox containers can reach it — you do not need to expose the port on `0.0.0.0`.
+
+3. **Supervisor binary on the host.** The gateway bind-mounts the `openshell-sandbox` supervisor
+   binary into each sandbox container. Because bind-mount paths are resolved by the host Docker
+   daemon (not inside the gateway container), the binary must exist at a path on the **host**
+   filesystem and be mounted at the **same absolute path** inside the gateway container. That way
+   the path the gateway records internally matches what Docker can find on the host when it
+   creates sandbox containers.
+
+## Quick Start
+
+Extract the supervisor binary to the host once, then start the gateway:
+
+```shell
+mkdir -p ~/openshell/supervisor
+docker create --name tmp-supervisor ghcr.io/nvidia/openshell/supervisor:latest
+docker cp tmp-supervisor:/openshell-sandbox ~/openshell/supervisor/openshell-sandbox
+docker rm tmp-supervisor
+chmod +x ~/openshell/supervisor/openshell-sandbox
+```
+
+Start the gateway:
+
+```shell
+docker run -d \
+  --name openshell-gateway \
+  --restart unless-stopped \
+  --group-add docker \
+  -p 127.0.0.1:8080:8080 \
+  -v openshell-state:/var/openshell \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v ~/openshell/supervisor/openshell-sandbox:~/openshell/supervisor/openshell-sandbox:ro \
+  -e OPENSHELL_DRIVERS=docker \
+  -e OPENSHELL_GRPC_ENDPOINT=http://host.openshell.internal:8080 \
+  -e OPENSHELL_DOCKER_SUPERVISOR_BIN=~/openshell/supervisor/openshell-sandbox \
+  -e OPENSHELL_DB_URL=sqlite:/var/openshell/openshell.db \
+  -e OPENSHELL_DISABLE_TLS=true \
+  ghcr.io/nvidia/openshell/gateway:latest
+```
+
+The volume mount uses `~/openshell/supervisor/openshell-sandbox` for both the host and container
+paths. The shell expands `~` in both halves before passing the argument to Docker, so both sides
+resolve to the same absolute path (e.g., `/home/user/openshell/supervisor/openshell-sandbox`).
+This satisfies the same-path requirement so the host Docker daemon can find the binary when
+creating sandbox containers.
+
+Register the gateway with the CLI. If running on the same machine, use `--local`:
+
+```shell
+openshell gateway add http://127.0.0.1:8080 --local --name local
+```
+
+If registering from a different machine on the same network, use the host IP and `--remote`:
+
+```shell
+openshell gateway add http://HOST_IP:8080 --remote --name remote
+```
+
+Confirm the CLI can reach the gateway:
+
+```shell
+openshell status
+```
+
+<Warning>
+Disabling TLS removes authentication. This example binds to `127.0.0.1` so only local
+connections are accepted. To accept remote connections, enable mTLS or restrict access with
+a firewall rule.
+</Warning>
+
+## Full mTLS Setup
+
+To run the gateway with mutual TLS, generate the PKI bundle first, then start the gateway with the cert paths configured.
+
+Bootstrap the PKI into a local state directory:
+
+```shell
+mkdir -p ~/.local/state/openshell/tls
+
+docker run --rm \
+  -v "$HOME/.local/state/openshell:/home/openshell/.local/state/openshell" \
+  -v "$HOME/.config/openshell:/home/openshell/.config/openshell" \
+  ghcr.io/nvidia/openshell/gateway:latest \
+  generate-certs \
+    --output-dir /home/openshell/.local/state/openshell/tls \
+    --server-san host.openshell.internal
+```
+
+This writes the server and client certificates under `~/.local/state/openshell/tls/`, writes sandbox JWT signing keys under `~/.local/state/openshell/tls/jwt/`, and copies the client bundle to `~/.config/openshell/gateways/openshell/mtls/` so the CLI picks it up automatically.
+
+Start the gateway with mTLS enabled:
+
+```shell
+docker run -d \
+  --name openshell-gateway \
+  --restart unless-stopped \
+  --group-add docker \
+  -p 127.0.0.1:8080:8080 \
+  -v "$HOME/.local/state/openshell:/home/openshell/.local/state/openshell" \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v ~/openshell/supervisor/openshell-sandbox:~/openshell/supervisor/openshell-sandbox:ro \
+  -e OPENSHELL_DRIVERS=docker \
+  -e OPENSHELL_GRPC_ENDPOINT=https://127.0.0.1:8080 \
+  -e OPENSHELL_DOCKER_SUPERVISOR_BIN=~/openshell/supervisor/openshell-sandbox \
+  -e OPENSHELL_DB_URL=sqlite:/home/openshell/.local/state/openshell/openshell.db \
+  -e OPENSHELL_LOCAL_TLS_DIR=/home/openshell/.local/state/openshell/tls \
+  -e OPENSHELL_TLS_CERT=/home/openshell/.local/state/openshell/tls/server/tls.crt \
+  -e OPENSHELL_TLS_KEY=/home/openshell/.local/state/openshell/tls/server/tls.key \
+  -e OPENSHELL_TLS_CLIENT_CA=/home/openshell/.local/state/openshell/tls/ca.crt \
+  -e OPENSHELL_ENABLE_MTLS_AUTH=true \
+  -e OPENSHELL_DOCKER_TLS_CA=/home/openshell/.local/state/openshell/tls/ca.crt \
+  -e OPENSHELL_DOCKER_TLS_CERT=/home/openshell/.local/state/openshell/tls/client/tls.crt \
+  -e OPENSHELL_DOCKER_TLS_KEY=/home/openshell/.local/state/openshell/tls/client/tls.key \
+  ghcr.io/nvidia/openshell/gateway:latest
+```
+
+Register the gateway with mTLS:
+
+```shell
+openshell gateway add https://127.0.0.1:8080 --local --name local
+```
+
+## Docker Compose
+
+The [`deploy/docker/`](https://github.com/NVIDIA/OpenShell/tree/main/deploy/docker) directory in
+the repository contains a production-ready Compose setup with full inline documentation:
+
+| File | Purpose |
+|---|---|
+| `docker-compose.yml` | Gateway service, volumes, and environment variables |
+| `gateway.toml` | TOML configuration mounted into the container |
+
+Clone or copy those files, then start the gateway:
+
+```shell
+docker compose -f deploy/docker/docker-compose.yml up -d
+```
+
+Register the gateway with the CLI. If registering from the same machine:
+
+```shell
+openshell gateway add http://127.0.0.1:8080 --local --name local
+```
+
+If registering from a different machine on the same network, replace `HOST_IP` with the
+machine's LAN address:
+
+```shell
+openshell gateway add http://HOST_IP:8080 --remote --name remote
+```
+
+## Using Podman
+
+Replace `docker` with `podman` in the commands above. Mount the Podman socket instead of the Docker socket and set the driver to `podman`:
+
+```shell
+podman run -d \
+  --name openshell-gateway \
+  -p 127.0.0.1:8080:8080 \
+  -v openshell-state:/var/openshell \
+  -v "$XDG_RUNTIME_DIR/podman/podman.sock:/var/run/podman.sock" \
+  -e OPENSHELL_DRIVERS=podman \
+  -e OPENSHELL_PODMAN_SOCKET=/var/run/podman.sock \
+  -e OPENSHELL_DB_URL=sqlite:/var/openshell/openshell.db \
+  -e OPENSHELL_DISABLE_TLS=true \
+  ghcr.io/nvidia/openshell/gateway:latest
+```
+
+## Next Steps
+
+- To create your first sandbox, refer to the [Quickstart](/get-started/quickstart).
+- To control what the agent can access, refer to [Policies](/sandboxes/policies).
+- For environment variable reference, refer to [Sandbox Compute Drivers](/reference/sandbox-compute-drivers).

@@ -1,0 +1,531 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Customize Sandbox Policies"
+sidebar-title: "Policies"
+description: "Apply, iterate, and debug sandbox network policies with hot-reload on running OpenShell sandboxes."
+keywords: "Generative AI, Cybersecurity, Policy, Network Policy, Sandbox, Security, Hot Reload"
+position: 5
+---
+
+Use this page to apply and iterate policy changes on running sandboxes. For a full field-by-field YAML definition, use the [Policy Schema Reference](/reference/policy-schema).
+
+## Policy Structure
+
+A policy has static sections `filesystem_policy`, `landlock`, and `process` that are locked at sandbox creation, and a dynamic section `network_policies` that is hot-reloadable on a running sandbox.
+
+```yaml wordWrap showLineNumbers={false}
+version: 1
+
+# Static: locked at sandbox creation. Paths the agent can read vs read/write.
+filesystem_policy:
+  read_only: [/usr, /lib, /etc]
+  read_write: [/sandbox, /tmp]
+
+# Static: Landlock LSM kernel enforcement. best_effort uses highest ABI the host supports.
+landlock:
+  compatibility: best_effort
+
+# Static: Unprivileged user/group the agent process runs as.
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+
+# Dynamic: hot-reloadable. Named blocks of endpoints + binaries allowed to reach them.
+network_policies:
+  my_api:
+    name: my-api
+    endpoints:
+      - host: api.example.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        access: full
+    binaries:
+      - path: /usr/bin/curl
+
+```
+
+Static sections are locked at sandbox creation. Changing them requires destroying and recreating the sandbox.
+Dynamic sections can be updated on a running sandbox with `openshell policy update` for incremental merges or `openshell policy set` for full replacement, and take effect without restarting.
+
+| Section | Type | Description |
+|---|---|---|
+| `filesystem_policy` | Static | Controls which directories the agent can access on disk. Paths are split into `read_only` and `read_write` lists. Any path not listed in either list is inaccessible. Set `include_workdir: true` to automatically add the agent's working directory to `read_write`. [Landlock LSM](https://docs.kernel.org/security/landlock.html) enforces these restrictions at the kernel level. |
+| `landlock` | Static | Configures Landlock LSM enforcement behavior. Set `compatibility` to `best_effort` (skip individual inaccessible paths while applying remaining rules) or `hard_requirement` (fail if any path is inaccessible or the required kernel ABI is unavailable). See the [Policy Schema Reference](/reference/policy-schema#landlock) for the full behavior table. |
+| `process` | Static | Sets the OS-level identity for the agent process. `run_as_user` and `run_as_group` default to `sandbox`. Root (`root` or `0`) is rejected. The agent also runs with seccomp filters that block dangerous system calls. |
+| `network_policies` | Dynamic | Controls network access for ordinary outbound traffic from the sandbox. Each block has a name, a list of endpoints (host, port, protocol, and optional rules), and a list of binaries allowed to use those endpoints. <br />Every outbound connection except `https://inference.local` goes through the proxy, which queries the [policy engine](/about/architecture) with the destination and calling binary. A connection is allowed only when both match an entry in the same policy block. <br />For endpoints with `protocol: rest`, the proxy auto-detects TLS and terminates it so each HTTP request is checked against that endpoint's `rules` (method and path). <br />Endpoints without `protocol` allow the TCP stream through without inspecting payloads. <br />If no endpoint matches, the connection is denied. Configure managed inference separately through [Configure](/inference/configure). |
+
+## Baseline Filesystem Paths
+
+When a sandbox runs in proxy mode (the default), OpenShell automatically adds baseline filesystem paths required for the sandbox child process to function: `/usr`, `/lib`, `/etc`, `/var/log` (read-only) and `/sandbox`, `/tmp` (read-write). Paths like `/app` are included in the baseline set but are only added if they exist in the container image.
+
+This filtering prevents a missing baseline path from degrading Landlock enforcement. Without it, a single missing path could cause the entire Landlock ruleset to fail, leaving the sandbox with no filesystem restrictions at all.
+
+User-specified paths in your policy YAML are not pre-filtered. If you list a path that does not exist:
+
+- In `best_effort` mode, the path is skipped with a warning and remaining rules are still applied.
+- In `hard_requirement` mode, sandbox startup fails immediately.
+
+This distinction means baseline system paths degrade gracefully while user-specified paths surface configuration errors.
+
+## Apply a Custom Policy
+
+Pass a policy YAML file when creating the sandbox:
+
+```shell
+openshell sandbox create --policy ./my-policy.yaml -- claude
+```
+
+`openshell sandbox create` keeps the sandbox running after the initial command exits, which is useful when you plan to iterate on the policy. Add `--no-keep` if you want the sandbox deleted automatically instead.
+
+To avoid passing `--policy` every time, set a default policy with an environment variable:
+
+```shell
+export OPENSHELL_SANDBOX_POLICY=./my-policy.yaml
+openshell sandbox create -- claude
+```
+
+The CLI uses the policy from `OPENSHELL_SANDBOX_POLICY` whenever `--policy` is not explicitly provided.
+
+## Iterate on a Running Sandbox
+
+To change what the sandbox can access, pull the current policy, edit the YAML, and push the update. The workflow is iterative: create the sandbox, monitor logs for denied actions, pull the policy, modify it, push, and verify.
+
+```mermaid
+flowchart TD
+    A["1. Create sandbox with initial policy"] --> B["2. Monitor logs for denied actions"]
+    B --> C["3. Pull current policy"]
+    C --> D["4. Modify the policy YAML"]
+    D --> E["5. Push updated policy"]
+    E --> F["6. Verify the new revision loaded"]
+    F --> B
+
+    style A fill:#76b900,stroke:#000000,color:#000000
+    style B fill:#76b900,stroke:#000000,color:#000000
+    style C fill:#76b900,stroke:#000000,color:#000000
+    style D fill:#ffffff,stroke:#000000,color:#000000
+    style E fill:#76b900,stroke:#000000,color:#000000
+    style F fill:#76b900,stroke:#000000,color:#000000
+
+    linkStyle default stroke:#76b900,stroke-width:2px
+```
+
+The following steps outline the hot-reload policy update workflow.
+
+1. Create the sandbox with your initial policy by following [Apply a Custom Policy](#apply-a-custom-policy) above (or set `OPENSHELL_SANDBOX_POLICY`).
+
+2. Monitor denials. Each log entry shows host, port, binary, and reason. Alternatively, use `openshell term` for a live dashboard.
+
+   ```shell
+   openshell logs <name> --tail --source sandbox
+   ```
+
+3. For additive network changes, use `openshell policy update`. This is the fastest path for adding endpoints, binaries, or REST allow/deny rules without replacing the full policy. The full option and format reference is in [Incremental Policy Updates](#incremental-policy-updates).
+
+   ```shell
+   openshell policy update <name> \
+     --add-endpoint api.github.com:443:read-only:rest:enforce \
+     --binary /usr/bin/gh \
+     --wait
+
+   openshell policy update <name> \
+     --add-allow 'api.github.com:443:POST:/repos/*/issues' \
+     --wait
+   ```
+
+   `--add-allow` and `--add-deny` currently target existing `protocol: rest` endpoints only. If you pass multiple update flags in one command, OpenShell applies them as one atomic merge batch and persists at most one new revision.
+
+4. For larger edits, pull the current policy and edit the YAML directly. Strip the metadata header (Version, Hash, Status) before reusing the file.
+
+   ```shell
+   openshell policy get <name> --full > current-policy.yaml
+   ```
+
+5. Edit the YAML: add or adjust `network_policies` entries, binaries, `access`, or `rules`.
+
+6. Push the updated policy when you need a full replacement. Exit codes: 0 = loaded, 1 = validation failed, 124 = timeout.
+
+   ```shell
+   openshell policy set <name> --policy current-policy.yaml --wait
+   ```
+
+7. Verify the new revision. If status is `loaded`, repeat from step 2 as needed; if `failed`, fix the policy and repeat from step 4.
+
+   ```shell
+   openshell policy list <name>
+   ```
+
+## Incremental Policy Updates
+
+Use `openshell policy update` when you want to merge network policy changes into the current live policy instead of replacing the whole YAML document. This command only updates the dynamic `network_policies` section.
+
+`openshell policy update` is useful when you want to:
+
+- add a new endpoint for an existing binary without touching other policy sections.
+- add a few REST allow or deny rules after you see a blocked request in the logs.
+- remove one endpoint or one named rule without rewriting the rest of the file.
+- preview a merged result locally with `--dry-run` before you send it to the gateway.
+
+Use `openshell policy set` instead when you want to replace the full policy, update static sections, or make broader edits that are easier to express in YAML.
+
+### Update Commands
+
+The incremental update surface is split into endpoint-level operations and REST rule-level operations.
+
+| Flag | What it changes | Typical use |
+|---|---|---|
+| `--add-endpoint <SPEC>` | Creates or merges a network rule and endpoint. | Allow a new host and port, optionally with `access`, `protocol`, `enforcement`, and binaries. |
+| `--remove-endpoint <SPEC>` | Removes one host and port match from the current policy. | Drop a stale endpoint or remove one port from a multi-port endpoint. |
+| `--remove-rule <NAME>` | Deletes a named `network_policies` entry. | Remove a whole rule by name when you no longer need it. |
+| `--add-allow <SPEC>` | Appends REST allow rules to an existing endpoint. | Permit one additional method and path on a REST API that is already configured. |
+| `--add-deny <SPEC>` | Appends REST deny rules to an existing endpoint. | Block a sensitive REST path under an endpoint that is otherwise allowed. |
+| `--binary <PATH>` | Adds binaries to every `--add-endpoint` rule in the same command. | Bind a new endpoint to one or more executables. |
+| `--rule-name <NAME>` | Overrides the generated rule name. | Keep a stable human-chosen rule name when adding exactly one endpoint. |
+| `--dry-run` | Shows the merged policy locally and does not call the gateway. | Review the result before persisting it. |
+| `--wait` | Polls until the sandbox reports that the new revision loaded. | Confirm the change took effect before continuing. |
+| `--timeout <SECS>` | Sets the timeout for `--wait`. | Extend the wait window for slower sandboxes. |
+
+`--wait` and `--dry-run` cannot be used together.
+
+### Add Endpoint Compared to Allow and Deny
+
+`--add-endpoint` works at the endpoint and rule level. It creates a new `network_policies` entry when needed, or merges into an existing rule that already covers the same host and port. Use it when you are defining where traffic may go and which binaries may send it.
+
+`--add-allow` and `--add-deny` work at the REST request level. They do not create binaries, and they do not create a new endpoint. They modify an existing endpoint that already has `protocol: rest`.
+
+This is the practical difference:
+
+- Use `--add-endpoint` to say "allow this binary to reach `api.github.com:443`."
+- Use `--add-allow` to say "for that existing REST endpoint, also allow `POST /repos/*/issues`."
+- Use `--add-deny` to say "for that existing REST endpoint, explicitly deny `POST /admin/**`."
+
+In the first pass of this feature:
+
+- `--add-allow` and `--add-deny` only work on `protocol: rest` endpoints.
+- `--add-deny` requires the endpoint to already have an allow base, either an `access` preset or explicit allow `rules`.
+- `protocol: sql` is not a practical incremental workflow today. OpenShell does not do full SQL parsing, and SQL enforcement is not meaningfully supported yet.
+
+### Endpoint Specs
+
+`--add-endpoint` uses this format:
+
+```text
+host:port[:access[:protocol[:enforcement]]]
+```
+
+Each segment has a fixed meaning:
+
+| Segment | Required | Meaning |
+|---|---|---|
+| `host` | Yes | Destination hostname. |
+| `port` | Yes | Destination port, `1` through `65535`. |
+| `access` | No | Access preset for REST endpoints: `read-only`, `read-write`, or `full`. |
+| `protocol` | No | L7 inspection mode: `rest` or `sql`. In practice, incremental updates are designed around `rest`. `sql` is audit-only and not a recommended workflow today. |
+| `enforcement` | No | Enforcement mode for inspected traffic: `enforce` or `audit`. |
+
+Examples:
+
+| Example | Meaning |
+|---|---|
+| `pypi.org:443` | Add a plain L4 endpoint. The proxy allows the TCP stream and does not inspect HTTP requests. |
+| `api.github.com:443:read-only:rest:enforce` | Add a REST endpoint with the `read-only` preset expanded by the policy engine into GET, HEAD, and OPTIONS access. |
+
+If you set `protocol: rest`, you also need an allow shape. With incremental updates, that means you should provide an `access` preset on `--add-endpoint`, then use `--add-allow` or `--add-deny` to refine it later.
+
+For example:
+
+- `api.github.com:443:read-only:rest` is valid.
+- `api.github.com:443::rest` is invalid. It does not mean "allow all traffic." A REST endpoint with `protocol` but no `access` or `rules` is rejected when the policy loads.
+
+When you pass multiple `--add-endpoint` flags in one command, every `--binary` value applies to every added endpoint in that command. If different endpoints need different binaries, use separate `policy update` commands.
+
+If you do not pass `--rule-name`, OpenShell generates one from the host and port, such as `allow_api_github_com_443`.
+
+### REST Rule Specs
+
+`--add-allow` and `--add-deny` use this format:
+
+```text
+host:port:METHOD:path_glob
+```
+
+This string identifies an existing REST endpoint and the request pattern you want to add.
+
+In shell commands, quote the full `SPEC` when it contains `*` or `**` so your shell passes it literally instead of expanding it as a local file glob.
+
+| Segment | Meaning |
+|---|---|
+| `host` | Existing endpoint host. |
+| `port` | Existing endpoint port. |
+| `METHOD` | HTTP method. The CLI normalizes it to uppercase. |
+| `path_glob` | URL path glob. It must start with `/`, or be `**`, or start with `**/`. |
+
+This example:
+
+```text
+api.github.com:443:POST:/repos/*/issues
+```
+
+means:
+
+- match the endpoint `api.github.com:443`.
+- match HTTP method `POST`.
+- match paths like `/repos/acme/issues`.
+- do not match deeper paths like `/repos/acme/project/issues/123` because `*` matches one path segment.
+
+Path globs follow the same semantics as YAML allow and deny rules:
+
+- `*` matches one path segment.
+- `**` matches any number of segments.
+- `/repos/*/issues` matches one repository owner or name segment in the middle.
+- `/repos/**` matches everything under `/repos/`.
+
+The rule-level commands only modify method and path constraints. They do not change binaries, hostnames, ports, or protocol settings.
+
+### Common Workflows
+
+Use these patterns as starting points when you decide whether to update an endpoint or append REST rules.
+
+#### Add a new L4 endpoint
+
+Use `--add-endpoint` when you need a new host and port and do not need REST inspection.
+
+```shell
+openshell policy update demo \
+  --add-endpoint pypi.org:443 \
+  --add-endpoint files.pythonhosted.org:443 \
+  --binary /usr/bin/pip \
+  --binary /usr/local/bin/uv \
+  --wait
+```
+
+This creates or merges endpoint entries and binds them to the listed binaries. It does not create per-path REST rules.
+
+#### Create a REST endpoint with a base allow set
+
+Use `--add-endpoint` first when the endpoint does not exist yet.
+
+```shell
+openshell policy update demo \
+  --add-endpoint api.github.com:443:read-only:rest:enforce \
+  --binary /usr/bin/gh \
+  --wait
+```
+
+This creates a REST endpoint and sets its base allow behavior through the `read-only` access preset.
+
+#### Add one more REST allow rule
+
+Use `--add-allow` after the REST endpoint already exists.
+
+```shell
+openshell policy update demo \
+  --add-allow 'api.github.com:443:POST:/repos/*/issues' \
+  --wait
+```
+
+This keeps the existing endpoint definition and appends one new allow rule. It does not add binaries or change the endpoint host and port.
+
+#### Add a REST deny rule under an allowed endpoint
+
+Use `--add-deny` when you want to carve out a blocked subtree under an existing REST endpoint.
+
+```shell
+openshell policy update demo \
+  --add-deny 'api.github.com:443:POST:/admin/**' \
+  --wait
+```
+
+This adds a deny rule to the existing REST endpoint. The endpoint must already have an allow base.
+
+#### Remove one endpoint or rule
+
+Use `--remove-endpoint` to remove one host and port pair, or `--remove-rule` to delete the whole named rule.
+
+```shell
+openshell policy update demo --remove-endpoint pypi.org:443 --wait
+openshell policy update demo --remove-rule github_repos --wait
+```
+
+If the target endpoint is part of a multi-port endpoint, `--remove-endpoint` removes only the specified port and keeps the rest.
+
+### Merge Semantics
+
+OpenShell applies all update flags from one `openshell policy update` command as one merge batch. The gateway validates the full merged result and persists at most one new policy revision.
+
+This means:
+
+- one command is atomic at the revision level.
+- multiple flags in one command succeed or fail together.
+- concurrent writers do not partially interleave one batch with another.
+
+When two updates race, the gateway uses optimistic retry. It fetches the latest revision, reapplies the full batch, validates the result again, and retries the write. This preserves the intent of each individual command while still allowing concurrent sandbox policy updates.
+
+### Preview and Validation
+
+Use `--dry-run` when you want to inspect the merged YAML before you send it to the gateway.
+
+```shell
+openshell policy update demo \
+  --add-allow 'api.github.com:443:GET:/repos/**' \
+  --dry-run
+```
+
+The CLI validates the argument shapes before it sends the request. The gateway then validates the merged policy against the current live policy and returns clear errors when:
+
+- a required segment is missing.
+- a port is outside `1` through `65535`.
+- `--add-allow` or `--add-deny` points at an endpoint that does not exist.
+- `--add-allow` or `--add-deny` targets a non-REST endpoint.
+- `--add-deny` targets an endpoint that has no base allow set.
+
+## Global Policy Override
+
+Use a global policy when you want one policy payload to apply to every sandbox.
+
+```shell
+openshell policy set --global --policy ./global-policy.yaml
+```
+
+When a global policy is configured:
+
+- The global payload is applied in full for all sandboxes.
+- Sandbox-level policy updates are rejected until the global policy is removed.
+
+To restore sandbox-level policy control, delete the global policy setting:
+
+```shell
+openshell policy delete --global
+```
+
+You can inspect a sandbox's effective settings and policy source with:
+
+```shell
+openshell settings get <name>
+```
+
+## Debug Denied Requests
+
+Check `openshell logs <name> --tail --source sandbox` for the denied host, path, and binary.
+
+When triaging denied requests, check:
+
+- Destination host and port to confirm which endpoint is missing.
+- Calling binary path to confirm which `binaries` entry needs to be added or adjusted.
+- HTTP method and path (for REST endpoints) to confirm which `rules` entry needs to be added or adjusted.
+
+Then push the updated policy as described above.
+
+For small changes, prefer `openshell policy update` over rewriting the full YAML:
+
+```shell
+openshell policy update <name> --add-allow 'api.github.com:443:GET:/repos/**' --wait
+```
+
+## Examples
+
+Add these blocks to the `network_policies` section of your sandbox policy. Apply with `openshell policy update` for incremental additions or `openshell policy set <name> --policy <file> --wait` for full replacement.
+Use **Simple endpoint** for host-level allowlists and **Granular rules** for method/path control.
+
+<Tabs>
+<Tab title="Simple endpoint">
+Allow `pip install` and `uv pip install` to reach PyPI:
+
+```yaml showLineNumbers={false}
+  pypi:
+    name: pypi
+    endpoints:
+      - host: pypi.org
+        port: 443
+      - host: files.pythonhosted.org
+        port: 443
+    binaries:
+      - { path: /usr/bin/pip }
+      - { path: /usr/local/bin/uv }
+```
+
+Endpoints without `protocol` use TCP passthrough, where the proxy allows the stream without inspecting payloads.
+</Tab>
+
+<Tab title="Granular rules">
+Allow Claude and the GitHub CLI to reach `api.github.com` with per-path rules: read-only (GET, HEAD, OPTIONS) and GraphQL (POST) for all paths; full write access for `alpha-repo`; and create/edit issues only for `bravo-repo`. Replace `<org_name>` with your GitHub org or username.
+
+<Tip>
+For an end-to-end walkthrough that combines this policy with a GitHub credential provider and sandbox creation, refer to [Github Sandbox](/tutorials/github-sandbox).
+
+</Tip>
+
+```yaml showLineNumbers={false}
+  github_repos:
+    name: github_repos
+    endpoints:
+      - host: api.github.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/**"
+          - allow:
+              method: HEAD
+              path: "/**"
+          - allow:
+              method: OPTIONS
+              path: "/**"
+          - allow:
+              method: POST
+              path: "/graphql"
+          - allow:
+              method: "*"
+              path: "/repos/<org_name>/alpha-repo/**"
+          - allow:
+              method: POST
+              path: "/repos/<org_name>/bravo-repo/issues"
+          - allow:
+              method: PATCH
+              path: "/repos/<org_name>/bravo-repo/issues/*"
+    binaries:
+      - { path: /usr/local/bin/claude }
+      - { path: /usr/bin/gh }
+```
+
+Endpoints with `protocol: rest` enable HTTP request inspection. The proxy auto-detects TLS on HTTPS endpoints, terminates it, and checks each HTTP request against the `rules` list.
+</Tab>
+
+</Tabs>
+
+### Query parameter matching
+
+REST rules can also constrain query parameter values:
+
+```yaml showLineNumbers={false}
+  download_api:
+    name: download_api
+    endpoints:
+      - host: api.example.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/api/v1/download"
+              query:
+                slug: "skill-*"
+                version:
+                  any: ["1.*", "2.*"]
+    binaries:
+      - { path: /usr/bin/curl }
+```
+
+`query` matchers are case-sensitive and run on decoded values. If a request has duplicate keys (for example, `tag=a&tag=b`), every value for that key must match the configured glob(s).
+
+## Next Steps
+
+Explore related topics:
+
+- To learn about network access rules and sandbox isolation layers, refer to [Index](/sandboxes/about).
+- To view the full field-by-field YAML definition, refer to the [Policy Schema Reference](/reference/policy-schema).
+- To review the default policy breakdown, refer to [Default Policy](/reference/default-policy).

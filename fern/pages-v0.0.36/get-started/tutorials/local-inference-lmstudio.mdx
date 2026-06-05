@@ -1,0 +1,212 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Route Local Inference Requests to LM Studio"
+sidebar-title: "Local Inference with LM Studio"
+slug: "get-started/tutorials/local-inference-lmstudio"
+description: "Configure inference.local to route sandbox requests to a local LM Studio server running on the gateway host."
+keywords: "Generative AI, Cybersecurity, Tutorial, Inference Routing, LM Studio, Local Inference, Sandbox"
+---
+
+This tutorial describes how to configure OpenShell to route inference requests to a local LM Studio server.
+
+<Note>
+The LM Studio server provides easy setup with both OpenAI and Anthropic compatible endpoints.
+
+</Note>
+
+This tutorial will cover:
+
+- Expose a local inference server to OpenShell sandboxes.
+- Verify end-to-end inference from inside a sandbox.
+
+## Prerequisites
+
+First, complete OpenShell installation and follow the [Quickstart](/get-started/quickstart).
+
+[Install the LM Studio app](https://lmstudio.ai/download). Make sure that your LM Studio is running in the same environment as your gateway.
+
+If you prefer to work without having to keep the LM Studio app open, download llmster (headless LM Studio) with the following command:
+
+<Tabs>
+<Tab title="Linux/Mac">
+```shell
+curl -fsSL https://lmstudio.ai/install.sh | bash
+```
+</Tab>
+
+<Tab title="Windows">
+```shell
+irm https://lmstudio.ai/install.ps1 | iex
+```
+</Tab>
+</Tabs>
+
+And start llmster:
+```shell
+lms daemon up
+```
+
+<Steps toc={true}>
+
+## Start LM Studio Local Server
+
+Start the LM Studio local server from the Developer tab, and verify the OpenAI-compatible endpoint is enabled.
+
+LM Studio will listen to `127.0.0.1:1234` by default. For use with OpenShell, you'll need to configure LM Studio to listen on all interfaces (`0.0.0.0`).
+
+If you're using the GUI, go to the Developer Tab, select Server Settings, then enable Serve on Local Network.
+
+If you're using llmster in headless mode, run `lms server start --bind 0.0.0.0`.
+
+## Test with a small model
+
+In the LM Studio app, head to the Model Search tab to download a small model like Qwen3.5 2B.
+
+In the terminal, use the following command to download and load the model:
+```shell
+lms get qwen/qwen3.5-2b
+lms load qwen/qwen3.5-2b
+```
+
+## Add LM Studio as a provider
+
+Choose the provider type that matches the client protocol you want to route through `inference.local`.
+
+<Tabs>
+<Tab title="OpenAI-compatible">
+
+Add LM Studio as an OpenAI-compatible provider through `host.openshell.internal`:
+
+```shell
+openshell provider create \
+    --name lmstudio \
+    --type openai \
+    --credential OPENAI_API_KEY=lmstudio \
+    --config OPENAI_BASE_URL=http://host.openshell.internal:1234/v1
+```
+
+Use this provider for clients that send OpenAI-compatible requests such as `POST /v1/chat/completions` or `POST /v1/responses`.
+
+</Tab>
+
+<Tab title="Anthropic-compatible">
+
+Add a provider that points to LM Studio's Anthropic-compatible `POST /v1/messages` endpoint:
+
+```shell
+openshell provider create \
+    --name lmstudio-anthropic \
+    --type anthropic \
+    --credential ANTHROPIC_API_KEY=lmstudio \
+    --config ANTHROPIC_BASE_URL=http://host.openshell.internal:1234
+```
+
+Use this provider for Anthropic-compatible `POST /v1/messages` requests.
+
+</Tab>
+
+</Tabs>
+
+## Configure LM Studio as the local inference provider
+
+Set the managed inference route for the active gateway:
+
+<div className="boxed-tabs">
+
+<Tabs>
+<Tab title="OpenAI-compatible">
+
+```shell
+openshell inference set --provider lmstudio --model qwen/qwen3.5-2b
+```
+
+If the command succeeds, OpenShell has verified that the upstream is reachable and accepts the expected OpenAI-compatible request shape.
+
+</Tab>
+
+<Tab title="Anthropic-compatible">
+
+```shell
+openshell inference set --provider lmstudio-anthropic --model qwen/qwen3.5-2b
+```
+
+If the command succeeds, OpenShell has verified that the upstream is reachable and accepts the expected Anthropic-compatible request shape.
+
+</Tab>
+
+</Tabs>
+
+</div>
+
+The active `inference.local` route is gateway-scoped, so only one provider and model pair is active at a time. Re-run `openshell inference set` whenever you want to switch between OpenAI-compatible and Anthropic-compatible clients.
+
+Confirm the saved config:
+
+```shell
+openshell inference get
+```
+
+You should see either `Provider: lmstudio` or `Provider: lmstudio-anthropic`, along with `Model: qwen/qwen3.5-2b`.
+
+## Verify from Inside a Sandbox
+
+Run a simple request through `https://inference.local`:
+
+<Tabs>
+<Tab title="OpenAI-compatible">
+
+```shell showLineNumbers={true}
+openshell sandbox create -- \
+    curl https://inference.local/v1/chat/completions \
+    --json '{"messages":[{"role":"user","content":"hello"}],"max_tokens":10}'
+    
+openshell sandbox create -- \
+    curl https://inference.local/v1/responses \
+    --json '{
+      "instructions": "You are a helpful assistant.",
+      "input": "hello",
+      "max_output_tokens": 10
+    }'
+```
+
+</Tab>
+
+<Tab title="Anthropic-compatible">
+
+```shell
+openshell sandbox create -- \
+    curl https://inference.local/v1/messages \
+    --json '{"messages":[{"role":"user","content":"hello"}],"max_tokens":10}'
+```
+
+</Tab>
+
+</Tabs>
+
+</Steps>
+
+## Troubleshooting
+
+If setup fails, check these first:
+
+- LM Studio local server is running and reachable from the gateway host
+- `OPENAI_BASE_URL` uses `http://host.openshell.internal:1234/v1` when you use an `openai` provider
+- `ANTHROPIC_BASE_URL` uses `http://host.openshell.internal:1234` when you use an `anthropic` provider
+- The gateway and LM Studio run on the same machine or a reachable network path
+- The configured model name matches the model exposed by LM Studio
+
+Useful commands:
+
+```shell
+openshell status
+openshell inference get
+openshell provider get lmstudio
+openshell provider get lmstudio-anthropic
+```
+
+## Next Steps
+
+- To learn more about using the LM Studio CLI, refer to [LM Studio docs](https://lmstudio.ai/docs/cli)
+- To learn more about managed inference, refer to [Index](/inference/about).
+- To configure a different self-hosted backend, refer to [Configure](/inference/configure).

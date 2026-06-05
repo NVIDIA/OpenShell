@@ -1,0 +1,195 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Gateway Authentication"
+description: "Gateway resolution, authentication modes, connection flow, OIDC support, and credential file layout."
+keywords: "Generative AI, Cybersecurity, Gateway, Authentication, mTLS, OIDC, OpenID Connect, Edge Authentication, Reference"
+position: 1
+---
+
+This page describes how the CLI resolves a gateway, authenticates with it, and where credentials are stored. For how to deploy or register gateways, refer to [Gateways](/sandboxes/manage-gateways).
+
+## Gateway Resolution
+
+When any CLI command needs to talk to the gateway, it resolves the target through a priority chain:
+
+1. `--gateway-endpoint <URL>` flag (direct URL).
+2. `-g <NAME>` flag.
+3. `OPENSHELL_GATEWAY` environment variable.
+4. Active gateway from `~/.config/openshell/active_gateway`.
+
+The CLI loads gateway metadata from disk to determine the endpoint URL and authentication mode.
+
+## Authentication Modes
+
+The CLI uses one of these authentication modes depending on the gateway's configuration.
+
+### mTLS
+
+The default mode for local Docker, Podman, and VM gateways without OIDC. The CLI presents a client certificate during the TLS handshake, and the gateway can map the verified certificate subject to a local user principal when mTLS user authentication is enabled.
+
+mTLS user authentication is for local single-user gateways. Kubernetes deployments must use OIDC or a trusted access proxy for user authentication; the Helm chart does not render `mtls_auth`.
+
+Set these environment variables before starting the gateway:
+
+| Environment variable | Purpose |
+|---|---|
+| `OPENSHELL_TLS_CERT` | Path to the gateway server certificate. |
+| `OPENSHELL_TLS_KEY` | Path to the gateway server private key. |
+| `OPENSHELL_TLS_CLIENT_CA` | Path to the CA certificate that verifies CLI client certificates. |
+| `OPENSHELL_ENABLE_MTLS_AUTH` | Set to `true` to authenticate CLI callers from verified client certificates. Defaults on for local Docker, Podman, and VM gateways with no OIDC issuer. |
+
+For local access, the server certificate must be valid for the endpoint the CLI uses. Include `localhost` and `127.0.0.1` in the certificate SANs when users connect to a local gateway through loopback.
+
+Package-managed local gateways on Homebrew, Debian, and RPM generate this bundle automatically for the `openshell` gateway name and use `https://127.0.0.1:17670` by default.
+When you register a package-managed local gateway with `openshell gateway add https://127.0.0.1:17670 --local --name openshell`, the CLI refreshes its mTLS bundle from the package-managed TLS directory.
+On Homebrew, the gateway service also mirrors the Docker sandbox client bundle into `$HOME/.local/state/openshell/homebrew/tls` before startup so Docker Desktop can bind-mount the files into sandbox containers.
+
+The CLI loads its mTLS bundle from `~/.config/openshell/gateways/<name>/mtls/`:
+
+| File | Purpose |
+|---|---|
+| `ca.crt` | CA certificate that verifies the gateway server certificate. |
+| `tls.crt` | Client certificate. It must chain to `OPENSHELL_TLS_CLIENT_CA`. |
+| `tls.key` | Client private key for `tls.crt`. |
+
+The connection flow:
+
+1. The CLI loads the certificate files.
+2. Opens a TCP connection to the gateway endpoint.
+3. Performs a TLS handshake, presenting the client certificate.
+4. The gateway verifies the client certificate against its CA.
+5. When mTLS user authentication is enabled, the gateway maps the verified certificate subject to a user principal.
+6. The gateway authorizes the gRPC method.
+
+### OIDC
+
+Gateways can validate OpenID Connect access tokens on gRPC requests. Configure OIDC when you want users, operators, or automation to authenticate with an identity provider such as Keycloak, Entra ID, or Okta.
+
+OIDC is application-layer authentication. TLS still controls the transport. If TLS client certificates remain required, the CLI must also have an mTLS bundle for the gateway.
+
+Configure the gateway with an issuer and audience:
+
+```shell
+openshell-gateway \
+  --oidc-issuer https://idp.example.com/realms/openshell \
+  --oidc-audience openshell-cli \
+  --oidc-roles-claim realm_access.roles \
+  --oidc-admin-role openshell-admin \
+  --oidc-user-role openshell-user
+```
+
+The same settings are available through environment variables:
+
+| Environment variable | Purpose | Default |
+|---|---|---|
+| `OPENSHELL_OIDC_ISSUER` | OIDC issuer URL. The gateway discovers `/.well-known/openid-configuration` from this URL. | None |
+| `OPENSHELL_OIDC_AUDIENCE` | Expected JWT `aud` claim. | `openshell-cli` |
+| `OPENSHELL_OIDC_JWKS_TTL` | JWKS cache TTL in seconds. The gateway also refreshes on an unknown key ID. | `3600` |
+| `OPENSHELL_OIDC_ROLES_CLAIM` | Dot-separated claim path containing roles. | `realm_access.roles` |
+| `OPENSHELL_OIDC_ADMIN_ROLE` | Role required for admin operations. | `openshell-admin` |
+| `OPENSHELL_OIDC_USER_ROLE` | Role required for standard user operations. | `openshell-user` |
+| `OPENSHELL_OIDC_SCOPES_CLAIM` | Dot-separated claim path containing scopes. Empty disables scope enforcement. | Empty |
+
+For Helm deployments, set the same values under `server.oidc`:
+
+```yaml
+server:
+  oidc:
+    issuer: https://idp.example.com/realms/openshell
+    audience: openshell-cli
+    rolesClaim: realm_access.roles
+    adminRole: openshell-admin
+    userRole: openshell-user
+    scopesClaim: ""
+```
+
+Register an OIDC gateway with the CLI:
+
+```shell
+openshell gateway add https://gateway.example.com \
+  --name production \
+  --oidc-issuer https://idp.example.com/realms/openshell \
+  --oidc-client-id openshell-cli \
+  --oidc-audience openshell-cli
+```
+
+When you register or log in to an OIDC gateway, the CLI uses the Authorization Code flow with PKCE. It opens a browser, receives the authorization code on a localhost callback, exchanges the code for tokens, and stores the token bundle under the gateway credential directory. If `OPENSHELL_OIDC_CLIENT_SECRET` is set, the CLI uses the client credentials flow instead. Use that mode for CI and other non-interactive automation.
+
+The connection flow:
+
+1. The CLI loads the stored OIDC token bundle.
+2. If the access token is expired and a refresh token is available, the CLI refreshes it.
+3. The CLI connects to the gateway and attaches `authorization: Bearer <token>` metadata to each gRPC request.
+4. The gateway validates the JWT signature, issuer, audience, expiration, and key ID against the issuer's JWKS.
+5. The gateway extracts roles and optional scopes from the configured claim paths.
+6. The gateway authorizes the gRPC method. Admin methods require the admin role, other authenticated methods require the user role. Admin role holders also satisfy user-role checks.
+
+If `OPENSHELL_OIDC_SCOPES_CLAIM` is set, the gateway also enforces scopes. It accepts space-delimited scope strings such as `scope: "openid sandbox:read"` and JSON arrays such as `scp: ["sandbox:read"]`. Standard OIDC scopes such as `openid`, `profile`, `email`, and `offline_access` are ignored for authorization. `openshell:all` grants access to all scoped methods.
+
+Supervisor-to-gateway RPCs do not use user OIDC tokens or mTLS user identity. Each sandbox supervisor presents a gateway-minted `Authorization: Bearer` token scoped to its sandbox ID. On Kubernetes, the gateway mints that token only after TokenReview validates the projected ServiceAccount token, the pod UID matches the live pod, and the pod's controlling `Sandbox` ownerReference matches the live Sandbox CR. Log upload, policy status, credential environment lookup, inference bundle lookup, and sandbox config sync run with sandbox-restricted scope, while CLI users authenticate with OIDC, edge auth, local mTLS user authentication, or an explicitly enabled unauthenticated local developer mode. `GetInferenceBundle` returns route material that includes provider credentials, so it requires a sandbox principal; user callers manage inference configuration through the user-facing inference APIs instead.
+
+Re-authenticate an OIDC gateway with:
+
+```shell
+openshell gateway login production
+```
+
+### Edge JWT (cloud gateways)
+
+For gateways behind a reverse proxy that handles authentication (e.g. Cloudflare Access), the CLI uses a browser-based login flow and routes traffic through a WebSocket tunnel.
+
+**Registration flow** (`openshell gateway add https://gateway.example.com`):
+
+1. The CLI stores gateway metadata with the edge authentication mode.
+2. Opens your browser to the gateway's authentication endpoint.
+3. The reverse proxy handles login (SSO, identity provider, etc.).
+4. After authentication, the browser relays the authorization token back to the CLI through a localhost callback.
+5. The CLI stores the token and sets the gateway as active.
+
+**Connection flow** (subsequent commands):
+
+1. The CLI starts a local proxy that listens on an ephemeral port.
+2. The proxy opens a WebSocket connection (`wss://`) to the gateway, attaching the stored bearer token in the upgrade headers.
+3. The reverse proxy authenticates the WebSocket upgrade request.
+4. The gateway bridges the WebSocket into the same service that handles direct mTLS connections.
+5. CLI commands send requests through the local proxy as plaintext HTTP/2 over the tunnel.
+
+This is transparent to the user. All CLI commands work the same regardless of whether the gateway uses mTLS, OIDC, or edge authentication.
+
+**Re-authentication**: If the token expires, run `openshell gateway login` to open the browser flow again and update the stored token.
+
+### Plaintext
+
+When a gateway is deployed with `server.disableTls=true`, TLS is disabled entirely. The CLI connects over plain HTTP/2. This mode is intended for local port-forwarding or gateways behind a trusted reverse proxy or tunnel that handles TLS termination externally.
+
+Register a plaintext gateway with an explicit `http://` endpoint:
+
+```shell
+openshell gateway add http://127.0.0.1:17670 --local
+```
+
+For Kubernetes local development, the Helm Skaffold overlay enables `[openshell.gateway.auth] allow_unauthenticated_users = true` so a port-forwarded plaintext gateway works without OIDC or mTLS user credentials. Leave this disabled for shared and production clusters.
+
+This stores the gateway with `auth_mode = plaintext`, skips mTLS client certificate lookup, and does not open the browser login flow.
+
+## File Layout
+
+All gateway credentials and metadata are stored under `~/.config/openshell/`:
+
+```text
+openshell/
+  active_gateway                    # Plain text: active gateway name
+  gateways/
+    <name>/
+      metadata.json                 # Gateway metadata (endpoint, auth mode, type)
+      mtls/                         # mTLS bundle (local and remote gateways)
+        ca.crt                      # CA certificate
+        tls.crt                     # Client certificate
+        tls.key                     # Client private key
+      edge_token                    # Edge auth JWT (cloud gateways)
+      oidc_token.json               # OIDC access token, refresh token, and expiry metadata
+      last_sandbox                  # Last-used sandbox for this gateway
+```
+
+For OIDC gateways, `metadata.json` also stores the issuer, CLI client ID, optional audience, and requested scopes. Treat `oidc_token.json` as a credential. OpenShell writes it with owner-only file permissions.

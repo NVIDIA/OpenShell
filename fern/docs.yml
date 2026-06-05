@@ -1,0 +1,78 @@
+instances:
+- url: openshell.docs.buildwithfern.com/openshell
+  custom-domain: docs.nvidia.com/openshell
+  multi-source: true
+title: NVIDIA OpenShell
+global-theme: nvidia
+announcement:
+  message: 🔔 NVIDIA OpenShell is <strong>alpha software</strong>. APIs and behavior
+    may change without notice. Do not use in production.
+footer: ./components/CustomFooter.tsx
+layout:
+  searchbar-placement: header
+  page-width: 1376px
+  sidebar-width: 248px
+  content-width: 812px
+  tabs-placement: header
+  hide-feedback: true
+colors:
+  accentPrimary:
+    dark: '#76B900'
+    light: '#76B900'
+  background:
+    light: '#FFFFFF'
+    dark: '#000000'
+theme:
+  page-actions: toolbar
+  footer-nav: minimal
+logo:
+  dark: ./assets/NVIDIA_dark.svg
+  light: ./assets/NVIDIA_light.svg
+  height: 20
+  href: /openshell/latest
+  right-text: OpenShell
+favicon: ./assets/NVIDIA_symbol.svg
+css:
+- ./main.css
+navbar-links:
+- type: github
+  value: https://github.com/NVIDIA/OpenShell
+experimental:
+  mdx-components:
+  - ./pages-latest/_components
+  - ./pages-dev/_components
+  - ./pages-v0.0.36/_components
+  - ./components
+versions:
+- display-name: Latest (v0.0.57)
+  path: ./versions/latest.yml
+  slug: latest
+- display-name: dev
+  path: ./versions/dev.yml
+  slug: dev
+- display-name: v0.0.36
+  path: ./versions/v0.0.36.yml
+  slug: v0.0.36
+redirects:
+- source: /openshell/index.html
+  destination: /openshell/latest
+- source: /openshell/index
+  destination: /openshell/latest
+- source: /openshell/latest/index.html
+  destination: /openshell/latest
+- source: /openshell/latest/index
+  destination: /openshell/latest
+- source: /openshell/latest/:path*/index.html
+  destination: /openshell/latest/:path*
+- source: /openshell/:path*/index.html
+  destination: /openshell/:path*
+- source: /openshell/:path*.html
+  destination: /openshell/:path*
+- source: /openshell/tutorials
+  destination: /openshell/latest/get-started/tutorials
+- source: /openshell/tutorials/:path*
+  destination: /openshell/latest/get-started/tutorials/:path*
+- source: /openshell/latest/tutorials
+  destination: /openshell/latest/get-started/tutorials
+- source: /openshell/latest/tutorials/:path*
+  destination: /openshell/latest/get-started/tutorials/:path*
