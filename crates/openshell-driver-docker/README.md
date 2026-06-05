@@ -36,6 +36,41 @@ contract:
 
 The agent child process does not retain these supervisor privileges.
 
+## Driver Config Mounts
+
+The gateway forwards the `docker` block from `--driver-config-json` to this
+driver. The driver accepts user-supplied `mounts` entries with these Docker
+mount types:
+
+- `volume`: mounts an existing Docker named volume. The driver validates that
+  the volume exists before provisioning and never creates or removes it.
+- `tmpfs`: mounts an in-memory filesystem with optional `options`,
+  `size_bytes`, and `mode`.
+
+Host bind mounts and image mounts are intentionally not part of the Docker
+driver-config schema. The driver still uses internal bind mounts for
+OpenShell-owned supervisor, token, and TLS material.
+
+Docker `volume` mounts may include `subpath`. Mount targets must be absolute
+container paths and must not replace the workspace root (`/sandbox`) or overlap
+OpenShell supervisor files, auth material, TLS material, or `/run/netns`.
+
+Example NFS usage relies on Docker's named-volume support rather than a host
+bind:
+
+```shell
+docker volume create \
+  --driver local \
+  --opt type=nfs \
+  --opt o=addr=10.0.0.10,rw,nfsvers=4 \
+  --opt device=:/exports/work \
+  work-nfs
+
+openshell sandbox create \
+  --driver-config-json '{"docker":{"mounts":[{"type":"volume","source":"work-nfs","target":"/sandbox/work"}]}}' \
+  -- claude
+```
+
 ## Supervisor Binary Resolution
 
 The Docker driver bind-mounts a host-side Linux `openshell-sandbox` binary into

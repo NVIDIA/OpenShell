@@ -78,6 +78,43 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
     }
 }
 
+fn json_struct(value: serde_json::Value) -> prost_types::Struct {
+    match json_value(value).kind {
+        Some(prost_types::value::Kind::StructValue(value)) => value,
+        _ => panic!("expected JSON object"),
+    }
+}
+
+fn json_value(value: serde_json::Value) -> prost_types::Value {
+    match value {
+        serde_json::Value::Null => prost_types::Value { kind: None },
+        serde_json::Value::Bool(value) => prost_types::Value {
+            kind: Some(prost_types::value::Kind::BoolValue(value)),
+        },
+        serde_json::Value::Number(value) => prost_types::Value {
+            kind: value.as_f64().map(prost_types::value::Kind::NumberValue),
+        },
+        serde_json::Value::String(value) => prost_types::Value {
+            kind: Some(prost_types::value::Kind::StringValue(value)),
+        },
+        serde_json::Value::Array(values) => prost_types::Value {
+            kind: Some(prost_types::value::Kind::ListValue(
+                prost_types::ListValue {
+                    values: values.into_iter().map(json_value).collect(),
+                },
+            )),
+        },
+        serde_json::Value::Object(values) => prost_types::Value {
+            kind: Some(prost_types::value::Kind::StructValue(prost_types::Struct {
+                fields: values
+                    .into_iter()
+                    .map(|(key, value)| (key, json_value(value)))
+                    .collect(),
+            })),
+        },
+    }
+}
+
 #[test]
 fn container_visible_endpoint_rewrites_loopback_hosts() {
     assert_eq!(
@@ -520,6 +557,131 @@ fn build_binds_uses_docker_tls_directory() {
             .iter()
             .all(|target| target.starts_with(TLS_MOUNT_DIR) || target == SUPERVISOR_MOUNT_PATH)
     );
+}
+
+#[test]
+fn build_container_create_body_includes_driver_config_mounts() {
+    let mut sandbox = test_sandbox();
+    let template = sandbox.spec.as_mut().unwrap().template.as_mut().unwrap();
+    template.driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [
+            {
+                "type": "volume",
+                "source": "work-nfs",
+                "target": "/sandbox/work",
+                "read_only": true,
+                "subpath": "project-a"
+            },
+            {
+                "type": "tmpfs",
+                "target": "/sandbox/cache",
+                "options": ["nosuid", "size=1048576"],
+                "size_bytes": 1_048_576,
+                "mode": 511
+            }
+        ]
+    })));
+
+    let body = build_container_create_body(&sandbox, &runtime_config()).unwrap();
+    let mounts = body
+        .host_config
+        .unwrap()
+        .mounts
+        .expect("driver config mounts should be set");
+
+    assert_eq!(mounts.len(), 2);
+    assert_eq!(mounts[0].typ, Some(MountTypeEnum::VOLUME));
+    assert_eq!(mounts[0].source.as_deref(), Some("work-nfs"));
+    assert_eq!(mounts[0].target.as_deref(), Some("/sandbox/work"));
+    assert_eq!(mounts[0].read_only, Some(true));
+    assert_eq!(
+        mounts[0]
+            .volume_options
+            .as_ref()
+            .and_then(|options| options.subpath.as_deref()),
+        Some("project-a")
+    );
+    assert_eq!(mounts[1].typ, Some(MountTypeEnum::TMPFS));
+    assert_eq!(mounts[1].target.as_deref(), Some("/sandbox/cache"));
+    assert_eq!(
+        mounts[1]
+            .tmpfs_options
+            .as_ref()
+            .and_then(|options| options.size_bytes),
+        Some(1_048_576)
+    );
+}
+
+#[test]
+fn driver_config_rejects_bind_mounts() {
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [{
+            "type": "bind",
+            "source": "/host/path",
+            "target": "/sandbox/host"
+        }]
+    })));
+
+    let err = build_container_create_body(&sandbox, &runtime_config()).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("invalid docker driver_config"));
+}
+
+#[test]
+fn driver_config_rejects_image_mounts() {
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [{
+            "type": "image",
+            "source": "ghcr.io/acme/tools:latest",
+            "target": "/opt/tools"
+        }]
+    })));
+
+    let err = build_container_create_body(&sandbox, &runtime_config()).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("invalid docker driver_config"));
+}
+
+#[test]
+fn driver_config_rejects_reserved_mount_targets() {
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [{
+            "type": "volume",
+            "source": "work-nfs",
+            "target": "/etc/openshell/auth/custom"
+        }]
+    })));
+
+    let err = build_container_create_body(&sandbox, &runtime_config()).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("reserved OpenShell path"));
 }
 
 #[test]

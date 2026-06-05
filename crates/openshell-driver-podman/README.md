@@ -50,6 +50,43 @@ The container spec in `container.rs` sets these security-critical fields:
 
 The restricted agent child does not retain these supervisor privileges.
 
+## Driver Config Mounts
+
+The gateway forwards the `podman` block from `--driver-config-json` to this
+driver. The driver accepts user-supplied `mounts` entries with these Podman
+mount types:
+
+- `volume`: mounts an existing Podman named volume. The driver validates that
+  the volume exists before provisioning and never creates or removes it.
+- `tmpfs`: mounts an in-memory filesystem with optional `options`,
+  `size_bytes`, and `mode`.
+- `image`: mounts an OCI image through Podman's image-volume API. The driver
+  pulls the image during provisioning using the sandbox image pull policy.
+
+Host bind mounts are intentionally not part of the driver-config schema. The
+driver still uses internal bind mounts for OpenShell-owned token and TLS
+material.
+
+Podman image and volume mounts do not support `subpath` in OpenShell driver
+config. Mount targets must be absolute container paths and must not replace the
+workspace root (`/sandbox`) or overlap OpenShell supervisor files, auth
+material, TLS material, or `/run/netns`.
+
+Example NFS usage relies on Podman's named-volume support rather than a host
+bind:
+
+```shell
+podman volume create \
+  --opt type=nfs \
+  --opt o=addr=10.0.0.10,rw,nfsvers=4 \
+  --opt device=:/exports/work \
+  work-nfs
+
+openshell sandbox create \
+  --driver-config-json '{"podman":{"mounts":[{"type":"volume","source":"work-nfs","target":"/sandbox/work"}]}}' \
+  -- claude
+```
+
 ### Capability Breakdown
 
 | Capability | Purpose |

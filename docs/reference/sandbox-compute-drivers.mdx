@@ -72,6 +72,42 @@ Select Docker with `compute_drivers = ["docker"]` in `[openshell.gateway]`. Conf
 
 For GPU-backed Docker sandboxes, configure Docker CDI before starting the gateway so OpenShell can detect the daemon capability.
 
+### Docker Driver Config Mounts
+
+Docker driver config accepts user-supplied `volume` and `tmpfs` mounts. Host
+bind mounts and image mounts are not accepted in Docker sandbox driver config.
+Docker's [storage documentation](https://docs.docker.com/engine/storage/)
+documents container storage mounts as volumes, bind mounts, tmpfs mounts, and
+named pipes. OpenShell intentionally exposes only Docker-managed volumes and
+tmpfs mounts for sandbox create.
+
+Use a `volume` mount for existing Docker named volumes. This includes NFS
+volumes created with Docker's local volume driver:
+
+```shell
+docker volume create \
+  --driver local \
+  --opt type=nfs \
+  --opt o=addr=10.0.0.10,rw,nfsvers=4 \
+  --opt device=:/exports/work \
+  work-nfs
+
+openshell sandbox create \
+  --driver-config-json '{"docker":{"mounts":[{"type":"volume","source":"work-nfs","target":"/sandbox/work","read_only":false}]}}' \
+  -- claude
+```
+
+Docker mount schema:
+
+| Type | Fields |
+|---|---|
+| `volume` | `source`, `target`, optional `read_only` (`false` by default), optional `subpath`. The named volume must already exist. |
+| `tmpfs` | `target`, optional `options`, optional `size_bytes`, optional `mode`. |
+
+OpenShell rejects mount targets that replace the workspace root, container root,
+supervisor files, TLS material, authentication material, or network namespace
+paths. Mounted paths remain subject to sandbox filesystem policy.
+
 ## Podman Driver
 
 [Podman](https://podman.io/)-backed sandboxes run as rootless containers on the gateway host. Use Podman for Linux workstation workflows that avoid a rootful Docker daemon.
@@ -83,6 +119,49 @@ For maintainer-level implementation details, refer to the [Podman driver README]
 Select Podman with `compute_drivers = ["podman"]` in `[openshell.gateway]`. Configure Podman driver values such as `socket_path`, `network_name`, `supervisor_image`, `stop_timeout_secs`, `image_pull_policy`, `grpc_endpoint`, `host_gateway_ip`, `sandbox_ssh_socket_path`, `sandbox_pids_limit`, and `guest_tls_*` in `[openshell.drivers.podman]`.
 
 On macOS with `podman machine`, the driver uses gvproxy's host-loopback IP, `192.168.127.254`, for sandbox host aliases by default. Set `host_gateway_ip` only when your Podman machine uses a non-standard host-loopback address. On Linux, an empty `host_gateway_ip` keeps Podman's `host-gateway` resolver behavior.
+
+### Podman Driver Config Mounts
+
+Podman driver config accepts user-supplied `volume`, `tmpfs`, and `image`
+mounts. Host bind mounts are not accepted in Podman sandbox driver config.
+
+Use a `volume` mount for existing Podman named volumes. This includes NFS
+volumes created with Podman's local volume driver:
+
+```shell
+podman volume create \
+  --opt type=nfs \
+  --opt o=addr=10.0.0.10,rw,nfsvers=4 \
+  --opt device=:/exports/work \
+  work-nfs
+
+openshell sandbox create \
+  --driver-config-json '{"podman":{"mounts":[{"type":"volume","source":"work-nfs","target":"/sandbox/work","read_only":false}]}}' \
+  -- claude
+```
+
+Use an `image` mount to mount an OCI image filesystem through Podman's
+image-volume API:
+
+```shell
+openshell sandbox create \
+  --driver-config-json '{"podman":{"mounts":[{"type":"image","source":"ghcr.io/acme/tools:latest","target":"/opt/tools"}]}}' \
+  -- claude
+```
+
+Podman mount schema:
+
+| Type | Fields |
+|---|---|
+| `volume` | `source`, `target`, optional `read_only` (`false` by default). The named volume must already exist. |
+| `tmpfs` | `target`, optional `options`, optional `size_bytes`, optional `mode`. |
+| `image` | `source`, `target`, optional `read_only` (`true` by default). |
+
+Podman `volume` and `image` mounts do not support `subpath` in OpenShell driver
+config. OpenShell rejects mount targets that replace the workspace root,
+container root, supervisor files, TLS material, authentication material, or
+network namespace paths. Mounted paths remain subject to sandbox filesystem
+policy.
 
 ## MicroVM Driver
 
@@ -114,6 +193,13 @@ For a launch-time override, set `OPENSHELL_DRIVERS=vm` in the gateway environmen
 Configure VM driver values such as `grpc_endpoint`, `driver_dir`, `state_dir`, `default_image`, `bootstrap_image`, `vcpus`, `mem_mib`, `overlay_disk_mib`, `krun_log_level`, and `guest_tls_*` in `[openshell.drivers.vm]`. The VM `state_dir` stores overlay disks, console logs, runtime state, image-rootfs cache, and the private `run/compute-driver.sock` socket.
 
 The gateway starts `openshell-driver-vm` over a private Unix socket and passes its process ID so the driver can reject unexpected local clients. The driver's standalone TCP listener is disabled unless `--allow-unauthenticated-tcp` is set for local development.
+
+### VM Driver Config Mounts
+
+The VM driver does not currently support user-supplied mounts through
+`--driver-config-json`. Each sandbox VM boots from a cached read-only image disk
+plus a per-sandbox writable overlay disk, and the driver owns the guest mount
+layout.
 
 ### Local image resolution
 
@@ -155,6 +241,18 @@ For maintainer-level implementation details, refer to the [Kubernetes driver REA
 | `sa_token_ttl_secs` | `server.sandboxJwt.k8sSaTokenTtlSecs` | Set the projected ServiceAccount token TTL used for the bootstrap token exchange. |
 
 The Kubernetes driver creates namespaced `agents.x-k8s.io/v1alpha1` `Sandbox` resources from the Kubernetes SIG Apps [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) project. The Agent Sandbox controller turns those resources into sandbox pods and related storage.
+
+### Kubernetes Driver Config Mounts
+
+The Kubernetes driver does not currently support Docker or Podman-style
+`mounts` entries in `--driver-config-json`. Kubernetes driver config is limited
+to pod scheduling and agent resource fields such as `pod.node_selector`,
+`pod.tolerations`, `pod.runtime_class_name`, `pod.priority_class_name`,
+`containers.agent.resources.requests`, and `containers.agent.resources.limits`.
+
+Kubernetes sandbox workspace storage uses Agent Sandbox
+`volumeClaimTemplates`. The gateway injects the default workspace claim when the
+template does not provide one.
 
 <Note>
 `Sandbox.spec.volumeClaimTemplates` is immutable after creation. To change storage configuration, delete the sandbox and create a new one with the updated spec.

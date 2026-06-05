@@ -62,6 +62,29 @@ Use this only for driver-specific fields that do not have a stable CLI flag.
 Prefer stable flags such as `--cpu`, `--memory`, and `--gpu` when they cover
 the same behavior.
 
+Docker accepts `volume` and `tmpfs` mounts in driver config. Podman accepts
+`volume`, `tmpfs`, and `image` mounts. Host bind mounts are not supported
+through `--driver-config-json`. Create NFS storage as a Docker or Podman named
+volume first, then mount that existing volume into the sandbox:
+
+```shell
+docker volume create \
+  --driver local \
+  --opt type=nfs \
+  --opt o=addr=10.0.0.10,rw,nfsvers=4 \
+  --opt device=:/exports/work \
+  work-nfs
+
+openshell sandbox create \
+  --driver-config-json '{"docker":{"mounts":[{"type":"volume","source":"work-nfs","target":"/sandbox/work"}]}}' \
+  -- claude
+```
+
+Use the `podman` envelope key and `podman volume create` for Podman-backed
+gateways. The volume must already exist before sandbox creation. Mounted paths
+remain subject to the sandbox filesystem policy, so allow the mount target when
+the agent needs access outside the default policy.
+
 ### GPU Resources
 
 To request GPU resources, add `--gpu`:

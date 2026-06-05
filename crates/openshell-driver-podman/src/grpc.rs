@@ -50,6 +50,7 @@ impl ComputeDriver for ComputeDriverService {
             .ok_or_else(|| Status::invalid_argument("sandbox is required"))?;
         self.driver
             .validate_sandbox_create(&sandbox)
+            .await
             .map_err(Status::from)?;
         Ok(Response::new(ValidateSandboxCreateResponse {}))
     }

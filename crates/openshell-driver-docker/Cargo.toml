@@ -21,6 +21,7 @@ tracing = { workspace = true }
 bytes = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+prost-types = { workspace = true }
 bollard = { version = "0.20" }
 tar = "0.4"
 tempfile = "3"

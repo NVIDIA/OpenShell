@@ -277,12 +277,14 @@ impl PodmanComputeDriver {
     }
 
     /// Validate a sandbox before creation.
-    pub fn validate_sandbox_create(
+    pub async fn validate_sandbox_create(
         &self,
         sandbox: &DriverSandbox,
     ) -> Result<(), ComputeDriverError> {
         let gpu_requested = sandbox.spec.as_ref().is_some_and(|s| s.gpu);
-        Self::validate_gpu_request(gpu_requested)
+        Self::validate_gpu_request(gpu_requested)?;
+        self.validate_user_volume_mounts_available(sandbox).await?;
+        Ok(())
     }
 
     fn validate_gpu_request(gpu_requested: bool) -> Result<(), ComputeDriverError> {
@@ -290,6 +292,27 @@ impl PodmanComputeDriver {
             return Err(ComputeDriverError::Precondition(
                 "GPU sandbox requested, but no NVIDIA GPU devices are available.".to_string(),
             ));
+        }
+        Ok(())
+    }
+
+    async fn validate_user_volume_mounts_available(
+        &self,
+        sandbox: &DriverSandbox,
+    ) -> Result<(), ComputeDriverError> {
+        let volumes = container::podman_driver_volume_mount_sources(sandbox)
+            .map_err(ComputeDriverError::Precondition)?;
+        for volume in volumes {
+            let exists = self
+                .client
+                .volume_exists(&volume)
+                .await
+                .map_err(ComputeDriverError::from)?;
+            if !exists {
+                return Err(ComputeDriverError::Precondition(format!(
+                    "podman volume '{volume}' does not exist"
+                )));
+            }
         }
         Ok(())
     }
@@ -311,6 +334,7 @@ impl PodmanComputeDriver {
         // resources (volume), so we don't leave orphans when the name is
         // invalid.
         let name = validated_container_name(&sandbox.name)?;
+        self.validate_sandbox_create(sandbox).await?;
 
         let vol_name = container::volume_name(&sandbox.id);
 
@@ -352,6 +376,16 @@ impl PodmanComputeDriver {
             .await
             .map_err(ComputeDriverError::from)?;
 
+        for image in container::podman_driver_image_mount_sources(sandbox)
+            .map_err(ComputeDriverError::Precondition)?
+        {
+            info!(image = %image, policy = %pull_policy, "Ensuring image mount source");
+            self.client
+                .pull_image(&image, pull_policy)
+                .await
+                .map_err(ComputeDriverError::from)?;
+        }
+
         // 2. Create workspace volume.
         if let Err(e) = self.client.create_volume(&vol_name).await {
             return Err(ComputeDriverError::from(e));
@@ -365,11 +399,12 @@ impl PodmanComputeDriver {
         };
 
         // 3. Create container.
-        let spec = container::build_container_spec_with_token(
+        let spec = container::try_build_container_spec_with_token(
             sandbox,
             &self.config,
             token_host_path.as_deref(),
-        );
+        )
+        .map_err(ComputeDriverError::Precondition)?;
         match self.client.create_container(&spec).await {
             Ok(_) => {}
             Err(PodmanApiError::Conflict(_)) => {

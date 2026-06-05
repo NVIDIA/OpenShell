@@ -497,6 +497,23 @@ impl PodmanClient {
         }
     }
 
+    /// Return whether a named volume exists. Does not create the volume.
+    pub async fn volume_exists(&self, name: &str) -> Result<bool, PodmanApiError> {
+        validate_name(name)?;
+        match self
+            .request_json::<Value>(
+                hyper::Method::GET,
+                &format!("/libpod/volumes/{name}/json"),
+                None,
+            )
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(PodmanApiError::NotFound(_)) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
     // ── Network operations ───────────────────────────────────────────────
 
     /// Create a bridge network with DNS enabled. Idempotent.
