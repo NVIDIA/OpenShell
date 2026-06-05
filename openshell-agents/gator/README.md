@@ -48,3 +48,5 @@ The GitHub provider profile allows read-only GraphQL queries on `api.github.com/
 Set `GATOR_CODEX_ACCESS_CREDENTIAL_KEY` or pass `--codex-access-key` if the gator Codex profile uses a credential key other than `CODEX_AUTH_ACCESS_TOKEN` for the short-lived access token.
 
 Use `--once` for a single reconciliation cycle. Use `--poll-interval <seconds>` to change the default 15-minute watch cadence.
+
+The launcher preserves existing gateway-owned Codex refresh material by default so multiple gator sandboxes do not overwrite each other's refresh-token lineage from host Codex auth. If gateway rotation fails, the launcher automatically resets gateway refresh material from host Codex auth and retries once. After `codex logout && codex login`, you can also pass `--reset-refresh` to force that reset before rotation.

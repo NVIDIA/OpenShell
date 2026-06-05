@@ -119,6 +119,14 @@ as each cycle can reconcile from that state.
 Use `--once` or `--watch` to override the manifest default. Use
 `--poll-interval <seconds>` to override the watch sleep interval.
 
+Refresh-backed providers are bootstrapped from manifest credential sources when
+no gateway refresh state exists. Later launches preserve gateway-owned refresh
+material and request a credential rotation first. If that rotation fails, the
+launcher treats the host credential source as a repair source, replaces the
+gateway refresh material, and retries rotation once. Use `--reset-refresh` to
+skip the preserve-first path and intentionally replace gateway refresh material
+from the host credential source before rotating.
+
 ## Subagents
 
 The launcher injects subagent definitions under `/sandbox/payload/subagents/`.

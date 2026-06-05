@@ -22,6 +22,7 @@ CODEX_LOCAL_BIN="${GATOR_CODEX_LOCAL_BIN:-}"
 RUN_MODE_OVERRIDE="${OPENSHELL_AGENT_RUN_MODE:-}"
 POLL_INTERVAL_OVERRIDE="${OPENSHELL_AGENT_POLL_INTERVAL_SECONDS:-}"
 MAX_TRANSIENT_FAILURES_OVERRIDE="${OPENSHELL_AGENT_MAX_TRANSIENT_FAILURES:-}"
+RESET_REFRESH="${OPENSHELL_AGENT_RESET_REFRESH:-0}"
 BACKGROUND=0
 KEEP_SANDBOX=0
 
@@ -42,6 +43,7 @@ Options:
   --once                  Run one bounded agent cycle
   --watch                 Keep the sandbox alive and re-run bounded cycles
   --poll-interval SECONDS Sleep duration between watch cycles
+  --reset-refresh         Replace gateway-owned refresh material from host auth before rotating
   --background            Run sandbox create in the background and write a log
   --keep                  Keep the sandbox after the harness exits
   -h, --help              Show this help
@@ -116,6 +118,10 @@ while [[ $# -gt 0 ]]; do
             [[ $# -ge 2 ]] || fail "--poll-interval requires a value"
             POLL_INTERVAL_OVERRIDE="$2"
             shift 2
+            ;;
+        --reset-refresh)
+            RESET_REFRESH=1
+            shift
             ;;
         --background)
             BACKGROUND=1
@@ -449,9 +455,26 @@ configure_provider_refresh() {
         fi
     done
 
-    openshell_cmd "${args[@]}" >/dev/null
-    openshell_cmd provider refresh rotate "$provider_name" --credential-key "$credential_key" >/dev/null
-    echo "Configured gateway refresh for $provider_name/$credential_key."
+    local status_output
+    local rotate_output
+    status_output="$(openshell_cmd provider refresh status "$provider_name" --credential-key "$credential_key" 2>&1 || true)"
+    if [[ "$RESET_REFRESH" != "1" && "$status_output" != *"No refresh configuration found"* ]]; then
+        echo "Preserving existing gateway refresh state for $provider_name/$credential_key. Use --reset-refresh to replace it from host auth."
+    else
+        openshell_cmd "${args[@]}" >/dev/null
+        echo "Configured gateway refresh for $provider_name/$credential_key."
+    fi
+    if ! rotate_output="$(openshell_cmd provider refresh rotate "$provider_name" --credential-key "$credential_key" 2>&1)"; then
+        if [[ "$RESET_REFRESH" != "1" && "$status_output" != *"No refresh configuration found"* ]]; then
+            echo "Gateway refresh rotation failed; resetting $provider_name/$credential_key from host auth and retrying once." >&2
+            openshell_cmd "${args[@]}" >/dev/null
+            openshell_cmd provider refresh rotate "$provider_name" --credential-key "$credential_key" >/dev/null
+        else
+            printf '%s\n' "$rotate_output" >&2
+            return 1
+        fi
+    fi
+    echo "Rotated gateway refresh credential for $provider_name/$credential_key."
 }
 
 GATEWAY="${GATEWAY_OVERRIDE:-${GATOR_GATEWAY:-$GATEWAY_DEFAULT}}"
