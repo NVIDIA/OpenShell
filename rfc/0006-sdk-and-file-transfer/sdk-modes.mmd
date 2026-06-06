@@ -1,0 +1,57 @@
+flowchart TB
+    subgraph pattern1["Agent in a Sandbox"]
+        direction TB
+        p1_desc["CLI-driven · Everything inside one boundary"]
+        p1_sandbox["OpenShell Sandbox"]
+        p1_agent["Agent Process\n+ Tool Calls\n+ Code Execution"]
+        p1_policy["Policy-Enforced Egress\nLandlock · Seccomp · Isolated FS"]
+        p1_iface["Interface: CLI\nSDK: Not needed"]
+    end
+
+    subgraph pattern2["Sandbox as a Tool"]
+        direction TB
+        p2_desc["SDK-driven · Agent outside, sandbox is disposable execution"]
+
+        subgraph invokers["Consumption Entrypoints"]
+            direction LR
+            p2_platform["Platform Worker\nAnthropic · Responses API"]
+            p2_framework["Agent Framework\nOpenAI Agents SDK · OpenClaw"]
+            p2_direct["Direct SDK\nCI/CD · Custom scripts"]
+        end
+
+        p2_sdk["OpenShell SDK\nPython or TypeScript"]
+        p2_grpc["gRPC (OIDC or mTLS)"]
+        p2_gw["OpenShell Gateway\nControl plane · Policy · Providers"]
+        p2_sandbox["Sandbox Pod\nDisposable · No credentials\nPolicy-enforced"]
+        p2_iface["Interface: SDK\nPrimary use case"]
+    end
+
+    p1_desc --> p1_sandbox
+    p1_sandbox --> p1_agent
+    p1_agent --> p1_policy
+    p1_policy --> p1_iface
+
+    p2_desc --> invokers
+    invokers --> p2_sdk
+    p2_sdk --> p2_grpc
+    p2_grpc --> p2_gw
+    p2_gw --> p2_sandbox
+    p2_sandbox --> p2_iface
+
+    style pattern1 fill:#F2EBF9,stroke:#5E40BE,stroke-width:2px
+    style pattern2 fill:#E6F5F5,stroke:#37A3A3,stroke-width:2px
+    style invokers fill:#FFF3E0,stroke:#F5921B,stroke-width:1px
+    style p1_sandbox fill:#5E40BE,stroke:#21134D,color:#fff
+    style p1_agent fill:#5E40BE,stroke:#21134D,color:#fff
+    style p1_policy fill:#E6F5F5,stroke:#37A3A3,color:#151515
+    style p1_iface fill:#FCE3E3,stroke:#A60000,color:#A60000
+    style p2_platform fill:#EE0000,stroke:#A60000,color:#fff
+    style p2_framework fill:#F5921B,stroke:#C27516,color:#fff
+    style p2_direct fill:#999999,stroke:#666666,color:#fff
+    style p2_sdk fill:#1A7A7A,stroke:#004D4D,color:#fff
+    style p2_grpc fill:#FCE3E3,stroke:#EE0000,color:#A60000
+    style p2_gw fill:#5E40BE,stroke:#21134D,color:#fff
+    style p2_sandbox fill:#F2EBF9,stroke:#5E40BE,color:#5E40BE
+    style p2_iface fill:#E6F5F5,stroke:#37A3A3,color:#1A7A7A
+    style p1_desc fill:none,stroke:none,color:#6A6A6A
+    style p2_desc fill:none,stroke:none,color:#6A6A6A

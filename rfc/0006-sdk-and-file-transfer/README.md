@@ -87,29 +87,45 @@ library that handles connection, auth, streaming, and error handling.
 | Multi-tenant platform | Per-tenant sandboxes with policies and credentials | No OIDC auth, no provider attach/detach in SDK |
 | CI/CD pipeline | Sandboxed test runs with repo seeding and artifact retrieval | No file transfer RPC |
 
-### Three sandbox modes
+### Two sandbox patterns
 
-The SDK serves Mode 2 and Mode 3. Mode 1 stays CLI-driven.
+OpenShell supports two usage patterns (see also the
+[LangChain framing](https://www.langchain.com/blog/the-two-patterns-by-which-agents-connect-sandboxes)):
 
-![Three Sandbox Modes](sdk-modes.png)
+![Sandbox Patterns](sdk-modes.png)
 
-**Mode 1: Sandbox the entire agent.** The agent process runs inside
-the sandbox. Interface: CLI. No SDK needed.
+**Agent in a Sandbox.** The agent process runs inside the sandbox.
+Everything (agent logic, tool calls, code execution) is contained
+within a single sandbox boundary. The agent holds no credentials and
+reaches no external services except through a policy-enforced proxy.
 
-**Mode 2: Platform-managed sandbox.** The platform (Anthropic, OpenAI)
-owns the agent loop. A separate worker on your infrastructure embeds
-the SDK and creates sandboxes. Brain and worker are physically
-separate systems. Mode 2 is a spectrum:
+- Interface: CLI (`openshell sandbox create --from openclaw`)
+- SDK relevance: None for end users. The CLI is the interface.
 
-| Variant | Who executes | OpenShell fits? |
-|---------|-------------|-----------------|
-| Responses API `container: auto` | OpenAI | No (closed) |
-| Responses API local shell | You | Yes: execute via `client.exec()` |
-| Anthropic Managed Agents | You (worker) | Yes: full SDK integration |
+**Sandbox as a Tool.** The agent runs outside the sandbox and uses it
+as a disposable execution environment. The agent (or the platform
+orchestrating it) creates sandboxes, sends code to run, and reads
+results back. Credentials are separated from the execution
+environment.
 
-**Mode 3: Framework sandbox extension.** The developer's process owns
-the agent loop. Harness + SDK live in one process. Logical separation.
-Examples: OpenAI Agents SDK, OpenClaw, LangChain.
+- Interface: SDK (Python or TypeScript)
+- SDK relevance: Primary use case. This is what the RFC enables.
+
+The same OpenShell SDKs and APIs are used regardless of who invokes
+them. The invoker may be a platform worker (Anthropic Managed Agents,
+OpenAI Responses API local shell), an agent framework (OpenAI Agents
+SDK, OpenClaw, LangChain), or a custom script (CI/CD pipeline). From
+OpenShell's perspective, these are all "Sandbox as a Tool" consumers
+using the same SDK surface.
+
+Where the invocation originates determines where to contribute if
+OpenShell compatibility needs a change:
+
+| Consumption entrypoint | Who invokes OpenShell | Where to contribute |
+|------------------------|----------------------|---------------------|
+| Platform API (e.g. Responses API, Managed Agents) | Platform worker on your infra | Implement the platform's sandbox contract (e.g. containers API) using OpenShell SDK |
+| Agent framework (e.g. OpenAI Agents SDK, OpenClaw) | Framework's sandbox extension | Implement the framework's SandboxClient interface using OpenShell SDK |
+| Direct SDK usage (e.g. CI/CD, custom scripts) | Your code | Call OpenShell SDK directly |
 
 ## Non-goals
 
@@ -119,8 +135,9 @@ Examples: OpenAI Agents SDK, OpenClaw, LangChain.
   internal. SDK consumers never talk to the supervisor directly.
 - **Draft policy workflow in the SDK.** Operator approval UI concern,
   not a programmatic SDK concern.
-- **Replacing the CLI.** The CLI remains the interface for Mode 1 and
-  for platform engineers. The SDK serves programmatic consumers.
+- **Replacing the CLI.** The CLI remains the interface for "Agent in
+  a Sandbox" and for platform engineers. The SDK serves programmatic
+  "Sandbox as a Tool" consumers.
 - **Per-principal sandbox isolation.** OIDC gives authentication
   (who is calling) but does not by itself give tenant isolation. The
   gateway does not currently filter sandbox visibility per principal.
@@ -138,7 +155,7 @@ Add wrappers for existing gateway RPCs. No gateway changes needed.
 | Method | RPC | Why |
 |--------|-----|-----|
 | OIDC auth | gRPC metadata interceptor | mTLS-only requires distributing client certificates to every SDK consumer. OIDC bearer tokens let any consumer connect to an OIDC-enabled gateway without certificate distribution, regardless of deployment model. |
-| `attach_provider()` / `detach_provider()` / `list_providers()` | AttachSandboxProvider, DetachSandboxProvider, ListSandboxProviders | Credential separation is Mode 2's core security property. Without it, SDK consumers must bake credentials into sandbox images or pass them as env vars visible to agent code. |
+| `attach_provider()` / `detach_provider()` / `list_providers()` | AttachSandboxProvider, DetachSandboxProvider, ListSandboxProviders | Credential separation is core to "Sandbox as a Tool." Without it, SDK consumers must bake credentials into sandbox images or pass them as env vars visible to agent code. |
 | `create_provider()` / `get_provider()` / `update_provider()` / `delete_provider()` | CreateProvider, GetProvider, UpdateProvider, DeleteProvider | API parity with the CLI. Platforms onboarding tenants programmatically need full provider lifecycle without a human running CLI commands. |
 | `watch()` | WatchSandbox | Polling at scale is untenable. Platforms need real-time status, logs, and error detection. |
 | `upload_path()` / `download_path()` | UploadFile, DownloadFile (new RPCs, see below) | Every use case involving local files is blocked without this. |
@@ -151,72 +168,15 @@ Should-have (wrapping existing RPCs):
 | `expose_service()` / service CRUD | ExposeService, GetService, ListServices, DeleteService | Sandbox-hosted HTTP services |
 | `get_logs()` | GetSandboxLogs | One-shot log retrieval for debugging |
 
-### 2. Add streaming file transfer RPCs to the gateway
+### 2. Streaming file transfer (dependency, design deferred)
 
-New proto definitions:
+The SDK needs `upload_path()` and `download_path()` methods, but
+these require new UploadFile/DownloadFile gRPC RPCs in the gateway
+that do not exist today. The detailed proto contract and routing
+design are tracked separately in
+[#1707](https://github.com/NVIDIA/OpenShell/issues/1707).
 
-```protobuf
-// Client streams file content into a sandbox.
-rpc UploadFile(stream UploadFileRequest) returns (UploadFileResponse);
-
-// Gateway streams file content out of a sandbox.
-rpc DownloadFile(DownloadFileRequest) returns (stream DownloadFileResponse);
-
-message UploadFileMetadata {
-  string sandbox_id = 1;
-  string remote_path = 2;
-  uint64 size_bytes = 3;
-  uint32 mode = 4;
-  bool is_archive = 5;
-}
-
-message UploadFileRequest {
-  oneof payload {
-    UploadFileMetadata metadata = 1;
-    bytes chunk = 2;
-  }
-}
-
-message UploadFileResponse {
-  uint64 bytes_written = 1;
-}
-
-message DownloadFileRequest {
-  string sandbox_id = 1;
-  string remote_path = 2;
-  bool as_archive = 3;
-}
-
-message DownloadFileHeader {
-  uint64 size_bytes = 1;
-  uint32 mode = 2;
-  bool is_archive = 3;
-}
-
-message DownloadFileResponse {
-  oneof payload {
-    DownloadFileHeader header = 1;
-    bytes chunk = 2;
-  }
-}
-```
-
-**Why streaming, not tar-over-exec-stdin:**
-
-- Streaming: 64KB chunks, constant memory regardless of file size
-- No gRPC message size limits (4MB default)
-- Progress reporting possible (count chunks)
-- Permissions preserved via metadata header
-- No dependency on `tar` being installed in the sandbox image
-
-![File Transfer Flow](sdk-file-transfer.png)
-
-**Routing:** The gateway routes file streams to the supervisor via the
-existing ConnectSupervisor/RelayStream infrastructure. The supervisor
-adds a file read/write handler alongside its existing SSH and exec
-relay handlers. No new transport layer needed.
-
-**Why file transfer is required:**
+**Why file transfer is needed:**
 
 The OpenAI Agents SDK illustrates this concretely. A developer writes:
 
@@ -239,6 +199,9 @@ Every platform integration has the same pattern:
 | OpenAI Agents SDK | Manifest LocalDir entries | Sandbox outputs |
 | OpenClaw (mirror mode) | Workspace before every command | Changes after every command |
 | CI/CD | Repo checkout, test fixtures | Coverage reports, build artifacts |
+
+This RFC identifies the need. The design of streaming file transfer
+is deferred to #1707.
 
 ### 3. Ship a TypeScript SDK
 
@@ -300,11 +263,10 @@ separation via provider attach.
 **Related PRs:** #1404 (auth foundation, merged), #1547 (Python SDK
 work, open), #1117 (Python wheels, open).
 
-### Phase 2: File Transfer (gateway + supervisor + SDK, requires this RFC)
+### Phase 2: File Transfer (design tracked in #1707)
 
-- UploadFile/DownloadFile proto definitions
-- Gateway implementation (route to supervisor via relay)
-- Supervisor file read/write handler
+- Design and implement streaming file transfer RPCs (see
+  [#1707](https://github.com/NVIDIA/OpenShell/issues/1707))
 - `upload_path()` / `download_path()` in Python SDK
 - Unit + integration tests
 
@@ -313,8 +275,6 @@ work, open), #1117 (Python wheels, open).
 **Enables:** All file-dependent use cases. Anthropic skill downloads,
 OpenAI Manifest materialization, OpenClaw mirror mode, CI/CD repo
 seeding.
-
-**Related PRs:** #1475 (relay infra, merged).
 
 ### Phase 3: TypeScript SDK
 
@@ -328,9 +288,9 @@ seeding.
 
 ### Phase 4: Integration examples
 
-- Anthropic self-hosted worker using Python SDK (Mode 2)
-- OpenAI Agents SDK sandbox provider using Python SDK (Mode 3)
-- OpenClaw plugin rewrite using TypeScript SDK (Mode 3)
+- Anthropic self-hosted worker using Python SDK (platform entrypoint)
+- OpenAI Agents SDK sandbox provider using Python SDK (framework entrypoint)
+- OpenClaw plugin rewrite using TypeScript SDK (framework entrypoint)
 
 **Enables:** Proof that it works end-to-end. Reference implementations
 for other integrations.
@@ -343,34 +303,6 @@ for other integrations.
 
 **Enables:** Multi-tenant per-sandbox policies. Sandbox-hosted HTTP
 services. Log retrieval.
-
-## Risks
-
-**Proto stability.** Adding UploadFile/DownloadFile to the proto is a
-permanent API commitment. If the design is wrong, we carry the cost.
-Mitigation: the proto is deliberately minimal (metadata + chunks).
-The `is_archive` flag provides the extensibility needed for directory
-transfers without adding a complex directory protocol.
-
-**Supervisor complexity.** Adding a file transfer handler to the
-supervisor increases the attack surface inside the sandbox.
-Mitigation: the handler writes to the sandbox filesystem using the
-same privilege model as the exec relay. It does not grant new
-capabilities; it provides a typed interface for an operation the CLI
-already performs over SSH.
-
-**Multi-language SDK maintenance.** Multiple SDKs increase the
-maintenance surface. Mitigation: [#1617](https://github.com/NVIDIA/OpenShell/issues/1617)
-proposes a shared Rust core with language-specific thin bindings.
-SDKs would not reimplement workflows (OIDC, file transfer, image
-building) per language; they wrap the Rust core. This RFC's scope
-(which RPCs to expose, auth model, file transfer contract) informs
-what the shared core needs to implement.
-
-**Community SDK fragmentation.** `moonshot-partners/openshell-node`
-exists (1 contributor, MIT, 7 RPCs). Shipping an official TS SDK may
-fragment the community. Mitigation: build in-repo for proto sync and
-release alignment. Consider reaching out to the community author.
 
 ## Alternatives
 
@@ -389,14 +321,8 @@ stdin=tarball)` for uploads and `exec(["tar", "cz", "/path"])` for
 downloads. This works for small files but breaks on large transfers
 (4MB default gRPC message size), provides no progress reporting, has
 no resume on failure, loses permissions inconsistently, and requires
-`tar` in the sandbox image.
-
-### REST API alongside gRPC
-
-Add an HTTP/REST API for file transfer instead of gRPC streaming.
-This would be simpler for curl-based consumers but inconsistent with
-the rest of the API (all gRPC). The existing gRPC gateway
-infrastructure (relay, supervisor) would need a parallel HTTP path.
+`tar` in the sandbox image. This alternative and others will be
+evaluated in the file transfer design (#1707).
 
 ### Adopt community TypeScript SDK
 
@@ -404,41 +330,6 @@ Fork or bless `moonshot-partners/openshell-node` instead of building
 in-repo. This avoids the new-package cost but introduces a dependency
 on a single external maintainer with no release alignment to
 OpenShell releases. Proto sync becomes manual.
-
-## Prior art
-
-**OpenAI Agents SDK:** SandboxClient interface with `session.write()`,
-`session.exec()`, `session.read()`. Supports Docker, E2B, Modal,
-Runloop, Vercel, Cloudflare, Blaxel, Daytona as providers. Each
-implements the same interface backed by their own API. This is the
-pattern our SDK adapter would follow.
-
-**Anthropic Managed Agents:** EnvironmentWorker pattern. Worker polls
-a queue, claims sessions, executes tool calls in a sandbox. The
-self-hosted variant runs the worker on your infrastructure. This is
-the pattern our Anthropic integration example would follow.
-
-**E2B SDK:** Python and TypeScript SDKs for sandboxed code execution.
-`Sandbox.upload_file()`, `Sandbox.download_file()`, `Sandbox.run()`.
-The file transfer methods use streaming HTTP. Similar scope to what
-we're proposing, different transport (HTTP vs gRPC).
-
-**Modal SDK:** Python SDK for cloud-based sandboxed execution.
-`modal.Sandbox.create()`, `.exec()`, `.terminate()`. File transfer
-uses Modal's volume system rather than per-file upload RPCs.
-
-## Resolved questions
-
-1. **TypeScript SDK location.** In-repo for proto sync and release
-   alignment. Decided per review feedback.
-
-2. **Provider CRUD in SDK.** Included in scope. API parity with the
-   CLI is a design principle. The trust boundary (credentials never
-   in the sandbox) is preserved regardless of whether providers are
-   created via CLI or SDK.
-
-3. **API parity.** CLI and SDK should have API parity as a principle,
-   excluding interactive features (shell access, TUI).
 
 ## Open questions
 
@@ -459,4 +350,3 @@ uses Modal's volume system rather than per-file upload RPCs.
 4. **Relationship to #1617 (shared Rust core).** This RFC defines
    what the SDK exposes. #1617 defines how it is implemented (shared
    Rust core with thin language bindings). The two RFCs should close
-   together since they inform each other.
