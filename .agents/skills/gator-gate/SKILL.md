@@ -51,7 +51,21 @@ All comments posted by this skill must begin with this marker:
 > **gator-agent**
 ```
 
-Use one canonical gator comment per issue or PR when possible. Edit it for state summaries if practical; otherwise post a new marked comment for material transitions.
+Use one canonical gator comment per issue or PR for baseline state summaries when possible. Edit it only for housekeeping updates that do not respond to new human activity.
+
+When gator is continuing a conversation after a human comment, review, or requested change, post a new marked comment. Do not edit an older comment for these conversational turns, because that hides the progression from PR readers.
+
+## Human Comment Disposition
+
+Every substantive human comment or review after a gator request must be addressed in the next gator action. Do not silently keep the same state when an author, maintainer, or reviewer responds.
+
+When a human response claims that requested changes were made, re-check the latest head and publicly disposition the response in a new marked comment:
+
+- If the response resolves the feedback, say it is resolved and move to the next state.
+- If the response does not resolve the feedback, explicitly acknowledge the response and list what remains unresolved.
+- If the response is ambiguous, ask the minimal clarifying question and keep the appropriate waiting state.
+
+The disposition must mention the relevant human response by author or timestamp when useful, include the current head SHA for PRs, and explain the next expected action. Do not edit the canonical gator comment for this disposition; continue the thread with a new comment so PR readers can see that new activity occurred after the human response.
 
 ## Labels
 
@@ -425,7 +439,7 @@ For validated PRs with direct user-facing UX changes, require Fern docs updates 
 
 If no blocking findings remain, decide whether E2E labels are needed, then move to `gator:watch-pipeline`.
 
-When resuming a PR already in `gator:in-review`, check whether gator review findings or maintainer review comments are still unanswered. If the PR author has pushed commits or replied after the latest feedback, re-review only the relevant changes and decide whether the feedback is resolved.
+When resuming a PR already in `gator:in-review`, check whether gator review findings or maintainer review comments are still unanswered. If the PR author has pushed commits or replied after the latest feedback, re-review only the relevant changes, decide whether the feedback is resolved, and publicly disposition the author response as described in Human Comment Disposition.
 
 If review feedback is waiting on the PR author for more than 48 business hours, post a single author nudge. Use the latest of these timestamps as the TTL start:
 
@@ -574,6 +588,25 @@ Review findings:
 Docs: <Fern docs updated / not needed because ... / missing for direct UX change>
 
 Next state: `<gator:in-review|gator:watch-pipeline|gator:follow-up-needed|gator:blocked>`
+```
+
+### Human Response Disposition
+
+Post this as a new comment after a substantive author, maintainer, or reviewer response. Do not edit an older gator comment for this case.
+
+```markdown
+> **gator-agent**
+
+## Re-check After <author|maintainer|reviewer> Update
+
+I re-evaluated latest head `<sha>` after <person>'s <date/time> comment: "<short quote or paraphrase>".
+
+Disposition: <resolved / partially resolved / not resolved / needs clarification>.
+
+Remaining items:
+- <specific unresolved item, or "No blocking items remain">
+
+Next state: `<gator:in-review|gator:watch-pipeline|gator:follow-up-needed|gator:blocked|gator:approval-needed>`
 ```
 
 ### Approval Needed
