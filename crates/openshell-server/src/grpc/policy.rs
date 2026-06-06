@@ -758,9 +758,15 @@ async fn supersede_other_pending_chunks_for_endpoint(
 }
 
 /// If the just-submitted mechanistic chunk targets a `(host, port, binary)`
-/// already covered by an approved `agent_authored` chunk, auto-reject the
-/// mechanistic chunk on arrival. The agent has already handled this access
-/// decision; the mechanistic draft would only add approval-queue noise.
+/// already covered by an approved chunk, auto-reject the mechanistic chunk
+/// on arrival — but only when the approved grants actually cover what it
+/// asks for. A connect-level resubmit (no L7 asks) is the classic
+/// straggler-flush noise case: denials recorded just before an approval
+/// hot-reloaded, flushed just after. Rejecting those keeps the approval
+/// queue clean. A submission carrying L7 method/path evidence OUTSIDE the
+/// union of the approved chunks' allow rules is different in kind: it is
+/// the agent asking for MORE than was granted, and it must surface as a
+/// fresh pending chunk for review, never vanish.
 ///
 /// `agent_authored` submissions are NEVER self-rejected — that path remains
 /// open for refinement. Only the mechanistic side is asymmetric.
@@ -771,6 +777,7 @@ async fn self_reject_mechanistic_if_already_covered(
     host: &str,
     port: i32,
     binary: &str,
+    proposed_rule: &NetworkPolicyRule,
 ) {
     if host.is_empty() || port == 0 || binary.is_empty() {
         return;
@@ -792,18 +799,46 @@ async fn self_reject_mechanistic_if_already_covered(
         }
     };
 
-    // If any approved chunk for this sandbox already targets the same
-    // (host, port, binary), the mechanistic submission is redundant.
-    let covered_by = approved
+    let covering: Vec<_> = approved
         .iter()
-        .find(|c| c.host == host && c.port == port && c.binary == binary);
-    let Some(covering) = covered_by else {
+        .filter(|c| c.host == host && c.port == port && c.binary == binary)
+        .collect();
+    if covering.is_empty() {
         return;
-    };
+    }
+
+    // Compare asks against the union of every approved grant for this
+    // endpoint, not just the first match: a ghost resubmit of the SECOND
+    // approval must be recognized as covered even though the first approved
+    // chunk knows nothing about its paths.
+    let new_asks = l7_asks(proposed_rule);
+    if !new_asks.is_empty() {
+        let granted: Vec<(String, String)> = covering
+            .iter()
+            .filter_map(|c| NetworkPolicyRule::decode(c.proposed_rule.as_slice()).ok())
+            .flat_map(|r| l7_asks(&r))
+            .collect();
+        let uncovered = new_asks.iter().any(|(method, path)| {
+            !granted
+                .iter()
+                .any(|(gm, gp)| l7_method_covers(gm, method) && l7_path_covers(gp, path))
+        });
+        if uncovered {
+            info!(
+                sandbox_id = %sandbox_id,
+                chunk_id = %new_chunk_id,
+                host = %host,
+                port = port,
+                binary = %binary,
+                "Mechanistic chunk carries L7 evidence beyond the approved grant; kept pending for review"
+            );
+            return;
+        }
+    }
 
     let reason = format!(
-        "already covered by approved chunk {} (agent_authored or prior auto-approval)",
-        covering.id
+        "already covered by approved chunk {} (no method/path evidence beyond the existing grant)",
+        covering[0].id
     );
     match state
         .store
@@ -819,7 +854,7 @@ async fn self_reject_mechanistic_if_already_covered(
             info!(
                 sandbox_id = %sandbox_id,
                 chunk_id = %new_chunk_id,
-                covering_chunk = %covering.id,
+                covering_chunk = %covering[0].id,
                 host = %host,
                 port = port,
                 binary = %binary,
@@ -834,6 +869,49 @@ async fn self_reject_mechanistic_if_already_covered(
             );
         }
     }
+}
+
+/// Extract the L7 `(method, path)` asks from a proposed rule's allow rules.
+/// Empty for a connect-level rule (no L7 inspection evidence).
+fn l7_asks(rule: &NetworkPolicyRule) -> Vec<(String, String)> {
+    rule.endpoints
+        .iter()
+        .flat_map(|ep| ep.rules.iter())
+        .filter_map(|r| r.allow.as_ref())
+        .filter(|a| !a.method.is_empty() || !a.path.is_empty())
+        .map(|a| (a.method.clone(), a.path.clone()))
+        .collect()
+}
+
+/// Does a granted method pattern cover an asked method?
+fn l7_method_covers(granted: &str, asked: &str) -> bool {
+    granted == "*" || granted.eq_ignore_ascii_case(asked)
+}
+
+/// Does a granted path glob cover an asked path?
+///
+/// Segment-wise: `*` matches exactly one segment, `**` matches any
+/// remainder but is only honoured as the FINAL segment — the only form the
+/// mechanistic mapper and provider profiles emit. Any unrecognized pattern
+/// shape falls back to exact string equality, which errs toward surfacing a
+/// reviewable card rather than silently swallowing an escalation.
+fn l7_path_covers(granted: &str, asked: &str) -> bool {
+    if granted == "**" || granted == asked {
+        return true;
+    }
+    let g: Vec<&str> = granted.split('/').collect();
+    let a: Vec<&str> = asked.split('/').collect();
+    // `**` anywhere but the tail is an unsupported shape; exact equality
+    // already failed above, so treat as not covered.
+    if g[..g.len().saturating_sub(1)].contains(&"**") {
+        return false;
+    }
+    if g.last() == Some(&"**") {
+        let prefix = &g[..g.len() - 1];
+        return a.len() >= prefix.len()
+            && prefix.iter().zip(&a).all(|(gs, asg)| *gs == "*" || gs == asg);
+    }
+    g.len() == a.len() && g.iter().zip(&a).all(|(gs, asg)| *gs == "*" || gs == asg)
 }
 
 /// Internally approve a chunk on the auto-approval path: merge into the
@@ -2354,6 +2432,7 @@ pub(super) async fn handle_submit_policy_analysis(
                 &record.host,
                 record.port,
                 &record.binary,
+                chunk.proposed_rule.as_ref().expect("checked above"),
             )
             .await;
         }
@@ -7564,6 +7643,225 @@ mod tests {
             &second.accepted_chunk_ids[0], stored_id,
             "second submit must report the same id as the first (dedup fold-in), not a fresh UUID"
         );
+    }
+
+    /// Build a test sandbox + a submit closure for the post-decision tests.
+    /// The closure submits one mechanistic chunk with the given rule and
+    /// returns the response.
+    async fn setup_post_decision_sandbox(
+        sandbox_id: &str,
+        sandbox_name: &str,
+    ) -> Arc<ServerState> {
+        use openshell_core::proto::{SandboxPhase, SandboxSpec};
+
+        let state = test_server_state().await;
+        let mut sandbox = Sandbox {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: sandbox_id.to_string(),
+                name: sandbox_name.to_string(),
+                created_at_ms: 1_000_000,
+                labels: std::collections::HashMap::new(),
+                resource_version: 0,
+            }),
+            spec: Some(SandboxSpec {
+                policy: None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sandbox.set_phase(SandboxPhase::Ready as i32);
+        state.store.put_message(&sandbox).await.unwrap();
+        state
+    }
+
+    /// Connect-level rule for `/usr/bin/curl -> api.example.com:443`, with
+    /// optional L7 method/path allow rules attached to the endpoint.
+    fn post_decision_rule(l7: &[(&str, &str)]) -> NetworkPolicyRule {
+        use openshell_core::proto::{L7Allow, NetworkBinary, NetworkEndpoint};
+
+        NetworkPolicyRule {
+            name: "allow_example".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "api.example.com".to_string(),
+                port: 443,
+                rules: l7
+                    .iter()
+                    .map(|(method, path)| L7Rule {
+                        allow: Some(L7Allow {
+                            method: (*method).to_string(),
+                            path: (*path).to_string(),
+                            ..Default::default()
+                        }),
+                    })
+                    .collect(),
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        }
+    }
+
+    async fn submit_mechanistic(
+        state: &Arc<ServerState>,
+        sandbox_name: &str,
+        rule: NetworkPolicyRule,
+    ) -> SubmitPolicyAnalysisResponse {
+        handle_submit_policy_analysis(
+            state,
+            with_user(Request::new(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.to_string(),
+                analysis_mode: "mechanistic".to_string(),
+                proposed_chunks: vec![PolicyChunk {
+                    rule_name: "allow_example".to_string(),
+                    proposed_rule: Some(rule),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner()
+    }
+
+    /// A decided chunk must stop absorbing new mechanistic submissions for
+    /// the same endpoint. Once the reviewer approves the connect-level
+    /// proposal, later denials for that host|port|binary carrying L7
+    /// method/path evidence beyond the approved grant must surface as a
+    /// fresh PENDING chunk for review — not fold their hit_count invisibly
+    /// into the decided row (dedup_key cleared on decision), and not be
+    /// swallowed by the post-approval self-reject sweep (which only fires
+    /// when the approved grants cover the new asks).
+    #[tokio::test]
+    async fn mechanistic_submit_after_decision_creates_fresh_pending_chunk() {
+        let sandbox_name = "mechanistic-post-decision";
+        let state = setup_post_decision_sandbox("sb-mech-post-decision", sandbox_name).await;
+
+        let first = submit_mechanistic(&state, sandbox_name, post_decision_rule(&[])).await;
+        assert_eq!(first.accepted_chunk_ids.len(), 1);
+        let first_id = first.accepted_chunk_ids[0].clone();
+
+        handle_approve_draft_chunk(
+            &state,
+            Request::new(ApproveDraftChunkRequest {
+                name: sandbox_name.to_string(),
+                chunk_id: first_id.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Post-approval L7 denial evidence: the agent asked for a write the
+        // connect-level approval never granted.
+        let second = submit_mechanistic(
+            &state,
+            sandbox_name,
+            post_decision_rule(&[("POST", "/repos/*/issues")]),
+        )
+        .await;
+        assert_eq!(second.accepted_chunk_ids.len(), 1);
+        let second_id = second.accepted_chunk_ids[0].clone();
+        assert_ne!(
+            first_id, second_id,
+            "a submit after the decision must create a fresh chunk, not fold into the approved one"
+        );
+
+        let pending = handle_get_draft_policy(
+            &state,
+            with_user(Request::new(GetDraftPolicyRequest {
+                name: sandbox_name.to_string(),
+                status_filter: "pending".to_string(),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert_eq!(
+            pending.chunks.len(),
+            1,
+            "the post-decision submit with uncovered L7 evidence must be reviewable as a pending chunk"
+        );
+        assert_eq!(pending.chunks[0].id, second_id);
+    }
+
+    /// The flip side of the previous test: a post-approval mechanistic
+    /// resubmit that asks for NOTHING beyond the approved grant is straggler
+    /// noise (denials recorded just before the approval hot-reloaded,
+    /// flushed just after) and must be self-rejected — no ghost card for the
+    /// reviewer. Covers both the identical connect-level resubmit and an L7
+    /// ask that is a subset of what was already approved.
+    #[tokio::test]
+    async fn mechanistic_resubmit_covered_by_approved_grant_self_rejects() {
+        let sandbox_name = "mechanistic-covered-resubmit";
+        let state = setup_post_decision_sandbox("sb-mech-covered", sandbox_name).await;
+
+        let first = submit_mechanistic(
+            &state,
+            sandbox_name,
+            post_decision_rule(&[("GET", "/user")]),
+        )
+        .await;
+        let first_id = first.accepted_chunk_ids[0].clone();
+        handle_approve_draft_chunk(
+            &state,
+            Request::new(ApproveDraftChunkRequest {
+                name: sandbox_name.to_string(),
+                chunk_id: first_id,
+            }),
+        )
+        .await
+        .unwrap();
+
+        // Identical L7 ask (subset of the grant) and a connect-level
+        // resubmit: both are covered, both must self-reject.
+        for rule in [
+            post_decision_rule(&[("GET", "/user")]),
+            post_decision_rule(&[]),
+        ] {
+            submit_mechanistic(&state, sandbox_name, rule).await;
+        }
+
+        let pending = handle_get_draft_policy(
+            &state,
+            with_user(Request::new(GetDraftPolicyRequest {
+                name: sandbox_name.to_string(),
+                status_filter: "pending".to_string(),
+            })),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+        assert!(
+            pending.chunks.is_empty(),
+            "covered resubmits must self-reject, not pile up as ghost cards: {:?}",
+            pending.chunks
+        );
+    }
+
+    /// Glob coverage semantics for the self-reject sweep: `*` is one
+    /// segment, `**` only as the trailing segment, unknown shapes fall back
+    /// to exact equality (conservative: surface a card rather than swallow).
+    #[test]
+    fn l7_path_covers_glob_semantics() {
+        // Exact and universal.
+        assert!(l7_path_covers("/user", "/user"));
+        assert!(l7_path_covers("**", "/anything/at/all"));
+        // Single-segment wildcard.
+        assert!(l7_path_covers("/repos/*/issues", "/repos/myorg/issues"));
+        assert!(!l7_path_covers("/repos/*/issues", "/repos/myorg/pulls"));
+        assert!(!l7_path_covers("/repos/*/issues", "/repos/a/b/issues"));
+        // Trailing `**` covers any remainder, including generalized asks.
+        assert!(l7_path_covers("/v1/models/**", "/v1/models/abc123"));
+        assert!(l7_path_covers("/v1/models/**", "/v1/models/*"));
+        assert!(l7_path_covers("/v1/**", "/v1/models/abc/def"));
+        assert!(!l7_path_covers("/v1/models/**", "/v2/models/abc"));
+        // Mid-pattern `**` is an unsupported shape: exact match only.
+        assert!(!l7_path_covers("/a/**/z", "/a/b/z"));
+        assert!(l7_path_covers("/a/**/z", "/a/**/z"));
+        // A grant for a specific id does not cover a generalized ask.
+        assert!(!l7_path_covers("/v1/models/abc", "/v1/models/*"));
     }
 
     /// Undo of an approve must clear any `rejection_reason` left over from a

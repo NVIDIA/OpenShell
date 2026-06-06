@@ -758,10 +758,15 @@ ORDER BY "created_at_ms" DESC
         }
         let payload = draft_chunk_payload_from_record(&record)?;
 
+        // Clear the dedup target once a chunk is decided: new observations for
+        // the same host|port|binary must surface as a fresh pending chunk
+        // (possibly carrying new L7 evidence) instead of silently folding
+        // their hit_count into a row the reviewer already acted on.
         let result = sqlx::query(
             r#"
 UPDATE "objects"
-SET "status" = ?3, "payload" = ?4, "updated_at_ms" = ?5
+SET "status" = ?3, "payload" = ?4, "updated_at_ms" = ?5,
+    "dedup_key" = CASE WHEN ?3 = 'pending' THEN "dedup_key" ELSE NULL END
 WHERE "object_type" = ?1 AND "id" = ?2
 "#,
         )

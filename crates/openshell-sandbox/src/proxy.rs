@@ -953,6 +953,7 @@ async fn handle_tcp_connection(
             .collect(),
         secret_resolver: secret_resolver.clone(),
         activity_tx: activity_tx.clone(),
+        denial_tx: denial_tx.clone(),
     };
 
     if effective_tls_skip {
@@ -3120,6 +3121,7 @@ async fn handle_forward_proxy(
             .collect(),
         secret_resolver: secret_resolver.clone(),
         activity_tx: activity_tx.cloned(),
+        denial_tx: denial_tx.cloned(),
     };
     let mut l7_activity_pending = false;
 
@@ -4177,6 +4179,7 @@ mod tests {
             cmdline_paths: vec![],
             secret_resolver: None,
             activity_tx: None,
+            denial_tx: None,
         };
         (config, tunnel_engine, ctx)
     }
@@ -4343,6 +4346,7 @@ mod tests {
             cmdline_paths: vec![],
             secret_resolver: resolver,
             activity_tx: None,
+            denial_tx: None,
         };
         let query_params = std::collections::HashMap::new();
 
@@ -4384,6 +4388,7 @@ mod tests {
             cmdline_paths: vec![],
             secret_resolver: None,
             activity_tx: None,
+            denial_tx: None,
         };
         let query_params = std::collections::HashMap::new();
         let config = websocket_l7_config(crate::l7::L7Protocol::Rest, false);

@@ -1271,6 +1271,7 @@ network_policies:
             cmdline_paths: vec![],
             secret_resolver: None,
             activity_tx: None,
+            denial_tx: None,
         };
         let (mut client_write, mut relay_read) = tokio::io::duplex(MAX_TEXT_MESSAGE_BYTES + 1024);
         let (mut relay_write, mut upstream_read) = tokio::io::duplex(MAX_TEXT_MESSAGE_BYTES + 1024);

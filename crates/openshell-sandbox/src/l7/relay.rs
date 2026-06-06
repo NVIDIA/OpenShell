@@ -8,6 +8,7 @@
 //! and either forwards or denies the request.
 
 use crate::activity_aggregator::{ActivitySender, try_record_activity};
+use crate::denial_aggregator::DenialEvent;
 use crate::l7::provider::{L7Provider, RelayOutcome};
 use crate::l7::rest::WebSocketExtensionMode;
 use crate::l7::{EnforcementMode, L7EndpointConfig, L7Protocol, L7RequestInfo};
@@ -40,6 +41,10 @@ pub struct L7EvalContext {
     pub(crate) secret_resolver: Option<Arc<SecretResolver>>,
     /// Anonymous activity counter channel.
     pub(crate) activity_tx: Option<ActivitySender>,
+    /// Denial aggregator channel. L7 request denials feed the same
+    /// observation-driven policy analysis as connect-stage denials, carrying
+    /// the observed method/path so proposals can be path-aware.
+    pub(crate) denial_tx: Option<tokio::sync::mpsc::UnboundedSender<DenialEvent>>,
 }
 
 #[derive(Default)]
@@ -453,6 +458,28 @@ fn emit_l7_request_log(
         .build();
     ocsf_emit!(event);
     emit_activity(ctx, decision_str == "deny", "l7_policy");
+    if decision_str == "deny" {
+        emit_l7_denial(ctx, request_info, redacted_target, reason);
+    }
+}
+
+/// Feed an L7 request denial to the denial aggregator (if configured) so the
+/// observation-driven analysis can propose path-aware rules. The target is
+/// already redacted (no query string / credentials), matching what the OCSF
+/// log records.
+fn emit_l7_denial(ctx: &L7EvalContext, request_info: &L7RequestInfo, path: &str, reason: &str) {
+    if let Some(tx) = &ctx.denial_tx {
+        let _ = tx.send(DenialEvent {
+            host: ctx.host.clone(),
+            port: ctx.port,
+            binary: ctx.binary_path.clone(),
+            ancestors: ctx.ancestors.clone(),
+            deny_reason: reason.to_string(),
+            denial_stage: "l7".to_string(),
+            l7_method: Some(request_info.action.clone()),
+            l7_path: Some(path.to_string()),
+        });
+    }
 }
 
 fn emit_activity(ctx: &L7EvalContext, denied: bool, deny_group: &'static str) {
@@ -763,6 +790,9 @@ where
                 ))
                 .build();
             ocsf_emit!(event);
+            if decision_str == "deny" {
+                emit_l7_denial(ctx, &request_info, &redacted_target, &reason);
+            }
         }
 
         // Store the resolved target for the deny response redaction
@@ -1309,6 +1339,51 @@ mod tests {
 
     const TEST_POLICY: &str = include_str!("../../data/sandbox-policy.rego");
 
+    /// An L7 deny must feed the denial aggregator with the observed
+    /// method/path so observation-driven analysis can propose path-aware
+    /// rules; allows must not.
+    #[test]
+    fn l7_deny_emits_denial_event_with_method_and_path() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let ctx = L7EvalContext {
+            host: "api.example.test".into(),
+            port: 443,
+            policy_name: "rest_api".into(),
+            binary_path: "/usr/bin/gh".into(),
+            ancestors: vec!["/bin/bash".into()],
+            cmdline_paths: vec![],
+            secret_resolver: None,
+            activity_tx: None,
+            denial_tx: Some(tx),
+        };
+        let request = L7RequestInfo {
+            action: "GET".into(),
+            target: "/user".into(),
+            query_params: std::collections::HashMap::new(),
+            graphql: None,
+        };
+
+        emit_l7_request_log(
+            &ctx,
+            &request,
+            "/user",
+            "deny",
+            "l7",
+            "GET /user not permitted by policy",
+            None,
+        );
+        let event = rx.try_recv().expect("deny must emit a denial event");
+        assert_eq!(event.host, "api.example.test");
+        assert_eq!(event.port, 443);
+        assert_eq!(event.binary, "/usr/bin/gh");
+        assert_eq!(event.denial_stage, "l7");
+        assert_eq!(event.l7_method.as_deref(), Some("GET"));
+        assert_eq!(event.l7_path.as_deref(), Some("/user"));
+
+        emit_l7_request_log(&ctx, &request, "/user", "allow", "l7", "", None);
+        assert!(rx.try_recv().is_err(), "allow must not emit a denial event");
+    }
+
     #[test]
     fn parse_rejection_detail_adds_l7_hint_for_encoded_slash() {
         let detail = parse_rejection_detail(
@@ -1383,6 +1458,7 @@ network_policies:
             cmdline_paths: vec![],
             secret_resolver: None,
             activity_tx: None,
+            denial_tx: None,
         };
         let request = L7RequestInfo {
             action: "WEBSOCKET_TEXT".into(),
@@ -1439,6 +1515,7 @@ network_policies:
             cmdline_paths: vec![],
             secret_resolver: None,
             activity_tx: None,
+            denial_tx: None,
         };
 
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
@@ -1544,6 +1621,7 @@ network_policies:
             cmdline_paths: vec![],
             secret_resolver: resolver.map(Arc::new),
             activity_tx: None,
+            denial_tx: None,
         };
 
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
@@ -1662,6 +1740,7 @@ network_policies:
             cmdline_paths: vec![],
             secret_resolver: resolver.map(Arc::new),
             activity_tx: None,
+            denial_tx: None,
         };
 
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
@@ -1833,6 +1912,7 @@ network_policies:
             cmdline_paths: vec![],
             secret_resolver: None,
             activity_tx: None,
+            denial_tx: None,
         };
 
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
@@ -1921,6 +2001,7 @@ network_policies:
             cmdline_paths: vec![],
             secret_resolver: None,
             activity_tx: None,
+            denial_tx: None,
         };
 
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
