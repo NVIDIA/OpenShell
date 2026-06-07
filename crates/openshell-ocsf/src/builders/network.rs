@@ -3,13 +3,11 @@
 
 //! Builder for Network Activity [4001] events.
 
-use std::net::IpAddr;
-
 use crate::builders::SandboxContext;
 use crate::enums::{ActionId, ActivityId, DispositionId, SeverityId, StatusId};
 use crate::events::base_event::BaseEventData;
 use crate::events::{NetworkActivityEvent, OcsfEvent};
-use crate::objects::{Actor, ConnectionInfo, Endpoint, FirewallRule, Process};
+use crate::objects::{Actor, ConnectionInfo, Endpoint, FirewallRule};
 
 /// Builder for Network Activity [4001] events.
 pub struct NetworkActivityBuilder<'a> {
@@ -58,43 +56,8 @@ impl<'a> NetworkActivityBuilder<'a> {
     }
 
     #[must_use]
-    pub fn activity(mut self, id: ActivityId) -> Self {
-        self.activity = id;
-        self
-    }
-    #[must_use]
     pub fn activity_name(mut self, name: impl Into<String>) -> Self {
         self.activity_name = Some(name.into());
-        self
-    }
-    #[must_use]
-    pub fn action(mut self, id: ActionId) -> Self {
-        self.action = Some(id);
-        self
-    }
-    #[must_use]
-    pub fn disposition(mut self, id: DispositionId) -> Self {
-        self.disposition = Some(id);
-        self
-    }
-    #[must_use]
-    pub fn src_endpoint_addr(mut self, ip: IpAddr, port: u16) -> Self {
-        self.src_endpoint = Some(Endpoint::from_ip(ip, port));
-        self
-    }
-    #[must_use]
-    pub fn dst_endpoint(mut self, endpoint: Endpoint) -> Self {
-        self.dst_endpoint = Some(endpoint);
-        self
-    }
-    #[must_use]
-    pub fn actor_process(mut self, process: Process) -> Self {
-        self.actor = Some(Actor { process });
-        self
-    }
-    #[must_use]
-    pub fn firewall_rule(mut self, name: &str, rule_type: &str) -> Self {
-        self.firewall_rule = Some(FirewallRule::new(name, rule_type));
         self
     }
     #[must_use]
@@ -176,12 +139,19 @@ impl<'a> NetworkActivityBuilder<'a> {
     }
 }
 
+impl_activity_setter!(NetworkActivityBuilder);
+impl_action_disposition_setters!(NetworkActivityBuilder);
+impl_actor_process_setter!(NetworkActivityBuilder);
+impl_dst_endpoint_setter!(NetworkActivityBuilder);
+impl_src_endpoint_addr_setter!(NetworkActivityBuilder);
+impl_firewall_rule_setter!(NetworkActivityBuilder);
 impl_builder_setters!(NetworkActivityBuilder);
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::builders::test_sandbox_context;
+    use crate::objects::Process;
 
     #[test]
     fn test_network_activity_builder() {

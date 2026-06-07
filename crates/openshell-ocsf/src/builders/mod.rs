@@ -55,6 +55,99 @@ macro_rules! impl_builder_setters {
     };
 }
 
+/// Generate the `activity` setter used by every event builder that carries an
+/// `activity` field.
+macro_rules! impl_activity_setter {
+    ($builder:ident) => {
+        impl<'a> $builder<'a> {
+            /// Set the event activity identifier.
+            #[must_use]
+            pub fn activity(mut self, id: $crate::enums::ActivityId) -> Self {
+                self.activity = id;
+                self
+            }
+        }
+    };
+}
+
+/// Generate `action` and `disposition` setters shared by network, HTTP, SSH,
+/// process, and detection-finding builders.
+macro_rules! impl_action_disposition_setters {
+    ($builder:ident) => {
+        impl<'a> $builder<'a> {
+            /// Set the action taken.
+            #[must_use]
+            pub fn action(mut self, id: $crate::enums::ActionId) -> Self {
+                self.action = Some(id);
+                self
+            }
+            /// Set the disposition of the action.
+            #[must_use]
+            pub fn disposition(mut self, id: $crate::enums::DispositionId) -> Self {
+                self.disposition = Some(id);
+                self
+            }
+        }
+    };
+}
+
+/// Generate the `actor_process` setter shared by network, HTTP, SSH, and
+/// process-activity builders.
+macro_rules! impl_actor_process_setter {
+    ($builder:ident) => {
+        impl<'a> $builder<'a> {
+            /// Set the acting process.
+            #[must_use]
+            pub fn actor_process(mut self, process: $crate::objects::Process) -> Self {
+                self.actor = Some($crate::objects::Actor { process });
+                self
+            }
+        }
+    };
+}
+
+/// Generate the `dst_endpoint` setter shared by network, HTTP, and SSH builders.
+macro_rules! impl_dst_endpoint_setter {
+    ($builder:ident) => {
+        impl<'a> $builder<'a> {
+            /// Set the destination endpoint.
+            #[must_use]
+            pub fn dst_endpoint(mut self, endpoint: $crate::objects::Endpoint) -> Self {
+                self.dst_endpoint = Some(endpoint);
+                self
+            }
+        }
+    };
+}
+
+/// Generate the `src_endpoint_addr` setter shared by network and SSH builders.
+macro_rules! impl_src_endpoint_addr_setter {
+    ($builder:ident) => {
+        impl<'a> $builder<'a> {
+            /// Set the source endpoint from a raw IP address and port.
+            #[must_use]
+            pub fn src_endpoint_addr(mut self, ip: std::net::IpAddr, port: u16) -> Self {
+                self.src_endpoint = Some($crate::objects::Endpoint::from_ip(ip, port));
+                self
+            }
+        }
+    };
+}
+
+/// Generate the `firewall_rule` setter shared by network and HTTP builders.
+macro_rules! impl_firewall_rule_setter {
+    ($builder:ident) => {
+        impl<'a> $builder<'a> {
+            /// Set the firewall rule that matched this event.
+            #[must_use]
+            pub fn firewall_rule(mut self, name: &str, rule_type: &str) -> Self {
+                self.firewall_rule = Some($crate::objects::FirewallRule::new(name, rule_type));
+                self
+            }
+        }
+    };
+}
+
 mod base;
 mod config;
 mod finding;

@@ -7,7 +7,7 @@ use crate::builders::SandboxContext;
 use crate::enums::{ActionId, ActivityId, DispositionId, SeverityId, StatusId};
 use crate::events::base_event::BaseEventData;
 use crate::events::{HttpActivityEvent, OcsfEvent};
-use crate::objects::{Actor, Endpoint, FirewallRule, HttpRequest, HttpResponse, Process};
+use crate::objects::{Actor, Endpoint, FirewallRule, HttpRequest, HttpResponse};
 
 /// Builder for HTTP Activity [4002] events.
 pub struct HttpActivityBuilder<'a> {
@@ -49,21 +49,6 @@ impl<'a> HttpActivityBuilder<'a> {
     }
 
     #[must_use]
-    pub fn activity(mut self, id: ActivityId) -> Self {
-        self.activity = id;
-        self
-    }
-    #[must_use]
-    pub fn action(mut self, id: ActionId) -> Self {
-        self.action = Some(id);
-        self
-    }
-    #[must_use]
-    pub fn disposition(mut self, id: DispositionId) -> Self {
-        self.disposition = Some(id);
-        self
-    }
-    #[must_use]
     pub fn http_request(mut self, req: HttpRequest) -> Self {
         self.http_request = Some(req);
         self
@@ -76,21 +61,6 @@ impl<'a> HttpActivityBuilder<'a> {
     #[must_use]
     pub fn src_endpoint(mut self, ep: Endpoint) -> Self {
         self.src_endpoint = Some(ep);
-        self
-    }
-    #[must_use]
-    pub fn dst_endpoint(mut self, ep: Endpoint) -> Self {
-        self.dst_endpoint = Some(ep);
-        self
-    }
-    #[must_use]
-    pub fn actor_process(mut self, process: Process) -> Self {
-        self.actor = Some(Actor { process });
-        self
-    }
-    #[must_use]
-    pub fn firewall_rule(mut self, name: &str, rule_type: &str) -> Self {
-        self.firewall_rule = Some(FirewallRule::new(name, rule_type));
         self
     }
     #[must_use]
@@ -136,13 +106,18 @@ impl<'a> HttpActivityBuilder<'a> {
     }
 }
 
+impl_activity_setter!(HttpActivityBuilder);
+impl_action_disposition_setters!(HttpActivityBuilder);
+impl_actor_process_setter!(HttpActivityBuilder);
+impl_dst_endpoint_setter!(HttpActivityBuilder);
+impl_firewall_rule_setter!(HttpActivityBuilder);
 impl_builder_setters!(HttpActivityBuilder);
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::builders::test_sandbox_context;
-    use crate::objects::Url;
+    use crate::objects::{Process, Url};
 
     #[test]
     fn test_http_activity_builder() {

@@ -49,21 +49,6 @@ impl<'a> DetectionFindingBuilder<'a> {
     }
 
     #[must_use]
-    pub fn activity(mut self, id: ActivityId) -> Self {
-        self.activity = id;
-        self
-    }
-    #[must_use]
-    pub fn action(mut self, id: ActionId) -> Self {
-        self.action = Some(id);
-        self
-    }
-    #[must_use]
-    pub fn disposition(mut self, id: DispositionId) -> Self {
-        self.disposition = Some(id);
-        self
-    }
-    #[must_use]
     pub fn finding_info(mut self, info: FindingInfo) -> Self {
         self.finding_info = Some(info);
         self
@@ -164,6 +149,8 @@ impl<'a> DetectionFindingBuilder<'a> {
     }
 }
 
+impl_activity_setter!(DetectionFindingBuilder);
+impl_action_disposition_setters!(DetectionFindingBuilder);
 impl_builder_setters!(DetectionFindingBuilder, no_status);
 
 #[cfg(test)]
