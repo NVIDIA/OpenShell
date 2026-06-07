@@ -24,7 +24,7 @@ credentials:
     env_vars: [AWS_REGION, AWS_DEFAULT_REGION]
     required: true
 discovery:
-  credentials: [aws_access_key_id, aws_secret_access_key, aws_region]
+  credentials: [aws_access_key_id, aws_secret_access_key, aws_session_token, aws_region]
 endpoints:
   # Default endpoint targets us-east-1 since the YAML loader does not yet
   # substitute the `{region}` placeholder. Operators in other regions
