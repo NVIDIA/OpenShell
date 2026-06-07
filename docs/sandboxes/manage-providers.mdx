@@ -256,6 +256,7 @@ The following provider types are supported.
 | Type | Environment Variables Injected | Typical Use |
 |---|---|---|
 | `anthropic` | `ANTHROPIC_API_KEY` | Anthropic API |
+| `aws-bedrock` | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_REGION` | AWS Bedrock InvokeModel via a translating bridge. Today the router does not inject any auth header; the configured `BEDROCK_BASE_URL` upstream is expected to handle auth itself. Refer to [Inference Routing](/sandboxes/inference-routing). |
 | `claude` | `ANTHROPIC_API_KEY`, `CLAUDE_API_KEY` | Claude Code, Anthropic API |
 | `codex` | `OPENAI_API_KEY` | OpenAI Codex |
 | `copilot` | `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_TOKEN` | GitHub Copilot CLI |
@@ -283,6 +284,7 @@ The following providers have been tested with `inference.local`. Any provider th
 
 | Provider | Name | Type | Base URL | API Key Variable |
 |---|---|---|---|---|
+| AWS Bedrock (via bridge) | `bedrock-bridge` | `aws-bedrock` | Operator-supplied `BEDROCK_BASE_URL` | None at router level (bridge holds creds) |
 | NVIDIA API Catalog | `nvidia-prod` | `nvidia` | `https://integrate.api.nvidia.com/v1` | `NVIDIA_API_KEY` |
 | Anthropic | `anthropic-prod` | `anthropic` | `https://api.anthropic.com` | `ANTHROPIC_API_KEY` |
 | Google Vertex AI | `vertex-prod` | `google-vertex-ai` | Regional, global, or multi-region Vertex endpoint | `GOOGLE_VERTEX_AI_TOKEN` or `GOOGLE_VERTEX_AI_SERVICE_ACCOUNT_TOKEN` |

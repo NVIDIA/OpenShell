@@ -620,26 +620,33 @@ fn resolve_provider_route(
     let profile = openshell_core::inference::profile_for(&provider_type).ok_or_else(|| {
         Status::invalid_argument(format!(
             "provider '{name}' has unsupported type '{raw_provider_type}' for cluster inference \
-                 (supported: openai, anthropic, nvidia, deepinfra, google-vertex-ai)",
+                 (supported: openai, anthropic, nvidia, deepinfra, google-vertex-ai, aws-bedrock)",
             name = provider.object_name()
         ))
     })?;
 
-    let api_key = find_provider_api_key(
-        provider,
-        profile.credential_key_names,
-        if provider_type == "google-vertex-ai" {
-            CredentialLookup::PreferredOnly
-        } else {
-            CredentialLookup::PreferredThenAny
-        },
-    )
-    .ok_or_else(|| {
-        Status::invalid_argument(format!(
-            "provider '{name}' has no usable API key credential",
-            name = provider.object_name()
-        ))
-    })?;
+    // Profiles with `auth: None` are bridge-fronted — the upstream
+    // authenticates itself, so the router doesn't need a credential at
+    // route-resolution time. Today this is `aws-bedrock`.
+    let api_key = if matches!(profile.auth, openshell_core::inference::AuthHeader::None) {
+        String::new()
+    } else {
+        find_provider_api_key(
+            provider,
+            profile.credential_key_names,
+            if provider_type == "google-vertex-ai" {
+                CredentialLookup::PreferredOnly
+            } else {
+                CredentialLookup::PreferredThenAny
+            },
+        )
+        .ok_or_else(|| {
+            Status::invalid_argument(format!(
+                "provider '{name}' has no usable API key credential",
+                name = provider.object_name()
+            ))
+        })?
+    };
 
     // Vertex AI requires a model-aware URL; delegate to specialised resolver.
     if provider_type == "google-vertex-ai" {
@@ -1057,6 +1064,72 @@ mod tests {
         let config = second.route.config.as_ref().expect("config");
         assert_eq!(config.provider_name, "openai-dev");
         assert_eq!(config.model_id, "gpt-4.1");
+    }
+
+    #[tokio::test]
+    async fn upsert_cluster_route_succeeds_for_aws_bedrock_without_api_key() {
+        // aws-bedrock is registered with `auth: AuthHeader::None` (the
+        // bridge-fronted shape) so route resolution must NOT require a
+        // credential lookup. Create a provider with empty credentials
+        // and confirm upsert succeeds, the resolved route carries
+        // `provider_type: "aws-bedrock"`, the default Bedrock base URL,
+        // and an empty api_key. SigV4 signing for direct AWS Bedrock is
+        // a separate follow-up; this test pins down the bridge-fronted
+        // contract this PR delivers.
+        let store = test_store().await;
+
+        let provider = Provider {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "provider-bedrock-bridge".to_string(),
+                name: "bedrock-bridge".to_string(),
+                created_at_ms: 1_000_000,
+                labels: std::collections::HashMap::new(),
+                resource_version: 0,
+            }),
+            r#type: "aws-bedrock".to_string(),
+            // Bridge-fronted: no credential needed at route-resolution
+            // time. The bridge holds operator-side auth in its own pod.
+            credentials: std::collections::HashMap::new(),
+            config: std::iter::once((
+                "BEDROCK_BASE_URL".to_string(),
+                "http://bedrock-bridge.demo.svc.cluster.local:8080".to_string(),
+            ))
+            .collect(),
+            credential_expires_at_ms: std::collections::HashMap::new(),
+        };
+        store
+            .put_message(&provider)
+            .await
+            .expect("provider should persist");
+
+        let upserted = upsert_cluster_inference_route(
+            &store,
+            CLUSTER_INFERENCE_ROUTE_NAME,
+            "bedrock-bridge",
+            "anthropic.claude-3-5-sonnet-20241022-v2:0",
+            0,
+            false,
+        )
+        .await
+        .expect("upsert should succeed for aws-bedrock provider");
+
+        assert_eq!(upserted.route.object_name(), CLUSTER_INFERENCE_ROUTE_NAME);
+        let config = upserted.route.config.as_ref().expect("config");
+        assert_eq!(config.provider_name, "bedrock-bridge");
+        assert_eq!(config.model_id, "anthropic.claude-3-5-sonnet-20241022-v2:0");
+
+        // Verify the resolved route metadata reflects bridge-fronted
+        // auth (empty api_key + provider_type = "aws-bedrock").
+        let managed = resolve_route_by_name(&store, CLUSTER_INFERENCE_ROUTE_NAME)
+            .await
+            .expect("route should resolve")
+            .expect("managed route should exist");
+        assert_eq!(managed.provider_type, "aws-bedrock");
+        assert_eq!(
+            managed.base_url,
+            "http://bedrock-bridge.demo.svc.cluster.local:8080"
+        );
+        assert_eq!(managed.api_key, "");
     }
 
     #[tokio::test]

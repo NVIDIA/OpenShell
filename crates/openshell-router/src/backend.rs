@@ -216,6 +216,13 @@ fn prepare_backend_request(
         AuthHeader::Custom(header_name) => {
             builder = builder.header(*header_name, &route.api_key);
         }
+        AuthHeader::None => {
+            // Bridge-fronted upstream: no router-side auth injection.
+            // The configured `endpoint` is expected to be a translating
+            // bridge / proxy whose own pod holds operator-side
+            // credentials. Used today by the `aws-bedrock` profile
+            // (SigV4 signing is a separate follow-up).
+        }
     }
     for (name, value) in &headers {
         builder = builder.header(name.as_str(), value.as_str());
