@@ -75,7 +75,7 @@ fn draw_form(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .split(inner);
 
     // --- Name ---
-    draw_text_field(
+    super::draw_text_field(
         frame,
         "Name",
         &form.name,
@@ -83,10 +83,12 @@ fn draw_form(frame: &mut Frame<'_>, app: &App, area: Rect) {
         form.focused_field == CreateFormField::Name,
         chunks[0],
         t,
+        "█",
+        true,
     );
 
     // --- Image ---
-    draw_text_field(
+    super::draw_text_field(
         frame,
         "Image",
         &form.image,
@@ -94,10 +96,12 @@ fn draw_form(frame: &mut Frame<'_>, app: &App, area: Rect) {
         form.focused_field == CreateFormField::Image,
         chunks[1],
         t,
+        "█",
+        true,
     );
 
     // --- Command ---
-    draw_text_field(
+    super::draw_text_field(
         frame,
         "Command",
         &form.command,
@@ -105,6 +109,8 @@ fn draw_form(frame: &mut Frame<'_>, app: &App, area: Rect) {
         form.focused_field == CreateFormField::Command,
         chunks[2],
         t,
+        "█",
+        true,
     );
 
     // --- Providers label ---
@@ -376,47 +382,4 @@ pub fn render_chase(
     }
 
     Line::from(spans)
-}
-
-// ---------------------------------------------------------------------------
-// Form helpers
-// ---------------------------------------------------------------------------
-
-fn draw_text_field(
-    frame: &mut Frame<'_>,
-    label: &str,
-    value: &str,
-    placeholder: &str,
-    focused: bool,
-    area: Rect,
-    theme: &crate::theme::Theme,
-) {
-    let t = theme;
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1), // label
-            Constraint::Length(1), // input
-            Constraint::Length(1), // gap
-        ])
-        .split(area);
-
-    let label_style = if focused { t.accent_bold } else { t.text };
-    let mut label_spans = vec![Span::styled(format!("{label}:"), label_style)];
-    if !placeholder.is_empty() {
-        label_spans.push(Span::styled(format!("  {placeholder}"), t.muted));
-    }
-    frame.render_widget(Paragraph::new(Line::from(label_spans)), chunks[0]);
-
-    let display = if value.is_empty() && !focused {
-        Line::from(Span::styled("  -", t.muted))
-    } else if focused {
-        Line::from(vec![
-            Span::styled(format!("  {value}"), t.accent),
-            Span::styled("█", t.accent),
-        ])
-    } else {
-        Line::from(Span::styled(format!("  {value}"), t.text))
-    };
-    frame.render_widget(Paragraph::new(display), chunks[1]);
 }

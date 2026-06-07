@@ -279,7 +279,7 @@ fn draw_enter_key(
 
     // Name field.
     let name_placeholder = format!("optional (defaults to {selected_type})");
-    draw_text_field(
+    super::draw_text_field(
         frame,
         "Name",
         &form.name,
@@ -287,6 +287,8 @@ fn draw_enter_key(
         form.key_field == ProviderKeyField::Name,
         chunks[idx],
         t,
+        "_",
+        false,
     );
     idx += 1;
 
@@ -295,7 +297,7 @@ fn draw_enter_key(
 
     if form.is_generic {
         // Env var name field.
-        draw_text_field(
+        super::draw_text_field(
             frame,
             "Env var name",
             &form.generic_env_name,
@@ -303,6 +305,8 @@ fn draw_enter_key(
             form.key_field == ProviderKeyField::EnvVarName,
             chunks[idx],
             t,
+            "_",
+            false,
         );
         idx += 1;
 
@@ -772,44 +776,6 @@ pub fn draw_update(frame: &mut Frame<'_>, app: &App, area: Rect) {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-fn draw_text_field(
-    frame: &mut Frame<'_>,
-    label: &str,
-    value: &str,
-    placeholder: &str,
-    focused: bool,
-    area: Rect,
-    theme: &crate::theme::Theme,
-) {
-    let t = theme;
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1), // label
-            Constraint::Length(1), // input
-        ])
-        .split(area);
-
-    let label_style = if focused { t.accent_bold } else { t.text };
-    let mut label_spans = vec![Span::styled(format!("{label}:"), label_style)];
-    if !placeholder.is_empty() {
-        label_spans.push(Span::styled(format!("  {placeholder}"), t.muted));
-    }
-    frame.render_widget(Paragraph::new(Line::from(label_spans)), chunks[0]);
-
-    let display = if value.is_empty() && !focused {
-        Line::from(Span::styled("  -", t.muted))
-    } else if focused {
-        Line::from(vec![
-            Span::styled(format!("  {value}"), t.accent),
-            Span::styled("_", t.accent),
-        ])
-    } else {
-        Line::from(Span::styled(format!("  {value}"), t.text))
-    };
-    frame.render_widget(Paragraph::new(display), chunks[1]);
-}
 
 fn draw_secret_field(
     frame: &mut Frame<'_>,

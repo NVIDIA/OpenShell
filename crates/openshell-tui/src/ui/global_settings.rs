@@ -4,7 +4,7 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Clear, Padding, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Borders, Cell, Padding, Row, Table};
 
 use super::draw_empty_message;
 
@@ -133,10 +133,6 @@ fn draw_confirm_set(frame: &mut Frame<'_>, app: &App, idx: usize, area: Rect) {
     };
     let new_value = app.setting_edit.as_ref().map_or("-", |e| e.input.as_str());
 
-    // 7 content lines + 2 border rows = 9 outer height.
-    let popup = centered_rect(60, 9, area);
-    frame.render_widget(Clear, popup);
-
     let lines = vec![
         Line::from(Span::styled(" Confirm Global Setting Change ", t.heading)),
         Line::from(""),
@@ -161,12 +157,7 @@ fn draw_confirm_set(frame: &mut Frame<'_>, app: &App, idx: usize, area: Rect) {
         ]),
     ];
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(t.border_focused)
-        .padding(Padding::horizontal(1));
-
-    frame.render_widget(Paragraph::new(lines).block(block), popup);
+    super::draw_confirm_popup(frame, lines, t.border_focused, 60, area);
 }
 
 fn draw_confirm_delete(frame: &mut Frame<'_>, app: &App, idx: usize, area: Rect) {
@@ -197,17 +188,5 @@ fn draw_confirm_delete(frame: &mut Frame<'_>, app: &App, idx: usize, area: Rect)
         ]),
     ];
 
-    // content lines + 2 for border
-    let popup_height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
-    let popup = centered_rect(60, popup_height, area);
-    frame.render_widget(Clear, popup);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(t.status_err)
-        .padding(Padding::horizontal(1));
-
-    frame.render_widget(Paragraph::new(lines).block(block), popup);
+    super::draw_confirm_popup(frame, lines, t.status_err, 60, area);
 }
-
-use super::centered_popup as centered_rect;
