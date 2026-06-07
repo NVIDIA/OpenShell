@@ -59,9 +59,28 @@ pub fn severity_tag(severity_id: u8) -> &'static str {
     }
 }
 
-/// Max length for the reason text in `[reason:...]` before truncation.
-const MAX_REASON_LEN: usize = 80;
+/// Max length for the reason text in `[reason:...]` before truncation. A
+/// denial reason carries the full destination endpoint plus the rejecting
+/// policy name (e.g. `endpoint host.example:443 not in policy <name>`), so the
+/// budget has to be wide enough to keep the port and policy name readable in
+/// the shorthand denial logs; 80 chars cut a typical reason mid-endpoint.
+const MAX_REASON_LEN: usize = 256;
 const MAX_MESSAGE_LEN: usize = 120;
+
+/// Truncate `text` to at most `max` bytes at a UTF-8 char boundary, appending
+/// an ellipsis when it was shortened. Slicing on a raw byte index panics when
+/// the index falls inside a multibyte char, so step back to the nearest
+/// boundary first.
+fn truncate_with_ellipsis(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &text[..end])
+}
 
 /// Format a `[reason:...]` tag from `status_detail` (or `message` fallback)
 /// for denied events.  Returns an empty string if neither field is set.
@@ -74,11 +93,11 @@ fn reason_tag(base: &BaseEventData) -> String {
     if text.is_empty() {
         return String::new();
     }
-    if text.len() > MAX_REASON_LEN {
-        format!(" [reason:{}...]", &text[..MAX_REASON_LEN])
-    } else {
-        format!(" [reason:{text}]")
-    }
+    let text = text.replace(['\n', '\r'], " ");
+    format!(
+        " [reason:{}]",
+        truncate_with_ellipsis(&text, MAX_REASON_LEN)
+    )
 }
 
 fn message_tag(base: &BaseEventData) -> String {
@@ -87,11 +106,7 @@ fn message_tag(base: &BaseEventData) -> String {
         return String::new();
     }
     let text = text.replace(['\n', '\r'], " ");
-    if text.len() > MAX_MESSAGE_LEN {
-        format!(" [msg:{}...]", &text[..MAX_MESSAGE_LEN])
-    } else {
-        format!(" [msg:{text}]")
-    }
+    format!(" [msg:{}]", truncate_with_ellipsis(&text, MAX_MESSAGE_LEN))
 }
 
 impl OcsfEvent {
@@ -644,12 +659,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_shorthand_reason_truncated_at_80_chars() {
-        let long_reason = "a".repeat(120);
+    fn denied_network_shorthand(status_detail: String) -> String {
         let mut b = base(4001, "Network Activity", 4, "Network Activity", 1, "Open");
         b.severity = crate::enums::SeverityId::Medium;
-        b.set_status_detail(long_reason.clone());
+        b.set_status_detail(status_detail);
 
         let event = OcsfEvent::NetworkActivity(NetworkActivityEvent {
             base: b,
@@ -664,20 +677,75 @@ mod tests {
             observation_point_id: None,
             is_src_dst_assignment_known: None,
         });
+        event.format_shorthand()
+    }
 
-        let shorthand = event.format_shorthand();
+    #[test]
+    fn test_shorthand_reason_truncated_beyond_max_len() {
+        let long_reason = "a".repeat(MAX_REASON_LEN + 40);
+        let shorthand = denied_network_shorthand(long_reason.clone());
         assert!(
             shorthand.contains("[reason:"),
             "should have reason tag: {shorthand}"
         );
         assert!(
             shorthand.contains("...]"),
-            "long reason should be truncated with ...: {shorthand}"
+            "an over-budget reason should be truncated with ...: {shorthand}"
         );
-        // The full 120-char reason should not appear
         assert!(
             !shorthand.contains(&long_reason),
-            "full reason should not appear: {shorthand}"
+            "full over-budget reason should not appear: {shorthand}"
+        );
+    }
+
+    #[test]
+    fn test_shorthand_reason_keeps_full_endpoint_and_policy() {
+        // Regression for #4760: a realistic denial reason (full FQDN, port, and
+        // rejecting policy name) is under the budget and must render end-to-end
+        // with no `...` truncation so the operator can read why it was denied.
+        let reason =
+            "endpoint nemoclaw-prr-repro-long-hostname-for-truncation-test.example.invalid:443 \
+             not in policy balanced"
+                .to_string();
+        assert!(reason.len() <= MAX_REASON_LEN);
+        let shorthand = denied_network_shorthand(reason.clone());
+        assert!(
+            shorthand.contains(&format!("[reason:{reason}]")),
+            "full reason (endpoint + :443 + policy name) should be readable: {shorthand}"
+        );
+        assert!(
+            !shorthand.contains("...]"),
+            "an in-budget reason should not be truncated: {shorthand}"
+        );
+    }
+
+    #[test]
+    fn test_shorthand_reason_truncates_on_multibyte_char_boundary() {
+        // A raw byte slice at MAX_REASON_LEN would panic when the boundary
+        // falls inside a multibyte char; truncation must step back safely. The
+        // boundary byte lands inside the 2-byte "é" here: MAX_REASON_LEN-1
+        // single-byte chars, then a multibyte char straddling the limit.
+        let reason = format!("{}étail", "a".repeat(MAX_REASON_LEN - 1));
+        let shorthand = denied_network_shorthand(reason);
+        assert!(
+            shorthand.contains("...]"),
+            "over-budget multibyte reason should be truncated: {shorthand}"
+        );
+    }
+
+    #[test]
+    fn test_shorthand_reason_normalizes_newlines() {
+        // status_detail can carry endpoint/error-derived text; the single-line
+        // shorthand must not let embedded CR/LF break downstream log parsing
+        // (CWE-117), matching the [msg:...] tag's normalization.
+        let shorthand = denied_network_shorthand("line one\nline two\rline three".to_string());
+        assert!(
+            !shorthand.contains('\n') && !shorthand.contains('\r'),
+            "reason newlines must be normalized: {shorthand}"
+        );
+        assert!(
+            shorthand.contains("line one line two line three"),
+            "reason newlines should become spaces: {shorthand}"
         );
     }
 
