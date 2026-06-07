@@ -27,8 +27,10 @@ shared runtime under `openshell-agents/runtime/` provides the sandbox entrypoint
 harness install helpers, an in-sandbox supervisor, and harness-specific execution
 adapters. The supervisor supports one-shot execution and long-lived watch mode:
 watch mode keeps the sandbox alive but runs harnesses as bounded child cycles,
-sleeping between cycles without holding a model transport connection open. Agent
-durable state remains domain-specific rather than stored in the sandbox runtime.
+sleeping between cycles without holding a model transport connection open. Watch
+mode retries harness transport failures and malformed cycle results with bounded
+backoff until the agent reports a terminal state. Agent durable state remains
+domain-specific rather than stored in the sandbox runtime.
 
 ## Linux Runtime Environments
 

@@ -12,7 +12,8 @@ require_env() {
 
 require_env OPENSHELL_AGENT_HARNESS
 
-SUPERVISOR="/sandbox/payload/runtime/supervisor.sh"
+PAYLOAD_DIR="${OPENSHELL_AGENT_PAYLOAD_DIR:-/sandbox/payload}"
+SUPERVISOR="$PAYLOAD_DIR/runtime/supervisor.sh"
 
 [[ -x "$SUPERVISOR" ]] || { echo "missing agent supervisor: $SUPERVISOR" >&2; exit 1; }
 

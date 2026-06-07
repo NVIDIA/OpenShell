@@ -39,7 +39,7 @@ sections:
 - `harness`: default harness and per-harness settings such as model and
   reasoning effort.
 - `runtime`: in-sandbox run mode (`once` or `watch`), watch poll interval, and
-  transient failure retry limit.
+  transient failure logging threshold.
 - `profile_paths`: ordered directories to scan for provider profile YAML files.
 - `settings`: gateway settings to apply before launch.
 - `providers`: provider instances to create or update, credential sources, and
@@ -108,8 +108,11 @@ OPENSHELL_AGENT_RESULT {"status":"waiting","next_poll_seconds":900,"reason":"che
 Supported statuses are `complete`, `waiting`, `blocked`, `transient_failure`, and
 `terminal_failure`. The supervisor sleeps between `waiting` or `blocked` cycles
 without keeping the harness connected, then launches a fresh harness cycle inside
-the same sandbox. This keeps long-lived agents resilient to harness transport
-disconnects while leaving durable state ownership to the agent domain.
+the same sandbox. In `watch` mode, missing or malformed result sentinels and
+harness transport failures are retried indefinitely with bounded backoff; only
+`complete` and `terminal_failure` stop the supervisor. This keeps long-lived
+agents resilient to upstream model errors while leaving durable state ownership
+to the agent domain.
 
 The shared runtime does not prescribe the durable state store. Gator uses GitHub
 labels, comments, reviews, and checks. Other agents can use a repository branch,
