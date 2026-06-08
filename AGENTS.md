@@ -160,6 +160,7 @@ ocsf_emit!(event);
 - Always use [Conventional Commits](https://www.conventionalcommits.org/) format for commit messages
 - Format: `<type>(<scope>): <description>` (scope is optional)
 - Common types: `feat`, `fix`, `docs`, `chore`, `refactor`, `test`, `ci`, `perf`
+- Sign each commit for DCO compliance (`git commit -s`, or include a `Signed-off-by: Name <email>` trailer)
 - Never mention Claude or any AI agent in commits (no author attribution, no Co-Authored-By, no references in commit messages)
 
 ## Pre-commit
