@@ -83,6 +83,7 @@ enum SandboxUploadPlan {
         files: Vec<String>,
     },
     Regular,
+    GitFilteredEmpty,
 }
 
 /// Convert a sandbox phase integer to a human-readable string.
@@ -2137,6 +2138,21 @@ pub async fn sandbox_create(
                             &sandbox_name,
                             &base_dir,
                             &files,
+                            local,
+                            dest,
+                            &effective_tls,
+                        )
+                        .await?;
+                    }
+                    SandboxUploadPlan::GitFilteredEmpty => {
+                        eprintln!(
+                            "  {} .gitignore filtering excluded all files in {}; uploading unfiltered",
+                            "⚠".yellow().bold(),
+                            local.display(),
+                        );
+                        sandbox_sync_up(
+                            &effective_server,
+                            &sandbox_name,
                             local,
                             dest,
                             &effective_tls,
@@ -5800,12 +5816,13 @@ fn sandbox_upload_plan(local_path: &Path, git_ignore: bool) -> Result<SandboxUpl
         }
     })?;
 
-    if git_ignore
-        && !metadata.file_type().is_symlink()
-        && let Ok((base_dir, files)) = git_sync_files(local_path)
-        && !files.is_empty()
-    {
-        return Ok(SandboxUploadPlan::GitAware { base_dir, files });
+    if git_ignore && !metadata.file_type().is_symlink() {
+        if let Ok((base_dir, files)) = git_sync_files(local_path) {
+            if files.is_empty() {
+                return Ok(SandboxUploadPlan::GitFilteredEmpty);
+            }
+            return Ok(SandboxUploadPlan::GitAware { base_dir, files });
+        }
     }
 
     Ok(SandboxUploadPlan::Regular)
@@ -8379,8 +8396,8 @@ mod tests {
 
         assert_eq!(
             plan,
-            super::SandboxUploadPlan::Regular,
-            "gitignored directory should fall back to regular upload"
+            super::SandboxUploadPlan::GitFilteredEmpty,
+            "gitignored directory should fall back with GitFilteredEmpty"
         );
     }
 

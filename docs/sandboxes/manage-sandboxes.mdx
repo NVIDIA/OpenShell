@@ -337,6 +337,13 @@ openshell sandbox create --upload ./src:/workspace/src --upload ./config:/worksp
 
 </Note>
 
+By default, uploads inside a Git repository respect `.gitignore` rules so that
+build artifacts, dependency caches, and other ignored files are not transferred.
+If `.gitignore` filtering excludes every file in the upload path, the CLI falls
+back to an unfiltered upload and prints a warning. Pass a path outside the Git
+work tree or use `sandbox upload` with an explicit file list to avoid the
+fallback.
+
 ## Delete Sandboxes
 
 Deleting a sandbox stops all processes, releases resources, and purges injected credentials.
