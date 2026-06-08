@@ -8975,6 +8975,8 @@ mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let tmpdir = tempfile::tempdir().expect("create tmpdir");
         with_tmp_xdg(tmpdir.path(), || {
+            let _no_browser = EnvVarGuard::set("OPENSHELL_NO_BROWSER", "0");
+            let _browser_auth_failure = EnvVarGuard::set("OPENSHELL_TEST_BROWSER_AUTH_FAIL", "1");
             let runtime = tokio::runtime::Runtime::new().expect("create runtime");
 
             // Register a working plaintext gateway first.
@@ -8995,12 +8997,9 @@ mod tests {
             });
             assert_eq!(load_active_gateway().as_deref(), Some("existing-gw"));
 
-            // Attempt cloud gateway add. The browser flow will fail because
-            // OPENSHELL_NO_BROWSER is NOT set but the /auth/connect endpoint
-            // is unreachable (connection refused), so the 120s timeout would
-            // kick in. To keep the test fast, set OPENSHELL_NO_BROWSER=0
-            // (explicitly not suppressed) and use a port that refuses connections.
-            // The CF auth flow will fail quickly on connection refused.
+            // Attempt cloud gateway add. Keep browser suppression disabled so
+            // auth failure still rolls back the registration, but use the
+            // test-only auth failure hook instead of opening the OS browser.
             runtime.block_on(async {
                 gateway_add(
                     "https://127.0.0.1:1",
