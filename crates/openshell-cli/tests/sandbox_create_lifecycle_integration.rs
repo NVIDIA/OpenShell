@@ -18,13 +18,14 @@ use openshell_core::proto::{
     ExecSandboxInput, ExecSandboxRequest, GatewayMessage, GetGatewayConfigRequest,
     GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
     GetSandboxConfigResponse, GetSandboxProviderEnvironmentRequest,
-    GetSandboxProviderEnvironmentResponse, GetSandboxRequest, HealthRequest, HealthResponse,
-    ListProvidersRequest, ListProvidersResponse, ListSandboxProvidersRequest,
-    ListSandboxProvidersResponse, ListSandboxesRequest, ListSandboxesResponse, PlatformEvent,
-    ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, Sandbox, SandboxCondition,
-    SandboxLogLine, SandboxPhase, SandboxResponse, SandboxStatus, SandboxStreamEvent,
-    ServiceStatus, SettingValue, SupervisorMessage, UpdateProviderRequest, WatchSandboxRequest,
-    sandbox_stream_event, setting_value,
+    GetSandboxProviderEnvironmentResponse, GetSandboxRequest, GpuResourceRequirements,
+    HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
+    ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
+    ListSandboxesResponse, PlatformEvent, ProviderResponse, RevokeSshSessionRequest,
+    RevokeSshSessionResponse, Sandbox, SandboxCondition, SandboxLogLine, SandboxPhase,
+    SandboxResponse, SandboxStatus, SandboxStreamEvent, ServiceStatus, SettingValue,
+    SupervisorMessage, UpdateProviderRequest, WatchSandboxRequest, sandbox_stream_event,
+    setting_value,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -1087,6 +1088,10 @@ fn test_tls(server: &TestServer) -> TlsOptions {
     server.tls.with_gateway_name("openshell")
 }
 
+fn gpu_requirements() -> GpuResourceRequirements {
+    GpuResourceRequirements {}
+}
+
 #[tokio::test]
 async fn sandbox_create_keeps_command_sessions_by_default() {
     let server = run_server().await;
@@ -1103,7 +1108,7 @@ async fn sandbox_create_keeps_command_sessions_by_default() {
         "openshell",
         &[],
         true,
-        false,
+        None,
         None,
         None,
         None,
@@ -1146,7 +1151,7 @@ async fn sandbox_create_sends_cpu_and_memory_limits_only() {
         "openshell",
         &[],
         true,
-        false,
+        None,
         Some("500m"),
         Some("2Gi"),
         None,
@@ -1223,7 +1228,7 @@ async fn sandbox_create_sends_driver_config_json() {
         "openshell",
         &[],
         true,
-        false,
+        None,
         None,
         None,
         Some(r#"{"kubernetes":{"pod":{"priority_class_name":"batch-low"}}}"#),
@@ -1281,6 +1286,56 @@ async fn sandbox_create_sends_driver_config_json() {
 }
 
 #[tokio::test]
+async fn sandbox_create_sends_gpu_default_request() {
+    let server = run_server().await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+
+    run::sandbox_create(
+        &server.endpoint,
+        Some("gpu-default"),
+        None,
+        "openshell",
+        &[],
+        true,
+        Some(gpu_requirements()),
+        None,
+        None,
+        None,
+        None,
+        &[],
+        None,
+        None,
+        &["echo".to_string(), "OK".to_string()],
+        Some(false),
+        Some(false),
+        &HashMap::new(),
+        &HashMap::new(),
+        "manual",
+        &tls,
+    )
+    .await
+    .expect("sandbox create should succeed");
+
+    let requests = create_requests(&server).await;
+    let gpu = requests[0]
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.resource_requirements.as_ref())
+        .and_then(|requirements| requirements.gpu.as_ref())
+        .expect("GPU requirement should be sent");
+
+    assert!(requests[0]
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.resource_requirements.as_ref())
+        .is_some_and(|requirements| requirements.gpu.is_some()));
+}
+
+#[tokio::test]
 async fn sandbox_create_does_not_infer_command_providers_when_v2_enabled() {
     let server = run_server().await;
     enable_providers_v2(&server).await;
@@ -1297,7 +1352,7 @@ async fn sandbox_create_does_not_infer_command_providers_when_v2_enabled() {
         "openshell",
         &[],
         true,
-        false,
+        None,
         None,
         None,
         None,
@@ -1355,7 +1410,7 @@ async fn sandbox_create_returns_vm_error_without_waiting_for_timeout() {
         "openshell",
         &[],
         true,
-        false,
+        None,
         None,
         None,
         None,
@@ -1409,7 +1464,7 @@ async fn sandbox_create_keeps_waiting_while_vm_progress_arrives() {
         "openshell",
         &[],
         true,
-        false,
+        None,
         None,
         None,
         None,
@@ -1455,7 +1510,7 @@ async fn sandbox_create_times_out_when_only_logs_arrive() {
         "openshell",
         &[],
         true,
-        false,
+        None,
         None,
         None,
         None,
@@ -1497,7 +1552,7 @@ async fn sandbox_create_deletes_command_sessions_with_no_keep() {
         "openshell",
         &[],
         false,
-        false,
+        None,
         None,
         None,
         None,
@@ -1543,7 +1598,7 @@ async fn sandbox_create_deletes_shell_sessions_with_no_keep() {
         "openshell",
         &[],
         false,
-        false,
+        None,
         None,
         None,
         None,
@@ -1589,7 +1644,7 @@ async fn sandbox_create_keeps_sandbox_with_hidden_keep_flag() {
         "openshell",
         &[],
         true,
-        false,
+        None,
         None,
         None,
         None,
@@ -1635,7 +1690,7 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
         "openshell",
         &[],
         false,
-        false,
+        None,
         None,
         None,
         None,
@@ -1787,7 +1842,7 @@ async fn sandbox_create_sends_environment_variables() {
         "openshell",
         &[],
         true,
-        false,
+        None,
         None,
         None,
         None,

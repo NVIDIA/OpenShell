@@ -29,6 +29,7 @@ use oci_client::manifest::{
 };
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Reference, RegistryOperation};
+use openshell_core::gpu::driver_gpu_requirements;
 use openshell_core::progress::{
     PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX, PROGRESS_STEP_STARTING_SANDBOX,
     format_bytes, mark_progress_active, mark_progress_complete, mark_progress_detail,
@@ -627,7 +628,12 @@ impl VmDriver {
         overlay_preparation: OverlayPreparation,
     ) -> Result<(), Status> {
         self.ensure_provisioning_active(&sandbox.id).await?;
-        let is_gpu = sandbox.spec.as_ref().is_some_and(|spec| spec.gpu);
+        let is_gpu = sandbox
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.resource_requirements.as_ref())
+            .and_then(|requirements| driver_gpu_requirements(Some(requirements)))
+            .is_some();
         self.publish_platform_event(
             sandbox.id.clone(),
             platform_event(
@@ -3079,7 +3085,7 @@ fn validate_vm_sandbox(sandbox: &Sandbox, gpu_enabled: bool) -> Result<(), Statu
     if let Some(template) = spec.template.as_ref() {
         validate_vm_sandbox_template(template)?;
     }
-    validate_vm_gpu_request(sandbox, gpu_enabled)?;
+    validate_gpu_request(sandbox, gpu_enabled)?;
 
     Ok(())
 }
@@ -3100,14 +3106,16 @@ fn validate_vm_sandbox_template(template: &SandboxTemplate) -> Result<(), Status
 }
 
 #[allow(clippy::result_large_err)]
-fn validate_vm_gpu_request(sandbox: &Sandbox, gpu_enabled: bool) -> Result<(), Status> {
+fn validate_gpu_request(sandbox: &Sandbox, gpu_enabled: bool) -> Result<(), Status> {
     let spec = sandbox
         .spec
         .as_ref()
         .ok_or_else(|| Status::invalid_argument("sandbox spec is required"))?;
 
+    let gpu_requirements = driver_gpu_requirements(spec.resource_requirements.as_ref());
+
     let _ = vm_gpu_device_id(sandbox)?;
-    if spec.gpu && !gpu_enabled {
+    if gpu_requirements.is_some() && !gpu_enabled {
         return Err(Status::failed_precondition(
             "GPU support is not enabled on this driver; start with --gpu",
         ));
@@ -3124,7 +3132,8 @@ fn vm_gpu_device_id(sandbox: &Sandbox) -> Result<Option<String>, Status> {
         .map_err(Status::invalid_argument)?
         .gpu_device_ids
         .unwrap_or_default();
-    if !spec.gpu && !gpu_device_ids.is_empty() {
+    let gpu_requirements = driver_gpu_requirements(spec.resource_requirements.as_ref());
+    if gpu_requirements.is_none() && !gpu_device_ids.is_empty() {
         return Err(Status::invalid_argument(
             "driver_config.gpu_device_ids requires gpu=true",
         ));
@@ -3135,8 +3144,8 @@ fn vm_gpu_device_id(sandbox: &Sandbox) -> Result<Option<String>, Status> {
         ));
     }
 
-    Ok(spec
-        .gpu
+    Ok(gpu_requirements
+        .is_some()
         .then(|| gpu_device_ids.into_iter().next().unwrap_or_default()))
 }
 
@@ -5064,6 +5073,7 @@ mod tests {
     };
     use openshell_core::proto::compute::v1::{
         DriverSandboxSpec as SandboxSpec, DriverSandboxTemplate as SandboxTemplate,
+        GpuResourceRequirements, ResourceRequirements,
     };
     use prost_types::{Struct, Value, value::Kind};
     use std::fs;
@@ -5099,6 +5109,12 @@ mod tests {
                 },
             ))
             .collect(),
+        }
+    }
+
+    fn gpu_resources() -> ResourceRequirements {
+        ResourceRequirements {
+            gpu: Some(GpuResourceRequirements {}),
         }
     }
 
@@ -5169,7 +5185,7 @@ mod tests {
         let sandbox = Sandbox {
             id: "sandbox-123".to_string(),
             spec: Some(SandboxSpec {
-                gpu: true,
+                resource_requirements: Some(gpu_resources()),
                 ..Default::default()
             }),
             ..Default::default()
@@ -5185,7 +5201,7 @@ mod tests {
         let sandbox = Sandbox {
             id: "sandbox-123".to_string(),
             spec: Some(SandboxSpec {
-                gpu: true,
+                resource_requirements: Some(gpu_resources()),
                 ..Default::default()
             }),
             ..Default::default()
@@ -5193,12 +5209,10 @@ mod tests {
         validate_vm_sandbox(&sandbox, true).expect("gpu should be accepted when enabled");
     }
 
-    #[test]
     fn validate_vm_sandbox_rejects_gpu_device_without_gpu() {
         let sandbox = Sandbox {
             id: "sandbox-123".to_string(),
             spec: Some(SandboxSpec {
-                gpu: false,
                 template: Some(SandboxTemplate {
                     driver_config: Some(gpu_device_ids_config(&["0000:2d:00.0"])),
                     ..Default::default()
@@ -5218,7 +5232,7 @@ mod tests {
         let sandbox = Sandbox {
             id: "sandbox-123".to_string(),
             spec: Some(SandboxSpec {
-                gpu: true,
+                resource_requirements: Some(gpu_resources()),
                 template: Some(SandboxTemplate {
                     driver_config: Some(gpu_device_ids_config(&["0000:2d:00.0", "0000:31:00.0"])),
                     ..Default::default()
@@ -5238,7 +5252,7 @@ mod tests {
         let sandbox = Sandbox {
             id: "sandbox-123".to_string(),
             spec: Some(SandboxSpec {
-                gpu: true,
+                resource_requirements: Some(gpu_resources()),
                 template: Some(SandboxTemplate {
                     driver_config: Some(gpu_device_ids_config(&[])),
                     ..Default::default()
@@ -5258,7 +5272,7 @@ mod tests {
         let sandbox = Sandbox {
             id: "sandbox-123".to_string(),
             spec: Some(SandboxSpec {
-                gpu: true,
+                resource_requirements: Some(gpu_resources()),
                 template: Some(SandboxTemplate {
                     driver_config: Some(gpu_device_id_typo_config(&["0000:2d:00.0"])),
                     ..Default::default()
@@ -5278,7 +5292,7 @@ mod tests {
         let sandbox = Sandbox {
             id: "sandbox-123".to_string(),
             spec: Some(SandboxSpec {
-                gpu: true,
+                resource_requirements: Some(gpu_resources()),
                 template: Some(SandboxTemplate {
                     agent_socket_path: "/tmp/agent.sock".to_string(),
                     driver_config: Some(gpu_device_ids_config(&[])),

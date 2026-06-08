@@ -42,12 +42,13 @@ use openshell_core::proto::{
     GetClusterInferenceRequest, GetDraftHistoryRequest, GetDraftPolicyRequest,
     GetGatewayConfigRequest, GetProviderProfileRequest, GetProviderRefreshStatusRequest,
     GetProviderRequest, GetSandboxConfigRequest, GetSandboxLogsRequest,
-    GetSandboxPolicyStatusRequest, GetSandboxRequest, GetServiceRequest, HealthRequest,
-    ImportProviderProfilesRequest, LintProviderProfilesRequest, ListProviderProfilesRequest,
-    ListProvidersRequest, ListSandboxPoliciesRequest, ListSandboxProvidersRequest,
-    ListSandboxesRequest, ListServicesRequest, PlatformEvent, PolicySource, PolicyStatus, Provider,
-    ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy, ProviderProfile,
-    ProviderProfileDiagnostic, ProviderProfileImportItem, RejectDraftChunkRequest,
+    GetSandboxPolicyStatusRequest, GetSandboxRequest, GetServiceRequest, GpuResourceRequirements,
+    HealthRequest, ImportProviderProfilesRequest, LintProviderProfilesRequest,
+    ListProviderProfilesRequest, ListProvidersRequest, ListSandboxPoliciesRequest,
+    ListSandboxProvidersRequest, ListSandboxesRequest, ListServicesRequest, PlatformEvent,
+    PolicySource, PolicyStatus, Provider, ProviderCredentialRefreshStatus,
+    ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileDiagnostic,
+    ProviderProfileImportItem, RejectDraftChunkRequest, ResourceRequirements,
     RevokeSshSessionRequest, RotateProviderCredentialRequest, Sandbox, SandboxPhase, SandboxPolicy,
     SandboxSpec, SandboxTemplate, ServiceEndpointResponse, SetClusterInferenceRequest,
     SettingScope, SettingValue, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
@@ -123,7 +124,7 @@ fn ready_false_condition_message(
 
 fn provisioning_timeout_message(
     timeout_secs: u64,
-    requested_gpu: bool,
+    resource_requirements: Option<&ResourceRequirements>,
     condition_message: Option<&str>,
 ) -> String {
     let mut message = format!("sandbox provisioning timed out after {timeout_secs}s");
@@ -133,7 +134,7 @@ fn provisioning_timeout_message(
         message.push_str(condition_message);
     }
 
-    if requested_gpu {
+    if resource_requirements.is_some_and(|requirements| requirements.gpu.is_some()) {
         message.push_str(
             ". Hint: this may be because the available GPU is already in use by another sandbox.",
         );
@@ -1753,7 +1754,7 @@ pub async fn sandbox_create(
     gateway_name: &str,
     uploads: &[(String, Option<String>, bool)],
     keep: bool,
-    gpu: bool,
+    gpu_requirements: Option<GpuResourceRequirements>,
     cpu: Option<&str>,
     memory: Option<&str>,
     driver_config_json: Option<&str>,
@@ -1809,8 +1810,6 @@ pub async fn sandbox_create(
         }
         None => None,
     };
-    let requested_gpu = gpu;
-
     let providers_v2_enabled = gateway_providers_v2_enabled(&mut client).await?;
     let inferred_types: Vec<String> = if providers_v2_enabled {
         Vec::new()
@@ -1842,9 +1841,11 @@ pub async fn sandbox_create(
         None
     };
 
+    let resource_requirements = gpu_requirements.map(|gpu| ResourceRequirements { gpu: Some(gpu) });
+
     let request = CreateSandboxRequest {
         spec: Some(SandboxSpec {
-            gpu: requested_gpu,
+            resource_requirements,
             environment: environment.clone(),
             policy,
             providers: configured_providers,
@@ -1989,7 +1990,7 @@ pub async fn sandbox_create(
         if remaining.is_zero() {
             let timeout_message = provisioning_timeout_message(
                 provision_timeout.as_secs(),
-                requested_gpu,
+                resource_requirements.as_ref(),
                 last_condition_message.as_deref(),
             );
             if let Some(d) = display.as_mut() {
@@ -2008,7 +2009,7 @@ pub async fn sandbox_create(
                 // Timeout fired — the stream was idle for too long.
                 let timeout_message = provisioning_timeout_message(
                     provision_timeout.as_secs(),
-                    requested_gpu,
+                    resource_requirements.as_ref(),
                     last_condition_message.as_deref(),
                 );
                 if let Some(d) = display.as_mut() {
@@ -7686,9 +7687,10 @@ mod tests {
         PROGRESS_STEP_STARTING_SANDBOX,
     };
     use openshell_core::proto::{
-        Provider, ProviderCredentialRefresh, ProviderCredentialRefreshStatus,
-        ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrant, ProviderProfile,
-        ProviderProfileCredential, SandboxCondition, SandboxStatus, datamodel::v1::ObjectMeta,
+        GpuResourceRequirements, Provider, ProviderCredentialRefresh,
+        ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
+        ProviderCredentialTokenGrant, ProviderProfile, ProviderProfileCredential,
+        ResourceRequirements, SandboxCondition, SandboxStatus, datamodel::v1::ObjectMeta,
     };
 
     struct EnvVarGuard {
@@ -8392,9 +8394,12 @@ mod tests {
 
     #[test]
     fn provisioning_timeout_message_includes_condition_and_gpu_hint() {
+        let resource_requirements = ResourceRequirements {
+            gpu: Some(GpuResourceRequirements {}),
+        };
         let message = provisioning_timeout_message(
             120,
-            true,
+            Some(&resource_requirements),
             Some("DependenciesNotReady: Pod exists with phase: Pending; Service Exists"),
         );
 
@@ -8405,7 +8410,15 @@ mod tests {
 
     #[test]
     fn provisioning_timeout_message_omits_gpu_hint_for_non_gpu_requests() {
-        let message = provisioning_timeout_message(120, false, None);
+        let message = provisioning_timeout_message(120, None, None);
+
+        assert_eq!(message, "sandbox provisioning timed out after 120s");
+    }
+
+    #[test]
+    fn provisioning_timeout_message_omits_gpu_hint_without_gpu_requirements() {
+        let resource_requirements = ResourceRequirements { gpu: None };
+        let message = provisioning_timeout_message(120, Some(&resource_requirements), None);
 
         assert_eq!(message, "sandbox provisioning timed out after 120s");
     }

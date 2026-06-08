@@ -760,7 +760,9 @@ mod tests {
     #[test]
     fn validate_sandbox_spec_accepts_gpu_flag() {
         let spec = SandboxSpec {
-            gpu: true,
+            resource_requirements: Some(openshell_core::proto::ResourceRequirements {
+                gpu: Some(openshell_core::proto::GpuResourceRequirements {}),
+            }),
             ..Default::default()
         };
         assert!(validate_sandbox_spec("gpu-sandbox", &spec).is_ok());

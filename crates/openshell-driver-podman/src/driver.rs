@@ -12,8 +12,12 @@ use crate::watcher::{
 use openshell_core::ComputeDriverError;
 use openshell_core::config::CDI_GPU_DEVICE_ALL;
 use openshell_core::driver_utils::supervisor_image_should_refresh;
-use openshell_core::gpu::{CdiGpuInventory, CdiGpuRoundRobin, CdiGpuSelectionError};
-use openshell_core::proto::compute::v1::{DriverSandbox, GetCapabilitiesResponse};
+use openshell_core::gpu::{
+    CdiGpuInventory, CdiGpuRoundRobin, CdiGpuSelectionError, driver_gpu_requirements,
+};
+use openshell_core::proto::compute::v1::{
+    DriverSandbox, GetCapabilitiesResponse, GpuResourceRequirements,
+};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -338,15 +342,31 @@ impl PodmanComputeDriver {
         &self,
         sandbox: &DriverSandbox,
     ) -> Result<(), ComputeDriverError> {
-        let gpu_requested = sandbox.spec.as_ref().is_some_and(|s| s.gpu);
+        let gpu_requirements = sandbox
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.resource_requirements.as_ref())
+            .and_then(|requirements| driver_gpu_requirements(Some(requirements)));
         let driver_config = PodmanSandboxDriverConfig::from_sandbox(sandbox)?;
-        if !gpu_requested && driver_config.cdi_devices.is_some() {
+        if gpu_requirements.is_none() && driver_config.cdi_devices.is_some() {
             return Err(ComputeDriverError::InvalidArgument(
                 "driver_config.cdi_devices requires gpu=true".to_string(),
             ));
         }
+        Self::validate_gpu_request(gpu_requirements)?;
         self.validate_user_volume_mounts_available(sandbox).await?;
         let _ = self.peek_default_gpu_device(sandbox)?;
+        Ok(())
+    }
+
+    fn validate_gpu_request(
+        gpu_requirements: Option<&GpuResourceRequirements>,
+    ) -> Result<(), ComputeDriverError> {
+        if gpu_requirements.is_some() && !Self::has_gpu_capacity() {
+            return Err(ComputeDriverError::Precondition(
+                "GPU sandbox requested, but no NVIDIA GPU devices are available.".to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -373,7 +393,8 @@ impl PodmanComputeDriver {
             return Ok(None);
         };
         let driver_config = PodmanSandboxDriverConfig::from_sandbox(sandbox)?;
-        if !spec.gpu || driver_config.cdi_devices.is_some() {
+        let gpu_requirements = driver_gpu_requirements(spec.resource_requirements.as_ref());
+        if gpu_requirements.is_none() || driver_config.cdi_devices.is_some() {
             return Ok(None);
         }
 

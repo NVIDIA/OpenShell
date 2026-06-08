@@ -5,7 +5,7 @@
 
 use crate::config::PodmanComputeConfig;
 use openshell_core::ComputeDriverError;
-use openshell_core::gpu::cdi_gpu_device_ids;
+use openshell_core::gpu::{cdi_gpu_device_ids, driver_gpu_requirements};
 use openshell_core::proto::compute::v1::{DriverSandbox, DriverSandboxTemplate};
 use openshell_core::proto_struct::deserialize_optional_non_empty_string_list;
 use openshell_core::{driver_mounts, proto_struct};
@@ -487,13 +487,14 @@ fn build_devices(
     let cdi_devices = PodmanSandboxDriverConfig::from_sandbox(sandbox)?
         .cdi_devices
         .unwrap_or_default();
-    if !spec.gpu && !cdi_devices.is_empty() {
+    let gpu_requirements = driver_gpu_requirements(spec.resource_requirements.as_ref());
+    if gpu_requirements.is_none() && !cdi_devices.is_empty() {
         return Err(ComputeDriverError::InvalidArgument(
             "driver_config.cdi_devices requires gpu=true".to_string(),
         ));
     }
 
-    cdi_gpu_device_ids(spec.gpu, &cdi_devices, selected_default_device)
+    cdi_gpu_device_ids(gpu_requirements, &cdi_devices, selected_default_device)
         .map(|device_ids| {
             device_ids.map(|device_ids| {
                 device_ids
@@ -1107,6 +1108,7 @@ fn parse_memory_to_bytes(quantity: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openshell_core::proto::compute::v1::{GpuResourceRequirements, ResourceRequirements};
 
     static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
@@ -1145,6 +1147,12 @@ mod tests {
                         .collect(),
                 })),
             },
+        }
+    }
+
+    fn gpu_resources() -> ResourceRequirements {
+        ResourceRequirements {
+            gpu: Some(GpuResourceRequirements {}),
         }
     }
 
@@ -1260,7 +1268,7 @@ mod tests {
 
         let mut sandbox = test_sandbox("test-id", "test-name");
         sandbox.spec = Some(DriverSandboxSpec {
-            gpu: true,
+            resource_requirements: Some(gpu_resources()),
             ..Default::default()
         });
         let config = test_config();
@@ -1302,7 +1310,7 @@ mod tests {
 
         let mut sandbox = test_sandbox("test-id", "test-name");
         sandbox.spec = Some(DriverSandboxSpec {
-            gpu: true,
+            resource_requirements: Some(gpu_resources()),
             template: Some(DriverSandboxTemplate {
                 driver_config: Some(cdi_devices_config(&["nvidia.com/gpu=0"])),
                 ..Default::default()
@@ -1343,7 +1351,7 @@ mod tests {
 
         let mut sandbox = test_sandbox("test-id", "test-name");
         sandbox.spec = Some(DriverSandboxSpec {
-            gpu: true,
+            resource_requirements: Some(gpu_resources()),
             template: Some(DriverSandboxTemplate {
                 driver_config: Some(cdi_devices_config(&[])),
                 ..Default::default()
@@ -1363,7 +1371,7 @@ mod tests {
 
         let mut sandbox = test_sandbox("test-id", "test-name");
         sandbox.spec = Some(DriverSandboxSpec {
-            gpu: true,
+            resource_requirements: Some(gpu_resources()),
             template: Some(DriverSandboxTemplate {
                 driver_config: Some(cdi_device_typo_config(&["nvidia.com/gpu=0"])),
                 ..Default::default()

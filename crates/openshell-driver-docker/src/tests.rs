@@ -13,7 +13,8 @@ use openshell_core::progress::{
     PROGRESS_STEP_STARTING_SANDBOX,
 };
 use openshell_core::proto::compute::v1::{
-    DriverResourceRequirements, DriverSandboxSpec, DriverSandboxTemplate,
+    DriverResourceRequirements, DriverSandboxSpec, DriverSandboxTemplate, GpuResourceRequirements,
+    ResourceRequirements,
 };
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -41,7 +42,7 @@ fn test_sandbox() -> DriverSandbox {
                 environment: HashMap::from([("TEMPLATE_ENV".to_string(), "template".to_string())]),
                 ..Default::default()
             }),
-            gpu: false,
+            resource_requirements: None,
             sandbox_token: String::new(),
         }),
         status: None,
@@ -76,6 +77,12 @@ fn list_string_driver_config(field: &str, values: &[&str]) -> prost_types::Struc
             },
         ))
         .collect(),
+    }
+}
+
+fn gpu_resources() -> ResourceRequirements {
+    ResourceRequirements {
+        gpu: Some(GpuResourceRequirements {}),
     }
 }
 
@@ -1045,7 +1052,7 @@ fn build_container_create_body_clears_inherited_cmd() {
 fn validate_sandbox_rejects_gpu_when_cdi_unavailable() {
     let config = runtime_config();
     let mut sandbox = test_sandbox();
-    sandbox.spec.as_mut().unwrap().gpu = true;
+    sandbox.spec.as_mut().unwrap().resource_requirements = Some(gpu_resources());
 
     let err = DockerComputeDriver::validate_sandbox(&sandbox, &config).unwrap_err();
 
@@ -1058,7 +1065,7 @@ fn validate_sandbox_rejects_invalid_cdi_devices_before_gpu_capability() {
     let config = runtime_config();
     let mut sandbox = test_sandbox();
     let spec = sandbox.spec.as_mut().unwrap();
-    spec.gpu = true;
+    spec.resource_requirements = Some(gpu_resources());
     spec.template.as_mut().unwrap().driver_config = Some(cdi_devices_config(&[]));
 
     let err = DockerComputeDriver::validate_sandbox(&sandbox, &config).unwrap_err();
@@ -1073,7 +1080,7 @@ fn validate_sandbox_rejects_unknown_driver_config_fields() {
     let config = runtime_config();
     let mut sandbox = test_sandbox();
     let spec = sandbox.spec.as_mut().unwrap();
-    spec.gpu = true;
+    spec.resource_requirements = Some(gpu_resources());
     spec.template.as_mut().unwrap().driver_config =
         Some(cdi_device_typo_config(&["nvidia.com/gpu=0"]));
 
@@ -1083,12 +1090,11 @@ fn validate_sandbox_rejects_unknown_driver_config_fields() {
     assert!(err.message().contains("unknown field"));
 }
 
-#[test]
 fn validate_sandbox_rejects_template_errors_before_device_config() {
     let config = runtime_config();
     let mut sandbox = test_sandbox();
     let spec = sandbox.spec.as_mut().unwrap();
-    spec.gpu = true;
+    spec.resource_requirements = Some(gpu_resources());
     let template = spec.template.as_mut().unwrap();
     template.agent_socket_path = "/tmp/agent.sock".to_string();
     template.driver_config = Some(cdi_devices_config(&[]));
@@ -1126,7 +1132,7 @@ fn build_container_create_body_maps_default_gpu_to_selected_cdi_device() {
     let mut config = runtime_config();
     config.supports_gpu = true;
     let mut sandbox = test_sandbox();
-    sandbox.spec.as_mut().unwrap().gpu = true;
+    sandbox.spec.as_mut().unwrap().resource_requirements = Some(gpu_resources());
 
     let create_body =
         build_container_create_body_with_default(&sandbox, &config, Some("nvidia.com/gpu=1"))
@@ -1168,7 +1174,7 @@ fn build_container_create_body_passes_explicit_cdi_device_id_through() {
     config.supports_gpu = true;
     let mut sandbox = test_sandbox();
     let spec = sandbox.spec.as_mut().unwrap();
-    spec.gpu = true;
+    spec.resource_requirements = Some(gpu_resources());
     spec.template.as_mut().unwrap().driver_config = Some(cdi_devices_config(&["nvidia.com/gpu=0"]));
 
     let create_body = build_container_create_body(&sandbox, &config).unwrap();
@@ -1207,7 +1213,7 @@ fn build_container_create_body_rejects_cdi_devices_without_gpu() {
 fn build_container_create_body_rejects_empty_cdi_devices() {
     let mut sandbox = test_sandbox();
     let spec = sandbox.spec.as_mut().unwrap();
-    spec.gpu = true;
+    spec.resource_requirements = Some(gpu_resources());
     spec.template.as_mut().unwrap().driver_config = Some(cdi_devices_config(&[]));
 
     let err = build_container_create_body(&sandbox, &runtime_config()).unwrap_err();

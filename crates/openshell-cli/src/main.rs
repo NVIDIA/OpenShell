@@ -19,6 +19,7 @@ use openshell_bootstrap::{
 use openshell_cli::completers;
 use openshell_cli::run;
 use openshell_cli::tls::TlsOptions;
+use openshell_core::proto::GpuResourceRequirements;
 
 /// Resolved gateway context: name + gateway endpoint.
 struct GatewayContext {
@@ -2625,6 +2626,7 @@ async fn main() -> Result<()> {
                         .map(|s| openshell_core::forward::ForwardSpec::parse(&s))
                         .transpose()?;
                     let keep = keep || !no_keep || editor.is_some() || forward.is_some();
+                    let gpu_requirements = gpu.then_some(GpuResourceRequirements {});
 
                     let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
                     let endpoint = &ctx.endpoint;
@@ -2637,7 +2639,7 @@ async fn main() -> Result<()> {
                         &ctx.name,
                         &upload_specs,
                         keep,
-                        gpu,
+                        gpu_requirements,
                         cpu.as_deref(),
                         memory.as_deref(),
                         driver_config_json.as_deref(),
@@ -4490,6 +4492,39 @@ mod tests {
                 ..
             }) => {
                 assert_eq!(driver_config_json.as_deref(), Some(json));
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_gpu_parses_driver_default() {
+        let cli = Cli::try_parse_from(["openshell", "sandbox", "create", "--gpu"])
+            .expect("sandbox create --gpu should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { gpu, .. }),
+                ..
+            }) => {
+                assert!(gpu);
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_gpu_driver_default_allows_trailing_command() {
+        let cli = Cli::try_parse_from(["openshell", "sandbox", "create", "--gpu", "--", "claude"])
+            .expect("sandbox create --gpu -- claude should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { gpu, command, .. }),
+                ..
+            }) => {
+                assert!(gpu);
+                assert_eq!(command, vec!["claude".to_string()]);
             }
             other => panic!("expected SandboxCommands::Create, got: {other:?}"),
         }

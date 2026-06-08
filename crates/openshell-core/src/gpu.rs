@@ -1,12 +1,39 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared GPU request helpers.
+//! Shared GPU resource requirement helpers.
 
 use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::config::CDI_GPU_DEVICE_ALL;
+use crate::proto::ResourceRequirements as SandboxResourceRequirements;
+use crate::proto::compute::v1::{
+    GpuResourceRequirements as DriverGpuResourceRequirements,
+    ResourceRequirements as DriverResourceRequirements,
+};
+
+/// Return whether sandbox resource requirements request a GPU.
+#[must_use]
+pub fn sandbox_gpu_requested(resources: Option<&SandboxResourceRequirements>) -> bool {
+    resources
+        .and_then(|resources| resources.gpu.as_ref())
+        .is_some()
+}
+
+/// Return whether compute-driver resource requirements request a GPU.
+#[must_use]
+pub fn driver_gpu_requested(resources: Option<&DriverResourceRequirements>) -> bool {
+    driver_gpu_requirements(resources).is_some()
+}
+
+/// Return the requested compute-driver GPU requirements, if present.
+#[must_use]
+pub fn driver_gpu_requirements(
+    resources: Option<&DriverResourceRequirements>,
+) -> Option<&DriverGpuResourceRequirements> {
+    resources.and_then(|resources| resources.gpu.as_ref())
+}
 
 const CDI_NVIDIA_GPU_PREFIX: &str = "nvidia.com/gpu=";
 const CDI_NVIDIA_GPU_ALL_SUFFIX: &str = "all";
@@ -158,17 +185,17 @@ impl fmt::Display for CdiGpuSelectionError {
 
 impl std::error::Error for CdiGpuSelectionError {}
 
-/// Resolve a local runtime GPU request into CDI device identifiers.
+/// Resolve a compute-driver GPU request into CDI device identifiers.
 ///
 /// `None` means no GPU was requested. Explicit driver-configured CDI devices
 /// pass through unchanged. A default GPU request uses the driver-selected
 /// default CDI ID.
 pub fn cdi_gpu_device_ids(
-    gpu: bool,
+    gpu: Option<&DriverGpuResourceRequirements>,
     cdi_devices: &[String],
     selected_default_device: Option<&str>,
 ) -> Result<Option<Vec<String>>, CdiGpuSelectionError> {
-    if !gpu {
+    if gpu.is_none() {
         return Ok(None);
     }
     if !cdi_devices.is_empty() {
@@ -180,8 +207,11 @@ pub fn cdi_gpu_device_ids(
 
 /// Resolve a GPU request with the legacy all-GPU default.
 #[must_use]
-pub fn cdi_gpu_device_ids_or_all(gpu: bool, cdi_devices: &[String]) -> Option<Vec<String>> {
-    gpu.then(|| {
+pub fn cdi_gpu_device_ids_or_all(
+    gpu: Option<&DriverGpuResourceRequirements>,
+    cdi_devices: &[String],
+) -> Option<Vec<String>> {
+    gpu.map(|_| {
         if cdi_devices.is_empty() {
             vec![CDI_GPU_DEVICE_ALL.to_string()]
         } else {
@@ -200,30 +230,36 @@ mod tests {
 
     #[test]
     fn cdi_gpu_device_ids_returns_none_when_absent() {
-        assert_eq!(cdi_gpu_device_ids(false, &[], None), Ok(None));
+        assert_eq!(cdi_gpu_device_ids(None, &[], None), Ok(None));
     }
 
     #[test]
     fn cdi_gpu_device_ids_uses_selected_default_device() {
+        let gpu = DriverGpuResourceRequirements {};
+
         assert_eq!(
-            cdi_gpu_device_ids(true, &[], Some("nvidia.com/gpu=0")),
+            cdi_gpu_device_ids(Some(&gpu), &[], Some("nvidia.com/gpu=0")),
             Ok(Some(vec!["nvidia.com/gpu=0".to_string()]))
         );
     }
 
     #[test]
     fn cdi_gpu_device_ids_rejects_missing_default_device() {
+        let gpu = DriverGpuResourceRequirements {};
+
         assert_eq!(
-            cdi_gpu_device_ids(true, &[], None),
+            cdi_gpu_device_ids(Some(&gpu), &[], None),
             Err(CdiGpuSelectionError::MissingDefaultDevice)
         );
     }
 
     #[test]
     fn cdi_gpu_device_ids_passes_explicit_device_ids_through() {
+        let gpu = DriverGpuResourceRequirements {};
+
         assert_eq!(
             cdi_gpu_device_ids(
-                true,
+                Some(&gpu),
                 &[
                     "nvidia.com/gpu=0".to_string(),
                     "nvidia.com/gpu=1".to_string()
@@ -239,8 +275,10 @@ mod tests {
 
     #[test]
     fn cdi_gpu_device_ids_or_all_uses_all_when_no_devices_are_configured() {
+        let gpu = DriverGpuResourceRequirements {};
+
         assert_eq!(
-            cdi_gpu_device_ids_or_all(true, &[]),
+            cdi_gpu_device_ids_or_all(Some(&gpu), &[]),
             Some(vec![CDI_GPU_DEVICE_ALL.to_string()])
         );
     }
