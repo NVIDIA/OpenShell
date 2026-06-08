@@ -1,0 +1,97 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Native CRD Controller"
+sidebar-title: "Native CRD Controller"
+description: "Declaratively create sandboxes with kubectl using the in-process OpenShellSandbox CRD."
+keywords: "Kubernetes, CRD, Controller, GitOps, OpenShellSandbox, Declarative"
+position: 6
+---
+
+<Warning>
+The native CRD controller is an early-development feature. The CRD installs with the chart and the controller runs automatically on every Kubernetes deployment.
+</Warning>
+
+OpenShell can be driven two ways. Both flows converge at the same gateway logic, so validation, persistence, telemetry, and provider lookup are identical.
+
+| Flow | Trigger | Reconciler | Use when |
+|---|---|---|---|
+| Imperative | `openshell sandbox create ...` (CLI / SDK) | None — direct gRPC | Interactive, scripts |
+| Declarative | `kubectl apply -f sandbox.yaml` | In-process inside the gateway | GitOps, fleet management, ArgoCD/Flux |
+
+```
+SDK / CLI ──► gateway gRPC ──┐
+                             ├──► gateway sandbox-create core ──► driver ──► agent-sandbox Sandbox + forwarder pod
+CRD ──► in-process reconciler ┘
+```
+
+## How it runs
+
+The CRD ships with the chart and is installed on first `helm install`. The reconciler is a tokio task the gateway binary spawns on the StatefulSet's ordinal-0 replica when the chart-set `OPENSHELL_CONTROLLER_WATCH_NAMESPACE` env var is present. Replicas with ordinal > 0 (`kubectl scale --replicas=N`) skip the spawn and serve SDK/CLI traffic only, so adding gateway replicas doesn't multiply the controller into racing copies.
+
+### Configurable values
+
+| Value | Default | Purpose |
+|---|---|---|
+| `controller.watchNamespace` | `""` (release namespace) | Namespace the controller watches. Single-namespace contract — one release, one namespace. |
+| `controller.logFilter` | `info,openshell_controller=info,kube=warn` | `RUST_LOG`-style filter applied to the controller's tracing subscriber, independent of `server.logLevel`. |
+
+## The custom resource
+
+One CRD in `openshell.nvidia.com/v1alpha1`, namespaced:
+
+| Kind | Short | Role |
+|---|---|---|
+| `OpenShellSandbox` | `oshs` | Self-contained sandbox — image, `startCommand`, `policyYaml`, `expose.port`, and optional `podCustomisations`. |
+
+### Minimal example
+
+```yaml
+apiVersion: openshell.nvidia.com/v1alpha1
+kind: OpenShellSandbox
+metadata:
+  name: alice
+  namespace: openshell
+spec:
+  image: ghcr.io/nvidia/openshell/sandbox:latest
+  startCommand: ["claude"]
+  policyYaml: |
+    version: 1
+    network: {}
+  expose:
+    port: 8080
+```
+
+```shell
+kubectl apply -f sandbox.yaml
+kubectl get oshs -n openshell
+```
+
+### Per-pod customisations
+
+`spec.podCustomisations` is patched onto the agent-sandbox `Sandbox` podSpec — `nodeSelector`, `tolerations`, `affinity`, `runtimeClassName`, `serviceAccountName`, per-container `resources`/`securityContext`/`env`/`volumeMounts`, and workspace PVC `storage.{type,size}`.
+
+```yaml
+spec:
+  image: ghcr.io/nvidia/openshell/sandbox:latest
+  policyYaml: |
+    version: 1
+  expose:
+    port: 8080
+  podCustomisations:
+    nodeSelector:
+      node-role.kubernetes.io/sandbox: "true"
+    storage:
+      type: persistent
+      size: 10Gi
+    containers:
+      - name: sandbox
+        resources:
+          requests: { cpu: "500m", memory: "1Gi" }
+          limits:   { cpu: "2",    memory: "4Gi" }
+```
+
+## Prerequisites
+
+- **agent-sandbox controller** — provides `sandboxes.agents.x-k8s.io`. Already required for the gateway; see [Setup](/kubernetes/setup#install-agent-sandbox).
+- **Kyverno** with a reachable admission webhook — the controller strips the agent-sandbox `Sandbox` `ownerReference` from the workspace PVC at admission so `kubectl delete oshs` doesn't reap the workspace. If Kyverno's webhook is not `Available=True`, deletes will silently take the workspace with them. Verify with `kubectl get deploy -n kyverno`.

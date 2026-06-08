@@ -19,6 +19,7 @@
 //! uniform [`ComputeRuntime`]. The remaining VM plumbing now lives in
 //! [`compute::vm`]; keep this file driver-agnostic going forward.
 
+pub mod api;
 mod auth;
 pub mod certgen;
 pub mod cli;
@@ -411,6 +412,29 @@ pub async fn run_server(
         });
     } else {
         info!("Metrics server disabled");
+    }
+
+    // Spawn the in-process CRD controller on Kubernetes deployments.
+    // Presence of OPENSHELL_CONTROLLER_WATCH_NAMESPACE is the chart's
+    // flag-free signal that we're the K8s-deployed gateway; non-K8s
+    // gateways (docker/podman/vm) never see the var and skip the spawn.
+    // We log and continue (rather than fail startup) if the controller
+    // can't start — the gateway data plane must keep serving SDK/CLI
+    // traffic even if CRD reconciliation is broken.
+    if std::env::var("OPENSHELL_CONTROLLER_WATCH_NAMESPACE").is_ok() {
+        let controller_config = openshell_controller::ControllerConfig::from_env();
+        info!(
+            namespace = %controller_config.watch_namespace,
+            "spawning in-process OpenShellSandbox controller"
+        );
+        let gateway = Arc::new(api::GatewayHandle::new(state.clone()));
+        tokio::spawn(async move {
+            if let Err(e) = openshell_controller::run(gateway, controller_config).await {
+                error!(error = %e, "openshell-controller exited with error");
+            } else {
+                info!("openshell-controller exited cleanly");
+            }
+        });
     }
 
     // Build TLS acceptor when TLS is configured; otherwise serve plaintext.

@@ -219,6 +219,7 @@ url = "https://storage.googleapis.com/skaffold/releases/v2.20.0/skaffold-linux-a
 url = "https://storage.googleapis.com/skaffold/releases/v2.20.0/skaffold-linux-amd64"
 
 [tools.skaffold."platforms.macos-arm64"]
+checksum = "blake3:cb665940f9b861c1160ddc9dd6601c047587396cb3ca029e2aa1f397ad9e6849"
 url = "https://storage.googleapis.com/skaffold/releases/v2.20.0/skaffold-darwin-arm64"
 
 [[tools.uv]]
@@ -255,3 +256,4 @@ url = "https://ziglang.org/download/0.14.1/zig-x86_64-linux-0.14.1.tar.xz"
 [tools.zig."platforms.macos-arm64"]
 checksum = "sha256:39f3dc5e79c22088ce878edc821dedb4ca5a1cd9f5ef915e9b3cc3053e8faefa"
 url = "https://ziglang.org/download/0.14.1/zig-aarch64-macos-0.14.1.tar.xz"
+provenance = "minisign"

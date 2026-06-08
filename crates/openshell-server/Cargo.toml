@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 openshell-bootstrap = { path = "../openshell-bootstrap" }
+openshell-controller = { path = "../openshell-controller" }
 openshell-core = { path = "../openshell-core" }
 openshell-driver-docker = { path = "../openshell-driver-docker" }
 openshell-driver-kubernetes = { path = "../openshell-driver-kubernetes" }

@@ -1,0 +1,202 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Reconciled in-process by the gateway on its ordinal-0 StatefulSet replica.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: openshellsandboxes.openshell.nvidia.com
+spec:
+  group: openshell.nvidia.com
+  names:
+    kind: OpenShellSandbox
+    listKind: OpenShellSandboxList
+    plural: openshellsandboxes
+    singular: openshellsandbox
+    shortNames:
+      - oshs
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Image
+          type: string
+          jsonPath: .spec.image
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Ready
+          type: string
+          jsonPath: .status.conditions[?(@.type=="Ready")].status
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          required:
+            - spec
+          properties:
+            apiVersion: { type: string }
+            kind: { type: string }
+            metadata: { type: object }
+            spec:
+              type: object
+              required:
+                - image
+                - policyYaml
+                - expose
+              properties:
+                image:
+                  type: string
+                  minLength: 1
+                  description: |
+                    OCI image reference for the sandbox workload (PID 1
+                    inside the sandbox container).
+                startCommand:
+                  type: array
+                  items: { type: string }
+                  description: |
+                    PID-1 argv inside the sandbox. When unset, the image's
+                    entrypoint is used.
+                policyYaml:
+                  type: string
+                  description: |
+                    Inline policy YAML body, applied to the sandbox via
+                    `openshell policy set` semantics.
+                expose:
+                  type: object
+                  required: [port]
+                  description: |
+                    In-sandbox listener exposed through the forwarder
+                    Service.
+                  properties:
+                    port:
+                      type: integer
+                      minimum: 1
+                      maximum: 65535
+                podCustomisations:
+                  type: object
+                  description: |
+                    Pod-shape overrides applied to the agent-sandbox
+                    `Sandbox` podSpec that materialises the workload pod.
+                    All fields optional; unset fields fall back to gateway
+                    defaults.
+                  properties:
+                    nodeSelector:
+                      type: object
+                      additionalProperties: { type: string }
+                    tolerations:
+                      type: array
+                      items:
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true
+                    affinity:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                    runtimeClassName:
+                      type: string
+                    serviceAccountName:
+                      type: string
+                    securityContext:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                    containers:
+                      type: array
+                      description: |
+                        Per-container overrides keyed by container name.
+                        `resources` and `securityContext` are patched onto
+                        the matching container; `env` and `volumeMounts`
+                        are APPENDED (gateway-set entries are preserved).
+                      items:
+                        type: object
+                        required: [name]
+                        properties:
+                          name: { type: string }
+                          resources:
+                            type: object
+                            x-kubernetes-preserve-unknown-fields: true
+                          securityContext:
+                            type: object
+                            x-kubernetes-preserve-unknown-fields: true
+                          env:
+                            type: array
+                            items:
+                              type: object
+                              required: [name]
+                              properties:
+                                name: { type: string }
+                                value: { type: string }
+                                valueFrom:
+                                  type: object
+                                  x-kubernetes-preserve-unknown-fields: true
+                          volumeMounts:
+                            type: array
+                            items:
+                              type: object
+                              required: [name, mountPath]
+                              properties:
+                                name: { type: string }
+                                mountPath: { type: string }
+                                subPath: { type: string }
+                                readOnly: { type: boolean }
+                    storage:
+                      type: object
+                      description: |
+                        Workspace PVC policy.
+                      properties:
+                        type:
+                          type: string
+                          enum: [persistent, ephemeral]
+                          default: persistent
+                        size:
+                          type: string
+                          description: |
+                            Storage request for the workspace PVC. Empty
+                            preserves the gateway/cluster default.
+            status:
+              type: object
+              properties:
+                phase:
+                  type: string
+                  enum: [Pending, Provisioning, Running, Terminating, Failed]
+                  description: |
+                    Lifecycle phase as observed by the in-process
+                    controller.
+                sandboxId:
+                  type: string
+                  description: |
+                    The gateway's internal UUID for this sandbox. Set
+                    once the gateway create-sandbox call succeeds.
+                message:
+                  type: string
+                  description: Human-readable detail about the current state.
+                observedGeneration:
+                  type: integer
+                  format: int64
+                lastUpdated:
+                  type: string
+                  format: date-time
+                conditions:
+                  type: array
+                  items:
+                    type: object
+                    required:
+                      - type
+                      - status
+                      - lastTransitionTime
+                      - reason
+                      - message
+                    properties:
+                      type: { type: string }
+                      status:
+                        type: string
+                        enum: ["True", "False", Unknown]
+                      observedGeneration: { type: integer, format: int64 }
+                      lastTransitionTime: { type: string, format: date-time }
+                      reason: { type: string }
+                      message: { type: string }

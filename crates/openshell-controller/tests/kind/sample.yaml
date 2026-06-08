@@ -1,0 +1,16 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Smallest viable OpenShellSandbox CR for iteration testing.
+
+apiVersion: openshell.nvidia.com/v1alpha1
+kind: OpenShellSandbox
+metadata:
+  name: sample
+  namespace: default
+spec:
+  image: ghcr.io/nvidia/openshell/sandbox:latest
+  policyYaml: |
+    version: 1
+  expose:
+    port: 8080

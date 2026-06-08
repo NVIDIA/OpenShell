@@ -42,3 +42,24 @@ rules:
       - pods
     verbs:
       - get
+  # OpenShellSandbox CRD reconciliation. `update` on the resource itself
+  # covers finalizer add/remove; `patch` on /status covers SSA from the
+  # controller's field manager.
+  - apiGroups:
+      - openshell.nvidia.com
+    resources:
+      - openshellsandboxes
+    verbs:
+      - get
+      - list
+      - watch
+      - update
+      - patch
+  - apiGroups:
+      - openshell.nvidia.com
+    resources:
+      - openshellsandboxes/status
+    verbs:
+      - get
+      - patch
+      - update

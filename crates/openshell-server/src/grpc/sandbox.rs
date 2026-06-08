@@ -118,7 +118,29 @@ async fn handle_create_sandbox_inner(
     state: &Arc<ServerState>,
     request: Request<CreateSandboxRequest>,
 ) -> Result<Response<SandboxResponse>, Status> {
-    let request = request.into_inner();
+    let sandbox = create_sandbox_core(state, request.into_inner()).await?;
+    Ok(Response::new(SandboxResponse {
+        sandbox: Some(sandbox),
+    }))
+}
+
+/// Create a sandbox, returning the gateway's view of it.
+///
+/// This is the shared core of `CreateSandbox` that both the gRPC handler and
+/// the in-process CRD controller call. It performs all gateway-side work —
+/// spec validation, provider resolution, image resolution, policy
+/// normalisation, JWT minting, compute driver dispatch — so callers get the
+/// same behaviour regardless of the entrypoint.
+///
+/// # Errors
+///
+/// Returns a [`Status`] when the request is invalid (`InvalidArgument` /
+/// `FailedPrecondition`), a provider can't be resolved, the compute driver
+/// rejects the sandbox, or JWT minting fails.
+pub async fn create_sandbox_core(
+    state: &Arc<ServerState>,
+    request: CreateSandboxRequest,
+) -> Result<Sandbox, Status> {
     let spec = request
         .spec
         .ok_or_else(|| Status::invalid_argument("spec is required"))?;
@@ -218,9 +240,7 @@ async fn handle_create_sandbox_inner(
         sandbox_name = %name,
         "CreateSandbox request completed successfully"
     );
-    Ok(Response::new(SandboxResponse {
-        sandbox: Some(sandbox),
-    }))
+    Ok(sandbox)
 }
 
 pub(super) async fn handle_get_sandbox(
@@ -488,24 +508,38 @@ async fn handle_delete_sandbox_inner(
     state: &Arc<ServerState>,
     request: Request<DeleteSandboxRequest>,
 ) -> Result<Response<DeleteSandboxResponse>, Status> {
-    let name = request.into_inner().name;
+    let deleted = delete_sandbox_core(state, &request.into_inner().name).await?;
+    Ok(Response::new(DeleteSandboxResponse { deleted }))
+}
+
+/// Delete a sandbox by name, returning whether the sandbox existed.
+///
+/// Shared between the gRPC handler and the in-process CRD controller so
+/// the deletion path runs the same compute-driver call + telemetry hook
+/// regardless of entrypoint.
+///
+/// # Errors
+///
+/// Returns a [`Status::invalid_argument`] when `name` is empty, or any
+/// status from the compute driver's delete call.
+pub async fn delete_sandbox_core(state: &Arc<ServerState>, name: &str) -> Result<bool, Status> {
     if name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
 
     let sandbox_id = state
         .store
-        .get_message_by_name::<Sandbox>(&name)
+        .get_message_by_name::<Sandbox>(name)
         .await
         .ok()
         .flatten()
         .map(|sandbox| sandbox.object_id().to_string());
-    let deleted = state.compute.delete_sandbox(&name).await?;
+    let deleted = state.compute.delete_sandbox(name).await?;
     if deleted && let Some(sandbox_id) = sandbox_id {
         state.telemetry.end_sandbox_session(&sandbox_id);
     }
     info!(sandbox_name = %name, "DeleteSandbox request completed successfully");
-    Ok(Response::new(DeleteSandboxResponse { deleted }))
+    Ok(deleted)
 }
 
 async fn sandbox_by_name(state: &Arc<ServerState>, name: &str) -> Result<Sandbox, Status> {

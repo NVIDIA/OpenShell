@@ -80,6 +80,14 @@ spec:
             - name: SSL_CERT_FILE
               value: /etc/openshell-tls/oidc-ca/ca.crt
             {{- end }}
+            # In-process CRD controller. Presence of
+            # OPENSHELL_CONTROLLER_WATCH_NAMESPACE tells the gateway
+            # binary it's the chart-deployed K8s replica; it spawns
+            # the reconciler on the ordinal-0 pod and skips on others.
+            - name: OPENSHELL_CONTROLLER_WATCH_NAMESPACE
+              value: {{ default (include "openshell.sandboxNamespace" .) .Values.controller.watchNamespace | quote }}
+            - name: OPENSHELL_CONTROLLER_LOG_FILTER
+              value: {{ .Values.controller.logFilter | quote }}
           volumeMounts:
             - name: openshell-data
               mountPath: /var/openshell

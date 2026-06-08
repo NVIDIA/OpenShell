@@ -3454,6 +3454,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-controller"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "futures",
+ "k8s-openapi",
+ "kube",
+ "kube-runtime",
+ "openshell-core",
+ "openshell-policy",
+ "prost-types",
+ "schemars",
+ "serde",
+ "serde_json",
+ "serde_yml",
+ "thiserror 2.0.18",
+ "tokio",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "openshell-core"
 version = "0.0.0"
 dependencies = [
@@ -3716,6 +3741,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "miette",
  "openshell-bootstrap",
+ "openshell-controller",
  "openshell-core",
  "openshell-driver-docker",
  "openshell-driver-kubernetes",

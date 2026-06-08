@@ -367,3 +367,17 @@ grpcRoute:
       protocol: HTTP
       # -- "Same" restricts attached routes to the release namespace; "All" allows any namespace.
       allowedRoutes: Same
+
+# Native CRD controller — reconciles OpenShellSandbox CRs into sandbox
+# creates against the existing gateway. Runs in-process inside the
+# gateway binary as a tokio task on the StatefulSet's ordinal-0 replica.
+# The CRD itself always installs from deploy/helm/openshell/crds/.
+controller:
+  # -- Namespace the controller watches. Empty defaults to the release
+  # namespace. v1 enforces a single-namespace contract — one Helm
+  # release ⇒ one watched namespace.
+  watchNamespace: ""
+  # -- `RUST_LOG`-style filter applied to the controller's tracing
+  # subscriber. Independent of `server.logLevel` so noisy kube-rs watch
+  # events can be suppressed without quieting the gateway.
+  logFilter: "info,openshell_controller=info,kube=warn"
