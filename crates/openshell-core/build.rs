@@ -66,16 +66,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(target_os = "windows")]
-fn protoc_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    Ok(protoc_bin_vendored::protoc_bin_path()?)
-}
-
-#[cfg(not(target_os = "windows"))]
-fn protoc_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    Ok(protobuf_src::protoc())
-}
-
 fn proto_include_dirs(proto_root: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     let mut includes = vec![proto_root.to_path_buf()];
     #[cfg(target_os = "windows")]
