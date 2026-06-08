@@ -12,5 +12,3 @@ spec:
   image: ghcr.io/nvidia/openshell/sandbox:latest
   policyYaml: |
     version: 1
-  expose:
-    port: 8080

@@ -8,6 +8,8 @@
 //! CRD schema (or vice versa) lets the kube-apiserver reject or silently
 //! drop content at admission.
 
+use std::collections::BTreeMap;
+
 use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -26,101 +28,42 @@ use serde::{Deserialize, Serialize};
 )]
 #[serde(rename_all = "camelCase")]
 pub struct OpenShellSandboxSpec {
-    /// OCI image reference for the sandbox workload (PID 1 inside the
-    /// sandbox container).
+    /// OCI image reference for the sandbox workload.
     pub image: String,
 
-    /// PID-1 argv inside the sandbox. When `None`, the image's entrypoint
-    /// is used.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub start_command: Option<Vec<String>>,
-
-    /// Inline policy YAML body, applied to the sandbox via the gateway's
-    /// `policy set` semantics.
+    /// Inline sandbox policy YAML.
     pub policy_yaml: String,
 
-    /// In-sandbox listener exposed through the forwarder Service.
-    pub expose: ExposeSpec,
+    /// Environment variables injected into the sandbox at runtime.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub environment: BTreeMap<String, String>,
 
-    /// Optional pod-shape overrides applied to the agent-sandbox `Sandbox`
-    /// podSpec that materialises the workload pod.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pod_customisations: Option<PodCustomisations>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct ExposeSpec {
-    /// In-sandbox TCP port the forwarder Service publishes.
-    pub port: u16,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct PodCustomisations {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub node_selector: Option<std::collections::BTreeMap<String, String>>,
+    /// Credential provider names attached to the sandbox.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tolerations: Vec<serde_json::Value>,
+    pub providers: Vec<String>,
+
+    /// Request an NVIDIA GPU for the sandbox.
+    #[serde(default)]
+    pub gpu: bool,
+
+    /// PCI BDF or device index for GPU pinning when `gpu` is true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub affinity: Option<serde_json::Value>,
+    pub gpu_device: Option<String>,
+
+    /// Log level exposed to processes running inside the sandbox.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_level: Option<String>,
+
+    /// Kubernetes `RuntimeClass` name requested for the sandbox pod.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_class_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub service_account_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub security_context: Option<serde_json::Value>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub containers: Vec<ContainerOverride>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub storage: Option<StorageSpec>,
-}
 
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct ContainerOverride {
-    pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resources: Option<serde_json::Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub security_context: Option<serde_json::Value>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub env: Vec<EnvVar>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub volume_mounts: Vec<serde_json::Value>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct EnvVar {
-    pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub value: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub value_from: Option<serde_json::Value>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct StorageSpec {
-    #[serde(default = "default_storage_type")]
-    pub r#type: StorageType,
-    /// Kubernetes quantity string (e.g. `10Gi`). `None` preserves the
-    /// gateway/cluster default.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub size: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum StorageType {
-    #[default]
-    Persistent,
-    Ephemeral,
-}
-
-fn default_storage_type() -> StorageType {
-    StorageType::Persistent
+    /// User-supplied labels propagated to the gateway-side sandbox.
+    ///
+    /// Keys prefixed with `openshell.nvidia.com/` are reserved for the
+    /// controller and silently filtered out on the wire.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema)]
@@ -151,6 +94,7 @@ pub enum Phase {
     Running,
     Terminating,
     Failed,
+    Deleted,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -164,4 +108,3 @@ pub struct Condition {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_generation: Option<i64>,
 }
-

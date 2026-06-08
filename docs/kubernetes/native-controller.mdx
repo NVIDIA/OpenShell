@@ -42,7 +42,21 @@ One CRD in `openshell.nvidia.com/v1alpha1`, namespaced:
 
 | Kind | Short | Role |
 |---|---|---|
-| `OpenShellSandbox` | `oshs` | Self-contained sandbox — image, `startCommand`, `policyYaml`, `expose.port`, and optional `podCustomisations`. |
+| `OpenShellSandbox` | `oshs` | Declarative sandbox request: image, policy, environment, providers, GPU, log level, runtime class, and user labels. |
+
+### Spec fields
+
+| Field | Type | Required | Purpose |
+|---|---|---|---|
+| `image` | string | yes | OCI image reference for the sandbox workload. |
+| `policyYaml` | string | yes | Inline sandbox policy YAML, parsed by the same code path as `openshell policy set`. |
+| `environment` | `map<string, string>` | no | Env vars injected at sandbox runtime. |
+| `providers` | `[string]` | no | Names of credential providers to attach. |
+| `gpu` | bool | no | Request an NVIDIA GPU for the sandbox. |
+| `gpuDevice` | string | no | PCI BDF or device index for GPU pinning. |
+| `logLevel` | string | no | Log level inside the sandbox. |
+| `runtimeClassName` | string | no | Kubernetes RuntimeClass for the sandbox pod. |
+| `labels` | `map<string, string>` | no | User labels propagated to the gateway sandbox. Keys under `openshell.nvidia.com/` are reserved. |
 
 ### Minimal example
 
@@ -54,12 +68,9 @@ metadata:
   namespace: openshell
 spec:
   image: ghcr.io/nvidia/openshell/sandbox:latest
-  startCommand: ["claude"]
   policyYaml: |
     version: 1
     network: {}
-  expose:
-    port: 8080
 ```
 
 ```shell
@@ -67,31 +78,24 @@ kubectl apply -f sandbox.yaml
 kubectl get oshs -n openshell
 ```
 
-### Per-pod customisations
-
-`spec.podCustomisations` is patched onto the agent-sandbox `Sandbox` podSpec — `nodeSelector`, `tolerations`, `affinity`, `runtimeClassName`, `serviceAccountName`, per-container `resources`/`securityContext`/`env`/`volumeMounts`, and workspace PVC `storage.{type,size}`.
+### Richer example
 
 ```yaml
 spec:
   image: ghcr.io/nvidia/openshell/sandbox:latest
   policyYaml: |
     version: 1
-  expose:
-    port: 8080
-  podCustomisations:
-    nodeSelector:
-      node-role.kubernetes.io/sandbox: "true"
-    storage:
-      type: persistent
-      size: 10Gi
-    containers:
-      - name: sandbox
-        resources:
-          requests: { cpu: "500m", memory: "1Gi" }
-          limits:   { cpu: "2",    memory: "4Gi" }
+  environment:
+    HTTP_PROXY: http://corp-proxy:3128
+  providers: [aws, github]
+  gpu: true
+  logLevel: debug
+  runtimeClassName: nvidia
+  labels:
+    team: platform
 ```
 
 ## Prerequisites
 
 - **agent-sandbox controller** — provides `sandboxes.agents.x-k8s.io`. Already required for the gateway; see [Setup](/kubernetes/setup#install-agent-sandbox).
-- **Kyverno** with a reachable admission webhook — the controller strips the agent-sandbox `Sandbox` `ownerReference` from the workspace PVC at admission so `kubectl delete oshs` doesn't reap the workspace. If Kyverno's webhook is not `Available=True`, deletes will silently take the workspace with them. Verify with `kubectl get deploy -n kyverno`.
+- **Kyverno** with a reachable admission webhook — the gateway uses Kyverno to keep workspace PVCs across sandbox replaces. If Kyverno's webhook is not `Available=True`, `kubectl delete oshs` may take the workspace with it. Verify with `kubectl get deploy -n kyverno`.

@@ -384,7 +384,7 @@ enum ReconcileError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ExposeSpec, OpenShellSandboxSpec, OpenShellSandboxStatus};
+    use crate::types::{OpenShellSandboxSpec, OpenShellSandboxStatus};
     use kube::core::ObjectMeta;
 
     fn cr_with_metadata(meta: ObjectMeta) -> OpenShellSandbox {
@@ -392,10 +392,14 @@ mod tests {
             metadata: meta,
             spec: OpenShellSandboxSpec {
                 image: "x".into(),
-                start_command: None,
                 policy_yaml: "version: 1\n".into(),
-                expose: ExposeSpec { port: 80 },
-                pod_customisations: None,
+                environment: std::collections::BTreeMap::default(),
+                providers: Vec::new(),
+                gpu: false,
+                gpu_device: None,
+                log_level: None,
+                runtime_class_name: None,
+                labels: std::collections::BTreeMap::default(),
             },
             status: None,
         }

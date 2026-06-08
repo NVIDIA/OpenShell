@@ -32,6 +32,10 @@ spec:
         - name: Ready
           type: string
           jsonPath: .status.conditions[?(@.type=="Ready")].status
+        - name: SandboxId
+          type: string
+          jsonPath: .status.sandboxId
+          priority: 1
         - name: Age
           type: date
           jsonPath: .metadata.creationTimestamp
@@ -49,124 +53,72 @@ spec:
               required:
                 - image
                 - policyYaml
-                - expose
               properties:
                 image:
                   type: string
                   minLength: 1
                   description: |
-                    OCI image reference for the sandbox workload (PID 1
-                    inside the sandbox container).
-                startCommand:
+                    OCI image reference for the sandbox workload.
+                policyYaml:
+                  type: string
+                  minLength: 1
+                  description: |
+                    Inline sandbox policy YAML. Parsed at reconcile time
+                    by the same code path the gateway uses for
+                    `openshell policy set`; malformed YAML surfaces in
+                    `.status.message` with `phase=Failed`.
+                environment:
+                  type: object
+                  additionalProperties: { type: string }
+                  description: |
+                    Environment variables injected into the sandbox at
+                    runtime. Maps directly to `SandboxSpec.environment`.
+                providers:
                   type: array
                   items: { type: string }
                   description: |
-                    PID-1 argv inside the sandbox. When unset, the image's
-                    entrypoint is used.
-                policyYaml:
+                    Names of credential providers (created via
+                    `openshell provider create`) to attach to the sandbox.
+                gpu:
+                  type: boolean
+                  default: false
+                  description: |
+                    Request an NVIDIA GPU for the sandbox.
+                gpuDevice:
                   type: string
                   description: |
-                    Inline policy YAML body, applied to the sandbox via
-                    `openshell policy set` semantics.
-                expose:
-                  type: object
-                  required: [port]
+                    Optional PCI BDF (e.g. `0000:2d:00.0`) or device
+                    index (`0`, `1`) when `gpu: true`. Empty asks the
+                    driver to assign the first available GPU.
+                logLevel:
+                  type: string
                   description: |
-                    In-sandbox listener exposed through the forwarder
-                    Service.
-                  properties:
-                    port:
-                      type: integer
-                      minimum: 1
-                      maximum: 65535
-                podCustomisations:
-                  type: object
+                    Log level exposed to processes running inside the
+                    sandbox. Maps to `SandboxSpec.log_level`.
+                runtimeClassName:
+                  type: string
                   description: |
-                    Pod-shape overrides applied to the agent-sandbox
-                    `Sandbox` podSpec that materialises the workload pod.
-                    All fields optional; unset fields fall back to gateway
-                    defaults.
-                  properties:
-                    nodeSelector:
-                      type: object
-                      additionalProperties: { type: string }
-                    tolerations:
-                      type: array
-                      items:
-                        type: object
-                        x-kubernetes-preserve-unknown-fields: true
-                    affinity:
-                      type: object
-                      x-kubernetes-preserve-unknown-fields: true
-                    runtimeClassName:
-                      type: string
-                    serviceAccountName:
-                      type: string
-                    securityContext:
-                      type: object
-                      x-kubernetes-preserve-unknown-fields: true
-                    containers:
-                      type: array
-                      description: |
-                        Per-container overrides keyed by container name.
-                        `resources` and `securityContext` are patched onto
-                        the matching container; `env` and `volumeMounts`
-                        are APPENDED (gateway-set entries are preserved).
-                      items:
-                        type: object
-                        required: [name]
-                        properties:
-                          name: { type: string }
-                          resources:
-                            type: object
-                            x-kubernetes-preserve-unknown-fields: true
-                          securityContext:
-                            type: object
-                            x-kubernetes-preserve-unknown-fields: true
-                          env:
-                            type: array
-                            items:
-                              type: object
-                              required: [name]
-                              properties:
-                                name: { type: string }
-                                value: { type: string }
-                                valueFrom:
-                                  type: object
-                                  x-kubernetes-preserve-unknown-fields: true
-                          volumeMounts:
-                            type: array
-                            items:
-                              type: object
-                              required: [name, mountPath]
-                              properties:
-                                name: { type: string }
-                                mountPath: { type: string }
-                                subPath: { type: string }
-                                readOnly: { type: boolean }
-                    storage:
-                      type: object
-                      description: |
-                        Workspace PVC policy.
-                      properties:
-                        type:
-                          type: string
-                          enum: [persistent, ephemeral]
-                          default: persistent
-                        size:
-                          type: string
-                          description: |
-                            Storage request for the workspace PVC. Empty
-                            preserves the gateway/cluster default.
+                    Kubernetes RuntimeClass name requested for the
+                    sandbox pod (e.g. `kata-containers`, `nvidia`).
+                    Maps to `SandboxTemplate.runtime_class_name`.
+                labels:
+                  type: object
+                  additionalProperties: { type: string }
+                  description: |
+                    User-supplied labels propagated to the gateway-side
+                    sandbox via `CreateSandboxRequest.labels`. Keys
+                    prefixed with `openshell.nvidia.com/` are reserved
+                    for the controller (cr-uid, cr-generation).
             status:
               type: object
               properties:
                 phase:
                   type: string
-                  enum: [Pending, Provisioning, Running, Terminating, Failed]
+                  enum: [Pending, Provisioning, Running, Terminating, Failed, Deleted]
                   description: |
                     Lifecycle phase as observed by the in-process
-                    controller.
+                    controller. `Deleted` is only transiently visible
+                    between finalizer cleanup and CR removal.
                 sandboxId:
                   type: string
                   description: |
