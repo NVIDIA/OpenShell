@@ -5816,13 +5816,14 @@ fn sandbox_upload_plan(local_path: &Path, git_ignore: bool) -> Result<SandboxUpl
         }
     })?;
 
-    if git_ignore && !metadata.file_type().is_symlink() {
-        if let Ok((base_dir, files)) = git_sync_files(local_path) {
-            if files.is_empty() {
-                return Ok(SandboxUploadPlan::GitFilteredEmpty);
-            }
-            return Ok(SandboxUploadPlan::GitAware { base_dir, files });
+    if git_ignore
+        && !metadata.file_type().is_symlink()
+        && let Ok((base_dir, files)) = git_sync_files(local_path)
+    {
+        if files.is_empty() {
+            return Ok(SandboxUploadPlan::GitFilteredEmpty);
         }
+        return Ok(SandboxUploadPlan::GitAware { base_dir, files });
     }
 
     Ok(SandboxUploadPlan::Regular)
