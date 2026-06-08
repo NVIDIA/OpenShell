@@ -353,7 +353,7 @@ mod tests {
 
         let result = print_output_collection("table", &items, test_item_to_json);
         assert!(result.is_ok());
-        assert!(result.unwrap()); // Should return false for table
+        assert!(!result.unwrap()); // Should return false for table
     }
 
     #[test]
