@@ -22,7 +22,7 @@ use std::path::Path;
 /// exist and this returns `false`, leaving mount options unchanged.
 #[cfg(target_os = "linux")]
 fn is_selinux_enabled() -> bool {
-    std::path::Path::new("/sys/fs/selinux").is_dir()
+    Path::new("/sys/fs/selinux").is_dir()
 }
 
 #[cfg(not(target_os = "linux"))]
