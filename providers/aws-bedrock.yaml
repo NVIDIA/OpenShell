@@ -3,33 +3,52 @@
 
 id: aws-bedrock
 display_name: AWS Bedrock
-description: Anthropic + Mistral + Llama models served via the AWS Bedrock InvokeModel API
+description: |
+  Anthropic + Mistral + Llama models served via the AWS Bedrock InvokeModel API.
+
+  Today this profile supports a bridge-fronted shape only: operators
+  point `BEDROCK_BASE_URL` at a translating bridge or
+  Bedrock-compatible proxy that handles auth in its own pod. Direct
+  AWS Bedrock with router-side SigV4 signing is a separate follow-up;
+  until that lands the AWS_* credentials below are declarative
+  schema only — none are required, none are auto-discovered, and the
+  router does not consume them.
 category: inference
 inference_capable: true
 credentials:
+  # Declarative-only until the SigV4 follow-up lands. None of these are
+  # required for the bridge-fronted shape; the router does not inject
+  # them on outbound requests.
   - name: aws_access_key_id
-    description: AWS access key id used for SigV4 signing of outbound Bedrock requests
+    description: AWS access key id (used by the SigV4 signer follow-up; unused today)
     env_vars: [AWS_ACCESS_KEY_ID]
-    required: true
+    required: false
   - name: aws_secret_access_key
-    description: AWS secret access key paired with aws_access_key_id
+    description: AWS secret access key (used by the SigV4 signer follow-up; unused today)
     env_vars: [AWS_SECRET_ACCESS_KEY]
-    required: true
+    required: false
   - name: aws_session_token
     description: Optional session token for temporary credentials (STS, IAM Roles for Service Accounts)
     env_vars: [AWS_SESSION_TOKEN]
     required: false
   - name: aws_region
-    description: AWS region the Bedrock endpoint resolves into (e.g. us-east-1)
+    description: AWS region (used by the SigV4 signer follow-up; unused today)
     env_vars: [AWS_REGION, AWS_DEFAULT_REGION]
-    required: true
+    required: false
 discovery:
-  credentials: [aws_access_key_id, aws_secret_access_key, aws_session_token, aws_region]
+  # Bridge-fronted routing intentionally does not consume AWS
+  # credentials, so `--from-existing` does not scan for them today.
+  # The SigV4 follow-up will repopulate this list.
+  credentials: []
 endpoints:
-  # Default endpoint targets us-east-1 since the YAML loader does not yet
-  # substitute the `{region}` placeholder. Operators in other regions
-  # override via the `BEDROCK_BASE_URL` config-key the same way the
-  # `anthropic` provider accepts `ANTHROPIC_BASE_URL`.
+  # Default endpoint targets us-east-1 for the SigV4-fronted shape that
+  # comes later. The YAML loader does not yet substitute a `{region}`
+  # placeholder; operators in other regions or running against a bridge
+  # override via the `BEDROCK_BASE_URL` config-key (mirrors how the
+  # `anthropic` profile accepts `ANTHROPIC_BASE_URL`). Until then the
+  # core profile sets `default_base_url: ""` so route resolution
+  # rejects providers without `BEDROCK_BASE_URL` rather than silently
+  # forwarding prompts to AWS with no usable auth.
   - host: bedrock-runtime.us-east-1.amazonaws.com
     port: 443
     protocol: rest

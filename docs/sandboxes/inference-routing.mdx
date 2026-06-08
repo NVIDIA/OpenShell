@@ -26,7 +26,7 @@ If code calls an external inference host directly, OpenShell evaluates that traf
 | Credentials | No sandbox API keys needed. Credentials come from the configured provider record. The router strips caller-supplied `Authorization` before forwarding the request. |
 | Header forwarding | `inference.local` forwards only a per-provider header allowlist. OpenAI routes allow `openai-organization` and `x-model-id`. Anthropic routes allow `anthropic-version` and `anthropic-beta`. Vertex Claude rawPredict routes strip `anthropic-beta` and do not forward `anthropic-version` as a header because the router injects `anthropic_version` into the Vertex request body. NVIDIA routes allow `x-model-id`. AWS Bedrock routes have no passthrough headers today. All other caller headers are stripped. |
 | Configuration | One provider and one model define sandbox inference for the active gateway. Every sandbox on that gateway sees the same `inference.local` backend. |
-| Provider support | NVIDIA, Anthropic, Google Vertex AI, and any OpenAI-compatible provider all work through the same endpoint. Vertex routes Claude models through `/v1/messages` and non-Anthropic models through `/v1/chat/completions`. The gateway resolves the upstream Vertex host from the provider config, including regional, global, and supported multi-region endpoints. |
+| Provider support | NVIDIA, Anthropic, Google Vertex AI, AWS Bedrock (via a translating bridge — direct AWS with SigV4 signing is a separate follow-up), and any OpenAI-compatible provider all work through the same endpoint. Vertex routes Claude models through `/v1/messages` and non-Anthropic models through `/v1/chat/completions`. The gateway resolves the upstream Vertex host from the provider config, including regional, global, and supported multi-region endpoints. |
 | Streaming reliability | The router tolerates idle gaps of up to 120 seconds between streamed chunks so long reasoning responses are not cut off mid-stream. |
 | Hot refresh | OpenShell picks up provider credential changes and inference updates without recreating sandboxes. Changes propagate within about 5 seconds by default. |
 
@@ -171,12 +171,26 @@ This reads `ANTHROPIC_API_KEY` from your environment.
 openshell provider create \
     --name bedrock-bridge \
     --type aws-bedrock \
+    --credential AWS_ACCESS_KEY_ID=unused-bridge-fronted-shape \
     --config BEDROCK_BASE_URL=http://your-bedrock-bridge.your-ns.svc.cluster.local:8080
 ```
 
-The `aws-bedrock` provider type is bridge-fronted: the router does not inject any auth header on outbound requests. Point `BEDROCK_BASE_URL` at a translating bridge or Bedrock-compatible proxy that handles authentication in its own pod. The bridge is expected to accept Bedrock InvokeModel requests on the patterns listed above and forward to the operator's real upstream.
+Then set the inference route, passing `--no-verify` because the validation probe does not yet support Bedrock protocols:
 
-For direct AWS Bedrock with SigV4 signing, refer to a future release that adds the SigV4 router-side signer. Today the discovery scan picks up `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, and `AWS_REGION` from your environment via `--from-existing`, but the router does not yet sign requests with them.
+```shell
+openshell inference set \
+    --provider bedrock-bridge \
+    --model anthropic.claude-3-5-sonnet-20241022-v2:0 \
+    --no-verify
+```
+
+**Why a placeholder credential?** `provider create` requires a non-empty `credentials` map. The bridge-fronted shape ignores AWS credentials at the router level (the bridge holds operator-side auth in its own pod), so any string value satisfies the structural requirement; `unused-bridge-fronted-shape` makes the intent obvious in `openshell provider get` output. When the SigV4 follow-up lands, this becomes a real key.
+
+**About the bridge-fronted shape.** The router does not inject any auth header on outbound requests. Point `BEDROCK_BASE_URL` at a translating bridge or Bedrock-compatible proxy that handles authentication in its own pod. The bridge is expected to accept Bedrock InvokeModel requests on the patterns listed above and forward to the operator's real upstream.
+
+**About `--no-verify`.** The default validation probe does not yet recognize the `aws_bedrock_invoke` and `aws_bedrock_invoke_stream` protocols, so without `--no-verify` the `inference set` call would fail before it could mint a route. The first sandbox round-trip is the real verification today.
+
+**For direct AWS Bedrock**, refer to a future release that adds the SigV4 router-side signer. Until then, a `BEDROCK_BASE_URL` is required at provider-create time — the core profile sets `default_base_url: ""`, so route resolution rejects providers without it rather than silently forwarding prompts to AWS with no usable auth.
 
 </Tab>
 </Tabs>
