@@ -1,12 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::gpu::{
+    GpuInventory, SubnetAllocator, allocate_vsock_cid, mac_from_sandbox_id, tap_device_name,
+};
 use crate::lifecycle::{
     BackendFeature, GuestInitDropin, LaunchAbortReason, LaunchPlan, LifecycleExtensionRegistry,
     RestoreContext, extension_state_dir,
-};
-use crate::gpu::{
-    GpuInventory, SubnetAllocator, allocate_vsock_cid, mac_from_sandbox_id, tap_device_name,
 };
 use crate::rootfs::{
     clone_or_copy_sparse_file, create_ext4_image_from_dir_with_size, create_rootfs_image_from_dir,
@@ -919,9 +919,7 @@ impl VmDriver {
                 sandbox: sandbox.clone(),
                 state_dir: state_dir.clone(),
             };
-            self.lifecycle_extensions
-                .after_restore(&persisted)
-                .await;
+            self.lifecycle_extensions.after_restore(&persisted).await;
         }
         tokio::spawn({
             let driver = self.clone();
@@ -1162,11 +1160,7 @@ impl VmDriver {
             sandbox: sandbox.clone(),
             state_dir: state_dir.clone(),
         };
-        if let Err(err) = self
-            .lifecycle_extensions
-            .before_restore(&persisted)
-            .await
-        {
+        if let Err(err) = self.lifecycle_extensions.before_restore(&persisted).await {
             warn!(
                 sandbox_id = %sandbox.id,
                 sandbox_name = %sandbox.name,
@@ -4566,7 +4560,9 @@ fn write_guest_init_dropin_manifest(
     let guest_path = overlay_upper_path(GUEST_INIT_DROPIN_MANIFEST);
     let contents = render_guest_init_dropin_manifest(dropins);
     write_rootfs_image_file(overlay_disk, &guest_path, &contents).map_err(|err| {
-        Status::internal(format!("write VM guest init drop-in manifest failed: {err}"))
+        Status::internal(format!(
+            "write VM guest init drop-in manifest failed: {err}"
+        ))
     })?;
     set_rootfs_image_file_mode(overlay_disk, &guest_path, 0o644).map_err(|err| {
         Status::internal(format!(
@@ -6377,8 +6373,8 @@ mod tests {
     }
 
     use crate::lifecycle::{
-        BackendFeature, LaunchPlan, LifecycleError, LifecycleExtension,
-        LifecycleExtensionRegistry, LifecycleResult,
+        BackendFeature, LaunchPlan, LifecycleError, LifecycleExtension, LifecycleExtensionRegistry,
+        LifecycleResult,
     };
     use crate::runtime::VmBackend;
 

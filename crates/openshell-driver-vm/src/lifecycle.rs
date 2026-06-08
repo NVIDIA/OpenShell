@@ -247,10 +247,7 @@ impl LaunchPlan {
         }
     }
 
-    pub fn require_backend_features(
-        &mut self,
-        features: impl IntoIterator<Item = BackendFeature>,
-    ) {
+    pub fn require_backend_features(&mut self, features: impl IntoIterator<Item = BackendFeature>) {
         for feature in features {
             self.require_backend_feature(feature);
         }
@@ -412,11 +409,7 @@ pub trait LifecycleExtension: std::fmt::Debug + Send + Sync {
     ///
     /// Invoked in reverse registration order. Errors are logged but do not
     /// propagate.
-    async fn after_delete(
-        &self,
-        _sandbox: &Sandbox,
-        _state_dir: &Path,
-    ) -> LifecycleResult<()> {
+    async fn after_delete(&self, _sandbox: &Sandbox, _state_dir: &Path) -> LifecycleResult<()> {
         Ok(())
     }
 
@@ -426,10 +419,7 @@ pub trait LifecycleExtension: std::fmt::Debug + Send + Sync {
     /// Returning an error causes the driver to skip restoring this
     /// sandbox; the persisted state is left on disk for operator
     /// inspection.
-    async fn before_restore(
-        &self,
-        _sandbox: &RestoreContext,
-    ) -> LifecycleResult<()> {
+    async fn before_restore(&self, _sandbox: &RestoreContext) -> LifecycleResult<()> {
         Ok(())
     }
 
@@ -439,10 +429,7 @@ pub trait LifecycleExtension: std::fmt::Debug + Send + Sync {
     /// Only invoked when restore succeeds. If the restore fails partway
     /// through, [`after_launch_failed`](Self::after_launch_failed)
     /// runs instead.
-    async fn after_restore(
-        &self,
-        _sandbox: &RestoreContext,
-    ) -> LifecycleResult<()> {
+    async fn after_restore(&self, _sandbox: &RestoreContext) -> LifecycleResult<()> {
         Ok(())
     }
 }
@@ -558,9 +545,7 @@ impl LifecycleExtensionRegistry {
             .iter()
             .filter(|ext| match ext.activation() {
                 ExtensionActivation::Global => true,
-                ExtensionActivation::OnRequest { key } => {
-                    sandbox_requested_extension(sandbox, key)
-                }
+                ExtensionActivation::OnRequest { key } => sandbox_requested_extension(sandbox, key),
             })
             .collect()
     }
@@ -649,10 +634,7 @@ impl LifecycleExtensionRegistry {
         }
     }
 
-    pub async fn before_restore(
-        &self,
-        sandbox: &RestoreContext,
-    ) -> LifecycleResult<()> {
+    pub async fn before_restore(&self, sandbox: &RestoreContext) -> LifecycleResult<()> {
         for ext in self.active_for(&sandbox.sandbox) {
             ext.before_restore(sandbox).await?;
         }
@@ -752,9 +734,7 @@ fn validate_extension_name(name: &str) -> LifecycleResult<()> {
     Ok(())
 }
 
-fn validate_descriptor_strings(
-    descriptor: &ExtensionDescriptor,
-) -> LifecycleResult<()> {
+fn validate_descriptor_strings(descriptor: &ExtensionDescriptor) -> LifecycleResult<()> {
     for value in descriptor
         .provides
         .kernel_profiles
@@ -932,11 +912,7 @@ mod tests {
             Ok(())
         }
 
-        async fn after_delete(
-            &self,
-            _sandbox: &Sandbox,
-            _state_dir: &Path,
-        ) -> LifecycleResult<()> {
+        async fn after_delete(&self, _sandbox: &Sandbox, _state_dir: &Path) -> LifecycleResult<()> {
             self.calls
                 .lock()
                 .unwrap()
@@ -1040,10 +1016,7 @@ mod tests {
             .configure_launch(&sandbox, &PathBuf::from("/tmp/state"), &mut plan)
             .await
             .expect_err("scripted failure should propagate");
-        assert!(
-            err.message()
-                .contains("scripted configure_launch failure")
-        );
+        assert!(err.message().contains("scripted configure_launch failure"));
 
         assert_eq!(ext_a.calls(), vec!["a:configure_launch"]);
         assert_eq!(ext_fail.calls(), vec!["boom:configure_launch"]);
