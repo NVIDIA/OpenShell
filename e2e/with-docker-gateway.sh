@@ -450,6 +450,7 @@ GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
   printf 'guest_tls_ca = %s\n'         "$(toml_string "${PKI_DIR}/ca.crt")"
   printf 'guest_tls_cert = %s\n'       "$(toml_string "${PKI_DIR}/client/tls.crt")"
   printf 'guest_tls_key = %s\n'        "$(toml_string "${PKI_DIR}/client/tls.key")"
+  printf 'enable_bind_mounts = true\n'
   # DOCKER_SUPERVISOR_ARGS holds either ("--docker-supervisor-bin" "<path>")
   # or ("--docker-supervisor-image" "<image>"); both map to TOML keys on
   # the docker driver config.

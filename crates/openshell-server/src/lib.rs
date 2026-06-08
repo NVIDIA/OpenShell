@@ -1368,6 +1368,21 @@ service_account_name = "sandbox-sa"
     }
 
     #[test]
+    fn podman_config_reads_bind_mount_opt_in_from_driver_table() {
+        let file: crate::config_file::ConfigFile = toml::from_str(
+            r"
+[openshell.drivers.podman]
+enable_bind_mounts = true
+",
+        )
+        .expect("valid config");
+
+        let cfg = crate::podman_config_from_file(Some(&file)).expect("podman config");
+
+        assert!(cfg.enable_bind_mounts);
+    }
+
+    #[test]
     fn gateway_listener_addresses_skip_driver_address_covered_by_wildcard() {
         let primary: SocketAddr = "0.0.0.0:8080".parse().unwrap();
         let docker: SocketAddr = "172.18.0.1:8080".parse().unwrap();

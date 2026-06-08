@@ -75,6 +75,7 @@ fn runtime_config() -> DockerDriverRuntimeConfig {
         daemon_version: "28.0.0".to_string(),
         supports_gpu: false,
         sandbox_pids_limit: DEFAULT_SANDBOX_PIDS_LIMIT,
+        enable_bind_mounts: false,
     }
 }
 
@@ -466,6 +467,12 @@ fn docker_pids_limit_uses_driver_default_and_allows_runtime_inherit() {
 }
 
 #[test]
+fn docker_compute_config_disables_bind_mounts_by_default() {
+    let cfg = DockerComputeConfig::default();
+    assert!(!cfg.enable_bind_mounts);
+}
+
+#[test]
 fn container_create_body_sets_driver_owned_pids_limit() {
     let body = build_container_create_body(&test_sandbox(), &runtime_config()).unwrap();
     let host_config = body.host_config.expect("host config");
@@ -613,7 +620,7 @@ fn build_container_create_body_includes_driver_config_mounts() {
 }
 
 #[test]
-fn driver_config_rejects_bind_mounts() {
+fn driver_config_rejects_bind_mounts_unless_enabled() {
     let mut sandbox = test_sandbox();
     sandbox
         .spec
@@ -633,7 +640,71 @@ fn driver_config_rejects_bind_mounts() {
     let err = build_container_create_body(&sandbox, &runtime_config()).unwrap_err();
 
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-    assert!(err.message().contains("invalid docker driver_config"));
+    assert!(err.message().contains("enable_bind_mounts = true"));
+}
+
+#[test]
+fn build_container_create_body_includes_bind_mounts_when_enabled() {
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [{
+            "type": "bind",
+            "source": "/host/path",
+            "target": "/sandbox/host",
+            "read_only": true
+        }]
+    })));
+    let mut config = runtime_config();
+    config.enable_bind_mounts = true;
+
+    let body = build_container_create_body(&sandbox, &config).unwrap();
+    let mounts = body
+        .host_config
+        .unwrap()
+        .mounts
+        .expect("driver config mounts should be set");
+
+    assert_eq!(mounts.len(), 1);
+    assert_eq!(mounts[0].typ, Some(MountTypeEnum::BIND));
+    assert_eq!(mounts[0].source.as_deref(), Some("/host/path"));
+    assert_eq!(mounts[0].target.as_deref(), Some("/sandbox/host"));
+    assert_eq!(mounts[0].read_only, Some(true));
+}
+
+#[test]
+fn driver_config_rejects_relative_bind_sources_when_enabled() {
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [{
+            "type": "bind",
+            "source": "relative/path",
+            "target": "/sandbox/host"
+        }]
+    })));
+    let mut config = runtime_config();
+    config.enable_bind_mounts = true;
+
+    let err = build_container_create_body(&sandbox, &config).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        err.message()
+            .contains("bind source must be an absolute host path")
+    );
 }
 
 #[test]

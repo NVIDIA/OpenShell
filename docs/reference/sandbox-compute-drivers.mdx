@@ -74,12 +74,14 @@ For GPU-backed Docker sandboxes, configure Docker CDI before starting the gatewa
 
 ### Docker Driver Config Mounts
 
-Docker driver config accepts user-supplied `volume` and `tmpfs` mounts. Host
-bind mounts and image mounts are not accepted in Docker sandbox driver config.
+Docker driver config accepts user-supplied `volume` and `tmpfs` mounts. It also
+accepts `bind` mounts when `[openshell.drivers.docker]` sets
+`enable_bind_mounts = true` in `gateway.toml`. Host bind mounts expose gateway
+host paths to sandbox requests, so they are disabled by default. Image mounts
+are not accepted in Docker sandbox driver config.
 Docker's [storage documentation](https://docs.docker.com/engine/storage/)
 documents container storage mounts as volumes, bind mounts, tmpfs mounts, and
-named pipes. OpenShell intentionally exposes only Docker-managed volumes and
-tmpfs mounts for sandbox create.
+named pipes.
 
 Use a `volume` mount for existing Docker named volumes. This includes NFS
 volumes created with Docker's local volume driver:
@@ -97,10 +99,24 @@ openshell sandbox create \
   -- claude
 ```
 
+Use a `bind` mount only after enabling it in the Docker driver table:
+
+```toml
+[openshell.drivers.docker]
+enable_bind_mounts = true
+```
+
+```shell
+openshell sandbox create \
+  --driver-config-json '{"docker":{"mounts":[{"type":"bind","source":"/srv/openshell/work","target":"/sandbox/work","read_only":false}]}}' \
+  -- claude
+```
+
 Docker mount schema:
 
 | Type | Fields |
 |---|---|
+| `bind` | `source`, `target`, optional `read_only` (`false` by default). `source` must be an absolute host path. Requires `enable_bind_mounts = true`. |
 | `volume` | `source`, `target`, optional `read_only` (`false` by default), optional `subpath`. The named volume must already exist. |
 | `tmpfs` | `target`, optional `options`, optional `size_bytes`, optional `mode`. |
 
@@ -123,7 +139,9 @@ On macOS with `podman machine`, the driver uses gvproxy's host-loopback IP, `192
 ### Podman Driver Config Mounts
 
 Podman driver config accepts user-supplied `volume`, `tmpfs`, and `image`
-mounts. Host bind mounts are not accepted in Podman sandbox driver config.
+mounts. It also accepts `bind` mounts when `[openshell.drivers.podman]` sets
+`enable_bind_mounts = true` in `gateway.toml`. Host bind mounts expose gateway
+host paths to sandbox requests, so they are disabled by default.
 
 Use a `volume` mount for existing Podman named volumes. This includes NFS
 volumes created with Podman's local volume driver:
@@ -149,10 +167,24 @@ openshell sandbox create \
   -- claude
 ```
 
+Use a `bind` mount only after enabling it in the Podman driver table:
+
+```toml
+[openshell.drivers.podman]
+enable_bind_mounts = true
+```
+
+```shell
+openshell sandbox create \
+  --driver-config-json '{"podman":{"mounts":[{"type":"bind","source":"/srv/openshell/work","target":"/sandbox/work","read_only":false}]}}' \
+  -- claude
+```
+
 Podman mount schema:
 
 | Type | Fields |
 |---|---|
+| `bind` | `source`, `target`, optional `read_only` (`false` by default). `source` must be an absolute host path. Requires `enable_bind_mounts = true`. |
 | `volume` | `source`, `target`, optional `read_only` (`false` by default). The named volume must already exist. |
 | `tmpfs` | `target`, optional `options`, optional `size_bytes`, optional `mode`. |
 | `image` | `source`, `target`, optional `read_only` (`true` by default). |

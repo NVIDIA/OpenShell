@@ -177,6 +177,11 @@ pub struct DockerComputeConfig {
     ///
     /// Set to `0` to leave Docker's runtime/default PID limit unchanged.
     pub sandbox_pids_limit: i64,
+
+    /// Allow sandbox requests to attach host bind mounts through
+    /// `template.driver_config`.
+    #[serde(default)]
+    pub enable_bind_mounts: bool,
 }
 
 impl Default for DockerComputeConfig {
@@ -195,6 +200,7 @@ impl Default for DockerComputeConfig {
             host_gateway_ip: String::new(),
             ssh_socket_path: "/run/openshell/ssh.sock".to_string(),
             sandbox_pids_limit: DEFAULT_SANDBOX_PIDS_LIMIT,
+            enable_bind_mounts: false,
         }
     }
 }
@@ -222,6 +228,7 @@ struct DockerDriverRuntimeConfig {
     daemon_version: String,
     supports_gpu: bool,
     sandbox_pids_limit: i64,
+    enable_bind_mounts: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -268,6 +275,12 @@ struct DockerSandboxDriverConfig {
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum DockerDriverMountConfig {
+    Bind {
+        source: String,
+        target: String,
+        #[serde(default)]
+        read_only: bool,
+    },
     Volume {
         source: String,
         target: String,
@@ -356,6 +369,7 @@ impl DockerComputeDriver {
                 daemon_version: version.version.unwrap_or_else(|| "unknown".to_string()),
                 supports_gpu,
                 sandbox_pids_limit: docker_config.sandbox_pids_limit,
+                enable_bind_mounts: docker_config.enable_bind_mounts,
             },
             events: broadcast::channel(WATCH_BUFFER).0,
             pending: Arc::new(Mutex::new(HashMap::new())),
@@ -420,7 +434,7 @@ impl DockerComputeDriver {
             ));
         }
 
-        let _ = docker_driver_config(template)?;
+        let _ = docker_driver_config(template, config.enable_bind_mounts)?;
         let _ = docker_resource_limits(template)?;
         Ok(())
     }
@@ -457,7 +471,7 @@ impl DockerComputeDriver {
             .as_ref()
             .and_then(|spec| spec.template.as_ref())
             .ok_or_else(|| Status::invalid_argument("sandbox.spec.template is required"))?;
-        let config = docker_driver_config(template)?;
+        let config = docker_driver_config(template, self.config.enable_bind_mounts)?;
         for mount in config.mounts {
             if let DockerDriverMountConfig::Volume { source, .. } = mount {
                 match self.docker.inspect_volume(source.trim()).await {
@@ -1568,6 +1582,7 @@ fn attach_docker_progress_metadata(
 
 fn docker_driver_config(
     template: &DriverSandboxTemplate,
+    enable_bind_mounts: bool,
 ) -> Result<DockerSandboxDriverConfig, Status> {
     let Some(config) = template.driver_config.as_ref() else {
         return Ok(DockerSandboxDriverConfig::default());
@@ -1577,17 +1592,31 @@ fn docker_driver_config(
     let config: DockerSandboxDriverConfig = serde_json::from_value(json).map_err(|err| {
         Status::failed_precondition(format!("invalid docker driver_config: {err}"))
     })?;
-    validate_docker_driver_mounts(&config.mounts)?;
+    validate_docker_driver_mounts(&config.mounts, enable_bind_mounts)?;
     Ok(config)
 }
 
-fn docker_driver_mounts(template: &DriverSandboxTemplate) -> Result<Vec<Mount>, Status> {
-    let config = docker_driver_config(template)?;
+fn docker_driver_mounts(
+    template: &DriverSandboxTemplate,
+    enable_bind_mounts: bool,
+) -> Result<Vec<Mount>, Status> {
+    let config = docker_driver_config(template, enable_bind_mounts)?;
     config.mounts.iter().map(docker_mount_from_config).collect()
 }
 
 fn docker_mount_from_config(config: &DockerDriverMountConfig) -> Result<Mount, Status> {
     match config {
+        DockerDriverMountConfig::Bind {
+            source,
+            target,
+            read_only,
+        } => Ok(Mount {
+            typ: Some(MountTypeEnum::BIND),
+            source: Some(validate_absolute_mount_source(source, "bind source")?),
+            target: Some(validate_container_mount_target(target)?),
+            read_only: Some(*read_only),
+            ..Default::default()
+        }),
         DockerDriverMountConfig::Volume {
             source,
             target,
@@ -1637,10 +1666,22 @@ fn docker_mount_from_config(config: &DockerDriverMountConfig) -> Result<Mount, S
     }
 }
 
-fn validate_docker_driver_mounts(mounts: &[DockerDriverMountConfig]) -> Result<(), Status> {
+fn validate_docker_driver_mounts(
+    mounts: &[DockerDriverMountConfig],
+    enable_bind_mounts: bool,
+) -> Result<(), Status> {
     let mut targets = HashSet::new();
     for mount in mounts {
         let target = match mount {
+            DockerDriverMountConfig::Bind { source, target, .. } => {
+                if !enable_bind_mounts {
+                    return Err(Status::failed_precondition(
+                        "docker bind mounts require enable_bind_mounts = true in [openshell.drivers.docker]",
+                    ));
+                }
+                validate_absolute_mount_source(source, "bind source")?;
+                target
+            }
             DockerDriverMountConfig::Volume {
                 source,
                 target,
@@ -1675,6 +1716,16 @@ fn validate_docker_driver_mounts(mounts: &[DockerDriverMountConfig]) -> Result<(
         }
     }
     Ok(())
+}
+
+fn validate_absolute_mount_source(source: &str, field: &str) -> Result<String, Status> {
+    let source = validate_mount_source(source, field)?;
+    if !Path::new(&source).is_absolute() {
+        return Err(Status::failed_precondition(format!(
+            "{field} must be an absolute host path"
+        )));
+    }
+    Ok(source)
 }
 
 fn validate_mount_source(source: &str, field: &str) -> Result<String, Status> {
@@ -2110,7 +2161,7 @@ fn build_container_create_body(
         .as_ref()
         .ok_or_else(|| Status::invalid_argument("sandbox.spec.template is required"))?;
     let resource_limits = docker_resource_limits(template)?;
-    let user_mounts = docker_driver_mounts(template)?;
+    let user_mounts = docker_driver_mounts(template, config.enable_bind_mounts)?;
     let mut labels = template.labels.clone();
     labels.insert(
         LABEL_MANAGED_BY.to_string(),

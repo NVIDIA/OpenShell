@@ -3,14 +3,18 @@
 
 #![cfg(feature = "e2e-local-container-driver")]
 
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::process::Output;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use openshell_e2e::harness::container::{ContainerEngine, e2e_driver};
 use openshell_e2e::harness::sandbox::SandboxGuard;
+use serde_json::{Map, Value};
 
 const TEST_IMAGE: &str = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest";
 const VOLUME_TARGET: &str = "/sandbox/e2e-volume";
+const BIND_TARGET: &str = "/sandbox/e2e-bind";
 
 struct VolumeGuard {
     engine: ContainerEngine,
@@ -72,6 +76,57 @@ async fn sandbox_mounts_existing_driver_config_volume() {
 
     sandbox.cleanup().await;
     verify_volume(&volume).expect("verify sandbox wrote to named test volume");
+}
+
+#[tokio::test]
+async fn sandbox_mounts_enabled_driver_config_bind() {
+    let driver = e2e_driver().expect("OPENSHELL_E2E_DRIVER must be set by the e2e wrapper");
+    assert!(
+        matches!(driver.as_str(), "docker" | "podman"),
+        "driver_config bind e2e requires docker or podman, got {driver}"
+    );
+
+    let cwd = std::env::current_dir().expect("resolve current dir");
+    let host_dir = tempfile::Builder::new()
+        .prefix("openshell-e2e-driver-config-bind-")
+        .tempdir_in(cwd)
+        .expect("create bind mount host dir");
+    fs::set_permissions(host_dir.path(), fs::Permissions::from_mode(0o777))
+    .expect("make bind mount host dir writable by sandbox user");
+    fs::write(host_dir.path().join("input.txt"), "host-bind-ok")
+        .expect("seed bind mount host dir");
+
+    let driver_config = driver_config_mount_json(
+        &driver,
+        serde_json::json!({
+            "type": "bind",
+            "source": host_dir.path(),
+            "target": BIND_TARGET,
+            "read_only": false
+        }),
+    );
+    let mut sandbox = SandboxGuard::create(&[
+        "--no-keep",
+        "--driver-config-json",
+        &driver_config,
+        "--",
+        "sh",
+        "-lc",
+        "set -eu; test \"$(cat /sandbox/e2e-bind/input.txt)\" = host-bind-ok; printf sandbox-bind-ok > /sandbox/e2e-bind/output.txt; cat /sandbox/e2e-bind/output.txt",
+    ])
+    .await
+    .expect("sandbox create with driver-config bind mount");
+
+    assert!(
+        sandbox.create_output.contains("sandbox-bind-ok"),
+        "sandbox should read and write the bind mount:\n{}",
+        sandbox.create_output
+    );
+
+    sandbox.cleanup().await;
+    let output = fs::read_to_string(host_dir.path().join("output.txt"))
+        .expect("read sandbox output from bind mount host dir");
+    assert_eq!(output, "sandbox-bind-ok");
 }
 
 fn seed_volume(volume: &VolumeGuard) -> Result<(), String> {
@@ -156,4 +211,15 @@ fn unique_volume_name(driver: &str) -> String {
         "openshell-e2e-driver-config-volume-{driver}-{}-{nanos}",
         std::process::id()
     )
+}
+
+fn driver_config_mount_json(driver: &str, mount: Value) -> String {
+    let mut root = Map::new();
+    root.insert(
+        driver.to_string(),
+        serde_json::json!({
+            "mounts": [mount]
+        }),
+    );
+    Value::Object(root).to_string()
 }

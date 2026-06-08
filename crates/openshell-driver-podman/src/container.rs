@@ -67,6 +67,12 @@ struct PodmanSandboxDriverConfig {
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum PodmanDriverMountConfig {
+    Bind {
+        source: String,
+        target: String,
+        #[serde(default)]
+        read_only: bool,
+    },
     Volume {
         source: String,
         target: String,
@@ -449,7 +455,10 @@ fn build_devices(sandbox: &DriverSandbox) -> Option<Vec<LinuxDevice>> {
     })
 }
 
-pub fn podman_driver_volume_mount_sources(sandbox: &DriverSandbox) -> Result<Vec<String>, String> {
+pub fn podman_driver_volume_mount_sources(
+    sandbox: &DriverSandbox,
+    enable_bind_mounts: bool,
+) -> Result<Vec<String>, String> {
     let template = sandbox
         .spec
         .as_ref()
@@ -457,7 +466,7 @@ pub fn podman_driver_volume_mount_sources(sandbox: &DriverSandbox) -> Result<Vec
     let Some(template) = template else {
         return Ok(Vec::new());
     };
-    let config = podman_driver_config(template)?;
+    let config = podman_driver_config(template, enable_bind_mounts)?;
     Ok(config
         .mounts
         .into_iter()
@@ -468,7 +477,10 @@ pub fn podman_driver_volume_mount_sources(sandbox: &DriverSandbox) -> Result<Vec
         .collect())
 }
 
-pub fn podman_driver_image_mount_sources(sandbox: &DriverSandbox) -> Result<Vec<String>, String> {
+pub fn podman_driver_image_mount_sources(
+    sandbox: &DriverSandbox,
+    enable_bind_mounts: bool,
+) -> Result<Vec<String>, String> {
     let template = sandbox
         .spec
         .as_ref()
@@ -476,7 +488,7 @@ pub fn podman_driver_image_mount_sources(sandbox: &DriverSandbox) -> Result<Vec<
     let Some(template) = template else {
         return Ok(Vec::new());
     };
-    let config = podman_driver_config(template)?;
+    let config = podman_driver_config(template, enable_bind_mounts)?;
     Ok(config
         .mounts
         .into_iter()
@@ -487,7 +499,10 @@ pub fn podman_driver_image_mount_sources(sandbox: &DriverSandbox) -> Result<Vec<
         .collect())
 }
 
-fn podman_user_mounts(sandbox: &DriverSandbox) -> Result<PodmanUserMounts, String> {
+fn podman_user_mounts(
+    sandbox: &DriverSandbox,
+    enable_bind_mounts: bool,
+) -> Result<PodmanUserMounts, String> {
     let template = sandbox
         .spec
         .as_ref()
@@ -495,10 +510,25 @@ fn podman_user_mounts(sandbox: &DriverSandbox) -> Result<PodmanUserMounts, Strin
     let Some(template) = template else {
         return Ok(PodmanUserMounts::default());
     };
-    let config = podman_driver_config(template)?;
+    let config = podman_driver_config(template, enable_bind_mounts)?;
     let mut result = PodmanUserMounts::default();
     for mount in config.mounts {
         match mount {
+            PodmanDriverMountConfig::Bind {
+                source,
+                target,
+                read_only,
+            } => {
+                result.mounts.push(Mount {
+                    kind: "bind".into(),
+                    source: validate_absolute_mount_source(&source, "bind source")?,
+                    destination: validate_container_mount_target(&target)?,
+                    options: vec![
+                        if read_only { "ro" } else { "rw" }.to_string(),
+                        "rbind".to_string(),
+                    ],
+                });
+            }
             PodmanDriverMountConfig::Volume {
                 source,
                 target,
@@ -558,6 +588,7 @@ fn podman_user_mounts(sandbox: &DriverSandbox) -> Result<PodmanUserMounts, Strin
 
 fn podman_driver_config(
     template: &DriverSandboxTemplate,
+    enable_bind_mounts: bool,
 ) -> Result<PodmanSandboxDriverConfig, String> {
     let Some(config) = template.driver_config.as_ref() else {
         return Ok(PodmanSandboxDriverConfig::default());
@@ -565,14 +596,27 @@ fn podman_driver_config(
     let json = Value::Object(proto_struct_to_json_object(config));
     let config: PodmanSandboxDriverConfig = serde_json::from_value(json)
         .map_err(|err| format!("invalid podman driver_config: {err}"))?;
-    validate_podman_driver_mounts(&config.mounts)?;
+    validate_podman_driver_mounts(&config.mounts, enable_bind_mounts)?;
     Ok(config)
 }
 
-fn validate_podman_driver_mounts(mounts: &[PodmanDriverMountConfig]) -> Result<(), String> {
+fn validate_podman_driver_mounts(
+    mounts: &[PodmanDriverMountConfig],
+    enable_bind_mounts: bool,
+) -> Result<(), String> {
     let mut targets = HashSet::new();
     for mount in mounts {
         let target = match mount {
+            PodmanDriverMountConfig::Bind { source, target, .. } => {
+                if !enable_bind_mounts {
+                    return Err(
+                        "podman bind mounts require enable_bind_mounts = true in [openshell.drivers.podman]"
+                            .to_string(),
+                    );
+                }
+                validate_absolute_mount_source(source, "bind source")?;
+                target
+            }
             PodmanDriverMountConfig::Volume {
                 source,
                 target,
@@ -613,6 +657,14 @@ fn validate_podman_driver_mounts(mounts: &[PodmanDriverMountConfig]) -> Result<(
         }
     }
     Ok(())
+}
+
+fn validate_absolute_mount_source(source: &str, field: &str) -> Result<String, String> {
+    let source = validate_mount_source(source, field)?;
+    if !Path::new(&source).is_absolute() {
+        return Err(format!("{field} must be an absolute host path"));
+    }
+    Ok(source)
 }
 
 fn validate_mount_source(source: &str, field: &str) -> Result<String, String> {
@@ -799,7 +851,7 @@ pub fn try_build_container_spec_with_token(
     let labels = build_labels(sandbox);
     let resource_limits = build_resource_limits(sandbox, config);
     let devices = build_devices(sandbox);
-    let user_mounts = podman_user_mounts(sandbox)?;
+    let user_mounts = podman_user_mounts(sandbox, config.enable_bind_mounts)?;
 
     // Network configuration -- always bridge mode.
     // Matches libpod's network spec format `{name: {opts}}`; the unit-struct
@@ -1682,7 +1734,7 @@ mod tests {
     }
 
     #[test]
-    fn driver_config_rejects_bind_mounts() {
+    fn driver_config_rejects_bind_mounts_unless_enabled() {
         use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
         let mut sandbox = test_sandbox("test-id", "test-name");
@@ -1703,7 +1755,73 @@ mod tests {
 
         let err = try_build_container_spec_with_token(&sandbox, &config, None).unwrap_err();
 
-        assert!(err.contains("invalid podman driver_config"));
+        assert!(err.contains("enable_bind_mounts = true"));
+    }
+
+    #[test]
+    fn container_spec_includes_bind_mounts_when_enabled() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    "mounts": [{
+                        "type": "bind",
+                        "source": "/host/path",
+                        "target": "/sandbox/host",
+                        "read_only": true
+                    }]
+                }))),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let mut config = test_config();
+        config.enable_bind_mounts = true;
+
+        let spec = build_container_spec(&sandbox, &config);
+        let mounts = spec["mounts"]
+            .as_array()
+            .expect("mounts should be an array");
+
+        assert!(mounts.iter().any(|mount| {
+            mount["type"].as_str() == Some("bind")
+                && mount["source"].as_str() == Some("/host/path")
+                && mount["destination"].as_str() == Some("/sandbox/host")
+                && mount["options"].as_array().is_some_and(|options| {
+                    options.iter().any(|option| option.as_str() == Some("ro"))
+                        && options
+                            .iter()
+                            .any(|option| option.as_str() == Some("rbind"))
+                })
+        }));
+    }
+
+    #[test]
+    fn driver_config_rejects_relative_bind_sources_when_enabled() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    "mounts": [{
+                        "type": "bind",
+                        "source": "relative/path",
+                        "target": "/sandbox/host"
+                    }]
+                }))),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let mut config = test_config();
+        config.enable_bind_mounts = true;
+
+        let err = try_build_container_spec_with_token(&sandbox, &config, None).unwrap_err();
+
+        assert!(err.contains("bind source must be an absolute host path"));
     }
 
     #[test]

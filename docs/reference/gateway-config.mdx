@@ -215,6 +215,7 @@ guest_tls_key      = "/etc/openshell/certs/client-key.pem"
 network_name       = "openshell-docker"
 host_gateway_ip    = "172.17.0.1"
 ssh_socket_path    = "/run/openshell/ssh.sock"
+enable_bind_mounts = false
 # Set to 0 to leave Docker's runtime default unchanged.
 sandbox_pids_limit = 2048
 ```
@@ -250,6 +251,7 @@ supervisor_image        = "ghcr.io/nvidia/openshell/supervisor:latest"
 guest_tls_ca            = "/etc/openshell/certs/ca.pem"
 guest_tls_cert          = "/etc/openshell/certs/client.pem"
 guest_tls_key           = "/etc/openshell/certs/client-key.pem"
+enable_bind_mounts      = false
 # Set to 0 to leave Podman's runtime default unchanged.
 sandbox_pids_limit      = 2048
 ```

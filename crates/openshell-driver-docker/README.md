@@ -42,15 +42,19 @@ The gateway forwards the `docker` block from `--driver-config-json` to this
 driver. The driver accepts user-supplied `mounts` entries with these Docker
 mount types:
 
+- `bind`: mounts an absolute host path when `[openshell.drivers.docker]`
+  has `enable_bind_mounts = true`.
 - `volume`: mounts an existing Docker named volume. The driver validates that
   the volume exists before provisioning and never creates or removes it.
 - `tmpfs`: mounts an in-memory filesystem with optional `options`,
   `size_bytes`, and `mode`.
 
-Host bind mounts and image mounts are intentionally not part of the Docker
+Host bind mounts are disabled by default because they expose gateway host
+paths to sandbox requests. Image mounts are not part of the Docker
 driver-config schema. The driver still uses internal bind mounts for
 OpenShell-owned supervisor, token, and TLS material.
 
+Docker `bind` mounts accept `source`, `target`, and optional `read_only`.
 Docker `volume` mounts may include `subpath`. Mount targets must be absolute
 container paths and must not replace the workspace root (`/sandbox`) or overlap
 OpenShell supervisor files, auth material, TLS material, or `/run/netns`.

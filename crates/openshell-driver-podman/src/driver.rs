@@ -300,8 +300,9 @@ impl PodmanComputeDriver {
         &self,
         sandbox: &DriverSandbox,
     ) -> Result<(), ComputeDriverError> {
-        let volumes = container::podman_driver_volume_mount_sources(sandbox)
-            .map_err(ComputeDriverError::Precondition)?;
+        let volumes =
+            container::podman_driver_volume_mount_sources(sandbox, self.config.enable_bind_mounts)
+                .map_err(ComputeDriverError::Precondition)?;
         for volume in volumes {
             let exists = self
                 .client
@@ -376,8 +377,9 @@ impl PodmanComputeDriver {
             .await
             .map_err(ComputeDriverError::from)?;
 
-        for image in container::podman_driver_image_mount_sources(sandbox)
-            .map_err(ComputeDriverError::Precondition)?
+        for image in
+            container::podman_driver_image_mount_sources(sandbox, self.config.enable_bind_mounts)
+                .map_err(ComputeDriverError::Precondition)?
         {
             info!(image = %image, policy = %pull_policy, "Ensuring image mount source");
             self.client

@@ -391,6 +391,7 @@ cp "${ROOT}/deploy/rpm/gateway.toml.default" "${GATEWAY_CONFIG}"
   printf 'guest_tls_ca = %s\n'     "$(toml_string "${PKI_DIR}/ca.crt")"
   printf 'guest_tls_cert = %s\n'   "$(toml_string "${PKI_DIR}/client/tls.crt")"
   printf 'guest_tls_key = %s\n'    "$(toml_string "${PKI_DIR}/client/tls.key")"
+  printf 'enable_bind_mounts = true\n'
   # The in-process Podman driver reads `socket_path` from TOML only — the
   # OPENSHELL_PODMAN_SOCKET env var is honoured by the standalone driver
   # binary, not the in-process driver used here. Pin the socket to the one

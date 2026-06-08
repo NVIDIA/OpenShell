@@ -122,6 +122,10 @@ pub struct PodmanComputeConfig {
     ///
     /// Set to `0` to leave Podman's runtime/default PID limit unchanged.
     pub sandbox_pids_limit: i64,
+    /// Allow sandbox requests to attach host bind mounts through
+    /// `template.driver_config`.
+    #[serde(default)]
+    pub enable_bind_mounts: bool,
 }
 
 impl PodmanComputeConfig {
@@ -246,6 +250,7 @@ impl Default for PodmanComputeConfig {
             guest_tls_cert: None,
             guest_tls_key: None,
             sandbox_pids_limit: DEFAULT_SANDBOX_PIDS_LIMIT,
+            enable_bind_mounts: false,
         }
     }
 }
@@ -267,6 +272,7 @@ impl std::fmt::Debug for PodmanComputeConfig {
             .field("guest_tls_cert", &self.guest_tls_cert)
             .field("guest_tls_key", &self.guest_tls_key)
             .field("sandbox_pids_limit", &self.sandbox_pids_limit)
+            .field("enable_bind_mounts", &self.enable_bind_mounts)
             .finish()
     }
 }
@@ -312,6 +318,7 @@ mod tests {
     fn default_config_sets_driver_owned_pids_limit() {
         let cfg = PodmanComputeConfig::default();
         assert_eq!(cfg.sandbox_pids_limit, DEFAULT_SANDBOX_PIDS_LIMIT);
+        assert!(!cfg.enable_bind_mounts);
         assert!(cfg.validate_runtime_limits().is_ok());
     }
 

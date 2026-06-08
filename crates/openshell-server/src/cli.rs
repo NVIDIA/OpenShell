@@ -1538,4 +1538,18 @@ default_image = "k8s-specific:1.0"
             .expect("deserializes");
         assert_eq!(parsed.default_image, "k8s-specific:1.0");
     }
+
+    #[test]
+    fn docker_config_reads_bind_mount_opt_in_from_driver_table() {
+        let file = config_file_from_toml(
+            r"
+[openshell.drivers.docker]
+enable_bind_mounts = true
+",
+        );
+
+        let cfg = super::build_docker_config(Some(&file), None).expect("docker config");
+
+        assert!(cfg.enable_bind_mounts);
+    }
 }
