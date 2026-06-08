@@ -30,11 +30,9 @@ impl GatewayHandle {
         Self { state }
     }
 
-    /// Create a sandbox.
-    ///
-    /// Delegates to `create_sandbox_core` — same path the gRPC handler
-    /// takes, so validation, persistence, telemetry, JWT minting, and
-    /// compute driver dispatch all apply.
+    /// Create a sandbox via the same path the gRPC handler takes.
+    /// Validation, persistence, telemetry, JWT minting, and compute
+    /// driver dispatch all apply.
     ///
     /// # Errors
     ///
@@ -44,9 +42,6 @@ impl GatewayHandle {
     }
 
     /// Delete a sandbox by name. Returns whether the sandbox existed.
-    ///
-    /// Delegates to `delete_sandbox_core` — same path the gRPC handler
-    /// takes.
     ///
     /// # Errors
     ///

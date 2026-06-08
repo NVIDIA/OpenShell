@@ -1,11 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Minimal reconciler for `OpenShellSandbox` CRs.
+//! Reconciler for `OpenShellSandbox` CRs.
 //!
-//! This is the scaffold body: it confirms the kube-rs `Controller` wiring,
-//! the status subresource path, and the conditions/phase shape end-to-end
-//! without yet calling the gateway to actually create a sandbox.
+//! Watches CRs in a single namespace, translates each spec into the
+//! gateway's `CreateSandboxRequest`, and patches CR status to reflect the
+//! gateway-side outcome. A finalizer keeps the CR alive until the
+//! gateway-side sandbox is confirmed deleted.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -200,9 +201,12 @@ async fn attach_finalizer(
         "kind": KIND,
         "metadata": { "finalizers": [FINALIZER] },
     });
+    // No `.force()`: our finalizer entry is unique to this field manager,
+    // so we shouldn't trip another manager's ownership of the list.
+    // Conflicts surface to the reconcile loop, which requeues.
     api.patch(
         name,
-        &PatchParams::apply(FIELD_MANAGER).force(),
+        &PatchParams::apply(FIELD_MANAGER),
         &Patch::Apply(&patch),
     )
     .await
@@ -347,9 +351,13 @@ async fn apply_status(
     name: &str,
     patch: serde_json::Value,
 ) -> Result<(), ReconcileError> {
+    // No `.force()`: other field managers (e.g. a future monitoring
+    // sidecar contributing to `.status.conditions`) keep their entries.
+    // SSA conflicts on fields we co-own surface as kube errors, which
+    // the reconcile loop requeues with backoff.
     api.patch_status(
         name,
-        &PatchParams::apply(FIELD_MANAGER).force(),
+        &PatchParams::apply(FIELD_MANAGER),
         &Patch::Apply(&patch),
     )
     .await

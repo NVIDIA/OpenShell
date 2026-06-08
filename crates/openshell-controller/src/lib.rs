@@ -42,6 +42,15 @@ pub use types::OpenShellSandbox;
 /// CRD list. The reconcile loop itself never returns under normal
 /// operation.
 pub async fn run<G: GatewayClient>(gateway: Arc<G>, config: ControllerConfig) -> Result<()> {
+    // Fail fast on empty watch_namespace. An empty string would silently
+    // produce a cluster-wide watch via `Api::namespaced("")`, which the
+    // controller's RBAC isn't scoped for — we'd flap on 403s deep in the
+    // reconcile loop instead of erroring at startup.
+    if config.watch_namespace.is_empty() {
+        return Err(anyhow::anyhow!(
+            "OPENSHELL_CONTROLLER_WATCH_NAMESPACE is empty; controller requires a namespace"
+        ));
+    }
     info!(
         namespace = %config.watch_namespace,
         "openshell-controller starting"

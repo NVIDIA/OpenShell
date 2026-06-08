@@ -147,6 +147,47 @@ kubectl -n openshell get statefulset,pod,pvc -l app.kubernetes.io/instance=opens
 kubectl -n openshell logs statefulset/openshell-postgres --tail=200
 ```
 
+#### Native CRD controller
+
+Every Helm-deployed gateway runs an in-process reconciler for
+`OpenShellSandbox` CRs under group `openshell.nvidia.com` on its
+ordinal-0 StatefulSet replica. The CRD ships with the chart.
+
+When `OpenShellSandbox` CRs are not progressing, check in order:
+
+```bash
+# 1. Was the controller spawned? (only on openshell-0)
+kubectl -n openshell logs openshell-0 | grep -E 'openshell-controller starting|spawning in-process'
+
+# 2. Is the CRD installed?
+kubectl get crd openshellsandboxes.openshell.nvidia.com
+
+# 3. Are the CRs visible?
+kubectl -n openshell get oshs
+
+# 4. Controller decisions (logs in the same gateway pod)
+kubectl -n openshell logs openshell-0 | grep -E 'reconcil|finalizer|gateway delete|CreateSandbox'
+
+# 5. Status detail on a specific CR
+kubectl -n openshell get oshs <name> -o yaml | yq '.status'
+```
+
+Common findings:
+
+- No `openshell-controller starting` line on openshell-0: the
+  OPENSHELL_CONTROLLER_WATCH_NAMESPACE env var didn't reach the pod.
+  Inspect with
+  `kubectl -n openshell get pod openshell-0 -o yaml | yq '.spec.containers[].env'`
+  and confirm `controller.watchNamespace` in `helm get values`.
+- CR stuck at `phase=Provisioning`: the gateway call is in flight or
+  the controller failed mid-call. Restart the gateway pod
+  (`kubectl -n openshell delete pod openshell-0`); the reconcile loop
+  re-fires on restart.
+- `kubectl delete oshs <name>` hangs: the finalizer is in place and the
+  gateway is unreachable or refusing the delete. Check
+  `kubectl -n openshell logs openshell-0 | grep 'gateway delete'` for
+  the most recent attempt.
+
 Check required Helm deployment secrets:
 
 ```bash
