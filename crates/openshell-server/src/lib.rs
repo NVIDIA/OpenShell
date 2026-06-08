@@ -416,25 +416,37 @@ pub async fn run_server(
 
     // Spawn the in-process CRD controller on Kubernetes deployments.
     // Presence of OPENSHELL_CONTROLLER_WATCH_NAMESPACE is the chart's
-    // flag-free signal that we're the K8s-deployed gateway; non-K8s
-    // gateways (docker/podman/vm) never see the var and skip the spawn.
-    // We log and continue (rather than fail startup) if the controller
-    // can't start — the gateway data plane must keep serving SDK/CLI
-    // traffic even if CRD reconciliation is broken.
+    // signal that we're the K8s-deployed gateway; non-K8s gateways
+    // (docker/podman/vm) never see the var and skip the spawn. Pinning
+    // to ordinal 0 means a post-install `kubectl scale --replicas=N`
+    // doesn't multiply the controller into N racing copies — replicas
+    // with ordinal > 0 serve SDK/CLI traffic only. Lease-based leader
+    // election is a follow-up.
     if std::env::var("OPENSHELL_CONTROLLER_WATCH_NAMESPACE").is_ok() {
-        let controller_config = openshell_controller::ControllerConfig::from_env();
-        info!(
-            namespace = %controller_config.watch_namespace,
-            "spawning in-process OpenShellSandbox controller"
-        );
-        let gateway = Arc::new(api::GatewayHandle::new(state.clone()));
-        tokio::spawn(async move {
-            if let Err(e) = openshell_controller::run(gateway, controller_config).await {
-                error!(error = %e, "openshell-controller exited with error");
-            } else {
-                info!("openshell-controller exited cleanly");
-            }
-        });
+        let hostname = std::env::var("HOSTNAME").unwrap_or_default();
+        if hostname.ends_with("-0") || hostname.is_empty() {
+            // Empty HOSTNAME = local/test runs outside a StatefulSet;
+            // assume single-replica and spawn.
+            let controller_config = openshell_controller::ControllerConfig::from_env();
+            info!(
+                hostname = %hostname,
+                namespace = %controller_config.watch_namespace,
+                "spawning in-process OpenShellSandbox controller"
+            );
+            let gateway = Arc::new(api::GatewayHandle::new(state.clone()));
+            tokio::spawn(async move {
+                if let Err(e) = openshell_controller::run(gateway, controller_config).await {
+                    error!(error = %e, "openshell-controller exited with error");
+                } else {
+                    info!("openshell-controller exited cleanly");
+                }
+            });
+        } else {
+            info!(
+                hostname = %hostname,
+                "OpenShellSandbox controller skipped on this replica (ordinal != 0)"
+            );
+        }
     }
 
     // Build TLS acceptor when TLS is configured; otherwise serve plaintext.

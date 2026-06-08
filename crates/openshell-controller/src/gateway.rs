@@ -26,6 +26,18 @@ pub trait GatewayClient: Send + Sync + 'static {
     /// Delete a sandbox by name. Returns whether the sandbox existed; a
     /// `false` is a successful no-op (the gateway side was already gone).
     async fn delete_sandbox(&self, name: &str) -> Result<bool, Status>;
+
+    /// Find at most one sandbox tagged with a given label.
+    ///
+    /// Used by the reconciler to discover whether a sandbox for the
+    /// current CR's uid already exists, so create can be skipped on
+    /// re-reconcile (cross-namespace name collisions, spec edits,
+    /// controller crash recovery).
+    async fn find_sandbox_by_label(
+        &self,
+        key: &str,
+        value: &str,
+    ) -> Result<Option<Sandbox>, Status>;
 }
 
 /// Stub implementation used by the standalone dev example and unit tests.
@@ -54,5 +66,13 @@ impl GatewayClient for NoopGateway {
             "NoopGateway::delete_sandbox — no-op"
         );
         Ok(false)
+    }
+
+    async fn find_sandbox_by_label(
+        &self,
+        _key: &str,
+        _value: &str,
+    ) -> Result<Option<Sandbox>, Status> {
+        Ok(None)
     }
 }

@@ -15,7 +15,7 @@ mod validation;
 // the gRPC handler. Narrowly re-exported so the sandbox module's other
 // internals stay private. The `pub` is crate-private in practice because
 // `grpc` itself is `mod grpc;` (not `pub mod`).
-pub use sandbox::{create_sandbox_core, delete_sandbox_core};
+pub use sandbox::{create_sandbox_core, delete_sandbox_core, find_sandbox_by_label};
 
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveAllDraftChunksResponse, ApproveDraftChunkRequest,

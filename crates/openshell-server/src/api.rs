@@ -49,6 +49,23 @@ impl GatewayHandle {
     pub async fn delete_sandbox(&self, name: &str) -> Result<bool, Status> {
         crate::grpc::delete_sandbox_core(&self.state, name).await
     }
+
+    /// Find at most one sandbox tagged with a given label.
+    ///
+    /// Used by the CRD controller for cr-uid based idempotency: before
+    /// creating a sandbox for a CR, look up whether one already exists
+    /// for that CR's unforgeable uid. Returns `None` if no match.
+    ///
+    /// # Errors
+    ///
+    /// See [`crate::grpc::sandbox::find_sandbox_by_label`].
+    pub async fn find_sandbox_by_label(
+        &self,
+        key: &str,
+        value: &str,
+    ) -> Result<Option<Sandbox>, Status> {
+        crate::grpc::find_sandbox_by_label(&self.state, key, value).await
+    }
 }
 
 #[async_trait::async_trait]
@@ -59,5 +76,13 @@ impl openshell_controller::GatewayClient for GatewayHandle {
 
     async fn delete_sandbox(&self, name: &str) -> Result<bool, Status> {
         Self::delete_sandbox(self, name).await
+    }
+
+    async fn find_sandbox_by_label(
+        &self,
+        key: &str,
+        value: &str,
+    ) -> Result<Option<Sandbox>, Status> {
+        Self::find_sandbox_by_label(self, key, value).await
     }
 }

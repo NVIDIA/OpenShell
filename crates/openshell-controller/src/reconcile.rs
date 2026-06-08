@@ -129,37 +129,66 @@ async fn reconcile<G: GatewayClient>(
         }
     };
 
-    // Step 1: announce Provisioning so kubectl shows the controller is
-    // working on it. The early-return idempotency check above ensures
-    // this only runs once per generation.
-    patch_status_provisioning(&api, &name, generation).await?;
+    // cr-uid idempotency: before creating, look for a gateway-side
+    // sandbox already tagged with this CR's uid. If one exists, reuse
+    // its id. Closes three real bugs:
+    //   - cross-namespace CR-name collisions (two CRs with the same
+    //     metadata.name in different namespaces) get distinct sandboxes
+    //     because each CR has a distinct unforgeable uid
+    //   - spec edits bump generation but uid stays — we update the
+    //     existing sandbox's status rather than calling create twice
+    //   - controller crash recovery: status went None mid-call, but
+    //     the gateway-side sandbox is already there
+    //
+    // metadata.uid is guaranteed by the apiserver for any CR that made
+    // it through admission, so the unwrap path is unreachable in
+    // practice.
+    let uid = obj.metadata.uid.as_deref().unwrap_or("");
+    let existing = ctx
+        .gateway
+        .find_sandbox_by_label(crate::translate::LABEL_CR_UID, uid)
+        .await?;
 
-    // Step 2: hand the request to the gateway. The gateway runs all the
-    // validation/persistence/JWT/compute-driver work itself; we just
-    // observe the outcome.
-    match ctx.gateway.create_sandbox(req).await {
-        Ok(sandbox) => {
-            let sandbox_id = sandbox
-                .metadata
-                .as_ref()
-                .map(|m| m.id.clone())
-                .unwrap_or_default();
-            patch_status_running(&api, &name, generation, &sandbox_id).await?;
-            Ok(Action::requeue(REQUEUE_INTERVAL))
+    let sandbox = match existing {
+        Some(sandbox) => {
+            info!(
+                name = %name,
+                sandbox_id = ?sandbox.metadata.as_ref().map(|m| m.id.as_str()),
+                "found existing gateway sandbox by cr-uid; skipping create"
+            );
+            sandbox
         }
-        Err(status) => {
-            // tonic::Status carries a gRPC code; surface it as a CR
-            // condition so users can see why the create failed.
-            patch_status_failed(
-                &api,
-                &name,
-                generation,
-                &format!("gateway: code={:?} message={}", status.code(), status.message()),
-            )
-            .await?;
-            Ok(Action::requeue(ERROR_REQUEUE_INTERVAL))
+        None => {
+            // Hand the request to the gateway. We don't pre-patch a
+            // Provisioning status — see is_already_handled for why a
+            // crash mid-call would leave the CR stuck if we did.
+            match ctx.gateway.create_sandbox(req).await {
+                Ok(sandbox) => sandbox,
+                Err(status) => {
+                    patch_status_failed(
+                        &api,
+                        &name,
+                        generation,
+                        &format!(
+                            "gateway: code={:?} message={}",
+                            status.code(),
+                            status.message()
+                        ),
+                    )
+                    .await?;
+                    return Ok(Action::requeue(ERROR_REQUEUE_INTERVAL));
+                }
+            }
         }
-    }
+    };
+
+    let sandbox_id = sandbox
+        .metadata
+        .as_ref()
+        .map(|m| m.id.clone())
+        .unwrap_or_default();
+    patch_status_running(&api, &name, generation, &sandbox_id).await?;
+    Ok(Action::requeue(REQUEUE_INTERVAL))
 }
 
 const APIV: &str = "openshell.nvidia.com/v1alpha1";
@@ -177,13 +206,9 @@ fn has_finalizer(obj: &OpenShellSandbox) -> bool {
 ///
 /// Returns true when `status.observedGeneration` matches the current
 /// `metadata.generation` AND a phase is set — any phase, including
-/// Provisioning, Running, or Failed. This guards against watch-event
-/// echoes from our own status patches re-entering the gateway call.
-///
-/// KNOWN LIMITATION: if the controller crashes between the Provisioning
-/// patch and the gateway call returning, the CR is stuck at Provisioning
-/// until the user edits `.spec` to bump generation. A proper cr-uid
-/// lookup against the gateway is the long-term fix.
+/// Running or Failed. This guards against watch-event echoes from our
+/// own status patches re-entering the gateway call. Crash recovery is
+/// handled by the cr-uid lookup in the reconcile body, not here.
 fn is_already_handled(obj: &OpenShellSandbox, generation: i64) -> bool {
     obj.status
         .as_ref()
@@ -271,30 +296,6 @@ async fn handle_deletion<G: GatewayClient>(
     }
 }
 
-async fn patch_status_provisioning(
-    api: &Api<OpenShellSandbox>,
-    name: &str,
-    generation: i64,
-) -> Result<(), ReconcileError> {
-    let now = Utc::now().to_rfc3339();
-    let patch = json!({
-        "apiVersion": APIV,
-        "kind": KIND,
-        "status": {
-            "phase": Phase::Provisioning,
-            "observedGeneration": generation,
-            "message": "calling gateway to create sandbox",
-            "lastUpdated": now,
-            "conditions": [{
-                "type": "Ready", "status": "False", "reason": "Provisioning",
-                "message": "Gateway create-sandbox call in flight",
-                "lastTransitionTime": now, "observedGeneration": generation,
-            }],
-        }
-    });
-    apply_status(api, name, patch).await
-}
-
 async fn patch_status_running(
     api: &Api<OpenShellSandbox>,
     name: &str,
@@ -379,6 +380,17 @@ fn error_policy<G: GatewayClient>(
 enum ReconcileError {
     #[error("kube error: {0}")]
     Kube(#[from] kube::Error),
+    #[error("gateway error: code={code:?} message={message}")]
+    Gateway { code: tonic::Code, message: String },
+}
+
+impl From<tonic::Status> for ReconcileError {
+    fn from(status: tonic::Status) -> Self {
+        Self::Gateway {
+            code: status.code(),
+            message: status.message().to_owned(),
+        }
+    }
 }
 
 #[cfg(test)]

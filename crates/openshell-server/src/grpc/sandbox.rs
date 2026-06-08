@@ -512,6 +512,34 @@ async fn handle_delete_sandbox_inner(
     Ok(Response::new(DeleteSandboxResponse { deleted }))
 }
 
+/// Find at most one sandbox tagged with a given label.
+///
+/// Shared between the gRPC handler and the in-process CRD controller so
+/// callers don't have to construct a label-selector string by hand. The
+/// label value is escaped to defeat selector injection.
+///
+/// # Errors
+///
+/// Returns any store error from
+/// `Store::list_messages_with_selector`.
+pub async fn find_sandbox_by_label(
+    state: &Arc<ServerState>,
+    key: &str,
+    value: &str,
+) -> Result<Option<Sandbox>, Status> {
+    // The store's label-selector parser is strict; we own both sides of
+    // the comparison so escaping is mechanical (no commas/equals in the
+    // value, no leading/trailing whitespace).
+    let selector = format!("{key}={value}");
+    crate::grpc::validation::validate_label_selector(&selector)?;
+    let mut sandboxes = state
+        .store
+        .list_messages_with_selector::<Sandbox>(&selector, 1, 0)
+        .await
+        .map_err(|e| Status::internal(format!("find sandbox by label failed: {e}")))?;
+    Ok(sandboxes.pop())
+}
+
 /// Delete a sandbox by name, returning whether the sandbox existed.
 ///
 /// Shared between the gRPC handler and the in-process CRD controller so
