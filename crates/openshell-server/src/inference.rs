@@ -1067,15 +1067,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upsert_cluster_route_succeeds_for_aws_bedrock_without_api_key() {
+    async fn upsert_cluster_route_succeeds_for_aws_bedrock_with_bridge_url() {
         // aws-bedrock is registered with `auth: AuthHeader::None` (the
-        // bridge-fronted shape) so route resolution must NOT require a
-        // credential lookup. Create a provider with empty credentials
-        // and confirm upsert succeeds, the resolved route carries
-        // `provider_type: "aws-bedrock"`, the default Bedrock base URL,
-        // and an empty api_key. SigV4 signing for direct AWS Bedrock is
-        // a separate follow-up; this test pins down the bridge-fronted
-        // contract this PR delivers.
+        // bridge-fronted shape) so route resolution does NOT require a
+        // real API key — but `provider create` still requires a
+        // non-empty credentials map at the gRPC layer, so operators
+        // pass a placeholder credential per the docs. The router
+        // ignores it on the outbound path.
+        //
+        // The other half of the contract is `BEDROCK_BASE_URL`: with
+        // `default_base_url: ""` in the core profile, providers
+        // without it fail route resolution rather than silently
+        // forwarding prompts to AWS Bedrock with no usable auth. This
+        // test pins down the success path.
         let store = test_store().await;
 
         let provider = Provider {
@@ -1087,9 +1091,14 @@ mod tests {
                 resource_version: 0,
             }),
             r#type: "aws-bedrock".to_string(),
-            // Bridge-fronted: no credential needed at route-resolution
-            // time. The bridge holds operator-side auth in its own pod.
-            credentials: std::collections::HashMap::new(),
+            // Placeholder credential — the router ignores it because
+            // auth: None skips header injection. Mirrors the
+            // doc-recommended `--credential AWS_ACCESS_KEY_ID=unused-bridge-fronted-shape`.
+            credentials: std::iter::once((
+                "AWS_ACCESS_KEY_ID".to_string(),
+                "unused-bridge-fronted-shape".to_string(),
+            ))
+            .collect(),
             config: std::iter::once((
                 "BEDROCK_BASE_URL".to_string(),
                 "http://bedrock-bridge.demo.svc.cluster.local:8080".to_string(),
@@ -1119,7 +1128,9 @@ mod tests {
         assert_eq!(config.model_id, "anthropic.claude-3-5-sonnet-20241022-v2:0");
 
         // Verify the resolved route metadata reflects bridge-fronted
-        // auth (empty api_key + provider_type = "aws-bedrock").
+        // auth (empty api_key + provider_type = "aws-bedrock"). Note
+        // the api_key is empty even though the provider has a
+        // credential — auth: None skips api-key lookup entirely.
         let managed = resolve_route_by_name(&store, CLUSTER_INFERENCE_ROUTE_NAME)
             .await
             .expect("route should resolve")
@@ -1130,6 +1141,62 @@ mod tests {
             "http://bedrock-bridge.demo.svc.cluster.local:8080"
         );
         assert_eq!(managed.api_key, "");
+    }
+
+    #[tokio::test]
+    async fn upsert_cluster_route_rejects_aws_bedrock_without_bedrock_base_url() {
+        // The companion to upsert_cluster_route_succeeds_for_aws_bedrock_with_bridge_url:
+        // an aws-bedrock provider without BEDROCK_BASE_URL must be
+        // rejected at route resolution. This pins down the safety
+        // contract johntmyers asked for — until the SigV4 follow-up
+        // lands, the router must NOT silently forward prompts to AWS
+        // with auth: None.
+        //
+        // Mechanism: AWS_BEDROCK_PROFILE.default_base_url is "". When
+        // the provider has no BEDROCK_BASE_URL config, base_url
+        // resolves to empty, triggering the existing
+        // empty-base_url check in resolve_provider_route.
+        let store = test_store().await;
+
+        let provider = Provider {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "provider-bedrock-misconfigured".to_string(),
+                name: "bedrock-misconfigured".to_string(),
+                created_at_ms: 1_000_000,
+                labels: std::collections::HashMap::new(),
+                resource_version: 0,
+            }),
+            r#type: "aws-bedrock".to_string(),
+            credentials: std::iter::once((
+                "AWS_ACCESS_KEY_ID".to_string(),
+                "unused-bridge-fronted-shape".to_string(),
+            ))
+            .collect(),
+            // Intentionally no BEDROCK_BASE_URL.
+            config: std::collections::HashMap::new(),
+            credential_expires_at_ms: std::collections::HashMap::new(),
+        };
+        store
+            .put_message(&provider)
+            .await
+            .expect("provider should persist");
+
+        let err = upsert_cluster_inference_route(
+            &store,
+            CLUSTER_INFERENCE_ROUTE_NAME,
+            "bedrock-misconfigured",
+            "anthropic.claude-3-5-sonnet-20241022-v2:0",
+            0,
+            false,
+        )
+        .await
+        .expect_err("upsert should reject aws-bedrock provider without BEDROCK_BASE_URL");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(
+            err.message().contains("empty base_url"),
+            "error should name the missing base_url, got: {}",
+            err.message()
+        );
     }
 
     #[tokio::test]
