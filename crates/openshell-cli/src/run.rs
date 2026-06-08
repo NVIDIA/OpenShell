@@ -1607,6 +1607,52 @@ fn build_sandbox_resource_limits(
     Ok(Some(Struct { fields }))
 }
 
+fn parse_driver_config_json(value: &str) -> Result<prost_types::Struct> {
+    let parsed: serde_json::Value = serde_json::from_str(value)
+        .into_diagnostic()
+        .wrap_err("--driver-config-json must be valid JSON")?;
+
+    let serde_json::Value::Object(fields) = parsed else {
+        return Err(miette!(
+            "--driver-config-json must be a JSON object keyed by driver name"
+        ));
+    };
+
+    Ok(prost_types::Struct {
+        fields: fields
+            .into_iter()
+            .map(|(key, value)| json_to_protobuf_value(value).map(|value| (key, value)))
+            .collect::<Result<_>>()?,
+    })
+}
+
+fn json_to_protobuf_value(value: serde_json::Value) -> Result<prost_types::Value> {
+    use prost_types::{ListValue, Struct, Value, value::Kind};
+
+    let kind = match value {
+        serde_json::Value::Null => Kind::NullValue(0),
+        serde_json::Value::Bool(value) => Kind::BoolValue(value),
+        serde_json::Value::Number(value) => Kind::NumberValue(value.as_f64().ok_or_else(|| {
+            miette!("--driver-config-json contains a number that cannot be represented")
+        })?),
+        serde_json::Value::String(value) => Kind::StringValue(value),
+        serde_json::Value::Array(values) => Kind::ListValue(ListValue {
+            values: values
+                .into_iter()
+                .map(json_to_protobuf_value)
+                .collect::<Result<_>>()?,
+        }),
+        serde_json::Value::Object(fields) => Kind::StructValue(Struct {
+            fields: fields
+                .into_iter()
+                .map(|(key, value)| json_to_protobuf_value(value).map(|value| (key, value)))
+                .collect::<Result<_>>()?,
+        }),
+    };
+
+    Ok(Value { kind: Some(kind) })
+}
+
 fn validate_cpu_quantity(value: &str) -> Result<String> {
     let value = value.trim();
     if value.is_empty() {
@@ -1701,6 +1747,7 @@ pub async fn sandbox_create(
     gpu_device: Option<&str>,
     cpu: Option<&str>,
     memory: Option<&str>,
+    driver_config_json: Option<&str>,
     editor: Option<Editor>,
     providers: &[String],
     policy: Option<&str>,
@@ -1770,11 +1817,15 @@ pub async fn sandbox_create(
 
     let policy = load_sandbox_policy(policy)?;
     let resource_limits = build_sandbox_resource_limits(cpu, memory)?;
+    let driver_config = driver_config_json
+        .map(parse_driver_config_json)
+        .transpose()?;
 
-    let template = if image.is_some() || resource_limits.is_some() {
+    let template = if image.is_some() || resource_limits.is_some() || driver_config.is_some() {
         Some(SandboxTemplate {
             image: image.unwrap_or_default(),
             resources: resource_limits,
+            driver_config,
             ..SandboxTemplate::default()
         })
     } else {
@@ -7471,11 +7522,11 @@ mod tests {
         git_sync_files, http_health_check, image_requests_gpu, import_local_package_mtls_bundle,
         inferred_provider_type, mtls_certs_exist_for_gateway, package_managed_tls_dirs,
         parse_cli_setting_value, parse_credential_expiry_cli_value, parse_credential_expiry_pairs,
-        parse_credential_pairs, plaintext_gateway_is_remote, progress_step_from_metadata,
-        provider_profile_allows_refresh_bootstrap, provisioning_timeout_message,
-        ready_false_condition_message, refresh_status_header, refresh_status_row, resolve_from,
-        sandbox_should_persist, sandbox_upload_plan, service_expose_status_error,
-        service_url_for_gateway,
+        parse_credential_pairs, parse_driver_config_json, plaintext_gateway_is_remote,
+        progress_step_from_metadata, provider_profile_allows_refresh_bootstrap,
+        provisioning_timeout_message, ready_false_condition_message, refresh_status_header,
+        refresh_status_row, resolve_from, sandbox_should_persist, sandbox_upload_plan,
+        service_expose_status_error, service_url_for_gateway,
     };
     use crate::TEST_ENV_LOCK;
     use hyper::StatusCode;
@@ -7871,6 +7922,56 @@ mod tests {
         assert!(build_sandbox_resource_limits(Some("half"), None).is_err());
         assert!(build_sandbox_resource_limits(None, Some("0Gi")).is_err());
         assert!(build_sandbox_resource_limits(None, Some("1.5Gi")).is_err());
+    }
+
+    #[test]
+    fn parse_driver_config_json_accepts_driver_keyed_object() {
+        let config =
+            parse_driver_config_json(r#"{"kubernetes":{"pod":{"node_selector":{"pool":"gpu"}}}}"#)
+                .expect("driver config should parse");
+
+        let kubernetes = config
+            .fields
+            .get("kubernetes")
+            .and_then(|value| value.kind.as_ref())
+            .and_then(|kind| match kind {
+                prost_types::value::Kind::StructValue(inner) => Some(inner),
+                _ => None,
+            })
+            .expect("kubernetes block should be a struct");
+        let pod = kubernetes
+            .fields
+            .get("pod")
+            .and_then(|value| value.kind.as_ref())
+            .and_then(|kind| match kind {
+                prost_types::value::Kind::StructValue(inner) => Some(inner),
+                _ => None,
+            })
+            .expect("pod block should be a struct");
+
+        assert!(pod.fields.contains_key("node_selector"));
+    }
+
+    #[test]
+    fn parse_driver_config_json_rejects_non_object() {
+        let err = parse_driver_config_json(r#"["kubernetes"]"#)
+            .expect_err("top-level array should be rejected");
+
+        assert!(
+            err.to_string().contains("keyed by driver name"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_driver_config_json_rejects_invalid_json() {
+        let err = parse_driver_config_json(r#"{"kubernetes":"#)
+            .expect_err("invalid JSON should be rejected");
+
+        assert!(
+            err.to_string().contains("must be valid JSON"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

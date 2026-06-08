@@ -6,6 +6,13 @@ use crate::config::{AuthHeader, ResolvedRoute};
 use crate::mock;
 use std::collections::HashSet;
 
+/// Maximum buffered inference response body, in bytes. The buffered path
+/// reads the whole response into memory; the route timeout bounds time, not
+/// memory, so without this cap an oversized upstream could force unbounded
+/// allocation. Mirrors the sandbox streaming byte cap. Over-cap responses fail
+/// as an upstream protocol error.
+const MAX_BUFFERED_RESPONSE_BODY: usize = 32 * 1024 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedEndpoint {
     pub url: String,
@@ -32,10 +39,12 @@ struct ValidationProbe {
     path: &'static str,
     protocol: &'static str,
     body: bytes::Bytes,
-    /// Alternate body to try when the primary probe fails with HTTP 400.
-    /// Used for `OpenAI` chat completions where newer models require
-    /// `max_completion_tokens` while legacy/self-hosted backends only
-    /// accept `max_tokens`.
+    /// Alternate body to try when the primary probe is rejected specifically
+    /// for `max_completion_tokens`. Used for `OpenAI` chat completions where
+    /// newer models require `max_completion_tokens` while legacy/self-hosted
+    /// backends only accept `max_tokens`. The retry is gated on the error
+    /// body naming that parameter, so an unrelated request-shape rejection
+    /// (wrong protocol for the model) falls through instead.
     fallback_body: Option<bytes::Bytes>,
 }
 
@@ -290,11 +299,11 @@ async fn send_backend_request(
     route: &ResolvedRoute,
     method: &str,
     path: &str,
-    headers: Vec<(String, String)>,
+    headers: &[(String, String)],
     body: bytes::Bytes,
 ) -> Result<reqwest::Response, RouterError> {
     let (builder, url) =
-        prepare_backend_request(client, route, method, path, &headers, body, false)?;
+        prepare_backend_request(client, route, method, path, headers, body, false)?;
     builder
         .timeout(route.timeout)
         .send()
@@ -312,23 +321,30 @@ async fn send_backend_request_streaming(
     route: &ResolvedRoute,
     method: &str,
     path: &str,
-    headers: Vec<(String, String)>,
+    headers: &[(String, String)],
     body: bytes::Bytes,
 ) -> Result<reqwest::Response, RouterError> {
-    let (builder, url) =
-        prepare_backend_request(client, route, method, path, &headers, body, true)?;
+    let (builder, url) = prepare_backend_request(client, route, method, path, headers, body, true)?;
     builder.send().await.map_err(|e| map_send_error(e, &url))
 }
 
-fn validation_probe(route: &ResolvedRoute) -> Result<ValidationProbe, ValidationFailure> {
-    if route
-        .protocols
-        .iter()
-        .any(|protocol| protocol == "openai_chat_completions")
-    {
+/// Validation probes for a route, in preference order.
+///
+/// A managed route advertises every protocol in its provider profile, so an
+/// embeddings model resolves to a route that also lists chat/completions. The
+/// caller tries these in order and falls through to the next on a request-shape
+/// rejection, so such a model validates against `/v1/embeddings` even though
+/// the chat probe rejects it. Embeddings is ordered last so a genuinely
+/// chat-capable route still validates against chat. Empty when the route
+/// exposes no writable protocol.
+fn validation_probes(route: &ResolvedRoute) -> Vec<ValidationProbe> {
+    let has = |protocol: &str| route.protocols.iter().any(|p| p == protocol);
+    let mut probes = Vec::new();
+
+    if has("openai_chat_completions") {
         // Use max_completion_tokens (modern OpenAI parameter, required by GPT-5+)
         // with max_tokens as fallback for legacy/self-hosted backends.
-        return Ok(ValidationProbe {
+        probes.push(ValidationProbe {
             path: "/v1/chat/completions",
             protocol: "openai_chat_completions",
             body: bytes::Bytes::from_static(
@@ -340,12 +356,8 @@ fn validation_probe(route: &ResolvedRoute) -> Result<ValidationProbe, Validation
         });
     }
 
-    if route
-        .protocols
-        .iter()
-        .any(|protocol| protocol == "anthropic_messages")
-    {
-        return Ok(ValidationProbe {
+    if has("anthropic_messages") {
+        probes.push(ValidationProbe {
             path: "/v1/messages",
             protocol: "anthropic_messages",
             body: bytes::Bytes::from_static(
@@ -355,12 +367,8 @@ fn validation_probe(route: &ResolvedRoute) -> Result<ValidationProbe, Validation
         });
     }
 
-    if route
-        .protocols
-        .iter()
-        .any(|protocol| protocol == "openai_responses")
-    {
-        return Ok(ValidationProbe {
+    if has("openai_responses") {
+        probes.push(ValidationProbe {
             path: "/v1/responses",
             protocol: "openai_responses",
             body: bytes::Bytes::from_static(br#"{"input":"ping","max_output_tokens":32}"#),
@@ -368,12 +376,8 @@ fn validation_probe(route: &ResolvedRoute) -> Result<ValidationProbe, Validation
         });
     }
 
-    if route
-        .protocols
-        .iter()
-        .any(|protocol| protocol == "openai_completions")
-    {
-        return Ok(ValidationProbe {
+    if has("openai_completions") {
+        probes.push(ValidationProbe {
             path: "/v1/completions",
             protocol: "openai_completions",
             body: bytes::Bytes::from_static(br#"{"prompt":"ping","max_tokens":32}"#),
@@ -381,45 +385,102 @@ fn validation_probe(route: &ResolvedRoute) -> Result<ValidationProbe, Validation
         });
     }
 
-    Err(ValidationFailure {
+    // Last so a chat-capable route prefers a chat probe, but an embeddings-only
+    // model still validates against its single writable endpoint.
+    if has("openai_embeddings") {
+        probes.push(ValidationProbe {
+            path: "/v1/embeddings",
+            protocol: "openai_embeddings",
+            body: bytes::Bytes::from_static(br#"{"input":"ping"}"#),
+            fallback_body: None,
+        });
+    }
+
+    probes
+}
+
+/// The request-shape failure for a route that advertises no writable protocol.
+///
+/// Shared by the empty-probe guard and the all-probes-failed fallback so the
+/// otherwise-unreachable terminal case is a value rather than a panic.
+fn no_writable_protocol_failure(route: &ResolvedRoute) -> ValidationFailure {
+    ValidationFailure {
         kind: ValidationFailureKind::RequestShape,
         details: format!(
             "route '{}' does not expose a writable inference protocol for validation",
             route.name
         ),
-    })
+    }
 }
 
 pub async fn verify_backend_endpoint(
     client: &reqwest::Client,
     route: &ResolvedRoute,
 ) -> Result<ValidatedEndpoint, ValidationFailure> {
-    let probe = validation_probe(route)?;
-    let headers = vec![("content-type".to_string(), "application/json".to_string())];
+    let probes = validation_probes(route);
+    let Some(first) = probes.first() else {
+        return Err(no_writable_protocol_failure(route));
+    };
 
     if mock::is_mock_route(route) {
         return Ok(ValidatedEndpoint {
-            url: build_provider_url(route, &route.model, probe.path, false),
-            protocol: probe.protocol.to_string(),
+            url: build_provider_url(route, &route.model, first.path, false),
+            protocol: first.protocol.to_string(),
         });
     }
 
+    let headers = vec![("content-type".to_string(), "application/json".to_string())];
+    let mut last_shape_failure = None;
+
+    for probe in &probes {
+        match try_validation_probe(client, route, probe, &headers).await {
+            Ok(endpoint) => return Ok(endpoint),
+            // A request-shape rejection means this protocol is wrong for the
+            // model (e.g. a chat probe against an embeddings model), so fall
+            // through to the next advertised protocol. Any other failure
+            // describes the backend itself (credentials, rate limit,
+            // connectivity, health) and is terminal across all protocols.
+            //
+            // Keep the first shape failure: it is the most-preferred protocol's
+            // rejection and the most actionable error to report.
+            Err(err) if err.kind == ValidationFailureKind::RequestShape => {
+                last_shape_failure.get_or_insert(err);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    Err(last_shape_failure.unwrap_or_else(|| no_writable_protocol_failure(route)))
+}
+
+/// Run one validation probe, retrying with its fallback body only when the
+/// upstream specifically rejected `max_completion_tokens`.
+///
+/// That retry exists for the GPT-5+ (`max_completion_tokens`) versus legacy
+/// (`max_tokens`) chat split. Firing it for any request-shape rejection would
+/// issue a second, pointless probe when the real signal is "wrong protocol for
+/// this model", and a transient `429`/`5xx` on that retry could become a
+/// terminal failure that stops the caller from reaching a protocol that would
+/// have validated.
+async fn try_validation_probe(
+    client: &reqwest::Client,
+    route: &ResolvedRoute,
+    probe: &ValidationProbe,
+    headers: &[(String, String)],
+) -> Result<ValidatedEndpoint, ValidationFailure> {
     let result = try_validation_request(
         client,
         route,
         probe.path,
         probe.protocol,
-        headers.clone(),
-        probe.body,
+        headers,
+        probe.body.clone(),
     )
     .await;
 
-    // If the primary probe failed with a request-shape error (HTTP 400) and
-    // there is a fallback body, retry with the alternate token parameter.
-    // This handles the split between `max_completion_tokens` (GPT-5+) and
-    // `max_tokens` (legacy/self-hosted backends).
-    if let (Err(err), Some(fallback_body)) = (&result, probe.fallback_body)
+    if let (Err(err), Some(fallback_body)) = (&result, &probe.fallback_body)
         && err.kind == ValidationFailureKind::RequestShape
+        && err.details.contains("max_completion_tokens")
     {
         return try_validation_request(
             client,
@@ -427,7 +488,7 @@ pub async fn verify_backend_endpoint(
             probe.path,
             probe.protocol,
             headers,
-            fallback_body,
+            fallback_body.clone(),
         )
         .await;
     }
@@ -441,7 +502,7 @@ async fn try_validation_request(
     route: &ResolvedRoute,
     path: &str,
     protocol: &str,
-    headers: Vec<(String, String)>,
+    headers: &[(String, String)],
     body: bytes::Bytes,
 ) -> Result<ValidatedEndpoint, ValidationFailure> {
     let response = send_backend_request(client, route, "POST", path, headers, body)
@@ -488,30 +549,55 @@ async fn try_validation_request(
         )
     };
 
-    let details = match status.as_u16() {
-        400 | 404 | 405 | 422 => {
-            format!("upstream rejected the validation request with HTTP {status}.{body_suffix}")
-        }
-        401 | 403 => {
-            format!("upstream rejected credentials with HTTP {status}.{body_suffix}")
-        }
-        429 => {
-            format!("upstream rate-limited the validation request with HTTP {status}.{body_suffix}")
-        }
-        500..=599 => format!("upstream returned HTTP {status}.{body_suffix}"),
-        _ => format!("upstream returned unexpected HTTP {status}.{body_suffix}"),
+    // Some OpenAI-compatible providers report an auth failure as 400/404/422
+    // with an auth-shaped error body rather than 401/403. Classify those as a
+    // terminal credential failure so a bad key is not mistaken for a
+    // wrong-protocol probe and masked by a later probe that accepts it.
+    let kind = match status.as_u16() {
+        401 | 403 => ValidationFailureKind::Credentials,
+        400 | 404 | 422 if body_looks_like_auth_error(body) => ValidationFailureKind::Credentials,
+        400 | 404 | 405 | 422 => ValidationFailureKind::RequestShape,
+        429 => ValidationFailureKind::RateLimited,
+        500..=599 => ValidationFailureKind::UpstreamHealth,
+        _ => ValidationFailureKind::Unexpected,
+    };
+
+    let summary = match kind {
+        ValidationFailureKind::Credentials => "upstream rejected credentials",
+        ValidationFailureKind::RateLimited => "upstream rate-limited the validation request",
+        ValidationFailureKind::UpstreamHealth => "upstream returned a server error",
+        ValidationFailureKind::RequestShape => "upstream rejected the validation request",
+        _ => "upstream returned an unexpected response",
     };
 
     Err(ValidationFailure {
-        kind: match status.as_u16() {
-            400 | 404 | 405 | 422 => ValidationFailureKind::RequestShape,
-            401 | 403 => ValidationFailureKind::Credentials,
-            429 => ValidationFailureKind::RateLimited,
-            500..=599 => ValidationFailureKind::UpstreamHealth,
-            _ => ValidationFailureKind::Unexpected,
-        },
-        details,
+        kind,
+        details: format!("{summary} with HTTP {status}.{body_suffix}"),
     })
+}
+
+/// Whether an upstream error body reads as an authentication or authorization
+/// failure. Some OpenAI-compatible providers return these as HTTP 400/404/422
+/// rather than 401/403, so validation inspects the body to avoid classifying a
+/// bad key as a wrong-protocol probe. Matching is conservative: only strong,
+/// auth-specific phrases, lowercased, to avoid catching generic "invalid model"
+/// request-shape errors.
+fn body_looks_like_auth_error(body: &str) -> bool {
+    let body = body.to_ascii_lowercase();
+    [
+        "invalid_api_key",
+        "invalid api key",
+        "incorrect api key",
+        "invalid_authentication",
+        "authentication_error",
+        "authentication failed",
+        "unauthorized",
+        "permission_denied",
+        "permission denied",
+        "missing api key",
+    ]
+    .iter()
+    .any(|needle| body.contains(needle))
 }
 
 /// Extract status and headers from a [`reqwest::Response`].
@@ -538,18 +624,58 @@ pub async fn proxy_to_backend(
     headers: Vec<(String, String)>,
     body: bytes::Bytes,
 ) -> Result<ProxyResponse, RouterError> {
-    let response = send_backend_request(client, route, method, path, headers, body).await?;
+    let response = send_backend_request(client, route, method, path, &headers, body).await?;
     let (status, resp_headers) = extract_response_metadata(&response);
-    let resp_body = response
-        .bytes()
-        .await
-        .map_err(|e| RouterError::UpstreamProtocol(format!("failed to read response body: {e}")))?;
+    let body = read_capped_response_body(response, MAX_BUFFERED_RESPONSE_BODY).await?;
 
     Ok(ProxyResponse {
         status,
         headers: resp_headers,
-        body: resp_body,
+        body,
     })
+}
+
+/// Read a response body fully into memory, rejecting anything over `max` bytes.
+///
+/// Used by the buffered proxy path so a misbehaving upstream cannot force
+/// unbounded allocation. The `Content-Length` check is a fast early-out; the
+/// chunk loop is the real guard and bounds an absent, chunked, or
+/// under-reported length. The cap counts the bytes reqwest yields: with no
+/// decompression features enabled (see `Cargo.toml`) those are wire bytes, so
+/// enabling a compression feature later would change what the cap measures.
+/// Over-cap responses fail as `UpstreamProtocol` and are never partially
+/// returned.
+async fn read_capped_response_body(
+    mut response: reqwest::Response,
+    max: usize,
+) -> Result<bytes::Bytes, RouterError> {
+    if let Some(len) = response.content_length()
+        && len > max as u64
+    {
+        return Err(RouterError::UpstreamProtocol(format!(
+            "inference response body of {len} bytes exceeds the {max} byte cap"
+        )));
+    }
+
+    // Preallocate to the advertised length when it is within the cap; the loop
+    // still enforces the bound for an absent or under-reported length.
+    let mut body: Vec<u8> = match response.content_length() {
+        Some(len) if len <= max as u64 => Vec::with_capacity(usize::try_from(len).unwrap_or(max)),
+        _ => Vec::new(),
+    };
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| RouterError::UpstreamProtocol(format!("failed to read response body: {e}")))?
+    {
+        if body.len() + chunk.len() > max {
+            return Err(RouterError::UpstreamProtocol(format!(
+                "inference response body exceeds the {max} byte cap"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(bytes::Bytes::from(body))
 }
 
 /// Forward a raw HTTP request to the backend, returning response headers
@@ -567,7 +693,7 @@ pub async fn proxy_to_backend_streaming(
     body: bytes::Bytes,
 ) -> Result<StreamingProxyResponse, RouterError> {
     let response =
-        send_backend_request_streaming(client, route, method, path, headers, body).await?;
+        send_backend_request_streaming(client, route, method, path, &headers, body).await?;
     let (status, resp_headers) = extract_response_metadata(&response);
 
     Ok(StreamingProxyResponse {
@@ -673,7 +799,8 @@ fn is_vertex_anthropic_rawpredict_route(route: &ResolvedRoute) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ValidationFailureKind, build_backend_url, build_provider_url, verify_backend_endpoint,
+        ValidationFailure, ValidationFailureKind, build_backend_url, build_provider_url,
+        verify_backend_endpoint,
     };
     use crate::config::{DEFAULT_ROUTE_TIMEOUT, ResolvedRoute};
     use openshell_core::inference::AuthHeader;
@@ -721,6 +848,100 @@ mod tests {
             model_in_path: false,
             request_path_override: None,
         }
+    }
+
+    /// The buffered path must reject an over-cap upstream response rather than
+    /// buffer it. Guards the DoS/OOM exposure of reading the body unbounded.
+    #[tokio::test]
+    async fn proxy_to_backend_rejects_over_cap_response_body() {
+        use super::{MAX_BUFFERED_RESPONSE_BODY, proxy_to_backend};
+
+        let mock_server = MockServer::start().await;
+        // One byte over the cap. wiremock sets an accurate Content-Length, so
+        // the size check rejects before the body is buffered.
+        let oversized = vec![b'a'; MAX_BUFFERED_RESPONSE_BODY + 1];
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(oversized))
+            .mount(&mock_server)
+            .await;
+
+        let route = test_route(&mock_server.uri(), &["model_discovery"], AuthHeader::Bearer);
+        let client = reqwest::Client::new();
+        let result = proxy_to_backend(
+            &client,
+            &route,
+            "model_discovery",
+            "GET",
+            "/v1/models",
+            vec![],
+            bytes::Bytes::new(),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(crate::RouterError::UpstreamProtocol(_))),
+            "over-cap response must fail as UpstreamProtocol, got: {result:?}"
+        );
+    }
+
+    /// Spawn a one-shot HTTP/1.1 upstream that replies with a chunked body and
+    /// no `Content-Length`, so the buffered read cannot pre-check a length and
+    /// must enforce the cap inside the chunk loop.
+    async fn spawn_chunked_upstream(chunks: &'static [&'static str]) -> std::net::SocketAddr {
+        use std::fmt::Write as _;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf).await;
+            let mut resp = String::from(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n",
+            );
+            for c in chunks {
+                let _ = write!(resp, "{:x}\r\n{c}\r\n", c.len());
+            }
+            resp.push_str("0\r\n\r\n");
+            sock.write_all(resp.as_bytes()).await.unwrap();
+        });
+        addr
+    }
+
+    /// The chunk-accumulation guard (not the `Content-Length` pre-check) must
+    /// reject an over-cap body when the response advertises no length.
+    #[tokio::test]
+    async fn read_capped_response_body_rejects_over_cap_chunked() {
+        let addr = spawn_chunked_upstream(&["aaaa", "bbbb", "cccc"]).await;
+        let response = reqwest::Client::new()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            response.content_length().is_none(),
+            "chunked response should advertise no Content-Length"
+        );
+        let result = super::read_capped_response_body(response, 8).await;
+        assert!(
+            matches!(result, Err(crate::RouterError::UpstreamProtocol(_))),
+            "over-cap chunked body must be rejected by the loop, got: {result:?}"
+        );
+    }
+
+    /// A body exactly at the cap is accepted (inclusive bound) and returned
+    /// intact through the chunk loop.
+    #[tokio::test]
+    async fn read_capped_response_body_accepts_body_at_cap() {
+        let addr = spawn_chunked_upstream(&["aaaa", "bbbb"]).await;
+        let response = reqwest::Client::new()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .unwrap();
+        let body = super::read_capped_response_body(response, 8).await.unwrap();
+        assert_eq!(&body[..], b"aaaabbbb");
     }
 
     #[test]
@@ -991,6 +1212,189 @@ mod tests {
         let validated = verify_backend_endpoint(&client, &route).await.unwrap();
 
         assert_eq!(validated.protocol, "openai_chat_completions");
+    }
+
+    /// A managed route for an embeddings model advertises the full provider
+    /// protocol set. The chat probe (tried first) rejects the embeddings model
+    /// as wrong-shape, so validation must fall through to the embeddings probe
+    /// rather than fail the route.
+    #[tokio::test]
+    async fn verify_embeddings_model_falls_through_chat_probe() {
+        let mock_server = MockServer::start().await;
+        let route = test_route(
+            &mock_server.uri(),
+            &[
+                "openai_chat_completions",
+                "openai_completions",
+                "openai_responses",
+                "openai_embeddings",
+                "model_discovery",
+            ],
+            AuthHeader::Bearer,
+        );
+
+        // Chat, completions, and responses probes reject the embedding model.
+        for chat_path in ["/v1/chat/completions", "/v1/completions", "/v1/responses"] {
+            Mock::given(method("POST"))
+                .and(path(chat_path))
+                .respond_with(
+                    ResponseTemplate::new(400)
+                        .set_body_string(r#"{"error":{"message":"not a chat model"}}"#),
+                )
+                .mount(&mock_server)
+                .await;
+        }
+        // The embeddings probe accepts it.
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"object": "list", "data": []})),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let validated = verify_backend_endpoint(&client, &route)
+            .await
+            .expect("embeddings model should validate via the embeddings probe");
+        assert_eq!(validated.protocol, "openai_embeddings");
+    }
+
+    /// A non-request-shape failure (credentials) is terminal: validation must
+    /// stop at the first probe and not fall through to a protocol that would
+    /// succeed, so a bad key is reported as such rather than masked.
+    #[tokio::test]
+    async fn verify_stops_on_credentials_failure() {
+        let mock_server = MockServer::start().await;
+        let route = test_route(
+            &mock_server.uri(),
+            &["openai_chat_completions", "openai_embeddings"],
+            AuthHeader::Bearer,
+        );
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(401).set_body_string(r#"{"error":"bad key"}"#))
+            .mount(&mock_server)
+            .await;
+        // Would succeed, but credentials failure on the first probe is terminal
+        // and this must never be reached.
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"object": "list", "data": []})),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let err = verify_backend_endpoint(&client, &route)
+            .await
+            .expect_err("a 401 must fail validation");
+        assert_eq!(err.kind, ValidationFailureKind::Credentials);
+    }
+
+    /// A 429 on the first probe is terminal (`RateLimited`) and must not fall
+    /// through to a later probe that would succeed.
+    #[tokio::test]
+    async fn verify_stops_on_rate_limit() {
+        let mock_server = MockServer::start().await;
+        let route = test_route(
+            &mock_server.uri(),
+            &["openai_chat_completions", "openai_embeddings"],
+            AuthHeader::Bearer,
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(429).set_body_string(r#"{"error":"slow down"}"#))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"object": "list", "data": []})),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let err = reqwest_verify(&route).await;
+        assert_eq!(err.kind, ValidationFailureKind::RateLimited);
+    }
+
+    /// An auth failure reported as HTTP 400 with an auth-shaped body is terminal
+    /// (`Credentials`), not a request-shape fall-through, so a bad key cannot be
+    /// masked by a later probe that accepts it.
+    #[tokio::test]
+    async fn verify_auth_error_as_400_is_terminal() {
+        let mock_server = MockServer::start().await;
+        let route = test_route(
+            &mock_server.uri(),
+            &["openai_chat_completions", "openai_embeddings"],
+            AuthHeader::Bearer,
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(
+                r#"{"error":{"code":"invalid_api_key","message":"Incorrect API key provided"}}"#,
+            ))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"object": "list", "data": []})),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let err = reqwest_verify(&route).await;
+        assert_eq!(err.kind, ValidationFailureKind::Credentials);
+    }
+
+    /// When every probe is rejected as request-shape, validation returns the
+    /// first (most-preferred protocol's) failure, not the last.
+    #[tokio::test]
+    async fn verify_all_probes_request_shape_returns_first() {
+        let mock_server = MockServer::start().await;
+        let route = test_route(
+            &mock_server.uri(),
+            &["openai_chat_completions", "openai_embeddings"],
+            AuthHeader::Bearer,
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_string(r#"{"error":"model not found: chat"}"#),
+            )
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_string(r#"{"error":"not an embeddings model"}"#),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let err = reqwest_verify(&route).await;
+        assert_eq!(err.kind, ValidationFailureKind::RequestShape);
+        assert!(
+            err.details.contains("model not found: chat"),
+            "should report the first (chat) failure, got: {}",
+            err.details
+        );
+    }
+
+    /// Helper: run `verify_backend_endpoint` and return the expected failure.
+    async fn reqwest_verify(route: &ResolvedRoute) -> ValidationFailure {
+        verify_backend_endpoint(&reqwest::Client::new(), route)
+            .await
+            .expect_err("validation should fail")
     }
 
     /// Non-chat-completions probes (e.g. `anthropic_messages`) should not

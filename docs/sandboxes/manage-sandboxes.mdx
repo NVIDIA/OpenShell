@@ -43,6 +43,25 @@ value as both the request and the limit so the scheduler reserves the same
 amount the sandbox can use. The VM driver currently accepts these flags but
 does not change VM allocation.
 
+### Driver-Specific Configuration
+
+Pass experimental driver-owned settings with `--driver-config-json`. The value
+must be a JSON object keyed by driver name. The gateway forwards only the block
+for its configured compute driver:
+
+Nested keys inside each driver block use snake_case. The top-level envelope keys
+are driver names, such as `kubernetes`, and are not part of the nested schema.
+
+```shell
+openshell sandbox create \
+  --driver-config-json '{"kubernetes":{"pod":{"runtime_class_name":"kata-containers","node_selector":{"pool":"gpu"}}}}' \
+  -- claude
+```
+
+Use this only for driver-specific fields that do not have a stable CLI flag.
+Prefer stable flags such as `--cpu`, `--memory`, and `--gpu` when they cover
+the same behavior.
+
 ### GPU Resources
 
 To request GPU resources, add `--gpu`:

@@ -4,7 +4,7 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Clear, Padding, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Borders, Cell, Padding, Row, Table};
 
 use super::draw_empty_message;
 use crate::app::{App, SandboxPolicyTab, SettingScope};
@@ -128,45 +128,10 @@ fn draw_edit_overlay(
     edit: &crate::app::SettingEditState,
     area: Rect,
 ) {
-    let t = &app.theme;
     let Some(entry) = app.sandbox_settings.get(edit.index) else {
         return;
     };
-
-    let title = format!(" Edit: {} ({}) ", entry.key, entry.kind.as_str());
-    let mut lines = vec![
-        Line::from(Span::styled(&title, t.heading)),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("Value: ", t.muted),
-            Span::styled(&edit.input, t.text),
-            Span::styled("_", t.accent),
-        ]),
-    ];
-
-    if let Some(ref err) = edit.error {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(err, t.status_err)));
-    }
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled("[Enter]", t.key_hint),
-        Span::styled(" Confirm  ", t.muted),
-        Span::styled("[Esc]", t.key_hint),
-        Span::styled(" Cancel", t.muted),
-    ]));
-
-    let popup_height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
-    let popup = centered_rect(50, popup_height, area);
-    frame.render_widget(Clear, popup);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(t.border_focused)
-        .padding(Padding::horizontal(1));
-
-    frame.render_widget(Paragraph::new(lines).block(block), popup);
+    super::draw_setting_edit_overlay(frame, &entry.key, entry.kind, edit, area, &app.theme);
 }
 
 fn draw_confirm_set(frame: &mut Frame<'_>, app: &App, idx: usize, area: Rect) {
@@ -201,16 +166,7 @@ fn draw_confirm_set(frame: &mut Frame<'_>, app: &App, idx: usize, area: Rect) {
         ]),
     ];
 
-    let popup_height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
-    let popup = centered_rect(60, popup_height, area);
-    frame.render_widget(Clear, popup);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(t.border_focused)
-        .padding(Padding::horizontal(1));
-
-    frame.render_widget(Paragraph::new(lines).block(block), popup);
+    super::draw_confirm_popup(frame, lines, t.border_focused, 60, area);
 }
 
 fn draw_confirm_delete(frame: &mut Frame<'_>, app: &App, idx: usize, area: Rect) {
@@ -239,16 +195,5 @@ fn draw_confirm_delete(frame: &mut Frame<'_>, app: &App, idx: usize, area: Rect)
         ]),
     ];
 
-    let popup_height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX);
-    let popup = centered_rect(55, popup_height, area);
-    frame.render_widget(Clear, popup);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(t.status_err)
-        .padding(Padding::horizontal(1));
-
-    frame.render_widget(Paragraph::new(lines).block(block), popup);
+    super::draw_confirm_popup(frame, lines, t.status_err, 55, area);
 }
-
-use super::centered_popup as centered_rect;

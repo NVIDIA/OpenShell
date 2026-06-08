@@ -1227,6 +1227,14 @@ enum SandboxCommands {
         #[arg(long)]
         memory: Option<String>,
 
+        /// Experimental driver-keyed JSON object for driver-specific sandbox settings.
+        /// Validation behavior is not yet finalized.
+        ///
+        /// For Kubernetes, pass a value such as
+        /// `{"kubernetes":{"pod":{"node_selector":{"pool":"gpu"}}}}`.
+        #[arg(long, value_name = "JSON")]
+        driver_config_json: Option<String>,
+
         /// Provider names to attach to this sandbox.
         #[arg(long = "provider")]
         providers: Vec<String>,
@@ -2541,6 +2549,7 @@ async fn main() -> Result<()> {
                     gpu_device,
                     cpu,
                     memory,
+                    driver_config_json,
                     providers,
                     policy,
                     forward,
@@ -2621,6 +2630,7 @@ async fn main() -> Result<()> {
                         gpu_device.as_deref(),
                         cpu.as_deref(),
                         memory.as_deref(),
+                        driver_config_json.as_deref(),
                         editor,
                         &providers,
                         policy.as_deref(),
@@ -4330,6 +4340,32 @@ mod tests {
                 assert_eq!(cpu.as_deref(), Some("500m"));
                 assert_eq!(memory.as_deref(), Some("2Gi"));
                 assert_eq!(command, vec!["claude".to_string()]);
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_driver_config_json_flag_parses() {
+        let json = r#"{"kubernetes":{"pod":{"node_selector":{"pool":"gpu"}}}}"#;
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--driver-config-json",
+            json,
+        ])
+        .expect("sandbox create driver config JSON flag should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command:
+                    Some(SandboxCommands::Create {
+                        driver_config_json, ..
+                    }),
+                ..
+            }) => {
+                assert_eq!(driver_config_json.as_deref(), Some(json));
             }
             other => panic!("expected SandboxCommands::Create, got: {other:?}"),
         }

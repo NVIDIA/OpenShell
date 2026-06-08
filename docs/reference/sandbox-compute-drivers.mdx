@@ -38,6 +38,28 @@ Docker and Podman apply them as runtime limits. Kubernetes applies them as both
 container requests and limits. The VM driver accepts the fields but currently
 ignores them.
 
+Sandbox create also accepts experimental driver-owned config through
+`--driver-config-json`. The value is a JSON object keyed by driver name. The
+gateway forwards only the block for the active driver, so a Kubernetes gateway
+receives the `kubernetes` object from a value such as:
+
+Nested keys inside each driver block use snake_case. The top-level envelope keys
+are driver names, such as `kubernetes`, and are not part of the nested schema.
+
+```shell
+openshell sandbox create \
+  --driver-config-json '{"kubernetes":{"pod":{"runtime_class_name":"kata-containers","priority_class_name":"batch-low"}}}' \
+  -- claude
+```
+
+Driver config is for fields without a stable public flag. Prefer `--cpu`,
+`--memory`, and `--gpu` for portable resource intent.
+
+For Kubernetes, `pod.runtime_class_name` maps to PodSpec `runtimeClassName`.
+It overrides the gateway's configured default runtime class for that sandbox,
+while a typed `SandboxTemplate.runtime_class_name` value from the API still
+takes precedence.
+
 ## Docker Driver
 
 [Docker](https://www.docker.com/get-started/)-backed sandboxes run as containers on the gateway host. Use Docker for local development, single-machine gateways, and hosts that already use Docker Desktop or Docker Engine.

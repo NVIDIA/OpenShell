@@ -7,6 +7,38 @@
 //! HTTP request is a known inference API call and routes it through the local
 //! sandbox router.
 
+/// How an inference protocol delivers its response to the sandboxed client.
+///
+/// `Streaming` protocols (chat completions, completions, responses, Anthropic
+/// messages) emit a Server-Sent Events token stream and are served through the
+/// chunked transfer-encoding path so tokens reach the client incrementally.
+///
+/// `Buffered` protocols (embeddings, model discovery) return a single JSON
+/// object the client parses whole. They must be served in one piece with an
+/// accurate `Content-Length`. Sending them through the streaming path is
+/// unsafe: a mid-body truncation (the streaming size cap or idle timeout)
+/// appends an SSE error event to bytes the client decodes as one JSON object,
+/// silently corrupting it.
+///
+/// Framing is a property of the protocol, declared once per pattern in
+/// [`default_patterns`], so the streaming-vs-buffered decision cannot drift
+/// across the dispatch sites that consume it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseFraming {
+    /// SSE token stream, served via chunked transfer-encoding.
+    ///
+    /// The `OpenAI` completion-style protocols are classified streaming
+    /// unconditionally. They are dual-mode (a `stream: false` request returns
+    /// one buffered JSON object), but the dispatch keys framing off the
+    /// protocol alone and does not inspect the request body, so they are
+    /// streamed defensively. Their buffered responses tolerate chunked framing;
+    /// only the embeddings and model-discovery shapes (no streaming mode at
+    /// all) must be served buffered.
+    Streaming,
+    /// Single JSON object, served buffered with an accurate `Content-Length`.
+    Buffered,
+}
+
 /// An inference API pattern for detecting inference calls in intercepted traffic.
 #[derive(Debug, Clone)]
 pub struct InferenceApiPattern {
@@ -14,6 +46,18 @@ pub struct InferenceApiPattern {
     pub path_glob: String,
     pub protocol: String,
     pub kind: String,
+    /// Response delivery mode for this protocol. Selects the buffered or
+    /// streaming proxy path; see [`ResponseFraming`].
+    pub framing: ResponseFraming,
+}
+
+impl InferenceApiPattern {
+    /// Whether this protocol's response must be served buffered (one JSON
+    /// object framed with an accurate `Content-Length`) rather than streamed.
+    #[must_use]
+    pub fn is_buffered(&self) -> bool {
+        matches!(self.framing, ResponseFraming::Buffered)
+    }
 }
 
 /// Default patterns for known inference APIs (`OpenAI`, Anthropic).
@@ -24,36 +68,51 @@ pub fn default_patterns() -> Vec<InferenceApiPattern> {
             path_glob: "/v1/chat/completions".to_string(),
             protocol: "openai_chat_completions".to_string(),
             kind: "chat_completion".to_string(),
+            framing: ResponseFraming::Streaming,
         },
         InferenceApiPattern {
             method: "POST".to_string(),
             path_glob: "/v1/completions".to_string(),
             protocol: "openai_completions".to_string(),
             kind: "completion".to_string(),
+            framing: ResponseFraming::Streaming,
         },
         InferenceApiPattern {
             method: "POST".to_string(),
             path_glob: "/v1/responses".to_string(),
             protocol: "openai_responses".to_string(),
             kind: "responses".to_string(),
+            framing: ResponseFraming::Streaming,
+        },
+        InferenceApiPattern {
+            method: "POST".to_string(),
+            path_glob: "/v1/embeddings".to_string(),
+            protocol: "openai_embeddings".to_string(),
+            kind: "embeddings".to_string(),
+            framing: ResponseFraming::Buffered,
         },
         InferenceApiPattern {
             method: "POST".to_string(),
             path_glob: "/v1/messages".to_string(),
             protocol: "anthropic_messages".to_string(),
             kind: "messages".to_string(),
+            framing: ResponseFraming::Streaming,
         },
+        // Model discovery returns one JSON object (a model list), never an SSE
+        // stream, so it is served buffered for the same reason as embeddings.
         InferenceApiPattern {
             method: "GET".to_string(),
             path_glob: "/v1/models".to_string(),
             protocol: "model_discovery".to_string(),
             kind: "models_list".to_string(),
+            framing: ResponseFraming::Buffered,
         },
         InferenceApiPattern {
             method: "GET".to_string(),
             path_glob: "/v1/models/*".to_string(),
             protocol: "model_discovery".to_string(),
             kind: "models_get".to_string(),
+            framing: ResponseFraming::Buffered,
         },
     ]
 }
@@ -267,20 +326,37 @@ fn find_crlf(buf: &[u8], start: usize) -> Option<usize> {
         .map(|offset| start + offset)
 }
 
+/// Reason phrase for an HTTP status code used on the inference proxy path.
+///
+/// Covers the statuses produced by the router error mapping (400/401/403/500/
+/// 502/503) and the upstream codes an inference backend can pass through
+/// verbatim (404/405 on unknown model or method, 422 on malformed embeddings
+/// input, 429 on rate limit). Unknown codes fall back to `"Unknown"` so the
+/// status line is still well-formed.
+fn http_status_text(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        411 => "Length Required",
+        413 => "Payload Too Large",
+        422 => "Unprocessable Entity",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        _ => "Unknown",
+    }
+}
+
 /// Format an HTTP/1.1 response from status, headers, and body.
 pub fn format_http_response(status: u16, headers: &[(String, String)], body: &[u8]) -> Vec<u8> {
     use std::fmt::Write;
 
-    let status_text = match status {
-        200 => "OK",
-        400 => "Bad Request",
-        403 => "Forbidden",
-        411 => "Length Required",
-        413 => "Payload Too Large",
-        500 => "Internal Server Error",
-        502 => "Bad Gateway",
-        _ => "Unknown",
-    };
+    let status_text = http_status_text(status);
 
     let mut response = format!("HTTP/1.1 {status} {status_text}\r\n");
     let mut has_content_length = false;
@@ -310,17 +386,7 @@ pub fn format_http_response(status: u16, headers: &[(String, String)], body: &[u
 pub fn format_http_response_header(status: u16, headers: &[(String, String)]) -> Vec<u8> {
     use std::fmt::Write;
 
-    let status_text = match status {
-        200 => "OK",
-        400 => "Bad Request",
-        403 => "Forbidden",
-        411 => "Length Required",
-        413 => "Payload Too Large",
-        500 => "Internal Server Error",
-        502 => "Bad Gateway",
-        503 => "Service Unavailable",
-        _ => "Unknown",
-    };
+    let status_text = http_status_text(status);
 
     let mut response = format!("HTTP/1.1 {status} {status_text}\r\n");
     for (name, value) in headers {
@@ -427,7 +493,11 @@ mod tests {
         let patterns = default_patterns();
         let result = detect_inference_pattern("GET", "/v1/models", &patterns);
         assert!(result.is_some());
-        assert_eq!(result.unwrap().protocol, "model_discovery");
+        let pattern = result.unwrap();
+        assert_eq!(pattern.protocol, "model_discovery");
+        // A model list is one JSON object; it must be served buffered, never
+        // through the SSE streaming path that could append an error frame.
+        assert!(pattern.is_buffered());
     }
 
     #[test]
@@ -435,14 +505,42 @@ mod tests {
         let patterns = default_patterns();
         let result = detect_inference_pattern("GET", "/v1/models/gpt-4.1", &patterns);
         assert!(result.is_some());
-        assert_eq!(result.unwrap().protocol, "model_discovery");
+        let pattern = result.unwrap();
+        assert_eq!(pattern.protocol, "model_discovery");
+        assert!(pattern.is_buffered());
     }
 
     #[test]
-    fn no_match_for_embeddings() {
+    fn detect_openai_embeddings() {
         let patterns = default_patterns();
         let result = detect_inference_pattern("POST", "/v1/embeddings", &patterns);
-        assert!(result.is_none());
+        assert!(result.is_some());
+        let pattern = result.unwrap();
+        assert_eq!(pattern.protocol, "openai_embeddings");
+        assert_eq!(pattern.kind, "embeddings");
+        assert!(pattern.is_buffered());
+    }
+
+    /// Every default pattern must declare framing consistent with how its
+    /// protocol actually responds: single-JSON-object protocols buffered,
+    /// SSE token streams streaming. A wrong classification routes a response
+    /// through the path that can corrupt or stall it.
+    #[test]
+    fn protocol_framing_classification() {
+        let patterns = default_patterns();
+        for pattern in &patterns {
+            let expected_buffered = matches!(
+                pattern.protocol.as_str(),
+                "model_discovery" | "openai_embeddings"
+            );
+            assert_eq!(
+                pattern.is_buffered(),
+                expected_buffered,
+                "{} ({}) has wrong framing",
+                pattern.protocol,
+                pattern.path_glob
+            );
+        }
     }
 
     #[test]
