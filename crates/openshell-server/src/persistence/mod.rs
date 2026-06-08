@@ -166,6 +166,12 @@ macro_rules! store_dispatch {
 }
 
 impl Store {
+    /// Returns `true` for single-replica backends (`SQLite`) where no lease
+    /// coordination is needed, `false` for multi-replica backends (`Postgres`).
+    pub fn is_single_replica(&self) -> bool {
+        matches!(self, Self::Sqlite(_))
+    }
+
     /// Connect to a persistence store based on the database URL.
     pub async fn connect(url: &str) -> CoreResult<Self> {
         if url.starts_with("postgres://") || url.starts_with("postgresql://") {

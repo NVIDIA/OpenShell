@@ -337,6 +337,8 @@ pub async fn run_server(
 
     let state = Arc::new(state);
 
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
     // Resume sandboxes that were stopped during the previous gateway
     // shutdown so the running compute state matches the persisted store.
     // Runs before watchers spawn so the watch loop sees the post-resume
@@ -345,7 +347,7 @@ pub async fn run_server(
         warn!(error = %err, "Failed to resume persisted sandboxes during startup");
     }
 
-    state.compute.spawn_watchers();
+    state.compute.spawn_watchers(shutdown_rx.clone());
     ssh_sessions::spawn_session_reaper(store.clone(), Duration::from_secs(3600));
     supervisor_session::spawn_relay_reaper(state.clone(), Duration::from_secs(30));
     provider_refresh::spawn_refresh_worker(state.clone(), Duration::from_secs(60));
@@ -426,7 +428,6 @@ pub async fn run_server(
         None
     };
 
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut listener_tasks = Vec::with_capacity(gateway_listeners.len());
     let enable_loopback_service_http = config.service_routing.enable_loopback_service_http;
     for (listener, listen_addr) in gateway_listeners {
