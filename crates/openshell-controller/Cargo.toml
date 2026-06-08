@@ -33,7 +33,10 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
+async-trait = "0.1"
+openshell-core = { path = "../openshell-core" }
 tokio = { workspace = true }
+tonic = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [lints]
