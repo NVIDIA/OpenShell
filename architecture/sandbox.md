@@ -82,7 +82,11 @@ plain tracing output.
 Provider profiles can also declare dynamic token grants. For matching HTTP
 endpoints, the supervisor obtains a SPIFFE JWT-SVID from the local Workload API,
 exchanges it for an OAuth2 access token, caches the token, and injects it as an
-`Authorization: Bearer` header before forwarding the request.
+`Authorization: Bearer` header before forwarding the request. Token grant
+endpoints are HTTPS-only except for loopback and Kubernetes service DNS hosts,
+and returned access tokens must be bearer-compatible before they are cached or
+injected. Token response lifetimes are capped and cached with an expiry margin
+unless a profile supplies an explicit cache TTL override.
 
 ## Connect and Logs
 

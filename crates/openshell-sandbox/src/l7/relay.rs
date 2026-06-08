@@ -781,7 +781,19 @@ where
 
         if allowed || config.enforcement == EnforcementMode::Audit {
             let req_with_auth =
-                crate::l7::token_grant_injection::inject_if_needed(req, ctx).await?;
+                match crate::l7::token_grant_injection::inject_if_needed(req, ctx).await {
+                    Ok(req) => req,
+                    Err(e) => {
+                        warn!(
+                            host = %ctx.host,
+                            port = ctx.port,
+                            error = %e,
+                            "Token grant failed in L7 relay"
+                        );
+                        write_bad_gateway_response(client).await?;
+                        return Ok(());
+                    }
+                };
 
             // Forward request to upstream and relay response
             let outcome = crate::l7::rest::relay_http_request_with_options_guarded(
@@ -1282,10 +1294,7 @@ where
                     error = %e,
                     "Token grant failed in passthrough relay"
                 );
-                let response =
-                    b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                client.write_all(response).await.into_diagnostic()?;
-                client.flush().await.into_diagnostic()?;
+                write_bad_gateway_response(client).await?;
                 return Ok(());
             }
         };
@@ -1329,6 +1338,16 @@ where
         "Credential injection relay completed"
     );
 
+    Ok(())
+}
+
+async fn write_bad_gateway_response<W>(client: &mut W) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let response = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    client.write_all(response).await.into_diagnostic()?;
+    client.flush().await.into_diagnostic()?;
     Ok(())
 }
 
@@ -1582,13 +1601,21 @@ network_policies:
         .await
         .unwrap();
 
-        let err = tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
             .await
-            .expect("relay should fail promptly")
+            .expect("relay should finish")
             .unwrap()
-            .expect_err("token grant failure should fail the L7 relay");
-        assert!(err.to_string().contains("Token grant failed"));
-        assert!(err.to_string().contains("oauth unavailable"));
+            .unwrap();
+
+        let mut client_response = [0u8; 512];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            app.read(&mut client_response),
+        )
+        .await
+        .expect("bad gateway response should reach client")
+        .unwrap();
+        assert!(String::from_utf8_lossy(&client_response[..n]).contains("502 Bad Gateway"));
 
         let mut upstream_request = [0u8; 128];
         let n = tokio::time::timeout(

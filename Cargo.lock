@@ -3538,6 +3538,7 @@ dependencies = [
  "serde_json",
  "serde_yml",
  "thiserror 2.0.18",
+ "url",
 ]
 
 [[package]]

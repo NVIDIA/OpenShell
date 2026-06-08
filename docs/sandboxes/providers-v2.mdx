@@ -306,14 +306,14 @@ Token grant fields:
 
 | Field | Required | Behavior |
 |---|---|---|
-| `token_endpoint` | Yes | OAuth2 token endpoint that accepts a SPIFFE JWT-SVID client assertion. |
+| `token_endpoint` | Yes | OAuth2 token endpoint that accepts a SPIFFE JWT-SVID client assertion. Use `https://` unless the endpoint is loopback or a Kubernetes service DNS name such as `token-issuer.default.svc.cluster.local`. |
 | `audience` | No | Resource audience requested from the token service. |
 | `jwt_svid_audience` | No | Audience used when requesting the JWT-SVID. When omitted, OpenShell derives an issuer-style audience from Keycloak token endpoint paths or falls back to the full token endpoint URL. |
 | `scopes` | No | OAuth2 scopes sent as a space-separated `scope` parameter. |
-| `cache_ttl_seconds` | No | Token cache TTL override. When omitted or `0`, OpenShell uses the token response `expires_in`, or five minutes if the response does not include an expiry. |
+| `cache_ttl_seconds` | No | Token cache TTL override. When omitted or `0`, OpenShell uses the token response `expires_in` with a 30-second safety margin and one-hour cap, or five minutes minus the margin if the response does not include an expiry. |
 | `audience_overrides` | No | Endpoint-specific `audience` and `scopes` overrides selected by host, port, and path. |
 
-Token grants require the sandbox supervisor to have access to a SPIFFE Workload API socket. They apply to HTTP traffic that the proxy can inspect. Endpoints with `tls: skip` bypass TLS termination and cannot receive dynamic token grant injection for HTTPS traffic.
+Token grants require the sandbox supervisor to have access to a SPIFFE Workload API socket. They apply to HTTP traffic that the proxy can inspect. Endpoints with `tls: skip` bypass TLS termination and cannot receive dynamic token grant injection for HTTPS traffic. The token service must return a bearer-compatible access token; malformed token values are rejected before caching or header injection.
 
 ## Provider Instances
 

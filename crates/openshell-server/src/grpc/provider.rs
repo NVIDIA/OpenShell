@@ -1912,10 +1912,10 @@ mod tests {
             refresh: None,
             path_template: String::new(),
             token_grant: Some(ProviderCredentialTokenGrant {
-                token_endpoint: "http://keycloak/realms/openshell/protocol/openid-connect/token"
-                    .to_string(),
+                token_endpoint: "http://keycloak.default.svc.cluster.local/realms/openshell/protocol/openid-connect/token".to_string(),
                 audience: "api://default".to_string(),
-                jwt_svid_audience: "http://keycloak/realms/openshell".to_string(),
+                jwt_svid_audience: "http://keycloak.default.svc.cluster.local/realms/openshell"
+                    .to_string(),
                 scopes: vec!["openid".to_string()],
                 cache_ttl_seconds: 300,
                 audience_overrides: service_audiences

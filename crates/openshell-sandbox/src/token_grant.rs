@@ -33,6 +33,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::net::IpAddr;
 use std::sync::{Arc, LazyLock, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -43,7 +44,18 @@ use spiffe::WorkloadApiClient;
 
 /// Token cache shared across all provider token grants.
 static TOKEN_CACHE: LazyLock<TokenCache> = LazyLock::new(TokenCache::new);
+static TOKEN_GRANT_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("token grant HTTP client configuration should be valid")
+});
 const MAX_OAUTH_ERROR_FIELD_LEN: usize = 256;
+const DEFAULT_TOKEN_CACHE_TTL_SECONDS: i64 = 300;
+const TOKEN_CACHE_EXPIRY_SKEW_SECONDS: i64 = 30;
+const MAX_TOKEN_EXPIRES_IN_SECONDS: i64 = 3600;
 
 /// `OAuth2` token response from the authorization server.
 #[derive(Debug, Clone, Deserialize)]
@@ -186,8 +198,8 @@ where
     Fut: Future<Output = Result<TokenResponse>>,
 {
     // Derive authorization server audience from token endpoint
-    // For Keycloak: http://keycloak/realms/openshell/protocol/openid-connect/token
-    //           -> http://keycloak/realms/openshell
+    // For Keycloak: https://auth.example.com/realms/openshell/protocol/openid-connect/token
+    //           -> https://auth.example.com/realms/openshell
     let jwt_audience = effective_jwt_svid_audience(input.token_endpoint, input.jwt_svid_audience);
     let cache_key = token_cache_key(
         input.provider_name,
@@ -203,16 +215,11 @@ where
     }
 
     let token_response = grant(jwt_audience).await?;
+    validate_access_token(&token_response.access_token)?;
 
-    // Calculate expiration time
-    let expires_at_ms = if input.cache_ttl_override > 0 {
-        current_time_ms() + (input.cache_ttl_override * 1000)
-    } else if token_response.expires_in > 0 {
-        current_time_ms() + (token_response.expires_in * 1000)
-    } else {
-        // Default to 5 minutes if no expiry provided
-        current_time_ms() + (300 * 1000)
-    };
+    let cache_ttl_seconds =
+        token_cache_ttl_seconds(input.cache_ttl_override, token_response.expires_in);
+    let expires_at_ms = current_time_ms().saturating_add(cache_ttl_seconds.saturating_mul(1000));
 
     // Cache the token
     input.cache.set(
@@ -281,6 +288,7 @@ async fn perform_token_grant(
     audience: &str,
     scopes: &[String],
 ) -> Result<TokenResponse> {
+    let token_endpoint_url = parse_token_endpoint_url(token_endpoint)?;
     let mut form_params = vec![
         ("grant_type", "client_credentials"),
         (
@@ -305,9 +313,8 @@ async fn perform_token_grant(
     }
 
     // POST to token endpoint
-    let client = reqwest::Client::new();
-    let response = client
-        .post(token_endpoint)
+    let response = TOKEN_GRANT_HTTP_CLIENT
+        .post(token_endpoint_url)
         .form(&form_params)
         .send()
         .await
@@ -328,19 +335,111 @@ async fn perform_token_grant(
     }
 
     // Parse token response
-    response
+    let token_response = response
         .json::<TokenResponse>()
         .await
         .into_diagnostic()
-        .wrap_err("failed to parse token response as JSON")
+        .wrap_err("failed to parse token response as JSON")?;
+    validate_access_token(&token_response.access_token)?;
+    Ok(token_response)
+}
+
+fn parse_token_endpoint_url(token_endpoint: &str) -> Result<reqwest::Url> {
+    let url = reqwest::Url::parse(token_endpoint)
+        .into_diagnostic()
+        .wrap_err("token_endpoint must be an absolute URL")?;
+    if token_endpoint_transport_allowed(&url) {
+        return Ok(url);
+    }
+
+    Err(miette::miette!(
+        "token_endpoint must use https, except http for loopback or in-cluster service hosts"
+    ))
+}
+
+fn token_endpoint_transport_allowed(url: &reqwest::Url) -> bool {
+    match url.scheme() {
+        "https" => true,
+        "http" => url
+            .host_str()
+            .is_some_and(|host| is_loopback_host(host) || is_kubernetes_service_host(host)),
+        _ => false,
+    }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim_matches(['[', ']']);
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) => v4.is_loopback(),
+        Ok(IpAddr::V6(v6)) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+        Err(_) => false,
+    }
+}
+
+fn is_kubernetes_service_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let labels = host.split('.').collect::<Vec<_>>();
+    let is_service_name = labels.len() == 3 && labels[2] == "svc";
+    let is_cluster_local_service =
+        labels.len() == 5 && labels[2] == "svc" && labels[3] == "cluster" && labels[4] == "local";
+    (is_service_name || is_cluster_local_service) && labels.iter().all(|label| !label.is_empty())
+}
+
+pub fn validate_access_token(token: &str) -> Result<()> {
+    if token.is_empty() || !is_token68(token) {
+        return Err(miette::miette!(
+            "token grant returned a malformed access token"
+        ));
+    }
+    Ok(())
+}
+
+fn is_token68(token: &str) -> bool {
+    let mut padding_started = false;
+    let mut saw_value = false;
+    for byte in token.bytes() {
+        if byte == b'=' {
+            padding_started = true;
+            continue;
+        }
+        if padding_started || !is_token68_value_byte(byte) {
+            return false;
+        }
+        saw_value = true;
+    }
+    saw_value
+}
+
+fn is_token68_value_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/')
+}
+
+fn token_cache_ttl_seconds(cache_ttl_override: i64, expires_in: i64) -> i64 {
+    if cache_ttl_override > 0 {
+        return cache_ttl_override;
+    }
+
+    let ttl = if expires_in > 0 {
+        expires_in.min(MAX_TOKEN_EXPIRES_IN_SECONDS)
+    } else {
+        DEFAULT_TOKEN_CACHE_TTL_SECONDS
+    };
+
+    ttl.saturating_sub(TOKEN_CACHE_EXPIRY_SKEW_SECONDS).max(1)
 }
 
 /// Derive the issuer/realm URL from a token endpoint URL.
 ///
 /// For Keycloak token endpoints like:
-///   `http://keycloak/realms/openshell/protocol/openid-connect/token`
+///   `https://auth.example.com/realms/openshell/protocol/openid-connect/token`
 /// Returns:
-///   `http://keycloak/realms/openshell`
+///   `https://auth.example.com/realms/openshell`
 ///
 /// This is used as the JWT-SVID audience claim when authenticating to the
 /// authorization server via JWT client assertion (RFC 7523).
@@ -512,6 +611,60 @@ mod tests {
         (format!("http://{addr}/token"), handle)
     }
 
+    async fn token_endpoint_redirect_once(
+        location: &str,
+    ) -> (String, tokio::task::JoinHandle<CapturedTokenRequest>) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind token endpoint");
+        let addr = listener.local_addr().expect("token endpoint local addr");
+        let location = location.to_string();
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept token request");
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 512];
+            let mut expected_len = None;
+
+            loop {
+                let n = stream.read(&mut chunk).await.expect("read token request");
+                assert!(n > 0, "token request stream closed before headers");
+                buf.extend_from_slice(&chunk[..n]);
+
+                if expected_len.is_none()
+                    && let Some(header_end) = header_end(&buf)
+                {
+                    let headers = String::from_utf8_lossy(&buf[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    expected_len = Some(header_end + content_length);
+                }
+
+                if expected_len.is_some_and(|len| buf.len() >= len) {
+                    break;
+                }
+            }
+
+            let captured = parse_token_request(&buf);
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write token response");
+            captured
+        });
+
+        (format!("http://{addr}/token"), handle)
+    }
+
     fn header_end(buf: &[u8]) -> Option<usize> {
         buf.windows(4)
             .position(|w| w == b"\r\n\r\n")
@@ -642,9 +795,10 @@ mod tests {
 
     #[test]
     fn test_derive_issuer_from_keycloak_token_endpoint() {
-        let token_endpoint = "http://keycloak/realms/openshell/protocol/openid-connect/token";
+        let token_endpoint =
+            "https://auth.example.com/realms/openshell/protocol/openid-connect/token";
         let issuer = derive_issuer_from_token_endpoint(token_endpoint);
-        assert_eq!(issuer, "http://keycloak/realms/openshell");
+        assert_eq!(issuer, "https://auth.example.com/realms/openshell");
     }
 
     #[test]
@@ -666,7 +820,7 @@ mod tests {
     #[test]
     fn effective_jwt_svid_audience_prefers_explicit_override() {
         let audience = effective_jwt_svid_audience(
-            "http://keycloak/realms/openshell/protocol/openid-connect/token",
+            "https://auth.example.com/realms/openshell/protocol/openid-connect/token",
             "spiffe://custom-audience",
         );
 
@@ -674,31 +828,115 @@ mod tests {
     }
 
     #[test]
+    fn validate_access_token_accepts_token68_values() {
+        for token in [
+            "abcXYZ123-._~+/",
+            "eyJhbGciOiJSUzI1NiJ9.payload.sig",
+            "token==",
+        ] {
+            validate_access_token(token).expect("token68 bearer token should be accepted");
+        }
+    }
+
+    #[test]
+    fn validate_access_token_rejects_header_injection_and_non_token68_values() {
+        for token in [
+            "",
+            "token with spaces",
+            "token\r\nX-Injected: yes",
+            "token\u{7f}",
+            "tokené",
+            "token=continued",
+            "==",
+        ] {
+            let err = validate_access_token(token)
+                .expect_err("malformed bearer token should be rejected");
+            assert_eq!(
+                err.to_string(),
+                "token grant returned a malformed access token"
+            );
+        }
+    }
+
+    #[test]
+    fn token_endpoint_url_allows_https_loopback_and_in_cluster_http() {
+        for endpoint in [
+            "https://auth.example.com/token",
+            "http://127.0.0.1:8080/token",
+            "http://[::1]:8080/token",
+            "http://token-issuer.default.svc.cluster.local/token",
+            "http://token-issuer.default.svc/token",
+        ] {
+            parse_token_endpoint_url(endpoint).expect("token endpoint should be allowed");
+        }
+    }
+
+    #[test]
+    fn token_endpoint_url_rejects_plain_http_non_cluster_hosts() {
+        for endpoint in [
+            "http://auth.example.com/token",
+            "http://keycloak/realms/openshell/protocol/openid-connect/token",
+            "http://token-issuer.default.svc.evil.com/token",
+            "ftp://auth.example.com/token",
+            "/relative/token",
+        ] {
+            assert!(
+                parse_token_endpoint_url(endpoint).is_err(),
+                "token endpoint should be rejected: {endpoint}"
+            );
+        }
+    }
+
+    #[test]
     fn token_cache_key_varies_by_resource_audience_and_scopes() {
         let base = token_cache_key(
             "alpha.default.svc.cluster.local\t80\t\tprovider:access_token",
-            "http://keycloak/realms/openshell/protocol/openid-connect/token",
-            "http://keycloak/realms/openshell",
+            "https://auth.example.com/realms/openshell/protocol/openid-connect/token",
+            "https://auth.example.com/realms/openshell",
             "alpha",
             &["alpha".to_string()],
         );
         let different_audience = token_cache_key(
             "alpha.default.svc.cluster.local\t80\t\tprovider:access_token",
-            "http://keycloak/realms/openshell/protocol/openid-connect/token",
-            "http://keycloak/realms/openshell",
+            "https://auth.example.com/realms/openshell/protocol/openid-connect/token",
+            "https://auth.example.com/realms/openshell",
             "delta",
             &["alpha".to_string()],
         );
         let different_scopes = token_cache_key(
             "alpha.default.svc.cluster.local\t80\t\tprovider:access_token",
-            "http://keycloak/realms/openshell/protocol/openid-connect/token",
-            "http://keycloak/realms/openshell",
+            "https://auth.example.com/realms/openshell/protocol/openid-connect/token",
+            "https://auth.example.com/realms/openshell",
             "alpha",
             &["delta".to_string()],
         );
 
         assert_ne!(base, different_audience);
         assert_ne!(base, different_scopes);
+    }
+
+    #[test]
+    fn token_cache_ttl_uses_override_without_endpoint_skew() {
+        assert_eq!(token_cache_ttl_seconds(120, 10), 120);
+        assert_eq!(token_cache_ttl_seconds(120, i64::MAX), 120);
+    }
+
+    #[test]
+    fn token_cache_ttl_skews_default_and_response_expires_in() {
+        assert_eq!(
+            token_cache_ttl_seconds(0, 0),
+            DEFAULT_TOKEN_CACHE_TTL_SECONDS - TOKEN_CACHE_EXPIRY_SKEW_SECONDS
+        );
+        assert_eq!(token_cache_ttl_seconds(0, 60), 30);
+        assert_eq!(token_cache_ttl_seconds(0, 10), 1);
+    }
+
+    #[test]
+    fn token_cache_ttl_clamps_large_response_expires_in() {
+        assert_eq!(
+            token_cache_ttl_seconds(0, i64::MAX),
+            MAX_TOKEN_EXPIRES_IN_SECONDS - TOKEN_CACHE_EXPIRY_SKEW_SECONDS
+        );
     }
 
     #[tokio::test]
@@ -832,6 +1070,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn obtain_provider_token_rejects_malformed_token_before_cache() {
+        let cache = TokenCache::new();
+        let scopes = vec!["read".to_string()];
+        let provider_name = "api.example.test\t443\t/v1/**\tprovider:access_token";
+        let token_endpoint = "https://auth.example.com/token";
+        let jwt_svid_audience = "https://auth.example.com";
+        let audience = "api://resource";
+
+        let err = obtain_provider_token_with_grant(
+            ObtainProviderTokenInput {
+                cache: &cache,
+                provider_name,
+                token_endpoint,
+                jwt_svid_audience,
+                audience,
+                scopes: &scopes,
+                cache_ttl_override: 0,
+            },
+            |_| async {
+                Ok(TokenResponse {
+                    access_token: "access-123\r\nX-Injected: yes".to_string(),
+                    token_type: "Bearer".to_string(),
+                    expires_in: 60,
+                    scope: "read".to_string(),
+                })
+            },
+        )
+        .await
+        .expect_err("malformed access token should fail before caching");
+
+        let cache_key = token_cache_key(
+            provider_name,
+            token_endpoint,
+            jwt_svid_audience,
+            audience,
+            &scopes,
+        );
+
+        assert_eq!(
+            err.to_string(),
+            "token grant returned a malformed access token"
+        );
+        assert!(
+            cache.get(&cache_key).is_none(),
+            "malformed access token must not be cached"
+        );
+    }
+
+    #[tokio::test]
     async fn obtain_provider_token_cache_ttl_override_extends_zero_expires_in() {
         let cache = TokenCache::new();
         let grant_calls = Arc::new(AtomicUsize::new(0));
@@ -915,6 +1202,37 @@ mod tests {
             !request.form.contains_key("client_id"),
             "JWT-SVID subject should identify the client"
         );
+    }
+
+    #[tokio::test]
+    async fn perform_token_grant_rejects_malformed_access_token() {
+        let (endpoint, request) = token_endpoint_once(
+            "200 OK",
+            r#"{"access_token":"access-123\r\nX-Injected: yes"}"#,
+        )
+        .await;
+
+        let err = perform_token_grant(&endpoint, "jwt-svid-token", "", &[])
+            .await
+            .expect_err("malformed access token should fail closed");
+        let _request = request.await.expect("token endpoint task should finish");
+
+        assert_eq!(
+            err.to_string(),
+            "token grant returned a malformed access token"
+        );
+    }
+
+    #[tokio::test]
+    async fn perform_token_grant_does_not_follow_redirects() {
+        let (endpoint, request) = token_endpoint_redirect_once("http://127.0.0.1:1/stolen").await;
+
+        let err = perform_token_grant(&endpoint, "jwt-svid-token", "", &[])
+            .await
+            .expect_err("redirect response should fail closed");
+        let _request = request.await.expect("token endpoint task should finish");
+
+        assert_eq!(err.to_string(), "token grant failed with status 302 Found");
     }
 
     #[tokio::test]

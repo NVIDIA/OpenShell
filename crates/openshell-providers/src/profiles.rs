@@ -14,6 +14,7 @@ use openshell_core::proto::{
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::sync::OnceLock;
 
 const PATH_TEMPLATE_CREDENTIAL_PLACEHOLDER: &str = "{credential}";
@@ -1187,6 +1188,17 @@ pub fn validate_profile_set(
                     }
                 }
             }
+
+            if let Some(token_grant) = credential.token_grant.as_ref()
+                && let Err(message) = validate_token_grant_endpoint(&token_grant.token_endpoint)
+            {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    "credentials.token_grant.token_endpoint",
+                    message,
+                ));
+            }
         }
 
         for (index, endpoint) in profile.endpoints.iter().enumerate() {
@@ -1225,6 +1237,53 @@ fn endpoint_is_valid(endpoint: &EndpointProfile) -> bool {
             .all(|port| (1..=65_535).contains(port));
     }
     (1..=65_535).contains(&endpoint.port)
+}
+
+fn validate_token_grant_endpoint(token_endpoint: &str) -> Result<(), String> {
+    let url = url::Url::parse(token_endpoint)
+        .map_err(|_| "token_endpoint must be an absolute URL".to_string())?;
+    if token_endpoint_transport_allowed(&url) {
+        return Ok(());
+    }
+
+    Err(
+        "token_endpoint must use https, except http for loopback or in-cluster service hosts"
+            .to_string(),
+    )
+}
+
+fn token_endpoint_transport_allowed(url: &url::Url) -> bool {
+    match url.scheme() {
+        "https" => true,
+        "http" => url
+            .host_str()
+            .is_some_and(|host| is_loopback_host(host) || is_kubernetes_service_host(host)),
+        _ => false,
+    }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim_matches(['[', ']']);
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) => v4.is_loopback(),
+        Ok(IpAddr::V6(v6)) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+        Err(_) => false,
+    }
+}
+
+fn is_kubernetes_service_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let labels = host.split('.').collect::<Vec<_>>();
+    let is_service_name = labels.len() == 3 && labels[2] == "svc";
+    let is_cluster_local_service =
+        labels.len() == 5 && labels[2] == "svc" && labels[3] == "cluster" && labels[4] == "local";
+    (is_service_name || is_cluster_local_service) && labels.iter().all(|label| !label.is_empty())
 }
 
 static DEFAULT_PROFILES: OnceLock<Vec<ProviderTypeProfile>> = OnceLock::new();
@@ -1540,8 +1599,8 @@ credentials:
     auth_style: bearer
     header_name: Authorization
     token_grant:
-      token_endpoint: http://keycloak/realms/openshell/protocol/openid-connect/token
-      jwt_svid_audience: http://keycloak/realms/openshell
+      token_endpoint: http://keycloak.default.svc.cluster.local/realms/openshell/protocol/openid-connect/token
+      jwt_svid_audience: http://keycloak.default.svc.cluster.local/realms/openshell
       audience: api://default
       scopes: [openid]
       cache_ttl_seconds: 300
@@ -1564,7 +1623,7 @@ credentials:
             .expect("token grant should parse");
         assert_eq!(
             token_grant.jwt_svid_audience,
-            "http://keycloak/realms/openshell"
+            "http://keycloak.default.svc.cluster.local/realms/openshell"
         );
         assert_eq!(token_grant.audience_overrides.len(), 2);
         assert_eq!(token_grant.audience_overrides[1].path, "/v1/**");
@@ -1583,6 +1642,96 @@ credentials:
             reparsed_token_grant.audience_overrides,
             token_grant.audience_overrides
         );
+    }
+
+    #[test]
+    fn validate_profile_set_rejects_plain_http_token_endpoint() {
+        for token_endpoint in [
+            "http://auth.example.com/token",
+            "http://token-issuer.default.svc.evil.com/token",
+        ] {
+            let profile = parse_profile_yaml(&format!(
+                r"
+id: insecure-token-grant
+display_name: Insecure Token Grant
+credentials:
+  - name: access_token
+    auth_style: bearer
+    header_name: Authorization
+    token_grant:
+      token_endpoint: {token_endpoint}
+      audience: api://default
+"
+            ))
+            .expect("profile should parse");
+
+            let diagnostics = validate_profile_set(&[("insecure.yaml".to_string(), profile)]);
+            let diagnostic = diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.field == "credentials.token_grant.token_endpoint")
+                .expect("token endpoint diagnostic should be reported");
+
+            assert_eq!(
+                diagnostic.message,
+                "token_endpoint must use https, except http for loopback or in-cluster service hosts"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_profile_set_allows_https_loopback_and_in_cluster_token_endpoints() {
+        for token_endpoint in [
+            "https://auth.example.com/token",
+            "http://127.0.0.1:8180/token",
+            "http://token-issuer.default.svc.cluster.local/token",
+        ] {
+            let profile = parse_profile_yaml(&format!(
+                r"
+id: secure-token-grant
+display_name: Secure Token Grant
+credentials:
+  - name: access_token
+    auth_style: bearer
+    header_name: Authorization
+    token_grant:
+      token_endpoint: {token_endpoint}
+      audience: api://default
+"
+            ))
+            .expect("profile should parse");
+
+            let diagnostics = validate_profile_set(&[("secure.yaml".to_string(), profile)]);
+            assert!(
+                diagnostics.is_empty(),
+                "unexpected diagnostics for {token_endpoint}: {diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_profile_set_rejects_relative_token_endpoint() {
+        let profile = parse_profile_yaml(
+            r"
+id: relative-token-grant
+display_name: Relative Token Grant
+credentials:
+  - name: access_token
+    auth_style: bearer
+    header_name: Authorization
+    token_grant:
+      token_endpoint: /token
+      audience: api://default
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("relative.yaml".to_string(), profile)]);
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.field == "credentials.token_grant.token_endpoint")
+            .expect("token endpoint diagnostic should be reported");
+
+        assert_eq!(diagnostic.message, "token_endpoint must be an absolute URL");
     }
 
     #[test]

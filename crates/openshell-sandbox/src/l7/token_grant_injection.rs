@@ -91,6 +91,8 @@ pub async fn inject_if_needed(req: L7Request, ctx: &L7EvalContext) -> Result<L7R
 
         match resolver.obtain(request).await {
             Ok(access_token) => {
+                let modified_raw_header =
+                    inject_authorization_header(&req.raw_header, &access_token)?;
                 ocsf_emit!(
                     NetworkActivityBuilder::new(crate::ocsf_ctx())
                         .activity(ActivityId::Other)
@@ -104,8 +106,6 @@ pub async fn inject_if_needed(req: L7Request, ctx: &L7EvalContext) -> Result<L7R
                         ))
                         .build()
                 );
-                let modified_raw_header =
-                    inject_authorization_header(&req.raw_header, &access_token)?;
                 return Ok(L7Request {
                     action: req.action,
                     target: req.target,
@@ -242,6 +242,8 @@ fn count_as_u32(count: usize) -> u32 {
 }
 
 fn inject_authorization_header(raw_header: &[u8], access_token: &str) -> Result<Vec<u8>> {
+    crate::token_grant::validate_access_token(access_token)?;
+
     let header_end = raw_header
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -540,6 +542,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn inject_authorization_header_rejects_malformed_access_token() {
+        let raw = b"GET /v1 HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
+
+        let err = inject_authorization_header(raw, "grant-token\r\nX-Injected: yes")
+            .expect_err("malformed token must not be injected");
+
+        assert_eq!(
+            err.to_string(),
+            "token grant returned a malformed access token"
+        );
+    }
+
     #[tokio::test]
     async fn inject_if_needed_uses_configured_resolver() {
         let fixture = TokenGrantTestFixture::success(
@@ -574,6 +589,44 @@ mod tests {
             String::from_utf8(rewritten.raw_header).expect("rewritten request should be UTF-8");
 
         assert!(rewritten.contains("Authorization: Bearer grant-token\r\n"));
+        fixture.assert_one_request("api.example.com\t443\t/v1/**\tprovider:access_token");
+    }
+
+    #[tokio::test]
+    async fn inject_if_needed_rejects_malformed_resolver_token() {
+        let fixture = TokenGrantTestFixture::success(
+            "api.example.com\t443\t/v1/**\tprovider:access_token",
+            "grant-token\r\nX-Injected: yes",
+        );
+
+        let ctx = L7EvalContext {
+            host: "api.example.com".into(),
+            port: 443,
+            policy_name: "api".into(),
+            binary_path: "/usr/bin/curl".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: None,
+            activity_tx: None,
+            dynamic_credentials: Some(fixture.dynamic_credentials()),
+            token_grant_resolver: Some(fixture.resolver()),
+        };
+        let req = L7Request {
+            action: "GET".to_string(),
+            target: "/v1/projects".to_string(),
+            query_params: std::collections::HashMap::new(),
+            raw_header: b"GET /v1/projects HTTP/1.1\r\nHost: api.example.com\r\n\r\n".to_vec(),
+            body_length: BodyLength::None,
+        };
+
+        let err = inject_if_needed(req, &ctx)
+            .await
+            .expect_err("malformed resolver token should fail closed");
+
+        assert_eq!(
+            err.to_string(),
+            "token grant returned a malformed access token"
+        );
         fixture.assert_one_request("api.example.com\t443\t/v1/**\tprovider:access_token");
     }
 }
