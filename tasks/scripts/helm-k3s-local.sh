@@ -143,6 +143,11 @@ apply_base_manifests() {
   local base="https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${AGENT_SANDBOX_VERSION}"
   echo "Applying agent-sandbox manifest (${AGENT_SANDBOX_VERSION})..."
   kubectl --kubeconfig="${KUBECONFIG_TARGET}" apply -f "${base}/manifest.yaml"
+  # Warm-pool extensions (SandboxTemplate / SandboxWarmPool / SandboxClaim) so the
+  # cluster is ready for warm-pooled sandboxes. extensions.yaml reconfigures the
+  # existing agent-sandbox-controller deployment rather than adding a new one.
+  echo "Applying agent-sandbox warm-pool extensions (${AGENT_SANDBOX_VERSION})..."
+  kubectl --kubeconfig="${KUBECONFIG_TARGET}" apply -f "${base}/extensions.yaml"
 }
 
 configure_ghcr_credentials() {

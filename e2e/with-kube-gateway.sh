@@ -533,10 +533,18 @@ fi
 # The Kubernetes compute driver creates and watches Sandbox CRs reconciled
 # by the upstream agent-sandbox-controller. Without the CRD + controller,
 # every gateway K8s call 404s and CreateSandbox never produces a Pod.
-echo "Installing agent-sandbox CRDs and controller (${AGENT_SANDBOX_VERSION})..."
+# The warm-pool extensions (SandboxTemplate / SandboxWarmPool / SandboxClaim) are
+# applied alongside core so the e2e cluster matches the dev cluster and is ready
+# for warm-pooled sandbox coverage. extensions.yaml reconfigures the
+# agent-sandbox-controller deployment, so wait for the rollout after both applies.
+echo "Installing agent-sandbox CRDs, controller, and warm-pool extensions (${AGENT_SANDBOX_VERSION})..."
 _agent_sandbox_base="https://github.com/kubernetes-sigs/agent-sandbox/releases/download/${AGENT_SANDBOX_VERSION}"
 kctl apply -f "${_agent_sandbox_base}/manifest.yaml"
+kctl apply -f "${_agent_sandbox_base}/extensions.yaml"
 kctl wait --for=condition=Established crd/sandboxes.agents.x-k8s.io --timeout=120s
+kctl wait --for=condition=Established crd/sandboxtemplates.extensions.agents.x-k8s.io --timeout=120s
+kctl wait --for=condition=Established crd/sandboxwarmpools.extensions.agents.x-k8s.io --timeout=120s
+kctl wait --for=condition=Established crd/sandboxclaims.extensions.agents.x-k8s.io --timeout=120s
 kctl -n agent-sandbox-system rollout status deployment/agent-sandbox-controller --timeout=300s
 
 helm_extra_args=()
