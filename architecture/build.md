@@ -30,7 +30,10 @@ watch mode keeps the sandbox alive but runs harnesses as bounded child cycles,
 sleeping between cycles without holding a model transport connection open. Watch
 mode retries harness transport failures and malformed cycle results with bounded
 backoff until the agent reports a terminal state. Agent durable state remains
-domain-specific rather than stored in the sandbox runtime.
+domain-specific rather than stored in the sandbox runtime. Harnesses that persist
+provider-managed credentials use current-name placeholders such as
+`openshell:resolve:env:GITHUB_TOKEN`, not revision-scoped placeholders, so the
+sandbox proxy can resolve the latest refreshed credential during long watch runs.
 
 ## Linux Runtime Environments
 

@@ -130,6 +130,11 @@ gateway refresh material, and retries rotation once. Use `--reset-refresh` to
 skip the preserve-first path and intentionally replace gateway refresh material
 from the host credential source before rotating.
 
+Long-lived harnesses must not persist revision-scoped provider placeholders such
+as `openshell:resolve:env:v123_TOKEN` into files they reuse across refreshes.
+Persist the current-name alias, for example `openshell:resolve:env:TOKEN`, so the
+sandbox proxy resolves the latest gateway-refreshed credential on each request.
+
 ## Subagents
 
 The launcher injects subagent definitions under `/sandbox/payload/subagents/`.
