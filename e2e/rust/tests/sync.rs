@@ -609,10 +609,15 @@ async fn upload_gitignored_directory_falls_back_to_unfiltered() {
 
     // Re-upload the gitignored directory (without --no-git-ignore).
     let upload_str = download_dest.to_str().expect("upload path is UTF-8");
-    guard
+    let upload_output = guard
         .upload_with_gitignore(upload_str, "/sandbox/reuploaded", &repo)
         .await
         .expect("upload gitignored directory");
+
+    assert!(
+        upload_output.contains(".gitignore filtering excluded all files"),
+        "expected fallback warning in upload output, got: {upload_output}"
+    );
 
     // Download the re-uploaded file and verify it arrived.
     let verify_dir = tmpdir.path().join("verify");
