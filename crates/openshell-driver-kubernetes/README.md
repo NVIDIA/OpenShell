@@ -61,10 +61,10 @@ the supervisor's network namespace mount setup on AppArmor-enabled nodes.
 
 ## GPU Support
 
-When a sandbox requests GPU support, the driver checks node allocatable capacity
-for `nvidia.com/gpu` and requests one GPU resource in the workload spec. The
-sandbox image must provide the user-space libraries needed by the agent
-workload.
+When `resource_requirements.gpu` is present, the driver checks node allocatable
+capacity for `nvidia.com/gpu` and sets the workload's `nvidia.com/gpu` resource
+limit. The default is to request a single GPU. The sandbox image must provide
+the user-space libraries needed by the agent workload.
 
 ## Driver Config POC
 
@@ -96,6 +96,6 @@ Resource keys use native Kubernetes resource names and quantity strings. The
 POC parser renders the keys listed above and ignores unknown fields.
 `pod.runtime_class_name` maps to PodSpec `runtimeClassName` and overrides the
 driver's configured `default_runtime_class_name`; the typed public
-`SandboxTemplate.runtime_class_name` still takes precedence when set. Use the
-public `gpu` flag for the default GPU request and `driver_config` only for
-additional driver-owned resource details.
+`SandboxTemplate.runtime_class_name` still takes precedence when set. Use
+`resource_requirements.gpu` for the default GPU request and `driver_config` only
+for additional driver-owned resource details.

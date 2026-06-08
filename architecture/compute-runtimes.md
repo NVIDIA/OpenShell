@@ -45,6 +45,9 @@ through the driver configuration. The Helm chart defaults sandbox agents to
 `Unconfined` so runtime/default AppArmor profiles do not block supervisor
 network namespace setup on AppArmor-enabled nodes.
 
+GPU requests enter the driver layer through
+`SandboxSpec.resource_requirements.gpu`.
+
 VM runtime state paths are derived only from driver-validated sandbox IDs
 matching `[A-Za-z0-9._-]{1,128}`. The gateway-owned VM driver socket uses a
 private `run/` directory plus Unix peer UID/PID checks. Standalone
@@ -82,7 +85,9 @@ users.
 Custom sandbox images must include the agent runtime and any system
 dependencies, but they should not need to include the gateway. GPU-capable
 images must include the user-space libraries required by the workload. The
-runtime still owns GPU device injection.
+runtime still owns GPU device injection. GPU requests can include explicit
+driver-native device IDs or a requested count; the gateway validates the public
+request shape and each runtime enforces the GPU allocation modes it supports.
 
 ## Deployment Shape
 
