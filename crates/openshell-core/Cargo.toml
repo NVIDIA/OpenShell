@@ -40,11 +40,6 @@ telemetry = ["dep:reqwest", "dep:chrono"]
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }
-
-[target.'cfg(not(target_os = "windows"))'.build-dependencies]
-protobuf-src = { workspace = true }
-
-[target.'cfg(target_os = "windows")'.build-dependencies]
 protoc-bin-vendored = { workspace = true }
 
 [dev-dependencies]

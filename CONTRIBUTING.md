@@ -287,7 +287,6 @@ Project requirements:
 - Rust 1.90+
 - Python 3.11+
 - Docker (running)
-- Z3 solver library (for the policy prover crate)
 
 ### Optional: Bazel (experimental)
 
@@ -309,26 +308,12 @@ echo "target" >> .bazelignore
 
 ### macOS build tools
 
-Install Apple Command Line Tools before building locally:
-
-```bash
-xcode-select --install
-```
-
-If Cargo fails while building `protobuf-src` with an error such as
-`fatal error: 'utility' file not found`, `fatal error: 'cstdlib' file not
-found`, or `A compiler with support for C++11 language features is required`,
-your Command Line Tools install may not expose the libc++ headers on the
-compiler's default include path. Reinstall Command Line Tools to correct the error:
-
-```bash
-sudo rm -rf /Library/Developer/CommandLineTools
-xcode-select --install
-```
+The policy prover uses Z3 on supported targets.
 
 ### Z3 installation
 
-The `openshell-prover` crate links against the system Z3 library via pkg-config.
+The `openshell-prover` crate links against Z3. On macOS and Linux, install the
+system Z3 development package; `z3-sys` discovers it through `pkg-config`.
 
 ```bash
 # macOS
@@ -341,10 +326,34 @@ sudo apt install libz3-dev
 sudo dnf install z3-devel
 ```
 
-If you prefer not to install Z3 system-wide, you can compile it from source as a one-time step:
+If you prefer not to install Z3 system-wide, use the bundled Z3 feature. This
+compiles Z3 from source during the Rust build:
 
 ```bash
 cargo build -p openshell-prover --features bundled-z3
+```
+
+For x86-64 Windows MSVC builds, use one of these Z3 paths:
+
+- System Z3: point `Z3_LIBRARY_PATH_OVERRIDE` at the directory containing the
+  64-bit MSVC Z3 library and `Z3_SYS_Z3_HEADER` at `z3.h`.
+- Bundled Z3: pass `--features bundled-z3` so `z3-sys` builds Z3 from source.
+
+Both Windows paths still require `libclang.dll` for `bindgen`. If LLVM is not on
+the default search path, set `LIBCLANG_PATH` to the directory containing
+`libclang.dll`.
+
+```powershell
+$env:LIBCLANG_PATH='C:\Program Files\Microsoft Visual Studio\2022\<Edition>\VC\Tools\Llvm\x64\bin'
+cargo build -p openshell-cli --target x86_64-pc-windows-msvc --features bundled-z3
+```
+
+### macOS build tools
+
+Install Apple Command Line Tools before building locally:
+
+```bash
+xcode-select --install
 ```
 
 ## Getting Started

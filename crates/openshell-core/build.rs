@@ -22,14 +22,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Protobuf compilation ---
     // Re-run when anything under proto/ changes (including newly added .proto files).
     println!("cargo:rerun-if-changed={PROTO_REL}");
-    // Use a bundled protoc.  The system protoc (from apt-get) does not bundle
-    // the well-known type includes (google/protobuf/struct.proto etc.), so the
-    // build script picks a vendored provider per platform.
+    // Use a vendored protoc binary and include tree. System protoc installs
+    // often omit the well-known type includes (google/protobuf/struct.proto,
+    // etc.), and protobuf-src requires autotools/sh which breaks MSVC builds.
     // SAFETY: This is run at build time in a single-threaded build script context.
     // No other threads are reading environment variables concurrently.
     #[allow(unsafe_code)]
     unsafe {
-        env::set_var("PROTOC", protoc_path()?);
+        env::set_var("PROTOC", protoc_bin_vendored::protoc_bin_path()?);
+        env::set_var("PROTOC_INCLUDE", protoc_bin_vendored::include_path()?);
     }
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
