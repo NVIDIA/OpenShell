@@ -38,6 +38,11 @@ pub trait GatewayClient: Send + Sync + 'static {
         key: &str,
         value: &str,
     ) -> Result<Option<Sandbox>, Status>;
+
+    /// Fetch a sandbox by name. The returned `Sandbox` carries the
+    /// gateway's current observation of the underlying pod's readiness,
+    /// which the reconciler projects into `.status.phase`.
+    async fn get_sandbox(&self, name: &str) -> Result<Sandbox, Status>;
 }
 
 /// Stub implementation used by the standalone dev example and unit tests.
@@ -74,5 +79,11 @@ impl GatewayClient for NoopGateway {
         _value: &str,
     ) -> Result<Option<Sandbox>, Status> {
         Ok(None)
+    }
+
+    async fn get_sandbox(&self, name: &str) -> Result<Sandbox, Status> {
+        Err(Status::not_found(format!(
+            "NoopGateway: no sandbox {name}"
+        )))
     }
 }

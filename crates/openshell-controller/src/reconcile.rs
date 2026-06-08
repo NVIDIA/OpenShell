@@ -28,6 +28,10 @@ use crate::types::{OpenShellSandbox, Phase};
 const FIELD_MANAGER: &str = "openshell-controller";
 const FINALIZER: &str = "openshell.nvidia.com/finalizer";
 const REQUEUE_INTERVAL: Duration = Duration::from_secs(30);
+/// Polling cadence while we're waiting for the gateway to observe the
+/// pod transition to Ready. Faster than `REQUEUE_INTERVAL` because users
+/// expect `kubectl get oshs` to converge quickly after a CR apply.
+const OBSERVE_INTERVAL: Duration = Duration::from_secs(3);
 const ERROR_REQUEUE_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Shared context handed to every reconcile call.
@@ -187,8 +191,21 @@ async fn reconcile<G: GatewayClient>(
         .as_ref()
         .map(|m| m.id.clone())
         .unwrap_or_default();
-    patch_status_running(&api, &name, generation, &sandbox_id).await?;
-    Ok(Action::requeue(REQUEUE_INTERVAL))
+    let sandbox_name = sandbox
+        .metadata
+        .as_ref()
+        .map_or_else(|| name.clone(), |m| m.name.clone());
+
+    // Project the gateway's view of the pod into CR status. The gateway's
+    // driver maintains a watch on the agent-sandbox `Sandbox` CR and
+    // updates `Sandbox.status.phase`; re-fetching gives us the live
+    // observation rather than the just-after-create snapshot. If the
+    // get fails (rare — we just created/found it), fall back to the
+    // sandbox we already have in hand.
+    let observed = ctx.gateway.get_sandbox(&sandbox_name).await.unwrap_or(sandbox);
+    let (phase, requeue) = phase_from_gateway(&observed);
+    patch_status(&api, &name, generation, &sandbox_id, phase).await?;
+    Ok(Action::requeue(requeue))
 }
 
 const APIV: &str = "openshell.nvidia.com/v1alpha1";
@@ -201,18 +218,18 @@ fn has_finalizer(obj: &OpenShellSandbox) -> bool {
         .is_some_and(|f| f.iter().any(|s| s == FINALIZER))
 }
 
-/// Whether the controller has already finished a reconcile for the current
-/// spec generation.
+/// Whether the controller has already reached a terminal state for the
+/// current spec generation.
 ///
-/// Returns true when `status.observedGeneration` matches the current
-/// `metadata.generation` AND a phase is set — any phase, including
-/// Running or Failed. This guards against watch-event echoes from our
-/// own status patches re-entering the gateway call. Crash recovery is
-/// handled by the cr-uid lookup in the reconcile body, not here.
+/// Returns true only for `Running` or `Failed` at the current
+/// `metadata.generation`. Transitional phases (`Pending`, `Provisioning`,
+/// `Terminating`) must continue to reconcile so the gateway-observed
+/// phase gets projected into status as the pod converges.
 fn is_already_handled(obj: &OpenShellSandbox, generation: i64) -> bool {
-    obj.status
-        .as_ref()
-        .is_some_and(|s| s.observed_generation == Some(generation) && s.phase.is_some())
+    obj.status.as_ref().is_some_and(|s| {
+        s.observed_generation == Some(generation)
+            && matches!(s.phase, Some(Phase::Running | Phase::Failed))
+    })
 }
 
 async fn attach_finalizer(
@@ -296,25 +313,50 @@ async fn handle_deletion<G: GatewayClient>(
     }
 }
 
-async fn patch_status_running(
+/// Map the gateway-side `SandboxPhase` proto into the CR phase + a
+/// requeue interval. Terminal states (Running, Failed) requeue on the
+/// long heartbeat; transitional states poll faster so kubectl converges
+/// quickly when the pod becomes Ready.
+fn phase_from_gateway(sandbox: &openshell_core::proto::Sandbox) -> (Phase, Duration) {
+    use openshell_core::proto::SandboxPhase as Gw;
+    // `Sandbox.phase` is a raw i32 since proto3 enums round-trip via
+    // their numeric tag. Unrecognised values map to Pending.
+    match Gw::try_from(sandbox.phase()).unwrap_or(Gw::Unspecified) {
+        Gw::Ready => (Phase::Running, REQUEUE_INTERVAL),
+        Gw::Provisioning | Gw::Unspecified => (Phase::Provisioning, OBSERVE_INTERVAL),
+        Gw::Deleting => (Phase::Terminating, OBSERVE_INTERVAL),
+        Gw::Error => (Phase::Failed, REQUEUE_INTERVAL),
+        Gw::Unknown => (Phase::Pending, OBSERVE_INTERVAL),
+    }
+}
+
+async fn patch_status(
     api: &Api<OpenShellSandbox>,
     name: &str,
     generation: i64,
     sandbox_id: &str,
+    phase: Phase,
 ) -> Result<(), ReconcileError> {
     let now = Utc::now().to_rfc3339();
+    let (cond_status, reason, message) = match phase {
+        Phase::Running => ("True", "Ready", "Gateway-observed sandbox is Ready"),
+        Phase::Provisioning => ("False", "Provisioning", "Gateway-observed sandbox is Provisioning"),
+        Phase::Terminating => ("False", "Terminating", "Sandbox is terminating"),
+        Phase::Failed => ("False", "Failed", "Gateway reports sandbox error"),
+        Phase::Pending | Phase::Deleted => ("Unknown", "Pending", "Awaiting gateway observation"),
+    };
     let patch = json!({
         "apiVersion": APIV,
         "kind": KIND,
         "status": {
-            "phase": Phase::Running,
+            "phase": phase,
             "observedGeneration": generation,
             "sandboxId": sandbox_id,
-            "message": "gateway sandbox created",
+            "message": message,
             "lastUpdated": now,
             "conditions": [{
-                "type": "Ready", "status": "True", "reason": "Created",
-                "message": "Gateway returned a sandbox",
+                "type": "Ready", "status": cond_status, "reason": reason,
+                "message": message,
                 "lastTransitionTime": now, "observedGeneration": generation,
             }],
         }
@@ -497,14 +539,19 @@ mod tests {
     }
 
     #[test]
-    fn is_already_handled_true_at_current_generation_for_any_phase() {
-        for phase in [
-            Phase::Pending,
-            Phase::Provisioning,
-            Phase::Running,
-            Phase::Failed,
-            Phase::Terminating,
-        ] {
+    fn is_already_handled_true_only_for_terminal_phases() {
+        // Running and Failed are terminal for the current generation and
+        // short-circuit reconcile. Transitional phases (Pending,
+        // Provisioning, Terminating) must continue to reconcile so the
+        // gateway-observed phase keeps getting projected into status.
+        let cases = [
+            (Phase::Pending, false),
+            (Phase::Provisioning, false),
+            (Phase::Terminating, false),
+            (Phase::Running, true),
+            (Phase::Failed, true),
+        ];
+        for (phase, expected) in cases {
             let mut cr = cr_with_metadata(ObjectMeta {
                 generation: Some(1),
                 ..Default::default()
@@ -514,9 +561,10 @@ mod tests {
                 phase: Some(phase),
                 ..Default::default()
             });
-            assert!(
+            assert_eq!(
                 is_already_handled(&cr, 1),
-                "phase {phase:?} at current generation should short-circuit"
+                expected,
+                "phase {phase:?} at current generation: expected is_already_handled={expected}"
             );
         }
     }

@@ -66,6 +66,16 @@ impl GatewayHandle {
     ) -> Result<Option<Sandbox>, Status> {
         crate::grpc::find_sandbox_by_label(&self.state, key, value).await
     }
+
+    /// Fetch a sandbox by name. The returned `Sandbox` carries the
+    /// gateway's current view including the driver-observed phase.
+    ///
+    /// # Errors
+    ///
+    /// See [`crate::grpc::sandbox::get_sandbox_core`].
+    pub async fn get_sandbox(&self, name: &str) -> Result<Sandbox, Status> {
+        crate::grpc::get_sandbox_core(&self.state, name).await
+    }
 }
 
 #[async_trait::async_trait]
@@ -84,5 +94,9 @@ impl openshell_controller::GatewayClient for GatewayHandle {
         value: &str,
     ) -> Result<Option<Sandbox>, Status> {
         Self::find_sandbox_by_label(self, key, value).await
+    }
+
+    async fn get_sandbox(&self, name: &str) -> Result<Sandbox, Status> {
+        Self::get_sandbox(self, name).await
     }
 }

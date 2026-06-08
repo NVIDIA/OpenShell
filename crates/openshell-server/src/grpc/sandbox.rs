@@ -247,21 +247,30 @@ pub(super) async fn handle_get_sandbox(
     state: &Arc<ServerState>,
     request: Request<GetSandboxRequest>,
 ) -> Result<Response<SandboxResponse>, Status> {
-    let name = request.into_inner().name;
-    if name.is_empty() {
-        return Err(Status::invalid_argument("name is required"));
-    }
-
-    let sandbox = state
-        .store
-        .get_message_by_name::<Sandbox>(&name)
-        .await
-        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?;
-
-    let sandbox = sandbox.ok_or_else(|| Status::not_found("sandbox not found"))?;
+    let sandbox = get_sandbox_core(state, &request.into_inner().name).await?;
     Ok(Response::new(SandboxResponse {
         sandbox: Some(sandbox),
     }))
+}
+
+/// Fetch a sandbox by name, returning the gateway's current view including
+/// the driver-observed phase. Used by the CRD controller to project the
+/// agent-sandbox-derived pod readiness back into the CR's `.status.phase`.
+///
+/// # Errors
+///
+/// `Status::invalid_argument` on empty name, `Status::not_found` if the
+/// sandbox isn't in the store, `Status::internal` on store errors.
+pub async fn get_sandbox_core(state: &Arc<ServerState>, name: &str) -> Result<Sandbox, Status> {
+    if name.is_empty() {
+        return Err(Status::invalid_argument("name is required"));
+    }
+    state
+        .store
+        .get_message_by_name::<Sandbox>(name)
+        .await
+        .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+        .ok_or_else(|| Status::not_found("sandbox not found"))
 }
 
 pub(super) async fn handle_list_sandboxes(

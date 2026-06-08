@@ -121,6 +121,28 @@ impl GatewayClient for TestGateway {
                 status: None,
             }))
     }
+
+    async fn get_sandbox(&self, name: &str) -> Result<Sandbox, Status> {
+        // Test stub: pretend the sandbox is always Ready. Real gateway
+        // reads the driver-observed pod readiness from its store.
+        let created = self.created.lock().await;
+        let Some(r) = created.iter().find(|r| r.name == name) else {
+            return Err(Status::not_found(format!("test gateway has no {name}")));
+        };
+        let mut sandbox = Sandbox {
+            metadata: Some(SandboxMeta {
+                id: format!("test-sandbox-{name}"),
+                name: r.name.clone(),
+                created_at_ms: 0,
+                labels: r.labels.clone(),
+                resource_version: 0,
+            }),
+            spec: None,
+            status: None,
+        };
+        sandbox.set_phase(openshell_core::proto::SandboxPhase::Ready as i32);
+        Ok(sandbox)
+    }
 }
 
 fn uuid_lite() -> String {
