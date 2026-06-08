@@ -98,9 +98,11 @@ fn emit_sandbox_create_telemetry(
     } else {
         SandboxTemplateSource::Default
     };
+    let gpu_requested =
+        openshell_core::gpu::public_gpu_requested(spec.resource_requirements.as_ref());
     openshell_core::telemetry::emit_sandbox_create(
         outcome,
-        spec.gpu,
+        gpu_requested,
         spec.providers.len() as u64,
         spec.policy.is_some(),
         template_source,

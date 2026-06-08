@@ -39,12 +39,13 @@ use openshell_core::proto::{
     GetClusterInferenceRequest, GetDraftHistoryRequest, GetDraftPolicyRequest,
     GetGatewayConfigRequest, GetProviderProfileRequest, GetProviderRefreshStatusRequest,
     GetProviderRequest, GetSandboxConfigRequest, GetSandboxLogsRequest,
-    GetSandboxPolicyStatusRequest, GetSandboxRequest, GetServiceRequest, HealthRequest,
-    ImportProviderProfilesRequest, LintProviderProfilesRequest, ListProviderProfilesRequest,
-    ListProvidersRequest, ListSandboxPoliciesRequest, ListSandboxProvidersRequest,
-    ListSandboxesRequest, ListServicesRequest, PlatformEvent, PolicySource, PolicyStatus, Provider,
-    ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy, ProviderProfile,
-    ProviderProfileDiagnostic, ProviderProfileImportItem, RejectDraftChunkRequest,
+    GetSandboxPolicyStatusRequest, GetSandboxRequest, GetServiceRequest, GpuResourceRequirements,
+    HealthRequest, ImportProviderProfilesRequest, LintProviderProfilesRequest,
+    ListProviderProfilesRequest, ListProvidersRequest, ListSandboxPoliciesRequest,
+    ListSandboxProvidersRequest, ListSandboxesRequest, ListServicesRequest, PlatformEvent,
+    PolicySource, PolicyStatus, Provider, ProviderCredentialRefreshStatus,
+    ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileDiagnostic,
+    ProviderProfileImportItem, RejectDraftChunkRequest, ResourceRequirements,
     RevokeSshSessionRequest, RotateProviderCredentialRequest, Sandbox, SandboxPhase, SandboxPolicy,
     SandboxSpec, SandboxTemplate, ServiceEndpointResponse, SetClusterInferenceRequest,
     SettingScope, SettingValue, TcpForwardFrame, TcpForwardInit, TcpRelayTarget,
@@ -1725,6 +1726,7 @@ pub async fn sandbox_create(
     uploads: &[(String, Option<String>, bool)],
     keep: bool,
     gpu: bool,
+    gpu_count: Option<u32>,
     cpu: Option<&str>,
     memory: Option<&str>,
     driver_config_json: Option<&str>,
@@ -1813,9 +1815,13 @@ pub async fn sandbox_create(
         None
     };
 
+    let resource_requirements = requested_gpu.then_some(ResourceRequirements {
+        gpu: Some(GpuResourceRequirements { count: gpu_count }),
+    });
+
     let request = CreateSandboxRequest {
         spec: Some(SandboxSpec {
-            gpu: requested_gpu,
+            resource_requirements,
             environment: environment.clone(),
             policy,
             providers: configured_providers,

@@ -27,7 +27,7 @@ use openshell_core::driver_utils::{
     LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
     LABEL_SANDBOX_NAMESPACE, SUPERVISOR_IMAGE_BINARY_PATH, supervisor_image_should_refresh,
 };
-use openshell_core::gpu::cdi_gpu_device_ids;
+use openshell_core::gpu::{cdi_gpu_device_ids, driver_gpu_count, driver_gpu_requested};
 use openshell_core::progress::{
     PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX, PROGRESS_STEP_STARTING_SANDBOX,
     format_bytes, mark_progress_active, mark_progress_complete, mark_progress_detail,
@@ -461,7 +461,14 @@ impl DockerComputeDriver {
 
         let driver_config =
             DockerSandboxDriverConfig::from_template(template).map_err(Status::invalid_argument)?;
-        Self::validate_gpu_request(spec.gpu, config.supports_gpu, &driver_config)?;
+        let gpu_requested = driver_gpu_requested(spec.resource_requirements.as_ref());
+        let gpu_count = driver_gpu_count(spec.resource_requirements.as_ref());
+        Self::validate_gpu_request(
+            gpu_requested,
+            gpu_count,
+            config.supports_gpu,
+            &driver_config,
+        )?;
         Ok(())
     }
 
@@ -510,12 +517,19 @@ impl DockerComputeDriver {
 
     fn validate_gpu_request(
         gpu: bool,
+        gpu_count: Option<u32>,
         supports_gpu: bool,
         driver_config: &DockerSandboxDriverConfig,
     ) -> Result<(), Status> {
         if !gpu && driver_config.cdi_devices.is_some() {
             return Err(Status::invalid_argument(
                 "driver_config.cdi_devices requires gpu=true",
+            ));
+        }
+
+        if gpu_count.is_some() {
+            return Err(Status::invalid_argument(
+                "docker GPU count requests are not supported; use --gpu without a count or driver_config.cdi_devices",
             ));
         }
 
@@ -2121,14 +2135,15 @@ fn build_device_requests(sandbox: &DriverSandbox) -> Result<Option<Vec<DeviceReq
         .map_err(Status::invalid_argument)?
         .cdi_devices
         .unwrap_or_default();
-    if !spec.gpu && !cdi_devices.is_empty() {
+    let gpu_requested = driver_gpu_requested(spec.resource_requirements.as_ref());
+    if !gpu_requested && !cdi_devices.is_empty() {
         return Err(Status::invalid_argument(
             "driver_config.cdi_devices requires gpu=true",
         ));
     }
 
     Ok(
-        cdi_gpu_device_ids(spec.gpu, &cdi_devices).map(|device_ids| {
+        cdi_gpu_device_ids(gpu_requested, &cdi_devices).map(|device_ids| {
             vec![DeviceRequest {
                 driver: Some("cdi".to_string()),
                 device_ids: Some(device_ids),

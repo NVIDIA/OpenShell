@@ -19,10 +19,11 @@ use openshell_core::ComputeDriverKind;
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, DeleteSandboxRequest, DriverCondition, DriverPlatformEvent,
     DriverResourceRequirements, DriverSandbox, DriverSandboxSpec, DriverSandboxStatus,
-    DriverSandboxTemplate, GetCapabilitiesRequest, GetSandboxRequest, ListSandboxesRequest,
-    ValidateSandboxCreateRequest, WatchSandboxesEvent, WatchSandboxesRequest,
-    compute_driver_client::ComputeDriverClient, compute_driver_server::ComputeDriver,
-    watch_sandboxes_event,
+    DriverSandboxTemplate, GetCapabilitiesRequest, GetSandboxRequest,
+    GpuResourceRequirements as DriverGpuResourceRequirements, ListSandboxesRequest,
+    ResourceRequirements as DriverSandboxResourceRequirements, ValidateSandboxCreateRequest,
+    WatchSandboxesEvent, WatchSandboxesRequest, compute_driver_client::ComputeDriverClient,
+    compute_driver_server::ComputeDriver, watch_sandboxes_event,
 };
 use openshell_core::proto::{
     PlatformEvent, Sandbox, SandboxCondition, SandboxPhase, SandboxSpec, SandboxStatus,
@@ -1279,7 +1280,14 @@ fn driver_sandbox_spec_from_public(
             .as_ref()
             .map(|template| driver_sandbox_template_from_public(template, driver_kind))
             .transpose()?,
-        gpu: spec.gpu,
+        resource_requirements: spec.resource_requirements.as_ref().map(|requirements| {
+            DriverSandboxResourceRequirements {
+                gpu: requirements
+                    .gpu
+                    .as_ref()
+                    .map(|gpu| DriverGpuResourceRequirements { count: gpu.count }),
+            }
+        }),
         sandbox_token: String::new(),
     })
 }
@@ -1660,7 +1668,9 @@ fn derive_phase(status: Option<&DriverSandboxStatus>) -> SandboxPhase {
 }
 
 fn rewrite_user_facing_conditions(status: &mut Option<SandboxStatus>, spec: Option<&SandboxSpec>) {
-    let gpu_requested = spec.is_some_and(|sandbox_spec| sandbox_spec.gpu);
+    let gpu_requested = spec
+        .and_then(|sandbox_spec| sandbox_spec.resource_requirements.as_ref())
+        .is_some_and(|requirements| openshell_core::gpu::public_gpu_requested(Some(requirements)));
     if !gpu_requested {
         return;
     }
@@ -1854,6 +1864,26 @@ mod tests {
                     .collect(),
             })),
         }
+    }
+
+    #[test]
+    fn driver_sandbox_spec_from_public_preserves_gpu_requirement() {
+        let public = SandboxSpec {
+            resource_requirements: Some(openshell_core::proto::ResourceRequirements {
+                gpu: Some(openshell_core::proto::GpuResourceRequirements { count: Some(2) }),
+            }),
+            ..Default::default()
+        };
+
+        let driver =
+            driver_sandbox_spec_from_public(&public, None).expect("driver spec should map");
+
+        let gpu = driver
+            .resource_requirements
+            .as_ref()
+            .and_then(|requirements| requirements.gpu.as_ref())
+            .expect("driver GPU requirement should be set");
+        assert_eq!(gpu.count, Some(2));
     }
 
     #[test]
@@ -2355,7 +2385,9 @@ mod tests {
         rewrite_user_facing_conditions(
             &mut status,
             Some(&SandboxSpec {
-                gpu: true,
+                resource_requirements: Some(openshell_core::proto::ResourceRequirements {
+                    gpu: Some(openshell_core::proto::GpuResourceRequirements { count: None }),
+                }),
                 ..Default::default()
             }),
         );
@@ -2383,13 +2415,7 @@ mod tests {
             ..Default::default()
         });
 
-        rewrite_user_facing_conditions(
-            &mut status,
-            Some(&SandboxSpec {
-                gpu: false,
-                ..Default::default()
-            }),
-        );
+        rewrite_user_facing_conditions(&mut status, Some(&SandboxSpec::default()));
 
         assert_eq!(status.unwrap().conditions[0].message, original);
     }
@@ -2668,7 +2694,9 @@ mod tests {
 
         let sandbox = Sandbox {
             spec: Some(SandboxSpec {
-                gpu: true,
+                resource_requirements: Some(openshell_core::proto::ResourceRequirements {
+                    gpu: Some(openshell_core::proto::GpuResourceRequirements { count: None }),
+                }),
                 ..Default::default()
             }),
             ..sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning)
@@ -2691,7 +2719,9 @@ mod tests {
             SandboxPhase::try_from(stored.phase()).unwrap(),
             SandboxPhase::Ready
         );
-        assert!(stored.spec.as_ref().is_some_and(|spec| spec.gpu));
+        assert!(stored.spec.as_ref().is_some_and(|spec| {
+            openshell_core::gpu::public_gpu_requested(spec.resource_requirements.as_ref())
+        }));
     }
 
     #[tokio::test]

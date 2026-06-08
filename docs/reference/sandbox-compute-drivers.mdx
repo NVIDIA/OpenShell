@@ -53,7 +53,8 @@ openshell sandbox create \
 ```
 
 Driver config is for fields without a stable public flag. Prefer `--cpu`,
-`--memory`, and `--gpu` for portable resource intent.
+`--memory`, and `--gpu` for supported resource intent. Pass a count to `--gpu`
+when the active driver supports counted allocation.
 
 Exact GPU device selection remains driver-owned and requires `--gpu`. Docker
 and Podman accept `cdi_devices`; replace the top-level `docker` key with

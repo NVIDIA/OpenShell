@@ -4,6 +4,40 @@
 //! Shared GPU request helpers.
 
 use crate::config::CDI_GPU_DEVICE_ALL;
+use crate::proto::ResourceRequirements as PublicResourceRequirements;
+use crate::proto::compute::v1::ResourceRequirements as DriverResourceRequirements;
+
+/// Return whether public resource requirements request a GPU.
+#[must_use]
+pub fn public_gpu_requested(resources: Option<&PublicResourceRequirements>) -> bool {
+    resources
+        .and_then(|resources| resources.gpu.as_ref())
+        .is_some()
+}
+
+/// Return the requested public GPU count, if one was specified.
+#[must_use]
+pub fn public_gpu_count(resources: Option<&PublicResourceRequirements>) -> Option<u32> {
+    resources
+        .and_then(|resources| resources.gpu.as_ref())
+        .and_then(|gpu| gpu.count)
+}
+
+/// Return whether driver resource requirements request a GPU.
+#[must_use]
+pub fn driver_gpu_requested(resources: Option<&DriverResourceRequirements>) -> bool {
+    resources
+        .and_then(|resources| resources.gpu.as_ref())
+        .is_some()
+}
+
+/// Return the requested driver GPU count, if one was specified.
+#[must_use]
+pub fn driver_gpu_count(resources: Option<&DriverResourceRequirements>) -> Option<u32> {
+    resources
+        .and_then(|resources| resources.gpu.as_ref())
+        .and_then(|gpu| gpu.count)
+}
 
 /// Resolve a GPU request into CDI device identifiers.
 ///

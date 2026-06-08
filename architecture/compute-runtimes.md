@@ -92,7 +92,10 @@ users.
 Custom sandbox images must include the agent runtime and any system
 dependencies, but they should not need to include the gateway. GPU-capable
 images must include the user-space libraries required by the workload. The
-runtime still owns GPU device injection.
+runtime still owns GPU device injection. GPU requests are explicit, and can be
+refined with a driver-native device identifier or requested count; the gateway
+validates the request shape and each runtime enforces the GPU allocation modes it
+supports.
 
 ## Deployment Shape
 

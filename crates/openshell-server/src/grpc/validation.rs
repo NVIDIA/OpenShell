@@ -134,6 +134,9 @@ pub(super) fn validate_sandbox_spec(
         validate_env_entries(&tmpl.environment, "spec.template.environment")?;
     }
 
+    // --- spec.resource_requirements.gpu ---
+    validate_gpu_request_fields(spec)?;
+
     // --- spec.policy serialized size ---
     if let Some(ref policy) = spec.policy {
         let size = policy.encoded_len();
@@ -142,6 +145,14 @@ pub(super) fn validate_sandbox_spec(
                 "policy serialized size exceeds maximum ({size} > {MAX_POLICY_SIZE})"
             )));
         }
+    }
+
+    Ok(())
+}
+
+fn validate_gpu_request_fields(spec: &openshell_core::proto::SandboxSpec) -> Result<(), Status> {
+    if openshell_core::gpu::public_gpu_count(spec.resource_requirements.as_ref()) == Some(0) {
+        return Err(Status::invalid_argument("gpu count must be greater than 0"));
     }
 
     Ok(())
@@ -760,10 +771,36 @@ mod tests {
     #[test]
     fn validate_sandbox_spec_accepts_gpu_flag() {
         let spec = SandboxSpec {
-            gpu: true,
+            resource_requirements: Some(openshell_core::proto::ResourceRequirements {
+                gpu: Some(openshell_core::proto::GpuResourceRequirements { count: None }),
+            }),
             ..Default::default()
         };
         assert!(validate_sandbox_spec("gpu-sandbox", &spec).is_ok());
+    }
+
+    #[test]
+    fn validate_sandbox_spec_accepts_gpu_count() {
+        let spec = SandboxSpec {
+            resource_requirements: Some(openshell_core::proto::ResourceRequirements {
+                gpu: Some(openshell_core::proto::GpuResourceRequirements { count: Some(2) }),
+            }),
+            ..Default::default()
+        };
+        assert!(validate_sandbox_spec("gpu-sandbox", &spec).is_ok());
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_zero_gpu_count() {
+        let spec = SandboxSpec {
+            resource_requirements: Some(openshell_core::proto::ResourceRequirements {
+                gpu: Some(openshell_core::proto::GpuResourceRequirements { count: Some(0) }),
+            }),
+            ..Default::default()
+        };
+        let err = validate_sandbox_spec("gpu-sandbox", &spec).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("gpu count must be greater than 0"));
     }
 
     #[test]

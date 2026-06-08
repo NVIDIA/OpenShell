@@ -28,6 +28,12 @@ struct GatewayContext {
     endpoint: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GpuCliRequest {
+    DriverDefault,
+    Count(u32),
+}
+
 /// Resolve the gateway name to a [`GatewayContext`] with the gateway endpoint.
 ///
 /// Resolution priority:
@@ -107,6 +113,31 @@ fn resolve_gateway(
         name: metadata.name,
         endpoint: metadata.gateway_endpoint,
     })
+}
+
+fn resolve_gpu_args(gpu: Option<GpuCliRequest>) -> (bool, Option<u32>) {
+    let gpu_count = match gpu {
+        Some(GpuCliRequest::Count(count)) => Some(count),
+        Some(GpuCliRequest::DriverDefault) | None => None,
+    };
+    let gpu = gpu.is_some();
+
+    (gpu, gpu_count)
+}
+
+fn parse_gpu_request(value: &str) -> std::result::Result<GpuCliRequest, String> {
+    if value.is_empty() {
+        return Ok(GpuCliRequest::DriverDefault);
+    }
+
+    let count = value
+        .parse::<u32>()
+        .map_err(|_| "GPU count must be a positive integer".to_string())?;
+    if count == 0 {
+        return Err("GPU count must be greater than 0".to_string());
+    }
+
+    Ok(GpuCliRequest::Count(count))
 }
 
 fn resolve_gateway_name(gateway_flag: &Option<String>) -> Option<String> {
@@ -1212,8 +1243,11 @@ enum SandboxCommands {
         editor: Option<CliEditor>,
 
         /// Request GPU resources for the sandbox.
-        #[arg(long)]
-        gpu: bool,
+        ///
+        /// Omit COUNT for the driver's default GPU selection, or pass COUNT
+        /// to request a specific number of GPUs.
+        #[arg(long, num_args = 0..=1, value_name = "COUNT", default_missing_value = "", value_parser = parse_gpu_request)]
+        gpu: Option<GpuCliRequest>,
 
         /// CPU limit for the sandbox (for example: 500m, 1, 2.5).
         #[arg(long)]
@@ -2621,6 +2655,7 @@ async fn main() -> Result<()> {
                         .map(|s| openshell_core::forward::ForwardSpec::parse(&s))
                         .transpose()?;
                     let keep = keep || !no_keep || editor.is_some() || forward.is_some();
+                    let (gpu, gpu_count) = resolve_gpu_args(gpu);
 
                     let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
                     let endpoint = &ctx.endpoint;
@@ -2634,6 +2669,7 @@ async fn main() -> Result<()> {
                         &upload_specs,
                         keep,
                         gpu,
+                        gpu_count,
                         cpu.as_deref(),
                         memory.as_deref(),
                         driver_config_json.as_deref(),
@@ -3629,6 +3665,30 @@ mod tests {
     }
 
     #[test]
+    fn resolve_gpu_args_handles_absent_gpu() {
+        let (gpu, gpu_count) = resolve_gpu_args(None);
+
+        assert!(!gpu);
+        assert_eq!(gpu_count, None);
+    }
+
+    #[test]
+    fn resolve_gpu_args_handles_driver_default() {
+        let (gpu, gpu_count) = resolve_gpu_args(Some(GpuCliRequest::DriverDefault));
+
+        assert!(gpu);
+        assert_eq!(gpu_count, None);
+    }
+
+    #[test]
+    fn resolve_gpu_args_handles_gpu_count() {
+        let (gpu, gpu_count) = resolve_gpu_args(Some(GpuCliRequest::Count(2)));
+
+        assert!(gpu);
+        assert_eq!(gpu_count, Some(2));
+    }
+
+    #[test]
     fn apply_auth_uses_stored_token() {
         let tmp = tempfile::tempdir().unwrap();
         with_tmp_xdg(tmp.path(), || {
@@ -4441,6 +4501,113 @@ mod tests {
             }
             other => panic!("expected SandboxCommands::Create, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn sandbox_create_gpu_parses_driver_default() {
+        let cli = Cli::try_parse_from(["openshell", "sandbox", "create", "--gpu"])
+            .expect("sandbox create --gpu should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { gpu, .. }),
+                ..
+            }) => {
+                assert_eq!(gpu, Some(GpuCliRequest::DriverDefault));
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_gpu_count_parses_from_gpu_flag() {
+        let cli = Cli::try_parse_from(["openshell", "sandbox", "create", "--gpu", "2"])
+            .expect("sandbox create --gpu 2 should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { gpu, .. }),
+                ..
+            }) => {
+                assert_eq!(gpu, Some(GpuCliRequest::Count(2)));
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_gpu_driver_default_allows_trailing_command() {
+        let cli = Cli::try_parse_from(["openshell", "sandbox", "create", "--gpu", "--", "claude"])
+            .expect("sandbox create --gpu -- claude should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { gpu, command, .. }),
+                ..
+            }) => {
+                assert_eq!(gpu, Some(GpuCliRequest::DriverDefault));
+                assert_eq!(command, vec!["claude".to_string()]);
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_gpu_count_allows_trailing_command() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "sandbox",
+            "create",
+            "--gpu",
+            "2",
+            "--",
+            "claude",
+        ])
+        .expect("sandbox create --gpu 2 -- claude should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { gpu, command, .. }),
+                ..
+            }) => {
+                assert_eq!(gpu, Some(GpuCliRequest::Count(2)));
+                assert_eq!(command, vec!["claude".to_string()]);
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_gpu_count_rejects_zero() {
+        let result = Cli::try_parse_from(["openshell", "sandbox", "create", "--gpu", "0"]);
+
+        assert!(result.is_err(), "sandbox create --gpu 0 should be rejected");
+    }
+
+    #[test]
+    fn sandbox_create_gpu_count_accepts_equals_syntax() {
+        let cli = Cli::try_parse_from(["openshell", "sandbox", "create", "--gpu=2"])
+            .expect("sandbox create --gpu=2 should parse");
+
+        match cli.command {
+            Some(Commands::Sandbox {
+                command: Some(SandboxCommands::Create { gpu, .. }),
+                ..
+            }) => {
+                assert_eq!(gpu, Some(GpuCliRequest::Count(2)));
+            }
+            other => panic!("expected SandboxCommands::Create, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_create_gpu_count_rejects_non_integer() {
+        let result = Cli::try_parse_from(["openshell", "sandbox", "create", "--gpu", "many"]);
+
+        assert!(
+            result.is_err(),
+            "sandbox create --gpu many should be rejected"
+        );
     }
 
     #[test]
