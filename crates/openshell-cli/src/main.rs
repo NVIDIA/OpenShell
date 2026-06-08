@@ -2663,9 +2663,7 @@ async fn main() -> Result<()> {
                     }
                     let dest_display = sandbox_dest.unwrap_or("~");
                     eprintln!("Uploading {} -> sandbox:{}", local.display(), dest_display);
-                    if !no_git_ignore
-                        && let Ok((base_dir, files)) = run::git_sync_files(local)
-                    {
+                    if !no_git_ignore && let Ok((base_dir, files)) = run::git_sync_files(local) {
                         if !files.is_empty() {
                             run::sandbox_sync_up_files(
                                 &ctx.endpoint,
