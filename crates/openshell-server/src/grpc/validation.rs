@@ -56,7 +56,7 @@ pub(super) fn validate_exec_request_fields(req: &ExecSandboxRequest) -> Result<(
         }
         reject_control_chars(value, &format!("environment value for '{key}'"))?;
     }
-    validate_env_entries(&req.environment, "environment")?;
+    validate_exec_env_entries(&req.environment, "environment")?;
     if !req.workdir.is_empty() {
         if req.workdir.len() > MAX_EXEC_WORKDIR_LEN {
             return Err(Status::invalid_argument(format!(
@@ -246,9 +246,40 @@ pub(super) fn validate_string_map(
     Ok(())
 }
 
+/// OPENSHELL_* keys that are allowed in exec environment. The Python SDK's
+/// `exec_python()` sends a serialized callable via this key.
+const EXEC_ALLOWED_OPENSHELL_KEYS: &[&str] = &["OPENSHELL_PYFUNC_B64"];
+
+/// Maximum total serialized size of user environment (bytes). The drivers
+/// serialize the full map as JSON into a single `OPENSHELL_USER_ENVIRONMENT`
+/// env var; capping the input prevents driver/runtime-specific startup
+/// failures from oversized env blocks.
+const MAX_ENV_SERIALIZED_SIZE: usize = 256 * 1024; // 256 KiB
+
 fn validate_env_entries(
     map: &std::collections::HashMap<String, String>,
     field_name: &str,
+) -> Result<(), Status> {
+    let total_size: usize = map.iter().map(|(k, v)| k.len() + v.len()).sum();
+    if total_size > MAX_ENV_SERIALIZED_SIZE {
+        return Err(Status::invalid_argument(format!(
+            "{field_name} total size exceeds {MAX_ENV_SERIALIZED_SIZE} byte limit ({total_size} bytes)"
+        )));
+    }
+    validate_env_entries_inner(map, field_name, &[])
+}
+
+fn validate_exec_env_entries(
+    map: &std::collections::HashMap<String, String>,
+    field_name: &str,
+) -> Result<(), Status> {
+    validate_env_entries_inner(map, field_name, EXEC_ALLOWED_OPENSHELL_KEYS)
+}
+
+fn validate_env_entries_inner(
+    map: &std::collections::HashMap<String, String>,
+    field_name: &str,
+    allowed_openshell_keys: &[&str],
 ) -> Result<(), Status> {
     for (key, value) in map {
         if !super::provider::is_valid_env_key(key) {
@@ -256,7 +287,7 @@ fn validate_env_entries(
                 "{field_name} keys must match ^[A-Za-z_][A-Za-z0-9_]*$; got '{key}'"
             )));
         }
-        if key.starts_with("OPENSHELL_") {
+        if key.starts_with("OPENSHELL_") && !allowed_openshell_keys.contains(&key.as_str()) {
             return Err(Status::invalid_argument(format!(
                 "{field_name} keys starting with OPENSHELL_ are reserved; got '{key}'"
             )));
@@ -966,6 +997,35 @@ mod tests {
         assert!(
             err.message().contains("OPENSHELL_") && err.message().contains("reserved"),
             "expected reserved key error, got: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn validate_exec_request_allows_pyfunc_helper_key() {
+        let req = ExecSandboxRequest {
+            sandbox_id: "id".to_string(),
+            command: vec!["python".to_string()],
+            environment: std::iter::once(("OPENSHELL_PYFUNC_B64".to_string(), "data".to_string()))
+                .collect(),
+            ..Default::default()
+        };
+        assert!(validate_exec_request_fields(&req).is_ok());
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_template_env_value_with_control_chars() {
+        let spec = SandboxSpec {
+            template: Some(SandboxTemplate {
+                environment: std::iter::once(("KEY".to_string(), "val\nue".to_string())).collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = validate_sandbox_spec("s", &spec).unwrap_err();
+        assert!(
+            err.message().contains("newline"),
+            "expected control char error, got: {}",
             err.message()
         );
     }
