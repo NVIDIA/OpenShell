@@ -917,6 +917,7 @@ async fn sandbox_create_sends_driver_config_json() {
         Some(false),
         Some(false),
         &HashMap::new(),
+        &HashMap::new(),
         "manual",
         &tls,
     )
@@ -1371,6 +1372,7 @@ async fn sandbox_create_sends_environment_variables() {
         None,
         None,
         None,
+        None,
         &[],
         None,
         None,
@@ -1421,5 +1423,22 @@ async fn sandbox_create_env_rejects_reserved_prefix() {
     assert!(
         msg.contains("OPENSHELL_") && msg.contains("reserved"),
         "error should mention reserved prefix, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn sandbox_create_env_rejects_invalid_key_name() {
+    let err = run::parse_env_pairs(&["1BAD=value".to_string()]).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("1BAD"),
+        "error should mention invalid key, got: {msg}"
+    );
+
+    let err = run::parse_env_pairs(&["BAD-NAME=value".to_string()]).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("BAD-NAME"),
+        "error should mention invalid key, got: {msg}"
     );
 }

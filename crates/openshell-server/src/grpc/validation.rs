@@ -56,7 +56,7 @@ pub(super) fn validate_exec_request_fields(req: &ExecSandboxRequest) -> Result<(
         }
         reject_control_chars(value, &format!("environment value for '{key}'"))?;
     }
-    reject_reserved_env_keys(&req.environment, "environment")?;
+    validate_env_entries(&req.environment, "environment")?;
     if !req.workdir.is_empty() {
         if req.workdir.len() > MAX_EXEC_WORKDIR_LEN {
             return Err(Status::invalid_argument(format!(
@@ -126,12 +126,12 @@ pub(super) fn validate_sandbox_spec(
         MAX_MAP_VALUE_LEN,
         "spec.environment",
     )?;
-    reject_reserved_env_keys(&spec.environment, "spec.environment")?;
+    validate_env_entries(&spec.environment, "spec.environment")?;
 
     // --- spec.template ---
     if let Some(ref tmpl) = spec.template {
         validate_sandbox_template(tmpl)?;
-        reject_reserved_env_keys(&tmpl.environment, "spec.template.environment")?;
+        validate_env_entries(&tmpl.environment, "spec.template.environment")?;
     }
 
     // --- spec.policy serialized size ---
@@ -246,16 +246,22 @@ pub(super) fn validate_string_map(
     Ok(())
 }
 
-fn reject_reserved_env_keys(
+fn validate_env_entries(
     map: &std::collections::HashMap<String, String>,
     field_name: &str,
 ) -> Result<(), Status> {
-    for key in map.keys() {
+    for (key, value) in map {
+        if !super::provider::is_valid_env_key(key) {
+            return Err(Status::invalid_argument(format!(
+                "{field_name} keys must match ^[A-Za-z_][A-Za-z0-9_]*$; got '{key}'"
+            )));
+        }
         if key.starts_with("OPENSHELL_") {
             return Err(Status::invalid_argument(format!(
                 "{field_name} keys starting with OPENSHELL_ are reserved; got '{key}'"
             )));
         }
+        reject_control_chars(value, &format!("{field_name} value for '{key}'"))?;
     }
     Ok(())
 }
@@ -960,6 +966,51 @@ mod tests {
         assert!(
             err.message().contains("OPENSHELL_") && err.message().contains("reserved"),
             "expected reserved key error, got: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_invalid_env_key_name() {
+        let spec = SandboxSpec {
+            environment: std::iter::once(("1BAD".to_string(), "val".to_string())).collect(),
+            ..Default::default()
+        };
+        let err = validate_sandbox_spec("s", &spec).unwrap_err();
+        assert!(
+            err.message().contains("1BAD"),
+            "expected invalid key error, got: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_env_value_with_control_chars() {
+        let spec = SandboxSpec {
+            environment: std::iter::once(("KEY".to_string(), "val\nue".to_string())).collect(),
+            ..Default::default()
+        };
+        let err = validate_sandbox_spec("s", &spec).unwrap_err();
+        assert!(
+            err.message().contains("newline"),
+            "expected control char error, got: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_invalid_template_env_key_name() {
+        let spec = SandboxSpec {
+            template: Some(SandboxTemplate {
+                environment: std::iter::once(("BAD-NAME".to_string(), "val".to_string())).collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = validate_sandbox_spec("s", &spec).unwrap_err();
+        assert!(
+            err.message().contains("BAD-NAME"),
+            "expected invalid key error, got: {}",
             err.message()
         );
     }

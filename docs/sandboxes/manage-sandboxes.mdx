@@ -173,7 +173,7 @@ openshell sandbox exec -n my-sandbox --env MY_VAR=hello -- printenv MY_VAR
 
 Per-command variables override the sandbox-level environment for that command only.
 
-Environment variable names starting with `OPENSHELL_` are reserved and rejected by the CLI.
+Environment variable names starting with `OPENSHELL_` are reserved. Keys must match `[A-Za-z_][A-Za-z0-9_]*`.
 
 ## Label a Sandbox
 

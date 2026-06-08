@@ -3922,6 +3922,11 @@ pub fn parse_key_value_pairs(items: &[String], flag: &str) -> Result<HashMap<Str
 pub fn parse_env_pairs(items: &[String]) -> Result<HashMap<String, String>> {
     let map = parse_key_value_pairs(items, "--env")?;
     for key in map.keys() {
+        if !is_valid_env_name(key) {
+            return Err(miette::miette!(
+                "--env key must match [A-Za-z_][A-Za-z0-9_]*; got '{key}'"
+            ));
+        }
         if key.starts_with("OPENSHELL_") {
             return Err(miette::miette!(
                 "--env keys starting with OPENSHELL_ are reserved; got '{key}'"
@@ -3929,6 +3934,17 @@ pub fn parse_env_pairs(items: &[String]) -> Result<HashMap<String, String>> {
         }
     }
     Ok(map)
+}
+
+fn is_valid_env_name(key: &str) -> bool {
+    let mut bytes = key.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    if !(first == b'_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    bytes.all(|b| b == b'_' || b.is_ascii_alphanumeric())
 }
 
 fn parse_credential_pairs(items: &[String]) -> Result<HashMap<String, String>> {
