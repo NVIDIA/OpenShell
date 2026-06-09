@@ -773,8 +773,12 @@ enum ProviderCommands {
         offset: u32,
 
         /// Print only provider names, one per line.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "output")]
         names: bool,
+
+        /// Output format.
+        #[arg(short = 'o', long = "output", value_enum, default_value_t = OutputFormat::Table, conflicts_with = "names")]
+        output: OutputFormat,
     },
 
     /// List available provider profiles.
@@ -2906,8 +2910,10 @@ async fn main() -> Result<()> {
                     limit,
                     offset,
                     names,
+                    output,
                 } => {
-                    run::provider_list(endpoint, limit, offset, names, &tls).await?;
+                    run::provider_list(endpoint, limit, offset, names, output.as_str(), &tls)
+                        .await?;
                 }
                 ProviderCommands::ListProfiles { output } => {
                     run::provider_list_profiles(endpoint, output.as_str(), &tls).await?;
