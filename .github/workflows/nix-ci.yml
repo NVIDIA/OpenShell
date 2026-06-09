@@ -1,0 +1,96 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Nix CI
+
+on:
+  push:
+    branches:
+      - main
+      - "pull-request/[0-9]+"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Build ${{ matrix.package }} (${{ matrix.target.system }})
+    runs-on: ${{ matrix.target.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - system: x86_64-linux
+            runner: linux-amd64-cpu8
+          - system: aarch64-linux
+            runner: linux-arm64-cpu8
+        package:
+          - openshell
+          - openshell-gateway
+          - openshell-sandbox
+          - openshell-driver-kubernetes
+          - openshell-driver-podman
+          - openshell-driver-vm
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Enable Magic Nix Cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Build package
+        run: nix build ".#packages.${{ matrix.target.system }}.${{ matrix.package }}" --no-link --print-build-logs --no-update-lock-file
+
+  checks:
+    name: Check ${{ matrix.check }} (${{ matrix.target.system }})
+    needs: build
+    runs-on: ${{ matrix.target.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - system: x86_64-linux
+            runner: linux-amd64-cpu8
+          - system: aarch64-linux
+            runner: linux-arm64-cpu8
+        check:
+          - openshell-bootstrap-test
+          - openshell-cli-test
+          - openshell-core-test
+          - openshell-driver-docker-test
+          - openshell-driver-kubernetes-test
+          - openshell-driver-podman-test
+          - openshell-driver-vm-test
+          - openshell-ocsf-test
+          - openshell-policy-test
+          - openshell-prover-test
+          - openshell-providers-test
+          - openshell-router-test
+          - openshell-sandbox-test
+          - openshell-server-macros-test
+          - openshell-server-test
+          - openshell-tui-test
+          - openshell-vfio-test
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Enable Magic Nix Cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Build check
+        run: nix build ".#checks.${{ matrix.target.system }}.${{ matrix.check }}" --no-link --print-build-logs --no-update-lock-file
