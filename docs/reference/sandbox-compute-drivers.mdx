@@ -83,21 +83,22 @@ Docker's [storage documentation](https://docs.docker.com/engine/storage/)
 documents container storage mounts as volumes, bind mounts, tmpfs mounts, and
 named pipes.
 
-Use a `volume` mount for existing Docker named volumes. This includes NFS
-volumes created with Docker's local volume driver:
+Use a `volume` mount for existing Docker named volumes:
 
 ```shell
-docker volume create \
-  --driver local \
-  --opt type=nfs \
-  --opt o=addr=10.0.0.10,rw,nfsvers=4 \
-  --opt device=:/exports/work \
-  work-nfs
+docker volume create openshell-work
 
 openshell sandbox create \
-  --driver-config-json '{"docker":{"mounts":[{"type":"volume","source":"work-nfs","target":"/sandbox/work","read_only":false}]}}' \
+  --driver-config-json '{"docker":{"mounts":[{"type":"volume","source":"openshell-work","target":"/sandbox/work","read_only":false}]}}' \
   -- claude
 ```
+
+<Warning>
+Bind mounts share gateway-host filesystem resources with the sandbox. They may
+be considered insecure because they can negate OpenShell controls such as
+workspace isolation and filesystem policy. Use them only when you understand and
+accept that loss of isolation.
+</Warning>
 
 Use a `bind` mount only after enabling it in the Docker driver table:
 
@@ -143,29 +144,22 @@ mounts. It also accepts `bind` mounts when `[openshell.drivers.podman]` sets
 `enable_bind_mounts = true` in `gateway.toml`. Host bind mounts expose gateway
 host paths to sandbox requests, so they are disabled by default.
 
-Use a `volume` mount for existing Podman named volumes. This includes NFS
-volumes created with Podman's local volume driver:
+Use a `volume` mount for existing Podman named volumes:
 
 ```shell
-podman volume create \
-  --opt type=nfs \
-  --opt o=addr=10.0.0.10,rw,nfsvers=4 \
-  --opt device=:/exports/work \
-  work-nfs
+podman volume create openshell-work
 
 openshell sandbox create \
-  --driver-config-json '{"podman":{"mounts":[{"type":"volume","source":"work-nfs","target":"/sandbox/work","read_only":false}]}}' \
+  --driver-config-json '{"podman":{"mounts":[{"type":"volume","source":"openshell-work","target":"/sandbox/work","read_only":false}]}}' \
   -- claude
 ```
 
-Use an `image` mount to mount an OCI image filesystem through Podman's
-image-volume API:
-
-```shell
-openshell sandbox create \
-  --driver-config-json '{"podman":{"mounts":[{"type":"image","source":"ghcr.io/acme/tools:latest","target":"/opt/tools"}]}}' \
-  -- claude
-```
+<Warning>
+Bind mounts share gateway-host filesystem resources with the sandbox. They may
+be considered insecure because they can negate OpenShell controls such as
+workspace isolation and filesystem policy. Use them only when you understand and
+accept that loss of isolation.
+</Warning>
 
 Use a `bind` mount only after enabling it in the Podman driver table:
 

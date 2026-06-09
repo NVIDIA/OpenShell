@@ -4,6 +4,7 @@
 #![cfg(feature = "e2e-local-container-driver")]
 
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::process::Output;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -93,8 +94,10 @@ async fn sandbox_mounts_enabled_driver_config_bind() {
         .expect("create bind mount host dir");
     fs::set_permissions(host_dir.path(), fs::Permissions::from_mode(0o777))
     .expect("make bind mount host dir writable by sandbox user");
-    fs::write(host_dir.path().join("input.txt"), "host-bind-ok")
-        .expect("seed bind mount host dir");
+    let input_path = host_dir.path().join("input.txt");
+    fs::write(&input_path, "host-bind-ok").expect("seed bind mount host dir");
+    fs::set_permissions(&input_path, fs::Permissions::from_mode(0o666))
+        .expect("make bind mount input readable by sandbox user");
 
     let driver_config = driver_config_mount_json(
         &driver,
@@ -105,8 +108,14 @@ async fn sandbox_mounts_enabled_driver_config_bind() {
             "read_only": false
         }),
     );
+    // Host bind mounts are explicitly unsafe: this test validates driver mount
+    // wiring, not Landlock enforcement over Docker Desktop's fakeowner mounts.
+    let policy = write_bind_mount_policy().expect("write bind mount policy");
+    let policy_path = policy.path().to_str().expect("policy path must be utf-8");
     let mut sandbox = SandboxGuard::create(&[
         "--no-keep",
+        "--policy",
+        policy_path,
         "--driver-config-json",
         &driver_config,
         "--",
@@ -127,6 +136,27 @@ async fn sandbox_mounts_enabled_driver_config_bind() {
     let output = fs::read_to_string(host_dir.path().join("output.txt"))
         .expect("read sandbox output from bind mount host dir");
     assert_eq!(output, "sandbox-bind-ok");
+}
+
+fn write_bind_mount_policy() -> Result<tempfile::NamedTempFile, String> {
+    let mut file =
+        tempfile::NamedTempFile::new().map_err(|err| format!("create bind policy: {err}"))?;
+    file.write_all(
+        br#"version: 1
+
+filesystem_policy:
+  include_workdir: false
+
+landlock:
+  compatibility: best_effort
+
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+"#,
+    )
+    .map_err(|err| format!("write bind policy: {err}"))?;
+    Ok(file)
 }
 
 fn seed_volume(volume: &VolumeGuard) -> Result<(), String> {

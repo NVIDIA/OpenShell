@@ -252,10 +252,6 @@ resolve_podman_supervisor_image() {
 ensure_podman_supervisor_image() {
   local image=$1
 
-  if podman_cmd image exists "${image}" 2>/dev/null; then
-    return 0
-  fi
-
   if [ "${image}" = "openshell/supervisor:dev" ] \
      && [ -z "${OPENSHELL_SUPERVISOR_IMAGE:-}" ] \
      && [ -z "${CI:-}" ]; then
@@ -268,6 +264,10 @@ ensure_podman_supervisor_image() {
 
     echo "ERROR: expected supervisor image '${image}' after local build." >&2
     exit 2
+  fi
+
+  if podman_cmd image exists "${image}" 2>/dev/null; then
+    return 0
   fi
 
   echo "Pulling Podman supervisor image ${image}..."
@@ -342,6 +342,7 @@ HOST_PORT=$(e2e_pick_port)
 HEALTH_PORT=$(e2e_pick_port)
 STATE_DIR="${WORKDIR}/state"
 mkdir -p "${STATE_DIR}"
+export XDG_STATE_HOME="${STATE_DIR}"
 JWT_DIR="${STATE_DIR}/jwt"
 
 E2E_NAMESPACE="e2e-podman-$$-${HOST_PORT}"

@@ -59,19 +59,13 @@ Docker `volume` mounts may include `subpath`. Mount targets must be absolute
 container paths and must not replace the workspace root (`/sandbox`) or overlap
 OpenShell supervisor files, auth material, TLS material, or `/run/netns`.
 
-Example NFS usage relies on Docker's named-volume support rather than a host
-bind:
+Example named-volume usage:
 
 ```shell
-docker volume create \
-  --driver local \
-  --opt type=nfs \
-  --opt o=addr=10.0.0.10,rw,nfsvers=4 \
-  --opt device=:/exports/work \
-  work-nfs
+docker volume create openshell-work
 
 openshell sandbox create \
-  --driver-config-json '{"docker":{"mounts":[{"type":"volume","source":"work-nfs","target":"/sandbox/work"}]}}' \
+  --driver-config-json '{"docker":{"mounts":[{"type":"volume","source":"openshell-work","target":"/sandbox/work"}]}}' \
   -- claude
 ```
 
