@@ -122,6 +122,9 @@ jobs:
       - name: Test
         run: mise run test:rust
 
+      - name: Verify telemetry can be compiled out
+        run: mise run rust:verify:telemetry-off
+
       - name: sccache stats
         if: always()
         run: |

@@ -3353,6 +3353,7 @@ filesystem_policy:
         });
     }
 
+    #[cfg(feature = "telemetry")]
     #[test]
     fn telemetry_enabled_creates_activity_collection_and_flush_channel() {
         let _guard = ENV_LOCK.lock().unwrap();

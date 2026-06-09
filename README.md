@@ -249,7 +249,9 @@ OpenShell is built agent-first — your agent is your first collaborator. Before
 
 OpenShell collects anonymous telemetry to help improve the project for developers. This data is not used to track individual user behavior. It helps us understand aggregate usage of sandbox, provider, and policy workflows so we can prioritize product improvements and share usage trends with the community.
 
-Disable telemetry by setting `OPENSHELL_TELEMETRY_ENABLED=false` on the gateway deployment. OpenShell propagates this deployment setting into sandbox supervisor environments so sandbox-side telemetry collection is disabled as well.
+Disable telemetry at runtime by setting `OPENSHELL_TELEMETRY_ENABLED=false` on the gateway deployment. OpenShell propagates this deployment setting into sandbox supervisor environments so sandbox-side telemetry collection is disabled as well.
+
+You can also compile telemetry out entirely. Telemetry support is a default-on `telemetry` Cargo feature; building with `--no-default-features` produces binaries that contain no telemetry endpoint, no telemetry HTTP client, and no emission code. Build telemetry-free artifacts with, for example, `cargo build --release -p openshell-server --no-default-features` (gateway) and the equivalent for `openshell-sandbox` and `openshell-driver-vm`. With telemetry compiled out, the gateway emits nothing and reports telemetry disabled to the sandboxes it launches.
 
 Telemetry events are limited to anonymous operational categories and counts, such as sandbox lifecycle outcomes, provider profile buckets, policy decision counts, and aggregate network activity denial categories. OpenShell telemetry does not collect sandbox names or IDs, hostnames, file paths, binary paths, prompts, credentials, provider names, model names, or user content.
 

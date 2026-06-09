@@ -15,7 +15,7 @@ name = "openshell-sandbox"
 path = "src/main.rs"
 
 [dependencies]
-openshell-core = { path = "../openshell-core" }
+openshell-core = { path = "../openshell-core", default-features = false }
 openshell-ocsf = { path = "../openshell-ocsf" }
 openshell-policy = { path = "../openshell-policy" }
 openshell-router = { path = "../openshell-router" }
@@ -88,6 +88,13 @@ landlock = "0.4"
 seccompiler = "0.5"
 tempfile = "3"
 uuid = { version = "1", features = ["v4"] }
+
+[features]
+default = ["telemetry"]
+## Compile in telemetry activity collection (forwards to openshell-core/telemetry).
+## On by default; build with `--no-default-features` for a telemetry-free sandbox
+## supervisor that never collects or forwards activity summaries.
+telemetry = ["openshell-core/telemetry"]
 
 [dev-dependencies]
 tempfile = "3"
