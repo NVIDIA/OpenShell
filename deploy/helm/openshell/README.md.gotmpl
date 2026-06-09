@@ -56,7 +56,7 @@ See [`values.yaml`](values.yaml) for source defaults. Selected overlays:
 - [`ci/values-gateway.yaml`](ci/values-gateway.yaml) - gateway-only configuration
 - [`ci/values-cert-manager.yaml`](ci/values-cert-manager.yaml) - cert-manager integration
 - [`ci/values-keycloak.yaml`](ci/values-keycloak.yaml) - Keycloak OIDC integration
-- [`ci/values-high-availability.yaml`](ci/values-high-availability.yaml) - HA gateway overlay with an external PostgreSQL Secret
+- [`ci/values-high-availability.yaml`](ci/values-high-availability.yaml) - CI overlay for multi-replica external PostgreSQL testing
 
 ### Database backend
 
@@ -69,10 +69,10 @@ server:
 
 #### External PostgreSQL
 
-Use external PostgreSQL for HA deployments. The OpenShell chart does not deploy
-a database; install PostgreSQL separately using the chart, operator, or managed
-service that fits your environment, then pass the connection URI through a
-Secret.
+Use external PostgreSQL when the gateway should connect to a database managed
+outside this chart. The OpenShell chart does not deploy a database; install
+PostgreSQL separately using the chart, operator, or managed service that fits
+your environment, then pass the connection URI through a Secret.
 
 Create a Secret containing the PostgreSQL connection URI if one does not
 already exist:
