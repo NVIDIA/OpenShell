@@ -43,6 +43,7 @@ COMMENT_STYLES: dict[str, str] = {
     ".yaml": "#",
     ".yml": "#",
     ".rego": "#",
+    ".nix": "#",
 }
 
 # Directories to skip entirely (relative to repo root).

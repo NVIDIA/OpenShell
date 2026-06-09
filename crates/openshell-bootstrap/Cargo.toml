@@ -9,6 +9,10 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[lib]
+name = "openshell_bootstrap"
+path = "src/lib.rs"
+
 [dependencies]
 openshell-core = { path = "../openshell-core" }
 bollard = "0.20"
