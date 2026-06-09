@@ -28,7 +28,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target:
+        target: &targets
           - system: x86_64-linux
             runner: linux-amd64-cpu8
           - system: aarch64-linux
@@ -41,15 +41,18 @@ jobs:
           - openshell-driver-podman
           - openshell-driver-vm
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - &checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-      - name: Install Nix
+      - &install-nix
+        name: Install Nix
         uses: DeterminateSystems/nix-installer-action@main
         with:
           extra-conf: |
             accept-flake-config = true
 
-      - name: Set up Cachix
+      - &setup-cachix
+        name: Set up Cachix
         uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
         with:
           name: openshell
@@ -66,11 +69,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - system: x86_64-linux
-            runner: linux-amd64-cpu8
-          - system: aarch64-linux
-            runner: linux-arm64-cpu8
+        target: *targets
         check:
           - openshell-bootstrap-test
           - openshell-cli-test
@@ -90,20 +89,9 @@ jobs:
           - openshell-tui-test
           - openshell-vfio-test
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-
-      - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@main
-        with:
-          extra-conf: |
-            accept-flake-config = true
-
-      - name: Set up Cachix
-        uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
-        with:
-          name: openshell
-          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
-          skipAddingSubstituter: true
+      - *checkout
+      - *install-nix
+      - *setup-cachix
 
       - name: Run test
         run: nix build ".#checks.${{ matrix.target.system }}.${{ matrix.check }}" --no-link --no-update-lock-file
@@ -114,11 +102,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - system: x86_64-linux
-            runner: linux-amd64-cpu8
-          - system: aarch64-linux
-            runner: linux-arm64-cpu8
+        target: *targets
         lint:
           - rustfmt
           - openshell-bootstrap-clippy
@@ -139,20 +123,9 @@ jobs:
           - openshell-tui-clippy
           - openshell-vfio-clippy
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-
-      - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@main
-        with:
-          extra-conf: |
-            accept-flake-config = true
-
-      - name: Set up Cachix
-        uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
-        with:
-          name: openshell
-          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
-          skipAddingSubstituter: true
+      - *checkout
+      - *install-nix
+      - *setup-cachix
 
       - name: Run lint
         run: nix build ".#checks.${{ matrix.target.system }}.${{ matrix.lint }}" --no-link --no-update-lock-file
