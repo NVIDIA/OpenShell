@@ -46,11 +46,16 @@ const CONTAINER_PREFIX: &str = "openshell-sandbox-";
 /// Volume name prefix.
 const VOLUME_PREFIX: &str = "openshell-sandbox-";
 
-/// Container-side mount paths for client TLS materials.
-const TLS_CA_MOUNT_PATH: &str = "/etc/openshell/tls/client/ca.crt";
-const TLS_CERT_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.crt";
-const TLS_KEY_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.key";
-const SANDBOX_TOKEN_MOUNT_PATH: &str = "/etc/openshell/auth/sandbox.jwt";
+/// Container-side mount paths for client TLS materials and the sandbox token.
+const TLS_CA_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_CA_MOUNT_PATH;
+const TLS_CERT_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_CERT_MOUNT_PATH;
+const TLS_KEY_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_KEY_MOUNT_PATH;
+const SANDBOX_TOKEN_MOUNT_PATH: &str = openshell_core::driver_utils::SANDBOX_TOKEN_MOUNT_PATH;
+
+/// Directory inside sandbox containers where the supervisor binary is mounted.
+const SUPERVISOR_MOUNT_DIR: &str = openshell_core::driver_utils::SUPERVISOR_CONTAINER_DIR;
+/// Full path to the supervisor binary inside sandbox containers.
+const SUPERVISOR_BINARY_PATH: &str = openshell_core::driver_utils::SUPERVISOR_CONTAINER_BINARY;
 
 /// Build a Podman container name from the sandbox name.
 #[must_use]
@@ -443,7 +448,7 @@ pub fn build_container_spec_with_token(
         // /opt/openshell/bin/openshell-sandbox.
         image_volumes: vec![ImageVolume {
             source: config.supervisor_image.clone(),
-            destination: "/opt/openshell/bin".into(),
+            destination: SUPERVISOR_MOUNT_DIR.into(),
             rw: false,
         }],
         hostname: format!("sandbox-{}", sandbox.name),
@@ -451,9 +456,9 @@ pub fn build_container_spec_with_token(
         // directly. Sandbox images (e.g. the community base image) set
         // ENTRYPOINT ["/bin/bash"], and Podman's `command` field only
         // overrides CMD — which gets appended as args to the entrypoint.
-        // Without this, the container would run `/bin/bash /opt/openshell/bin/openshell-sandbox`
-        // and bash would fail trying to interpret the binary as a script.
-        entrypoint: vec!["/opt/openshell/bin/openshell-sandbox".into()],
+        // Without this, the container would run the entrypoint binary with
+        // the supervisor path as an argument instead of executing it directly.
+        entrypoint: vec![SUPERVISOR_BINARY_PATH.into()],
         command: vec![],
         // Force the supervisor to run as root (UID 0). Sandbox images may
         // set a non-root USER directive (e.g. `USER sandbox`), but the
@@ -1162,7 +1167,7 @@ mod tests {
         );
         assert_eq!(
             vol["destination"].as_str(),
-            Some("/opt/openshell/bin"),
+            Some(SUPERVISOR_MOUNT_DIR),
             "image volume destination should be /opt/openshell/bin"
         );
         assert_eq!(

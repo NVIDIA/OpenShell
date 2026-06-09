@@ -59,11 +59,11 @@ const WATCH_BUFFER: usize = 128;
 const WATCH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const WATCH_POLL_MAX_BACKOFF: Duration = Duration::from_secs(30);
 
-const SUPERVISOR_MOUNT_PATH: &str = "/opt/openshell/bin/openshell-sandbox";
-const TLS_CA_MOUNT_PATH: &str = "/etc/openshell/tls/client/ca.crt";
-const TLS_CERT_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.crt";
-const TLS_KEY_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.key";
-const SANDBOX_TOKEN_MOUNT_PATH: &str = "/etc/openshell/auth/sandbox.jwt";
+const SUPERVISOR_MOUNT_PATH: &str = openshell_core::driver_utils::SUPERVISOR_CONTAINER_BINARY;
+const TLS_CA_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_CA_MOUNT_PATH;
+const TLS_CERT_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_CERT_MOUNT_PATH;
+const TLS_KEY_MOUNT_PATH: &str = openshell_core::driver_utils::TLS_KEY_MOUNT_PATH;
+const SANDBOX_TOKEN_MOUNT_PATH: &str = openshell_core::driver_utils::SANDBOX_TOKEN_MOUNT_PATH;
 const SANDBOX_COMMAND: &str = "sleep infinity";
 const SUPERVISOR_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const HOST_OPENSHELL_INTERNAL: &str = "host.openshell.internal";

@@ -36,6 +36,42 @@ pub const LABEL_SANDBOX_NAMESPACE: &str = "openshell.ai/sandbox-namespace";
 /// path used when building the `openshell-sandbox` image layer.
 pub const SUPERVISOR_IMAGE_BINARY_PATH: &str = "/openshell-sandbox";
 
+/// Directory inside sandbox containers where the supervisor binary is mounted.
+///
+/// Compute drivers that side-load the supervisor into a shared volume mount
+/// the binary here so the sandbox container can execute it from a fixed path.
+pub const SUPERVISOR_CONTAINER_DIR: &str = "/opt/openshell/bin";
+
+/// Full path to the supervisor binary inside sandbox containers.
+///
+/// Equals `SUPERVISOR_CONTAINER_DIR + "/openshell-sandbox"`. Use this when
+/// the full executable path is needed (Docker entrypoint, Podman entrypoint,
+/// VM rootfs injection). Use `SUPERVISOR_CONTAINER_DIR` when only the
+/// directory mount-point is needed (Kubernetes emptyDir volume mount).
+pub const SUPERVISOR_CONTAINER_BINARY: &str = "/opt/openshell/bin/openshell-sandbox";
+
+// ---------------------------------------------------------------------------
+// In-container mount paths for guest TLS materials and the sandbox token.
+//
+// All container-based drivers (Docker, Podman, Kubernetes) mount the gateway's
+// mTLS client credentials at these fixed paths inside every sandbox container.
+// The supervisor reads these paths on startup to establish its gRPC-over-mTLS
+// connection back to the gateway. The paths must remain stable across driver
+// versions since the supervisor binary is built and packaged separately.
+// ---------------------------------------------------------------------------
+
+/// Container-side mount path for the guest mTLS CA certificate.
+pub const TLS_CA_MOUNT_PATH: &str = "/etc/openshell/tls/client/ca.crt";
+
+/// Container-side mount path for the guest mTLS client certificate.
+pub const TLS_CERT_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.crt";
+
+/// Container-side mount path for the guest mTLS client private key.
+pub const TLS_KEY_MOUNT_PATH: &str = "/etc/openshell/tls/client/tls.key";
+
+/// Container-side mount path for the per-sandbox JWT token.
+pub const SANDBOX_TOKEN_MOUNT_PATH: &str = "/etc/openshell/auth/sandbox.jwt";
+
 /// Return the XDG state path for a driver's sandbox JWT token file.
 ///
 /// The resulting path is `$XDG_STATE_HOME/openshell/<driver_subdir>[/<namespace>]/<sandbox_id>/sandbox.jwt`.

@@ -769,7 +769,7 @@ fn extract_image_size(message: &str) -> Option<u64> {
 }
 
 /// Path where the supervisor binary is mounted inside the agent container.
-const SUPERVISOR_MOUNT_PATH: &str = "/opt/openshell/bin";
+const SUPERVISOR_MOUNT_PATH: &str = openshell_core::driver_utils::SUPERVISOR_CONTAINER_DIR;
 
 /// Name of the volume used to side-load the supervisor binary.
 const SUPERVISOR_VOLUME_NAME: &str = "openshell-supervisor-bin";
