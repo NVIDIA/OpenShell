@@ -29,6 +29,7 @@ make_payload() {
 
     mkdir -p "$dir/runtime/harnesses/test"
     printf 'test prompt\n' > "$dir/agent-prompt.md"
+    cp "$SUPERVISOR_UNDER_TEST" "$dir/runtime/supervisor.sh"
     cat > "$dir/runtime/harnesses/test/exec.sh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
@@ -43,13 +44,12 @@ run_supervisor() {
     local output_file="$3"
 
     set +e
-    OPENSHELL_AGENT_PAYLOAD_DIR="$payload_dir" \
-        OPENSHELL_AGENT_HARNESS=test \
+    OPENSHELL_AGENT_HARNESS=test \
         OPENSHELL_AGENT_RUN_MODE="$mode" \
         OPENSHELL_AGENT_POLL_INTERVAL_SECONDS=1 \
         OPENSHELL_AGENT_MAX_TRANSIENT_FAILURES=2 \
         OPENSHELL_AGENT_TEST_STATE="${OPENSHELL_AGENT_TEST_STATE:-}" \
-        bash "$SUPERVISOR_UNDER_TEST" > "$output_file" 2>&1
+        bash "$payload_dir/runtime/supervisor.sh" > "$output_file" 2>&1
     local status=$?
     set -e
     return "$status"

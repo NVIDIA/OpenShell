@@ -19,7 +19,7 @@ Launch a headless sandbox agent that runs the `gator-gate` skill against OpenShe
   "Run gator on PR 1536 and keep watching until it closes or merges."
 ```
 
-By default the launcher uses `openshell-agents/Dockerfile.gator` as the sandbox source. Local gateways build that Dockerfile with `openshell-agents/` as the build context, which lets the image use shared harness install scripts from `runtime/` and gator-specific policy from `gator/policy.yaml`. Use `--from <image>` to run a prebuilt image on remote gateways.
+By default the launcher uses `openshell-agents/Dockerfile.gator` as the sandbox source. Local gateways build that Dockerfile with `openshell-agents/` as the build context, which lets the image use shared harness install scripts from `runtime/` and gator-specific policy from `gator/policy.yaml`. The launcher bakes rendered prompts, skills, subagents, and runtime files into `/etc/openshell/agent-payload`, so `--from` must point to a local Dockerfile or directory containing a Dockerfile.
 
 Use `--harness codex` to select Codex explicitly. Other harness names are rejected until their support is added to `agent.yaml` and `openshell-agents/runtime/harnesses/<name>/`. Agent directories do not carry their own harness implementations; they provide prompt templates and optional skills or subagents for the shared runtime to inject.
 
@@ -31,14 +31,14 @@ The launcher:
 
 - Scans `profile_paths` in manifest order and imports `providers/github-gator.yaml`.
 - Creates or updates the `github-gator` provider from `gh auth token`.
-- Selects the requested harness and uploads the common runtime into the sandbox payload.
+- Selects the requested harness and bakes the common runtime into the immutable sandbox payload.
 - For `--harness codex`, imports `providers/codex-gator.yaml`, creates or updates the `codex-gator` provider from `$HOME/.codex/auth.json`, and stores the refresh token as gateway-only refresh material.
 - For `--harness codex`, configures gateway-managed refresh for `CODEX_AUTH_ACCESS_TOKEN` and rotates it before launching the sandbox.
 - Enables `providers_v2_enabled`, `agent_policy_proposals_enabled`, and `proposal_approval_mode=auto` at gateway scope.
 - Uses the gator image policy copied to `/etc/openshell/policy.yaml`.
-- Uploads the current `.agents/skills/gator-gate/SKILL.md` into the sandbox payload.
-- Uploads `.claude/agents/principal-engineer-reviewer.md` so the selected harness can run a deterministic independent reviewer execution through `/sandbox/payload/runtime/subagent.sh principal-engineer-reviewer < task.md`.
-- For `--harness codex`, optionally uploads a host Codex executable as `/sandbox/payload/runtime/harnesses/codex/codex`.
+- Bakes the current `.agents/skills/gator-gate/SKILL.md` into `/etc/openshell/agent-payload`.
+- Bakes `.claude/agents/principal-engineer-reviewer.md` so the selected harness can run a deterministic independent reviewer execution through `/etc/openshell/agent-payload/runtime/subagent.sh principal-engineer-reviewer < task.md`.
+- For `--harness codex`, optionally bakes a host Codex executable as `/etc/openshell/agent-payload/runtime/harnesses/codex/codex`.
 - Starts the selected harness without a TTY.
 - Runs gator in `watch` mode by default. The sandbox stays alive while the supervisor sleeps between bounded Codex cycles, so Codex is not connected during passive PR waits.
 - Deletes the sandbox automatically after the supervisor exits. Pass `--keep` to preserve it for debugging.

@@ -67,8 +67,10 @@ WORK="$(mktemp -d)"
 cd "$WORK"
 
 CODEX_BIN="${CODEX_BIN:-codex}"
-if [[ -x /sandbox/payload/runtime/harnesses/codex/codex ]]; then
-    CODEX_BIN=/sandbox/payload/runtime/harnesses/codex/codex
+ADAPTER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PAYLOAD_DIR="$(cd "$ADAPTER_DIR/../../.." && pwd)"
+if [[ -x "$PAYLOAD_DIR/runtime/harnesses/codex/codex" ]]; then
+    CODEX_BIN="$PAYLOAD_DIR/runtime/harnesses/codex/codex"
 fi
 CODEX_MODEL="${CODEX_MODEL:-gpt-5.5}"
 CODEX_REASONING="${CODEX_REASONING:-high}"

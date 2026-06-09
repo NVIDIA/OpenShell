@@ -5,7 +5,7 @@ Runtime mode: {{RUN_MODE}}.
 
 Load and follow this skill exactly:
 
-/sandbox/payload/.agents/skills/gator-gate/SKILL.md
+/etc/openshell/agent-payload/.agents/skills/gator-gate/SKILL.md
 
 Important sandbox constraints:
 

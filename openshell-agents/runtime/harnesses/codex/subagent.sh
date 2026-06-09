@@ -11,15 +11,17 @@ if [[ $# -ne 1 ]]; then
 fi
 
 SUBAGENT_ID="$1"
-SUBAGENT_PROMPT="/sandbox/payload/subagents/$SUBAGENT_ID.md"
+ADAPTER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PAYLOAD_DIR="$(cd "$ADAPTER_DIR/../../.." && pwd)"
+SUBAGENT_PROMPT="$PAYLOAD_DIR/subagents/$SUBAGENT_ID.md"
 [[ -f "$SUBAGENT_PROMPT" ]] || {
     echo "missing subagent prompt: $SUBAGENT_PROMPT" >&2
     exit 1
 }
 
 CODEX_BIN="${CODEX_BIN:-codex}"
-if [[ -x /sandbox/payload/runtime/harnesses/codex/codex ]]; then
-    CODEX_BIN=/sandbox/payload/runtime/harnesses/codex/codex
+if [[ -x "$PAYLOAD_DIR/runtime/harnesses/codex/codex" ]]; then
+    CODEX_BIN="$PAYLOAD_DIR/runtime/harnesses/codex/codex"
 fi
 
 CODEX_MODEL="${CODEX_MODEL:-gpt-5.5}"

@@ -34,7 +34,7 @@ Options:
   --agent NAME|PATH       Agent manifest directory or name under openshell-agents/
   --gateway NAME          Gateway name to use
   --name NAME             Sandbox name
-  --from IMAGE            Sandbox source/image
+  --from DOCKERFILE|DIR   Local Dockerfile source for the sandbox image
   --harness NAME          Agent harness to run
   --github-provider NAME  Override the github-gator provider instance name
   --codex-provider NAME   Override the codex-gator provider instance name
@@ -510,6 +510,7 @@ done
 
 PAYLOAD_PARENT="$(mktemp -d "${TMPDIR:-/tmp}/openshell-agent.XXXXXX")"
 PAYLOAD_DIR="$PAYLOAD_PARENT/payload"
+PAYLOAD_IMAGE_DIR="/etc/openshell/agent-payload"
 cleanup_payload() {
     rm -rf "$PAYLOAD_PARENT"
 }
@@ -537,7 +538,7 @@ for ((upload_index = 0; upload_index < UPLOAD_COUNT; upload_index++)); do
     cp "$source_path" "$destination_path"
 done
 
-SUBAGENT_COMMAND="bash /sandbox/payload/runtime/subagent.sh principal-engineer-reviewer < task.md"
+SUBAGENT_COMMAND="bash $PAYLOAD_IMAGE_DIR/runtime/subagent.sh principal-engineer-reviewer < task.md"
 PROMPT_TEMPLATE_PATH="$(resolve_manifest_path "$PROMPT_TEMPLATE")"
 [[ -f "$PROMPT_TEMPLATE_PATH" ]] || fail "missing prompt template: $PROMPT_TEMPLATE_PATH"
 ruby - "$PROMPT_TEMPLATE_PATH" "$PAYLOAD_DIR/agent-prompt.md" "$HARNESS" "$SUBAGENT_COMMAND" "$RUN_MODE" "$POLL_INTERVAL_SECONDS" "$USER_PROMPT" <<'RUBY'
@@ -555,6 +556,73 @@ rendered = template.gsub(/\{\{([A-Z0-9_]+)\}\}/) do
 end
 File.write(output_path, rendered)
 RUBY
+
+prepare_immutable_sandbox_source() {
+    local source="$1"
+    local dockerfile
+    local context
+
+    if [[ -f "$source" ]]; then
+        local lower_name
+        lower_name="$(basename "$source" | tr '[:upper:]' '[:lower:]')"
+        [[ "$lower_name" == *dockerfile* || "$lower_name" == *.dockerfile ]] || fail "immutable agent payload requires --from to be a Dockerfile path or directory: $source"
+        dockerfile="$(cd "$(dirname "$source")" && pwd)/$(basename "$source")"
+        context="$(cd "$(dirname "$source")" && pwd)"
+    elif [[ -d "$source" && -f "$source/Dockerfile" ]]; then
+        context="$(cd "$source" && pwd)"
+        dockerfile="$context/Dockerfile"
+    else
+        fail "immutable agent payload requires a local Dockerfile source; --from '$source' cannot receive read-only agent guts"
+    fi
+
+    local build_context="$PAYLOAD_PARENT/build-context"
+    mkdir -p "$build_context"
+    (
+        cd "$context"
+        tar --exclude './gator/logs' --exclude './logs' -cf - .
+    ) | (
+        cd "$build_context"
+        tar -xf -
+    )
+
+    rm -rf "$build_context/openshell-agent-payload"
+    mkdir -p "$build_context/openshell-agent-payload"
+    cp -R "$PAYLOAD_DIR/." "$build_context/openshell-agent-payload/"
+
+    if [[ -L "$build_context/.dockerignore" ]]; then
+        rm -f "$build_context/.dockerignore"
+    fi
+
+    {
+        printf '\n# OpenShell staged immutable agent payload\n'
+        printf '!openshell-agent-payload\n'
+        printf '!openshell-agent-payload/**\n'
+    } >> "$build_context/.dockerignore"
+
+    local rel_dockerfile
+    rel_dockerfile="${dockerfile#$context/}"
+    local build_dockerfile="$build_context/$rel_dockerfile"
+    [[ -f "$build_dockerfile" ]] || fail "failed to stage Dockerfile: $rel_dockerfile"
+    [[ ! -L "$build_dockerfile" ]] || fail "staged Dockerfile must not be a symlink: $rel_dockerfile"
+
+    ruby - "$build_dockerfile" "$PAYLOAD_IMAGE_DIR" <<'RUBY'
+dockerfile_path, payload_image_dir = ARGV
+lines = File.readlines(dockerfile_path)
+final_stage_start = lines.rindex { |line| line.strip.start_with?("FROM ") } || 0
+final_user = lines[final_stage_start..].reverse.find { |line| line.strip.start_with?("USER ") }&.strip
+File.open(dockerfile_path, "a") do |file|
+  file.puts
+  file.puts "USER root"
+  file.puts "COPY openshell-agent-payload/ #{payload_image_dir}/"
+  file.puts "RUN chmod -R a-w #{payload_image_dir}"
+  file.puts final_user if final_user
+end
+RUBY
+
+    SANDBOX_FROM="$build_dockerfile"
+}
+
+prepare_immutable_sandbox_source "$SANDBOX_FROM"
 
 for ((setting_index = 0; setting_index < SETTING_COUNT; setting_index++)); do
     key_var="SETTING_${setting_index}_KEY"
@@ -644,12 +712,11 @@ SANDBOX_CMD=(
     --name "$SANDBOX_NAME"
     --from "$SANDBOX_FROM"
     "${PROVIDER_ARGS[@]}"
-    --upload "$PAYLOAD_DIR:/sandbox"
     --no-git-ignore
     --no-auto-providers
     --no-tty
     "${KEEP_ARGS[@]}"
-    -- env "${HARNESS_ENV_ARGS[@]}" bash /sandbox/payload/runtime/entrypoint.sh
+    -- env "${HARNESS_ENV_ARGS[@]}" bash "$PAYLOAD_IMAGE_DIR/runtime/entrypoint.sh"
 )
 
 echo "Launching $AGENT_DISPLAY_NAME sandbox '$SANDBOX_NAME' on gateway '$GATEWAY'..."

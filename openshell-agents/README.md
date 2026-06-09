@@ -46,7 +46,8 @@ sections:
   optional refresh configuration.
 - `skills`: files to inject into the sandbox payload.
 - `subagents`: subagent definitions to inject into the sandbox payload.
-- `prompt_template`: prompt template rendered into `/sandbox/payload/agent-prompt.md`.
+- `prompt_template`: prompt template rendered into the immutable agent payload as
+  `agent-prompt.md`.
 
 Manifest paths support these prefixes:
 
@@ -72,24 +73,33 @@ Manifest paths support these prefixes:
 8. Render the prompt template with runtime values such as `{{HARNESS}}`,
    `{{RUN_MODE}}`, `{{POLL_INTERVAL_SECONDS}}`, `{{SUBAGENT_COMMAND}}`, and
    `{{USER_PROMPT}}`.
-9. Apply manifest-declared gateway settings.
-10. Resolve provider profile IDs by scanning `profile_paths` in order.
-11. Import each provider profile into the gateway. If an active profile already
-    exists, the launcher keeps going and uses it.
-12. Resolve provider credentials from host commands, JSON files, or literal
-    manifest values.
-13. Create or update each provider instance and attach every selected provider
-    to the sandbox.
-14. Configure and rotate refresh-backed provider credentials when declared by
-    the manifest.
-15. Run `openshell sandbox create` with the rendered payload uploaded to
-    `/sandbox`.
-16. Inside the sandbox, run `/sandbox/payload/runtime/entrypoint.sh`.
-17. The runtime entrypoint starts `/sandbox/payload/runtime/supervisor.sh`.
-18. The supervisor invokes `/sandbox/payload/runtime/harnesses/<harness>/exec.sh`
-    as a bounded child execution.
-19. Harness adapters prepare harness-local auth/config and execute the agent
+9. Build a temporary Docker context that bakes the rendered payload into
+   `/etc/openshell/agent-payload`.
+10. Apply manifest-declared gateway settings.
+11. Resolve provider profile IDs by scanning `profile_paths` in order.
+12. Import each provider profile into the gateway. If an active profile already
+     exists, the launcher keeps going and uses it.
+13. Resolve provider credentials from host commands, JSON files, or literal
+     manifest values.
+14. Create or update each provider instance and attach every selected provider
+     to the sandbox.
+15. Configure and rotate refresh-backed provider credentials when declared by
+     the manifest.
+16. Run `openshell sandbox create` from that temporary Dockerfile source.
+17. Inside the sandbox, run `/etc/openshell/agent-payload/runtime/entrypoint.sh`.
+18. The runtime entrypoint starts
+    `/etc/openshell/agent-payload/runtime/supervisor.sh`.
+19. The supervisor invokes
+    `/etc/openshell/agent-payload/runtime/harnesses/<harness>/exec.sh` as a
+    bounded child execution.
+20. Harness adapters prepare harness-local auth/config and execute the agent
     prompt headlessly.
+
+The payload directory is baked into the image under `/etc/openshell`, which the
+gator filesystem policy mounts read-only for agent processes. Prompts, skills,
+subagent definitions, and runtime scripts are agent guts, not workspace state.
+Agents should write session artifacts, checkouts, temporary files, and future
+memory records under `/sandbox` or `/tmp` instead.
 
 ## Runtime Modes
 
@@ -137,12 +147,13 @@ sandbox proxy resolves the latest gateway-refreshed credential on each request.
 
 ## Subagents
 
-The launcher injects subagent definitions under `/sandbox/payload/subagents/`.
+The launcher injects subagent definitions under
+`/etc/openshell/agent-payload/subagents/`.
 Prompt templates should refer to the generic command instead of a harness-specific
 script:
 
 ```shell
-bash /sandbox/payload/runtime/subagent.sh <subagent-id> < task.md
+bash /etc/openshell/agent-payload/runtime/subagent.sh <subagent-id> < task.md
 ```
 
 The shared subagent dispatcher forwards the task to the active harness adapter.
