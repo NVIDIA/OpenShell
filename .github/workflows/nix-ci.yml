@@ -49,13 +49,15 @@ jobs:
           extra-conf: |
             accept-flake-config = true
 
-      - name: Build and upload package
-        env:
-          CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
-        run: |
-          : "${CACHIX_AUTH_TOKEN:?CACHIX_AUTH_TOKEN is required to upload to Cachix}"
-          nix run --inputs-from . nixpkgs#cachix -- watch-exec openshell -- \
-            nix build ".#packages.${{ matrix.target.system }}.${{ matrix.package }}" --no-link --no-update-lock-file
+      - name: Set up Cachix
+        uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+        with:
+          name: openshell
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          skipAddingSubstituter: true
+
+      - name: Build package
+        run: nix build ".#packages.${{ matrix.target.system }}.${{ matrix.package }}" --no-link --no-update-lock-file
 
   test:
     name: Test ${{ matrix.check }} (${{ matrix.target.system }})
@@ -96,17 +98,18 @@ jobs:
           extra-conf: |
             accept-flake-config = true
 
-      - name: Run and upload test
-        env:
-          CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
-        run: |
-          : "${CACHIX_AUTH_TOKEN:?CACHIX_AUTH_TOKEN is required to upload to Cachix}"
-          nix run --inputs-from . nixpkgs#cachix -- watch-exec openshell -- \
-            nix build ".#checks.${{ matrix.target.system }}.${{ matrix.check }}" --no-link --no-update-lock-file
+      - name: Set up Cachix
+        uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+        with:
+          name: openshell
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          skipAddingSubstituter: true
+
+      - name: Run test
+        run: nix build ".#checks.${{ matrix.target.system }}.${{ matrix.check }}" --no-link --no-update-lock-file
 
   lint:
     name: Lint ${{ matrix.lint }} (${{ matrix.target.system }})
-    needs: build
     runs-on: ${{ matrix.target.runner }}
     strategy:
       fail-fast: false
@@ -144,10 +147,12 @@ jobs:
           extra-conf: |
             accept-flake-config = true
 
-      - name: Run and upload lint
-        env:
-          CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
-        run: |
-          : "${CACHIX_AUTH_TOKEN:?CACHIX_AUTH_TOKEN is required to upload to Cachix}"
-          nix run --inputs-from . nixpkgs#cachix -- watch-exec openshell -- \
-            nix build ".#checks.${{ matrix.target.system }}.${{ matrix.lint }}" --no-link --no-update-lock-file
+      - name: Set up Cachix
+        uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+        with:
+          name: openshell
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          skipAddingSubstituter: true
+
+      - name: Run lint
+        run: nix build ".#checks.${{ matrix.target.system }}.${{ matrix.lint }}" --no-link --no-update-lock-file
