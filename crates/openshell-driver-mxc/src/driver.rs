@@ -662,6 +662,7 @@ fn make_sandbox_with_condition(
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+    use futures::StreamExt;
     use openshell_core::proto::compute::v1::DriverSandboxSpec;
     use openshell_core::proto::{FilesystemPolicy, SandboxPolicy};
     use std::time::Duration;

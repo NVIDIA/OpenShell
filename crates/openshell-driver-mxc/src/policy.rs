@@ -325,7 +325,8 @@ mod tests {
 
     #[test]
     fn embedded_rejects_network_policy_on_isolation_session() {
-        use openshell_core::proto::{NetworkBinary, NetworkEndpoint, NetworkPolicyRule};
+        use openshell_core::proto::{NetworkEndpoint, NetworkPolicyRule};
+        let mapper = EmbeddedPolicyMapper;
         let mut policy = fs_policy(&["C:/work/demo"], &[]);
         policy.network_policies.insert(
             "api".to_string(),
@@ -335,10 +336,7 @@ mod tests {
                     host: "example.com".into(),
                     ..Default::default()
                 }],
-                binaries: vec![NetworkBinary {
-                    path: "/usr/bin/curl".into(),
-                    harness: false,
-                }],
+                binaries: Vec::new(),
             },
         );
         let ctx = demo_ctx(Some("C:/work/demo"));
