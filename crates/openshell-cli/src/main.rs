@@ -1208,8 +1208,6 @@ enum SandboxCommands {
         editor: Option<CliEditor>,
 
         /// Request GPU resources for the sandbox.
-        /// GPU intent is also inferred automatically for known GPU-designated
-        /// image names such as `nvidia-gpu`.
         #[arg(long)]
         gpu: bool,
 

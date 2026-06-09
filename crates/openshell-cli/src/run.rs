@@ -1781,7 +1781,7 @@ pub async fn sandbox_create(
         }
         None => None,
     };
-    let requested_gpu = gpu || image.as_deref().is_some_and(image_requests_gpu);
+    let requested_gpu = gpu;
 
     let providers_v2_enabled = gateway_providers_v2_enabled(&mut client).await?;
     let inferred_types: Vec<String> = if providers_v2_enabled {
@@ -2386,19 +2386,6 @@ fn value_is_explicit_local_path(value: &str) -> bool {
 
 fn value_looks_like_bare_dockerfile_name(value: &str) -> bool {
     !value.contains('/') && !value.contains(':') && filename_looks_like_dockerfile(Path::new(value))
-}
-
-fn image_requests_gpu(image: &str) -> bool {
-    let image_name = image
-        .rsplit('/')
-        .next()
-        .unwrap_or(image)
-        .split([':', '@'])
-        .next()
-        .unwrap_or(image)
-        .to_ascii_lowercase();
-
-    image_name.contains("gpu")
 }
 
 fn dockerfile_sources_supported_for_gateway(metadata: Option<&GatewayMetadata>) -> bool {
@@ -7538,7 +7525,7 @@ mod tests {
         dockerfile_sources_supported_for_gateway, format_endpoint, format_gateway_select_header,
         format_gateway_select_items, format_provider_attachment_table, gateway_add,
         gateway_auth_label, gateway_env_override_warning, gateway_select_with, gateway_type_label,
-        git_sync_files, http_health_check, image_requests_gpu, import_local_package_mtls_bundle,
+        git_sync_files, http_health_check, import_local_package_mtls_bundle,
         inferred_provider_type, mtls_certs_exist_for_gateway, package_managed_tls_dirs,
         parse_cli_setting_value, parse_credential_expiry_cli_value, parse_credential_expiry_pairs,
         parse_credential_pairs, parse_driver_config_json, plaintext_gateway_is_remote,
@@ -8042,36 +8029,6 @@ mod tests {
     fn sandbox_should_persist_when_forward_is_requested() {
         let spec = openshell_core::forward::ForwardSpec::new(8080);
         assert!(sandbox_should_persist(false, Some(&spec)));
-    }
-
-    #[test]
-    fn image_requests_gpu_matches_known_gpu_image_names() {
-        for image in [
-            "ghcr.io/nvidia/openshell-community/sandboxes/nvidia-gpu:latest",
-            "registry.example.com/team/gpu:dev",
-            "nvcr.io/example/my-gpu-image@sha256:deadbeef",
-        ] {
-            assert!(
-                image_requests_gpu(image),
-                "expected GPU detection for {image}"
-            );
-        }
-    }
-
-    #[test]
-    fn image_requests_gpu_ignores_non_gpu_image_names() {
-        for image in [
-            "ghcr.io/nvidia/openshell-community/sandboxes/base:latest",
-            "registry.example.com/gpu/team/base:latest",
-            "registry.example.com/team/notebook:latest",
-            "cuda-toolkit:latest",
-            "registry.example.com/team/graphics:latest",
-        ] {
-            assert!(
-                !image_requests_gpu(image),
-                "did not expect GPU detection for {image}"
-            );
-        }
     }
 
     #[test]

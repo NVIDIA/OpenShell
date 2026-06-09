@@ -141,7 +141,7 @@ OpenShell can pass host GPUs into sandboxes for local inference, fine-tuning, or
 openshell sandbox create --gpu --from [gpu-enabled-sandbox] -- claude
 ```
 
-Docker-backed GPU sandboxes auto-select CDI when available and otherwise fall back to Docker's NVIDIA GPU request path (`--gpus all`). GPU intent is also inferred automatically for community images with `gpu` in the name.
+Docker-backed GPU sandboxes auto-select CDI when available and otherwise fall back to Docker's NVIDIA GPU request path (`--gpus all`).
 
 **Requirements:** NVIDIA drivers and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) must be installed on the host. The sandbox image itself must include the appropriate GPU drivers and libraries for your workload — the default `base` image does not. See the [BYOC example](https://github.com/NVIDIA/OpenShell/tree/main/examples/bring-your-own-container) for building a custom sandbox image with GPU support.
 
