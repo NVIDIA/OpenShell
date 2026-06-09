@@ -418,12 +418,17 @@ impl DockerComputeDriver {
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("sandbox.spec.template is required"))?;
 
+        Self::validate_sandbox_template(template)?;
+        Self::validate_gpu_request(spec.gpu, config.supports_gpu)?;
+        Ok(())
+    }
+
+    fn validate_sandbox_template(template: &DriverSandboxTemplate) -> Result<(), Status> {
         if template.image.trim().is_empty() {
             return Err(Status::failed_precondition(
                 "docker sandboxes require a template image",
             ));
         }
-        Self::validate_gpu_request(spec.gpu, config.supports_gpu)?;
         if !template.agent_socket_path.trim().is_empty() {
             return Err(Status::failed_precondition(
                 "docker compute driver does not support template.agent_socket_path",
