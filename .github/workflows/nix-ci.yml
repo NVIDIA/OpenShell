@@ -23,7 +23,7 @@ defaults:
 
 jobs:
   build:
-    name: Build ${{ matrix.package }} (${{ matrix.target.system }})
+    name: Build (${{ matrix.target.system }})
     runs-on: ${{ matrix.target.runner }}
     strategy:
       fail-fast: false
@@ -33,26 +33,25 @@ jobs:
             runner: linux-amd64-cpu8
           - system: aarch64-linux
             runner: linux-arm64-cpu8
-        package:
-          - openshell
-          - openshell-gateway
-          - openshell-sandbox
-          - openshell-driver-kubernetes
-          - openshell-driver-podman
-          - openshell-driver-vm
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-      - name: Build package
+      - name: Build packages
         uses: ./.github/actions/setup-nix
         with:
           build: packages
           system: ${{ matrix.target.system }}
-          target: ${{ matrix.package }}
+          targets: |
+            openshell
+            openshell-gateway
+            openshell-sandbox
+            openshell-driver-kubernetes
+            openshell-driver-podman
+            openshell-driver-vm
           cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
   images:
-    name: Build Image ${{ matrix.image }} (${{ matrix.target.system }})
+    name: Build Images (${{ matrix.target.system }})
     needs: build
     runs-on: ${{ matrix.target.runner }}
     strategy:
@@ -63,22 +62,21 @@ jobs:
             runner: linux-amd64-cpu8
           - system: aarch64-linux
             runner: linux-arm64-cpu8
-        image:
-          - openshell-gateway-image
-          - openshell-supervisor-image
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-      - name: Build image
+      - name: Build images
         uses: ./.github/actions/setup-nix
         with:
           build: packages
           system: ${{ matrix.target.system }}
-          target: ${{ matrix.image }}
+          targets: |
+            openshell-gateway-image
+            openshell-supervisor-image
           cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
   test:
-    name: Test ${{ matrix.check }} (${{ matrix.target.system }})
+    name: Test (${{ matrix.target.system }})
     needs: build
     runs-on: ${{ matrix.target.runner }}
     strategy:
@@ -89,68 +87,63 @@ jobs:
             runner: linux-amd64-cpu8
           - system: aarch64-linux
             runner: linux-arm64-cpu8
-        check:
-          - openshell-bootstrap-test
-          - openshell-cli-test
-          - openshell-core-test
-          - openshell-driver-docker-test
-          - openshell-driver-kubernetes-test
-          - openshell-driver-podman-test
-          - openshell-driver-vm-test
-          - openshell-ocsf-test
-          - openshell-policy-test
-          - openshell-prover-test
-          - openshell-providers-test
-          - openshell-router-test
-          - openshell-sandbox-test
-          - openshell-server-macros-test
-          - openshell-server-test
-          - openshell-tui-test
-          - openshell-vfio-test
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-      - name: Run test
+      - name: Run tests
         uses: ./.github/actions/setup-nix
         with:
           build: checks
           system: ${{ matrix.target.system }}
-          target: ${{ matrix.check }}
+          targets: |
+            openshell-bootstrap-test
+            openshell-cli-test
+            openshell-core-test
+            openshell-driver-docker-test
+            openshell-driver-kubernetes-test
+            openshell-driver-podman-test
+            openshell-driver-vm-test
+            openshell-ocsf-test
+            openshell-policy-test
+            openshell-prover-test
+            openshell-providers-test
+            openshell-router-test
+            openshell-sandbox-test
+            openshell-server-macros-test
+            openshell-server-test
+            openshell-tui-test
+            openshell-vfio-test
           cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
   lint:
-    name: Lint ${{ matrix.lint }}
+    name: Lint
     runs-on: linux-amd64-cpu8
-    strategy:
-      fail-fast: false
-      matrix:
-        lint:
-          - rustfmt
-          - spdx-headers
-          - openshell-bootstrap-clippy
-          - openshell-cli-clippy
-          - openshell-core-clippy
-          - openshell-driver-docker-clippy
-          - openshell-driver-kubernetes-clippy
-          - openshell-driver-podman-clippy
-          - openshell-driver-vm-clippy
-          - openshell-ocsf-clippy
-          - openshell-policy-clippy
-          - openshell-prover-clippy
-          - openshell-providers-clippy
-          - openshell-router-clippy
-          - openshell-sandbox-clippy
-          - openshell-server-macros-clippy
-          - openshell-server-clippy
-          - openshell-tui-clippy
-          - openshell-vfio-clippy
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
-      - name: Run lint
+      - name: Run lints
         uses: ./.github/actions/setup-nix
         with:
           build: checks
           system: x86_64-linux
-          target: ${{ matrix.lint }}
+          targets: |
+            rustfmt
+            spdx-headers
+            openshell-bootstrap-clippy
+            openshell-cli-clippy
+            openshell-core-clippy
+            openshell-driver-docker-clippy
+            openshell-driver-kubernetes-clippy
+            openshell-driver-podman-clippy
+            openshell-driver-vm-clippy
+            openshell-ocsf-clippy
+            openshell-policy-clippy
+            openshell-prover-clippy
+            openshell-providers-clippy
+            openshell-router-clippy
+            openshell-sandbox-clippy
+            openshell-server-macros-clippy
+            openshell-server-clippy
+            openshell-tui-clippy
+            openshell-vfio-clippy
           cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}

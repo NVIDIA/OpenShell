@@ -1,5 +1,5 @@
-name: Setup Nix
-description: Install Nix, configure Cachix, and build a flake target.
+name: Nix Build
+description: Install Nix, configure Cachix, and build flake targets.
 
 inputs:
   build:
@@ -8,8 +8,8 @@ inputs:
   system:
     description: Nix system to build for.
     required: true
-  target:
-    description: Package or check target to build.
+  targets:
+    description: Newline-separated package or check targets to build.
     required: true
   cachix_auth_token:
     description: Cachix write token.
@@ -31,6 +31,17 @@ runs:
         authToken: ${{ inputs.cachix_auth_token }}
         skipAddingSubstituter: true
 
-    - name: Build target
+    - name: Build targets
       shell: bash
-      run: nix build ".#${{ inputs.build }}.${{ inputs.system }}.${{ inputs.target }}" --no-link --no-update-lock-file
+      env:
+        BUILD: ${{ inputs.build }}
+        SYSTEM: ${{ inputs.system }}
+        TARGETS: ${{ inputs.targets }}
+      run: |
+        attrs=()
+        while IFS= read -r target; do
+          [ -n "$target" ] || continue
+          attrs+=(".#${BUILD}.${SYSTEM}.${target}")
+        done <<< "$TARGETS"
+
+        nix build "${attrs[@]}" --no-link --no-update-lock-file
