@@ -16,24 +16,9 @@ OpenShell builds these main artifacts:
 | Supervisor container image | `deploy/docker/Dockerfile.supervisor` |
 | Helm chart | `deploy/helm/openshell` |
 | VM driver/runtime assets | `crates/openshell-driver-vm` |
-| Agent sandbox launchers | `openshell-agents/` manifests, images, and shared runtime adapters |
 | Published docs site | `docs/` rendered by Fern config in `fern/` |
 
-Sandbox community images are built outside this repository. Repository-owned
-agent launchers use manifest files under `openshell-agents/<agent>/` to describe
-agent intent, provider profile IDs, prompt templates, skills, subagents, and
-harness defaults. Agent directories do not own harness implementations. The
-shared runtime under `openshell-agents/runtime/` provides the sandbox entrypoint,
-harness install helpers, an in-sandbox supervisor, and harness-specific execution
-adapters. The supervisor supports one-shot execution and long-lived watch mode:
-watch mode keeps the sandbox alive but runs harnesses as bounded child cycles,
-sleeping between cycles without holding a model transport connection open. Watch
-mode retries harness transport failures and malformed cycle results with bounded
-backoff until the agent reports a terminal state. Agent durable state remains
-domain-specific rather than stored in the sandbox runtime. Harnesses that persist
-provider-managed credentials use current-name placeholders such as
-`openshell:resolve:env:GITHUB_TOKEN`, not revision-scoped placeholders, so the
-sandbox proxy can resolve the latest refreshed credential during long watch runs.
+Sandbox community images are built outside this repository.
 
 ## Linux Runtime Environments
 
