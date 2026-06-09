@@ -1,0 +1,36 @@
+name: Setup Nix
+description: Install Nix, configure Cachix, and build a flake target.
+
+inputs:
+  build:
+    description: Flake output namespace, such as packages or checks.
+    required: true
+  system:
+    description: Nix system to build for.
+    required: true
+  target:
+    description: Package or check target to build.
+    required: true
+  cachix_auth_token:
+    description: Cachix write token.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Install Nix
+      uses: DeterminateSystems/nix-installer-action@main
+      with:
+        extra-conf: |
+          accept-flake-config = true
+
+    - name: Set up Cachix
+      uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
+      with:
+        name: openshell
+        authToken: ${{ inputs.cachix_auth_token }}
+        skipAddingSubstituter: true
+
+    - name: Build target
+      shell: bash
+      run: nix build ".#${{ inputs.build }}.${{ inputs.system }}.${{ inputs.target }}" --no-link --no-update-lock-file
