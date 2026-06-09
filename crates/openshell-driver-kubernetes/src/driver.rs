@@ -28,6 +28,7 @@ use openshell_core::proto::compute::v1::{
     GetCapabilitiesResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
     WatchSandboxesPlatformEvent, WatchSandboxesSandboxEvent, watch_sandboxes_event,
 };
+use openshell_core::proto_struct::{struct_to_json_object, value_to_json};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::pin::Pin;
@@ -1147,7 +1148,7 @@ fn kubernetes_driver_config(template: &SandboxTemplate) -> KubernetesSandboxDriv
         return KubernetesSandboxDriverConfig::default();
     };
 
-    let json = serde_json::Value::Object(proto_struct_to_json_object(config));
+    let json = serde_json::Value::Object(struct_to_json_object(config));
     match serde_json::from_value(json) {
         Ok(config) => config,
         Err(err) => {
@@ -1824,44 +1825,13 @@ fn platform_config_bool(template: &SandboxTemplate, key: &str) -> Option<bool> {
 fn platform_config_struct(template: &SandboxTemplate, key: &str) -> Option<serde_json::Value> {
     let config = template.platform_config.as_ref()?;
     let value = config.fields.get(key)?;
-    let json = proto_value_to_json(value);
+    let json = value_to_json(value);
     // Return None for null/empty objects so callers can distinguish
     // "field absent" from "field present but empty".
     match &json {
         serde_json::Value::Null => None,
         serde_json::Value::Object(m) if m.is_empty() => None,
         _ => Some(json),
-    }
-}
-
-fn proto_struct_to_json_object(
-    config: &prost_types::Struct,
-) -> serde_json::Map<String, serde_json::Value> {
-    config
-        .fields
-        .iter()
-        .map(|(key, value)| (key.clone(), proto_value_to_json(value)))
-        .collect()
-}
-
-fn proto_value_to_json(value: &prost_types::Value) -> serde_json::Value {
-    match value.kind.as_ref() {
-        Some(prost_types::value::Kind::NumberValue(num)) => serde_json::Number::from_f64(*num)
-            .map_or(serde_json::Value::Null, serde_json::Value::Number),
-        Some(prost_types::value::Kind::StringValue(val)) => serde_json::Value::String(val.clone()),
-        Some(prost_types::value::Kind::BoolValue(val)) => serde_json::Value::Bool(*val),
-        Some(prost_types::value::Kind::StructValue(val)) => {
-            let mut map = serde_json::Map::new();
-            for (key, value) in &val.fields {
-                map.insert(key.clone(), proto_value_to_json(value));
-            }
-            serde_json::Value::Object(map)
-        }
-        Some(prost_types::value::Kind::ListValue(list)) => {
-            let values = list.values.iter().map(proto_value_to_json).collect();
-            serde_json::Value::Array(values)
-        }
-        Some(prost_types::value::Kind::NullValue(_)) | None => serde_json::Value::Null,
     }
 }
 
