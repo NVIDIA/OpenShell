@@ -199,6 +199,30 @@ fn prepare_backend_request(
     body: bytes::Bytes,
     stream_response: bool,
 ) -> Result<(reqwest::RequestBuilder, String), RouterError> {
+    // For AWS Bedrock routes the model id is encoded in the URL path
+    // (`/model/{modelId}/invoke[-with-response-stream]`), not in the
+    // JSON body. The caller's path can carry any model id; rewrite it
+    // to the operator-configured `route.model` so a sandbox cannot
+    // pick a different upstream model than what `inference set`
+    // configured. If the path is not a recognized Bedrock shape on a
+    // Bedrock route, reject the request rather than forwarding
+    // verbatim.
+    let rewritten_path: String;
+    let path = if route_is_bedrock(route) {
+        match rewrite_bedrock_path(route, path) {
+            Some(p) => {
+                rewritten_path = p;
+                rewritten_path.as_str()
+            }
+            None => {
+                return Err(RouterError::Internal(format!(
+                    "AWS Bedrock route received non-Bedrock path '{path}'; expected /model/<id>/invoke[-with-response-stream]"
+                )));
+            }
+        }
+    } else {
+        path
+    };
     let url = build_provider_url(route, &route.model, path, stream_response);
     let headers = sanitize_request_headers(route, headers);
 
@@ -259,6 +283,14 @@ fn prepare_backend_request(
                     // in the body; strip it so Vertex AI does not reject the
                     // request with "Extra inputs are not permitted".
                     obj.remove("model");
+                } else if route_is_bedrock(route) {
+                    // AWS Bedrock InvokeModel encodes the model in the URL
+                    // path; the request body is the raw provider-specific
+                    // payload (e.g. an Anthropic Messages body for Claude
+                    // models, a Mistral payload for Mistral models). The
+                    // body must not be mutated — injecting a "model" field
+                    // here would either be silently ignored or rejected as
+                    // an unexpected key by the upstream / bridge.
                 } else {
                     obj.insert(
                         "model".to_string(),
@@ -796,6 +828,66 @@ fn build_backend_url(endpoint: &str, path: &str) -> String {
     format!("{base}{path}")
 }
 
+/// Check whether a route targets an AWS Bedrock `InvokeModel` endpoint.
+///
+/// Returns true when any of the route's protocols is one of the Bedrock
+/// invocation protocols. Used to gate Bedrock-specific request shaping
+/// (path-segment rewriting, skipped body-model injection) in
+/// [`prepare_backend_request`].
+fn route_is_bedrock(route: &ResolvedRoute) -> bool {
+    route
+        .protocols
+        .iter()
+        .any(|p| p == "aws_bedrock_invoke" || p == "aws_bedrock_invoke_stream")
+}
+
+/// Parse a Bedrock invocation path into its `(model_id, action_suffix)`
+/// components.
+///
+/// Recognized shapes (caller's path on the way into the router):
+/// - `/model/<model_id>/invoke`                       → action `/invoke`
+/// - `/model/<model_id>/invoke-with-response-stream`  → action
+///   `/invoke-with-response-stream`
+///
+/// `<model_id>` must be non-empty and contain no `/`. A trailing query
+/// string is stripped before matching. Returns `None` when the path
+/// does not match either shape — the caller treats that as a malformed
+/// request and rejects rather than forwarding verbatim.
+fn parse_bedrock_invocation_path(path: &str) -> Option<(&str, &'static str)> {
+    let path_only = path.split('?').next().unwrap_or(path);
+    let rest = path_only.strip_prefix("/model/")?;
+    let slash_at = rest.find('/')?;
+    if slash_at == 0 {
+        return None;
+    }
+    let model_id = &rest[..slash_at];
+    let suffix = &rest[slash_at..];
+    let action: &'static str = match suffix {
+        "/invoke" => "/invoke",
+        "/invoke-with-response-stream" => "/invoke-with-response-stream",
+        _ => return None,
+    };
+    Some((model_id, action))
+}
+
+/// Rewrite a Bedrock invocation path so the model segment is the
+/// operator-configured `route.model` rather than whatever the caller
+/// supplied. Returns the rewritten path on success, or `None` when the
+/// inbound path is not a recognized Bedrock invocation shape.
+///
+/// Why rewrite rather than reject: the inbound L7 pattern detector
+/// already accepts only `/model/{x}/invoke[-with-response-stream]`
+/// shapes for Bedrock routes, so a caller-supplied model segment that
+/// differs from the operator-configured one is the only case this
+/// function changes — and changing it (vs. rejecting) lets sandbox
+/// code that hardcodes a different model continue to work, while still
+/// guaranteeing the operator's chosen model is what reaches the
+/// upstream.
+fn rewrite_bedrock_path(route: &ResolvedRoute, path: &str) -> Option<String> {
+    let (_caller_model, action) = parse_bedrock_invocation_path(path)?;
+    Some(format!("/model/{}{}", route.model, action))
+}
+
 /// Check whether a route targets a Vertex AI Anthropic rawPredict endpoint.
 ///
 /// The predicate is purely structural — it tests `model_in_path`,
@@ -821,10 +913,13 @@ fn is_vertex_anthropic_rawpredict_route(route: &ResolvedRoute) -> bool {
 mod tests {
     use super::{
         ValidationFailure, ValidationFailureKind, build_backend_url, build_provider_url,
-        verify_backend_endpoint,
+        parse_bedrock_invocation_path, prepare_backend_request, rewrite_bedrock_path,
+        route_is_bedrock, verify_backend_endpoint,
     };
+    use crate::RouterError;
     use crate::config::{DEFAULT_ROUTE_TIMEOUT, ResolvedRoute};
     use openshell_core::inference::AuthHeader;
+    use std::time::Duration;
     use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1729,7 +1824,7 @@ mod tests {
         );
         let headers = vec![("content-type".to_string(), "application/json".to_string())];
 
-        let (builder, _url) = super::prepare_backend_request(
+        let (builder, _url) = prepare_backend_request(
             &client,
             &route,
             "POST",
@@ -1800,7 +1895,7 @@ mod tests {
         );
         let headers = vec![("content-type".to_string(), "application/json".to_string())];
 
-        let (builder, _url) = super::prepare_backend_request(
+        let (builder, _url) = prepare_backend_request(
             &client,
             &route,
             "POST",
@@ -1922,7 +2017,7 @@ mod tests {
         );
         let headers = vec![("content-type".to_string(), "application/json".to_string())];
 
-        let (builder, _url) = super::prepare_backend_request(
+        let (builder, _url) = prepare_backend_request(
             &client,
             &route,
             "POST",
@@ -1984,7 +2079,7 @@ mod tests {
         );
         let headers = vec![("content-type".to_string(), "application/json".to_string())];
 
-        let (builder, _url) = super::prepare_backend_request(
+        let (builder, _url) = prepare_backend_request(
             &client,
             &route,
             "POST",
@@ -2048,7 +2143,7 @@ mod tests {
         );
         let headers = vec![("content-type".to_string(), "application/json".to_string())];
 
-        let (builder, _url) = super::prepare_backend_request(
+        let (builder, _url) = prepare_backend_request(
             &client,
             &route,
             "POST",
@@ -2080,5 +2175,278 @@ mod tests {
             Some("gemini-pro"),
             "Vertex Gemini route must still rewrite the model field, got: {received_body}"
         );
+    }
+
+    // ============================================================
+    // AWS Bedrock route shaping (path rewriting + body preservation)
+    // ============================================================
+
+    /// `parse_bedrock_invocation_path` rejects malformed paths.
+    #[test]
+    fn parse_bedrock_invocation_path_rejects_malformed() {
+        // Empty model id: `/model//invoke`
+        assert!(parse_bedrock_invocation_path("/model//invoke").is_none());
+        // Multi-segment model id: `/model/a/b/invoke`
+        assert!(parse_bedrock_invocation_path("/model/a/b/invoke").is_none());
+        // Unknown action: `/model/foo/converse`
+        assert!(parse_bedrock_invocation_path("/model/foo/converse").is_none());
+        // Wrong prefix: `/v1/messages`
+        assert!(parse_bedrock_invocation_path("/v1/messages").is_none());
+        // Missing slash before action
+        assert!(parse_bedrock_invocation_path("/model/foo").is_none());
+    }
+
+    #[test]
+    fn parse_bedrock_invocation_path_accepts_invoke() {
+        let parsed = parse_bedrock_invocation_path(
+            "/model/anthropic.claude-3-5-sonnet-20241022-v2:0/invoke",
+        );
+        assert_eq!(
+            parsed,
+            Some(("anthropic.claude-3-5-sonnet-20241022-v2:0", "/invoke"))
+        );
+    }
+
+    #[test]
+    fn parse_bedrock_invocation_path_accepts_invoke_with_response_stream() {
+        let parsed = parse_bedrock_invocation_path(
+            "/model/anthropic.claude-opus-4-7/invoke-with-response-stream",
+        );
+        assert_eq!(
+            parsed,
+            Some(("anthropic.claude-opus-4-7", "/invoke-with-response-stream"))
+        );
+    }
+
+    #[test]
+    fn parse_bedrock_invocation_path_strips_query_string() {
+        let parsed =
+            parse_bedrock_invocation_path("/model/anthropic.claude-opus-4-7/invoke?trace=1");
+        assert_eq!(parsed, Some(("anthropic.claude-opus-4-7", "/invoke")));
+    }
+
+    /// `route_is_bedrock` matches both Bedrock protocol variants.
+    #[test]
+    fn route_is_bedrock_matches_invoke_protocols() {
+        let invoke_only = test_route(
+            "https://example.com",
+            &["aws_bedrock_invoke"],
+            AuthHeader::None,
+        );
+        assert!(route_is_bedrock(&invoke_only));
+
+        let stream_only = test_route(
+            "https://example.com",
+            &["aws_bedrock_invoke_stream"],
+            AuthHeader::None,
+        );
+        assert!(route_is_bedrock(&stream_only));
+
+        let both = test_route(
+            "https://example.com",
+            &["aws_bedrock_invoke", "aws_bedrock_invoke_stream"],
+            AuthHeader::None,
+        );
+        assert!(route_is_bedrock(&both));
+
+        let openai = test_route(
+            "https://example.com",
+            &["openai_chat_completions"],
+            AuthHeader::Bearer,
+        );
+        assert!(!route_is_bedrock(&openai));
+    }
+
+    /// `rewrite_bedrock_path` swaps caller's model segment for the
+    /// route-configured model on both invoke variants.
+    #[test]
+    fn rewrite_bedrock_path_substitutes_operator_model() {
+        let mut route = test_route(
+            "https://bedrock-bridge.example",
+            &["aws_bedrock_invoke", "aws_bedrock_invoke_stream"],
+            AuthHeader::None,
+        );
+        route.model = "anthropic.claude-opus-4-7".to_string();
+
+        let rewritten = rewrite_bedrock_path(&route, "/model/some-other-model/invoke");
+        assert_eq!(
+            rewritten,
+            Some("/model/anthropic.claude-opus-4-7/invoke".to_string())
+        );
+
+        let rewritten_stream = rewrite_bedrock_path(&route, "/model/x/invoke-with-response-stream");
+        assert_eq!(
+            rewritten_stream,
+            Some("/model/anthropic.claude-opus-4-7/invoke-with-response-stream".to_string())
+        );
+    }
+
+    #[test]
+    fn rewrite_bedrock_path_returns_none_for_non_bedrock_path() {
+        let route = test_route(
+            "https://bedrock-bridge.example",
+            &["aws_bedrock_invoke"],
+            AuthHeader::None,
+        );
+        assert_eq!(rewrite_bedrock_path(&route, "/v1/messages"), None);
+        assert_eq!(rewrite_bedrock_path(&route, "/model//invoke"), None);
+        assert_eq!(rewrite_bedrock_path(&route, "/model/a/b/invoke"), None);
+    }
+
+    /// End-to-end: an inbound Bedrock request that names a different
+    /// model in the path arrives at the upstream/bridge with the
+    /// operator's model, and the body is unchanged (no `"model"`
+    /// injection).
+    #[tokio::test]
+    async fn bedrock_route_rewrites_model_in_path_and_preserves_body() {
+        let mock_server = MockServer::start().await;
+        let mut route = test_route(
+            &mock_server.uri(),
+            &["aws_bedrock_invoke", "aws_bedrock_invoke_stream"],
+            AuthHeader::None,
+        );
+        route.model = "anthropic.claude-opus-4-7".to_string();
+
+        // The mock asserts the upstream sees the operator's model in
+        // the path, NOT the caller's model.
+        Mock::given(method("POST"))
+            .and(path("/model/anthropic.claude-opus-4-7/invoke"))
+            // Caller body has a "model" key; we expect it to pass
+            // through unchanged. The mock uses body_partial_json so
+            // additional fields are OK; the assertion below pins the
+            // body more tightly.
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ok": true})))
+            .mount(&mock_server)
+            .await;
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("client");
+
+        // Caller-supplied body — we deliberately include a "model"
+        // field naming a DIFFERENT model than the operator's, to
+        // verify the router does not inject route.model on top of
+        // it. The body should pass through verbatim because Bedrock
+        // encodes the model in the path.
+        let caller_body = serde_json::json!({
+            "model": "caller-supplied-model-name",
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+
+        let (builder, url) = prepare_backend_request(
+            &client,
+            &route,
+            "POST",
+            "/model/some-other-model/invoke",
+            &[],
+            bytes::Bytes::from(caller_body.to_string()),
+            false,
+        )
+        .expect("prepare should succeed");
+
+        // URL should target the operator's model, not the caller's.
+        assert!(
+            url.ends_with("/model/anthropic.claude-opus-4-7/invoke"),
+            "URL must use operator model, got: {url}"
+        );
+
+        let resp = builder.send().await.expect("send");
+        assert_eq!(resp.status(), 200);
+
+        // Inspect what wiremock actually received.
+        let received = mock_server.received_requests().await.expect("requests");
+        assert_eq!(received.len(), 1);
+        let req = &received[0];
+        let received_body: serde_json::Value =
+            serde_json::from_slice(&req.body).expect("json body");
+        // Caller's model name should pass through (NOT replaced by
+        // route.model). This proves the body is untouched.
+        assert_eq!(
+            received_body.get("model").and_then(|v| v.as_str()),
+            Some("caller-supplied-model-name"),
+            "Bedrock route must NOT rewrite body model, got: {received_body}"
+        );
+        assert!(
+            received_body.get("messages").is_some(),
+            "messages field should pass through unchanged"
+        );
+    }
+
+    /// Streaming variant: the same path-rewrite + body-preservation
+    /// contract applies to invoke-with-response-stream.
+    #[tokio::test]
+    async fn bedrock_route_streaming_rewrites_model_in_path() {
+        let mock_server = MockServer::start().await;
+        let mut route = test_route(
+            &mock_server.uri(),
+            &["aws_bedrock_invoke", "aws_bedrock_invoke_stream"],
+            AuthHeader::None,
+        );
+        route.model = "anthropic.claude-opus-4-7".to_string();
+
+        Mock::given(method("POST"))
+            .and(path(
+                "/model/anthropic.claude-opus-4-7/invoke-with-response-stream",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string("event: ok\n\n"))
+            .mount(&mock_server)
+            .await;
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("client");
+
+        let (builder, url) = prepare_backend_request(
+            &client,
+            &route,
+            "POST",
+            "/model/another-model/invoke-with-response-stream",
+            &[],
+            bytes::Bytes::from(r#"{"messages":[]}"#),
+            true,
+        )
+        .expect("prepare should succeed");
+
+        assert!(
+            url.ends_with("/model/anthropic.claude-opus-4-7/invoke-with-response-stream"),
+            "Streaming URL must use operator model, got: {url}"
+        );
+
+        let resp = builder.send().await.expect("send");
+        assert_eq!(resp.status(), 200);
+    }
+
+    /// Defense-in-depth: a Bedrock route receiving a non-Bedrock path
+    /// is rejected rather than forwarded. The L7 pattern detector
+    /// upstream of the router should never produce this combination,
+    /// but if it ever did, we must not silently forward.
+    #[test]
+    fn bedrock_route_rejects_non_bedrock_path() {
+        let client = reqwest::Client::new();
+        let route = test_route(
+            "https://bedrock-bridge.example",
+            &["aws_bedrock_invoke"],
+            AuthHeader::None,
+        );
+        let result = prepare_backend_request(
+            &client,
+            &route,
+            "POST",
+            "/v1/messages",
+            &[],
+            bytes::Bytes::from(r"{}"),
+            false,
+        );
+        match result {
+            Err(RouterError::Internal(msg)) => {
+                assert!(
+                    msg.contains("Bedrock") && msg.contains("/v1/messages"),
+                    "error must name the offending path, got: {msg}"
+                );
+            }
+            other => panic!("expected RouterError::Internal, got {other:?}"),
+        }
     }
 }
