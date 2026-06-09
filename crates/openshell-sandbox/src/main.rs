@@ -15,7 +15,8 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
-use openshell_sandbox::run_sandbox;
+use openshell_core::sandbox_env::{NetworkEnforcementMode, SupervisorRole};
+use openshell_sandbox::{SupervisorRuntimeConfig, run_sandbox};
 
 /// Subcommand name used to self-copy the supervisor binary into a shared volume.
 ///
@@ -105,6 +106,34 @@ struct Args {
     /// Port for health check endpoint.
     #[arg(long, default_value = "8080")]
     health_port: u16,
+
+    /// Runtime role for this supervisor process.
+    #[arg(
+        long,
+        env = openshell_core::sandbox_env::SUPERVISOR_ROLE,
+        default_value_t = SupervisorRole::Combined
+    )]
+    supervisor_role: SupervisorRole,
+
+    /// Network enforcement mode for this supervisor process.
+    #[arg(
+        long,
+        env = openshell_core::sandbox_env::NETWORK_ENFORCEMENT_MODE,
+        default_value_t = NetworkEnforcementMode::Auto
+    )]
+    network_enforcement_mode: NetworkEnforcementMode,
+
+    /// Endpoint for a node/host enforcer when using external-enforcer mode.
+    #[arg(long, env = openshell_core::sandbox_env::ENFORCER_ENDPOINT)]
+    enforcer_endpoint: Option<String>,
+
+    /// Pod IP supplied by Kubernetes for external enforcer registration.
+    #[arg(long, env = openshell_core::sandbox_env::POD_IP)]
+    pod_ip: Option<String>,
+
+    /// Listen address used when this process runs as a node/host enforcer.
+    #[arg(long, default_value = openshell_sandbox::enforcer::DEFAULT_LISTEN_ADDR)]
+    enforcer_listen_addr: std::net::SocketAddr,
 }
 
 /// Copy the running executable to `dest`, creating parent directories as
@@ -287,6 +316,28 @@ fn main() -> Result<()> {
             vec!["/bin/bash".to_string()]
         };
 
+        if matches!(args.supervisor_role, SupervisorRole::Enforcer) {
+            info!(
+                listen_addr = %args.enforcer_listen_addr,
+                network_enforcement_mode = %args.network_enforcement_mode,
+                "Starting OpenShell node enforcer"
+            );
+            return openshell_sandbox::enforcer::run(
+                openshell_sandbox::enforcer::EnforcerRuntimeConfig {
+                    listen_addr: args.enforcer_listen_addr,
+                    network_enforcement_mode: args.network_enforcement_mode,
+                },
+            )
+            .await;
+        }
+
+        let runtime_config = SupervisorRuntimeConfig {
+            role: args.supervisor_role,
+            network_enforcement_mode: args.network_enforcement_mode,
+            enforcer_endpoint: args.enforcer_endpoint,
+            pod_ip: args.pod_ip,
+        };
+
         info!(command = ?command, "Starting sandbox");
         // Note: "Starting sandbox" stays as plain info!() since the OCSF context
         // is not yet initialized at this point (run_sandbox hasn't been called).
@@ -294,6 +345,7 @@ fn main() -> Result<()> {
 
         run_sandbox(
             command,
+            runtime_config,
             args.workdir,
             args.timeout,
             args.interactive,

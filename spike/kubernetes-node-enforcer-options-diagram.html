@@ -1,0 +1,412 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OpenShell Kubernetes Node Enforcer Option</title>
+  <style>
+    :root {
+      --bg: #06080d;
+      --panel: #101827;
+      --panel-2: #0b1120;
+      --text: #e5e7eb;
+      --muted: #9ca3af;
+      --line: #334155;
+      --blue: #38bdf8;
+      --green: #34d399;
+      --amber: #fbbf24;
+      --red: #fb7185;
+      --violet: #a78bfa;
+      --orange: #fb923c;
+      --teal: #2dd4bf;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--text);
+      background:
+        linear-gradient(145deg, rgba(45, 212, 191, 0.08), transparent 28rem),
+        linear-gradient(315deg, rgba(251, 146, 60, 0.08), transparent 28rem),
+        var(--bg);
+      font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    main {
+      width: min(1680px, calc(100vw - 32px));
+      margin: 0 auto;
+      padding: 28px 0 36px;
+    }
+
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: end;
+      gap: 24px;
+      margin-bottom: 18px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(24px, 4vw, 40px);
+      font-weight: 780;
+      letter-spacing: 0;
+    }
+
+    .subtitle {
+      margin: 9px 0 0;
+      max-width: 1020px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.55;
+    }
+
+    .branch {
+      padding: 8px 10px;
+      border-radius: 8px;
+      border: 1px solid rgba(148, 163, 184, 0.22);
+      background: rgba(15, 23, 42, 0.72);
+      color: #cbd5e1;
+      font-size: 11px;
+      white-space: nowrap;
+    }
+
+    .diagram {
+      overflow: auto;
+      border: 1px solid rgba(148, 163, 184, 0.24);
+      border-radius: 8px;
+      background: rgba(15, 23, 42, 0.72);
+      box-shadow: 0 20px 72px rgba(0, 0, 0, 0.36);
+    }
+
+    svg {
+      display: block;
+      width: 100%;
+      min-width: 1240px;
+      height: auto;
+    }
+
+    .notes {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 14px;
+      margin-top: 16px;
+    }
+
+    .note {
+      border: 1px solid rgba(148, 163, 184, 0.22);
+      border-radius: 8px;
+      background: rgba(15, 23, 42, 0.76);
+      padding: 14px;
+    }
+
+    .note h3 {
+      margin: 0 0 8px;
+      font-size: 12px;
+      letter-spacing: 0;
+    }
+
+    .note p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.55;
+    }
+
+    footer {
+      margin-top: 15px;
+      color: #64748b;
+      font-size: 10px;
+      line-height: 1.6;
+    }
+
+    footer a {
+      color: #93c5fd;
+    }
+
+    @media (max-width: 980px) {
+      main {
+        width: calc(100vw - 20px);
+        padding-top: 18px;
+      }
+
+      header {
+        display: block;
+      }
+
+      .branch {
+        display: inline-block;
+        margin-top: 12px;
+      }
+
+      .notes {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>Kubernetes Node Enforcer Option</h1>
+        <p class="subtitle">
+          The node-enforcer branch adds a fourth Kubernetes isolation shape: keep the workload supervisor and proxy in the sandbox pod, but move privileged pod-network-namespace enforcement to an operator-controlled DaemonSet on each node.
+        </p>
+      </div>
+      <div class="branch">branch: node-enforcer-poc/tmutch</div>
+    </header>
+
+    <section class="diagram" aria-label="OpenShell Kubernetes node-enforcer option diagram">
+      <svg viewBox="0 0 1680 1460" role="img" aria-labelledby="diagram-title diagram-desc">
+        <title id="diagram-title">OpenShell Kubernetes node-enforcer option</title>
+        <desc id="diagram-desc">Diagram of the node-enforcer topology and comparison to supervisor-netns, soft-proxy, split-pod, and isolation backend options.</desc>
+        <defs>
+          <pattern id="grid" width="36" height="36" patternUnits="userSpaceOnUse">
+            <path d="M 36 0 L 0 0 0 36" fill="none" stroke="#1f2937" stroke-width="0.5"/>
+          </pattern>
+          <marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#38bdf8"/>
+          </marker>
+          <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#34d399"/>
+          </marker>
+          <marker id="arrow-amber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#fbbf24"/>
+          </marker>
+          <marker id="arrow-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#fb7185"/>
+          </marker>
+          <marker id="arrow-violet" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#a78bfa"/>
+          </marker>
+          <style>
+            .title { fill: #f8fafc; font-size: 18px; font-weight: 780; letter-spacing: 0; }
+            .sub { fill: #94a3b8; font-size: 9px; letter-spacing: 0; }
+            .label { fill: #cbd5e1; font-size: 9px; letter-spacing: 0; }
+            .tiny { fill: #94a3b8; font-size: 7px; letter-spacing: 0; }
+            .box-title { fill: #f8fafc; font-size: 11px; font-weight: 750; letter-spacing: 0; }
+            .box-sub { fill: #cbd5e1; font-size: 8px; letter-spacing: 0; }
+            .gain { fill: #34d399; font-size: 8px; letter-spacing: 0; }
+            .loss { fill: #fb7185; font-size: 8px; letter-spacing: 0; }
+            .warn { fill: #fbbf24; font-size: 8px; letter-spacing: 0; }
+            .flow { fill: none; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+            .dash { fill: none; stroke-width: 1.4; stroke-dasharray: 5 5; stroke-linecap: round; stroke-linejoin: round; }
+            .thin { fill: none; stroke-width: 1.1; stroke-linecap: round; stroke-linejoin: round; }
+          </style>
+        </defs>
+
+        <rect width="1680" height="1460" fill="#06080d"/>
+        <rect width="1680" height="1460" fill="url(#grid)" opacity="0.9"/>
+
+        <!-- Main topology panel -->
+        <rect x="40" y="42" width="1600" height="655" rx="12" fill="rgba(15, 23, 42, 0.68)" stroke="#334155" stroke-width="1.2"/>
+        <text x="68" y="78" class="title">Option 4: Node-Enforcer Topology</text>
+        <text x="68" y="99" class="sub">workload supervisor remains in the sandbox pod; privileged netns/nft enforcement moves to a node-local DaemonSet</text>
+
+        <!-- Gateway -->
+        <rect x="82" y="154" width="226" height="94" rx="8" fill="#0b1120" stroke="#34d399" stroke-width="1.4"/>
+        <text x="110" y="188" class="box-title">Gateway</text>
+        <text x="110" y="209" class="box-sub">creates Sandbox CR</text>
+        <text x="110" y="226" class="box-sub">injects role + enforcement mode</text>
+
+        <rect x="82" y="304" width="226" height="94" rx="8" fill="#0b1120" stroke="#a78bfa" stroke-width="1.4"/>
+        <text x="110" y="338" class="box-title">Kubernetes Driver</text>
+        <text x="110" y="359" class="box-sub">supervisor_role=workload</text>
+        <text x="110" y="376" class="box-sub">network=external-enforcer</text>
+
+        <!-- Cluster / node -->
+        <rect x="386" y="128" width="1184" height="530" rx="14" fill="rgba(2, 6, 23, 0.42)" stroke="#475569" stroke-width="1.3" stroke-dasharray="8 4"/>
+        <text x="414" y="156" class="label">Kubernetes node</text>
+
+        <rect x="430" y="202" width="324" height="290" rx="12" fill="rgba(15, 23, 42, 0.86)" stroke="#fb923c" stroke-width="1.4"/>
+        <text x="456" y="232" class="box-title">node-enforcer DaemonSet</text>
+        <text x="456" y="253" class="box-sub">same supervisor image, role=enforcer</text>
+        <text x="456" y="270" class="box-sub">hostNetwork + hostPID + privileged</text>
+        <text x="456" y="287" class="box-sub">listens on host-network endpoint</text>
+
+        <rect x="464" y="326" width="256" height="62" rx="7" fill="#0b1120" stroke="#fbbf24" stroke-width="1.3"/>
+        <text x="486" y="354" class="box-title">Namespace lookup</text>
+        <text x="486" y="372" class="box-sub">find pod netns by pod IP in /proc</text>
+
+        <rect x="464" y="412" width="256" height="58" rx="7" fill="#0b1120" stroke="#fb7185" stroke-width="1.3"/>
+        <text x="486" y="440" class="box-title">Install nft table</text>
+        <text x="486" y="458" class="box-sub">setns(CLONE_NEWNET) + nft -f</text>
+
+        <rect x="860" y="180" width="414" height="376" rx="12" fill="rgba(15, 23, 42, 0.86)" stroke="#38bdf8" stroke-width="1.4" stroke-dasharray="8 4"/>
+        <text x="888" y="210" class="label">Sandbox pod network namespace</text>
+
+        <rect x="894" y="242" width="332" height="90" rx="8" fill="#0b1120" stroke="#34d399" stroke-width="1.4"/>
+        <text x="924" y="274" class="box-title">Workload supervisor</text>
+        <text x="924" y="294" class="box-sub">policy loading, proxy, SSH, logs, agent lifecycle</text>
+        <text x="924" y="312" class="box-sub">registers with node enforcer before spawning agent</text>
+
+        <rect x="894" y="372" width="144" height="72" rx="8" fill="#0b1120" stroke="#34d399" stroke-width="1.4"/>
+        <text x="922" y="403" class="box-title">Local proxy</text>
+        <text x="922" y="423" class="box-sub">OPA + L7 + creds</text>
+
+        <rect x="1082" y="372" width="144" height="72" rx="8" fill="#0b1120" stroke="#fb7185" stroke-width="1.4"/>
+        <text x="1106" y="403" class="box-title">Agent child</text>
+        <text x="1106" y="423" class="box-sub">sandbox user</text>
+
+        <rect x="936" y="486" width="226" height="40" rx="7" fill="#0b1120" stroke="#fbbf24" stroke-width="1.2"/>
+        <text x="960" y="510" class="box-title">openshell_external_enforcer table</text>
+
+        <rect x="1322" y="230" width="202" height="84" rx="8" fill="#0b1120" stroke="#94a3b8" stroke-width="1.3"/>
+        <text x="1350" y="262" class="box-title">External services</text>
+        <text x="1350" y="282" class="box-sub">allowed only through proxy</text>
+
+        <rect x="1322" y="380" width="202" height="84" rx="8" fill="#0b1120" stroke="#a78bfa" stroke-width="1.3"/>
+        <text x="1350" y="412" class="box-title">Gateway session</text>
+        <text x="1350" y="432" class="box-sub">config, relay, logs</text>
+
+        <path class="flow" d="M308 201 C344 201 348 254 386 254" stroke="#34d399" marker-end="url(#arrow-green)"/>
+        <text x="322" y="187" class="label">create sandbox</text>
+        <path class="flow" d="M308 351 L386 351" stroke="#a78bfa" marker-end="url(#arrow-violet)"/>
+        <text x="322" y="339" class="label">inject env</text>
+
+        <path class="flow" d="M894 300 C820 300 812 248 762 248" stroke="#fbbf24" marker-end="url(#arrow-amber)"/>
+        <text x="770" y="288" class="label">HTTP registration</text>
+        <text x="772" y="304" class="tiny">pod IP + sandbox ID</text>
+
+        <path class="flow" d="M720 356 C780 356 810 506 928 506" stroke="#fb7185" marker-end="url(#arrow-red)"/>
+        <text x="744" y="430" class="label">install pod-netns nft rules</text>
+
+        <path class="flow" d="M1082 405 L1046 405" stroke="#38bdf8" marker-end="url(#arrow-blue)"/>
+        <text x="1046" y="391" class="label">HTTP_PROXY</text>
+        <path class="flow" d="M1038 405 L1294 272 L1314 272" stroke="#34d399" marker-end="url(#arrow-green)"/>
+        <text x="1170" y="328" class="label">UID 0 proxy egress</text>
+        <path class="dash" d="M1154 444 C1160 482 1202 512 1230 506" stroke="#fb7185" marker-end="url(#arrow-red)"/>
+        <text x="1182" y="488" class="label">non-root direct socket rejected</text>
+        <path class="dash" d="M1226 290 C1268 316 1282 406 1314 422" stroke="#a78bfa" marker-end="url(#arrow-violet)"/>
+        <text x="1240" y="374" class="label">gateway callback</text>
+
+        <rect x="82" y="534" width="674" height="92" rx="8" fill="rgba(2, 6, 23, 0.56)" stroke="#475569"/>
+        <text x="110" y="564" class="box-title">What moved out of the workload pod?</text>
+        <text x="110" y="588" class="gain">+ netns discovery and nftables installation are node-side infrastructure duties</text>
+        <text x="110" y="610" class="gain">+ workload supervisor keeps policy/proxy/credentials close to the agent</text>
+
+        <rect x="820" y="584" width="704" height="42" rx="8" fill="rgba(2, 6, 23, 0.56)" stroke="#475569"/>
+        <text x="848" y="610" class="warn">Prototype hardening required: authenticate registrations, verify pod ownership, reconcile cleanup/stale state, avoid per-release DaemonSet port conflicts.</text>
+
+        <!-- Comparison panel -->
+        <rect x="40" y="736" width="1600" height="372" rx="12" fill="rgba(15, 23, 42, 0.68)" stroke="#334155" stroke-width="1.2"/>
+        <text x="68" y="774" class="title">Comparison Against Other Kubernetes Options</text>
+        <text x="68" y="795" class="sub">The options differ mostly by where the hard network boundary lives and whether the workload pod needs elevated privileges.</text>
+
+        <line x1="68" y1="824" x2="1612" y2="824" stroke="#334155"/>
+        <text x="80" y="852" class="label">Option</text>
+        <text x="312" y="852" class="label">Hard egress boundary</text>
+        <text x="622" y="852" class="label">Privileged component</text>
+        <text x="910" y="852" class="label">What remains local to agent pod</text>
+        <text x="1260" y="852" class="label">Main tradeoff</text>
+
+        <line x1="68" y1="872" x2="1612" y2="872" stroke="#1f2937"/>
+        <text x="80" y="902" class="box-sub">Supervisor-netns</text>
+        <text x="312" y="902" class="box-sub">inner netns + veth + nft</text>
+        <text x="622" y="902" class="box-sub">sandbox workload supervisor</text>
+        <text x="910" y="902" class="box-sub">all policy, proxy, fs, process, netns</text>
+        <text x="1260" y="902" class="loss">strong but requires elevated sandbox pod</text>
+
+        <line x1="68" y1="924" x2="1612" y2="924" stroke="#1f2937"/>
+        <text x="80" y="954" class="box-sub">Soft-proxy</text>
+        <text x="312" y="954" class="box-sub">none for direct sockets</text>
+        <text x="622" y="954" class="box-sub">none for network setup</text>
+        <text x="910" y="954" class="box-sub">proxy, policy, lifecycle, logs</text>
+        <text x="1260" y="954" class="loss">deployable but bypass is not kernel-blocked</text>
+
+        <line x1="68" y1="976" x2="1612" y2="976" stroke="#1f2937"/>
+        <text x="80" y="1006" class="box-sub">Split-pod</text>
+        <text x="312" y="1006" class="box-sub">CNI NetworkPolicy</text>
+        <text x="622" y="1006" class="box-sub">trusted supervisor pod / platform</text>
+        <text x="910" y="1006" class="box-sub">agent only; optional sideload SSH/Landlock</text>
+        <text x="1260" y="1006" class="loss">loses trusted per-binary identity cross-pod</text>
+
+        <line x1="68" y1="1028" x2="1612" y2="1028" stroke="#1f2937"/>
+        <text x="80" y="1058" class="box-sub">Node-enforcer</text>
+        <text x="312" y="1058" class="box-sub">pod netns nft table installed by DaemonSet</text>
+        <text x="622" y="1058" class="box-sub">node enforcer only</text>
+        <text x="910" y="1058" class="box-sub">proxy, OPA, creds, SSH, agent lifecycle</text>
+        <text x="1260" y="1058" class="gain">keeps proxy local; moves network privilege out</text>
+
+        <line x1="68" y1="1080" x2="1612" y2="1080" stroke="#1f2937"/>
+        <text x="80" y="1102" class="box-sub">Isolation Backend</text>
+        <text x="312" y="1102" class="box-sub">selected backend: netns, CNI, node, VM</text>
+        <text x="622" y="1102" class="box-sub">backend-specific</text>
+        <text x="910" y="1102" class="box-sub">supervisor as policy authority</text>
+        <text x="1260" y="1102" class="warn">needs verifiable handoff and fail-closed contract</text>
+
+        <!-- Backend placement panel -->
+        <rect x="40" y="1148" width="1600" height="272" rx="12" fill="rgba(15, 23, 42, 0.68)" stroke="#334155" stroke-width="1.2"/>
+        <text x="68" y="1186" class="title">How Node-Enforcer Fits the Isolation Backend Abstraction</text>
+
+        <rect x="90" y="1226" width="248" height="88" rx="8" fill="#0b1120" stroke="#34d399" stroke-width="1.3"/>
+        <text x="118" y="1258" class="box-title">Supervisor contract</text>
+        <text x="118" y="1278" class="box-sub">policy authority, proxy, audit</text>
+        <text x="118" y="1295" class="box-sub">register before agent exec</text>
+
+        <rect x="442" y="1226" width="248" height="88" rx="8" fill="#0b1120" stroke="#a78bfa" stroke-width="1.3"/>
+        <text x="470" y="1258" class="box-title">Backend handle</text>
+        <text x="470" y="1278" class="box-sub">pod IP + sandbox ID</text>
+        <text x="470" y="1295" class="box-sub">node-local enforcer endpoint</text>
+
+        <rect x="794" y="1226" width="248" height="88" rx="8" fill="#0b1120" stroke="#fb923c" stroke-width="1.3"/>
+        <text x="822" y="1258" class="box-title">Backend mechanism</text>
+        <text x="822" y="1278" class="box-sub">hostPID /proc scan</text>
+        <text x="822" y="1295" class="box-sub">setns + nft ruleset</text>
+
+        <rect x="1146" y="1226" width="248" height="88" rx="8" fill="#0b1120" stroke="#fbbf24" stroke-width="1.3"/>
+        <text x="1174" y="1258" class="box-title">Required invariant</text>
+        <text x="1174" y="1278" class="box-sub">no agent execution before</text>
+        <text x="1174" y="1295" class="box-sub">boundary is installed/verified</text>
+
+        <path class="flow" d="M338 1270 L434 1270" stroke="#34d399" marker-end="url(#arrow-green)"/>
+        <path class="flow" d="M690 1270 L786 1270" stroke="#a78bfa" marker-end="url(#arrow-violet)"/>
+        <path class="flow" d="M1042 1270 L1138 1270" stroke="#fb923c" marker-end="url(#arrow-amber)"/>
+
+        <rect x="1428" y="1226" width="164" height="88" rx="8" fill="#0b1120" stroke="#fb7185" stroke-width="1.3"/>
+        <text x="1450" y="1258" class="box-title">Open questions</text>
+        <text x="1450" y="1278" class="box-sub">authn/authz</text>
+        <text x="1450" y="1295" class="box-sub">cleanup + ownership checks</text>
+
+        <text x="68" y="1370" class="tiny">Sources: node-enforcer-poc/tmutch branch files architecture/plans/node-enforcer-topology-findings.md, crates/openshell-sandbox/src/enforcer.rs, crates/openshell-sandbox/src/lib.rs, crates/openshell-driver-kubernetes/src/driver.rs, deploy/helm/openshell/templates/node-enforcer.yaml, docs/reference/sandbox-compute-drivers.mdx, plus proposal context from #981 and #1737.</text>
+      </svg>
+    </section>
+
+    <section class="notes" aria-label="node enforcer summary notes">
+      <article class="note">
+        <h3>What It Preserves</h3>
+        <p>The workload supervisor still owns proxy, OPA, credential resolution, inference routing, SSH, logs, settings reloads, and agent lifecycle inside the sandbox pod.</p>
+      </article>
+      <article class="note">
+        <h3>What It Moves</h3>
+        <p>The node enforcer owns pod network namespace discovery and coarse nftables egress enforcement, moving that privilege out of the sandbox workload pod.</p>
+      </article>
+      <article class="note">
+        <h3>What It Does Not Do</h3>
+        <p>It does not split the agent into a separate pod and does not use Kubernetes NetworkPolicy as the hard boundary. Dynamic endpoint and L7 policy still live in the proxy.</p>
+      </article>
+      <article class="note">
+        <h3>Hardening Work</h3>
+        <p>The POC needs authenticated registration, pod ownership verification, cleanup/reconciliation for stale namespaces, and shared-cluster deployment rules.</p>
+      </article>
+    </section>
+
+    <footer>
+      Related proposal context:
+      <a href="https://github.com/NVIDIA/OpenShell/issues/981">split-pod #981</a>,
+      <a href="https://github.com/NVIDIA/OpenShell/issues/1737">Isolation Backend #1737</a>.
+      Local branch sources are listed inside the diagram.
+    </footer>
+  </main>
+</body>
+</html>

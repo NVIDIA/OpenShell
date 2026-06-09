@@ -49,6 +49,30 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
+Selector labels for the node enforcer DaemonSet.
+
+The node enforcer must not share the gateway Service selector labels because it
+does not expose the gateway's named ports.
+*/}}
+{{- define "openshell.nodeEnforcerName" -}}
+{{- printf "%s-node-enforcer" (include "openshell.name" .) | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{- define "openshell.nodeEnforcerSelectorLabels" -}}
+app.kubernetes.io/name: {{ include "openshell.nodeEnforcerName" . }}
+app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
+
+{{- define "openshell.nodeEnforcerLabels" -}}
+helm.sh/chart: {{ include "openshell.chart" . }}
+{{ include "openshell.nodeEnforcerSelectorLabels" . }}
+{{- if .Chart.AppVersion }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+{{- end }}
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- end }}
+
+{{/*
 Create the name of the service account to use
 */}}
 {{- define "openshell.serviceAccountName" -}}

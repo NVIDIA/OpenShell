@@ -63,6 +63,7 @@ sha1 = "0.10"
 
 # IP network / CIDR parsing
 ipnet = "2"
+url = { workspace = true }
 
 # Serialization
 serde = { workspace = true }

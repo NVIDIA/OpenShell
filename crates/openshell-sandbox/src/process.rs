@@ -242,8 +242,11 @@ impl ProcessHandle {
                 for (key, value) in child_env::proxy_env_vars(&proxy_url) {
                     cmd.env(key, value);
                 }
-            } else if let Some(http_addr) = proxy.http_addr {
-                let proxy_url = format!("http://{http_addr}");
+            } else {
+                let proxy_url = proxy.http_addr.map_or_else(
+                    || "http://127.0.0.1:3128".to_string(),
+                    |http_addr| format!("http://{http_addr}"),
+                );
                 for (key, value) in child_env::proxy_env_vars(&proxy_url) {
                     cmd.env(key, value);
                 }
@@ -541,6 +544,10 @@ pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
             .into_diagnostic()?
             .ok_or_else(|| miette::miette!("Failed to resolve user primary group"))?
     };
+
+    if nix::unistd::geteuid() == user.uid && nix::unistd::getegid() == group.gid {
+        return Ok(());
+    }
 
     if user_name.is_some() {
         let user_cstr =

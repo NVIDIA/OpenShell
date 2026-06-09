@@ -77,6 +77,18 @@ This provides defense-in-depth: even if a container escape vulnerability exists,
 | Risk if enabled with GPU | NVIDIA device plugin compatibility with user namespaces is unverified. OpenShell logs a warning when both GPU and user namespaces are active on the same sandbox. |
 | Recommendation | Enable on non-GPU clusters running Kubernetes with user namespace support available (1.33+ beta, 1.36+ GA) for stronger host isolation. Test GPU workloads separately before enabling on GPU clusters. |
 
+### Privileged Kubernetes Pods
+
+Kubernetes gateway deployments can set `securityContext.privileged` on every sandbox pod container for clusters that require privileged pod admission.
+This is a short-term compatibility escape hatch and weakens the container boundary.
+
+| Aspect | Detail |
+|---|---|
+| Default | Disabled. |
+| What you can change | Enable deployment-wide through Helm with `server.sandboxPrivileged: true` or in gateway config with `[openshell.drivers.kubernetes] privileged = true`. |
+| Risk if enabled | The container receives privileged Linux capabilities and broader host-facing access. Treat the cluster and workload as trusted. |
+| Recommendation | Leave disabled unless a trusted Kubernetes deployment requires the `supervisor-netns` enforcement mode. The Kubernetes default is `soft-proxy`, which avoids privileged pod admission but does not kernel-block direct socket egress. Prefer `external-enforcer` when a cluster can run the privileged node enforcer DaemonSet and sandbox pods should remain unprivileged. |
+
 ### Binary Identity Binding
 
 The proxy identifies which binary initiated each connection by reading `/proc/<pid>/exe` (the kernel-trusted executable path).

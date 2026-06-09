@@ -12,6 +12,7 @@ Each sandbox workload has two trust levels:
 |---|---|
 | Supervisor | Starts as root inside the workload, prepares isolation, runs the proxy, fetches config, injects credentials, serves the relay socket, and launches child processes. |
 | Agent child | Runs as an unprivileged user with filesystem, process, and network restrictions applied. |
+| Node enforcer | Optional privileged host/node-side supervisor role for Kubernetes. It accepts workload registrations and installs coarse pod-netns egress rules while policy decisions stay in the workload proxy. |
 
 The supervisor keeps enough privilege to manage the sandbox, but the agent child
 loses that privilege before user code runs.
@@ -40,6 +41,13 @@ OpenShell uses overlapping controls rather than a single sandbox primitive:
 | Seccomp | Blocks dangerous syscalls, including raw socket paths that bypass the proxy. |
 | Network namespace | Forces ordinary agent egress through the local CONNECT proxy. |
 | Policy proxy | Evaluates destination, binary identity, TLS/L7 rules, SSRF checks, and inference interception. |
+
+The supervisor resolves an explicit network enforcement mode at startup.
+`combined`/`supervisor-netns` preserves the local hard netns path. Kubernetes
+defaults to `workload`/`soft-proxy`, which keeps the pod unprivileged and
+reports that direct sockets are not kernel-blocked. `external-enforcer`
+delegates the coarse direct-egress boundary to a host/node component while
+leaving dynamic endpoint policy in the proxy.
 
 The supervisor may enrich baseline filesystem allowances for runtime-required
 paths, such as proxy support files or GPU device paths when a GPU is present.

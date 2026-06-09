@@ -1,0 +1,559 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OpenShell Isolation Architecture</title>
+  <style>
+    :root {
+      --bg: #020617;
+      --panel: #0f172a;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --grid: #1e293b;
+      --cyan: #22d3ee;
+      --emerald: #34d399;
+      --violet: #a78bfa;
+      --amber: #fbbf24;
+      --rose: #fb7185;
+      --orange: #fb923c;
+      --slate: #94a3b8;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--text);
+      background:
+        radial-gradient(circle at 18% 12%, rgba(34, 211, 238, 0.08), transparent 24rem),
+        radial-gradient(circle at 78% 8%, rgba(251, 191, 36, 0.07), transparent 22rem),
+        var(--bg);
+      font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    main {
+      width: min(1560px, calc(100vw - 32px));
+      margin: 0 auto;
+      padding: 28px 0 36px;
+    }
+
+    .header {
+      display: flex;
+      justify-content: space-between;
+      gap: 24px;
+      align-items: end;
+      margin-bottom: 18px;
+    }
+
+    .title-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .pulse {
+      width: 12px;
+      height: 12px;
+      border-radius: 999px;
+      background: var(--emerald);
+      box-shadow: 0 0 0 rgba(52, 211, 153, 0.65);
+      animation: pulse 2.1s infinite;
+      flex: 0 0 auto;
+    }
+
+    @keyframes pulse {
+      0% { box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.55); }
+      70% { box-shadow: 0 0 0 12px rgba(52, 211, 153, 0); }
+      100% { box-shadow: 0 0 0 0 rgba(52, 211, 153, 0); }
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(24px, 4vw, 40px);
+      font-weight: 760;
+      letter-spacing: 0;
+    }
+
+    .subtitle {
+      margin: 8px 0 0 24px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.55;
+      max-width: 900px;
+    }
+
+    .meta {
+      color: var(--muted);
+      font-size: 11px;
+      text-align: right;
+      line-height: 1.6;
+      white-space: nowrap;
+    }
+
+    .diagram-card {
+      border: 1px solid rgba(148, 163, 184, 0.24);
+      border-radius: 8px;
+      overflow: auto;
+      background: rgba(15, 23, 42, 0.72);
+      box-shadow: 0 22px 80px rgba(0, 0, 0, 0.32);
+    }
+
+    svg {
+      display: block;
+      width: 100%;
+      min-width: 1120px;
+      height: auto;
+    }
+
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+      margin-top: 16px;
+    }
+
+    .card {
+      border: 1px solid rgba(148, 163, 184, 0.22);
+      border-radius: 8px;
+      background: rgba(15, 23, 42, 0.78);
+      padding: 14px 15px 16px;
+    }
+
+    .card-header {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      margin-bottom: 9px;
+    }
+
+    .card-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 999px;
+      flex: 0 0 auto;
+    }
+
+    .card-dot.cyan { background: var(--cyan); }
+    .card-dot.rose { background: var(--rose); }
+    .card-dot.amber { background: var(--amber); }
+
+    h3 {
+      margin: 0;
+      font-size: 13px;
+      font-weight: 720;
+      letter-spacing: 0;
+    }
+
+    ul {
+      margin: 0;
+      padding: 0;
+      list-style: none;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.65;
+    }
+
+    footer {
+      margin-top: 16px;
+      color: #64748b;
+      font-size: 10px;
+      line-height: 1.6;
+    }
+
+    @media (max-width: 900px) {
+      main {
+        width: calc(100vw - 20px);
+        padding-top: 18px;
+      }
+
+      .header {
+        display: block;
+      }
+
+      .subtitle {
+        margin-left: 0;
+      }
+
+      .meta {
+        margin-top: 12px;
+        text-align: left;
+        white-space: normal;
+      }
+
+      .cards {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header class="header">
+      <div>
+        <div class="title-row">
+          <span class="pulse" aria-hidden="true"></span>
+          <h1>OpenShell Networking + Filesystem Isolation</h1>
+        </div>
+        <p class="subtitle">
+          Gateway policy delivery stays separate from sandbox-local enforcement. The supervisor prepares static controls, launches the agent as an unprivileged child, and forces observable egress through the policy proxy.
+        </p>
+      </div>
+      <div class="meta">
+        Standalone HTML/SVG<br>
+        Generated from repo docs + sandbox code
+      </div>
+    </header>
+
+    <section class="diagram-card" aria-label="OpenShell isolation architecture diagram">
+      <svg viewBox="0 0 1500 1360" role="img" aria-labelledby="diagram-title diagram-desc">
+        <title id="diagram-title">OpenShell isolation architecture</title>
+        <desc id="diagram-desc">A three-panel architecture diagram showing gateway and sandbox boundaries, network egress enforcement, and filesystem startup isolation.</desc>
+        <defs>
+          <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+            <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#1e293b" stroke-width="0.5"/>
+          </pattern>
+
+          <marker id="arrow-cyan" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#22d3ee"/>
+          </marker>
+          <marker id="arrow-emerald" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#34d399"/>
+          </marker>
+          <marker id="arrow-amber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#fbbf24"/>
+          </marker>
+          <marker id="arrow-rose" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#fb7185"/>
+          </marker>
+          <marker id="arrow-slate" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#94a3b8"/>
+          </marker>
+
+          <filter id="soft-shadow" x="-30%" y="-30%" width="160%" height="160%">
+            <feDropShadow dx="0" dy="8" stdDeviation="8" flood-color="#000000" flood-opacity="0.28"/>
+          </filter>
+
+          <style>
+            .panel-title { fill: #e2e8f0; font-size: 18px; font-weight: 760; letter-spacing: 0; }
+            .panel-sub { fill: #94a3b8; font-size: 10px; letter-spacing: 0; }
+            .box-title { fill: #f8fafc; font-size: 12px; font-weight: 740; letter-spacing: 0; }
+            .box-sub { fill: #cbd5e1; font-size: 9px; letter-spacing: 0; }
+            .box-note { fill: #94a3b8; font-size: 8px; letter-spacing: 0; }
+            .tiny { fill: #94a3b8; font-size: 7px; letter-spacing: 0; }
+            .label { fill: #cbd5e1; font-size: 9px; letter-spacing: 0; }
+            .legend { fill: #cbd5e1; font-size: 9px; letter-spacing: 0; }
+            .flow { fill: none; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+            .flow-thin { fill: none; stroke-width: 1.2; stroke-linecap: round; stroke-linejoin: round; }
+            .flow-dash { fill: none; stroke-width: 1.5; stroke-dasharray: 5 5; stroke-linecap: round; stroke-linejoin: round; }
+            .boundary-label { fill: #fbbf24; font-size: 10px; font-weight: 700; letter-spacing: 0; }
+          </style>
+        </defs>
+
+        <rect width="1500" height="1360" fill="#020617"/>
+        <rect width="1500" height="1360" fill="url(#grid)" opacity="0.9"/>
+
+        <!-- Background panel boundaries -->
+        <rect x="38" y="36" width="1424" height="386" rx="12" fill="rgba(120, 53, 15, 0.08)" stroke="#fbbf24" stroke-width="1.3" stroke-dasharray="8 4"/>
+        <text x="58" y="64" class="panel-title">1. Runtime Boundary</text>
+        <text x="58" y="84" class="panel-sub">Gateway delivers desired state. Sandbox supervisor owns runtime enforcement.</text>
+
+        <rect x="38" y="452" width="1424" height="438" rx="12" fill="rgba(136, 19, 55, 0.055)" stroke="#fb7185" stroke-width="1.3" stroke-dasharray="8 4"/>
+        <text x="58" y="480" class="panel-title">2. Network Egress Enforcement</text>
+        <text x="58" y="500" class="panel-sub">Ordinary traffic is forced through the proxy, evaluated, and either forwarded, denied, logged, or routed to inference.local.</text>
+
+        <rect x="38" y="920" width="1424" height="278" rx="12" fill="rgba(6, 78, 59, 0.055)" stroke="#34d399" stroke-width="1.3" stroke-dasharray="8 4"/>
+        <text x="58" y="948" class="panel-title">3. Filesystem + Process Startup</text>
+        <text x="58" y="968" class="panel-sub">Static controls are prepared before exec and normally require sandbox recreation to change.</text>
+
+        <!-- Runtime boundary -->
+        <rect x="76" y="116" width="205" height="72" rx="6" fill="#0f172a"/>
+        <rect x="76" y="116" width="205" height="72" rx="6" fill="rgba(8, 51, 68, 0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+        <text x="98" y="145" class="box-title">CLI / SDK / TUI</text>
+        <text x="98" y="164" class="box-sub">user-facing API clients</text>
+
+        <rect x="356" y="104" width="270" height="96" rx="6" fill="#0f172a"/>
+        <rect x="356" y="104" width="270" height="96" rx="6" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1.5"/>
+        <text x="382" y="134" class="box-title">Gateway Control Plane</text>
+        <text x="382" y="154" class="box-sub">sandbox state, policy revisions</text>
+        <text x="382" y="171" class="box-sub">settings, credentials, inference routes</text>
+
+        <rect x="682" y="116" width="218" height="72" rx="6" fill="#0f172a"/>
+        <rect x="682" y="116" width="218" height="72" rx="6" fill="rgba(120, 53, 15, 0.3)" stroke="#fbbf24" stroke-width="1.5"/>
+        <text x="710" y="145" class="box-title">Compute Runtime</text>
+        <text x="710" y="164" class="box-sub">Docker, Podman, K8s, VM</text>
+
+        <rect x="950" y="92" width="404" height="310" rx="12" fill="rgba(15, 23, 42, 0.48)" stroke="#fbbf24" stroke-width="1.2" stroke-dasharray="8 4"/>
+        <text x="972" y="119" class="boundary-label">Sandbox workload</text>
+
+        <rect x="984" y="144" width="298" height="84" rx="6" fill="#0f172a"/>
+        <rect x="984" y="144" width="298" height="84" rx="6" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1.5"/>
+        <text x="1012" y="174" class="box-title">Supervisor</text>
+        <text x="1012" y="193" class="box-sub">root prelude, policy load, config polling</text>
+        <text x="1012" y="210" class="box-sub">proxy, SSH relay, log push</text>
+
+        <rect x="984" y="268" width="298" height="72" rx="6" fill="#0f172a"/>
+        <rect x="984" y="268" width="298" height="72" rx="6" fill="rgba(136, 19, 55, 0.4)" stroke="#fb7185" stroke-width="1.5"/>
+        <text x="1012" y="297" class="box-title">Restricted Agent Child</text>
+        <text x="1012" y="316" class="box-sub">sandbox user + group</text>
+        <text x="1012" y="331" class="box-note">Landlock, seccomp, netns active</text>
+
+        <rect x="1320" y="146" width="116" height="50" rx="6" fill="#0f172a"/>
+        <rect x="1320" y="146" width="116" height="50" rx="6" fill="rgba(76, 29, 149, 0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+        <text x="1339" y="174" class="box-title">OPA</text>
+        <text x="1338" y="190" class="box-sub">policy engine</text>
+
+        <rect x="1320" y="214" width="116" height="50" rx="6" fill="#0f172a"/>
+        <rect x="1320" y="214" width="116" height="50" rx="6" fill="rgba(136, 19, 55, 0.4)" stroke="#fb7185" stroke-width="1.5"/>
+        <text x="1334" y="242" class="box-title">Proxy</text>
+        <text x="1337" y="258" class="box-sub">egress gate</text>
+
+        <rect x="1320" y="282" width="116" height="50" rx="6" fill="#0f172a"/>
+        <rect x="1320" y="282" width="116" height="50" rx="6" fill="rgba(30, 41, 59, 0.5)" stroke="#94a3b8" stroke-width="1.5"/>
+        <text x="1334" y="310" class="box-title">Relay</text>
+        <text x="1332" y="326" class="box-sub">connect/exec/fs</text>
+
+        <path class="flow" d="M281 152 L347 152" stroke="#22d3ee" marker-end="url(#arrow-cyan)"/>
+        <text x="296" y="141" class="label">gRPC / HTTP</text>
+
+        <path class="flow" d="M626 152 L673 152" stroke="#34d399" marker-end="url(#arrow-emerald)"/>
+        <text x="634" y="141" class="label">launch request</text>
+
+        <path class="flow" d="M900 152 C926 152 926 186 976 186" stroke="#fbbf24" marker-end="url(#arrow-amber)"/>
+        <text x="909" y="137" class="label">provisions workload</text>
+
+        <path class="flow-dash" d="M984 170 C846 182 756 210 626 184" stroke="#34d399" marker-end="url(#arrow-emerald)"/>
+        <text x="718" y="203" class="label">outbound supervisor session</text>
+        <text x="720" y="219" class="tiny">config refresh, logs, relays</text>
+
+        <path class="flow" d="M1133 228 L1133 260" stroke="#34d399" marker-end="url(#arrow-emerald)"/>
+        <text x="1146" y="250" class="label">spawn + restrict</text>
+
+        <path class="flow-thin" d="M1282 188 L1312 171" stroke="#a78bfa" marker-end="url(#arrow-slate)"/>
+        <path class="flow-thin" d="M1282 198 L1312 239" stroke="#fb7185" marker-end="url(#arrow-rose)"/>
+        <path class="flow-thin" d="M1282 206 L1312 307" stroke="#94a3b8" marker-end="url(#arrow-slate)"/>
+
+        <!-- Network panel -->
+        <rect x="76" y="552" width="185" height="74" rx="6" fill="#0f172a"/>
+        <rect x="76" y="552" width="185" height="74" rx="6" fill="rgba(136, 19, 55, 0.4)" stroke="#fb7185" stroke-width="1.5"/>
+        <text x="100" y="582" class="box-title">Agent Process</text>
+        <text x="100" y="601" class="box-sub">HTTP(S), git, model SDKs</text>
+        <text x="100" y="616" class="box-note">env: http_proxy / HTTPS_PROXY</text>
+
+        <rect x="76" y="676" width="185" height="82" rx="6" fill="#0f172a"/>
+        <rect x="76" y="676" width="185" height="82" rx="6" fill="rgba(30, 41, 59, 0.5)" stroke="#94a3b8" stroke-width="1.5"/>
+        <text x="98" y="705" class="box-title">Bypass Guards</text>
+        <text x="98" y="724" class="box-sub">netns + veth route</text>
+        <text x="98" y="741" class="box-sub">nft rejects non-proxy TCP/UDP</text>
+
+        <rect x="332" y="552" width="190" height="74" rx="6" fill="#0f172a"/>
+        <rect x="332" y="552" width="190" height="74" rx="6" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1.5"/>
+        <text x="358" y="582" class="box-title">Local CONNECT Proxy</text>
+        <text x="358" y="601" class="box-sub">proxy endpoint inside netns</text>
+        <text x="358" y="616" class="box-note">terminates selected TLS/L7</text>
+
+        <rect x="584" y="540" width="190" height="62" rx="6" fill="#0f172a"/>
+        <rect x="584" y="540" width="190" height="62" rx="6" fill="rgba(76, 29, 149, 0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+        <text x="610" y="568" class="box-title">Binary Identity</text>
+        <text x="610" y="586" class="box-sub">path, sha256, ancestors</text>
+
+        <rect x="584" y="626" width="190" height="62" rx="6" fill="#0f172a"/>
+        <rect x="584" y="626" width="190" height="62" rx="6" fill="rgba(136, 19, 55, 0.4)" stroke="#fb7185" stroke-width="1.5"/>
+        <text x="610" y="654" class="box-title">SSRF Hard Blocks</text>
+        <text x="610" y="672" class="box-sub">internal IPs unless allowed</text>
+
+        <rect x="584" y="712" width="190" height="62" rx="6" fill="#0f172a"/>
+        <rect x="584" y="712" width="190" height="62" rx="6" fill="rgba(76, 29, 149, 0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+        <text x="610" y="740" class="box-title">OPA L4 Decision</text>
+        <text x="610" y="758" class="box-sub">host, port, binary, policy</text>
+
+        <rect x="854" y="540" width="204" height="82" rx="6" fill="#0f172a"/>
+        <rect x="854" y="540" width="204" height="82" rx="6" fill="rgba(8, 51, 68, 0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+        <text x="882" y="570" class="box-title">TLS / L7 Inspection</text>
+        <text x="882" y="589" class="box-sub">REST, GraphQL, WebSocket</text>
+        <text x="882" y="606" class="box-note">method, path, operation, fields</text>
+
+        <rect x="1136" y="540" width="210" height="82" rx="6" fill="#0f172a"/>
+        <rect x="1136" y="540" width="210" height="82" rx="6" fill="rgba(30, 41, 59, 0.5)" stroke="#94a3b8" stroke-width="1.5"/>
+        <text x="1166" y="570" class="box-title">External Services</text>
+        <text x="1166" y="589" class="box-sub">allowed upstream traffic</text>
+        <text x="1166" y="606" class="box-note">credentials resolved only in proxy</text>
+
+        <rect x="854" y="694" width="204" height="72" rx="6" fill="#0f172a"/>
+        <rect x="854" y="694" width="204" height="72" rx="6" fill="rgba(251, 146, 60, 0.3)" stroke="#fb923c" stroke-width="1.5"/>
+        <text x="884" y="723" class="box-title">inference.local</text>
+        <text x="884" y="742" class="box-sub">special route, not OPA network</text>
+
+        <rect x="1136" y="694" width="210" height="72" rx="6" fill="#0f172a"/>
+        <rect x="1136" y="694" width="210" height="72" rx="6" fill="rgba(251, 146, 60, 0.3)" stroke="#fb923c" stroke-width="1.5"/>
+        <text x="1164" y="723" class="box-title">openshell-router</text>
+        <text x="1164" y="742" class="box-sub">configured model backends</text>
+
+        <rect x="854" y="798" width="204" height="62" rx="6" fill="#0f172a"/>
+        <rect x="854" y="798" width="204" height="62" rx="6" fill="rgba(136, 19, 55, 0.4)" stroke="#fb7185" stroke-width="1.5"/>
+        <text x="884" y="826" class="box-title">Deny / Audit / Log</text>
+        <text x="884" y="844" class="box-sub">OCSF + structured 403</text>
+
+        <rect x="1136" y="798" width="210" height="62" rx="6" fill="#0f172a"/>
+        <rect x="1136" y="798" width="210" height="62" rx="6" fill="rgba(120, 53, 15, 0.3)" stroke="#fbbf24" stroke-width="1.5"/>
+        <text x="1164" y="826" class="box-title">Policy Proposals</text>
+        <text x="1164" y="844" class="box-sub">L4 denial summaries to gateway</text>
+
+        <path class="flow" d="M261 589 L323 589" stroke="#34d399" marker-end="url(#arrow-emerald)"/>
+        <text x="276" y="577" class="label">ordinary egress</text>
+        <path class="flow-dash" d="M168 626 L168 668" stroke="#94a3b8" marker-end="url(#arrow-slate)"/>
+        <text x="185" y="651" class="label">bypass attempt</text>
+        <path class="flow" d="M522 589 C548 589 548 571 576 571" stroke="#a78bfa" marker-end="url(#arrow-slate)"/>
+        <path class="flow" d="M522 589 C548 589 548 657 576 657" stroke="#fb7185" marker-end="url(#arrow-rose)"/>
+        <path class="flow" d="M679 602 L679 618" stroke="#a78bfa" marker-end="url(#arrow-slate)"/>
+        <path class="flow" d="M679 688 L679 704" stroke="#a78bfa" marker-end="url(#arrow-slate)"/>
+        <path class="flow" d="M774 743 C810 743 810 581 846 581" stroke="#22d3ee" marker-end="url(#arrow-cyan)"/>
+        <text x="790" y="713" class="label">allowed + protocol inspect</text>
+        <path class="flow" d="M1058 581 L1127 581" stroke="#22d3ee" marker-end="url(#arrow-cyan)"/>
+        <text x="1073" y="570" class="label">forward</text>
+        <path class="flow" d="M774 743 L846 730" stroke="#fb923c" marker-end="url(#arrow-amber)"/>
+        <text x="788" y="759" class="label">special host</text>
+        <path class="flow" d="M1058 730 L1127 730" stroke="#fb923c" marker-end="url(#arrow-amber)"/>
+        <path class="flow-dash" d="M774 743 C816 764 812 829 846 829" stroke="#fb7185" marker-end="url(#arrow-rose)"/>
+        <text x="790" y="803" class="label">deny wins</text>
+        <path class="flow-dash" d="M1058 829 L1127 829" stroke="#fbbf24" marker-end="url(#arrow-amber)"/>
+        <text x="1070" y="818" class="label">L4 DenialEvent</text>
+
+        <!-- Filesystem panel -->
+        <rect x="76" y="1016" width="178" height="74" rx="6" fill="#0f172a"/>
+        <rect x="76" y="1016" width="178" height="74" rx="6" fill="rgba(76, 29, 149, 0.4)" stroke="#a78bfa" stroke-width="1.5"/>
+        <text x="102" y="1046" class="box-title">Policy YAML</text>
+        <text x="102" y="1065" class="box-sub">filesystem_policy</text>
+        <text x="102" y="1080" class="box-note">read_only + read_write</text>
+
+        <rect x="306" y="1006" width="188" height="94" rx="6" fill="#0f172a"/>
+        <rect x="306" y="1006" width="188" height="94" rx="6" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1.5"/>
+        <text x="332" y="1036" class="box-title">Supervisor Prelude</text>
+        <text x="332" y="1055" class="box-sub">load + validate policy</text>
+        <text x="332" y="1072" class="box-sub">enrich baseline paths</text>
+        <text x="332" y="1087" class="box-note">workdir and runtime material</text>
+
+        <rect x="554" y="1006" width="196" height="94" rx="6" fill="#0f172a"/>
+        <rect x="554" y="1006" width="196" height="94" rx="6" fill="rgba(136, 19, 55, 0.4)" stroke="#fb7185" stroke-width="1.5"/>
+        <text x="582" y="1036" class="box-title">Landlock Prepare</text>
+        <text x="582" y="1055" class="box-sub">open PathFds as root</text>
+        <text x="582" y="1072" class="box-sub">build ruleset</text>
+        <text x="582" y="1087" class="box-note">best_effort or hard_requirement</text>
+
+        <rect x="806" y="1006" width="190" height="94" rx="6" fill="#0f172a"/>
+        <rect x="806" y="1006" width="190" height="94" rx="6" fill="rgba(30, 41, 59, 0.5)" stroke="#94a3b8" stroke-width="1.5"/>
+        <text x="834" y="1036" class="box-title">pre_exec Child</text>
+        <text x="834" y="1055" class="box-sub">enter netns/mount ns</text>
+        <text x="834" y="1072" class="box-sub">drop to sandbox user</text>
+        <text x="834" y="1087" class="box-note">no supervisor identity socket</text>
+
+        <rect x="1050" y="1006" width="196" height="94" rx="6" fill="#0f172a"/>
+        <rect x="1050" y="1006" width="196" height="94" rx="6" fill="rgba(136, 19, 55, 0.4)" stroke="#fb7185" stroke-width="1.5"/>
+        <text x="1078" y="1036" class="box-title">Enforce Controls</text>
+        <text x="1078" y="1055" class="box-sub">restrict_self()</text>
+        <text x="1078" y="1072" class="box-sub">seccomp filter</text>
+        <text x="1078" y="1087" class="box-note">raw socket and privilege paths blocked</text>
+
+        <rect x="1278" y="1006" width="154" height="94" rx="6" fill="#0f172a"/>
+        <rect x="1278" y="1006" width="154" height="94" rx="6" fill="rgba(8, 51, 68, 0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+        <text x="1306" y="1036" class="box-title">Exec Agent</text>
+        <text x="1306" y="1055" class="box-sub">restricted runtime</text>
+        <text x="1306" y="1072" class="box-note">undeclared paths denied</text>
+
+        <rect x="242" y="1134" width="200" height="48" rx="6" fill="#0f172a"/>
+        <rect x="242" y="1134" width="200" height="48" rx="6" fill="rgba(8, 51, 68, 0.4)" stroke="#22d3ee" stroke-width="1.5"/>
+        <text x="266" y="1163" class="box-title">Read-only paths</text>
+        <text x="266" y="1178" class="box-note">/usr, /lib, /etc, /app...</text>
+
+        <rect x="476" y="1134" width="200" height="48" rx="6" fill="#0f172a"/>
+        <rect x="476" y="1134" width="200" height="48" rx="6" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399" stroke-width="1.5"/>
+        <text x="500" y="1163" class="box-title">Read-write paths</text>
+        <text x="500" y="1178" class="box-note">/sandbox, /tmp, workdir...</text>
+
+        <rect x="710" y="1134" width="200" height="48" rx="6" fill="#0f172a"/>
+        <rect x="710" y="1134" width="200" height="48" rx="6" fill="rgba(120, 53, 15, 0.3)" stroke="#fbbf24" stroke-width="1.5"/>
+        <text x="734" y="1163" class="box-title">Runtime enrichment</text>
+        <text x="734" y="1178" class="box-note">proxy support, GPU devices</text>
+
+        <rect x="944" y="1134" width="200" height="48" rx="6" fill="#0f172a"/>
+        <rect x="944" y="1134" width="200" height="48" rx="6" fill="rgba(136, 19, 55, 0.4)" stroke="#fb7185" stroke-width="1.5"/>
+        <text x="968" y="1163" class="box-title">Blocked by default</text>
+        <text x="968" y="1178" class="box-note">undeclared filesystem paths</text>
+
+        <path class="flow" d="M254 1053 L297 1053" stroke="#a78bfa" marker-end="url(#arrow-slate)"/>
+        <path class="flow" d="M494 1053 L545 1053" stroke="#34d399" marker-end="url(#arrow-emerald)"/>
+        <path class="flow" d="M750 1053 L797 1053" stroke="#fb7185" marker-end="url(#arrow-rose)"/>
+        <path class="flow" d="M996 1053 L1041 1053" stroke="#94a3b8" marker-end="url(#arrow-slate)"/>
+        <path class="flow" d="M1246 1053 L1269 1053" stroke="#22d3ee" marker-end="url(#arrow-cyan)"/>
+
+        <path class="flow-thin" d="M400 1100 C400 1118 342 1118 342 1128" stroke="#22d3ee" marker-end="url(#arrow-cyan)"/>
+        <path class="flow-thin" d="M400 1100 C400 1120 576 1118 576 1128" stroke="#34d399" marker-end="url(#arrow-emerald)"/>
+        <path class="flow-thin" d="M400 1100 C400 1126 810 1118 810 1128" stroke="#fbbf24" marker-end="url(#arrow-amber)"/>
+        <path class="flow-thin" d="M1148 1100 C1148 1124 1044 1120 1044 1128" stroke="#fb7185" marker-end="url(#arrow-rose)"/>
+
+        <!-- Legend below all boundaries -->
+        <rect x="284" y="1238" width="930" height="70" rx="8" fill="rgba(15, 23, 42, 0.76)" stroke="rgba(148, 163, 184, 0.28)" stroke-width="1.2"/>
+        <text x="306" y="1264" class="legend">Legend</text>
+        <rect x="306" y="1280" width="16" height="10" rx="2" fill="rgba(8, 51, 68, 0.4)" stroke="#22d3ee"/>
+        <text x="332" y="1289" class="legend">client / protocol inspection</text>
+        <rect x="510" y="1280" width="16" height="10" rx="2" fill="rgba(6, 78, 59, 0.4)" stroke="#34d399"/>
+        <text x="536" y="1289" class="legend">gateway or supervisor control</text>
+        <rect x="744" y="1280" width="16" height="10" rx="2" fill="rgba(76, 29, 149, 0.4)" stroke="#a78bfa"/>
+        <text x="770" y="1289" class="legend">policy engine / policy data</text>
+        <rect x="956" y="1280" width="16" height="10" rx="2" fill="rgba(136, 19, 55, 0.4)" stroke="#fb7185"/>
+        <text x="982" y="1289" class="legend">security enforcement / deny path</text>
+      </svg>
+    </section>
+
+    <section class="cards" aria-label="diagram notes">
+      <article class="card">
+        <div class="card-header">
+          <span class="card-dot cyan"></span>
+          <h3>Network Isolation</h3>
+        </div>
+        <ul>
+          <li>Traffic is configured for proxy mode in sandbox policy conversion.</li>
+          <li>The child receives proxy environment variables before exec.</li>
+          <li>Network namespace and nftables reject direct TCP/UDP bypass attempts.</li>
+        </ul>
+      </article>
+
+      <article class="card">
+        <div class="card-header">
+          <span class="card-dot rose"></span>
+          <h3>Filesystem Isolation</h3>
+        </div>
+        <ul>
+          <li>Landlock PathFds are opened while the supervisor still has root privileges.</li>
+          <li>The child drops to the sandbox user before Landlock and seccomp enforcement.</li>
+          <li>Read-only, read-write, workdir, and enriched runtime paths define the visible filesystem.</li>
+        </ul>
+      </article>
+
+      <article class="card">
+        <div class="card-header">
+          <span class="card-dot amber"></span>
+          <h3>Dynamic Policy</h3>
+        </div>
+        <ul>
+          <li>Network policy can reload for new connections or safely parsed HTTP requests.</li>
+          <li>Filesystem and process controls are startup-time controls.</li>
+          <li>L4 denials can become pending gateway policy proposals.</li>
+        </ul>
+      </article>
+    </section>
+
+    <footer>
+      References inspected: docs/about/how-it-works.mdx, architecture/sandbox.md, architecture/security-policy.md, crates/openshell-policy/src/lib.rs, crates/openshell-sandbox/src/policy.rs, crates/openshell-sandbox/src/process.rs, crates/openshell-sandbox/src/sandbox/linux/landlock.rs, crates/openshell-sandbox/src/sandbox/linux/netns.rs, crates/openshell-sandbox/src/sandbox/linux/seccomp.rs, crates/openshell-sandbox/src/sandbox/linux/nft_ruleset.rs.
+    </footer>
+  </main>
+</body>
+</html>

@@ -63,3 +63,138 @@ pub const USER_ENVIRONMENT: &str = "OPENSHELL_USER_ENVIRONMENT";
 /// writes and rotates this file; the supervisor exchanges its contents
 /// for a gateway JWT at startup and on refresh.
 pub const K8S_SA_TOKEN_FILE: &str = "OPENSHELL_K8S_SA_TOKEN_FILE";
+
+/// Runtime role selected for the sandbox supervisor binary.
+pub const SUPERVISOR_ROLE: &str = "OPENSHELL_SUPERVISOR_ROLE";
+
+/// Network enforcement mode selected for the sandbox supervisor binary.
+pub const NETWORK_ENFORCEMENT_MODE: &str = "OPENSHELL_NETWORK_ENFORCEMENT_MODE";
+
+/// Endpoint for an external node/host enforcer.
+pub const ENFORCER_ENDPOINT: &str = "OPENSHELL_ENFORCER_ENDPOINT";
+
+/// Node IP injected by Kubernetes when an external node enforcer is used.
+pub const NODE_IP: &str = "OPENSHELL_NODE_IP";
+
+/// Pod IP injected by Kubernetes for node-enforcer registration.
+pub const POD_IP: &str = "OPENSHELL_POD_IP";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SupervisorRole {
+    /// Runs inside the sandbox/container and owns workload lifecycle.
+    Workload,
+    /// Runs as a privileged host/node-side enforcement component.
+    Enforcer,
+    /// Current local-style topology: one supervisor owns lifecycle and hard controls.
+    #[default]
+    Combined,
+}
+
+impl SupervisorRole {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Workload => "workload",
+            Self::Enforcer => "enforcer",
+            Self::Combined => "combined",
+        }
+    }
+}
+
+impl std::fmt::Display for SupervisorRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for SupervisorRole {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "workload" => Ok(Self::Workload),
+            "enforcer" => Ok(Self::Enforcer),
+            "combined" => Ok(Self::Combined),
+            other => Err(format!(
+                "unknown supervisor role '{other}'; expected 'workload', 'enforcer', or 'combined'"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NetworkEnforcementMode {
+    /// Resolve from the supervisor role and runtime hints.
+    #[default]
+    Auto,
+    /// Cooperative proxy environment only; direct sockets are not kernel-blocked.
+    SoftProxy,
+    /// Supervisor-managed netns/veth/nft enforcement.
+    SupervisorNetns,
+    /// Enforcement delegated to a node/host enforcer.
+    ExternalEnforcer,
+}
+
+impl NetworkEnforcementMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::SoftProxy => "soft-proxy",
+            Self::SupervisorNetns => "supervisor-netns",
+            Self::ExternalEnforcer => "external-enforcer",
+        }
+    }
+}
+
+impl std::fmt::Display for NetworkEnforcementMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for NetworkEnforcementMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "soft-proxy" => Ok(Self::SoftProxy),
+            "supervisor-netns" => Ok(Self::SupervisorNetns),
+            "external-enforcer" => Ok(Self::ExternalEnforcer),
+            other => Err(format!(
+                "unknown network enforcement mode '{other}'; expected 'auto', 'soft-proxy', 'supervisor-netns', or 'external-enforcer'"
+            )),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NetworkEnforcementMode, SupervisorRole};
+
+    #[test]
+    fn supervisor_role_round_trips_kebab_case() {
+        assert_eq!("workload".parse(), Ok(SupervisorRole::Workload));
+        assert_eq!(SupervisorRole::Enforcer.to_string(), "enforcer");
+        assert_eq!(
+            serde_json::to_value(SupervisorRole::Combined).unwrap(),
+            serde_json::json!("combined")
+        );
+    }
+
+    #[test]
+    fn network_enforcement_mode_round_trips_kebab_case() {
+        assert_eq!("soft-proxy".parse(), Ok(NetworkEnforcementMode::SoftProxy));
+        assert_eq!(
+            NetworkEnforcementMode::ExternalEnforcer.to_string(),
+            "external-enforcer"
+        );
+        assert_eq!(
+            serde_json::to_value(NetworkEnforcementMode::SupervisorNetns).unwrap(),
+            serde_json::json!("supervisor-netns")
+        );
+    }
+}

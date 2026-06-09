@@ -1,0 +1,434 @@
+<!--
+SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+SPDX-License-Identifier: Apache-2.0
+-->
+
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OpenShell Kubernetes Isolation Tradeoffs</title>
+  <style>
+    :root {
+      --bg: #05070b;
+      --panel: #0f172a;
+      --line: #334155;
+      --text: #e5e7eb;
+      --muted: #9ca3af;
+      --blue: #38bdf8;
+      --green: #34d399;
+      --amber: #fbbf24;
+      --red: #fb7185;
+      --violet: #a78bfa;
+      --orange: #fb923c;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--text);
+      background:
+        linear-gradient(140deg, rgba(56, 189, 248, 0.08), transparent 28rem),
+        linear-gradient(330deg, rgba(251, 191, 36, 0.07), transparent 30rem),
+        var(--bg);
+      font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    main {
+      width: min(1640px, calc(100vw - 32px));
+      margin: 0 auto;
+      padding: 28px 0 36px;
+    }
+
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: end;
+      gap: 24px;
+      margin-bottom: 18px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(24px, 4vw, 40px);
+      letter-spacing: 0;
+      font-weight: 780;
+    }
+
+    .subtitle {
+      margin: 9px 0 0;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.55;
+      max-width: 980px;
+    }
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 10px;
+      border: 1px solid rgba(148, 163, 184, 0.22);
+      border-radius: 8px;
+      color: #cbd5e1;
+      background: rgba(15, 23, 42, 0.72);
+      font-size: 11px;
+      white-space: nowrap;
+    }
+
+    .tag::before {
+      content: "";
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: var(--amber);
+      box-shadow: 0 0 16px rgba(251, 191, 36, 0.75);
+    }
+
+    .diagram {
+      overflow: auto;
+      border: 1px solid rgba(148, 163, 184, 0.24);
+      border-radius: 8px;
+      background: rgba(15, 23, 42, 0.72);
+      box-shadow: 0 20px 70px rgba(0, 0, 0, 0.34);
+    }
+
+    svg {
+      display: block;
+      width: 100%;
+      min-width: 1220px;
+      height: auto;
+    }
+
+    .notes {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 14px;
+      margin-top: 16px;
+    }
+
+    .note {
+      border: 1px solid rgba(148, 163, 184, 0.22);
+      border-radius: 8px;
+      background: rgba(15, 23, 42, 0.76);
+      padding: 14px;
+    }
+
+    .note h3 {
+      margin: 0 0 8px;
+      font-size: 12px;
+      letter-spacing: 0;
+    }
+
+    .note p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.55;
+    }
+
+    footer {
+      margin-top: 15px;
+      color: #64748b;
+      font-size: 10px;
+      line-height: 1.6;
+    }
+
+    footer a {
+      color: #93c5fd;
+    }
+
+    @media (max-width: 980px) {
+      main {
+        width: calc(100vw - 20px);
+        padding-top: 18px;
+      }
+
+      .header {
+        display: block;
+      }
+
+      .tag {
+        margin-top: 12px;
+      }
+
+      .notes {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header class="header">
+      <div>
+        <h1>Kubernetes Isolation Tradeoffs</h1>
+        <p class="subtitle">
+          Current OpenShell keeps the supervisor and agent in one Kubernetes sandbox pod. The split-pod proposals move untrusted agent execution into a separate pod and use platform egress controls, while the Isolation Backend proposal turns the boundary machinery into an explicit contract.
+        </p>
+      </div>
+      <div class="tag">current vs proposed states</div>
+    </header>
+
+    <section class="diagram" aria-label="OpenShell Kubernetes isolation tradeoff diagram">
+      <svg viewBox="0 0 1600 1380" role="img" aria-labelledby="diagram-title diagram-desc">
+        <title id="diagram-title">OpenShell Kubernetes isolation tradeoffs</title>
+        <desc id="diagram-desc">Comparison of current in-pod isolation, proposed split-pod isolation, and an isolation backend abstraction for OpenShell Kubernetes sandboxes.</desc>
+        <defs>
+          <pattern id="grid" width="36" height="36" patternUnits="userSpaceOnUse">
+            <path d="M 36 0 L 0 0 0 36" fill="none" stroke="#1f2937" stroke-width="0.5"/>
+          </pattern>
+          <marker id="arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#38bdf8"/>
+          </marker>
+          <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#34d399"/>
+          </marker>
+          <marker id="arrow-amber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#fbbf24"/>
+          </marker>
+          <marker id="arrow-red" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#fb7185"/>
+          </marker>
+          <marker id="arrow-violet" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="#a78bfa"/>
+          </marker>
+          <style>
+            .title { fill: #f8fafc; font-size: 17px; font-weight: 780; letter-spacing: 0; }
+            .subtitle { fill: #94a3b8; font-size: 9px; letter-spacing: 0; }
+            .label { fill: #cbd5e1; font-size: 9px; letter-spacing: 0; }
+            .tiny { fill: #94a3b8; font-size: 7px; letter-spacing: 0; }
+            .box-title { fill: #f8fafc; font-size: 11px; font-weight: 750; letter-spacing: 0; }
+            .box-sub { fill: #cbd5e1; font-size: 8px; letter-spacing: 0; }
+            .warn { fill: #fbbf24; font-size: 8px; letter-spacing: 0; }
+            .loss { fill: #fb7185; font-size: 8px; letter-spacing: 0; }
+            .gain { fill: #34d399; font-size: 8px; letter-spacing: 0; }
+            .flow { fill: none; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+            .dash { fill: none; stroke-width: 1.4; stroke-dasharray: 5 5; stroke-linecap: round; stroke-linejoin: round; }
+            .thin { fill: none; stroke-width: 1.1; stroke-linecap: round; stroke-linejoin: round; }
+          </style>
+        </defs>
+
+        <rect width="1600" height="1380" fill="#05070b"/>
+        <rect width="1600" height="1380" fill="url(#grid)" opacity="0.9"/>
+
+        <!-- Column panels -->
+        <rect x="40" y="42" width="480" height="865" rx="12" fill="rgba(30, 41, 59, 0.50)" stroke="#64748b" stroke-width="1.3"/>
+        <text x="66" y="78" class="title">A. Current Kubernetes State</text>
+        <text x="66" y="99" class="subtitle">single sandbox pod, supervisor builds the inner boundary</text>
+
+        <rect x="560" y="42" width="480" height="865" rx="12" fill="rgba(6, 78, 59, 0.18)" stroke="#34d399" stroke-width="1.3"/>
+        <text x="586" y="78" class="title">B. Split-Pod Proposal</text>
+        <text x="586" y="99" class="subtitle">trusted supervisor pod, untrusted agent pod, CNI egress boundary</text>
+
+        <rect x="1080" y="42" width="480" height="865" rx="12" fill="rgba(76, 29, 149, 0.18)" stroke="#a78bfa" stroke-width="1.3"/>
+        <text x="1106" y="78" class="title">C. Isolation Backend Interface</text>
+        <text x="1106" y="99" class="subtitle">common supervisor contract, backend-specific boundary realization</text>
+
+        <!-- Current column -->
+        <rect x="86" y="128" width="388" height="520" rx="12" fill="rgba(15, 23, 42, 0.86)" stroke="#94a3b8" stroke-width="1.2" stroke-dasharray="8 4"/>
+        <text x="108" y="156" class="label">Sandbox Pod</text>
+
+        <rect x="116" y="184" width="328" height="106" rx="7" fill="#0f172a" stroke="#34d399" stroke-width="1.4"/>
+        <text x="142" y="216" class="box-title">openshell-sandbox supervisor</text>
+        <text x="142" y="236" class="box-sub">root prelude, proxy, OPA, credentials</text>
+        <text x="142" y="253" class="box-sub">SSH relay, logs, process spawn</text>
+        <text x="142" y="271" class="warn">requires elevated pod capabilities</text>
+
+        <rect x="116" y="342" width="328" height="120" rx="7" fill="#0f172a" stroke="#38bdf8" stroke-width="1.4"/>
+        <text x="142" y="374" class="box-title">Inner network namespace</text>
+        <text x="142" y="394" class="box-sub">veth route forces egress to proxy</text>
+        <text x="142" y="411" class="box-sub">nftables rejects direct TCP/UDP bypass</text>
+        <text x="142" y="429" class="box-sub">bypass monitor records attempts</text>
+
+        <rect x="154" y="514" width="252" height="76" rx="7" fill="#0f172a" stroke="#fb7185" stroke-width="1.4"/>
+        <text x="180" y="544" class="box-title">Restricted agent process</text>
+        <text x="180" y="564" class="box-sub">sandbox user, Landlock, seccomp</text>
+        <text x="180" y="580" class="box-sub">binary identity via /proc</text>
+
+        <path class="flow" d="M280 290 L280 334" stroke="#34d399" marker-end="url(#arrow-green)"/>
+        <text x="292" y="318" class="label">spawn</text>
+        <path class="flow" d="M280 462 L280 506" stroke="#38bdf8" marker-end="url(#arrow-blue)"/>
+        <text x="292" y="489" class="label">enter namespace</text>
+
+        <rect x="88" y="694" width="386" height="170" rx="8" fill="rgba(2, 6, 23, 0.58)" stroke="#475569"/>
+        <text x="112" y="724" class="box-title">Current tradeoffs</text>
+        <text x="112" y="750" class="gain">+ Strong in-pod egress forcing independent of CNI</text>
+        <text x="112" y="772" class="gain">+ Per-binary network policy input still available</text>
+        <text x="112" y="794" class="loss">- Supervisor privilege sits in same pod as agent</text>
+        <text x="112" y="816" class="loss">- Blocks restricted-v2 / hardened managed clusters</text>
+        <text x="112" y="838" class="loss">- Agent and supervisor logs share the workload stream</text>
+
+        <!-- Split-pod column -->
+        <rect x="598" y="132" width="178" height="228" rx="12" fill="rgba(15, 23, 42, 0.86)" stroke="#34d399" stroke-width="1.2" stroke-dasharray="8 4"/>
+        <text x="624" y="160" class="label">Supervisor Pod</text>
+
+        <rect x="620" y="188" width="134" height="66" rx="7" fill="#0f172a" stroke="#34d399" stroke-width="1.4"/>
+        <text x="640" y="217" class="box-title">Proxy + OPA</text>
+        <text x="640" y="236" class="box-sub">L7 policy gate</text>
+
+        <rect x="620" y="276" width="134" height="54" rx="7" fill="#0f172a" stroke="#a78bfa" stroke-width="1.4"/>
+        <text x="640" y="307" class="box-title">Credentials</text>
+        <text x="640" y="323" class="box-sub">never in agent pod</text>
+
+        <rect x="820" y="132" width="178" height="228" rx="12" fill="rgba(15, 23, 42, 0.86)" stroke="#fb7185" stroke-width="1.2" stroke-dasharray="8 4"/>
+        <text x="844" y="160" class="label">Agent Pod</text>
+
+        <rect x="842" y="188" width="134" height="70" rx="7" fill="#0f172a" stroke="#fb7185" stroke-width="1.4"/>
+        <text x="862" y="217" class="box-title">Untrusted image</text>
+        <text x="862" y="236" class="box-sub">non-root, no caps</text>
+        <text x="862" y="251" class="box-sub">gVisor or Kata</text>
+
+        <rect x="842" y="278" width="134" height="52" rx="7" fill="#0f172a" stroke="#fbbf24" stroke-width="1.4"/>
+        <text x="858" y="308" class="box-title">Sideload binary</text>
+        <text x="858" y="323" class="box-sub">optional SSH/Landlock</text>
+
+        <rect x="635" y="420" width="320" height="95" rx="8" fill="#0f172a" stroke="#38bdf8" stroke-width="1.4"/>
+        <text x="662" y="452" class="box-title">Kubernetes NetworkPolicy</text>
+        <text x="662" y="472" class="box-sub">allow: agent pod to supervisor:3128</text>
+        <text x="662" y="489" class="box-sub">allow: DNS when configured</text>
+        <text x="662" y="506" class="box-sub">deny: all other direct egress at CNI layer</text>
+
+        <rect x="635" y="558" width="320" height="72" rx="8" fill="#0f172a" stroke="#fb923c" stroke-width="1.4"/>
+        <text x="662" y="588" class="box-title">RuntimeClass</text>
+        <text x="662" y="608" class="box-sub">gVisor userspace kernel or Kata VM boundary</text>
+
+        <path class="flow" d="M842 224 C800 224 802 224 762 224" stroke="#38bdf8" marker-end="url(#arrow-blue)"/>
+        <text x="774" y="211" class="label">HTTP_PROXY</text>
+        <path class="dash" d="M909 258 L909 412" stroke="#38bdf8" marker-end="url(#arrow-blue)"/>
+        <text x="922" y="382" class="label">non-cooperative traffic</text>
+        <path class="flow" d="M795 515 L795 550" stroke="#fb923c" marker-end="url(#arrow-amber)"/>
+
+        <rect x="598" y="694" width="402" height="170" rx="8" fill="rgba(2, 6, 23, 0.58)" stroke="#475569"/>
+        <text x="622" y="724" class="box-title">Split-pod tradeoffs</text>
+        <text x="622" y="750" class="gain">+ Agent pod can run non-root with zero capabilities</text>
+        <text x="622" y="772" class="gain">+ gVisor/Kata reduces host-kernel blast radius</text>
+        <text x="622" y="794" class="gain">+ Separate log streams for audit and agent output</text>
+        <text x="622" y="816" class="loss">- Per-binary destination restrictions are lost cross-pod</text>
+        <text x="622" y="838" class="loss">- Enforcement now depends on CNI NetworkPolicy support</text>
+
+        <!-- Isolation backend column -->
+        <rect x="1118" y="128" width="402" height="96" rx="8" fill="#0f172a" stroke="#34d399" stroke-width="1.4"/>
+        <text x="1146" y="160" class="box-title">Supervisor stays policy authority</text>
+        <text x="1146" y="181" class="box-sub">proxy, OPA, credentials, audit, inference routing</text>
+        <text x="1146" y="199" class="box-sub">drives one runtime contract instead of inline topology code</text>
+
+        <rect x="1118" y="272" width="402" height="102" rx="8" fill="#0f172a" stroke="#a78bfa" stroke-width="1.4"/>
+        <text x="1146" y="304" class="box-title">Isolation Backend contract</text>
+        <text x="1146" y="325" class="box-sub">realize boundary, return verifiable handle</text>
+        <text x="1146" y="342" class="box-sub">fail closed if boundary is not ready</text>
+        <text x="1146" y="359" class="box-sub">operator-selected, not workload-selected</text>
+
+        <rect x="1118" y="422" width="128" height="88" rx="8" fill="#0f172a" stroke="#38bdf8" stroke-width="1.4"/>
+        <text x="1142" y="456" class="box-title">In-pod</text>
+        <text x="1142" y="476" class="box-sub">netns + nft</text>
+        <text x="1142" y="492" class="box-sub">status quo path</text>
+
+        <rect x="1252" y="422" width="128" height="88" rx="8" fill="#0f172a" stroke="#34d399" stroke-width="1.4"/>
+        <text x="1274" y="456" class="box-title">Delegated</text>
+        <text x="1274" y="476" class="box-sub">split pod</text>
+        <text x="1274" y="492" class="box-sub">CNI boundary</text>
+
+        <rect x="1386" y="422" width="128" height="88" rx="8" fill="#0f172a" stroke="#fb923c" stroke-width="1.4"/>
+        <text x="1408" y="456" class="box-title">VM / Node</text>
+        <text x="1408" y="476" class="box-sub">microVM</text>
+        <text x="1408" y="492" class="box-sub">node agent</text>
+
+        <rect x="1118" y="562" width="402" height="72" rx="8" fill="#0f172a" stroke="#fbbf24" stroke-width="1.4"/>
+        <text x="1146" y="592" class="box-title">Two invariants</text>
+        <text x="1146" y="612" class="box-sub">no unguarded workload egress before verification</text>
+        <text x="1146" y="628" class="box-sub">no workload execution before boundary ready</text>
+
+        <path class="flow" d="M1319 224 L1319 264" stroke="#a78bfa" marker-end="url(#arrow-violet)"/>
+        <path class="flow" d="M1319 374 L1319 414" stroke="#a78bfa" marker-end="url(#arrow-violet)"/>
+        <path class="thin" d="M1319 510 L1319 554" stroke="#fbbf24" marker-end="url(#arrow-amber)"/>
+        <path class="thin" d="M1319 510 C1240 532 1184 536 1184 554" stroke="#38bdf8" marker-end="url(#arrow-blue)"/>
+        <path class="thin" d="M1319 510 C1418 532 1450 536 1450 554" stroke="#fb923c" marker-end="url(#arrow-amber)"/>
+
+        <rect x="1118" y="694" width="402" height="170" rx="8" fill="rgba(2, 6, 23, 0.58)" stroke="#475569"/>
+        <text x="1142" y="724" class="box-title">Abstraction tradeoffs</text>
+        <text x="1142" y="750" class="gain">+ Separates policy authority from boundary machinery</text>
+        <text x="1142" y="772" class="gain">+ Lets split-pod, VM, or node-agent backends share a contract</text>
+        <text x="1142" y="794" class="gain">+ Enables in-pod refactor first, delegated later</text>
+        <text x="1142" y="816" class="loss">- Requires verifiable handoff and fail-closed semantics</text>
+        <text x="1142" y="838" class="loss">- Scope is unsettled: network only vs fs/syscall/process too</text>
+
+        <!-- Cross-column comparison -->
+        <rect x="40" y="948" width="1520" height="300" rx="12" fill="rgba(15, 23, 42, 0.68)" stroke="#334155" stroke-width="1.2"/>
+        <text x="66" y="985" class="title">Decision Map</text>
+        <text x="66" y="1006" class="subtitle">The diagrams point to different places for the hard boundary. That changes who must be trusted and which controls are enforceable.</text>
+
+        <line x1="66" y1="1030" x2="1534" y2="1030" stroke="#334155"/>
+        <text x="80" y="1058" class="label">Hard egress boundary</text>
+        <text x="390" y="1058" class="box-sub">current: netns + nftables inside pod</text>
+        <text x="755" y="1058" class="box-sub">split-pod: CNI NetworkPolicy outside agent pod</text>
+        <text x="1185" y="1058" class="box-sub">backend: selected per environment, verified by contract</text>
+
+        <line x1="66" y1="1078" x2="1534" y2="1078" stroke="#1f2937"/>
+        <text x="80" y="1106" class="label">Kernel isolation</text>
+        <text x="390" y="1106" class="box-sub">current: runc + seccomp + Landlock</text>
+        <text x="755" y="1106" class="box-sub">split-pod: gVisor userspace kernel or Kata VM</text>
+        <text x="1185" y="1106" class="box-sub">backend: can represent in-pod, VM, or delegated runtime</text>
+
+        <line x1="66" y1="1126" x2="1534" y2="1126" stroke="#1f2937"/>
+        <text x="80" y="1154" class="label">L7, credentials, inference</text>
+        <text x="390" y="1154" class="box-sub">current: local supervisor proxy</text>
+        <text x="755" y="1154" class="box-sub">split-pod: supervisor pod proxy</text>
+        <text x="1185" y="1154" class="box-sub">backend: remains with supervisor policy authority</text>
+
+        <line x1="66" y1="1174" x2="1534" y2="1174" stroke="#1f2937"/>
+        <text x="80" y="1202" class="label">Known loss / risk</text>
+        <text x="390" y="1202" class="box-sub">current: privileged setup near untrusted workload</text>
+        <text x="755" y="1202" class="box-sub">split-pod: per-binary policy and deny logs become weaker</text>
+        <text x="1185" y="1202" class="box-sub">backend: verification and versioning become first-class</text>
+
+        <line x1="66" y1="1222" x2="1534" y2="1222" stroke="#1f2937"/>
+        <text x="80" y="1250" class="label">Best fit</text>
+        <text x="390" y="1250" class="box-sub">local dev, k3d/k3s, environments allowing capabilities</text>
+        <text x="755" y="1250" class="box-sub">enterprise clusters, OpenShift/Gardener-style restrictions</text>
+        <text x="1185" y="1250" class="box-sub">long-term architecture that lets both shapes coexist</text>
+
+        <!-- Source strip -->
+        <rect x="220" y="1288" width="1160" height="48" rx="8" fill="rgba(2, 6, 23, 0.7)" stroke="#334155"/>
+        <text x="244" y="1318" class="tiny">Sources: current code/docs; #899 restricted SCC; #981 split supervisor/agent pod; #1305 proxy/runtime decomposition; #1650 process/network split PR; #1703 external compute driver PR; #1737 Isolation Backend interface.</text>
+      </svg>
+    </section>
+
+    <section class="notes" aria-label="summary notes">
+      <article class="note">
+        <h3>Current State</h3>
+        <p>The Kubernetes driver creates one Sandbox CR whose pod runs the agent container with supervisor sideloading and elevated capabilities so the supervisor can create the inner network namespace.</p>
+      </article>
+      <article class="note">
+        <h3>Split Pod</h3>
+        <p>The proposal moves the proxy and policy authority into a trusted supervisor pod. The agent pod becomes untrusted, non-root, no-capabilities, and optionally gVisor or Kata isolated.</p>
+      </article>
+      <article class="note">
+        <h3>NetworkPolicy</h3>
+        <p>Today Helm renders an ingress-only sandbox SSH NetworkPolicy. The split-pod proposal adds egress NetworkPolicy so agent pods can reach only the supervisor proxy and DNS.</p>
+      </article>
+      <article class="note">
+        <h3>Backend Interface</h3>
+        <p>The interface proposal keeps the supervisor as policy authority while letting in-pod, split-pod, VM, or node-agent backends realize the isolation boundary with explicit verification.</p>
+      </article>
+    </section>
+
+    <footer>
+      Sources used: <a href="https://github.com/NVIDIA/OpenShell/issues/899">#899</a>,
+      <a href="https://github.com/NVIDIA/OpenShell/issues/981">#981</a>,
+      <a href="https://github.com/NVIDIA/OpenShell/issues/1305">#1305</a>,
+      <a href="https://github.com/NVIDIA/OpenShell/pull/1650">PR #1650</a>,
+      <a href="https://github.com/NVIDIA/OpenShell/pull/1703">PR #1703</a>,
+      <a href="https://github.com/NVIDIA/OpenShell/issues/1737">#1737</a>,
+      plus local files <code>architecture/compute-runtimes.md</code>,
+      <code>deploy/helm/openshell/templates/networkpolicy.yaml</code>, and
+      <code>crates/openshell-driver-kubernetes/src/driver.rs</code>.
+    </footer>
+  </main>
+</body>
+</html>
