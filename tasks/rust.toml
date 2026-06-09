@@ -25,3 +25,17 @@ hide = true
 description = "Check Rust formatting"
 run = "cargo fmt --all -- --check"
 hide = true
+
+["rust:verify:telemetry-off"]
+description = "Verify telemetry emission code is compiled out with --no-default-features"
+run = [
+  # Positive control: the default (telemetry-on) gateway must contain the
+  # markers, so the absent checks below can never become silently vacuous.
+  "cargo build -p openshell-server --bin openshell-gateway",
+  "tasks/scripts/verify-telemetry-compiled-out.sh present target/debug/openshell-gateway",
+  # Guard: telemetry-free builds must contain no telemetry markers.
+  "cargo build -p openshell-server --bin openshell-gateway --no-default-features",
+  "tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-gateway",
+  "cargo build -p openshell-sandbox --bin openshell-sandbox --no-default-features",
+  "tasks/scripts/verify-telemetry-compiled-out.sh absent target/debug/openshell-sandbox",
+]
