@@ -28,7 +28,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: &targets
+        target:
           - system: x86_64-linux
             runner: linux-amd64-cpu8
           - system: aarch64-linux
@@ -41,26 +41,15 @@ jobs:
           - openshell-driver-podman
           - openshell-driver-vm
     steps:
-      - &checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-
-      - &install-nix
-        name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@main
-        with:
-          extra-conf: |
-            accept-flake-config = true
-
-      - &setup-cachix
-        name: Set up Cachix
-        uses: cachix/cachix-action@5f2d7c5294214f71b873db4b969586b980625e71 # v17
-        with:
-          name: openshell
-          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
-          skipAddingSubstituter: true
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Build package
-        run: nix build ".#packages.${{ matrix.target.system }}.${{ matrix.package }}" --no-link --no-update-lock-file
+        uses: ./.github/actions/setup-nix
+        with:
+          build: packages
+          system: ${{ matrix.target.system }}
+          target: ${{ matrix.package }}
+          cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
   test:
     name: Test ${{ matrix.check }} (${{ matrix.target.system }})
@@ -69,7 +58,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: *targets
+        target:
+          - system: x86_64-linux
+            runner: linux-amd64-cpu8
+          - system: aarch64-linux
+            runner: linux-arm64-cpu8
         check:
           - openshell-bootstrap-test
           - openshell-cli-test
@@ -89,12 +82,15 @@ jobs:
           - openshell-tui-test
           - openshell-vfio-test
     steps:
-      - *checkout
-      - *install-nix
-      - *setup-cachix
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Run test
-        run: nix build ".#checks.${{ matrix.target.system }}.${{ matrix.check }}" --no-link --no-update-lock-file
+        uses: ./.github/actions/setup-nix
+        with:
+          build: checks
+          system: ${{ matrix.target.system }}
+          target: ${{ matrix.check }}
+          cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
   lint:
     name: Lint ${{ matrix.lint }} (${{ matrix.target.system }})
@@ -102,7 +98,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: *targets
+        target:
+          - system: x86_64-linux
+            runner: linux-amd64-cpu8
+          - system: aarch64-linux
+            runner: linux-arm64-cpu8
         lint:
           - rustfmt
           - openshell-bootstrap-clippy
@@ -123,9 +123,12 @@ jobs:
           - openshell-tui-clippy
           - openshell-vfio-clippy
     steps:
-      - *checkout
-      - *install-nix
-      - *setup-cachix
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
       - name: Run lint
-        run: nix build ".#checks.${{ matrix.target.system }}.${{ matrix.lint }}" --no-link --no-update-lock-file
+        uses: ./.github/actions/setup-nix
+        with:
+          build: checks
+          system: ${{ matrix.target.system }}
+          target: ${{ matrix.lint }}
+          cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
