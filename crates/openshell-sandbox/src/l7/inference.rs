@@ -116,17 +116,28 @@ pub fn default_patterns() -> Vec<InferenceApiPattern> {
         },
         // AWS Bedrock InvokeModel + InvokeModelWithResponseStream. The `*`
         // segment is the Bedrock model id (e.g. `anthropic.claude-opus-4-7`).
+        //
+        // Framing differs between the two endpoints. InvokeModel returns ONE
+        // JSON object the client decodes whole — it must be served buffered
+        // with an accurate `Content-Length`, otherwise the streaming proxy's
+        // size-cap or idle-timeout failure mode would append an SSE error
+        // event to bytes the caller decodes as one JSON object, silently
+        // corrupting it. InvokeModelWithResponseStream returns an
+        // AWS event-stream of binary chunks and must go through the
+        // streaming path so chunks reach the agent incrementally.
         InferenceApiPattern {
             method: "POST".to_string(),
             path_glob: "/model/*/invoke".to_string(),
             protocol: "aws_bedrock_invoke".to_string(),
             kind: "messages".to_string(),
+            framing: ResponseFraming::Buffered,
         },
         InferenceApiPattern {
             method: "POST".to_string(),
             path_glob: "/model/*/invoke-with-response-stream".to_string(),
             protocol: "aws_bedrock_invoke_stream".to_string(),
             kind: "messages".to_string(),
+            framing: ResponseFraming::Streaming,
         },
     ]
 }
@@ -637,6 +648,43 @@ mod tests {
     fn aws_bedrock_rejects_unknown_action() {
         let patterns = default_patterns();
         assert!(detect_inference_pattern("POST", "/model/foo/converse", &patterns).is_none());
+    }
+
+    /// `InvokeModel` returns one JSON object — must be served buffered.
+    /// Sending it through the streaming proxy would risk truncation or an
+    /// appended SSE error event corrupting the JSON body the caller decodes.
+    #[test]
+    fn aws_bedrock_invoke_is_buffered() {
+        let patterns = default_patterns();
+        let invoke =
+            detect_inference_pattern("POST", "/model/anthropic.claude-opus-4-7/invoke", &patterns)
+                .expect("InvokeModel pattern must match");
+        assert_eq!(invoke.protocol, "aws_bedrock_invoke");
+        assert!(
+            invoke.is_buffered(),
+            "InvokeModel must be Buffered (one JSON object, accurate Content-Length); \
+             streaming would risk corrupting the response"
+        );
+    }
+
+    /// `InvokeModelWithResponseStream` returns an AWS event-stream of
+    /// binary chunks — must go through the streaming proxy so chunks
+    /// reach the agent incrementally.
+    #[test]
+    fn aws_bedrock_invoke_stream_is_streaming() {
+        let patterns = default_patterns();
+        let stream = detect_inference_pattern(
+            "POST",
+            "/model/anthropic.claude-opus-4-7/invoke-with-response-stream",
+            &patterns,
+        )
+        .expect("InvokeModelWithResponseStream pattern must match");
+        assert_eq!(stream.protocol, "aws_bedrock_invoke_stream");
+        assert!(
+            !stream.is_buffered(),
+            "InvokeModelWithResponseStream must be Streaming so the AWS \
+             event-stream chunks reach the agent incrementally"
+        );
     }
 
     #[test]
