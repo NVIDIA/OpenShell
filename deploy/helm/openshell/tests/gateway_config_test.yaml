@@ -170,6 +170,22 @@ tests:
           path: spec.template.spec.containers[0].args
           content: "sqlite:/var/openshell/openshell.db"
 
+  - it: fails when legacy postgres.enabled is set
+    template: templates/statefulset.yaml
+    set:
+      postgres.enabled: true
+    asserts:
+      - failedTemplate:
+          errorPattern: "postgres.enabled was removed"
+
+  - it: fails when multiple replicas use the default SQLite database
+    template: templates/statefulset.yaml
+    set:
+      replicaCount: 2
+    asserts:
+      - failedTemplate:
+          errorPattern: "replicaCount > 1 requires server.externalDbSecret"
+
   - it: does not pass --db-url in args when externalDbSecret is set
     template: templates/statefulset.yaml
     set:

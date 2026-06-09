@@ -3,7 +3,8 @@
 
 # Default values for OpenShell
 
-# -- Number of OpenShell gateway replicas.
+# -- Number of OpenShell gateway replicas. Values greater than 1 require
+# server.externalDbSecret because the default SQLite backend is per pod.
 replicaCount: 1
 
 image:

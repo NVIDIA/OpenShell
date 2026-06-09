@@ -161,7 +161,7 @@ JWT signing Secret.
 | probes.startup.failureThreshold | int | `30` | Startup probe failure threshold before the container is killed. |
 | probes.startup.periodSeconds | int | `2` | Startup probe period, in seconds. |
 | probes.startup.timeoutSeconds | int | `1` | Startup probe timeout, in seconds. |
-| replicaCount | int | `1` | Number of OpenShell gateway replicas. |
+| replicaCount | int | `1` | Number of OpenShell gateway replicas. Values greater than 1 require server.externalDbSecret because the default SQLite backend is per pod. |
 | resources | object | `{}` | Gateway pod resource requests and limits. |
 | sandboxServiceAccount.annotations | object | `{}` | Annotations to add to the generated sandbox service account. |
 | sandboxServiceAccount.create | bool | `true` | Create a service account for sandbox pods. |

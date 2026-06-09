@@ -143,3 +143,15 @@ init-container
 {{- printf "%s://%s.%s.svc.cluster.local:%d" $scheme (include "openshell.fullname" .) .Release.Namespace (int .Values.service.port) -}}
 {{- end -}}
 {{- end }}
+
+{{/*
+Validate chart values that Helm would otherwise accept silently.
+*/}}
+{{- define "openshell.validateValues" -}}
+{{- if and (hasKey .Values "postgres") (kindIs "map" .Values.postgres) (hasKey .Values.postgres "enabled") -}}
+{{- fail "postgres.enabled was removed; the OpenShell chart no longer deploys PostgreSQL. Provision PostgreSQL separately and set server.externalDbSecret to a Secret containing a PostgreSQL URI." -}}
+{{- end -}}
+{{- if and (gt (int (default 1 .Values.replicaCount)) 1) (not .Values.server.externalDbSecret) -}}
+{{- fail "replicaCount > 1 requires server.externalDbSecret; multiple gateway replicas cannot share the default per-pod SQLite database." -}}
+{{- end -}}
+{{- end }}
