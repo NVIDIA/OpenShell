@@ -188,9 +188,19 @@ let
           cargoArtifacts = cratesTestDeps;
         }
       );
+
+      clippy = craneLib.cargoClippy (
+        common
+        // {
+          inherit src;
+          nativeBuildInputs = lib.unique (effectiveNativeBuildInputs ++ nativeCheckInputs);
+          cargoArtifacts = cratesTestDeps;
+          cargoClippyExtraArgs = "--all-targets -- -D warnings";
+        }
+      );
     in
     {
-      inherit package test;
+      inherit package test clippy;
     };
 in
 {

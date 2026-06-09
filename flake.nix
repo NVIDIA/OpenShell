@@ -63,6 +63,13 @@
           openshell-driver-podman = workspaceCrates.openshell-driver-podman.package;
         };
 
+        crateTests = lib.mapAttrs' (
+          name: crate: lib.nameValuePair "${name}-test" crate.test
+        ) workspaceCrates;
+        crateClippy = lib.mapAttrs' (
+          name: crate: lib.nameValuePair "${name}-clippy" crate.clippy
+        ) workspaceCrates;
+
         treefmtEval = treefmt-nix.lib.evalModule pkgs {
           projectRootFile = "flake.nix";
           programs.nixfmt.enable = true;
@@ -77,7 +84,8 @@
         };
 
         checks =
-          lib.mapAttrs' (name: crate: lib.nameValuePair "${name}-test" crate.test) workspaceCrates
+          crateTests
+          // crateClippy
           // {
             rustfmt = craneLib.cargoFmt {
               pname = "openshell-workspace";
