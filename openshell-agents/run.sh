@@ -510,13 +510,14 @@ done
 
 PAYLOAD_PARENT="$(mktemp -d "${TMPDIR:-/tmp}/openshell-agent.XXXXXX")"
 PAYLOAD_DIR="$PAYLOAD_PARENT/payload"
+WORKSPACE_UPLOAD_DIR="$PAYLOAD_PARENT/workspace"
 PAYLOAD_IMAGE_DIR="/etc/openshell/agent-payload"
 cleanup_payload() {
     rm -rf "$PAYLOAD_PARENT"
 }
 trap 'cleanup_config; cleanup_payload' EXIT
 
-mkdir -p "$PAYLOAD_DIR"
+mkdir -p "$PAYLOAD_DIR" "$WORKSPACE_UPLOAD_DIR"
 cp -R "$SCRIPT_DIR/runtime" "$PAYLOAD_DIR/runtime"
 chmod +x "$PAYLOAD_DIR/runtime"/*.sh
 chmod +x "$PAYLOAD_DIR/runtime/harnesses/$HARNESS"/*.sh
@@ -712,6 +713,7 @@ SANDBOX_CMD=(
     --name "$SANDBOX_NAME"
     --from "$SANDBOX_FROM"
     "${PROVIDER_ARGS[@]}"
+    --upload "$WORKSPACE_UPLOAD_DIR:/sandbox"
     --no-git-ignore
     --no-auto-providers
     --no-tty
