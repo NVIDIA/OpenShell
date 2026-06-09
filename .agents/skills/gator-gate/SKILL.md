@@ -15,9 +15,11 @@ Codex and other agent harnesses should load this skill from the repository path 
 
 ## Prerequisites
 
-- The `gh` CLI must be authenticated (`gh auth status`)
+- The `gh` CLI must be able to call GitHub APIs (`gh api user --jq '.login'`)
 - You must be in the OpenShell repository root
 - GitHub write permissions are required to apply labels, comment, close issues/PRs, or post `/ok to test`
+
+Do not use `gh auth status` as the authentication health check inside provider-backed sandboxes. Scoped provider tokens may be exposed as `openshell:resolve:env:*` placeholders and `gh auth status` probes endpoints outside the gator policy, causing false "token is invalid" reports even when allowed `gh api` and `gh pr` calls succeed. Use `gh api user --jq '.login'` and a repo-scoped probe instead.
 
 ## Authority Rules
 
