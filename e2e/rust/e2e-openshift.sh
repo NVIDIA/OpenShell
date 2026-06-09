@@ -135,7 +135,8 @@ EXTERNAL_PG_DATABASE="openshell"
 EXTERNAL_PG_USERNAME="openshell"
 
 log "Deploying standalone PostgreSQL as external database..."
-helm install "$EXTERNAL_PG_RELEASE" oci://registry-1.docker.io/bitnamicharts/postgresql \
+helm repo add bitnami https://charts.bitnami.com/bitnami 2>/dev/null || true
+helm install "$EXTERNAL_PG_RELEASE" bitnami/postgresql --version 18.6.7 \
   -n "$NAMESPACE" \
   --set auth.username="$EXTERNAL_PG_USERNAME" \
   --set auth.password="$EXTERNAL_PG_PASSWORD" \

@@ -198,7 +198,8 @@ scenario_cleanup_release() {
 scenario_deploy_external_pg() {
   local pg_host pg_uri
   echo "==> Deploying standalone PostgreSQL as external database..."
-  helmctl install pg-external oci://registry-1.docker.io/bitnamicharts/postgresql \
+  helmctl repo add bitnami https://charts.bitnami.com/bitnami 2>/dev/null || true
+  helmctl install pg-external bitnami/postgresql --version 18.6.7 \
     --namespace "${NAMESPACE}" \
     --set auth.username=openshell \
     --set auth.password=ext-test-password \
