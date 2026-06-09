@@ -91,6 +91,12 @@
           projectRootFile = "flake.nix";
           programs.nixfmt.enable = true;
         };
+
+        spdxHeaders = pkgs.runCommand "spdx-headers" { src = lib.cleanSource ./.; } ''
+          cd "$src"
+          ${pkgs.python3}/bin/python scripts/update_license_headers.py --check
+          touch "$out"
+        '';
       in
       {
         packages =
@@ -112,6 +118,7 @@
               src = craneLib.cleanCargoSource ./.;
               cargoExtraArgs = "--all";
             };
+            spdx-headers = spdxHeaders;
           };
 
         devShells.default = pkgs.mkShell {

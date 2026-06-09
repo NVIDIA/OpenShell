@@ -119,18 +119,14 @@ jobs:
           cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
   lint:
-    name: Lint ${{ matrix.lint }} (${{ matrix.target.system }})
-    runs-on: ${{ matrix.target.runner }}
+    name: Lint ${{ matrix.lint }}
+    runs-on: linux-amd64-cpu8
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - system: x86_64-linux
-            runner: linux-amd64-cpu8
-          - system: aarch64-linux
-            runner: linux-arm64-cpu8
         lint:
           - rustfmt
+          - spdx-headers
           - openshell-bootstrap-clippy
           - openshell-cli-clippy
           - openshell-core-clippy
@@ -155,6 +151,6 @@ jobs:
         uses: ./.github/actions/setup-nix
         with:
           build: checks
-          system: ${{ matrix.target.system }}
+          system: x86_64-linux
           target: ${{ matrix.lint }}
           cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
