@@ -60,9 +60,10 @@ NOTES:
     from ${GITHUB_URL}/releases/latest.
 
     Linux installs the Debian package on amd64/arm64 or the RPM packages on
-    x86_64/aarch64, depending on the host package manager.
-    macOS installs the release Homebrew formula on Apple Silicon and starts a
-    brew services-backed local gateway.
+    x86_64/aarch64, depending on the host package manager. When snapd is
+    available and no native Docker Engine is installed, the installer prefers
+    the Snap path. macOS installs the release Homebrew formula on Apple Silicon
+    and starts a brew services-backed local gateway.
 EOF
 }
 
@@ -74,6 +75,14 @@ require_cmd() {
   if ! has_cmd "$1"; then
     error "'$1' is required"
   fi
+}
+
+has_snapd() {
+  has_cmd snap && systemctl is-active --quiet snapd.socket 2>/dev/null
+}
+
+has_native_docker() {
+  has_cmd docker && ! snap list docker >/dev/null 2>&1
 }
 
 download() {
@@ -468,6 +477,17 @@ detect_platform() {
 }
 
 linux_package_method() {
+  case "${OPENSHELL_INSTALL_METHOD:-}" in
+    classic)
+      ;;
+    *)
+      if has_snapd && ! has_native_docker; then
+        echo "snap"
+        return 0
+      fi
+      ;;
+  esac
+
   if has_cmd dpkg; then
     echo "deb"
   elif has_cmd rpm; then
@@ -953,6 +973,83 @@ install_linux_rpm() {
   start_user_gateway
 }
 
+install_linux_snap() {
+  set_linux_target_runtime_dir
+
+  # Docker snap must be installed before openshell so that the
+  # openshell:docker -> docker:docker-daemon interface connection
+  # can succeed. The docker-daemon slot doesn't exist until the
+  # Docker snap itself is present.
+  if ! snap list docker >/dev/null 2>&1; then
+    info "docker snap not found, installing..."
+    as_root snap install docker
+  else
+    info "docker snap already present"
+  fi
+
+  info "installing openshell snap..."
+  as_root snap install openshell
+
+  # Connect required interfaces. Network and network-bind auto-connect
+  # on install; the remaining plugs need explicit connection. snap connect
+  # is idempotent — it succeeds whether the connection was just made or
+  # already existed.
+  as_root snap connect openshell:docker docker:docker-daemon
+  as_root snap connect openshell:log-observe
+  as_root snap connect openshell:system-observe
+  as_root snap connect openshell:ssh-keys
+
+  info "installed openshell snap from Snap Store"
+  info "registering local gateway as ${TARGET_USER}..."
+  register_local_gateway_snap
+  wait_for_local_gateway_listener_snap
+  wait_for_local_gateway_status
+}
+
+register_local_gateway_snap() {
+  _register_bin="${OPENSHELL_REGISTER_BIN:-openshell}"
+
+  if _add_output="$($_register_bin gateway add "http://127.0.0.1:${LOCAL_GATEWAY_PORT}" --local --name openshell 2>&1)"; then
+    [ -z "$_add_output" ] || print_gateway_add_output "$_add_output"
+    return 0
+  fi
+
+  _add_status=$?
+
+  case "$_add_output" in
+    *"already exists"*)
+      info "local gateway already exists; removing and re-adding it..."
+      remove_local_gateway_registration
+      "$_register_bin" gateway add "http://127.0.0.1:${LOCAL_GATEWAY_PORT}" --local --name openshell
+      ;;
+    *)
+      printf '%s\n' "$_add_output" >&2
+      return "$_add_status"
+      ;;
+  esac
+}
+
+wait_for_local_gateway_listener_snap() {
+  _timeout="${OPENSHELL_INSTALL_GATEWAY_TIMEOUT_SNAP:-90}"
+  _elapsed=0
+  _last_output=""
+  _probe_url="http://127.0.0.1:${LOCAL_GATEWAY_PORT}/"
+
+  info "waiting for local gateway listener to become reachable..."
+  while [ "$_elapsed" -lt "$_timeout" ]; do
+    if _last_output="$(curl -sS --max-time 2 "$_probe_url" 2>&1)"; then
+      info "local gateway listener is reachable"
+      return 0
+    fi
+    sleep 1
+    _elapsed=$((_elapsed + 1))
+  done
+
+  [ -z "$_last_output" ] || printf '%s
+' "$_last_output" >&2
+  error "local gateway listener did not become reachable at ${_probe_url} within ${_timeout}s"
+}
+
 install_macos_homebrew() {
   check_macos_platform
 
@@ -1033,12 +1130,16 @@ main() {
 
   case "$PLATFORM" in
     linux)
-      require_linux_package_glibc
       case "$(linux_package_method)" in
+        snap)
+          install_linux_snap
+          ;;
         deb)
+          require_linux_package_glibc
           install_linux_deb
           ;;
         rpm)
+          require_linux_package_glibc
           install_linux_rpm
           ;;
         *)
