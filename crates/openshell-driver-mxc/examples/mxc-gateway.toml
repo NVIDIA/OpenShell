@@ -1,0 +1,39 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# MXC gateway config for the June 15 demo.
+#
+# Pass to the gateway with `--config <path>` (or the gateway's config-file
+# discovery). The `[openshell.drivers.mxc]` table is deserialized into
+# `MxcComputeConfig`.
+#
+# Keep `share_dir`, `agent_cwd`, the agent_command target path, and demo.yaml's
+# `filesystem_policy.read_write` entry IDENTICAL, or the positive proof will not
+# line up.
+
+[openshell.drivers.mxc]
+# Path to wxc-exec.exe — REQUIRED for live runs on the demo box. Leave commented
+# for mock-mode smoke tests (set OPENSHELL_MXC_MOCK_WXC=1 instead).
+# wxc_exec_path = "C:\\mxc\\wxc-exec.exe"
+
+# MXC configurationId for isolation session. Never use "small" (known OS bug).
+default_configuration_id = "composable"
+
+# Host folder mapped read-write into the sandbox; where hello.txt appears.
+share_dir = "C:/work/openshell-mxc-demo"
+
+# Working directory for the agent inside the sandbox (defaults to share_dir).
+agent_cwd = "C:/work/openshell-mxc-demo"
+
+# The agent the driver execs (exec-in-driver). POSITIVE demo: writes hello.txt
+# INSIDE the granted share. Swap target to an out-of-policy path (e.g.
+# C:/Windows/Temp/hello.txt) to drive the NEGATIVE proof.
+agent_command = [
+  "powershell",
+  "-NoProfile",
+  "-Command",
+  "Set-Content -Path 'C:/work/openshell-mxc-demo/hello.txt' -Value 'hello from mxc'",
+]
+
+# Enable --debug on wxc-exec invocations.
+debug = false

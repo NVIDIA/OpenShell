@@ -9,7 +9,9 @@
 
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 use thiserror::Error;
 use tokio::process::Command;
 use tracing::debug;
@@ -19,6 +21,31 @@ pub const MXC_SCHEMA_VERSION: &str = "0.6.0-alpha";
 
 /// Default `configurationId` for isolation session. Never use `"small"` (known OS bug).
 pub const DEFAULT_CONFIGURATION_ID: &str = "composable";
+
+/// Environment flag selecting the in-process mock `wxc-exec` shim. When set to
+/// `"1"`, the invoker does NOT spawn the real `wxc-exec.exe`; instead it emits
+/// canned provision/start/stop/deprovision results and simulates AppContainer
+/// filesystem-policy enforcement for the exec phase. This is what makes the
+/// full create → Ready → policy-proof round trip runnable off the demo box.
+pub const MOCK_ENV_VAR: &str = "OPENSHELL_MXC_MOCK_WXC";
+
+fn mock_enabled() -> bool {
+    std::env::var(MOCK_ENV_VAR).map(|v| v == "1").unwrap_or(false)
+}
+
+/// Normalize a path/command fragment to lowercase backslash form for the mock's
+/// in-policy substring check.
+fn mock_normalize(s: &str) -> String {
+    s.replace('/', "\\").to_lowercase()
+}
+
+/// Per-process mock state: `iso:` sandbox id → granted read-write paths
+/// (normalized). Populated by the mock provision, consumed by the mock exec to
+/// decide whether the agent's write target is in-policy.
+fn mock_grants() -> &'static Mutex<HashMap<String, Vec<String>>> {
+    static GRANTS: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
+    GRANTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 // ── Request types ─────────────────────────────────────────────────────────────
 
@@ -133,6 +160,8 @@ impl InvokerError {
 pub struct WxcExecInvoker {
     exec_path: PathBuf,
     debug: bool,
+    /// When true, use the in-process mock instead of spawning `wxc-exec.exe`.
+    mock: bool,
 }
 
 impl WxcExecInvoker {
@@ -140,12 +169,30 @@ impl WxcExecInvoker {
         Self {
             exec_path: exec_path.into(),
             debug,
+            mock: mock_enabled(),
+        }
+    }
+
+    /// Test-only constructor that forces mock mode without touching the
+    /// process-global `OPENSHELL_MXC_MOCK_WXC` env var (avoids races/UB across
+    /// parallel tests under edition 2024's `unsafe` `set_var`).
+    #[cfg(test)]
+    pub(crate) fn mocked(exec_path: impl Into<PathBuf>) -> Self {
+        Self {
+            exec_path: exec_path.into(),
+            debug: false,
+            mock: true,
         }
     }
 
     /// Encode `config` as base64 and invoke wxc-exec, returning the parsed envelope.
     /// Use this for all **non-exec** phases (provision/start/stop/deprovision).
     pub async fn run_phase(&self, config: &serde_json::Value) -> Result<(), InvokerError> {
+        if self.mock {
+            // Mock start/stop/deprovision: canned `{"result":{}}` success.
+            debug!(phase = ?config.get("phase"), "mock wxc-exec phase (no-op success)");
+            return Ok(());
+        }
         let json = serde_json::to_string(config)?;
         let b64 = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
 
@@ -198,6 +245,19 @@ impl WxcExecInvoker {
         configuration_id: &str,
         filesystem: MxcFilesystem,
     ) -> Result<String, InvokerError> {
+        if self.mock {
+            // Mock provision: mint a synthetic `iso:` id and record the granted
+            // read-write paths so the mock exec can enforce the policy.
+            let id = format!("iso:mock-{}", uuid::Uuid::new_v4());
+            let grants: Vec<String> = filesystem
+                .readwrite_paths
+                .iter()
+                .map(|p| mock_normalize(p))
+                .collect();
+            mock_grants().lock().unwrap().insert(id.clone(), grants);
+            debug!(sandbox_id = %id, "mock wxc-exec provision");
+            return Ok(id);
+        }
         let config = serde_json::json!({
             "version": MXC_SCHEMA_VERSION,
             "phase": "provision",
@@ -289,6 +349,9 @@ impl WxcExecInvoker {
         iso_sandbox_id: &str,
         process: MxcProcess,
     ) -> Result<tokio::process::Child, InvokerError> {
+        if self.mock {
+            return self.mock_spawn_exec(iso_sandbox_id, &process);
+        }
         let config = serde_json::json!({
             "version": MXC_SCHEMA_VERSION,
             "phase": "exec",
@@ -316,6 +379,45 @@ impl WxcExecInvoker {
         }
 
         debug!(sandbox_id = %iso_sandbox_id, command = %process.command_line, "wxc-exec exec spawn");
+        let child = cmd.spawn()?;
+        Ok(child)
+    }
+
+    /// Mock exec: simulate AppContainer filesystem-policy enforcement.
+    ///
+    /// The agent's write target is considered **in-policy** iff the command line
+    /// references one of the granted read-write paths recorded at mock provision.
+    /// In-policy → run the real agent command (so the positive-proof artifact,
+    /// e.g. `hello.txt`, actually appears on the host shared folder). Out-of-policy
+    /// → refuse with an access-denied message on stderr and a non-zero exit,
+    /// mirroring how the AppContainer denies the write on the demo box.
+    fn mock_spawn_exec(
+        &self,
+        iso_sandbox_id: &str,
+        process: &MxcProcess,
+    ) -> Result<tokio::process::Child, InvokerError> {
+        let grants = mock_grants()
+            .lock()
+            .unwrap()
+            .get(iso_sandbox_id)
+            .cloned()
+            .unwrap_or_default();
+        let cmd_norm = mock_normalize(&process.command_line);
+        let in_policy = grants.iter().any(|g| !g.is_empty() && cmd_norm.contains(g));
+
+        let mut cmd = Command::new("cmd");
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if in_policy {
+            debug!(sandbox_id = %iso_sandbox_id, command = %process.command_line, "mock exec: in-policy, running agent");
+            cmd.arg("/c").arg(&process.command_line);
+        } else {
+            debug!(sandbox_id = %iso_sandbox_id, command = %process.command_line, "mock exec: OUT-OF-POLICY, denying");
+            // Emit an access-denied message to stderr and exit non-zero.
+            cmd.arg("/c")
+                .arg("echo Access is denied. (out-of-policy write blocked by AppContainer) 1>&2& exit 1");
+        }
         let child = cmd.spawn()?;
         Ok(child)
     }
