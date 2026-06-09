@@ -5,7 +5,8 @@
 //! and self-reported readiness.
 
 use crate::mxc::{MxcFilesystem, MxcProcess, WxcExecInvoker};
-use crate::policy::{MapCtx, PolicyMapper, StubPolicyMapper};
+use crate::policy::{EmbeddedPolicyMapper, MapCtx, PolicyMapper};
+use openshell_core::proto::SandboxPolicy;
 use openshell_core::proto::compute::v1::{
     DriverCondition, DriverPlatformEvent, DriverSandbox, DriverSandboxStatus,
     GetCapabilitiesResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
@@ -146,6 +147,13 @@ pub struct MxcComputeBackend {
     registry: Arc<Mutex<HashMap<String, SandboxEntry>>>,
     watch_tx: Arc<broadcast::Sender<WatchSandboxesEvent>>,
     policy_mapper: Arc<dyn PolicyMapper>,
+    /// Out-of-band side channel for the `SandboxPolicy` (A1). The proto driver
+    /// contract has no `policy` field and there is no driver-side
+    /// `GetSandboxConfig`, so `ComputeRuntime::create_sandbox` stages the policy
+    /// here keyed by sandbox id (mirroring the `sandbox_token` injection),
+    /// immediately before dispatching to this backend's `create_sandbox`, which
+    /// removes/consumes it.
+    pending_policies: Arc<Mutex<HashMap<String, SandboxPolicy>>>,
 }
 
 impl std::fmt::Debug for MxcComputeBackend {
@@ -165,8 +173,26 @@ impl MxcComputeBackend {
             config,
             registry: Arc::new(Mutex::new(HashMap::new())),
             watch_tx: Arc::new(watch_tx),
-            policy_mapper: Arc::new(StubPolicyMapper),
+            // Primary impl: the embedded mapper (Giedrius's logic vendored into
+            // `policy_map`). Swap for `StubPolicyMapper` only for scaffolding.
+            policy_mapper: Arc::new(EmbeddedPolicyMapper),
+            pending_policies: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Returns a clone of the `pending_policies` side channel so the gateway's
+    /// `ComputeRuntime` can stage the typed `SandboxPolicy` by sandbox id right
+    /// before dispatching `create_sandbox` (A1 wiring).
+    pub fn policy_sink(&self) -> Arc<Mutex<HashMap<String, SandboxPolicy>>> {
+        self.pending_policies.clone()
+    }
+
+    /// Test-only constructor wiring the in-process mock `wxc-exec` shim.
+    #[cfg(test)]
+    pub(crate) fn new_mocked(config: MxcComputeConfig) -> Self {
+        let mut backend = Self::new(config);
+        backend.invoker = WxcExecInvoker::mocked(&backend.config.wxc_exec_path);
+        backend
     }
 
     pub fn capabilities(&self) -> GetCapabilitiesResponse {
@@ -215,6 +241,13 @@ impl MxcComputeBackend {
     }
 
     pub async fn create_sandbox(&self, sandbox: &DriverSandbox) -> Result<(), tonic::Status> {
+        let sandbox_id = sandbox.id.clone();
+
+        // Consume the out-of-band policy staged by `ComputeRuntime::create_sandbox`
+        // (A1). Always remove — even on the early-return paths below — so nothing
+        // leaks if validation or the duplicate check rejects the create.
+        let policy = self.pending_policies.lock().await.remove(&sandbox_id);
+
         self.validate_sandbox_create(sandbox)?;
 
         if sandbox
@@ -225,7 +258,6 @@ impl MxcComputeBackend {
             return Err(tonic::Status::invalid_argument("sandbox_token is required"));
         }
 
-        let sandbox_id = sandbox.id.clone();
         let sandbox_name = sandbox.name.clone();
 
         {
@@ -266,7 +298,8 @@ impl MxcComputeBackend {
         let sandbox = sandbox.clone();
 
         tokio::spawn(async move {
-            run_lifecycle(invoker, config, policy_mapper, registry, watch_tx, sandbox).await;
+            run_lifecycle(invoker, config, policy_mapper, registry, watch_tx, sandbox, policy)
+                .await;
         });
 
         Ok(())
@@ -384,6 +417,7 @@ impl MxcComputeBackend {
 
 // ── Lifecycle task ────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn run_lifecycle(
     invoker: WxcExecInvoker,
     config: MxcComputeConfig,
@@ -391,11 +425,12 @@ async fn run_lifecycle(
     registry: Arc<Mutex<HashMap<String, SandboxEntry>>>,
     watch_tx: Arc<broadcast::Sender<WatchSandboxesEvent>>,
     sandbox: DriverSandbox,
+    policy: Option<SandboxPolicy>,
 ) {
     let sandbox_id = sandbox.id.clone();
     let sandbox_name = sandbox.name.clone();
 
-    // 1. Map policy → MXC filesystem config.
+    // 1. Map policy → MXC filesystem config (A1: policy is now threaded in).
     let map_ctx = MapCtx {
         sandbox_id: sandbox_id.clone(),
         share_dir: if config.share_dir.is_empty() {
@@ -404,7 +439,7 @@ async fn run_lifecycle(
             Some(config.share_dir.clone())
         },
     };
-    let mapped = match policy_mapper.map(&map_ctx) {
+    let mapped = match policy_mapper.map(policy.as_ref(), &map_ctx) {
         Ok(m) => m,
         Err(e) => {
             set_failed(&registry, &watch_tx, &sandbox, &sandbox_id, &e.to_string()).await;
@@ -614,5 +649,225 @@ fn make_sandbox_with_condition(
             conditions: vec![condition.clone()],
             deleting,
         }),
+    }
+}
+
+// ── Lifecycle + policy-proof tests (mock wxc-exec) ─────────────────────────────
+//
+// These drive the full create → provision → start → exec → self-report Ready
+// flow against the in-process mock shim, proving the positive (in-policy write
+// succeeds, Ready reached) and negative (out-of-policy write denied + denial
+// event) paths WITHOUT the demo box. Windows-only (the crate is Windows-gated),
+// run by the `windows:test:x64` mise lane.
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use openshell_core::proto::compute::v1::DriverSandboxSpec;
+    use openshell_core::proto::{FilesystemPolicy, SandboxPolicy};
+    use std::time::Duration;
+
+    fn driver_sandbox(id: &str) -> DriverSandbox {
+        DriverSandbox {
+            id: id.to_string(),
+            name: id.to_string(),
+            namespace: String::new(),
+            spec: Some(DriverSandboxSpec {
+                sandbox_token: "test-token".into(),
+                ..Default::default()
+            }),
+            status: None,
+        }
+    }
+
+    fn fs_policy(read_write: &[&str]) -> SandboxPolicy {
+        SandboxPolicy {
+            filesystem: Some(FilesystemPolicy {
+                include_workdir: false,
+                read_only: Vec::new(),
+                read_write: read_write.iter().map(|s| s.to_string()).collect(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn ready_condition(sb: &DriverSandbox) -> Option<DriverCondition> {
+        sb.status
+            .as_ref()?
+            .conditions
+            .iter()
+            .find(|c| c.r#type == "Ready")
+            .cloned()
+    }
+
+    /// Poll the backend registry until the predicate matches or the deadline hits.
+    async fn wait_for<F>(backend: &MxcComputeBackend, name: &str, mut pred: F) -> Option<DriverSandbox>
+    where
+        F: FnMut(&DriverSandbox) -> bool,
+    {
+        for _ in 0..100 {
+            if let Some(sb) = backend.get_sandbox(name).await {
+                if pred(&sb) {
+                    return Some(sb);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        None
+    }
+
+    fn demo_config(share_dir: &str, agent_command: Vec<String>) -> MxcComputeConfig {
+        MxcComputeConfig {
+            wxc_exec_path: "wxc-exec.exe".into(),
+            default_configuration_id: "composable".into(),
+            agent_command,
+            agent_cwd: share_dir.into(),
+            share_dir: share_dir.into(),
+            debug: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn positive_in_policy_write_reaches_ready_and_materializes_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let share = tmp.path().to_string_lossy().replace('\\', "/");
+        let hello = format!("{share}/hello.txt");
+        let cmd = vec![
+            "powershell".into(),
+            "-NoProfile".into(),
+            "-Command".into(),
+            format!("Set-Content -LiteralPath {hello} -Value hi"),
+        ];
+        let backend = MxcComputeBackend::new_mocked(demo_config(&share, cmd));
+
+        // Stage the policy via the A1 side channel (as ComputeRuntime would).
+        let sink = backend.policy_sink();
+        sink.lock()
+            .await
+            .insert("sb-pos".into(), fs_policy(&[&share]));
+
+        let sb = driver_sandbox("sb-pos");
+        backend.create_sandbox(&sb).await.expect("create accepted");
+
+        // Self-reported Ready=True (no supervisor) once the agent exec launches.
+        let ready = wait_for(&backend, "sb-pos", |s| {
+            ready_condition(s).is_some_and(|c| c.status == "True" && c.reason == "AgentRunning")
+        })
+        .await;
+        assert!(ready.is_some(), "sandbox should self-report Ready=True");
+
+        // Positive proof: the in-policy write materializes the host artifact.
+        let host_path = std::path::Path::new(tmp.path()).join("hello.txt");
+        let mut found = false;
+        for _ in 0..100 {
+            if host_path.exists() {
+                found = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(found, "hello.txt should appear in the granted share folder");
+    }
+
+    #[tokio::test]
+    async fn negative_out_of_policy_write_is_denied_with_event() {
+        let share_tmp = tempfile::tempdir().unwrap();
+        let out_tmp = tempfile::tempdir().unwrap();
+        let share = share_tmp.path().to_string_lossy().replace('\\', "/");
+        let out_path = format!(
+            "{}/hello.txt",
+            out_tmp.path().to_string_lossy().replace('\\', "/")
+        );
+        let cmd = vec![
+            "powershell".into(),
+            "-NoProfile".into(),
+            "-Command".into(),
+            format!("Set-Content -LiteralPath {out_path} -Value hi"),
+        ];
+        let backend = MxcComputeBackend::new_mocked(demo_config(&share, cmd));
+
+        // Subscribe to the watch stream BEFORE create so we catch the denial event.
+        let mut stream = backend.watch_sandboxes().await;
+
+        let sink = backend.policy_sink();
+        sink.lock()
+            .await
+            .insert("sb-neg".into(), fs_policy(&[&share]));
+        backend
+            .create_sandbox(&driver_sandbox("sb-neg"))
+            .await
+            .expect("create accepted");
+
+        // Collect events until we observe the AgentExecFailed platform event.
+        let mut saw_denial = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(500), stream.next()).await {
+                Ok(Some(Ok(ev))) => {
+                    if let Some(watch_sandboxes_event::Payload::PlatformEvent(pe)) = ev.payload {
+                        if pe
+                            .event
+                            .as_ref()
+                            .is_some_and(|e| e.reason == "AgentExecFailed")
+                        {
+                            saw_denial = true;
+                            break;
+                        }
+                    }
+                }
+                Ok(_) => break,
+                Err(_) => continue,
+            }
+        }
+        assert!(saw_denial, "expected an AgentExecFailed denial platform event");
+
+        // The out-of-policy artifact must NOT have been written by the mock.
+        let out_fs = std::path::Path::new(out_tmp.path()).join("hello.txt");
+        assert!(!out_fs.exists(), "out-of-policy write must be denied");
+
+        // And the sandbox surfaces a terminal ExecFailed Ready=False condition.
+        let failed = wait_for(&backend, "sb-neg", |s| {
+            ready_condition(s).is_some_and(|c| c.status == "False" && c.reason == "ExecFailed")
+        })
+        .await;
+        assert!(failed.is_some(), "sandbox should report ExecFailed");
+    }
+
+    #[tokio::test]
+    async fn unmappable_network_policy_fails_create_lifecycle() {
+        use openshell_core::proto::{NetworkEndpoint, NetworkPolicyRule};
+        let tmp = tempfile::tempdir().unwrap();
+        let share = tmp.path().to_string_lossy().replace('\\', "/");
+        let cmd = vec!["cmd".into(), "/c".into(), "exit 0".into()];
+        let backend = MxcComputeBackend::new_mocked(demo_config(&share, cmd));
+
+        let mut policy = fs_policy(&[&share]);
+        policy.network_policies.insert(
+            "api".into(),
+            NetworkPolicyRule {
+                name: "api".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "example.com".into(),
+                    ..Default::default()
+                }],
+                binaries: Vec::new(),
+            },
+        );
+        backend.policy_sink().lock().await.insert("sb-net".into(), policy);
+        backend
+            .create_sandbox(&driver_sandbox("sb-net"))
+            .await
+            .expect("create accepted (rejection happens in lifecycle)");
+
+        // Unmappable policy surfaces as a terminal create-time failure, never a
+        // silent drop. (ValidateSandboxCreate has no policy side channel, so the
+        // mapper rejection happens at map-time in run_lifecycle.)
+        let failed = wait_for(&backend, "sb-net", |s| {
+            ready_condition(s).is_some_and(|c| c.status == "False" && c.reason == "ProvisionFailed")
+        })
+        .await;
+        assert!(
+            failed.is_some(),
+            "network policy on isolation_session must fail the create"
+        );
     }
 }

@@ -23,6 +23,10 @@ mod grpc;
 mod mxc;
 #[cfg(target_os = "windows")]
 mod policy;
+// Embedded mapping logic vendored from Giedrius's mapper. Pure `serde`, NOT
+// Windows-gated, so its parity tests run on Linux CI even though the rest of the
+// driver is Windows-only.
+mod policy_map;
 
 #[cfg(target_os = "windows")]
 pub use driver::{MxcComputeBackend, MxcComputeConfig};
