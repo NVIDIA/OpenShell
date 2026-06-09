@@ -250,12 +250,19 @@ impl MxcComputeBackend {
 
         self.validate_sandbox_create(sandbox)?;
 
+        // `sandbox_token` is minted by the gateway only when the sandbox-JWT
+        // issuer is configured. On MXC there is no in-sandbox supervisor that
+        // would ever consume it (the supervisor-removal design — D1/D4), so an
+        // absent token must not block create. Log it and move on.
         if sandbox
             .spec
             .as_ref()
             .map_or(true, |s| s.sandbox_token.is_empty())
         {
-            return Err(tonic::Status::invalid_argument("sandbox_token is required"));
+            tracing::debug!(
+                sandbox = %sandbox.name,
+                "no sandbox_token minted (no supervisor consumer on MXC)"
+            );
         }
 
         let sandbox_name = sandbox.name.clone();
