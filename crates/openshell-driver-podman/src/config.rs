@@ -331,7 +331,10 @@ mod tests {
     #[test]
     fn default_config_sets_health_check_interval() {
         let cfg = PodmanComputeConfig::default();
-        assert_eq!(cfg.health_check_interval_secs, DEFAULT_HEALTH_CHECK_INTERVAL_SECS);
+        assert_eq!(
+            cfg.health_check_interval_secs,
+            DEFAULT_HEALTH_CHECK_INTERVAL_SECS
+        );
     }
 
     #[test]
