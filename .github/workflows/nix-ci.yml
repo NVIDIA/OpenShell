@@ -51,6 +51,32 @@ jobs:
           target: ${{ matrix.package }}
           cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
 
+  images:
+    name: Build Image ${{ matrix.image }} (${{ matrix.target.system }})
+    needs: build
+    runs-on: ${{ matrix.target.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - system: x86_64-linux
+            runner: linux-amd64-cpu8
+          - system: aarch64-linux
+            runner: linux-arm64-cpu8
+        image:
+          - openshell-gateway-image
+          - openshell-supervisor-image
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Build image
+        uses: ./.github/actions/setup-nix
+        with:
+          build: packages
+          system: ${{ matrix.target.system }}
+          target: ${{ matrix.image }}
+          cachix_auth_token: ${{ secrets.CACHIX_AUTH_TOKEN }}
+
   test:
     name: Test ${{ matrix.check }} (${{ matrix.target.system }})
     needs: build

@@ -70,6 +70,16 @@
           openshell-driver-podman = workspaceCrates.openshell-driver-podman.package;
         };
 
+        images =
+          if pkgs.stdenv.hostPlatform.isLinux then
+            import ./nix/images.nix {
+              inherit pkgs;
+              gateway = crates.openshell-gateway;
+              supervisor = crates.openshell-sandbox;
+            }
+          else
+            { };
+
         crateTests = lib.mapAttrs' (
           name: crate: lib.nameValuePair "${name}-test" crate.test
         ) workspaceCrates;
@@ -83,12 +93,15 @@
         };
       in
       {
-        packages = crates // {
-          default = pkgs.symlinkJoin {
-            name = "openshell-0.0.0";
-            paths = lib.attrValues crates;
+        packages =
+          crates
+          // images
+          // {
+            default = pkgs.symlinkJoin {
+              name = "openshell-0.0.0";
+              paths = lib.attrValues crates;
+            };
           };
-        };
 
         checks =
           crateTests
