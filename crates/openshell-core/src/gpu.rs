@@ -5,18 +5,18 @@
 
 use crate::config::CDI_GPU_DEVICE_ALL;
 
-/// Resolve the existing GPU request fields into CDI device identifiers.
+/// Resolve a GPU request into CDI device identifiers.
 ///
-/// `None` means no GPU was requested. A GPU request with no explicit device
-/// ID uses the CDI all-GPU request; otherwise the driver-native ID passes
-/// through unchanged.
+/// `None` means no GPU was requested. A GPU request with no explicit CDI
+/// devices uses the CDI all-GPU request; otherwise the driver-configured CDI
+/// devices pass through unchanged.
 #[must_use]
-pub fn cdi_gpu_device_ids(gpu: bool, gpu_device: &str) -> Option<Vec<String>> {
+pub fn cdi_gpu_device_ids(gpu: bool, cdi_devices: &[String]) -> Option<Vec<String>> {
     gpu.then(|| {
-        if gpu_device.is_empty() {
+        if cdi_devices.is_empty() {
             vec![CDI_GPU_DEVICE_ALL.to_string()]
         } else {
-            vec![gpu_device.to_string()]
+            cdi_devices.to_vec()
         }
     })
 }
@@ -27,22 +27,31 @@ mod tests {
 
     #[test]
     fn cdi_gpu_device_ids_returns_none_when_absent() {
-        assert_eq!(cdi_gpu_device_ids(false, ""), None);
+        assert_eq!(cdi_gpu_device_ids(false, &[]), None);
     }
 
     #[test]
     fn cdi_gpu_device_ids_defaults_empty_request_to_all_gpus() {
         assert_eq!(
-            cdi_gpu_device_ids(true, ""),
+            cdi_gpu_device_ids(true, &[]),
             Some(vec![CDI_GPU_DEVICE_ALL.to_string()])
         );
     }
 
     #[test]
-    fn cdi_gpu_device_ids_passes_explicit_device_id_through() {
+    fn cdi_gpu_device_ids_passes_explicit_device_ids_through() {
         assert_eq!(
-            cdi_gpu_device_ids(true, "nvidia.com/gpu=0"),
-            Some(vec!["nvidia.com/gpu=0".to_string()])
+            cdi_gpu_device_ids(
+                true,
+                &[
+                    "nvidia.com/gpu=0".to_string(),
+                    "nvidia.com/gpu=1".to_string()
+                ]
+            ),
+            Some(vec![
+                "nvidia.com/gpu=0".to_string(),
+                "nvidia.com/gpu=1".to_string()
+            ])
         );
     }
 }

@@ -36,6 +36,7 @@ thiserror = { workspace = true }
 miette = { workspace = true }
 
 [dev-dependencies]
+prost-types = { workspace = true }
 temp-env = "0.3"
 
 [lints]

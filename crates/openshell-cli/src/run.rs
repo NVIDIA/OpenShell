@@ -1725,7 +1725,6 @@ pub async fn sandbox_create(
     uploads: &[(String, Option<String>, bool)],
     keep: bool,
     gpu: bool,
-    gpu_device: Option<&str>,
     cpu: Option<&str>,
     memory: Option<&str>,
     driver_config_json: Option<&str>,
@@ -1817,7 +1816,6 @@ pub async fn sandbox_create(
     let request = CreateSandboxRequest {
         spec: Some(SandboxSpec {
             gpu: requested_gpu,
-            gpu_device: gpu_device.unwrap_or_default().to_string(),
             environment: environment.clone(),
             policy,
             providers: configured_providers,

@@ -42,10 +42,40 @@ fn test_sandbox() -> DriverSandbox {
                 ..Default::default()
             }),
             gpu: false,
-            gpu_device: String::new(),
             sandbox_token: String::new(),
         }),
         status: None,
+    }
+}
+
+fn cdi_devices_config(device_ids: &[&str]) -> prost_types::Struct {
+    list_string_driver_config("cdi_devices", device_ids)
+}
+
+fn cdi_device_typo_config(device_ids: &[&str]) -> prost_types::Struct {
+    list_string_driver_config("cdi_device", device_ids)
+}
+
+fn list_string_driver_config(field: &str, values: &[&str]) -> prost_types::Struct {
+    prost_types::Struct {
+        fields: std::iter::once((
+            field.to_string(),
+            prost_types::Value {
+                kind: Some(prost_types::value::Kind::ListValue(
+                    prost_types::ListValue {
+                        values: values
+                            .iter()
+                            .map(|device_id| prost_types::Value {
+                                kind: Some(prost_types::value::Kind::StringValue(
+                                    (*device_id).to_string(),
+                                )),
+                            })
+                            .collect(),
+                    },
+                )),
+            },
+        ))
+        .collect(),
     }
 }
 
@@ -986,6 +1016,52 @@ fn validate_sandbox_rejects_gpu_when_cdi_unavailable() {
 }
 
 #[test]
+fn validate_sandbox_rejects_invalid_cdi_devices_before_gpu_capability() {
+    let config = runtime_config();
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    spec.gpu = true;
+    spec.template.as_mut().unwrap().driver_config = Some(cdi_devices_config(&[]));
+
+    let err = DockerComputeDriver::validate_sandbox(&sandbox, &config).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("invalid docker driver_config"));
+    assert!(err.message().contains("non-empty list"));
+}
+
+#[test]
+fn validate_sandbox_rejects_unknown_driver_config_fields() {
+    let config = runtime_config();
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    spec.gpu = true;
+    spec.template.as_mut().unwrap().driver_config =
+        Some(cdi_device_typo_config(&["nvidia.com/gpu=0"]));
+
+    let err = DockerComputeDriver::validate_sandbox(&sandbox, &config).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("unknown field"));
+}
+
+#[test]
+fn validate_sandbox_rejects_template_errors_before_device_config() {
+    let config = runtime_config();
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    spec.gpu = true;
+    let template = spec.template.as_mut().unwrap();
+    template.agent_socket_path = "/tmp/agent.sock".to_string();
+    template.driver_config = Some(cdi_devices_config(&[]));
+
+    let err = DockerComputeDriver::validate_sandbox(&sandbox, &config).unwrap_err();
+
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(err.message().contains("agent_socket_path"));
+}
+
+#[test]
 fn validate_sandbox_auth_requires_gateway_token() {
     let mut sandbox = test_sandbox();
     sandbox.spec.as_mut().unwrap().sandbox_token.clear();
@@ -1036,7 +1112,7 @@ fn build_container_create_body_passes_explicit_cdi_device_id_through() {
     let mut sandbox = test_sandbox();
     let spec = sandbox.spec.as_mut().unwrap();
     spec.gpu = true;
-    spec.gpu_device = "nvidia.com/gpu=0".to_string();
+    spec.template.as_mut().unwrap().driver_config = Some(cdi_devices_config(&["nvidia.com/gpu=0"]));
 
     let create_body = build_container_create_body(&sandbox, &config).unwrap();
     let request = create_body
@@ -1051,6 +1127,35 @@ fn build_container_create_body_passes_explicit_cdi_device_id_through() {
         request.device_ids.as_ref().unwrap(),
         &vec!["nvidia.com/gpu=0".to_string()]
     );
+}
+
+#[test]
+fn build_container_create_body_rejects_cdi_devices_without_gpu() {
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(cdi_devices_config(&["nvidia.com/gpu=0"]));
+
+    let err = build_container_create_body(&sandbox, &runtime_config()).unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("requires gpu=true"));
+}
+
+#[test]
+fn build_container_create_body_rejects_empty_cdi_devices() {
+    let mut sandbox = test_sandbox();
+    let spec = sandbox.spec.as_mut().unwrap();
+    spec.gpu = true;
+    spec.template.as_mut().unwrap().driver_config = Some(cdi_devices_config(&[]));
+
+    let err = build_container_create_body(&sandbox, &runtime_config()).unwrap_err();
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    assert!(err.message().contains("non-empty list"));
 }
 
 #[test]

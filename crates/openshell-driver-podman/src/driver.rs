@@ -5,7 +5,7 @@
 
 use crate::client::{PodmanApiError, PodmanClient};
 use crate::config::PodmanComputeConfig;
-use crate::container::{self, LABEL_MANAGED_FILTER, LABEL_SANDBOX_ID};
+use crate::container::{self, LABEL_MANAGED_FILTER, LABEL_SANDBOX_ID, PodmanSandboxDriverConfig};
 use crate::watcher::{
     self, WatchStream, driver_sandbox_from_inspect, driver_sandbox_from_list_entry,
 };
@@ -282,6 +282,12 @@ impl PodmanComputeDriver {
         sandbox: &DriverSandbox,
     ) -> Result<(), ComputeDriverError> {
         let gpu_requested = sandbox.spec.as_ref().is_some_and(|s| s.gpu);
+        let driver_config = PodmanSandboxDriverConfig::from_sandbox(sandbox)?;
+        if !gpu_requested && driver_config.cdi_devices.is_some() {
+            return Err(ComputeDriverError::InvalidArgument(
+                "driver_config.cdi_devices requires gpu=true".to_string(),
+            ));
+        }
         Self::validate_gpu_request(gpu_requested)?;
         self.validate_user_volume_mounts_available(sandbox).await?;
         Ok(())
@@ -405,8 +411,7 @@ impl PodmanComputeDriver {
             sandbox,
             &self.config,
             token_host_path.as_deref(),
-        )
-        .map_err(ComputeDriverError::Precondition)?;
+        )?;
         match self.client.create_container(&spec).await {
             Ok(_) => {}
             Err(PodmanApiError::Conflict(_)) => {

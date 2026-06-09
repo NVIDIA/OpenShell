@@ -28,6 +28,7 @@ tempfile = "3"
 url = { workspace = true }
 
 [dev-dependencies]
+prost-types = { workspace = true }
 temp-env = "0.3"
 
 [lints]

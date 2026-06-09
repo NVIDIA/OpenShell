@@ -1280,7 +1280,6 @@ fn driver_sandbox_spec_from_public(
             .map(|template| driver_sandbox_template_from_public(template, driver_kind))
             .transpose()?,
         gpu: spec.gpu,
-        gpu_device: spec.gpu_device.clone(),
         sandbox_token: String::new(),
     })
 }

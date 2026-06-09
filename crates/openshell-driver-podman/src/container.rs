@@ -4,8 +4,10 @@
 //! Container spec construction for the Podman driver.
 
 use crate::config::PodmanComputeConfig;
+use openshell_core::ComputeDriverError;
 use openshell_core::gpu::cdi_gpu_device_ids;
 use openshell_core::proto::compute::v1::{DriverSandbox, DriverSandboxTemplate};
+use openshell_core::proto_struct::deserialize_optional_non_empty_string_list;
 use openshell_core::{driver_mounts, proto_struct};
 use serde::Serialize;
 use serde_json::Value;
@@ -61,8 +63,37 @@ const SUPERVISOR_BINARY_PATH: &str = openshell_core::driver_utils::SUPERVISOR_CO
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
-struct PodmanSandboxDriverConfig {
+pub struct PodmanSandboxDriverConfig {
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_non_empty_string_list"
+    )]
+    pub cdi_devices: Option<Vec<String>>,
     mounts: Vec<PodmanDriverMountConfig>,
+}
+
+impl PodmanSandboxDriverConfig {
+    pub fn from_sandbox(sandbox: &DriverSandbox) -> Result<Self, ComputeDriverError> {
+        let Some(template) = sandbox
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.template.as_ref())
+        else {
+            return Ok(Self::default());
+        };
+
+        Self::from_template(template)
+    }
+
+    pub fn from_template(template: &DriverSandboxTemplate) -> Result<Self, ComputeDriverError> {
+        let Some(config) = template.driver_config.as_ref() else {
+            return Ok(Self::default());
+        };
+
+        serde_json::from_value(proto_struct::struct_to_json_value(config)).map_err(|err| {
+            ComputeDriverError::InvalidArgument(format!("invalid podman driver_config: {err}"))
+        })
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -446,14 +477,27 @@ fn podman_pids_limit(value: i64) -> Option<i64> {
 }
 
 /// Build CDI GPU device list if GPU is requested.
-fn build_devices(sandbox: &DriverSandbox) -> Option<Vec<LinuxDevice>> {
-    let spec = sandbox.spec.as_ref()?;
-    cdi_gpu_device_ids(spec.gpu, &spec.gpu_device).map(|device_ids| {
-        device_ids
-            .into_iter()
-            .map(|path| LinuxDevice { path })
-            .collect()
-    })
+fn build_devices(sandbox: &DriverSandbox) -> Result<Option<Vec<LinuxDevice>>, ComputeDriverError> {
+    let Some(spec) = sandbox.spec.as_ref() else {
+        return Ok(None);
+    };
+    let cdi_devices = PodmanSandboxDriverConfig::from_sandbox(sandbox)?
+        .cdi_devices
+        .unwrap_or_default();
+    if !spec.gpu && !cdi_devices.is_empty() {
+        return Err(ComputeDriverError::InvalidArgument(
+            "driver_config.cdi_devices requires gpu=true".to_string(),
+        ));
+    }
+
+    Ok(
+        cdi_gpu_device_ids(spec.gpu, &cdi_devices).map(|device_ids| {
+            device_ids
+                .into_iter()
+                .map(|path| LinuxDevice { path })
+                .collect()
+        }),
+    )
 }
 
 pub fn podman_driver_volume_mount_sources(
@@ -725,25 +769,26 @@ fn validate_tmpfs_options(options: &[String]) -> Result<Vec<String>, String> {
 #[cfg(test)]
 #[must_use]
 pub fn build_container_spec(sandbox: &DriverSandbox, config: &PodmanComputeConfig) -> Value {
-    build_container_spec_with_token(sandbox, config, None)
+    try_build_container_spec_with_token(sandbox, config, None)
+        .expect("container spec should be valid")
 }
 
-#[must_use]
 #[cfg(test)]
+#[must_use]
 pub fn build_container_spec_with_token(
     sandbox: &DriverSandbox,
     config: &PodmanComputeConfig,
     token_host_path: Option<&Path>,
 ) -> Value {
     try_build_container_spec_with_token(sandbox, config, token_host_path)
-        .expect("valid Podman container spec")
+        .expect("container spec should be valid")
 }
 
 pub fn try_build_container_spec_with_token(
     sandbox: &DriverSandbox,
     config: &PodmanComputeConfig,
     token_host_path: Option<&Path>,
-) -> Result<Value, String> {
+) -> Result<Value, ComputeDriverError> {
     let image = resolve_image(sandbox, config);
     let name = container_name(&sandbox.name);
     let vol = volume_name(&sandbox.id);
@@ -751,8 +796,9 @@ pub fn try_build_container_spec_with_token(
     let env = build_env(sandbox, config, image);
     let labels = build_labels(sandbox);
     let resource_limits = build_resource_limits(sandbox, config);
-    let devices = build_devices(sandbox);
-    let user_mounts = podman_user_mounts(sandbox, config.enable_bind_mounts)?;
+    let devices = build_devices(sandbox)?;
+    let user_mounts = podman_user_mounts(sandbox, config.enable_bind_mounts)
+        .map_err(ComputeDriverError::InvalidArgument)?;
 
     // Network configuration -- always bridge mode.
     // Matches libpod's network spec format `{name: {opts}}`; the unit-struct
@@ -1214,12 +1260,15 @@ mod tests {
 
     #[test]
     fn container_spec_passes_explicit_cdi_device_id_through() {
-        use openshell_core::proto::compute::v1::DriverSandboxSpec;
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
         let mut sandbox = test_sandbox("test-id", "test-name");
         sandbox.spec = Some(DriverSandboxSpec {
             gpu: true,
-            gpu_device: "nvidia.com/gpu=0".to_string(),
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(cdi_devices_config(&["nvidia.com/gpu=0"])),
+                ..Default::default()
+            }),
             ..Default::default()
         });
         let config = test_config();
@@ -1229,6 +1278,65 @@ mod tests {
             spec["devices"][0]["path"].as_str(),
             Some("nvidia.com/gpu=0")
         );
+    }
+
+    #[test]
+    fn container_spec_rejects_cdi_devices_without_gpu() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(cdi_devices_config(&["nvidia.com/gpu=0"])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let config = test_config();
+
+        let err = try_build_container_spec_with_token(&sandbox, &config, None).unwrap_err();
+        assert!(matches!(err, ComputeDriverError::InvalidArgument(_)));
+        assert!(err.to_string().contains("requires gpu=true"));
+    }
+
+    #[test]
+    fn container_spec_rejects_empty_cdi_devices() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            gpu: true,
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(cdi_devices_config(&[])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let config = test_config();
+
+        let err = try_build_container_spec_with_token(&sandbox, &config, None).unwrap_err();
+        assert!(matches!(err, ComputeDriverError::InvalidArgument(_)));
+        assert!(err.to_string().contains("non-empty list"));
+    }
+
+    #[test]
+    fn container_spec_rejects_unknown_driver_config_fields() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            gpu: true,
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(cdi_device_typo_config(&["nvidia.com/gpu=0"])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let config = test_config();
+
+        let err = try_build_container_spec_with_token(&sandbox, &config, None).unwrap_err();
+        assert!(matches!(err, ComputeDriverError::InvalidArgument(_)));
+        assert!(err.to_string().contains("unknown field"));
     }
 
     #[test]
@@ -1508,6 +1616,37 @@ mod tests {
         }
     }
 
+    fn cdi_devices_config(device_ids: &[&str]) -> prost_types::Struct {
+        list_string_driver_config("cdi_devices", device_ids)
+    }
+
+    fn cdi_device_typo_config(device_ids: &[&str]) -> prost_types::Struct {
+        list_string_driver_config("cdi_device", device_ids)
+    }
+
+    fn list_string_driver_config(field: &str, values: &[&str]) -> prost_types::Struct {
+        prost_types::Struct {
+            fields: std::iter::once((
+                field.to_string(),
+                prost_types::Value {
+                    kind: Some(prost_types::value::Kind::ListValue(
+                        prost_types::ListValue {
+                            values: values
+                                .iter()
+                                .map(|device_id| prost_types::Value {
+                                    kind: Some(prost_types::value::Kind::StringValue(
+                                        (*device_id).to_string(),
+                                    )),
+                                })
+                                .collect(),
+                        },
+                    )),
+                },
+            ))
+            .collect(),
+        }
+    }
+
     fn test_config() -> PodmanComputeConfig {
         PodmanComputeConfig {
             socket_path: std::path::PathBuf::from("/tmp/test.sock"),
@@ -1725,7 +1864,7 @@ mod tests {
 
         let err = try_build_container_spec_with_token(&sandbox, &config, None).unwrap_err();
 
-        assert!(err.contains("enable_bind_mounts = true"));
+        assert!(err.to_string().contains("enable_bind_mounts = true"));
     }
 
     #[test]
@@ -1830,7 +1969,10 @@ mod tests {
 
         let err = try_build_container_spec_with_token(&sandbox, &config, None).unwrap_err();
 
-        assert!(err.contains("bind source must be an absolute host path"));
+        assert!(
+            err.to_string()
+                .contains("bind source must be an absolute host path")
+        );
     }
 
     #[test]
@@ -1855,7 +1997,7 @@ mod tests {
 
         let err = try_build_container_spec_with_token(&sandbox, &config, None).unwrap_err();
 
-        assert!(err.contains("reserved OpenShell path"));
+        assert!(err.to_string().contains("reserved OpenShell path"));
     }
 
     #[test]

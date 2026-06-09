@@ -22,6 +22,7 @@ use futures::{Stream, StreamExt};
 use openshell_core::config::{
     DEFAULT_DOCKER_NETWORK_NAME, DEFAULT_SANDBOX_PIDS_LIMIT, DEFAULT_STOP_TIMEOUT_SECS,
 };
+use openshell_core::driver_mounts;
 use openshell_core::driver_utils::{
     LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
     LABEL_SANDBOX_NAMESPACE, SUPERVISOR_IMAGE_BINARY_PATH, supervisor_image_should_refresh,
@@ -41,8 +42,10 @@ use openshell_core::proto::compute::v1::{
     WatchSandboxesRequest, WatchSandboxesSandboxEvent, compute_driver_server::ComputeDriver,
     watch_sandboxes_event,
 };
+use openshell_core::proto_struct::{
+    deserialize_optional_non_empty_string_list, struct_to_json_value,
+};
 use openshell_core::{Config, Error, Result as CoreResult};
-use openshell_core::{driver_mounts, proto_struct};
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
@@ -270,7 +273,35 @@ struct DockerResourceLimits {
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct DockerSandboxDriverConfig {
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_non_empty_string_list"
+    )]
+    cdi_devices: Option<Vec<String>>,
     mounts: Vec<DockerDriverMountConfig>,
+}
+
+impl DockerSandboxDriverConfig {
+    fn from_sandbox(sandbox: &DriverSandbox) -> Result<Self, String> {
+        let Some(template) = sandbox
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.template.as_ref())
+        else {
+            return Ok(Self::default());
+        };
+
+        Self::from_template(template)
+    }
+
+    fn from_template(template: &DriverSandboxTemplate) -> Result<Self, String> {
+        let Some(config) = template.driver_config.as_ref() else {
+            return Ok(Self::default());
+        };
+
+        serde_json::from_value(struct_to_json_value(config))
+            .map_err(|err| format!("invalid docker driver_config: {err}"))
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -298,6 +329,14 @@ enum DockerDriverMountConfig {
         size_bytes: Option<f64>,
         #[serde(default)]
         mode: Option<f64>,
+    },
+    Image {
+        source: String,
+        target: String,
+        #[serde(default = "default_true")]
+        read_only: bool,
+        #[serde(default)]
+        subpath: Option<String>,
     },
 }
 
@@ -418,12 +457,18 @@ impl DockerComputeDriver {
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("sandbox.spec.template is required"))?;
 
-        Self::validate_sandbox_template(template)?;
-        Self::validate_gpu_request(spec.gpu, config.supports_gpu)?;
+        Self::validate_sandbox_template(template, config)?;
+
+        let driver_config =
+            DockerSandboxDriverConfig::from_template(template).map_err(Status::invalid_argument)?;
+        Self::validate_gpu_request(spec.gpu, config.supports_gpu, &driver_config)?;
         Ok(())
     }
 
-    fn validate_sandbox_template(template: &DriverSandboxTemplate) -> Result<(), Status> {
+    fn validate_sandbox_template(
+        template: &DriverSandboxTemplate,
+        config: &DockerDriverRuntimeConfig,
+    ) -> Result<(), Status> {
         if template.image.trim().is_empty() {
             return Err(Status::failed_precondition(
                 "docker sandboxes require a template image",
@@ -463,7 +508,17 @@ impl DockerComputeDriver {
         ))
     }
 
-    fn validate_gpu_request(gpu: bool, supports_gpu: bool) -> Result<(), Status> {
+    fn validate_gpu_request(
+        gpu: bool,
+        supports_gpu: bool,
+        driver_config: &DockerSandboxDriverConfig,
+    ) -> Result<(), Status> {
+        if !gpu && driver_config.cdi_devices.is_some() {
+            return Err(Status::invalid_argument(
+                "driver_config.cdi_devices requires gpu=true",
+            ));
+        }
+
         if gpu && !supports_gpu {
             return Err(Status::failed_precondition(
                 "docker GPU sandboxes require Docker CDI support. Enable CDI on the Docker daemon, then restart the OpenShell gateway/server so GPU capability is detected.",
@@ -1602,14 +1657,8 @@ fn docker_driver_config(
     template: &DriverSandboxTemplate,
     enable_bind_mounts: bool,
 ) -> Result<DockerSandboxDriverConfig, Status> {
-    let Some(config) = template.driver_config.as_ref() else {
-        return Ok(DockerSandboxDriverConfig::default());
-    };
-
-    let json = serde_json::Value::Object(proto_struct::struct_to_json_object(config));
-    let config: DockerSandboxDriverConfig = serde_json::from_value(json).map_err(|err| {
-        Status::failed_precondition(format!("invalid docker driver_config: {err}"))
-    })?;
+    let config =
+        DockerSandboxDriverConfig::from_template(template).map_err(Status::invalid_argument)?;
     validate_docker_driver_mounts(&config.mounts, enable_bind_mounts)?;
     Ok(config)
 }
@@ -1699,6 +1748,9 @@ fn docker_mount_from_config(config: &DockerDriverMountConfig) -> Result<Mount, S
             }),
             ..Default::default()
         }),
+        DockerDriverMountConfig::Image { .. } => Err(Status::failed_precondition(
+            "invalid docker driver_config: docker image mounts are not supported",
+        )),
     }
 }
 
@@ -1745,6 +1797,17 @@ fn validate_docker_driver_mounts(
                     docker_tmpfs_option(option)?;
                 }
                 target
+            }
+            DockerDriverMountConfig::Image {
+                source,
+                target,
+                read_only,
+                subpath,
+            } => {
+                let _ = (source, target, read_only, subpath);
+                return Err(Status::failed_precondition(
+                    "invalid docker driver_config: docker image mounts are not supported",
+                ));
             }
         };
         let target = driver_mounts::validate_container_mount_target(target)
@@ -2050,14 +2113,29 @@ fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig
         .collect()
 }
 
-fn docker_gpu_device_requests(gpu: bool, gpu_device: &str) -> Option<Vec<DeviceRequest>> {
-    cdi_gpu_device_ids(gpu, gpu_device).map(|device_ids| {
-        vec![DeviceRequest {
-            driver: Some("cdi".to_string()),
-            device_ids: Some(device_ids),
-            ..Default::default()
-        }]
-    })
+fn build_device_requests(sandbox: &DriverSandbox) -> Result<Option<Vec<DeviceRequest>>, Status> {
+    let Some(spec) = sandbox.spec.as_ref() else {
+        return Ok(None);
+    };
+    let cdi_devices = DockerSandboxDriverConfig::from_sandbox(sandbox)
+        .map_err(Status::invalid_argument)?
+        .cdi_devices
+        .unwrap_or_default();
+    if !spec.gpu && !cdi_devices.is_empty() {
+        return Err(Status::invalid_argument(
+            "driver_config.cdi_devices requires gpu=true",
+        ));
+    }
+
+    Ok(
+        cdi_gpu_device_ids(spec.gpu, &cdi_devices).map(|device_ids| {
+            vec![DeviceRequest {
+                driver: Some("cdi".to_string()),
+                device_ids: Some(device_ids),
+                ..Default::default()
+            }]
+        }),
+    )
 }
 
 fn build_container_create_body(
@@ -2074,6 +2152,7 @@ fn build_container_create_body(
         .ok_or_else(|| Status::invalid_argument("sandbox.spec.template is required"))?;
     let resource_limits = docker_resource_limits(template)?;
     let user_mounts = docker_driver_mounts(template, config.enable_bind_mounts)?;
+    let device_requests = build_device_requests(sandbox)?;
     let mut labels = template.labels.clone();
     labels.insert(
         LABEL_MANAGED_BY.to_string(),
@@ -2103,7 +2182,7 @@ fn build_container_create_body(
             nano_cpus: resource_limits.nano_cpus,
             memory: resource_limits.memory_bytes,
             pids_limit: docker_pids_limit(config.sandbox_pids_limit)?,
-            device_requests: docker_gpu_device_requests(spec.gpu, &spec.gpu_device),
+            device_requests,
             binds: Some(build_binds(sandbox, config)?),
             mounts: Some(user_mounts),
             restart_policy: Some(RestartPolicy {

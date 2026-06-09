@@ -85,10 +85,8 @@ message DriverSandboxSpec {
   DriverSandboxTemplate template = 6;
   // Request NVIDIA GPU resources for this sandbox.
   bool gpu = 9;
-  // Optional PCI BDF address (e.g. "0000:2d:00.0") or device index
-  // (e.g. "0", "1"). When empty with gpu=true, the driver assigns the
-  // first available GPU.
-  string gpu_device = 10;
+  reserved 10;
+  reserved "gpu_device";
   // Gateway-minted JWT identifying this sandbox to the gateway. Set by
   // the gateway on create; the driver materialises it via its native
   // secret mechanism (Docker/Podman/VM bind-mount a per-sandbox file;

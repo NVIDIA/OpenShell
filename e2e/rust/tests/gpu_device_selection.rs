@@ -11,7 +11,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use openshell_e2e::harness::binary::openshell_cmd;
-use openshell_e2e::harness::container::ContainerEngine;
+use openshell_e2e::harness::container::{ContainerEngine, e2e_driver};
 use openshell_e2e::harness::output::strip_ansi;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use serde_json::{Map, Value};
@@ -130,6 +130,22 @@ fn has_cdi_gpu_device(device_id: &str) -> bool {
         .any(|discovered| discovered == device_id)
 }
 
+fn e2e_driver_config_key() -> &'static str {
+    match e2e_driver().as_deref() {
+        Some("podman") => "podman",
+        _ => "docker",
+    }
+}
+
+fn cdi_devices_driver_config_json(device_ids: &[&str]) -> String {
+    serde_json::json!({
+        e2e_driver_config_key(): {
+            "cdi_devices": device_ids
+        }
+    })
+    .to_string()
+}
+
 fn runtime_gpu_lines(gpu_device: &str) -> Vec<String> {
     let engine = ContainerEngine::from_env();
     let image = gpu_probe_image();
@@ -174,9 +190,11 @@ fn runtime_gpu_lines(gpu_device: &str) -> Vec<String> {
 
 async fn sandbox_gpu_lines(gpu_device: Option<&str>) -> Vec<String> {
     let mut args = vec!["--gpu"];
+    let driver_config_json;
     if let Some(gpu_device) = gpu_device {
-        args.push("--gpu-device");
-        args.push(gpu_device);
+        driver_config_json = cdi_devices_driver_config_json(&[gpu_device]);
+        args.push("--driver-config-json");
+        args.push(driver_config_json.as_str());
     }
     args.extend(["--", "sh", "-lc", "nvidia-smi -L"]);
 
@@ -271,16 +289,17 @@ async fn gpu_all_device_request_matches_plain_all_gpu_container() {
 
 #[tokio::test]
 async fn gpu_invalid_device_request_fails() {
-    let output = sandbox_create_output(&[
+    let driver_config_json = cdi_devices_driver_config_json(&["nvidia.com/gpu=invalid"]);
+    let args = vec![
         "--gpu",
-        "--gpu-device",
-        "nvidia.com/gpu=invalid",
+        "--driver-config-json",
+        driver_config_json.as_str(),
         "--",
         "sh",
         "-lc",
         "nvidia-smi -L",
-    ])
-    .await;
+    ];
+    let output = sandbox_create_output(&args).await;
     let output_lower = output.to_ascii_lowercase();
 
     assert!(

@@ -36,12 +36,16 @@ use openshell_core::progress::{
 use openshell_core::proto::compute::v1::{
     CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     DriverCondition as SandboxCondition, DriverPlatformEvent as PlatformEvent,
-    DriverSandbox as Sandbox, DriverSandboxStatus as SandboxStatus, GetCapabilitiesRequest,
-    GetCapabilitiesResponse, GetSandboxRequest, GetSandboxResponse, ListSandboxesRequest,
-    ListSandboxesResponse, StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
+    DriverSandbox as Sandbox, DriverSandboxStatus as SandboxStatus,
+    DriverSandboxTemplate as SandboxTemplate, GetCapabilitiesRequest, GetCapabilitiesResponse,
+    GetSandboxRequest, GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse,
+    StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateRequest,
     ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
     WatchSandboxesPlatformEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
     compute_driver_server::ComputeDriver, watch_sandboxes_event,
+};
+use openshell_core::proto_struct::{
+    deserialize_optional_non_empty_string_list, struct_to_json_value,
 };
 use openshell_vfio::SysfsRoot;
 use prost::Message;
@@ -74,6 +78,40 @@ const DEFAULT_MEM_MIB: u32 = 2048;
 const DEFAULT_OVERLAY_DISK_MIB: u64 = 4096;
 const DEFAULT_REGISTRY_LAYER_DOWNLOAD_CONCURRENCY: usize = 4;
 const MAX_REGISTRY_LAYER_DOWNLOAD_CONCURRENCY: usize = 16;
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct VmSandboxDriverConfig {
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_non_empty_string_list"
+    )]
+    gpu_device_ids: Option<Vec<String>>,
+}
+
+impl VmSandboxDriverConfig {
+    fn from_sandbox(sandbox: &Sandbox) -> Result<Self, String> {
+        let Some(template) = sandbox
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.template.as_ref())
+        else {
+            return Ok(Self::default());
+        };
+
+        Self::from_template(template)
+    }
+
+    fn from_template(template: &SandboxTemplate) -> Result<Self, String> {
+        let Some(config) = template.driver_config.as_ref() else {
+            return Ok(Self::default());
+        };
+
+        serde_json::from_value(struct_to_json_value(config))
+            .map_err(|err| format!("invalid vm driver_config: {err}"))
+    }
+}
+
 /// gvproxy host-loopback IP — gvproxy's TCP/UDP/ICMP forwarder NAT-rewrites
 /// this destination to the host's `127.0.0.1` and dials out from the host
 /// process. This is the only address that transparently reaches host-bound
@@ -651,9 +689,12 @@ impl VmDriver {
             )));
         }
 
-        let gpu_device = sandbox.spec.as_ref().map_or("", |s| s.gpu_device.as_str());
-        let gpu_bdf = if is_gpu {
-            Some(self.assign_gpu_to_record(&sandbox.id, gpu_device).await?)
+        let gpu_device_id = vm_gpu_device_id(&sandbox)?;
+        let gpu_bdf = if let Some(gpu_device_id) = gpu_device_id.as_deref() {
+            Some(
+                self.assign_gpu_to_record(&sandbox.id, gpu_device_id)
+                    .await?,
+            )
         } else {
             None
         };
@@ -3035,29 +3076,68 @@ fn validate_vm_sandbox(sandbox: &Sandbox, gpu_enabled: bool) -> Result<(), Statu
         .as_ref()
         .ok_or_else(|| Status::invalid_argument("sandbox spec is required"))?;
 
+    if let Some(template) = spec.template.as_ref() {
+        validate_vm_sandbox_template(template)?;
+    }
+    validate_vm_gpu_request(sandbox, gpu_enabled)?;
+
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_vm_sandbox_template(template: &SandboxTemplate) -> Result<(), Status> {
+    if !template.agent_socket_path.is_empty() {
+        return Err(Status::failed_precondition(
+            "vm sandboxes do not support template.agent_socket_path",
+        ));
+    }
+    if template.platform_config.is_some() {
+        return Err(Status::failed_precondition(
+            "vm sandboxes do not support template.platform_config",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn validate_vm_gpu_request(sandbox: &Sandbox, gpu_enabled: bool) -> Result<(), Status> {
+    let spec = sandbox
+        .spec
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("sandbox spec is required"))?;
+
+    let _ = vm_gpu_device_id(sandbox)?;
     if spec.gpu && !gpu_enabled {
         return Err(Status::failed_precondition(
             "GPU support is not enabled on this driver; start with --gpu",
         ));
     }
-
-    if !spec.gpu && !spec.gpu_device.is_empty() {
-        return Err(Status::invalid_argument("gpu_device requires gpu=true"));
-    }
-
-    if let Some(template) = spec.template.as_ref() {
-        if !template.agent_socket_path.is_empty() {
-            return Err(Status::failed_precondition(
-                "vm sandboxes do not support template.agent_socket_path",
-            ));
-        }
-        if template.platform_config.is_some() {
-            return Err(Status::failed_precondition(
-                "vm sandboxes do not support template.platform_config",
-            ));
-        }
-    }
     Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn vm_gpu_device_id(sandbox: &Sandbox) -> Result<Option<String>, Status> {
+    let Some(spec) = sandbox.spec.as_ref() else {
+        return Ok(None);
+    };
+    let gpu_device_ids = VmSandboxDriverConfig::from_sandbox(sandbox)
+        .map_err(Status::invalid_argument)?
+        .gpu_device_ids
+        .unwrap_or_default();
+    if !spec.gpu && !gpu_device_ids.is_empty() {
+        return Err(Status::invalid_argument(
+            "driver_config.gpu_device_ids requires gpu=true",
+        ));
+    }
+    if gpu_device_ids.len() > 1 {
+        return Err(Status::invalid_argument(
+            "vm driver currently supports at most one gpu_device_ids entry",
+        ));
+    }
+
+    Ok(spec
+        .gpu
+        .then(|| gpu_device_ids.into_iter().next().unwrap_or_default()))
 }
 
 #[allow(clippy::result_large_err)]
@@ -4995,6 +5075,33 @@ mod tests {
     static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
+    fn gpu_device_ids_config(device_ids: &[&str]) -> Struct {
+        list_string_driver_config("gpu_device_ids", device_ids)
+    }
+
+    fn gpu_device_id_typo_config(device_ids: &[&str]) -> Struct {
+        list_string_driver_config("gpu_device_id", device_ids)
+    }
+
+    fn list_string_driver_config(field: &str, values: &[&str]) -> Struct {
+        Struct {
+            fields: std::iter::once((
+                field.to_string(),
+                Value {
+                    kind: Some(Kind::ListValue(prost_types::ListValue {
+                        values: values
+                            .iter()
+                            .map(|device_id| Value {
+                                kind: Some(Kind::StringValue((*device_id).to_string())),
+                            })
+                            .collect(),
+                    })),
+                },
+            ))
+            .collect(),
+        }
+    }
+
     #[test]
     fn vm_pulling_layer_event_adds_progress_detail_metadata() {
         let mut event = platform_event(
@@ -5092,15 +5199,99 @@ mod tests {
             id: "sandbox-123".to_string(),
             spec: Some(SandboxSpec {
                 gpu: false,
-                gpu_device: "0000:2d:00.0".to_string(),
+                template: Some(SandboxTemplate {
+                    driver_config: Some(gpu_device_ids_config(&["0000:2d:00.0"])),
+                    ..Default::default()
+                }),
                 ..Default::default()
             }),
             ..Default::default()
         };
         let err = validate_vm_sandbox(&sandbox, true)
-            .expect_err("gpu_device without gpu should be rejected");
+            .expect_err("gpu_device_ids without gpu should be rejected");
         assert_eq!(err.code(), Code::InvalidArgument);
-        assert!(err.message().contains("gpu_device requires gpu=true"));
+        assert!(err.message().contains("gpu_device_ids requires gpu=true"));
+    }
+
+    #[test]
+    fn validate_vm_sandbox_rejects_multiple_gpu_device_ids() {
+        let sandbox = Sandbox {
+            id: "sandbox-123".to_string(),
+            spec: Some(SandboxSpec {
+                gpu: true,
+                template: Some(SandboxTemplate {
+                    driver_config: Some(gpu_device_ids_config(&["0000:2d:00.0", "0000:31:00.0"])),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err =
+            validate_vm_sandbox(&sandbox, true).expect_err("multiple GPUs should be rejected");
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("at most one gpu_device_ids"));
+    }
+
+    #[test]
+    fn validate_vm_sandbox_rejects_empty_gpu_device_ids() {
+        let sandbox = Sandbox {
+            id: "sandbox-123".to_string(),
+            spec: Some(SandboxSpec {
+                gpu: true,
+                template: Some(SandboxTemplate {
+                    driver_config: Some(gpu_device_ids_config(&[])),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err =
+            validate_vm_sandbox(&sandbox, true).expect_err("empty GPU IDs should be rejected");
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("non-empty list"));
+    }
+
+    #[test]
+    fn validate_vm_sandbox_rejects_unknown_driver_config_fields() {
+        let sandbox = Sandbox {
+            id: "sandbox-123".to_string(),
+            spec: Some(SandboxSpec {
+                gpu: true,
+                template: Some(SandboxTemplate {
+                    driver_config: Some(gpu_device_id_typo_config(&["0000:2d:00.0"])),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err =
+            validate_vm_sandbox(&sandbox, true).expect_err("unknown field should be rejected");
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("unknown field"));
+    }
+
+    #[test]
+    fn validate_vm_sandbox_rejects_template_errors_before_device_config() {
+        let sandbox = Sandbox {
+            id: "sandbox-123".to_string(),
+            spec: Some(SandboxSpec {
+                gpu: true,
+                template: Some(SandboxTemplate {
+                    agent_socket_path: "/tmp/agent.sock".to_string(),
+                    driver_config: Some(gpu_device_ids_config(&[])),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err =
+            validate_vm_sandbox(&sandbox, true).expect_err("template error should be rejected");
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("agent_socket_path"));
     }
 
     #[test]

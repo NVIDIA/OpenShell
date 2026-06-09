@@ -1215,12 +1215,6 @@ enum SandboxCommands {
         #[arg(long)]
         gpu: bool,
 
-        /// Target a driver-specific GPU device. Docker and Podman use CDI device IDs
-        /// (for example "nvidia.com/gpu=0"); VM uses a PCI BDF or index.
-        /// Only valid with --gpu. When omitted with --gpu, the driver uses its default GPU selection.
-        #[arg(long, requires = "gpu")]
-        gpu_device: Option<String>,
-
         /// CPU limit for the sandbox (for example: 500m, 1, 2.5).
         #[arg(long)]
         cpu: Option<String>,
@@ -2556,7 +2550,6 @@ async fn main() -> Result<()> {
                     no_keep,
                     editor,
                     gpu,
-                    gpu_device,
                     cpu,
                     memory,
                     driver_config_json,
@@ -2641,7 +2634,6 @@ async fn main() -> Result<()> {
                         &upload_specs,
                         keep,
                         gpu,
-                        gpu_device.as_deref(),
                         cpu.as_deref(),
                         memory.as_deref(),
                         driver_config_json.as_deref(),
