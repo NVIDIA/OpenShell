@@ -26,7 +26,6 @@ hide = true
 description = "Lint the openshell Helm chart (defaults + all CI configuration variants)"
 run = """
   set -e
-  helm dependency build deploy/helm/openshell
   echo "--- helm lint: defaults ---"
   echo "values files: deploy/helm/openshell/values.yaml"
   helm lint deploy/helm/openshell
@@ -46,7 +45,6 @@ run = """
   if ! helm plugin list | grep -q unittest; then
     helm plugin install https://github.com/helm-unittest/helm-unittest --verify=false
   fi
-  helm dependency build deploy/helm/openshell
   helm unittest deploy/helm/openshell
 """
 

@@ -1,24 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# CI/dev overlay for exercising the gateway with more than one replica.
-# SQLite is not suitable for HA because each replica has its own pod volume, so
-# this overlay enables the bundled PostgreSQL dependency added by the chart.
+# CI/dev overlay for exercising the gateway with more than one replica. SQLite
+# is not suitable for HA because each replica has its own pod volume, so this
+# overlay expects the caller to provide a PostgreSQL Secret named openshell-ha-pg.
 replicaCount: 2
 
-global:
-  security:
-    # The mirror serves the same pinned Bitnami PostgreSQL digest, but Bitnami's
-    # chart verification treats non-Docker-Hub registries as unrecognized.
-    allowInsecureImages: true
-
-postgres:
-  enabled: true
-  # Keep the HA CI/dev overlay off Docker Hub's unauthenticated pull path.
-  # The Bitnami subchart defaults to registry-1.docker.io/bitnami/postgresql:latest.
-  image:
-    registry: mirror.gcr.io
-    repository: bitnami/postgresql
-    digest: sha256:7651d7f24aad83fe68a222f7f20eded10d325c96ebee285ca5bf8162eddcba64
-  auth:
-    password: openshell-ha-ci
+server:
+  externalDbSecret: openshell-ha-pg

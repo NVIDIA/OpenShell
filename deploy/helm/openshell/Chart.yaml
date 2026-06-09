@@ -11,9 +11,3 @@ type: application
 # empty), so a released chart automatically pulls the matching gateway and supervisor images.
 version: 0.0.0
 appVersion: "0.0.0"
-dependencies:
-  - name: postgresql
-    version: 18.6.7
-    repository: oci://registry-1.docker.io/bitnamicharts
-    condition: postgres.enabled
-    alias: postgres

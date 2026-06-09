@@ -90,7 +90,7 @@ description = "Run Rust CLI e2e tests against an OpenShell gateway deployed on K
 run = "e2e/rust/e2e-kubernetes.sh"
 
 ["e2e:kubernetes:db"]
-description = "Run Kubernetes e2e with all database backend scenarios (SQLite, bundled PostgreSQL, external PostgreSQL with existingSecret)"
+description = "Run Kubernetes e2e with all database backend scenarios (SQLite and external PostgreSQL with existingSecret)"
 env = { OPENSHELL_E2E_KUBE_DB_SCENARIOS = "1" }
 run = "e2e/rust/e2e-kubernetes.sh"
 

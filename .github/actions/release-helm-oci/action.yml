@@ -71,14 +71,6 @@ runs:
           exit 1
         fi
 
-    - name: Build chart dependencies
-      env:
-        CHART_DIR: ${{ steps.prep.outputs.chart_dir }}
-      shell: bash
-      run: |
-        set -euo pipefail
-        helm dependency build "${CHART_DIR}"
-
     - name: Package Helm chart
       env:
         CHART_DIR: ${{ steps.prep.outputs.chart_dir }}

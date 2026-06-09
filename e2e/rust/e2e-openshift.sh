@@ -7,7 +7,6 @@
 # Prerequisites:
 #   - oc CLI authenticated to an OpenShift cluster
 #   - helm 3.x installed
-#   - Chart dependencies built (helm dependency build deploy/helm/openshell)
 #
 # Usage:
 #   mise run e2e:openshift
@@ -15,6 +14,7 @@
 
 set -euo pipefail
 
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CHART_PATH="${CHART_PATH:-./deploy/helm/openshell}"
 NAMESPACE="openshell"
 RELEASE="openshell"
@@ -23,6 +23,13 @@ WAIT_TIMEOUT="120s"
 PASSED=0
 FAILED=0
 SCENARIOS=()
+EXTERNAL_PG_SECRET="my-pg-credentials"
+EXTERNAL_PG_SERVICE="openshell-e2e-postgres"
+EXTERNAL_PG_SERVICE_ACCOUNT="openshell-e2e-postgres"
+EXTERNAL_PG_PASSWORD="openshell-e2e-postgres"
+EXTERNAL_PG_DATABASE="openshell"
+EXTERNAL_PG_USERNAME="openshell"
+EXTERNAL_PG_MANIFEST="${ROOT}/e2e/kubernetes/postgres-fixture.yaml"
 
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -59,6 +66,30 @@ cleanup_release() {
   done
   # Clean up PVCs left by StatefulSets
   oc delete pvc -n "$NAMESPACE" -l "app.kubernetes.io/instance=$RELEASE" --wait=false 2>/dev/null || true
+}
+
+deploy_external_pg() {
+  local pg_uri
+
+  log "Deploying standalone PostgreSQL as external database..."
+  oc create serviceaccount "$EXTERNAL_PG_SERVICE_ACCOUNT" -n "$NAMESPACE" 2>/dev/null || true
+  oc adm policy add-scc-to-user anyuid -z "$EXTERNAL_PG_SERVICE_ACCOUNT" -n "$NAMESPACE" >/dev/null
+
+  oc apply -n "$NAMESPACE" -f "$EXTERNAL_PG_MANIFEST"
+  oc rollout status "deployment/${EXTERNAL_PG_SERVICE}" -n "$NAMESPACE" --timeout="$WAIT_TIMEOUT"
+
+  pg_uri="postgresql://${EXTERNAL_PG_USERNAME}:${EXTERNAL_PG_PASSWORD}@${EXTERNAL_PG_SERVICE}.${NAMESPACE}.svc.cluster.local:5432/${EXTERNAL_PG_DATABASE}"
+  log "Creating existing Secret with PostgreSQL credentials..."
+  oc delete secret "$EXTERNAL_PG_SECRET" -n "$NAMESPACE" --ignore-not-found >/dev/null 2>&1 || true
+  oc create secret generic "$EXTERNAL_PG_SECRET" -n "$NAMESPACE" \
+    --from-literal=uri="$pg_uri"
+}
+
+cleanup_external_pg() {
+  oc delete -n "$NAMESPACE" -f "$EXTERNAL_PG_MANIFEST" --ignore-not-found 2>/dev/null || true
+  oc delete secret "$EXTERNAL_PG_SECRET" -n "$NAMESPACE" --ignore-not-found 2>/dev/null || true
+  oc adm policy remove-scc-from-user anyuid -z "$EXTERNAL_PG_SERVICE_ACCOUNT" \
+    -n "$NAMESPACE" 2>/dev/null || true
 }
 
 verify_gateway() {
@@ -105,73 +136,30 @@ helm install "$RELEASE" "$CHART_PATH" -n "$NAMESPACE" \
 verify_gateway "$SCENARIO"
 cleanup_release
 
-# --- scenario 2: Bundled PostgreSQL -------------------------------------------
-
-SCENARIO="Bundled PostgreSQL"
-log "Testing: $SCENARIO"
-cleanup_release
-
-helm install "$RELEASE" "$CHART_PATH" -n "$NAMESPACE" \
-  "${OPENSHIFT_FLAGS[@]}" \
-  --set postgres.enabled=true
-
-# Wait for postgres to be ready first
-log "Waiting for bundled PostgreSQL..."
-wait_for_ready "app.kubernetes.io/name=postgres,app.kubernetes.io/instance=$RELEASE" "$WAIT_TIMEOUT" || true
-
-verify_gateway "$SCENARIO"
-cleanup_release
-
-# --- scenario 3: External PostgreSQL with existing Secret -------------------
+# --- scenario 2: External PostgreSQL with existing Secret -------------------
 
 SCENARIO="External PostgreSQL (externalDbSecret)"
 log "Testing: $SCENARIO"
 cleanup_release
 
-# Deploy a standalone Bitnami PostgreSQL as the "external" database
-EXTERNAL_PG_RELEASE="pg-external"
-EXTERNAL_PG_PASSWORD="ext-test-password"
-EXTERNAL_PG_DATABASE="openshell"
-EXTERNAL_PG_USERNAME="openshell"
-
-log "Deploying standalone PostgreSQL as external database..."
-helm install "$EXTERNAL_PG_RELEASE" oci://registry-1.docker.io/bitnamicharts/postgresql \
-  -n "$NAMESPACE" \
-  --set auth.username="$EXTERNAL_PG_USERNAME" \
-  --set auth.password="$EXTERNAL_PG_PASSWORD" \
-  --set auth.database="$EXTERNAL_PG_DATABASE" \
-  --set primary.podSecurityContext.fsGroup=null \
-  --set primary.containerSecurityContext.runAsUser=null \
-  --wait --timeout "$WAIT_TIMEOUT" 2>/dev/null || true
-
-wait_for_ready "app.kubernetes.io/name=postgresql,app.kubernetes.io/instance=$EXTERNAL_PG_RELEASE" "$WAIT_TIMEOUT" || true
-
-EXTERNAL_PG_HOST="${EXTERNAL_PG_RELEASE}-postgresql.${NAMESPACE}.svc.cluster.local"
-EXTERNAL_PG_URI="postgresql://${EXTERNAL_PG_USERNAME}:${EXTERNAL_PG_PASSWORD}@${EXTERNAL_PG_HOST}:5432/${EXTERNAL_PG_DATABASE}"
-
-# Create the existing Secret with the uri key
-log "Creating existing Secret with PostgreSQL credentials..."
-oc create secret generic my-pg-credentials -n "$NAMESPACE" \
-  --from-literal=uri="$EXTERNAL_PG_URI" \
-  2>/dev/null || true
+deploy_external_pg
 
 # Install OpenShell pointing at the existing Secret
 helm install "$RELEASE" "$CHART_PATH" -n "$NAMESPACE" \
   "${OPENSHIFT_FLAGS[@]}" \
-  --set server.externalDbSecret=my-pg-credentials
+  --set server.externalDbSecret="$EXTERNAL_PG_SECRET"
 
 verify_gateway "$SCENARIO"
 
 # Cleanup external postgres and secret
 cleanup_release
-helm uninstall "$EXTERNAL_PG_RELEASE" -n "$NAMESPACE" --wait 2>/dev/null || true
-oc delete secret my-pg-credentials -n "$NAMESPACE" 2>/dev/null || true
-oc delete pvc -n "$NAMESPACE" -l "app.kubernetes.io/instance=$EXTERNAL_PG_RELEASE" --wait=false 2>/dev/null || true
+cleanup_external_pg
 
 # --- teardown ---------------------------------------------------------------
 
 log "Removing SCC binding and namespace"
 oc adm policy remove-scc-from-user privileged -z "${RELEASE}-sandbox" -n "$NAMESPACE" 2>/dev/null || true
+cleanup_external_pg
 oc delete ns "$NAMESPACE" --wait=false 2>/dev/null || true
 
 # --- summary ----------------------------------------------------------------

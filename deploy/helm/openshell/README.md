@@ -56,7 +56,7 @@ See [`values.yaml`](values.yaml) for source defaults. Selected overlays:
 - [`ci/values-gateway.yaml`](ci/values-gateway.yaml) - gateway-only configuration
 - [`ci/values-cert-manager.yaml`](ci/values-cert-manager.yaml) - cert-manager integration
 - [`ci/values-keycloak.yaml`](ci/values-keycloak.yaml) - Keycloak OIDC integration
-- [`ci/values-high-availability.yaml`](ci/values-high-availability.yaml) - HA gateway test overlay with bundled PostgreSQL
+- [`ci/values-high-availability.yaml`](ci/values-high-availability.yaml) - HA gateway overlay with an external PostgreSQL Secret
 
 ### Database backend
 
@@ -65,11 +65,14 @@ By default, OpenShell uses SQLite:
 ```yaml
 server:
   dbUrl: "sqlite:/var/openshell/openshell.db"
-postgres:
-  enabled: false
 ```
 
 #### External PostgreSQL
+
+Use external PostgreSQL for HA deployments. The OpenShell chart does not deploy
+a database; install PostgreSQL separately using the chart, operator, or managed
+service that fits your environment, then pass the connection URI through a
+Secret.
 
 Create a Secret containing the PostgreSQL connection URI if one does not
 already exist:
@@ -86,18 +89,6 @@ helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <vers
   -n openshell \
   --set server.externalDbSecret=my-pg-credentials
 ```
-
-#### Bundled PostgreSQL
-
-Deploy a PostgreSQL instance alongside the gateway using the bundled
-Bitnami subchart. A random password is generated automatically:
-
-```bash
-helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
-  --set postgres.enabled=true
-```
-
-To set an explicit password, add `--set postgres.auth.password=my-secret-password`.
 
 #### OpenShift
 
@@ -159,12 +150,6 @@ JWT signing Secret.
 | podLabels | object | `{}` | Extra labels to add to the gateway pod. |
 | podLifecycle.terminationGracePeriodSeconds | int | `5` | Grace period, in seconds, before Kubernetes terminates the gateway pod. |
 | podSecurityContext.fsGroup | int | `1000` | fsGroup assigned to the gateway pod. |
-| postgres.auth.database | string | `"openshell"` |  |
-| postgres.auth.password | string | `""` |  |
-| postgres.auth.username | string | `"openshell"` |  |
-| postgres.enabled | bool | `false` | Deploy the bundled Bitnami PostgreSQL subchart. |
-| postgres.primary.persistence.enabled | bool | `true` |  |
-| postgres.serviceBindings.enabled | bool | `true` |  |
 | probes.liveness.failureThreshold | int | `3` | Liveness probe failure threshold before the container is restarted. |
 | probes.liveness.initialDelaySeconds | int | `2` | Liveness probe initial delay, in seconds. |
 | probes.liveness.periodSeconds | int | `5` | Liveness probe period, in seconds. |

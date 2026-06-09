@@ -9,8 +9,8 @@ still override anything in this file.
 
 One value is intentionally NOT rendered here:
   - server.dbUrl              → passed via OPENSHELL_DB_URL env var (from Secret)
-                                 when postgres.enabled=true or server.externalDbSecret
-                                 is set, otherwise --db-url arg for SQLite
+                                 when server.externalDbSecret is set, otherwise
+                                 --db-url arg for SQLite
 */}}
 apiVersion: v1
 kind: ConfigMap

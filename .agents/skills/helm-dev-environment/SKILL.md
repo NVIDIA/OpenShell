@@ -66,9 +66,10 @@ generates mTLS secrets on first install. Envoy Gateway opt-in; see the Optional 
 
 The gateway Service uses ClusterIP. Access is via Envoy Gateway (port `8080`) or `kubectl port-forward`.
 
-**HA test deploy** (two gateway replicas + bundled PostgreSQL): uncomment
+**HA test deploy** (two gateway replicas + external PostgreSQL Secret): uncomment
 `#- ci/values-high-availability.yaml` in `deploy/helm/openshell/skaffold.yaml`,
-then run `mise run helm:skaffold:run` or `mise run helm:skaffold:dev`.
+create the Secret named `openshell-ha-pg` with a `uri` key, then run
+`mise run helm:skaffold:run` or `mise run helm:skaffold:dev`.
 
 ### TLS behaviour
 
@@ -203,7 +204,7 @@ mise run helm:k3s:status
 | `deploy/helm/openshell/ci/values-skaffold.yaml` | Dev overrides (image pull policy, TLS disabled for local Skaffold) |
 | `deploy/helm/openshell/ci/values-cert-manager.yaml` | cert-manager PKI overlay (opt-in; disables pkiInitJob) |
 | `deploy/helm/openshell/ci/values-gateway.yaml` | Envoy Gateway GRPCRoute + Gateway overlay |
-| `deploy/helm/openshell/ci/values-high-availability.yaml` | HA test overlay (`replicaCount: 2` with bundled PostgreSQL) |
+| `deploy/helm/openshell/ci/values-high-availability.yaml` | HA test overlay (`replicaCount: 2` with external PostgreSQL Secret) |
 | `deploy/helm/openshell/ci/values-keycloak.yaml` | Keycloak OIDC overlay |
 | `deploy/helm/openshell/ci/values-tls-disabled.yaml` | Lint-only: TLS + auth disabled (reverse-proxy edge termination) |
 | `deploy/kube/manifests/envoy-gateway-openshell.yaml` | GatewayClass for Envoy Gateway (`mise run helm:gateway:apply`) |

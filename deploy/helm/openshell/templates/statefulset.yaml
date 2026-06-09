@@ -1,8 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-{{- if and .Values.postgres.enabled (not .Values.postgres.serviceBindings.enabled) (not .Values.server.externalDbSecret) }}
-{{- fail "postgres.serviceBindings.enabled must be true when using bundled PostgreSQL" }}
-{{- end }}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -56,16 +53,16 @@ spec:
           args:
             - --config
             - /etc/openshell/gateway.toml
-            {{- if not (or .Values.postgres.enabled .Values.server.externalDbSecret) }}
+            {{- if not .Values.server.externalDbSecret }}
             - --db-url
             - {{ .Values.server.dbUrl | quote }}
             {{- end }}
           env:
-            {{- if or .Values.postgres.enabled .Values.server.externalDbSecret }}
+            {{- if .Values.server.externalDbSecret }}
             - name: OPENSHELL_DB_URL
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "openshell.dbSecretName" . }}
+                  name: {{ .Values.server.externalDbSecret }}
                   key: uri
             {{- end }}
             # All gateway settings live in the ConfigMap-backed TOML file

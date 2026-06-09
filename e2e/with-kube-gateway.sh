@@ -30,9 +30,15 @@
 #
 # Database backend scenarios:
 #   Set OPENSHELL_E2E_KUBE_DB_SCENARIOS=1 to run the test command against
-#   three database configurations (SQLite, bundled PostgreSQL, external
-#   PostgreSQL with existingSecret). When unset, the default single-install
-#   behavior is unchanged.
+#   the supported database configurations: SQLite and external PostgreSQL
+#   with an existing Secret. When unset, the default single-install behavior
+#   is unchanged.
+#
+# External PostgreSQL fixture:
+#   Set OPENSHELL_E2E_KUBE_EXTERNAL_POSTGRES_SECRET to create an ephemeral
+#   PostgreSQL Deployment and a matching Secret with a `uri` key before
+#   installing OpenShell. This is used by HA CI so the gateway can run multiple
+#   replicas without requiring the OpenShell chart to own a database.
 
 set -euo pipefail
 
@@ -66,7 +72,13 @@ PORTFORWARD_LOG="${WORKDIR}/portforward.log"
 PORTFORWARD_HEALTH_PID=""
 PORTFORWARD_HEALTH_LOG="${WORKDIR}/portforward-health.log"
 HELM_INSTALLED=0
-EXTERNAL_PG_DEPLOYED=0
+EXTERNAL_PG_FIXTURE_DEPLOYED=0
+EXTERNAL_PG_FIXTURE_SECRET=""
+EXTERNAL_PG_FIXTURE_MANIFEST="${ROOT}/e2e/kubernetes/postgres-fixture.yaml"
+EXTERNAL_PG_FIXTURE_SERVICE="openshell-e2e-postgres"
+EXTERNAL_PG_FIXTURE_USER="openshell"
+EXTERNAL_PG_FIXTURE_PASSWORD="openshell-e2e-postgres"
+EXTERNAL_PG_FIXTURE_DATABASE="openshell"
 
 # Isolate CLI/SDK gateway metadata from the developer's real config.
 export XDG_CONFIG_HOME="${WORKDIR}/config"
@@ -80,19 +92,41 @@ helmctl() {
   helm --kube-context "${KUBE_CONTEXT}" "$@"
 }
 
-chart_without_dependencies() {
-  local src="${ROOT}/deploy/helm/openshell"
-  local dst="${WORKDIR}/helm-chart-no-deps"
+deploy_postgres_fixture() {
+  local secret_name="$1"
+  local pg_uri
 
-  rm -rf "${dst}"
-  cp -a "${src}" "${dst}"
-  rm -rf "${dst}/charts" "${dst}/Chart.lock"
-  awk '
-    /^dependencies:[[:space:]]*$/ { skip = 1; next }
-    skip && /^[^[:space:]-]/ { skip = 0 }
-    !skip { print }
-  ' "${src}/Chart.yaml" >"${dst}/Chart.yaml"
-  printf '%s\n' "${dst}"
+  echo "Deploying external PostgreSQL fixture ${EXTERNAL_PG_FIXTURE_SERVICE}..."
+  if ! kctl get namespace "${NAMESPACE}" >/dev/null 2>&1; then
+    kctl create namespace "${NAMESPACE}"
+  fi
+
+  kctl -n "${NAMESPACE}" apply -f "${EXTERNAL_PG_FIXTURE_MANIFEST}"
+  EXTERNAL_PG_FIXTURE_DEPLOYED=1
+  EXTERNAL_PG_FIXTURE_SECRET="${secret_name}"
+
+  kctl -n "${NAMESPACE}" rollout status "deployment/${EXTERNAL_PG_FIXTURE_SERVICE}" --timeout=120s
+
+  pg_uri="postgresql://${EXTERNAL_PG_FIXTURE_USER}:${EXTERNAL_PG_FIXTURE_PASSWORD}@${EXTERNAL_PG_FIXTURE_SERVICE}.${NAMESPACE}.svc.cluster.local:5432/${EXTERNAL_PG_FIXTURE_DATABASE}"
+  kctl -n "${NAMESPACE}" delete secret "${secret_name}" \
+    --ignore-not-found >/dev/null 2>&1 || true
+  kctl -n "${NAMESPACE}" create secret generic "${secret_name}" \
+    --from-literal=uri="${pg_uri}"
+}
+
+cleanup_postgres_fixture() {
+  local secret_name="$1"
+
+  [ -n "${KUBE_CONTEXT}" ] || return 0
+  [ -n "${NAMESPACE}" ] || return 0
+
+  kctl -n "${NAMESPACE}" delete -f "${EXTERNAL_PG_FIXTURE_MANIFEST}" \
+    --ignore-not-found >/dev/null 2>&1 || true
+  kctl -n "${NAMESPACE}" delete secret "${secret_name}" \
+    --ignore-not-found >/dev/null 2>&1 || true
+
+  EXTERNAL_PG_FIXTURE_DEPLOYED=0
+  EXTERNAL_PG_FIXTURE_SECRET=""
 }
 
 cleanup() {
@@ -134,13 +168,8 @@ cleanup() {
     fi
   fi
 
-  if [ "${EXTERNAL_PG_DEPLOYED}" = "1" ] && [ -n "${KUBE_CONTEXT}" ] && [ -n "${NAMESPACE}" ]; then
-    helmctl uninstall pg-external --namespace "${NAMESPACE}" --wait \
-      --timeout 60s >/dev/null 2>&1 || true
-    kctl -n "${NAMESPACE}" delete secret my-pg-credentials \
-      --ignore-not-found >/dev/null 2>&1 || true
-    kctl delete pvc -n "${NAMESPACE}" \
-      -l "app.kubernetes.io/instance=pg-external" --wait=false >/dev/null 2>&1 || true
+  if [ "${EXTERNAL_PG_FIXTURE_DEPLOYED}" = "1" ]; then
+    cleanup_postgres_fixture "${EXTERNAL_PG_FIXTURE_SECRET}"
   fi
 
   if [ "${HELM_INSTALLED}" = "1" ] && [ -n "${KUBE_CONTEXT}" ] && [ -n "${NAMESPACE}" ]; then
@@ -200,45 +229,20 @@ scenario_cleanup_release() {
 }
 
 scenario_deploy_external_pg() {
-  local pg_host pg_uri
   echo "==> Deploying standalone PostgreSQL as external database..."
-  helmctl install pg-external oci://registry-1.docker.io/bitnamicharts/postgresql \
-    --namespace "${NAMESPACE}" \
-    --set auth.username=openshell \
-    --set auth.password=ext-test-password \
-    --set auth.database=openshell \
-    --wait --timeout 120s 2>/dev/null || true
-  EXTERNAL_PG_DEPLOYED=1
-
-  kctl -n "${NAMESPACE}" wait pod \
-    -l "app.kubernetes.io/name=postgresql,app.kubernetes.io/instance=pg-external" \
-    --for=condition=Ready --timeout=120s || true
-
-  pg_host="pg-external-postgresql.${NAMESPACE}.svc.cluster.local"
-  pg_uri="postgresql://openshell:ext-test-password@${pg_host}:5432/openshell"
-
-  echo "==> Creating Secret with PostgreSQL URI..."
-  kctl -n "${NAMESPACE}" create secret generic my-pg-credentials \
-    --from-literal=uri="${pg_uri}" \
-    2>/dev/null || true
+  deploy_postgres_fixture my-pg-credentials
 }
 
 scenario_cleanup_external_pg() {
   echo "==> Cleaning up external PostgreSQL..."
-  helmctl uninstall pg-external --namespace "${NAMESPACE}" --wait \
-    --timeout 60s 2>/dev/null || true
-  kctl -n "${NAMESPACE}" delete secret my-pg-credentials \
-    --ignore-not-found >/dev/null 2>&1 || true
-  kctl delete pvc -n "${NAMESPACE}" \
-    -l "app.kubernetes.io/instance=pg-external" --wait=false 2>/dev/null || true
-  EXTERNAL_PG_DEPLOYED=0
+  cleanup_postgres_fixture my-pg-credentials
 }
 
 # Run a single DB-backend scenario: install chart → port-forward → run tests → cleanup.
 # Usage: run_scenario "label" "type" [extra --set flags...]
-#   type: sqlite | bundled-pg | external-pg
+#   type: sqlite | external-pg
 run_scenario() {
-  local scenario_label="$1" scenario_type="$2"
+  local scenario_label="$1"
   shift 2
   local scenario_exit=0
 
@@ -258,13 +262,6 @@ run_scenario() {
     "$@" \
     --wait --timeout 5m
   HELM_INSTALLED=1
-
-  if [ "${scenario_type}" = "bundled-pg" ]; then
-    echo "Waiting for bundled PostgreSQL to become ready..."
-    kctl -n "${NAMESPACE}" wait pod \
-      -l "app.kubernetes.io/name=postgres,app.kubernetes.io/instance=${RELEASE_NAME}" \
-      --for=condition=Ready --timeout=120s || true
-  fi
 
   LOCAL_PORT="$(e2e_pick_port)"
   echo "Starting kubectl port-forward svc/openshell ${LOCAL_PORT}:8080..."
@@ -545,7 +542,6 @@ if [ -n "${HOST_GATEWAY_IP}" ]; then
 fi
 
 helm_values_args=(--values "${ROOT}/deploy/helm/openshell/ci/values-skaffold.yaml")
-helm_extra_values_enabled=0
 if [ -n "${OPENSHELL_E2E_KUBE_EXTRA_VALUES:-}" ]; then
   IFS=':' read -r -a extra_values_files <<< "${OPENSHELL_E2E_KUBE_EXTRA_VALUES}"
   for values_file in "${extra_values_files[@]}"; do
@@ -554,13 +550,10 @@ if [ -n "${OPENSHELL_E2E_KUBE_EXTRA_VALUES:-}" ]; then
       values_file="${ROOT}/${values_file}"
     fi
     helm_values_args+=(--values "${values_file}")
-    helm_extra_values_enabled=1
   done
 fi
 
 if [ "${OPENSHELL_E2E_KUBE_DB_SCENARIOS:-0}" = "1" ]; then
-  helm dependency build "${ROOT}/deploy/helm/openshell"
-
   # --- Multi-scenario mode: test all database backends ---
   DB_PASSED=0
   DB_FAILED=0
@@ -569,10 +562,6 @@ if [ "${OPENSHELL_E2E_KUBE_DB_SCENARIOS:-0}" = "1" ]; then
 
   run_scenario "SQLite (default)" sqlite \
     "${helm_extra_args[@]}"
-
-  run_scenario "Bundled PostgreSQL" bundled-pg \
-    "${helm_extra_args[@]}" \
-    --set postgres.enabled=true
 
   scenario_deploy_external_pg
   run_scenario "External PostgreSQL (externalDbSecret)" external-pg \
@@ -596,17 +585,13 @@ if [ "${OPENSHELL_E2E_KUBE_DB_SCENARIOS:-0}" = "1" ]; then
   fi
 else
   # --- Single-install mode (default, existing behavior) ---
-  helm_dependency_args=()
-  if [ "${helm_extra_values_enabled}" = "1" ]; then
-    chart_dir="${ROOT}/deploy/helm/openshell"
-    helm_dependency_args=(--dependency-update)
-  else
-    chart_dir="$(chart_without_dependencies)"
+  if [ -n "${OPENSHELL_E2E_KUBE_EXTERNAL_POSTGRES_SECRET:-}" ]; then
+    deploy_postgres_fixture "${OPENSHELL_E2E_KUBE_EXTERNAL_POSTGRES_SECRET}"
   fi
+
   echo "Installing Helm chart (release=${RELEASE_NAME}, namespace=${NAMESPACE}, tag=${IMAGE_TAG_VALUE})..."
-  helmctl install "${RELEASE_NAME}" "${chart_dir}" \
+  helmctl install "${RELEASE_NAME}" "${ROOT}/deploy/helm/openshell" \
     --namespace "${NAMESPACE}" --create-namespace \
-    "${helm_dependency_args[@]}" \
     "${helm_values_args[@]}" \
     --set "fullnameOverride=openshell" \
     --set "image.repository=${REGISTRY_VALUE}/gateway" \

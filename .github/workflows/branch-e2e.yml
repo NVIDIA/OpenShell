@@ -122,6 +122,7 @@ jobs:
       image-tag: ${{ github.sha }}
       job-name: Kubernetes HA E2E (Rust smoke)
       extra-helm-values: deploy/helm/openshell/ci/values-high-availability.yaml
+      external-postgres-secret: openshell-ha-pg
 
   core-e2e-result:
     name: Core E2E result

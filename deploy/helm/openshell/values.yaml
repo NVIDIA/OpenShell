@@ -257,28 +257,6 @@ server:
     # issuer uses a non-public CA (e.g. OpenShift ingress, private PKI).
     caConfigMapName: ""
 
-# Bundled PostgreSQL backing store (Bitnami subchart).
-# Set enabled=true to deploy a PostgreSQL instance alongside the gateway.
-# For external PostgreSQL, leave enabled=false and set server.externalDbSecret
-# to a pre-existing Secret containing a `uri` key.
-postgres:
-  # -- Deploy the bundled Bitnami PostgreSQL subchart.
-  enabled: false
-  # Values below configure the bundled Bitnami PostgreSQL subchart
-  # (aliased as "postgres" in Chart.yaml). The subchart uses these to
-  # initialise the PostgreSQL instance.
-  auth:
-    username: openshell
-    password: ""
-    database: openshell
-  # Bitnami service-binding Secrets — must stay true. The gateway reads
-  # the connection URI from the subchart-managed Secret.
-  serviceBindings:
-    enabled: true
-  primary:
-    persistence:
-      enabled: true
-
 # NetworkPolicy restricting SSH ingress on sandbox pods to the gateway only.
 networkPolicy:
   # -- Create a NetworkPolicy restricting SSH ingress on sandbox pods to the gateway.

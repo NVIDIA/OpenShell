@@ -170,16 +170,6 @@ tests:
           path: spec.template.spec.containers[0].args
           content: "sqlite:/var/openshell/openshell.db"
 
-  - it: does not pass --db-url in args when postgres.enabled is true
-    template: templates/statefulset.yaml
-    set:
-      postgres.enabled: true
-      postgres.auth.password: test-pw
-    asserts:
-      - notContains:
-          path: spec.template.spec.containers[0].args
-          content: "--db-url"
-
   - it: does not pass --db-url in args when externalDbSecret is set
     template: templates/statefulset.yaml
     set:
@@ -189,79 +179,7 @@ tests:
           path: spec.template.spec.containers[0].args
           content: "--db-url"
 
-  - it: references Bitnami service-binding Secret when postgres.enabled is true
-    template: templates/statefulset.yaml
-    set:
-      postgres.enabled: true
-      postgres.auth.password: test-pw
-    asserts:
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: OPENSHELL_DB_URL
-            valueFrom:
-              secretKeyRef:
-                name: openshell-postgres-svcbind-custom-user
-                key: uri
-
-  - it: respects postgres.fullnameOverride for bundled service-binding Secret
-    template: templates/statefulset.yaml
-    set:
-      postgres.enabled: true
-      postgres.auth.password: test-pw
-      postgres.fullnameOverride: my-pg
-    asserts:
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: OPENSHELL_DB_URL
-            valueFrom:
-              secretKeyRef:
-                name: my-pg-svcbind-custom-user
-                key: uri
-
-  - it: respects postgres.nameOverride for bundled service-binding Secret
-    template: templates/statefulset.yaml
-    set:
-      postgres.enabled: true
-      postgres.auth.password: test-pw
-      postgres.nameOverride: pgdb
-    asserts:
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: OPENSHELL_DB_URL
-            valueFrom:
-              secretKeyRef:
-                name: openshell-pgdb-svcbind-custom-user
-                key: uri
-
-  - it: fails when serviceBindings is disabled with bundled postgres
-    template: templates/statefulset.yaml
-    set:
-      postgres.enabled: true
-      postgres.serviceBindings.enabled: false
-    asserts:
-      - failedTemplate:
-          errorMessage: "postgres.serviceBindings.enabled must be true when using bundled PostgreSQL"
-
-  - it: allows serviceBindings disabled when externalDbSecret is set
-    template: templates/statefulset.yaml
-    set:
-      postgres.enabled: true
-      postgres.serviceBindings.enabled: false
-      server.externalDbSecret: my-external-secret
-    asserts:
-      - contains:
-          path: spec.template.spec.containers[0].env
-          content:
-            name: OPENSHELL_DB_URL
-            valueFrom:
-              secretKeyRef:
-                name: my-external-secret
-                key: uri
-
-  - it: references externalDbSecret when set without postgres.enabled
+  - it: references externalDbSecret when set
     template: templates/statefulset.yaml
     set:
       server.externalDbSecret: my-pg-secret
@@ -275,18 +193,19 @@ tests:
                 name: my-pg-secret
                 key: uri
 
-  - it: externalDbSecret overrides bundled secret when both are set
+  - it: renders HA external database configuration from the CI overlay
     template: templates/statefulset.yaml
-    set:
-      postgres.enabled: true
-      postgres.auth.password: test-pw
-      server.externalDbSecret: my-external-secret
+    values:
+      - ../ci/values-high-availability.yaml
     asserts:
+      - equal:
+          path: spec.replicas
+          value: 2
       - contains:
           path: spec.template.spec.containers[0].env
           content:
             name: OPENSHELL_DB_URL
             valueFrom:
               secretKeyRef:
-                name: my-external-secret
+                name: openshell-ha-pg
                 key: uri

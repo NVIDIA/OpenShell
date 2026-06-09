@@ -82,6 +82,29 @@ helm upgrade --install openshell \
 
 The chart automatically generates PKI secrets on first install using pre-install Helm hooks. No manual secret creation is required.
 
+## Configure an HA database
+
+The chart uses SQLite by default. SQLite is suitable for single-replica
+evaluation, but HA gateway deployments need PostgreSQL so replicas share the
+same persistence store. The OpenShell chart does not deploy PostgreSQL; install
+or provision it separately, then create a Secret containing the connection URI:
+
+```shell
+kubectl create secret generic openshell-db -n openshell \
+  --from-literal=uri="postgresql://user:pass@postgres.example.com:5432/openshell"
+```
+
+Reference that Secret when installing the chart:
+
+```shell
+helm upgrade --install openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  --set replicaCount=2 \
+  --set server.externalDbSecret=openshell-db
+```
+
 ## Wait for the gateway to be ready
 
 ```shell
@@ -136,7 +159,9 @@ The most commonly changed values are:
 | Value | Purpose |
 |---|---|
 | `image.repository` / `image.tag` | Gateway container image. Defaults to `ghcr.io/nvidia/openshell/gateway:latest`. |
+| `replicaCount` | Number of gateway replicas. Set `server.externalDbSecret` before running more than one replica. |
 | `server.sandboxNamespace` | Namespace where sandbox pods are created. Defaults to the Helm release namespace when left empty. |
+| `server.externalDbSecret` | Secret containing a PostgreSQL connection URI in the `uri` key. Required for HA. |
 | `server.sandboxImage` | Default sandbox image used when a sandbox does not specify one. |
 | `server.sandboxImagePullSecrets` | Image pull secrets attached to sandbox pods. Referenced Secrets must exist in the sandbox namespace. |
 | `server.grpcEndpoint` | Endpoint that sandbox supervisors use to call back to the gateway. Must be reachable from inside the cluster. |
