@@ -4778,11 +4778,65 @@ pub async fn provider_get(server: &str, name: &str, tls: &TlsOptions) -> Result<
     Ok(())
 }
 
+fn provider_to_json(provider: &Provider) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+
+    // Core fields
+    obj.insert("id".to_string(), serde_json::json!(provider.object_id()));
+    obj.insert(
+        "name".to_string(),
+        serde_json::json!(provider.object_name()),
+    );
+    obj.insert("type".to_string(), serde_json::json!(provider.r#type));
+
+    // Credential keys (NEVER values - security)
+    let credential_keys: Vec<String> = provider.credentials.keys().cloned().collect();
+    obj.insert(
+        "credential_keys".to_string(),
+        serde_json::json!(credential_keys),
+    );
+
+    // Config (non-secret configuration)
+    if !provider.config.is_empty() {
+        obj.insert("config".to_string(), serde_json::json!(provider.config));
+    }
+
+    // Metadata fields (only if metadata exists)
+    if let Some(meta) = &provider.metadata {
+        if !meta.labels.is_empty() {
+            obj.insert("labels".to_string(), serde_json::json!(meta.labels));
+        }
+        if meta.resource_version != 0 {
+            obj.insert(
+                "resource_version".to_string(),
+                serde_json::json!(meta.resource_version),
+            );
+        }
+        if meta.created_at_ms != 0 {
+            obj.insert(
+                "created_at_ms".to_string(),
+                serde_json::json!(meta.created_at_ms),
+            );
+        }
+    }
+
+    // Credential expiration times (only if present)
+    if !provider.credential_expires_at_ms.is_empty() {
+        obj.insert(
+            "credential_expires_at_ms".to_string(),
+            serde_json::json!(provider.credential_expires_at_ms),
+        );
+    }
+
+    serde_json::Value::Object(obj)
+}
+
 pub async fn provider_list(
     server: &str,
     limit: u32,
     offset: u32,
     names_only: bool,
+    output: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
@@ -4791,6 +4845,11 @@ pub async fn provider_list(
         .await
         .into_diagnostic()?;
     let providers = response.into_inner().providers;
+
+    // Handle structured output formats (json, yaml)
+    if crate::output::print_output_collection(output, &providers, provider_to_json)? {
+        return Ok(());
+    }
 
     if providers.is_empty() {
         if !names_only {
