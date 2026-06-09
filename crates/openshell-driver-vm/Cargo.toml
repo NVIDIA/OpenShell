@@ -19,7 +19,7 @@ name = "openshell-driver-vm"
 path = "src/main.rs"
 
 [dependencies]
-openshell-core = { path = "../openshell-core" }
+openshell-core = { path = "../openshell-core", default-features = false }
 openshell-vfio = { path = "../openshell-vfio" }
 
 bollard = { version = "0.20", features = ["ssh"] }
@@ -45,6 +45,13 @@ tar = "0.4"
 flate2 = "1"
 sha2 = "0.10"
 zstd = "0.13"
+
+[features]
+default = ["telemetry"]
+## Compile in telemetry support (forwards to openshell-core/telemetry). On by
+## default; build with `--no-default-features` for a telemetry-free VM driver
+## that reports telemetry disabled to the sandboxes it launches.
+telemetry = ["openshell-core/telemetry"]
 
 [dev-dependencies]
 temp-env = "0.3"

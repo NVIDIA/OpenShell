@@ -20,6 +20,25 @@ OpenShell builds these main artifacts:
 
 Sandbox community images are built outside this repository.
 
+## Build Features
+
+Anonymous telemetry emission is gated behind a default-on `telemetry` Cargo
+feature. It is defined in `openshell-core` (where the emission code, HTTP
+client, and endpoint live) and forwarded by the binary crates that emit or
+collect telemetry: `openshell-server` (gateway), `openshell-sandbox`
+(supervisor), and `openshell-driver-vm`. Every crate depends on
+`openshell-core` with `default-features = false`, so the binary crate's feature
+is the single switch that enables `openshell-core/telemetry` for its build
+graph. In-process drivers (`docker`, `kubernetes`, `podman`) inherit the
+gateway's setting through feature unification and carry no passthrough.
+
+Building a binary with `--no-default-features` compiles out telemetry entirely:
+no endpoint, no telemetry HTTP client, and no emission code. With telemetry
+compiled out, `telemetry::enabled()` is always `false` and the `emit_*` helpers
+are no-ops, so the data-model types stay available and dependent crates compile
+unchanged. The runtime `OPENSHELL_TELEMETRY_ENABLED` switch remains the way to
+disable telemetry in a default (telemetry-enabled) build.
+
 ## Linux Runtime Environments
 
 OpenShell uses different Linux libc environments for different host artifacts.
