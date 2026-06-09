@@ -135,6 +135,10 @@ struct NetworkEndpointDef {
     graphql_persisted_queries: BTreeMap<String, GraphqlOperationDef>,
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     graphql_max_body_bytes: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    credential_signing: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    signing_service: String,
 }
 
 // Signature dictated by serde's `skip_serializing_if`, which requires `&T`.
@@ -347,6 +351,8 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                                 })
                                 .collect(),
                             graphql_max_body_bytes: e.graphql_max_body_bytes,
+                            credential_signing: e.credential_signing,
+                            signing_service: e.signing_service,
                         }
                     })
                     .collect(),
@@ -512,6 +518,8 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                                 })
                                 .collect(),
                             graphql_max_body_bytes: e.graphql_max_body_bytes,
+                            credential_signing: e.credential_signing.clone(),
+                            signing_service: e.signing_service.clone(),
                         }
                     })
                     .collect(),
@@ -694,6 +702,16 @@ pub enum PolicyViolation {
     TooManyPaths { count: usize },
     /// A network endpoint uses a TLD wildcard (e.g. `*.com`).
     TldWildcard { policy_name: String, host: String },
+    /// A network endpoint uses a wildcard shape that does not match runtime semantics.
+    InvalidHostWildcard { policy_name: String, host: String },
+    /// `credential_signing` is set but `signing_service` is missing.
+    MissingSigningService { policy_name: String, host: String },
+    /// `credential_signing` has an unrecognized value.
+    UnknownCredentialSigning {
+        policy_name: String,
+        host: String,
+        value: String,
+    },
 }
 
 impl fmt::Display for PolicyViolation {
@@ -728,6 +746,32 @@ impl fmt::Display for PolicyViolation {
                     f,
                     "network policy '{policy_name}': TLD wildcard '{host}' is not allowed; \
                      use subdomain wildcards like '*.example.com' instead"
+                )
+            }
+            Self::InvalidHostWildcard { policy_name, host } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': invalid host wildcard '{host}'; \
+                     middle DNS label wildcards must be the entire label '*' and recursive '**' \
+                     is only allowed as the entire first label"
+                )
+            }
+            Self::MissingSigningService { policy_name, host } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': endpoint '{host}' has credential_signing \
+                     set but signing_service is empty"
+                )
+            }
+            Self::UnknownCredentialSigning {
+                policy_name,
+                host,
+                value,
+            } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': endpoint '{host}' has unrecognized \
+                     credential_signing value '{value}' (expected sigv4, sigv4:body, or sigv4:no_body)"
                 )
             }
         }
@@ -834,6 +878,30 @@ pub fn validate_sandbox_policy(
                     });
                 }
             }
+            if host_wildcard_shape_invalid(&ep.host) {
+                violations.push(PolicyViolation::InvalidHostWildcard {
+                    policy_name: name.clone(),
+                    host: ep.host.clone(),
+                });
+            }
+            if !ep.credential_signing.is_empty()
+                && !matches!(
+                    ep.credential_signing.as_str(),
+                    "sigv4" | "sigv4:body" | "sigv4:no_body"
+                )
+            {
+                violations.push(PolicyViolation::UnknownCredentialSigning {
+                    policy_name: name.clone(),
+                    host: ep.host.clone(),
+                    value: ep.credential_signing.clone(),
+                });
+            }
+            if !ep.credential_signing.is_empty() && ep.signing_service.is_empty() {
+                violations.push(PolicyViolation::MissingSigningService {
+                    policy_name: name.clone(),
+                    host: ep.host.clone(),
+                });
+            }
         }
     }
 
@@ -842,6 +910,22 @@ pub fn validate_sandbox_policy(
     } else {
         Err(violations)
     }
+}
+
+fn host_wildcard_shape_invalid(host: &str) -> bool {
+    if !host.contains('*') || host == "*" || host == "**" {
+        return false;
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    let first_label = labels.first().copied().unwrap_or_default();
+    if first_label.contains("**") && first_label != "**" {
+        return true;
+    }
+    labels
+        .iter()
+        .skip(1)
+        .copied()
+        .any(|label| label.contains("**") || (label.contains('*') && label != "*"))
 }
 
 /// Truncate a string for safe inclusion in error messages.
@@ -1376,6 +1460,47 @@ network_policies:
     }
 
     #[test]
+    fn validate_accepts_middle_label_star_wildcard() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "ok".into(),
+            NetworkPolicyRule {
+                name: "ok-rule".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "*.s3.*.amazonaws.com".into(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        assert!(validate_sandbox_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_partial_middle_label_wildcard() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "bad".into(),
+            NetworkPolicyRule {
+                name: "bad-rule".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "*.s3.us-*.amazonaws.com".into(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::InvalidHostWildcard { .. }))
+        );
+    }
+
+    #[test]
     fn validate_accepts_explicit_domain() {
         let mut policy = restrictive_default_policy();
         policy.network_policies.insert(
@@ -1391,6 +1516,141 @@ network_policies:
             },
         );
         assert!(validate_sandbox_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_credential_signing_without_signing_service() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "aws".into(),
+            NetworkPolicyRule {
+                name: "bedrock".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "bedrock-runtime.us-east-1.amazonaws.com".into(),
+                    port: 443,
+                    credential_signing: "sigv4".into(),
+                    signing_service: String::new(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::MissingSigningService { .. }))
+        );
+    }
+
+    #[test]
+    fn validate_accepts_credential_signing_with_signing_service() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "aws".into(),
+            NetworkPolicyRule {
+                name: "bedrock".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "bedrock-runtime.us-east-1.amazonaws.com".into(),
+                    port: 443,
+                    credential_signing: "sigv4".into(),
+                    signing_service: "bedrock".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        assert!(validate_sandbox_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_sigv4_body_with_signing_service() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "aws".into(),
+            NetworkPolicyRule {
+                name: "bedrock".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "bedrock-runtime.us-east-1.amazonaws.com".into(),
+                    port: 443,
+                    credential_signing: "sigv4:body".into(),
+                    signing_service: "bedrock".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        assert!(validate_sandbox_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_sigv4_no_body_with_signing_service() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "aws".into(),
+            NetworkPolicyRule {
+                name: "s3".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "s3.us-east-1.amazonaws.com".into(),
+                    port: 443,
+                    credential_signing: "sigv4:no_body".into(),
+                    signing_service: "s3".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        assert!(validate_sandbox_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_sigv4_no_body_without_signing_service() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "aws".into(),
+            NetworkPolicyRule {
+                name: "s3".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "s3.us-east-1.amazonaws.com".into(),
+                    port: 443,
+                    credential_signing: "sigv4:no_body".into(),
+                    signing_service: String::new(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::MissingSigningService { .. }))
+        );
+    }
+
+    #[test]
+    fn validate_rejects_unknown_credential_signing() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "aws".into(),
+            NetworkPolicyRule {
+                name: "test".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "example.amazonaws.com".into(),
+                    port: 443,
+                    credential_signing: "sigv4_typo".into(),
+                    signing_service: "bedrock".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::UnknownCredentialSigning { .. }))
+        );
     }
 
     #[test]

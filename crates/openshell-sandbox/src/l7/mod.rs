@@ -50,6 +50,26 @@ pub enum TlsMode {
     Skip,
 }
 
+/// Credential signing mode for proxy-side request signing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CredentialSigning {
+    #[default]
+    None,
+    /// Auto-detect: include body in signature when Content-Length is present,
+    /// skip body when Transfer-Encoding is chunked or body is absent.
+    SigV4,
+    /// Always include body in signature (buffer body, compute SHA-256 hash).
+    SigV4Body,
+    /// Never include body in signature (use UNSIGNED-PAYLOAD, stream through).
+    SigV4NoBody,
+}
+
+impl CredentialSigning {
+    pub fn is_sigv4(&self) -> bool {
+        matches!(self, Self::SigV4 | Self::SigV4Body | Self::SigV4NoBody)
+    }
+}
+
 /// Enforcement mode for L7 policy decisions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EnforcementMode {
@@ -88,6 +108,11 @@ pub struct L7EndpointConfig {
     /// When true, client-to-server GraphQL-over-WebSocket operation messages
     /// are classified with the same operation policy used by GraphQL-over-HTTP.
     pub websocket_graphql_policy: bool,
+    /// Proxy-side credential signing mode for this endpoint.
+    pub credential_signing: CredentialSigning,
+    /// AWS signing service name (e.g. `"bedrock"`). Required when
+    /// `credential_signing` is `SigV4`.
+    pub signing_service: String,
 }
 
 /// Result of an L7 policy decision for a single request.
@@ -165,6 +190,36 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
         .filter(|v| *v > 0)
         .unwrap_or(graphql::DEFAULT_MAX_BODY_BYTES);
 
+    let credential_signing = match get_object_str(val, "credential_signing").as_deref() {
+        Some("sigv4") => CredentialSigning::SigV4,
+        Some("sigv4:body") => CredentialSigning::SigV4Body,
+        Some("sigv4:no_body") => CredentialSigning::SigV4NoBody,
+        Some(other) if !other.is_empty() => {
+            let event = openshell_ocsf::NetworkActivityBuilder::new(crate::ocsf_ctx())
+                .activity(openshell_ocsf::ActivityId::Other)
+                .severity(openshell_ocsf::SeverityId::High)
+                .message(format!(
+                    "rejecting endpoint: unrecognized credential_signing value {other:?}"
+                ))
+                .build();
+            openshell_ocsf::ocsf_emit!(event);
+            return None;
+        }
+        _ => CredentialSigning::None,
+    };
+
+    let signing_service = get_object_str(val, "signing_service").unwrap_or_default();
+
+    if credential_signing.is_sigv4() && signing_service.is_empty() {
+        let event = openshell_ocsf::NetworkActivityBuilder::new(crate::ocsf_ctx())
+            .activity(openshell_ocsf::ActivityId::Other)
+            .severity(openshell_ocsf::SeverityId::High)
+            .message("rejecting endpoint: credential_signing requires signing_service".to_string())
+            .build();
+        openshell_ocsf::ocsf_emit!(event);
+        return None;
+    }
+
     Some(L7EndpointConfig {
         protocol,
         path: get_object_str(val, "path").unwrap_or_default(),
@@ -175,6 +230,8 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
         websocket_credential_rewrite,
         request_body_credential_rewrite,
         websocket_graphql_policy,
+        credential_signing,
+        signing_service,
     })
 }
 
@@ -367,17 +424,25 @@ fn validate_host_wildcard(errors: &mut Vec<String>, loc: &str, host: &str) {
 
     let labels: Vec<&str> = host.split('.').collect();
     let first_label = labels.first().copied().unwrap_or_default();
-    if labels.iter().skip(1).any(|label| label.contains('*')) {
-        errors.push(format!(
-            "{loc}: host wildcard may only appear in the first DNS label, got '{host}'"
-        ));
-        return;
-    }
     if first_label.contains("**") && first_label != "**" {
         errors.push(format!(
             "{loc}: recursive host wildcard '**' is only allowed as the entire first DNS label, got '{host}'"
         ));
         return;
+    }
+    for label in labels.iter().skip(1).copied() {
+        if label.contains("**") {
+            errors.push(format!(
+                "{loc}: recursive host wildcard '**' is only allowed as the entire first DNS label, got '{host}'"
+            ));
+            return;
+        }
+        if label.contains('*') && label != "*" {
+            errors.push(format!(
+                "{loc}: middle DNS label wildcard must be the entire label '*', got '{host}'"
+            ));
+            return;
+        }
     }
 
     // Reject TLD or single-label wildcards. They are accepted by the policy
@@ -1197,6 +1262,41 @@ mod tests {
     }
 
     #[test]
+    fn parse_credential_signing_sigv4() {
+        let val = regorus::Value::from_json_str(
+            r#"{"protocol": "rest", "credential_signing": "sigv4", "signing_service": "bedrock", "host": "bedrock.us-east-1.amazonaws.com", "port": 443}"#,
+        ).unwrap();
+        let config = parse_l7_config(&val).unwrap();
+        assert_eq!(config.credential_signing, CredentialSigning::SigV4);
+        assert!(config.credential_signing.is_sigv4());
+    }
+
+    #[test]
+    fn parse_credential_signing_sigv4_body() {
+        let val = regorus::Value::from_json_str(
+            r#"{"protocol": "rest", "credential_signing": "sigv4:body", "signing_service": "bedrock", "host": "bedrock.us-east-1.amazonaws.com", "port": 443}"#,
+        ).unwrap();
+        let config = parse_l7_config(&val).unwrap();
+        assert_eq!(config.credential_signing, CredentialSigning::SigV4Body);
+        assert!(config.credential_signing.is_sigv4());
+    }
+
+    #[test]
+    fn parse_credential_signing_sigv4_no_body() {
+        let val = regorus::Value::from_json_str(
+            r#"{"protocol": "rest", "credential_signing": "sigv4:no_body", "signing_service": "s3", "host": "s3.us-east-1.amazonaws.com", "port": 443}"#,
+        ).unwrap();
+        let config = parse_l7_config(&val).unwrap();
+        assert_eq!(config.credential_signing, CredentialSigning::SigV4NoBody);
+        assert!(config.credential_signing.is_sigv4());
+    }
+
+    #[test]
+    fn is_sigv4_false_for_none() {
+        assert!(!CredentialSigning::None.is_sigv4());
+    }
+
+    #[test]
     fn parse_l7_config_websocket_protocol() {
         let val = regorus::Value::from_json_str(
             r#"{"protocol": "websocket", "host": "gateway.example.com", "port": 443}"#,
@@ -1808,12 +1908,36 @@ mod tests {
     }
 
     #[test]
-    fn validate_wildcard_host_mid_label_error() {
+    fn validate_wildcard_host_middle_label_star_valid_no_error() {
         let data = serde_json::json!({
             "network_policies": {
                 "test": {
                     "endpoints": [{
-                        "host": "foo.*.example.com",
+                        "host": "*.s3.*.amazonaws.com",
+                        "port": 443
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, warnings) = validate_l7_policies(&data);
+        assert!(
+            errors.is_empty(),
+            "*.s3.*.amazonaws.com should be valid, got errors: {errors:?}"
+        );
+        assert!(
+            warnings.is_empty(),
+            "*.s3.*.amazonaws.com should not warn, got warnings: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn validate_wildcard_host_middle_label_partial_star_error() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "*.s3.us-*.amazonaws.com",
                         "port": 443
                     }],
                     "binaries": []
@@ -1822,8 +1946,30 @@ mod tests {
         });
         let (errors, _warnings) = validate_l7_policies(&data);
         assert!(
-            errors.iter().any(|e| e.contains("first DNS label")),
-            "Mid-label wildcard should be rejected, got errors: {errors:?}"
+            errors
+                .iter()
+                .any(|e| e.contains("middle DNS label wildcard")),
+            "Partial middle-label wildcard should be rejected, got errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_wildcard_host_middle_label_double_star_error() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "*.s3.**.amazonaws.com",
+                        "port": 443
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _warnings) = validate_l7_policies(&data);
+        assert!(
+            errors.iter().any(|e| e.contains("recursive host wildcard")),
+            "Middle-label ** wildcard should be rejected, got errors: {errors:?}"
         );
     }
 

@@ -19,6 +19,8 @@ use std::sync::OnceLock;
 const PATH_TEMPLATE_CREDENTIAL_PLACEHOLDER: &str = "{credential}";
 
 const BUILT_IN_PROFILE_YAMLS: &[&str] = &[
+    include_str!("../../../providers/aws.yaml"),
+    include_str!("../../../providers/aws-s3.yaml"),
     include_str!("../../../providers/claude-code.yaml"),
     include_str!("../../../providers/codex.yaml"),
     include_str!("../../../providers/copilot.yaml"),
@@ -169,6 +171,10 @@ pub struct EndpointProfile {
     pub graphql_max_body_bytes: u32,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub path: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub credential_signing: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub signing_service: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -543,6 +549,7 @@ pub fn provider_refresh_strategy_from_yaml(raw: &str) -> Option<ProviderCredenti
         "google_service_account_jwt" => {
             Some(ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt)
         }
+        "aws_sts_assume_role" => Some(ProviderCredentialRefreshStrategy::AwsStsAssumeRole),
         _ => None,
     }
 }
@@ -557,6 +564,7 @@ pub fn provider_refresh_strategy_to_yaml(
         ProviderCredentialRefreshStrategy::Oauth2RefreshToken => "oauth2_refresh_token",
         ProviderCredentialRefreshStrategy::Oauth2ClientCredentials => "oauth2_client_credentials",
         ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => "google_service_account_jwt",
+        ProviderCredentialRefreshStrategy::AwsStsAssumeRole => "aws_sts_assume_role",
         ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
     }
 }
@@ -638,6 +646,8 @@ fn endpoint_to_proto(endpoint: &EndpointProfile) -> NetworkEndpoint {
             .collect(),
         graphql_max_body_bytes: endpoint.graphql_max_body_bytes,
         path: endpoint.path.clone(),
+        credential_signing: endpoint.credential_signing.clone(),
+        signing_service: endpoint.signing_service.clone(),
     }
 }
 
@@ -668,6 +678,8 @@ fn endpoint_from_proto(endpoint: &NetworkEndpoint) -> EndpointProfile {
             .collect(),
         graphql_max_body_bytes: endpoint.graphql_max_body_bytes,
         path: endpoint.path.clone(),
+        credential_signing: endpoint.credential_signing.clone(),
+        signing_service: endpoint.signing_service.clone(),
     }
 }
 
@@ -1689,5 +1701,81 @@ endpoints:
         .unwrap_err();
 
         assert!(matches!(err, ProfileError::InvalidEndpoint { id, .. } if id == "bad-endpoint"));
+    }
+
+    #[test]
+    fn aws_sts_strategy_serde_roundtrip() {
+        use openshell_core::proto::ProviderCredentialRefreshStrategy;
+        assert_eq!(
+            super::provider_refresh_strategy_from_yaml("aws_sts_assume_role"),
+            Some(ProviderCredentialRefreshStrategy::AwsStsAssumeRole)
+        );
+        assert_eq!(
+            super::provider_refresh_strategy_to_yaml(
+                ProviderCredentialRefreshStrategy::AwsStsAssumeRole
+            ),
+            "aws_sts_assume_role"
+        );
+    }
+
+    #[test]
+    fn aws_profile_parses_correctly() {
+        let aws = get_default_profile("aws").expect("aws profile should exist");
+        assert_eq!(aws.display_name, "AWS");
+        assert_eq!(aws.credentials.len(), 3);
+        let access_key = aws
+            .credentials
+            .iter()
+            .find(|c| c.name == "access_key_id")
+            .unwrap();
+        assert!(access_key.refresh.is_some());
+        let refresh = access_key.refresh.as_ref().unwrap();
+        assert_eq!(
+            refresh.strategy,
+            openshell_core::proto::ProviderCredentialRefreshStrategy::AwsStsAssumeRole
+        );
+        assert!(
+            refresh
+                .material
+                .iter()
+                .any(|m| m.name == "role_arn" && m.required)
+        );
+    }
+
+    #[test]
+    fn aws_s3_profile_parses_with_endpoints() {
+        let aws_s3 = get_default_profile("aws-s3").expect("aws-s3 profile should exist");
+        assert_eq!(aws_s3.display_name, "AWS S3");
+        assert!(!aws_s3.endpoints.is_empty());
+        assert!(
+            !aws_s3
+                .endpoints
+                .iter()
+                .any(|e| e.host == "**.amazonaws.com")
+        );
+        assert!(
+            aws_s3
+                .endpoints
+                .iter()
+                .any(|e| e.host == "*.s3.*.amazonaws.com")
+        );
+        assert!(
+            aws_s3
+                .endpoints
+                .iter()
+                .any(|e| e.host == "s3.*.amazonaws.com")
+        );
+        assert!(
+            aws_s3
+                .endpoints
+                .iter()
+                .any(|e| e.host == "*.s3.dualstack.*.amazonaws.com")
+        );
+        assert!(
+            aws_s3
+                .endpoints
+                .iter()
+                .any(|e| e.host == "s3.dualstack.*.amazonaws.com")
+        );
     }
 }

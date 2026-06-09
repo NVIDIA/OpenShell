@@ -226,6 +226,7 @@ struct MintedCredential {
     access_token: String,
     expires_at_ms: i64,
     refresh_token: Option<String>,
+    additional_credentials: HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -279,6 +280,7 @@ pub fn refresh_strategy_name(strategy: i32) -> &'static str {
         ProviderCredentialRefreshStrategy::Oauth2RefreshToken => "oauth2_refresh_token",
         ProviderCredentialRefreshStrategy::Oauth2ClientCredentials => "oauth2_client_credentials",
         ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => "google_service_account_jwt",
+        ProviderCredentialRefreshStrategy::AwsStsAssumeRole => "aws_sts_assume_role",
         ProviderCredentialRefreshStrategy::Unspecified => "unspecified",
     }
 }
@@ -289,6 +291,7 @@ pub fn is_gateway_mintable_strategy(strategy: ProviderCredentialRefreshStrategy)
         ProviderCredentialRefreshStrategy::Oauth2RefreshToken
             | ProviderCredentialRefreshStrategy::Oauth2ClientCredentials
             | ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt
+            | ProviderCredentialRefreshStrategy::AwsStsAssumeRole
     )
 }
 
@@ -407,12 +410,23 @@ async fn apply_minted_credential(
     updated
         .credentials
         .insert(credential_key.to_string(), minted.access_token.clone());
+    for (key, value) in &minted.additional_credentials {
+        updated.credentials.insert(key.clone(), value.clone());
+    }
     if minted.expires_at_ms > 0 {
         updated
             .credential_expires_at_ms
             .insert(credential_key.to_string(), minted.expires_at_ms);
+        for key in minted.additional_credentials.keys() {
+            updated
+                .credential_expires_at_ms
+                .insert(key.clone(), minted.expires_at_ms);
+        }
     } else {
         updated.credential_expires_at_ms.remove(credential_key);
+        for key in minted.additional_credentials.keys() {
+            updated.credential_expires_at_ms.remove(key);
+        }
     }
     crate::grpc::provider::validate_provider_update_against_attached_sandboxes(store, &updated)
         .await?;
@@ -421,12 +435,23 @@ async fn apply_minted_credential(
             current
                 .credentials
                 .insert(credential_key.to_string(), minted.access_token.clone());
+            for (key, value) in &minted.additional_credentials {
+                current.credentials.insert(key.clone(), value.clone());
+            }
             if minted.expires_at_ms > 0 {
                 current
                     .credential_expires_at_ms
                     .insert(credential_key.to_string(), minted.expires_at_ms);
+                for key in minted.additional_credentials.keys() {
+                    current
+                        .credential_expires_at_ms
+                        .insert(key.clone(), minted.expires_at_ms);
+                }
             } else {
                 current.credential_expires_at_ms.remove(credential_key);
+                for key in minted.additional_credentials.keys() {
+                    current.credential_expires_at_ms.remove(key);
+                }
             }
         })
         .await
@@ -448,6 +473,9 @@ async fn mint_credential(
         }
         ProviderCredentialRefreshStrategy::GoogleServiceAccountJwt => {
             mint_google_service_account_jwt(state).await
+        }
+        ProviderCredentialRefreshStrategy::AwsStsAssumeRole => {
+            mint_aws_sts_assume_role(state).await
         }
         ProviderCredentialRefreshStrategy::External
         | ProviderCredentialRefreshStrategy::Static
@@ -544,6 +572,97 @@ async fn mint_google_service_account_jwt(
     request_token(&token_url, &form, lifetime_secs).await
 }
 
+async fn mint_aws_sts_assume_role(
+    state: &StoredProviderCredentialRefreshState,
+) -> Result<MintedCredential, Status> {
+    let role_arn = required_material(&state.material, "role_arn")?;
+    let session_name = material_value(&state.material, &["session_name"])
+        .unwrap_or_else(|| "openshell-sandbox".to_string());
+    let external_id = material_value(&state.material, &["external_id"]);
+    let region =
+        material_value(&state.material, &["aws_region"]).unwrap_or_else(|| "us-east-1".to_string());
+
+    let region_provider = aws_sdk_sts::config::Region::new(region);
+    let mut config_loader =
+        aws_config::defaults(aws_config::BehaviorVersion::latest()).region(region_provider);
+
+    if let (Some(access_key), Some(secret_key)) = (
+        material_value(&state.material, &["aws_access_key_id"]),
+        material_value(&state.material, &["aws_secret_access_key"]),
+    ) {
+        let creds = aws_sdk_sts::config::Credentials::new(
+            access_key,
+            secret_key,
+            None,
+            None,
+            "openshell-provider-refresh",
+        );
+        config_loader = config_loader.credentials_provider(creds);
+    }
+
+    let sdk_config = config_loader.load().await;
+    let sts_config = {
+        let mut builder = aws_sdk_sts::config::Builder::from(&sdk_config);
+        if let Some(endpoint) = material_value(&state.material, &["sts_endpoint_url"])
+            && let Ok(parsed) = reqwest::Url::parse(&endpoint)
+            && parsed.host_str().is_some_and(is_loopback_host)
+        {
+            builder = builder.endpoint_url(endpoint);
+        }
+        builder.build()
+    };
+    let client = aws_sdk_sts::Client::from_conf(sts_config);
+
+    let max_lifetime_i64 = if state.max_lifetime_seconds > 0 {
+        state.max_lifetime_seconds
+    } else {
+        DEFAULT_MAX_LIFETIME_SECONDS
+    };
+    let max_lifetime = i32::try_from(max_lifetime_i64.min(i64::from(i32::MAX))).unwrap_or(i32::MAX);
+
+    let mut req = client
+        .assume_role()
+        .role_arn(&role_arn)
+        .role_session_name(&session_name)
+        .duration_seconds(max_lifetime);
+
+    if let Some(eid) = external_id {
+        req = req.external_id(eid);
+    }
+
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| Status::internal(format!("STS AssumeRole failed: {e}")))?;
+
+    let creds = resp
+        .credentials()
+        .ok_or_else(|| Status::internal("STS AssumeRole response missing credentials"))?;
+
+    let access_key_id = creds.access_key_id().to_string();
+    let secret_access_key = creds.secret_access_key().to_string();
+    let session_token = creds.session_token().to_string();
+
+    let now_ms = current_time_ms();
+    let expires_at_ms = creds
+        .expiration()
+        .to_millis()
+        .unwrap_or_else(|_| now_ms + max_lifetime_i64 * 1000);
+    let max_expires = now_ms + max_lifetime_i64 * 1000;
+    let expires_at_ms = expires_at_ms.min(max_expires);
+
+    let mut additional = HashMap::new();
+    additional.insert("AWS_SECRET_ACCESS_KEY".to_string(), secret_access_key);
+    additional.insert("AWS_SESSION_TOKEN".to_string(), session_token);
+
+    Ok(MintedCredential {
+        access_token: access_key_id,
+        expires_at_ms,
+        refresh_token: None,
+        additional_credentials: additional,
+    })
+}
+
 async fn request_token(
     token_url: &str,
     form: &[(String, String)],
@@ -603,6 +722,7 @@ async fn request_token(
         refresh_token: token
             .refresh_token
             .filter(|refresh_token| !refresh_token.trim().is_empty()),
+        additional_credentials: HashMap::new(),
     })
 }
 
@@ -1162,6 +1282,214 @@ mod tests {
                 .credentials
                 .contains_key("MS_GRAPH_ACCESS_TOKEN")
         );
+    }
+
+    #[test]
+    fn refresh_strategy_name_includes_aws_sts() {
+        assert_eq!(
+            refresh_strategy_name(ProviderCredentialRefreshStrategy::AwsStsAssumeRole as i32),
+            "aws_sts_assume_role"
+        );
+    }
+
+    #[tokio::test]
+    async fn aws_sts_assume_role_mints_three_credentials_from_mock_endpoint() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(body_string_contains("Action=AssumeRole"))
+            .and(body_string_contains("RoleArn=arn"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<AssumeRoleResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
+  <AssumeRoleResult>
+    <AssumedRoleUser>
+      <AssumedRoleId>AROA3XFRBF23:test-session</AssumedRoleId>
+      <Arn>arn:aws:sts::123456789012:assumed-role/TestRole/test-session</Arn>
+    </AssumedRoleUser>
+    <Credentials>
+      <AccessKeyId>ASIAMOCKKEY</AccessKeyId>
+      <SecretAccessKey>MockSecretAccessKey123</SecretAccessKey>
+      <SessionToken>MockSessionTokenXYZ</SessionToken>
+      <Expiration>2099-01-01T00:00:00Z</Expiration>
+    </Credentials>
+  </AssumeRoleResult>
+  <ResponseMetadata>
+    <RequestId>01234567-89ab-cdef-0123-456789abcdef</RequestId>
+  </ResponseMetadata>
+</AssumeRoleResponse>"#,
+            ))
+            .mount(&mock_server)
+            .await;
+
+        let store = test_store().await;
+        let prov = provider("aws-sts-test", "aws");
+        store.put_message(&prov).await.unwrap();
+
+        let state = new_refresh_state(
+            &prov,
+            "AWS_ACCESS_KEY_ID",
+            NewRefreshStateConfig {
+                strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole,
+                material: HashMap::from([
+                    (
+                        "role_arn".to_string(),
+                        "arn:aws:iam::123456789012:role/TestRole".to_string(),
+                    ),
+                    ("session_name".to_string(), "test-session".to_string()),
+                    ("aws_access_key_id".to_string(), "AKIATESTKEY".to_string()),
+                    (
+                        "aws_secret_access_key".to_string(),
+                        "TestSecretKey".to_string(),
+                    ),
+                    ("sts_endpoint_url".to_string(), mock_server.uri()),
+                ]),
+                secret_material_keys: vec!["aws_secret_access_key".to_string()],
+                expires_at_ms: 0,
+                token_url: String::new(),
+                scopes: Vec::new(),
+                refresh_before_seconds: 300,
+                max_lifetime_seconds: 3600,
+            },
+        )
+        .unwrap();
+        put_refresh_state(&store, &state).await.unwrap();
+
+        let refreshed = refresh_provider_credential(&store, "aws-sts-test", "AWS_ACCESS_KEY_ID")
+            .await
+            .unwrap();
+        assert_eq!(refreshed.status, "refreshed");
+        assert!(refreshed.expires_at_ms > 0);
+
+        let stored = store
+            .get_message_by_name::<Provider>("aws-sts-test")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.credentials.get("AWS_ACCESS_KEY_ID"),
+            Some(&"ASIAMOCKKEY".to_string())
+        );
+        assert_eq!(
+            stored.credentials.get("AWS_SECRET_ACCESS_KEY"),
+            Some(&"MockSecretAccessKey123".to_string())
+        );
+        assert_eq!(
+            stored.credentials.get("AWS_SESSION_TOKEN"),
+            Some(&"MockSessionTokenXYZ".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_minted_credential_writes_additional_keys() {
+        use super::apply_minted_credential;
+
+        let store = test_store().await;
+        let mut prov = provider("aws-test", "aws");
+        prov.credentials
+            .insert("AWS_ACCESS_KEY_ID".to_string(), "old-key".to_string());
+        store.put_message(&prov).await.unwrap();
+
+        let minted = super::MintedCredential {
+            access_token: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            expires_at_ms: 4_000_000_000_000,
+            refresh_token: None,
+            additional_credentials: HashMap::from([
+                (
+                    "AWS_SECRET_ACCESS_KEY".to_string(),
+                    "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+                ),
+                (
+                    "AWS_SESSION_TOKEN".to_string(),
+                    "FwoGZXIvYXdzEBYaDH...EXAMPLETOKEN".to_string(),
+                ),
+            ]),
+        };
+
+        apply_minted_credential(&store, &prov, "AWS_ACCESS_KEY_ID", &minted)
+            .await
+            .unwrap();
+
+        let stored = store
+            .get_message_by_name::<Provider>("aws-test")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.credentials.get("AWS_ACCESS_KEY_ID"),
+            Some(&"AKIAIOSFODNN7EXAMPLE".to_string())
+        );
+        assert_eq!(
+            stored.credentials.get("AWS_SECRET_ACCESS_KEY"),
+            Some(&"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string())
+        );
+        assert_eq!(
+            stored.credentials.get("AWS_SESSION_TOKEN"),
+            Some(&"FwoGZXIvYXdzEBYaDH...EXAMPLETOKEN".to_string())
+        );
+        assert_eq!(
+            stored.credential_expires_at_ms.get("AWS_ACCESS_KEY_ID"),
+            Some(&4_000_000_000_000)
+        );
+        assert_eq!(
+            stored.credential_expires_at_ms.get("AWS_SECRET_ACCESS_KEY"),
+            Some(&4_000_000_000_000)
+        );
+        assert_eq!(
+            stored.credential_expires_at_ms.get("AWS_SESSION_TOKEN"),
+            Some(&4_000_000_000_000)
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_minted_credential_validates_additional_keys_against_sandboxes() {
+        use super::apply_minted_credential;
+
+        let store = test_store().await;
+        let mut existing_provider = provider("existing-aws", "aws");
+        existing_provider
+            .credentials
+            .insert("AWS_SECRET_ACCESS_KEY".to_string(), "existing".to_string());
+        store.put_message(&existing_provider).await.unwrap();
+
+        let refreshing_provider = provider("refreshing-aws", "aws");
+        store.put_message(&refreshing_provider).await.unwrap();
+
+        store
+            .put_message(&Sandbox {
+                metadata: Some(ObjectMeta {
+                    id: "sandbox-aws-collision".to_string(),
+                    name: "aws-collision".to_string(),
+                    created_at_ms: 1,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                spec: Some(SandboxSpec {
+                    providers: vec!["existing-aws".to_string(), "refreshing-aws".to_string()],
+                    ..SandboxSpec::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let minted = super::MintedCredential {
+            access_token: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            expires_at_ms: 4_000_000_000_000,
+            refresh_token: None,
+            additional_credentials: HashMap::from([
+                (
+                    "AWS_SECRET_ACCESS_KEY".to_string(),
+                    "secret-key".to_string(),
+                ),
+                ("AWS_SESSION_TOKEN".to_string(), "session-token".to_string()),
+            ]),
+        };
+
+        let err =
+            apply_minted_credential(&store, &refreshing_provider, "AWS_ACCESS_KEY_ID", &minted)
+                .await
+                .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("AWS_SECRET_ACCESS_KEY"));
     }
 
     fn provider(name: &str, provider_type: &str) -> Provider {
