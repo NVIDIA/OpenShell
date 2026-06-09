@@ -51,7 +51,7 @@ jobs:
         uses: DeterminateSystems/magic-nix-cache-action@main
 
       - name: Build package
-        run: nix build ".#packages.${{ matrix.target.system }}.${{ matrix.package }}" --no-link --print-build-logs --no-update-lock-file
+        run: nix build ".#packages.${{ matrix.target.system }}.${{ matrix.package }}" --no-link --no-update-lock-file
 
   test:
     name: Test ${{ matrix.check }} (${{ matrix.target.system }})
@@ -93,7 +93,7 @@ jobs:
         uses: DeterminateSystems/magic-nix-cache-action@main
 
       - name: Run test
-        run: nix build ".#checks.${{ matrix.target.system }}.${{ matrix.check }}" --no-link --print-build-logs --no-update-lock-file
+        run: nix build ".#checks.${{ matrix.target.system }}.${{ matrix.check }}" --no-link --no-update-lock-file
 
   lint:
     name: Lint ${{ matrix.lint }} (${{ matrix.target.system }})
@@ -109,6 +109,23 @@ jobs:
             runner: linux-arm64-cpu8
         lint:
           - rustfmt
+          - openshell-bootstrap-clippy
+          - openshell-cli-clippy
+          - openshell-core-clippy
+          - openshell-driver-docker-clippy
+          - openshell-driver-kubernetes-clippy
+          - openshell-driver-podman-clippy
+          - openshell-driver-vm-clippy
+          - openshell-ocsf-clippy
+          - openshell-policy-clippy
+          - openshell-prover-clippy
+          - openshell-providers-clippy
+          - openshell-router-clippy
+          - openshell-sandbox-clippy
+          - openshell-server-macros-clippy
+          - openshell-server-clippy
+          - openshell-tui-clippy
+          - openshell-vfio-clippy
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
 
@@ -119,4 +136,4 @@ jobs:
         uses: DeterminateSystems/magic-nix-cache-action@main
 
       - name: Run lint
-        run: nix build ".#checks.${{ matrix.target.system }}.${{ matrix.lint }}" --no-link --print-build-logs --no-update-lock-file
+        run: nix build ".#checks.${{ matrix.target.system }}.${{ matrix.lint }}" --no-link --no-update-lock-file
