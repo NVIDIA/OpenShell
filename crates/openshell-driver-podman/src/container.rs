@@ -880,7 +880,7 @@ pub fn try_build_container_spec_with_token(
                     openshell_core::config::DEFAULT_SSH_PORT
                 ),
             ],
-            interval: 3_000_000_000,
+            interval: config.health_check_interval_secs * 1_000_000_000,
             timeout: 2_000_000_000,
             retries: 10,
             start_period: 5_000_000_000,
@@ -1326,6 +1326,19 @@ mod tests {
             command.contains("test -S /run/openshell/test-ssh.sock"),
             "healthcheck should consider the supervisor Unix socket ready"
         );
+    }
+
+    #[test]
+    fn container_spec_healthcheck_interval_from_config() {
+        let sandbox = test_sandbox("test-id", "test-name");
+        let mut config = test_config();
+        config.health_check_interval_secs = 30;
+        let spec = build_container_spec(&sandbox, &config);
+
+        let interval = spec["healthconfig"]["Interval"]
+            .as_u64()
+            .expect("healthcheck interval should be a u64");
+        assert_eq!(interval, 30_000_000_000);
     }
 
     #[test]

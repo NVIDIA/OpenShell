@@ -135,7 +135,7 @@ async fn main() -> Result<()> {
         guest_tls_cert: args.podman_tls_cert,
         guest_tls_key: args.podman_tls_key,
         sandbox_pids_limit: args.sandbox_pids_limit,
-        enable_bind_mounts: false,
+        ..PodmanComputeConfig::default()
     })
     .await
     .into_diagnostic()?;
