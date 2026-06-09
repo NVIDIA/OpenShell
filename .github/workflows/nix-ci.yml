@@ -53,8 +53,8 @@ jobs:
       - name: Build package
         run: nix build ".#packages.${{ matrix.target.system }}.${{ matrix.package }}" --no-link --print-build-logs --no-update-lock-file
 
-  checks:
-    name: Check ${{ matrix.check }} (${{ matrix.target.system }})
+  test:
+    name: Test ${{ matrix.check }} (${{ matrix.target.system }})
     needs: build
     runs-on: ${{ matrix.target.runner }}
     strategy:
@@ -92,5 +92,31 @@ jobs:
       - name: Enable Magic Nix Cache
         uses: DeterminateSystems/magic-nix-cache-action@main
 
-      - name: Build check
+      - name: Run test
         run: nix build ".#checks.${{ matrix.target.system }}.${{ matrix.check }}" --no-link --print-build-logs --no-update-lock-file
+
+  lint:
+    name: Lint ${{ matrix.lint }} (${{ matrix.target.system }})
+    needs: build
+    runs-on: ${{ matrix.target.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - system: x86_64-linux
+            runner: linux-amd64-cpu8
+          - system: aarch64-linux
+            runner: linux-arm64-cpu8
+        lint:
+          - rustfmt
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Enable Magic Nix Cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Run lint
+        run: nix build ".#checks.${{ matrix.target.system }}.${{ matrix.lint }}" --no-link --print-build-logs --no-update-lock-file

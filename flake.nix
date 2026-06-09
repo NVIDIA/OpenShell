@@ -76,7 +76,15 @@
           };
         };
 
-        checks = lib.mapAttrs' (name: crate: lib.nameValuePair "${name}-test" crate.test) workspaceCrates;
+        checks =
+          lib.mapAttrs' (name: crate: lib.nameValuePair "${name}-test" crate.test) workspaceCrates
+          // {
+            rustfmt = craneLib.cargoFmt {
+              pname = "openshell-workspace";
+              src = craneLib.cleanCargoSource ./.;
+              cargoExtraArgs = "--all";
+            };
+          };
 
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
