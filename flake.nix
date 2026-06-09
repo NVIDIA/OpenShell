@@ -4,6 +4,13 @@
 {
   description = "OpenShell development environment";
 
+  nixConfig = {
+    extra-substituters = [ "https://openshell.cachix.org" ];
+    extra-trusted-public-keys = [
+      "openshell.cachix.org-1:OAr5MunsfH5PZvUsfD08OtGx5RtcwdNZGJdU5FqLm5w="
+    ];
+  };
+
   inputs = {
     flake-utils.url = "github:numtide/flake-utils";
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -105,6 +112,8 @@
             llvmPackages.libclang
             # system dependency for openshell-prover
             z3
+            # caching utility
+            cachix
           ];
 
           env = {
