@@ -38,6 +38,8 @@ if ([string]::IsNullOrWhiteSpace($TargetDir)) {
 }
 
 $UnsupportedDriverPackageExcludes = "--exclude openshell-driver-docker --exclude openshell-driver-kubernetes --exclude openshell-driver-podman --exclude openshell-driver-vm"
+$BundledZ3WorkspaceFeatures = "--features openshell-cli/bundled-z3,openshell-prover/bundled-z3"
+$BundledZ3ServerFeatures = "--features openshell-server/bundled-z3,openshell-prover/bundled-z3"
 
 function Resolve-VsDevCmd {
     if ($env:OPENSHELL_VSDEVCMD -and (Test-Path $env:OPENSHELL_VSDEVCMD)) {
@@ -75,6 +77,54 @@ function Resolve-VsDevCmd {
     }
 
     throw "Could not find VsDevCmd.bat. Install Visual Studio Build Tools, or set OPENSHELL_VSDEVCMD."
+}
+
+function Resolve-LibclangPath {
+    if ($env:LIBCLANG_PATH) {
+        $candidate = Join-Path $env:LIBCLANG_PATH "libclang.dll"
+        if (Test-Path $candidate) {
+            return (Resolve-Path $env:LIBCLANG_PATH).Path
+        }
+        throw "LIBCLANG_PATH is set but libclang.dll was not found at: $candidate"
+    }
+
+    $programFilesX86 = [Environment]::GetEnvironmentVariable("ProgramFiles(x86)")
+    if ($programFilesX86) {
+        $vswhere = Join-Path $programFilesX86 "Microsoft Visual Studio\Installer\vswhere.exe"
+    } else {
+        $vswhere = $null
+    }
+    if ($vswhere -and (Test-Path $vswhere)) {
+        $found = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Llvm.Clang -find "VC\Tools\Llvm\x64\bin\libclang.dll" | Select-Object -First 1
+        if ($found -and (Test-Path $found)) {
+            return (Split-Path -Parent (Resolve-Path $found).Path)
+        }
+    }
+
+    $programFiles = @(
+        [Environment]::GetEnvironmentVariable("ProgramFiles"),
+        [Environment]::GetEnvironmentVariable("ProgramFiles(x86)")
+    ) | Where-Object { $_ }
+    $versions = @("2022", "18", "17")
+    $editions = @("Enterprise", "Professional", "Community", "BuildTools")
+    foreach ($root in $programFiles) {
+        foreach ($version in $versions) {
+            foreach ($edition in $editions) {
+                $candidateDir = Join-Path $root "Microsoft Visual Studio\$version\$edition\VC\Tools\Llvm\x64\bin"
+                $candidate = Join-Path $candidateDir "libclang.dll"
+                if (Test-Path $candidate) {
+                    return (Resolve-Path $candidateDir).Path
+                }
+            }
+        }
+    }
+
+    $llvmDir = "C:\Program Files\LLVM\bin"
+    if (Test-Path (Join-Path $llvmDir "libclang.dll")) {
+        return (Resolve-Path $llvmDir).Path
+    }
+
+    throw "Could not find libclang.dll. Install Visual Studio C++ Clang tools, or set LIBCLANG_PATH to the directory containing libclang.dll."
 }
 
 function Get-HostArch {
@@ -139,14 +189,14 @@ function Invoke-VsCargo {
 function Invoke-Check([string] $RustTarget) {
     Invoke-VsCargo `
         -RustTarget $RustTarget `
-        -CargoArgs "cargo check --workspace $UnsupportedDriverPackageExcludes --target $RustTarget" `
+        -CargoArgs "cargo check --workspace $UnsupportedDriverPackageExcludes --target $RustTarget $BundledZ3WorkspaceFeatures" `
         -LogName "build-$RustTarget-check.log"
 }
 
 function Invoke-Build([string] $RustTarget) {
     Invoke-VsCargo `
         -RustTarget $RustTarget `
-        -CargoArgs "cargo build --release --target $RustTarget --bin openshell-gateway --bin openshell" `
+        -CargoArgs "cargo build --release --target $RustTarget --bin openshell-gateway --bin openshell $BundledZ3WorkspaceFeatures" `
         -LogName "build-$RustTarget-release.log"
 }
 
@@ -156,7 +206,7 @@ function Invoke-Test([string] $RustTarget) {
     }
     Invoke-VsCargo `
         -RustTarget $RustTarget `
-        -CargoArgs "cargo test --workspace $UnsupportedDriverPackageExcludes --target $RustTarget --no-fail-fast" `
+        -CargoArgs "cargo test --workspace $UnsupportedDriverPackageExcludes --target $RustTarget --no-fail-fast $BundledZ3WorkspaceFeatures" `
         -LogName "test-$RustTarget.log"
 }
 
@@ -172,7 +222,7 @@ function Invoke-UnsupportedContractTests([string] $RustTarget) {
     foreach ($test in $tests) {
         Invoke-VsCargo `
             -RustTarget $RustTarget `
-            -CargoArgs "cargo test -p openshell-server --target $RustTarget $test" `
+            -CargoArgs "cargo test -p openshell-server --target $RustTarget $test $BundledZ3ServerFeatures" `
             -LogName "test-$RustTarget-unsupported-$test.log"
     }
 }
@@ -204,6 +254,8 @@ function Show-Artifacts([string[]] $RustTargets) {
 }
 
 $targets = Get-SelectedTargets $Target
+$env:LIBCLANG_PATH = Resolve-LibclangPath
+Write-Host "==> LIBCLANG_PATH=$env:LIBCLANG_PATH"
 
 switch ($Action) {
     "check" {
