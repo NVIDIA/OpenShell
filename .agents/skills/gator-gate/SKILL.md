@@ -21,6 +21,15 @@ Codex and other agent harnesses should load this skill from the repository path 
 
 Do not use `gh auth status` as the authentication health check inside provider-backed sandboxes. Scoped provider tokens may be exposed as `openshell:resolve:env:*` placeholders and `gh auth status` probes endpoints outside the gator policy, causing false "token is invalid" reports even when allowed `gh api` and `gh pr` calls succeed. Use `gh api user --jq '.login'` and a repo-scoped probe instead.
 
+Use REST-backed `gh api` for GitHub write actions inside gator sandboxes. Do not rely on `gh issue edit`, `gh pr edit`, or other high-level write commands when a REST path is available, because some of them use GraphQL mutations and gator policy allows GraphQL reads only. Do not fall back to `curl` for credentialed GitHub writes unless the active provider policy explicitly allows the `curl` binary for the same scoped endpoint. Preferred write shapes:
+
+```bash
+jq -Rs '{body:.}' comment.md > /tmp/comment.json
+gh api --method POST repos/NVIDIA/OpenShell/issues/<number>/comments --input /tmp/comment.json --jq .html_url
+gh api --method POST repos/NVIDIA/OpenShell/issues/<number>/labels -f labels[]="gator:<state>"
+gh api --method DELETE repos/NVIDIA/OpenShell/issues/<number>/labels/gator%3Ablocked --silent || true
+```
+
 ## Authority Rules
 
 - Do not push commits to a contributor's PR branch by default.
@@ -96,11 +105,13 @@ gh label create "gator:approval-needed" --description "Gator completed review; m
 When changing state, remove all existing `gator:*` labels first, then add the new one.
 
 ```bash
-gh issue edit <number> --remove-label "gator:follow-up-needed" --remove-label "gator:blocked" --remove-label "gator:validated" --remove-label "gator:in-review" --remove-label "gator:watch-pipeline" --remove-label "gator:approval-needed"
-gh issue edit <number> --add-label "gator:<state>"
+for label in gator%3Afollow-up-needed gator%3Ablocked gator%3Avalidated gator%3Ain-review gator%3Awatch-pipeline gator%3Aapproval-needed; do
+  gh api --method DELETE repos/NVIDIA/OpenShell/issues/<number>/labels/$label --silent || true
+done
+gh api --method POST repos/NVIDIA/OpenShell/issues/<number>/labels -f labels[]="gator:<state>"
 ```
 
-Pull requests are also GitHub issues for label operations, so `gh issue edit <pr-number>` is valid for PR labels.
+Pull requests are also GitHub issues for label operations, so the REST issue label endpoints are valid for PR labels.
 
 ## Invocation Modes
 
@@ -217,14 +228,14 @@ When not running under supervised watch mode, do not stop after a one-shot check
 
 Default live-watch cadence:
 
-- Poll every 15 minutes for PRs in active states: `gator:in-review`, `gator:watch-pipeline`, `gator:approval-needed`, and `gator:blocked`.
-- Watch PRs indefinitely across gator state transitions until they close, merge, or the operator stops the session.
-- Poll every 60 minutes for issue-only `gator:follow-up-needed` or issue-only `gator:blocked` states until they progress, close, or reach a TTL threshold.
+- For supervised watch mode, set `next_poll_seconds` to 900 for PRs in active states: `gator:in-review`, `gator:watch-pipeline`, `gator:approval-needed`, and `gator:blocked`.
+- Watch PRs indefinitely across gator state transitions until they close, merge, or the operator stops the session. In supervised watch mode this means return a `waiting` or `blocked` result sentinel and let the supervisor sleep outside the model session.
+- For supervised watch mode, set `next_poll_seconds` to 3600 for issue-only `gator:follow-up-needed` or issue-only `gator:blocked` states until they progress, close, or reach a TTL threshold.
 - Stop immediately for issue-only `gator:validated` items that have no associated PR.
 - Do not stop PR monitoring just because the gator state changes, a human comments, or new commits arrive. Treat those as triggers to re-evaluate and continue from the new state.
 - Stop PR monitoring only when the PR closes, merges, the operator stops the session, or an unrecoverable process blocker prevents further agent action.
 
-Use a concise loop summary before waiting, for example: "Watching PR #123 every 15 minutes until it closes, merges, or the session is stopped; comments, commits, and gator state changes will trigger re-evaluation and continued monitoring."
+Use a concise cycle summary before returning the result sentinel, for example: "No action needed for PR #123; supervisor should recheck in 15 minutes until it closes, merges, or the session is stopped."
 
 Use 48 business hours as the default inactivity threshold for states that are waiting on a person. Business hours are Monday through Friday; do not count Saturday or Sunday.
 

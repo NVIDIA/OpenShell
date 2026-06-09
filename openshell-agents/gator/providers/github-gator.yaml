@@ -96,6 +96,8 @@ endpoints:
 binaries:
   - /usr/bin/gh
   - /usr/local/bin/gh
+  - /usr/bin/curl
+  - /usr/local/bin/curl
   - /usr/bin/git
   - /usr/local/bin/git
   - /usr/bin/codex
