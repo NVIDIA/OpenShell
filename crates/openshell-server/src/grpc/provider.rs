@@ -98,7 +98,7 @@ pub(super) async fn create_provider_record(
         return Err(Status::invalid_argument("provider.type is required"));
     }
     if provider.credentials.is_empty()
-        && !provider_type_allows_empty_credentials_for_refresh(store, &provider.r#type).await?
+        && !provider_type_allows_empty_credentials(store, &provider.r#type).await?
     {
         return Err(Status::invalid_argument(
             "provider.credentials must not be empty",
@@ -753,6 +753,111 @@ fn host_pattern_labels_match(pattern: &[&str], host: &[&str]) -> bool {
     }
 }
 
+fn dynamic_token_grant_match_score(host: &str, path: &str) -> u32 {
+    host_pattern_specificity(host) + endpoint_path_specificity(path)
+}
+
+fn host_pattern_specificity(pattern: &str) -> u32 {
+    let wildcard_penalty = count_as_u32(pattern.matches('*').count());
+    let label_count = count_as_u32(pattern.split('.').filter(|label| !label.is_empty()).count());
+    let literal_chars = count_as_u32(pattern.chars().filter(|ch| *ch != '*').count());
+    100_000u32
+        .saturating_sub(wildcard_penalty.saturating_mul(10_000))
+        .saturating_add(label_count.saturating_mul(100))
+        .saturating_add(literal_chars)
+}
+
+fn endpoint_path_specificity(path: &str) -> u32 {
+    if path.is_empty() || path == "**" {
+        return 0;
+    }
+    1_000_000u32.saturating_add(count_as_u32(path.chars().filter(|ch| *ch != '*').count()))
+}
+
+fn count_as_u32(count: usize) -> u32 {
+    u32::try_from(count).unwrap_or(u32::MAX)
+}
+
+fn host_patterns_can_overlap(first: &str, second: &str) -> bool {
+    let first = first.to_ascii_lowercase();
+    let second = second.to_ascii_lowercase();
+    if !first.contains('*') {
+        return host_pattern_matches(&second, &first);
+    }
+    if !second.contains('*') {
+        return host_pattern_matches(&first, &second);
+    }
+    let first_labels: Vec<&str> = first.split('.').collect();
+    let second_labels: Vec<&str> = second.split('.').collect();
+    host_pattern_labels_can_overlap(&first_labels, &second_labels)
+}
+
+fn host_pattern_labels_can_overlap(first: &[&str], second: &[&str]) -> bool {
+    match (first.split_first(), second.split_first()) {
+        (None, None) => true,
+        (None, Some((label, rest))) if *label == "**" => {
+            host_pattern_labels_can_overlap(first, rest)
+        }
+        (Some((label, rest)), None) if *label == "**" => {
+            host_pattern_labels_can_overlap(rest, second)
+        }
+        (None, _) | (_, None) => false,
+        (Some((label, rest)), _) if *label == "**" => {
+            host_pattern_labels_can_overlap(rest, second)
+                || host_pattern_labels_can_overlap(first, &second[1..])
+        }
+        (_, Some((label, rest))) if *label == "**" => {
+            host_pattern_labels_can_overlap(first, rest)
+                || host_pattern_labels_can_overlap(&first[1..], second)
+        }
+        (Some((first_label, first_rest)), Some((second_label, second_rest))) => {
+            (*first_label == "*" || *second_label == "*" || first_label == second_label)
+                && host_pattern_labels_can_overlap(first_rest, second_rest)
+        }
+    }
+}
+
+fn path_patterns_can_overlap(first: &str, second: &str) -> bool {
+    if path_matches_all(first) || path_matches_all(second) {
+        return true;
+    }
+    if !first.contains('*') {
+        return endpoint_path_matches(second, first);
+    }
+    if !second.contains('*') {
+        return endpoint_path_matches(first, second);
+    }
+    match (path_prefix_pattern(first), path_prefix_pattern(second)) {
+        (Some(first_prefix), Some(second_prefix)) => {
+            first_prefix == second_prefix
+                || first_prefix.starts_with(&format!("{second_prefix}/"))
+                || second_prefix.starts_with(&format!("{first_prefix}/"))
+        }
+        _ => true,
+    }
+}
+
+fn path_matches_all(path: &str) -> bool {
+    path.is_empty() || path == "**" || path == "/**"
+}
+
+fn path_prefix_pattern(path: &str) -> Option<&str> {
+    path.strip_suffix("/**")
+}
+
+fn endpoint_path_matches(pattern: &str, path: &str) -> bool {
+    if path_matches_all(pattern) {
+        return true;
+    }
+    if pattern == path {
+        return true;
+    }
+    if let Some(prefix) = path_prefix_pattern(pattern) {
+        return path == prefix || path.starts_with(&format!("{prefix}/"));
+    }
+    glob::Pattern::new(pattern).is_ok_and(|glob| glob.matches(path))
+}
+
 pub async fn validate_provider_environment_keys_unique(
     store: &Store,
     provider_names: &[String],
@@ -814,6 +919,7 @@ async fn validate_provider_environment_keys_unique_at(
     now_ms: i64,
 ) -> Result<(), Status> {
     let mut seen = std::collections::HashMap::<String, String>::new();
+    let mut dynamic_bindings = Vec::new();
     for name in provider_names {
         let provider = match candidate_provider {
             Some(candidate) if candidate.object_name() == name.as_str() => candidate.clone(),
@@ -835,6 +941,153 @@ async fn validate_provider_environment_keys_unique_at(
                 }
             } else {
                 seen.insert(key, provider_name.clone());
+            }
+        }
+        dynamic_bindings.extend(dynamic_token_grant_bindings_for_provider(store, &provider).await?);
+    }
+    validate_dynamic_token_grant_bindings_unambiguous(&dynamic_bindings)?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DynamicTokenGrantBinding {
+    provider_name: String,
+    credential_name: String,
+    host: String,
+    port: u32,
+    path: String,
+    score: u32,
+}
+
+async fn dynamic_token_grant_bindings_for_provider(
+    store: &Store,
+    provider: &Provider,
+) -> Result<Vec<DynamicTokenGrantBinding>, Status> {
+    let provider_name = provider.object_name().to_string();
+    let profile_id = normalize_provider_type(&provider.r#type).unwrap_or(provider.r#type.as_str());
+    let Some(profile) = get_provider_type_profile(store, profile_id).await? else {
+        return Ok(Vec::new());
+    };
+    let profile = profile.to_proto();
+    let mut bindings = Vec::new();
+    for credential in &profile.credentials {
+        if credential.token_grant.is_none() {
+            continue;
+        }
+        for endpoint in &profile.endpoints {
+            for port in endpoint_ports(endpoint.port, &endpoint.ports) {
+                push_dynamic_token_grant_bindings_for_endpoint(
+                    &mut bindings,
+                    &provider_name,
+                    credential,
+                    &endpoint.host,
+                    port,
+                    &endpoint.path,
+                );
+            }
+        }
+    }
+    Ok(bindings)
+}
+
+fn push_dynamic_token_grant_bindings_for_endpoint(
+    bindings: &mut Vec<DynamicTokenGrantBinding>,
+    provider_name: &str,
+    credential: &ProviderProfileCredential,
+    endpoint_host: &str,
+    endpoint_port: u32,
+    endpoint_path: &str,
+) {
+    push_dynamic_token_grant_binding(
+        bindings,
+        provider_name,
+        &credential.name,
+        endpoint_host,
+        endpoint_port,
+        endpoint_path,
+    );
+
+    let Some(token_grant) = credential.token_grant.as_ref() else {
+        return;
+    };
+
+    for override_config in &token_grant.audience_overrides {
+        if !token_grant_override_matches_endpoint(override_config, endpoint_host, endpoint_port) {
+            continue;
+        }
+        let override_host = if override_config.host.is_empty() {
+            endpoint_host
+        } else {
+            override_config.host.as_str()
+        };
+        let override_port = if override_config.port == 0 {
+            endpoint_port
+        } else {
+            override_config.port
+        };
+        let override_path = if override_config.path.is_empty() {
+            endpoint_path
+        } else {
+            override_config.path.as_str()
+        };
+        push_dynamic_token_grant_binding(
+            bindings,
+            provider_name,
+            &credential.name,
+            override_host,
+            override_port,
+            override_path,
+        );
+    }
+}
+
+fn push_dynamic_token_grant_binding(
+    bindings: &mut Vec<DynamicTokenGrantBinding>,
+    provider_name: &str,
+    credential_name: &str,
+    host: &str,
+    port: u32,
+    path: &str,
+) {
+    let candidate = DynamicTokenGrantBinding {
+        provider_name: provider_name.to_string(),
+        credential_name: credential_name.to_string(),
+        host: host.to_ascii_lowercase(),
+        port,
+        path: path.to_string(),
+        score: dynamic_token_grant_match_score(host, path),
+    };
+    if !bindings.iter().any(|binding| binding == &candidate) {
+        bindings.push(candidate);
+    }
+}
+
+fn validate_dynamic_token_grant_bindings_unambiguous(
+    bindings: &[DynamicTokenGrantBinding],
+) -> Result<(), Status> {
+    for (index, first) in bindings.iter().enumerate() {
+        for second in bindings.iter().skip(index + 1) {
+            if first.provider_name == second.provider_name
+                && first.credential_name == second.credential_name
+            {
+                continue;
+            }
+            if first.port == second.port
+                && first.score == second.score
+                && host_patterns_can_overlap(&first.host, &second.host)
+                && path_patterns_can_overlap(&first.path, &second.path)
+            {
+                return Err(Status::failed_precondition(format!(
+                    "dynamic token grants for '{}:{}' and '{}:{}' are ambiguous for {}:{} path selectors '{}' and '{}'; make one host/path selector more specific or attach only one matching provider",
+                    first.provider_name,
+                    first.credential_name,
+                    second.provider_name,
+                    second.credential_name,
+                    first.host,
+                    first.port,
+                    first.path,
+                    second.path
+                )));
             }
         }
     }
@@ -1192,14 +1445,14 @@ fn validate_refresh_material(
     Ok(())
 }
 
-async fn provider_type_allows_empty_credentials_for_refresh(
+async fn provider_type_allows_empty_credentials(
     store: &Store,
     provider_type: &str,
 ) -> Result<bool, Status> {
     let Some(profile) = get_provider_type_profile(store, provider_type).await? else {
         return Ok(false);
     };
-    Ok(profile.allows_gateway_refresh_bootstrap())
+    Ok(profile.allows_empty_provider_credentials())
 }
 
 async fn merged_provider_profiles(store: &Store) -> Result<Vec<ProviderTypeProfile>, Status> {
@@ -1916,6 +2169,8 @@ mod tests {
                 audience: "api://default".to_string(),
                 jwt_svid_audience: "http://keycloak.default.svc.cluster.local/realms/openshell"
                     .to_string(),
+                client_assertion_type:
+                    "urn:ietf:params:oauth:client-assertion-type:jwt-bearer".to_string(),
                 scopes: vec!["openid".to_string()],
                 cache_ttl_seconds: 300,
                 audience_overrides: service_audiences
@@ -1962,6 +2217,105 @@ mod tests {
             assert_eq!(grant.scopes, vec![audience.to_string()]);
             assert!(grant.audience_overrides.is_empty());
         }
+    }
+
+    async fn import_token_grant_profile(
+        state: &Arc<ServerState>,
+        id: &str,
+        host: &str,
+        port: u32,
+        path: &str,
+    ) {
+        let mut profile = custom_profile(id);
+        profile.credentials = vec![token_grant_credential("access_token")];
+        profile.endpoints = vec![NetworkEndpoint {
+            host: host.to_string(),
+            port,
+            path: path.to_string(),
+            protocol: "rest".to_string(),
+            ..Default::default()
+        }];
+        handle_import_provider_profiles(
+            state,
+            Request::new(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(profile),
+                    source: format!("{id}.yaml"),
+                }],
+            }),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn create_empty_token_grant_provider(
+        store: &Store,
+        name: &str,
+        provider_type: &str,
+    ) -> Provider {
+        create_provider_record(
+            store,
+            Provider {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: String::new(),
+                    name: name.to_string(),
+                    created_at_ms: 1_000_000,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                r#type: provider_type.to_string(),
+                credentials: HashMap::new(),
+                config: HashMap::new(),
+                credential_expires_at_ms: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn dynamic_token_grants_reject_equal_specificity_overlap() {
+        let state = test_server_state().await;
+        let store = state.store.as_ref();
+        import_token_grant_profile(&state, "grant-a", "api.example.com", 443, "/v1/**").await;
+        import_token_grant_profile(&state, "grant-b", "api.example.com", 443, "/v1/**").await;
+        create_empty_token_grant_provider(store, "provider-a", "grant-a").await;
+        create_empty_token_grant_provider(store, "provider-b", "grant-b").await;
+
+        let err = validate_provider_environment_keys_unique(
+            store,
+            &["provider-a".to_string(), "provider-b".to_string()],
+        )
+        .await
+        .expect_err("equal-specificity dynamic grants should be ambiguous");
+
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("dynamic token grants"));
+        assert!(err.message().contains("ambiguous"));
+    }
+
+    #[tokio::test]
+    async fn dynamic_token_grants_allow_more_specific_path_overlap() {
+        let state = test_server_state().await;
+        let store = state.store.as_ref();
+        import_token_grant_profile(&state, "grant-default", "api.example.com", 443, "/v1/**").await;
+        import_token_grant_profile(
+            &state,
+            "grant-admin",
+            "api.example.com",
+            443,
+            "/v1/admin/**",
+        )
+        .await;
+        create_empty_token_grant_provider(store, "provider-default", "grant-default").await;
+        create_empty_token_grant_provider(store, "provider-admin", "grant-admin").await;
+
+        validate_provider_environment_keys_unique(
+            store,
+            &["provider-default".to_string(), "provider-admin".to_string()],
+        )
+        .await
+        .expect("more-specific path should make dynamic grants deterministic");
     }
 
     fn provider_with_values(name: &str, provider_type: &str) -> Provider {
@@ -2084,6 +2438,30 @@ mod tests {
             refresh: None,
             path_template: String::new(),
             token_grant: None,
+        }
+    }
+
+    fn token_grant_credential(name: &str) -> ProviderProfileCredential {
+        ProviderProfileCredential {
+            name: name.to_string(),
+            description: String::new(),
+            env_vars: Vec::new(),
+            required: true,
+            auth_style: "bearer".to_string(),
+            header_name: "authorization".to_string(),
+            query_param: String::new(),
+            refresh: None,
+            path_template: String::new(),
+            token_grant: Some(ProviderCredentialTokenGrant {
+                token_endpoint: "https://auth.example.com/token".to_string(),
+                audience: "api://default".to_string(),
+                jwt_svid_audience: "https://auth.example.com".to_string(),
+                client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+                    .to_string(),
+                scopes: vec!["read".to_string()],
+                cache_ttl_seconds: 300,
+                audience_overrides: Vec::new(),
+            }),
         }
     }
 

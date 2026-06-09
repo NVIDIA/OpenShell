@@ -15,6 +15,7 @@ credentials:
       token_endpoint: http://token-issuer.default.svc.cluster.local/token
       audience: demo-default
       jwt_svid_audience: http://token-issuer.default.svc.cluster.local
+      client_assertion_type: urn:ietf:params:oauth:client-assertion-type:jwt-spiffe
       scopes: [demo]
       cache_ttl_seconds: 60
       audience_overrides:

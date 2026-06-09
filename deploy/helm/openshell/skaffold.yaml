@@ -81,6 +81,26 @@ deploy:
       #  # wait ensures Gateway API CRDs are registered before the openshell
       #  # release attempts to create Gateway and HTTPRoute resources.
       #  wait: true
+      # SPIRE — installs SPIRE Server, Agent, Controller Manager, CSI Driver,
+      # and OIDC Discovery Provider using the SPIFFE hardened charts.
+      # Uncomment both releases and ci/values-spire.yaml below to use
+      # SPIFFE JWT-SVIDs for dynamic provider token grants.
+      #- name: spire-crds
+      #  repo: https://spiffe.github.io/helm-charts-hardened/
+      #  remoteChart: spire-crds
+      #  version: 0.5.0
+      #  namespace: spire
+      #  createNamespace: true
+      #  wait: true
+      #- name: spire
+      #  repo: https://spiffe.github.io/helm-charts-hardened/
+      #  remoteChart: spire
+      #  version: 0.29.0
+      #  namespace: spire
+      #  createNamespace: true
+      #  valuesFiles:
+      #    - ci/values-spire-stack.yaml
+      #  wait: true
       - name: openshell
         chartPath: .
         namespace: openshell
@@ -97,6 +117,9 @@ deploy:
           #- ci/values-keycloak.yaml
           # To enable the Gateway API HTTPRoute (requires Envoy Gateway above):
           #- ci/values-gateway.yaml
+          # To enable SPIFFE/SPIRE provider token grants (requires the
+          # spire-crds and spire releases above):
+          #- ci/values-spire.yaml
           # To test multi-replica external PostgreSQL behavior:
           #- ci/values-high-availability.yaml
         setValueTemplates:

@@ -22,6 +22,7 @@
 //! Token grant parameters come from the provider profile `token_grant` field:
 //! - `token_endpoint` — `OAuth2` token service URL
 //! - `jwt_svid_audience` — SPIRE JWT-SVID audience override (optional)
+//! - `client_assertion_type` — `OAuth2` client assertion type (optional)
 //! - `audience` — Resource audience to request from the token service
 //! - `scopes` — `OAuth2` scopes to request (optional)
 //! - `cache_ttl_seconds` — Cache override (0 = use `expires_in` from response)
@@ -56,6 +57,8 @@ const MAX_OAUTH_ERROR_FIELD_LEN: usize = 256;
 const DEFAULT_TOKEN_CACHE_TTL_SECONDS: i64 = 300;
 const TOKEN_CACHE_EXPIRY_SKEW_SECONDS: i64 = 30;
 const MAX_TOKEN_EXPIRES_IN_SECONDS: i64 = 3600;
+const DEFAULT_CLIENT_ASSERTION_TYPE: &str =
+    "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
 
 /// `OAuth2` token response from the authorization server.
 #[derive(Debug, Clone, Deserialize)]
@@ -136,6 +139,7 @@ impl TokenCache {
 /// * `provider_name` — Unique provider identifier (used as cache key)
 /// * `token_endpoint` — `OAuth2` token service URL
 /// * `jwt_svid_audience` — Optional audience to request when fetching the JWT-SVID
+/// * `client_assertion_type` — Optional `OAuth2` client assertion type
 /// * `audience` — Resource audience to request in the token request
 /// * `scopes` — `OAuth2` scopes to request (may be empty)
 /// * `cache_ttl_override` — Cache TTL in seconds (0 = use `expires_in` from response)
@@ -152,6 +156,7 @@ pub async fn obtain_provider_token(
     provider_name: &str,
     token_endpoint: &str,
     jwt_svid_audience: &str,
+    client_assertion_type: &str,
     audience: &str,
     scopes: &[String],
     cache_ttl_override: i64,
@@ -162,6 +167,7 @@ pub async fn obtain_provider_token(
             provider_name,
             token_endpoint,
             jwt_svid_audience,
+            client_assertion_type,
             audience,
             scopes,
             cache_ttl_override,
@@ -173,7 +179,14 @@ pub async fn obtain_provider_token(
 
             // Perform OAuth2 JWT client assertion grant
             // The audience parameter in the token request specifies the resource server
-            perform_token_grant(token_endpoint, &jwt_svid, audience, scopes).await
+            perform_token_grant(
+                token_endpoint,
+                &jwt_svid,
+                client_assertion_type,
+                audience,
+                scopes,
+            )
+            .await
         },
     )
     .await
@@ -184,6 +197,7 @@ struct ObtainProviderTokenInput<'a> {
     provider_name: &'a str,
     token_endpoint: &'a str,
     jwt_svid_audience: &'a str,
+    client_assertion_type: &'a str,
     audience: &'a str,
     scopes: &'a [String],
     cache_ttl_override: i64,
@@ -205,6 +219,7 @@ where
         input.provider_name,
         input.token_endpoint,
         &jwt_audience,
+        effective_client_assertion_type(input.client_assertion_type),
         input.audience,
         input.scopes,
     );
@@ -275,7 +290,7 @@ fn provider_spiffe_workload_api_socket_from_env() -> Result<String> {
 ///
 /// POSTs to the token endpoint with:
 /// - `grant_type=client_credentials`
-/// - `client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-spiffe`
+/// - `client_assertion_type=<configured assertion type>`
 /// - `client_assertion=<JWT-SVID>` (client identity is in the JWT's `sub` claim)
 /// - `audience=<audience>` (if provided)
 /// - `scope=<scopes>` (if provided)
@@ -285,16 +300,15 @@ fn provider_spiffe_workload_api_socket_from_env() -> Result<String> {
 async fn perform_token_grant(
     token_endpoint: &str,
     jwt_svid: &str,
+    client_assertion_type: &str,
     audience: &str,
     scopes: &[String],
 ) -> Result<TokenResponse> {
     let token_endpoint_url = parse_token_endpoint_url(token_endpoint)?;
+    let client_assertion_type = effective_client_assertion_type(client_assertion_type);
     let mut form_params = vec![
         ("grant_type", "client_credentials"),
-        (
-            "client_assertion_type",
-            "urn:ietf:params:oauth:client-assertion-type:jwt-spiffe",
-        ),
+        ("client_assertion_type", client_assertion_type),
         ("client_assertion", jwt_svid),
     ];
 
@@ -468,18 +482,28 @@ fn effective_jwt_svid_audience(token_endpoint: &str, jwt_svid_audience: &str) ->
     }
 }
 
+fn effective_client_assertion_type(client_assertion_type: &str) -> &str {
+    if client_assertion_type.trim().is_empty() {
+        DEFAULT_CLIENT_ASSERTION_TYPE
+    } else {
+        client_assertion_type
+    }
+}
+
 fn token_cache_key(
     provider_name: &str,
     token_endpoint: &str,
     jwt_svid_audience: &str,
+    client_assertion_type: &str,
     audience: &str,
     scopes: &[String],
 ) -> String {
     format!(
-        "{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}",
         provider_name,
         token_endpoint,
         jwt_svid_audience,
+        client_assertion_type,
         audience,
         scopes.join(" ")
     )
@@ -749,6 +773,7 @@ mod tests {
                 provider_name: input.provider_name,
                 token_endpoint: input.token_endpoint,
                 jwt_svid_audience: input.jwt_svid_audience,
+                client_assertion_type: DEFAULT_CLIENT_ASSERTION_TYPE,
                 audience: input.audience,
                 scopes: input.scopes,
                 cache_ttl_override: input.cache_ttl_override,
@@ -784,6 +809,7 @@ mod tests {
                 provider_name,
                 token_endpoint,
                 jwt_svid_audience,
+                client_assertion_type: DEFAULT_CLIENT_ASSERTION_TYPE,
                 audience,
                 scopes,
                 cache_ttl_override,
@@ -893,6 +919,7 @@ mod tests {
             "alpha.default.svc.cluster.local\t80\t\tprovider:access_token",
             "https://auth.example.com/realms/openshell/protocol/openid-connect/token",
             "https://auth.example.com/realms/openshell",
+            DEFAULT_CLIENT_ASSERTION_TYPE,
             "alpha",
             &["alpha".to_string()],
         );
@@ -900,6 +927,7 @@ mod tests {
             "alpha.default.svc.cluster.local\t80\t\tprovider:access_token",
             "https://auth.example.com/realms/openshell/protocol/openid-connect/token",
             "https://auth.example.com/realms/openshell",
+            DEFAULT_CLIENT_ASSERTION_TYPE,
             "delta",
             &["alpha".to_string()],
         );
@@ -907,12 +935,22 @@ mod tests {
             "alpha.default.svc.cluster.local\t80\t\tprovider:access_token",
             "https://auth.example.com/realms/openshell/protocol/openid-connect/token",
             "https://auth.example.com/realms/openshell",
+            DEFAULT_CLIENT_ASSERTION_TYPE,
             "alpha",
             &["delta".to_string()],
+        );
+        let different_assertion_type = token_cache_key(
+            "alpha.default.svc.cluster.local\t80\t\tprovider:access_token",
+            "https://auth.example.com/realms/openshell/protocol/openid-connect/token",
+            "https://auth.example.com/realms/openshell",
+            "urn:ietf:params:oauth:client-assertion-type:jwt-spiffe",
+            "alpha",
+            &["alpha".to_string()],
         );
 
         assert_ne!(base, different_audience);
         assert_ne!(base, different_scopes);
+        assert_ne!(base, different_assertion_type);
     }
 
     #[test]
@@ -1042,6 +1080,7 @@ mod tests {
             provider_name,
             token_endpoint,
             jwt_svid_audience,
+            DEFAULT_CLIENT_ASSERTION_TYPE,
             audience,
             &scopes,
         );
@@ -1084,6 +1123,7 @@ mod tests {
                 provider_name,
                 token_endpoint,
                 jwt_svid_audience,
+                client_assertion_type: DEFAULT_CLIENT_ASSERTION_TYPE,
                 audience,
                 scopes: &scopes,
                 cache_ttl_override: 0,
@@ -1104,6 +1144,7 @@ mod tests {
             provider_name,
             token_endpoint,
             jwt_svid_audience,
+            DEFAULT_CLIENT_ASSERTION_TYPE,
             audience,
             &scopes,
         );
@@ -1163,9 +1204,10 @@ mod tests {
         .await;
         let scopes = vec!["read".to_string(), "write".to_string()];
 
-        let response = perform_token_grant(&endpoint, "jwt-svid-token", "api://resource", &scopes)
-            .await
-            .expect("token grant should succeed");
+        let response =
+            perform_token_grant(&endpoint, "jwt-svid-token", "", "api://resource", &scopes)
+                .await
+                .expect("token grant should succeed");
         let request = request.await.expect("token endpoint task should finish");
 
         assert_eq!(response.access_token, "access-123");
@@ -1184,7 +1226,7 @@ mod tests {
                 .form
                 .get("client_assertion_type")
                 .map(String::as_str),
-            Some("urn:ietf:params:oauth:client-assertion-type:jwt-spiffe")
+            Some(DEFAULT_CLIENT_ASSERTION_TYPE)
         );
         assert_eq!(
             request.form.get("client_assertion").map(String::as_str),
@@ -1205,6 +1247,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn perform_token_grant_uses_configured_client_assertion_type() {
+        let (endpoint, request) =
+            token_endpoint_once("200 OK", r#"{"access_token":"access-123"}"#).await;
+
+        let response = perform_token_grant(
+            &endpoint,
+            "jwt-svid-token",
+            "urn:ietf:params:oauth:client-assertion-type:jwt-spiffe",
+            "",
+            &[],
+        )
+        .await
+        .expect("token grant should succeed");
+        let request = request.await.expect("token endpoint task should finish");
+
+        assert_eq!(response.access_token, "access-123");
+        assert_eq!(
+            request
+                .form
+                .get("client_assertion_type")
+                .map(String::as_str),
+            Some("urn:ietf:params:oauth:client-assertion-type:jwt-spiffe")
+        );
+    }
+
+    #[tokio::test]
     async fn perform_token_grant_rejects_malformed_access_token() {
         let (endpoint, request) = token_endpoint_once(
             "200 OK",
@@ -1212,7 +1280,7 @@ mod tests {
         )
         .await;
 
-        let err = perform_token_grant(&endpoint, "jwt-svid-token", "", &[])
+        let err = perform_token_grant(&endpoint, "jwt-svid-token", "", "", &[])
             .await
             .expect_err("malformed access token should fail closed");
         let _request = request.await.expect("token endpoint task should finish");
@@ -1227,7 +1295,7 @@ mod tests {
     async fn perform_token_grant_does_not_follow_redirects() {
         let (endpoint, request) = token_endpoint_redirect_once("http://127.0.0.1:1/stolen").await;
 
-        let err = perform_token_grant(&endpoint, "jwt-svid-token", "", &[])
+        let err = perform_token_grant(&endpoint, "jwt-svid-token", "", "", &[])
             .await
             .expect_err("redirect response should fail closed");
         let _request = request.await.expect("token endpoint task should finish");
@@ -1240,7 +1308,7 @@ mod tests {
         let (endpoint, request) =
             token_endpoint_once("200 OK", r#"{"access_token":"access-123"}"#).await;
 
-        let response = perform_token_grant(&endpoint, "jwt-svid-token", "", &[])
+        let response = perform_token_grant(&endpoint, "jwt-svid-token", "", "", &[])
             .await
             .expect("token grant should succeed without audience or scopes");
         let request = request.await.expect("token endpoint task should finish");
@@ -1262,7 +1330,7 @@ mod tests {
         )
         .await;
 
-        let err = perform_token_grant(&endpoint, "jwt-svid-token", "api://resource", &[])
+        let err = perform_token_grant(&endpoint, "jwt-svid-token", "", "api://resource", &[])
             .await
             .expect_err("token grant should fail on OAuth error");
         let request = request.await.expect("token endpoint task should finish");
@@ -1285,7 +1353,7 @@ mod tests {
         )
         .await;
 
-        let err = perform_token_grant(&endpoint, "jwt-svid-token", "", &[])
+        let err = perform_token_grant(&endpoint, "jwt-svid-token", "", "", &[])
             .await
             .expect_err("token grant should fail on server error");
         let _request = request.await.expect("token endpoint task should finish");
@@ -1303,7 +1371,7 @@ mod tests {
     async fn perform_token_grant_reports_malformed_success_json() {
         let (endpoint, request) = token_endpoint_once("200 OK", r#"{"access_token":42"#).await;
 
-        let err = perform_token_grant(&endpoint, "jwt-svid-token", "", &[])
+        let err = perform_token_grant(&endpoint, "jwt-svid-token", "", "", &[])
             .await
             .expect_err("malformed token response should fail");
         let _request = request.await.expect("token endpoint task should finish");

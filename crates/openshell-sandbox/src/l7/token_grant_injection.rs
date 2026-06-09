@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use miette::{Result, miette};
-use openshell_core::proto::ProviderCredentialTokenGrant;
+use openshell_core::proto::{ProviderCredentialTokenGrant, ProviderProfileCredential};
 use openshell_ocsf::{
     ActionId, ActivityId, DispositionId, Endpoint, NetworkActivityBuilder, SeverityId, StatusId,
     ocsf_emit,
@@ -22,6 +22,7 @@ pub struct TokenGrantRequest<'a> {
     pub provider_key: &'a str,
     pub token_endpoint: &'a str,
     pub jwt_svid_audience: &'a str,
+    pub client_assertion_type: &'a str,
     pub audience: &'a str,
     pub scopes: &'a [String],
     pub cache_ttl_seconds: i64,
@@ -47,6 +48,7 @@ impl TokenGrantResolver for SpiffeTokenGrantResolver {
                 request.provider_key,
                 request.token_endpoint,
                 request.jwt_svid_audience,
+                request.client_assertion_type,
                 request.audience,
                 request.scopes,
                 request.cache_ttl_seconds,
@@ -92,7 +94,7 @@ pub async fn inject_if_needed(req: L7Request, ctx: &L7EvalContext) -> Result<L7R
         match resolver.obtain(request).await {
             Ok(access_token) => {
                 let modified_raw_header =
-                    inject_authorization_header(&req.raw_header, &access_token)?;
+                    inject_token_grant_header(&req.raw_header, &cred, &access_token)?;
                 ocsf_emit!(
                     NetworkActivityBuilder::new(crate::ocsf_ctx())
                         .activity(ActivityId::Other)
@@ -152,6 +154,7 @@ fn token_grant_request<'a>(
         provider_key,
         token_endpoint: &token_grant.token_endpoint,
         jwt_svid_audience: &token_grant.jwt_svid_audience,
+        client_assertion_type: &token_grant.client_assertion_type,
         audience: &token_grant.audience,
         scopes: &token_grant.scopes,
         cache_ttl_seconds: token_grant.cache_ttl_seconds,
@@ -241,9 +244,78 @@ fn count_as_u32(count: usize) -> u32 {
     u32::try_from(count).unwrap_or(u32::MAX)
 }
 
-fn inject_authorization_header(raw_header: &[u8], access_token: &str) -> Result<Vec<u8>> {
+fn inject_token_grant_header(
+    raw_header: &[u8],
+    credential: &ProviderProfileCredential,
+    access_token: &str,
+) -> Result<Vec<u8>> {
     crate::token_grant::validate_access_token(access_token)?;
+    let (header_name, header_value) = token_grant_header(credential, access_token)?;
+    inject_header(raw_header, &header_name, &header_value)
+}
 
+fn token_grant_header(
+    credential: &ProviderProfileCredential,
+    access_token: &str,
+) -> Result<(String, String)> {
+    match credential.auth_style.trim().to_ascii_lowercase().as_str() {
+        "" | "bearer" => {
+            let header_name = if credential.header_name.trim().is_empty() {
+                "Authorization"
+            } else {
+                credential.header_name.trim()
+            };
+            validate_header_name(header_name)?;
+            Ok((header_name.to_string(), format!("Bearer {access_token}")))
+        }
+        "header" => {
+            let header_name = credential.header_name.trim();
+            if header_name.is_empty() {
+                return Err(miette!(
+                    "token grant auth_style header requires header_name"
+                ));
+            }
+            validate_header_name(header_name)?;
+            Ok((header_name.to_string(), access_token.to_string()))
+        }
+        other => Err(miette!(
+            "token grant auth_style '{other}' is not supported; use bearer or header"
+        )),
+    }
+}
+
+fn validate_header_name(header_name: &str) -> Result<()> {
+    let valid = !header_name.is_empty()
+        && header_name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(miette!(
+            "token grant header_name is not a valid HTTP header name"
+        ))
+    }
+}
+
+fn inject_header(raw_header: &[u8], header_name: &str, header_value: &str) -> Result<Vec<u8>> {
     let header_end = raw_header
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -256,8 +328,8 @@ fn inject_authorization_header(raw_header: &[u8], access_token: &str) -> Result<
         .next()
         .ok_or_else(|| miette!("HTTP headers missing request line"))?;
 
-    let auth_header = format!("Authorization: Bearer {access_token}");
-    let mut new_raw_header = Vec::with_capacity(raw_header.len() + auth_header.len() + 2);
+    let inserted_header = format!("{header_name}: {header_value}");
+    let mut new_raw_header = Vec::with_capacity(raw_header.len() + inserted_header.len() + 2);
     new_raw_header.extend_from_slice(request_line.as_bytes());
     new_raw_header.extend_from_slice(b"\r\n");
 
@@ -267,7 +339,7 @@ fn inject_authorization_header(raw_header: &[u8], access_token: &str) -> Result<
         }
         if line
             .split_once(':')
-            .is_some_and(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+            .is_some_and(|(name, _)| name.eq_ignore_ascii_case(header_name))
         {
             continue;
         }
@@ -275,7 +347,7 @@ fn inject_authorization_header(raw_header: &[u8], access_token: &str) -> Result<
         new_raw_header.extend_from_slice(b"\r\n");
     }
 
-    new_raw_header.extend_from_slice(auth_header.as_bytes());
+    new_raw_header.extend_from_slice(inserted_header.as_bytes());
     new_raw_header.extend_from_slice(&raw_header[header_end..]);
 
     Ok(new_raw_header)
@@ -298,6 +370,7 @@ pub mod test_support {
         provider_key: String,
         token_endpoint: String,
         jwt_svid_audience: String,
+        client_assertion_type: String,
         audience: String,
         scopes: Vec<String>,
         cache_ttl_seconds: i64,
@@ -365,6 +438,10 @@ pub mod test_support {
             assert_eq!(request.provider_key, expected_provider_key);
             assert_eq!(request.token_endpoint, "https://auth.example.com/token");
             assert_eq!(request.jwt_svid_audience, "https://auth.example.com");
+            assert_eq!(
+                request.client_assertion_type,
+                "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+            );
             assert_eq!(request.audience, "api://example");
             assert_eq!(request.scopes, ["read"]);
             assert_eq!(request.cache_ttl_seconds, 300);
@@ -376,6 +453,8 @@ pub mod test_support {
             token_endpoint: "https://auth.example.com/token".to_string(),
             audience: "api://example".to_string(),
             jwt_svid_audience: "https://auth.example.com".to_string(),
+            client_assertion_type: "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+                .to_string(),
             scopes: vec!["read".to_string()],
             cache_ttl_seconds: 300,
             audience_overrides: Vec::new(),
@@ -391,6 +470,7 @@ pub mod test_support {
                 provider_key: request.provider_key.to_string(),
                 token_endpoint: request.token_endpoint.to_string(),
                 jwt_svid_audience: request.jwt_svid_audience.to_string(),
+                client_assertion_type: request.client_assertion_type.to_string(),
                 audience: request.audience.to_string(),
                 scopes: request.scopes.to_vec(),
                 cache_ttl_seconds: request.cache_ttl_seconds,
@@ -411,6 +491,14 @@ mod tests {
     use super::*;
     use crate::l7::provider::{BodyLength, L7Request};
     use crate::l7::token_grant_injection::test_support::TokenGrantTestFixture;
+
+    fn credential(auth_style: &str, header_name: &str) -> ProviderProfileCredential {
+        ProviderProfileCredential {
+            auth_style: auth_style.to_string(),
+            header_name: header_name.to_string(),
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn dynamic_credential_key_matches_endpoint_host_port_and_path() {
@@ -509,11 +597,12 @@ mod tests {
     }
 
     #[test]
-    fn inject_authorization_header_replaces_existing_authorization() {
+    fn inject_token_grant_header_replaces_existing_authorization() {
         let raw = b"GET /v1 HTTP/1.1\r\nHost: api.example.com\r\nauthorization: Bearer stale-token\r\nAccept: application/json\r\n\r\n";
 
         let rewritten =
-            inject_authorization_header(raw, "grant-token").expect("header should rewrite");
+            inject_token_grant_header(raw, &credential("bearer", "Authorization"), "grant-token")
+                .expect("header should rewrite");
         let rewritten = String::from_utf8(rewritten).expect("rewritten header should be UTF-8");
 
         assert!(rewritten.contains("Authorization: Bearer grant-token\r\n"));
@@ -530,11 +619,11 @@ mod tests {
     }
 
     #[test]
-    fn inject_authorization_header_preserves_header_terminator_before_body() {
+    fn inject_token_grant_header_preserves_header_terminator_before_body() {
         let raw = b"POST /v1 HTTP/1.1\r\nHost: api.example.com\r\nContent-Length: 2\r\n\r\nOK";
 
-        let rewritten =
-            inject_authorization_header(raw, "grant-token").expect("header should rewrite");
+        let rewritten = inject_token_grant_header(raw, &credential("bearer", ""), "grant-token")
+            .expect("header should rewrite");
 
         assert_eq!(
             rewritten,
@@ -543,11 +632,29 @@ mod tests {
     }
 
     #[test]
-    fn inject_authorization_header_rejects_malformed_access_token() {
+    fn inject_token_grant_header_uses_custom_header_style() {
+        let raw = b"GET /v1 HTTP/1.1\r\nHost: api.example.com\r\nX-Api-Token: stale-token\r\n\r\n";
+
+        let rewritten =
+            inject_token_grant_header(raw, &credential("header", "X-Api-Token"), "grant-token")
+                .expect("header should rewrite");
+        let rewritten = String::from_utf8(rewritten).expect("rewritten header should be UTF-8");
+
+        assert!(rewritten.contains("X-Api-Token: grant-token\r\n"));
+        assert!(!rewritten.contains("stale-token"));
+        assert!(!rewritten.contains("Bearer grant-token"));
+    }
+
+    #[test]
+    fn inject_token_grant_header_rejects_malformed_access_token() {
         let raw = b"GET /v1 HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
 
-        let err = inject_authorization_header(raw, "grant-token\r\nX-Injected: yes")
-            .expect_err("malformed token must not be injected");
+        let err = inject_token_grant_header(
+            raw,
+            &credential("bearer", "Authorization"),
+            "grant-token\r\nX-Injected: yes",
+        )
+        .expect_err("malformed token must not be injected");
 
         assert_eq!(
             err.to_string(),

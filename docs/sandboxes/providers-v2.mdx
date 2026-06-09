@@ -60,7 +60,7 @@ Providers v2 currently includes these user-facing features:
 - Runtime sandbox provider lifecycle commands under `openshell sandbox provider list|attach|detach`.
 - Credential refresh configuration with `openshell provider refresh status|configure|rotate|delete`.
 - Credential expiry metadata with `openshell provider update --credential-expires-at`; values accept Unix epoch milliseconds or ISO/RFC3339 timestamps.
-- Dynamic token grants that use the sandbox's SPIFFE JWT-SVID as an OAuth2 client assertion and inject a short-lived `Authorization: Bearer` token for matching profile endpoints.
+- Dynamic token grants that use the sandbox's SPIFFE JWT-SVID as an OAuth2 client assertion and inject short-lived tokens into supported headers for matching profile endpoints.
 
 ## Roadmap
 
@@ -68,7 +68,7 @@ The following Providers v2 design items are not part of the current behavior:
 
 | Roadmap item | Current behavior |
 |---|---|
-| General profile-driven credential placement | Static `auth_style`, `header_name`, `query_param`, and `path_template` placement metadata is stored and validated, but static credential injection still depends on environment placeholders generated from provider credentials. Dynamic `token_grant` credentials inject bearer tokens for matching HTTP endpoints. |
+| General profile-driven credential placement | Static `auth_style`, `header_name`, `query_param`, and `path_template` placement metadata is stored and validated, but static credential injection still depends on environment placeholders generated from provider credentials. Dynamic `token_grant` credentials support `bearer` and `header` placement for matching HTTP endpoints. |
 | Endpoint and binary scoped credential injection | Provider profile endpoints and binaries affect policy composition. Dynamic token grants are endpoint-scoped. Static placeholder injection is not yet restricted by profile endpoint or binary metadata. |
 | Credential verification on create | `openshell provider create` does not yet probe provider verification endpoints or expose `--no-verify`. |
 | Automatic credential scope extraction | OpenShell does not yet inspect upstream provider responses to discover credential scopes. |
@@ -188,12 +188,13 @@ credentials:
 
     # Optional dynamic credential. The sandbox supervisor requests a
     # SPIFFE JWT-SVID, exchanges it at token_endpoint, caches the returned
-    # access token, and injects it as Authorization: Bearer for matching
-    # endpoint traffic.
+    # access token, and injects it according to auth_style/header_name for
+    # matching endpoint traffic.
     token_grant:
       token_endpoint: https://login.example.com/realms/custom/protocol/openid-connect/token
       audience: api://custom-api
       jwt_svid_audience: https://login.example.com/realms/custom
+      client_assertion_type: urn:ietf:params:oauth:client-assertion-type:jwt-bearer
       scopes: [api.read, api.write]
       cache_ttl_seconds: 300
       audience_overrides:
@@ -258,7 +259,7 @@ binaries:
 
 `category` groups profiles in `openshell provider list-profiles`. Use one of the values in the category enum.
 
-`credentials` declares the credential names, environment variables, auth metadata, optional refresh metadata, and optional dynamic token grant metadata for the provider type. The `auth_style` field accepts `basic`, `bearer`, `header`, `query`, or `path`. When `auth_style` is `path`, set `path_template` to a URL path containing the `{credential}` placeholder exactly once (for example, `/v1/{credential}/resources`). Static credentials are exposed as placeholder environment variables and resolved in outbound HTTP requests. Dynamic token grants are resolved by the sandbox proxy on demand for matching profile endpoints.
+`credentials` declares the credential names, environment variables, auth metadata, optional refresh metadata, and optional dynamic token grant metadata for the provider type. The `auth_style` field accepts `basic`, `bearer`, `header`, `query`, or `path`. When `auth_style` is `path`, set `path_template` to a URL path containing the `{credential}` placeholder exactly once (for example, `/v1/{credential}/resources`). Static credentials are exposed as placeholder environment variables and resolved in outbound HTTP requests. Dynamic token grants are resolved by the sandbox proxy on demand for matching profile endpoints and support `bearer` or `header` placement.
 
 `discovery` controls what `--from-existing` scans when
 `providers_v2_enabled=true`. Each entry in `discovery.credentials` must name a
@@ -300,7 +301,16 @@ OpenShell keeps token endpoints profile-owned. Refresh material cannot override 
 
 ### Dynamic Token Grants
 
-`token_grant` belongs to one credential declaration. When a sandbox with the provider attached sends HTTP traffic to a matching profile endpoint, the supervisor requests a SPIFFE JWT-SVID from the local Workload API, exchanges it at `token_endpoint`, caches the returned access token, and injects `Authorization: Bearer <token>` before forwarding the request upstream.
+`token_grant` belongs to one credential declaration. When a sandbox with the provider attached sends HTTP traffic to a matching profile endpoint, the supervisor requests a SPIFFE JWT-SVID from the local Workload API, exchanges it at `token_endpoint`, caches the returned access token, and injects it before forwarding the request upstream. Use `auth_style: bearer` to inject `Authorization: Bearer <token>`, or `auth_style: header` with `header_name` to inject the raw access token into a custom header. Token grants do not support `query` or `path` placement.
+
+Create provider instances for token-grant-only profiles with `--runtime-credentials`. This records an empty provider instance and makes the runtime-resolved credential source explicit:
+
+```shell
+openshell provider create \
+  --name spiffe-token-demo \
+  --type spiffe-token-demo \
+  --runtime-credentials
+```
 
 Token grant fields:
 
@@ -309,11 +319,12 @@ Token grant fields:
 | `token_endpoint` | Yes | OAuth2 token endpoint that accepts a SPIFFE JWT-SVID client assertion. Use `https://` unless the endpoint is loopback or a Kubernetes service DNS name such as `token-issuer.default.svc.cluster.local`. |
 | `audience` | No | Resource audience requested from the token service. |
 | `jwt_svid_audience` | No | Audience used when requesting the JWT-SVID. When omitted, OpenShell derives an issuer-style audience from Keycloak token endpoint paths or falls back to the full token endpoint URL. |
+| `client_assertion_type` | No | OAuth2 `client_assertion_type` form value. Defaults to RFC 7523 `urn:ietf:params:oauth:client-assertion-type:jwt-bearer`. Set a provider-specific value, such as `urn:ietf:params:oauth:client-assertion-type:jwt-spiffe`, only when the token issuer explicitly requires it. |
 | `scopes` | No | OAuth2 scopes sent as a space-separated `scope` parameter. |
 | `cache_ttl_seconds` | No | Token cache TTL override. When omitted or `0`, OpenShell uses the token response `expires_in` with a 30-second safety margin and one-hour cap, or five minutes minus the margin if the response does not include an expiry. |
 | `audience_overrides` | No | Endpoint-specific `audience` and `scopes` overrides selected by host, port, and path. |
 
-Token grants require the sandbox supervisor to have access to a SPIFFE Workload API socket. They apply to HTTP traffic that the proxy can inspect. Endpoints with `tls: skip` bypass TLS termination and cannot receive dynamic token grant injection for HTTPS traffic. The token service must return a bearer-compatible access token; malformed token values are rejected before caching or header injection.
+Token grants require the sandbox supervisor to have access to a SPIFFE Workload API socket. They apply to HTTP traffic that the proxy can inspect. Endpoints with `tls: skip` bypass TLS termination and cannot receive dynamic token grant injection for HTTPS traffic. The token service must return a token value that is safe for HTTP header placement; malformed values are rejected before caching or header injection.
 
 ## Provider Instances
 
@@ -355,6 +366,8 @@ openshell provider create \
   --type custom-api \
   --credential CUSTOM_API_TOKEN
 ```
+
+Provider profiles whose required credentials are fully runtime-resolvable through `token_grant` or gateway-managed refresh can be created without `--credential`.
 
 Inspect the provider:
 
@@ -651,7 +664,7 @@ Already-running processes keep the environment they started with. OpenShell does
 
 Detaching a provider removes its provider policy layer from future effective policy reads and removes its credential placeholders from future process environments. It does not remove environment variables from already-running processes.
 
-OpenShell rejects provider updates and refresh configuration when they would make two providers attached to the same sandbox expose the same active credential environment key. Use provider-specific credential names when one sandbox needs multiple providers with overlapping upstream concepts.
+OpenShell rejects provider updates and refresh configuration when they would make two providers attached to the same sandbox expose the same active credential environment key. It also rejects attached provider sets with ambiguous dynamic token grants at equal host/path specificity. Use provider-specific credential names and make one dynamic grant selector more specific when one sandbox needs multiple providers with overlapping upstream concepts.
 
 ## Next Steps
 

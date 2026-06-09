@@ -3623,6 +3623,7 @@ dependencies = [
  "clap",
  "futures",
  "futures-util",
+ "glob",
  "hex",
  "hmac",
  "http",

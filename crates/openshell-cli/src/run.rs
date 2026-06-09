@@ -4468,7 +4468,8 @@ fn missing_credentials_error(provider_type: &str) -> miette::Report {
 
     miette::miette!(
         "no credentials resolved for provider type '{provider_type}'. \
-         Use --credential KEY[=VALUE] or --from-existing with the appropriate env vars set."
+         Use --credential KEY[=VALUE], --runtime-credentials for runtime-resolved profile credentials, \
+         or --from-existing with the appropriate env vars set."
     )
 }
 
@@ -4483,14 +4484,45 @@ pub async fn provider_create(
     config: &[String],
     tls: &TlsOptions,
 ) -> Result<()> {
-    if from_gcloud_adc && (from_existing || !credentials.is_empty()) {
+    provider_create_with_options(
+        server,
+        name,
+        provider_type,
+        from_existing,
+        credentials,
+        from_gcloud_adc,
+        false,
+        config,
+        tls,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn provider_create_with_options(
+    server: &str,
+    name: &str,
+    provider_type: &str,
+    from_existing: bool,
+    credentials: &[String],
+    from_gcloud_adc: bool,
+    runtime_credentials: bool,
+    config: &[String],
+    tls: &TlsOptions,
+) -> Result<()> {
+    if from_gcloud_adc && (from_existing || !credentials.is_empty() || runtime_credentials) {
         return Err(miette::miette!(
-            "--from-gcloud-adc cannot be combined with --from-existing or --credential"
+            "--from-gcloud-adc cannot be combined with --from-existing or --credential; it also cannot be combined with --runtime-credentials"
         ));
     }
-    if from_existing && !credentials.is_empty() {
+    if from_existing && (!credentials.is_empty() || runtime_credentials) {
         return Err(miette::miette!(
-            "--from-existing cannot be combined with --credential"
+            "--from-existing cannot be combined with --credential or --runtime-credentials"
+        ));
+    }
+    if runtime_credentials && !credentials.is_empty() {
+        return Err(miette::miette!(
+            "--runtime-credentials cannot be combined with --credential"
         ));
     }
 
@@ -4553,11 +4585,25 @@ pub async fn provider_create(
         if from_existing {
             return Err(missing_credentials_error(&provider_type));
         }
-        let allows_refresh_bootstrap = fetch_provider_profile(&mut client, &provider_type)
-            .await
-            .ok()
-            .is_some_and(|profile| provider_profile_allows_refresh_bootstrap(&profile));
-        if !allows_refresh_bootstrap {
+        if !from_gcloud_adc && !runtime_credentials {
+            return Err(missing_credentials_error(&provider_type));
+        }
+        let allows_empty_credentials = if runtime_credentials {
+            provider_profile_allows_empty_credentials(
+                &fetch_provider_profile(&mut client, &provider_type).await?,
+            )
+        } else {
+            fetch_provider_profile(&mut client, &provider_type)
+                .await
+                .ok()
+                .is_some_and(|profile| provider_profile_allows_empty_credentials(&profile))
+        };
+        if !allows_empty_credentials {
+            if runtime_credentials {
+                return Err(miette::miette!(
+                    "--runtime-credentials is only valid for provider profiles whose required credentials are resolved at runtime"
+                ));
+            }
             return Err(missing_credentials_error(&provider_type));
         }
     }
@@ -4652,8 +4698,8 @@ pub async fn provider_create(
     Ok(())
 }
 
-fn provider_profile_allows_refresh_bootstrap(profile: &ProviderProfile) -> bool {
-    ProviderTypeProfile::from_proto(profile).allows_gateway_refresh_bootstrap()
+fn provider_profile_allows_empty_credentials(profile: &ProviderProfile) -> bool {
+    ProviderTypeProfile::from_proto(profile).allows_empty_provider_credentials()
 }
 
 pub async fn provider_get(server: &str, name: &str, tls: &TlsOptions) -> Result<()> {
@@ -7529,7 +7575,7 @@ mod tests {
         inferred_provider_type, mtls_certs_exist_for_gateway, package_managed_tls_dirs,
         parse_cli_setting_value, parse_credential_expiry_cli_value, parse_credential_expiry_pairs,
         parse_credential_pairs, parse_driver_config_json, plaintext_gateway_is_remote,
-        progress_step_from_metadata, provider_profile_allows_refresh_bootstrap,
+        progress_step_from_metadata, provider_profile_allows_empty_credentials,
         provisioning_timeout_message, ready_false_condition_message, refresh_status_header,
         refresh_status_row, resolve_from, sandbox_should_persist, sandbox_upload_plan,
         service_expose_status_error, service_url_for_gateway,
@@ -7552,8 +7598,8 @@ mod tests {
     };
     use openshell_core::proto::{
         Provider, ProviderCredentialRefresh, ProviderCredentialRefreshStatus,
-        ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileCredential,
-        SandboxCondition, SandboxStatus, datamodel::v1::ObjectMeta,
+        ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrant, ProviderProfile,
+        ProviderProfileCredential, SandboxCondition, SandboxStatus, datamodel::v1::ObjectMeta,
     };
 
     struct EnvVarGuard {
@@ -7780,7 +7826,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_bootstrap_requires_all_required_credentials_to_be_gateway_mintable() {
+    fn empty_provider_credentials_require_all_required_credentials_to_be_runtime_resolvable() {
         let refresh_token_profile = ProviderProfile {
             credentials: vec![ProviderProfileCredential {
                 name: "MS_GRAPH_ACCESS_TOKEN".to_string(),
@@ -7793,8 +7839,24 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(provider_profile_allows_refresh_bootstrap(
+        assert!(provider_profile_allows_empty_credentials(
             &refresh_token_profile
+        ));
+
+        let token_grant_profile = ProviderProfile {
+            credentials: vec![ProviderProfileCredential {
+                name: "ACCESS_TOKEN".to_string(),
+                required: true,
+                token_grant: Some(ProviderCredentialTokenGrant {
+                    token_endpoint: "https://auth.example.com/token".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(provider_profile_allows_empty_credentials(
+            &token_grant_profile
         ));
 
         let mixed_static_profile = ProviderProfile {
@@ -7817,7 +7879,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        assert!(!provider_profile_allows_refresh_bootstrap(
+        assert!(!provider_profile_allows_empty_credentials(
             &mixed_static_profile
         ));
 
@@ -7833,7 +7895,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(provider_profile_allows_refresh_bootstrap(
+        assert!(provider_profile_allows_empty_credentials(
             &optional_refresh_profile
         ));
     }
@@ -8883,7 +8945,7 @@ mod tests {
     }
 
     #[test]
-    fn refresh_bootstrap_allows_oauth2_refresh_token() {
+    fn empty_provider_credentials_allow_oauth2_refresh_token() {
         use openshell_core::proto::{
             ProviderCredentialRefresh, ProviderCredentialRefreshStrategy, ProviderProfile,
             ProviderProfileCredential,
@@ -8902,7 +8964,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            provider_profile_allows_refresh_bootstrap(&profile),
+            provider_profile_allows_empty_credentials(&profile),
             "Oauth2RefreshToken should be allowed for refresh bootstrap"
         );
     }

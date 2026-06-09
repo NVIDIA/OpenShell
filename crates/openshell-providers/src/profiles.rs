@@ -102,6 +102,8 @@ pub struct TokenGrantProfile {
     pub audience: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub jwt_svid_audience: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub client_assertion_type: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scopes: Vec<String>,
     #[serde(default, skip_serializing_if = "is_zero_i64")]
@@ -348,23 +350,23 @@ impl ProviderTypeProfile {
         vars
     }
 
-    /// Whether this profile can be created without an initial access token because
-    /// the gateway can mint at least one credential immediately from refresh
-    /// material, and no required credential falls outside that gateway-mintable set.
+    /// Whether this profile can be created without initial static credentials.
+    ///
+    /// Empty provider creation is allowed when at least one credential can be
+    /// resolved at runtime, and every required credential can be resolved at
+    /// runtime. Runtime-resolvable credentials are either gateway-mintable
+    /// refresh credentials or sandbox-side dynamic token grants.
     #[must_use]
-    pub fn allows_gateway_refresh_bootstrap(&self) -> bool {
-        let mut has_gateway_mintable_credential = false;
+    pub fn allows_empty_provider_credentials(&self) -> bool {
+        let mut has_runtime_resolvable_credential = false;
         for credential in &self.credentials {
-            let is_gateway_mintable = credential
-                .refresh
-                .as_ref()
-                .is_some_and(CredentialRefreshProfile::is_gateway_mintable);
-            if credential.required && !is_gateway_mintable {
+            let is_runtime_resolvable = credential.is_runtime_resolvable();
+            if credential.required && !is_runtime_resolvable {
                 return false;
             }
-            has_gateway_mintable_credential |= is_gateway_mintable;
+            has_runtime_resolvable_credential |= is_runtime_resolvable;
         }
-        has_gateway_mintable_credential
+        has_runtime_resolvable_credential
     }
 
     #[must_use]
@@ -405,6 +407,17 @@ impl ProviderTypeProfile {
             endpoints: self.endpoints.iter().map(endpoint_to_proto).collect(),
             binaries: self.binaries.iter().map(binary_to_proto).collect(),
         }
+    }
+}
+
+impl CredentialProfile {
+    #[must_use]
+    pub fn is_runtime_resolvable(&self) -> bool {
+        self.token_grant.is_some()
+            || self
+                .refresh
+                .as_ref()
+                .is_some_and(CredentialRefreshProfile::is_gateway_mintable)
     }
 }
 
@@ -642,6 +655,7 @@ fn token_grant_from_proto(
         token_endpoint: token_grant.token_endpoint.clone(),
         audience: token_grant.audience.clone(),
         jwt_svid_audience: token_grant.jwt_svid_audience.clone(),
+        client_assertion_type: token_grant.client_assertion_type.clone(),
         scopes: token_grant.scopes.clone(),
         cache_ttl_seconds: token_grant.cache_ttl_seconds,
         audience_overrides: token_grant
@@ -659,6 +673,7 @@ fn token_grant_to_proto(
         token_endpoint: token_grant.token_endpoint.clone(),
         audience: token_grant.audience.clone(),
         jwt_svid_audience: token_grant.jwt_svid_audience.clone(),
+        client_assertion_type: token_grant.client_assertion_type.clone(),
         scopes: token_grant.scopes.clone(),
         cache_ttl_seconds: token_grant.cache_ttl_seconds,
         audience_overrides: token_grant
@@ -1199,6 +1214,16 @@ pub fn validate_profile_set(
                     message,
                 ));
             }
+            if credential.token_grant.is_some()
+                && let Err(message) = validate_token_grant_auth_style(credential)
+            {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    "credentials.token_grant.auth_style",
+                    message,
+                ));
+            }
         }
 
         for (index, endpoint) in profile.endpoints.iter().enumerate() {
@@ -1250,6 +1275,13 @@ fn validate_token_grant_endpoint(token_endpoint: &str) -> Result<(), String> {
         "token_endpoint must use https, except http for loopback or in-cluster service hosts"
             .to_string(),
     )
+}
+
+fn validate_token_grant_auth_style(credential: &CredentialProfile) -> Result<(), String> {
+    match credential.auth_style.trim().to_ascii_lowercase().as_str() {
+        "" | "bearer" | "header" => Ok(()),
+        _ => Err("token_grant credentials support auth_style bearer or header".to_string()),
+    }
 }
 
 fn token_endpoint_transport_allowed(url: &url::Url) -> bool {
@@ -1398,13 +1430,14 @@ mod tests {
             vec!["service_account_token", "gcloud_adc_token"]
         );
         assert!(
-            profile.allows_gateway_refresh_bootstrap(),
+            profile.allows_empty_provider_credentials(),
             "Vertex profile should allow empty-create bootstrap via gateway-mintable credentials"
         );
     }
 
     #[test]
-    fn refresh_bootstrap_requires_a_gateway_mintable_path_and_no_required_static_credentials() {
+    fn empty_provider_credentials_require_a_runtime_resolvable_path_and_no_required_static_credentials()
+     {
         let optional_refresh_profile = parse_profile_yaml(
             r"
 id: optional-refresh
@@ -1417,7 +1450,21 @@ credentials:
 ",
         )
         .expect("profile");
-        assert!(optional_refresh_profile.allows_gateway_refresh_bootstrap());
+        assert!(optional_refresh_profile.allows_empty_provider_credentials());
+
+        let token_grant_profile = parse_profile_yaml(
+            r"
+id: token-grant
+display_name: Token Grant
+credentials:
+  - name: access_token
+    required: true
+    token_grant:
+      token_endpoint: https://auth.example.com/token
+",
+        )
+        .expect("profile");
+        assert!(token_grant_profile.allows_empty_provider_credentials());
 
         let mixed_required_profile = parse_profile_yaml(
             r"
@@ -1433,7 +1480,7 @@ credentials:
 ",
         )
         .expect("profile");
-        assert!(!mixed_required_profile.allows_gateway_refresh_bootstrap());
+        assert!(!mixed_required_profile.allows_empty_provider_credentials());
 
         let static_only_profile = parse_profile_yaml(
             r"
@@ -1445,7 +1492,7 @@ credentials:
 ",
         )
         .expect("profile");
-        assert!(!static_only_profile.allows_gateway_refresh_bootstrap());
+        assert!(!static_only_profile.allows_empty_provider_credentials());
     }
 
     #[test]
@@ -1601,6 +1648,7 @@ credentials:
     token_grant:
       token_endpoint: http://keycloak.default.svc.cluster.local/realms/openshell/protocol/openid-connect/token
       jwt_svid_audience: http://keycloak.default.svc.cluster.local/realms/openshell
+      client_assertion_type: urn:ietf:params:oauth:client-assertion-type:jwt-spiffe
       audience: api://default
       scopes: [openid]
       cache_ttl_seconds: 300
@@ -1624,6 +1672,10 @@ credentials:
         assert_eq!(
             token_grant.jwt_svid_audience,
             "http://keycloak.default.svc.cluster.local/realms/openshell"
+        );
+        assert_eq!(
+            token_grant.client_assertion_type,
+            "urn:ietf:params:oauth:client-assertion-type:jwt-spiffe"
         );
         assert_eq!(token_grant.audience_overrides.len(), 2);
         assert_eq!(token_grant.audience_overrides[1].path, "/v1/**");
@@ -1732,6 +1784,62 @@ credentials:
             .expect("token endpoint diagnostic should be reported");
 
         assert_eq!(diagnostic.message, "token_endpoint must be an absolute URL");
+    }
+
+    #[test]
+    fn validate_profile_set_rejects_token_grant_query_or_path_auth_style() {
+        for auth_style in ["query", "path"] {
+            let profile = parse_profile_yaml(&format!(
+                r"
+id: unsupported-token-grant-style
+display_name: Unsupported Token Grant Style
+credentials:
+  - name: access_token
+    auth_style: {auth_style}
+    token_grant:
+      token_endpoint: https://auth.example.com/token
+"
+            ))
+            .expect("profile should parse");
+
+            let diagnostics = validate_profile_set(&[("unsupported.yaml".to_string(), profile)]);
+            let diagnostic = diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.field == "credentials.token_grant.auth_style")
+                .expect("auth style diagnostic should be reported");
+
+            assert_eq!(
+                diagnostic.message,
+                "token_grant credentials support auth_style bearer or header"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_profile_set_requires_header_name_for_token_grant_header_auth_style() {
+        let profile = parse_profile_yaml(
+            r"
+id: missing-header-token-grant
+display_name: Missing Header Token Grant
+credentials:
+  - name: access_token
+    auth_style: header
+    token_grant:
+      token_endpoint: https://auth.example.com/token
+",
+        )
+        .expect("profile should parse");
+
+        let diagnostics = validate_profile_set(&[("missing-header.yaml".to_string(), profile)]);
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.field == "credentials.header_name")
+            .expect("header_name diagnostic should be reported");
+
+        assert_eq!(
+            diagnostic.message,
+            "header_name is required for header auth"
+        );
     }
 
     #[test]

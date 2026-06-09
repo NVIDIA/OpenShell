@@ -716,7 +716,7 @@ impl From<CliEditor> for openshell_cli::ssh::Editor {
 #[derive(Subcommand, Debug)]
 enum ProviderCommands {
     /// Create a provider config.
-    #[command(group = clap::ArgGroup::new("cred_source").required(true).args(["from_existing", "credentials", "from_gcloud_adc"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    #[command(group = clap::ArgGroup::new("cred_source").required(true).args(["from_existing", "credentials", "from_gcloud_adc", "runtime_credentials"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Create {
         /// Provider name.
         #[arg(long)]
@@ -727,22 +727,26 @@ enum ProviderCommands {
         provider_type: String,
 
         /// Load provider credentials/config from existing local state.
-        #[arg(long, conflicts_with_all = ["credentials", "from_gcloud_adc"])]
+        #[arg(long, conflicts_with_all = ["credentials", "from_gcloud_adc", "runtime_credentials"])]
         from_existing: bool,
 
         /// Provider credential pair (`KEY=VALUE`) or env lookup key (`KEY`).
         #[arg(
             long = "credential",
             value_name = "KEY[=VALUE]",
-            conflicts_with_all = ["from_existing", "from_gcloud_adc"]
+            conflicts_with_all = ["from_existing", "from_gcloud_adc", "runtime_credentials"]
         )]
         credentials: Vec<String>,
 
         /// Configure credentials from gcloud Application Default Credentials
         /// (`~/.config/gcloud/application_default_credentials.json`).
         /// Only valid for google-vertex-ai providers.
-        #[arg(long, group = "cred_source", conflicts_with_all = ["from_existing", "credentials"])]
+        #[arg(long, group = "cred_source", conflicts_with_all = ["from_existing", "credentials", "runtime_credentials"])]
         from_gcloud_adc: bool,
+
+        /// Create a provider whose required credentials are resolved at runtime by the gateway/sandbox.
+        #[arg(long, conflicts_with_all = ["from_existing", "credentials", "from_gcloud_adc"])]
+        runtime_credentials: bool,
 
         /// Provider config key/value pair.
         #[arg(long = "config", value_name = "KEY=VALUE")]
@@ -2834,15 +2838,17 @@ async fn main() -> Result<()> {
                     from_existing,
                     credentials,
                     from_gcloud_adc,
+                    runtime_credentials,
                     config,
                 } => {
-                    run::provider_create(
+                    run::provider_create_with_options(
                         endpoint,
                         &name,
                         provider_type.as_str(),
                         from_existing,
                         &credentials,
                         from_gcloud_adc,
+                        runtime_credentials,
                         &config,
                         &tls,
                     )
@@ -3907,6 +3913,60 @@ mod tests {
                 assert_eq!(name, "work-github");
                 assert_eq!(provider_type, "github-readonly");
                 assert_eq!(credentials, vec!["GITHUB_TOKEN=token"]);
+            }
+            other => panic!("expected provider create command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provider_create_requires_credential_source() {
+        let err = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "create",
+            "--name",
+            "spiffe-token-demo",
+            "--type",
+            "spiffe-token-demo",
+        ])
+        .expect_err("provider create should require a credential source");
+
+        assert!(err.to_string().contains("--runtime-credentials"));
+    }
+
+    #[test]
+    fn provider_create_accepts_runtime_credentials() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "provider",
+            "create",
+            "--name",
+            "spiffe-token-demo",
+            "--type",
+            "spiffe-token-demo",
+            "--runtime-credentials",
+        ])
+        .expect("provider create should parse runtime credentials");
+
+        match cli.command {
+            Some(Commands::Provider {
+                command:
+                    Some(ProviderCommands::Create {
+                        name,
+                        provider_type,
+                        from_existing,
+                        credentials,
+                        from_gcloud_adc,
+                        runtime_credentials,
+                        ..
+                    }),
+            }) => {
+                assert_eq!(name, "spiffe-token-demo");
+                assert_eq!(provider_type, "spiffe-token-demo");
+                assert!(!from_existing);
+                assert!(credentials.is_empty());
+                assert!(!from_gcloud_adc);
+                assert!(runtime_credentials);
             }
             other => panic!("expected provider create command, got: {other:?}"),
         }

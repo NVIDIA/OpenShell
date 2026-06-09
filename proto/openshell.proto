@@ -932,6 +932,10 @@ message ProviderCredentialTokenGrant {
 
   // Optional: endpoint-specific resource audience overrides.
   repeated ProviderCredentialTokenGrantAudienceOverride audience_overrides = 5;
+
+  // Optional: OAuth2 client_assertion_type value. If omitted, OpenShell uses
+  // urn:ietf:params:oauth:client-assertion-type:jwt-bearer.
+  string client_assertion_type = 7;
 }
 
 // Provider credential declaration.

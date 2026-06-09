@@ -343,7 +343,7 @@ impl OpenShell for TestOpenShell {
         if provider.credentials.is_empty() {
             let bootstrap_allowed =
                 if let Some(profile) = openshell_providers::get_default_profile(&provider.r#type) {
-                    profile.allows_gateway_refresh_bootstrap()
+                    profile.allows_empty_provider_credentials()
                 } else {
                     self.state
                         .profiles
@@ -353,7 +353,7 @@ impl OpenShell for TestOpenShell {
                         .cloned()
                         .is_some_and(|profile| {
                             openshell_providers::ProviderTypeProfile::from_proto(&profile)
-                                .allows_gateway_refresh_bootstrap()
+                                .allows_empty_provider_credentials()
                         })
                 };
             if !bootstrap_allowed {
@@ -1119,13 +1119,14 @@ async fn provider_create_allows_empty_credentials_for_gateway_refresh_profiles()
         },
     );
 
-    run::provider_create(
+    run::provider_create_with_options(
         &ts.endpoint,
         "custom-refresh-provider",
         "custom-refresh",
         false,
         &[],
         false,
+        true,
         &[],
         &ts.tls,
     )
@@ -1136,6 +1137,50 @@ async fn provider_create_allows_empty_credentials_for_gateway_refresh_profiles()
     let provider = stored.get("custom-refresh-provider").expect("provider");
     assert_eq!(provider.r#type, "custom-refresh");
     assert!(provider.credentials.is_empty());
+}
+
+#[tokio::test]
+async fn provider_create_requires_runtime_credentials_for_empty_gateway_refresh_profiles() {
+    let ts = run_server().await;
+    ts.state.profiles.lock().await.insert(
+        "custom-refresh".to_string(),
+        ProviderProfile {
+            id: "custom-refresh".to_string(),
+            display_name: "Custom Refresh".to_string(),
+            credentials: vec![ProviderProfileCredential {
+                name: "ACCESS_TOKEN".to_string(),
+                required: true,
+                refresh: Some(ProviderCredentialRefresh {
+                    strategy: ProviderCredentialRefreshStrategy::Oauth2RefreshToken as i32,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+    );
+
+    let err = run::provider_create(
+        &ts.endpoint,
+        "custom-refresh-provider",
+        "custom-refresh",
+        false,
+        &[],
+        false,
+        &[],
+        &ts.tls,
+    )
+    .await
+    .expect_err("empty runtime-resolved providers should require an explicit source");
+
+    assert!(err.to_string().contains("--runtime-credentials"));
+    assert!(
+        !ts.state
+            .providers
+            .lock()
+            .await
+            .contains_key("custom-refresh-provider")
+    );
 }
 
 #[tokio::test]

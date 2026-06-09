@@ -64,7 +64,7 @@ openshell --gateway-endpoint "$GATEWAY" provider profile import \
 openshell --gateway-endpoint "$GATEWAY" provider create \
   --name spiffe-token-demo \
   --type spiffe-token-demo \
-  --credential access_token=unused
+  --runtime-credentials
 
 openshell --gateway-endpoint "$GATEWAY" sandbox create \
   --name spiffe-token-demo \
