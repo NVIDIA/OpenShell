@@ -556,13 +556,17 @@ async fn monitor_exec(
     match child.wait().await {
         Ok(status) if status.success() => {
             info!(sandbox = %sandbox.name, "MXC agent exec completed successfully");
+            // A successful one-shot agent (exit 0) must NOT demote the sandbox to
+            // Error. The isolation session is still alive until stop/deprovision,
+            // and the demo's positive proof is "Ready + in-policy file written".
+            // Keep Ready=True so derive_phase leaves the public phase at Ready.
             let done = make_sandbox_with_condition(
                 &sandbox,
                 &DriverCondition {
                     r#type: "Ready".into(),
-                    status: "False".into(),
-                    reason: "ExecCompleted".into(),
-                    message: "Agent exec finished with exit code 0".into(),
+                    status: "True".into(),
+                    reason: "AgentCompleted".into(),
+                    message: "Agent exec finished successfully (exit code 0)".into(),
                     last_transition_time: String::new(),
                 },
                 false,
@@ -570,7 +574,7 @@ async fn monitor_exec(
             let mut reg = registry.lock().await;
             if let Some(entry) = reg.get_mut(&sandbox_id) {
                 entry.sandbox = done.clone();
-                entry.phase_state = PhaseState::Stopped;
+                entry.phase_state = PhaseState::Running;
             }
             drop(reg);
             let _ = watch_tx.send(sandbox_event(done));
@@ -774,6 +778,18 @@ mod lifecycle_tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         assert!(found, "hello.txt should appear in the granted share folder");
+
+        // A successful one-shot agent (exit 0) must STAY Ready, not demote to
+        // Error. Assert the terminal condition is Ready=True/AgentCompleted so the
+        // positive demo shows a green Ready phase, not a red Error.
+        let completed = wait_for(&backend, "sb-pos", |s| {
+            ready_condition(s).is_some_and(|c| c.status == "True" && c.reason == "AgentCompleted")
+        })
+        .await;
+        assert!(
+            completed.is_some(),
+            "sandbox should remain Ready=True (AgentCompleted) after a successful exec, never demote to Error"
+        );
     }
 
     #[tokio::test]
