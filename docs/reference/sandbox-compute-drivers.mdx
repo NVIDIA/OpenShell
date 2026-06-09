@@ -163,8 +163,10 @@ The Kubernetes driver creates namespaced `agents.x-k8s.io/v1alpha1` `Sandbox` re
 
 `nodeEnforcer.enabled=true` deploys an optional privileged DaemonSet that runs
 the supervisor image in `enforcer` mode. This topology is experimental: the
-current enforcer acknowledges workload registrations so the deployment shape can
-be tested, but host-side rule installation is not active yet.
+current enforcer accepts workload registrations and installs coarse nftables
+egress rules inside the registered pod network namespace. Production hardening
+still needs authenticated registration, pod ownership checks, cleanup and
+reconciliation behavior, and shared-cluster deployment rules.
 
 <Note>
 `Sandbox.spec.volumeClaimTemplates` is immutable after creation. To change storage configuration, delete the sandbox and create a new one with the updated spec.

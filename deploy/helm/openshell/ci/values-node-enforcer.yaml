@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# CI/dev overlay for exercising the Kubernetes node-enforcer topology.
+# Sandbox pods stay unprivileged in workload supervisor mode, while the
+# privileged node enforcer DaemonSet owns coarse pod-network-namespace egress
+# enforcement.
+nodeEnforcer:
+  enabled: true
+
+server:
+  networkEnforcementMode: external-enforcer

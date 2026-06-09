@@ -1542,10 +1542,10 @@ default_image = "k8s-specific:1.0"
     #[test]
     fn kubernetes_driver_parses_privileged_from_driver_table() {
         let file = config_file_from_toml(
-            r#"
+            r"
 [openshell.drivers.kubernetes]
 privileged = true
-"#,
+",
         );
         let merged = crate::config_file::driver_table(
             super::ComputeDriverKind::Kubernetes,

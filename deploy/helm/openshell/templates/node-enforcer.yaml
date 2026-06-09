@@ -12,12 +12,12 @@ metadata:
 spec:
   selector:
     matchLabels:
-      {{- include "openshell.selectorLabels" . | nindent 6 }}
+      {{- include "openshell.nodeEnforcerSelectorLabels" . | nindent 6 }}
       app.kubernetes.io/component: node-enforcer
   template:
     metadata:
       labels:
-        {{- include "openshell.labels" . | nindent 8 }}
+        {{- include "openshell.nodeEnforcerLabels" . | nindent 8 }}
         app.kubernetes.io/component: node-enforcer
     spec:
       hostNetwork: true

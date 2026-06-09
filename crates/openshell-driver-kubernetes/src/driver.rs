@@ -3110,7 +3110,7 @@ mod tests {
         );
         assert_eq!(
             pod_template["spec"]["containers"][0]["securityContext"]["capabilities"]["add"][0],
-            serde_json::json!("SYS_ADMIN"),
+            serde_json::json!("SYS_PTRACE"),
             "AppArmor rendering must preserve required capabilities"
         );
     }

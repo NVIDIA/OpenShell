@@ -25,6 +25,9 @@ tests:
       - equal:
           path: spec.template.spec.containers[0].securityContext.privileged
           value: true
+      - equal:
+          path: spec.template.metadata.labels["app.kubernetes.io/name"]
+          value: openshell-node-enforcer
       - contains:
           path: spec.template.spec.containers[0].args
           content: external-enforcer

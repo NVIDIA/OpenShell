@@ -3,7 +3,7 @@
 
 //! Node/host enforcer entrypoint and workload registration client.
 //!
-//! The node enforcer runs as a privileged host-PID DaemonSet. Workload
+//! The node enforcer runs as a privileged host-PID `DaemonSet`. Workload
 //! supervisors register after loading policy and before spawning the agent
 //! process. The enforcer locates the pod network namespace by pod IP and
 //! installs coarse nftables rules in that namespace:
@@ -225,11 +225,14 @@ async fn install_external_enforcement_blocking(sandbox_id: String, pod_ip: IpAdd
 }
 
 #[cfg(not(target_os = "linux"))]
-async fn install_external_enforcement_blocking(sandbox_id: String, pod_ip: IpAddr) -> Result<()> {
+fn install_external_enforcement_blocking(
+    sandbox_id: String,
+    pod_ip: IpAddr,
+) -> std::future::Ready<Result<()>> {
     let _ = sandbox_id;
-    Err(miette::miette!(
+    std::future::ready(Err(miette::miette!(
         "external node enforcement is only supported on Linux nodes (pod_ip={pod_ip})"
-    ))
+    )))
 }
 
 #[cfg(target_os = "linux")]
