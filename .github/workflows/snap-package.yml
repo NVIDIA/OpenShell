@@ -76,6 +76,59 @@ jobs:
           set -euo pipefail
           sudo snap install snapcraft --classic
 
+      - name: Download prebuilt CLI binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b40e67214ff5f5447ce83dd # v8
+        with:
+          name: cli-linux-${{ matrix.arch }}
+          path: prebuilt/cli
+
+      - name: Download prebuilt gateway binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b40e67214ff5f5447ce83dd # v8
+        with:
+          name: gateway-binary-linux-${{ matrix.arch }}
+          path: prebuilt/gateway
+
+      - name: Download prebuilt sandbox binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b40e67214ff5f5447ce83dd # v8
+        with:
+          name: supervisor-binary-linux-${{ matrix.arch }}
+          path: prebuilt/sandbox
+
+      - name: Extract prebuilt binaries
+        run: |
+          set -euo pipefail
+          mkdir -p prebuilt/{cli,gateway,sandbox}
+
+          for d in cli gateway sandbox; do
+            for tarball in prebuilt/$d/*.tar.gz; do
+              if [ -f "$tarball" ]; then
+                tar -xzf "$tarball" -C "prebuilt/$d"
+              else
+                echo "WARNING: no tarball found in prebuilt/$d/" >&2
+              fi
+            done
+          done
+          ls -laR prebuilt/
+
+      - name: Prepare snap build directory
+        run: |
+          set -euo pipefail
+          mkdir -p snap/prebuilt
+
+          cp prebuilt/cli/openshell snap/prebuilt/openshell
+          cp prebuilt/gateway/openshell-gateway snap/prebuilt/openshell-gateway
+          cp prebuilt/sandbox/openshell-sandbox snap/prebuilt/openshell-sandbox
+
+          cp deploy/snap/bin/openshell-gateway-wrapper snap/prebuilt/
+          cp LICENSE snap/prebuilt/
+          cp README.md snap/prebuilt/
+
+          mkdir -p snap/prebuilt/meta/gui
+          cp snap/local/term.desktop snap/prebuilt/meta/gui/term.desktop
+          cp snap/local/icon.png snap/prebuilt/meta/gui/icon.png
+
+          python3 tasks/scripts/release.py get-version --snap > snap/prebuilt/version
+
       - name: Build snap
         run: |
           set -euo pipefail

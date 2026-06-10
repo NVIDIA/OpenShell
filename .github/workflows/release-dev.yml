@@ -654,7 +654,7 @@ jobs:
 
   build-snap:
     name: Build Snap
-    needs: [compute-versions]
+    needs: [compute-versions, build-cli-linux, build-gateway-binary-linux, build-supervisor-binary-linux]
     uses: ./.github/workflows/snap-package.yml
     with:
       checkout-ref: ${{ github.sha }}
