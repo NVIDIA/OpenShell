@@ -20,6 +20,7 @@ use openshell_ocsf::{
 };
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 /// Context for L7 request policy evaluation.
@@ -40,6 +41,10 @@ pub struct L7EvalContext {
     pub(crate) secret_resolver: Option<Arc<SecretResolver>>,
     /// Anonymous activity counter channel.
     pub(crate) activity_tx: Option<ActivitySender>,
+    /// When true, L7 denials are logged but allowed through (permissive mode).
+    pub permissive: bool,
+    /// Denial event channel for feeding the proposal pipeline.
+    pub(crate) denial_tx: Option<mpsc::UnboundedSender<crate::denial_aggregator::DenialEvent>>,
 }
 
 #[derive(Default)]
@@ -217,6 +222,32 @@ where
         };
 
         let Some(config) = select_l7_config_for_path(configs, &req.target) else {
+            if ctx.permissive {
+                if let Some(ref tx) = ctx.denial_tx {
+                    let _ = tx.send(crate::denial_aggregator::DenialEvent {
+                        host: ctx.host.clone(),
+                        port: ctx.port,
+                        binary: ctx.binary_path.clone(),
+                        ancestors: ctx.ancestors.clone(),
+                        deny_reason: "no L7 endpoint path matched request".to_string(),
+                        denial_stage: "l7".to_string(),
+                        l7_method: Some(req.action.clone()),
+                        l7_path: Some(req.target.clone()),
+                    });
+                }
+                crate::l7::rest::relay_http_request_with_options_guarded(
+                    &req,
+                    client,
+                    upstream,
+                    crate::l7::rest::RelayRequestOptions {
+                        resolver: ctx.secret_resolver.as_deref(),
+                        generation_guard: Some(engine.generation_guard()),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+                continue;
+            }
             crate::l7::rest::RestProvider::default()
                 .deny(
                     &req,
@@ -344,7 +375,27 @@ where
 
         let _ = &eval_target;
 
-        if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
+        if ctx.permissive
+            && !allowed
+            && !force_deny
+            && let Some(ref tx) = ctx.denial_tx
+        {
+            let _ = tx.send(crate::denial_aggregator::DenialEvent {
+                host: ctx.host.clone(),
+                port: ctx.port,
+                binary: ctx.binary_path.clone(),
+                ancestors: ctx.ancestors.clone(),
+                deny_reason: reason.clone(),
+                denial_stage: "l7".to_string(),
+                l7_method: Some(request_info.action.clone()),
+                l7_path: Some(request_info.target.clone()),
+            });
+        }
+
+        if allowed
+            || (config.enforcement == EnforcementMode::Audit && !force_deny)
+            || (ctx.permissive && !force_deny)
+        {
             let outcome = crate::l7::rest::relay_http_request_with_options_guarded(
                 &req,
                 client,
@@ -768,7 +819,23 @@ where
         // Store the resolved target for the deny response redaction
         let _ = &eval_target;
 
-        if allowed || config.enforcement == EnforcementMode::Audit {
+        if ctx.permissive
+            && !allowed
+            && let Some(ref tx) = ctx.denial_tx
+        {
+            let _ = tx.send(crate::denial_aggregator::DenialEvent {
+                host: ctx.host.clone(),
+                port: ctx.port,
+                binary: ctx.binary_path.clone(),
+                ancestors: ctx.ancestors.clone(),
+                deny_reason: reason.clone(),
+                denial_stage: "l7".to_string(),
+                l7_method: Some(request_info.action.clone()),
+                l7_path: Some(request_info.target.clone()),
+            });
+        }
+
+        if allowed || config.enforcement == EnforcementMode::Audit || ctx.permissive {
             // Forward request to upstream and relay response
             let outcome = crate::l7::rest::relay_http_request_with_options_guarded(
                 &req,
@@ -1000,7 +1067,27 @@ where
 
         let _ = &eval_target;
 
-        if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
+        if ctx.permissive
+            && !allowed
+            && !force_deny
+            && let Some(ref tx) = ctx.denial_tx
+        {
+            let _ = tx.send(crate::denial_aggregator::DenialEvent {
+                host: ctx.host.clone(),
+                port: ctx.port,
+                binary: ctx.binary_path.clone(),
+                ancestors: ctx.ancestors.clone(),
+                deny_reason: reason.clone(),
+                denial_stage: "l7".to_string(),
+                l7_method: Some(request_info.action.clone()),
+                l7_path: Some(request_info.target.clone()),
+            });
+        }
+
+        if allowed
+            || (config.enforcement == EnforcementMode::Audit && !force_deny)
+            || (ctx.permissive && !force_deny)
+        {
             let outcome = crate::l7::rest::relay_http_request_with_resolver_guarded(
                 &req,
                 client,
@@ -1383,6 +1470,8 @@ network_policies:
             cmdline_paths: vec![],
             secret_resolver: None,
             activity_tx: None,
+            permissive: false,
+            denial_tx: None,
         };
         let request = L7RequestInfo {
             action: "WEBSOCKET_TEXT".into(),
@@ -1439,6 +1528,8 @@ network_policies:
             cmdline_paths: vec![],
             secret_resolver: None,
             activity_tx: None,
+            permissive: false,
+            denial_tx: None,
         };
 
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
@@ -1544,6 +1635,8 @@ network_policies:
             cmdline_paths: vec![],
             secret_resolver: resolver.map(Arc::new),
             activity_tx: None,
+            permissive: false,
+            denial_tx: None,
         };
 
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
@@ -1662,6 +1755,8 @@ network_policies:
             cmdline_paths: vec![],
             secret_resolver: resolver.map(Arc::new),
             activity_tx: None,
+            permissive: false,
+            denial_tx: None,
         };
 
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
@@ -1833,6 +1928,8 @@ network_policies:
             cmdline_paths: vec![],
             secret_resolver: None,
             activity_tx: None,
+            permissive: false,
+            denial_tx: None,
         };
 
         let (mut app, mut relay_client) = tokio::io::duplex(8192);
@@ -1921,6 +2018,8 @@ network_policies:
             cmdline_paths: vec![],
             secret_resolver: None,
             activity_tx: None,
+            permissive: false,
+            denial_tx: None,
         };
 
         let (mut app, mut relay_client) = tokio::io::duplex(8192);

@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from openshell._proto import datamodel_pb2, sandbox_pb2
+from openshell._proto import datamodel_pb2, openshell_pb2, sandbox_pb2
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -2049,3 +2049,369 @@ def test_overlapping_policies_l7_connect_does_not_crash(
         assert "200" in result.stdout, (
             f"Overlapping L7 policies should not crash; expected 200, got: {result.stdout}"
         )
+
+
+# =============================================================================
+# Permissive mode tests
+# =============================================================================
+
+
+def test_permissive_mode_allows_denied_connection(
+    sandbox: Callable[..., Sandbox],
+) -> None:
+    """PERM-1: Permissive mode allows connections that would normally be denied.
+
+    Create a sandbox with a restrictive policy (allow only example.com:443)
+    and permissive=True. A connection to an unlisted host should succeed
+    instead of returning 403.
+    """
+    policy = _base_policy(
+        network_policies={
+            "limited": sandbox_pb2.NetworkPolicyRule(
+                name="limited",
+                endpoints=[
+                    sandbox_pb2.NetworkEndpoint(host="example.com", port=443),
+                ],
+                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+            ),
+        },
+    )
+    spec = datamodel_pb2.SandboxSpec(policy=policy, permissive=True)
+    with sandbox(spec=spec, delete_on_exit=True) as sb:
+        # Without permissive, this would return 403 (not in policy)
+        result = sb.exec_python(
+            _proxy_connect(), args=("api.anthropic.com", 443)
+        )
+        assert result.exit_code == 0, result.stderr
+        assert "200" in result.stdout, (
+            f"Permissive mode should allow denied connections; got: {result.stdout}"
+        )
+
+        # Policy-allowed endpoint should also work
+        result = sb.exec_python(_proxy_connect(), args=("example.com", 443))
+        assert result.exit_code == 0, result.stderr
+        assert "200" in result.stdout
+
+
+def test_permissive_mode_without_policy(
+    sandbox: Callable[..., Sandbox],
+) -> None:
+    """PERM-2: Permissive mode works with no network policies (pure discovery).
+
+    When no policy rules are defined, all connections are would-be-denied.
+    In permissive mode they should all succeed.
+    """
+    policy = _base_policy(network_policies={})
+    spec = datamodel_pb2.SandboxSpec(policy=policy, permissive=True)
+    with sandbox(spec=spec, delete_on_exit=True) as sb:
+        result = sb.exec_python(
+            _proxy_connect(), args=("api.anthropic.com", 443)
+        )
+        assert result.exit_code == 0, result.stderr
+        assert "200" in result.stdout, (
+            f"Permissive mode with empty policy should allow; got: {result.stdout}"
+        )
+
+
+def test_permissive_mode_ssrf_still_blocks(
+    sandbox: Callable[..., Sandbox],
+) -> None:
+    """PERM-3: SSRF safety guards remain active even in permissive mode.
+
+    Loopback addresses are infrastructure safety guards, not policy controls.
+    They must stay blocked even when permissive mode is on.
+    """
+    policy = _base_policy(network_policies={})
+    spec = datamodel_pb2.SandboxSpec(policy=policy, permissive=True)
+    with sandbox(spec=spec, delete_on_exit=True) as sb:
+        result = sb.exec_python(_proxy_connect(), args=("127.0.0.1", 80))
+        assert result.exit_code == 0, result.stderr
+        assert "403" in result.stdout, (
+            f"SSRF loopback should remain blocked in permissive mode; got: {result.stdout}"
+        )
+
+
+def test_permissive_mode_generates_draft_proposals(
+    sandbox: Callable[..., Sandbox],
+    sandbox_client: SandboxClient,
+) -> None:
+    """PERM-4: Permissive mode feeds the draft proposal pipeline.
+
+    Connections that are audit-allowed in permissive mode should generate
+    pending draft policy proposals via the mechanistic mapper, just like
+    real denials do in enforce mode.
+    """
+    import time
+
+    policy = _base_policy(
+        network_policies={
+            "limited": sandbox_pb2.NetworkPolicyRule(
+                name="limited",
+                endpoints=[
+                    sandbox_pb2.NetworkEndpoint(host="example.com", port=443),
+                ],
+                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+            ),
+        },
+    )
+    spec = datamodel_pb2.SandboxSpec(policy=policy, permissive=True)
+    with sandbox(spec=spec, delete_on_exit=True) as sb:
+        result = sb.exec_python(
+            _proxy_connect(), args=("api.anthropic.com", 443)
+        )
+        assert result.exit_code == 0, result.stderr
+        assert "200" in result.stdout, (
+            f"Permissive mode should allow; got: {result.stdout}"
+        )
+
+        # Wait for the denial aggregator flush interval (~10s default).
+        time.sleep(15)
+
+        # Query draft proposals via gRPC.
+        resp = sandbox_client._stub.GetDraftPolicy(
+            openshell_pb2.GetDraftPolicyRequest(
+                name=sb.sandbox.name,
+                status_filter="pending",
+            )
+        )
+
+        hosts = [
+            ep.host
+            for chunk in resp.chunks
+            if chunk.proposed_rule
+            for ep in chunk.proposed_rule.endpoints
+        ]
+        assert any("anthropic" in h for h in hosts), (
+            f"Expected a pending proposal for api.anthropic.com; got hosts: {hosts}"
+        )
+
+
+def test_permissive_mode_forward_proxy(
+    sandbox: Callable[..., Sandbox],
+) -> None:
+    """PERM-5: Forward-proxy (non-CONNECT) requests are also allowed in permissive mode.
+
+    Plain HTTP requests through the forward proxy use a different code path
+    than CONNECT tunnels. Permissive mode must bypass both.
+    """
+    policy = _base_policy(network_policies={})
+    spec = datamodel_pb2.SandboxSpec(policy=policy, permissive=True)
+    with sandbox(spec=spec, delete_on_exit=True) as sb:
+        result = sb.exec_python(
+            _forward_proxy_raw(),
+            args=(_PROXY_HOST, _PROXY_PORT, "http://httpbin.org/get"),
+        )
+        assert result.exit_code == 0, result.stderr
+        assert "403" not in result.stdout, (
+            f"Forward proxy should allow in permissive mode; got: {result.stdout}"
+        )
+
+
+def test_permissive_mode_l7_deny_allowed(
+    sandbox: Callable[..., Sandbox],
+) -> None:
+    """PERM-6: L7-enforced denials are overridden by permissive mode.
+
+    A policy with protocol: rest, enforcement: enforce, access: read-only
+    would deny POST at the L7 layer. In permissive mode the POST should
+    succeed and generate a denial event.
+    """
+    policy = _base_policy(
+        network_policies={
+            "anthropic": sandbox_pb2.NetworkPolicyRule(
+                name="anthropic",
+                endpoints=[
+                    sandbox_pb2.NetworkEndpoint(
+                        host="api.anthropic.com",
+                        port=443,
+                        protocol="rest",
+                        tls="terminate",
+                        enforcement="enforce",
+                        access="read-only",
+                    ),
+                ],
+                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+            ),
+        },
+    )
+    spec = datamodel_pb2.SandboxSpec(policy=policy, permissive=True)
+    with sandbox(spec=spec, delete_on_exit=True) as sb:
+        # POST would be denied at L7 in enforce mode (read-only allows only GET).
+        # In permissive mode, the POST should go through.
+        result = sb.exec_python(
+            _proxy_connect_then_http(),
+            args=("api.anthropic.com", 443, "POST", "/v1/messages"),
+        )
+        assert result.exit_code == 0, result.stderr
+        resp = json.loads(result.stdout)
+        assert "200" in resp["connect_status"], (
+            f"CONNECT should succeed; got: {resp['connect_status']}"
+        )
+        assert resp["http_status"] != 403, (
+            f"L7 POST should not be proxy-denied in permissive mode; got status {resp['http_status']}"
+        )
+
+
+def test_permissive_mode_unlisted_host_generates_proposal(
+    sandbox: Callable[..., Sandbox],
+    sandbox_client: SandboxClient,
+) -> None:
+    """PERM-7: L4-denied hosts in permissive mode with a base policy still generate proposals.
+
+    Verifies the full pipeline: permissive sandbox with a base policy,
+    connection to an unlisted host, denial fed to the aggregator, and proposal
+    visible as a pending draft chunk.
+    """
+    import time
+
+    policy = _base_policy(
+        network_policies={
+            "anthropic": sandbox_pb2.NetworkPolicyRule(
+                name="anthropic",
+                endpoints=[
+                    sandbox_pb2.NetworkEndpoint(
+                        host="api.anthropic.com",
+                        port=443,
+                        protocol="rest",
+                        tls="terminate",
+                        enforcement="enforce",
+                        access="read-only",
+                    ),
+                ],
+                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+            ),
+        },
+    )
+    spec = datamodel_pb2.SandboxSpec(policy=policy, permissive=True)
+    with sandbox(spec=spec, delete_on_exit=True) as sb:
+        # Connect to a host NOT in the policy — L4 denied but permissive-allowed.
+        result = sb.exec_python(
+            _proxy_connect(), args=("httpbin.org", 443)
+        )
+        assert result.exit_code == 0, result.stderr
+        assert "200" in result.stdout, (
+            f"Permissive should allow unlisted host; got: {result.stdout}"
+        )
+
+        time.sleep(15)
+
+        stub = sandbox_client._stub
+        draft_resp = stub.GetDraftPolicy(
+            openshell_pb2.GetDraftPolicyRequest(
+                name=sb.sandbox.name,
+                status_filter="pending",
+            )
+        )
+
+        httpbin_chunks = [
+            c
+            for c in draft_resp.chunks
+            if c.proposed_rule
+            and any(
+                "httpbin" in ep.host for ep in c.proposed_rule.endpoints
+            )
+        ]
+        assert httpbin_chunks, (
+            f"Expected a pending proposal for httpbin.org; "
+            f"got {len(draft_resp.chunks)} total chunks"
+        )
+
+
+def test_permissive_mode_l7_deny_generates_method_path_proposal(
+    sandbox: Callable[..., Sandbox],
+    sandbox_client: SandboxClient,
+) -> None:
+    """PERM-8: L7-denied POST in permissive mode generates a proposal with method/path.
+
+    A read-only endpoint denies POST at the L7 layer. In permissive mode the
+    request goes through, and the denial feeds the aggregator with l7_method
+    and l7_path. The mechanistic mapper should produce a chunk whose proposed
+    rule contains L7 rules (method/path samples), not just a bare host:port.
+    """
+    import time
+
+    policy = _base_policy(
+        network_policies={
+            "anthropic": sandbox_pb2.NetworkPolicyRule(
+                name="anthropic",
+                endpoints=[
+                    sandbox_pb2.NetworkEndpoint(
+                        host="api.anthropic.com",
+                        port=443,
+                        protocol="rest",
+                        tls="terminate",
+                        enforcement="enforce",
+                        access="read-only",
+                    ),
+                ],
+                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+            ),
+        },
+    )
+    spec = datamodel_pb2.SandboxSpec(policy=policy, permissive=True)
+    with sandbox(spec=spec, delete_on_exit=True) as sb:
+        # POST denied at L7 (read-only), but allowed in permissive mode.
+        result = sb.exec_python(
+            _proxy_connect_then_http(),
+            args=("api.anthropic.com", 443, "POST", "/v1/messages"),
+        )
+        assert result.exit_code == 0, result.stderr
+        resp = json.loads(result.stdout)
+        assert "200" in resp["connect_status"], (
+            f"CONNECT should succeed; got: {resp['connect_status']}"
+        )
+        assert resp["http_status"] != 403, (
+            f"POST should not be proxy-denied in permissive; got {resp['http_status']}"
+        )
+
+        time.sleep(20)
+
+        stub = sandbox_client._stub
+        draft_resp = stub.GetDraftPolicy(
+            openshell_pb2.GetDraftPolicyRequest(
+                name=sb.sandbox.name,
+                status_filter="",
+            )
+        )
+
+        all_hosts = [
+            (ep.host, ep.port, ep.protocol, c.status)
+            for c in draft_resp.chunks
+            if c.proposed_rule
+            for ep in c.proposed_rule.endpoints
+        ]
+        anthropic_chunks = [
+            c
+            for c in draft_resp.chunks
+            if c.proposed_rule
+            and any(
+                "anthropic" in ep.host for ep in c.proposed_rule.endpoints
+            )
+        ]
+        assert anthropic_chunks, (
+            f"Expected a proposal from L7 POST denial; "
+            f"got {len(draft_resp.chunks)} total chunks with endpoints: {all_hosts}"
+        )
+
+        # Verify the proposal has L7 rules with the denied method/path.
+        chunk = anthropic_chunks[0]
+        l7_endpoints = [
+            ep
+            for ep in chunk.proposed_rule.endpoints
+            if ep.protocol
+        ]
+        assert l7_endpoints, (
+            f"Expected L7-aware proposal (protocol set); "
+            f"got endpoints: "
+            f"{[(ep.host, ep.port, ep.protocol) for ep in chunk.proposed_rule.endpoints]}"
+        )
+        l7_rules = [
+            (rule.allow.method, rule.allow.path)
+            for ep in l7_endpoints
+            for rule in ep.rules
+            if rule.allow.method
+        ]
+        assert any(
+            method == "POST" and "/v1/messages" in path
+            for method, path in l7_rules
+        ), f"Expected an L7 rule with method=POST and path /v1/messages; got rules: {l7_rules}"

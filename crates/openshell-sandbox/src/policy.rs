@@ -68,6 +68,8 @@ pub enum NetworkMode {
 pub struct ProxyPolicy {
     /// TCP address for a local HTTP proxy (loopback-only).
     pub http_addr: Option<SocketAddr>,
+    /// When true, log but do not enforce policy denials (audit2allow mode).
+    pub permissive: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -103,7 +105,10 @@ impl TryFrom<ProtoSandboxPolicy> for SandboxPolicy {
         // can be evaluated by OPA and `inference.local` is always addressable.
         let network = NetworkPolicy {
             mode: NetworkMode::Proxy,
-            proxy: Some(ProxyPolicy { http_addr: None }),
+            proxy: Some(ProxyPolicy {
+                http_addr: None,
+                permissive: false,
+            }),
         };
 
         Ok(Self {

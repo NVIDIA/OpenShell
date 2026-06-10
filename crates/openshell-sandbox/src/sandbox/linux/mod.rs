@@ -20,6 +20,14 @@ pub struct PreparedSandbox {
     policy: SandboxPolicy,
 }
 
+impl PreparedSandbox {
+    /// Disable Landlock enforcement while keeping seccomp active.
+    /// Used by permissive mode to skip filesystem restrictions.
+    pub fn skip_landlock(&mut self) {
+        self.landlock = None;
+    }
+}
+
 /// Phase 1: Prepare sandbox restrictions **as root** (before `drop_privileges`).
 ///
 /// Opens Landlock `PathFds` while the process still has root privileges,
