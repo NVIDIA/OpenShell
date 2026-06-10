@@ -274,6 +274,15 @@ request_denied_for_endpoint(request, endpoint) if {
 	command_matches(request.command, deny_rule.command)
 }
 
+# --- L7 deny rule matching: JSON-RPC method + params ---
+
+request_denied_for_endpoint(request, endpoint) if {
+	some deny_rule
+	deny_rule := endpoint.deny_rules[_]
+	deny_rule.rpc_method
+	jsonrpc_rule_matches(request, deny_rule)
+}
+
 # --- L7 deny rule matching: GraphQL operation ---
 
 request_denied_for_endpoint(request, endpoint) if {
@@ -423,10 +432,7 @@ request_allowed_for_endpoint(request, endpoint) if {
 	some rule
 	rule := endpoint.rules[_]
 	rule.allow.rpc_method
-	jsonrpc := object.get(request, "jsonrpc", {})
-	method := object.get(jsonrpc, "method", null)
-	method != null
-	glob.match(rule.allow.rpc_method, [], method)
+	jsonrpc_rule_matches(request, rule.allow)
 }
 
 # --- L7 rule matching: GraphQL operation ---
@@ -648,6 +654,35 @@ query_value_matches(value, matcher) if {
 	count(any_patterns) > 0
 	some i
 	glob.match(any_patterns[i], [], value)
+}
+
+# JSON-RPC method and params matching. The sandbox flattens object params into
+# dot-separated keys before policy evaluation, e.g. arguments.scope.
+jsonrpc_rule_matches(request, rule) if {
+	jsonrpc := object.get(request, "jsonrpc", {})
+	method := object.get(jsonrpc, "method", null)
+	method != null
+	glob.match(rule.rpc_method, [], method)
+	jsonrpc_params_match(jsonrpc, rule)
+}
+
+jsonrpc_params_match(jsonrpc, rule) if {
+	param_rules := object.get(rule, "params", {})
+	not jsonrpc_param_mismatch(jsonrpc, param_rules)
+}
+
+jsonrpc_param_mismatch(jsonrpc, param_rules) if {
+	some key
+	matcher := param_rules[key]
+	not jsonrpc_param_key_matches(jsonrpc, key, matcher)
+}
+
+jsonrpc_param_key_matches(jsonrpc, key, matcher) if {
+	params := object.get(jsonrpc, "params", {})
+	value := object.get(params, key, null)
+	value != null
+	is_string(value)
+	query_value_matches(value, matcher)
 }
 
 # SQL command matching: "*" matches any; otherwise case-insensitive.

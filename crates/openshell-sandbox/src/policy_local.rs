@@ -1084,6 +1084,7 @@ fn network_endpoint_from_json(
                 operation_name: String::new(),
                 fields: Vec::new(),
                 rpc_method: String::new(),
+                params: HashMap::new(),
             }),
         })
         .collect();
@@ -1099,6 +1100,7 @@ fn network_endpoint_from_json(
             operation_name: String::new(),
             fields: Vec::new(),
             rpc_method: String::new(),
+            params: HashMap::new(),
         })
         .collect();
 

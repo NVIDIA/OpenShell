@@ -821,6 +821,7 @@ fn allow_to_proto(allow: &L7AllowProfile) -> L7Allow {
         operation_name: allow.operation_name.clone(),
         fields: allow.fields.clone(),
         rpc_method: String::new(),
+        params: HashMap::new(),
     }
 }
 
@@ -854,6 +855,7 @@ fn deny_rule_to_proto(rule: &L7DenyRuleProfile) -> L7DenyRule {
         operation_name: rule.operation_name.clone(),
         fields: rule.fields.clone(),
         rpc_method: String::new(),
+        params: HashMap::new(),
     }
 }
 

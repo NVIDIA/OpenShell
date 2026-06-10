@@ -4,6 +4,7 @@
 //! JSON-RPC 2.0 over HTTP L7 inspection.
 
 use miette::Result;
+use std::collections::HashMap;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::l7::provider::{L7Provider, L7Request};
@@ -33,6 +34,7 @@ pub(crate) async fn parse_jsonrpc_http_request<C: AsyncRead + AsyncWrite + Unpin
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JsonRpcRequestInfo {
     pub method: Option<String>,
+    pub params: HashMap<String, String>,
     pub error: Option<String>,
 }
 
@@ -54,18 +56,54 @@ pub fn parse_jsonrpc_body(body: &[u8]) -> JsonRpcRequestInfo {
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
         return JsonRpcRequestInfo {
             method: None,
+            params: HashMap::new(),
             error: Some("invalid JSON".to_string()),
         };
     };
     let Some(method) = value.get("method").and_then(|m| m.as_str()) else {
         return JsonRpcRequestInfo {
             method: None,
+            params: HashMap::new(),
             error: Some("missing or non-string 'method' field".to_string()),
         };
     };
     JsonRpcRequestInfo {
         method: Some(method.to_string()),
+        params: value
+            .get("params")
+            .map_or_else(HashMap::new, flatten_jsonrpc_params),
         error: None,
+    }
+}
+
+fn flatten_jsonrpc_params(value: &serde_json::Value) -> HashMap<String, String> {
+    let mut params = HashMap::new();
+    flatten_json_value("", value, &mut params);
+    params
+}
+
+fn flatten_json_value(prefix: &str, value: &serde_json::Value, out: &mut HashMap<String, String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                let next = if prefix.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{prefix}.{key}")
+                };
+                flatten_json_value(&next, child, out);
+            }
+        }
+        serde_json::Value::String(s) if !prefix.is_empty() => {
+            out.insert(prefix.to_string(), s.clone());
+        }
+        serde_json::Value::Number(n) if !prefix.is_empty() => {
+            out.insert(prefix.to_string(), n.to_string());
+        }
+        serde_json::Value::Bool(b) if !prefix.is_empty() => {
+            out.insert(prefix.to_string(), b.to_string());
+        }
+        _ => {}
     }
 }
 
@@ -79,6 +117,20 @@ mod tests {
         let info = parse_jsonrpc_body(body);
         assert_eq!(info.method.as_deref(), Some("initialize"));
         assert!(info.error.is_none());
+    }
+
+    #[test]
+    fn flattens_object_params_for_policy_matching() {
+        let body = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"submit_report","arguments":{"scope":"workspace/main"}}}"#;
+        let info = parse_jsonrpc_body(body);
+        assert_eq!(
+            info.params.get("name").map(String::as_str),
+            Some("submit_report")
+        );
+        assert_eq!(
+            info.params.get("arguments.scope").map(String::as_str),
+            Some("workspace/main")
+        );
     }
 
     #[test]

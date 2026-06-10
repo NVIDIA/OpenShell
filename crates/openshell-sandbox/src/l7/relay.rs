@@ -1321,6 +1321,7 @@ pub fn evaluate_l7_request(
             "graphql": request.graphql.clone(),
             "jsonrpc": request.jsonrpc.as_ref().map(|j| serde_json::json!({
                 "method": j.method,
+                "params": j.params,
                 "error": j.error,
             })),
         }
