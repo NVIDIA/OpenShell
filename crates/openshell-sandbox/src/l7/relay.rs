@@ -981,7 +981,11 @@ where
                     SeverityId::Informational,
                 ),
             };
-            let rpc_method = jsonrpc_info.method.as_deref().unwrap_or("-");
+            let rpc_method = jsonrpc_info
+                .calls
+                .first()
+                .map(|call| call.method.as_str())
+                .unwrap_or("-");
             let event = HttpActivityBuilder::new(crate::ocsf_ctx())
                 .activity(ActivityId::Other)
                 .action(action_id)
@@ -1296,6 +1300,33 @@ pub fn evaluate_l7_request(
     ctx: &L7EvalContext,
     request: &L7RequestInfo,
 ) -> Result<(bool, String)> {
+    if let Some(jsonrpc) = &request.jsonrpc
+        && jsonrpc.is_batch
+        && !jsonrpc.calls.is_empty()
+    {
+        for call in &jsonrpc.calls {
+            let mut item_request = request.clone();
+            item_request.jsonrpc = Some(crate::l7::jsonrpc::JsonRpcRequestInfo {
+                calls: vec![call.clone()],
+                is_batch: false,
+                error: None,
+            });
+            let (allowed, reason) = evaluate_l7_request_once(engine, ctx, &item_request)?;
+            if !allowed {
+                return Ok((false, reason));
+            }
+        }
+        return Ok((true, String::new()));
+    }
+
+    evaluate_l7_request_once(engine, ctx, request)
+}
+
+fn evaluate_l7_request_once(
+    engine: &TunnelPolicyEngine,
+    ctx: &L7EvalContext,
+    request: &L7RequestInfo,
+) -> Result<(bool, String)> {
     if engine.is_stale() {
         return Err(miette!(
             "L7 tunnel policy generation is stale [captured_generation:{} current_generation:{}]",
@@ -1319,11 +1350,14 @@ pub fn evaluate_l7_request(
             "path": request.target,
             "query_params": request.query_params.clone(),
             "graphql": request.graphql.clone(),
-            "jsonrpc": request.jsonrpc.as_ref().map(|j| serde_json::json!({
-                "method": j.method,
-                "params": j.params,
-                "error": j.error,
-            })),
+            "jsonrpc": request.jsonrpc.as_ref().map(|j| {
+                let call = if j.is_batch { None } else { j.calls.first() };
+                serde_json::json!({
+                    "method": call.map(|call| call.method.as_str()),
+                    "params": call.map(|call| call.params.clone()).unwrap_or_default(),
+                    "error": j.error,
+                })
+            }),
         }
     });
 
@@ -1964,6 +1998,77 @@ network_policies:
 
         assert!(!allowed);
         assert!(reason.contains("WEBSOCKET_TEXT /ws not permitted"));
+    }
+
+    #[test]
+    fn jsonrpc_batch_evaluates_each_call() {
+        let data = r#"
+network_policies:
+  jsonrpc_api:
+    name: jsonrpc_api
+    endpoints:
+      - host: api.example.test
+        port: 443
+        protocol: json-rpc
+        enforcement: enforce
+        rules:
+          - allow:
+              method: POST
+              path: "/mcp"
+              rpc_method: "tools/list"
+          - allow:
+              method: POST
+              path: "/mcp"
+              rpc_method: "tools/call"
+              params:
+                name: read_status
+        deny_rules:
+          - rpc_method: "tools/call"
+            params:
+              name: blocked_action
+    binaries:
+      - { path: /usr/bin/node }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let tunnel_engine = engine
+            .clone_engine_for_tunnel(engine.current_generation())
+            .unwrap();
+        let ctx = L7EvalContext {
+            host: "api.example.test".into(),
+            port: 443,
+            policy_name: "jsonrpc_api".into(),
+            binary_path: "/usr/bin/node".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: None,
+            activity_tx: None,
+            dynamic_credentials: None,
+            token_grant_resolver: None,
+        };
+        let mut request = L7RequestInfo {
+            action: "POST".into(),
+            target: "/mcp".into(),
+            query_params: std::collections::HashMap::new(),
+            graphql: None,
+            jsonrpc: Some(crate::l7::jsonrpc::parse_jsonrpc_body(
+                br#"[
+                    {"jsonrpc":"2.0","id":1,"method":"tools/list"},
+                    {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_status"}}
+                ]"#,
+            )),
+        };
+
+        let (allowed, reason) = evaluate_l7_request(&tunnel_engine, &ctx, &request).unwrap();
+        assert!(allowed, "{reason}");
+
+        request.jsonrpc = Some(crate::l7::jsonrpc::parse_jsonrpc_body(
+            br#"[
+                {"jsonrpc":"2.0","id":1,"method":"tools/list"},
+                {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"blocked_action"}}
+            ]"#,
+        ));
+        let (allowed, _) = evaluate_l7_request(&tunnel_engine, &ctx, &request).unwrap();
+        assert!(!allowed);
     }
 
     #[tokio::test]
