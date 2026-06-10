@@ -40,7 +40,7 @@ The launcher:
 - Bakes `.claude/agents/principal-engineer-reviewer.md` so the selected harness can run a deterministic independent reviewer execution through `/etc/openshell/agent-payload/runtime/subagent.sh principal-engineer-reviewer < task.md`.
 - For `--harness codex`, optionally bakes a host Codex executable as `/etc/openshell/agent-payload/runtime/harnesses/codex/codex`.
 - Starts the selected harness without a TTY.
-- Runs gator in `watch` mode by default. The sandbox stays alive while the supervisor sleeps between bounded Codex cycles, so Codex is not connected during passive PR waits. The supervisor prints periodic heartbeat lines during those sleeps.
+- Runs gator in `watch` mode by default. The sandbox stays alive while the supervisor sleeps between bounded Codex cycles, so Codex is not connected during passive PR waits. The supervisor prints periodic heartbeat lines during active cycles and passive sleeps.
 - Deletes the sandbox automatically after the supervisor exits. Pass `--keep` to preserve it for debugging.
 
 The GitHub provider profile allows read-only GraphQL queries on `api.github.com/graphql` so `gh` read paths can use GraphQL when needed. Write operations remain REST-only and scoped to the two allowed repositories.

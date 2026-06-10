@@ -118,14 +118,15 @@ OPENSHELL_AGENT_RESULT {"status":"waiting","next_poll_seconds":900,"reason":"che
 Supported statuses are `complete`, `waiting`, `blocked`, `transient_failure`, and
 `terminal_failure`. The supervisor sleeps between `waiting` or `blocked` cycles
 without keeping the harness connected, then launches a fresh harness cycle inside
-the same sandbox. During long sleeps, it prints a heartbeat every 60 seconds by
-default so operators can distinguish deliberate waiting from a stuck launch. Set
-`OPENSHELL_AGENT_HEARTBEAT_SECONDS=0` to disable heartbeats or another integer to
-change the interval. In `watch` mode, missing or malformed result sentinels and
-harness transport failures are retried indefinitely with bounded backoff; only
-`complete` and `terminal_failure` stop the supervisor. This keeps long-lived
-agents resilient to upstream model errors while leaving durable state ownership
-to the agent domain.
+the same sandbox. During active harness cycles and long sleeps, it prints a
+heartbeat every 60 seconds by default so operators can distinguish deliberate
+work or waiting from a stuck launch. Set `OPENSHELL_AGENT_HEARTBEAT_SECONDS=0`
+to disable heartbeats or another integer to change the interval. In `watch`
+mode, missing or malformed result sentinels and harness transport failures are
+retried indefinitely with bounded backoff; only `complete` and
+`terminal_failure` stop the supervisor. This keeps long-lived agents resilient
+to upstream model errors while leaving durable state ownership to the agent
+domain.
 
 The shared runtime does not prescribe the durable state store. Gator uses GitHub
 labels, comments, reviews, and checks. Other agents can use a repository branch,

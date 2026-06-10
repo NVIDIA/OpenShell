@@ -114,6 +114,17 @@ sleep_with_heartbeat() {
     done
 }
 
+active_cycle_heartbeat() {
+    local active_cycle="$1"
+    local elapsed=0
+
+    while true; do
+        sleep "$HEARTBEAT_SECONDS" || exit 0
+        elapsed=$((elapsed + HEARTBEAT_SECONDS))
+        echo "openshell-agent: still running $RUN_MODE cycle $active_cycle with harness $OPENSHELL_AGENT_HARNESS after ${elapsed}s" >&2
+    done
+}
+
 retry_watch_cycle() {
     local reason="$1"
     transient_failures=$((transient_failures + 1))
@@ -143,11 +154,22 @@ cap_transient_backoff() {
 
 run_cycle() {
     local output_file="$1"
+    local heartbeat_pid=""
+
+    if [[ "$HEARTBEAT_SECONDS" -gt 0 ]]; then
+        active_cycle_heartbeat "$cycle" &
+        heartbeat_pid=$!
+    fi
 
     set +e
     bash "$ADAPTER" "$PROMPT_FILE" 2>&1 | tee "$output_file"
     local status=${PIPESTATUS[0]}
     set -e
+
+    if [[ -n "$heartbeat_pid" ]]; then
+        kill "$heartbeat_pid" 2>/dev/null || true
+        wait "$heartbeat_pid" 2>/dev/null || true
+    fi
 
     return "$status"
 }
