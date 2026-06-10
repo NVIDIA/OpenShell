@@ -3,7 +3,7 @@
 
 //! Podman compute driver.
 
-use crate::client::{PodmanApiError, PodmanClient};
+use crate::client::{PodmanApiError, PodmanClient, VolumeInspect};
 use crate::config::PodmanComputeConfig;
 use crate::container::{self, LABEL_MANAGED_FILTER, LABEL_SANDBOX_ID};
 use crate::watcher::{
@@ -55,6 +55,15 @@ fn validated_container_name(sandbox_name: &str) -> Result<String, ComputeDriverE
     crate::client::validate_name(&name)
         .map_err(|e| ComputeDriverError::Precondition(e.to_string()))?;
     Ok(name)
+}
+
+fn podman_volume_is_bind_backed(volume: &VolumeInspect) -> bool {
+    (volume.driver.is_empty() || volume.driver == "local")
+        && volume.options.get("o").is_some_and(|options| {
+            options
+                .split(',')
+                .any(|option| option.trim().eq_ignore_ascii_case("bind"))
+        })
 }
 
 fn sandbox_token_host_path(sandbox_id: &str) -> Result<PathBuf, ComputeDriverError> {
@@ -304,15 +313,21 @@ impl PodmanComputeDriver {
             container::podman_driver_volume_mount_sources(sandbox, self.config.enable_bind_mounts)
                 .map_err(ComputeDriverError::Precondition)?;
         for volume in volumes {
-            let exists = self
-                .client
-                .volume_exists(&volume)
-                .await
-                .map_err(ComputeDriverError::from)?;
-            if !exists {
-                return Err(ComputeDriverError::Precondition(format!(
-                    "podman volume '{volume}' does not exist"
-                )));
+            match self.client.inspect_volume(&volume).await {
+                Ok(volume_info) => {
+                    if !self.config.enable_bind_mounts && podman_volume_is_bind_backed(&volume_info)
+                    {
+                        return Err(ComputeDriverError::Precondition(format!(
+                            "podman volume '{volume}' is backed by a host bind mount and requires enable_bind_mounts = true in [openshell.drivers.podman]"
+                        )));
+                    }
+                }
+                Err(PodmanApiError::NotFound(_)) => {
+                    return Err(ComputeDriverError::Precondition(format!(
+                        "podman volume '{volume}' does not exist"
+                    )));
+                }
+                Err(err) => return Err(ComputeDriverError::from(err)),
             }
         }
         Ok(())
@@ -674,6 +689,8 @@ mod tests {
     use super::*;
     use crate::test_utils::{StubResponse, spawn_podman_stub};
     use hyper::StatusCode;
+    use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+    use std::collections::HashMap;
     use std::path::PathBuf;
 
     #[test]
@@ -795,8 +812,174 @@ mod tests {
         PodmanComputeDriver::for_tests(config)
     }
 
+    fn test_driver_with_config(config: PodmanComputeConfig) -> PodmanComputeDriver {
+        PodmanComputeDriver::for_tests(config)
+    }
+
+    fn json_value(value: serde_json::Value) -> prost_types::Value {
+        match value {
+            serde_json::Value::Null => prost_types::Value { kind: None },
+            serde_json::Value::Bool(value) => prost_types::Value {
+                kind: Some(prost_types::value::Kind::BoolValue(value)),
+            },
+            serde_json::Value::Number(value) => prost_types::Value {
+                kind: value.as_f64().map(prost_types::value::Kind::NumberValue),
+            },
+            serde_json::Value::String(value) => prost_types::Value {
+                kind: Some(prost_types::value::Kind::StringValue(value)),
+            },
+            serde_json::Value::Array(values) => prost_types::Value {
+                kind: Some(prost_types::value::Kind::ListValue(
+                    prost_types::ListValue {
+                        values: values.into_iter().map(json_value).collect(),
+                    },
+                )),
+            },
+            serde_json::Value::Object(values) => prost_types::Value {
+                kind: Some(prost_types::value::Kind::StructValue(prost_types::Struct {
+                    fields: values
+                        .into_iter()
+                        .map(|(key, value)| (key, json_value(value)))
+                        .collect(),
+                })),
+            },
+        }
+    }
+
+    fn json_struct(value: serde_json::Value) -> prost_types::Struct {
+        match json_value(value).kind {
+            Some(prost_types::value::Kind::StructValue(value)) => value,
+            _ => panic!("expected JSON object"),
+        }
+    }
+
+    fn sandbox_with_volume_mount(volume: &str) -> DriverSandbox {
+        DriverSandbox {
+            id: "sandbox-123".to_string(),
+            name: "demo".to_string(),
+            namespace: String::new(),
+            spec: Some(DriverSandboxSpec {
+                template: Some(DriverSandboxTemplate {
+                    driver_config: Some(json_struct(serde_json::json!({
+                        "mounts": [{
+                            "type": "volume",
+                            "source": volume,
+                            "target": "/sandbox/work"
+                        }]
+                    }))),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            status: None,
+        }
+    }
+
     fn api_path(path: &str) -> String {
         format!("/v5.0.0{path}")
+    }
+
+    #[test]
+    fn podman_local_volume_with_bind_option_is_bind_backed() {
+        let volume = VolumeInspect {
+            driver: "local".to_string(),
+            options: HashMap::from([("o".to_string(), "rw,bind".to_string())]),
+        };
+
+        assert!(podman_volume_is_bind_backed(&volume));
+    }
+
+    #[test]
+    fn podman_empty_driver_volume_with_bind_option_is_bind_backed() {
+        let volume = VolumeInspect {
+            driver: String::new(),
+            options: HashMap::from([("o".to_string(), "bind".to_string())]),
+        };
+
+        assert!(podman_volume_is_bind_backed(&volume));
+    }
+
+    #[test]
+    fn podman_local_volume_without_bind_option_is_not_bind_backed() {
+        let volume = VolumeInspect {
+            driver: "local".to_string(),
+            options: HashMap::from([("o".to_string(), "addr=127.0.0.1,rw".to_string())]),
+        };
+
+        assert!(!podman_volume_is_bind_backed(&volume));
+    }
+
+    #[test]
+    fn podman_nonlocal_volume_with_bind_option_is_not_bind_backed() {
+        let volume = VolumeInspect {
+            driver: "custom".to_string(),
+            options: HashMap::from([("o".to_string(), "bind".to_string())]),
+        };
+
+        assert!(!podman_volume_is_bind_backed(&volume));
+    }
+
+    #[tokio::test]
+    async fn validate_sandbox_rejects_bind_backed_named_volume_unless_enabled() {
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "bind-volume-disabled",
+            vec![StubResponse::new(
+                StatusCode::OK,
+                r#"{"Name":"work-bind","Driver":"local","Options":{"type":"none","o":"rw,bind","device":"/srv/work"}}"#,
+            )],
+        );
+        let driver = test_driver(socket_path.clone());
+        let sandbox = sandbox_with_volume_mount("work-bind");
+
+        let err = driver
+            .validate_sandbox_create(&sandbox)
+            .await
+            .expect_err("bind-backed volume should require bind mount opt-in");
+
+        match err {
+            ComputeDriverError::Precondition(message) => {
+                assert!(message.contains("enable_bind_mounts = true"));
+            }
+            other => panic!("expected precondition error, got {other:?}"),
+        }
+        handle.await.expect("stub task should finish");
+        assert_eq!(
+            request_log
+                .lock()
+                .expect("request log lock should not be poisoned")
+                .as_slice(),
+            [format!(
+                "GET {}",
+                api_path("/libpod/volumes/work-bind/json")
+            )]
+        );
+        let _ = std::fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn validate_sandbox_allows_bind_backed_named_volume_when_enabled() {
+        let (socket_path, _request_log, handle) = spawn_podman_stub(
+            "bind-volume-enabled",
+            vec![StubResponse::new(
+                StatusCode::OK,
+                r#"{"Name":"work-bind","Driver":"local","Options":{"type":"none","o":"rw,bind","device":"/srv/work"}}"#,
+            )],
+        );
+        let config = PodmanComputeConfig {
+            socket_path: socket_path.clone(),
+            enable_bind_mounts: true,
+            ..PodmanComputeConfig::default()
+        };
+        let driver = test_driver_with_config(config);
+        let sandbox = sandbox_with_volume_mount("work-bind");
+
+        driver
+            .validate_sandbox_create(&sandbox)
+            .await
+            .expect("bind-backed volume should be allowed when bind mounts are enabled");
+
+        handle.await.expect("stub task should finish");
+        let _ = std::fs::remove_file(socket_path);
     }
 
     #[tokio::test]

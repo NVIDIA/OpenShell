@@ -196,6 +196,16 @@ pub struct PortMappingEntry {
     pub host_ip: String,
 }
 
+/// A named Podman volume returned by the libpod inspect API.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct VolumeInspect {
+    #[serde(default)]
+    pub driver: String,
+    #[serde(default)]
+    pub options: HashMap<String, String>,
+}
+
 /// A Podman event from the events stream.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -497,21 +507,15 @@ impl PodmanClient {
         }
     }
 
-    /// Return whether a named volume exists. Does not create the volume.
-    pub async fn volume_exists(&self, name: &str) -> Result<bool, PodmanApiError> {
+    /// Inspect a named volume. Does not create the volume.
+    pub async fn inspect_volume(&self, name: &str) -> Result<VolumeInspect, PodmanApiError> {
         validate_name(name)?;
-        match self
-            .request_json::<Value>(
-                hyper::Method::GET,
-                &format!("/libpod/volumes/{name}/json"),
-                None,
-            )
-            .await
-        {
-            Ok(_) => Ok(true),
-            Err(PodmanApiError::NotFound(_)) => Ok(false),
-            Err(e) => Err(e),
-        }
+        self.request_json(
+            hyper::Method::GET,
+            &format!("/libpod/volumes/{name}/json"),
+            None,
+        )
+        .await
     }
 
     // ── Network operations ───────────────────────────────────────────────
@@ -755,6 +759,8 @@ fn url_encode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::{StubResponse, spawn_podman_stub};
+    use hyper::StatusCode;
 
     #[test]
     fn url_encode_encodes_special_characters() {
@@ -793,5 +799,34 @@ mod tests {
         // Exactly at the limit should be accepted.
         let exact_name = "a".repeat(MAX_NAME_LEN);
         assert!(validate_name(&exact_name).is_ok());
+    }
+
+    #[tokio::test]
+    async fn inspect_volume_parses_driver_options() {
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "inspect-volume",
+            vec![StubResponse::new(
+                StatusCode::OK,
+                r#"{"Name":"work-bind","Driver":"local","Options":{"type":"none","o":"rw,bind","device":"/srv/work"}}"#,
+            )],
+        );
+        let client = PodmanClient::new(socket_path.clone());
+
+        let volume = client
+            .inspect_volume("work-bind")
+            .await
+            .expect("volume inspect should parse");
+
+        assert_eq!(volume.driver, "local");
+        assert_eq!(volume.options.get("o").map(String::as_str), Some("rw,bind"));
+        handle.await.expect("stub task should finish");
+        assert_eq!(
+            request_log
+                .lock()
+                .expect("request log lock should not be poisoned")
+                .as_slice(),
+            ["GET /v5.0.0/libpod/volumes/work-bind/json"]
+        );
+        let _ = std::fs::remove_file(socket_path);
     }
 }

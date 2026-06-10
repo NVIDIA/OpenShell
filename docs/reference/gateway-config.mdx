@@ -259,6 +259,9 @@ supervisor_image        = "ghcr.io/nvidia/openshell/supervisor:latest"
 guest_tls_ca            = "/etc/openshell/certs/ca.pem"
 guest_tls_cert          = "/etc/openshell/certs/client.pem"
 guest_tls_key           = "/etc/openshell/certs/client-key.pem"
+# Unsafe operator override. Host bind mounts, including Podman local-driver
+# bind-backed volumes, expose gateway-host paths inside sandboxes and can
+# negate OpenShell isolation and filesystem controls.
 enable_bind_mounts      = false
 # Set to 0 to leave Podman's runtime default unchanged.
 sandbox_pids_limit      = 2048

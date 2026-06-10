@@ -59,7 +59,9 @@ mount types:
 - `bind`: mounts an absolute host path when `[openshell.drivers.podman]`
   has `enable_bind_mounts = true`.
 - `volume`: mounts an existing Podman named volume. The driver validates that
-  the volume exists before provisioning and never creates or removes it.
+  the volume exists before provisioning and never creates or removes it. Podman
+  local-driver volumes created with bind options are treated as host bind
+  mounts and require `enable_bind_mounts = true`.
 - `tmpfs`: mounts an in-memory filesystem with optional `options`,
   `size_bytes`, and `mode`.
 - `image`: mounts an OCI image through Podman's image-volume API. The driver
