@@ -16,6 +16,18 @@
 # for mock-mode smoke tests (set OPENSHELL_MXC_MOCK_WXC=1 instead).
 # wxc_exec_path = "C:\\mxc\\wxc-exec.exe"
 
+# Backend to target:
+#   "isolation_session" (default) - persistent session; grant-only filesystem
+#       policy (NO default-deny: a write to an ungranted path may still succeed).
+#   "process_container" - one-shot AppContainer; genuinely default-deny (a write
+#       to any ungranted path is denied by the OS). No persistent session.
+# backend = "process_container"
+
+# process_container only: request a Less-Privileged AppContainer (stricter).
+# pc_least_privilege = false
+# process_container only: AppContainer capabilities to grant (e.g. internetClient).
+# pc_capabilities = []
+
 # MXC configurationId for isolation session. Never use "small" (known OS bug).
 default_configuration_id = "composable"
 

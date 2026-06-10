@@ -49,13 +49,26 @@ fn mock_grants() -> &'static Mutex<HashMap<String, Vec<String>>> {
 
 // ── Request types ─────────────────────────────────────────────────────────────
 
-/// Filesystem shares for the sandbox (MXC provision-time only).
-#[derive(Debug, Default, Serialize)]
+/// Filesystem shares for the sandbox.
+///
+/// `isolation_session` honors `readwrite`/`readonly` (grant-only — it has no
+/// deny primitive). `processContainer` additionally honors `denied_paths`
+/// because the AppContainer backend can stamp deny ACEs; it is also genuinely
+/// default-deny, so anything not granted is already inaccessible.
+#[derive(Debug, Default)]
 pub struct MxcFilesystem {
-    #[serde(rename = "readwritePaths", skip_serializing_if = "Vec::is_empty")]
     pub readwrite_paths: Vec<String>,
-    #[serde(rename = "readonlyPaths", skip_serializing_if = "Vec::is_empty")]
     pub readonly_paths: Vec<String>,
+    pub denied_paths: Vec<String>,
+}
+
+/// `processContainer`-specific knobs (one-shot AppContainer backend).
+#[derive(Debug, Default, Clone)]
+pub struct MxcProcessContainer {
+    /// Request a Less-Privileged AppContainer (stricter default-deny).
+    pub least_privilege: bool,
+    /// AppContainer capabilities to grant (e.g. `internetClient`).
+    pub capabilities: Vec<String>,
 }
 
 /// Process config for the exec phase.
@@ -387,10 +400,6 @@ impl WxcExecInvoker {
     ///
     /// The agent's write target is considered **in-policy** iff the command line
     /// references one of the granted read-write paths recorded at mock provision.
-    /// In-policy → run the real agent command (so the positive-proof artifact,
-    /// e.g. `hello.txt`, actually appears on the host shared folder). Out-of-policy
-    /// → refuse with an access-denied message on stderr and a non-zero exit,
-    /// mirroring how the AppContainer denies the write on the demo box.
     fn mock_spawn_exec(
         &self,
         iso_sandbox_id: &str,
@@ -402,6 +411,20 @@ impl WxcExecInvoker {
             .get(iso_sandbox_id)
             .cloned()
             .unwrap_or_default();
+        Self::mock_spawn_with_grants(process, &grants)
+    }
+
+    /// Shared mock enforcement used by both the `isolation_session` exec phase
+    /// and the one-shot `processContainer` path.
+    ///
+    /// In-policy → run the real agent command (so the positive-proof artifact,
+    /// e.g. `hello.txt`, actually appears on the host shared folder). Out-of-policy
+    /// → refuse with an access-denied message on stderr and a non-zero exit,
+    /// mirroring how the `AppContainer` denies the write on the demo box.
+    fn mock_spawn_with_grants(
+        process: &MxcProcess,
+        grants: &[String],
+    ) -> Result<tokio::process::Child, InvokerError> {
         let cmd_norm = mock_normalize(&process.command_line);
         let in_policy = grants.iter().any(|g| !g.is_empty() && cmd_norm.contains(g));
 
@@ -410,14 +433,87 @@ impl WxcExecInvoker {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         if in_policy {
-            debug!(sandbox_id = %iso_sandbox_id, command = %process.command_line, "mock exec: in-policy, running agent");
+            debug!(command = %process.command_line, "mock exec: in-policy, running agent");
             cmd.arg("/c").arg(&process.command_line);
         } else {
-            debug!(sandbox_id = %iso_sandbox_id, command = %process.command_line, "mock exec: OUT-OF-POLICY, denying");
-            // Emit an access-denied message to stderr and exit non-zero.
+            debug!(command = %process.command_line, "mock exec: OUT-OF-POLICY, denying");
             cmd.arg("/c")
                 .arg("echo Access is denied. (out-of-policy write blocked by AppContainer) 1>&2& exit 1");
         }
+        let child = cmd.spawn()?;
+        Ok(child)
+    }
+
+    /// Build a **one-shot** `processContainer` config (no `phase`) and spawn it.
+    ///
+    /// Unlike the `isolation_session` lifecycle (provision → start → exec →
+    /// stop → deprovision), `processContainer` is a single ephemeral
+    /// AppContainer: one `wxc-exec` invocation creates the container, runs the
+    /// one process, and tears down when it exits. The AppContainer is genuinely
+    /// default-deny, so a write to any ungranted path is denied by the OS.
+    ///
+    /// **Stdout is raw agent output; the exit code is the agent's own exit code.**
+    pub async fn run_oneshot(
+        &self,
+        container_id: &str,
+        filesystem: MxcFilesystem,
+        pc: MxcProcessContainer,
+        process: MxcProcess,
+    ) -> Result<tokio::process::Child, InvokerError> {
+        if self.mock {
+            let grants: Vec<String> = filesystem
+                .readwrite_paths
+                .iter()
+                .map(|p| mock_normalize(p))
+                .collect();
+            return Self::mock_spawn_with_grants(&process, &grants);
+        }
+
+        let mut filesystem_json = serde_json::Map::new();
+        if !filesystem.readwrite_paths.is_empty() {
+            filesystem_json.insert("readwritePaths".into(), filesystem.readwrite_paths.into());
+        }
+        if !filesystem.readonly_paths.is_empty() {
+            filesystem_json.insert("readonlyPaths".into(), filesystem.readonly_paths.into());
+        }
+        if !filesystem.denied_paths.is_empty() {
+            filesystem_json.insert("deniedPaths".into(), filesystem.denied_paths.into());
+        }
+
+        let mut pc_json = serde_json::Map::new();
+        pc_json.insert("leastPrivilege".into(), pc.least_privilege.into());
+        if !pc.capabilities.is_empty() {
+            pc_json.insert("capabilities".into(), pc.capabilities.into());
+        }
+
+        let config = serde_json::json!({
+            "version": MXC_SCHEMA_VERSION,
+            "containerId": container_id,
+            "containment": "processcontainer",
+            "process": {
+                "commandLine": process.command_line,
+                "cwd": process.cwd,
+                "env": process.env,
+                "timeout": process.timeout,
+            },
+            "processContainer": serde_json::Value::Object(pc_json),
+            "filesystem": serde_json::Value::Object(filesystem_json),
+        });
+
+        let json = serde_json::to_string(&config)?;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
+
+        let mut cmd = Command::new(&self.exec_path);
+        cmd.arg("--config-base64")
+            .arg(&b64)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if self.debug {
+            cmd.arg("--debug");
+        }
+
+        debug!(container_id = %container_id, command = %process.command_line, "wxc-exec one-shot processContainer spawn");
         let child = cmd.spawn()?;
         Ok(child)
     }
@@ -515,6 +611,35 @@ mod tests {
             "composable"
         );
         assert_eq!(config["filesystem"]["readwritePaths"][0], "C:\\work\\demo");
+    }
+
+    #[test]
+    fn oneshot_processcontainer_config_json_shape() {
+        // Mirror the JSON `run_oneshot` builds for the one-shot processContainer
+        // path: no `phase` (routes to one-shot), `containment: processcontainer`,
+        // a `process` block, the `processContainer` knobs, and filesystem grants
+        // incl. deniedPaths.
+        let config = serde_json::json!({
+            "version": MXC_SCHEMA_VERSION,
+            "containerId": "sb-1",
+            "containment": "processcontainer",
+            "process": {
+                "commandLine": "C:\\work\\demo\\agent.exe",
+                "cwd": "C:\\work\\demo",
+                "env": Vec::<String>::new(),
+                "timeout": 0,
+            },
+            "processContainer": { "leastPrivilege": true },
+            "filesystem": {
+                "readwritePaths": ["C:\\work\\demo"],
+                "deniedPaths": ["C:\\secret"],
+            },
+        });
+        assert_eq!(config["containment"], "processcontainer");
+        assert!(config.get("phase").is_none(), "one-shot config must omit phase");
+        assert_eq!(config["processContainer"]["leastPrivilege"], true);
+        assert_eq!(config["filesystem"]["readwritePaths"][0], "C:\\work\\demo");
+        assert_eq!(config["filesystem"]["deniedPaths"][0], "C:\\secret");
     }
 
     #[test]

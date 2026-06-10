@@ -4,7 +4,7 @@
 //! MXC compute backend: lifecycle logic, in-memory registry, exec-in-driver,
 //! and self-reported readiness.
 
-use crate::mxc::{MxcFilesystem, MxcProcess, WxcExecInvoker};
+use crate::mxc::{MxcFilesystem, MxcProcess, MxcProcessContainer, WxcExecInvoker};
 use crate::policy::{EmbeddedPolicyMapper, MapCtx, PolicyMapper};
 use openshell_core::proto::SandboxPolicy;
 use openshell_core::proto::compute::v1::{
@@ -30,6 +30,21 @@ const DEFAULT_IMAGE_SENTINEL: &str = "mxc:isolation-session";
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
+/// Which MXC backend the driver targets.
+///
+/// - `IsolationSession` (default): persistent, attachable session
+///   (provision → start → exec → stop → deprovision). Grant-only filesystem
+///   policy — it has no deny primitive and is NOT default-deny.
+/// - `ProcessContainer`: one-shot AppContainer. Genuinely default-deny: a
+///   write to any ungranted path is denied by the OS. No persistent session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MxcBackend {
+    #[default]
+    IsolationSession,
+    ProcessContainer,
+}
+
 /// Configuration for the MXC compute driver.
 ///
 /// Loaded from `[openshell.drivers.mxc]` in the gateway TOML file, or from
@@ -39,6 +54,12 @@ const DEFAULT_IMAGE_SENTINEL: &str = "mxc:isolation-session";
 pub struct MxcComputeConfig {
     /// Path to `wxc-exec.exe`. Required for live runs.
     pub wxc_exec_path: String,
+    /// Backend to target. Default: `isolation_session`.
+    pub backend: MxcBackend,
+    /// `processContainer` only: request a Less-Privileged AppContainer.
+    pub pc_least_privilege: bool,
+    /// `processContainer` only: AppContainer capabilities to grant.
+    pub pc_capabilities: Vec<String>,
     /// MXC `configurationId` for isolation session. Default: `"composable"`.
     /// Never use `"small"` (known OS bug).
     pub default_configuration_id: String,
@@ -60,6 +81,9 @@ impl Default for MxcComputeConfig {
     fn default() -> Self {
         Self {
             wxc_exec_path: "wxc-exec.exe".into(),
+            backend: MxcBackend::default(),
+            pc_least_privilege: false,
+            pc_capabilities: Vec::new(),
             default_configuration_id: crate::mxc::DEFAULT_CONFIGURATION_ID.into(),
             agent_command: Vec::new(),
             agent_cwd: String::new(),
@@ -454,38 +478,14 @@ async fn run_lifecycle(
         }
     };
 
-    // 2. Provision.
+    // 2. Build filesystem grants + the agent process (shared across backends).
     let filesystem = MxcFilesystem {
         readwrite_paths: mapped.readwrite_paths,
         readonly_paths: mapped.readonly_paths,
+        // OpenShell's policy model has no explicit deny field; default-deny is
+        // implicit. processContainer enforces that at the OS level regardless.
+        denied_paths: Vec::new(),
     };
-    let iso_sandbox_id = match invoker
-        .provision(&config.default_configuration_id, filesystem)
-        .await
-    {
-        Ok(id) => id,
-        Err(e) => {
-            set_failed(&registry, &watch_tx, &sandbox, &sandbox_id, &e.to_string()).await;
-            return;
-        }
-    };
-    info!(sandbox = %sandbox_name, iso_id = %iso_sandbox_id, "MXC provisioned");
-
-    {
-        let mut reg = registry.lock().await;
-        if let Some(entry) = reg.get_mut(&sandbox_id) {
-            entry.iso_sandbox_id = Some(iso_sandbox_id.clone());
-        }
-    }
-
-    // 3. Start.
-    if let Err(e) = invoker.start(&iso_sandbox_id).await {
-        set_failed(&registry, &watch_tx, &sandbox, &sandbox_id, &e.to_string()).await;
-        return;
-    }
-    info!(sandbox = %sandbox_name, "MXC started");
-
-    // 4. Exec agent command — spawn (don't await).
     let command_line = config.agent_command.join(" ");
     let cwd = if config.agent_cwd.is_empty() {
         config.share_dir.clone()
@@ -498,14 +498,62 @@ async fn run_lifecycle(
         env: Vec::new(),
         timeout: 0,
     };
-    let child = match invoker.spawn_exec(&iso_sandbox_id, process).await {
-        Ok(c) => c,
-        Err(e) => {
-            set_failed(&registry, &watch_tx, &sandbox, &sandbox_id, &e.to_string()).await;
-            return;
+
+    // 3. Launch the agent. The backends differ fundamentally:
+    //    - isolation_session: persistent (provision -> start -> exec).
+    //    - processContainer: one-shot (a single ephemeral AppContainer).
+    let child = match config.backend {
+        MxcBackend::IsolationSession => {
+            let iso_sandbox_id = match invoker
+                .provision(&config.default_configuration_id, filesystem)
+                .await
+            {
+                Ok(id) => id,
+                Err(e) => {
+                    set_failed(&registry, &watch_tx, &sandbox, &sandbox_id, &e.to_string()).await;
+                    return;
+                }
+            };
+            info!(sandbox = %sandbox_name, iso_id = %iso_sandbox_id, "MXC provisioned");
+            {
+                let mut reg = registry.lock().await;
+                if let Some(entry) = reg.get_mut(&sandbox_id) {
+                    entry.iso_sandbox_id = Some(iso_sandbox_id.clone());
+                }
+            }
+            if let Err(e) = invoker.start(&iso_sandbox_id).await {
+                set_failed(&registry, &watch_tx, &sandbox, &sandbox_id, &e.to_string()).await;
+                return;
+            }
+            info!(sandbox = %sandbox_name, "MXC started");
+            match invoker.spawn_exec(&iso_sandbox_id, process).await {
+                Ok(c) => c,
+                Err(e) => {
+                    set_failed(&registry, &watch_tx, &sandbox, &sandbox_id, &e.to_string()).await;
+                    return;
+                }
+            }
+        }
+        MxcBackend::ProcessContainer => {
+            // One-shot: no provision/start, no persistent iso id. The
+            // AppContainer is created, runs the agent, and is torn down on exit.
+            let pc = MxcProcessContainer {
+                least_privilege: config.pc_least_privilege,
+                capabilities: config.pc_capabilities.clone(),
+            };
+            match invoker
+                .run_oneshot(&sandbox_id, filesystem, pc, process)
+                .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    set_failed(&registry, &watch_tx, &sandbox, &sandbox_id, &e.to_string()).await;
+                    return;
+                }
+            }
         }
     };
-    info!(sandbox = %sandbox_name, command = %command_line, "MXC agent exec launched");
+    info!(sandbox = %sandbox_name, command = %command_line, backend = ?config.backend, "MXC agent launched");
 
     // 5. Self-report Ready=True.
     let ready_sandbox = make_sandbox_with_condition(
@@ -729,12 +777,10 @@ mod lifecycle_tests {
 
     fn demo_config(share_dir: &str, agent_command: Vec<String>) -> MxcComputeConfig {
         MxcComputeConfig {
-            wxc_exec_path: "wxc-exec.exe".into(),
-            default_configuration_id: "composable".into(),
             agent_command,
             agent_cwd: share_dir.into(),
             share_dir: share_dir.into(),
-            debug: false,
+            ..Default::default()
         }
     }
 
@@ -790,6 +836,51 @@ mod lifecycle_tests {
             completed.is_some(),
             "sandbox should remain Ready=True (AgentCompleted) after a successful exec, never demote to Error"
         );
+    }
+
+    #[tokio::test]
+    async fn processcontainer_one_shot_in_policy_write_reaches_ready() {
+        // The processContainer backend skips provision/start and runs a single
+        // one-shot. The mock routes through `run_oneshot`, deriving grants from
+        // the filesystem (not a provision step), so the in-policy write should
+        // materialize and the sandbox should reach Ready=True.
+        let tmp = tempfile::tempdir().unwrap();
+        let share = tmp.path().to_string_lossy().replace('\\', "/");
+        let hello = format!("{share}/hello.txt");
+        let cmd = vec![
+            "powershell".into(),
+            "-NoProfile".into(),
+            "-Command".into(),
+            format!("Set-Content -LiteralPath {hello} -Value hi"),
+        ];
+        let mut config = demo_config(&share, cmd);
+        config.backend = MxcBackend::ProcessContainer;
+        let backend = MxcComputeBackend::new_mocked(config);
+
+        let sink = backend.policy_sink();
+        sink.lock()
+            .await
+            .insert("sb-pc".into(), fs_policy(&[&share]));
+
+        let sb = driver_sandbox("sb-pc");
+        backend.create_sandbox(&sb).await.expect("create accepted");
+
+        let ready = wait_for(&backend, "sb-pc", |s| {
+            ready_condition(s).is_some_and(|c| c.status == "True" && c.reason == "AgentRunning")
+        })
+        .await;
+        assert!(ready.is_some(), "processContainer sandbox should self-report Ready=True");
+
+        let host_path = std::path::Path::new(tmp.path()).join("hello.txt");
+        let mut found = false;
+        for _ in 0..100 {
+            if host_path.exists() {
+                found = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(found, "in-policy write should materialize under processContainer");
     }
 
     #[tokio::test]

@@ -29,6 +29,6 @@ mod policy;
 mod policy_map;
 
 #[cfg(target_os = "windows")]
-pub use driver::{MxcComputeBackend, MxcComputeConfig};
+pub use driver::{MxcBackend, MxcComputeBackend, MxcComputeConfig};
 #[cfg(target_os = "windows")]
 pub use grpc::ComputeDriverService;
