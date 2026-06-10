@@ -92,6 +92,98 @@ openshell sandbox create -- claude
 
 The CLI uses the policy from `OPENSHELL_SANDBOX_POLICY` whenever `--policy` is not explicitly provided.
 
+## Discover Policy with Permissive Mode
+
+When onboarding a new workload, you may not know which endpoints it needs. Permissive mode lets you run the sandbox without enforcing network policy — all connections succeed, but connections that *would have been denied* are logged and turned into draft policy proposals. You review and approve the proposals, then export the learned policy for future use.
+
+This is similar to SELinux's `audit2allow` workflow: run permissively, observe what the workload needs, then generate a policy from the observations.
+
+### Quick start
+
+Create a sandbox in permissive mode and run your workload:
+
+```shell
+openshell sandbox create --permissive --name my-sandbox -- bash
+```
+
+From inside the sandbox, the workload can reach any public endpoint. Try a few:
+
+```shell
+curl -s https://httpbin.org/get
+curl -s https://api.github.com/zen
+curl -s https://ifconfig.me
+```
+
+All three succeed. Without `--permissive`, they would return 403 because no network policy allows them.
+
+After the workload finishes (or while it runs), check the draft proposals that were generated:
+
+```shell
+openshell rule get my-sandbox --status pending
+```
+
+```text
+Chunk: bd3696f3-...
+  Status: pending
+  Rule: allow_httpbin_org_443
+  Binary: /usr/bin/curl
+  Confidence: 65%
+  Rationale: Allow curl to connect to httpbin.org:443 (HTTPS).
+  Endpoints: httpbin.org:443 [L4]
+
+Chunk: 31099f86-...
+  Status: pending
+  Rule: allow_api_github_com_443
+  Binary: /usr/bin/curl
+  Confidence: 65%
+  Rationale: Allow curl to connect to api.github.com:443 (HTTPS).
+  Endpoints: api.github.com:443 [L4]
+```
+
+Approve all proposals and export the learned policy:
+
+```shell
+openshell rule approve-all my-sandbox
+openshell sandbox get my-sandbox --policy-only > learned-policy.yaml
+```
+
+Use the exported policy for future sandboxes with full enforcement:
+
+```shell
+openshell sandbox create --policy learned-policy.yaml -- bash
+```
+
+### What permissive mode changes
+
+| Layer | Behavior |
+|---|---|
+| Network policy (L4/L7) | Denied connections are logged as draft proposals but allowed through. |
+| Filesystem (Landlock) | Skipped entirely. Filesystem policy must be authored manually. |
+| Process (seccomp) | Always enforced. Permissive mode does not weaken process integrity controls. |
+| SSRF guards | Always enforced. Loopback, link-local, and cloud metadata addresses remain blocked. |
+| Credential injection | Credentials are injected normally for connections that match a policy endpoint. |
+
+### Combining with a base policy
+
+Permissive mode works with no policy at all (pure L4 discovery), but providing a base policy with `protocol` hints enables richer L7 learning. Without protocol declarations, the proxy tunnels connections as raw TCP and can only learn host:port — not HTTP method and path.
+
+```shell
+openshell sandbox create --permissive --policy base-policy.yaml -- bash
+```
+
+If no protocol hints are present, the CLI prints a reminder at startup:
+
+```text
+⚠ Permissive mode: no HTTP endpoints declared in policy.
+  L7 audit will be limited to host:port only.
+  To capture HTTP method/path detail, add endpoint protocol hints:
+
+    endpoints:
+      - host: api.example.com
+        port: 443
+        protocol: rest
+```
+
 ## Iterate on a Running Sandbox
 
 To change what the sandbox can access, pull the current policy, edit the YAML, and push the update. The workflow is iterative: create the sandbox, monitor logs for denied actions, pull the policy, modify it, push, and verify.

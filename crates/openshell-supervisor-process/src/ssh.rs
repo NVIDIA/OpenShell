@@ -835,9 +835,15 @@ fn spawn_pty_shell(
 
     // Phase 1: Prepare Landlock ruleset before the child applies it.
     #[cfg(target_os = "linux")]
-    let prepared_sandbox =
+    let mut prepared_sandbox =
         crate::process::prepare_child_sandbox(policy, workdir.as_deref(), enforcement_mode)
             .map_err(|err| anyhow::anyhow!("Failed to prepare sandbox: {err}"))?;
+    #[cfg(target_os = "linux")]
+    if policy.network.proxy.as_ref().is_some_and(|p| p.permissive)
+        && let Some(prepared) = prepared_sandbox.as_mut()
+    {
+        prepared.skip_landlock();
+    }
 
     #[cfg(unix)]
     {
@@ -989,9 +995,15 @@ fn spawn_pipe_exec(
 
     // Phase 1: Prepare Landlock ruleset before the child applies it.
     #[cfg(target_os = "linux")]
-    let prepared_sandbox =
+    let mut prepared_sandbox =
         crate::process::prepare_child_sandbox(policy, workdir.as_deref(), enforcement_mode)
             .map_err(|err| anyhow::anyhow!("Failed to prepare sandbox: {err}"))?;
+    #[cfg(target_os = "linux")]
+    if policy.network.proxy.as_ref().is_some_and(|p| p.permissive)
+        && let Some(prepared) = prepared_sandbox.as_mut()
+    {
+        prepared.skip_landlock();
+    }
 
     #[cfg(unix)]
     {
