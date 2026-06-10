@@ -9,6 +9,7 @@
 //! evaluated against OPA policy, and either forwarded or denied.
 
 pub mod graphql;
+pub(crate) mod http;
 pub mod inference;
 pub mod path;
 pub mod provider;
