@@ -29,7 +29,7 @@ mod imp {
     use clap::Parser;
     use openshell_driver_mxc::{
         DEFAULT_COMMAND, DEFAULT_CONTAINMENT, DEFAULT_MXC_VERSION, LossItem, MxcMappingOptions,
-        build_loss_report, map_to_mxc, render_readme,
+        build_loss_report, map_to_mxc, render_readme, split_policy,
     };
     use serde_json::Value;
 
@@ -81,10 +81,40 @@ mod imp {
         /// Emit `OpenShell` wildcard hosts into `allowedHosts` despite lossiness.
         #[arg(long)]
         allow_wildcards: bool,
+
+        /// Run the lossless split instead of the coarse map.
+        ///
+        /// Requires `--proxy-port`. Prints the MXC config (with proxy redirect
+        /// and empty `allowedHosts`) and the trimmed proxy policy side-by-side.
+        #[arg(long)]
+        split: bool,
+
+        /// Localhost port the `OpenShell` CONNECT proxy listens on (required with `--split`).
+        #[arg(long)]
+        proxy_port: Option<u16>,
     }
 
     pub fn run() -> Result<()> {
         let args = Args::parse();
+
+        if args.split {
+            let port = args
+                .proxy_port
+                .ok_or_else(|| anyhow!("--proxy-port is required with --split"))?;
+            let policy_path = args
+                .policy
+                .as_ref()
+                .ok_or_else(|| anyhow!("--policy is required with --split"))?;
+            let stem = policy_path
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            let slug = args.container_id.clone().unwrap_or(stem);
+            let mut opts = build_options(&args, &slug);
+            opts.proxy_localhost_port = Some(port);
+            return show_split(policy_path, &opts);
+        }
 
         if let Some(examples_root) = &args.examples_root {
             let mut examples = discover_example_policies(examples_root)?;
@@ -207,6 +237,70 @@ mod imp {
         let readme = render_readme(&policy_path.display().to_string(), &report, config);
         std::fs::write(&readme_path, readme)
             .with_context(|| format!("writing {}", readme_path.display()))?;
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Lossless-split display
+    // -----------------------------------------------------------------------
+
+    fn show_split(policy_path: &Path, opts: &MxcMappingOptions) -> Result<()> {
+        let content = std::fs::read_to_string(policy_path)
+            .with_context(|| format!("reading {}", policy_path.display()))?;
+        let policy = openshell_policy::parse_sandbox_policy(&content)
+            .map_err(|e| anyhow!("parsing {}: {e}", policy_path.display()))?;
+
+        let result = split_policy(&policy, opts)
+            .ok_or_else(|| anyhow!("split_policy returned None — is --proxy-port set?"))?;
+
+        println!("=== MXC ContainerConfig (filesystem + proxy redirect) ===");
+        println!("{}", serde_json::to_string_pretty(&result.mxc_config)?);
+
+        println!();
+        println!("=== Proxy policy (preserved for OpenShell fine-grained enforcement) ===");
+        if result.proxy_policy.network_policies.is_empty() {
+            println!("  (no network_policies — nothing for the proxy to enforce)");
+        } else {
+            let mut rules: Vec<_> = result.proxy_policy.network_policies.iter().collect();
+            rules.sort_by_key(|(k, _)| k.as_str());
+            for (name, rule) in rules {
+                println!("  rule: {name}");
+                for ep in &rule.endpoints {
+                    let ports = if ep.ports.is_empty() {
+                        String::new()
+                    } else {
+                        format!(":{}", ep.ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(","))
+                    };
+                    println!(
+                        "    endpoint: {}{}  protocol={} tls={} access={} enforcement={}",
+                        ep.host, ports,
+                        if ep.protocol.is_empty() { "-" } else { &ep.protocol },
+                        if ep.tls.is_empty() { "-" } else { &ep.tls },
+                        if ep.access.is_empty() { "-" } else { &ep.access },
+                        if ep.enforcement.is_empty() { "-" } else { &ep.enforcement },
+                    );
+                    if !ep.rules.is_empty() {
+                        println!("      allow rules: {}", ep.rules.len());
+                    }
+                    if !ep.deny_rules.is_empty() {
+                        println!("      deny rules: {}", ep.deny_rules.len());
+                    }
+                }
+                let binaries: Vec<_> = rule.binaries.iter().map(|b| b.path.as_str()).collect();
+                if !binaries.is_empty() {
+                    println!("    binaries: {}", binaries.join(", "));
+                }
+            }
+        }
+
+        if !result.loss.is_empty() {
+            println!();
+            println!("=== Filesystem loss items ({} item(s)) ===", result.loss.len());
+            for item in &result.loss {
+                println!("  [{}] {}: {}", item.severity, item.path, item.message);
+            }
+        }
 
         Ok(())
     }

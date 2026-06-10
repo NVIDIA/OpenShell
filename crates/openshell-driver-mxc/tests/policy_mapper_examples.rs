@@ -18,7 +18,7 @@
 
 use std::path::{Path, PathBuf};
 
-use openshell_driver_mxc::{MxcMappingOptions, map_to_mxc};
+use openshell_driver_mxc::{MxcMappingOptions, map_to_mxc, split_policy};
 use openshell_policy::parse_sandbox_policy;
 use serde_json::Value;
 
@@ -175,6 +175,83 @@ fn quickstart_coarse_mapping() {
         has("error", "binaries[0].path"),
         "expected binary-scope loss"
     );
+}
+
+#[test]
+fn split_policy_routes_network_to_proxy() {
+    let path = examples_root().join("sandbox-policy-quickstart/policy.yaml");
+    let yaml = std::fs::read_to_string(&path).expect("read quickstart");
+    let policy = parse_sandbox_policy(&yaml).expect("parse quickstart");
+
+    let opts = MxcMappingOptions {
+        proxy_localhost_port: Some(8080),
+        ..Default::default()
+    };
+    let result = split_policy(&policy, &opts).expect("split_policy returns Some when port is set");
+    let cfg = &result.mxc_config;
+
+    // Proxy redirect is emitted.
+    assert_eq!(cfg["network"]["proxy"]["host"], "127.0.0.1");
+    assert_eq!(cfg["network"]["proxy"]["port"], 8080);
+
+    // Direct egress is blocked; allowedHosts is empty (proxy enforces the list).
+    assert_eq!(cfg["network"]["defaultPolicy"], "block");
+    assert!(
+        str_list(&cfg["network"]["allowedHosts"]).is_empty(),
+        "split path must not populate allowedHosts"
+    );
+
+    // Filesystem grants are preserved unchanged.
+    assert_eq!(
+        str_list(&cfg["filesystem"]["readwritePaths"]),
+        policy.filesystem.as_ref().unwrap().read_write
+    );
+
+    // Network policy is returned verbatim for the proxy.
+    assert_eq!(
+        result.proxy_policy.network_policies.len(),
+        policy.network_policies.len(),
+        "proxy_policy must carry all network rules"
+    );
+    assert!(
+        result.proxy_policy.filesystem.is_none(),
+        "proxy_policy must not carry filesystem rules"
+    );
+
+    // No binary-scope, port, or protocol losses — those are delegated to the proxy.
+    let net_losses: Vec<_> = result
+        .loss
+        .iter()
+        .filter(|i| i.path.starts_with("network_policies"))
+        .collect();
+    assert!(
+        net_losses.is_empty(),
+        "split path must not generate network losses: {net_losses:?}"
+    );
+}
+
+#[test]
+fn split_policy_returns_none_without_port() {
+    let opts = MxcMappingOptions::default();
+    let policy = parse_sandbox_policy("").unwrap_or_default();
+    assert!(
+        split_policy(&policy, &opts).is_none(),
+        "split_policy must return None when proxy_localhost_port is not set"
+    );
+}
+
+#[test]
+fn split_policy_deterministic() {
+    let path = examples_root().join("sandbox-policy-quickstart/policy.yaml");
+    let yaml = std::fs::read_to_string(&path).expect("read quickstart");
+    let policy = parse_sandbox_policy(&yaml).expect("parse quickstart");
+    let opts = MxcMappingOptions {
+        proxy_localhost_port: Some(9999),
+        ..Default::default()
+    };
+    let a = split_policy(&policy, &opts).unwrap();
+    let b = split_policy(&policy, &opts).unwrap();
+    assert_eq!(a.mxc_config, b.mxc_config, "split_policy must be deterministic");
 }
 
 #[test]

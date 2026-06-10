@@ -67,11 +67,114 @@ pub struct MxcMappingResult {
     pub loss: Vec<LossItem>,
 }
 
+/// Result of the lossless split: the MXC config carries filesystem grants and a
+/// proxy redirect; the full network policy is returned unchanged for the
+/// `OpenShell` CONNECT proxy to enforce.
+#[derive(Clone, Debug)]
+pub struct SplitPolicyResult {
+    /// MXC `ContainerConfig` with filesystem grants and `network.proxy` redirect.
+    ///
+    /// `network.allowedHosts` is empty — direct egress is blocked at the MXC
+    /// layer. All outbound connections flow through the proxy; the proxy enforces
+    /// the full `OpenShell` network policy.
+    pub mxc_config: Value,
+    /// Full `OpenShell` network policy preserved verbatim for the host CONNECT
+    /// proxy. Only `network_policies` is populated; the proxy does not enforce
+    /// filesystem rules.
+    pub proxy_policy: SandboxPolicy,
+    /// Loss items from the filesystem side only. Network rules produce no losses
+    /// here — they are delegated to the proxy rather than approximated.
+    pub loss: Vec<LossItem>,
+}
+
 /// Map an `OpenShell` policy to a coarse MXC `ContainerConfig`.
 pub fn map_to_mxc(policy: &SandboxPolicy, opts: &MxcMappingOptions) -> MxcMappingResult {
     let mut loss = Vec::new();
     let config = build_mxc_config(policy, opts, &mut loss);
     MxcMappingResult { config, loss }
+}
+
+/// Lossless split: map filesystem + containment to MXC, delegate network to the
+/// `OpenShell` CONNECT proxy.
+///
+/// The returned [`SplitPolicyResult::mxc_config`] sets `network.proxy` to
+/// `127.0.0.1:{proxy_localhost_port}` and leaves `allowedHosts` empty — direct
+/// egress is blocked at the MXC layer and all outbound connections flow through
+/// the proxy. [`SplitPolicyResult::proxy_policy`] carries the original
+/// `network_policies` verbatim; no binary-scope, port, protocol, or wildcard
+/// loss items are generated for the network side.
+///
+/// Returns `None` if `opts.proxy_localhost_port` is not set. Use [`map_to_mxc`]
+/// for the standalone coarse path when no proxy is in the loop.
+pub fn split_policy(policy: &SandboxPolicy, opts: &MxcMappingOptions) -> Option<SplitPolicyResult> {
+    let port = opts.proxy_localhost_port?;
+    let mut loss = Vec::new();
+    let mxc_config = build_split_mxc_config(policy, opts, port, &mut loss);
+    let proxy_policy = SandboxPolicy {
+        network_policies: policy.network_policies.clone(),
+        ..Default::default()
+    };
+    Some(SplitPolicyResult {
+        mxc_config,
+        proxy_policy,
+        loss,
+    })
+}
+
+fn build_split_mxc_config(
+    policy: &SandboxPolicy,
+    opts: &MxcMappingOptions,
+    proxy_port: u16,
+    items: &mut Vec<LossItem>,
+) -> Value {
+    let mut process = json!({
+        "commandLine": opts.command,
+        "timeout": opts.timeout_ms,
+    });
+    if let Some(cwd) = &opts.cwd {
+        process["cwd"] = json!(cwd);
+    }
+    if !opts.env.is_empty() {
+        process["env"] = json!(opts.env);
+    }
+
+    let filesystem = map_filesystem(policy, opts, items);
+
+    // Direct egress is blocked; all outbound flows through the OpenShell proxy.
+    // allowedHosts is intentionally empty — the proxy enforces the full policy.
+    let network = json!({
+        "defaultPolicy": "block",
+        "allowedHosts": [],
+        "blockedHosts": [],
+        "proxy": {
+            "host": "127.0.0.1",
+            "port": proxy_port,
+        },
+    });
+
+    let mut config = json!({
+        "version": opts.mxc_version,
+        "containerId": opts.container_id,
+        "containment": opts.containment,
+        "lifecycle": {
+            "destroyOnExit": true,
+            "preservePolicy": false,
+        },
+        "process": process,
+        "filesystem": filesystem,
+        "network": network,
+        "ui": {
+            "disable": true,
+            "clipboard": "none",
+            "injection": false,
+        },
+    });
+
+    // No network hosts, so backend-specific network blocks (processContainer
+    // internetClient, etc.) are not added — correct for the proxy path.
+    add_backend_specific_config(&mut config, &opts.containment, &[], items);
+    add_static_policy_loss(policy, opts, items);
+    config
 }
 
 fn build_mxc_config(

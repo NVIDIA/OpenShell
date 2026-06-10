@@ -37,5 +37,6 @@ pub use grpc::ComputeDriverService;
 #[cfg(target_os = "windows")]
 pub use policy_map::{
     DEFAULT_COMMAND, DEFAULT_CONTAINMENT, DEFAULT_MXC_VERSION, LossItem, MxcMappingOptions,
-    MxcMappingResult, OPEN_SHELL_SUPERSET_GAPS, build_loss_report, map_to_mxc, render_readme,
+    MxcMappingResult, OPEN_SHELL_SUPERSET_GAPS, SplitPolicyResult, build_loss_report, map_to_mxc,
+    render_readme, split_policy,
 };
