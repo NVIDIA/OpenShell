@@ -17,7 +17,11 @@ const TRUST_DOMAIN_PREFIX =
   process.env.TRUST_DOMAIN_PREFIX || "spiffe://openshell.local/openshell/sandbox/";
 const ACCESS_TOKEN_ISSUER =
   process.env.ACCESS_TOKEN_ISSUER || "http://token-issuer.default.svc.cluster.local";
-const ACCESS_TOKEN_SECRET = process.env.ACCESS_TOKEN_SECRET || "openshell-demo-secret";
+const ACCESS_TOKEN_SECRET = process.env.ACCESS_TOKEN_SECRET;
+
+if (!ACCESS_TOKEN_SECRET) {
+  throw new Error("ACCESS_TOKEN_SECRET is required");
+}
 
 let cachedJwks;
 let cachedJwksAt = 0;

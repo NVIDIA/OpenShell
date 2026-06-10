@@ -185,7 +185,9 @@ workspace_default_storage_size = "10Gi"
 # Kubelet clamps projected tokens below 600 seconds. The driver caps values at 86400.
 sa_token_ttl_secs              = 3600
 # Optional SPIFFE Workload API socket mounted into sandbox pods for dynamic
-# provider token grants. Supervisor-to-gateway auth still uses gateway JWTs.
+# provider token grants. Use an absolute path under a dedicated directory;
+# shared roots such as /run, /var, /tmp, and /etc are rejected.
+# Supervisor-to-gateway auth still uses gateway JWTs.
 provider_spiffe_workload_api_socket_path = "/spiffe-workload-api/spire-agent.sock"
 ```
 

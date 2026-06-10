@@ -258,7 +258,19 @@ fn supervisor_identity_mount_target(socket_path: &str) -> Result<Option<PathBuf>
             openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET
         ));
     }
+    if is_shared_root_mount_shadow(parent) {
+        return Err(miette::miette!(
+            "{} must live below a dedicated subdirectory; refusing to hide shared directory {}",
+            openshell_core::sandbox_env::PROVIDER_SPIFFE_WORKLOAD_API_SOCKET,
+            parent.display()
+        ));
+    }
     Ok(Some(parent.to_path_buf()))
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn is_shared_root_mount_shadow(parent: &Path) -> bool {
+    matches!(parent.to_str(), Some("/run" | "/var" | "/tmp" | "/etc"))
 }
 
 #[cfg(target_os = "linux")]
@@ -300,7 +312,7 @@ fn create_supervisor_identity_mount_namespace(target: &Path) -> Result<OwnedFd> 
 
 #[cfg(target_os = "linux")]
 fn open_current_mount_namespace() -> std::io::Result<OwnedFd> {
-    let file = std::fs::File::open("/proc/self/ns/mnt")?;
+    let file = std::fs::File::open("/proc/thread-self/ns/mnt")?;
     Ok(file.into())
 }
 
@@ -1268,5 +1280,25 @@ mod tests {
         assert!(supervisor_identity_mount_target("tcp:127.0.0.1:8081").is_err());
         assert!(supervisor_identity_mount_target("spiffe-workload-api/spire-agent.sock").is_err());
         assert!(supervisor_identity_mount_target("/spire-agent.sock").is_err());
+    }
+
+    #[test]
+    fn supervisor_identity_mount_target_rejects_shared_root_shadowing() {
+        for socket_path in [
+            "/run/spire-agent.sock",
+            "/var/spire-agent.sock",
+            "/tmp/spire-agent.sock",
+            "/etc/spire-agent.sock",
+        ] {
+            let err = supervisor_identity_mount_target(socket_path)
+                .expect_err("shared root shadowing should be rejected");
+            assert!(err.to_string().contains("dedicated subdirectory"));
+        }
+
+        assert_eq!(
+            supervisor_identity_mount_target("/run/spire/spire-agent.sock")
+                .expect("dedicated subdirectory should be accepted"),
+            Some(PathBuf::from("/run/spire"))
+        );
     }
 }

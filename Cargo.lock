@@ -3533,6 +3533,7 @@ dependencies = [
 name = "openshell-providers"
 version = "0.0.0"
 dependencies = [
+ "glob",
  "openshell-core",
  "serde",
  "serde_json",

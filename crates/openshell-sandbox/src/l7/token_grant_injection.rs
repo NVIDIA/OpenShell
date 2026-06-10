@@ -10,8 +10,8 @@ use std::sync::Arc;
 use miette::{Result, miette};
 use openshell_core::proto::{ProviderCredentialTokenGrant, ProviderProfileCredential};
 use openshell_ocsf::{
-    ActionId, ActivityId, DispositionId, Endpoint, NetworkActivityBuilder, SeverityId, StatusId,
-    ocsf_emit,
+    ActionId, ActivityId, DispositionId, Endpoint, HttpActivityBuilder, HttpRequest, SeverityId,
+    StatusId, Url as OcsfUrl, ocsf_emit,
 };
 use tracing::warn;
 
@@ -95,12 +95,17 @@ pub async fn inject_if_needed(req: L7Request, ctx: &L7EvalContext) -> Result<L7R
             Ok(access_token) => {
                 let modified_raw_header =
                     inject_token_grant_header(&req.raw_header, &cred, &access_token)?;
+                let provider_key = ocsf_message_field(&provider_key);
                 ocsf_emit!(
-                    NetworkActivityBuilder::new(crate::ocsf_ctx())
+                    HttpActivityBuilder::new(crate::ocsf_ctx())
                         .activity(ActivityId::Other)
                         .action(ActionId::Allowed)
                         .disposition(DispositionId::Allowed)
                         .severity(SeverityId::Informational)
+                        .http_request(HttpRequest::new(
+                            &req.action,
+                            OcsfUrl::new("http", &ctx.host, request_path, ctx.port),
+                        ))
                         .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
                         .message(format!(
                             "Token grant successful for {} to {}:{}",
@@ -124,13 +129,18 @@ pub async fn inject_if_needed(req: L7Request, ctx: &L7EvalContext) -> Result<L7R
                     error = %e,
                     "Token grant failed"
                 );
+                let provider_key = ocsf_message_field(&provider_key);
                 ocsf_emit!(
-                    NetworkActivityBuilder::new(crate::ocsf_ctx())
+                    HttpActivityBuilder::new(crate::ocsf_ctx())
                         .activity(ActivityId::Fail)
                         .action(ActionId::Denied)
                         .disposition(DispositionId::Blocked)
-                        .severity(SeverityId::High)
+                        .severity(SeverityId::Medium)
                         .status(StatusId::Failure)
+                        .http_request(HttpRequest::new(
+                            &req.action,
+                            OcsfUrl::new("http", &ctx.host, request_path, ctx.port),
+                        ))
                         .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
                         .message(format!(
                             "Token grant failed for {} to {}:{}: {}",
@@ -144,6 +154,13 @@ pub async fn inject_if_needed(req: L7Request, ctx: &L7EvalContext) -> Result<L7R
     }
 
     Ok(req)
+}
+
+fn ocsf_message_field(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| if ch.is_control() { '_' } else { ch })
+        .collect()
 }
 
 fn token_grant_request<'a>(
@@ -306,12 +323,16 @@ fn validate_header_name(header_name: &str) -> Result<()> {
                         | b'~'
                 )
         });
-    if valid {
-        Ok(())
-    } else {
-        Err(miette!(
+    if !valid {
+        return Err(miette!(
             "token grant header_name is not a valid HTTP header name"
-        ))
+        ));
+    }
+    match header_name.to_ascii_lowercase().as_str() {
+        "host" | "content-length" | "transfer-encoding" | "connection" => Err(miette!(
+            "token grant header_name may not override HTTP framing or connection headers"
+        )),
+        _ => Ok(()),
     }
 }
 
@@ -339,7 +360,7 @@ fn inject_header(raw_header: &[u8], header_name: &str, header_value: &str) -> Re
         }
         if line
             .split_once(':')
-            .is_some_and(|(name, _)| name.eq_ignore_ascii_case(header_name))
+            .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case(header_name))
         {
             continue;
         }
@@ -616,6 +637,40 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn inject_token_grant_header_replaces_existing_authorization_with_ows_before_colon() {
+        let raw = b"GET /v1 HTTP/1.1\r\nHost: api.example.com\r\nAuthorization : Bearer stale-token\r\nAccept: application/json\r\n\r\n";
+
+        let rewritten =
+            inject_token_grant_header(raw, &credential("bearer", "Authorization"), "grant-token")
+                .expect("header should rewrite");
+        let rewritten = String::from_utf8(rewritten).expect("rewritten header should be UTF-8");
+
+        assert!(rewritten.contains("Authorization: Bearer grant-token\r\n"));
+        assert!(!rewritten.contains("stale-token"));
+        assert_eq!(
+            rewritten
+                .lines()
+                .filter(|line| line
+                    .split_once(':')
+                    .is_some_and(|(name, _)| name.trim().eq_ignore_ascii_case("authorization")))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn token_grant_header_rejects_framing_and_connection_headers() {
+        for header_name in ["Host", "Content-Length", "Transfer-Encoding", "Connection"] {
+            let err = token_grant_header(&credential("header", header_name), "grant-token")
+                .expect_err("framing header override should be rejected");
+            assert_eq!(
+                err.to_string(),
+                "token grant header_name may not override HTTP framing or connection headers"
+            );
+        }
     }
 
     #[test]

@@ -15,6 +15,7 @@ PROFILE_ID="${PROFILE_ID:-spiffe-token-demo}"
 PORT_FORWARD_PORT="${PORT_FORWARD_PORT:-8097}"
 GATEWAY_ENDPOINT="${GATEWAY_ENDPOINT:-http://127.0.0.1:${PORT_FORWARD_PORT}}"
 KEEP_SANDBOX="${KEEP_SANDBOX:-0}"
+ACCESS_TOKEN_SECRET="${ACCESS_TOKEN_SECRET:-$(openssl rand -hex 32)}"
 
 TEMP_CONFIG_HOME=""
 if [[ -z "${XDG_CONFIG_HOME:-}" ]]; then
@@ -90,11 +91,17 @@ sandbox_curl_until() {
 
 OS=(openshell --gateway-endpoint "$GATEWAY_ENDPOINT")
 
+printf "\n$ kubectl -n default create secret generic openshell-spiffe-token-demo --from-literal=access-token-secret=*** --dry-run=client -o yaml | kubectl apply -f -\n"
+kubectl -n default create secret generic openshell-spiffe-token-demo \
+    --from-literal=access-token-secret="$ACCESS_TOKEN_SECRET" \
+    --dry-run=client \
+    -o yaml | kubectl apply -f -
+
 run kubectl apply -k "$K8S_DIR"
-run kubectl rollout restart deployment/token-issuer deployment/alpha deployment/beta
-run kubectl rollout status deployment/token-issuer
-run kubectl rollout status deployment/alpha
-run kubectl rollout status deployment/beta
+run kubectl -n default rollout restart deployment/token-issuer deployment/alpha deployment/beta
+run kubectl -n default rollout status deployment/token-issuer --timeout=180s
+run kubectl -n default rollout status deployment/alpha --timeout=180s
+run kubectl -n default rollout status deployment/beta --timeout=180s
 
 kubectl -n openshell port-forward svc/openshell "${PORT_FORWARD_PORT}:8080" >/tmp/openshell-spiffe-token-demo-port-forward.log 2>&1 &
 PF_PID=$!
@@ -126,10 +133,10 @@ assert_contains "$BETA_OUTPUT" "azp: spiffe://openshell.local/openshell/sandbox/
 
 sleep 1
 
-printf "\n$ kubectl logs -l app=alpha --tail=20 --prefix=true\n"
-kubectl logs -l app=alpha --tail=20 --prefix=true | sed 's/^/alpha> /'
+printf "\n$ kubectl -n default logs -l app=alpha --tail=20 --prefix=true\n"
+kubectl -n default logs -l app=alpha --tail=20 --prefix=true | sed 's/^/alpha> /'
 
-printf "\n$ kubectl logs -l app=beta --tail=20 --prefix=true\n"
-kubectl logs -l app=beta --tail=20 --prefix=true | sed 's/^/beta> /'
+printf "\n$ kubectl -n default logs -l app=beta --tail=20 --prefix=true\n"
+kubectl -n default logs -l app=beta --tail=20 --prefix=true | sed 's/^/beta> /'
 
 printf "\nSPIFFE token grant demo succeeded.\n"

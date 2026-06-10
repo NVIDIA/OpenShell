@@ -175,25 +175,30 @@ impl std::fmt::Debug for KubernetesComputeDriver {
 }
 
 impl KubernetesComputeDriver {
-    pub async fn new(config: KubernetesComputeConfig) -> Result<Self, KubeError> {
+    pub async fn new(config: KubernetesComputeConfig) -> Result<Self, KubernetesDriverError> {
+        config
+            .validate_provider_spiffe_workload_api_socket_path()
+            .map_err(KubernetesDriverError::Precondition)?;
         let base_config = match kube::Config::incluster() {
             Ok(c) => c,
             Err(_) => kube::Config::infer()
                 .await
-                .map_err(kube::Error::InferConfig)?,
+                .map_err(kube::Error::InferConfig)
+                .map_err(KubernetesDriverError::from_kube)?,
         };
 
         let mut kube_config = base_config.clone();
         kube_config.connect_timeout = Some(Duration::from_secs(10));
         kube_config.read_timeout = Some(Duration::from_secs(30));
         kube_config.write_timeout = Some(Duration::from_secs(30));
-        let client = Client::try_from(kube_config)?;
+        let client = Client::try_from(kube_config).map_err(KubernetesDriverError::from_kube)?;
 
         let mut watch_kube_config = base_config;
         watch_kube_config.connect_timeout = Some(Duration::from_secs(10));
         watch_kube_config.read_timeout = None;
         watch_kube_config.write_timeout = Some(Duration::from_secs(30));
-        let watch_client = Client::try_from(watch_kube_config)?;
+        let watch_client =
+            Client::try_from(watch_kube_config).map_err(KubernetesDriverError::from_kube)?;
 
         Ok(Self {
             client,
@@ -1778,8 +1783,8 @@ fn spiffe_socket_mount_path(socket_path: &str) -> String {
     std::path::Path::new(socket_path)
         .parent()
         .and_then(std::path::Path::to_str)
-        .filter(|path| !path.is_empty())
-        .unwrap_or("/spiffe-workload-api")
+        .filter(|path| !path.is_empty() && *path != "/")
+        .expect("provider SPIFFE socket path should be validated before pod rendering")
         .to_string()
 }
 

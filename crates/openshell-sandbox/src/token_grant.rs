@@ -49,6 +49,7 @@ static TOKEN_GRANT_HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .connect_timeout(Duration::from_secs(30))
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("token grant HTTP client configuration should be valid")

@@ -1287,9 +1287,9 @@ async fn hash_provider_profile_revision(
     provider_type: &str,
     hasher: &mut Sha256,
 ) -> Result<(), Status> {
-    if get_default_profile(provider_type).is_some() {
+    if let Some(profile) = get_default_profile(provider_type) {
         hasher.update(b"builtin-profile");
-        hasher.update(provider_type.as_bytes());
+        hasher.update(profile.to_proto().encode_to_vec());
         return Ok(());
     }
 

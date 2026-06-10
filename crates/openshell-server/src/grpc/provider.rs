@@ -968,7 +968,16 @@ async fn dynamic_token_grant_bindings_for_provider(
     let Some(profile) = get_provider_type_profile(store, profile_id).await? else {
         return Ok(Vec::new());
     };
-    let profile = profile.to_proto();
+    Ok(dynamic_token_grant_bindings_for_profile(
+        &provider_name,
+        &profile.to_proto(),
+    ))
+}
+
+fn dynamic_token_grant_bindings_for_profile(
+    provider_name: &str,
+    profile: &ProviderProfile,
+) -> Vec<DynamicTokenGrantBinding> {
     let mut bindings = Vec::new();
     for credential in &profile.credentials {
         if credential.token_grant.is_none() {
@@ -978,7 +987,7 @@ async fn dynamic_token_grant_bindings_for_provider(
             for port in endpoint_ports(endpoint.port, &endpoint.ports) {
                 push_dynamic_token_grant_bindings_for_endpoint(
                     &mut bindings,
-                    &provider_name,
+                    provider_name,
                     credential,
                     &endpoint.host,
                     port,
@@ -987,7 +996,7 @@ async fn dynamic_token_grant_bindings_for_provider(
             }
         }
     }
-    Ok(bindings)
+    bindings
 }
 
 fn push_dynamic_token_grant_bindings_for_endpoint(
@@ -1291,6 +1300,11 @@ pub(super) async fn handle_import_provider_profiles(
     add_empty_profile_set_diagnostic(&profiles, &mut diagnostics);
     diagnostics.extend(profile_conflict_diagnostics(state.store.as_ref(), &profiles).await?);
     diagnostics.extend(validate_profile_set(&profiles));
+    if !has_errors(&diagnostics) {
+        diagnostics.extend(
+            profile_import_attached_sandbox_diagnostics(state.store.as_ref(), &profiles).await?,
+        );
+    }
 
     if has_errors(&diagnostics) {
         return Ok(Response::new(ImportProviderProfilesResponse {
@@ -1558,6 +1572,83 @@ async fn profile_conflict_diagnostics(
             });
         }
     }
+    Ok(diagnostics)
+}
+
+async fn profile_import_attached_sandbox_diagnostics(
+    store: &Store,
+    profiles: &[(String, ProviderTypeProfile)],
+) -> Result<Vec<ProfileValidationDiagnostic>, Status> {
+    let mut candidate_profiles =
+        std::collections::HashMap::<String, (String, ProviderProfile)>::new();
+    for (source, profile) in profiles {
+        let Some(id) = normalize_profile_id(&profile.id) else {
+            continue;
+        };
+        candidate_profiles.insert(id, (source.clone(), profile.to_proto()));
+    }
+    if candidate_profiles.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let sandboxes = scan_sandboxes(store, |sandbox| {
+        sandbox
+            .spec
+            .as_ref()
+            .is_some_and(|spec| !spec.providers.is_empty())
+            .then_some(sandbox)
+    })
+    .await?;
+    let mut diagnostics = Vec::new();
+    for sandbox in sandboxes {
+        let sandbox_name = sandbox.object_name().to_string();
+        let spec = sandbox.spec.as_ref().expect("filtered by scan_sandboxes");
+        let mut bindings = Vec::new();
+        let mut imported_profiles_used = Vec::<(String, String)>::new();
+
+        for provider_name in &spec.providers {
+            let Some(provider) = store
+                .get_message_by_name::<Provider>(provider_name)
+                .await
+                .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
+            else {
+                continue;
+            };
+            let profile_id =
+                normalize_provider_type(&provider.r#type).unwrap_or(provider.r#type.as_str());
+            if let Some((source, profile)) = candidate_profiles.get(profile_id) {
+                bindings.extend(dynamic_token_grant_bindings_for_profile(
+                    provider.object_name(),
+                    profile,
+                ));
+                let used = (source.clone(), profile_id.to_string());
+                if !imported_profiles_used.contains(&used) {
+                    imported_profiles_used.push(used);
+                }
+            } else {
+                bindings.extend(dynamic_token_grant_bindings_for_provider(store, &provider).await?);
+            }
+        }
+
+        if imported_profiles_used.is_empty() {
+            continue;
+        }
+        if let Err(err) = validate_dynamic_token_grant_bindings_unambiguous(&bindings) {
+            for (source, profile_id) in &imported_profiles_used {
+                diagnostics.push(ProfileValidationDiagnostic {
+                    source: source.clone(),
+                    profile_id: profile_id.clone(),
+                    field: "credentials.token_grant.audience_overrides".to_string(),
+                    message: format!(
+                        "import would create ambiguous dynamic token grants on sandbox '{sandbox_name}': {}",
+                        err.message()
+                    ),
+                    severity: "error".to_string(),
+                });
+            }
+        }
+    }
+
     Ok(diagnostics)
 }
 
@@ -2316,6 +2407,70 @@ mod tests {
         )
         .await
         .expect("more-specific path should make dynamic grants deterministic");
+    }
+
+    #[tokio::test]
+    async fn import_provider_profile_rejects_attached_dynamic_binding_ambiguity() {
+        let state = test_server_state().await;
+        let store = state.store.as_ref();
+        import_token_grant_profile(&state, "grant-existing", "api.example.com", 443, "/v1/**")
+            .await;
+        create_empty_token_grant_provider(store, "provider-existing", "grant-existing").await;
+        create_provider_record(
+            store,
+            provider_with_values("provider-candidate", "grant-new"),
+        )
+        .await
+        .unwrap();
+        store
+            .put_message(&Sandbox {
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "sandbox-import-ambiguity-id".to_string(),
+                    name: "sandbox-import-ambiguity".to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                    resource_version: 0,
+                }),
+                spec: Some(SandboxSpec {
+                    providers: vec![
+                        "provider-existing".to_string(),
+                        "provider-candidate".to_string(),
+                    ],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let mut profile = custom_profile("grant-new");
+        profile.credentials = vec![token_grant_credential("access_token")];
+        profile.endpoints = vec![NetworkEndpoint {
+            host: "api.example.com".to_string(),
+            port: 443,
+            path: "/v1/**".to_string(),
+            protocol: "rest".to_string(),
+            ..Default::default()
+        }];
+        let response = handle_import_provider_profiles(
+            &state,
+            Request::new(ImportProviderProfilesRequest {
+                profiles: vec![ProviderProfileImportItem {
+                    profile: Some(profile),
+                    source: "grant-new.yaml".to_string(),
+                }],
+            }),
+        )
+        .await
+        .unwrap()
+        .into_inner();
+
+        assert!(!response.imported);
+        assert!(response.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("import would create ambiguous dynamic token grants")
+        }));
     }
 
     fn provider_with_values(name: &str, provider_type: &str) -> Provider {

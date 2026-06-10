@@ -34,11 +34,16 @@ For the Helm dev environment, deploy with the SPIRE releases and
 From the repository root:
 
 ```bash
+ACCESS_TOKEN_SECRET="$(openssl rand -hex 32)"
+KUBECONFIG=kubeconfig kubectl -n default create secret generic openshell-spiffe-token-demo \
+  --from-literal=access-token-secret="$ACCESS_TOKEN_SECRET" \
+  --dry-run=client \
+  -o yaml | KUBECONFIG=kubeconfig kubectl apply -f -
 KUBECONFIG=kubeconfig kubectl apply -k examples/spiffe-token-grant-demo/k8s
-KUBECONFIG=kubeconfig kubectl rollout restart deployment/token-issuer deployment/alpha deployment/beta
-KUBECONFIG=kubeconfig kubectl rollout status deployment/token-issuer
-KUBECONFIG=kubeconfig kubectl rollout status deployment/alpha
-KUBECONFIG=kubeconfig kubectl rollout status deployment/beta
+KUBECONFIG=kubeconfig kubectl -n default rollout restart deployment/token-issuer deployment/alpha deployment/beta
+KUBECONFIG=kubeconfig kubectl -n default rollout status deployment/token-issuer --timeout=180s
+KUBECONFIG=kubeconfig kubectl -n default rollout status deployment/alpha --timeout=180s
+KUBECONFIG=kubeconfig kubectl -n default rollout status deployment/beta --timeout=180s
 ```
 
 ## Register Provider And Test
@@ -52,7 +57,7 @@ KUBECONFIG=kubeconfig kubectl port-forward -n openshell svc/openshell 8097:8080
 Then run:
 
 ```bash
-export XDG_CONFIG_HOME=/private/tmp/openshell-spiffe-token-demo-config
+export XDG_CONFIG_HOME="$(mktemp -d)"
 export GATEWAY=http://127.0.0.1:8097
 
 openshell --gateway-endpoint "$GATEWAY" settings set \
@@ -101,8 +106,8 @@ beta called with path /:
 The protected services also write proof-of-life logs when they accept a call:
 
 ```bash
-KUBECONFIG=kubeconfig kubectl logs deployment/alpha --tail=20
-KUBECONFIG=kubeconfig kubectl logs deployment/beta --tail=20
+KUBECONFIG=kubeconfig kubectl -n default logs deployment/alpha --tail=20
+KUBECONFIG=kubeconfig kubectl -n default logs deployment/beta --tail=20
 ```
 
 Example log lines:

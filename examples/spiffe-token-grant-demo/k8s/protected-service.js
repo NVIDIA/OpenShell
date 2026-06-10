@@ -10,7 +10,11 @@ const EXPECTED_AUDIENCE = process.env.EXPECTED_AUDIENCE || SERVICE_NAME;
 const EXPECTED_SCOPE = process.env.EXPECTED_SCOPE || SERVICE_NAME;
 const ACCESS_TOKEN_ISSUER =
   process.env.ACCESS_TOKEN_ISSUER || "http://token-issuer.default.svc.cluster.local";
-const ACCESS_TOKEN_SECRET = process.env.ACCESS_TOKEN_SECRET || "openshell-demo-secret";
+const ACCESS_TOKEN_SECRET = process.env.ACCESS_TOKEN_SECRET;
+
+if (!ACCESS_TOKEN_SECRET) {
+  throw new Error("ACCESS_TOKEN_SECRET is required");
+}
 
 function b64urlDecode(value) {
   const padded = `${value}${"=".repeat((4 - (value.length % 4)) % 4)}`;

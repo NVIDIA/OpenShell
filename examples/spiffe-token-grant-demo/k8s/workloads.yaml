@@ -27,10 +27,11 @@ spec:
             - name: http
               containerPort: 8080
           env:
-            - name: NODE_TLS_REJECT_UNAUTHORIZED
-              value: "0"
             - name: ACCESS_TOKEN_SECRET
-              value: openshell-demo-secret
+              valueFrom:
+                secretKeyRef:
+                  name: openshell-spiffe-token-demo
+                  key: access-token-secret
             - name: ACCESS_TOKEN_ISSUER
               value: http://token-issuer.default.svc.cluster.local
             - name: SPIRE_JWKS_URI
@@ -100,7 +101,10 @@ spec:
             - name: EXPECTED_SCOPE
               value: alpha
             - name: ACCESS_TOKEN_SECRET
-              value: openshell-demo-secret
+              valueFrom:
+                secretKeyRef:
+                  name: openshell-spiffe-token-demo
+                  key: access-token-secret
             - name: ACCESS_TOKEN_ISSUER
               value: http://token-issuer.default.svc.cluster.local
           readinessProbe:
@@ -162,7 +166,10 @@ spec:
             - name: EXPECTED_SCOPE
               value: beta
             - name: ACCESS_TOKEN_SECRET
-              value: openshell-demo-secret
+              valueFrom:
+                secretKeyRef:
+                  name: openshell-spiffe-token-demo
+                  key: access-token-secret
             - name: ACCESS_TOKEN_ISSUER
               value: http://token-issuer.default.svc.cluster.local
           readinessProbe:
