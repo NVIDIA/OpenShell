@@ -55,6 +55,10 @@ fail() {
     exit 1
 }
 
+log() {
+    echo "openshell-agent-launcher: $*" >&2
+}
+
 require_cmd() {
     command -v "$1" >/dev/null 2>&1 || fail "missing required command: $1"
 }
@@ -517,6 +521,8 @@ cleanup_payload() {
 }
 trap 'cleanup_config; cleanup_payload' EXIT
 
+log "Preparing $AGENT_DISPLAY_NAME with harness '$HARNESS' in '$RUN_MODE' mode on gateway '$GATEWAY'."
+
 mkdir -p "$PAYLOAD_DIR" "$WORKSPACE_UPLOAD_DIR"
 cp -R "$SCRIPT_DIR/runtime" "$PAYLOAD_DIR/runtime"
 chmod +x "$PAYLOAD_DIR/runtime"/*.sh
@@ -623,8 +629,10 @@ RUBY
     SANDBOX_FROM="$build_dockerfile"
 }
 
+log "Staging immutable sandbox payload from '$SANDBOX_FROM'."
 prepare_immutable_sandbox_source "$SANDBOX_FROM"
 
+log "Configuring gateway settings."
 for ((setting_index = 0; setting_index < SETTING_COUNT; setting_index++)); do
     key_var="SETTING_${setting_index}_KEY"
     value_var="SETTING_${setting_index}_VALUE"
@@ -644,6 +652,7 @@ for ((provider_index = 0; provider_index < PROVIDER_COUNT; provider_index++)); d
     credential_count="${!credential_count_var}"
     profile_file="$(resolve_profile_file "$profile_id")"
 
+    log "Importing provider profile '$profile_id' for provider '$provider_name'."
     import_provider_profile "$profile_id" "$profile_file"
 
     credential_args=()
@@ -680,6 +689,7 @@ for ((provider_index = 0; provider_index < PROVIDER_COUNT; provider_index++)); d
     esac
 
     if [[ "${!refresh_enabled_var}" == "true" ]]; then
+        log "Refreshing provider credential '$provider_name/${!refresh_key_var}'."
         configure_provider_refresh "$provider_index"
     fi
     PROVIDER_ARGS+=(--provider "$provider_name")
@@ -721,7 +731,7 @@ SANDBOX_CMD=(
     -- env "${HARNESS_ENV_ARGS[@]}" bash "$PAYLOAD_IMAGE_DIR/runtime/entrypoint.sh"
 )
 
-echo "Launching $AGENT_DISPLAY_NAME sandbox '$SANDBOX_NAME' on gateway '$GATEWAY'..."
+log "Launching $AGENT_DISPLAY_NAME sandbox '$SANDBOX_NAME' on gateway '$GATEWAY'."
 if [[ "$BACKGROUND" == "1" ]]; then
     LOG_DIR="$(resolve_manifest_path "$BACKGROUND_LOG_DIR")"
     mkdir -p "$LOG_DIR"

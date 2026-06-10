@@ -19,6 +19,7 @@ ADAPTER="$PAYLOAD_DIR/runtime/harnesses/$OPENSHELL_AGENT_HARNESS/exec.sh"
 RUN_MODE="${OPENSHELL_AGENT_RUN_MODE:-once}"
 POLL_INTERVAL_SECONDS="${OPENSHELL_AGENT_POLL_INTERVAL_SECONDS:-900}"
 MAX_TRANSIENT_FAILURES="${OPENSHELL_AGENT_MAX_TRANSIENT_FAILURES:-5}"
+HEARTBEAT_SECONDS="${OPENSHELL_AGENT_HEARTBEAT_SECONDS:-60}"
 MAX_SLEEP_SECONDS=86400
 
 [[ -f "$PROMPT_FILE" ]] || { echo "missing agent prompt: $PROMPT_FILE" >&2; exit 1; }
@@ -30,6 +31,7 @@ case "$RUN_MODE" in
 esac
 [[ "$POLL_INTERVAL_SECONDS" =~ ^[0-9]+$ ]] || { echo "OPENSHELL_AGENT_POLL_INTERVAL_SECONDS must be an integer" >&2; exit 2; }
 [[ "$MAX_TRANSIENT_FAILURES" =~ ^[0-9]+$ ]] || { echo "OPENSHELL_AGENT_MAX_TRANSIENT_FAILURES must be an integer" >&2; exit 2; }
+[[ "$HEARTBEAT_SECONDS" =~ ^[0-9]+$ ]] || { echo "OPENSHELL_AGENT_HEARTBEAT_SECONDS must be an integer" >&2; exit 2; }
 [[ "$POLL_INTERVAL_SECONDS" -gt 0 ]] || { echo "OPENSHELL_AGENT_POLL_INTERVAL_SECONDS must be greater than zero" >&2; exit 2; }
 
 json_string_field() {
@@ -87,6 +89,31 @@ safe_sleep_seconds() {
     printf '%s\n' "$value"
 }
 
+sleep_with_heartbeat() {
+    local total_seconds="$1"
+    local reason="$2"
+    local remaining="$total_seconds"
+
+    if [[ "$HEARTBEAT_SECONDS" -le 0 ]]; then
+        sleep "$remaining"
+        return
+    fi
+
+    while [[ "$remaining" -gt 0 ]]; do
+        local chunk="$remaining"
+        if [[ "$chunk" -gt "$HEARTBEAT_SECONDS" ]]; then
+            chunk="$HEARTBEAT_SECONDS"
+        fi
+
+        sleep "$chunk"
+        remaining=$((remaining - chunk))
+
+        if [[ "$remaining" -gt 0 ]]; then
+            echo "openshell-agent: still waiting ($reason); next cycle in ${remaining}s" >&2
+        fi
+    done
+}
+
 retry_watch_cycle() {
     local reason="$1"
     transient_failures=$((transient_failures + 1))
@@ -100,7 +127,7 @@ retry_watch_cycle() {
     else
         echo "openshell-agent: transient watch failure $transient_failures ($reason); retrying in ${transient_backoff_seconds}s" >&2
     fi
-    sleep "$transient_backoff_seconds"
+    sleep_with_heartbeat "$transient_backoff_seconds" "$reason"
     transient_backoff_seconds=$((transient_backoff_seconds * 2))
     cap_transient_backoff
 }
@@ -192,7 +219,7 @@ while true; do
             transient_failures=0
             transient_backoff_seconds=30
             echo "openshell-agent: $status ($reason); sleeping ${next_poll_seconds}s outside harness" >&2
-            sleep "$next_poll_seconds"
+            sleep_with_heartbeat "$next_poll_seconds" "$reason"
             ;;
         transient_failure)
             if [[ "$RUN_MODE" == "once" ]]; then
