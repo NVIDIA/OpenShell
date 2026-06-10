@@ -79,7 +79,13 @@ function Resolve-VsDevCmd {
     throw "Could not find VsDevCmd.bat. Install Visual Studio Build Tools, or set OPENSHELL_VSDEVCMD."
 }
 
+function Get-LibclangBinSubdir {
+    return ([System.Runtime.InteropServices.RuntimeInformation, mscorlib]::OSArchitecture.ToString())
+}
+
 function Resolve-LibclangPath {
+    $subdir = Get-LibclangBinSubdir
+
     if ($env:LIBCLANG_PATH) {
         $candidate = Join-Path $env:LIBCLANG_PATH "libclang.dll"
         if (Test-Path $candidate) {
@@ -95,7 +101,7 @@ function Resolve-LibclangPath {
         $vswhere = $null
     }
     if ($vswhere -and (Test-Path $vswhere)) {
-        $found = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Llvm.Clang -find "VC\Tools\Llvm\x64\bin\libclang.dll" | Select-Object -First 1
+        $found = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Llvm.Clang -find "VC\Tools\Llvm\$subdir\bin\libclang.dll" | Select-Object -First 1
         if ($found -and (Test-Path $found)) {
             return (Split-Path -Parent (Resolve-Path $found).Path)
         }
@@ -110,7 +116,7 @@ function Resolve-LibclangPath {
     foreach ($root in $programFiles) {
         foreach ($version in $versions) {
             foreach ($edition in $editions) {
-                $candidateDir = Join-Path $root "Microsoft Visual Studio\$version\$edition\VC\Tools\Llvm\x64\bin"
+                $candidateDir = Join-Path $root "Microsoft Visual Studio\$version\$edition\VC\Tools\Llvm\$subdir\bin"
                 $candidate = Join-Path $candidateDir "libclang.dll"
                 if (Test-Path $candidate) {
                     return (Resolve-Path $candidateDir).Path
