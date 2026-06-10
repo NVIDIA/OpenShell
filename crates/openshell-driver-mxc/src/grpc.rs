@@ -9,16 +9,11 @@
 use crate::driver::MxcComputeBackend;
 use futures::{Stream, StreamExt};
 use openshell_core::proto::compute::v1::{
-    CreateSandboxRequest, CreateSandboxResponse, 
-    DeleteSandboxRequest, DeleteSandboxResponse,
-    GetCapabilitiesRequest, GetCapabilitiesResponse, 
-    GetSandboxRequest, GetSandboxResponse,
-    ListSandboxesRequest, ListSandboxesResponse, 
-    StopSandboxRequest, StopSandboxResponse,
-    ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, 
-    WatchSandboxesEvent,
-    WatchSandboxesRequest, 
-    compute_driver_server::ComputeDriver,
+    CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
+    GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest, GetSandboxResponse,
+    ListSandboxesRequest, ListSandboxesResponse, StopSandboxRequest, StopSandboxResponse,
+    ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesEvent,
+    WatchSandboxesRequest, compute_driver_server::ComputeDriver,
 };
 use std::pin::Pin;
 use tonic::{Request, Response, Status};

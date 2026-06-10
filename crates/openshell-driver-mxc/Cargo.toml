@@ -21,10 +21,6 @@ futures = { workspace = true }
 tokio-stream = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-# serde_yaml is not a workspace dependency, but 0.9.34 is already resolved in
-# Cargo.lock (transitive). Used by the embedded `policy_map` module to consume
-# the OpenShell policy in the shape Giedrius's mapper expects.
-serde_yaml = "0.9"
 base64 = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
@@ -34,6 +30,11 @@ uuid = { workspace = true }
 tokio = { workspace = true }
 # tempfile is not a workspace dependency; 3.27 is already resolved in Cargo.lock.
 tempfile = "3"
+# Used only by the Windows-only example + integration test (parse policy YAML
+# into the typed proto, and drive the CLI). Inert on non-Windows.
+openshell-policy = { path = "../openshell-policy" }
+clap = { workspace = true }
+anyhow = { workspace = true }
 
 [lints]
 workspace = true

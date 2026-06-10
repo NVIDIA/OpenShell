@@ -23,12 +23,19 @@ mod grpc;
 mod mxc;
 #[cfg(target_os = "windows")]
 mod policy;
-// Embedded mapping logic vendored from Giedrius's mapper. Pure `serde`, NOT
-// Windows-gated, so its parity tests run on Linux CI even though the rest of the
-// driver is Windows-only.
+// Embedded mapper logic (source of truth; was the `openshell-policy-mapper`
+// crate). Windows-only — MXC and the policy mapper are not built for Linux/WSL.
+#[cfg(target_os = "windows")]
 mod policy_map;
 
 #[cfg(target_os = "windows")]
 pub use driver::{MxcBackend, MxcComputeBackend, MxcComputeConfig};
 #[cfg(target_os = "windows")]
 pub use grpc::ComputeDriverService;
+// Re-export the embedded mapper API so the windows-only example and integration
+// test can reach it without making `policy_map` a public module.
+#[cfg(target_os = "windows")]
+pub use policy_map::{
+    DEFAULT_COMMAND, DEFAULT_CONTAINMENT, DEFAULT_MXC_VERSION, LossItem, MxcMappingOptions,
+    MxcMappingResult, OPEN_SHELL_SUPERSET_GAPS, build_loss_report, map_to_mxc, render_readme,
+};
