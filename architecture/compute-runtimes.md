@@ -42,10 +42,13 @@ but currently ignores them.
 
 Docker and Podman also accept per-sandbox driver-config mounts for existing
 runtime-managed named volumes and tmpfs mounts. Podman additionally accepts
-image mounts through its image-volume API. User-supplied host bind mounts are
-available only when explicitly enabled in the active local driver table of
-`gateway.toml`; driver-owned supervisor, token, and TLS bind mounts stay
-reserved.
+image mounts through its image-volume API. User-supplied bind and volume mounts
+default to read-only. Direct host bind mounts, and Docker local-driver
+bind-backed named volumes, are available only when explicitly enabled in the
+active local driver table of `gateway.toml`. Host bind mounts are an unsafe
+operator override because they place gateway-host filesystem state inside the
+sandbox and can negate OpenShell workspace isolation and filesystem-policy
+controls. Driver-owned supervisor, token, and TLS bind mounts stay reserved.
 
 Kubernetes deployments may set an AppArmor profile on sandbox agent containers
 through the driver configuration. The Helm chart defaults sandbox agents to

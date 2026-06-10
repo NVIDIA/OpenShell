@@ -6,6 +6,7 @@
 use crate::config::PodmanComputeConfig;
 use openshell_core::gpu::cdi_gpu_device_ids;
 use openshell_core::proto::compute::v1::{DriverSandbox, DriverSandboxTemplate};
+use openshell_core::{driver_mounts, proto_struct};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
@@ -70,13 +71,13 @@ enum PodmanDriverMountConfig {
     Bind {
         source: String,
         target: String,
-        #[serde(default)]
+        #[serde(default = "default_true")]
         read_only: bool,
     },
     Volume {
         source: String,
         target: String,
-        #[serde(default)]
+        #[serde(default = "default_true")]
         read_only: bool,
         #[serde(default)]
         subpath: Option<String>,
@@ -521,8 +522,8 @@ fn podman_user_mounts(
             } => {
                 result.mounts.push(Mount {
                     kind: "bind".into(),
-                    source: validate_absolute_mount_source(&source, "bind source")?,
-                    destination: validate_container_mount_target(&target)?,
+                    source: driver_mounts::validate_absolute_mount_source(&source, "bind source")?,
+                    destination: driver_mounts::validate_container_mount_target(&target)?,
                     options: vec![
                         if read_only { "ro" } else { "rw" }.to_string(),
                         "rbind".to_string(),
@@ -537,8 +538,8 @@ fn podman_user_mounts(
             } => {
                 reject_subpath(subpath.as_deref(), "podman volume mounts")?;
                 result.volumes.push(NamedVolume {
-                    name: validate_mount_source(&source, "volume source")?,
-                    dest: validate_container_mount_target(&target)?,
+                    name: driver_mounts::validate_mount_source(&source, "volume source")?,
+                    dest: driver_mounts::validate_container_mount_target(&target)?,
                     options: vec![if read_only { "ro" } else { "rw" }.to_string()],
                 });
             }
@@ -564,7 +565,7 @@ fn podman_user_mounts(
                 result.mounts.push(Mount {
                     kind: "tmpfs".into(),
                     source: "tmpfs".into(),
-                    destination: validate_container_mount_target(&target)?,
+                    destination: driver_mounts::validate_container_mount_target(&target)?,
                     options,
                 });
             }
@@ -576,8 +577,8 @@ fn podman_user_mounts(
             } => {
                 reject_subpath(subpath.as_deref(), "podman image mounts")?;
                 result.image_volumes.push(ImageVolume {
-                    source: validate_mount_source(&source, "image source")?,
-                    destination: validate_container_mount_target(&target)?,
+                    source: driver_mounts::validate_mount_source(&source, "image source")?,
+                    destination: driver_mounts::validate_container_mount_target(&target)?,
                     rw: !read_only,
                 });
             }
@@ -593,7 +594,7 @@ fn podman_driver_config(
     let Some(config) = template.driver_config.as_ref() else {
         return Ok(PodmanSandboxDriverConfig::default());
     };
-    let json = Value::Object(proto_struct_to_json_object(config));
+    let json = Value::Object(proto_struct::struct_to_json_object(config));
     let config: PodmanSandboxDriverConfig = serde_json::from_value(json)
         .map_err(|err| format!("invalid podman driver_config: {err}"))?;
     validate_podman_driver_mounts(&config.mounts, enable_bind_mounts)?;
@@ -614,7 +615,7 @@ fn validate_podman_driver_mounts(
                             .to_string(),
                     );
                 }
-                validate_absolute_mount_source(source, "bind source")?;
+                driver_mounts::validate_absolute_mount_source(source, "bind source")?;
                 target
             }
             PodmanDriverMountConfig::Volume {
@@ -623,7 +624,7 @@ fn validate_podman_driver_mounts(
                 subpath,
                 ..
             } => {
-                validate_mount_source(source, "volume source")?;
+                driver_mounts::validate_mount_source(source, "volume source")?;
                 reject_subpath(subpath.as_deref(), "podman volume mounts")?;
                 target
             }
@@ -644,12 +645,12 @@ fn validate_podman_driver_mounts(
                 subpath,
                 ..
             } => {
-                validate_mount_source(source, "image source")?;
+                driver_mounts::validate_mount_source(source, "image source")?;
                 reject_subpath(subpath.as_deref(), "podman image mounts")?;
                 target
             }
         };
-        let target = validate_container_mount_target(target)?;
+        let target = driver_mounts::validate_container_mount_target(target)?;
         if !targets.insert(target.clone()) {
             return Err(format!(
                 "duplicate podman driver_config mount target '{target}'"
@@ -659,32 +660,11 @@ fn validate_podman_driver_mounts(
     Ok(())
 }
 
-fn validate_absolute_mount_source(source: &str, field: &str) -> Result<String, String> {
-    let source = validate_mount_source(source, field)?;
-    if !Path::new(&source).is_absolute() {
-        return Err(format!("{field} must be an absolute host path"));
-    }
-    Ok(source)
-}
-
-fn validate_mount_source(source: &str, field: &str) -> Result<String, String> {
-    let source = source.trim();
-    if source.is_empty() {
-        return Err(format!("{field} must not be empty"));
-    }
-    if source.as_bytes().contains(&0) {
-        return Err(format!("{field} must not contain NUL bytes"));
-    }
-    Ok(source.to_string())
-}
-
 fn reject_subpath(subpath: Option<&str>, mount_type: &str) -> Result<(), String> {
     let Some(subpath) = subpath else {
         return Ok(());
     };
-    if subpath.trim().is_empty() {
-        return Err("mount subpath must not be empty".to_string());
-    }
+    driver_mounts::validate_mount_subpath(subpath)?;
     Err(format!("{mount_type} do not support subpath"))
 }
 
@@ -739,85 +719,6 @@ fn validate_tmpfs_options(options: &[String]) -> Result<Vec<String>, String> {
             Ok(option.to_string())
         })
         .collect()
-}
-
-fn validate_container_mount_target(target: &str) -> Result<String, String> {
-    let target = normalize_container_mount_target(target);
-    if target.is_empty() {
-        return Err("mount target must not be empty".to_string());
-    }
-    if target.as_bytes().contains(&0) {
-        return Err("mount target must not contain NUL bytes".to_string());
-    }
-    if !target.starts_with('/') {
-        return Err("mount target must be an absolute container path".to_string());
-    }
-    if target == "/" {
-        return Err("mount target must not be the container root".to_string());
-    }
-    let path = Path::new(&target);
-    if path
-        .components()
-        .any(|component| matches!(component, std::path::Component::ParentDir))
-    {
-        return Err("mount target must not contain '..'".to_string());
-    }
-    if target == "/sandbox" {
-        return Err("mount target '/sandbox' is reserved for the OpenShell workspace".to_string());
-    }
-    for reserved in [
-        "/opt/openshell",
-        "/etc/openshell/auth",
-        "/etc/openshell/tls",
-        "/run/netns",
-    ] {
-        if path_is_or_under(&target, reserved) {
-            return Err(format!(
-                "mount target '{target}' conflicts with reserved OpenShell path '{reserved}'"
-            ));
-        }
-    }
-    Ok(target)
-}
-
-fn normalize_container_mount_target(target: &str) -> String {
-    let target = target.trim();
-    if target == "/" {
-        return target.to_string();
-    }
-    target.trim_end_matches('/').to_string()
-}
-
-fn path_is_or_under(path: &str, parent: &str) -> bool {
-    path == parent
-        || path
-            .strip_prefix(parent)
-            .is_some_and(|rest| rest.starts_with('/'))
-}
-
-fn proto_struct_to_json_object(config: &prost_types::Struct) -> serde_json::Map<String, Value> {
-    config
-        .fields
-        .iter()
-        .map(|(key, value)| (key.clone(), proto_value_to_json(value)))
-        .collect()
-}
-
-fn proto_value_to_json(value: &prost_types::Value) -> Value {
-    match value.kind.as_ref() {
-        Some(prost_types::value::Kind::NumberValue(num)) => {
-            serde_json::Number::from_f64(*num).map_or(Value::Null, Value::Number)
-        }
-        Some(prost_types::value::Kind::StringValue(val)) => Value::String(val.clone()),
-        Some(prost_types::value::Kind::BoolValue(val)) => Value::Bool(*val),
-        Some(prost_types::value::Kind::StructValue(val)) => {
-            Value::Object(proto_struct_to_json_object(val))
-        }
-        Some(prost_types::value::Kind::ListValue(list)) => {
-            Value::Array(list.values.iter().map(proto_value_to_json).collect())
-        }
-        Some(prost_types::value::Kind::NullValue(_)) | None => Value::Null,
-    }
 }
 
 /// Build the Podman container creation JSON spec.
@@ -1734,6 +1635,75 @@ mod tests {
     }
 
     #[test]
+    fn container_spec_defaults_volume_mounts_to_read_only() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    "mounts": [{
+                        "type": "volume",
+                        "source": "work-nfs",
+                        "target": "/sandbox/work"
+                    }]
+                }))),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let config = test_config();
+
+        let spec = build_container_spec(&sandbox, &config);
+        let volumes = spec["volumes"]
+            .as_array()
+            .expect("volumes should be an array");
+
+        assert!(volumes.iter().any(|volume| {
+            volume["name"].as_str() == Some("work-nfs")
+                && volume["dest"].as_str() == Some("/sandbox/work")
+                && volume["options"].as_array().is_some_and(|options| {
+                    options.iter().any(|option| option.as_str() == Some("ro"))
+                })
+        }));
+    }
+
+    #[test]
+    fn container_spec_allows_explicit_writable_volume_mounts() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    "mounts": [{
+                        "type": "volume",
+                        "source": "work-nfs",
+                        "target": "/sandbox/work",
+                        "read_only": false
+                    }]
+                }))),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let config = test_config();
+
+        let spec = build_container_spec(&sandbox, &config);
+        let volumes = spec["volumes"]
+            .as_array()
+            .expect("volumes should be an array");
+
+        assert!(volumes.iter().any(|volume| {
+            volume["name"].as_str() == Some("work-nfs")
+                && volume["dest"].as_str() == Some("/sandbox/work")
+                && volume["options"].as_array().is_some_and(|options| {
+                    options.iter().any(|option| option.as_str() == Some("rw"))
+                })
+        }));
+    }
+
+    #[test]
     fn driver_config_rejects_bind_mounts_unless_enabled() {
         use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
 
@@ -1771,6 +1741,45 @@ mod tests {
                         "source": "/host/path",
                         "target": "/sandbox/host",
                         "read_only": true
+                    }]
+                }))),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let mut config = test_config();
+        config.enable_bind_mounts = true;
+
+        let spec = build_container_spec(&sandbox, &config);
+        let mounts = spec["mounts"]
+            .as_array()
+            .expect("mounts should be an array");
+
+        assert!(mounts.iter().any(|mount| {
+            mount["type"].as_str() == Some("bind")
+                && mount["source"].as_str() == Some("/host/path")
+                && mount["destination"].as_str() == Some("/sandbox/host")
+                && mount["options"].as_array().is_some_and(|options| {
+                    options.iter().any(|option| option.as_str() == Some("ro"))
+                        && options
+                            .iter()
+                            .any(|option| option.as_str() == Some("rbind"))
+                })
+        }));
+    }
+
+    #[test]
+    fn container_spec_defaults_enabled_bind_mounts_to_read_only() {
+        use openshell_core::proto::compute::v1::{DriverSandboxSpec, DriverSandboxTemplate};
+
+        let mut sandbox = test_sandbox("test-id", "test-name");
+        sandbox.spec = Some(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                driver_config: Some(json_struct(serde_json::json!({
+                    "mounts": [{
+                        "type": "bind",
+                        "source": "/host/path",
+                        "target": "/sandbox/host"
                     }]
                 }))),
                 ..Default::default()

@@ -11,6 +11,7 @@
 
 pub mod auth;
 pub mod config;
+pub mod driver_mounts;
 pub mod driver_utils;
 pub mod error;
 pub mod forward;
@@ -22,6 +23,7 @@ pub mod net;
 pub mod paths;
 pub mod progress;
 pub mod proto;
+pub mod proto_struct;
 pub mod sandbox_env;
 pub mod settings;
 pub mod telemetry;

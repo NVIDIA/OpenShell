@@ -76,8 +76,10 @@ For GPU-backed Docker sandboxes, configure Docker CDI before starting the gatewa
 
 Docker driver config accepts user-supplied `volume` and `tmpfs` mounts. It also
 accepts `bind` mounts when `[openshell.drivers.docker]` sets
-`enable_bind_mounts = true` in `gateway.toml`. Image mounts are not accepted in
-Docker sandbox driver config. See Docker's [storage documentation](https://docs.docker.com/engine/storage/) for more information.
+`enable_bind_mounts = true` in `gateway.toml`. See Docker's [storage documentation](https://docs.docker.com/engine/storage/) for more information.
+Docker local-driver named volumes created with bind options also expose
+gateway-host paths, so OpenShell treats them like bind mounts and requires
+`enable_bind_mounts = true`.
 
 Use a `volume` mount for existing Docker named volumes:
 
@@ -113,13 +115,14 @@ Docker mount schema:
 
 | Type | Fields |
 |---|---|
-| `bind` | `source`, `target`, optional `read_only` (`false` by default). `source` must be an absolute host path. Requires `enable_bind_mounts = true`. |
-| `volume` | `source`, `target`, optional `read_only` (`false` by default), optional `subpath`. The named volume must already exist. |
+| `bind` | `source`, `target`, optional `read_only` (`true` by default). `source` must be an absolute host path. Requires `enable_bind_mounts = true`. |
+| `volume` | `source`, `target`, optional `read_only` (`true` by default), optional `subpath`. The named volume must already exist. Docker local-driver bind-backed volumes require `enable_bind_mounts = true`. |
 | `tmpfs` | `target`, optional `options`, optional `size_bytes`, optional `mode`. |
 
 OpenShell rejects mount targets that replace the workspace root, container root,
-supervisor files, TLS material, authentication material, or network namespace
-paths. Mounted paths remain subject to sandbox filesystem policy.
+supervisor files, `/etc/openshell`, `/etc/openshell-tls`, authentication
+material, or network namespace paths. These checks do not make host bind mounts
+safe.
 
 ## Podman Driver
 
@@ -174,16 +177,16 @@ Podman mount schema:
 
 | Type | Fields |
 |---|---|
-| `bind` | `source`, `target`, optional `read_only` (`false` by default). `source` must be an absolute host path. Requires `enable_bind_mounts = true`. |
-| `volume` | `source`, `target`, optional `read_only` (`false` by default). The named volume must already exist. |
+| `bind` | `source`, `target`, optional `read_only` (`true` by default). `source` must be an absolute host path. Requires `enable_bind_mounts = true`. |
+| `volume` | `source`, `target`, optional `read_only` (`true` by default). The named volume must already exist. |
 | `tmpfs` | `target`, optional `options`, optional `size_bytes`, optional `mode`. |
 | `image` | `source`, `target`, optional `read_only` (`true` by default). |
 
 Podman `volume` and `image` mounts do not support `subpath` in OpenShell driver
 config. OpenShell rejects mount targets that replace the workspace root,
-container root, supervisor files, TLS material, authentication material, or
-network namespace paths. Mounted paths remain subject to sandbox filesystem
-policy.
+container root, supervisor files, `/etc/openshell`, `/etc/openshell-tls`,
+authentication material, or network namespace paths. These checks do not make
+host bind mounts safe.
 
 ## MicroVM Driver
 

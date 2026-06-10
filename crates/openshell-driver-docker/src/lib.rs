@@ -42,6 +42,7 @@ use openshell_core::proto::compute::v1::{
     watch_sandboxes_event,
 };
 use openshell_core::{Config, Error, Result as CoreResult};
+use openshell_core::{driver_mounts, proto_struct};
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
@@ -278,13 +279,13 @@ enum DockerDriverMountConfig {
     Bind {
         source: String,
         target: String,
-        #[serde(default)]
+        #[serde(default = "default_true")]
         read_only: bool,
     },
     Volume {
         source: String,
         target: String,
-        #[serde(default)]
+        #[serde(default = "default_true")]
         read_only: bool,
         #[serde(default)]
         subpath: Option<String>,
@@ -298,6 +299,10 @@ enum DockerDriverMountConfig {
         #[serde(default)]
         mode: Option<f64>,
     },
+}
+
+fn default_true() -> bool {
+    true
 }
 
 type WatchStream =
@@ -475,7 +480,15 @@ impl DockerComputeDriver {
         for mount in config.mounts {
             if let DockerDriverMountConfig::Volume { source, .. } = mount {
                 match self.docker.inspect_volume(source.trim()).await {
-                    Ok(_) => {}
+                    Ok(volume) => {
+                        if !self.config.enable_bind_mounts && docker_volume_is_bind_backed(&volume)
+                        {
+                            return Err(Status::failed_precondition(format!(
+                                "docker volume '{}' is backed by a host bind mount and requires enable_bind_mounts = true in [openshell.drivers.docker]",
+                                source.trim()
+                            )));
+                        }
+                    }
                     Err(err) if is_not_found_error(&err) => {
                         return Err(Status::failed_precondition(format!(
                             "docker volume '{}' does not exist",
@@ -1588,7 +1601,7 @@ fn docker_driver_config(
         return Ok(DockerSandboxDriverConfig::default());
     };
 
-    let json = serde_json::Value::Object(proto_struct_to_json_object(config));
+    let json = serde_json::Value::Object(proto_struct::struct_to_json_object(config));
     let config: DockerSandboxDriverConfig = serde_json::from_value(json).map_err(|err| {
         Status::failed_precondition(format!("invalid docker driver_config: {err}"))
     })?;
@@ -1612,8 +1625,14 @@ fn docker_mount_from_config(config: &DockerDriverMountConfig) -> Result<Mount, S
             read_only,
         } => Ok(Mount {
             typ: Some(MountTypeEnum::BIND),
-            source: Some(validate_absolute_mount_source(source, "bind source")?),
-            target: Some(validate_container_mount_target(target)?),
+            source: Some(
+                driver_mounts::validate_absolute_mount_source(source, "bind source")
+                    .map_err(Status::failed_precondition)?,
+            ),
+            target: Some(
+                driver_mounts::validate_container_mount_target(target)
+                    .map_err(Status::failed_precondition)?,
+            ),
             read_only: Some(*read_only),
             ..Default::default()
         }),
@@ -1624,14 +1643,23 @@ fn docker_mount_from_config(config: &DockerDriverMountConfig) -> Result<Mount, S
             subpath,
         } => Ok(Mount {
             typ: Some(MountTypeEnum::VOLUME),
-            source: Some(validate_mount_source(source, "volume source")?),
-            target: Some(validate_container_mount_target(target)?),
+            source: Some(
+                driver_mounts::validate_mount_source(source, "volume source")
+                    .map_err(Status::failed_precondition)?,
+            ),
+            target: Some(
+                driver_mounts::validate_container_mount_target(target)
+                    .map_err(Status::failed_precondition)?,
+            ),
             read_only: Some(*read_only),
             volume_options: subpath
                 .as_ref()
                 .map(|subpath| {
                     Ok::<MountVolumeOptions, Status>(MountVolumeOptions {
-                        subpath: Some(validate_mount_subpath(subpath)?),
+                        subpath: Some(
+                            driver_mounts::validate_mount_subpath(subpath)
+                                .map_err(Status::failed_precondition)?,
+                        ),
                         ..Default::default()
                     })
                 })
@@ -1645,7 +1673,10 @@ fn docker_mount_from_config(config: &DockerDriverMountConfig) -> Result<Mount, S
             mode,
         } => Ok(Mount {
             typ: Some(MountTypeEnum::TMPFS),
-            target: Some(validate_container_mount_target(target)?),
+            target: Some(
+                driver_mounts::validate_container_mount_target(target)
+                    .map_err(Status::failed_precondition)?,
+            ),
             tmpfs_options: Some(MountTmpfsOptions {
                 size_bytes: validate_optional_positive_integral_i64(
                     *size_bytes,
@@ -1679,7 +1710,8 @@ fn validate_docker_driver_mounts(
                         "docker bind mounts require enable_bind_mounts = true in [openshell.drivers.docker]",
                     ));
                 }
-                validate_absolute_mount_source(source, "bind source")?;
+                driver_mounts::validate_absolute_mount_source(source, "bind source")
+                    .map_err(Status::failed_precondition)?;
                 target
             }
             DockerDriverMountConfig::Volume {
@@ -1688,9 +1720,11 @@ fn validate_docker_driver_mounts(
                 subpath,
                 ..
             } => {
-                validate_mount_source(source, "volume source")?;
+                driver_mounts::validate_mount_source(source, "volume source")
+                    .map_err(Status::failed_precondition)?;
                 if let Some(subpath) = subpath {
-                    validate_mount_subpath(subpath)?;
+                    driver_mounts::validate_mount_subpath(subpath)
+                        .map_err(Status::failed_precondition)?;
                 }
                 target
             }
@@ -1708,7 +1742,8 @@ fn validate_docker_driver_mounts(
                 target
             }
         };
-        let target = validate_container_mount_target(target)?;
+        let target = driver_mounts::validate_container_mount_target(target)
+            .map_err(Status::failed_precondition)?;
         if !targets.insert(target.clone()) {
             return Err(Status::failed_precondition(format!(
                 "duplicate docker driver_config mount target '{target}'"
@@ -1716,51 +1751,6 @@ fn validate_docker_driver_mounts(
         }
     }
     Ok(())
-}
-
-fn validate_absolute_mount_source(source: &str, field: &str) -> Result<String, Status> {
-    let source = validate_mount_source(source, field)?;
-    if !Path::new(&source).is_absolute() {
-        return Err(Status::failed_precondition(format!(
-            "{field} must be an absolute host path"
-        )));
-    }
-    Ok(source)
-}
-
-fn validate_mount_source(source: &str, field: &str) -> Result<String, Status> {
-    let source = source.trim();
-    if source.is_empty() {
-        return Err(Status::failed_precondition(format!(
-            "{field} must not be empty"
-        )));
-    }
-    if source.as_bytes().contains(&0) {
-        return Err(Status::failed_precondition(format!(
-            "{field} must not contain NUL bytes"
-        )));
-    }
-    Ok(source.to_string())
-}
-
-fn validate_mount_subpath(subpath: &str) -> Result<String, Status> {
-    let subpath = subpath.trim();
-    if subpath.is_empty() {
-        return Err(Status::failed_precondition(
-            "mount subpath must not be empty",
-        ));
-    }
-    let path = Path::new(subpath);
-    if path.is_absolute()
-        || path
-            .components()
-            .any(|component| matches!(component, std::path::Component::ParentDir))
-    {
-        return Err(Status::failed_precondition(
-            "mount subpath must be relative and must not contain '..'",
-        ));
-    }
-    Ok(subpath.to_string())
 }
 
 fn validate_optional_positive_integral_i64(
@@ -1828,96 +1818,13 @@ fn docker_tmpfs_option(option: &str) -> Result<Vec<String>, Status> {
     }
 }
 
-fn validate_container_mount_target(target: &str) -> Result<String, Status> {
-    let target = normalize_container_mount_target(target);
-    if target.is_empty() {
-        return Err(Status::failed_precondition(
-            "mount target must not be empty",
-        ));
-    }
-    if target.as_bytes().contains(&0) {
-        return Err(Status::failed_precondition(
-            "mount target must not contain NUL bytes",
-        ));
-    }
-    if !target.starts_with('/') {
-        return Err(Status::failed_precondition(
-            "mount target must be an absolute container path",
-        ));
-    }
-    if target == "/" {
-        return Err(Status::failed_precondition(
-            "mount target must not be the container root",
-        ));
-    }
-    let path = Path::new(&target);
-    if path
-        .components()
-        .any(|component| matches!(component, std::path::Component::ParentDir))
-    {
-        return Err(Status::failed_precondition(
-            "mount target must not contain '..'",
-        ));
-    }
-    if target == "/sandbox" {
-        return Err(Status::failed_precondition(
-            "mount target '/sandbox' is reserved for the OpenShell workspace",
-        ));
-    }
-    for reserved in [
-        "/opt/openshell",
-        "/etc/openshell/auth",
-        "/etc/openshell/tls",
-        "/run/netns",
-    ] {
-        if path_is_or_under(&target, reserved) {
-            return Err(Status::failed_precondition(format!(
-                "mount target '{target}' conflicts with reserved OpenShell path '{reserved}'"
-            )));
-        }
-    }
-    Ok(target)
-}
-
-fn normalize_container_mount_target(target: &str) -> String {
-    let target = target.trim();
-    if target == "/" {
-        return target.to_string();
-    }
-    target.trim_end_matches('/').to_string()
-}
-
-fn path_is_or_under(path: &str, parent: &str) -> bool {
-    path == parent
-        || path
-            .strip_prefix(parent)
-            .is_some_and(|rest| rest.starts_with('/'))
-}
-
-fn proto_struct_to_json_object(
-    config: &prost_types::Struct,
-) -> serde_json::Map<String, serde_json::Value> {
-    config
-        .fields
-        .iter()
-        .map(|(key, value)| (key.clone(), proto_value_to_json(value)))
-        .collect()
-}
-
-fn proto_value_to_json(value: &prost_types::Value) -> serde_json::Value {
-    match value.kind.as_ref() {
-        Some(prost_types::value::Kind::NumberValue(num)) => serde_json::Number::from_f64(*num)
-            .map_or(serde_json::Value::Null, serde_json::Value::Number),
-        Some(prost_types::value::Kind::StringValue(val)) => serde_json::Value::String(val.clone()),
-        Some(prost_types::value::Kind::BoolValue(val)) => serde_json::Value::Bool(*val),
-        Some(prost_types::value::Kind::StructValue(val)) => {
-            serde_json::Value::Object(proto_struct_to_json_object(val))
-        }
-        Some(prost_types::value::Kind::ListValue(list)) => {
-            serde_json::Value::Array(list.values.iter().map(proto_value_to_json).collect())
-        }
-        Some(prost_types::value::Kind::NullValue(_)) | None => serde_json::Value::Null,
-    }
+fn docker_volume_is_bind_backed(volume: &bollard::models::Volume) -> bool {
+    volume.driver == "local"
+        && volume.options.get("o").is_some_and(|options| {
+            options
+                .split(',')
+                .any(|option| option.trim().eq_ignore_ascii_case("bind"))
+        })
 }
 
 fn build_binds(
@@ -2193,7 +2100,7 @@ fn build_container_create_body(
             pids_limit: docker_pids_limit(config.sandbox_pids_limit)?,
             device_requests: docker_gpu_device_requests(spec.gpu, &spec.gpu_device),
             binds: Some(build_binds(sandbox, config)?),
-            mounts: (!user_mounts.is_empty()).then_some(user_mounts),
+            mounts: Some(user_mounts),
             restart_policy: Some(RestartPolicy {
                 name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
                 maximum_retry_count: None,

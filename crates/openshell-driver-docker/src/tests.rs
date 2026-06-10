@@ -116,6 +116,21 @@ fn json_value(value: serde_json::Value) -> prost_types::Value {
     }
 }
 
+fn inspected_volume(driver: &str, options: HashMap<String, String>) -> bollard::models::Volume {
+    bollard::models::Volume {
+        name: "openshell-test-volume".to_string(),
+        driver: driver.to_string(),
+        mountpoint: "/var/lib/docker/volumes/openshell-test-volume/_data".to_string(),
+        created_at: None,
+        status: None,
+        labels: HashMap::new(),
+        scope: None,
+        cluster_volume: None,
+        options,
+        usage_data: None,
+    }
+}
+
 #[test]
 fn container_visible_endpoint_rewrites_loopback_hosts() {
     assert_eq!(
@@ -620,6 +635,63 @@ fn build_container_create_body_includes_driver_config_mounts() {
 }
 
 #[test]
+fn driver_config_defaults_volume_mounts_to_read_only() {
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [{
+            "type": "volume",
+            "source": "work-nfs",
+            "target": "/sandbox/work"
+        }]
+    })));
+
+    let body = build_container_create_body(&sandbox, &runtime_config()).unwrap();
+    let mounts = body
+        .host_config
+        .unwrap()
+        .mounts
+        .expect("driver config mounts should be set");
+
+    assert_eq!(mounts[0].read_only, Some(true));
+}
+
+#[test]
+fn driver_config_allows_explicit_writable_volume_mounts() {
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [{
+            "type": "volume",
+            "source": "work-nfs",
+            "target": "/sandbox/work",
+            "read_only": false
+        }]
+    })));
+
+    let body = build_container_create_body(&sandbox, &runtime_config()).unwrap();
+    let mounts = body
+        .host_config
+        .unwrap()
+        .mounts
+        .expect("driver config mounts should be set");
+
+    assert_eq!(mounts[0].read_only, Some(false));
+}
+
+#[test]
 fn driver_config_rejects_bind_mounts_unless_enabled() {
     let mut sandbox = test_sandbox();
     sandbox
@@ -675,6 +747,36 @@ fn build_container_create_body_includes_bind_mounts_when_enabled() {
     assert_eq!(mounts[0].typ, Some(MountTypeEnum::BIND));
     assert_eq!(mounts[0].source.as_deref(), Some("/host/path"));
     assert_eq!(mounts[0].target.as_deref(), Some("/sandbox/host"));
+    assert_eq!(mounts[0].read_only, Some(true));
+}
+
+#[test]
+fn driver_config_defaults_enabled_bind_mounts_to_read_only() {
+    let mut sandbox = test_sandbox();
+    sandbox
+        .spec
+        .as_mut()
+        .unwrap()
+        .template
+        .as_mut()
+        .unwrap()
+        .driver_config = Some(json_struct(serde_json::json!({
+        "mounts": [{
+            "type": "bind",
+            "source": "/host/path",
+            "target": "/sandbox/host"
+        }]
+    })));
+    let mut config = runtime_config();
+    config.enable_bind_mounts = true;
+
+    let body = build_container_create_body(&sandbox, &config).unwrap();
+    let mounts = body
+        .host_config
+        .unwrap()
+        .mounts
+        .expect("driver config mounts should be set");
+
     assert_eq!(mounts[0].read_only, Some(true));
 }
 
@@ -753,6 +855,44 @@ fn driver_config_rejects_reserved_mount_targets() {
 
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     assert!(err.message().contains("reserved OpenShell path"));
+}
+
+#[test]
+fn docker_local_volume_with_bind_option_is_bind_backed() {
+    let volume = inspected_volume(
+        "local",
+        HashMap::from([
+            ("type".to_string(), "none".to_string()),
+            ("o".to_string(), "rw,bind".to_string()),
+            ("device".to_string(), "/tmp/openshell".to_string()),
+        ]),
+    );
+
+    assert!(docker_volume_is_bind_backed(&volume));
+}
+
+#[test]
+fn docker_local_volume_without_bind_option_is_not_bind_backed() {
+    let volume = inspected_volume(
+        "local",
+        HashMap::from([
+            ("type".to_string(), "nfs".to_string()),
+            ("o".to_string(), "addr=127.0.0.1,rw".to_string()),
+            ("device".to_string(), ":/exports/openshell".to_string()),
+        ]),
+    );
+
+    assert!(!docker_volume_is_bind_backed(&volume));
+}
+
+#[test]
+fn docker_nonlocal_volume_with_bind_option_is_not_bind_backed() {
+    let volume = inspected_volume(
+        "custom",
+        HashMap::from([("o".to_string(), "bind".to_string())]),
+    );
+
+    assert!(!docker_volume_is_bind_backed(&volume));
 }
 
 #[test]

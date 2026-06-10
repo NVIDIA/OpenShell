@@ -215,6 +215,9 @@ guest_tls_key      = "/etc/openshell/certs/client-key.pem"
 network_name       = "openshell-docker"
 host_gateway_ip    = "172.17.0.1"
 ssh_socket_path    = "/run/openshell/ssh.sock"
+# Unsafe operator override. Host bind mounts, including Docker local-driver
+# bind-backed volumes, expose gateway-host paths inside sandboxes and can
+# negate OpenShell isolation and filesystem controls.
 enable_bind_mounts = false
 # Set to 0 to leave Docker's runtime default unchanged.
 sandbox_pids_limit = 2048
