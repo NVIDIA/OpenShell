@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -129,6 +129,20 @@ fn is_podman_available() -> bool {
     podman_socket_candidates()
         .iter()
         .any(|path| podman_socket_responds(path))
+        || podman_cli_responds()
+}
+
+/// The Podman API socket symlink is not always present (it varies by
+/// version, machine provider, and platform).  Fall back to the CLI,
+/// which has its own internal discovery for reaching the machine.
+fn podman_cli_responds() -> bool {
+    Command::new("podman")
+        .arg("info")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .is_ok_and(|o| o.status.success())
 }
 
 fn podman_socket_candidates() -> Vec<PathBuf> {
