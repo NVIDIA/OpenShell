@@ -58,7 +58,10 @@ if "$CODEX_BIN" exec --help 2>/dev/null | grep -q -- "--ignore-rules"; then
     CODEX_EXEC_ARGS+=(--ignore-rules)
 fi
 
+echo "openshell-agent: invoking Codex sub-agent '$SUBAGENT_ID' (model=$CODEX_MODEL, reasoning=$CODEX_REASONING)" >&2
+
 exec "$CODEX_BIN" "${CODEX_EXEC_ARGS[@]}" \
     -c "model=\"${CODEX_MODEL}\"" \
     -c "model_reasoning_effort=\"${CODEX_REASONING}\"" \
-    - <"$PROMPT_FILE"
+    "$(<"$PROMPT_FILE")" \
+    < /dev/null
