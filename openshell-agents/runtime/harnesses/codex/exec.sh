@@ -23,6 +23,7 @@ PROMPT_FILE="$1"
 export GH_TOKEN="$GITHUB_TOKEN"
 export HOME=/sandbox/home
 
+echo "openshell-agent: preparing Codex harness auth and workspace" >&2
 mkdir -p "$HOME/.codex"
 node - <<'NODE'
 const fs = require("fs");
@@ -74,6 +75,8 @@ if [[ -x "$PAYLOAD_DIR/runtime/harnesses/codex/codex" ]]; then
 fi
 CODEX_MODEL="${CODEX_MODEL:-gpt-5.5}"
 CODEX_REASONING="${CODEX_REASONING:-high}"
+
+echo "openshell-agent: invoking Codex bounded cycle (model=$CODEX_MODEL, reasoning=$CODEX_REASONING)" >&2
 
 CODEX_EXEC_ARGS=(
     exec
