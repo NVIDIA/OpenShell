@@ -135,6 +135,8 @@ struct NetworkEndpointDef {
     graphql_persisted_queries: BTreeMap<String, GraphqlOperationDef>,
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     graphql_max_body_bytes: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    json_rpc: Option<JsonRpcConfigDef>,
 }
 
 // Signature dictated by serde's `skip_serializing_if`, which requires `&T`.
@@ -147,6 +149,17 @@ fn is_zero(v: &u16) -> bool {
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_zero_u32(v: &u32) -> bool {
     *v == 0
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JsonRpcConfigDef {
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    max_body_bytes: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    on_parse_error: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    batch_policy: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -183,6 +196,10 @@ struct L7AllowDef {
     operation_name: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     fields: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    rpc_method: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    params: BTreeMap<String, QueryMatcherDef>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -216,6 +233,10 @@ struct L7DenyRuleDef {
     operation_name: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     fields: Vec<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    rpc_method: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    params: BTreeMap<String, QueryMatcherDef>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -462,6 +483,8 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                                                     (key, yaml_matcher)
                                                 })
                                                 .collect(),
+                                            rpc_method: String::new(),
+                                            params: BTreeMap::new(),
                                         },
                                     }
                                 })
@@ -491,6 +514,8 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                                             (key.clone(), yaml_matcher)
                                         })
                                         .collect(),
+                                    rpc_method: String::new(),
+                                    params: BTreeMap::new(),
                                 })
                                 .collect(),
                             allow_encoded_slash: e.allow_encoded_slash,
@@ -512,6 +537,7 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                                 })
                                 .collect(),
                             graphql_max_body_bytes: e.graphql_max_body_bytes,
+                            json_rpc: None,
                         }
                     })
                     .collect(),
