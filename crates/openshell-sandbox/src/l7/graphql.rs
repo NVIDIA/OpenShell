@@ -802,6 +802,8 @@ network_policies:
             cmdline_paths: Vec::new(),
             secret_resolver: None,
             activity_tx: None,
+            permissive: false,
+            denial_tx: None,
         };
         let request_info = crate::l7::L7RequestInfo {
             action: req.action,

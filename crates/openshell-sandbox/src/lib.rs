@@ -348,7 +348,7 @@ pub async fn run_sandbox(
     // Load policy and initialize OPA engine
     let openshell_endpoint_for_proxy = openshell_endpoint.clone();
     let sandbox_name_for_agg = sandbox.clone();
-    let (policy, opa_engine, retained_proto) = load_policy(
+    let (mut policy, opa_engine, retained_proto, permissive) = load_policy(
         sandbox_id.clone(),
         sandbox,
         openshell_endpoint.clone(),
@@ -356,6 +356,14 @@ pub async fn run_sandbox(
         policy_data,
     )
     .await?;
+
+    if permissive {
+        if let Some(ref mut proxy) = policy.network.proxy {
+            proxy.permissive = true;
+        }
+        info!("Sandbox running in permissive mode: policy denials will be logged but not enforced");
+    }
+
     let policy_local_ctx = Arc::new(policy_local::PolicyLocalContext::new(
         retained_proto.clone(),
         openshell_endpoint.clone(),
@@ -1955,7 +1963,10 @@ mod baseline_tests {
             },
             network: NetworkPolicy {
                 mode: NetworkMode::Proxy,
-                proxy: Some(ProxyPolicy { http_addr: None }),
+                proxy: Some(ProxyPolicy {
+                    http_addr: None,
+                    permissive: false,
+                }),
             },
             landlock: LandlockPolicy::default(),
             process: ProcessPolicy::default(),
@@ -2086,6 +2097,7 @@ async fn load_policy(
     SandboxPolicy,
     Option<Arc<OpaEngine>>,
     Option<openshell_core::proto::SandboxPolicy>,
+    bool, // permissive
 )> {
     // File mode: load OPA engine from rego rules + YAML data (dev override)
     if let (Some(policy_file), Some(data_file)) = (&policy_rules, &policy_data) {
@@ -2109,13 +2121,16 @@ async fn load_policy(
             filesystem: config.filesystem,
             network: NetworkPolicy {
                 mode: NetworkMode::Proxy,
-                proxy: Some(ProxyPolicy { http_addr: None }),
+                proxy: Some(ProxyPolicy {
+                    http_addr: None,
+                    permissive: false,
+                }),
             },
             landlock: config.landlock,
             process: config.process,
         };
         enrich_sandbox_baseline_paths(&mut policy);
-        return Ok((policy, Some(Arc::new(engine)), None));
+        return Ok((policy, Some(Arc::new(engine)), None, false));
     }
 
     // gRPC mode: fetch typed proto policy, construct OPA engine from baked rules + proto data
@@ -2125,8 +2140,10 @@ async fn load_policy(
             endpoint = %endpoint,
             "Fetching sandbox policy via gRPC"
         );
-        let proto_policy =
-            grpc_retry("Policy fetch", || grpc_client::fetch_policy(endpoint, id)).await?;
+        let (proto_policy, permissive) = grpc_retry("Policy fetch", || {
+            grpc_client::fetch_policy_and_permissive(endpoint, id)
+        })
+        .await?;
 
         let mut proto_policy = if let Some(p) = proto_policy {
             p
@@ -2185,7 +2202,7 @@ async fn load_policy(
         let opa_engine = Some(Arc::new(OpaEngine::from_proto(&proto_policy)?));
 
         let policy = SandboxPolicy::try_from(proto_policy.clone())?;
-        return Ok((policy, opa_engine, Some(proto_policy)));
+        return Ok((policy, opa_engine, Some(proto_policy), permissive));
     }
 
     // No policy source available

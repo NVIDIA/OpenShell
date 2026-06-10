@@ -329,6 +329,12 @@ message SandboxSpec {
   // managed fleet-wide.
   reserved 11;
   reserved "proposal_approval_mode";
+  // When true, the sandbox logs but does not enforce policy denials
+  // (audit2allow mode). Network policy violations are logged and
+  // forwarded to the denial aggregator but connections proceed.
+  // Filesystem (Landlock) restrictions are skipped entirely.
+  // Seccomp and process-identity controls remain enforced.
+  bool permissive = 12;
 }
 
 // Public sandbox template mapped onto compute-driver template inputs.

@@ -228,6 +228,7 @@ impl ProxyHandle {
             );
         }
 
+        let permissive = policy.permissive;
         let join = tokio::spawn(async move {
             loop {
                 match listener.accept().await {
@@ -257,6 +258,7 @@ impl ProxyHandle {
                                 resolver,
                                 dtx,
                                 atx,
+                                permissive,
                             )
                             .await
                             {
@@ -413,6 +415,7 @@ async fn handle_tcp_connection(
     secret_resolver: Option<Arc<SecretResolver>>,
     denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
     activity_tx: Option<ActivitySender>,
+    permissive: bool,
 ) -> Result<()> {
     let mut buf = vec![0u8; MAX_HEADER_BYTES];
     let mut used = 0usize;
@@ -460,6 +463,7 @@ async fn handle_tcp_connection(
             secret_resolver,
             denial_tx.as_ref(),
             activity_tx.as_ref(),
+            permissive,
         )
         .await;
     }
@@ -557,44 +561,75 @@ async fn handle_tcp_connection(
     // Allowed connections are logged after the L7 config check (below)
     // so we can distinguish CONNECT (L4-only) from CONNECT_L7 (L7 follows).
     if matches!(decision.action, NetworkAction::Deny { .. }) {
-        let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
-            .activity(ActivityId::Open)
-            .action(ActionId::Denied)
-            .disposition(DispositionId::Blocked)
-            .severity(SeverityId::Medium)
-            .status(StatusId::Failure)
-            .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-            .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
-            .actor_process(
-                Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
-                    .with_cmd_line(&cmdline_str),
+        if permissive {
+            let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                .activity(ActivityId::Open)
+                .action(ActionId::Allowed)
+                .disposition(DispositionId::Logged)
+                .severity(SeverityId::Medium)
+                .status(StatusId::Success)
+                .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+                .actor_process(
+                    Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
+                        .with_cmd_line(&cmdline_str),
+                )
+                .firewall_rule("-", "opa")
+                .message(format!("CONNECT audit-allow {host_lc}:{port} (permissive)"))
+                .status_detail(&deny_reason)
+                .build();
+            ocsf_emit!(event);
+            emit_denial(
+                &denial_tx,
+                &host_lc,
+                port,
+                &binary_str,
+                &decision,
+                &deny_reason,
+                "connect",
+            );
+            emit_activity(&activity_tx, true, "connect_policy_permissive");
+            // Fall through to allow path — SSRF checks still apply below
+        } else {
+            let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                .activity(ActivityId::Open)
+                .action(ActionId::Denied)
+                .disposition(DispositionId::Blocked)
+                .severity(SeverityId::Medium)
+                .status(StatusId::Failure)
+                .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+                .actor_process(
+                    Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
+                        .with_cmd_line(&cmdline_str),
+                )
+                .firewall_rule("-", "opa")
+                .message(format!("CONNECT denied {host_lc}:{port}"))
+                .status_detail(&deny_reason)
+                .build();
+            ocsf_emit!(event);
+            emit_denial(
+                &denial_tx,
+                &host_lc,
+                port,
+                &binary_str,
+                &decision,
+                &deny_reason,
+                "connect",
+            );
+            emit_activity(&activity_tx, true, "connect_policy");
+            respond(
+                &mut client,
+                &build_json_error_response(
+                    403,
+                    "Forbidden",
+                    "policy_denied",
+                    &format!("CONNECT {host_lc}:{port} not permitted by policy"),
+                ),
             )
-            .firewall_rule("-", "opa")
-            .message(format!("CONNECT denied {host_lc}:{port}"))
-            .status_detail(&deny_reason)
-            .build();
-        ocsf_emit!(event);
-        emit_denial(
-            &denial_tx,
-            &host_lc,
-            port,
-            &binary_str,
-            &decision,
-            &deny_reason,
-            "connect",
-        );
-        emit_activity(&activity_tx, true, "connect_policy");
-        respond(
-            &mut client,
-            &build_json_error_response(
-                403,
-                "Forbidden",
-                "policy_denied",
-                &format!("CONNECT {host_lc}:{port} not permitted by policy"),
-            ),
-        )
-        .await?;
-        return Ok(());
+            .await?;
+            return Ok(());
+        }
     }
 
     let sandbox_entrypoint_pid = entrypoint_pid.load(Ordering::Acquire);
@@ -896,7 +931,8 @@ async fn handle_tcp_connection(
 
     // Check if endpoint has L7 config for protocol-aware inspection, and
     // retain the generation for HTTP passthrough keep-alive tunnels.
-    let l7_route = query_l7_route_snapshot(&opa_engine, &decision, &host_lc, port);
+    let l7_route =
+        query_l7_route_snapshot_with_permissive(&opa_engine, &decision, &host_lc, port, permissive);
     let should_inspect_l7 = l7_inspection_active(l7_route.as_ref());
 
     // Log the allowed CONNECT — use CONNECT_L7 when L7 inspection follows,
@@ -953,6 +989,8 @@ async fn handle_tcp_connection(
             .collect(),
         secret_resolver: secret_resolver.clone(),
         activity_tx: activity_tx.clone(),
+        permissive,
+        denial_tx: denial_tx.clone(),
     };
 
     if effective_tls_skip {
@@ -1937,16 +1975,26 @@ fn emit_l7_tunnel_close_after_policy_change(host: &str, port: u16, error: miette
 ///
 /// Returns `Some(L7EndpointConfig)` if the matched endpoint has L7 config (protocol field),
 /// `None` for L4-only endpoints.
+#[cfg(test)]
 fn query_l7_route_snapshot(
     engine: &OpaEngine,
     decision: &ConnectDecision,
     host: &str,
     port: u16,
 ) -> Option<L7RouteSnapshot> {
-    // Only query if action is Allow (not Deny)
+    query_l7_route_snapshot_with_permissive(engine, decision, host, port, false)
+}
+
+fn query_l7_route_snapshot_with_permissive(
+    engine: &OpaEngine,
+    decision: &ConnectDecision,
+    host: &str,
+    port: u16,
+    permissive: bool,
+) -> Option<L7RouteSnapshot> {
     let has_policy = match &decision.action {
         NetworkAction::Allow { matched_policy } => matched_policy.is_some(),
-        NetworkAction::Deny { .. } => false,
+        NetworkAction::Deny { .. } => permissive,
     };
     if !has_policy {
         return None;
@@ -2931,6 +2979,7 @@ async fn handle_forward_proxy(
     secret_resolver: Option<Arc<SecretResolver>>,
     denial_tx: Option<&mpsc::UnboundedSender<DenialEvent>>,
     activity_tx: Option<&ActivitySender>,
+    permissive: bool,
 ) -> Result<()> {
     // 1. Parse the absolute-form URI. `path` is marked `mut` so that, when an
     //    L7 config applies, the canonicalized form produced below replaces it
@@ -3058,11 +3107,45 @@ async fn handle_forward_proxy(
             .join(", ")
     };
 
-    // 4. Only proceed on explicit Allow — reject Deny
+    // 4. Only proceed on explicit Allow — reject Deny (unless permissive)
     let matched_policy = match &decision.action {
         NetworkAction::Allow { matched_policy } => matched_policy.clone(),
         NetworkAction::Deny { reason } => {
-            {
+            if permissive {
+                let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+                    .activity(ActivityId::Other)
+                    .action(ActionId::Allowed)
+                    .disposition(DispositionId::Logged)
+                    .severity(SeverityId::Medium)
+                    .status(StatusId::Success)
+                    .http_request(HttpRequest::new(
+                        method,
+                        OcsfUrl::new("http", &host_lc, &path, port),
+                    ))
+                    .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                    .src_endpoint(Endpoint::from_ip(peer_addr.ip(), peer_addr.port()))
+                    .actor_process(
+                        Process::from_bypass(&binary_str, &pid_str, &ancestors_str)
+                            .with_cmd_line(&cmdline_str),
+                    )
+                    .firewall_rule("-", "opa")
+                    .message(format!(
+                        "FORWARD audit-allow {method} {host_lc}:{port}{path} (permissive)"
+                    ))
+                    .build();
+                ocsf_emit!(event);
+                emit_denial_simple(
+                    denial_tx,
+                    &host_lc,
+                    port,
+                    &binary_str,
+                    &decision,
+                    reason,
+                    "forward",
+                );
+                emit_activity_simple(activity_tx, true, "forward_policy_permissive");
+                None // fall through with no matched policy
+            } else {
                 let event = HttpActivityBuilder::new(crate::ocsf_ctx())
                     .activity(ActivityId::Other)
                     .action(ActionId::Denied)
@@ -3083,28 +3166,28 @@ async fn handle_forward_proxy(
                     .message(format!("FORWARD denied {method} {host_lc}:{port}{path}"))
                     .build();
                 ocsf_emit!(event);
+                emit_denial_simple(
+                    denial_tx,
+                    &host_lc,
+                    port,
+                    &binary_str,
+                    &decision,
+                    reason,
+                    "forward",
+                );
+                emit_activity_simple(activity_tx, true, "forward_policy");
+                respond(
+                    client,
+                    &build_json_error_response(
+                        403,
+                        "Forbidden",
+                        "policy_denied",
+                        &format!("{method} {host_lc}:{port}{path} not permitted by policy"),
+                    ),
+                )
+                .await?;
+                return Ok(());
             }
-            emit_denial_simple(
-                denial_tx,
-                &host_lc,
-                port,
-                &binary_str,
-                &decision,
-                reason,
-                "forward",
-            );
-            emit_activity_simple(activity_tx, true, "forward_policy");
-            respond(
-                client,
-                &build_json_error_response(
-                    403,
-                    "Forbidden",
-                    "policy_denied",
-                    &format!("{method} {host_lc}:{port}{path} not permitted by policy"),
-                ),
-            )
-            .await?;
-            return Ok(());
         }
     };
     let policy_str = matched_policy.as_deref().unwrap_or("-");
@@ -3158,13 +3241,16 @@ async fn handle_forward_proxy(
             .collect(),
         secret_resolver: secret_resolver.clone(),
         activity_tx: activity_tx.cloned(),
+        permissive,
+        denial_tx: denial_tx.cloned(),
     };
     let mut l7_activity_pending = false;
 
     // 4b. If the endpoint has L7 config, evaluate the request against
     //     L7 policy.  The forward proxy handles exactly one request per
     //     connection (Connection: close), so a single evaluation suffices.
-    if let Some(route) = query_l7_route_snapshot(&opa_engine, &decision, &host_lc, port)
+    if let Some(route) =
+        query_l7_route_snapshot_with_permissive(&opa_engine, &decision, &host_lc, port, permissive)
         && !route.configs.is_empty()
     {
         if route.generation != forward_generation_guard.captured_generation() {
@@ -3265,142 +3351,170 @@ async fn handle_forward_proxy(
                     return Ok(());
                 }
             };
-        let Some(l7_config) = select_l7_config_for_path(&route.configs, &path) else {
-            emit_activity_simple(activity_tx, true, "l7_policy");
-            respond(
-                client,
-                &build_json_error_response(
-                    403,
-                    "Forbidden",
-                    "policy_denied",
-                    &format!("{method} {host_lc}:{port}{path} did not match an L7 endpoint path"),
-                ),
-            )
-            .await?;
-            return Ok(());
-        };
-        forward_websocket_request =
-            crate::l7::rest::request_is_websocket_upgrade(&forward_request_bytes);
-        websocket_extensions = crate::l7::relay::websocket_extension_mode(&l7_config.config);
-        request_body_credential_rewrite = l7_config.config.protocol == crate::l7::L7Protocol::Rest
-            && l7_config.config.request_body_credential_rewrite;
-        forward_upgrade_config = Some(l7_config.config.clone());
-        forward_upgrade_target = path.clone();
-        forward_upgrade_query_params = query_params.clone();
-        let graphql = if l7_config.config.protocol == crate::l7::L7Protocol::Graphql {
-            let header_end = forward_request_bytes
-                .windows(4)
-                .position(|w| w == b"\r\n\r\n")
-                .map_or(forward_request_bytes.len(), |p| p + 4);
-            let header_str = std::str::from_utf8(&forward_request_bytes[..header_end])
-                .map_err(|_| miette::miette!("Forward GraphQL headers contain invalid UTF-8"))?;
-            let body_length = crate::l7::rest::parse_body_length(header_str)?;
-            let mut graphql_request = crate::l7::provider::L7Request {
-                action: method.to_string(),
-                target: path.clone(),
-                query_params: query_params.clone(),
-                raw_header: forward_request_bytes,
-                body_length,
-            };
-            let info = match crate::l7::graphql::inspect_graphql_request(
-                client,
-                &mut graphql_request,
-                l7_config.config.graphql_max_body_bytes,
-            )
-            .await
-            {
-                Ok(info) => info,
-                Err(e) => {
-                    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
-                        .activity(ActivityId::Fail)
-                        .severity(SeverityId::Medium)
-                        .status(StatusId::Failure)
-                        .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                        .message(format!("FORWARD_GRAPHQL_L7 request rejected: {e}"))
-                        .build();
-                    ocsf_emit!(event);
-                    emit_activity_simple(activity_tx, true, "l7_parse_rejection");
-                    respond(
-                        client,
-                        &build_json_error_response(
-                            400,
-                            "Bad Request",
-                            "invalid_graphql_request",
-                            &format!("GraphQL request rejected before policy evaluation: {e}"),
-                        ),
-                    )
-                    .await?;
-                    return Ok(());
+        let l7_config = select_l7_config_for_path(&route.configs, &path);
+        if l7_config.is_none() {
+            if permissive {
+                if let Some(tx) = denial_tx {
+                    let _ = tx.send(DenialEvent {
+                        host: host_lc.clone(),
+                        port,
+                        binary: binary_str.clone(),
+                        ancestors: decision
+                            .ancestors
+                            .iter()
+                            .map(|p| p.display().to_string())
+                            .collect(),
+                        deny_reason: "no L7 endpoint path matched".to_string(),
+                        denial_stage: "l7".to_string(),
+                        l7_method: Some(method.to_string()),
+                        l7_path: Some(path.clone()),
+                    });
                 }
-            };
-            forward_request_bytes = graphql_request.raw_header;
-            Some(info)
-        } else {
-            None
-        };
-        let request_info = crate::l7::L7RequestInfo {
-            action: method.to_string(),
-            target: path.clone(),
-            query_params,
-            graphql,
-        };
-
-        let parse_error_reason = request_info
-            .graphql
-            .as_ref()
-            .and_then(|info| info.error.as_deref())
-            .map(|error| format!("GraphQL request rejected: {error}"));
-        let force_deny = parse_error_reason.is_some();
-        let (allowed, reason) = parse_error_reason.map_or_else(
-            || {
-                crate::l7::relay::evaluate_l7_request(&tunnel_engine, &l7_ctx, &request_info)
-                    .unwrap_or_else(|e| {
+                emit_activity_simple(activity_tx, true, "l7_policy_permissive");
+            } else {
+                emit_activity_simple(activity_tx, true, "l7_policy");
+                respond(
+                    client,
+                    &build_json_error_response(
+                        403,
+                        "Forbidden",
+                        "policy_denied",
+                        &format!(
+                            "{method} {host_lc}:{port}{path} did not match an L7 endpoint path"
+                        ),
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+        }
+        if let Some(l7_config) = l7_config {
+            forward_websocket_request =
+                crate::l7::rest::request_is_websocket_upgrade(&forward_request_bytes);
+            websocket_extensions = crate::l7::relay::websocket_extension_mode(&l7_config.config);
+            request_body_credential_rewrite = l7_config.config.protocol
+                == crate::l7::L7Protocol::Rest
+                && l7_config.config.request_body_credential_rewrite;
+            forward_upgrade_config = Some(l7_config.config.clone());
+            forward_upgrade_target = path.clone();
+            forward_upgrade_query_params = query_params.clone();
+            let graphql = if l7_config.config.protocol == crate::l7::L7Protocol::Graphql {
+                let header_end = forward_request_bytes
+                    .windows(4)
+                    .position(|w| w == b"\r\n\r\n")
+                    .map_or(forward_request_bytes.len(), |p| p + 4);
+                let header_str = std::str::from_utf8(&forward_request_bytes[..header_end])
+                    .map_err(|_| {
+                        miette::miette!("Forward GraphQL headers contain invalid UTF-8")
+                    })?;
+                let body_length = crate::l7::rest::parse_body_length(header_str)?;
+                let mut graphql_request = crate::l7::provider::L7Request {
+                    action: method.to_string(),
+                    target: path.clone(),
+                    query_params: query_params.clone(),
+                    raw_header: forward_request_bytes,
+                    body_length,
+                };
+                let info = match crate::l7::graphql::inspect_graphql_request(
+                    client,
+                    &mut graphql_request,
+                    l7_config.config.graphql_max_body_bytes,
+                )
+                .await
+                {
+                    Ok(info) => info,
+                    Err(e) => {
                         let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
                             .activity(ActivityId::Fail)
-                            .severity(SeverityId::Low)
+                            .severity(SeverityId::Medium)
                             .status(StatusId::Failure)
                             .dst_endpoint(Endpoint::from_domain(&host_lc, port))
-                            .message(format!("L7 eval failed, denying request: {e}"))
+                            .message(format!("FORWARD_GRAPHQL_L7 request rejected: {e}"))
                             .build();
                         ocsf_emit!(event);
-                        (false, format!("L7 evaluation error: {e}"))
-                    })
-            },
-            |reason| (false, reason),
-        );
-
-        let decision_str = match (allowed, l7_config.config.enforcement) {
-            (_, _) if force_deny => "deny",
-            (true, _) => "allow",
-            (false, crate::l7::EnforcementMode::Audit) => "audit",
-            (false, crate::l7::EnforcementMode::Enforce) => "deny",
-        };
-
-        {
-            let (action_id, disposition_id, severity) = match decision_str {
-                "deny" => (ActionId::Denied, DispositionId::Blocked, SeverityId::Medium),
-                "allow" | "audit" => (
-                    ActionId::Allowed,
-                    DispositionId::Allowed,
-                    SeverityId::Informational,
-                ),
-                _ => (
-                    ActionId::Other,
-                    DispositionId::Other,
-                    SeverityId::Informational,
-                ),
-            };
-            let engine_type = if l7_config.config.protocol == crate::l7::L7Protocol::Graphql {
-                "l7-graphql"
+                        emit_activity_simple(activity_tx, true, "l7_parse_rejection");
+                        respond(
+                            client,
+                            &build_json_error_response(
+                                400,
+                                "Bad Request",
+                                "invalid_graphql_request",
+                                &format!("GraphQL request rejected before policy evaluation: {e}"),
+                            ),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                };
+                forward_request_bytes = graphql_request.raw_header;
+                Some(info)
             } else {
-                "l7"
+                None
             };
-            let message_prefix = if l7_config.config.protocol == crate::l7::L7Protocol::Graphql {
-                "FORWARD_GRAPHQL_L7"
-            } else {
-                "FORWARD_L7"
+            let request_info = crate::l7::L7RequestInfo {
+                action: method.to_string(),
+                target: path.clone(),
+                query_params,
+                graphql,
             };
-            let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+
+            let parse_error_reason = request_info
+                .graphql
+                .as_ref()
+                .and_then(|info| info.error.as_deref())
+                .map(|error| format!("GraphQL request rejected: {error}"));
+            let force_deny = parse_error_reason.is_some();
+            let (allowed, reason) = parse_error_reason.map_or_else(
+                || {
+                    crate::l7::relay::evaluate_l7_request(&tunnel_engine, &l7_ctx, &request_info)
+                        .unwrap_or_else(|e| {
+                            let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                                .activity(ActivityId::Fail)
+                                .severity(SeverityId::Low)
+                                .status(StatusId::Failure)
+                                .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                                .message(format!("L7 eval failed, denying request: {e}"))
+                                .build();
+                            ocsf_emit!(event);
+                            (false, format!("L7 evaluation error: {e}"))
+                        })
+                },
+                |reason| (false, reason),
+            );
+
+            let decision_str = match (allowed, l7_config.config.enforcement) {
+                (_, _) if force_deny => "deny",
+                (true, _) => "allow",
+                (false, crate::l7::EnforcementMode::Audit) => "audit",
+                (false, crate::l7::EnforcementMode::Enforce) => "deny",
+            };
+
+            {
+                let (action_id, disposition_id, severity) = match decision_str {
+                    "deny" => (ActionId::Denied, DispositionId::Blocked, SeverityId::Medium),
+                    "allow" | "audit" => (
+                        ActionId::Allowed,
+                        DispositionId::Allowed,
+                        SeverityId::Informational,
+                    ),
+                    _ => (
+                        ActionId::Other,
+                        DispositionId::Other,
+                        SeverityId::Informational,
+                    ),
+                };
+                let engine_type = if l7_config.config.protocol == crate::l7::L7Protocol::Graphql {
+                    "l7-graphql"
+                } else {
+                    "l7"
+                };
+                let message_prefix = if l7_config.config.protocol == crate::l7::L7Protocol::Graphql
+                {
+                    "FORWARD_GRAPHQL_L7"
+                } else {
+                    "FORWARD_L7"
+                };
+                let event = HttpActivityBuilder::new(crate::ocsf_ctx())
                 .activity(ActivityId::Other)
                 .action(action_id)
                 .disposition(disposition_id)
@@ -3420,37 +3534,58 @@ async fn handle_forward_proxy(
                     "{message_prefix} {decision_str} {method} {host_lc}:{port}{path} reason={reason}"
                 ))
                 .build();
-            ocsf_emit!(event);
-        }
+                ocsf_emit!(event);
+            }
 
-        let effectively_denied = force_deny
-            || (!allowed && l7_config.config.enforcement == crate::l7::EnforcementMode::Enforce);
+            let l7_would_deny = force_deny
+                || (!allowed
+                    && l7_config.config.enforcement == crate::l7::EnforcementMode::Enforce);
 
-        if effectively_denied {
-            emit_activity_simple(activity_tx, true, "l7_policy");
-            emit_denial_simple(
-                denial_tx,
-                &host_lc,
-                port,
-                &binary_str,
-                &decision,
-                &reason,
-                "forward-l7-deny",
-            );
-            respond(
-                client,
-                &build_json_error_response(
-                    403,
-                    "Forbidden",
-                    "policy_denied",
-                    &format!("{method} {host_lc}:{port}{path} denied by L7 policy: {reason}"),
-                ),
-            )
-            .await?;
-            return Ok(());
-        }
-        l7_activity_pending = true;
-        forward_tunnel_engine = Some(tunnel_engine);
+            if l7_would_deny && !permissive {
+                emit_activity_simple(activity_tx, true, "l7_policy");
+                emit_denial_simple(
+                    denial_tx,
+                    &host_lc,
+                    port,
+                    &binary_str,
+                    &decision,
+                    &reason,
+                    "forward-l7-deny",
+                );
+                respond(
+                    client,
+                    &build_json_error_response(
+                        403,
+                        "Forbidden",
+                        "policy_denied",
+                        &format!("{method} {host_lc}:{port}{path} denied by L7 policy: {reason}"),
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+            if l7_would_deny && permissive {
+                if let Some(tx) = denial_tx {
+                    let _ = tx.send(DenialEvent {
+                        host: host_lc.clone(),
+                        port,
+                        binary: binary_str.clone(),
+                        ancestors: decision
+                            .ancestors
+                            .iter()
+                            .map(|p| p.display().to_string())
+                            .collect(),
+                        deny_reason: reason.clone(),
+                        denial_stage: "l7".to_string(),
+                        l7_method: Some(method.to_string()),
+                        l7_path: Some(path.clone()),
+                    });
+                }
+                emit_activity_simple(activity_tx, true, "l7_policy_permissive");
+            }
+            l7_activity_pending = true;
+            forward_tunnel_engine = Some(tunnel_engine);
+        } // if let Some(l7_config)
     }
 
     // 5. DNS resolution + SSRF defence (mirrors the CONNECT path logic).
@@ -4215,6 +4350,8 @@ mod tests {
             cmdline_paths: vec![],
             secret_resolver: None,
             activity_tx: None,
+            permissive: false,
+            denial_tx: None,
         };
         (config, tunnel_engine, ctx)
     }
@@ -4381,6 +4518,8 @@ mod tests {
             cmdline_paths: vec![],
             secret_resolver: resolver,
             activity_tx: None,
+            permissive: false,
+            denial_tx: None,
         };
         let query_params = std::collections::HashMap::new();
 
@@ -4422,6 +4561,8 @@ mod tests {
             cmdline_paths: vec![],
             secret_resolver: None,
             activity_tx: None,
+            permissive: false,
+            denial_tx: None,
         };
         let query_params = std::collections::HashMap::new();
         let config = websocket_l7_config(crate::l7::L7Protocol::Rest, false);
