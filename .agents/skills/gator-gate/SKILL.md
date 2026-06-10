@@ -126,10 +126,25 @@ Resolve PRs and issues carefully:
 
 ```bash
 gh issue view <issue> --json number,title,body,state,author,labels,comments,createdAt,updatedAt,closedAt,url
-gh pr view <pr> --json number,title,body,state,author,labels,comments,reviews,closingIssuesReferences,files,isDraft,mergeStateStatus,reviewDecision,headRefOid,headRefName,baseRefName,url
+gh pr view <pr> --json number,title,body,state,author,labels,comments,reviews,closingIssuesReferences,files,isDraft,mergeStateStatus,reviewDecision,headRefOid,headRefName,baseRefName,mergedAt,closedAt,url
 ```
 
 For a PR-only input, derive linked issues from `closingIssuesReferences`, PR body references such as `Fixes #123`, and issue comments that mention the PR. If no linked issue exists, validate the PR directly.
+
+## Invocation Scope
+
+Before discovering work, define the invocation target selector and keep every later query within that selector.
+
+- Explicit issue or PR numbers: process only those items, even if a PR is closed or merged.
+- "My PRs" or similar operator-owned requests: resolve the current GitHub user with `gh api user --jq '.login'` and process only PRs authored by that login.
+- "All active PRs", "all gator-labeled PRs", or repo-wide requests: process across authors only when the operator explicitly asks for repo-wide scope. For write actions across authors, verify maintainer authority first.
+- No-number requests that mention untriaged issues: process only the issue set implied by the request, such as open issues with `state:triage-needed`.
+
+For PR watch requests, normal discovery should include open non-draft PRs matching the target selector. Closed/merged reconciliation may also include closed or merged PRs matching the same selector when they still have an active `gator:*` label. This is a cleanup extension of the current invocation scope, not permission to scan or mutate all gator-labeled PRs in the repository.
+
+When using closed/merged reconciliation for a PR that was not explicitly requested by number, require a prior comment beginning with `> **gator-agent**` before mutating labels.
+
+If a closed or merged PR has an active `gator:*` label but no gator marker and was not explicitly requested, report the label drift in the cycle summary and leave the labels unchanged.
 
 ## State Machine
 
@@ -212,6 +227,26 @@ If multiple `gator:*` labels exist:
 
 If no `gator:*` label exists, begin validation.
 
+## Closed/Merged PR Reconciliation
+
+Before running normal PR validation, review, CI, or approval logic, check whether each target PR is already closed or merged.
+
+For merged PRs:
+
+1. Post a `Monitoring Complete` comment when the PR still has an active `gator:*` label or the latest gator comment does not already record monitoring completion.
+2. Remove all active `gator:*` labels.
+3. Do not run duplicate detection, review, CI watch, approval nudges, or other active-state transitions.
+
+For closed-unmerged PRs:
+
+1. Post a `Monitoring Complete` comment when the PR still has an active `gator:*` label or the latest gator comment does not already record monitoring completion.
+2. Remove all active `gator:*` labels.
+3. Do not run duplicate detection, review, CI watch, approval nudges, or other active-state transitions.
+
+For closed or merged PRs that have no active `gator:*` label and already have a monitoring-complete gator comment, take no GitHub write action.
+
+In supervised watch mode, return `OPENSHELL_AGENT_RESULT {"status":"complete","reason":"pr_merged"}` or `OPENSHELL_AGENT_RESULT {"status":"complete","reason":"pr_closed"}` only when all targeted PRs in the cycle are closed, merged, or otherwise complete. If any targeted PR still needs future reconciliation, return the appropriate `waiting` or `blocked` sentinel for the active work.
+
 ## Watch Loop Rules
 
 Every gator state is a watch state. On each invocation, determine the current state, inspect the latest issue/PR activity, and either advance to the next state, keep waiting, or post a TTL nudge.
@@ -222,7 +257,7 @@ When `OPENSHELL_AGENT_RUN_MODE=watch`, the OpenShell agent supervisor owns the s
 OPENSHELL_AGENT_RESULT {"status":"waiting","next_poll_seconds":900,"reason":"checks_pending"}
 ```
 
-Use `status=waiting` for routine CI/PR activity waits, `status=blocked` for human or process blockers, `status=complete` for closed/merged/terminal items, `status=terminal_failure` for unrecoverable errors, and `status=transient_failure` only when the supervisor should retry soon. The supervisor will sleep and invoke the harness again with fresh GitHub state.
+Use `status=waiting` for routine CI/PR activity waits, `status=blocked` for human or process blockers, `status=complete` for closed or merged PRs and other complete items, `status=terminal_failure` for unrecoverable errors, and `status=transient_failure` only when the supervisor should retry soon. The supervisor will sleep and invoke the harness again with fresh GitHub state.
 
 When not running under supervised watch mode, do not stop after a one-shot check when a PR is in an active waiting state unless the operator explicitly asks for a one-shot status check. Enter a polling loop and state the interval and stop conditions before waiting.
 
@@ -638,6 +673,20 @@ Checks: <summary>
 E2E: <summary or N/A>
 
 Human maintainer approval or merge decision is now required.
+```
+
+### Monitoring Complete
+
+```markdown
+> **gator-agent**
+
+## Monitoring Complete
+
+Monitoring is complete because this PR has <merged / been closed without merge>.
+
+Final status: <summary of the last known gator state, checks, or review status when useful>
+
+I removed the active `gator:*` label because there is nothing left for gator to monitor on this PR.
 ```
 
 ### Maintainer Nudge
