@@ -21,6 +21,11 @@ require_env GITHUB_TOKEN
 
 PROMPT_FILE="$1"
 export GH_TOKEN="$GITHUB_TOKEN"
+export GH_PROMPT_DISABLED=1
+export GH_NO_UPDATE_NOTIFIER=1
+export GH_NO_EXTENSION_UPDATE_NOTIFIER=1
+export GH_TELEMETRY=false
+export DO_NOT_TRACK=1
 export HOME=/sandbox/home
 
 echo "openshell-agent: preparing Codex harness auth and workspace" >&2
