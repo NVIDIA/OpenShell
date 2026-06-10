@@ -6,7 +6,7 @@
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bollard::Docker;
@@ -121,9 +121,10 @@ async fn sandbox_mounts_enabled_driver_config_bind() {
     fs::set_permissions(&input_path, fs::Permissions::from_mode(0o666))
         .expect("make bind mount input readable by sandbox user");
 
+    let bind_source = bind_mount_source_path(&driver, host_dir.path());
     let bind_mount = serde_json::json!({
         "type": "bind",
-        "source": host_dir.path(),
+        "source": bind_source,
         "target": BIND_TARGET,
         "read_only": false
     });
@@ -426,4 +427,22 @@ fn driver_config_mount_json(driver: &str, mount: &Value) -> String {
         }),
     );
     Value::Object(root).to_string()
+}
+
+fn bind_mount_source_path(driver: &str, path: &Path) -> PathBuf {
+    if driver == "docker" {
+        github_actions_host_work_path(path).unwrap_or_else(|| path.to_path_buf())
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn github_actions_host_work_path(path: &Path) -> Option<PathBuf> {
+    if std::env::var("GITHUB_ACTIONS").ok().as_deref() != Some("true") {
+        return None;
+    }
+
+    let relative = path.strip_prefix("/__w").ok()?;
+    let mapped = Path::new("/home/runner/_work").join(relative);
+    mapped.exists().then_some(mapped)
 }

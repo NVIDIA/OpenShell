@@ -30,10 +30,11 @@ _BASE_PROCESS = sandbox_pb2.ProcessPolicy(run_as_user="sandbox", run_as_group="s
 # Standard proxy address inside the sandbox network namespace
 _PROXY_HOST = "10.200.0.1"
 _PROXY_PORT = 3128
-# sslip.io keeps the wildcard test on deterministic public DNS. Vendor-owned
-# telemetry subdomains can be NXDOMAIN or resolve to private ranges in CI.
-_PUBLIC_WILDCARD_SUFFIX = "1.1.1.1.sslip.io"
+# example.com keeps the wildcard test on public DNS while avoiding sslip.io
+# rewrites that can resolve to internal ranges in CI.
+_PUBLIC_WILDCARD_SUFFIX = "example.com"
 _PUBLIC_WILDCARD_PATTERN = f"*.{_PUBLIC_WILDCARD_SUFFIX}"
+_PUBLIC_WILDCARD_SUBDOMAIN = f"www.{_PUBLIC_WILDCARD_SUFFIX}"
 
 
 def _base_policy(
@@ -1865,19 +1866,13 @@ def test_host_wildcard_matches_subdomain(
     )
     spec = datamodel_pb2.SandboxSpec(policy=policy)
     with sandbox(spec=spec, delete_on_exit=True) as sb:
-        first_subdomain = f"alpha.{_PUBLIC_WILDCARD_SUFFIX}"
-        result = sb.exec_python(_proxy_connect(), args=(first_subdomain, 443))
-        assert result.exit_code == 0, result.stderr
-        assert "200" in result.stdout, (
-            f"{_PUBLIC_WILDCARD_PATTERN} should match {first_subdomain}: "
-            f"{result.stdout}"
+        result = sb.exec_python(
+            _proxy_connect(), args=(_PUBLIC_WILDCARD_SUBDOMAIN, 443)
         )
-
-        second_subdomain = f"beta.{_PUBLIC_WILDCARD_SUFFIX}"
-        result = sb.exec_python(_proxy_connect(), args=(second_subdomain, 443))
         assert result.exit_code == 0, result.stderr
         assert "200" in result.stdout, (
-            f"{_PUBLIC_WILDCARD_PATTERN} should match {second_subdomain}: "
+            f"{_PUBLIC_WILDCARD_PATTERN} should match "
+            f"{_PUBLIC_WILDCARD_SUBDOMAIN}: "
             f"{result.stdout}"
         )
 
