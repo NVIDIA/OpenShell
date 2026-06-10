@@ -46,7 +46,7 @@ spec:
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
-        - name: {{ .Chart.Name }}
+        - name: openshell-gateway
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           image: {{ include "openshell.image" . | quote }}

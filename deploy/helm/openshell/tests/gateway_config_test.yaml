@@ -18,6 +18,13 @@ tests:
       - exists:
           path: spec.template.metadata.annotations["checksum/gateway-config"]
 
+  - it: uses a stable gateway container name
+    template: templates/statefulset.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].name
+          value: openshell-gateway
+
   - it: mounts the OIDC CA bundle when TLS is disabled
     template: templates/statefulset.yaml
     set:

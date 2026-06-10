@@ -132,7 +132,7 @@ Common findings:
 helm -n openshell status openshell
 helm -n openshell get values openshell
 kubectl -n openshell get statefulset,pod,svc,pvc
-kubectl -n openshell logs statefulset/openshell --tail=200
+kubectl -n openshell logs statefulset/openshell -c openshell-gateway --tail=200
 kubectl -n openshell rollout status statefulset/openshell
 ```
 
@@ -238,7 +238,7 @@ If the gateway is healthy but sandbox creation fails:
 ```bash
 kubectl -n openshell get pods
 kubectl -n openshell get events --sort-by=.lastTimestamp | tail -n 50
-kubectl -n openshell logs statefulset/openshell --tail=200
+kubectl -n openshell logs statefulset/openshell -c openshell-gateway --tail=200
 ```
 
 Check the configured sandbox namespace:
@@ -286,7 +286,7 @@ openshell logs <sandbox-name>
 | Docker or Podman sandbox never registers | Wrong callback endpoint or supervisor startup failure | Gateway logs and sandbox container logs |
 | Docker GPU e2e fails before GPU sandbox comparison | NVIDIA CDI specs are missing or Docker has not discovered them | `docker info --format '{{json .DiscoveredDevices}}'`, `/etc/cdi`, `/var/run/cdi`, `nvidia-cdi-refresh.service` |
 | Kubernetes gateway pod pending | PVC unbound, taint, selector, or insufficient resources | `kubectl -n openshell describe pod <pod>` |
-| Kubernetes gateway pod crash loops | Missing secret, bad DB URL, bad TLS config | `kubectl -n openshell logs statefulset/openshell` |
+| Kubernetes gateway pod crash loops | Missing secret, bad DB URL, bad TLS config | `kubectl -n openshell logs statefulset/openshell -c openshell-gateway` |
 | CLI TLS error | Local mTLS bundle does not match server cert/CA | Check `~/.config/openshell/gateways/<name>/mtls/` |
 | Image pull failure | Gateway or sandbox image cannot be pulled | Runtime events and image pull credentials |
 | `K8s namespace not ready` with `envoy-gateway-openshell.yaml: the server could not find the requested resource` | Optional Gateway API manifest was applied without Envoy Gateway CRDs, or k3s Helm controller startup exceeded the namespace wait | Apply `deploy/kube/manifests/envoy-gateway-openshell.yaml` manually only after Envoy Gateway is installed and `grpcRoute` is enabled |
