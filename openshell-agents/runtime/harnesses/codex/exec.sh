@@ -95,4 +95,5 @@ fi
 exec "$CODEX_BIN" "${CODEX_EXEC_ARGS[@]}" \
     -c "model=\"${CODEX_MODEL}\"" \
     -c "model_reasoning_effort=\"${CODEX_REASONING}\"" \
-    "$(<"$PROMPT_FILE")"
+    "$(<"$PROMPT_FILE")" \
+    < /dev/null
