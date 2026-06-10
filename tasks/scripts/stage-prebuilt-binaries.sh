@@ -52,6 +52,10 @@ host_os() {
   uname -s
 }
 
+has_cargo_zigbuild() {
+  command -v cargo-zigbuild >/dev/null 2>&1 || mise which cargo-zigbuild >/dev/null 2>&1
+}
+
 detect_arches() {
   if [[ -n "${PREBUILT_ARCH:-}" ]]; then
     normalize_arch "${PREBUILT_ARCH}"
@@ -159,15 +163,17 @@ build_component_for_arch() {
   build_target="$target"
 
   if [[ "$component" == "gateway" ]]; then
-    if command -v cargo-zigbuild >/dev/null 2>&1 || mise which cargo-zigbuild >/dev/null 2>&1; then
+    if has_cargo_zigbuild; then
       cargo_subcommand=(cargo zigbuild)
       build_target="${target}.2.31"
     else
       echo "Error: cargo-zigbuild + zig are required to build ${binary} with the glibc 2.31 floor." >&2
       exit 1
     fi
+  elif [[ "$target_libc" == "musl" ]] && has_cargo_zigbuild; then
+    cargo_subcommand=(cargo zigbuild)
   elif [[ "$current_host_os" != "Linux" || "$current_host_arch" != "$arch" ]]; then
-    if command -v cargo-zigbuild >/dev/null 2>&1 || mise which cargo-zigbuild >/dev/null 2>&1; then
+    if has_cargo_zigbuild; then
       cargo_subcommand=(cargo zigbuild)
     else
       echo "Error: cannot build ${binary} for linux/${arch} on ${current_host_os}/${current_host_arch}." >&2

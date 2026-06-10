@@ -61,7 +61,9 @@ Binary staging is driven by `tasks/scripts/stage-prebuilt-binaries.sh`. Gateway
 binaries use `cargo zigbuild` with GNU targets pinned to glibc 2.31, including
 native-architecture builds, so the gateway image, standalone tarballs, and Linux
 packages share the same host portability floor. Supervisor binaries remain
-static musl. Local Docker image tasks infer the target architecture from
+static musl and use `cargo zigbuild` when available, including native CPU
+architectures, so C dependencies are compiled for the musl target instead of the
+host GNU libc target. Local Docker image tasks infer the target architecture from
 `DOCKER_PLATFORM` when set, otherwise from the container engine host metadata
 with the kernel architecture as the fallback. CI invokes the same staging step
 via the `rust-native-build.yml` workflow (per-architecture, per-component) and
