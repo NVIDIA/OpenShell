@@ -117,9 +117,15 @@ sleep_with_heartbeat() {
 active_cycle_heartbeat() {
     local active_cycle="$1"
     local elapsed=0
+    local sleep_pid=""
+
+    trap 'if [[ -n "${sleep_pid:-}" ]]; then kill "$sleep_pid" 2>/dev/null || true; wait "$sleep_pid" 2>/dev/null || true; fi; exit 0' TERM INT EXIT
 
     while true; do
-        sleep "$HEARTBEAT_SECONDS" || exit 0
+        sleep "$HEARTBEAT_SECONDS" &
+        sleep_pid=$!
+        wait "$sleep_pid" || exit 0
+        sleep_pid=""
         elapsed=$((elapsed + HEARTBEAT_SECONDS))
         echo "openshell-agent: still running $RUN_MODE cycle $active_cycle with harness $OPENSHELL_AGENT_HARNESS after ${elapsed}s" >&2
     done
