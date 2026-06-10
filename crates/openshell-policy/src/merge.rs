@@ -748,6 +748,7 @@ fn expand_access_preset(protocol: &str, access: &str) -> Option<Vec<L7Rule>> {
                     operation_name: String::new(),
                     fields: Vec::new(),
                     rpc_method: String::new(),
+                    params: HashMap::default(),
                 }),
             })
             .collect(),
@@ -963,6 +964,7 @@ mod tests {
                 operation_name: String::new(),
                 fields: Vec::new(),
                 rpc_method: String::new(),
+                params: HashMap::default(),
             }),
         }
     }

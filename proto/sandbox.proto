@@ -165,6 +165,9 @@ message L7DenyRule {
   repeated string fields = 7;
   // JSON-RPC method name (JSON-RPC): exact name or glob, e.g. "tools/call".
   string rpc_method = 8;
+  // JSON-RPC params matcher map. Dot-separated keys select nested params
+  // fields, e.g. "arguments.scope".
+  map<string, L7QueryMatcher> params = 9;
 }
 
 // An L7 policy rule (allow-only).
@@ -193,6 +196,9 @@ message L7Allow {
   repeated string fields = 7;
   // JSON-RPC method name (JSON-RPC): exact name or glob, e.g. "tools/call".
   string rpc_method = 8;
+  // JSON-RPC params matcher map. Dot-separated keys select nested params
+  // fields, e.g. "arguments.scope".
+  map<string, L7QueryMatcher> params = 9;
 }
 
 // Query value matcher for one query parameter key.

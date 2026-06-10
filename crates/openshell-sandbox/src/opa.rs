@@ -923,6 +923,24 @@ fn resolve_binary_in_container(_policy_path: &str, _entrypoint_pid: u32) -> Opti
     None
 }
 
+fn l7_matchers_to_json(
+    matchers: &std::collections::HashMap<String, openshell_core::proto::L7QueryMatcher>,
+) -> serde_json::Map<String, serde_json::Value> {
+    matchers
+        .iter()
+        .map(|(key, matcher)| {
+            let mut matcher_json = serde_json::json!({});
+            if !matcher.glob.is_empty() {
+                matcher_json["glob"] = matcher.glob.clone().into();
+            }
+            if !matcher.any.is_empty() {
+                matcher_json["any"] = matcher.any.clone().into();
+            }
+            (key.clone(), matcher_json)
+        })
+        .collect()
+}
+
 /// Convert typed proto policy fields to JSON suitable for `engine.add_data_json()`.
 ///
 /// The rego rules reference `data.*` directly, so the JSON structure has
@@ -1028,28 +1046,17 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                                 {
                                     allow["fields"] = a.fields.clone().into();
                                 }
-                                let query: serde_json::Map<String, serde_json::Value> = a
-                                    .map(|allow| {
-                                        allow
-                                            .query
-                                            .iter()
-                                            .map(|(key, matcher)| {
-                                                let mut matcher_json = serde_json::json!({});
-                                                if !matcher.glob.is_empty() {
-                                                    matcher_json["glob"] =
-                                                        matcher.glob.clone().into();
-                                                }
-                                                if !matcher.any.is_empty() {
-                                                    matcher_json["any"] =
-                                                        matcher.any.clone().into();
-                                                }
-                                                (key.clone(), matcher_json)
-                                            })
-                                            .collect()
-                                    })
-                                    .unwrap_or_default();
+                                let query = a.map_or_else(serde_json::Map::new, |allow| {
+                                    l7_matchers_to_json(&allow.query)
+                                });
                                 if !query.is_empty() {
                                     allow["query"] = query.into();
+                                }
+                                let params = a.map_or_else(serde_json::Map::new, |allow| {
+                                    l7_matchers_to_json(&allow.params)
+                                });
+                                if !params.is_empty() {
+                                    allow["params"] = params.into();
                                 }
                                 serde_json::json!({ "allow": allow })
                             })
@@ -1086,22 +1093,16 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                                 if !d.fields.is_empty() {
                                     deny["fields"] = d.fields.clone().into();
                                 }
-                                let query: serde_json::Map<String, serde_json::Value> = d
-                                    .query
-                                    .iter()
-                                    .map(|(key, matcher)| {
-                                        let mut matcher_json = serde_json::json!({});
-                                        if !matcher.glob.is_empty() {
-                                            matcher_json["glob"] = matcher.glob.clone().into();
-                                        }
-                                        if !matcher.any.is_empty() {
-                                            matcher_json["any"] = matcher.any.clone().into();
-                                        }
-                                        (key.clone(), matcher_json)
-                                    })
-                                    .collect();
+                                if !d.rpc_method.is_empty() {
+                                    deny["rpc_method"] = d.rpc_method.clone().into();
+                                }
+                                let query = l7_matchers_to_json(&d.query);
                                 if !query.is_empty() {
                                     deny["query"] = query.into();
+                                }
+                                let params = l7_matchers_to_json(&d.params);
+                                if !params.is_empty() {
+                                    deny["params"] = params.into();
                                 }
                                 deny
                             })
@@ -1951,6 +1952,16 @@ process:
     }
 
     fn l7_jsonrpc_input(host: &str, port: u16, path: &str, rpc_method: &str) -> serde_json::Value {
+        l7_jsonrpc_input_with_params(host, port, path, rpc_method, serde_json::json!({}))
+    }
+
+    fn l7_jsonrpc_input_with_params(
+        host: &str,
+        port: u16,
+        path: &str,
+        rpc_method: &str,
+        params: serde_json::Value,
+    ) -> serde_json::Value {
         serde_json::json!({
             "network": { "host": host, "port": port },
             "exec": {
@@ -1963,7 +1974,8 @@ process:
                 "path": path,
                 "query_params": {},
                 "jsonrpc": {
-                    "method": rpc_method
+                    "method": rpc_method,
+                    "params": params
                 }
             }
         })
@@ -2516,6 +2528,7 @@ network_policies:
                             operation_name: String::new(),
                             fields: Vec::new(),
                             rpc_method: String::new(),
+                            params: std::collections::HashMap::new(),
                         }),
                     }],
                     ..Default::default()
@@ -2587,6 +2600,7 @@ network_policies:
                             operation_name: String::new(),
                             fields: Vec::new(),
                             rpc_method: "initialize".to_string(),
+                            params: std::collections::HashMap::new(),
                         }),
                     }],
                     ..Default::default()
@@ -2621,6 +2635,80 @@ network_policies:
 
         let deny_input = l7_jsonrpc_input("mcp.proto.com", 8000, "/mcp", "tools/list");
         assert!(!eval_l7(&engine, &deny_input));
+    }
+
+    #[test]
+    fn l7_jsonrpc_params_rules_filter_tools_call() {
+        let data = r#"
+network_policies:
+  jsonrpc_params:
+    name: jsonrpc_params
+    endpoints:
+      - host: mcp.params.test
+        port: 8000
+        path: /mcp
+        protocol: json-rpc
+        enforcement: enforce
+        rules:
+          - allow:
+              rpc_method: tools/call
+              params:
+                name: read_status
+          - allow:
+              rpc_method: tools/call
+              params:
+                name: submit_report
+                arguments.scope: workspace/main
+        deny_rules:
+          - rpc_method: tools/call
+            params:
+              name: blocked_action
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).expect("engine from yaml");
+
+        let read_status = l7_jsonrpc_input_with_params(
+            "mcp.params.test",
+            8000,
+            "/mcp",
+            "tools/call",
+            serde_json::json!({"name": "read_status"}),
+        );
+        assert!(eval_l7(&engine, &read_status));
+
+        let submit_report = l7_jsonrpc_input_with_params(
+            "mcp.params.test",
+            8000,
+            "/mcp",
+            "tools/call",
+            serde_json::json!({
+                "name": "submit_report",
+                "arguments.scope": "workspace/main"
+            }),
+        );
+        assert!(eval_l7(&engine, &submit_report));
+
+        let blocked_without_args = l7_jsonrpc_input_with_params(
+            "mcp.params.test",
+            8000,
+            "/mcp",
+            "tools/call",
+            serde_json::json!({"name": "blocked_action"}),
+        );
+        assert!(!eval_l7(&engine, &blocked_without_args));
+
+        let blocked_with_args = l7_jsonrpc_input_with_params(
+            "mcp.params.test",
+            8000,
+            "/mcp",
+            "tools/call",
+            serde_json::json!({
+                "name": "blocked_action",
+                "arguments.reason": "test"
+            }),
+        );
+        assert!(!eval_l7(&engine, &blocked_with_args));
     }
 
     #[test]

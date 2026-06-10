@@ -261,6 +261,24 @@ struct NetworkBinaryDef {
 // YAML → proto conversion
 // ---------------------------------------------------------------------------
 
+fn matcher_def_to_proto(matcher: QueryMatcherDef) -> L7QueryMatcher {
+    match matcher {
+        QueryMatcherDef::Glob(glob) => L7QueryMatcher { glob, any: vec![] },
+        QueryMatcherDef::Any(any) => L7QueryMatcher {
+            glob: String::new(),
+            any: any.any,
+        },
+    }
+}
+
+fn matcher_proto_to_def(matcher: L7QueryMatcher) -> QueryMatcherDef {
+    if matcher.any.is_empty() {
+        QueryMatcherDef::Glob(matcher.glob)
+    } else {
+        QueryMatcherDef::Any(QueryAnyDef { any: matcher.any })
+    }
+}
+
 fn to_proto(raw: PolicyFile) -> SandboxPolicy {
     let network_policies = raw
         .network_policies
@@ -311,16 +329,15 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                                             .query
                                             .into_iter()
                                             .map(|(key, matcher)| {
-                                                let proto = match matcher {
-                                                    QueryMatcherDef::Glob(glob) => {
-                                                        L7QueryMatcher { glob, any: vec![] }
-                                                    }
-                                                    QueryMatcherDef::Any(any) => L7QueryMatcher {
-                                                        glob: String::new(),
-                                                        any: any.any,
-                                                    },
-                                                };
-                                                (key, proto)
+                                                (key, matcher_def_to_proto(matcher))
+                                            })
+                                            .collect(),
+                                        params: r
+                                            .allow
+                                            .params
+                                            .into_iter()
+                                            .map(|(key, matcher)| {
+                                                (key, matcher_def_to_proto(matcher))
                                             })
                                             .collect(),
                                     }),
@@ -341,18 +358,12 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                                     query: d
                                         .query
                                         .into_iter()
-                                        .map(|(key, matcher)| {
-                                            let proto = match matcher {
-                                                QueryMatcherDef::Glob(glob) => {
-                                                    L7QueryMatcher { glob, any: vec![] }
-                                                }
-                                                QueryMatcherDef::Any(any) => L7QueryMatcher {
-                                                    glob: String::new(),
-                                                    any: any.any,
-                                                },
-                                            };
-                                            (key, proto)
-                                        })
+                                        .map(|(key, matcher)| (key, matcher_def_to_proto(matcher)))
+                                        .collect(),
+                                    params: d
+                                        .params
+                                        .into_iter()
+                                        .map(|(key, matcher)| (key, matcher_def_to_proto(matcher)))
                                         .collect(),
                                 })
                                 .collect(),
@@ -488,17 +499,16 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                                                 .query
                                                 .into_iter()
                                                 .map(|(key, matcher)| {
-                                                    let yaml_matcher = if matcher.any.is_empty() {
-                                                        QueryMatcherDef::Glob(matcher.glob)
-                                                    } else {
-                                                        QueryMatcherDef::Any(QueryAnyDef {
-                                                            any: matcher.any,
-                                                        })
-                                                    };
-                                                    (key, yaml_matcher)
+                                                    (key, matcher_proto_to_def(matcher))
                                                 })
                                                 .collect(),
-                                            params: BTreeMap::new(),
+                                            params: a
+                                                .params
+                                                .into_iter()
+                                                .map(|(key, matcher)| {
+                                                    (key, matcher_proto_to_def(matcher))
+                                                })
+                                                .collect(),
                                         },
                                     }
                                 })
@@ -519,17 +529,16 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                                         .query
                                         .iter()
                                         .map(|(key, matcher)| {
-                                            let yaml_matcher = if matcher.any.is_empty() {
-                                                QueryMatcherDef::Glob(matcher.glob.clone())
-                                            } else {
-                                                QueryMatcherDef::Any(QueryAnyDef {
-                                                    any: matcher.any.clone(),
-                                                })
-                                            };
-                                            (key.clone(), yaml_matcher)
+                                            (key.clone(), matcher_proto_to_def(matcher.clone()))
                                         })
                                         .collect(),
-                                    params: BTreeMap::new(),
+                                    params: d
+                                        .params
+                                        .iter()
+                                        .map(|(key, matcher)| {
+                                            (key.clone(), matcher_proto_to_def(matcher.clone()))
+                                        })
+                                        .collect(),
                                 })
                                 .collect(),
                             allow_encoded_slash: e.allow_encoded_slash,
