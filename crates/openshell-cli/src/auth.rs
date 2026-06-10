@@ -102,6 +102,15 @@ pub async fn browser_auth_flow(gateway_endpoint: &str) -> Result<String> {
         ));
     }
 
+    #[cfg(test)]
+    if std::env::var("OPENSHELL_TEST_BROWSER_AUTH_FAIL")
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    {
+        return Err(miette::miette!(
+            "browser authentication failed (OPENSHELL_TEST_BROWSER_AUTH_FAIL is set)"
+        ));
+    }
+
     let listener = TcpListener::bind("127.0.0.1:0").await.into_diagnostic()?;
     let local_addr = listener.local_addr().into_diagnostic()?;
     let callback_port = local_addr.port();

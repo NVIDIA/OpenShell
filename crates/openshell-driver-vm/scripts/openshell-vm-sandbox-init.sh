@@ -570,6 +570,80 @@ configure_hostname() {
     ts "hostname=${sandbox_hostname}"
 }
 
+run_openshell_init_dropins() {
+    # Run executable drop-ins from /opt/openshell/init.d in deterministic
+    # ASCII-sorted order. Drop-ins are *executed* in a child shell rather
+    # than sourced, so they cannot mutate parent shell state or exit the
+    # caller. They inherit `OPENSHELL_VM_INIT_PHASE`, `ROOT_PREFIX`, and
+    # any `OPENSHELL_VM_DATA_*` env vars set by lifecycle extensions.
+    #
+    # Security: this runs as root before the supervisor enforces policy, so
+    # it executes *only* the drop-ins the VM driver explicitly injected this
+    # launch, as enumerated in the driver-authored manifest. Anything else
+    # found under init.d (e.g. files baked into a user-controlled guest
+    # image) is ignored. The manifest lives in the overlay upperdir, which
+    # the driver owns, so a guest image cannot forge or shadow it. A missing
+    # manifest is treated as "run nothing" (fail-closed).
+    local init_dir manifest
+    init_dir="$(root_path /opt/openshell/init.d)"
+    manifest="$(root_path /opt/openshell/init.d.manifest)"
+
+    if [ ! -f "$manifest" ]; then
+        if [ -d "$init_dir" ]; then
+            ts "no OpenShell VM init drop-in manifest present; skipping init.d"
+        fi
+        return 0
+    fi
+
+    export OPENSHELL_VM_INIT_PHASE="before-supervisor"
+    export ROOT_PREFIX="${ROOT_PREFIX:-}"
+
+    # Fail closed on any inconsistency: every drop-in below is trusted,
+    # required setup the driver injected on purpose, so we abort the boot
+    # rather than run a half-configured sandbox. Aborting exits this init
+    # non-zero; the VM helper then exits and the driver runs
+    # lifecycle-extension cleanup, so a failed init does not leak resources.
+    # The loop runs in the main shell (process substitution, not a pipe), so
+    # `exit` here terminates init as intended.
+    local name dropin rc
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        # Manifest entries are bare file names that the driver already
+        # validated. A separator or traversal here means the manifest was
+        # tampered with after the driver wrote it.
+        case "$name" in
+            */* | . | ..)
+                ts "FATAL: unsafe init drop-in manifest entry '${name}'"
+                exit 1
+                ;;
+        esac
+
+        # The driver writes each entry's file and marks it 0755 in the same
+        # operation, so a missing or non-executable entry means the overlay
+        # was tampered with or provisioning is broken.
+        dropin="${init_dir}/${name}"
+        if [ ! -f "$dropin" ]; then
+            ts "FATAL: init drop-in '${name}' listed in manifest but not found"
+            exit 1
+        fi
+        if [ ! -x "$dropin" ]; then
+            ts "FATAL: init drop-in '${name}' is not executable"
+            exit 1
+        fi
+
+        ts "running OpenShell VM init drop-in ${name}"
+        rc=0
+        set +e
+        "$dropin"
+        rc=$?
+        set -e
+        if [ "$rc" -ne 0 ]; then
+            ts "FATAL: OpenShell VM init drop-in ${name} failed with exit code ${rc}"
+            exit 1
+        fi
+    done < <(LC_ALL=C sort -u "$manifest")
+}
+
 run_post_overlay_setup() {
     # Source QEMU-injected environment variables if present. The file lives in
     # the overlay upperdir so the cached bootstrap rootfs remains immutable.
@@ -728,6 +802,8 @@ if [ -d /sandbox ]; then
         fi
     fi
 fi
+
+run_openshell_init_dropins
 
 rewrite_openshell_endpoint_if_needed
 

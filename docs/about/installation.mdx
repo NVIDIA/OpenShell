@@ -75,6 +75,65 @@ To keep the user service running after logout, enable linger:
 sudo loginctl enable-linger $USER
 ```
 
+## Snap
+
+Install the OpenShell snap from the Snap Store:
+
+```shell
+sudo snap install openshell --classic
+```
+
+The snap defines two apps: the `openshell` CLI and the `openshell.gateway`
+systemd service. The gateway listens on `https://127.0.0.1:17670` and
+stores its database at `$SNAP_COMMON/gateway.db` (typically
+`/var/snap/openshell/common/gateway.db`). Create `$SNAP_COMMON/gateway.toml`
+when you need to override gateway settings.
+
+### Snap store installs
+
+When installing from the Snap Store, snapd automatically connects the `home`,
+`network`, `network-bind`, and `ssh-keys` plugs. The `docker` plug still
+requires manual connection:
+
+```shell
+sudo snap connect openshell:docker docker:docker-daemon
+```
+
+The snap declares `default-provider: docker` on the Docker plug so snapd will
+offer to install the Docker snap, but the connection itself must be made
+manually.
+
+### Locally built snap packages
+
+When installing a locally built `.snap` file, no plugs are connected by default:
+
+```shell
+sudo snap install ./openshell_*.snap --dangerous --classic
+sudo snap connect openshell:home
+sudo snap connect openshell:network
+sudo snap connect openshell:network-bind
+sudo snap connect openshell:ssh-keys
+sudo snap connect openshell:docker docker:docker-daemon
+sudo snap connect openshell:log-observe
+sudo snap connect openshell:system-observe
+```
+
+The `log-observe` and `system-observe` plugs are needed for the gateway service
+to read logs and inspect system processes. The `docker` plug requires the
+`docker:docker-daemon` slot from the Docker snap and does not work with
+system-installed Docker.
+
+### Gateway service
+
+The gateway runs as a snap daemon with `refresh-mode: endure`, meaning snapd
+will not restart it during snap refreshes. This prevents the gateway from
+killing active sandbox sessions mid-refresh. Restart the service manually after
+a snap refresh when you need the updated binary:
+
+```shell
+sudo systemctl restart snap.openshell.gateway
+```
+
 ## Kubernetes
 
 Kubernetes deployments use the OpenShell Helm chart. For step-by-step installation, refer to [Kubernetes Setup](/kubernetes/setup). For chart values and packaging details, refer to the [Helm chart README](https://github.com/NVIDIA/OpenShell/blob/main/deploy/helm/openshell/README.md).

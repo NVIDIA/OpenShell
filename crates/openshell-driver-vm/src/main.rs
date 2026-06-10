@@ -36,6 +36,9 @@ struct Args {
     #[arg(long = "vm-image-disk", hide = true)]
     vm_image_disk: Option<PathBuf>,
 
+    #[arg(long = "vm-kernel-image", hide = true)]
+    vm_kernel_image: Option<PathBuf>,
+
     #[arg(long, hide = true)]
     vm_exec: Option<String>,
 
@@ -482,6 +485,7 @@ fn build_vm_launch_config(args: &Args) -> std::result::Result<VmLaunchConfig, St
         root_disk,
         overlay_disk,
         image_disk,
+        kernel_image: args.vm_kernel_image.clone(),
         vcpus: args.vm_vcpus,
         mem_mib: args.vm_mem_mib,
         exec_path,

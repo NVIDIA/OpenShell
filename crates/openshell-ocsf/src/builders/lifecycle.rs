@@ -31,12 +31,6 @@ impl<'a> AppLifecycleBuilder<'a> {
     }
 
     #[must_use]
-    pub fn activity(mut self, id: ActivityId) -> Self {
-        self.activity = id;
-        self
-    }
-
-    #[must_use]
     pub fn build(self) -> OcsfEvent {
         let activity_name = self.activity.lifecycle_label().to_string();
         let mut base = BaseEventData::new(
@@ -59,6 +53,7 @@ impl<'a> AppLifecycleBuilder<'a> {
     }
 }
 
+impl_activity_setter!(AppLifecycleBuilder);
 impl_builder_setters!(AppLifecycleBuilder);
 
 #[cfg(test)]

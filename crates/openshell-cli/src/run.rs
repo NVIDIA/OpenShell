@@ -83,6 +83,7 @@ enum SandboxUploadPlan {
         files: Vec<String>,
     },
     Regular,
+    GitFilteredEmpty,
 }
 
 /// Convert a sandbox phase integer to a human-readable string.
@@ -1286,28 +1287,8 @@ pub fn gateway_list(gateway_flag: &Option<String>, output: &str) -> Result<()> {
     let gateways = list_gateways()?;
     let active = gateway_flag.clone().or_else(load_active_gateway);
 
-    match output {
-        "json" => {
-            let items: Vec<serde_json::Value> = gateways
-                .iter()
-                .map(|g| gateway_to_json(g, &active))
-                .collect();
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&items).into_diagnostic()?
-            );
-            return Ok(());
-        }
-        "yaml" => {
-            let items: Vec<serde_json::Value> = gateways
-                .iter()
-                .map(|g| gateway_to_json(g, &active))
-                .collect();
-            print!("{}", serde_yml::to_string(&items).into_diagnostic()?);
-            return Ok(());
-        }
-        "table" => {}
-        _ => return Err(miette!("unsupported output format: {output}")),
+    if crate::output::print_output_collection(output, &gateways, |g| gateway_to_json(g, &active))? {
+        return Ok(());
     }
 
     if gateways.is_empty() {
@@ -1756,6 +1737,7 @@ pub async fn sandbox_create(
     tty_override: Option<bool>,
     auto_providers_override: Option<bool>,
     labels: &HashMap<String, String>,
+    environment: &HashMap<String, String>,
     approval_mode: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
@@ -1836,6 +1818,7 @@ pub async fn sandbox_create(
         spec: Some(SandboxSpec {
             gpu: requested_gpu,
             gpu_device: gpu_device.unwrap_or_default().to_string(),
+            environment: environment.clone(),
             policy,
             providers: configured_providers,
             template,
@@ -2137,6 +2120,21 @@ pub async fn sandbox_create(
                             &sandbox_name,
                             &base_dir,
                             &files,
+                            local,
+                            dest,
+                            &effective_tls,
+                        )
+                        .await?;
+                    }
+                    SandboxUploadPlan::GitFilteredEmpty => {
+                        eprintln!(
+                            "  {} .gitignore filtering excluded all files in {}; uploading unfiltered",
+                            "⚠".yellow().bold(),
+                            local.display(),
+                        );
+                        sandbox_sync_up(
+                            &effective_server,
+                            &sandbox_name,
                             local,
                             dest,
                             &effective_tls,
@@ -2638,6 +2636,7 @@ const MAX_STDIN_PAYLOAD: usize = 4 * 1024 * 1024;
 /// Execute a command in a running sandbox via gRPC, streaming output to the terminal.
 ///
 /// Returns the remote command's exit code.
+#[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
 pub async fn sandbox_exec_grpc(
     server: &str,
     name: &str,
@@ -2645,6 +2644,7 @@ pub async fn sandbox_exec_grpc(
     workdir: Option<&str>,
     timeout_seconds: u32,
     tty_override: Option<bool>,
+    environment: &HashMap<String, String>,
     tls: &TlsOptions,
 ) -> Result<i32> {
     let mut client = grpc_client(server, tls).await?;
@@ -2699,8 +2699,15 @@ pub async fn sandbox_exec_grpc(
         .unwrap_or_else(|| std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
 
     if tty_override == Some(true) && std::io::stdin().is_terminal() {
-        return sandbox_exec_interactive_grpc(client, &sandbox, command, workdir, timeout_seconds)
-            .await;
+        return sandbox_exec_interactive_grpc(
+            client,
+            &sandbox,
+            command,
+            workdir,
+            timeout_seconds,
+            environment,
+        )
+        .await;
     }
 
     // Make the streaming gRPC call.
@@ -2709,7 +2716,7 @@ pub async fn sandbox_exec_grpc(
             sandbox_id: sandbox.object_id().to_string(),
             command: command.to_vec(),
             workdir: workdir.unwrap_or_default().to_string(),
-            environment: HashMap::new(),
+            environment: environment.clone(),
             timeout_seconds,
             stdin: stdin_payload,
             tty,
@@ -3055,6 +3062,7 @@ async fn sandbox_exec_interactive_grpc(
     command: &[String],
     workdir: Option<&str>,
     timeout_seconds: u32,
+    environment: &HashMap<String, String>,
 ) -> Result<i32> {
     use openshell_core::proto::{ExecSandboxInput, ExecSandboxWindowResize, exec_sandbox_input};
     use tokio_stream::wrappers::ReceiverStream;
@@ -3070,7 +3078,7 @@ async fn sandbox_exec_interactive_grpc(
                 sandbox_id: sandbox.object_id().to_string(),
                 command: command.to_vec(),
                 workdir: workdir.unwrap_or_default().to_string(),
-                environment: HashMap::new(),
+                environment: environment.clone(),
                 timeout_seconds,
                 stdin: Vec::new(),
                 tty: true,
@@ -3263,22 +3271,8 @@ pub async fn sandbox_list(
 
     let sandboxes = response.into_inner().sandboxes;
 
-    match output {
-        "json" => {
-            let items: Vec<serde_json::Value> = sandboxes.iter().map(sandbox_to_json).collect();
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&items).into_diagnostic()?
-            );
-            return Ok(());
-        }
-        "yaml" => {
-            let items: Vec<serde_json::Value> = sandboxes.iter().map(sandbox_to_json).collect();
-            print!("{}", serde_yml::to_string(&items).into_diagnostic()?);
-            return Ok(());
-        }
-        "table" => {}
-        _ => return Err(miette!("unsupported output format: {output}")),
+    if crate::output::print_output_collection(output, &sandboxes, sandbox_to_json)? {
+        return Ok(());
     }
 
     if sandboxes.is_empty() {
@@ -3888,7 +3882,7 @@ async fn auto_create_provider(
     Ok(())
 }
 
-fn parse_key_value_pairs(items: &[String], flag: &str) -> Result<HashMap<String, String>> {
+pub fn parse_key_value_pairs(items: &[String], flag: &str) -> Result<HashMap<String, String>> {
     let mut map = HashMap::new();
 
     for item in items {
@@ -3905,6 +3899,34 @@ fn parse_key_value_pairs(items: &[String], flag: &str) -> Result<HashMap<String,
     }
 
     Ok(map)
+}
+
+pub fn parse_env_pairs(items: &[String]) -> Result<HashMap<String, String>> {
+    let map = parse_key_value_pairs(items, "--env")?;
+    for key in map.keys() {
+        if !is_valid_env_name(key) {
+            return Err(miette::miette!(
+                "--env key must match [A-Za-z_][A-Za-z0-9_]*; got '{key}'"
+            ));
+        }
+        if key.starts_with("OPENSHELL_") {
+            return Err(miette::miette!(
+                "--env keys starting with OPENSHELL_ are reserved; got '{key}'"
+            ));
+        }
+    }
+    Ok(map)
+}
+
+fn is_valid_env_name(key: &str) -> bool {
+    let mut bytes = key.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    if !(first == b'_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    bytes.all(|b| b == b'_' || b.is_ascii_alphanumeric())
 }
 
 fn parse_credential_pairs(items: &[String]) -> Result<HashMap<String, String>> {
@@ -4778,17 +4800,12 @@ pub async fn provider_list_profiles(server: &str, output: &str, tls: &TlsOptions
         .map(ProviderTypeProfile::from_proto)
         .collect::<Vec<_>>();
 
-    match output {
-        "yaml" => {
-            print!("{}", profiles_to_yaml(&dto_profiles).into_diagnostic()?);
-            return Ok(());
-        }
-        "json" => {
-            println!("{}", profiles_to_json(&dto_profiles).into_diagnostic()?);
-            return Ok(());
-        }
-        "table" => {}
-        _ => return Err(miette!("unsupported output format: {output}")),
+    if crate::output::print_output_direct(
+        output,
+        || profiles_to_json(&dto_profiles).into_diagnostic(),
+        || profiles_to_yaml(&dto_profiles).into_diagnostic(),
+    )? {
+        return Ok(());
     }
 
     if profiles.is_empty() {
@@ -4829,15 +4846,14 @@ pub async fn provider_profile_export(
         .ok_or_else(|| miette!("provider profile '{id}' not found"))?;
     let profile = ProviderTypeProfile::from_proto(&profile);
 
-    match output {
-        "yaml" => print!("{}", profile_to_yaml(&profile).into_diagnostic()?),
-        "json" => println!("{}", profile_to_json(&profile).into_diagnostic()?),
-        "table" => {
-            return Err(miette!(
-                "profile export supports '-o yaml' and '-o json'; table output is not supported"
-            ));
-        }
-        _ => return Err(miette!("unsupported output format: {output}")),
+    if !crate::output::print_output_direct(
+        output,
+        || profile_to_json(&profile).into_diagnostic(),
+        || profile_to_yaml(&profile).into_diagnostic(),
+    )? {
+        return Err(miette!(
+            "profile export supports '-o yaml' and '-o json'; table output is not supported"
+        ));
     }
     Ok(())
 }
@@ -5804,6 +5820,9 @@ fn sandbox_upload_plan(local_path: &Path, git_ignore: bool) -> Result<SandboxUpl
         && !metadata.file_type().is_symlink()
         && let Ok((base_dir, files)) = git_sync_files(local_path)
     {
+        if files.is_empty() {
+            return Ok(SandboxUploadPlan::GitFilteredEmpty);
+        }
         return Ok(SandboxUploadPlan::GitAware { base_dir, files });
     }
 
@@ -8365,6 +8384,25 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_upload_plan_falls_back_when_all_files_gitignored() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let repo = tmpdir.path().join("repo");
+        fs::create_dir_all(repo.join("runs")).expect("create repo");
+        init_git_repo(&repo);
+        fs::write(repo.join(".gitignore"), "runs/\n").expect("write .gitignore");
+        fs::write(repo.join("runs/test.json"), r#"{"key":"value"}"#).expect("write test.json");
+
+        let plan =
+            sandbox_upload_plan(&repo.join("runs"), true).expect("upload plan should succeed");
+
+        assert_eq!(
+            plan,
+            super::SandboxUploadPlan::GitFilteredEmpty,
+            "gitignored directory should fall back with GitFilteredEmpty"
+        );
+    }
+
+    #[test]
     fn git_sync_files_ignores_inherited_git_env() {
         let _lock = TEST_ENV_LOCK
             .lock()
@@ -8975,6 +9013,8 @@ mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let tmpdir = tempfile::tempdir().expect("create tmpdir");
         with_tmp_xdg(tmpdir.path(), || {
+            let _no_browser = EnvVarGuard::set("OPENSHELL_NO_BROWSER", "0");
+            let _browser_auth_failure = EnvVarGuard::set("OPENSHELL_TEST_BROWSER_AUTH_FAIL", "1");
             let runtime = tokio::runtime::Runtime::new().expect("create runtime");
 
             // Register a working plaintext gateway first.
@@ -8995,12 +9035,9 @@ mod tests {
             });
             assert_eq!(load_active_gateway().as_deref(), Some("existing-gw"));
 
-            // Attempt cloud gateway add. The browser flow will fail because
-            // OPENSHELL_NO_BROWSER is NOT set but the /auth/connect endpoint
-            // is unreachable (connection refused), so the 120s timeout would
-            // kick in. To keep the test fast, set OPENSHELL_NO_BROWSER=0
-            // (explicitly not suppressed) and use a port that refuses connections.
-            // The CF auth flow will fail quickly on connection refused.
+            // Attempt cloud gateway add. Keep browser suppression disabled so
+            // auth failure still rolls back the registration, but use the
+            // test-only auth failure hook instead of opening the OS browser.
             runtime.block_on(async {
                 gateway_add(
                     "https://127.0.0.1:1",

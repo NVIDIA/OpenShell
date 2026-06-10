@@ -1275,6 +1275,10 @@ enum SandboxCommands {
         #[arg(long = "label")]
         labels: Vec<String>,
 
+        /// Environment variables to inject into the sandbox (KEY=VALUE format, repeatable).
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        envs: Vec<String>,
+
         /// Approval mode for agent-authored policy proposals.
         ///
         /// `manual` (default): every proposal lands in the draft inbox for
@@ -1380,6 +1384,10 @@ enum SandboxCommands {
         /// Disable pseudo-terminal allocation.
         #[arg(long, overrides_with = "tty")]
         no_tty: bool,
+
+        /// Environment variables to set for the command (KEY=VALUE format, repeatable).
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        envs: Vec<String>,
 
         /// Command and arguments to execute.
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
@@ -2558,6 +2566,7 @@ async fn main() -> Result<()> {
                     auto_providers,
                     no_auto_providers,
                     labels,
+                    envs,
                     approval_mode,
                     command,
                 } => {
@@ -2591,6 +2600,9 @@ async fn main() -> Result<()> {
                         }
                         labels_map.insert(parts[0].to_string(), parts[1].to_string());
                     }
+
+                    // Parse --env flags into a HashMap<String, String>.
+                    let env_map = run::parse_env_pairs(&envs)?;
 
                     // Parse --upload specs into [(local_path, sandbox_path, git_ignore)].
                     let upload_specs: Vec<(String, Option<String>, bool)> = upload
@@ -2639,6 +2651,7 @@ async fn main() -> Result<()> {
                         tty_override,
                         auto_providers_override,
                         &labels_map,
+                        &env_map,
                         &approval_mode,
                         &tls,
                     ))
@@ -2664,20 +2677,26 @@ async fn main() -> Result<()> {
                     let dest_display = sandbox_dest.unwrap_or("~");
                     eprintln!("Uploading {} -> sandbox:{}", local.display(), dest_display);
                     if !no_git_ignore && let Ok((base_dir, files)) = run::git_sync_files(local) {
-                        run::sandbox_sync_up_files(
-                            &ctx.endpoint,
-                            &name,
-                            &base_dir,
-                            &files,
-                            local,
-                            sandbox_dest,
-                            &tls,
-                        )
-                        .await?;
-                        eprintln!("{} Upload complete", "✓".green().bold());
-                        return Ok(());
+                        if !files.is_empty() {
+                            run::sandbox_sync_up_files(
+                                &ctx.endpoint,
+                                &name,
+                                &base_dir,
+                                &files,
+                                local,
+                                sandbox_dest,
+                                &tls,
+                            )
+                            .await?;
+                            eprintln!("{} Upload complete", "✓".green().bold());
+                            return Ok(());
+                        }
+                        eprintln!(
+                            "{} .gitignore filtering excluded all files in {}; uploading unfiltered",
+                            "⚠".yellow().bold(),
+                            local.display(),
+                        );
                     }
-                    // Fallback: upload without git filtering
                     run::sandbox_sync_up(&ctx.endpoint, &name, local, sandbox_dest, &tls).await?;
                     eprintln!("{} Upload complete", "✓".green().bold());
                 }
@@ -2751,6 +2770,7 @@ async fn main() -> Result<()> {
                             timeout,
                             tty,
                             no_tty,
+                            envs,
                             command,
                         } => {
                             let name = resolve_sandbox_name(name, &ctx.name)?;
@@ -2762,6 +2782,7 @@ async fn main() -> Result<()> {
                             } else {
                                 None // auto-detect
                             };
+                            let env_map = run::parse_env_pairs(&envs)?;
                             let exit_code = run::sandbox_exec_grpc(
                                 endpoint,
                                 &name,
@@ -2769,6 +2790,7 @@ async fn main() -> Result<()> {
                                 workdir.as_deref(),
                                 timeout,
                                 tty_override,
+                                &env_map,
                                 &tls,
                             )
                             .await?;

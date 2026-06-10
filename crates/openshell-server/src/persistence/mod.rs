@@ -136,6 +136,35 @@ pub fn generate_name() -> String {
         .collect()
 }
 
+/// Decode a single [`ObjectRecord`] into a protobuf message, hydrating
+/// `resource_version` from the authoritative DB row.
+///
+/// Extracted to avoid repeating the identical decode-and-hydrate block across
+/// `get_message`, `get_message_by_name`, `list_messages`, and
+/// `list_messages_with_selector`.
+fn decode_record<T: Message + Default + SetResourceVersion>(
+    record: ObjectRecord,
+) -> PersistenceResult<T> {
+    let mut message = T::decode(record.payload.as_slice())
+        .map_err(|e| PersistenceError::Decode(format!("protobuf decode error: {e}")))?;
+    message.set_resource_version(record.resource_version);
+    Ok(message)
+}
+
+/// Dispatch a method call to the underlying store implementation.
+///
+/// Every `Store` method is a two-arm `match self { Postgres(s) => s.method(...).await, … }`
+/// with no logic of its own. This macro captures the common pattern so that
+/// each method body is a single line.
+macro_rules! store_dispatch {
+    ($self:ident . $method:ident ( $($arg:expr),* )) => {
+        match $self {
+            Self::Postgres(s) => s.$method($($arg),*).await,
+            Self::Sqlite(s) => s.$method($($arg),*).await,
+        }
+    };
+}
+
 impl Store {
     /// Connect to a persistence store based on the database URL.
     pub async fn connect(url: &str) -> CoreResult<Self> {
@@ -166,10 +195,7 @@ impl Store {
 
     /// Verify connectivity to the underlying database.
     pub async fn ping(&self) -> PersistenceResult<()> {
-        match self {
-            Self::Postgres(store) => store.ping().await,
-            Self::Sqlite(store) => store.ping().await,
-        }
+        store_dispatch!(self.ping())
     }
 
     /// Test support only: close the underlying connection pool.
@@ -180,10 +206,7 @@ impl Store {
     /// Do not call from runtime code today; this tears down the active pool.
     #[cfg(any(test, feature = "test-support"))]
     pub async fn close(&self) {
-        match self {
-            Self::Postgres(store) => store.close().await,
-            Self::Sqlite(store) => store.close().await,
-        }
+        store_dispatch!(self.close());
     }
 
     /// Insert or update a generic object with compare-and-swap support.
@@ -209,18 +232,7 @@ impl Store {
         labels: Option<&str>,
         condition: WriteCondition,
     ) -> PersistenceResult<WriteResult> {
-        match self {
-            Self::Postgres(store) => {
-                store
-                    .put_if(object_type, id, name, payload, labels, condition)
-                    .await
-            }
-            Self::Sqlite(store) => {
-                store
-                    .put_if(object_type, id, name, payload, labels, condition)
-                    .await
-            }
-        }
+        store_dispatch!(self.put_if(object_type, id, name, payload, labels, condition))
     }
 
     /// Delete an object by id with compare-and-swap support.
@@ -240,18 +252,7 @@ impl Store {
         id: &str,
         expected_resource_version: u64,
     ) -> PersistenceResult<bool> {
-        match self {
-            Self::Postgres(store) => {
-                store
-                    .delete_if(object_type, id, expected_resource_version)
-                    .await
-            }
-            Self::Sqlite(store) => {
-                store
-                    .delete_if(object_type, id, expected_resource_version)
-                    .await
-            }
-        }
+        store_dispatch!(self.delete_if(object_type, id, expected_resource_version))
     }
 
     /// Insert or update a generic named object with an application-owned scope.
@@ -264,18 +265,7 @@ impl Store {
         payload: &[u8],
         labels: Option<&str>,
     ) -> PersistenceResult<()> {
-        match self {
-            Self::Postgres(store) => {
-                store
-                    .put_scoped(object_type, id, name, scope, payload, labels)
-                    .await
-            }
-            Self::Sqlite(store) => {
-                store
-                    .put_scoped(object_type, id, name, scope, payload, labels)
-                    .await
-            }
-        }
+        store_dispatch!(self.put_scoped(object_type, id, name, scope, payload, labels))
     }
 
     /// Fetch an object by id.
@@ -284,10 +274,7 @@ impl Store {
         object_type: &str,
         id: &str,
     ) -> PersistenceResult<Option<ObjectRecord>> {
-        match self {
-            Self::Postgres(store) => store.get(object_type, id).await,
-            Self::Sqlite(store) => store.get(object_type, id).await,
-        }
+        store_dispatch!(self.get(object_type, id))
     }
 
     /// Fetch an object by name within an object type.
@@ -296,26 +283,17 @@ impl Store {
         object_type: &str,
         name: &str,
     ) -> PersistenceResult<Option<ObjectRecord>> {
-        match self {
-            Self::Postgres(store) => store.get_by_name(object_type, name).await,
-            Self::Sqlite(store) => store.get_by_name(object_type, name).await,
-        }
+        store_dispatch!(self.get_by_name(object_type, name))
     }
 
     /// Delete an object by id.
     pub async fn delete(&self, object_type: &str, id: &str) -> PersistenceResult<bool> {
-        match self {
-            Self::Postgres(store) => store.delete(object_type, id).await,
-            Self::Sqlite(store) => store.delete(object_type, id).await,
-        }
+        store_dispatch!(self.delete(object_type, id))
     }
 
     /// Delete an object by name within an object type.
     pub async fn delete_by_name(&self, object_type: &str, name: &str) -> PersistenceResult<bool> {
-        match self {
-            Self::Postgres(store) => store.delete_by_name(object_type, name).await,
-            Self::Sqlite(store) => store.delete_by_name(object_type, name).await,
-        }
+        store_dispatch!(self.delete_by_name(object_type, name))
     }
 
     /// List objects by type.
@@ -325,10 +303,7 @@ impl Store {
         limit: u32,
         offset: u32,
     ) -> PersistenceResult<Vec<ObjectRecord>> {
-        match self {
-            Self::Postgres(store) => store.list(object_type, limit, offset).await,
-            Self::Sqlite(store) => store.list(object_type, limit, offset).await,
-        }
+        store_dispatch!(self.list(object_type, limit, offset))
     }
 
     /// List objects by type and application-owned scope.
@@ -339,10 +314,7 @@ impl Store {
         limit: u32,
         offset: u32,
     ) -> PersistenceResult<Vec<ObjectRecord>> {
-        match self {
-            Self::Postgres(store) => store.list_by_scope(object_type, scope, limit, offset).await,
-            Self::Sqlite(store) => store.list_by_scope(object_type, scope, limit, offset).await,
-        }
+        store_dispatch!(self.list_by_scope(object_type, scope, limit, offset))
     }
 
     /// List objects by type with label selector filtering.
@@ -354,18 +326,7 @@ impl Store {
         limit: u32,
         offset: u32,
     ) -> PersistenceResult<Vec<ObjectRecord>> {
-        match self {
-            Self::Postgres(store) => {
-                store
-                    .list_with_selector(object_type, label_selector, limit, offset)
-                    .await
-            }
-            Self::Sqlite(store) => {
-                store
-                    .list_with_selector(object_type, label_selector, limit, offset)
-                    .await
-            }
-        }
+        store_dispatch!(self.list_with_selector(object_type, label_selector, limit, offset))
     }
 
     // -----------------------------------------------------------------------
@@ -405,18 +366,10 @@ impl Store {
         &self,
         id: &str,
     ) -> PersistenceResult<Option<T>> {
-        let record = self.get(T::object_type(), id).await?;
-        let Some(record) = record else {
-            return Ok(None);
-        };
-
-        let mut message = T::decode(record.payload.as_slice())
-            .map_err(|e| PersistenceError::Decode(format!("protobuf decode error: {e}")))?;
-
-        // Hydrate resource_version from DB row (authoritative source)
-        message.set_resource_version(record.resource_version);
-
-        Ok(Some(message))
+        self.get(T::object_type(), id)
+            .await?
+            .map(decode_record)
+            .transpose()
     }
 
     /// Fetch and decode a protobuf message by name.
@@ -424,18 +377,10 @@ impl Store {
         &self,
         name: &str,
     ) -> PersistenceResult<Option<T>> {
-        let record = self.get_by_name(T::object_type(), name).await?;
-        let Some(record) = record else {
-            return Ok(None);
-        };
-
-        let mut message = T::decode(record.payload.as_slice())
-            .map_err(|e| PersistenceError::Decode(format!("protobuf decode error: {e}")))?;
-
-        // Hydrate resource_version from DB row (authoritative source)
-        message.set_resource_version(record.resource_version);
-
-        Ok(Some(message))
+        self.get_by_name(T::object_type(), name)
+            .await?
+            .map(decode_record)
+            .transpose()
     }
 
     /// List and decode protobuf messages, hydrating `resource_version` from
@@ -445,15 +390,11 @@ impl Store {
         limit: u32,
         offset: u32,
     ) -> PersistenceResult<Vec<T>> {
-        let records = self.list(T::object_type(), limit, offset).await?;
-        let mut messages = Vec::with_capacity(records.len());
-        for record in records {
-            let mut message = T::decode(record.payload.as_slice())
-                .map_err(|e| PersistenceError::Decode(format!("protobuf decode error: {e}")))?;
-            message.set_resource_version(record.resource_version);
-            messages.push(message);
-        }
-        Ok(messages)
+        self.list(T::object_type(), limit, offset)
+            .await?
+            .into_iter()
+            .map(decode_record)
+            .collect()
     }
 
     /// List and decode protobuf messages with label selector filtering,
@@ -466,17 +407,11 @@ impl Store {
         limit: u32,
         offset: u32,
     ) -> PersistenceResult<Vec<T>> {
-        let records = self
-            .list_with_selector(T::object_type(), label_selector, limit, offset)
-            .await?;
-        let mut messages = Vec::with_capacity(records.len());
-        for record in records {
-            let mut message = T::decode(record.payload.as_slice())
-                .map_err(|e| PersistenceError::Decode(format!("protobuf decode error: {e}")))?;
-            message.set_resource_version(record.resource_version);
-            messages.push(message);
-        }
-        Ok(messages)
+        self.list_with_selector(T::object_type(), label_selector, limit, offset)
+            .await?
+            .into_iter()
+            .map(decode_record)
+            .collect()
     }
 
     /// Update a protobuf message using CAS (compare-and-swap).
@@ -658,10 +593,7 @@ impl Store {
         payload: &[u8],
         labels: Option<&str>,
     ) -> PersistenceResult<()> {
-        match self {
-            Self::Postgres(store) => store.put(object_type, id, name, payload, labels).await,
-            Self::Sqlite(store) => store.put(object_type, id, name, payload, labels).await,
-        }
+        store_dispatch!(self.put(object_type, id, name, payload, labels))
     }
 
     pub async fn put_message<T: Message + ObjectType + ObjectId + ObjectName + ObjectLabels>(

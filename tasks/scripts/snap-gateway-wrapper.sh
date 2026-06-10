@@ -2,6 +2,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+# Snap wrapper for openshell-gateway. Sets snap-specific defaults:
+#   - OPENSHELL_DB_URL  -> sqlite:$SNAP_COMMON/gateway.db (overridable)
+#   - OPENSHELL_DISABLE_TLS -> true
+# If $SNAP_COMMON/gateway.toml exists, passes it as --config so operators
+# can override settings without rebuilding the snap.
+
 set -eu
 
 CANONICAL_CONFIG_FILE="${SNAP_COMMON}/gateway.toml"

@@ -48,6 +48,7 @@ pub struct VmLaunchConfig {
     pub root_disk: PathBuf,
     pub overlay_disk: PathBuf,
     pub image_disk: Option<PathBuf>,
+    pub kernel_image: Option<PathBuf>,
     pub vcpus: u8,
     pub mem_mib: u32,
     pub exec_path: String,
@@ -126,12 +127,15 @@ fn run_qemu_vm(config: &VmLaunchConfig) -> Result<(), String> {
     let guest_env = qemu_guest_env_vars(config, host_dns_server());
     write_guest_env_file(&config.overlay_disk, &guest_env)?;
 
-    let runtime_dir = qemu_runtime_dir()?;
     let gw_port = config.gateway_port.unwrap_or(0);
     setup_tap_networking(tap_device, host_ip, gw_port)?;
     let mut tap_guard = TapGuard::new(tap_device.to_string(), host_ip.to_string(), gw_port);
 
-    let vmlinux = runtime_dir.join("vmlinux");
+    let vmlinux = if let Some(kernel_image) = &config.kernel_image {
+        kernel_image.clone()
+    } else {
+        qemu_runtime_dir()?.join("vmlinux")
+    };
     if !vmlinux.is_file() {
         return Err(format!("VM kernel not found: {}", vmlinux.display()));
     }
@@ -648,6 +652,12 @@ fn procguard_kill_children() {
 }
 
 fn run_libkrun_vm(config: &VmLaunchConfig) -> Result<(), String> {
+    if let Some(kernel_image) = &config.kernel_image {
+        return Err(format!(
+            "selected kernel image is not supported by this VM backend: {}",
+            kernel_image.display()
+        ));
+    }
     if !config.root_disk.is_file() {
         return Err(format!(
             "root disk image not found: {}",
@@ -1397,6 +1407,7 @@ mod tests {
             root_disk: PathBuf::from("/rootfs.ext4"),
             overlay_disk: PathBuf::from("/overlay.ext4"),
             image_disk: None,
+            kernel_image: None,
             vcpus: 2,
             mem_mib: 2048,
             exec_path: "/srv/openshell-vm-sandbox-init.sh".to_string(),

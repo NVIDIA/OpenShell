@@ -73,7 +73,10 @@ async fn sandbox_file_upload_download_round_trip() {
     // Verify nested file.
     let nested = fs::read_to_string(download_dir.join("subdir/nested.txt"))
         .expect("read subdir/nested.txt after download");
-    assert_eq!(nested, "nested-content", "subdir/nested.txt content mismatch");
+    assert_eq!(
+        nested, "nested-content",
+        "subdir/nested.txt content mismatch"
+    );
 
     // ---------------------------------------------------------------
     // Step 4 — Large-file round-trip (~512 KiB) to exercise multi-chunk
@@ -112,7 +115,8 @@ async fn sandbox_file_upload_download_round_trip() {
         .await
         .expect("download large file");
 
-    let actual_data = fs::read(large_down.join("large.bin")).expect("read large.bin after download");
+    let actual_data =
+        fs::read(large_down.join("large.bin")).expect("read large.bin after download");
     let actual_hash = {
         let mut hasher = Sha256::new();
         hasher.update(&actual_data);
@@ -152,8 +156,8 @@ async fn sandbox_file_upload_download_round_trip() {
         .await
         .expect("download single file");
 
-    let single_content = fs::read_to_string(single_down.join("single.txt"))
-        .expect("read single.txt after download");
+    let single_content =
+        fs::read_to_string(single_down.join("single.txt")).expect("read single.txt after download");
     assert_eq!(
         single_content, "single-file-payload",
         "single.txt content mismatch"
@@ -364,7 +368,11 @@ async fn sandbox_download_file_only() {
             .expect("sandbox create --keep");
 
     guard
-        .exec(&["sh", "-c", "printf greeting-payload > /sandbox/greeting.txt"])
+        .exec(&[
+            "sh",
+            "-c",
+            "printf greeting-payload > /sandbox/greeting.txt",
+        ])
         .await
         .expect("seed greeting.txt inside the sandbox");
 
@@ -436,7 +444,9 @@ async fn sandbox_download_directory_only() {
 /// match the short markers individually instead.
 fn assert_resolves_outside_workspace(err: &str, label: &str) {
     assert!(
-        err.contains("resolves to") && err.contains("outside the") && err.contains("sandbox workspace"),
+        err.contains("resolves to")
+            && err.contains("outside the")
+            && err.contains("sandbox workspace"),
         "expected resolves-outside-workspace error for {label}, got: {err}"
     );
 }
@@ -539,6 +549,93 @@ async fn sandbox_download_handles_dash_leading_basename() {
     assert_eq!(
         actual, "dash-payload",
         "dash-leading file content mismatch — tar may have parsed the basename as an option"
+    );
+
+    guard.cleanup().await;
+}
+
+/// Regression for #1778: uploading a directory whose contents are entirely
+/// excluded by `.gitignore` must still transfer the files instead of
+/// silently reporting success with zero bytes sent.
+///
+/// Reproduces the reported workflow: download files from a sandbox into a
+/// local git repo where the target directory is gitignored, then re-upload
+/// to the same sandbox at a different path.
+#[tokio::test]
+async fn upload_gitignored_directory_falls_back_to_unfiltered() {
+    let mut guard =
+        SandboxGuard::create_keep(&["sh", "-c", "echo Ready && sleep infinity"], "Ready")
+            .await
+            .expect("sandbox create --keep");
+
+    // Seed a file inside the sandbox so we have something to download.
+    guard
+        .exec(&[
+            "sh",
+            "-c",
+            "mkdir -p /sandbox/runs && printf downloaded-payload > /sandbox/runs/test.json",
+        ])
+        .await
+        .expect("seed runs/test.json inside the sandbox");
+
+    // Download the file into a local git repo where `runs/` is gitignored.
+    let tmpdir = tempfile::tempdir().expect("create tmpdir");
+    let repo = tmpdir.path().join("repo");
+    fs::create_dir_all(&repo).expect("create repo dir");
+
+    let git_init = tokio::process::Command::new("git")
+        .args(["init"])
+        .current_dir(&repo)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .expect("git init");
+    assert!(git_init.success(), "git init should succeed");
+
+    fs::write(repo.join(".gitignore"), "runs/\n").expect("write .gitignore");
+
+    let download_dest = repo.join("runs");
+    fs::create_dir_all(&download_dest).expect("create runs dir");
+    let download_str = download_dest.to_str().expect("download path is UTF-8");
+
+    guard
+        .download("/sandbox/runs/test.json", download_str)
+        .await
+        .expect("download runs/test.json");
+
+    let local_file = download_dest.join("test.json");
+    assert!(local_file.exists(), "downloaded file should exist locally");
+
+    // Re-upload the gitignored directory (without --no-git-ignore).
+    let upload_str = download_dest.to_str().expect("upload path is UTF-8");
+    let upload_output = guard
+        .upload_with_gitignore(upload_str, "/sandbox/reuploaded", &repo)
+        .await
+        .expect("upload gitignored directory");
+
+    assert!(
+        upload_output.contains(".gitignore filtering excluded all files"),
+        "expected fallback warning in upload output, got: {upload_output}"
+    );
+
+    // Download the re-uploaded file and verify it arrived.
+    let verify_dir = tmpdir.path().join("verify");
+    fs::create_dir_all(&verify_dir).expect("create verify dir");
+    let verify_str = verify_dir.to_str().expect("verify path is UTF-8");
+
+    guard
+        .download("/sandbox/reuploaded", verify_str)
+        .await
+        .expect("download reuploaded directory");
+
+    // The upload wraps contents under the source basename, so the file
+    // lands at verify/runs/test.json.
+    let reuploaded = fs::read_to_string(verify_dir.join("runs/test.json"))
+        .expect("reuploaded test.json should exist");
+    assert_eq!(
+        reuploaded, "downloaded-payload",
+        "reuploaded file content mismatch — gitignored directory was not uploaded"
     );
 
     guard.cleanup().await;

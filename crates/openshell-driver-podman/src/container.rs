@@ -244,6 +244,13 @@ fn build_env(
     let mut env: BTreeMap<String, String> = BTreeMap::new();
 
     // 1. User-supplied environment (lowest priority).
+    // Template vars first, then spec overwrites (spec is user-specified).
+    let mut user_env: BTreeMap<String, String> = BTreeMap::new();
+    if let Some(t) = template {
+        for (k, v) in &t.environment {
+            user_env.insert(k.clone(), v.clone());
+        }
+    }
     if let Some(s) = spec {
         if !s.log_level.is_empty() {
             env.insert(
@@ -252,13 +259,14 @@ fn build_env(
             );
         }
         for (k, v) in &s.environment {
-            env.insert(k.clone(), v.clone());
+            user_env.insert(k.clone(), v.clone());
         }
     }
-    if let Some(t) = template {
-        for (k, v) in &t.environment {
-            env.insert(k.clone(), v.clone());
-        }
+    env.extend(user_env.clone());
+    if !user_env.is_empty()
+        && let Ok(json) = serde_json::to_string(&user_env)
+    {
+        env.insert(openshell_core::sandbox_env::USER_ENVIRONMENT.into(), json);
     }
 
     // 2. Required driver vars (highest priority -- always overwrite).

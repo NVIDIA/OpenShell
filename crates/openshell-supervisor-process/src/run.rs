@@ -232,6 +232,11 @@ pub async fn run_process(
         let netns_fd = ssh_netns_fd;
         let ca_paths = ca_file_paths.clone();
         let provider_credentials_clone = provider_credentials.clone();
+        let user_env_clone: std::collections::HashMap<String, String> =
+            std::env::var(openshell_core::sandbox_env::USER_ENVIRONMENT)
+                .ok()
+                .and_then(|json| serde_json::from_str(&json).ok())
+                .unwrap_or_default();
 
         let (ssh_ready_tx, ssh_ready_rx) = tokio::sync::oneshot::channel();
 
@@ -245,6 +250,7 @@ pub async fn run_process(
                 proxy_url,
                 ca_paths,
                 provider_credentials_clone,
+                user_env_clone,
             )
             .await
             {
