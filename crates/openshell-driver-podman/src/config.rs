@@ -131,7 +131,8 @@ pub struct PodmanComputeConfig {
     /// Podman runs the health check command at this interval to determine
     /// container readiness. Lower values detect readiness faster but
     /// increase process churn (each check spawns a conmon subprocess).
-    /// Defaults to [`DEFAULT_HEALTH_CHECK_INTERVAL_SECS`].
+    /// Set to `0` to disable health checks entirely.
+    /// Defaults to [`DEFAULT_HEALTH_CHECK_INTERVAL_SECS`] (10 seconds).
     pub health_check_interval_secs: u64,
 }
 

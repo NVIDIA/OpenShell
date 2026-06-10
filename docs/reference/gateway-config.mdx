@@ -264,7 +264,7 @@ enable_bind_mounts      = false
 sandbox_pids_limit      = 2048
 # Health check interval in seconds. Lower values detect readiness faster
 # but increase process churn (each check spawns a conmon subprocess).
-# Default: 10.
+# Set to 0 to disable health checks entirely. Default: 10.
 health_check_interval_secs = 10
 ```
 
