@@ -104,7 +104,9 @@ required-features = ["e2e-gpu"]
 
 [dependencies]
 base64 = "0.22"
+bollard = "0.20"
 bytes = "1"
+futures-util = "0.3"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }

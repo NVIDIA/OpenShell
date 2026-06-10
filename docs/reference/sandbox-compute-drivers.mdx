@@ -76,12 +76,8 @@ For GPU-backed Docker sandboxes, configure Docker CDI before starting the gatewa
 
 Docker driver config accepts user-supplied `volume` and `tmpfs` mounts. It also
 accepts `bind` mounts when `[openshell.drivers.docker]` sets
-`enable_bind_mounts = true` in `gateway.toml`. Host bind mounts expose gateway
-host paths to sandbox requests, so they are disabled by default. Image mounts
-are not accepted in Docker sandbox driver config.
-Docker's [storage documentation](https://docs.docker.com/engine/storage/)
-documents container storage mounts as volumes, bind mounts, tmpfs mounts, and
-named pipes.
+`enable_bind_mounts = true` in `gateway.toml`. Image mounts are not accepted in
+Docker sandbox driver config. See Docker's [storage documentation](https://docs.docker.com/engine/storage/) for more information.
 
 Use a `volume` mount for existing Docker named volumes:
 
