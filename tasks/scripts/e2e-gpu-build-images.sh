@@ -16,6 +16,7 @@ BASE_IMAGE="${OPENSHELL_SANDBOX_BASE_IMAGE:-ghcr.io/nvidia/openshell-community/s
 CUDA_BUILD_IMAGE="${CUDA_BUILD_IMAGE:-nvcr.io/nvidia/cuda:12.8.1-base-ubuntu22.04}"
 CUDA_SAMPLES_REPO="${CUDA_SAMPLES_REPO:-https://github.com/NVIDIA/cuda-samples}"
 CUDA_SAMPLES_REF="${CUDA_SAMPLES_REF:-v12.8}"
+SUPPORTED_IMAGES=(smoke-pass smoke-fail cuda-basic)
 
 shell_quote() {
   local value=$1
@@ -39,21 +40,12 @@ yaml_quote() {
 }
 
 available_image_dirs() {
-  local dockerfile
   local preferred
-  local seen=" "
 
-  for preferred in smoke-pass smoke-fail cuda-basic; do
+  for preferred in "${SUPPORTED_IMAGES[@]}"; do
     if [[ -f "${IMAGES_ROOT}/${preferred}/Dockerfile" ]]; then
       echo "${preferred}"
-      seen+="${preferred} "
     fi
-  done
-
-  find "${IMAGES_ROOT}" -mindepth 2 -maxdepth 2 -name Dockerfile -type f | sort | while IFS= read -r dockerfile; do
-    name="$(basename "$(dirname "${dockerfile}")")"
-    [[ "${seen}" == *" ${name} "* ]] && continue
-    echo "${name}"
   done
 }
 
@@ -88,6 +80,19 @@ image_expectation() {
       exit 1
       ;;
   esac
+}
+
+workload_input_fingerprint() {
+  local -a names=("$@")
+
+  {
+    printf 'OPENSHELL_SANDBOX_BASE_IMAGE=%s\n' "${BASE_IMAGE}"
+    if contains_image cuda-basic "${names[@]}"; then
+      printf 'CUDA_BUILD_IMAGE=%s\n' "${CUDA_BUILD_IMAGE}"
+      printf 'CUDA_SAMPLES_REPO=%s\n' "${CUDA_SAMPLES_REPO}"
+      printf 'CUDA_SAMPLES_REF=%s\n' "${CUDA_SAMPLES_REF}"
+    fi
+  } | git -C "${ROOT}" hash-object --stdin | cut -c1-8
 }
 
 mapfile -t available < <(available_image_dirs)
@@ -128,11 +133,13 @@ fi
 if [[ -n "${OPENSHELL_GPU_WORKLOAD_IMAGE_TAG:-}" ]]; then
   image_tag="${OPENSHELL_GPU_WORKLOAD_IMAGE_TAG}"
 else
-  image_tag="${source_short_sha}"
+  input_fingerprint="$(workload_input_fingerprint "${selected[@]}")"
+  image_tag="${source_short_sha}-${input_fingerprint}"
   if [[ "${source_dirty}" == "true" ]]; then
     image_tag="${image_tag}-dirty"
   fi
 fi
+input_fingerprint="$(workload_input_fingerprint "${selected[@]}")"
 
 declare -A image_refs=()
 
@@ -148,11 +155,22 @@ for name in "${selected[@]}"; do
   build_args=(
     --build-arg "OPENSHELL_SANDBOX_BASE_IMAGE=${BASE_IMAGE}"
   )
+  build_labels=(
+    --label "com.nvidia.openshell.gpu-workload.source=${name}"
+    --label "com.nvidia.openshell.gpu-workload.base-image=${BASE_IMAGE}"
+    --label "com.nvidia.openshell.gpu-workload.input-fingerprint=${input_fingerprint}"
+    --label "org.opencontainers.image.revision=${source_sha}"
+  )
   if [[ "${name}" == "cuda-basic" ]]; then
     build_args+=(
       --build-arg "CUDA_BUILD_IMAGE=${CUDA_BUILD_IMAGE}"
       --build-arg "CUDA_SAMPLES_REPO=${CUDA_SAMPLES_REPO}"
       --build-arg "CUDA_SAMPLES_REF=${CUDA_SAMPLES_REF}"
+    )
+    build_labels+=(
+      --label "com.nvidia.openshell.gpu-workload.cuda-build-image=${CUDA_BUILD_IMAGE}"
+      --label "com.nvidia.openshell.gpu-workload.cuda-samples-repo=${CUDA_SAMPLES_REPO}"
+      --label "com.nvidia.openshell.gpu-workload.cuda-samples-ref=${CUDA_SAMPLES_REF}"
     )
   fi
 
@@ -162,8 +180,7 @@ for name in "${selected[@]}"; do
     --load \
     --provenance=false \
     -t "${image_ref}" \
-    --label "com.nvidia.openshell.gpu-workload.source=${name}" \
-    --label "org.opencontainers.image.revision=${source_sha}" \
+    "${build_labels[@]}" \
     "${build_args[@]}" \
     "${context}"
 
@@ -180,6 +197,11 @@ manifest_path="${BUILD_DIR}/workloads.yaml"
   write_env_var OPENSHELL_GPU_WORKLOAD_IMAGE_SOURCE_PATH "${IMAGES_ROOT}"
   write_env_var OPENSHELL_GPU_WORKLOAD_IMAGE_SOURCE_SHA "${source_sha}"
   write_env_var OPENSHELL_GPU_WORKLOAD_IMAGE_SOURCE_DIRTY "${source_dirty}"
+  write_env_var OPENSHELL_GPU_WORKLOAD_IMAGE_INPUT_FINGERPRINT "${input_fingerprint}"
+  write_env_var OPENSHELL_SANDBOX_BASE_IMAGE "${BASE_IMAGE}"
+  write_env_var CUDA_BUILD_IMAGE "${CUDA_BUILD_IMAGE}"
+  write_env_var CUDA_SAMPLES_REPO "${CUDA_SAMPLES_REPO}"
+  write_env_var CUDA_SAMPLES_REF "${CUDA_SAMPLES_REF}"
   write_env_var OPENSHELL_GPU_WORKLOAD_CONTAINER_ENGINE "${CONTAINER_ENGINE}"
   write_env_var OPENSHELL_E2E_WORKLOAD_MANIFEST "${manifest_path}"
   for name in "${selected[@]}"; do
@@ -194,11 +216,17 @@ manifest_path="${BUILD_DIR}/workloads.yaml"
   echo "  path: $(yaml_quote "${IMAGES_ROOT}")"
   echo "  revision: $(yaml_quote "${source_sha}")"
   echo "  dirty: ${source_dirty}"
+  echo "  input_fingerprint: $(yaml_quote "${input_fingerprint}")"
   echo "  container_engine: $(yaml_quote "${CONTAINER_ENGINE}")"
+  echo "  inputs:"
+  echo "    openshell_sandbox_base_image: $(yaml_quote "${BASE_IMAGE}")"
+  echo "    cuda_build_image: $(yaml_quote "${CUDA_BUILD_IMAGE}")"
+  echo "    cuda_samples_repo: $(yaml_quote "${CUDA_SAMPLES_REPO}")"
+  echo "    cuda_samples_ref: $(yaml_quote "${CUDA_SAMPLES_REF}")"
   echo "workloads:"
   for name in "${selected[@]}"; do
     echo "  - name: $(yaml_quote "${name}")"
-    echo "    image: $(yaml_quote "${image_refs[${name}]}" )"
+    echo "    image: $(yaml_quote "${image_refs[${name}]}")"
     echo "    command:"
     echo "      - $(yaml_quote "/usr/local/bin/openshell-gpu-workload")"
     echo "    expect: $(yaml_quote "$(image_expectation "${name}")")"

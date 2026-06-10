@@ -26,7 +26,7 @@ description = "Run Docker GPU end-to-end tests"
 depends = ["e2e:docker:gpu"]
 
 ["e2e:workloads:build"]
-description = "Build local workload test images and manifest for e2e validation"
+description = "Build local GPU workload test images and manifest"
 run = "bash tasks/scripts/e2e-gpu-build-images.sh"
 
 ["e2e:k3s:gpu"]
