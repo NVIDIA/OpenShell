@@ -955,10 +955,12 @@ where
             .as_deref()
             .map(|e| format!("JSON-RPC request rejected: {e}"));
         let force_deny = parse_error_reason.is_some();
-        let (allowed, reason) = if let Some(reason) = parse_error_reason {
-            (false, reason)
+        let (allowed, reason, jsonrpc_log_info) = if let Some(reason) = parse_error_reason {
+            (false, reason, jsonrpc_info.clone())
         } else {
-            evaluate_l7_request(engine, ctx, &request_info)?
+            let evaluation =
+                evaluate_jsonrpc_l7_request_for_log(engine, ctx, &request_info, &jsonrpc_info)?;
+            (evaluation.allowed, evaluation.reason, evaluation.log_info)
         };
 
         if close_if_stale(engine.generation_guard(), ctx) {
@@ -981,11 +983,11 @@ where
                     SeverityId::Informational,
                 ),
             };
-            let rpc_method = jsonrpc_info
-                .calls
-                .first()
-                .map(|call| call.method.as_str())
-                .unwrap_or("-");
+            let endpoint = format!("{}:{}{}", ctx.host, ctx.port, redacted_target);
+            let params_sha256 = jsonrpc_log_info
+                .params_sha256()
+                .unwrap_or_else(|| "<empty>".to_string());
+            let policy_version = engine.captured_generation();
             let event = HttpActivityBuilder::new(crate::ocsf_ctx())
                 .activity(ActivityId::Other)
                 .action(action_id)
@@ -997,9 +999,14 @@ where
                 ))
                 .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
                 .firewall_rule(&ctx.policy_name, "l7-jsonrpc")
-                .message(format!(
-                    "JSONRPC_L7_REQUEST {decision_str} {} {}:{}{} rpc_method={rpc_method} reason={}",
-                    request_info.action, ctx.host, ctx.port, redacted_target, reason,
+                .message(jsonrpc_log_message(
+                    decision_str,
+                    &request_info.action,
+                    &endpoint,
+                    &jsonrpc_log_info,
+                    &params_sha256,
+                    policy_version,
+                    &reason,
                 ))
                 .build();
             ocsf_emit!(event);
@@ -1274,6 +1281,38 @@ fn graphql_log_summary(info: &crate::l7::graphql::GraphqlRequestInfo) -> String 
     format!("graphql_ops={}", ops.join(";"))
 }
 
+fn jsonrpc_log_message(
+    decision: &str,
+    http_method: &str,
+    endpoint: &str,
+    info: &crate::l7::jsonrpc::JsonRpcRequestInfo,
+    params_sha256: &str,
+    policy_version: u64,
+    reason: &str,
+) -> String {
+    let rpc_methods = jsonrpc_methods_for_log(info);
+    format!(
+        "JSONRPC_L7_REQUEST decision={decision} http_method={http_method} endpoint={endpoint} rpc_methods={rpc_methods} params_sha256={params_sha256} policy_version={policy_version} reason={reason}"
+    )
+}
+
+fn jsonrpc_methods_for_log(info: &crate::l7::jsonrpc::JsonRpcRequestInfo) -> String {
+    if info.calls.is_empty() {
+        return "-".to_string();
+    }
+    info.calls
+        .iter()
+        .map(|call| call.method.as_str())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+struct JsonRpcEvaluation {
+    allowed: bool,
+    reason: String,
+    log_info: crate::l7::jsonrpc::JsonRpcRequestInfo,
+}
+
 /// Check if a miette error represents a benign connection close.
 ///
 /// TLS handshake EOF, missing `close_notify`, connection resets, and broken
@@ -1305,12 +1344,7 @@ pub fn evaluate_l7_request(
         && !jsonrpc.calls.is_empty()
     {
         for call in &jsonrpc.calls {
-            let mut item_request = request.clone();
-            item_request.jsonrpc = Some(crate::l7::jsonrpc::JsonRpcRequestInfo {
-                calls: vec![call.clone()],
-                is_batch: false,
-                error: None,
-            });
+            let item_request = jsonrpc_request_for_call(request, call);
             let (allowed, reason) = evaluate_l7_request_once(engine, ctx, &item_request)?;
             if !allowed {
                 return Ok((false, reason));
@@ -1320,6 +1354,66 @@ pub fn evaluate_l7_request(
     }
 
     evaluate_l7_request_once(engine, ctx, request)
+}
+
+fn evaluate_jsonrpc_l7_request_for_log(
+    engine: &TunnelPolicyEngine,
+    ctx: &L7EvalContext,
+    request: &L7RequestInfo,
+    jsonrpc: &crate::l7::jsonrpc::JsonRpcRequestInfo,
+) -> Result<JsonRpcEvaluation> {
+    if jsonrpc.is_batch && !jsonrpc.calls.is_empty() {
+        let mut denied_calls = Vec::new();
+        let mut first_denied_reason = None;
+        for call in &jsonrpc.calls {
+            let item_request = jsonrpc_request_for_call(request, call);
+            let (allowed, reason) = evaluate_l7_request_once(engine, ctx, &item_request)?;
+            if !allowed {
+                if first_denied_reason.is_none() {
+                    first_denied_reason = Some(reason);
+                }
+                denied_calls.push(call.clone());
+            }
+        }
+
+        if denied_calls.is_empty() {
+            return Ok(JsonRpcEvaluation {
+                allowed: true,
+                reason: String::new(),
+                log_info: jsonrpc.clone(),
+            });
+        }
+
+        return Ok(JsonRpcEvaluation {
+            allowed: false,
+            reason: first_denied_reason.unwrap_or_else(|| "request denied by policy".to_string()),
+            log_info: crate::l7::jsonrpc::JsonRpcRequestInfo {
+                calls: denied_calls,
+                is_batch: true,
+                error: None,
+            },
+        });
+    }
+
+    let (allowed, reason) = evaluate_l7_request_once(engine, ctx, request)?;
+    Ok(JsonRpcEvaluation {
+        allowed,
+        reason,
+        log_info: jsonrpc.clone(),
+    })
+}
+
+fn jsonrpc_request_for_call(
+    request: &L7RequestInfo,
+    call: &crate::l7::jsonrpc::JsonRpcCallInfo,
+) -> L7RequestInfo {
+    let mut item_request = request.clone();
+    item_request.jsonrpc = Some(crate::l7::jsonrpc::JsonRpcRequestInfo {
+        calls: vec![call.clone()],
+        is_batch: false,
+        error: None,
+    });
+    item_request
 }
 
 fn evaluate_l7_request_once(
@@ -2026,6 +2120,7 @@ network_policies:
           - rpc_method: "tools/call"
             params:
               name: blocked_action
+          - rpc_method: "tools/delete"
     binaries:
       - { path: /usr/bin/node }
 "#;
@@ -2064,11 +2159,113 @@ network_policies:
         request.jsonrpc = Some(crate::l7::jsonrpc::parse_jsonrpc_body(
             br#"[
                 {"jsonrpc":"2.0","id":1,"method":"tools/list"},
-                {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"blocked_action"}}
+                {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"blocked_action"}},
+                {"jsonrpc":"2.0","id":3,"method":"tools/delete","params":{"name":"purge_cache"}}
             ]"#,
         ));
         let (allowed, _) = evaluate_l7_request(&tunnel_engine, &ctx, &request).unwrap();
         assert!(!allowed);
+
+        let jsonrpc = request.jsonrpc.as_ref().expect("jsonrpc request");
+        let evaluation =
+            evaluate_jsonrpc_l7_request_for_log(&tunnel_engine, &ctx, &request, jsonrpc).unwrap();
+        assert!(!evaluation.allowed);
+        assert!(evaluation.log_info.is_batch);
+        assert_eq!(
+            jsonrpc_methods_for_log(&evaluation.log_info),
+            "tools/call,tools/delete"
+        );
+
+        let full_params_sha256 = jsonrpc.params_sha256().expect("full batch params digest");
+        let log_params_sha256 = evaluation
+            .log_info
+            .params_sha256()
+            .expect("logged batch params digest");
+        assert_ne!(full_params_sha256, log_params_sha256);
+        let message = jsonrpc_log_message(
+            "deny",
+            "POST",
+            "api.example.test:443/mcp",
+            &evaluation.log_info,
+            &log_params_sha256,
+            42,
+            &evaluation.reason,
+        );
+        assert!(message.contains("rpc_methods=tools/call,tools/delete"));
+        assert!(message.contains("params_sha256="));
+        assert!(!message.contains("params_sha256=sha256:"));
+        assert!(message.contains("policy_version=42"));
+        assert!(!message.contains("tools/list"));
+        assert!(!message.contains("blocked_action"));
+        assert!(!message.contains("purge_cache"));
+    }
+
+    #[test]
+    fn jsonrpc_log_records_digest_not_args() {
+        let info = crate::l7::jsonrpc::parse_jsonrpc_body(
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"delete_resource","arguments":{"scope":"secret-scope"}}}"#,
+        );
+        let params_sha256 = info.params_sha256().expect("params digest");
+        let message = jsonrpc_log_message(
+            "deny",
+            "POST",
+            "mcp.example.com:443/mcp",
+            &info,
+            &params_sha256,
+            42,
+            "request denied by policy",
+        );
+
+        assert!(message.contains("endpoint=mcp.example.com:443/mcp"));
+        assert!(message.contains("rpc_methods=tools/call"));
+        assert!(message.contains("params_sha256="));
+        assert!(!message.contains("params_sha256=sha256:"));
+        assert!(message.contains("policy_version=42"));
+        assert!(!message.contains("delete_resource"));
+        assert!(!message.contains("secret-scope"));
+
+        let batch = crate::l7::jsonrpc::parse_jsonrpc_body(
+            br#"[
+                {"jsonrpc":"2.0","id":1,"method":"tools/list"},
+                {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"delete_resource"}}
+            ]"#,
+        );
+        let batch_params_sha256 = batch.params_sha256().expect("batch params digest");
+        let batch_message = jsonrpc_log_message(
+            "allow",
+            "POST",
+            "mcp.example.com:443/mcp",
+            &batch,
+            &batch_params_sha256,
+            43,
+            "",
+        );
+
+        assert!(batch_message.starts_with("JSONRPC_L7_REQUEST "));
+        assert!(batch_message.contains("rpc_methods=tools/list,tools/call"));
+        assert!(batch_message.contains("params_sha256="));
+        assert!(!batch_message.contains("params_sha256=sha256:"));
+        assert!(batch_message.contains("policy_version=43"));
+        assert!(!batch_message.contains("rpc_method="));
+        assert!(!batch_message.contains("delete_resource"));
+
+        let no_params = crate::l7::jsonrpc::parse_jsonrpc_body(
+            br#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+        );
+        let no_params_sha256 = no_params
+            .params_sha256()
+            .unwrap_or_else(|| "<empty>".to_string());
+        let no_params_message = jsonrpc_log_message(
+            "allow",
+            "POST",
+            "mcp.example.com:443/mcp",
+            &no_params,
+            &no_params_sha256,
+            44,
+            "",
+        );
+        assert!(no_params_message.contains("rpc_methods=initialize"));
+        assert!(no_params_message.contains("params_sha256=<empty>"));
     }
 
     #[tokio::test]
