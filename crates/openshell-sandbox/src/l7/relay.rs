@@ -178,6 +178,25 @@ where
                 .into_diagnostic()?;
             Ok(())
         }
+        L7Protocol::JsonRpc => {
+            if close_if_stale(engine.generation_guard(), ctx) {
+                return Ok(());
+            }
+            // JSON-RPC provider not yet implemented — fall through to passthrough
+            {
+                let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                    .activity(ActivityId::Other)
+                    .severity(SeverityId::Low)
+                    .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+                    .message("JSON-RPC L7 provider not yet implemented, falling back to passthrough")
+                    .build();
+                ocsf_emit!(event);
+            }
+            tokio::io::copy_bidirectional(client, upstream)
+                .await
+                .into_diagnostic()?;
+            Ok(())
+        }
     }
 }
 
@@ -341,7 +360,7 @@ where
         let engine_type = match config.protocol {
             L7Protocol::Graphql => "l7-graphql",
             L7Protocol::Websocket => "l7-websocket",
-            L7Protocol::Rest | L7Protocol::Sql => "l7",
+            L7Protocol::Rest | L7Protocol::Sql | L7Protocol::JsonRpc => "l7",
         };
         emit_l7_request_log(
             ctx,

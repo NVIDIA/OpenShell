@@ -25,6 +25,7 @@ pub enum L7Protocol {
     Websocket,
     Graphql,
     Sql,
+    JsonRpc,
 }
 
 impl L7Protocol {
@@ -34,6 +35,7 @@ impl L7Protocol {
             "websocket" => Some(Self::Websocket),
             "graphql" => Some(Self::Graphql),
             "sql" => Some(Self::Sql),
+            "json-rpc" => Some(Self::JsonRpc),
             _ => None,
         }
     }
@@ -598,7 +600,7 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
 
             if !protocol.is_empty() && L7Protocol::parse(protocol).is_none() {
                 errors.push(format!(
-                    "{loc}: unknown protocol '{protocol}' (expected rest, websocket, graphql, or sql)"
+                    "{loc}: unknown protocol '{protocol}' (expected rest, websocket, graphql, sql, or json-rpc)"
                 ));
             }
 
