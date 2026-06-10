@@ -142,6 +142,23 @@ Before discovering work, define the invocation target selector and keep every la
 
 For PR watch requests, normal discovery should include open non-draft PRs matching the target selector. Closed/merged reconciliation may also include closed or merged PRs matching the same selector when they still have an active `gator:*` label. This is a cleanup extension of the current invocation scope, not permission to scan or mutate all gator-labeled PRs in the repository.
 
+When searching for closed or merged PRs with active gator labels, query each label separately and de-dupe by PR number. Do not combine labels into one comma-separated search term; GitHub search does not treat that as an OR query and can miss PRs. Example for "my PRs":
+
+```bash
+author="$(gh api user --jq '.login')"
+for label in \
+  gator:follow-up-needed \
+  gator:blocked \
+  gator:validated \
+  gator:in-review \
+  gator:watch-pipeline \
+  gator:approval-needed; do
+  gh pr list --repo NVIDIA/OpenShell --author "$author" --state closed \
+    --search "label:$label" \
+    --json number,title,state,mergedAt,closedAt,labels,url,updatedAt
+done | jq -s 'add | unique_by(.number)'
+```
+
 When using closed/merged reconciliation for a PR that was not explicitly requested by number, require a prior comment beginning with `> **gator-agent**` before mutating labels.
 
 If a closed or merged PR has an active `gator:*` label but no gator marker and was not explicitly requested, report the label drift in the cycle summary and leave the labels unchanged.
