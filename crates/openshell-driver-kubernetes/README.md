@@ -93,7 +93,7 @@ openshell sandbox create \
 ```
 
 Resource keys use native Kubernetes resource names and quantity strings. The
-POC parser renders the keys listed above and ignores unknown fields.
+POC parser renders the keys listed above and rejects unknown fields.
 `pod.runtime_class_name` maps to PodSpec `runtimeClassName` and overrides the
 driver's configured `default_runtime_class_name`; the typed public
 `SandboxTemplate.runtime_class_name` still takes precedence when set. Use the

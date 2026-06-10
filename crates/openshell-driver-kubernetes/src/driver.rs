@@ -45,6 +45,8 @@ pub enum KubernetesDriverError {
     #[error("sandbox already exists")]
     AlreadyExists,
     #[error("{0}")]
+    InvalidArgument(String),
+    #[error("{0}")]
     Precondition(String),
     #[error("{0}")]
     Message(String),
@@ -63,6 +65,7 @@ impl From<KubernetesDriverError> for openshell_core::ComputeDriverError {
     fn from(err: KubernetesDriverError) -> Self {
         match err {
             KubernetesDriverError::AlreadyExists => Self::AlreadyExists,
+            KubernetesDriverError::InvalidArgument(m) => Self::InvalidArgument(m),
             KubernetesDriverError::Precondition(m) => Self::Precondition(m),
             KubernetesDriverError::Message(m) => Self::Message(m),
         }
@@ -89,14 +92,38 @@ const SPIFFE_WORKLOAD_API_VOLUME_NAME: &str = "spiffe-workload-api";
 // translation layer; the RFC boundary is Struct at the gateway, typed config in
 // the selected driver.
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct KubernetesSandboxDriverConfig {
     pod: KubernetesPodDriverConfig,
     containers: KubernetesDriverContainersConfig,
 }
 
+impl KubernetesSandboxDriverConfig {
+    fn from_sandbox(sandbox: &Sandbox) -> Result<Self, String> {
+        let Some(template) = sandbox
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.template.as_ref())
+        else {
+            return Ok(Self::default());
+        };
+
+        Self::from_template(template)
+    }
+
+    fn from_template(template: &SandboxTemplate) -> Result<Self, String> {
+        let Some(config) = template.driver_config.as_ref() else {
+            return Ok(Self::default());
+        };
+
+        let json = serde_json::Value::Object(struct_to_json_object(config));
+        serde_json::from_value(json)
+            .map_err(|err| format!("invalid kubernetes driver_config: {err}"))
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct KubernetesPodDriverConfig {
     node_selector: BTreeMap<String, String>,
     runtime_class_name: String,
@@ -105,19 +132,19 @@ struct KubernetesPodDriverConfig {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct KubernetesDriverContainersConfig {
     agent: KubernetesContainerDriverConfig,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct KubernetesContainerDriverConfig {
     resources: KubernetesContainerResourceConfig,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct KubernetesContainerResourceConfig {
     requests: BTreeMap<String, String>,
     limits: BTreeMap<String, String>,
@@ -252,6 +279,8 @@ impl KubernetesComputeDriver {
     }
 
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), tonic::Status> {
+        let _ = KubernetesSandboxDriverConfig::from_sandbox(sandbox)
+            .map_err(tonic::Status::invalid_argument)?;
         let gpu_requested = sandbox.spec.as_ref().is_some_and(|spec| spec.gpu);
         if gpu_requested
             && !self.has_gpu_capacity().await.map_err(|err| {
@@ -345,6 +374,8 @@ impl KubernetesComputeDriver {
     }
 
     pub async fn create_sandbox(&self, sandbox: &Sandbox) -> Result<(), KubernetesDriverError> {
+        let _ = KubernetesSandboxDriverConfig::from_sandbox(sandbox)
+            .map_err(KubernetesDriverError::InvalidArgument)?;
         let name = sandbox.name.as_str();
         info!(
             sandbox_id = %sandbox.id,
@@ -1144,18 +1175,8 @@ fn spec_pod_env(spec: Option<&SandboxSpec>) -> std::collections::HashMap<String,
 }
 
 fn kubernetes_driver_config(template: &SandboxTemplate) -> KubernetesSandboxDriverConfig {
-    let Some(config) = template.driver_config.as_ref() else {
-        return KubernetesSandboxDriverConfig::default();
-    };
-
-    let json = serde_json::Value::Object(struct_to_json_object(config));
-    match serde_json::from_value(json) {
-        Ok(config) => config,
-        Err(err) => {
-            warn!(error = %err, "Ignoring invalid Kubernetes driver_config");
-            KubernetesSandboxDriverConfig::default()
-        }
-    }
+    KubernetesSandboxDriverConfig::from_template(template)
+        .expect("validated Kubernetes driver_config")
 }
 
 fn sandbox_to_k8s_spec(
@@ -1947,7 +1968,7 @@ mod tests {
     }
 
     #[test]
-    fn driver_config_ignores_invalid_shape() {
+    fn driver_config_rejects_invalid_shape() {
         let template = SandboxTemplate {
             driver_config: Some(json_struct(serde_json::json!({
                 "pod": "not-an-object"
@@ -1955,11 +1976,44 @@ mod tests {
             ..SandboxTemplate::default()
         };
 
-        let config = kubernetes_driver_config(&template);
+        let err = KubernetesSandboxDriverConfig::from_template(&template).unwrap_err();
 
-        assert!(config.pod.node_selector.is_empty());
-        assert!(config.containers.agent.resources.requests.is_empty());
-        assert!(config.containers.agent.resources.limits.is_empty());
+        assert!(err.contains("invalid kubernetes driver_config"));
+    }
+
+    #[test]
+    fn driver_config_rejects_unknown_fields() {
+        let template = SandboxTemplate {
+            driver_config: Some(json_struct(serde_json::json!({
+                "cdi_devices": ["nvidia.com/gpu=0"]
+            }))),
+            ..SandboxTemplate::default()
+        };
+
+        let err = KubernetesSandboxDriverConfig::from_template(&template).unwrap_err();
+
+        assert!(err.contains("unknown field"));
+    }
+
+    #[test]
+    fn driver_config_from_sandbox_rejects_unknown_fields() {
+        let sandbox = Sandbox {
+            id: "sandbox-123".to_string(),
+            spec: Some(SandboxSpec {
+                gpu: true,
+                template: Some(SandboxTemplate {
+                    driver_config: Some(json_struct(serde_json::json!({
+                        "cdi_devices": ["nvidia.com/gpu=0"]
+                    }))),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = KubernetesSandboxDriverConfig::from_sandbox(&sandbox).unwrap_err();
+        assert!(err.contains("unknown field"));
     }
 
     #[test]
