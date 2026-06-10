@@ -297,6 +297,7 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                                         operation_type: r.allow.operation_type,
                                         operation_name: r.allow.operation_name,
                                         fields: r.allow.fields,
+                                        rpc_method: r.allow.rpc_method,
                                         query: r
                                             .allow
                                             .query
@@ -328,6 +329,7 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                                     operation_type: d.operation_type,
                                     operation_name: d.operation_name,
                                     fields: d.fields,
+                                    rpc_method: d.rpc_method,
                                     query: d
                                         .query
                                         .into_iter()
@@ -469,6 +471,7 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                                             operation_type: a.operation_type,
                                             operation_name: a.operation_name,
                                             fields: a.fields,
+                                            rpc_method: a.rpc_method,
                                             query: a
                                                 .query
                                                 .into_iter()
@@ -483,7 +486,6 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                                                     (key, yaml_matcher)
                                                 })
                                                 .collect(),
-                                            rpc_method: String::new(),
                                             params: BTreeMap::new(),
                                         },
                                     }
@@ -500,6 +502,7 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                                     operation_type: d.operation_type.clone(),
                                     operation_name: d.operation_name.clone(),
                                     fields: d.fields.clone(),
+                                    rpc_method: d.rpc_method.clone(),
                                     query: d
                                         .query
                                         .iter()
@@ -514,7 +517,6 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                                             (key.clone(), yaml_matcher)
                                         })
                                         .collect(),
-                                    rpc_method: String::new(),
                                     params: BTreeMap::new(),
                                 })
                                 .collect(),

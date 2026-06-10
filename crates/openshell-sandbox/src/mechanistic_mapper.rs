@@ -355,6 +355,7 @@ fn build_l7_rules(samples: &HashMap<(String, String), u32>) -> Vec<L7Rule> {
                 operation_type: String::new(),
                 operation_name: String::new(),
                 fields: Vec::new(),
+                rpc_method: String::new(),
             }),
         });
     }
