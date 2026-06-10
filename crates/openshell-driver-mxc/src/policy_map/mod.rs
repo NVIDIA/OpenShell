@@ -18,10 +18,10 @@
 //!   and anything MXC cannot express (ports, protocol, L7 rules, binary scope)
 //!   is recorded in the loss report. Use this when MXC enforces network on its
 //!   own, with no `OpenShell` proxy in the loop.
-//! - `split_policy` (added in a later sprint) — the *lossless* split for the
-//!   Windows MXC compute driver: MXC handles filesystem + containment + a
-//!   `network.proxy` redirect, while the full `OpenShell` network policy is
-//!   preserved in a trimmed policy enforced by the host CONNECT proxy.
+//! - [`split_policy`] — the *lossless* split for the Windows MXC compute
+//!   driver: MXC handles filesystem + containment + a `network.proxy` redirect,
+//!   while the full `OpenShell` network policy is preserved in a trimmed policy
+//!   enforced by the host CONNECT proxy.
 //!
 //! The report/loss-report helpers are only exercised by the example and the
 //! integration tests, so the Windows lib build would otherwise warn on them;
@@ -38,5 +38,5 @@ mod report;
 
 pub use config::{DEFAULT_COMMAND, DEFAULT_CONTAINMENT, DEFAULT_MXC_VERSION};
 pub use loss::{LossItem, OPEN_SHELL_SUPERSET_GAPS};
-pub use map::{MxcMappingOptions, MxcMappingResult, map_to_mxc};
+pub use map::{MxcMappingOptions, MxcMappingResult, SplitPolicyResult, map_to_mxc, split_policy};
 pub use report::{build_loss_report, render_readme};
