@@ -178,25 +178,7 @@ where
                 .into_diagnostic()?;
             Ok(())
         }
-        L7Protocol::JsonRpc => {
-            if close_if_stale(engine.generation_guard(), ctx) {
-                return Ok(());
-            }
-            // JSON-RPC provider not yet implemented — fall through to passthrough
-            {
-                let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
-                    .activity(ActivityId::Other)
-                    .severity(SeverityId::Low)
-                    .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
-                    .message("JSON-RPC L7 provider not yet implemented, falling back to passthrough")
-                    .build();
-                ocsf_emit!(event);
-            }
-            tokio::io::copy_bidirectional(client, upstream)
-                .await
-                .into_diagnostic()?;
-            Ok(())
-        }
+        L7Protocol::JsonRpc => relay_jsonrpc(config, &engine, client, upstream, ctx).await,
     }
 }
 
@@ -316,6 +298,7 @@ where
             target: redacted_target.clone(),
             query_params: req.query_params.clone(),
             graphql: graphql_info.clone(),
+            jsonrpc: None,
         };
         let websocket_request = crate::l7::rest::request_is_websocket_upgrade(&req.raw_header);
         if config.protocol == L7Protocol::Websocket && !websocket_request {
@@ -713,6 +696,7 @@ where
             target: redacted_target.clone(),
             query_params: req.query_params.clone(),
             graphql: None,
+            jsonrpc: None,
         };
         let websocket_request = crate::l7::rest::request_is_websocket_upgrade(&req.raw_header);
         if config.protocol == L7Protocol::Websocket && !websocket_request {
@@ -904,6 +888,162 @@ fn close_if_stale(guard: &PolicyGenerationGuard, ctx: &L7EvalContext) -> bool {
     true
 }
 
+async fn relay_jsonrpc<C, U>(
+    config: &L7EndpointConfig,
+    engine: &TunnelPolicyEngine,
+    client: &mut C,
+    upstream: &mut U,
+    ctx: &L7EvalContext,
+) -> Result<()>
+where
+    C: AsyncRead + AsyncWrite + Unpin + Send,
+    U: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    loop {
+        if close_if_stale(engine.generation_guard(), ctx) {
+            return Ok(());
+        }
+
+        let parsed = match crate::l7::jsonrpc::parse_jsonrpc_http_request(
+            client,
+            64 * 1024,
+            crate::l7::path::CanonicalizeOptions {
+                allow_encoded_slash: config.allow_encoded_slash,
+                ..Default::default()
+            },
+        )
+        .await
+        {
+            Ok(Some(parsed)) => parsed,
+            Ok(None) => return Ok(()),
+            Err(e) => {
+                if is_benign_connection_error(&e) {
+                    debug!(
+                        host = %ctx.host,
+                        port = ctx.port,
+                        error = %e,
+                        "JSON-RPC L7 connection closed"
+                    );
+                } else {
+                    let detail =
+                        parse_rejection_detail(&e.to_string(), ParseRejectionMode::L7Endpoint);
+                    emit_parse_rejection(ctx, &detail, "l7-jsonrpc");
+                }
+                return Ok(());
+            }
+        };
+
+        let req = parsed.request;
+        let jsonrpc_info = parsed.info;
+
+        if close_if_stale(engine.generation_guard(), ctx) {
+            return Ok(());
+        }
+
+        let redacted_target = req.target.clone();
+
+        let request_info = L7RequestInfo {
+            action: req.action.clone(),
+            target: redacted_target.clone(),
+            query_params: req.query_params.clone(),
+            graphql: None,
+            jsonrpc: Some(jsonrpc_info.clone()),
+        };
+
+        let parse_error_reason = jsonrpc_info
+            .error
+            .as_deref()
+            .map(|e| format!("JSON-RPC request rejected: {e}"));
+        let force_deny = parse_error_reason.is_some();
+        let (allowed, reason) = if let Some(reason) = parse_error_reason {
+            (false, reason)
+        } else {
+            evaluate_l7_request(engine, ctx, &request_info)?
+        };
+
+        if close_if_stale(engine.generation_guard(), ctx) {
+            return Ok(());
+        }
+
+        let decision_str = match (allowed, config.enforcement) {
+            (_, _) if force_deny => "deny",
+            (true, _) => "allow",
+            (false, EnforcementMode::Audit) => "audit",
+            (false, EnforcementMode::Enforce) => "deny",
+        };
+
+        {
+            let (action_id, disposition_id, severity) = match decision_str {
+                "deny" => (ActionId::Denied, DispositionId::Blocked, SeverityId::Medium),
+                _ => (
+                    ActionId::Allowed,
+                    DispositionId::Allowed,
+                    SeverityId::Informational,
+                ),
+            };
+            let rpc_method = jsonrpc_info.method.as_deref().unwrap_or("-");
+            let event = HttpActivityBuilder::new(crate::ocsf_ctx())
+                .activity(ActivityId::Other)
+                .action(action_id)
+                .disposition(disposition_id)
+                .severity(severity)
+                .http_request(HttpRequest::new(
+                    &request_info.action,
+                    OcsfUrl::new("http", &ctx.host, &redacted_target, ctx.port),
+                ))
+                .dst_endpoint(Endpoint::from_domain(&ctx.host, ctx.port))
+                .firewall_rule(&ctx.policy_name, "l7-jsonrpc")
+                .message(format!(
+                    "JSONRPC_L7_REQUEST {decision_str} {} {}:{}{} rpc_method={rpc_method} reason={}",
+                    request_info.action, ctx.host, ctx.port, redacted_target, reason,
+                ))
+                .build();
+            ocsf_emit!(event);
+        }
+
+        if allowed || (config.enforcement == EnforcementMode::Audit && !force_deny) {
+            let outcome = crate::l7::rest::relay_http_request_with_resolver_guarded(
+                &req,
+                client,
+                upstream,
+                ctx.secret_resolver.as_deref(),
+                Some(engine.generation_guard()),
+            )
+            .await?;
+            match outcome {
+                RelayOutcome::Reusable => {}
+                RelayOutcome::Consumed => {
+                    debug!(
+                        host = %ctx.host,
+                        port = ctx.port,
+                        "Upstream connection not reusable, closing JSON-RPC L7 relay"
+                    );
+                    return Ok(());
+                }
+                RelayOutcome::Upgraded { .. } => {
+                    return Ok(());
+                }
+            }
+        } else {
+            crate::l7::rest::RestProvider::default()
+                .deny_with_redacted_target(
+                    &req,
+                    &ctx.policy_name,
+                    &reason,
+                    client,
+                    Some(&redacted_target),
+                    Some(crate::l7::rest::DenyResponseContext {
+                        host: Some(&ctx.host),
+                        port: Some(ctx.port),
+                        binary: Some(&ctx.binary_path),
+                    }),
+                )
+                .await?;
+            return Ok(());
+        }
+    }
+}
+
 async fn relay_graphql<C, U>(
     config: &L7EndpointConfig,
     engine: &TunnelPolicyEngine,
@@ -981,6 +1121,7 @@ where
             target: redacted_target.clone(),
             query_params: req.query_params.clone(),
             graphql: Some(graphql_info.clone()),
+            jsonrpc: None,
         };
 
         // Malformed or ambiguous GraphQL requests, such as duplicated GET
@@ -1178,6 +1319,10 @@ pub fn evaluate_l7_request(
             "path": request.target,
             "query_params": request.query_params.clone(),
             "graphql": request.graphql.clone(),
+            "jsonrpc": request.jsonrpc.as_ref().map(|j| serde_json::json!({
+                "method": j.method,
+                "error": j.error,
+            })),
         }
     });
 
@@ -1811,6 +1956,7 @@ network_policies:
             target: "/ws".into(),
             query_params: std::collections::HashMap::new(),
             graphql: None,
+            jsonrpc: None,
         };
 
         let (allowed, reason) = evaluate_l7_request(&tunnel_engine, &ctx, &request).unwrap();
@@ -2425,5 +2571,101 @@ network_policies:
             n, 0,
             "stale passthrough request must not be forwarded upstream"
         );
+    }
+
+    #[tokio::test]
+    async fn jsonrpc_relay_denies_method_not_in_allow_list() {
+        let data = r"
+network_policies:
+  mcp_api:
+    name: mcp_api
+    endpoints:
+      - host: mcp.example.test
+        port: 8000
+        path: /mcp
+        protocol: json-rpc
+        enforcement: enforce
+        rules:
+          - allow:
+              rpc_method: initialize
+    binaries:
+      - { path: /usr/bin/python3 }
+";
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let input = NetworkInput {
+            host: "mcp.example.test".into(),
+            port: 8000,
+            binary_path: PathBuf::from("/usr/bin/python3"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let (endpoint_config, generation) = engine
+            .query_endpoint_config_with_generation(&input)
+            .unwrap();
+        let config = crate::l7::parse_l7_config(&endpoint_config.unwrap()).unwrap();
+        let tunnel_engine = engine.clone_engine_for_tunnel(generation).unwrap();
+        let ctx = L7EvalContext {
+            host: "mcp.example.test".into(),
+            port: 8000,
+            policy_name: "mcp_api".into(),
+            binary_path: "/usr/bin/python3".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            secret_resolver: None,
+            activity_tx: None,
+            dynamic_credentials: None,
+            token_grant_resolver: None,
+        };
+
+        let (mut app, mut relay_client) = tokio::io::duplex(8192);
+        let (mut relay_upstream, mut upstream) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(async move {
+            relay_with_inspection(
+                &config,
+                tunnel_engine,
+                &mut relay_client,
+                &mut relay_upstream,
+                &ctx,
+            )
+            .await
+        });
+
+        let body =
+            br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_repos"}}"#;
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: mcp.example.test:8000\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        app.write_all(request.as_bytes()).await.unwrap();
+        app.write_all(body).await.unwrap();
+
+        let mut response = [0u8; 512];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), app.read(&mut response))
+            .await
+            .expect("relay should respond without reaching upstream")
+            .unwrap();
+        let response = String::from_utf8_lossy(&response[..n]);
+        assert!(
+            response.contains("403"),
+            "tools/call not in allow list must be denied with 403, got: {response:?}"
+        );
+
+        let mut upstream_buf = [0u8; 128];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            upstream.read(&mut upstream_buf),
+        )
+        .await
+        .unwrap_or(Ok(0))
+        .unwrap_or(0);
+        assert_eq!(n, 0, "denied request must not be forwarded to upstream");
+
+        drop(app);
+        tokio::time::timeout(std::time::Duration::from_secs(1), relay)
+            .await
+            .expect("relay should complete")
+            .unwrap()
+            .unwrap();
     }
 }

@@ -1021,6 +1021,7 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                                     "command": a.map_or("", |a| &a.command),
                                     "operation_type": a.map_or("", |a| &a.operation_type),
                                     "operation_name": a.map_or("", |a| &a.operation_name),
+                                    "rpc_method": a.map_or("", |a| &a.rpc_method),
                                 });
                                 if let Some(a) = a
                                     && !a.fields.is_empty()
@@ -1946,6 +1947,25 @@ process:
         })
     }
 
+    fn l7_jsonrpc_input(host: &str, port: u16, path: &str, rpc_method: &str) -> serde_json::Value {
+        serde_json::json!({
+            "network": { "host": host, "port": port },
+            "exec": {
+                "path": "/usr/bin/curl",
+                "ancestors": [],
+                "cmdline_paths": []
+            },
+            "request": {
+                "method": "POST",
+                "path": path,
+                "query_params": {},
+                "jsonrpc": {
+                    "method": rpc_method
+                }
+            }
+        })
+    }
+
     fn l7_graphql_input(host: &str, operations: serde_json::Value) -> serde_json::Value {
         serde_json::json!({
             "network": { "host": host, "port": 443 },
@@ -2492,6 +2512,7 @@ network_policies:
                             operation_type: String::new(),
                             operation_name: String::new(),
                             fields: Vec::new(),
+                            rpc_method: String::new(),
                         }),
                     }],
                     ..Default::default()
@@ -2537,6 +2558,65 @@ network_policies:
             "/download",
             serde_json::json!({ "tag": ["evil"] }),
         );
+        assert!(!eval_l7(&engine, &deny_input));
+    }
+
+    #[test]
+    fn l7_jsonrpc_rpc_method_from_proto_is_enforced() {
+        let mut network_policies = std::collections::HashMap::new();
+        network_policies.insert(
+            "jsonrpc_proto".to_string(),
+            NetworkPolicyRule {
+                name: "jsonrpc_proto".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "mcp.proto.com".to_string(),
+                    port: 8000,
+                    path: "/mcp".to_string(),
+                    protocol: "json-rpc".to_string(),
+                    enforcement: "enforce".to_string(),
+                    rules: vec![L7Rule {
+                        allow: Some(L7Allow {
+                            method: String::new(),
+                            path: String::new(),
+                            command: String::new(),
+                            query: std::collections::HashMap::new(),
+                            operation_type: String::new(),
+                            operation_name: String::new(),
+                            fields: Vec::new(),
+                            rpc_method: "initialize".to_string(),
+                        }),
+                    }],
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/curl".to_string(),
+                    ..Default::default()
+                }],
+            },
+        );
+
+        let proto = ProtoSandboxPolicy {
+            version: 1,
+            filesystem: Some(ProtoFs {
+                include_workdir: true,
+                read_only: vec![],
+                read_write: vec![],
+            }),
+            landlock: Some(openshell_core::proto::LandlockPolicy {
+                compatibility: "best_effort".to_string(),
+            }),
+            process: Some(ProtoProc {
+                run_as_user: "sandbox".to_string(),
+                run_as_group: "sandbox".to_string(),
+            }),
+            network_policies,
+        };
+
+        let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
+        let allow_input = l7_jsonrpc_input("mcp.proto.com", 8000, "/mcp", "initialize");
+        assert!(eval_l7(&engine, &allow_input));
+
+        let deny_input = l7_jsonrpc_input("mcp.proto.com", 8000, "/mcp", "tools/list");
         assert!(!eval_l7(&engine, &deny_input));
     }
 

@@ -417,6 +417,18 @@ request_allowed_for_endpoint(request, endpoint) if {
 	command_matches(request.command, rule.allow.command)
 }
 
+# --- L7 rule matching: JSON-RPC method ---
+
+request_allowed_for_endpoint(request, endpoint) if {
+	some rule
+	rule := endpoint.rules[_]
+	rule.allow.rpc_method
+	jsonrpc := object.get(request, "jsonrpc", {})
+	method := object.get(jsonrpc, "method", null)
+	method != null
+	glob.match(rule.allow.rpc_method, [], method)
+}
+
 # --- L7 rule matching: GraphQL operation ---
 
 request_allowed_for_endpoint(request, endpoint) if {

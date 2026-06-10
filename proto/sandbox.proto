@@ -160,6 +160,8 @@ message L7DenyRule {
   // GraphQL root field globs. Deny rules match when any selected root field
   // matches any configured glob.
   repeated string fields = 7;
+  // JSON-RPC method name (JSON-RPC): exact name or glob, e.g. "tools/call".
+  string rpc_method = 8;
 }
 
 // An L7 policy rule (allow-only).
@@ -186,6 +188,8 @@ message L7Allow {
   // GraphQL root field globs. Allow rules match only when every selected root
   // field matches one of the configured globs. Omit to match all fields.
   repeated string fields = 7;
+  // JSON-RPC method name (JSON-RPC): exact name or glob, e.g. "tools/call".
+  string rpc_method = 8;
 }
 
 // Query value matcher for one query parameter key.

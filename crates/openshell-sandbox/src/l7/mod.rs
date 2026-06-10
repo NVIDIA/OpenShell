@@ -11,6 +11,7 @@
 pub mod graphql;
 pub(crate) mod http;
 pub mod inference;
+pub mod jsonrpc;
 pub mod path;
 pub mod provider;
 pub mod relay;
@@ -113,6 +114,8 @@ pub struct L7RequestInfo {
     pub query_params: std::collections::HashMap<String, Vec<String>>,
     /// Parsed GraphQL operation metadata for GraphQL endpoints.
     pub graphql: Option<graphql::GraphqlRequestInfo>,
+    /// Parsed JSON-RPC request metadata for JSON-RPC endpoints.
+    pub jsonrpc: Option<jsonrpc::JsonRpcRequestInfo>,
 }
 
 /// Parse an L7 endpoint config from a regorus Value (returned by Rego query).
