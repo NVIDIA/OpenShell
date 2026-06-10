@@ -119,7 +119,7 @@ jobs:
           cp prebuilt/gateway/openshell-gateway snap/prebuilt/openshell-gateway
           cp prebuilt/sandbox/openshell-sandbox snap/prebuilt/openshell-sandbox
 
-          cp deploy/snap/bin/openshell-gateway-wrapper snap/prebuilt/
+          cp tasks/scripts/snap-gateway-wrapper.sh snap/prebuilt/openshell-gateway-wrapper
           cp LICENSE snap/prebuilt/
           cp README.md snap/prebuilt/
 
