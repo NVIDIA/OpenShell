@@ -49,6 +49,12 @@ paths, such as proxy support files or GPU device paths when a GPU is present.
 All ordinary agent egress is routed through the sandbox proxy. The proxy
 identifies the calling binary, checks trust-on-first-use binary identity, rejects
 unsafe internal destinations, and evaluates the active policy.
+For inspected HTTP traffic, the proxy can enforce REST method/path rules,
+WebSocket upgrade and text-message rules, GraphQL operation rules, and
+JSON-RPC method and params rules on sandbox-to-server request bodies. JSON-RPC
+request inspection buffers up to the endpoint `json_rpc.max_body_bytes` limit.
+JSON-RPC responses and server-to-client MCP messages on response or SSE streams
+are relayed but are not currently parsed for policy enforcement.
 
 `https://inference.local` is special. It bypasses OPA network policy and is
 handled by the inference interception path:
