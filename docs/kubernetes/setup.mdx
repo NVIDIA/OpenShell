@@ -12,7 +12,7 @@ position: 1
 The OpenShell Helm chart is experimental and under active development. Templates, values, and defaults can change between releases. Do not use it in production.
 </Warning>
 
-Use the Kubernetes deployment when the gateway should run on a shared cluster, in a cloud environment, or as part of team infrastructure. The Helm chart deploys the gateway as a StatefulSet and handles PKI bootstrap, RBAC, and sandbox namespace setup automatically.
+Use the Kubernetes deployment when the gateway should run on a shared cluster, in a cloud environment, or as part of team infrastructure. The Helm chart handles PKI bootstrap, RBAC, sandbox namespace setup, and the gateway workload. It uses a StatefulSet by default for the SQLite database, and can render a Deployment when `server.externalDbSecret` points at an external database.
 
 ## Prerequisites
 
@@ -88,6 +88,12 @@ The chart automatically generates PKI secrets on first install using pre-install
 kubectl -n openshell rollout status statefulset/openshell
 ```
 
+If you set `workload.kind=deployment`, wait on the Deployment instead:
+
+```shell
+kubectl -n openshell rollout status deployment/openshell
+```
+
 ## Connect to the gateway
 
 For local evaluation, use a port-forward:
@@ -137,6 +143,8 @@ The most commonly changed values are:
 |---|---|
 | `image.repository` / `image.tag` | Gateway container image. Defaults to `ghcr.io/nvidia/openshell/gateway:latest`. |
 | `replicaCount` | Number of gateway replicas. Leave at `1` unless you are explicitly testing multi-replica behavior. |
+| `workload.kind` | Gateway workload controller. Use `statefulset` for SQLite or `deployment` with `server.externalDbSecret`. |
+| `workload.allowMultiReplicaStatefulSet` | Allow `replicaCount > 1` with `workload.kind=statefulset`. Prefer Deployment for external database-backed multi-replica gateways. |
 | `server.sandboxNamespace` | Namespace where sandbox pods are created. Defaults to the Helm release namespace when left empty. |
 | `server.externalDbSecret` | Secret containing a PostgreSQL connection URI in the `uri` key. Use when the database is managed outside the chart. |
 | `server.sandboxImage` | Default sandbox image used when a sandbox does not specify one. |

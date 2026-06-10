@@ -71,7 +71,7 @@ OpenShell publishes the gateway image for `linux/amd64` and `linux/arm64`.
 |---|---|---|
 | Gateway | `ghcr.io/nvidia/openshell/gateway:latest` | Helm chart install or upgrade, or standalone container deployment |
 
-The Helm chart in `deploy/helm/openshell` deploys the gateway StatefulSet, service account, service, persistent storage, and network policy for Kubernetes.
+The Helm chart in `deploy/helm/openshell` deploys the gateway workload, service account, service, optional persistent storage, and network policy for Kubernetes. It defaults to a StatefulSet for SQLite-backed installs and can render a Deployment for external database-backed installs.
 
 Sandbox images are maintained separately in the [openshell-community](https://github.com/nvidia/openshell-community) repository.
 

@@ -68,6 +68,9 @@ installing the chart.
 oc -n openshell rollout status statefulset/openshell
 ```
 
+If you set `workload.kind=deployment`, use
+`oc -n openshell rollout status deployment/openshell` instead.
+
 </Steps>
 
 ## Connect to the gateway

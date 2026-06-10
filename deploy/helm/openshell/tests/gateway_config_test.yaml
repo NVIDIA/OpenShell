@@ -4,6 +4,7 @@
 suite: gateway TOML config shape
 templates:
   - templates/gateway-config.yaml
+  - templates/deployment.yaml
   - templates/statefulset.yaml
 release:
   name: openshell
@@ -17,6 +18,13 @@ tests:
     asserts:
       - exists:
           path: spec.template.metadata.annotations["checksum/gateway-config"]
+
+  - it: renders a StatefulSet by default
+    template: templates/statefulset.yaml
+    asserts:
+      - equal:
+          path: kind
+          value: StatefulSet
 
   - it: uses a stable gateway container name
     template: templates/statefulset.yaml
@@ -193,6 +201,80 @@ tests:
       - failedTemplate:
           errorPattern: "replicaCount > 1 requires server.externalDbSecret"
 
+  - it: renders a Deployment for external database-backed gateway workloads
+    template: templates/deployment.yaml
+    set:
+      workload.kind: deployment
+      replicaCount: 2
+      server.externalDbSecret: my-pg-secret
+    asserts:
+      - equal:
+          path: kind
+          value: Deployment
+      - equal:
+          path: spec.replicas
+          value: 2
+      - equal:
+          path: spec.template.spec.containers[0].name
+          value: openshell-gateway
+      - notContains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: openshell-data
+            mountPath: /var/openshell
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OPENSHELL_DB_URL
+            valueFrom:
+              secretKeyRef:
+                name: my-pg-secret
+                key: uri
+
+  - it: fails when a Deployment uses the default SQLite database
+    template: templates/statefulset.yaml
+    set:
+      workload.kind: deployment
+    asserts:
+      - failedTemplate:
+          errorPattern: "workload.kind=deployment requires server.externalDbSecret"
+
+  - it: fails when multiple replicas use a StatefulSet without an override
+    template: templates/statefulset.yaml
+    set:
+      replicaCount: 2
+      server.externalDbSecret: my-pg-secret
+    asserts:
+      - failedTemplate:
+          errorPattern: "replicaCount > 1 with workload.kind=statefulset requires workload.allowMultiReplicaStatefulSet=true"
+
+  - it: allows a multi-replica StatefulSet with an external database and explicit override
+    template: templates/statefulset.yaml
+    set:
+      replicaCount: 2
+      server.externalDbSecret: my-pg-secret
+      workload.allowMultiReplicaStatefulSet: true
+    asserts:
+      - equal:
+          path: kind
+          value: StatefulSet
+      - equal:
+          path: spec.replicas
+          value: 2
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: openshell-data
+            mountPath: /var/openshell
+
+  - it: fails when workload.kind is invalid
+    template: templates/statefulset.yaml
+    set:
+      workload.kind: daemonset
+    asserts:
+      - failedTemplate:
+          errorPattern: "workload.kind must be one of: statefulset, deployment"
+
   - it: does not pass --db-url in args when externalDbSecret is set
     template: templates/statefulset.yaml
     set:
@@ -216,11 +298,14 @@ tests:
                 name: my-pg-secret
                 key: uri
 
-  - it: renders HA external database configuration from the CI overlay
-    template: templates/statefulset.yaml
+  - it: renders HA external database configuration from the CI overlay as a Deployment
+    template: templates/deployment.yaml
     values:
       - ../ci/values-high-availability.yaml
     asserts:
+      - equal:
+          path: kind
+          value: Deployment
       - equal:
           path: spec.replicas
           value: 2

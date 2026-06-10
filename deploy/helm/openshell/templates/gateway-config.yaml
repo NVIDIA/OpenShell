@@ -4,7 +4,7 @@
 ConfigMap holding the gateway TOML config file (RFC 0003).
 
 The gateway reads `/etc/openshell/gateway.toml` (mounted from this ConfigMap)
-at startup. CLI flags and OPENSHELL_* env vars on the StatefulSet container
+at startup. CLI flags and OPENSHELL_* env vars on the gateway workload container
 still override anything in this file.
 
 One value is intentionally NOT rendered here:

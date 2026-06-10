@@ -7,6 +7,17 @@
 # server.externalDbSecret because the default SQLite backend is per pod.
 replicaCount: 1
 
+workload:
+  # -- Gateway workload controller kind. Use `statefulset` for the default
+  # SQLite database, or `deployment` when server.externalDbSecret points at an
+  # external database.
+  kind: statefulset
+  # -- Allow replicaCount > 1 while rendering a StatefulSet. Prefer
+  # workload.kind=deployment for external database-backed multi-replica
+  # gateways; this override exists for operators who explicitly require
+  # StatefulSet identity or storage semantics.
+  allowMultiReplicaStatefulSet: false
+
 image:
   # -- Gateway image repository.
   repository: ghcr.io/nvidia/openshell/gateway

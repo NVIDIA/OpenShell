@@ -1,27 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 {{- include "openshell.validateValues" . }}
-{{- if eq (include "openshell.workloadKind" .) "statefulset" }}
+{{- if eq (include "openshell.workloadKind" .) "deployment" }}
 apiVersion: apps/v1
-kind: StatefulSet
+kind: Deployment
 metadata:
   name: {{ include "openshell.fullname" . }}
   labels:
     {{- include "openshell.labels" . | nindent 4 }}
 spec:
-  serviceName: {{ include "openshell.fullname" . }}
   replicas: {{ .Values.replicaCount }}
   selector:
     matchLabels:
       {{- include "openshell.selectorLabels" . | nindent 6 }}
   template:
     {{- include "openshell.gatewayPodTemplate" . | nindent 4 }}
-  volumeClaimTemplates:
-    - metadata:
-        name: openshell-data
-      spec:
-        accessModes: ["ReadWriteOnce"]
-        resources:
-          requests:
-            storage: 1Gi
 {{- end }}

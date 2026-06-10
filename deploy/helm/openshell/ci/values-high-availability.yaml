@@ -6,5 +6,8 @@
 # overlay expects the caller to provide a PostgreSQL Secret named openshell-ha-pg.
 replicaCount: 2
 
+workload:
+  kind: deployment
+
 server:
   externalDbSecret: openshell-ha-pg

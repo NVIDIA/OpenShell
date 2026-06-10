@@ -495,8 +495,9 @@ openshell gateway remove local                         # Remove local registrati
 ```bash
 # Inspect a Kubernetes Helm release and gateway pod
 helm -n openshell status openshell
-kubectl -n openshell get pods,svc
-kubectl -n openshell logs statefulset/openshell --tail=100
+kubectl -n openshell get deployment,statefulset,pods,svc
+kubectl -n openshell logs deployment/openshell -c openshell-gateway --tail=100
+kubectl -n openshell logs statefulset/openshell -c openshell-gateway --tail=100
 ```
 
 For Docker, Podman, and VM-backed gateways, inspect the gateway process or container logs and the selected runtime directly.

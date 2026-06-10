@@ -97,8 +97,11 @@ runtime still owns GPU device injection.
 ## Deployment Shape
 
 Kubernetes deployments use the Helm chart under `deploy/helm/openshell`. The
-chart deploys the gateway and sandbox runtime integration, but HA deployments
-must point `server.externalDbSecret` at an operator-managed PostgreSQL database.
+chart deploys the gateway and sandbox runtime integration. The default gateway
+workload is a StatefulSet for SQLite-backed single-replica installs. External
+database-backed installs can render a Deployment with `workload.kind=deployment`;
+HA deployments must point `server.externalDbSecret` at an operator-managed
+PostgreSQL database.
 Standalone local deployments start the gateway with a selected runtime such as
 Docker, Podman, or VM. The CLI can register multiple gateways and switch between
 them without changing the sandbox architecture.

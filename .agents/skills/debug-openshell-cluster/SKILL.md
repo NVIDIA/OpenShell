@@ -54,7 +54,7 @@ Use gateway metadata, deployment values, or the user's setup notes to identify t
 |---|---|
 | Docker | Gateway process logs, Docker daemon health, sandbox containers, image pulls. |
 | Podman | Podman socket, rootless networking, sandbox containers, image pulls. |
-| Kubernetes | Helm release, StatefulSet, service, secrets, sandbox pods, events. |
+| Kubernetes | Helm release, gateway workload, service, secrets, sandbox pods, events. |
 | VM | VM driver logs, rootfs availability, host virtualization support. |
 
 ### Step 3: Check Docker-Backed Gateways
@@ -131,12 +131,17 @@ Common findings:
 ```bash
 helm -n openshell status openshell
 helm -n openshell get values openshell
-kubectl -n openshell get statefulset,pod,svc,pvc
+kubectl -n openshell get deployment,statefulset,pod,svc,pvc
+kubectl -n openshell logs deployment/openshell -c openshell-gateway --tail=200
 kubectl -n openshell logs statefulset/openshell -c openshell-gateway --tail=200
+kubectl -n openshell rollout status deployment/openshell
 kubectl -n openshell rollout status statefulset/openshell
 ```
 
-Look for failed installs, unexpected values, missing namespace, wrong image tag, TLS settings that do not match the registered endpoint, and scheduling failures.
+Use the log and rollout commands for the workload kind that exists in the
+release. Look for failed installs, unexpected values, missing namespace, wrong
+image tag, TLS settings that do not match the registered endpoint, and
+scheduling failures.
 
 For HA or PostgreSQL-backed installs, also check the external database Secret
 referenced by `server.externalDbSecret` and the PostgreSQL workload if the test
@@ -169,7 +174,7 @@ Secrets but does not create the sandbox JWT signing Secret.
 
 If the gateway exits with `failed to read sandbox JWT signing key from
 /etc/openshell-jwt/signing.pem`, verify that `openshell-jwt-keys` contains
-`signing.pem`, `public.pem`, and `kid`, and that the StatefulSet mounts the
+`signing.pem`, `public.pem`, and `kid`, and that the gateway workload mounts the
 `sandbox-jwt` secret at `/etc/openshell-jwt`. The sandbox JWT mount is required
 even when local Helm values disable TLS.
 
@@ -194,8 +199,9 @@ label, supervisor env vars `OPENSHELL_K8S_SA_TOKEN_FILE` and
 Check the image references currently used by the gateway deployment:
 
 ```bash
+kubectl -n openshell get deployment openshell -o jsonpath="{.spec.template.spec.containers[*].image}{\"\n\"}{.spec.template.spec.containers[*].env[?(@.name==\"OPENSHELL_SUPERVISOR_IMAGE\")].value}{\"\n\"}"
 kubectl -n openshell get statefulset openshell -o jsonpath="{.spec.template.spec.containers[*].image}{\"\n\"}{.spec.template.spec.containers[*].env[?(@.name==\"OPENSHELL_SUPERVISOR_IMAGE\")].value}{\"\n\"}"
-helm -n openshell get values openshell | grep -E 'repository|tag|supervisorImage'
+helm -n openshell get values openshell | grep -E 'repository|tag|supervisorImage|workload'
 ```
 
 The gateway image built from `deploy/docker/Dockerfile.gateway` and the scratch supervisor image built from `deploy/docker/Dockerfile.supervisor` should use the same build tag in branch and E2E deploys. A stale supervisor image can make sandbox behavior lag behind gateway policy or proto changes.
@@ -238,6 +244,7 @@ If the gateway is healthy but sandbox creation fails:
 ```bash
 kubectl -n openshell get pods
 kubectl -n openshell get events --sort-by=.lastTimestamp | tail -n 50
+kubectl -n openshell logs deployment/openshell -c openshell-gateway --tail=200
 kubectl -n openshell logs statefulset/openshell -c openshell-gateway --tail=200
 ```
 
@@ -286,7 +293,7 @@ openshell logs <sandbox-name>
 | Docker or Podman sandbox never registers | Wrong callback endpoint or supervisor startup failure | Gateway logs and sandbox container logs |
 | Docker GPU e2e fails before GPU sandbox comparison | NVIDIA CDI specs are missing or Docker has not discovered them | `docker info --format '{{json .DiscoveredDevices}}'`, `/etc/cdi`, `/var/run/cdi`, `nvidia-cdi-refresh.service` |
 | Kubernetes gateway pod pending | PVC unbound, taint, selector, or insufficient resources | `kubectl -n openshell describe pod <pod>` |
-| Kubernetes gateway pod crash loops | Missing secret, bad DB URL, bad TLS config | `kubectl -n openshell logs statefulset/openshell -c openshell-gateway` |
+| Kubernetes gateway pod crash loops | Missing secret, bad DB URL, bad TLS config | `kubectl -n openshell logs deployment/openshell -c openshell-gateway` or `kubectl -n openshell logs statefulset/openshell -c openshell-gateway` |
 | CLI TLS error | Local mTLS bundle does not match server cert/CA | Check `~/.config/openshell/gateways/<name>/mtls/` |
 | Image pull failure | Gateway or sandbox image cannot be pulled | Runtime events and image pull credentials |
 | `K8s namespace not ready` with `envoy-gateway-openshell.yaml: the server could not find the requested resource` | Optional Gateway API manifest was applied without Envoy Gateway CRDs, or k3s Helm controller startup exceeded the namespace wait | Apply `deploy/kube/manifests/envoy-gateway-openshell.yaml` manually only after Envoy Gateway is installed and `grpcRoute` is enabled |

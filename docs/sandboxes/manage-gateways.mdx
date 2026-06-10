@@ -140,8 +140,9 @@ openshell gateway info
 For Kubernetes gateways, inspect the gateway workload and cluster events:
 
 ```shell
-kubectl -n openshell get pods
-kubectl -n openshell logs statefulset/openshell
+kubectl -n openshell get deployment,statefulset,pods
+kubectl -n openshell logs deployment/openshell -c openshell-gateway --tail=100
+kubectl -n openshell logs statefulset/openshell -c openshell-gateway --tail=100
 kubectl -n openshell get events --sort-by=.lastTimestamp
 ```
 

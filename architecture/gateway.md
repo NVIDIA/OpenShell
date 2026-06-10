@@ -384,8 +384,8 @@ hook Job using the gateway image itself -- no separate cert-generation image,
 no extra mirror burden in air-gapped environments. In the default built-in PKI
 path the hook creates TLS and sandbox JWT Secrets. When cert-manager is enabled,
 cert-manager owns TLS Secrets and the hook runs with `--jwt-only` so the
-required sandbox JWT Secret still exists before the gateway StatefulSet mounts
-it, even if `pkiInitJob.enabled` remains true. On package-managed local
+required sandbox JWT Secret still exists before the gateway workload mounts it,
+even if `pkiInitJob.enabled` remains true. On package-managed local
 gateways, the same command runs from the systemd
 unit's `ExecStartPre` to bootstrap PKI into the configured local TLS directory
 on first start. The Linux package unit defaults that directory to

@@ -62,7 +62,8 @@ See [`values.yaml`](values.yaml) for source defaults. Selected overlays:
 
 ### Database backend
 
-By default, OpenShell uses SQLite:
+By default, OpenShell uses SQLite and runs the gateway as a StatefulSet so the
+database is backed by a per-pod PVC:
 
 ```yaml
 server:
@@ -89,8 +90,14 @@ Then install the chart pointing at that Secret:
 ```bash
 helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart --version <version> \
   -n openshell \
+  --set workload.kind=deployment \
   --set server.externalDbSecret=my-pg-credentials
 ```
+
+Use `workload.kind=deployment` for external database-backed multi-replica
+gateways. `workload.kind=statefulset` is still available for single-replica
+SQLite installs and for operators who explicitly need StatefulSet identity or
+storage semantics.
 
 #### OpenShift
 
