@@ -6,6 +6,7 @@
 
 use crate::mxc::{MxcFilesystem, MxcProcess, MxcProcessContainer, WxcExecInvoker};
 use crate::policy::{EmbeddedPolicyMapper, MapCtx, PolicyMapper};
+use futures::Stream;
 use openshell_core::proto::SandboxPolicy;
 use openshell_core::proto::compute::v1::{
     DriverCondition, DriverPlatformEvent, DriverSandbox, DriverSandboxStatus,
@@ -17,7 +18,6 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::process::Child;
-use futures::Stream;
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{info, warn};
@@ -329,8 +329,16 @@ impl MxcComputeBackend {
         let sandbox = sandbox.clone();
 
         tokio::spawn(async move {
-            run_lifecycle(invoker, config, policy_mapper, registry, watch_tx, sandbox, policy)
-                .await;
+            run_lifecycle(
+                invoker,
+                config,
+                policy_mapper,
+                registry,
+                watch_tx,
+                sandbox,
+                policy,
+            )
+            .await;
         });
 
         Ok(())
@@ -408,7 +416,8 @@ impl MxcComputeBackend {
     /// First emits a snapshot of all current sandboxes, then forwards live
     /// events from the broadcast channel.
     pub async fn watch_sandboxes(&self) -> WatchStream {
-        let (tx, rx) = mpsc::channel::<Result<WatchSandboxesEvent, openshell_core::ComputeDriverError>>(256);
+        let (tx, rx) =
+            mpsc::channel::<Result<WatchSandboxesEvent, openshell_core::ComputeDriverError>>(256);
 
         // Send initial snapshots before subscribing so we don't miss live events.
         let snapshots: Vec<DriverSandbox> = {
@@ -760,7 +769,11 @@ mod lifecycle_tests {
     }
 
     /// Poll the backend registry until the predicate matches or the deadline hits.
-    async fn wait_for<F>(backend: &MxcComputeBackend, name: &str, mut pred: F) -> Option<DriverSandbox>
+    async fn wait_for<F>(
+        backend: &MxcComputeBackend,
+        name: &str,
+        mut pred: F,
+    ) -> Option<DriverSandbox>
     where
         F: FnMut(&DriverSandbox) -> bool,
     {
@@ -933,7 +946,10 @@ mod lifecycle_tests {
                 Err(_) => continue,
             }
         }
-        assert!(saw_denial, "expected an AgentExecFailed denial platform event");
+        assert!(
+            saw_denial,
+            "expected an AgentExecFailed denial platform event"
+        );
 
         // The out-of-policy artifact must NOT have been written by the mock.
         let out_fs = std::path::Path::new(out_tmp.path()).join("hello.txt");
@@ -967,7 +983,11 @@ mod lifecycle_tests {
                 binaries: Vec::new(),
             },
         );
-        backend.policy_sink().lock().await.insert("sb-net".into(), policy);
+        backend
+            .policy_sink()
+            .lock()
+            .await
+            .insert("sb-net".into(), policy);
         backend
             .create_sandbox(&driver_sandbox("sb-net"))
             .await

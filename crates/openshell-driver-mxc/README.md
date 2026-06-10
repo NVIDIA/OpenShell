@@ -60,15 +60,37 @@ openshell-gateway --drivers mxc ...
 - Windows 11 Insider build ≥ 26300.8553
 - `IsoSessionApp.dll` present and registered
 - `wxc-exec.exe` built with `--features isolation_session`
-- Giedrius's policy mapper crate wired as the primary `PolicyMapper` binding
-  (until then the `StubPolicyMapper` grants only `share_dir` as read-write)
+
+For off-box smoke tests against the in-process mock shim (no `wxc-exec`,
+no isolation session needed), set `OPENSHELL_MXC_MOCK_WXC=1`.
 
 ## PolicyMapper seam
 
 Policy translation (`SandboxPolicy` → MXC `ContainerConfig`) is delegated to
-Giedrius's Rust mapper crate via the `policy::PolicyMapper` trait. Until that
-crate lands, `StubPolicyMapper` applies only the `share_dir` grant and rejects
-everything else. **No live agent runs** until the real mapper is wired.
+a `policy::PolicyMapper` trait. The primary implementation,
+`EmbeddedPolicyMapper`, calls the embedded [`policy_map`](src/policy_map/)
+module's `map_to_mxc` directly on the typed proto (no YAML bridge), then
+normalizes the resulting filesystem paths to Windows form. `policy_map/` is
+the **source of truth** for the OpenShell→MXC mapping — it was the standalone
+`openshell-policy-mapper` crate, now embedded as a module here. The original
+`StubPolicyMapper` is retained as a documented, compile-only fallback that only
+maps `share_dir`.
+
+Everything in this crate — including the mapper, the
+[`policy-to-mxc`](examples/policy-to-mxc.rs) example, and the parity tests in
+[`tests/policy_mapper_examples.rs`](tests/policy_mapper_examples.rs) — is
+Windows-only (`#[cfg(target_os = "windows")]`); the crate is an empty stub on
+other platforms. The mapper's parity tests therefore run on the Windows MSVC
+test lane (`mise run windows:test:x64`), not the Linux lane.
+
+## Packaging the demo for the demo box
+
+Use [`examples/package-demo.ps1`](examples/package-demo.ps1) to assemble
+the gateway EXE, CLI EXE, runtime DLLs (`libz3.dll`), `demo.yaml`, the
+gateway config, and the runbook into one folder, then copy that folder to
+the demo Windows host and follow `mxc-demo-runbook.md` inside it. The
+script prints a SHA256 manifest so the operator can sanity-check what
+landed before moving it.
 
 ## Deferred work
 

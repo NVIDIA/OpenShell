@@ -3,15 +3,16 @@
 
 //! PolicyMapper seam: `SandboxPolicy` → MXC `ContainerConfig` fragment.
 //!
-//! This skill does **not** write the actual policy mapping rules — that is
-//! Giedrius's logic, **embedded** as the [`crate::policy_map`] module (team
-//! decision: a module in this crate, not a separate crate). This file defines
-//! the trait seam plus:
+//! This file does **not** write the actual policy mapping rules — that logic is
+//! **embedded** as the [`crate::policy_map`] module (the source of truth; it was
+//! the standalone `openshell-policy-mapper` crate). This file defines the trait
+//! seam plus:
 //!
-//! - [`EmbeddedPolicyMapper`] — the **primary** impl. Bridges the
-//!   `SandboxPolicy` proto into the `serde_yaml::Value` shape the embedded
-//!   mapper expects, calls [`crate::policy_map::build_mxc_config`], extracts the
-//!   MXC filesystem shares, and rejects the create on any `error`-severity loss.
+//! - [`EmbeddedPolicyMapper`] — the **primary** impl. Calls
+//!   [`crate::policy_map::map_to_mxc`] directly on the typed `SandboxPolicy`
+//!   proto (no YAML bridge), extracts the MXC filesystem shares, normalizes
+//!   their paths to Windows form, and rejects the create on any `error`-severity
+//!   loss.
 //! - [`StubPolicyMapper`] — a compile-only fallback that grants only the demo
 //!   `share_dir`. Kept so the crate builds/tests without exercising the embed.
 //!
@@ -19,7 +20,6 @@
 //! `MapError::Unsupported` and are rejected in `ValidateSandboxCreate`.
 
 use openshell_core::proto::SandboxPolicy;
-use serde_yaml::{Mapping, Value as YamlValue};
 use thiserror::Error;
 
 /// The MXC config fragment derived from a `SandboxPolicy`.
@@ -80,122 +80,26 @@ pub trait PolicyMapper: Send + Sync {
 // ── Path normalization ──────────────────────────────────────────────────────
 
 /// Normalize forward-slash paths to Windows backslash form. Path normalization
-/// lives here (the bridge), in one place — Giedrius's mapper passes path strings
-/// through unchanged.
+/// lives here, in one place — the embedded mapper copies path strings through
+/// unchanged.
 fn normalize_path(p: &str) -> String {
     p.replace('/', "\\")
 }
 
 // ── Embedded mapper (primary impl) ──────────────────────────────────────────
 
-/// Primary `PolicyMapper`: bridges the proto policy into the embedded
-/// `policy_map` module (vendored from Giedrius's mapper).
+/// Primary `PolicyMapper`: calls the embedded `policy_map` module (the source of
+/// truth) directly on the typed `SandboxPolicy` proto.
 pub struct EmbeddedPolicyMapper;
-
-/// Convert the `SandboxPolicy` proto IR into the `serde_yaml::Value` the embedded
-/// mapper consumes. **Key bridge fact:** the proto's `filesystem` field maps to
-/// the YAML key **`filesystem_policy`** (the name the mapper reads).
-fn policy_to_yaml(policy: &SandboxPolicy) -> YamlValue {
-    let mut root = Mapping::new();
-
-    if let Some(fs) = &policy.filesystem {
-        let mut fs_map = Mapping::new();
-        let rw: Vec<YamlValue> = fs
-            .read_write
-            .iter()
-            .map(|p| YamlValue::String(normalize_path(p)))
-            .collect();
-        let ro: Vec<YamlValue> = fs
-            .read_only
-            .iter()
-            .map(|p| YamlValue::String(normalize_path(p)))
-            .collect();
-        fs_map.insert(YamlValue::from("read_write"), YamlValue::Sequence(rw));
-        fs_map.insert(YamlValue::from("read_only"), YamlValue::Sequence(ro));
-        fs_map.insert(
-            YamlValue::from("include_workdir"),
-            YamlValue::Bool(fs.include_workdir),
-        );
-        root.insert(YamlValue::from("filesystem_policy"), YamlValue::Mapping(fs_map));
-    }
-
-    if let Some(landlock) = &policy.landlock {
-        if !landlock.compatibility.is_empty() {
-            let mut ll = Mapping::new();
-            ll.insert(
-                YamlValue::from("compatibility"),
-                YamlValue::from(landlock.compatibility.clone()),
-            );
-            root.insert(YamlValue::from("landlock"), YamlValue::Mapping(ll));
-        }
-    }
-
-    if let Some(process) = &policy.process {
-        if !process.run_as_user.is_empty() || !process.run_as_group.is_empty() {
-            let mut p = Mapping::new();
-            if !process.run_as_user.is_empty() {
-                p.insert(
-                    YamlValue::from("run_as_user"),
-                    YamlValue::from(process.run_as_user.clone()),
-                );
-            }
-            if !process.run_as_group.is_empty() {
-                p.insert(
-                    YamlValue::from("run_as_group"),
-                    YamlValue::from(process.run_as_group.clone()),
-                );
-            }
-            root.insert(YamlValue::from("process"), YamlValue::Mapping(p));
-        }
-    }
-
-    if !policy.network_policies.is_empty() {
-        let mut nets = Mapping::new();
-        for (name, rule) in &policy.network_policies {
-            let mut rule_map = Mapping::new();
-            let endpoints: Vec<YamlValue> = rule
-                .endpoints
-                .iter()
-                .map(|ep| {
-                    let mut e = Mapping::new();
-                    if !ep.host.is_empty() {
-                        e.insert(YamlValue::from("host"), YamlValue::from(ep.host.clone()));
-                    }
-                    if ep.port != 0 {
-                        e.insert(YamlValue::from("port"), YamlValue::from(ep.port));
-                    }
-                    if !ep.protocol.is_empty() {
-                        e.insert(
-                            YamlValue::from("protocol"),
-                            YamlValue::from(ep.protocol.clone()),
-                        );
-                    }
-                    YamlValue::Mapping(e)
-                })
-                .collect();
-            rule_map.insert(YamlValue::from("endpoints"), YamlValue::Sequence(endpoints));
-            let binaries: Vec<YamlValue> = rule
-                .binaries
-                .iter()
-                .map(|b| {
-                    let mut bm = Mapping::new();
-                    bm.insert(YamlValue::from("path"), YamlValue::from(b.path.clone()));
-                    YamlValue::Mapping(bm)
-                })
-                .collect();
-            rule_map.insert(YamlValue::from("binaries"), YamlValue::Sequence(binaries));
-            nets.insert(YamlValue::from(name.clone()), YamlValue::Mapping(rule_map));
-        }
-        root.insert(YamlValue::from("network_policies"), YamlValue::Mapping(nets));
-    }
-
-    YamlValue::Mapping(root)
-}
 
 fn extract_paths(config: &serde_json::Value, key: &str) -> Vec<String> {
     config["filesystem"][key]
         .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -208,14 +112,21 @@ impl PolicyMapper for EmbeddedPolicyMapper {
             )
         })?;
 
-        let yaml = policy_to_yaml(policy);
-        let opts = crate::policy_map::MappingOptions::for_isolation_session(ctx.sandbox_id.clone());
-        let mut losses = Vec::new();
-        let config = crate::policy_map::build_mxc_config(&yaml, &opts, &mut losses);
+        // Map directly off the typed proto. The MXC driver runs an isolation
+        // session, so use that containment: its network branch yields an
+        // `error` loss for any host allowlist, which is what rejects network
+        // policy below.
+        let opts = crate::policy_map::MxcMappingOptions {
+            containment: "isolation_session".to_owned(),
+            container_id: ctx.sandbox_id.clone(),
+            ..Default::default()
+        };
+        let result = crate::policy_map::map_to_mxc(policy, &opts);
 
         // Reject the create on any error-severity loss. Warnings/info (e.g. the
         // filesystem default-deny note) are advisory and do not block.
-        let errors: Vec<LossItem> = losses
+        let errors: Vec<LossItem> = result
+            .loss
             .iter()
             .filter(|i| i.severity == "error")
             .map(|i| LossItem {
@@ -227,8 +138,16 @@ impl PolicyMapper for EmbeddedPolicyMapper {
             return Err(MapError::Unsupported(errors));
         }
 
-        let mut readwrite = extract_paths(&config, "readwritePaths");
-        let readonly = extract_paths(&config, "readonlyPaths");
+        // The embedded mapper copies paths verbatim; normalize them (and the
+        // demo share dir) to Windows backslash form here, in one place.
+        let mut readwrite: Vec<String> = extract_paths(&result.config, "readwritePaths")
+            .iter()
+            .map(|p| normalize_path(p))
+            .collect();
+        let readonly: Vec<String> = extract_paths(&result.config, "readonlyPaths")
+            .iter()
+            .map(|p| normalize_path(p))
+            .collect();
 
         // Always grant the demo host-visible share read-write so the positive
         // proof artifact (`hello.txt`) appears on the host. For the demo this
@@ -309,9 +228,11 @@ mod tests {
         let ctx = demo_ctx(Some("C:/work/openshell-mxc-demo"));
         let config = mapper.map(Some(&policy), &ctx).unwrap();
         // Forward slashes normalized to Windows backslashes by the bridge.
-        assert!(config
-            .readwrite_paths
-            .contains(&"C:\\work\\openshell-mxc-demo".to_string()));
+        assert!(
+            config
+                .readwrite_paths
+                .contains(&"C:\\work\\openshell-mxc-demo".to_string())
+        );
         assert_eq!(config.readonly_paths, vec!["C:\\tools"]);
     }
 
