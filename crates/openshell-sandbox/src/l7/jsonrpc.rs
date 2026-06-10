@@ -33,19 +33,15 @@ pub(crate) async fn parse_jsonrpc_http_request<C: AsyncRead + AsyncWrite + Unpin
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JsonRpcRequestInfo {
-    pub method: Option<String>,
-    pub params: HashMap<String, String>,
+    pub calls: Vec<JsonRpcCallInfo>,
+    pub is_batch: bool,
     pub error: Option<String>,
 }
 
-/// Returns true if the parsed request's method matches the given `rpc_method` rule pattern.
-///
-/// An empty `rpc_method` pattern matches any method.
-pub fn rpc_method_rule_matches(info: &JsonRpcRequestInfo, rpc_method: &str) -> bool {
-    if rpc_method.is_empty() {
-        return true;
-    }
-    info.method.as_deref() == Some(rpc_method)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsonRpcCallInfo {
+    pub method: String,
+    pub params: HashMap<String, String>,
 }
 
 /// Parse a JSON-RPC 2.0 request body and extract the `method` field.
@@ -55,25 +51,60 @@ pub fn rpc_method_rule_matches(info: &JsonRpcRequestInfo, rpc_method: &str) -> b
 pub fn parse_jsonrpc_body(body: &[u8]) -> JsonRpcRequestInfo {
     let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
         return JsonRpcRequestInfo {
-            method: None,
-            params: HashMap::new(),
+            calls: Vec::new(),
+            is_batch: false,
             error: Some("invalid JSON".to_string()),
         };
     };
-    let Some(method) = value.get("method").and_then(|m| m.as_str()) else {
+
+    if let serde_json::Value::Array(items) = value {
+        if items.is_empty() {
+            return JsonRpcRequestInfo {
+                calls: Vec::new(),
+                is_batch: true,
+                error: Some("empty batch".to_string()),
+            };
+        }
+        let mut calls = Vec::new();
+        for item in &items {
+            let Some(call) = parse_jsonrpc_call(item) else {
+                return JsonRpcRequestInfo {
+                    calls: Vec::new(),
+                    is_batch: true,
+                    error: Some("batch item missing or non-string 'method' field".to_string()),
+                };
+            };
+            calls.push(call);
+        }
         return JsonRpcRequestInfo {
-            method: None,
-            params: HashMap::new(),
+            calls,
+            is_batch: true,
+            error: None,
+        };
+    }
+
+    let Some(call) = parse_jsonrpc_call(&value) else {
+        return JsonRpcRequestInfo {
+            calls: Vec::new(),
+            is_batch: false,
             error: Some("missing or non-string 'method' field".to_string()),
         };
     };
     JsonRpcRequestInfo {
-        method: Some(method.to_string()),
+        calls: vec![call],
+        is_batch: false,
+        error: None,
+    }
+}
+
+fn parse_jsonrpc_call(value: &serde_json::Value) -> Option<JsonRpcCallInfo> {
+    let method = value.get("method").and_then(|m| m.as_str())?;
+    Some(JsonRpcCallInfo {
+        method: method.to_string(),
         params: value
             .get("params")
             .map_or_else(HashMap::new, flatten_jsonrpc_params),
-        error: None,
-    }
+    })
 }
 
 fn flatten_jsonrpc_params(value: &serde_json::Value) -> HashMap<String, String> {
@@ -115,7 +146,12 @@ mod tests {
     fn parses_method_from_request_body() {
         let body = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
         let info = parse_jsonrpc_body(body);
-        assert_eq!(info.method.as_deref(), Some("initialize"));
+        assert_eq!(
+            info.calls.first().map(|call| call.method.as_str()),
+            Some("initialize")
+        );
+        assert_eq!(info.calls.len(), 1);
+        assert!(!info.is_batch);
         assert!(info.error.is_none());
     }
 
@@ -123,31 +159,32 @@ mod tests {
     fn flattens_object_params_for_policy_matching() {
         let body = br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"submit_report","arguments":{"scope":"workspace/main"}}}"#;
         let info = parse_jsonrpc_body(body);
+        let params = &info.calls.first().expect("single request call").params;
         assert_eq!(
-            info.params.get("name").map(String::as_str),
+            params.get("name").map(String::as_str),
             Some("submit_report")
         );
         assert_eq!(
-            info.params.get("arguments.scope").map(String::as_str),
+            params.get("arguments.scope").map(String::as_str),
             Some("workspace/main")
         );
     }
 
     #[test]
-    fn rpc_method_rule_empty_matches_any() {
-        let info = parse_jsonrpc_body(br#"{"jsonrpc":"2.0","id":1,"method":"tools/call"}"#);
-        assert!(rpc_method_rule_matches(&info, ""));
-    }
-
-    #[test]
-    fn rpc_method_rule_matches_exact_method() {
-        let info = parse_jsonrpc_body(br#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#);
-        assert!(rpc_method_rule_matches(&info, "initialize"));
-    }
-
-    #[test]
-    fn rpc_method_rule_does_not_match_different_method() {
-        let info = parse_jsonrpc_body(br#"{"jsonrpc":"2.0","id":1,"method":"tools/call"}"#);
-        assert!(!rpc_method_rule_matches(&info, "initialize"));
+    fn parses_valid_batch_without_error() {
+        let body = br#"[
+            {"jsonrpc":"2.0","id":1,"method":"tools/list"},
+            {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"read_status"}}
+        ]"#;
+        let info = parse_jsonrpc_body(body);
+        assert!(info.error.is_none());
+        assert!(info.is_batch);
+        assert_eq!(info.calls.len(), 2);
+        assert_eq!(info.calls[0].method, "tools/list");
+        assert_eq!(info.calls[1].method, "tools/call");
+        assert_eq!(
+            info.calls[1].params.get("name").map(String::as_str),
+            Some("read_status")
+        );
     }
 }
