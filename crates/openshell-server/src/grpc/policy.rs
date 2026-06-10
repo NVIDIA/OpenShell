@@ -1221,6 +1221,8 @@ pub(super) async fn handle_get_sandbox_config(
     let provider_env_revision =
         compute_provider_env_revision(state.store.as_ref(), &sandbox_provider_names).await?;
 
+    let permissive = sandbox.spec.as_ref().is_some_and(|s| s.permissive);
+
     Ok(Response::new(GetSandboxConfigResponse {
         policy,
         version,
@@ -1230,6 +1232,7 @@ pub(super) async fn handle_get_sandbox_config(
         policy_source: policy_source.into(),
         global_policy_version,
         provider_env_revision,
+        permissive,
     }))
 }
 

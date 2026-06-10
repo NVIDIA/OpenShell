@@ -562,7 +562,22 @@ fn inspect_websocket_text_message(
         None,
     );
     if !allowed && inspector.enforcement == EnforcementMode::Enforce {
-        return Err(miette!("websocket text message denied by policy"));
+        if inspector.ctx.permissive {
+            if let Some(ref tx) = inspector.ctx.denial_tx {
+                let _ = tx.send(crate::denial_aggregator::DenialEvent {
+                    host: host.to_string(),
+                    port,
+                    binary: inspector.ctx.binary_path.clone(),
+                    ancestors: inspector.ctx.ancestors.clone(),
+                    deny_reason: reason,
+                    denial_stage: "l7".to_string(),
+                    l7_method: Some(request_info.action),
+                    l7_path: Some(request_info.target),
+                });
+            }
+        } else {
+            return Err(miette!("websocket text message denied by policy"));
+        }
     }
     Ok(())
 }
@@ -630,7 +645,22 @@ fn inspect_graphql_websocket_message(
                 Some(&graphql),
             );
             if (!allowed && inspector.enforcement == EnforcementMode::Enforce) || force_deny {
-                return Err(miette!("websocket GraphQL message denied by policy"));
+                if inspector.ctx.permissive && !force_deny {
+                    if let Some(ref tx) = inspector.ctx.denial_tx {
+                        let _ = tx.send(crate::denial_aggregator::DenialEvent {
+                            host: host.to_string(),
+                            port,
+                            binary: inspector.ctx.binary_path.clone(),
+                            ancestors: inspector.ctx.ancestors.clone(),
+                            deny_reason: reason,
+                            denial_stage: "l7".to_string(),
+                            l7_method: Some(request_info.action),
+                            l7_path: Some(request_info.target),
+                        });
+                    }
+                } else {
+                    return Err(miette!("websocket GraphQL message denied by policy"));
+                }
             }
             Ok(())
         }
@@ -1271,6 +1301,8 @@ network_policies:
             cmdline_paths: vec![],
             secret_resolver: None,
             activity_tx: None,
+            permissive: false,
+            denial_tx: None,
         };
         let (mut client_write, mut relay_read) = tokio::io::duplex(MAX_TEXT_MESSAGE_BYTES + 1024);
         let (mut relay_write, mut upstream_read) = tokio::io::duplex(MAX_TEXT_MESSAGE_BYTES + 1024);

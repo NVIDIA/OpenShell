@@ -546,21 +546,6 @@ async fn connect_inference(endpoint: &str) -> Result<InferenceClient<AuthedChann
     Ok(InferenceClient::new(channel))
 }
 
-/// Fetch sandbox policy from `OpenShell` server via gRPC.
-///
-/// Returns `Ok(Some(policy))` when the server has a policy configured,
-/// or `Ok(None)` when the sandbox was created without a policy (the sandbox
-/// should discover one from disk or use the restrictive default).
-pub async fn fetch_policy(endpoint: &str, sandbox_id: &str) -> Result<Option<ProtoSandboxPolicy>> {
-    debug!(endpoint = %endpoint, sandbox_id = %sandbox_id, "Connecting to OpenShell server");
-
-    let mut client = connect(endpoint).await?;
-
-    debug!("Connected, fetching sandbox policy");
-
-    fetch_policy_with_client(&mut client, sandbox_id).await
-}
-
 /// Fetch sandbox policy using an existing client connection.
 async fn fetch_policy_with_client(
     client: &mut OpenShellClient<AuthedChannel>,
@@ -583,6 +568,33 @@ async fn fetch_policy_with_client(
     Ok(Some(inner.policy.ok_or_else(|| {
         miette::miette!("Server returned non-zero version but empty policy")
     })?))
+}
+
+/// Fetch sandbox policy and permissive flag from the config response.
+pub async fn fetch_policy_and_permissive(
+    endpoint: &str,
+    sandbox_id: &str,
+) -> Result<(Option<ProtoSandboxPolicy>, bool)> {
+    let mut client = connect(endpoint).await?;
+
+    let response = client
+        .get_sandbox_config(GetSandboxConfigRequest {
+            sandbox_id: sandbox_id.to_string(),
+        })
+        .await
+        .into_diagnostic()?;
+
+    let inner = response.into_inner();
+    let permissive = inner.permissive;
+
+    if inner.version == 0 && inner.policy.is_none() {
+        return Ok((None, permissive));
+    }
+
+    let policy = inner
+        .policy
+        .ok_or_else(|| miette::miette!("Server returned non-zero version but empty policy"))?;
+    Ok((Some(policy), permissive))
 }
 
 /// Sync a locally-discovered policy using an existing client connection.

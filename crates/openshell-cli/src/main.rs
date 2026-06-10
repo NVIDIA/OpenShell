@@ -1277,6 +1277,14 @@ enum SandboxCommands {
         #[arg(long = "env", value_name = "KEY=VALUE")]
         envs: Vec<String>,
 
+        /// Run in permissive mode: log but do not enforce network policy denials.
+        /// Connections that would be blocked are allowed through and logged as
+        /// draft policy proposals. Filesystem (Landlock) restrictions are skipped.
+        /// Seccomp and process-identity controls remain enforced.
+        /// Use with --policy to provide protocol hints for richer L7 learning.
+        #[arg(long)]
+        permissive: bool,
+
         /// Approval mode for agent-authored policy proposals.
         ///
         /// `manual` (default): every proposal lands in the draft inbox for
@@ -2565,6 +2573,7 @@ async fn main() -> Result<()> {
                     no_auto_providers,
                     labels,
                     envs,
+                    permissive,
                     approval_mode,
                     command,
                 } => {
@@ -2651,6 +2660,7 @@ async fn main() -> Result<()> {
                         &labels_map,
                         &env_map,
                         &approval_mode,
+                        permissive,
                         &tls,
                     ))
                     .await?;

@@ -799,8 +799,12 @@ fn spawn_pty_shell(
 
     // Phase 1 (as root): Prepare Landlock ruleset before drop_privileges.
     #[cfg(target_os = "linux")]
-    let prepared_sandbox = sandbox::linux::prepare(policy, workdir.as_deref())
+    let mut prepared_sandbox = sandbox::linux::prepare(policy, workdir.as_deref())
         .map_err(|err| anyhow::anyhow!("Failed to prepare sandbox: {err}"))?;
+    #[cfg(target_os = "linux")]
+    if policy.network.proxy.as_ref().is_some_and(|p| p.permissive) {
+        prepared_sandbox.skip_landlock();
+    }
 
     #[cfg(unix)]
     {
@@ -948,8 +952,12 @@ fn spawn_pipe_exec(
 
     // Phase 1 (as root): Prepare Landlock ruleset before drop_privileges.
     #[cfg(target_os = "linux")]
-    let prepared_sandbox = sandbox::linux::prepare(policy, workdir.as_deref())
+    let mut prepared_sandbox = sandbox::linux::prepare(policy, workdir.as_deref())
         .map_err(|err| anyhow::anyhow!("Failed to prepare sandbox: {err}"))?;
+    #[cfg(target_os = "linux")]
+    if policy.network.proxy.as_ref().is_some_and(|p| p.permissive) {
+        prepared_sandbox.skip_landlock();
+    }
 
     #[cfg(unix)]
     {

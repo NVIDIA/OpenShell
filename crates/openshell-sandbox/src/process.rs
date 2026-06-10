@@ -267,8 +267,12 @@ impl ProcessHandle {
         // This MUST happen before drop_privileges() so that root-only paths
         // (e.g. mode 700 directories) can be opened. See issue #803.
         #[cfg(target_os = "linux")]
-        let prepared_sandbox = sandbox::linux::prepare(policy, workdir)
+        let mut prepared_sandbox = sandbox::linux::prepare(policy, workdir)
             .map_err(|err| miette::miette!("Failed to prepare sandbox: {err}"))?;
+        #[cfg(target_os = "linux")]
+        if policy.network.proxy.as_ref().is_some_and(|p| p.permissive) {
+            prepared_sandbox.skip_landlock();
+        }
 
         // Set up process group for signal handling (non-interactive mode only).
         // In interactive mode, we inherit the parent's process group to maintain
