@@ -2472,6 +2472,24 @@ network_policies:
     }
 
     #[test]
+    fn l7_rest_request_ignores_null_jsonrpc_metadata() {
+        let engine = l7_engine();
+        let mut input = l7_input_with_query(
+            "api.query.com",
+            8080,
+            "GET",
+            "/download",
+            serde_json::json!({
+                "tag": ["foo-a"],
+            }),
+        );
+        input["request"]["graphql"] = serde_json::Value::Null;
+        input["request"]["jsonrpc"] = serde_json::Value::Null;
+
+        assert!(eval_l7(&engine, &input));
+    }
+
+    #[test]
     fn l7_query_missing_required_key_denied() {
         let engine = l7_engine();
         let input = l7_input_with_query(
