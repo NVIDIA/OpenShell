@@ -149,7 +149,11 @@ Gateway workload kind. StatefulSet is the default because the default SQLite
 database requires persistent per-pod storage.
 */}}
 {{- define "openshell.workloadKind" -}}
-{{- default "statefulset" .Values.workload.kind | lower -}}
+{{- $workload := .Values.workload | default dict -}}
+{{- if not (kindIs "map" $workload) -}}
+{{- fail "workload must be a map with kind and allowMultiReplicaStatefulSet fields." -}}
+{{- end -}}
+{{- default "statefulset" (get $workload "kind") | lower -}}
 {{- end }}
 
 {{/*
@@ -157,6 +161,7 @@ Validate chart values that Helm would otherwise accept silently.
 */}}
 {{- define "openshell.validateValues" -}}
 {{- $workloadKind := include "openshell.workloadKind" . -}}
+{{- $workload := .Values.workload | default dict -}}
 {{- $replicaCount := int (default 1 .Values.replicaCount) -}}
 {{- if and (hasKey .Values "postgres") (kindIs "map" .Values.postgres) (hasKey .Values.postgres "enabled") -}}
 {{- fail "postgres.enabled was removed; the OpenShell chart no longer deploys PostgreSQL. Provision PostgreSQL separately and set server.externalDbSecret to a Secret containing a PostgreSQL URI." -}}
@@ -170,7 +175,7 @@ Validate chart values that Helm would otherwise accept silently.
 {{- if and (gt $replicaCount 1) (not .Values.server.externalDbSecret) -}}
 {{- fail "replicaCount > 1 requires server.externalDbSecret; multiple gateway replicas cannot share the default per-pod SQLite database." -}}
 {{- end -}}
-{{- if and (eq $workloadKind "statefulset") (gt $replicaCount 1) (not (.Values.workload.allowMultiReplicaStatefulSet | default false)) -}}
+{{- if and (eq $workloadKind "statefulset") (gt $replicaCount 1) (not (get $workload "allowMultiReplicaStatefulSet" | default false)) -}}
 {{- fail "replicaCount > 1 with workload.kind=statefulset requires workload.allowMultiReplicaStatefulSet=true; use workload.kind=deployment for external database-backed multi-replica gateways." -}}
 {{- end -}}
 {{- end }}

@@ -26,6 +26,15 @@ tests:
           path: kind
           value: StatefulSet
 
+  - it: treats a null workload map as the default StatefulSet
+    template: templates/statefulset.yaml
+    set:
+      workload: null
+    asserts:
+      - equal:
+          path: kind
+          value: StatefulSet
+
   - it: uses a stable gateway container name
     template: templates/statefulset.yaml
     asserts:
