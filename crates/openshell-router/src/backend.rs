@@ -216,7 +216,10 @@ fn prepare_backend_request(
             }
             None => {
                 return Err(RouterError::Internal(format!(
-                    "AWS Bedrock route received non-Bedrock path '{path}'; expected /model/<id>/invoke[-with-response-stream]"
+                    "AWS Bedrock route received unprocessable path '{path}' or invalid \
+                     route.model; expected /model/<id>/invoke and a model id with no \
+                     path separators, URL delimiters, percent escapes, traversal \
+                     segments, whitespace, or control characters"
                 )));
             }
         }
@@ -834,6 +837,10 @@ fn build_backend_url(endpoint: &str, path: &str) -> String {
 /// invocation protocols. Used to gate Bedrock-specific request shaping
 /// (path-segment rewriting, skipped body-model injection) in
 /// [`prepare_backend_request`].
+///
+/// `aws_bedrock_invoke_stream` is recognized for forward-compatibility
+/// with the streaming follow-up but is not currently advertised by the
+/// L7 pattern set.
 fn route_is_bedrock(route: &ResolvedRoute) -> bool {
     route
         .protocols
@@ -841,20 +848,30 @@ fn route_is_bedrock(route: &ResolvedRoute) -> bool {
         .any(|p| p == "aws_bedrock_invoke" || p == "aws_bedrock_invoke_stream")
 }
 
-/// Parse a Bedrock invocation path into its `(model_id, action_suffix)`
+/// Parse a Bedrock invocation path into its `(model_id, action_suffix, query_tail)`
 /// components.
 ///
-/// Recognized shapes (caller's path on the way into the router):
-/// - `/model/<model_id>/invoke`                       → action `/invoke`
-/// - `/model/<model_id>/invoke-with-response-stream`  → action
-///   `/invoke-with-response-stream`
+/// Recognized shape (caller's path on the way into the router):
+/// - `/model/<model_id>/invoke[?<query>]`             → action `/invoke`
 ///
-/// `<model_id>` must be non-empty and contain no `/`. A trailing query
-/// string is stripped before matching. Returns `None` when the path
-/// does not match either shape — the caller treats that as a malformed
-/// request and rejects rather than forwarding verbatim.
-fn parse_bedrock_invocation_path(path: &str) -> Option<(&str, &'static str)> {
-    let path_only = path.split('?').next().unwrap_or(path);
+/// `<model_id>` must be non-empty and contain no `/`. The query tail
+/// (including the leading `?`) is preserved so [`rewrite_bedrock_path`]
+/// can restore it; the L7 matcher accepts queries, so silently dropping
+/// them here would mutate the request shape between the matcher and
+/// the upstream. Returns `None` when the path does not match — the
+/// caller treats that as a malformed request and rejects rather than
+/// forwarding verbatim.
+///
+/// `InvokeModelWithResponseStream` (`/invoke-with-response-stream`) is
+/// deferred until the streaming relay grows protocol-aware AWS
+/// event-stream error termination; the L7 pattern set does not
+/// advertise it today, so it cannot reach this parser.
+fn parse_bedrock_invocation_path(path: &str) -> Option<(&str, &'static str, &str)> {
+    // Slice up to but not including `?`, then keep the `?`-prefixed
+    // tail so callers can re-attach it without reconstructing the
+    // delimiter.
+    let (path_only, query_tail) =
+        path.find('?').map_or((path, ""), |idx| (&path[..idx], &path[idx..]));
     let rest = path_only.strip_prefix("/model/")?;
     let slash_at = rest.find('/')?;
     if slash_at == 0 {
@@ -864,28 +881,64 @@ fn parse_bedrock_invocation_path(path: &str) -> Option<(&str, &'static str)> {
     let suffix = &rest[slash_at..];
     let action: &'static str = match suffix {
         "/invoke" => "/invoke",
-        "/invoke-with-response-stream" => "/invoke-with-response-stream",
         _ => return None,
     };
-    Some((model_id, action))
+    Some((model_id, action, query_tail))
 }
 
 /// Rewrite a Bedrock invocation path so the model segment is the
 /// operator-configured `route.model` rather than whatever the caller
 /// supplied. Returns the rewritten path on success, or `None` when the
-/// inbound path is not a recognized Bedrock invocation shape.
+/// inbound path is not a recognized Bedrock invocation shape or when
+/// `route.model` is not a valid Bedrock model id.
 ///
 /// Why rewrite rather than reject: the inbound L7 pattern detector
-/// already accepts only `/model/{x}/invoke[-with-response-stream]`
-/// shapes for Bedrock routes, so a caller-supplied model segment that
-/// differs from the operator-configured one is the only case this
-/// function changes — and changing it (vs. rejecting) lets sandbox
-/// code that hardcodes a different model continue to work, while still
-/// guaranteeing the operator's chosen model is what reaches the
-/// upstream.
+/// already accepts only `/model/{x}/invoke` shapes for Bedrock routes,
+/// so a caller-supplied model segment that differs from the
+/// operator-configured one is the only case this function changes —
+/// and changing it (vs. rejecting) lets sandbox code that hardcodes a
+/// different model continue to work, while still guaranteeing the
+/// operator's chosen model is what reaches the upstream.
+///
+/// Defense-in-depth model-ID validation: the server-side resolver
+/// (`openshell-server::inference::resolve_provider_route`) already
+/// rejects malformed Bedrock model ids at route-save time, but the
+/// router enforces the same contract before interpolating
+/// `route.model` into a URL path segment. Values containing `/`, `\`,
+/// `?`, `#`, `%`, traversal segments, whitespace, or control chars
+/// are rejected so a stale or hand-edited route store cannot produce
+/// ambiguous or malformed upstream paths.
 fn rewrite_bedrock_path(route: &ResolvedRoute, path: &str) -> Option<String> {
-    let (_caller_model, action) = parse_bedrock_invocation_path(path)?;
-    Some(format!("/model/{}{}", route.model, action))
+    if !is_valid_bedrock_model_id(&route.model) {
+        return None;
+    }
+    let (_caller_model, action, query_tail) = parse_bedrock_invocation_path(path)?;
+    Some(format!("/model/{}{}{}", route.model, action, query_tail))
+}
+
+/// Defense-in-depth predicate matching the server-side
+/// `validate_aws_bedrock_model_id` contract — see that function for the
+/// authoritative reasoning. Returns `true` when `value` is safe to
+/// interpolate into a Bedrock URL path segment. The router uses this
+/// before constructing an upstream path so a stale or out-of-band route
+/// store cannot bypass the resolver's validation.
+fn is_valid_bedrock_model_id(value: &str) -> bool {
+    if value.is_empty() || value != value.trim() {
+        return false;
+    }
+    if value.contains('/') || value.contains('\\') {
+        return false;
+    }
+    if value.chars().any(|c| matches!(c, '?' | '#' | '%')) {
+        return false;
+    }
+    if value.contains("..") {
+        return false;
+    }
+    if value.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return false;
+    }
+    true
 }
 
 /// Check whether a route targets a Vertex AI Anthropic rawPredict endpoint.
@@ -2190,6 +2243,10 @@ mod tests {
         assert!(parse_bedrock_invocation_path("/model/a/b/invoke").is_none());
         // Unknown action: `/model/foo/converse`
         assert!(parse_bedrock_invocation_path("/model/foo/converse").is_none());
+        // Streaming variant is deferred until protocol-aware error
+        // framing exists; the parser must reject it the same way it
+        // rejects any other unknown action.
+        assert!(parse_bedrock_invocation_path("/model/foo/invoke-with-response-stream").is_none());
         // Wrong prefix: `/v1/messages`
         assert!(parse_bedrock_invocation_path("/v1/messages").is_none());
         // Missing slash before action
@@ -2203,29 +2260,26 @@ mod tests {
         );
         assert_eq!(
             parsed,
-            Some(("anthropic.claude-3-5-sonnet-20241022-v2:0", "/invoke"))
+            Some(("anthropic.claude-3-5-sonnet-20241022-v2:0", "/invoke", ""))
         );
     }
 
+    /// Query strings on Bedrock invoke paths are preserved through the
+    /// rewrite so the matcher (which accepts queries) and the upstream
+    /// see the same shape.
     #[test]
-    fn parse_bedrock_invocation_path_accepts_invoke_with_response_stream() {
-        let parsed = parse_bedrock_invocation_path(
-            "/model/anthropic.claude-opus-4-7/invoke-with-response-stream",
-        );
-        assert_eq!(
-            parsed,
-            Some(("anthropic.claude-opus-4-7", "/invoke-with-response-stream"))
-        );
-    }
-
-    #[test]
-    fn parse_bedrock_invocation_path_strips_query_string() {
+    fn parse_bedrock_invocation_path_preserves_query_string() {
         let parsed =
             parse_bedrock_invocation_path("/model/anthropic.claude-opus-4-7/invoke?trace=1");
-        assert_eq!(parsed, Some(("anthropic.claude-opus-4-7", "/invoke")));
+        assert_eq!(
+            parsed,
+            Some(("anthropic.claude-opus-4-7", "/invoke", "?trace=1"))
+        );
     }
 
-    /// `route_is_bedrock` matches both Bedrock protocol variants.
+    /// `route_is_bedrock` matches the Bedrock invocation protocol(s).
+    /// `aws_bedrock_invoke_stream` is recognized for forward-compatibility
+    /// even though no L7 pattern advertises it today.
     #[test]
     fn route_is_bedrock_matches_invoke_protocols() {
         let invoke_only = test_route(
@@ -2235,19 +2289,12 @@ mod tests {
         );
         assert!(route_is_bedrock(&invoke_only));
 
-        let stream_only = test_route(
+        let stream_forward_compat = test_route(
             "https://example.com",
             &["aws_bedrock_invoke_stream"],
             AuthHeader::None,
         );
-        assert!(route_is_bedrock(&stream_only));
-
-        let both = test_route(
-            "https://example.com",
-            &["aws_bedrock_invoke", "aws_bedrock_invoke_stream"],
-            AuthHeader::None,
-        );
-        assert!(route_is_bedrock(&both));
+        assert!(route_is_bedrock(&stream_forward_compat));
 
         let openai = test_route(
             "https://example.com",
@@ -2258,12 +2305,12 @@ mod tests {
     }
 
     /// `rewrite_bedrock_path` swaps caller's model segment for the
-    /// route-configured model on both invoke variants.
+    /// route-configured model and preserves any query string.
     #[test]
     fn rewrite_bedrock_path_substitutes_operator_model() {
         let mut route = test_route(
             "https://bedrock-bridge.example",
-            &["aws_bedrock_invoke", "aws_bedrock_invoke_stream"],
+            &["aws_bedrock_invoke"],
             AuthHeader::None,
         );
         route.model = "anthropic.claude-opus-4-7".to_string();
@@ -2274,10 +2321,11 @@ mod tests {
             Some("/model/anthropic.claude-opus-4-7/invoke".to_string())
         );
 
-        let rewritten_stream = rewrite_bedrock_path(&route, "/model/x/invoke-with-response-stream");
+        let rewritten_with_query =
+            rewrite_bedrock_path(&route, "/model/some-other-model/invoke?trace=1");
         assert_eq!(
-            rewritten_stream,
-            Some("/model/anthropic.claude-opus-4-7/invoke-with-response-stream".to_string())
+            rewritten_with_query,
+            Some("/model/anthropic.claude-opus-4-7/invoke?trace=1".to_string())
         );
     }
 
@@ -2291,6 +2339,44 @@ mod tests {
         assert_eq!(rewrite_bedrock_path(&route, "/v1/messages"), None);
         assert_eq!(rewrite_bedrock_path(&route, "/model//invoke"), None);
         assert_eq!(rewrite_bedrock_path(&route, "/model/a/b/invoke"), None);
+        // Streaming variant is deferred at the L7 layer; the router
+        // must not produce an upstream path for it either.
+        assert_eq!(
+            rewrite_bedrock_path(&route, "/model/x/invoke-with-response-stream"),
+            None
+        );
+    }
+
+    /// Defense-in-depth: `rewrite_bedrock_path` rejects route models
+    /// that would produce ambiguous or malformed upstream URL paths,
+    /// even if a malformed value somehow reached the router store.
+    #[test]
+    fn rewrite_bedrock_path_rejects_unsafe_route_model() {
+        let mut route = test_route(
+            "https://bedrock-bridge.example",
+            &["aws_bedrock_invoke"],
+            AuthHeader::None,
+        );
+
+        for unsafe_model in [
+            "anthropic.claude/../../etc/passwd",
+            "anthropic.claude\\backslash",
+            "model?injected=1",
+            "model#fragment",
+            "percent%2fencoded",
+            "..",
+            " leading-space",
+            "trailing-space ",
+            "tab\there",
+            "newline\nhere",
+            "",
+        ] {
+            route.model = unsafe_model.to_string();
+            assert!(
+                rewrite_bedrock_path(&route, "/model/foo/invoke").is_none(),
+                "rewrite_bedrock_path must reject unsafe route.model: {unsafe_model:?}"
+            );
+        }
     }
 
     /// End-to-end: an inbound Bedrock request that names a different
@@ -2302,7 +2388,7 @@ mod tests {
         let mock_server = MockServer::start().await;
         let mut route = test_route(
             &mock_server.uri(),
-            &["aws_bedrock_invoke", "aws_bedrock_invoke_stream"],
+            &["aws_bedrock_invoke"],
             AuthHeader::None,
         );
         route.model = "anthropic.claude-opus-4-7".to_string();
@@ -2371,51 +2457,6 @@ mod tests {
             received_body.get("messages").is_some(),
             "messages field should pass through unchanged"
         );
-    }
-
-    /// Streaming variant: the same path-rewrite + body-preservation
-    /// contract applies to invoke-with-response-stream.
-    #[tokio::test]
-    async fn bedrock_route_streaming_rewrites_model_in_path() {
-        let mock_server = MockServer::start().await;
-        let mut route = test_route(
-            &mock_server.uri(),
-            &["aws_bedrock_invoke", "aws_bedrock_invoke_stream"],
-            AuthHeader::None,
-        );
-        route.model = "anthropic.claude-opus-4-7".to_string();
-
-        Mock::given(method("POST"))
-            .and(path(
-                "/model/anthropic.claude-opus-4-7/invoke-with-response-stream",
-            ))
-            .respond_with(ResponseTemplate::new(200).set_body_string("event: ok\n\n"))
-            .mount(&mock_server)
-            .await;
-
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .expect("client");
-
-        let (builder, url) = prepare_backend_request(
-            &client,
-            &route,
-            "POST",
-            "/model/another-model/invoke-with-response-stream",
-            &[],
-            bytes::Bytes::from(r#"{"messages":[]}"#),
-            true,
-        )
-        .expect("prepare should succeed");
-
-        assert!(
-            url.ends_with("/model/anthropic.claude-opus-4-7/invoke-with-response-stream"),
-            "Streaming URL must use operator model, got: {url}"
-        );
-
-        let resp = builder.send().await.expect("send");
-        assert_eq!(resp.status(), 200);
     }
 
     /// Defense-in-depth: a Bedrock route receiving a non-Bedrock path

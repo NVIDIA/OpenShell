@@ -370,6 +370,52 @@ fn vertex_location_and_host(region: &str) -> (String, String) {
     (location, host)
 }
 
+/// Reject Bedrock model ids that would produce ambiguous or malformed
+/// upstream URL paths.
+///
+/// AWS Bedrock encodes the model in `/model/<id>/invoke`, so the value
+/// is interpolated directly into a URL path segment. Without
+/// validation, a value containing `/`, `\`, percent escapes, query or
+/// fragment delimiters, traversal segments, whitespace, or control
+/// characters could break out of the path segment, smuggle a different
+/// upstream route, or produce ambiguous/malformed paths upstream.
+///
+/// Mirrors [`validate_vertex_model_id`] — Bedrock has the same exposure
+/// for the same reason, and the contract is enforced again at the
+/// router layer (`is_valid_bedrock_model_id`) as defense-in-depth.
+fn validate_aws_bedrock_model_id(value: &str) -> Result<(), Status> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(Status::invalid_argument("model_id is required"));
+    }
+    if value != trimmed {
+        return Err(Status::invalid_argument(format!(
+            "AWS Bedrock model_id must not include leading or trailing whitespace: {value:?}"
+        )));
+    }
+    if value.contains('/') || value.contains('\\') {
+        return Err(Status::invalid_argument(format!(
+            "AWS Bedrock model_id must not contain path separators: {value:?}"
+        )));
+    }
+    if value.chars().any(|c| matches!(c, '?' | '#' | '%')) {
+        return Err(Status::invalid_argument(format!(
+            "AWS Bedrock model_id must not contain URL delimiters or percent escapes: {value:?}"
+        )));
+    }
+    if value.contains("..") {
+        return Err(Status::invalid_argument(format!(
+            "AWS Bedrock model_id must not contain traversal segments: {value:?}"
+        )));
+    }
+    if value.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err(Status::invalid_argument(format!(
+            "AWS Bedrock model_id must not contain whitespace or control characters: {value:?}"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_vertex_model_id(value: &str) -> Result<(), Status> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -661,6 +707,16 @@ fn resolve_provider_route(
             provider_type,
             route,
         });
+    }
+
+    // AWS Bedrock encodes the model in the URL path
+    // (`/model/<id>/invoke`), so the model id is interpolated directly
+    // into a path segment by the router. Validate up front so the route
+    // store cannot hold a model id that would produce ambiguous or
+    // malformed upstream paths. Defense-in-depth: the router enforces
+    // the same contract again before constructing an upstream URL.
+    if provider_type == "aws-bedrock" {
+        validate_aws_bedrock_model_id(model_id)?;
     }
 
     let base_url = find_provider_config_value(provider, profile.base_url_config_keys)
@@ -1197,6 +1253,70 @@ mod tests {
             "error should name the missing base_url, got: {}",
             err.message()
         );
+    }
+
+    /// Bedrock route resolution must reject model ids that would
+    /// produce ambiguous or malformed upstream URL paths. The Vertex
+    /// suite has equivalent coverage; this is the Bedrock companion.
+    #[tokio::test]
+    async fn upsert_cluster_route_rejects_aws_bedrock_unsafe_model_id() {
+        let store = test_store().await;
+
+        let provider = Provider {
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: "provider-bedrock-bridge".to_string(),
+                name: "bedrock-bridge".to_string(),
+                created_at_ms: 1_000_000,
+                labels: std::collections::HashMap::new(),
+                resource_version: 0,
+            }),
+            r#type: "aws-bedrock".to_string(),
+            credentials: std::collections::HashMap::new(),
+            config: std::iter::once((
+                "BEDROCK_BASE_URL".to_string(),
+                "http://bedrock-bridge.demo.svc.cluster.local:8080".to_string(),
+            ))
+            .collect(),
+            credential_expires_at_ms: std::collections::HashMap::new(),
+        };
+        store
+            .put_message(&provider)
+            .await
+            .expect("provider should persist");
+
+        for unsafe_model in [
+            "anthropic.claude/../../etc/passwd",
+            "back\\slash-id",
+            "model?injected=1",
+            "model#fragment",
+            "percent%2fencoded",
+            "model..v2",
+            " leading-space",
+            "trailing-space ",
+            "tab\there",
+            "newline\nhere",
+        ] {
+            let err = upsert_cluster_inference_route(
+                &store,
+                CLUSTER_INFERENCE_ROUTE_NAME,
+                "bedrock-bridge",
+                unsafe_model,
+                0,
+                false,
+            )
+            .await
+            .expect_err(unsafe_model);
+            assert_eq!(
+                err.code(),
+                tonic::Code::InvalidArgument,
+                "{unsafe_model:?} should fail with InvalidArgument"
+            );
+            assert!(
+                err.message().contains("AWS Bedrock model_id"),
+                "error must name AWS Bedrock model_id for {unsafe_model:?}, got: {}",
+                err.message()
+            );
+        }
     }
 
     #[tokio::test]
@@ -2634,6 +2754,79 @@ mod tests {
             "expected path traversal error, got: {}",
             err.message()
         );
+    }
+
+    /// Bedrock model ids appear as a URL path segment in
+    /// `/model/<id>/invoke`. Mirrors the Vertex validation suite.
+    #[test]
+    fn validate_aws_bedrock_model_id_accepts_well_formed_ids() {
+        // Real Bedrock model ids: provider-prefixed, dotted, hyphenated,
+        // possibly versioned with `:0` suffix.
+        validate_aws_bedrock_model_id("anthropic.claude-opus-4-7").expect("dotted id");
+        validate_aws_bedrock_model_id("anthropic.claude-3-5-sonnet-20241022-v2:0")
+            .expect("versioned id");
+        validate_aws_bedrock_model_id("meta.llama3-70b-instruct-v1:0").expect("meta id");
+        validate_aws_bedrock_model_id("mistral.mixtral-8x7b-instruct-v0:1").expect("mistral id");
+    }
+
+    #[test]
+    fn validate_aws_bedrock_model_id_rejects_empty() {
+        let err = validate_aws_bedrock_model_id("").expect_err("empty must be rejected");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("required"));
+    }
+
+    #[test]
+    fn validate_aws_bedrock_model_id_rejects_path_separators() {
+        for value in ["foo/bar", "anthropic.claude/../passwd", "back\\slash"] {
+            let err = validate_aws_bedrock_model_id(value).expect_err(value);
+            assert!(
+                err.message().contains("path separators"),
+                "expected path-separator error for {value:?}, got: {}",
+                err.message()
+            );
+        }
+    }
+
+    #[test]
+    fn validate_aws_bedrock_model_id_rejects_url_delimiters() {
+        for value in ["model?injected=1", "model#fragment", "percent%2fencoded"] {
+            let err = validate_aws_bedrock_model_id(value).expect_err(value);
+            assert!(
+                err.message().contains("URL delimiters"),
+                "expected URL-delimiter error for {value:?}, got: {}",
+                err.message()
+            );
+        }
+    }
+
+    #[test]
+    fn validate_aws_bedrock_model_id_rejects_traversal() {
+        let err = validate_aws_bedrock_model_id("model..v2")
+            .expect_err("double-dot traversal must be rejected");
+        assert!(
+            err.message().contains("traversal"),
+            "expected path traversal error, got: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn validate_aws_bedrock_model_id_rejects_whitespace_and_control() {
+        for value in [
+            " leading",
+            "trailing ",
+            "in middle",
+            "tab\tin",
+            "newline\nin",
+        ] {
+            let err = validate_aws_bedrock_model_id(value).expect_err(value);
+            assert!(
+                err.message().contains("whitespace") || err.message().contains("control"),
+                "expected whitespace/control error for {value:?}, got: {}",
+                err.message()
+            );
+        }
     }
 
     #[test]
