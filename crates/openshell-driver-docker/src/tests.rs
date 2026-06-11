@@ -382,6 +382,31 @@ fn docker_gateway_route_uses_bridge_gateway_for_linux_docker() {
     );
 }
 
+// Regression for macOS + OPENSHELL_DRIVERS=docker against a Podman-machine
+// socket (OpenShell issue #1358): the daemon looks like generic Linux, but the
+// bridge gateway IP only exists inside the VM. Binding it on the host fails
+// with EADDRNOTAVAIL during gateway startup.
+#[test]
+#[cfg(target_os = "macos")]
+fn docker_gateway_route_uses_host_gateway_for_podman_machine_on_macos() {
+    let info = SystemInfo {
+        // Observed values when docker CLI talks to podman machine API.
+        operating_system: Some("fedora".to_string()),
+        name: Some("localhost.localdomain".to_string()),
+        labels: None,
+        ..Default::default()
+    };
+
+    let route = docker_gateway_route(
+        &info,
+        // Typical Podman machine bridge gateway; not routable on the macOS host.
+        IpAddr::V4(Ipv4Addr::new(10, 89, 0, 1)),
+        DEFAULT_SERVER_PORT,
+        None,
+    );
+    assert_eq!(route, DockerGatewayRoute::HostGateway);
+}
+
 #[test]
 fn docker_gateway_route_uses_host_gateway_when_host_runtime_requires_it() {
     let info = SystemInfo {
