@@ -1941,6 +1941,28 @@ mod tests {
     }
 
     #[test]
+    fn sync_error_retry_filter_accepts_transport_failures() {
+        let err = miette::miette!("transport error: connection reset by peer");
+        assert!(sync_error_is_retryable(&err));
+    }
+
+    #[test]
+    fn sync_error_retry_filter_accepts_transient_ssh_probe_failures() {
+        let err = Err::<(), _>(miette::miette!(
+            "ssh probe exited with status exit status: 255"
+        ))
+        .wrap_err("failed to resolve sandbox source path '/sandbox/ha-sync/ha-sync-upload'")
+        .unwrap_err();
+        assert!(sync_error_is_retryable(&err));
+    }
+
+    #[test]
+    fn sync_error_retry_filter_rejects_validation_failures() {
+        let err = miette::miette!("sandbox source path '/etc/passwd' resolves outside /sandbox");
+        assert!(!sync_error_is_retryable(&err));
+    }
+
+    #[test]
     #[allow(unsafe_code)] // Test-only: env vars require unsafe in Rust 2024.
     fn install_ssh_config_adds_include_once_and_updates_managed_file() {
         let _guard = TEST_ENV_LOCK
