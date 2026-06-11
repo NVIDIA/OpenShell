@@ -94,6 +94,8 @@ ipnet = "2"
 tempfile = "3"
 rustix = { workspace = true }
 x509-parser = "0.16"
+arc-swap = "1"
+notify = "8"
 
 [features]
 bundled-z3 = ["openshell-prover/bundled-z3"]

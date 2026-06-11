@@ -413,20 +413,28 @@ pub async fn run_server(
         info!("Metrics server disabled");
     }
 
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
     // Build TLS acceptor when TLS is configured; otherwise serve plaintext.
     let tls_acceptor = if let Some(tls) = &config.tls {
-        Some(TlsAcceptor::from_files(
+        let acceptor = TlsAcceptor::from_files(
             &tls.cert_path,
             &tls.key_path,
             tls.client_ca_path.as_deref(),
             tls.require_client_auth,
-        )?)
+        )?;
+
+        // Spawn file-watcher-based TLS certificate reload worker.
+        // Watches parent directories of cert/key/CA files and atomically
+        // reloads when changes are detected.
+        acceptor.spawn_reload_worker(shutdown_rx.clone());
+
+        Some(acceptor)
     } else {
         info!("TLS disabled — accepting plaintext connections");
         None
     };
 
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut listener_tasks = Vec::with_capacity(gateway_listeners.len());
     let enable_loopback_service_http = config.service_routing.enable_loopback_service_http;
     for (listener, listen_addr) in gateway_listeners {
@@ -615,7 +623,10 @@ fn spawn_gateway_connection(
                     warn!(client = %addr, listen = %listen_addr, "Rejected plaintext HTTP on non-loopback gateway listener");
                 }
                 Ok(ConnectionProtocol::Tls | ConnectionProtocol::Unknown) => {
-                    match acceptor.inner().accept(stream).await {
+                    // acceptor.acceptor() snapshots the current TLS config;
+                    // the returned acceptor owns an Arc that stays alive for
+                    // the full duration of the handshake.
+                    match acceptor.acceptor().accept(stream).await {
                         Ok(tls_stream) => {
                             let peer_identity = multiplex::extract_peer_identity(&tls_stream);
                             if let Err(e) = service
