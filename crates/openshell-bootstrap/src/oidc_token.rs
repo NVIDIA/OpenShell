@@ -7,7 +7,7 @@
 //! `$XDG_CONFIG_HOME/openshell/gateways/<name>/oidc_token.json`.
 //! File permissions are `0600` (owner-only).
 
-use crate::paths::user_gateways_dir;
+use crate::paths::user_gateway_dir;
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::paths::{ensure_parent_dir_restricted, set_file_owner_only};
 use serde::{Deserialize, Serialize};
@@ -36,9 +36,7 @@ pub struct OidcTokenBundle {
 
 /// Path to the stored OIDC token bundle for a gateway.
 pub fn oidc_token_path(gateway_name: &str) -> Result<PathBuf> {
-    Ok(user_gateways_dir()?
-        .join(gateway_name)
-        .join("oidc_token.json"))
+    Ok(user_gateway_dir(gateway_name)?.join("oidc_token.json"))
 }
 
 /// Store an OIDC token bundle for a gateway.
@@ -91,4 +89,44 @@ pub fn is_token_expired(bundle: &OidcTokenBundle) -> bool {
         .unwrap_or_default()
         .as_secs();
     now + 30 >= expires_at
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[allow(unsafe_code)]
+    fn with_tmp_xdg<F: FnOnce()>(tmp: &std::path::Path, f: F) {
+        let _guard = crate::XDG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let orig = std::env::var("XDG_CONFIG_HOME").ok();
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", tmp);
+        }
+        f();
+        unsafe {
+            match orig {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn oidc_token_paths_reject_multi_component_gateway_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_tmp_xdg(tmp.path(), || {
+            let bundle = OidcTokenBundle {
+                access_token: "token".to_string(),
+                refresh_token: None,
+                expires_at: None,
+                issuer: "https://issuer.example.com".to_string(),
+                client_id: "openshell-cli".to_string(),
+            };
+            assert!(store_oidc_token("../escape", &bundle).is_err());
+            assert!(load_oidc_token("../escape").is_none());
+            assert!(remove_oidc_token("../escape").is_err());
+        });
+    }
 }

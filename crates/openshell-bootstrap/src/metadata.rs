@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::paths::{
-    last_sandbox_path, system_active_gateway_path, system_gateways_dir, user_active_gateway_path,
-    user_gateways_dir,
+    last_sandbox_path, system_active_gateway_path, system_gateway_dir, system_gateways_dir,
+    user_active_gateway_path, user_gateway_dir, user_gateways_dir, validated_gateway_name,
 };
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::paths::ensure_parent_dir_restricted;
@@ -98,11 +98,11 @@ pub struct ListedGateway {
 }
 
 fn user_gateway_metadata_path(name: &str) -> Result<PathBuf> {
-    Ok(user_gateways_dir()?.join(name).join("metadata.json"))
+    Ok(user_gateway_dir(name)?.join("metadata.json"))
 }
 
-fn system_gateway_metadata_path(name: &str) -> PathBuf {
-    system_gateways_dir().join(name).join("metadata.json")
+fn system_gateway_metadata_path(name: &str) -> Result<PathBuf> {
+    Ok(system_gateway_dir(name)?.join("metadata.json"))
 }
 
 fn resolve_gateway_metadata_path(name: &str) -> Result<Option<(PathBuf, GatewayMetadataSource)>> {
@@ -111,7 +111,7 @@ fn resolve_gateway_metadata_path(name: &str) -> Result<Option<(PathBuf, GatewayM
         return Ok(Some((user, GatewayMetadataSource::User)));
     }
 
-    let system = system_gateway_metadata_path(name);
+    let system = system_gateway_metadata_path(name)?;
     if system.exists() {
         return Ok(Some((system, GatewayMetadataSource::System)));
     }
@@ -212,7 +212,7 @@ pub fn gateway_metadata_source(name: &str) -> Result<Option<GatewayMetadataSourc
 
 pub fn load_gateway_metadata(name: &str) -> Result<GatewayMetadata> {
     let primary = user_gateway_metadata_path(name)?;
-    let system = system_gateway_metadata_path(name);
+    let system = system_gateway_metadata_path(name)?;
     let Some((path, _source)) = resolve_gateway_metadata_path(name)? else {
         return Err(miette::miette!(
             "no metadata found for gateway '{name}' (looked in {} and {})",
@@ -230,12 +230,24 @@ pub fn get_gateway_metadata(name: &str) -> Option<GatewayMetadata> {
 
 /// Save the active gateway name to persistent storage.
 pub fn save_active_gateway(name: &str) -> Result<()> {
+    validated_gateway_name(name)?;
     let path = user_active_gateway_path()?;
     ensure_parent_dir_restricted(&path)?;
     std::fs::write(&path, name)
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to write active gateway to {}", path.display()))?;
     Ok(())
+}
+
+fn read_gateway_name(path: &Path) -> Option<String> {
+    let value = read_nonempty_trimmed(path)?;
+    match validated_gateway_name(&value) {
+        Ok(_) => Some(value),
+        Err(err) => {
+            tracing::warn!(path = %path.display(), error = %err, "ignoring invalid active gateway name");
+            None
+        }
+    }
 }
 fn read_nonempty_trimmed(path: &Path) -> Option<String> {
     let contents = std::fs::read_to_string(path).ok()?;
@@ -250,7 +262,7 @@ pub fn load_user_active_gateway() -> Option<String> {
     user_active_gateway_path()
         .ok()
         .as_deref()
-        .and_then(read_nonempty_trimmed)
+        .and_then(read_gateway_name)
 }
 
 /// Load the active gateway name from persistent storage.
@@ -259,7 +271,7 @@ pub fn load_user_active_gateway() -> Option<String> {
 /// system-level active gateway file when no per-user selection exists, so
 /// installer-provided defaults can take effect on a fresh system.
 pub fn load_active_gateway() -> Option<String> {
-    load_user_active_gateway().or_else(|| read_nonempty_trimmed(&system_active_gateway_path()))
+    load_user_active_gateway().or_else(|| read_gateway_name(&system_active_gateway_path()))
 }
 
 /// Save the last-used sandbox name for a gateway to persistent storage.
@@ -897,6 +909,36 @@ mod tests {
             assert_eq!(gateways.len(), 1);
             assert_eq!(gateways[0].metadata.gateway_endpoint, "https://system");
             assert_eq!(gateways[0].source, GatewayMetadataSource::System);
+        });
+    }
+
+    #[test]
+    fn gateway_names_must_be_single_path_components() {
+        let user = tempfile::tempdir().unwrap();
+        let system = tempfile::tempdir().unwrap();
+        with_tmp_xdg_and_system(user.path(), system.path(), || {
+            let meta = GatewayMetadata {
+                name: "shared".to_string(),
+                gateway_endpoint: "https://example.com".to_string(),
+                ..Default::default()
+            };
+            assert!(store_gateway_metadata("../escape", &meta).is_err());
+            assert!(load_gateway_metadata("../escape").is_err());
+            assert!(save_last_sandbox("../escape", "sb-123").is_err());
+            assert!(save_active_gateway("../escape").is_err());
+        });
+    }
+
+    #[test]
+    fn load_active_gateway_ignores_invalid_user_name_and_falls_back_to_system() {
+        let user = tempfile::tempdir().unwrap();
+        let system = tempfile::tempdir().unwrap();
+        with_tmp_xdg_and_system(user.path(), system.path(), || {
+            std::fs::write(user.path().join("active_gateway"), "../escape").unwrap();
+            std::fs::write(system.path().join("active_gateway"), "system-default").unwrap();
+
+            assert_eq!(load_user_active_gateway(), None);
+            assert_eq!(load_active_gateway(), Some("system-default".to_string()));
         });
     }
 }
