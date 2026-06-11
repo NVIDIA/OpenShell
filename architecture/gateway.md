@@ -110,6 +110,11 @@ non-owner gateway pod. If a peer owner is stale or unreachable during a rollout,
 the serving gateway retries ownership lookup until the normal relay wait
 deadline.
 
+File upload and download use tar-over-SSH through the same relay path. A gateway
+pod termination drops the active SSH proxy byte stream, so the CLI retries the
+whole sync operation with a fresh SSH session instead of attempting mid-stream
+resume.
+
 Gateway peer RPCs authenticate with Kubernetes ServiceAccount identity rather
 than a shared secret. Helm mounts a projected, pod-bound token with audience
 `openshell-gateway-peer`; the receiving gateway validates it through

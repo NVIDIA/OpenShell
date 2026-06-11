@@ -3,6 +3,9 @@
 
 #![cfg(feature = "e2e-kubernetes")]
 
+use std::fs;
+use std::io::Write;
+use std::path::Path;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
@@ -11,7 +14,13 @@ use openshell_e2e::harness::output::strip_ansi;
 use openshell_e2e::harness::port::{find_free_port, wait_for_port};
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio::process::{Child, Command};
+
+static KUBE_HA_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+const HA_SYNC_PAYLOAD_BYTES: usize = 32 * 1024 * 1024;
+const HA_SYNC_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[derive(Clone)]
 struct KubeTarget {
@@ -119,6 +128,18 @@ impl KubeTarget {
             "--timeout=90s",
         ])
         .await?;
+        Ok(())
+    }
+
+    async fn roll_gateway_pods(
+        &self,
+        pods: Vec<String>,
+        expected: usize,
+    ) -> Result<(), String> {
+        for pod in pods {
+            self.delete_gateway_pod(&pod).await?;
+            self.wait_for_gateway_pods(expected).await?;
+        }
         Ok(())
     }
 
@@ -357,8 +378,104 @@ async fn assert_exec_through_all_pods(
     Ok(())
 }
 
+fn write_deterministic_payload(path: &Path, size: usize) {
+    let mut file = fs::File::create(path).expect("create HA sync payload");
+    let mut offset = 0usize;
+    let mut remaining = size;
+    let mut buf = vec![0_u8; 64 * 1024];
+
+    while remaining > 0 {
+        let chunk_len = remaining.min(buf.len());
+        for (idx, byte) in buf[..chunk_len].iter_mut().enumerate() {
+            *byte = u8::try_from((offset + idx) % 251).expect("byte value fits");
+        }
+        file.write_all(&buf[..chunk_len])
+            .expect("write HA sync payload chunk");
+        offset += chunk_len;
+        remaining -= chunk_len;
+    }
+}
+
+fn sha256_file(path: &Path) -> String {
+    let data = fs::read(path).expect("read file for SHA-256");
+    let mut hasher = Sha256::new();
+    hasher.update(&data);
+    hex::encode(hasher.finalize())
+}
+
+fn upload_command(sandbox_name: &str, local_path: &Path, dest: &str) -> Command {
+    let mut cmd = openshell_cmd();
+    cmd.arg("sandbox")
+        .arg("upload")
+        .arg(sandbox_name)
+        .arg(local_path)
+        .arg(dest)
+        .arg("--no-git-ignore");
+    cmd
+}
+
+fn download_command(sandbox_name: &str, sandbox_path: &str, local_dest: &Path) -> Command {
+    let mut cmd = openshell_cmd();
+    cmd.arg("sandbox")
+        .arg("download")
+        .arg(sandbox_name)
+        .arg(sandbox_path)
+        .arg(local_dest);
+    cmd
+}
+
+async fn run_cli_during_gateway_pod_roll(
+    kube: &KubeTarget,
+    mut cmd: Command,
+    operation: &str,
+) -> Result<String, String> {
+    let pods = kube.wait_for_gateway_pods(2).await?;
+
+    cmd.stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let child = cmd
+        .spawn()
+        .map_err(|err| format!("failed to spawn {operation} command: {err}"))?;
+
+    let (roll_result, output_result) = tokio::time::timeout(HA_SYNC_TIMEOUT, async {
+        let roll = async {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            kube.roll_gateway_pods(pods, 2).await
+        };
+        tokio::join!(roll, child.wait_with_output())
+    })
+    .await
+    .map_err(|_| {
+        format!(
+            "{operation} command and gateway pod roll did not finish within {HA_SYNC_TIMEOUT:?}"
+        )
+    })?;
+
+    roll_result.map_err(|err| {
+        format!("gateway pod roll failed while {operation} command was running: {err}")
+    })?;
+
+    let output =
+        output_result.map_err(|err| format!("failed to wait for {operation} command: {err}"))?;
+    let combined = strip_ansi(&format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    ));
+    if !output.status.success() {
+        return Err(format!(
+            "{operation} command failed with exit {:?} during gateway pod roll:\n{combined}",
+            output.status.code()
+        ));
+    }
+
+    Ok(combined)
+}
+
 #[tokio::test]
 async fn sandbox_exec_rebalances_across_gateway_scale_and_rollout() {
+    let _test_lock = KUBE_HA_TEST_LOCK.lock().await;
     let kube = KubeTarget::from_env();
 
     let mut pods = kube
@@ -448,6 +565,72 @@ async fn sandbox_exec_rebalances_across_gateway_scale_and_rollout() {
                 });
         delete_sandbox.cleanup().await;
     }
+
+    sandbox.cleanup().await;
+}
+
+#[tokio::test]
+async fn sandbox_file_sync_survives_gateway_pod_rolls() {
+    let _test_lock = KUBE_HA_TEST_LOCK.lock().await;
+    let kube = KubeTarget::from_env();
+
+    kube.scale_gateway(2)
+        .await
+        .expect("gateway should run with two HA replicas for sync outage testing");
+    kube.wait_for_gateway_pods(2)
+        .await
+        .expect("gateway should have two ready replicas before sync outage testing");
+
+    let mut sandbox =
+        SandboxGuard::create_keep(&["sh", "-c", "echo Ready && sleep infinity"], "Ready")
+            .await
+            .expect("sandbox create --keep for HA sync testing");
+
+    let tmpdir = tempfile::tempdir().expect("create HA sync tmpdir");
+    let upload_dir = tmpdir.path().join("ha-sync-upload");
+    fs::create_dir_all(&upload_dir).expect("create HA sync upload dir");
+    fs::write(upload_dir.join("marker.txt"), "ha-sync-marker")
+        .expect("write HA sync marker");
+
+    let payload = upload_dir.join("payload.bin");
+    write_deterministic_payload(&payload, HA_SYNC_PAYLOAD_BYTES);
+    let expected_hash = sha256_file(&payload);
+
+    let upload = upload_command(&sandbox.name, &upload_dir, "/sandbox/ha-sync");
+    run_cli_during_gateway_pod_roll(&kube, upload, "upload")
+        .await
+        .expect("upload should survive rolling gateway pod outages");
+
+    let remote_payload = "/sandbox/ha-sync/ha-sync-upload/payload.bin";
+    let remote_hash_cmd = format!("sha256sum {remote_payload} | awk '{{print $1}}'");
+    let remote_hash = sandbox
+        .exec(&["sh", "-c", &remote_hash_cmd])
+        .await
+        .expect("uploaded payload should be readable in sandbox");
+    assert!(
+        strip_ansi(&remote_hash).contains(&expected_hash),
+        "uploaded payload SHA-256 mismatch; expected {expected_hash}, got:\n{remote_hash}"
+    );
+
+    let download_dir = tmpdir.path().join("ha-sync-download");
+    fs::create_dir_all(&download_dir).expect("create HA sync download dir");
+    let download = download_command(
+        &sandbox.name,
+        "/sandbox/ha-sync/ha-sync-upload",
+        &download_dir,
+    );
+    run_cli_during_gateway_pod_roll(&kube, download, "download")
+        .await
+        .expect("download should survive rolling gateway pod outages");
+
+    let actual_hash = sha256_file(&download_dir.join("payload.bin"));
+    assert_eq!(
+        expected_hash, actual_hash,
+        "downloaded payload SHA-256 mismatch after gateway pod rolls"
+    );
+    let marker = fs::read_to_string(download_dir.join("marker.txt"))
+        .expect("read downloaded HA sync marker");
+    assert_eq!(marker, "ha-sync-marker", "downloaded marker mismatch");
 
     sandbox.cleanup().await;
 }
