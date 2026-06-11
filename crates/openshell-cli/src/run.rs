@@ -121,7 +121,7 @@ fn ready_false_condition_message(
 
 fn provisioning_timeout_message(
     timeout_secs: u64,
-    requested_gpu: bool,
+    resource_requirements: Option<&ResourceRequirements>,
     condition_message: Option<&str>,
 ) -> String {
     let mut message = format!("sandbox provisioning timed out after {timeout_secs}s");
@@ -131,7 +131,7 @@ fn provisioning_timeout_message(
         message.push_str(condition_message);
     }
 
-    if requested_gpu {
+    if resource_requirements.is_some_and(|requirements| requirements.gpu.is_some()) {
         message.push_str(
             ". Hint: this may be because the available GPU is already in use by another sandbox.",
         );
@@ -1961,7 +1961,7 @@ pub async fn sandbox_create(
         if remaining.is_zero() {
             let timeout_message = provisioning_timeout_message(
                 provision_timeout.as_secs(),
-                requested_gpu,
+                resource_requirements.as_ref(),
                 last_condition_message.as_deref(),
             );
             if let Some(d) = display.as_mut() {
@@ -1980,7 +1980,7 @@ pub async fn sandbox_create(
                 // Timeout fired — the stream was idle for too long.
                 let timeout_message = provisioning_timeout_message(
                     provision_timeout.as_secs(),
-                    requested_gpu,
+                    resource_requirements.as_ref(),
                     last_condition_message.as_deref(),
                 );
                 if let Some(d) = display.as_mut() {
@@ -7596,9 +7596,10 @@ mod tests {
         PROGRESS_STEP_STARTING_SANDBOX,
     };
     use openshell_core::proto::{
-        Provider, ProviderCredentialRefresh, ProviderCredentialRefreshStatus,
-        ProviderCredentialRefreshStrategy, ProviderCredentialTokenGrant, ProviderProfile,
-        ProviderProfileCredential, SandboxCondition, SandboxStatus, datamodel::v1::ObjectMeta,
+        GpuResourceRequirements, Provider, ProviderCredentialRefresh,
+        ProviderCredentialRefreshStatus, ProviderCredentialRefreshStrategy,
+        ProviderCredentialTokenGrant, ProviderProfile, ProviderProfileCredential,
+        ResourceRequirements, SandboxCondition, SandboxStatus, datamodel::v1::ObjectMeta,
     };
 
     struct EnvVarGuard {
@@ -8286,9 +8287,12 @@ mod tests {
 
     #[test]
     fn provisioning_timeout_message_includes_condition_and_gpu_hint() {
+        let resource_requirements = ResourceRequirements {
+            gpu: Some(GpuResourceRequirements { count: None }),
+        };
         let message = provisioning_timeout_message(
             120,
-            true,
+            Some(&resource_requirements),
             Some("DependenciesNotReady: Pod exists with phase: Pending; Service Exists"),
         );
 
@@ -8299,7 +8303,15 @@ mod tests {
 
     #[test]
     fn provisioning_timeout_message_omits_gpu_hint_for_non_gpu_requests() {
-        let message = provisioning_timeout_message(120, false, None);
+        let message = provisioning_timeout_message(120, None, None);
+
+        assert_eq!(message, "sandbox provisioning timed out after 120s");
+    }
+
+    #[test]
+    fn provisioning_timeout_message_omits_gpu_hint_without_gpu_requirements() {
+        let resource_requirements = ResourceRequirements { gpu: None };
+        let message = provisioning_timeout_message(120, Some(&resource_requirements), None);
 
         assert_eq!(message, "sandbox provisioning timed out after 120s");
     }
