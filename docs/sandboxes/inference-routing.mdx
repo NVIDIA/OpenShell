@@ -61,12 +61,13 @@ Supported request patterns depend on the provider configured for `inference.loca
 | Pattern | Method | Path |
 |---|---|---|
 | InvokeModel | `POST` | `/model/{modelId}/invoke` |
-| InvokeModelWithResponseStream | `POST` | `/model/{modelId}/invoke-with-response-stream` |
 
 The `{modelId}` segment is constrained to a single non-empty path segment to avoid path-traversal liabilities. `/model//invoke` and `/model/a/b/invoke` both no-match.
 
 <Note>
 Today the `aws-bedrock` provider type is bridge-fronted only. The router does not inject any auth header on outbound requests; the configured `BEDROCK_BASE_URL` is expected to point at a translating bridge or Bedrock-compatible proxy whose own pod holds operator-side credentials. SigV4 signing for direct AWS Bedrock is deferred to a follow-up release.
+
+`InvokeModelWithResponseStream` is intentionally not advertised yet. The streaming path emits AWS event-stream framing, which our protocol-aware error path does not yet model; surfacing it without that work risks shipping responses the sandbox cannot interpret on failure. It will land alongside the streaming-error work in a follow-up.
 </Note>
 
 </Tab>
@@ -184,11 +185,11 @@ openshell inference set \
     --no-verify
 ```
 
-**Why a placeholder credential?** `provider create` requires a non-empty `credentials` map. The bridge-fronted shape ignores AWS credentials at the router level (the bridge holds operator-side auth in its own pod), so any string value satisfies the structural requirement; `unused-bridge-fronted-shape` makes the intent obvious in `openshell provider get` output. When the SigV4 follow-up lands, this becomes a real key.
+**Why a placeholder credential?** `provider create` requires a non-empty `credentials` map even when the upstream auth scheme is `AuthHeader::None` — `aws-bedrock` falls into that bucket today because the router never injects a credential header on outbound requests; the bridge holds operator-side auth in its own pod. Any non-empty string value satisfies the structural requirement; `unused-bridge-fronted-shape` makes the intent obvious in `openshell provider get` output. The same pattern applies to any standalone-router profile that registers `AuthHeader::None`. When the SigV4 follow-up lands and the router begins signing requests itself, this becomes a real key.
 
 **About the bridge-fronted shape.** The router does not inject any auth header on outbound requests. Point `BEDROCK_BASE_URL` at a translating bridge or Bedrock-compatible proxy that handles authentication in its own pod. The bridge is expected to accept Bedrock InvokeModel requests on the patterns listed above and forward to the operator's real upstream.
 
-**About `--no-verify`.** The default validation probe does not yet recognize the `aws_bedrock_invoke` and `aws_bedrock_invoke_stream` protocols, so without `--no-verify` the `inference set` call would fail before it could mint a route. The first sandbox round-trip is the real verification today.
+**About `--no-verify`.** The default validation probe does not yet recognize the `aws_bedrock_invoke` protocol, so without `--no-verify` the `inference set` call would fail before it could mint a route. The first sandbox round-trip is the real verification today.
 
 **For direct AWS Bedrock**, refer to a future release that adds the SigV4 router-side signer. Until then, a `BEDROCK_BASE_URL` is required at provider-create time — the core profile sets `default_base_url: ""`, so route resolution rejects providers without it rather than silently forwarding prompts to AWS with no usable auth.
 
