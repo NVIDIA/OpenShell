@@ -60,9 +60,10 @@ fn validated_container_name(sandbox_name: &str) -> Result<String, ComputeDriverE
 fn podman_volume_is_bind_backed(volume: &VolumeInspect) -> bool {
     (volume.driver.is_empty() || volume.driver == "local")
         && volume.options.get("o").is_some_and(|options| {
-            options
-                .split(',')
-                .any(|option| option.trim().eq_ignore_ascii_case("bind"))
+            options.split(',').any(|option| {
+                let option = option.trim();
+                option.eq_ignore_ascii_case("bind") || option.eq_ignore_ascii_case("rbind")
+            })
         })
 }
 
@@ -890,6 +891,16 @@ mod tests {
     }
 
     #[test]
+    fn podman_local_volume_with_rbind_option_is_bind_backed() {
+        let volume = VolumeInspect {
+            driver: "local".to_string(),
+            options: HashMap::from([("o".to_string(), "rw,rbind".to_string())]),
+        };
+
+        assert!(podman_volume_is_bind_backed(&volume));
+    }
+
+    #[test]
     fn podman_empty_driver_volume_with_bind_option_is_bind_backed() {
         let volume = VolumeInspect {
             driver: String::new(),
@@ -951,6 +962,43 @@ mod tests {
             [format!(
                 "GET {}",
                 api_path("/libpod/volumes/work-bind/json")
+            )]
+        );
+        let _ = std::fs::remove_file(socket_path);
+    }
+
+    #[tokio::test]
+    async fn validate_sandbox_rejects_rbind_backed_named_volume_unless_enabled() {
+        let (socket_path, request_log, handle) = spawn_podman_stub(
+            "rbind-volume-disabled",
+            vec![StubResponse::new(
+                StatusCode::OK,
+                r#"{"Name":"work-rbind","Driver":"local","Options":{"type":"none","o":"rw,rbind","device":"/srv/work"}}"#,
+            )],
+        );
+        let driver = test_driver(socket_path.clone());
+        let sandbox = sandbox_with_volume_mount("work-rbind");
+
+        let err = driver
+            .validate_sandbox_create(&sandbox)
+            .await
+            .expect_err("rbind-backed volume should require bind mount opt-in");
+
+        match err {
+            ComputeDriverError::Precondition(message) => {
+                assert!(message.contains("enable_bind_mounts = true"));
+            }
+            other => panic!("expected precondition error, got {other:?}"),
+        }
+        handle.await.expect("stub task should finish");
+        assert_eq!(
+            request_log
+                .lock()
+                .expect("request log lock should not be poisoned")
+                .as_slice(),
+            [format!(
+                "GET {}",
+                api_path("/libpod/volumes/work-rbind/json")
             )]
         );
         let _ = std::fs::remove_file(socket_path);

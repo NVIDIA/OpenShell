@@ -872,6 +872,20 @@ fn docker_local_volume_with_bind_option_is_bind_backed() {
 }
 
 #[test]
+fn docker_local_volume_with_rbind_option_is_bind_backed() {
+    let volume = inspected_volume(
+        "local",
+        HashMap::from([
+            ("type".to_string(), "none".to_string()),
+            ("o".to_string(), "rw,rbind".to_string()),
+            ("device".to_string(), "/tmp/openshell".to_string()),
+        ]),
+    );
+
+    assert!(docker_volume_is_bind_backed(&volume));
+}
+
+#[test]
 fn docker_local_volume_without_bind_option_is_not_bind_backed() {
     let volume = inspected_volume(
         "local",

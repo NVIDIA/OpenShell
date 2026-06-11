@@ -1821,9 +1821,10 @@ fn docker_tmpfs_option(option: &str) -> Result<Vec<String>, Status> {
 fn docker_volume_is_bind_backed(volume: &bollard::models::Volume) -> bool {
     volume.driver == "local"
         && volume.options.get("o").is_some_and(|options| {
-            options
-                .split(',')
-                .any(|option| option.trim().eq_ignore_ascii_case("bind"))
+            options.split(',').any(|option| {
+                let option = option.trim();
+                option.eq_ignore_ascii_case("bind") || option.eq_ignore_ascii_case("rbind")
+            })
         })
 }
 
