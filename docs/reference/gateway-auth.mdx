@@ -16,9 +16,9 @@ When any CLI command needs to talk to the gateway, it resolves the target throug
 1. `--gateway-endpoint <URL>` flag (direct URL).
 2. `-g <NAME>` flag.
 3. `OPENSHELL_GATEWAY` environment variable.
-4. Active gateway from `~/.config/openshell/active_gateway`.
+4. Active gateway from `~/.config/openshell/active_gateway`, falling back to `/etc/openshell/active_gateway` when no user selection exists.
 
-The CLI loads gateway metadata from disk to determine the endpoint URL and authentication mode.
+The CLI loads gateway metadata from `~/.config/openshell/gateways/<name>/metadata.json` first and falls back to `/etc/openshell/gateways/<name>/metadata.json` when no user entry exists.
 
 ## Authentication Modes
 
@@ -175,7 +175,7 @@ This stores the gateway with `auth_mode = plaintext`, skips mTLS client certific
 
 ## File Layout
 
-All gateway credentials and metadata are stored under `~/.config/openshell/`:
+User-managed gateway credentials and metadata are stored under `~/.config/openshell/`:
 
 ```text
 openshell/
@@ -191,5 +191,17 @@ openshell/
       oidc_token.json               # OIDC access token, refresh token, and expiry metadata
       last_sandbox                  # Last-used sandbox for this gateway
 ```
+
+Installers can also seed read-only defaults under `/etc/openshell/` (or a non-empty absolute `OPENSHELL_SYSTEM_GATEWAY_DIR` override) using the same active-gateway and metadata layout:
+
+```text
+/etc/openshell/
+  active_gateway
+  gateways/
+    <name>/
+      metadata.json
+```
+
+Only `active_gateway` and `metadata.json` fall back to the system layout. mTLS bundles, OIDC tokens, edge tokens, and `last_sandbox` remain per-user state.
 
 For OIDC gateways, `metadata.json` also stores the issuer, CLI client ID, optional audience, and requested scopes. Treat `oidc_token.json` as a credential. OpenShell writes it with owner-only file permissions.
