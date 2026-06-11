@@ -37,6 +37,21 @@ on:
         required: false
         type: string
         default: "v0.5.0"
+      test-name:
+        description: "Rust e2e test target to run (sets OPENSHELL_E2E_KUBE_TEST)"
+        required: false
+        type: string
+        default: ""
+      kubernetes-features:
+        description: "Cargo feature list for the Kubernetes e2e crate"
+        required: false
+        type: string
+        default: ""
+      use-envoy-gateway:
+        description: "Install Envoy Gateway and run the e2e command through the chart GRPCRoute"
+        required: false
+        type: boolean
+        default: false
       mise-version:
         description: "mise version to install on the bare Kubernetes e2e runner"
         required: false
@@ -123,6 +138,9 @@ jobs:
           OPENSHELL_E2E_KUBE_CONTEXT: kind-${{ env.KIND_CLUSTER_NAME }}
           OPENSHELL_E2E_KUBE_EXTRA_VALUES: ${{ inputs.extra-helm-values }}
           OPENSHELL_E2E_KUBE_EXTERNAL_POSTGRES_SECRET: ${{ inputs.external-postgres-secret }}
+          OPENSHELL_E2E_KUBE_TEST: ${{ inputs.test-name }}
+          OPENSHELL_E2E_KUBERNETES_FEATURES: ${{ inputs.kubernetes-features }}
+          OPENSHELL_E2E_KUBE_USE_ENVOY: ${{ inputs.use-envoy-gateway }}
           IMAGE_TAG: ${{ inputs.image-tag }}
           OPENSHELL_REGISTRY: ghcr.io/nvidia/openshell
         run: mise run --no-deps --skip-deps e2e:kubernetes
