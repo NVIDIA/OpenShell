@@ -11,8 +11,10 @@ use crate::watcher::{
 };
 use openshell_core::ComputeDriverError;
 use openshell_core::driver_utils::supervisor_image_should_refresh;
-use openshell_core::gpu::{driver_gpu_count, driver_gpu_requested};
-use openshell_core::proto::compute::v1::{DriverSandbox, GetCapabilitiesResponse};
+use openshell_core::gpu::driver_gpu_requirements;
+use openshell_core::proto::compute::v1::{
+    DriverSandbox, GetCapabilitiesResponse, GpuResourceRequirements,
+};
 use std::path::PathBuf;
 use std::time::Duration;
 use tracing::{info, warn};
@@ -282,39 +284,33 @@ impl PodmanComputeDriver {
         &self,
         sandbox: &DriverSandbox,
     ) -> Result<(), ComputeDriverError> {
-        let gpu_requested = sandbox
+        let gpu_requirements = sandbox
             .spec
             .as_ref()
             .and_then(|spec| spec.resource_requirements.as_ref())
-            .is_some_and(|requirements| driver_gpu_requested(Some(requirements)));
-        let gpu_count = sandbox
-            .spec
-            .as_ref()
-            .and_then(|spec| spec.resource_requirements.as_ref())
-            .and_then(|requirements| driver_gpu_count(Some(requirements)));
+            .and_then(|requirements| driver_gpu_requirements(Some(requirements)));
         let driver_config = PodmanSandboxDriverConfig::from_sandbox(sandbox)?;
-        if !gpu_requested && driver_config.cdi_devices.is_some() {
+        if gpu_requirements.is_none() && driver_config.cdi_devices.is_some() {
             return Err(ComputeDriverError::InvalidArgument(
                 "driver_config.cdi_devices requires gpu=true".to_string(),
             ));
         }
-        Self::validate_gpu_request(gpu_requested, gpu_count)?;
+        Self::validate_gpu_request(gpu_requirements)?;
         self.validate_user_volume_mounts_available(sandbox).await?;
         Ok(())
     }
 
     fn validate_gpu_request(
-        gpu_requested: bool,
-        gpu_count: Option<u32>,
+        gpu_requirements: Option<&GpuResourceRequirements>,
     ) -> Result<(), ComputeDriverError> {
-        if gpu_count.is_some() {
+        if gpu_requirements.and_then(|gpu| gpu.count).is_some() {
             return Err(ComputeDriverError::InvalidArgument(
                 "podman GPU count requests are not supported; use --gpu without a count or driver_config.cdi_devices"
                     .to_string(),
             ));
         }
 
-        if gpu_requested && !Self::has_gpu_capacity() {
+        if gpu_requirements.is_some() && !Self::has_gpu_capacity() {
             return Err(ComputeDriverError::Precondition(
                 "GPU sandbox requested, but no NVIDIA GPU devices are available.".to_string(),
             ));
@@ -715,7 +711,8 @@ mod tests {
 
     #[test]
     fn validate_gpu_request_rejects_gpu_count() {
-        let err = PodmanComputeDriver::validate_gpu_request(true, Some(2))
+        let gpu = GpuResourceRequirements { count: Some(2) };
+        let err = PodmanComputeDriver::validate_gpu_request(Some(&gpu))
             .expect_err("gpu count should be rejected");
 
         assert!(matches!(err, ComputeDriverError::InvalidArgument(_)));

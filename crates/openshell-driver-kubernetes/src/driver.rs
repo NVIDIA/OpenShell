@@ -17,7 +17,7 @@ use kube::{Client, Error as KubeError};
 use openshell_core::driver_utils::{
     LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, SUPERVISOR_IMAGE_BINARY_PATH,
 };
-use openshell_core::gpu::{driver_gpu_count, driver_gpu_requested};
+use openshell_core::gpu::driver_gpu_requirements;
 use openshell_core::progress::{
     PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX, PROGRESS_STEP_STARTING_SANDBOX,
     format_bytes, mark_progress_active, mark_progress_complete, mark_progress_detail,
@@ -26,8 +26,9 @@ use openshell_core::proto::compute::v1::{
     DriverCondition as SandboxCondition, DriverPlatformEvent as PlatformEvent,
     DriverSandbox as Sandbox, DriverSandboxSpec as SandboxSpec,
     DriverSandboxStatus as SandboxStatus, DriverSandboxTemplate as SandboxTemplate,
-    GetCapabilitiesResponse, WatchSandboxesDeletedEvent, WatchSandboxesEvent,
-    WatchSandboxesPlatformEvent, WatchSandboxesSandboxEvent, watch_sandboxes_event,
+    GetCapabilitiesResponse, GpuResourceRequirements, WatchSandboxesDeletedEvent,
+    WatchSandboxesEvent, WatchSandboxesPlatformEvent, WatchSandboxesSandboxEvent,
+    watch_sandboxes_event,
 };
 use openshell_core::proto_struct::{struct_to_json_object, value_to_json};
 use serde::Deserialize;
@@ -282,8 +283,12 @@ impl KubernetesComputeDriver {
     pub async fn validate_sandbox_create(&self, sandbox: &Sandbox) -> Result<(), tonic::Status> {
         let _ = KubernetesSandboxDriverConfig::from_sandbox(sandbox)
             .map_err(tonic::Status::invalid_argument)?;
-        let gpu_requested = validate_gpu_resource_requirements(sandbox)?;
-        if gpu_requested
+        let gpu_requirements = sandbox
+            .spec
+            .as_ref()
+            .and_then(|spec| driver_gpu_requirements(spec.resource_requirements.as_ref()));
+        validate_gpu_request(gpu_requirements)?;
+        if gpu_requirements.is_some()
             && !self.has_gpu_capacity().await.map_err(|err| {
                 tonic::Status::internal(format!("check GPU node capacity failed: {err}"))
             })?
@@ -377,7 +382,11 @@ impl KubernetesComputeDriver {
     pub async fn create_sandbox(&self, sandbox: &Sandbox) -> Result<(), KubernetesDriverError> {
         let _ = KubernetesSandboxDriverConfig::from_sandbox(sandbox)
             .map_err(KubernetesDriverError::InvalidArgument)?;
-        validate_gpu_resource_requirements(sandbox).map_err(|status| {
+        let gpu_requirements = sandbox
+            .spec
+            .as_ref()
+            .and_then(|spec| driver_gpu_requirements(spec.resource_requirements.as_ref()));
+        validate_gpu_request(gpu_requirements).map_err(|status| {
             KubernetesDriverError::InvalidArgument(status.message().to_string())
         })?;
         let name = sandbox.name.as_str();
@@ -642,22 +651,16 @@ impl KubernetesComputeDriver {
     }
 }
 
-fn validate_gpu_resource_requirements(sandbox: &Sandbox) -> Result<bool, tonic::Status> {
-    let Some(resource_requirements) = sandbox
-        .spec
-        .as_ref()
-        .and_then(|spec| spec.resource_requirements.as_ref())
-    else {
-        return Ok(false);
-    };
-
-    if driver_gpu_count(Some(resource_requirements)) == Some(0) {
+fn validate_gpu_request(
+    gpu_requirements: Option<&GpuResourceRequirements>,
+) -> Result<(), tonic::Status> {
+    if gpu_requirements.and_then(|gpu| gpu.count) == Some(0) {
         return Err(tonic::Status::invalid_argument(
             "gpu count must be greater than 0",
         ));
     }
 
-    Ok(driver_gpu_requested(Some(resource_requirements)))
+    Ok(())
 }
 
 fn sandbox_labels(sandbox: &Sandbox) -> BTreeMap<String, String> {
@@ -1223,10 +1226,9 @@ fn sandbox_to_k8s_spec(
         if let Some(template) = spec.template.as_ref() {
             root.insert(
                 "podTemplate".to_string(),
-                sandbox_template_to_k8s_with_gpu_count(
+                sandbox_template_to_k8s_with_gpu_requirements(
                     template,
-                    driver_gpu_requested(spec.resource_requirements.as_ref()),
-                    driver_gpu_count(spec.resource_requirements.as_ref()),
+                    driver_gpu_requirements(spec.resource_requirements.as_ref()),
                     &pod_env,
                     inject_workspace,
                     params,
@@ -1260,12 +1262,9 @@ fn sandbox_to_k8s_spec(
         let pod_env = spec_pod_env(spec);
         root.insert(
             "podTemplate".to_string(),
-            sandbox_template_to_k8s_with_gpu_count(
+            sandbox_template_to_k8s_with_gpu_requirements(
                 &SandboxTemplate::default(),
-                spec.and_then(|s| s.resource_requirements.as_ref())
-                    .is_some_and(|requirements| driver_gpu_requested(Some(requirements))),
-                spec.and_then(|s| s.resource_requirements.as_ref())
-                    .and_then(|requirements| driver_gpu_count(Some(requirements))),
+                driver_gpu_requirements(spec.and_then(|s| s.resource_requirements.as_ref())),
                 &pod_env,
                 inject_workspace,
                 params,
@@ -1286,20 +1285,19 @@ fn sandbox_template_to_k8s(
     inject_workspace: bool,
     params: &SandboxPodParams<'_>,
 ) -> serde_json::Value {
-    sandbox_template_to_k8s_with_gpu_count(
+    let gpu_requirements = gpu.then_some(GpuResourceRequirements { count: None });
+    sandbox_template_to_k8s_with_gpu_requirements(
         template,
-        gpu,
-        None,
+        gpu_requirements.as_ref(),
         spec_environment,
         inject_workspace,
         params,
     )
 }
 
-fn sandbox_template_to_k8s_with_gpu_count(
+fn sandbox_template_to_k8s_with_gpu_requirements(
     template: &SandboxTemplate,
-    gpu: bool,
-    gpu_count: Option<u32>,
+    gpu_requirements: Option<&GpuResourceRequirements>,
     spec_environment: &std::collections::HashMap<String, String>,
     inject_workspace: bool,
     params: &SandboxPodParams<'_>,
@@ -1382,7 +1380,7 @@ fn sandbox_template_to_k8s_with_gpu_count(
 
     if use_user_namespaces {
         spec.insert("hostUsers".to_string(), serde_json::json!(false));
-        if gpu {
+        if gpu_requirements.is_some() {
             warn!(
                 "GPU sandbox with user namespaces enabled — \
                  NVIDIA device plugin compatibility is unverified"
@@ -1491,7 +1489,7 @@ fn sandbox_template_to_k8s_with_gpu_count(
         serde_json::Value::Array(volume_mounts),
     );
 
-    if let Some(resources) = container_resources(template, gpu, gpu_count) {
+    if let Some(resources) = container_resources(template, gpu_requirements) {
         container.insert("resources".to_string(), resources);
     }
     apply_agent_driver_resources(&mut container, &driver_config.containers.agent.resources);
@@ -1671,8 +1669,7 @@ fn app_armor_profile_to_k8s(profile: &AppArmorProfile) -> serde_json::Value {
 
 fn container_resources(
     template: &SandboxTemplate,
-    gpu: bool,
-    gpu_count: Option<u32>,
+    gpu_requirements: Option<&GpuResourceRequirements>,
 ) -> Option<serde_json::Value> {
     // Start from the raw resources passthrough in platform_config (preserves
     // custom resource types like GPU limits that users set via the public API
@@ -1706,8 +1703,8 @@ fn container_resources(
         apply("requests", "memory", memory_request);
     }
 
-    if gpu {
-        let quantity = gpu_count.map_or_else(
+    if let Some(gpu) = gpu_requirements {
+        let quantity = gpu.count.map_or_else(
             || GPU_RESOURCE_QUANTITY.to_string(),
             |count| count.to_string(),
         );
@@ -2085,7 +2082,11 @@ mod tests {
             ..Sandbox::default()
         };
 
-        let err = validate_gpu_resource_requirements(&sandbox).unwrap_err();
+        let gpu_requirements = sandbox
+            .spec
+            .as_ref()
+            .and_then(|spec| driver_gpu_requirements(spec.resource_requirements.as_ref()));
+        let err = validate_gpu_request(gpu_requirements).unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert!(err.message().contains("gpu count must be greater than 0"));
     }
@@ -2423,10 +2424,10 @@ mod tests {
     fn gpu_count_sandbox_adds_requested_gpu_limit() {
         let pod_template = {
             let params = SandboxPodParams::default();
-            sandbox_template_to_k8s_with_gpu_count(
+            let gpu_requirements = GpuResourceRequirements { count: Some(2) };
+            sandbox_template_to_k8s_with_gpu_requirements(
                 &SandboxTemplate::default(),
-                true,
-                Some(2),
+                Some(&gpu_requirements),
                 &std::collections::HashMap::new(),
                 true,
                 &params,

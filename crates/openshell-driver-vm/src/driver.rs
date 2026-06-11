@@ -29,7 +29,7 @@ use oci_client::manifest::{
 };
 use oci_client::secrets::RegistryAuth;
 use oci_client::{Reference, RegistryOperation};
-use openshell_core::gpu::{driver_gpu_count, driver_gpu_requested};
+use openshell_core::gpu::driver_gpu_requirements;
 use openshell_core::progress::{
     PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX, PROGRESS_STEP_STARTING_SANDBOX,
     format_bytes, mark_progress_active, mark_progress_complete, mark_progress_detail,
@@ -632,7 +632,8 @@ impl VmDriver {
             .spec
             .as_ref()
             .and_then(|spec| spec.resource_requirements.as_ref())
-            .is_some_and(|requirements| driver_gpu_requested(Some(requirements)));
+            .and_then(|requirements| driver_gpu_requirements(Some(requirements)))
+            .is_some();
         self.publish_platform_event(
             sandbox.id.clone(),
             platform_event(
@@ -3084,7 +3085,7 @@ fn validate_vm_sandbox(sandbox: &Sandbox, gpu_enabled: bool) -> Result<(), Statu
     if let Some(template) = spec.template.as_ref() {
         validate_vm_sandbox_template(template)?;
     }
-    validate_vm_gpu_request(sandbox, gpu_enabled)?;
+    validate_gpu_request(sandbox, gpu_enabled)?;
 
     Ok(())
 }
@@ -3105,14 +3106,14 @@ fn validate_vm_sandbox_template(template: &SandboxTemplate) -> Result<(), Status
 }
 
 #[allow(clippy::result_large_err)]
-fn validate_vm_gpu_request(sandbox: &Sandbox, gpu_enabled: bool) -> Result<(), Status> {
+fn validate_gpu_request(sandbox: &Sandbox, gpu_enabled: bool) -> Result<(), Status> {
     let spec = sandbox
         .spec
         .as_ref()
         .ok_or_else(|| Status::invalid_argument("sandbox spec is required"))?;
 
-    let gpu_requested = driver_gpu_requested(spec.resource_requirements.as_ref());
-    let gpu_count = driver_gpu_count(spec.resource_requirements.as_ref());
+    let gpu_requirements = driver_gpu_requirements(spec.resource_requirements.as_ref());
+    let gpu_count = gpu_requirements.and_then(|gpu| gpu.count);
 
     if gpu_count == Some(0) {
         return Err(Status::invalid_argument("gpu count must be greater than 0"));
@@ -3125,7 +3126,7 @@ fn validate_vm_gpu_request(sandbox: &Sandbox, gpu_enabled: bool) -> Result<(), S
     }
 
     let _ = vm_gpu_device_id(sandbox)?;
-    if gpu_requested && !gpu_enabled {
+    if gpu_requirements.is_some() && !gpu_enabled {
         return Err(Status::failed_precondition(
             "GPU support is not enabled on this driver; start with --gpu",
         ));
@@ -3142,8 +3143,8 @@ fn vm_gpu_device_id(sandbox: &Sandbox) -> Result<Option<String>, Status> {
         .map_err(Status::invalid_argument)?
         .gpu_device_ids
         .unwrap_or_default();
-    let gpu_requested = driver_gpu_requested(spec.resource_requirements.as_ref());
-    if !gpu_requested && !gpu_device_ids.is_empty() {
+    let gpu_requirements = driver_gpu_requirements(spec.resource_requirements.as_ref());
+    if gpu_requirements.is_none() && !gpu_device_ids.is_empty() {
         return Err(Status::invalid_argument(
             "driver_config.gpu_device_ids requires gpu=true",
         ));
@@ -3154,7 +3155,9 @@ fn vm_gpu_device_id(sandbox: &Sandbox) -> Result<Option<String>, Status> {
         ));
     }
 
-    Ok(gpu_requested.then(|| gpu_device_ids.into_iter().next().unwrap_or_default()))
+    Ok(gpu_requirements
+        .is_some()
+        .then(|| gpu_device_ids.into_iter().next().unwrap_or_default()))
 }
 
 #[allow(clippy::result_large_err)]

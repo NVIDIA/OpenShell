@@ -5,7 +5,7 @@
 
 use crate::config::PodmanComputeConfig;
 use openshell_core::ComputeDriverError;
-use openshell_core::gpu::{cdi_gpu_device_ids, driver_gpu_requested};
+use openshell_core::gpu::{cdi_gpu_device_ids, driver_gpu_requirements};
 use openshell_core::proto::compute::v1::{DriverSandbox, DriverSandboxTemplate};
 use openshell_core::proto_struct::deserialize_optional_non_empty_string_list;
 use openshell_core::{driver_mounts, proto_struct};
@@ -484,15 +484,15 @@ fn build_devices(sandbox: &DriverSandbox) -> Result<Option<Vec<LinuxDevice>>, Co
     let cdi_devices = PodmanSandboxDriverConfig::from_sandbox(sandbox)?
         .cdi_devices
         .unwrap_or_default();
-    let gpu_requested = driver_gpu_requested(spec.resource_requirements.as_ref());
-    if !gpu_requested && !cdi_devices.is_empty() {
+    let gpu_requirements = driver_gpu_requirements(spec.resource_requirements.as_ref());
+    if gpu_requirements.is_none() && !cdi_devices.is_empty() {
         return Err(ComputeDriverError::InvalidArgument(
             "driver_config.cdi_devices requires gpu=true".to_string(),
         ));
     }
 
     Ok(
-        cdi_gpu_device_ids(gpu_requested, &cdi_devices).map(|device_ids| {
+        cdi_gpu_device_ids(gpu_requirements, &cdi_devices).map(|device_ids| {
             device_ids
                 .into_iter()
                 .map(|path| LinuxDevice { path })
