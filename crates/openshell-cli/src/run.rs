@@ -1725,8 +1725,7 @@ pub async fn sandbox_create(
     gateway_name: &str,
     uploads: &[(String, Option<String>, bool)],
     keep: bool,
-    gpu: bool,
-    gpu_count: Option<u32>,
+    gpu_requirements: Option<GpuResourceRequirements>,
     cpu: Option<&str>,
     memory: Option<&str>,
     driver_config_json: Option<&str>,
@@ -1782,8 +1781,6 @@ pub async fn sandbox_create(
         }
         None => None,
     };
-    let requested_gpu = gpu;
-
     let providers_v2_enabled = gateway_providers_v2_enabled(&mut client).await?;
     let inferred_types: Vec<String> = if providers_v2_enabled {
         Vec::new()
@@ -1815,9 +1812,7 @@ pub async fn sandbox_create(
         None
     };
 
-    let resource_requirements = requested_gpu.then_some(ResourceRequirements {
-        gpu: Some(GpuResourceRequirements { count: gpu_count }),
-    });
+    let resource_requirements = gpu_requirements.map(|gpu| ResourceRequirements { gpu: Some(gpu) });
 
     let request = CreateSandboxRequest {
         spec: Some(SandboxSpec {

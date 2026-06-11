@@ -19,6 +19,7 @@ use openshell_bootstrap::{
 use openshell_cli::completers;
 use openshell_cli::run;
 use openshell_cli::tls::TlsOptions;
+use openshell_core::proto::GpuResourceRequirements;
 
 /// Resolved gateway context: name + gateway endpoint.
 struct GatewayContext {
@@ -115,14 +116,12 @@ fn resolve_gateway(
     })
 }
 
-fn resolve_gpu_args(gpu: Option<GpuCliRequest>) -> (bool, Option<u32>) {
-    let gpu_count = match gpu {
-        Some(GpuCliRequest::Count(count)) => Some(count),
-        Some(GpuCliRequest::DriverDefault) | None => None,
-    };
-    let gpu = gpu.is_some();
-
-    (gpu, gpu_count)
+fn resolve_gpu_requirements(gpu: Option<GpuCliRequest>) -> Option<GpuResourceRequirements> {
+    match gpu {
+        Some(GpuCliRequest::Count(count)) => Some(GpuResourceRequirements { count: Some(count) }),
+        Some(GpuCliRequest::DriverDefault) => Some(GpuResourceRequirements { count: None }),
+        None => None,
+    }
 }
 
 fn parse_gpu_request(value: &str) -> std::result::Result<GpuCliRequest, String> {
@@ -2655,7 +2654,7 @@ async fn main() -> Result<()> {
                         .map(|s| openshell_core::forward::ForwardSpec::parse(&s))
                         .transpose()?;
                     let keep = keep || !no_keep || editor.is_some() || forward.is_some();
-                    let (gpu, gpu_count) = resolve_gpu_args(gpu);
+                    let gpu_requirements = resolve_gpu_requirements(gpu);
 
                     let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
                     let endpoint = &ctx.endpoint;
@@ -2668,8 +2667,7 @@ async fn main() -> Result<()> {
                         &ctx.name,
                         &upload_specs,
                         keep,
-                        gpu,
-                        gpu_count,
+                        gpu_requirements,
                         cpu.as_deref(),
                         memory.as_deref(),
                         driver_config_json.as_deref(),
@@ -3665,27 +3663,26 @@ mod tests {
     }
 
     #[test]
-    fn resolve_gpu_args_handles_absent_gpu() {
-        let (gpu, gpu_count) = resolve_gpu_args(None);
+    fn resolve_gpu_requirements_handles_absent_gpu() {
+        let gpu = resolve_gpu_requirements(None);
 
-        assert!(!gpu);
-        assert_eq!(gpu_count, None);
+        assert_eq!(gpu, None);
     }
 
     #[test]
-    fn resolve_gpu_args_handles_driver_default() {
-        let (gpu, gpu_count) = resolve_gpu_args(Some(GpuCliRequest::DriverDefault));
+    fn resolve_gpu_requirements_handles_driver_default() {
+        let gpu = resolve_gpu_requirements(Some(GpuCliRequest::DriverDefault))
+            .expect("GPU requirement should be present");
 
-        assert!(gpu);
-        assert_eq!(gpu_count, None);
+        assert_eq!(gpu.count, None);
     }
 
     #[test]
-    fn resolve_gpu_args_handles_gpu_count() {
-        let (gpu, gpu_count) = resolve_gpu_args(Some(GpuCliRequest::Count(2)));
+    fn resolve_gpu_requirements_handles_gpu_count() {
+        let gpu = resolve_gpu_requirements(Some(GpuCliRequest::Count(2)))
+            .expect("GPU requirement should be present");
 
-        assert!(gpu);
-        assert_eq!(gpu_count, Some(2));
+        assert_eq!(gpu.count, Some(2));
     }
 
     #[test]

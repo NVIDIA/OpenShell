@@ -18,13 +18,14 @@ use openshell_core::proto::{
     ExecSandboxInput, ExecSandboxRequest, GatewayMessage, GetGatewayConfigRequest,
     GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
     GetSandboxConfigResponse, GetSandboxProviderEnvironmentRequest,
-    GetSandboxProviderEnvironmentResponse, GetSandboxRequest, HealthRequest, HealthResponse,
-    ListProvidersRequest, ListProvidersResponse, ListSandboxProvidersRequest,
-    ListSandboxProvidersResponse, ListSandboxesRequest, ListSandboxesResponse, PlatformEvent,
-    ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, Sandbox, SandboxCondition,
-    SandboxLogLine, SandboxPhase, SandboxResponse, SandboxStatus, SandboxStreamEvent,
-    ServiceStatus, SettingValue, SupervisorMessage, UpdateProviderRequest, WatchSandboxRequest,
-    sandbox_stream_event, setting_value,
+    GetSandboxProviderEnvironmentResponse, GetSandboxRequest, GpuResourceRequirements,
+    HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
+    ListSandboxProvidersRequest, ListSandboxProvidersResponse, ListSandboxesRequest,
+    ListSandboxesResponse, PlatformEvent, ProviderResponse, RevokeSshSessionRequest,
+    RevokeSshSessionResponse, Sandbox, SandboxCondition, SandboxLogLine, SandboxPhase,
+    SandboxResponse, SandboxStatus, SandboxStreamEvent, ServiceStatus, SettingValue,
+    SupervisorMessage, UpdateProviderRequest, WatchSandboxRequest, sandbox_stream_event,
+    setting_value,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -766,6 +767,10 @@ fn test_tls(server: &TestServer) -> TlsOptions {
     server.tls.with_gateway_name("openshell")
 }
 
+fn gpu_requirements(count: Option<u32>) -> GpuResourceRequirements {
+    GpuResourceRequirements { count }
+}
+
 #[tokio::test]
 async fn sandbox_create_keeps_command_sessions_by_default() {
     let server = run_server().await;
@@ -782,7 +787,6 @@ async fn sandbox_create_keeps_command_sessions_by_default() {
         "openshell",
         &[],
         true,
-        false,
         None,
         None,
         None,
@@ -826,7 +830,6 @@ async fn sandbox_create_sends_cpu_and_memory_limits_only() {
         "openshell",
         &[],
         true,
-        false,
         None,
         Some("500m"),
         Some("2Gi"),
@@ -904,7 +907,6 @@ async fn sandbox_create_sends_driver_config_json() {
         "openshell",
         &[],
         true,
-        false,
         None,
         None,
         None,
@@ -978,8 +980,7 @@ async fn sandbox_create_sends_gpu_default_request() {
         "openshell",
         &[],
         true,
-        true,
-        None,
+        Some(gpu_requirements(None)),
         None,
         None,
         None,
@@ -1025,8 +1026,7 @@ async fn sandbox_create_sends_gpu_count_request() {
         "openshell",
         &[],
         true,
-        true,
-        Some(2),
+        Some(gpu_requirements(Some(2))),
         None,
         None,
         None,
@@ -1073,7 +1073,6 @@ async fn sandbox_create_does_not_infer_command_providers_when_v2_enabled() {
         "openshell",
         &[],
         true,
-        false,
         None,
         None,
         None,
@@ -1132,7 +1131,6 @@ async fn sandbox_create_returns_vm_error_without_waiting_for_timeout() {
         "openshell",
         &[],
         true,
-        false,
         None,
         None,
         None,
@@ -1187,7 +1185,6 @@ async fn sandbox_create_keeps_waiting_while_vm_progress_arrives() {
         "openshell",
         &[],
         true,
-        false,
         None,
         None,
         None,
@@ -1234,7 +1231,6 @@ async fn sandbox_create_times_out_when_only_logs_arrive() {
         "openshell",
         &[],
         true,
-        false,
         None,
         None,
         None,
@@ -1276,7 +1272,6 @@ async fn sandbox_create_deletes_command_sessions_with_no_keep() {
         None,
         "openshell",
         &[],
-        false,
         false,
         None,
         None,
@@ -1324,7 +1319,6 @@ async fn sandbox_create_deletes_shell_sessions_with_no_keep() {
         "openshell",
         &[],
         false,
-        false,
         None,
         None,
         None,
@@ -1371,7 +1365,6 @@ async fn sandbox_create_keeps_sandbox_with_hidden_keep_flag() {
         "openshell",
         &[],
         true,
-        false,
         None,
         None,
         None,
@@ -1418,7 +1411,6 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
         "openshell",
         &[],
         false,
-        false,
         None,
         None,
         None,
@@ -1461,7 +1453,6 @@ async fn sandbox_create_sends_environment_variables() {
         "openshell",
         &[],
         true,
-        false,
         None,
         None,
         None,
