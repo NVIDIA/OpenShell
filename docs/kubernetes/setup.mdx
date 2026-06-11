@@ -157,6 +157,7 @@ The most commonly changed values are:
 | `server.appArmorProfile` | AppArmor profile requested for sandbox agent containers. Defaults to `Unconfined`. |
 | `server.disableTls` | Run the gateway over plaintext HTTP. Use only behind a trusted transport. |
 | `server.auth.allowUnauthenticatedUsers` | Accept user-facing calls without OIDC or mTLS credentials. Use only for trusted local development or a fully trusted access proxy. |
+| `server.auth.allowOidcAuthOnly` | Allow OIDC authentication without RBAC roles. Use only when any valid issuer token should have gateway access. |
 | `server.enableLoopbackServiceHttp` | Enable local plaintext HTTP for loopback sandbox service URLs. Defaults to `true`. |
 | `pkiInitJob.serverDnsNames` / `certManager.serverDnsNames` | Additional gateway server DNS SANs. Wildcard SANs also enable sandbox service URLs under that domain. |
 | `supervisor.sideloadMethod` | How the supervisor binary is delivered into sandbox pods. Leave empty to auto-detect based on cluster version: clusters running Kubernetes 1.35 or later use `image-volume` (ImageVolume GA in 1.36); older clusters use `init-container`. Set explicitly to `image-volume` on Kubernetes 1.33 or 1.34 with the ImageVolume feature gate enabled, or to `init-container` to force the legacy path on any version. |

@@ -31,6 +31,7 @@ server:
     jwksTtl: 60
     # Keycloak puts realm roles at realm_access.roles in the JWT.
     rolesClaim: "realm_access.roles"
-    # Leave both empty for authentication-only mode (any valid token is accepted).
+    # RBAC mode: both roles must be set. Leave both empty only with
+    # server.auth.allowOidcAuthOnly=true for authentication-only mode.
     adminRole: "openshell-admin"
     userRole: "openshell-user"

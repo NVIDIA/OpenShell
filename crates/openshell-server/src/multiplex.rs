@@ -442,9 +442,9 @@ where
 /// for local single-user gateways, or to an unsafe local developer user when
 /// `auth.allow_unauthenticated_users` is explicitly enabled.
 ///
-/// When neither OIDC nor sandbox credentials are configured (a barebones
-/// dev gateway), the chain is left as `None` so the router short-circuits
-/// to pass-through unless mTLS or local unauthenticated users are enabled.
+/// When neither OIDC nor sandbox credentials are configured, the chain is left
+/// as `None`; authenticated methods still fail closed unless mTLS or local
+/// unauthenticated users are enabled explicitly.
 fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> {
     let mut authenticators: Vec<Arc<dyn crate::auth::authenticator::Authenticator>> = Vec::new();
     if let Some(k8s) = state.k8s_sa_authenticator.clone() {
@@ -469,8 +469,8 @@ fn build_authenticator_chain(state: &ServerState) -> Option<AuthenticatorChain> 
 /// - Strip any external `x-openshell-auth-source` marker first (so callers
 ///   cannot spoof a sandbox identity).
 /// - Health probes / reflection bypass the chain entirely.
-/// - When no chain is configured (OIDC not configured), forward without
-///   authentication — preserves today's pass-through behavior.
+/// - When no chain is configured, authenticated methods fail closed unless
+///   mTLS user auth or the explicit local unauthenticated user mode applies.
 /// - Otherwise, run the chain. The first match produces a `Principal`.
 ///   `Principal::User` is gated by the RBAC `AuthzPolicy`.
 ///   `Principal::Sandbox` is gated by a supervisor-method allowlist, then
@@ -588,9 +588,9 @@ where
             } else if allow_unauthenticated_users {
                 unauthenticated_dev_user_principal()
             } else {
-                // No auth configured — pass through for dev /
-                // fronting-proxy deployments.
-                return inner.ready().await?.call(req).await;
+                return Ok(status_response(tonic::Status::unauthenticated(
+                    "gateway authentication is not configured",
+                )));
             };
 
             match principal {
@@ -1545,6 +1545,21 @@ mod tests {
                 Some(Principal::User(user))
                     if user.identity.subject == "unauthenticated-local-dev"
             ));
+        }
+
+        #[tokio::test]
+        async fn missing_chain_without_explicit_auth_fails_closed() {
+            let (recorder, seen) = PrincipalRecorder::new();
+            let mut router =
+                AuthGrpcRouter::with_peer_identity(recorder, None, None, None, false, false);
+
+            let res = router
+                .call(empty_request("/openshell.v1.OpenShell/ListSandboxes"))
+                .await
+                .unwrap();
+
+            assert!(seen.lock().unwrap().is_none());
+            assert_eq!(grpc_status(&res).as_deref(), Some("16"));
         }
 
         #[tokio::test]

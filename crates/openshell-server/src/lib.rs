@@ -216,6 +216,9 @@ pub async fn run_server(
     if database_url.is_empty() {
         return Err(Error::config("database_url is required"));
     }
+    config
+        .validate_gateway_auth_posture()
+        .map_err(Error::config)?;
 
     let store = Arc::new(Store::connect(database_url).await?);
 
