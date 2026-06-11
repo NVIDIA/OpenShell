@@ -162,6 +162,14 @@ struct JsonRpcConfigDef {
     batch_policy: String,
 }
 
+fn json_rpc_config_from_proto(max_body_bytes: u32) -> Option<JsonRpcConfigDef> {
+    (max_body_bytes > 0).then_some(JsonRpcConfigDef {
+        max_body_bytes,
+        on_parse_error: String::new(),
+        batch_policy: String::new(),
+    })
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GraphqlOperationDef {
@@ -370,6 +378,10 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                                 })
                                 .collect(),
                             graphql_max_body_bytes: e.graphql_max_body_bytes,
+                            json_rpc_max_body_bytes: e
+                                .json_rpc
+                                .as_ref()
+                                .map_or(0, |config| config.max_body_bytes),
                         }
                     })
                     .collect(),
@@ -539,7 +551,7 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                                 })
                                 .collect(),
                             graphql_max_body_bytes: e.graphql_max_body_bytes,
-                            json_rpc: None,
+                            json_rpc: json_rpc_config_from_proto(e.json_rpc_max_body_bytes),
                         }
                     })
                     .collect(),
@@ -1725,6 +1737,35 @@ network_policies:
         assert_eq!(ep.rules[1].allow.as_ref().unwrap().operation_name, "Issue*");
         assert_eq!(ep.deny_rules[0].operation_type, "mutation");
         assert_eq!(ep.deny_rules[0].fields, vec!["deleteRepository"]);
+    }
+
+    #[test]
+    fn round_trip_preserves_json_rpc_max_body_bytes() {
+        let yaml = r"
+version: 1
+network_policies:
+  mcp:
+    name: mcp
+    endpoints:
+      - host: mcp.example.com
+        port: 443
+        protocol: json-rpc
+        enforcement: enforce
+        json_rpc:
+          max_body_bytes: 131072
+        rules:
+          - allow:
+              rpc_method: initialize
+    binaries:
+      - path: /usr/bin/curl
+";
+        let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
+        let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
+        let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+
+        let ep = &proto2.network_policies["mcp"].endpoints[0];
+        assert_eq!(ep.protocol, "json-rpc");
+        assert_eq!(ep.json_rpc_max_body_bytes, 131_072);
     }
 
     #[test]

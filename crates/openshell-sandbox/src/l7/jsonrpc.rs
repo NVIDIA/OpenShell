@@ -8,6 +8,8 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::l7::provider::{L7Provider, L7Request};
 
+pub const DEFAULT_MAX_BODY_BYTES: usize = 64 * 1024;
+
 pub struct JsonRpcHttpRequest {
     pub request: L7Request,
     pub info: JsonRpcRequestInfo,
