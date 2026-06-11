@@ -617,6 +617,82 @@ mod tests {
     }
 
     #[test]
+    fn system_gateway_last_sandbox_persists_in_user_config_without_shadowing() {
+        let user = tempfile::tempdir().unwrap();
+        let system = tempfile::tempdir().unwrap();
+        with_tmp_xdg_and_system(user.path(), system.path(), || {
+            write_system_metadata(&system.path().join("gateways"), "shared", "https://system");
+
+            save_last_sandbox("shared", "sb-123").unwrap();
+
+            assert_eq!(load_last_sandbox("shared"), Some("sb-123".to_string()));
+            assert_eq!(
+                gateway_metadata_source("shared").unwrap(),
+                Some(GatewayMetadataSource::System)
+            );
+            assert_eq!(
+                load_gateway_metadata("shared").unwrap().gateway_endpoint,
+                "https://system"
+            );
+
+            let user_gateway_dir = user_gateway_metadata_path("shared")
+                .unwrap()
+                .parent()
+                .unwrap()
+                .to_path_buf();
+            assert!(user_gateway_dir.join("last_sandbox").exists());
+            assert!(!user_gateway_dir.join("metadata.json").exists());
+        });
+    }
+
+    #[test]
+    fn system_gateway_last_sandbox_creates_user_parent_dir_without_metadata() {
+        let user = tempfile::tempdir().unwrap();
+        let system = tempfile::tempdir().unwrap();
+        with_tmp_xdg_and_system(user.path(), system.path(), || {
+            write_system_metadata(&system.path().join("gateways"), "shared", "https://system");
+
+            let user_gateway_dir = user_gateway_metadata_path("shared")
+                .unwrap()
+                .parent()
+                .unwrap()
+                .to_path_buf();
+            assert!(!user_gateway_dir.exists());
+
+            save_last_sandbox("shared", "sb-123").unwrap();
+
+            assert!(user_gateway_dir.is_dir());
+            assert_eq!(
+                std::fs::read_to_string(user_gateway_dir.join("last_sandbox")).unwrap(),
+                "sb-123"
+            );
+            assert!(!user_gateway_dir.join("metadata.json").exists());
+            assert_eq!(
+                gateway_metadata_source("shared").unwrap(),
+                Some(GatewayMetadataSource::System)
+            );
+        });
+    }
+
+    #[test]
+    fn clearing_system_gateway_last_sandbox_keeps_system_metadata_visible() {
+        let user = tempfile::tempdir().unwrap();
+        let system = tempfile::tempdir().unwrap();
+        with_tmp_xdg_and_system(user.path(), system.path(), || {
+            write_system_metadata(&system.path().join("gateways"), "shared", "https://system");
+            save_last_sandbox("shared", "sb-123").unwrap();
+
+            clear_last_sandbox_if_matches("shared", "sb-123");
+
+            assert_eq!(load_last_sandbox("shared"), None);
+            let gateways = list_gateways_with_source().unwrap();
+            assert_eq!(gateways.len(), 1);
+            assert_eq!(gateways[0].metadata.name, "shared");
+            assert_eq!(gateways[0].source, GatewayMetadataSource::System);
+            assert_eq!(gateways[0].metadata.gateway_endpoint, "https://system");
+        });
+    }
+    #[test]
     fn load_user_active_gateway_does_not_fall_back_to_system_dir() {
         let user = tempfile::tempdir().unwrap();
         let system = tempfile::tempdir().unwrap();
