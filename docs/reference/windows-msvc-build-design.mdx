@@ -63,6 +63,10 @@ Windows validation is exposed through `tasks/windows.toml`:
 The Windows tasks call `tasks/scripts/windows-msvc.ps1`. The wrapper discovers
 Visual Studio's `VsDevCmd.bat`, adds rustup MSVC targets, clears inherited
 `RUSTC_WRAPPER`, and keeps build artifacts under the normal Cargo target tree.
+By default it enables bundled Z3 for reproducible Windows builds. When
+`Z3_LIBRARY_PATH_OVERRIDE` points at a directory containing `libz3.lib`, the
+wrapper uses that system Z3 instead and requires `Z3_SYS_Z3_HEADER` to point at
+the full path to `z3.h`.
 
 The lane uses `mise run --skip-tools windows:*` because Windows Rust comes from
 rustup and linking comes from Visual Studio Build Tools. Mise orchestrates the

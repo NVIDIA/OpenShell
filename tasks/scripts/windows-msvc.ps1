@@ -40,6 +40,8 @@ if ([string]::IsNullOrWhiteSpace($TargetDir)) {
 $UnsupportedDriverPackageExcludes = "--exclude openshell-driver-docker --exclude openshell-driver-kubernetes --exclude openshell-driver-podman --exclude openshell-driver-vm"
 $BundledZ3WorkspaceFeatures = "--features openshell-cli/bundled-z3,openshell-prover/bundled-z3"
 $BundledZ3ServerFeatures = "--features openshell-server/bundled-z3,openshell-prover/bundled-z3"
+$Z3WorkspaceFeatures = $BundledZ3WorkspaceFeatures
+$Z3ServerFeatures = $BundledZ3ServerFeatures
 
 function Resolve-VsDevCmd {
     if ($env:OPENSHELL_VSDEVCMD -and (Test-Path $env:OPENSHELL_VSDEVCMD)) {
@@ -159,6 +161,57 @@ function Get-SelectedTargets([string] $RequestedTarget) {
     return @($RequestedTarget)
 }
 
+function Resolve-Z3HeaderPath([string] $HeaderPath) {
+    if ([string]::IsNullOrWhiteSpace($HeaderPath)) {
+        throw "Z3_LIBRARY_PATH_OVERRIDE is set. Set Z3_SYS_Z3_HEADER to the full path of z3.h."
+    }
+
+    if (-not (Test-Path $HeaderPath -PathType Leaf)) {
+        throw "Z3_SYS_Z3_HEADER is set but z3.h was not found at: $HeaderPath"
+    }
+    if ((Split-Path -Leaf $HeaderPath) -ne "z3.h") {
+        throw "Z3_SYS_Z3_HEADER must point to z3.h. Got: $HeaderPath"
+    }
+
+    return (Resolve-Path $HeaderPath).Path
+}
+
+function Configure-Z3 {
+    if ([string]::IsNullOrWhiteSpace($env:Z3_LIBRARY_PATH_OVERRIDE)) {
+        Write-Host "==> Z3: bundled"
+        return [pscustomobject]@{
+            WorkspaceFeatures = $BundledZ3WorkspaceFeatures
+            ServerFeatures = $BundledZ3ServerFeatures
+        }
+    }
+
+    if (-not (Test-Path $env:Z3_LIBRARY_PATH_OVERRIDE -PathType Container)) {
+        throw "Z3_LIBRARY_PATH_OVERRIDE is set but the directory does not exist: $env:Z3_LIBRARY_PATH_OVERRIDE"
+    }
+
+    $libDir = (Resolve-Path $env:Z3_LIBRARY_PATH_OVERRIDE).Path
+    $importLib = Join-Path $libDir "libz3.lib"
+    if (-not (Test-Path $importLib -PathType Leaf)) {
+        throw "Z3_LIBRARY_PATH_OVERRIDE is set but libz3.lib was not found at: $importLib"
+    }
+
+    $env:Z3_LIBRARY_PATH_OVERRIDE = $libDir
+    $env:Z3_SYS_Z3_HEADER = Resolve-Z3HeaderPath $env:Z3_SYS_Z3_HEADER
+
+    if (($env:PATH -split ";") -notcontains $libDir) {
+        $env:PATH = "$libDir;$env:PATH"
+    }
+
+    Write-Host "==> Z3: system"
+    Write-Host "    Z3_LIBRARY_PATH_OVERRIDE=$env:Z3_LIBRARY_PATH_OVERRIDE"
+    Write-Host "    Z3_SYS_Z3_HEADER=$env:Z3_SYS_Z3_HEADER"
+
+    return [pscustomobject]@{
+        WorkspaceFeatures = ""
+        ServerFeatures = ""
+    }
+}
+
 function Invoke-VsCargo {
     param(
         [Parameter(Mandatory = $true)] [string] $RustTarget,
@@ -195,14 +248,14 @@ function Invoke-VsCargo {
 function Invoke-Check([string] $RustTarget) {
     Invoke-VsCargo `
         -RustTarget $RustTarget `
-        -CargoArgs "cargo check --workspace $UnsupportedDriverPackageExcludes --target $RustTarget $BundledZ3WorkspaceFeatures" `
+        -CargoArgs "cargo check --workspace $UnsupportedDriverPackageExcludes --target $RustTarget $Z3WorkspaceFeatures" `
         -LogName "build-$RustTarget-check.log"
 }
 
 function Invoke-Build([string] $RustTarget) {
     Invoke-VsCargo `
         -RustTarget $RustTarget `
-        -CargoArgs "cargo build --release --target $RustTarget --bin openshell-gateway --bin openshell $BundledZ3WorkspaceFeatures" `
+        -CargoArgs "cargo build --release --target $RustTarget --bin openshell-gateway --bin openshell $Z3WorkspaceFeatures" `
         -LogName "build-$RustTarget-release.log"
 }
 
@@ -212,7 +265,7 @@ function Invoke-Test([string] $RustTarget) {
     }
     Invoke-VsCargo `
         -RustTarget $RustTarget `
-        -CargoArgs "cargo test --workspace $UnsupportedDriverPackageExcludes --target $RustTarget --no-fail-fast $BundledZ3WorkspaceFeatures" `
+        -CargoArgs "cargo test --workspace $UnsupportedDriverPackageExcludes --target $RustTarget --no-fail-fast $Z3WorkspaceFeatures" `
         -LogName "test-$RustTarget.log"
 }
 
@@ -228,7 +281,7 @@ function Invoke-UnsupportedContractTests([string] $RustTarget) {
     foreach ($test in $tests) {
         Invoke-VsCargo `
             -RustTarget $RustTarget `
-            -CargoArgs "cargo test -p openshell-server --target $RustTarget $test $BundledZ3ServerFeatures" `
+            -CargoArgs "cargo test -p openshell-server --target $RustTarget $test $Z3ServerFeatures" `
             -LogName "test-$RustTarget-unsupported-$test.log"
     }
 }
@@ -260,6 +313,9 @@ function Show-Artifacts([string[]] $RustTargets) {
 }
 
 $targets = Get-SelectedTargets $Target
+$z3Features = Configure-Z3
+$Z3WorkspaceFeatures = $z3Features.WorkspaceFeatures
+$Z3ServerFeatures = $z3Features.ServerFeatures
 $env:LIBCLANG_PATH = Resolve-LibclangPath
 Write-Host "==> LIBCLANG_PATH=$env:LIBCLANG_PATH"
 

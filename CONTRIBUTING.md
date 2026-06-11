@@ -336,7 +336,9 @@ cargo build -p openshell-prover --features bundled-z3
 For x86-64 Windows MSVC builds, use one of these Z3 paths:
 
 - System Z3: point `Z3_LIBRARY_PATH_OVERRIDE` at the directory containing the
-  64-bit MSVC Z3 library and `Z3_SYS_Z3_HEADER` at `z3.h`.
+  64-bit MSVC Z3 library and `Z3_SYS_Z3_HEADER` at the full path to `z3.h`.
+  The `windows:*` tasks use this path automatically when `Z3_LIBRARY_PATH_OVERRIDE`
+  is set.
 - Bundled Z3: pass `--features bundled-z3` so `z3-sys` builds Z3 from source.
 
 Both Windows paths still require `libclang.dll` for `bindgen`. If LLVM is not on
@@ -346,6 +348,14 @@ the default search path, set `LIBCLANG_PATH` to the directory containing
 ```powershell
 $env:LIBCLANG_PATH='C:\Program Files\Microsoft Visual Studio\2022\<Edition>\VC\Tools\Llvm\x64\bin'
 cargo build -p openshell-cli --target x86_64-pc-windows-msvc --features bundled-z3
+```
+
+To use a local x64 Z3 release with the Windows task wrapper:
+
+```powershell
+$env:Z3_LIBRARY_PATH_OVERRIDE='C:\path\to\z3-4.16.0-x64-win\bin'
+$env:Z3_SYS_Z3_HEADER='C:\path\to\z3-4.16.0-x64-win\include\z3.h'
+mise run --skip-tools windows:build:x64
 ```
 
 ### macOS build tools
