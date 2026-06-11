@@ -104,6 +104,8 @@ server:
     scopesClaim: ""
 ```
 
+For Kubernetes and other shared gateways, set both `adminRole` and `userRole` for RBAC. Authentication-only mode leaves both roles empty and authorizes any valid token from the issuer; it requires an explicit opt-in with `server.auth.allowOidcAuthOnly=true` in Helm or `allow_oidc_auth_only = true` under `[openshell.gateway.auth]` in TOML.
+
 Register an OIDC gateway with the CLI:
 
 ```shell
@@ -123,7 +125,7 @@ The connection flow:
 3. The CLI connects to the gateway and attaches `authorization: Bearer <token>` metadata to each gRPC request.
 4. The gateway validates the JWT signature, issuer, audience, expiration, and key ID against the issuer's JWKS.
 5. The gateway extracts roles and optional scopes from the configured claim paths.
-6. The gateway authorizes the gRPC method. Admin methods require the admin role, other authenticated methods require the user role. Admin role holders also satisfy user-role checks.
+6. The gateway authorizes the gRPC method. In RBAC mode, admin methods require the admin role, other authenticated methods require the user role, and admin role holders also satisfy user-role checks. In authentication-only mode, role checks are skipped only after the deployment explicitly opts in.
 
 If `OPENSHELL_OIDC_SCOPES_CLAIM` is set, the gateway also enforces scopes. It accepts space-delimited scope strings such as `scope: "openid sandbox:read"` and JSON arrays such as `scp: ["sandbox:read"]`. Standard OIDC scopes such as `openid`, `profile`, `email`, and `offline_access` are ignored for authorization. `openshell:all` grants access to all scoped methods.
 

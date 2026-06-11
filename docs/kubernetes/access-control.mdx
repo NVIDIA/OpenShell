@@ -37,7 +37,10 @@ helm upgrade openshell \
   --version <version> \
   --namespace openshell \
   --set server.oidc.issuer=https://your-idp.example.com/realms/openshell \
-  --set server.oidc.audience=openshell-cli
+  --set server.oidc.audience=openshell-cli \
+  --set server.oidc.rolesClaim=realm_access.roles \
+  --set server.oidc.adminRole=openshell-admin \
+  --set server.oidc.userRole=openshell-user
 ```
 
 The `audience` value must match the client ID configured in your identity provider for the OpenShell resource server.
@@ -53,12 +56,11 @@ The `audience` value must match the client ID configured in your identity provid
 | `server.oidc.adminRole` | `""` | Role name that grants admin access. |
 | `server.oidc.userRole` | `""` | Role name that grants standard user access. |
 | `server.oidc.scopesClaim` | `""` | Dot-separated path to the scopes array in JWT claims. |
+| `server.auth.allowOidcAuthOnly` | `false` | Explicit opt-in for OIDC authentication-only mode when both role values are empty. |
 
 ### Auth-only mode vs. RBAC mode
 
-Leave both `adminRole` and `userRole` empty to use auth-only mode: any request with a valid JWT from the configured issuer is accepted, but no role distinction is enforced.
-
-Set both values to enable RBAC mode, where the gateway checks the role claim and enforces access based on the assigned role:
+Set both role values to enable RBAC mode, where the gateway checks the role claim and enforces access based on the assigned role. This is the recommended mode for shared Kubernetes deployments:
 
 ```shell
 helm upgrade openshell \
@@ -72,7 +74,19 @@ helm upgrade openshell \
   --set server.oidc.userRole=openshell-user
 ```
 
-Both `adminRole` and `userRole` must be set, or both must be empty. Setting only one is not supported.
+Authentication-only mode accepts any request with a valid JWT from the configured issuer and does not enforce an admin/user role distinction. To use it, leave both `adminRole` and `userRole` empty and explicitly opt in:
+
+```shell
+helm upgrade openshell \
+  oci://ghcr.io/nvidia/openshell/helm-chart \
+  --version <version> \
+  --namespace openshell \
+  --set server.oidc.issuer=https://your-idp.example.com/realms/openshell \
+  --set server.oidc.audience=openshell-cli \
+  --set server.auth.allowOidcAuthOnly=true
+```
+
+Both `adminRole` and `userRole` must be set, or both must be empty. Setting only one is not supported. Helm rejects authentication-only mode unless `server.auth.allowOidcAuthOnly=true` is set.
 
 ### Provider-specific rolesClaim paths
 
