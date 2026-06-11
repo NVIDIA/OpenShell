@@ -305,7 +305,7 @@ impl<S> GrpcRateLimitService<S> {
 
 impl<S, B> tower::Service<Request<B>> for GrpcRateLimitService<S>
 where
-    S: tower::Service<Request<B>, Response = Response<tonic::body::BoxBody>>,
+    S: tower::Service<Request<B>, Response = Response<tonic::body::Body>>,
     S::Future: Send + 'static,
     B: Send + 'static,
 {
@@ -953,7 +953,7 @@ mod tests {
     }
 
     impl Service<Request<()>> for CountingGrpcService {
-        type Response = Response<tonic::body::BoxBody>;
+        type Response = Response<tonic::body::Body>;
         type Error = std::convert::Infallible;
         type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
 
@@ -963,7 +963,7 @@ mod tests {
 
         fn call(&mut self, _req: Request<()>) -> Self::Future {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            std::future::ready(Ok(Response::new(tonic::body::empty_body())))
+            std::future::ready(Ok(Response::new(tonic::body::Body::empty())))
         }
     }
 
@@ -985,7 +985,7 @@ mod tests {
     }
 
     impl Service<Request<()>> for PendingInnerService {
-        type Response = Response<tonic::body::BoxBody>;
+        type Response = Response<tonic::body::Body>;
         type Error = std::convert::Infallible;
         type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
 
@@ -995,7 +995,7 @@ mod tests {
 
         fn call(&mut self, _req: Request<()>) -> Self::Future {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            std::future::ready(Ok(Response::new(tonic::body::empty_body())))
+            std::future::ready(Ok(Response::new(tonic::body::Body::empty())))
         }
     }
 
