@@ -400,3 +400,61 @@ async fn gateway_add_can_shadow_system_gateway_with_user_registration() {
     assert_eq!(beta["source"], "user");
     assert_eq!(beta["endpoint"], "http://127.0.0.1:17671");
 }
+
+#[tokio::test]
+async fn gateway_remove_rejects_system_only_registration_and_preserves_entry() {
+    let config_dir = tempfile::tempdir().expect("create config dir");
+    let system_dir = tempfile::tempdir().expect("create system dir");
+    write_system_gateway_metadata(
+        system_dir.path(),
+        "beta",
+        "http://127.0.0.1:17670",
+        17670,
+        false,
+        "plaintext",
+    );
+
+    let (remove_output, remove_code) = run_with_config(
+        config_dir.path(),
+        Some(system_dir.path()),
+        &["gateway", "remove", "beta"],
+    )
+    .await;
+    assert_ne!(
+        remove_code, 0,
+        "gateway remove should reject system-only registrations:\n{remove_output}"
+    );
+    let clean_remove = strip_ansi(&remove_output);
+    let normalized_remove = clean_remove
+        .replace(['│', '×'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        normalized_remove
+            .contains("installed by the system and cannot be removed from user config"),
+        "expected system-only removal guidance:\n{clean_remove}"
+    );
+
+    let (list_output, list_code) = run_with_config(
+        config_dir.path(),
+        Some(system_dir.path()),
+        &["gateway", "list", "-o", "json"],
+    )
+    .await;
+    assert_eq!(
+        list_code, 0,
+        "gateway list -o json should still succeed:\n{list_output}"
+    );
+
+    let items: serde_json::Value =
+        serde_json::from_str(&list_output).expect("parse gateway list json");
+    let beta = items
+        .as_array()
+        .expect("gateway list json array")
+        .iter()
+        .find(|item| item["name"] == "beta")
+        .expect("find beta entry after failed remove");
+    assert_eq!(beta["source"], "system");
+    assert_eq!(beta["endpoint"], "http://127.0.0.1:17670");
+}
