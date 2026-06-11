@@ -715,6 +715,118 @@ fn install_fake_ssh(dir: &TempDir) -> std::path::PathBuf {
     ssh_path
 }
 
+fn install_fake_forwarding_ssh(dir: &TempDir) -> std::path::PathBuf {
+    let ssh_path = dir.path().join("ssh");
+    let pid_path = dir.path().join("fake-forward.pid");
+    fs::write(
+        &ssh_path,
+        r#"#!/bin/sh
+set -eu
+
+forward=""
+sandbox_id=""
+previous=""
+
+for arg in "$@"; do
+  if [ "$previous" = "-L" ]; then
+    forward="$arg"
+    previous=""
+    continue
+  fi
+
+  if [ "$previous" = "-o" ]; then
+    case "$arg" in
+      ProxyCommand=*)
+        sandbox_id="$(printf '%s\n' "$arg" | sed -n 's/.*--sandbox-id \([^ ]*\).*/\1/p')"
+        ;;
+    esac
+    previous=""
+    continue
+  fi
+
+  case "$arg" in
+    -L|-o)
+      previous="$arg"
+      ;;
+  esac
+done
+
+if [ -z "$forward" ]; then
+  exit 0
+fi
+
+first="${forward%%:*}"
+rest="${forward#*:}"
+case "$first" in
+  ''|*[!0-9]*)
+    port="${rest%%:*}"
+    ;;
+  *)
+    port="$first"
+    ;;
+esac
+
+if [ -z "$port" ] || [ -z "$sandbox_id" ]; then
+  exit 1
+fi
+
+nohup python3 -c '
+import signal
+import socket
+import sys
+
+port = int(sys.argv[1])
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+sock.bind(("127.0.0.1", port))
+sock.listen(16)
+
+def stop(_signum, _frame):
+    sock.close()
+    raise SystemExit(0)
+
+signal.signal(signal.SIGTERM, stop)
+signal.signal(signal.SIGINT, stop)
+signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
+while True:
+    conn, _addr = sock.accept()
+    conn.close()
+' "$port" ssh ssh-proxy --sandbox-id "$sandbox_id" -L "$forward" >/dev/null 2>&1 &
+echo $! > '@PID_PATH@'
+
+exit 0
+"#
+        .replace("@PID_PATH@", &pid_path.display().to_string()),
+    )
+    .unwrap();
+    let mut perms = fs::metadata(&ssh_path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&ssh_path, perms).unwrap();
+
+    let pgrep_path = dir.path().join("pgrep");
+    fs::write(
+        &pgrep_path,
+        format!(
+            r"#!/bin/sh
+if [ -s '{}' ]; then
+  cat '{}'
+  exit 0
+fi
+exit 1
+",
+            pid_path.display(),
+            pid_path.display()
+        ),
+    )
+    .unwrap();
+    let mut perms = fs::metadata(&pgrep_path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&pgrep_path, perms).unwrap();
+
+    ssh_path
+}
+
 fn test_env(fake_ssh_dir: &TempDir, xdg_dir: &TempDir) -> EnvVarGuard {
     test_env_with(fake_ssh_dir, xdg_dir, &[])
 }
@@ -1302,7 +1414,7 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
     let xdg_dir = tempfile::tempdir().unwrap();
     let _env = test_env(&fake_ssh_dir, &xdg_dir);
     let tls = test_tls(&server);
-    install_fake_ssh(&fake_ssh_dir);
+    install_fake_forwarding_ssh(&fake_ssh_dir);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let forward_port = listener.local_addr().unwrap().port();
     drop(listener);
@@ -1334,6 +1446,11 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
     .expect("sandbox create with forward should succeed");
 
     assert!(deleted_names(&server).await.is_empty());
+    let record = openshell_core::forward::read_forward_pid("persistent-forward", forward_port)
+        .expect("fake forward should be tracked");
+    let _ = std::process::Command::new("kill")
+        .arg(record.pid.to_string())
+        .status();
 }
 
 #[tokio::test]

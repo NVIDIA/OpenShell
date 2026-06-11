@@ -314,6 +314,8 @@ openshell forward start 8000 my-sandbox
 openshell forward start 8000 my-sandbox -d    # run in background
 ```
 
+OpenShell prints the local URL only after the forward listener is reachable. Background forwards must be tracked locally so `openshell forward list` and `openshell forward stop` can manage them.
+
 List and stop active forwards:
 
 ```shell
