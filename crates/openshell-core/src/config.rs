@@ -612,6 +612,43 @@ pub struct GatewayAuthConfig {
     /// gateway-minted sandbox JWTs.
     #[serde(default)]
     pub allow_unauthenticated_users: bool,
+
+    /// When true, an OIDC issuer may authenticate users without requiring
+    /// configured RBAC roles. Configured scope checks still apply, so shared
+    /// deployments must opt in explicitly.
+    #[serde(default)]
+    pub allow_oidc_auth_only: bool,
+}
+
+/// Effective network exposure of the gateway API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatewayExposure {
+    /// The gateway API is reachable only through local loopback listeners.
+    Local,
+    /// The gateway API is shared or reachable beyond local loopback.
+    Shared,
+}
+
+/// How verified mTLS client certificates may be used by this deployment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MtlsIdentityMode {
+    /// A verified client certificate may represent a gateway user.
+    UserAuthentication,
+    /// Client certificates secure transport but must not represent users.
+    TransportOnly,
+}
+
+/// Resolved deployment facts required to validate gateway authentication.
+///
+/// The gateway server constructs this after selecting its compute driver and
+/// discovering any driver-provided listeners. It deliberately contains no raw
+/// driver configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GatewayAuthPosture {
+    /// Effective reachability of the gateway API.
+    pub exposure: GatewayExposure,
+    /// Whether mTLS identities may authenticate gateway users.
+    pub mtls_identity: MtlsIdentityMode,
 }
 
 /// One configured gateway interceptor service.
@@ -936,6 +973,89 @@ impl Config {
         self.service_routing.enable_loopback_service_http = enabled;
         self
     }
+
+    /// Validate authentication settings that depend only on configuration.
+    pub fn validate_gateway_auth_config(&self) -> Result<(), String> {
+        if self.auth.allow_oidc_auth_only && self.oidc.is_none() {
+            return Err(
+                "auth.allow_oidc_auth_only=true requires OIDC to be configured".to_string(),
+            );
+        }
+
+        if let Some(oidc) = &self.oidc {
+            let admin_set = !oidc.admin_role.is_empty();
+            let user_set = !oidc.user_role.is_empty();
+
+            if admin_set != user_set {
+                return Err(format!(
+                    "OIDC RBAC misconfiguration: admin_role={:?}, user_role={:?}. \
+                     Either set both roles (RBAC mode) or leave both empty (authentication-only mode).",
+                    oidc.admin_role, oidc.user_role,
+                ));
+            }
+
+            if admin_set && self.auth.allow_oidc_auth_only {
+                return Err(
+                    "auth.allow_oidc_auth_only=true is only valid when OIDC admin_role and user_role are both empty"
+                        .to_string(),
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validate authentication against the resolved deployment posture.
+    ///
+    /// This composes the configuration-only checks with facts supplied by the
+    /// gateway after compute-driver selection and listener discovery.
+    pub fn validate_gateway_auth_posture(&self, posture: GatewayAuthPosture) -> Result<(), String> {
+        self.validate_gateway_auth_config()?;
+
+        let shared = posture.exposure == GatewayExposure::Shared;
+        if let Some(oidc) = &self.oidc {
+            let rbac_enabled = !oidc.admin_role.is_empty();
+
+            if shared && !rbac_enabled && !self.auth.allow_oidc_auth_only {
+                return Err(
+                    "OIDC authentication-only mode is disabled for shared gateway deployments; \
+                     configure admin_role and user_role for RBAC, or set \
+                     auth.allow_oidc_auth_only=true to skip role checks while retaining configured scope checks"
+                        .to_string(),
+                );
+            }
+        }
+
+        if posture.mtls_identity == MtlsIdentityMode::TransportOnly && self.mtls_auth.enabled {
+            return Err(
+                "mTLS user authentication is not supported when client certificates are transport-only; \
+                 configure OIDC or a trusted fronting proxy for user authentication"
+                    .to_string(),
+            );
+        }
+
+        let has_user_auth_path = self.oidc.is_some()
+            || (self.mtls_auth.enabled
+                && posture.mtls_identity == MtlsIdentityMode::UserAuthentication)
+            || self.auth.allow_unauthenticated_users;
+        if shared && !has_user_auth_path {
+            let message = match posture.mtls_identity {
+                MtlsIdentityMode::UserAuthentication => {
+                    "shared gateway deployments require an explicit auth path; configure OIDC, \
+                     mTLS user auth, or set auth.allow_unauthenticated_users=true \
+                     only behind a trusted local-dev/fronting-proxy boundary"
+                }
+                MtlsIdentityMode::TransportOnly => {
+                    "shared gateway deployments require an explicit auth path; configure OIDC, \
+                     or set auth.allow_unauthenticated_users=true only behind a trusted \
+                     local-dev/fronting-proxy boundary"
+                }
+            };
+            return Err(message.to_string());
+        }
+
+        Ok(())
+    }
 }
 
 impl Default for ServiceRoutingConfig {
@@ -1020,9 +1140,10 @@ mod tests {
     #[cfg(unix)]
     use super::is_reachable_unix_socket;
     use super::{
-        ComputeDriverKind, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, GatewayInterceptorBindingPolicy,
-        GatewayInterceptorConfig, GatewayInterceptorFailurePolicy, GatewayJwtConfig,
-        GatewayProviderProfileSourceConfig, PolicyValidationFailureMode,
+        ComputeDriverKind, Config, DEFAULT_SERVICE_ROUTING_DOMAIN, GatewayAuthPosture,
+        GatewayExposure, GatewayInterceptorBindingPolicy, GatewayInterceptorConfig,
+        GatewayInterceptorFailurePolicy, GatewayJwtConfig, GatewayProviderProfileSourceConfig,
+        MtlsIdentityMode, OidcConfig, PolicyValidationFailureMode,
         detect_docker_socket_from_candidates, detect_driver, detect_podman_socket_from_candidates,
         docker_host_unix_socket_path, docker_socket_responds, is_unix_socket,
         normalize_compute_driver_name, podman_socket_candidates_from_env, podman_socket_responds,
@@ -1104,6 +1225,155 @@ mod tests {
     fn config_disables_unauthenticated_users_by_default() {
         let cfg = Config::new(None);
         assert!(!cfg.auth.allow_unauthenticated_users);
+    }
+
+    fn oidc_config(admin_role: &str, user_role: &str) -> OidcConfig {
+        OidcConfig {
+            issuer: "https://issuer.example.com".to_string(),
+            audience: "openshell-cli".to_string(),
+            jwks_ttl_secs: 3600,
+            roles_claim: "realm_access.roles".to_string(),
+            admin_role: admin_role.to_string(),
+            user_role: user_role.to_string(),
+            scopes_claim: String::new(),
+        }
+    }
+
+    const fn local_auth_posture() -> GatewayAuthPosture {
+        GatewayAuthPosture {
+            exposure: GatewayExposure::Local,
+            mtls_identity: MtlsIdentityMode::UserAuthentication,
+        }
+    }
+
+    const fn shared_auth_posture() -> GatewayAuthPosture {
+        GatewayAuthPosture {
+            exposure: GatewayExposure::Shared,
+            mtls_identity: MtlsIdentityMode::UserAuthentication,
+        }
+    }
+
+    const fn transport_only_shared_auth_posture() -> GatewayAuthPosture {
+        GatewayAuthPosture {
+            exposure: GatewayExposure::Shared,
+            mtls_identity: MtlsIdentityMode::TransportOnly,
+        }
+    }
+
+    #[test]
+    fn gateway_auth_posture_allows_loopback_oidc_auth_only_without_override() {
+        let cfg = Config::new(None).with_oidc(oidc_config("", ""));
+
+        assert!(
+            cfg.validate_gateway_auth_posture(local_auth_posture())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn gateway_auth_posture_rejects_shared_oidc_auth_only_without_override() {
+        let cfg = Config::new(None).with_oidc(oidc_config("", ""));
+
+        let err = cfg
+            .validate_gateway_auth_posture(shared_auth_posture())
+            .unwrap_err();
+        assert!(err.contains("OIDC authentication-only mode"));
+    }
+
+    #[test]
+    fn gateway_auth_posture_allows_shared_oidc_auth_only_with_override() {
+        let mut cfg = Config::new(None).with_oidc(oidc_config("", ""));
+        cfg.auth.allow_oidc_auth_only = true;
+
+        assert!(
+            cfg.validate_gateway_auth_posture(shared_auth_posture())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn gateway_auth_config_rejects_oidc_auth_only_override_without_oidc() {
+        let mut cfg = Config::new(None);
+        cfg.auth.allow_oidc_auth_only = true;
+
+        let err = cfg.validate_gateway_auth_config().unwrap_err();
+        assert!(err.contains("requires OIDC to be configured"));
+    }
+
+    #[test]
+    fn gateway_auth_config_rejects_oidc_auth_only_override_with_rbac() {
+        let mut cfg = Config::new(None).with_oidc(oidc_config("openshell-admin", "openshell-user"));
+        cfg.auth.allow_oidc_auth_only = true;
+
+        let err = cfg.validate_gateway_auth_config().unwrap_err();
+        assert!(err.contains("only valid when OIDC admin_role and user_role are both empty"));
+    }
+
+    #[test]
+    fn gateway_auth_posture_allows_shared_oidc_rbac() {
+        let cfg = Config::new(None).with_oidc(oidc_config("openshell-admin", "openshell-user"));
+
+        assert!(
+            cfg.validate_gateway_auth_posture(shared_auth_posture())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn gateway_auth_config_rejects_partial_oidc_roles() {
+        let cfg = Config::new(None).with_oidc(oidc_config("openshell-admin", ""));
+
+        let err = cfg.validate_gateway_auth_config().unwrap_err();
+        assert!(err.contains("OIDC RBAC misconfiguration"));
+    }
+
+    #[test]
+    fn gateway_auth_posture_rejects_shared_gateway_without_auth_path() {
+        let cfg = Config::new(None);
+
+        let err = cfg
+            .validate_gateway_auth_posture(shared_auth_posture())
+            .unwrap_err();
+        assert!(err.contains("require an explicit auth path"));
+    }
+
+    #[test]
+    fn gateway_auth_posture_rejects_shared_gateway_with_only_sandbox_jwt() {
+        let mut cfg = Config::new(None);
+        cfg.gateway_jwt = Some(GatewayJwtConfig {
+            signing_key_path: "/tmp/signing.pem".into(),
+            public_key_path: "/tmp/public.pem".into(),
+            kid_path: "/tmp/kid".into(),
+            gateway_id: "openshell".to_string(),
+            ttl_secs: 3600,
+        });
+
+        let err = cfg
+            .validate_gateway_auth_posture(shared_auth_posture())
+            .unwrap_err();
+        assert!(err.contains("require an explicit auth path"));
+    }
+
+    #[test]
+    fn gateway_auth_posture_rejects_transport_only_mtls_user_auth() {
+        let mut cfg = Config::new(None).with_oidc(oidc_config("openshell-admin", "openshell-user"));
+        cfg.mtls_auth.enabled = true;
+
+        let err = cfg
+            .validate_gateway_auth_posture(transport_only_shared_auth_posture())
+            .unwrap_err();
+        assert!(err.contains("mTLS user authentication is not supported"));
+    }
+
+    #[test]
+    fn gateway_auth_posture_allows_local_mtls_user_auth() {
+        let mut cfg = Config::new(None);
+        cfg.mtls_auth.enabled = true;
+
+        assert!(
+            cfg.validate_gateway_auth_posture(local_auth_posture())
+                .is_ok()
+        );
     }
 
     #[test]

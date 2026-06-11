@@ -58,7 +58,10 @@ mod ws_tunnel;
 
 use metrics_exporter_prometheus::PrometheusBuilder;
 use openshell_core::net::set_tcp_nodelay_best_effort;
-use openshell_core::{ComputeDriverKind, Config, Error, ObjectLabels, Result};
+use openshell_core::{
+    ComputeDriverKind, Config, Error, GatewayAuthPosture, GatewayExposure, MtlsIdentityMode,
+    ObjectLabels, Result,
+};
 use openshell_supervisor_middleware::MiddlewareRegistry;
 use std::collections::HashMap;
 use std::io::ErrorKind;
@@ -78,7 +81,7 @@ pub(crate) static TEST_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::n
 #[cfg(test)]
 pub(crate) static TEST_TRACING_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-use compute::ComputeRuntime;
+use compute::{ComputeRuntime, GatewayListenerRequirement};
 use gateway_listener::{BoundGatewayListener, GatewayListenerScope, bind_gateway_listeners};
 pub use grpc::OpenShellService;
 pub use http::{health_router, http_router, metrics_router, service_http_router};
@@ -257,6 +260,9 @@ pub(crate) async fn run_server(
     if database_url.is_empty() {
         return Err(Error::config("database_url is required"));
     }
+    config
+        .validate_gateway_auth_config()
+        .map_err(Error::config)?;
 
     let middleware_registrations = config_file
         .as_ref()
@@ -280,24 +286,6 @@ pub(crate) async fn run_server(
 
     let store = Arc::new(Store::connect(database_url).await?);
 
-    let oidc_cache = if let Some(ref oidc) = config.oidc {
-        // Validate RBAC configuration before starting.
-        let policy = auth::authz::AuthzPolicy {
-            admin_role: oidc.admin_role.clone(),
-            user_role: oidc.user_role.clone(),
-            scopes_enabled: !oidc.scopes_claim.is_empty(),
-        };
-        policy.validate().map_err(Error::config)?;
-
-        let cache = auth::oidc::JwksCache::new(oidc)
-            .await
-            .map_err(|e| Error::config(format!("OIDC initialization failed: {e}")))?;
-        info!("OIDC JWT validation enabled (issuer: {})", oidc.issuer);
-        Some(Arc::new(cache))
-    } else {
-        None
-    };
-
     let sandbox_index = SandboxIndex::new();
     let sandbox_watch_bus = SandboxWatchBus::new();
     let supervisor_sessions = Arc::new(supervisor_session::SupervisorSessionRegistry::new());
@@ -318,6 +306,34 @@ pub(crate) async fn run_server(
         supervisor_sessions.clone(),
     )
     .await?;
+    let auth_posture = resolved_gateway_auth_posture(
+        &config,
+        compute.driver_kind(),
+        compute.gateway_listener_requirements(),
+    );
+    config
+        .validate_gateway_auth_posture(auth_posture)
+        .map_err(Error::config)?;
+
+    let oidc_cache = if let Some(ref oidc) = config.oidc {
+        // Validate RBAC configuration before starting.
+        let policy = auth::authz::AuthzPolicy {
+            admin_role: oidc.admin_role.clone(),
+            user_role: oidc.user_role.clone(),
+            scopes_enabled: !oidc.scopes_claim.is_empty(),
+        };
+        policy.validate().map_err(Error::config)?;
+
+        let cache = auth::oidc::JwksCache::new(oidc)
+            .await
+            .map_err(|e| Error::config(format!("OIDC initialization failed: {e}")))?;
+        info!("OIDC JWT validation enabled (issuer: {})", oidc.issuer);
+        warn_if_oidc_auth_only_enabled(&config);
+        Some(Arc::new(cache))
+    } else {
+        None
+    };
+
     let gateway_interceptors =
         openshell_gateway_interceptors::initialize(config.gateway_interceptors.clone())
             .await
@@ -954,6 +970,52 @@ fn builtin_compute_driver(name: &str) -> Option<ComputeDriverKind> {
     name.parse().ok()
 }
 
+fn resolved_gateway_auth_posture(
+    config: &Config,
+    driver_kind: Option<ComputeDriverKind>,
+    driver_listener_requirements: &[GatewayListenerRequirement],
+) -> GatewayAuthPosture {
+    let kubernetes = driver_kind == Some(ComputeDriverKind::Kubernetes);
+    let has_non_loopback_listener =
+        driver_listener_requirements
+            .iter()
+            .any(|requirement| match requirement {
+                GatewayListenerRequirement::Exact { address, .. } => !address.ip().is_loopback(),
+                GatewayListenerRequirement::DefaultRouteInterface { .. } => true,
+                GatewayListenerRequirement::LoopbackInterface { .. } => false,
+            });
+    let shared = kubernetes || !config.bind_address.ip().is_loopback() || has_non_loopback_listener;
+
+    GatewayAuthPosture {
+        exposure: if shared {
+            GatewayExposure::Shared
+        } else {
+            GatewayExposure::Local
+        },
+        mtls_identity: if kubernetes {
+            MtlsIdentityMode::TransportOnly
+        } else {
+            MtlsIdentityMode::UserAuthentication
+        },
+    }
+}
+
+fn oidc_auth_only_enabled(config: &Config) -> bool {
+    config.auth.allow_oidc_auth_only
+        && config
+            .oidc
+            .as_ref()
+            .is_some_and(|oidc| oidc.admin_role.is_empty() && oidc.user_role.is_empty())
+}
+
+fn warn_if_oidc_auth_only_enabled(config: &Config) {
+    if oidc_auth_only_enabled(config) {
+        warn!(
+            "OIDC authentication-only mode enabled; RBAC role checks are disabled and configured scope checks still apply"
+        );
+    }
+}
+
 fn kubernetes_sandbox_jwt_expiry_disabled(config: &Config) -> bool {
     config
         .gateway_jwt
@@ -1035,10 +1097,10 @@ mod tests {
         MultiplexService, ServerState, TlsAcceptor, allow_plaintext_service_http,
         bind_gateway_listeners, classify_initial_bytes, configured_compute_driver,
         is_benign_tls_handshake_failure, kubernetes_sandbox_jwt_expiry_disabled,
-        serve_gateway_listener,
+        oidc_auth_only_enabled, resolved_gateway_auth_posture, serve_gateway_listener,
     };
     use openshell_core::{
-        ComputeDriverKind, Config,
+        ComputeDriverKind, Config, GatewayExposure, MtlsIdentityMode,
         proto::{HealthRequest, open_shell_client::OpenShellClient},
     };
     use std::io::{Error, ErrorKind};
@@ -1058,6 +1120,33 @@ mod tests {
         gateway_listener::GatewayListenerSpec,
         tls_test_utils::{generate_test_certs_with_ca, install_rustls_provider},
     };
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        #[allow(unsafe_code)]
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var(key).ok();
+            // SAFETY: tests serialize environment mutation with TEST_ENV_LOCK.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        #[allow(unsafe_code)]
+        fn drop(&mut self) {
+            match self.original.as_deref() {
+                // SAFETY: tests serialize environment mutation with TEST_ENV_LOCK.
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                // SAFETY: tests serialize environment mutation with TEST_ENV_LOCK.
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
 
     fn test_driver_startup<'a>(
         config: &'a Config,
@@ -1376,36 +1465,121 @@ mod tests {
     }
 
     #[test]
-    fn configured_compute_driver_triggers_auto_detection_when_empty() {
+    fn configured_compute_driver_autodetects_kubernetes_when_empty_in_cluster() {
+        let _lock = super::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = EnvVarGuard::set("KUBERNETES_SERVICE_HOST", "127.0.0.1");
         let config = Config::new(None).with_compute_drivers(std::iter::empty::<String>());
-        // Empty drivers triggers auto-detection, which may return Some or None
-        // depending on the environment. This test verifies the auto-detection path
-        // is taken rather than immediately returning an error.
-        let result = configured_compute_driver(&config, test_driver_startup(&config, None));
-        // Either we get a detected driver or an error about none being detected.
-        match result {
-            Ok(ConfiguredComputeDriver::Builtin(driver)) => {
-                assert!(
-                    matches!(
-                        driver,
-                        ComputeDriverKind::Kubernetes
-                            | ComputeDriverKind::Docker
-                            | ComputeDriverKind::Podman
-                    ),
-                    "auto-detected unexpected driver: {driver:?}"
-                );
-            }
-            Ok(ConfiguredComputeDriver::Remote { name }) => {
-                panic!("auto-detection returned remote driver: {name}");
-            }
-            Err(e) => {
-                assert!(
-                    e.to_string()
-                        .contains("auto-detection found no suitable driver"),
-                    "unexpected error: {e}"
-                );
-            }
+        let driver =
+            configured_compute_driver(&config, test_driver_startup(&config, None)).unwrap();
+
+        assert!(matches!(
+            driver,
+            ConfiguredComputeDriver::Builtin(ComputeDriverKind::Kubernetes)
+        ));
+
+        let posture =
+            resolved_gateway_auth_posture(&config, Some(ComputeDriverKind::Kubernetes), &[]);
+        assert_eq!(posture.exposure, GatewayExposure::Shared);
+        assert_eq!(posture.mtls_identity, MtlsIdentityMode::TransportOnly);
+    }
+
+    #[test]
+    fn configured_compute_driver_normalizes_mixed_case_kubernetes() {
+        let config = Config::new(None).with_compute_drivers(["Kubernetes"]);
+        let driver =
+            configured_compute_driver(&config, test_driver_startup(&config, None)).unwrap();
+
+        assert!(matches!(
+            driver,
+            ConfiguredComputeDriver::Builtin(ComputeDriverKind::Kubernetes)
+        ));
+    }
+
+    #[test]
+    fn mixed_case_kubernetes_toml_with_mtls_is_rejected_after_driver_resolution() {
+        let file: super::config_file::ConfigFile = toml::from_str(
+            r#"
+[openshell.gateway]
+compute_drivers = ["Kubernetes"]
+
+[openshell.gateway.mtls_auth]
+enabled = true
+"#,
+        )
+        .expect("valid gateway TOML");
+        let gateway = &file.openshell.gateway;
+        let mut config = Config::new(None).with_compute_drivers(
+            gateway
+                .compute_drivers
+                .clone()
+                .expect("compute drivers configured"),
+        );
+        config.mtls_auth = gateway.mtls_auth.clone().expect("mTLS auth configured");
+
+        let driver =
+            configured_compute_driver(&config, test_driver_startup(&config, Some(&file))).unwrap();
+        let driver_kind = driver.name().parse().ok();
+        let posture = resolved_gateway_auth_posture(&config, driver_kind, &[]);
+
+        assert_eq!(posture.exposure, GatewayExposure::Shared);
+        assert_eq!(posture.mtls_identity, MtlsIdentityMode::TransportOnly);
+        let err = config.validate_gateway_auth_posture(posture).unwrap_err();
+        assert!(err.contains("mTLS user authentication is not supported"));
+    }
+
+    #[test]
+    fn resolved_kubernetes_posture_rejects_mtls_regardless_of_raw_driver_config() {
+        for raw_drivers in [Vec::<String>::new(), vec!["Kubernetes".to_string()]] {
+            let mut config = Config::new(None).with_compute_drivers(raw_drivers);
+            config.mtls_auth.enabled = true;
+            let posture =
+                resolved_gateway_auth_posture(&config, Some(ComputeDriverKind::Kubernetes), &[]);
+
+            let err = config.validate_gateway_auth_posture(posture).unwrap_err();
+            assert!(err.contains("mTLS user authentication is not supported"));
         }
+    }
+
+    #[test]
+    fn resolved_posture_marks_driver_non_loopback_listener_shared() {
+        let config = Config::new(None);
+        let driver_bind: SocketAddr = "172.18.0.1:17670".parse().expect("valid address");
+        let posture = resolved_gateway_auth_posture(
+            &config,
+            None,
+            &[docker_listener_requirement(driver_bind)],
+        );
+
+        assert_eq!(posture.exposure, GatewayExposure::Shared);
+        assert_eq!(posture.mtls_identity, MtlsIdentityMode::UserAuthentication);
+        let err = config.validate_gateway_auth_posture(posture).unwrap_err();
+        assert!(err.contains("require an explicit auth path"));
+    }
+
+    #[test]
+    fn resolved_posture_marks_default_route_listener_shared() {
+        let config = Config::new(None);
+        let requirement = GatewayListenerRequirement::DefaultRouteInterface {
+            driver_name: "docker".to_string(),
+            reason: "managed bridge".to_string(),
+        };
+        let posture = resolved_gateway_auth_posture(&config, None, &[requirement]);
+
+        assert_eq!(posture.exposure, GatewayExposure::Shared);
+    }
+
+    #[test]
+    fn resolved_posture_keeps_loopback_listener_local() {
+        let config = Config::new(None);
+        let requirement = GatewayListenerRequirement::LoopbackInterface {
+            driver_name: "docker".to_string(),
+            reason: "host loopback".to_string(),
+        };
+        let posture = resolved_gateway_auth_posture(&config, None, &[requirement]);
+
+        assert_eq!(posture.exposure, GatewayExposure::Local);
     }
 
     #[test]
@@ -1524,6 +1698,29 @@ mod tests {
             &config_with_jwt_ttl(3600)
         ));
         assert!(!kubernetes_sandbox_jwt_expiry_disabled(&Config::new(None)));
+    }
+
+    #[test]
+    fn oidc_auth_only_enabled_requires_explicit_active_mode() {
+        let mut config = Config::new(None).with_oidc(openshell_core::OidcConfig {
+            issuer: "https://issuer.example.com".to_string(),
+            audience: "openshell-cli".to_string(),
+            jwks_ttl_secs: 3600,
+            roles_claim: "realm_access.roles".to_string(),
+            admin_role: String::new(),
+            user_role: String::new(),
+            scopes_claim: String::new(),
+        });
+
+        assert!(!oidc_auth_only_enabled(&config));
+
+        config.auth.allow_oidc_auth_only = true;
+        assert!(oidc_auth_only_enabled(&config));
+
+        let oidc = config.oidc.as_mut().expect("OIDC configured");
+        oidc.admin_role = "openshell-admin".to_string();
+        oidc.user_role = "openshell-user".to_string();
+        assert!(!oidc_auth_only_enabled(&config));
     }
 
     #[tokio::test]

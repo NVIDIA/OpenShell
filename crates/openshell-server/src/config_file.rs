@@ -538,11 +538,13 @@ policy_validation_failure_mode = "keep_old"
         let toml = r"
 [openshell.gateway.auth]
 allow_unauthenticated_users = true
+allow_oidc_auth_only = true
 ";
         let tmp = write_tmp(toml);
         let file = load(tmp.path()).expect("valid auth config parses");
         let auth = file.openshell.gateway.auth.expect("auth config");
         assert!(auth.allow_unauthenticated_users);
+        assert!(auth.allow_oidc_auth_only);
     }
 
     #[test]

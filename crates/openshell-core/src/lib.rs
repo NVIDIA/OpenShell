@@ -43,10 +43,11 @@ pub mod time;
 pub mod transport_errors;
 
 pub use config::{
-    ComputeDriverKind, Config, GatewayAuthConfig, GatewayInterceptorBindingOverride,
-    GatewayInterceptorBindingPolicy, GatewayInterceptorConfig, GatewayInterceptorFailurePolicy,
-    GatewayInterceptorPhaseConfig, GatewayJwtConfig, GatewayProviderProfileSourceConfig,
-    MtlsAuthConfig, OidcConfig, PolicyValidationFailureMode, TlsConfig,
+    ComputeDriverKind, Config, GatewayAuthConfig, GatewayAuthPosture, GatewayExposure,
+    GatewayInterceptorBindingOverride, GatewayInterceptorBindingPolicy, GatewayInterceptorConfig,
+    GatewayInterceptorFailurePolicy, GatewayInterceptorPhaseConfig, GatewayJwtConfig,
+    GatewayProviderProfileSourceConfig, MtlsAuthConfig, MtlsIdentityMode, OidcConfig,
+    PolicyValidationFailureMode, TlsConfig,
 };
 pub use error::{ComputeDriverError, Error, Result};
 pub use metadata::{

@@ -198,8 +198,25 @@ Validate chart values that Helm would otherwise accept silently.
 {{- $workloadKind := include "openshell.workloadKind" . -}}
 {{- $workload := .Values.workload | default dict -}}
 {{- $replicaCount := int (default 1 .Values.replicaCount) -}}
+{{- $oidcIssuer := default "" .Values.server.oidc.issuer -}}
+{{- $oidcAdminRole := default "" .Values.server.oidc.adminRole -}}
+{{- $oidcUserRole := default "" .Values.server.oidc.userRole -}}
+{{- $oidcAdminRoleSet := ne $oidcAdminRole "" -}}
+{{- $oidcUserRoleSet := ne $oidcUserRole "" -}}
 {{- if and (hasKey .Values "postgres") (kindIs "map" .Values.postgres) (hasKey .Values.postgres "enabled") -}}
 {{- fail "postgres.enabled was removed; the OpenShell chart no longer deploys PostgreSQL. Provision PostgreSQL separately and set server.externalDbSecret to a Secret containing a PostgreSQL URI." -}}
+{{- end -}}
+{{- if and .Values.server.auth.allowOidcAuthOnly (not $oidcIssuer) -}}
+{{- fail "server.auth.allowOidcAuthOnly=true requires server.oidc.issuer to be configured." -}}
+{{- end -}}
+{{- if and $oidcIssuer (ne $oidcAdminRoleSet $oidcUserRoleSet) -}}
+{{- fail "server.oidc.adminRole and server.oidc.userRole must either both be set for OIDC RBAC or both be empty for authentication-only mode." -}}
+{{- end -}}
+{{- if and .Values.server.auth.allowOidcAuthOnly $oidcAdminRoleSet $oidcUserRoleSet -}}
+{{- fail "server.auth.allowOidcAuthOnly=true is only valid when server.oidc.adminRole and server.oidc.userRole are both empty." -}}
+{{- end -}}
+{{- if and $oidcIssuer (not $oidcAdminRoleSet) (not .Values.server.auth.allowOidcAuthOnly) -}}
+{{- fail "OIDC authentication-only mode skips role checks while retaining configured scope checks. Set server.oidc.adminRole and server.oidc.userRole for RBAC, or set server.auth.allowOidcAuthOnly=true to opt in explicitly." -}}
 {{- end -}}
 {{- if not (or (eq $workloadKind "statefulset") (eq $workloadKind "deployment")) -}}
 {{- fail "workload.kind must be one of: statefulset, deployment." -}}
