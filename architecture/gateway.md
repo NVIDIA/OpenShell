@@ -94,6 +94,31 @@ authenticated sandbox ID with any sandbox ID or name resolved from the request.
 Supervisor control and relay streams require a matching sandbox principal before
 the gateway registers the session or bridges relay bytes.
 
+## HA Supervisor Ownership
+
+In multi-replica Kubernetes deployments, every gateway pod can accept client
+RPCs, but a sandbox supervisor maintains one active stream to one gateway
+replica at a time. The connected replica publishes a short-lived supervisor
+owner record in the shared Postgres object store with its replica id, peer DNS
+endpoint, supervisor instance id, and connection epoch. Heartbeats renew the
+record, and reconnects from the same supervisor instance with a newer epoch can
+supersede the previous owner before the TTL expires.
+
+Session-bound operations such as exec, TCP forwarding, file sync, and sandbox
+service routing first check the local session registry. If the supervisor is
+owned by another gateway replica, the serving gateway opens an internal
+`PeerRelay` stream to that owner and asks it to open the supervisor relay. This
+keeps client traffic working when a Kubernetes Service routes the client to a
+non-owner gateway pod. If a peer owner is stale or unreachable during a rollout,
+the serving gateway retries ownership lookup until the normal relay wait
+deadline.
+
+Gateway peer RPCs authenticate with Kubernetes ServiceAccount identity rather
+than a shared secret. Helm mounts a projected, pod-bound token with audience
+`openshell-gateway-peer`; the receiving gateway validates it through
+TokenReview, checks the live pod UID and chart selector labels, and authorizes
+only the internal peer relay method.
+
 ## API Surface
 
 The gateway API is organized around platform objects and operational streams:

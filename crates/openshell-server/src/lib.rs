@@ -41,6 +41,7 @@ mod sandbox_index;
 mod sandbox_watch;
 mod service_routing;
 mod ssh_sessions;
+mod supervisor_owner;
 pub mod supervisor_session;
 mod telemetry;
 #[cfg(any(test, feature = "test-support"))]
@@ -126,6 +127,12 @@ pub struct ServerState {
     /// query session state to surface supervisor readiness.
     pub supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
 
+    /// Stable identity for this gateway process.
+    pub replica_id: String,
+
+    /// Internal endpoint other gateway replicas can dial for peer RPCs.
+    pub peer_endpoint: Option<String>,
+
     /// OIDC JWKS cache for JWT validation. `None` when OIDC is not configured.
     pub oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
 
@@ -147,6 +154,9 @@ pub struct ServerState {
 
     /// Gateway-wide gRPC request rate limiter shared by every multiplex path.
     pub(crate) grpc_rate_limiter: Option<multiplex::GrpcRateLimiter>,
+
+    /// Optional K8s `ServiceAccount` authenticator for gateway peer RPCs.
+    pub peer_authenticator: Option<Arc<auth::peer::PeerServiceAccountAuthenticator>>,
 }
 
 fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
@@ -179,6 +189,8 @@ impl ServerState {
         supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
         oidc_cache: Option<Arc<auth::oidc::JwksCache>>,
     ) -> Self {
+        let replica_id = compute::lease::replica_id();
+        let peer_endpoint = derive_peer_endpoint(&config);
         let grpc_rate_limiter = multiplex::GrpcRateLimiter::from_config(&config);
         Self {
             config,
@@ -192,13 +204,44 @@ impl ServerState {
             ssh_connections_by_sandbox: Mutex::new(HashMap::new()),
             settings_mutex: tokio::sync::Mutex::new(()),
             supervisor_sessions,
+            replica_id,
+            peer_endpoint,
             oidc_cache,
             sandbox_jwt_issuer: None,
             sandbox_jwt_authenticator: None,
             k8s_sa_authenticator: None,
+            peer_authenticator: None,
             grpc_rate_limiter,
         }
     }
+}
+
+fn derive_peer_endpoint(config: &Config) -> Option<String> {
+    if let Ok(endpoint) = std::env::var("OPENSHELL_PEER_ENDPOINT")
+        && !endpoint.trim().is_empty()
+    {
+        return Some(endpoint.trim().to_string());
+    }
+
+    let pod_name = std::env::var("OPENSHELL_POD_NAME").ok()?;
+    let namespace = std::env::var("OPENSHELL_POD_NAMESPACE").ok()?;
+    let service = std::env::var("OPENSHELL_PEER_SERVICE_NAME").ok()?;
+    if pod_name.trim().is_empty() || namespace.trim().is_empty() || service.trim().is_empty() {
+        return None;
+    }
+
+    let scheme = if config.tls.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    Some(format!(
+        "{scheme}://{pod}.{service}.{namespace}.svc.cluster.local:{port}",
+        pod = pod_name.trim(),
+        service = service.trim(),
+        namespace = namespace.trim(),
+        port = config.bind_address.port()
+    ))
 }
 
 /// Run the `OpenShell` server.
@@ -358,6 +401,51 @@ pub(crate) async fn run_server(
                 "in-cluster K8s client construction failed; \
                  K8s ServiceAccount bootstrap is disabled"
             ),
+        }
+    }
+
+    if std::env::var_os("KUBERNETES_SERVICE_HOST").is_some() {
+        let namespace = std::env::var("OPENSHELL_POD_NAMESPACE").ok();
+        let service_account = std::env::var("OPENSHELL_SERVICE_ACCOUNT_NAME").ok();
+        match (namespace, service_account) {
+            (Some(namespace), Some(service_account))
+                if !namespace.trim().is_empty() && !service_account.trim().is_empty() =>
+            {
+                let required_labels =
+                    auth::peer::required_pod_labels_from_env().map_err(Error::config)?;
+                match kube::Client::try_default().await {
+                    Ok(client) => {
+                        let audience = auth::peer::peer_token_audience_from_env();
+                        let resolver = Arc::new(auth::peer::LiveGatewayPeerResolver::new(
+                            client,
+                            namespace.trim(),
+                            audience.clone(),
+                            service_account.trim().to_string(),
+                            required_labels,
+                        ));
+                        let authenticator =
+                            auth::peer::PeerServiceAccountAuthenticator::new(resolver);
+                        state.peer_authenticator = Some(Arc::new(authenticator));
+                        info!(
+                            namespace = %namespace.trim(),
+                            service_account = %service_account.trim(),
+                            audience,
+                            "gateway peer ServiceAccount TokenReview authentication enabled"
+                        );
+                    }
+                    Err(err) => warn!(
+                        error = %err,
+                        "in-cluster K8s client construction failed; \
+                         gateway peer ServiceAccount authentication is disabled"
+                    ),
+                }
+            }
+            _ => {
+                debug!(
+                    "OPENSHELL_POD_NAMESPACE or OPENSHELL_SERVICE_ACCOUNT_NAME missing; \
+                     gateway peer ServiceAccount authentication disabled"
+                );
+            }
         }
     }
 

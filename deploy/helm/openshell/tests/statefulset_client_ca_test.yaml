@@ -17,13 +17,13 @@ tests:
       certManager.enabled: false
     asserts:
       - equal:
-          path: spec.template.spec.volumes[3].name
+          path: spec.template.spec.volumes[4].name
           value: tls-client-ca
       - equal:
-          path: spec.template.spec.volumes[3].secret.secretName
+          path: spec.template.spec.volumes[4].secret.secretName
           value: openshell-server-tls
       - equal:
-          path: spec.template.spec.volumes[3].secret.items[0].key
+          path: spec.template.spec.volumes[4].secret.items[0].key
           value: ca.crt
 
   - it: shares the cert-manager server TLS ca.crt when clientCaFromServerTlsSecret is true
@@ -33,13 +33,13 @@ tests:
       certManager.clientCaFromServerTlsSecret: true
     asserts:
       - equal:
-          path: spec.template.spec.volumes[3].name
+          path: spec.template.spec.volumes[4].name
           value: tls-client-ca
       - equal:
-          path: spec.template.spec.volumes[3].secret.secretName
+          path: spec.template.spec.volumes[4].secret.secretName
           value: openshell-server-tls
       - equal:
-          path: spec.template.spec.volumes[3].secret.items[0].key
+          path: spec.template.spec.volumes[4].secret.items[0].key
           value: ca.crt
 
   # Regression: with cert-manager enabled and pkiInitJob left at its default
@@ -55,13 +55,13 @@ tests:
       pkiInitJob.enabled: true
     asserts:
       - equal:
-          path: spec.template.spec.volumes[3].name
+          path: spec.template.spec.volumes[4].name
           value: tls-client-ca
       - equal:
-          path: spec.template.spec.volumes[3].secret.secretName
+          path: spec.template.spec.volumes[4].secret.secretName
           value: openshell-server-client-ca
       - notExists:
-          path: spec.template.spec.volumes[3].secret.items
+          path: spec.template.spec.volumes[4].secret.items
 
   # When cert-manager owns TLS, does not share its CA, and no separate client CA
   # secret is configured, there is no client CA to mount: the volume must not
@@ -76,7 +76,7 @@ tests:
     asserts:
       - lengthEqual:
           path: spec.template.spec.volumes
-          count: 3
+          count: 4
       - notContains:
           path: spec.template.spec.containers[0].volumeMounts
           content:

@@ -185,6 +185,15 @@ service OpenShell {
   // no new TLS handshake, no reverse HTTP CONNECT.
   rpc RelayStream(stream RelayFrame) returns (stream RelayFrame);
 
+  // Internal gateway-to-gateway relay forwarding.
+  //
+  // A gateway replica that receives a user request for a sandbox whose
+  // supervisor session is owned by a different replica opens this stream to the
+  // owner. The first frame carries PeerRelayInit; subsequent frames carry raw
+  // bytes in either direction. This RPC is authenticated as a gateway peer, not
+  // as a user or sandbox supervisor.
+  rpc PeerRelay(stream PeerRelayFrame) returns (stream PeerRelayFrame);
+
   // Watch a sandbox and stream updates.
   //
   // This stream can include:
@@ -1430,6 +1439,9 @@ message SupervisorHello {
   string sandbox_id = 1;
   // Supervisor instance ID (e.g. boot id or process epoch).
   string instance_id = 2;
+  // Monotonic counter scoped to instance_id. Incremented for each reconnect so
+  // gateways can distinguish a fresh supervisor connection from stale cleanup.
+  uint64 connection_epoch = 3;
 }
 
 // Gateway accepts the supervisor session.
@@ -1495,6 +1507,25 @@ message RelayInit {
 message RelayFrame {
   oneof payload {
     RelayInit init = 1;
+    bytes data = 2;
+  }
+}
+
+// Initial frame for gateway peer relay forwarding.
+message PeerRelayInit {
+  // Stable sandbox UUID whose supervisor relay should be opened.
+  string sandbox_id = 1;
+  // Relay target to ask the owning gateway to open on its local supervisor
+  // session. The channel_id is assigned by the forwarding gateway.
+  RelayOpen relay_open = 2;
+  // Gateway replica id that initiated the peer relay.
+  string requester_replica_id = 3;
+}
+
+// A single frame on the gateway-to-gateway peer relay RPC.
+message PeerRelayFrame {
+  oneof payload {
+    PeerRelayInit init = 1;
     bytes data = 2;
   }
 }

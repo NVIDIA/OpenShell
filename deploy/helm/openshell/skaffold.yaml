@@ -143,3 +143,25 @@ profiles:
         path: /deploy/helm/releases/0/setValues
         value:
           server.disableTls: "false"
+  - name: high-availability
+    patches:
+      - op: add
+        path: /deploy/helm/releases/0/valuesFiles/-
+        value: ci/values-high-availability.yaml
+  - name: ha-envoy
+    patches:
+      - op: add
+        path: /deploy/helm/releases/0
+        value:
+          name: envoy-gateway
+          remoteChart: oci://docker.io/envoyproxy/gateway-helm
+          version: v1.7.2
+          namespace: envoy-gateway-system
+          createNamespace: true
+          wait: true
+      - op: add
+        path: /deploy/helm/releases/1/valuesFiles/-
+        value: ci/values-high-availability.yaml
+      - op: add
+        path: /deploy/helm/releases/1/valuesFiles/-
+        value: ci/values-gateway.yaml
