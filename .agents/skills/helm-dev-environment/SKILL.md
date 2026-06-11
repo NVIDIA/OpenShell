@@ -197,9 +197,9 @@ Service rather than `svc/openshell`. That keeps client traffic on the same path
 as a real reverse proxy while gateway pods rotate behind it:
 
 ```bash
-KUBECONFIG=kubeconfig kubectl -n envoy-gateway-system get svc \
+KUBECONFIG=kubeconfig kubectl get svc -A \
   -l gateway.envoyproxy.io/owning-gateway-name=openshell
-KUBECONFIG=kubeconfig kubectl -n envoy-gateway-system port-forward \
+KUBECONFIG=kubeconfig kubectl -n <envoy-service-namespace> port-forward \
   svc/<envoy-service-name> 8080:80
 openshell gateway add http://127.0.0.1:8080 --name openshell --local
 ```
@@ -215,10 +215,13 @@ The kube e2e wrapper creates only one port-forward, to `svc/openshell`; it no
 longer forwards the unauthenticated health listener or runs a `/readyz` e2e
 target. `/readyz` remains covered by server unit/integration tests.
 
-Use `mise run e2e:kubernetes:ha-rebalancing` for the HA rebalancing test. The
-test validates sandbox create/watch and exec across gateway scale-up, scale-down,
-and pod replacement. For reverse-proxy validation, run the HA deployment with the
-`ha-envoy` Skaffold profile and point the test client at the Envoy proxy Service.
+Use `mise run e2e:kubernetes:ha-rebalancing` for full-suite HA coverage. The
+task creates an external PostgreSQL fixture, installs Envoy Gateway, applies
+`deploy/kube/manifests/envoy-gateway-openshell.yaml`, enables the chart
+`GRPCRoute`, and runs the full Kubernetes e2e suite, including
+`kubernetes_ha_rebalancing`. That coverage validates sandbox create/watch and
+exec through the Envoy proxy while gateway replicas scale up, scale down, and
+rotate.
 
 If you reuse an existing Skaffold cluster for the full kube suite, make sure the
 cluster has the Docker Desktop host-gateway alias configured for host-gateway
