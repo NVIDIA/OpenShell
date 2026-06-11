@@ -78,7 +78,13 @@ const ANTHROPIC_PROTOCOLS: &[&str] = &["anthropic_messages", "model_discovery"];
 /// base-URL-override escape hatch path.
 const VERTEX_AI_PROTOCOLS: &[&str] = &["anthropic_messages", "model_discovery"];
 
-const AWS_BEDROCK_PROTOCOLS: &[&str] = &["aws_bedrock_invoke", "aws_bedrock_invoke_stream"];
+// `aws_bedrock_invoke_stream` (`/model/{id}/invoke-with-response-stream`) is
+// deferred to a follow-up alongside protocol-aware AWS event-stream error
+// handling: the shared streaming relay's truncation/timeout path injects
+// SSE-formatted error frames, which would corrupt downstream Bedrock
+// event-stream parsers. Until that lands, this profile advertises only
+// the buffered `InvokeModel` shape.
+const AWS_BEDROCK_PROTOCOLS: &[&str] = &["aws_bedrock_invoke"];
 
 static OPENAI_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
     provider_type: "openai",
@@ -171,9 +177,10 @@ static NVIDIA_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
 // which is deferred to a follow-up PR (see #1704 thread). Until then,
 // operators point `BEDROCK_BASE_URL` at a translating bridge or
 // Bedrock-compatible proxy that handles auth in its own pod. The router
-// passes Bedrock InvokeModel requests through opaquely; the L7 patterns
-// `/model/{modelId}/invoke` and `/model/{modelId}/invoke-with-response-stream`
-// are wired up in `crates/openshell-sandbox/src/l7/inference.rs`.
+// passes Bedrock `InvokeModel` requests through opaquely; the L7 pattern
+// `/model/{modelId}/invoke` is wired up in
+// `crates/openshell-sandbox/src/l7/inference.rs`. `InvokeModelWithResponseStream`
+// is deferred to the same follow-up that adds protocol-aware error framing.
 //
 // Note: `default_base_url` is intentionally an empty string. Without
 // `BEDROCK_BASE_URL` config, route resolution rejects the provider
@@ -371,7 +378,10 @@ mod tests {
     fn aws_bedrock_protocols_are_bedrock_specific() {
         let profile = profile_for("aws-bedrock").expect("profile registered");
         assert!(profile.protocols.contains(&"aws_bedrock_invoke"));
-        assert!(profile.protocols.contains(&"aws_bedrock_invoke_stream"));
+        // `aws_bedrock_invoke_stream` is deferred to the follow-up that adds
+        // protocol-aware AWS event-stream error framing; until then the
+        // profile advertises only the buffered `InvokeModel` shape.
+        assert!(!profile.protocols.contains(&"aws_bedrock_invoke_stream"));
     }
 
     #[test]

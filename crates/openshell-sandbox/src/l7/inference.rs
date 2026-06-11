@@ -114,30 +114,28 @@ pub fn default_patterns() -> Vec<InferenceApiPattern> {
             kind: "models_get".to_string(),
             framing: ResponseFraming::Buffered,
         },
-        // AWS Bedrock InvokeModel + InvokeModelWithResponseStream. The `*`
-        // segment is the Bedrock model id (e.g. `anthropic.claude-opus-4-7`).
+        // AWS Bedrock InvokeModel. The `*` segment is the Bedrock model id
+        // (e.g. `anthropic.claude-opus-4-7`).
         //
-        // Framing differs between the two endpoints. InvokeModel returns ONE
-        // JSON object the client decodes whole — it must be served buffered
-        // with an accurate `Content-Length`, otherwise the streaming proxy's
-        // size-cap or idle-timeout failure mode would append an SSE error
-        // event to bytes the caller decodes as one JSON object, silently
-        // corrupting it. InvokeModelWithResponseStream returns an
-        // AWS event-stream of binary chunks and must go through the
-        // streaming path so chunks reach the agent incrementally.
+        // InvokeModel returns ONE JSON object the client decodes whole — it
+        // must be served buffered with an accurate `Content-Length`, otherwise
+        // the streaming proxy's size-cap or idle-timeout failure mode would
+        // append an SSE error event to bytes the caller decodes as one JSON
+        // object, silently corrupting it.
+        //
+        // `InvokeModelWithResponseStream`
+        // (`/model/{id}/invoke-with-response-stream`) is deferred to a
+        // follow-up: Bedrock streams use AWS event-stream framing, but the
+        // shared streaming relay's truncation/timeout/upstream-error path
+        // emits SSE-formatted error frames, which would corrupt downstream
+        // event-stream parsers. The follow-up adds protocol-aware error
+        // termination before re-introducing the streaming pattern.
         InferenceApiPattern {
             method: "POST".to_string(),
             path_glob: "/model/*/invoke".to_string(),
             protocol: "aws_bedrock_invoke".to_string(),
             kind: "messages".to_string(),
             framing: ResponseFraming::Buffered,
-        },
-        InferenceApiPattern {
-            method: "POST".to_string(),
-            path_glob: "/model/*/invoke-with-response-stream".to_string(),
-            protocol: "aws_bedrock_invoke_stream".to_string(),
-            kind: "messages".to_string(),
-            framing: ResponseFraming::Streaming,
         },
     ]
 }
@@ -578,7 +576,7 @@ mod tests {
         for pattern in &patterns {
             let expected_buffered = matches!(
                 pattern.protocol.as_str(),
-                "model_discovery" | "openai_embeddings"
+                "model_discovery" | "openai_embeddings" | "aws_bedrock_invoke"
             );
             assert_eq!(
                 pattern.is_buffered(),
@@ -600,16 +598,34 @@ mod tests {
         assert_eq!(result.unwrap().kind, "messages");
     }
 
+    /// `InvokeModelWithResponseStream` is intentionally NOT advertised by
+    /// the default pattern set today. The shared streaming relay's
+    /// truncation/timeout/upstream-error path emits SSE-formatted error
+    /// frames, which would corrupt the AWS event-stream framing Bedrock
+    /// streams use. The pattern is restored alongside protocol-aware
+    /// error termination in a follow-up; until then, intercepted
+    /// `/invoke-with-response-stream` requests fall through to the
+    /// non-inference path rather than being mis-routed through the
+    /// SSE-injecting relay.
     #[test]
-    fn detect_aws_bedrock_invoke_stream() {
+    fn aws_bedrock_invoke_stream_pattern_is_deferred() {
         let patterns = default_patterns();
-        let result = detect_inference_pattern(
-            "POST",
-            "/model/anthropic.claude-opus-4-7/invoke-with-response-stream",
-            &patterns,
+        assert!(
+            detect_inference_pattern(
+                "POST",
+                "/model/anthropic.claude-opus-4-7/invoke-with-response-stream",
+                &patterns,
+            )
+            .is_none(),
+            "InvokeModelWithResponseStream must not be advertised until \
+             protocol-aware AWS event-stream error framing exists"
         );
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().protocol, "aws_bedrock_invoke_stream");
+        assert!(
+            !patterns
+                .iter()
+                .any(|p| p.protocol == "aws_bedrock_invoke_stream"),
+            "no pattern should declare protocol=aws_bedrock_invoke_stream"
+        );
     }
 
     #[test]
@@ -664,26 +680,6 @@ mod tests {
             invoke.is_buffered(),
             "InvokeModel must be Buffered (one JSON object, accurate Content-Length); \
              streaming would risk corrupting the response"
-        );
-    }
-
-    /// `InvokeModelWithResponseStream` returns an AWS event-stream of
-    /// binary chunks — must go through the streaming proxy so chunks
-    /// reach the agent incrementally.
-    #[test]
-    fn aws_bedrock_invoke_stream_is_streaming() {
-        let patterns = default_patterns();
-        let stream = detect_inference_pattern(
-            "POST",
-            "/model/anthropic.claude-opus-4-7/invoke-with-response-stream",
-            &patterns,
-        )
-        .expect("InvokeModelWithResponseStream pattern must match");
-        assert_eq!(stream.protocol, "aws_bedrock_invoke_stream");
-        assert!(
-            !stream.is_buffered(),
-            "InvokeModelWithResponseStream must be Streaming so the AWS \
-             event-stream chunks reach the agent incrementally"
         );
     }
 
