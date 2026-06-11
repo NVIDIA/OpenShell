@@ -3,6 +3,7 @@
 
 mod app;
 mod clipboard;
+mod edge_tunnel;
 mod event;
 pub mod theme;
 mod ui;
@@ -18,7 +19,9 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use miette::{IntoDiagnostic, Result};
-use openshell_bootstrap::{GatewayMetadata, list_gateways_with_source};
+use openshell_bootstrap::{
+    GatewayMetadata, edge_token::load_edge_token, list_gateways_with_source,
+};
 use openshell_core::auth::EdgeAuthInterceptor;
 use openshell_core::metadata::{ObjectId, ObjectLabels, ObjectName};
 use openshell_core::proto::SandboxPhase;
@@ -497,6 +500,7 @@ async fn handle_gateway_switch(app: &mut App) {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GatewayChannelMode {
     Oidc,
+    Edge,
     Plaintext,
     Mtls,
 }
@@ -504,6 +508,7 @@ enum GatewayChannelMode {
 fn gateway_channel_mode(meta: Option<&GatewayMetadata>, endpoint: &str) -> GatewayChannelMode {
     match meta.and_then(|m| m.auth_mode.as_deref()) {
         Some("oidc") => GatewayChannelMode::Oidc,
+        Some("cloudflare_jwt") => GatewayChannelMode::Edge,
         Some("plaintext") => GatewayChannelMode::Plaintext,
         _ if endpoint.starts_with("http://") => GatewayChannelMode::Plaintext,
         _ => GatewayChannelMode::Mtls,
@@ -536,6 +541,17 @@ async fn connect_to_gateway(name: &str, endpoint: &str) -> Result<(Channel, Edge
             let channel = build_oidc_channel(name, endpoint).await?;
             Ok((channel, interceptor))
         }
+        GatewayChannelMode::Edge => {
+            let token = load_edge_token(name).ok_or_else(|| {
+                miette::miette!(
+                    "No edge token for gateway '{name}'.\n\
+                     Authenticate with: openshell gateway login"
+                )
+            })?;
+            let interceptor = EdgeAuthInterceptor::new(None, Some(&token))?;
+            let channel = build_edge_channel(endpoint, &token).await?;
+            Ok((channel, interceptor))
+        }
         GatewayChannelMode::Plaintext => {
             let channel = build_plaintext_channel(endpoint).await?;
             Ok((channel, EdgeAuthInterceptor::noop()))
@@ -545,6 +561,14 @@ async fn connect_to_gateway(name: &str, endpoint: &str) -> Result<(Channel, Edge
             Ok((channel, EdgeAuthInterceptor::noop()))
         }
     }
+}
+
+async fn build_edge_channel(endpoint: &str, token: &str) -> Result<Channel> {
+    if endpoint.starts_with("https://") {
+        let proxy = edge_tunnel::start_tunnel_proxy(endpoint, token).await?;
+        return build_plaintext_channel(&format!("http://{}", proxy.local_addr)).await;
+    }
+    build_plaintext_channel(endpoint).await
 }
 
 async fn build_plaintext_channel(endpoint: &str) -> Result<Channel> {
@@ -2560,6 +2584,18 @@ mod tests {
         assert_eq!(
             gateway_channel_mode(Some(&meta), "https://gateway.example.com"),
             GatewayChannelMode::Plaintext
+        );
+    }
+
+    #[test]
+    fn gateway_channel_mode_prefers_edge_metadata() {
+        let meta = GatewayMetadata {
+            auth_mode: Some("cloudflare_jwt".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            gateway_channel_mode(Some(&meta), "https://gateway.example.com"),
+            GatewayChannelMode::Edge
         );
     }
 

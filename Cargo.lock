@@ -3821,6 +3821,7 @@ version = "0.0.0"
 dependencies = [
  "base64 0.22.1",
  "crossterm 0.28.1",
+ "futures",
  "miette",
  "openshell-bootstrap",
  "openshell-core",
@@ -3831,6 +3832,7 @@ dependencies = [
  "serde",
  "terminal-colorsaurus",
  "tokio",
+ "tokio-tungstenite 0.26.2",
  "tonic",
  "tracing",
  "url",
