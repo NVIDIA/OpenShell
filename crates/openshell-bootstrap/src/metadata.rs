@@ -243,17 +243,23 @@ fn read_nonempty_trimmed(path: &Path) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
+/// Load the per-user active gateway name from persistent storage.
+///
+/// Returns `None` if no user-scoped active gateway has been set.
+pub fn load_user_active_gateway() -> Option<String> {
+    user_active_gateway_path()
+        .ok()
+        .as_deref()
+        .and_then(read_nonempty_trimmed)
+}
+
 /// Load the active gateway name from persistent storage.
 ///
 /// Returns `None` if no active gateway has been set. Falls back to the
 /// system-level active gateway file when no per-user selection exists, so
 /// installer-provided defaults can take effect on a fresh system.
 pub fn load_active_gateway() -> Option<String> {
-    user_active_gateway_path()
-        .ok()
-        .as_deref()
-        .and_then(read_nonempty_trimmed)
-        .or_else(|| read_nonempty_trimmed(&system_active_gateway_path()))
+    load_user_active_gateway().or_else(|| read_nonempty_trimmed(&system_active_gateway_path()))
 }
 
 /// Save the last-used sandbox name for a gateway to persistent storage.
@@ -610,6 +616,15 @@ mod tests {
         .unwrap();
     }
 
+    #[test]
+    fn load_user_active_gateway_does_not_fall_back_to_system_dir() {
+        let user = tempfile::tempdir().unwrap();
+        let system = tempfile::tempdir().unwrap();
+        with_tmp_xdg_and_system(user.path(), system.path(), || {
+            std::fs::write(system.path().join("active_gateway"), "from-system").unwrap();
+            assert_eq!(load_user_active_gateway(), None);
+        });
+    }
     #[test]
     fn load_active_gateway_falls_back_to_system_dir() {
         let user = tempfile::tempdir().unwrap();

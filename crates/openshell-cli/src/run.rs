@@ -21,8 +21,8 @@ use miette::{IntoDiagnostic, Result, WrapErr, miette};
 use openshell_bootstrap::{
     GatewayMetadata, clear_active_gateway, clear_last_sandbox_if_matches,
     extract_host_from_ssh_destination, get_gateway_metadata, list_gateways, load_active_gateway,
-    remove_gateway_metadata, resolve_ssh_hostname, save_active_gateway, save_last_sandbox,
-    store_gateway_metadata,
+    load_user_active_gateway, remove_gateway_metadata, resolve_ssh_hostname, save_active_gateway,
+    save_last_sandbox, store_gateway_metadata,
 };
 use openshell_bootstrap::{
     GatewayMetadataSource, ListedGateway, gateway_metadata_source, list_gateways_with_source,
@@ -942,7 +942,8 @@ pub async fn gateway_add(
     // OIDC takes precedence over plaintext/mTLS/edge detection — the user
     // explicitly opted in with --oidc-issuer regardless of scheme.
     if let Some(issuer) = oidc_issuer {
-        let previous_active = load_active_gateway();
+        let previous_active = load_user_active_gateway();
+
         let metadata = GatewayMetadata {
             name: name.to_string(),
             gateway_endpoint: endpoint.clone(),
@@ -1133,7 +1134,8 @@ pub async fn gateway_add(
         eprintln!("{} TLS certificates present", "✓".green().bold());
     } else {
         // Cloud (edge-authenticated) gateway.
-        let previous_active = load_active_gateway();
+        let previous_active = load_user_active_gateway();
+
         let metadata = GatewayMetadata {
             name: name.to_string(),
             gateway_endpoint: endpoint.clone(),
@@ -7617,7 +7619,7 @@ mod tests {
 
     use openshell_bootstrap::{
         GatewayMetadata, GatewayMetadataSource, ListedGateway, load_active_gateway,
-        load_gateway_metadata, store_gateway_metadata,
+        load_gateway_metadata, load_user_active_gateway, store_gateway_metadata,
     };
     use openshell_core::progress::{
         PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX,
@@ -7678,6 +7680,22 @@ mod tests {
         );
         f();
         drop(guard);
+    }
+    fn with_tmp_xdg_and_system<F: FnOnce()>(tmp: &Path, system: &Path, f: F) {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let xdg_guard = EnvVarGuard::set(
+            "XDG_CONFIG_HOME",
+            tmp.to_str().expect("temp path should be utf-8"),
+        );
+        let system_guard = EnvVarGuard::set(
+            "OPENSHELL_SYSTEM_GATEWAY_DIR",
+            system.to_str().expect("system path should be utf-8"),
+        );
+        f();
+        drop(system_guard);
+        drop(xdg_guard);
     }
 
     fn edge_registration(name: &str, endpoint: &str) -> GatewayMetadata {
@@ -9073,6 +9091,46 @@ mod tests {
             );
         });
     }
+    #[test]
+    fn gateway_add_oidc_rollback_keeps_system_active_fallback_userless() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let user = tempfile::tempdir().expect("create user tmpdir");
+        let system = tempfile::tempdir().expect("create system tmpdir");
+        with_tmp_xdg_and_system(user.path(), system.path(), || {
+            fs::write(system.path().join("active_gateway"), "system-default")
+                .expect("write system active gateway");
+            assert_eq!(load_user_active_gateway(), None);
+            assert_eq!(load_active_gateway().as_deref(), Some("system-default"));
+
+            let runtime = tokio::runtime::Runtime::new().expect("create runtime");
+            runtime.block_on(async {
+                gateway_add(
+                    "https://gateway.example.com",
+                    Some("oidc-fail"),
+                    None,
+                    false,
+                    Some("http://127.0.0.1:1/realms/nonexistent"),
+                    "openshell-cli",
+                    None,
+                    None,
+                    false,
+                )
+                .await
+                .expect("gateway_add should not return Err on auth failure");
+            });
+
+            assert!(
+                load_gateway_metadata("oidc-fail").is_err(),
+                "failed OIDC gateway should be removed after auth failure"
+            );
+            assert_eq!(
+                load_user_active_gateway(),
+                None,
+                "rollback should not persist the system fallback into user config"
+            );
+            assert_eq!(load_active_gateway().as_deref(), Some("system-default"));
+        });
+    }
 
     #[test]
     fn gateway_add_cloud_rolls_back_on_auth_failure() {
@@ -9130,6 +9188,48 @@ mod tests {
                 Some("existing-gw"),
                 "active gateway should be restored after rollback"
             );
+        });
+    }
+    #[test]
+    fn gateway_add_cloud_rollback_keeps_system_active_fallback_userless() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let user = tempfile::tempdir().expect("create user tmpdir");
+        let system = tempfile::tempdir().expect("create system tmpdir");
+        with_tmp_xdg_and_system(user.path(), system.path(), || {
+            let _no_browser = EnvVarGuard::set("OPENSHELL_NO_BROWSER", "0");
+            let _browser_auth_failure = EnvVarGuard::set("OPENSHELL_TEST_BROWSER_AUTH_FAIL", "1");
+            fs::write(system.path().join("active_gateway"), "system-default")
+                .expect("write system active gateway");
+            assert_eq!(load_user_active_gateway(), None);
+            assert_eq!(load_active_gateway().as_deref(), Some("system-default"));
+
+            let runtime = tokio::runtime::Runtime::new().expect("create runtime");
+            runtime.block_on(async {
+                gateway_add(
+                    "https://127.0.0.1:1",
+                    Some("cloud-fail"),
+                    None,
+                    false,
+                    None,
+                    "openshell-cli",
+                    None,
+                    None,
+                    false,
+                )
+                .await
+                .expect("gateway_add should not return Err on auth failure");
+            });
+
+            assert!(
+                load_gateway_metadata("cloud-fail").is_err(),
+                "failed cloud gateway should be removed after auth failure"
+            );
+            assert_eq!(
+                load_user_active_gateway(),
+                None,
+                "rollback should not persist the system fallback into user config"
+            );
+            assert_eq!(load_active_gateway().as_deref(), Some("system-default"));
         });
     }
 }
