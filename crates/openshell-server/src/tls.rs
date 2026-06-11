@@ -349,47 +349,11 @@ fn tls_ocsf_ctx() -> SandboxContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tls_test_utils::{
+        generate_test_certs_with_ca, install_rustls_provider, write_test_file,
+    };
     use rcgen::{CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
-    use std::io::Write;
     use tokio::net::{TcpListener, TcpStream};
-
-    fn install_rustls_provider() {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    }
-
-    /// Generate test CA + server certs in `dir`, returning the CA cert and
-    /// keypair so callers can sign additional server or client certificates.
-    fn generate_test_certs_with_ca(dir: &Path) -> (rcgen::Certificate, KeyPair) {
-        let mut ca_params =
-            CertificateParams::new(Vec::<String>::new()).expect("failed to create CA params");
-        ca_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        ca_params
-            .distinguished_name
-            .push(rcgen::DnType::CommonName, "test-ca");
-        let ca_key = KeyPair::generate().expect("failed to generate CA key");
-        let ca_cert = ca_params
-            .self_signed(&ca_key)
-            .expect("failed to sign CA cert");
-
-        let server_params = CertificateParams::new(vec!["localhost".to_string()])
-            .expect("failed to create server params");
-        let server_key = KeyPair::generate().expect("failed to generate server key");
-        let server_cert = server_params
-            .signed_by(&server_key, &ca_cert, &ca_key)
-            .expect("failed to sign server cert");
-
-        let write_file = |name: &str, data: &[u8]| {
-            let path = dir.join(name);
-            File::create(&path)
-                .and_then(|mut file| file.write_all(data))
-                .expect("failed to write test file");
-        };
-        write_file("ca.pem", ca_cert.pem().as_bytes());
-        write_file("server-cert.pem", server_cert.pem().as_bytes());
-        write_file("server-key.pem", server_key.serialize_pem().as_bytes());
-
-        (ca_cert, ca_key)
-    }
 
     /// Generate a new server cert + key in `dir`, signed by the given CA.
     /// Overwrites `server-cert.pem` and `server-key.pem`.
@@ -401,14 +365,8 @@ mod tests {
             .signed_by(&server_key, ca_cert, ca_key)
             .expect("failed to sign server cert");
 
-        let write_file = |name: &str, data: &[u8]| {
-            let path = dir.join(name);
-            File::create(&path)
-                .and_then(|mut file| file.write_all(data))
-                .expect("failed to write test file");
-        };
-        write_file("server-cert.pem", server_cert.pem().as_bytes());
-        write_file("server-key.pem", server_key.serialize_pem().as_bytes());
+        write_test_file(dir, "server-cert.pem", server_cert.pem().as_bytes());
+        write_test_file(dir, "server-key.pem", server_key.serialize_pem().as_bytes());
     }
 
     fn build_test_client_config(ca_path: &Path) -> Arc<rustls::ClientConfig> {
@@ -489,7 +447,10 @@ mod tests {
         std::fs::write(dir.path().join("server-cert.pem"), b"garbage")
             .expect("failed to write garbage");
 
-        assert!(acceptor.reload().is_err(), "reload with garbage cert should fail");
+        assert!(
+            acceptor.reload().is_err(),
+            "reload with garbage cert should fail"
+        );
 
         // Old config must still be accessible after a failed reload.
         drop(acceptor_before);
@@ -566,7 +527,9 @@ mod tests {
         let reload_handle = tokio::spawn(async move {
             for _ in 0..20 {
                 generate_server_cert(&ca_cert, &ca_key, dir.path());
-                acceptor.reload().expect("reload with valid cert should succeed");
+                acceptor
+                    .reload()
+                    .expect("reload with valid cert should succeed");
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         });
@@ -618,9 +581,7 @@ mod tests {
                 .await
                 .expect("TLS accept failed");
         });
-        let tcp_1 = TcpStream::connect(addr1)
-            .await
-            .expect("connect failed");
+        let tcp_1 = TcpStream::connect(addr1).await.expect("connect failed");
         let tls_1 = connector
             .connect(server_name.clone(), tcp_1)
             .await
@@ -646,9 +607,7 @@ mod tests {
                 .await
                 .expect("TLS accept failed");
         });
-        let tcp_2 = TcpStream::connect(addr2)
-            .await
-            .expect("connect failed");
+        let tcp_2 = TcpStream::connect(addr2).await.expect("connect failed");
         let tls_2 = connector
             .connect(server_name.clone(), tcp_2)
             .await
@@ -807,36 +766,19 @@ mod tests {
         let new_ca_cert = new_ca_params
             .self_signed(&new_ca_key)
             .expect("failed to sign new CA cert");
-        std::fs::write(
-            dir.path().join("ca.pem"),
-            new_ca_cert.pem().as_bytes(),
-        )
-        .expect("failed to write new CA");
+        std::fs::write(dir.path().join("ca.pem"), new_ca_cert.pem().as_bytes())
+            .expect("failed to write new CA");
 
-        // Generate new server cert signed by new CA
-        let server_params = CertificateParams::new(vec!["localhost".to_string()])
-            .expect("failed to create server params");
-        let server_key = KeyPair::generate().expect("failed to generate server key");
-        let server_cert = server_params
-            .signed_by(&server_key, &new_ca_cert, &new_ca_key)
-            .expect("failed to sign server cert");
-        std::fs::write(
-            dir.path().join("server-cert.pem"),
-            server_cert.pem().as_bytes(),
-        )
-        .expect("failed to write server cert");
-        std::fs::write(
-            dir.path().join("server-key.pem"),
-            server_key.serialize_pem().as_bytes(),
-        )
-        .expect("failed to write server key");
-
-        acceptor.reload().expect("reload with new CA should succeed");
+        // Generate new server cert signed by new CA and reload
+        generate_server_cert(&new_ca_cert, &new_ca_key, dir.path());
+        acceptor
+            .reload()
+            .expect("reload with new CA should succeed");
 
         // Generate client cert signed by new CA, write to files
         let client_key = KeyPair::generate().expect("failed to generate client key");
-        let mut client_params = CertificateParams::new(Vec::<String>::new())
-            .expect("failed to create client params");
+        let mut client_params =
+            CertificateParams::new(Vec::<String>::new()).expect("failed to create client params");
         client_params
             .distinguished_name
             .push(rcgen::DnType::CommonName, "test-client");
