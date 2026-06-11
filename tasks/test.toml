@@ -94,6 +94,11 @@ description = "Run Kubernetes e2e with all database backend scenarios (SQLite an
 env = { OPENSHELL_E2E_KUBE_DB_SCENARIOS = "1" }
 run = "e2e/rust/e2e-kubernetes.sh"
 
+["e2e:kubernetes:ha-rebalancing"]
+description = "Run Kubernetes HA connection-rebalancing e2e against two gateway replicas and external PostgreSQL"
+env = { OPENSHELL_E2E_KUBE_EXTERNAL_POSTGRES_SECRET = "openshell-ha-pg", OPENSHELL_E2E_KUBE_EXTRA_VALUES = "deploy/helm/openshell/ci/values-high-availability.yaml", OPENSHELL_E2E_KUBE_TEST = "kubernetes_ha_rebalancing", OPENSHELL_E2E_KUBERNETES_FEATURES = "e2e,e2e-kubernetes" }
+run = "e2e/rust/e2e-kubernetes.sh"
+
 ["e2e:vm"]
 description = "Start openshell-gateway with the VM compute driver and run the cluster-agnostic smoke e2e"
 run = "e2e/rust/e2e-vm.sh"

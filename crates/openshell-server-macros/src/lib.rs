@@ -56,6 +56,7 @@ enum AuthMode {
     Sandbox,
     Bearer,
     Dual,
+    Peer,
 }
 
 #[derive(Clone, Copy)]
@@ -116,11 +117,11 @@ impl RpcAuth {
         };
 
         match mode {
-            AuthMode::Unauthenticated | AuthMode::Sandbox => {
+            AuthMode::Unauthenticated | AuthMode::Sandbox | AuthMode::Peer => {
                 if let Some(ref s) = scope {
                     return Err(Error::new(
                         s.span(),
-                        "`scope` is only valid for `auth = \"bearer\"` or `auth = \"dual\"` (sandbox principals don't carry scopes)",
+                        "`scope` is only valid for `auth = \"bearer\"` or `auth = \"dual\"`",
                     ));
                 }
                 if role.is_some() {
@@ -156,10 +157,11 @@ fn parse_auth_mode(value: &LitStr) -> Result<AuthMode> {
         "sandbox" => Ok(AuthMode::Sandbox),
         "bearer" => Ok(AuthMode::Bearer),
         "dual" => Ok(AuthMode::Dual),
+        "peer" => Ok(AuthMode::Peer),
         other => Err(Error::new(
             value.span(),
             format!(
-                "invalid auth mode `{other}`; expected one of `unauthenticated`, `sandbox`, `bearer`, `dual`"
+                "invalid auth mode `{other}`; expected one of `unauthenticated`, `sandbox`, `bearer`, `dual`, `peer`"
             ),
         )),
     }
@@ -290,6 +292,7 @@ fn expand(args: &AuthzArgs, item: &mut ItemImpl) -> Result<proc_macro2::TokenStr
             }
             AuthMode::Bearer => quote! { crate::auth::method_authz::AuthMode::Bearer },
             AuthMode::Dual => quote! { crate::auth::method_authz::AuthMode::Dual },
+            AuthMode::Peer => quote! { crate::auth::method_authz::AuthMode::Peer },
         };
 
         let scope_tokens = match &auth.scope {

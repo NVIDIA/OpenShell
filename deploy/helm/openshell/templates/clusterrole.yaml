@@ -8,8 +8,8 @@ metadata:
   labels:
     {{- include "openshell.labels" . | nindent 4 }}
 rules:
-  # Validate projected sandbox ServiceAccount tokens during the
-  # IssueSandboxToken bootstrap exchange.
+  # Validate projected ServiceAccount tokens during sandbox bootstrap and
+  # internal gateway peer authentication.
   - apiGroups:
       - authentication.k8s.io
     resources:

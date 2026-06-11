@@ -132,10 +132,9 @@ Common findings:
 helm -n openshell status openshell
 helm -n openshell get values openshell
 kubectl -n openshell get deployment,statefulset,pod,svc,pvc
-kubectl -n openshell logs deployment/openshell -c openshell-gateway --tail=200
-kubectl -n openshell logs statefulset/openshell -c openshell-gateway --tail=200
-kubectl -n openshell rollout status deployment/openshell
-kubectl -n openshell rollout status statefulset/openshell
+WORKLOAD="$(kubectl -n openshell get deployment openshell >/dev/null 2>&1 && echo deployment/openshell || echo statefulset/openshell)"
+kubectl -n openshell logs "${WORKLOAD}" -c openshell-gateway --tail=200
+kubectl -n openshell rollout status "${WORKLOAD}"
 ```
 
 Use the log and rollout commands for the workload kind that exists in the
@@ -152,6 +151,32 @@ kubectl -n openshell get secret openshell-ha-pg -o yaml
 kubectl -n openshell get deployment,service,pod -l app.kubernetes.io/name=openshell-e2e-postgres
 kubectl -n openshell logs deployment/openshell-e2e-postgres --tail=200
 ```
+
+For multi-replica gateway installs, supervisor and client session traffic may
+be served by a non-owner gateway replica and relayed to the current supervisor
+owner over the internal `PeerRelay` RPC. Check the headless peer Service,
+projected peer ServiceAccount token volume, and TokenReview RBAC:
+
+```bash
+kubectl -n openshell get svc openshell-peer -o wide
+kubectl -n openshell get endpoints openshell-peer
+kubectl -n openshell get pod -l app.kubernetes.io/instance=openshell \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{.spec.volumes[?(@.name=="gateway-peer-token")]}{"\n"}{.spec.containers[0].env[?(@.name=="OPENSHELL_PEER_SERVICE_ACCOUNT_TOKEN_FILE")]}{"\n"}{.spec.containers[0].env[?(@.name=="OPENSHELL_PEER_ENDPOINT")]}{"\n"}{end}'
+kubectl auth can-i create tokenreviews.authentication.k8s.io \
+  --as=system:serviceaccount:openshell:openshell
+kubectl auth can-i get pods -n openshell \
+  --as=system:serviceaccount:openshell:openshell
+kubectl -n openshell logs "${WORKLOAD}" --tail=200 | grep -E 'gateway peer|PeerRelay|supervisor owner|owner relay'
+```
+
+Expected gateway startup logs include
+`gateway peer ServiceAccount TokenReview authentication enabled`. If peer relay
+calls fail with `Unauthenticated`, verify the `gateway-peer-token` projected
+volume has audience `openshell-gateway-peer` and that the receiving gateway can
+create TokenReviews. If they fail with `PermissionDenied`, verify the gateway
+ServiceAccount name, release namespace, pod UID, and Helm selector labels match
+the live gateway pods. Deployment-backed gateway pods should also publish
+`OPENSHELL_PEER_ENDPOINT` from their pod IP.
 
 Check required Helm deployment secrets:
 
@@ -199,8 +224,8 @@ label, supervisor env vars `OPENSHELL_K8S_SA_TOKEN_FILE` and
 Check the image references currently used by the gateway deployment:
 
 ```bash
-kubectl -n openshell get deployment openshell -o jsonpath="{.spec.template.spec.containers[*].image}{\"\n\"}{.spec.template.spec.containers[*].env[?(@.name==\"OPENSHELL_SUPERVISOR_IMAGE\")].value}{\"\n\"}"
-kubectl -n openshell get statefulset openshell -o jsonpath="{.spec.template.spec.containers[*].image}{\"\n\"}{.spec.template.spec.containers[*].env[?(@.name==\"OPENSHELL_SUPERVISOR_IMAGE\")].value}{\"\n\"}"
+WORKLOAD="$(kubectl -n openshell get deployment openshell >/dev/null 2>&1 && echo deployment/openshell || echo statefulset/openshell)"
+kubectl -n openshell get "${WORKLOAD}" -o jsonpath="{.spec.template.spec.containers[*].image}{\"\n\"}{.spec.template.spec.containers[*].env[?(@.name==\"OPENSHELL_SUPERVISOR_IMAGE\")].value}{\"\n\"}"
 helm -n openshell get values openshell | grep -E 'repository|tag|supervisorImage|workload'
 ```
 
@@ -244,8 +269,8 @@ If the gateway is healthy but sandbox creation fails:
 ```bash
 kubectl -n openshell get pods
 kubectl -n openshell get events --sort-by=.lastTimestamp | tail -n 50
-kubectl -n openshell logs deployment/openshell -c openshell-gateway --tail=200
-kubectl -n openshell logs statefulset/openshell -c openshell-gateway --tail=200
+WORKLOAD="$(kubectl -n openshell get deployment openshell >/dev/null 2>&1 && echo deployment/openshell || echo statefulset/openshell)"
+kubectl -n openshell logs "${WORKLOAD}" -c openshell-gateway --tail=200
 ```
 
 Check the configured sandbox namespace:

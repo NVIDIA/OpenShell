@@ -66,10 +66,34 @@ generates mTLS secrets on first install. Envoy Gateway opt-in; see the Optional 
 
 The gateway Service uses ClusterIP. Access is via Envoy Gateway (port `8080`) or `kubectl port-forward`.
 
-**HA test deploy** (two gateway replicas + external PostgreSQL Secret): uncomment
-`#- ci/values-high-availability.yaml` in `deploy/helm/openshell/skaffold.yaml`,
-create the Secret named `openshell-ha-pg` with a `uri` key, then run
-`mise run helm:skaffold:run` or `mise run helm:skaffold:dev`.
+Skaffold profiles are available for HA and reverse-proxy development. Run these from
+`deploy/helm/openshell/`:
+
+```bash
+# Two gateway replicas + external PostgreSQL Secret.
+KUBECONFIG=../../../kubeconfig skaffold run -p high-availability
+
+# Two gateway replicas + Envoy Gateway + Gateway API route.
+KUBECONFIG=../../../kubeconfig skaffold run -p ha-envoy
+```
+
+The HA profiles expect a Secret named `openshell-ha-pg` in the `openshell`
+namespace with a `uri` key. For local manual testing, either create your own
+PostgreSQL Secret or use the e2e PostgreSQL fixture manifest in
+`e2e/kubernetes/postgres-fixture.yaml`.
+
+For the `ha-envoy` profile, return to the repository root and apply the
+GatewayClass and BackendTrafficPolicy manifest after Skaffold has installed
+Envoy Gateway:
+
+```bash
+KUBECONFIG=kubeconfig mise run helm:gateway:apply
+```
+
+The BackendTrafficPolicy disables Envoy request and stream-duration timeouts for
+OpenShell's `GRPCRoute`. Keep that policy in `deploy/kube/manifests/envoy-gateway-openshell.yaml`,
+not in the Helm chart; it is required for long-lived gRPC create/watch/exec/relay
+streams during gateway rollouts and scale events.
 
 ### TLS behaviour
 
@@ -139,23 +163,73 @@ but will point to a deleted cluster — safe to ignore or clean up manually.
 
 ## Optional Add-ons
 
-Each add-on requires uncommenting the corresponding `valuesFiles` entry in
-`deploy/helm/openshell/skaffold.yaml` before running `helm:skaffold:dev` or `helm:skaffold:run`.
+Some add-ons can be enabled by uncommenting values in `skaffold.yaml`, but prefer
+the dedicated Skaffold profiles when they exist. Profiles avoid leaving local
+manual edits in the worktree.
 
 ### Envoy Gateway (Gateway API / GRPCRoute)
 
-Envoy Gateway is already installed by Skaffold (the `envoy-gateway` Helm release in
-`skaffold.yaml`). To activate routing:
+Use the `ha-envoy` Skaffold profile for HA reverse-proxy testing:
 
-1. Uncomment `#- values-gateway.yaml` in `skaffold.yaml`
-2. Redeploy: `mise run helm:skaffold:run`
-3. Apply the GatewayClass: `mise run helm:gateway:apply`
-4. Access: `http://127.0.0.1:8080`
+```bash
+cd deploy/helm/openshell
+KUBECONFIG=../../../kubeconfig skaffold run -p ha-envoy
+cd ../../..
+KUBECONFIG=kubeconfig mise run helm:gateway:apply
+```
 
-`values-gateway.yaml` creates a `Gateway` (listener on port 80, class `eg`) and a
-`GRPCRoute` in the `openshell` namespace. Envoy Gateway provisions a LoadBalancer
-service for the proxy; klipper-lb binds it to hostPort 80, reachable via the
-`8080:80` load balancer port mapping.
+`values-gateway.yaml` creates a `Gateway` (listener on port 80, class `eg`) and
+`GRPCRoute` in the `openshell` namespace. The `ha-envoy` profile installs the
+Envoy Gateway Helm chart and layers both `values-high-availability.yaml` and
+`values-gateway.yaml` onto the OpenShell release.
+
+`deploy/kube/manifests/envoy-gateway-openshell.yaml` creates:
+
+- `GatewayClass/eg`
+- `BackendTrafficPolicy/openshell-grpc-timeouts`
+
+The Envoy Gateway proxy Service is usually exposed through the k3d load balancer
+at `http://127.0.0.1:8080`. If the cluster was created with a different
+`HELM_K3S_LB_HOST_PORT`, use that host port instead.
+
+For manual tests against an existing cluster, prefer forwarding the Envoy proxy
+Service rather than `svc/openshell`. That keeps client traffic on the same path
+as a real reverse proxy while gateway pods rotate behind it:
+
+```bash
+KUBECONFIG=kubeconfig kubectl -n envoy-gateway-system get svc \
+  -l gateway.envoyproxy.io/owning-gateway-name=openshell
+KUBECONFIG=kubeconfig kubectl -n envoy-gateway-system port-forward \
+  svc/<envoy-service-name> 8080:80
+openshell gateway add http://127.0.0.1:8080 --name openshell --local
+```
+
+When running e2e tests manually through Envoy, register gateway metadata (as
+above) instead of relying only on `OPENSHELL_GATEWAY_ENDPOINT`; some tests call
+`openshell gateway info` and expect metadata for the active gateway.
+
+### Kubernetes E2E Notes
+
+Use `mise run e2e:kubernetes` for the standard Helm-backed Kubernetes suite.
+The kube e2e wrapper creates only one port-forward, to `svc/openshell`; it no
+longer forwards the unauthenticated health listener or runs a `/readyz` e2e
+target. `/readyz` remains covered by server unit/integration tests.
+
+Use `mise run e2e:kubernetes:ha-rebalancing` for the HA rebalancing test. The
+test validates sandbox create/watch and exec across gateway scale-up, scale-down,
+and pod replacement. For reverse-proxy validation, run the HA deployment with the
+`ha-envoy` Skaffold profile and point the test client at the Envoy proxy Service.
+
+If you reuse an existing Skaffold cluster for the full kube suite, make sure the
+cluster has the Docker Desktop host-gateway alias configured for host-gateway
+tests. The e2e wrapper sets this on chart installs; manual reuse may require:
+
+```bash
+KUBECONFIG=kubeconfig helm upgrade openshell deploy/helm/openshell \
+  --namespace openshell --reuse-values \
+  --set server.hostGatewayIP=192.168.65.254 \
+  --wait --timeout 5m
+```
 
 ### Keycloak OIDC
 
@@ -226,6 +300,6 @@ mise run helm:k3s:status
 | `deploy/helm/openshell/ci/values-spire.yaml` | SPIFFE/SPIRE provider token grant overlay |
 | `deploy/helm/openshell/ci/values-spire-stack.yaml` | SPIRE hardened chart values for local dev |
 | `deploy/helm/openshell/ci/values-tls-disabled.yaml` | Lint-only: TLS + auth disabled (reverse-proxy edge termination) |
-| `deploy/kube/manifests/envoy-gateway-openshell.yaml` | GatewayClass for Envoy Gateway (`mise run helm:gateway:apply`) |
+| `deploy/kube/manifests/envoy-gateway-openshell.yaml` | GatewayClass and BackendTrafficPolicy for Envoy Gateway (`mise run helm:gateway:apply`) |
 | `tasks/scripts/helm-k3s-local.sh` | k3d cluster create/delete/start/stop/status |
 | `tasks/scripts/keycloak-k8s-setup.sh` | Keycloak deploy + realm import |
