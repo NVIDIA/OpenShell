@@ -4,7 +4,7 @@
 //! SSH connection and proxy utilities.
 
 use crate::tls::{TlsOptions, grpc_client};
-use miette::{IntoDiagnostic, Result, WrapErr};
+use miette::{IntoDiagnostic, Report, Result, WrapErr};
 #[cfg(unix)]
 use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
 use openshell_core::ObjectId;
@@ -18,6 +18,7 @@ use openshell_core::proto::{
 };
 use owo_colors::OwoColorize;
 use std::fs;
+use std::future::Future;
 use std::io::{IsTerminal, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -38,6 +39,9 @@ const FORWARD_LISTENER_PROBE_INTERVAL: Duration = Duration::from_millis(50);
 /// Per-attempt connect timeout, so one hung probe cannot consume the whole
 /// grace period.
 const FORWARD_LISTENER_CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
+
+const SYNC_RETRY_ATTEMPTS: usize = 4;
+const SYNC_RETRY_DELAY: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug)]
 pub enum Editor {
@@ -587,6 +591,7 @@ pub(crate) async fn sandbox_exec_without_exec(
 }
 
 /// What to pack into the tar archive streamed to the sandbox.
+#[derive(Clone)]
 enum UploadSource {
     /// A single local file or directory.  `tar_name` controls the entry name
     /// inside the archive (e.g. the target basename for file-to-file uploads).
@@ -952,17 +957,15 @@ pub async fn sandbox_sync_up_files(
     if files.is_empty() {
         return Ok(());
     }
-    ssh_tar_upload(
-        server,
-        name,
-        dest,
-        UploadSource::FileList {
-            base_dir: base_dir.to_path_buf(),
-            files: files.to_vec(),
-            archive_prefix: file_list_archive_prefix(local_path),
-        },
-        tls,
-    )
+    let source = UploadSource::FileList {
+        base_dir: base_dir.to_path_buf(),
+        files: files.to_vec(),
+        archive_prefix: file_list_archive_prefix(local_path),
+    };
+    retry_sandbox_sync("upload", || {
+        let source = source.clone();
+        async move { ssh_tar_upload(server, name, dest, source, tls).await }
+    })
     .await
 }
 
@@ -996,16 +999,14 @@ pub async fn sandbox_sync_up(
     {
         let (parent, target_name) = split_sandbox_path(path);
         if parent != "/" {
-            return ssh_tar_upload(
-                server,
-                name,
-                Some(parent),
-                UploadSource::SinglePath {
-                    local_path: local_path.to_path_buf(),
-                    tar_name: target_name.into(),
-                },
-                tls,
-            )
+            let source = UploadSource::SinglePath {
+                local_path: local_path.to_path_buf(),
+                tar_name: target_name.into(),
+            };
+            return retry_sandbox_sync("upload", || {
+                let source = source.clone();
+                async move { ssh_tar_upload(server, name, Some(parent), source, tls).await }
+            })
             .await;
         }
     }
@@ -1023,16 +1024,14 @@ pub async fn sandbox_sync_up(
         directory_upload_prefix(local_path)
     };
 
-    ssh_tar_upload(
-        server,
-        name,
-        sandbox_path,
-        UploadSource::SinglePath {
-            local_path: local_path.to_path_buf(),
-            tar_name,
-        },
-        tls,
-    )
+    let source = UploadSource::SinglePath {
+        local_path: local_path.to_path_buf(),
+        tar_name,
+    };
+    retry_sandbox_sync("upload", || {
+        let source = source.clone();
+        async move { ssh_tar_upload(server, name, sandbox_path, source, tls).await }
+    })
     .await
 }
 
@@ -1140,6 +1139,19 @@ pub async fn sandbox_sync_down(
     dest: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
+    retry_sandbox_sync("download", || async {
+        sandbox_sync_down_once(server, name, sandbox_path, dest, tls).await
+    })
+    .await
+}
+
+async fn sandbox_sync_down_once(
+    server: &str,
+    name: &str,
+    sandbox_path: &str,
+    dest: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
     let sandbox_path = validate_sandbox_source_path(sandbox_path)?;
     let session = ssh_session_config(server, name, tls).await?;
     let sandbox_path = resolve_sandbox_source_path(&session, &sandbox_path).await?;
@@ -1151,6 +1163,50 @@ pub async fn sandbox_sync_down(
             sandbox_sync_down_directory(&session, &sandbox_path, dest).await
         }
     }
+}
+
+async fn retry_sandbox_sync<F, Fut>(operation: &str, mut run: F) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    let mut attempt = 1;
+    loop {
+        match run().await {
+            Ok(()) => return Ok(()),
+            Err(err) if attempt < SYNC_RETRY_ATTEMPTS && sync_error_is_retryable(&err) => {
+                tracing::warn!(
+                    operation,
+                    attempt,
+                    max_attempts = SYNC_RETRY_ATTEMPTS,
+                    error = %err,
+                    "sandbox sync operation failed; retrying"
+                );
+                tokio::time::sleep(SYNC_RETRY_DELAY).await;
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn sync_error_is_retryable(err: &Report) -> bool {
+    let message = format!("{err:?}").to_ascii_lowercase();
+    [
+        "broken pipe",
+        "connection",
+        "early eof",
+        "http2",
+        "h2 protocol",
+        "transport error",
+        "unexpected eof",
+        "unavailable",
+        "ssh tar create exited",
+        "ssh tar extract exited",
+        "failed to extract tar archive from sandbox",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
 }
 
 /// Stream a tar archive from the sandbox and extract it into a fresh
@@ -1652,6 +1708,18 @@ mod tests {
         assert!(output.contains("LogLevel ERROR"));
         assert!(output.contains("Host other"));
         assert_eq!(output.matches("Host openshell-demo").count(), 1);
+    }
+
+    #[test]
+    fn sync_error_retry_filter_accepts_transport_failures() {
+        let err = miette::miette!("transport error: connection reset by peer");
+        assert!(sync_error_is_retryable(&err));
+    }
+
+    #[test]
+    fn sync_error_retry_filter_rejects_validation_failures() {
+        let err = miette::miette!("sandbox source path '/etc/passwd' resolves outside /sandbox");
+        assert!(!sync_error_is_retryable(&err));
     }
 
     #[test]
