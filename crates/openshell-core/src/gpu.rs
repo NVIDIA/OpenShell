@@ -63,6 +63,47 @@ pub fn cdi_gpu_device_ids(
     }
 }
 
+/// Validate a compute-driver GPU request against driver-owned specific devices.
+///
+/// Drivers call this when a sandbox request combines portable GPU requirements
+/// with exact device identifiers in `driver_config`.
+///
+/// # Errors
+/// Returns an error when the sandbox GPU request is absent or when `gpu.count`
+/// does not equal the number of specific devices. A single exact device is
+/// compatible with the default sandbox GPU request where `gpu.count` is absent.
+pub fn validate_specific_gpu_device_request(
+    gpu: Option<&DriverGpuResourceRequirements>,
+    specific_devices: &[String],
+    driver_config_field: &str,
+) -> Result<(), String> {
+    let device_count = specific_devices.len();
+    if device_count == 0 {
+        return Ok(());
+    }
+
+    let Some(gpu) = gpu else {
+        return Err(format!("{driver_config_field} requires a gpu request"));
+    };
+
+    let Some(count) = gpu.count else {
+        if device_count == 1 {
+            return Ok(());
+        }
+        return Err(format!(
+            "{driver_config_field} requires an explicit gpu count matching its length ({device_count})"
+        ));
+    };
+
+    if usize::try_from(count).ok() != Some(device_count) {
+        return Err(format!(
+            "gpu count ({count}) must match {driver_config_field} length ({device_count})"
+        ));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,6 +139,94 @@ mod tests {
                 "nvidia.com/gpu=0".to_string(),
                 "nvidia.com/gpu=1".to_string()
             ])
+        );
+    }
+
+    #[test]
+    fn validate_specific_gpu_device_request_ignores_empty_devices() {
+        validate_specific_gpu_device_request(None, &[], "driver_config.cdi_devices")
+            .expect("empty exact device lists should not be validated");
+    }
+
+    #[test]
+    fn validate_specific_gpu_device_request_accepts_matching_count() {
+        let gpu = DriverGpuResourceRequirements { count: Some(2) };
+        let specific_devices = vec![
+            "nvidia.com/gpu=0".to_string(),
+            "nvidia.com/gpu=1".to_string(),
+        ];
+
+        validate_specific_gpu_device_request(
+            Some(&gpu),
+            &specific_devices,
+            "driver_config.cdi_devices",
+        )
+        .expect("matching count should be accepted");
+    }
+
+    #[test]
+    fn validate_specific_gpu_device_request_accepts_missing_count_for_one_device() {
+        let gpu = DriverGpuResourceRequirements { count: None };
+        let specific_devices = vec!["nvidia.com/gpu=0".to_string()];
+
+        validate_specific_gpu_device_request(
+            Some(&gpu),
+            &specific_devices,
+            "driver_config.cdi_devices",
+        )
+        .expect("single exact device should be compatible with a default GPU request");
+    }
+
+    #[test]
+    fn validate_specific_gpu_device_request_rejects_missing_gpu_request() {
+        let specific_devices = vec!["nvidia.com/gpu=0".to_string()];
+
+        let err = validate_specific_gpu_device_request(
+            None,
+            &specific_devices,
+            "driver_config.cdi_devices",
+        )
+        .expect_err("missing GPU request should be rejected");
+
+        assert_eq!(err, "driver_config.cdi_devices requires a gpu request");
+    }
+
+    #[test]
+    fn validate_specific_gpu_device_request_rejects_missing_count_for_multiple_devices() {
+        let gpu = DriverGpuResourceRequirements { count: None };
+        let specific_devices = vec![
+            "nvidia.com/gpu=0".to_string(),
+            "nvidia.com/gpu=1".to_string(),
+        ];
+
+        let err = validate_specific_gpu_device_request(
+            Some(&gpu),
+            &specific_devices,
+            "driver_config.cdi_devices",
+        )
+        .expect_err("missing count should be rejected for multiple devices");
+
+        assert_eq!(
+            err,
+            "driver_config.cdi_devices requires an explicit gpu count matching its length (2)"
+        );
+    }
+
+    #[test]
+    fn validate_specific_gpu_device_request_rejects_mismatch() {
+        let gpu = DriverGpuResourceRequirements { count: Some(2) };
+        let specific_devices = vec!["nvidia.com/gpu=0".to_string()];
+
+        let err = validate_specific_gpu_device_request(
+            Some(&gpu),
+            &specific_devices,
+            "driver_config.cdi_devices",
+        )
+        .expect_err("mismatched count should be rejected");
+
+        assert_eq!(
+            err,
+            "gpu count (2) must match driver_config.cdi_devices length (1)"
         );
     }
 }

@@ -27,7 +27,9 @@ use openshell_core::driver_utils::{
     LABEL_MANAGED_BY, LABEL_MANAGED_BY_VALUE, LABEL_SANDBOX_ID, LABEL_SANDBOX_NAME,
     LABEL_SANDBOX_NAMESPACE, SUPERVISOR_IMAGE_BINARY_PATH, supervisor_image_should_refresh,
 };
-use openshell_core::gpu::{cdi_gpu_device_ids, driver_gpu_requirements};
+use openshell_core::gpu::{
+    cdi_gpu_device_ids, driver_gpu_requirements, validate_specific_gpu_device_request,
+};
 use openshell_core::progress::{
     PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX, PROGRESS_STEP_STARTING_SANDBOX,
     format_bytes, mark_progress_active, mark_progress_complete, mark_progress_detail,
@@ -514,23 +516,25 @@ impl DockerComputeDriver {
         supports_gpu: bool,
         driver_config: &DockerSandboxDriverConfig,
     ) -> Result<(), Status> {
-        if gpu_requirements.is_none() && driver_config.cdi_devices.is_some() {
-            return Err(Status::invalid_argument(
-                "driver_config.cdi_devices requires gpu=true",
-            ));
-        }
-
-        if gpu_requirements.and_then(|gpu| gpu.count).is_some() {
-            return Err(Status::invalid_argument(
-                "docker GPU count requests are not supported; use --gpu without a count or driver_config.cdi_devices",
-            ));
-        }
-
         if gpu_requirements.is_some() && !supports_gpu {
             return Err(Status::failed_precondition(
                 "docker GPU sandboxes require Docker CDI support. Enable CDI on the Docker daemon, then restart the OpenShell gateway/server so GPU capability is detected.",
             ));
         }
+
+        if let Some(cdi_devices) = driver_config.cdi_devices.as_deref() {
+            validate_specific_gpu_device_request(
+                gpu_requirements,
+                cdi_devices,
+                "driver_config.cdi_devices",
+            )
+            .map_err(Status::invalid_argument)?;
+        } else if gpu_requirements.and_then(|gpu| gpu.count).is_some() {
+            return Err(Status::invalid_argument(
+                "docker GPU count requests are not supported; use --gpu without a count or driver_config.cdi_devices",
+            ));
+        }
+
         Ok(())
     }
 
@@ -2129,11 +2133,12 @@ fn build_device_requests(sandbox: &DriverSandbox) -> Result<Option<Vec<DeviceReq
         .cdi_devices
         .unwrap_or_default();
     let gpu_requirements = driver_gpu_requirements(spec.resource_requirements.as_ref());
-    if gpu_requirements.is_none() && !cdi_devices.is_empty() {
-        return Err(Status::invalid_argument(
-            "driver_config.cdi_devices requires gpu=true",
-        ));
-    }
+    validate_specific_gpu_device_request(
+        gpu_requirements,
+        &cdi_devices,
+        "driver_config.cdi_devices",
+    )
+    .map_err(Status::invalid_argument)?;
 
     Ok(
         cdi_gpu_device_ids(gpu_requirements, &cdi_devices).map(|device_ids| {
