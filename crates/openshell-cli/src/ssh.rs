@@ -1198,9 +1198,13 @@ fn sync_error_is_retryable(err: &Report) -> bool {
         "early eof",
         "http2",
         "h2 protocol",
+        "reset before headers",
+        "service is currently unavailable",
         "transport error",
         "unexpected eof",
         "unavailable",
+        "upstream connect error",
+        "ssh probe exited with status exit status: 255",
         "ssh tar create exited",
         "ssh tar extract exited",
         "failed to extract tar archive from sandbox",
@@ -1713,6 +1717,16 @@ mod tests {
     #[test]
     fn sync_error_retry_filter_accepts_transport_failures() {
         let err = miette::miette!("transport error: connection reset by peer");
+        assert!(sync_error_is_retryable(&err));
+    }
+
+    #[test]
+    fn sync_error_retry_filter_accepts_transient_ssh_probe_failures() {
+        let err = Err::<(), _>(miette::miette!(
+            "ssh probe exited with status exit status: 255"
+        ))
+        .wrap_err("failed to resolve sandbox source path '/sandbox/ha-sync/ha-sync-upload'")
+        .unwrap_err();
         assert!(sync_error_is_retryable(&err));
     }
 
