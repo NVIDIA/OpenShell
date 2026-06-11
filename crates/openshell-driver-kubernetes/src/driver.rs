@@ -401,6 +401,7 @@ impl KubernetesComputeDriver {
             supervisor_image_pull_policy: &self.config.supervisor_image_pull_policy,
             supervisor_sideload_method: self.config.supervisor_sideload_method,
             service_account_name: &self.config.service_account_name,
+            automount_service_account_token: self.config.automount_service_account_token,
             sandbox_id: &sandbox.id,
             sandbox_name: &sandbox.name,
             grpc_endpoint: &self.config.grpc_endpoint,
@@ -1119,6 +1120,7 @@ struct SandboxPodParams<'a> {
     supervisor_image_pull_policy: &'a str,
     supervisor_sideload_method: SupervisorSideloadMethod,
     service_account_name: &'a str,
+    automount_service_account_token: bool,
     sandbox_id: &'a str,
     sandbox_name: &'a str,
     grpc_endpoint: &'a str,
@@ -1146,6 +1148,7 @@ impl Default for SandboxPodParams<'_> {
             supervisor_image_pull_policy: "",
             supervisor_sideload_method: SupervisorSideloadMethod::default(),
             service_account_name: DEFAULT_SANDBOX_SERVICE_ACCOUNT_NAME,
+            automount_service_account_token: false,
             sandbox_id: "",
             sandbox_name: "",
             grpc_endpoint: "",
@@ -1354,11 +1357,9 @@ fn sandbox_template_to_k8s(
         );
     }
 
-    // Disable service account token auto-mounting for security hardening.
-    // Sandbox pods should not have access to the Kubernetes API by default.
     spec.insert(
         "automountServiceAccountToken".to_string(),
-        serde_json::json!(false),
+        serde_json::json!(params.automount_service_account_token),
     );
 
     let mut container = serde_json::Map::new();
@@ -3102,6 +3103,27 @@ mod tests {
             pod_template["spec"]["automountServiceAccountToken"],
             serde_json::json!(false),
             "explicit service account selection must not re-enable default token automounting"
+        );
+    }
+
+    #[test]
+    fn sandbox_template_can_enable_service_account_token_automount() {
+        let params = SandboxPodParams {
+            automount_service_account_token: true,
+            ..Default::default()
+        };
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            &std::collections::HashMap::new(),
+            true,
+            &params,
+        );
+
+        assert_eq!(
+            pod_template["spec"]["automountServiceAccountToken"],
+            serde_json::json!(true),
+            "operators can opt sandboxes into Kubernetes API credentials"
         );
     }
 

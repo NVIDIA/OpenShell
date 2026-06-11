@@ -38,6 +38,9 @@ struct Args {
     )]
     sandbox_service_account: String,
 
+    #[arg(long, env = "OPENSHELL_K8S_AUTOMOUNT_SERVICE_ACCOUNT_TOKEN")]
+    automount_service_account_token: bool,
+
     #[arg(long, env = "OPENSHELL_SANDBOX_IMAGE")]
     sandbox_image: Option<String>,
 
@@ -109,6 +112,7 @@ async fn main() -> Result<()> {
     let driver = KubernetesComputeDriver::new(KubernetesComputeConfig {
         namespace: args.sandbox_namespace,
         service_account_name: args.sandbox_service_account,
+        automount_service_account_token: args.automount_service_account_token,
         default_image: args.sandbox_image.unwrap_or_default(),
         image_pull_policy: args.sandbox_image_pull_policy.unwrap_or_default(),
         image_pull_secrets: args.sandbox_image_pull_secrets,

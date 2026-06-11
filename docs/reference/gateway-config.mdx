@@ -91,6 +91,7 @@ default_image           = "ghcr.io/nvidia/openshell/sandbox:latest"
 supervisor_image        = "ghcr.io/nvidia/openshell/supervisor:latest"
 client_tls_secret_name  = "openshell-client-tls"
 service_account_name    = "openshell-sandbox"
+automount_service_account_token = false
 host_gateway_ip         = "10.0.0.1"
 enable_user_namespaces  = false
 sa_token_ttl_secs       = 3600
@@ -169,6 +170,7 @@ client_ca_path = "/etc/openshell-tls/client-ca/ca.crt"
 [openshell.drivers.kubernetes]
 namespace                      = "agents"
 service_account_name           = "openshell-sandbox"
+automount_service_account_token = false
 default_image                  = "ghcr.io/nvidia/openshell/sandbox:latest"
 image_pull_policy              = "IfNotPresent"
 image_pull_secrets             = ["regcred"]
