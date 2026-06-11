@@ -1140,6 +1140,9 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                     if e.graphql_max_body_bytes > 0 {
                         ep["graphql_max_body_bytes"] = e.graphql_max_body_bytes.into();
                     }
+                    if e.json_rpc_max_body_bytes > 0 {
+                        ep["json_rpc_max_body_bytes"] = e.json_rpc_max_body_bytes.into();
+                    }
                     ep
                 })
                 .collect();

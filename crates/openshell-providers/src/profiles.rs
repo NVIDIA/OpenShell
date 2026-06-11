@@ -200,6 +200,8 @@ pub struct EndpointProfile {
     pub graphql_persisted_queries: HashMap<String, GraphqlOperationProfile>,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub graphql_max_body_bytes: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub json_rpc_max_body_bytes: u32,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub path: String,
 }
@@ -743,6 +745,7 @@ fn endpoint_to_proto(endpoint: &EndpointProfile) -> NetworkEndpoint {
             .map(|(name, operation)| (name.clone(), graphql_operation_to_proto(operation)))
             .collect(),
         graphql_max_body_bytes: endpoint.graphql_max_body_bytes,
+        json_rpc_max_body_bytes: endpoint.json_rpc_max_body_bytes,
         path: endpoint.path.clone(),
     }
 }
@@ -773,6 +776,7 @@ fn endpoint_from_proto(endpoint: &NetworkEndpoint) -> EndpointProfile {
             .map(|(name, operation)| (name.clone(), graphql_operation_from_proto(operation)))
             .collect(),
         graphql_max_body_bytes: endpoint.graphql_max_body_bytes,
+        json_rpc_max_body_bytes: endpoint.json_rpc_max_body_bytes,
         path: endpoint.path.clone(),
     }
 }

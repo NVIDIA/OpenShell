@@ -128,6 +128,9 @@ message NetworkEndpoint {
   // Advisor-proposed endpoints must not satisfy exact-host SSRF trust unless
   // they are converted through an explicit user-authored policy path.
   bool advisor_proposed = 18;
+  // Maximum JSON-RPC-over-HTTP request body bytes to buffer for inspection.
+  // Defaults to 65536 when unset.
+  uint32 json_rpc_max_body_bytes = 19;
 }
 
 // Trusted GraphQL operation classification.

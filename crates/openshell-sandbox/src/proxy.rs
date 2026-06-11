@@ -3412,7 +3412,7 @@ async fn handle_forward_proxy(
             let body = match crate::l7::http::read_body_for_inspection(
                 client,
                 &mut jsonrpc_request,
-                64 * 1024,
+                l7_config.config.json_rpc_max_body_bytes,
             )
             .await
             {
@@ -4142,6 +4142,7 @@ mod tests {
             tls: crate::l7::TlsMode::Auto,
             enforcement: crate::l7::EnforcementMode::Enforce,
             graphql_max_body_bytes: crate::l7::graphql::DEFAULT_MAX_BODY_BYTES,
+            json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
             allow_encoded_slash: false,
             websocket_credential_rewrite,
             request_body_credential_rewrite: false,
@@ -4741,6 +4742,7 @@ network_policies:
                     tls: crate::l7::TlsMode::Auto,
                     enforcement: crate::l7::EnforcementMode::Enforce,
                     graphql_max_body_bytes: crate::l7::graphql::DEFAULT_MAX_BODY_BYTES,
+                    json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
                     allow_encoded_slash: false,
                     websocket_credential_rewrite: false,
                     request_body_credential_rewrite: false,
@@ -4754,6 +4756,7 @@ network_policies:
                     tls: crate::l7::TlsMode::Auto,
                     enforcement: crate::l7::EnforcementMode::Enforce,
                     graphql_max_body_bytes: crate::l7::graphql::DEFAULT_MAX_BODY_BYTES,
+                    json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
                     allow_encoded_slash: false,
                     websocket_credential_rewrite: false,
                     request_body_credential_rewrite: false,

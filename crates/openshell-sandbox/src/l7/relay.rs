@@ -906,7 +906,7 @@ where
 
         let parsed = match crate::l7::jsonrpc::parse_jsonrpc_http_request(
             client,
-            64 * 1024,
+            config.json_rpc_max_body_bytes,
             crate::l7::path::CanonicalizeOptions {
                 allow_encoded_slash: config.allow_encoded_slash,
                 ..Default::default()
@@ -1993,6 +1993,7 @@ network_policies:
             tls: crate::l7::TlsMode::Auto,
             enforcement: EnforcementMode::Enforce,
             graphql_max_body_bytes: 0,
+            json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
             allow_encoded_slash: false,
             websocket_credential_rewrite: true,
             request_body_credential_rewrite: false,
@@ -2096,6 +2097,7 @@ network_policies:
             tls: crate::l7::TlsMode::Auto,
             enforcement: EnforcementMode::Enforce,
             graphql_max_body_bytes: 0,
+            json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
             allow_encoded_slash: false,
             websocket_credential_rewrite: true,
             request_body_credential_rewrite: false,
@@ -2216,6 +2218,7 @@ network_policies:
             tls: crate::l7::TlsMode::Auto,
             enforcement: EnforcementMode::Enforce,
             graphql_max_body_bytes: 0,
+            json_rpc_max_body_bytes: crate::l7::jsonrpc::DEFAULT_MAX_BODY_BYTES,
             allow_encoded_slash: false,
             websocket_credential_rewrite: true,
             request_body_credential_rewrite: false,
