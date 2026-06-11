@@ -1,0 +1,162 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Sync Docs Website
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: "Whether to sync or remove a docs snapshot"
+        required: true
+        default: sync
+        type: choice
+        options:
+          - sync
+          - remove
+      channel:
+        description: "Docs channel to update or remove"
+        required: true
+        type: choice
+        options:
+          - dev
+          - latest
+          - version
+      source_ref:
+        description: "Source commit SHA, branch, or tag to snapshot when operation=sync"
+        required: false
+        type: string
+      version_slug:
+        description: "Version slug when channel=version, e.g. v0.0.36"
+        required: false
+        type: string
+      display_name:
+        description: "Optional version selector display name"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: docs-website
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout automation
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          path: automation
+
+      - name: Validate inputs
+        # Pass dispatch inputs through env vars rather than interpolating
+        # ${{ inputs.* }} directly into the script. source_ref/version_slug are
+        # free-form strings, so inlining them would allow shell injection into
+        # the runner (e.g. version_slug = "$(...)"). Quoted env vars are inert.
+        env:
+          OPERATION: ${{ inputs.operation }}
+          CHANNEL: ${{ inputs.channel }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+          VERSION_SLUG: ${{ inputs.version_slug }}
+        run: |
+          set -euo pipefail
+          if [[ "$OPERATION" == "sync" && -z "$SOURCE_REF" ]]; then
+            echo "source_ref is required when operation=sync" >&2
+            exit 1
+          fi
+          if [[ "$CHANNEL" == "version" && -z "$VERSION_SLUG" ]]; then
+            echo "version_slug is required when channel=version" >&2
+            exit 1
+          fi
+
+      - name: Checkout source docs
+        if: ${{ inputs.operation == 'sync' }}
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ inputs.source_ref }}
+          fetch-depth: 0
+          path: source
+
+      - name: Checkout docs website branch
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: docs-website
+          fetch-depth: 0
+          path: docs-website
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57 # v8.0.0
+        with:
+          version: "0.10.12"
+
+      - name: Update docs snapshot
+        # Inputs flow in as quoted env vars to avoid shell injection; see the
+        # Validate inputs step above.
+        env:
+          OPERATION: ${{ inputs.operation }}
+          CHANNEL: ${{ inputs.channel }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+          VERSION_SLUG: ${{ inputs.version_slug }}
+          DISPLAY_NAME: ${{ inputs.display_name }}
+        run: |
+          uv run automation/tasks/scripts/sync_docs_website.py \
+            --operation "$OPERATION" \
+            --source-root source \
+            --docs-website-root docs-website \
+            --channel "$CHANNEL" \
+            --source-ref "$SOURCE_REF" \
+            --version-slug "$VERSION_SLUG" \
+            --display-name "$DISPLAY_NAME"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: "24"
+
+      - name: Install Fern CLI
+        working-directory: docs-website
+        run: |
+          FERN_VERSION=$(node -p "require('./fern/fern.config.json').version")
+          npm install -g "fern-api@${FERN_VERSION}"
+
+      - name: Validate docs website
+        working-directory: docs-website/fern
+        run: fern check
+
+      - name: Commit docs website changes
+        working-directory: docs-website
+        # Inputs flow in as quoted env vars to avoid shell injection (the commit
+        # message embeds free-form source_ref/version_slug); see Validate inputs.
+        env:
+          OPERATION: ${{ inputs.operation }}
+          CHANNEL: ${{ inputs.channel }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+          VERSION_SLUG: ${{ inputs.version_slug }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          # https://api.github.com/users/github-actions%5Bbot%5D
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .
+          if git diff --cached --quiet; then
+            echo "No docs website changes to commit."
+            exit 0
+          fi
+          target="$VERSION_SLUG"
+          if [[ -z "${target}" ]]; then
+            target="$CHANNEL"
+          fi
+          if [[ "$OPERATION" == "sync" ]]; then
+            git commit -m "docs(website): sync ${target} docs from ${SOURCE_REF}"
+          else
+            git commit -m "docs(website): remove ${target} docs"
+          fi
+          git push origin HEAD:docs-website
