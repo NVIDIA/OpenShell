@@ -217,11 +217,24 @@ fn configured_egress_addr(config: &MxcComputeConfig) -> Result<Option<SocketAddr
             "mxc egress_proxy_addr is required when egress_proxy is enabled",
         ));
     }
-    raw.parse::<SocketAddr>().map(Some).map_err(|e| {
+    let addr = raw.parse::<SocketAddr>().map_err(|e| {
         tonic::Status::invalid_argument(format!(
             "mxc egress_proxy_addr must be an IP:PORT socket address: {e}"
         ))
-    })
+    })?;
+    // MXC 0.6.0-alpha expresses the redirect as {"proxy": {"localhost": N}}
+    // — it has no way to encode a non-loopback host. Reject early so the
+    // operator gets a clear message rather than a silent policy gap.
+    // Use 127.0.0.1:PORT. Future schema versions may lift this restriction.
+    if addr.ip() != std::net::IpAddr::from([127, 0, 0, 1]) {
+        return Err(tonic::Status::invalid_argument(format!(
+            "mxc egress_proxy_addr must be 127.0.0.1:PORT — MXC 0.6.0-alpha \
+             expresses the redirect as {{\"localhost\": N}} and cannot encode \
+             non-loopback addresses (got {})",
+            addr.ip()
+        )));
+    }
+    Ok(Some(addr))
 }
 
 impl MxcComputeBackend {
@@ -872,6 +885,29 @@ mod lifecycle_tests {
     }
 
     #[test]
+    fn egress_non_loopback_addr_is_rejected() {
+        // MXC 0.6.0-alpha can only express {"proxy": {"localhost": N}}, so
+        // non-127.0.0.1 redirect addresses must be rejected at validate time.
+        let mut config = demo_config(
+            "C:/work/demo",
+            vec!["cmd".into(), "/c".into(), "exit 0".into()],
+        );
+        config.backend = MxcBackend::ProcessContainer;
+        config.egress_proxy = true;
+        config.egress_proxy_addr = "10.0.0.1:18080".into();
+        let backend = MxcComputeBackend::new_mocked(config);
+        let err = backend
+            .validate_sandbox_create(&driver_sandbox("sb-nonlocal"))
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(
+            err.message().contains("127.0.0.1"),
+            "error should mention 127.0.0.1, got: {}",
+            err.message()
+        );
+    }
+
+    #[test]
     fn egress_on_isolation_session_is_rejected() {
         let mut config = demo_config(
             "C:/work/demo",
@@ -1062,8 +1098,16 @@ mod lifecycle_tests {
                 .unwrap()
                 .is_empty()
         );
-        assert_eq!(recorded["network"]["proxy"]["host"], "127.0.0.1");
-        assert_eq!(recorded["network"]["proxy"]["port"], 18080);
+        // MXC 0.6.0-alpha accepts only {"proxy": {"localhost": N}}.
+        assert_eq!(recorded["network"]["proxy"]["localhost"], 18080);
+        assert!(
+            recorded["network"]["proxy"].get("host").is_none(),
+            "proxy must not contain 'host' key"
+        );
+        assert!(
+            recorded["network"]["proxy"].get("port").is_none(),
+            "proxy must not contain 'port' key"
+        );
 
         let reg = backend.registry.lock().await;
         let entry = reg.get("sb-egress").expect("registry entry");

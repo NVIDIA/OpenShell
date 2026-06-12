@@ -94,16 +94,19 @@ pub struct MxcProcess {
 }
 
 fn network_json(network: &MxcNetwork) -> serde_json::Value {
+    // MXC 0.6.0-alpha schema accepts ONLY {"proxy": {"localhost": <port>}}.
+    // {"host": ..., "port": ...} and every other shape is rejected — verified
+    // empirically against the real wxc-exec 0.6.0-alpha binary via --dry-run.
+    // See also docs/reference/mxc-compute-driver-design.mdx §network.proxy.
+    // The MxcNetwork.proxy field remains SocketAddr so callers keep full
+    // precision; only the port is serialized into the localhost key.
     let mut value = serde_json::json!({
         "defaultPolicy": network.default_policy.as_str(),
         "allowedHosts": [],
         "blockedHosts": [],
     });
     if let Some(proxy) = network.proxy {
-        value["proxy"] = serde_json::json!({
-            "host": proxy.ip().to_string(),
-            "port": proxy.port(),
-        });
+        value["proxy"] = serde_json::json!({ "localhost": proxy.port() });
     }
     value
 }
@@ -755,8 +758,31 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert_eq!(config["network"]["proxy"]["host"], "127.0.0.1");
-        assert_eq!(config["network"]["proxy"]["port"], 18080);
+        // MXC 0.6.0-alpha accepts only {"proxy": {"localhost": N}}.
+        assert_eq!(config["network"]["proxy"]["localhost"], 18080);
+        assert!(
+            config["network"]["proxy"].get("host").is_none(),
+            "proxy must not contain 'host' key"
+        );
+        assert!(
+            config["network"]["proxy"].get("port").is_none(),
+            "proxy must not contain 'port' key"
+        );
+    }
+
+    #[test]
+    fn network_json_emits_localhost_port_shape() {
+        // MXC 0.6.0-alpha rejects {"host":...,"port":...} and accepts only
+        // {"proxy": {"localhost": N}} — verified against the real binary via
+        // --dry-run. This test pins the exact emitted JSON shape.
+        let network = MxcNetwork {
+            default_policy: "block".into(),
+            proxy: Some("127.0.0.1:18080".parse().unwrap()),
+        };
+        let value = network_json(&network);
+        assert_eq!(value["proxy"]["localhost"], 18080);
+        assert!(value["proxy"].get("host").is_none());
+        assert!(value["proxy"].get("port").is_none());
     }
 
     #[test]
