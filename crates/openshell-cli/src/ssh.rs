@@ -7,6 +7,8 @@ use crate::tls::{TlsOptions, grpc_client};
 use miette::{IntoDiagnostic, Result, WrapErr};
 #[cfg(unix)]
 use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
+#[cfg(unix)]
+use nix::unistd::Pid;
 use openshell_core::ObjectId;
 use openshell_core::forward::{
     ForwardSpec, build_proxy_command, find_ssh_forward_pid, format_gateway_url,
@@ -507,16 +509,24 @@ fn forward_probe_host(spec: &ForwardSpec) -> &str {
     }
 }
 
-/// Best-effort kill of a forward whose listener never came up. Failures are
-/// ignored: the process may already be exiting, and the caller surfaces the
+/// Best-effort termination of a forward whose listener never came up. Failures
+/// are ignored: the process may already be exiting, and the caller surfaces the
 /// original listener error regardless.
+#[cfg(unix)]
 fn terminate_forward_pid(pid: u32) {
-    let _ = Command::new("kill")
-        .arg(pid.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    let Ok(raw_pid) = i32::try_from(pid) else {
+        return;
+    };
+    if raw_pid <= 0 {
+        return;
+    }
+
+    let _ = nix::sys::signal::kill(Pid::from_raw(raw_pid), Signal::SIGTERM);
 }
+
+/// Non-Unix builds cannot manage OpenSSH process IDs with Unix signals.
+#[cfg(not(unix))]
+fn terminate_forward_pid(_pid: u32) {}
 
 fn foreground_forward_started_message(name: &str, spec: &ForwardSpec) -> String {
     format!(
