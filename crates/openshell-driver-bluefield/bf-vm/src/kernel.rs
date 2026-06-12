@@ -229,6 +229,7 @@ mod tests {
             gateway_port: None,
             guest_init_dropins: Vec::new(),
             env: Vec::new(),
+            resources: Vec::new(),
         }
     }
 

@@ -17,8 +17,9 @@ use openshell_vfio::SysfsRoot;
 
 use crate::gpu::mac_from_sandbox_id;
 use crate::lifecycle::{
-    BackendFeature, ExtensionActivation, ExtensionDescriptor, LaunchAbortReason, LaunchPlan,
-    LifecycleError, LifecycleExtension, LifecycleResult, RestoreContext,
+    BackendFeature, ExtensionActivation, ExtensionDescriptor, GuestResource, LaunchAbortReason,
+    LaunchPlan, LifecycleError, LifecycleExtension, LifecycleResult, PciPassthroughDevice,
+    RestoreContext,
 };
 
 use bf_inventory::{VfPool, VfSlot};
@@ -188,7 +189,7 @@ impl LifecycleExtension for BluefieldExtension {
 
     async fn configure_launch(
         &self,
-        _sandbox: &Sandbox,
+        sandbox: &Sandbox,
         _state_dir: &Path,
         plan: &mut LaunchPlan,
     ) -> LifecycleResult<()> {
@@ -196,6 +197,16 @@ impl LifecycleExtension for BluefieldExtension {
         plan.require_backend_feature(BackendFeature::PciPassthrough);
         plan.require_backend_feature(BackendFeature::GuestInitDropins);
         plan.guest_init_dropins.push(guest_egress::dropin());
+
+        // Declare the VF as a passthrough device now (before the backend is
+        // resolved and validated) so the driver promotes the launch to QEMU
+        // and the non-GPU launch guard sees a concrete device backing. The
+        // actual vfio-pci bind happens in `before_launch`; the claim is
+        // idempotent per sandbox, so claiming here and there is safe.
+        let slot = self.claim_slot(&sandbox.id)?;
+        plan.add_resource(GuestResource::PciPassthrough(PciPassthroughDevice::new(
+            slot.host_bdf,
+        )));
 
         // Select the BlueField guest kernel + load its VF driver modules so the
         // assigned VF is not an inert PCI function in the guest.
@@ -252,6 +263,12 @@ impl LifecycleExtension for BluefieldExtension {
         guard.disarm();
 
         self.record_attachment(&sandbox.id, AttachmentRecord { slot: slot.clone() });
+
+        // Attach the bound VF to the guest as a passthrough device (idempotent
+        // with the declaration made in `configure_launch`).
+        plan.add_resource(GuestResource::PciPassthrough(PciPassthroughDevice::new(
+            slot.host_bdf.clone(),
+        )));
 
         if let Some(egress) = &self.egress {
             plan.env.extend(egress.env(&slot));
@@ -379,6 +396,15 @@ mod tests {
         ))
     }
 
+    fn passthrough_bdfs(plan: &LaunchPlan) -> Vec<&str> {
+        plan.resources
+            .iter()
+            .map(|resource| match resource {
+                GuestResource::PciPassthrough(device) => device.host_bdf.as_str(),
+            })
+            .collect()
+    }
+
     fn sample_plan() -> LaunchPlan {
         LaunchPlan {
             backend: crate::runtime::VmBackend::Qemu,
@@ -397,6 +423,7 @@ mod tests {
             gateway_port: None,
             guest_init_dropins: Vec::new(),
             env: Vec::new(),
+            resources: Vec::new(),
         }
     }
 
@@ -428,6 +455,7 @@ mod tests {
                 .iter()
                 .any(|e| e == "OPENSHELL_VM_DATA_IP=10.0.120.10/22")
         );
+        assert_eq!(passthrough_bdfs(&plan), vec!["0000:03:00.2"]);
 
         let bind_state = state::load_bind_state("sandbox-1", &state).unwrap();
         assert_eq!(bind_state.host_bdf, "0000:03:00.2");
@@ -484,8 +512,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn configure_launch_selects_bluefield_kernel() {
-        let extension = BluefieldExtension::new(VfPool::new([]))
+    async fn configure_launch_selects_kernel_and_declares_vf_passthrough() {
+        let extension = BluefieldExtension::new(VfPool::new([VfSlot::new("vf0", "0000:03:00.2")]))
             .with_kernel(BluefieldKernel::from_image("/opt/openshell/kernels/bf-vmlinux"));
 
         let mut plan = sample_plan();
@@ -502,6 +530,13 @@ mod tests {
             plan.required_backend_features
                 .contains(&BackendFeature::ExternalKernelImage)
         );
+        // The VF is declared as a passthrough device so the driver promotes
+        // the launch to QEMU and the non-GPU guard sees a concrete device.
+        assert!(
+            plan.required_backend_features
+                .contains(&BackendFeature::PciPassthrough)
+        );
+        assert_eq!(passthrough_bdfs(&plan), vec!["0000:03:00.2"]);
     }
 
     #[tokio::test]

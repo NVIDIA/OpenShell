@@ -138,6 +138,9 @@ struct Args {
     #[arg(long, hide = true)]
     vm_gpu_bdf: Option<String>,
 
+    #[arg(long = "vm-pci-passthrough", hide = true)]
+    vm_pci_passthrough: Vec<String>,
+
     #[arg(long, hide = true)]
     vm_tap_device: Option<String>,
 
@@ -496,6 +499,7 @@ fn build_vm_launch_config(args: &Args) -> std::result::Result<VmLaunchConfig, St
         console_output,
         backend,
         gpu_bdf: args.vm_gpu_bdf.clone(),
+        pci_passthrough: args.vm_pci_passthrough.clone(),
         tap_device: args.vm_tap_device.clone(),
         guest_ip: args.vm_guest_ip.clone(),
         host_ip: args.vm_host_ip.clone(),
