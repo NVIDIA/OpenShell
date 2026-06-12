@@ -605,6 +605,11 @@ impl WxcExecInvoker {
     }
 
     /// Run the stop phase.
+    ///
+    /// `stop`/`deprovision` are **unit** variants in the wxc-exec schema: they
+    /// must serialize as `null`, not `{}`. Empirical (build 26300.8553,
+    /// wxc-exec 2026-06-10): `"stop": {}` is rejected with `malformed_request`
+    /// ("invalid type: map, expected unit"); `provision`/`start` accept maps.
     pub async fn stop(&self, iso_sandbox_id: &str) -> Result<(), InvokerError> {
         let config = serde_json::json!({
             "version": MXC_SCHEMA_VERSION,
@@ -612,14 +617,14 @@ impl WxcExecInvoker {
             "sandboxId": iso_sandbox_id,
             "experimental": {
                 "isolation_session": {
-                    "stop": {}
+                    "stop": null
                 }
             }
         });
         self.run_phase(&config).await
     }
 
-    /// Run the deprovision phase.
+    /// Run the deprovision phase (unit variant — see [`Self::stop`]).
     pub async fn deprovision(&self, iso_sandbox_id: &str) -> Result<(), InvokerError> {
         let config = serde_json::json!({
             "version": MXC_SCHEMA_VERSION,
@@ -627,7 +632,7 @@ impl WxcExecInvoker {
             "sandboxId": iso_sandbox_id,
             "experimental": {
                 "isolation_session": {
-                    "deprovision": {}
+                    "deprovision": null
                 }
             }
         });
@@ -802,6 +807,29 @@ mod tests {
         let config = oneshot_config_json("sb-1", &filesystem, &pc, &process, None);
 
         assert!(config.get("network").is_none());
+    }
+
+    #[test]
+    fn stop_and_deprovision_serialize_as_unit_variants() {
+        // Pins the empirical schema contract (test box, build 26300.8553):
+        // stop/deprovision are unit variants and must be `null`; `{}` is
+        // rejected with malformed_request "invalid type: map, expected unit".
+        for phase in ["stop", "deprovision"] {
+            let config = serde_json::json!({
+                "version": MXC_SCHEMA_VERSION,
+                "phase": phase,
+                "sandboxId": "iso:wxc-test",
+                "experimental": {
+                    "isolation_session": {
+                        phase: null
+                    }
+                }
+            });
+            assert!(
+                config["experimental"]["isolation_session"][phase].is_null(),
+                "{phase} must serialize as null (unit variant)"
+            );
+        }
     }
 
     #[test]
