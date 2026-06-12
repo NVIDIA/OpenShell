@@ -1,0 +1,28 @@
+[package]
+name = "bf-vm"
+description = "Bare-metal VM runtime adapter for the OpenShell BlueField driver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = []
+
+[dependencies]
+bf-core = { path = "../bf-core" }
+bf-inventory = { path = "../bf-inventory" }
+clap = { workspace = true }
+openshell-core = { path = "../../openshell-core", default-features = false }
+openshell-driver-vm = { path = "../../openshell-driver-vm" }
+openshell-vfio = { path = "../../openshell-vfio" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
