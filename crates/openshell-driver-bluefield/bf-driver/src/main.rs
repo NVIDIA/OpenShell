@@ -207,10 +207,8 @@ async fn main() -> Result<()> {
         );
     }
 
-    let bluefield_config = args
-        .bluefield
-        .to_driver_config(args.openshell_endpoint.clone())
-        .map_err(|err| miette::miette!("{err}"))?;
+    let bluefield_config =
+        bluefield_config_from_args(&args).map_err(|err| miette::miette!("{err}"))?;
 
     // This stage runs the workload-side VM driver that binds a VF per
     // sandbox. The leader/control-plane role is layered on in a later stage.
@@ -251,6 +249,14 @@ async fn build_vm_driver(args: &Args, bluefield: BluefieldDriverConfig) -> Resul
     )
     .await
     .map_err(|err| miette!("{err}"))
+}
+
+fn bluefield_config_from_args(args: &Args) -> std::result::Result<BluefieldDriverConfig, String> {
+    let mut config = args
+        .bluefield
+        .to_driver_config(args.openshell_endpoint.clone())?;
+    config.enabled = true;
+    Ok(config)
 }
 
 /// Serve any `ComputeDriver` over the selected listener. Shared by every role
@@ -757,6 +763,26 @@ mod tests {
                 socket_path: PathBuf::from("/tmp/compute-driver.sock"),
                 expected_peer_pid: None,
             }
+        );
+    }
+
+    #[test]
+    fn bluefield_binary_enables_bluefield_extension_without_flag() {
+        let args = Args::parse_from([
+            "openshell-driver-bluefield",
+            "--allow-unauthenticated-tcp",
+            "--bind-address",
+            "127.0.0.1:50061",
+            "--openshell-endpoint",
+            "http://127.0.0.1:8080",
+        ]);
+
+        let config = super::bluefield_config_from_args(&args).unwrap();
+
+        assert!(config.enabled);
+        assert_eq!(
+            config.openshell_endpoint.as_deref(),
+            Some("http://127.0.0.1:8080")
         );
     }
 }
