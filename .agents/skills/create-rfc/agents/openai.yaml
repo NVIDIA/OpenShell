@@ -1,0 +1,4 @@
+interface:
+  display_name: "Create RFC"
+  short_description: "Create OpenShell RFC proposals"
+  default_prompt: "Use $create-rfc to draft an OpenShell RFC from this design."
