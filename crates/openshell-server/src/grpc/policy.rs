@@ -1410,9 +1410,22 @@ pub(super) async fn handle_get_sandbox_provider_environment(
     let provider_names = spec.providers;
     let provider_env_revision =
         compute_provider_env_revision(state.store.as_ref(), &provider_names).await?;
-    let provider_environment =
-        super::provider::resolve_provider_environment(state.store.as_ref(), &provider_names)
-            .await?;
+
+    let global_settings = load_global_settings(state.store.as_ref()).await?;
+    let providers_v2_enabled =
+        bool_setting_enabled(&global_settings, settings::PROVIDERS_V2_ENABLED_KEY).unwrap_or_else(
+            |e| {
+                warn!("failed to read providers_v2_enabled setting, defaulting to false: {e}");
+                false
+            },
+        );
+
+    let provider_environment = super::provider::resolve_provider_environment(
+        state.store.as_ref(),
+        &provider_names,
+        providers_v2_enabled,
+    )
+    .await?;
 
     info!(
         sandbox_id = %sandbox_id,
