@@ -108,6 +108,35 @@ the demo Windows host and follow `mxc-demo-runbook.md` inside it. The
 script prints a SHA256 manifest so the operator can sanity-check what
 landed before moving it.
 
+## Real-MXC test lane
+
+Three tasks drive real `wxc-exec.exe` hardware; all are **skip-safe** — any test
+or scenario that requires an absent binary or backend prints a SKIP reason and
+exits 0 rather than failing.
+
+| Task | What it runs | When to use |
+|---|---|---|
+| `windows:test:mxc-real:x64` | `tests/wxc_exec_real.rs` — Tier-2 invoker tests with `--ignored --test-threads=1` | Pre-merge on any Windows host that has `wxc-exec`; dry-run tests always pass; enforcement tests probe-gate themselves |
+| `windows:e2e:mxc` | `examples/run-mxc-e2e.ps1` — Tier-3 scenario runner, real binary, probe-gated | Demo box / nightly; needs the gateway + CLI binaries in the script directory |
+| `windows:e2e:mxc:mock` | Same runner with `-Mock` — wiring-only, no real `wxc-exec` needed | Any Windows host (CI, dev machine); validates wiring and the network-reject scenario |
+
+**Probe script:** `examples/probe-mxc-host.ps1` emits a JSON capability report
+(OS build, wxc-exec path/version, dry-run exit code, per-backend trial result,
+and a `verdicts` object). Run it before the real-MXC lane to understand what
+will PASS vs SKIP on a given host:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass `
+  -File crates/openshell-driver-mxc/examples/probe-mxc-host.ps1
+```
+
+**Skip semantics:** tests in `wxc_exec_real.rs` are marked
+`#[ignore = "requires real wxc-exec"]` — the standard `windows:test:x64` suite
+never runs them. `OPENSHELL_WXC_EXEC_PATH` overrides the default
+`C:\mxc\wxc-exec.exe` lookup. See `docs4gtb/mxc-box-capabilities.md` for the
+empirical capability snapshot of the development box (build 26200, processcontainer
+velocity keys not enabled, isolation_session absent).
+
 ## Deferred work
 
 - **Interactive exec/connect/forward** → `adapt-openshell-gateway-windows`
