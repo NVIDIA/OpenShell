@@ -1,0 +1,12 @@
+[package]
+name = "bf-inventory"
+description = "BlueField function inventory, discovery, and allocation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+bf-core = { path = "../bf-core" }
+openshell-vfio = { path = "../../openshell-vfio" }
