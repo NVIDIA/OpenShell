@@ -37,8 +37,8 @@ pub mod telemetry;
 pub mod time;
 
 pub use config::{
-    ComputeDriverKind, Config, GatewayAuthConfig, GatewayJwtConfig, MtlsAuthConfig, OidcConfig,
-    TlsConfig,
+    ComputeDriverKind, Config, DetectedDriver, GatewayAuthConfig, GatewayJwtConfig,
+    MtlsAuthConfig, OidcConfig, TlsConfig,
 };
 pub use error::{ComputeDriverError, Error, Result};
 pub use metadata::{GetResourceVersion, ObjectId, ObjectLabels, ObjectName, SetResourceVersion};
