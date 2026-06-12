@@ -10,6 +10,8 @@ use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction
 #[cfg(unix)]
 use nix::unistd::Pid;
 use openshell_core::ObjectId;
+#[cfg(unix)]
+use openshell_core::forward::pid_matches_forward;
 use openshell_core::forward::{
     ForwardSpec, build_proxy_command, find_ssh_forward_pid, format_gateway_url,
     resolve_ssh_gateway, shell_escape, validate_ssh_session_response, write_forward_pid,
@@ -31,11 +33,15 @@ use tokio::net::TcpStream;
 use tokio::process::{Child, Command as TokioCommand};
 use tokio_stream::wrappers::ReceiverStream;
 
-/// Time budget for a forward to become healthy after `ssh` starts: covers both
-/// backgrounded-PID discovery and listener readiness, in foreground and
-/// background.
-const FORWARD_STARTUP_GRACE_PERIOD: Duration = Duration::from_secs(2);
-/// Delay between listener/PID probes within the grace period.
+/// Time budget for finding the OpenSSH background process after `ssh -f`
+/// returns. PID discovery is separate from listener readiness so missing
+/// process tracking still fails quickly.
+const FORWARD_PID_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
+/// Time budget for the local listener to become reachable after `ssh` starts.
+/// This is a user-visible readiness deadline for both foreground and background
+/// forwards, not a soft cleanup grace period.
+const FORWARD_LISTENER_READINESS_TIMEOUT: Duration = Duration::from_secs(10);
+/// Delay between listener/PID probes within the configured timeout.
 const FORWARD_LISTENER_PROBE_INTERVAL: Duration = Duration::from_millis(50);
 /// Per-attempt connect timeout, so one hung probe cannot consume the whole
 /// grace period.
@@ -378,11 +384,11 @@ pub async fn sandbox_forward(
                 )
             })?;
 
-        if let Err(err) = wait_for_forward_listener(spec, FORWARD_STARTUP_GRACE_PERIOD)
+        if let Err(err) = wait_for_forward_listener(spec, FORWARD_LISTENER_READINESS_TIMEOUT)
             .await
             .wrap_err("ssh process started but local forward listener was not reachable")
         {
-            terminate_forward_pid(pid);
+            terminate_forward_pid(pid, port, &session.sandbox_id);
             return Err(err);
         }
 
@@ -412,7 +418,7 @@ pub async fn sandbox_forward(
 /// session) means forwarding never came up, so it errors instead of waiting
 /// out the grace period.
 async fn wait_for_foreground_forward_start(child: &mut Child, spec: &ForwardSpec) -> Result<()> {
-    let listener = wait_for_forward_listener(spec, FORWARD_STARTUP_GRACE_PERIOD);
+    let listener = wait_for_forward_listener(spec, FORWARD_LISTENER_READINESS_TIMEOUT);
     tokio::pin!(listener);
     tokio::select! {
         result = &mut listener => result,
@@ -439,7 +445,7 @@ async fn wait_for_foreground_forward_start(child: &mut Child, spec: &ForwardSpec
 /// so the PID is unknown when `command.status()` returns and must be discovered
 /// afterward. Returns `None` if it never appears within the grace period.
 async fn wait_for_ssh_forward_pid(sandbox_id: &str, port: u16) -> Option<u32> {
-    let deadline = tokio::time::Instant::now() + FORWARD_STARTUP_GRACE_PERIOD;
+    let deadline = tokio::time::Instant::now() + FORWARD_PID_DISCOVERY_TIMEOUT;
     loop {
         if let Some(pid) = find_ssh_forward_pid(sandbox_id, port) {
             return Some(pid);
@@ -513,11 +519,17 @@ fn forward_probe_host(spec: &ForwardSpec) -> &str {
 /// are ignored: the process may already be exiting, and the caller surfaces the
 /// original listener error regardless.
 #[cfg(unix)]
-fn terminate_forward_pid(pid: u32) {
+fn terminate_forward_pid(pid: u32, port: u16, sandbox_id: &str) {
     let Ok(raw_pid) = i32::try_from(pid) else {
         return;
     };
     if raw_pid <= 0 {
+        return;
+    }
+    if !pid_matches_forward(pid, port, Some(sandbox_id)) {
+        // The PID came from a process-table scan, not a file we own. Re-check
+        // immediately before signaling so a stale or spoofed match is left
+        // untouched instead of terminating an unrelated process.
         return;
     }
 
@@ -526,7 +538,7 @@ fn terminate_forward_pid(pid: u32) {
 
 /// Non-Unix builds cannot manage OpenSSH process IDs with Unix signals.
 #[cfg(not(unix))]
-fn terminate_forward_pid(_pid: u32) {}
+fn terminate_forward_pid(_pid: u32, _port: u16, _sandbox_id: &str) {}
 
 fn foreground_forward_started_message(name: &str, spec: &ForwardSpec) -> String {
     format!(
@@ -1791,6 +1803,48 @@ mod tests {
             .unwrap_err();
         let text = format!("{err:?}");
         assert!(text.contains("local forward listener did not open"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_forward_pid_skips_process_that_no_longer_matches_forward() {
+        let dir = tempfile::tempdir().unwrap();
+        let terminated_path = dir.path().join("terminated");
+        let mut child = Command::new("python3")
+            .arg("-c")
+            .arg(
+                r#"
+import pathlib
+import signal
+import sys
+import time
+
+terminated_path = pathlib.Path(sys.argv[1])
+
+def stop(_signum, _frame):
+    terminated_path.write_text("terminated")
+    raise SystemExit(0)
+
+signal.signal(signal.SIGTERM, stop)
+
+while True:
+    time.sleep(1)
+"#,
+            )
+            .arg(&terminated_path)
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+
+        terminate_forward_pid(child.id(), 43210, "id-spoofed-forward");
+        std::thread::sleep(Duration::from_millis(200));
+
+        assert!(
+            !terminated_path.exists(),
+            "mismatched process should not receive SIGTERM"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]

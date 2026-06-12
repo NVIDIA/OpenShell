@@ -727,10 +727,27 @@ fn install_fake_pgrep_no_match(dir: &TempDir) -> std::path::PathBuf {
     install_executable_script(dir, "pgrep", "#!/bin/sh\nexit 1\n")
 }
 
-async fn wait_for_file(path: &std::path::Path, timeout: Duration) -> bool {
+async fn wait_for_process_exit(pid: u32, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
-        if path.exists() {
+        let output = std::process::Command::new("ps")
+            .arg("-o")
+            .arg("stat=")
+            .arg("-p")
+            .arg(pid.to_string())
+            .stderr(std::process::Stdio::null())
+            .output();
+        let alive = output.is_ok_and(|output| {
+            if !output.status.success() {
+                return false;
+            }
+            let stat = String::from_utf8_lossy(&output.stdout);
+            // Linux can leave the orphaned fake forward as a short-lived zombie
+            // until the container's init process reaps it. A zombie has already
+            // exited, so it satisfies this cleanup assertion.
+            !stat.trim_start().starts_with('Z')
+        });
+        if !alive {
             return true;
         }
         if Instant::now() >= deadline {
@@ -844,39 +861,87 @@ exit 1
     ssh_path
 }
 
-fn install_fake_unreachable_forwarding_ssh(dir: &TempDir) -> std::path::PathBuf {
+struct FakeUnreachableForward {
+    log_path: std::path::PathBuf,
+    pid_path: std::path::PathBuf,
+}
+
+fn install_fake_unreachable_forwarding_ssh(dir: &TempDir) -> FakeUnreachableForward {
+    let log_path = dir.path().join("fake-forward.log");
     let pid_path = dir.path().join("fake-forward.pid");
-    let terminated_path = dir.path().join("fake-forward.terminated");
+    let ready_path = dir.path().join("fake-forward.ready");
     install_executable_script(
         dir,
         "ssh",
         r#"#!/bin/sh
 set -eu
 
-nohup python3 -c '
+forward=""
+sandbox_id=""
+previous=""
+
+for arg in "$@"; do
+  if [ "$previous" = "-L" ]; then
+    forward="$arg"
+    previous=""
+    continue
+  fi
+
+  if [ "$previous" = "-o" ]; then
+    case "$arg" in
+      ProxyCommand=*)
+        sandbox_id="$(printf '%s\n' "$arg" | sed -n 's/.*--sandbox-id \([^ ]*\).*/\1/p')"
+        ;;
+    esac
+    previous=""
+    continue
+  fi
+
+  case "$arg" in
+    -L|-o)
+      previous="$arg"
+      ;;
+  esac
+done
+
+if [ -z "$forward" ] || [ -z "$sandbox_id" ]; then
+  exit 1
+fi
+
+trap '' HUP
+python3 -c '
 import pathlib
 import signal
 import sys
 import time
 
-terminated_path = pathlib.Path(sys.argv[1])
+ready_path = pathlib.Path(sys.argv[1])
 
-def stop(_signum, _frame):
-    terminated_path.write_text("terminated")
-    raise SystemExit(0)
-
-signal.signal(signal.SIGTERM, stop)
-signal.signal(signal.SIGINT, stop)
 signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
+ready_path.write_text("ready")
 
 while True:
     time.sleep(1)
-' '@TERMINATED_PATH@' >/dev/null 2>&1 &
-echo $! > '@PID_PATH@'
+' '@READY_PATH@' ssh ssh-proxy --sandbox-id "$sandbox_id" -L "$forward" >'@LOG_PATH@' 2>&1 &
+pid="$!"
+i=0
+while [ "$i" -lt 100 ]; do
+  if [ -e '@READY_PATH@' ]; then
+    break
+  fi
+  i=$((i + 1))
+  sleep 0.05
+done
+if [ ! -e '@READY_PATH@' ]; then
+  exit 1
+fi
+echo "$pid" > '@PID_PATH@'
 
 exit 0
 "#
-        .replace("@TERMINATED_PATH@", &terminated_path.display().to_string())
+        .replace("@LOG_PATH@", &log_path.display().to_string())
+        .replace("@READY_PATH@", &ready_path.display().to_string())
         .replace("@PID_PATH@", &pid_path.display().to_string()),
     );
 
@@ -896,7 +961,7 @@ exit 1
         ),
     );
 
-    terminated_path
+    FakeUnreachableForward { log_path, pid_path }
 }
 
 fn test_env(fake_ssh_dir: &TempDir, xdg_dir: &TempDir) -> EnvVarGuard {
@@ -1554,13 +1619,36 @@ async fn sandbox_forward_background_fails_when_pid_is_not_discoverable() {
 }
 
 #[tokio::test]
+async fn sandbox_forward_foreground_fails_when_ssh_exits_before_listener_opens() {
+    let server = run_server().await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let forward_port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let spec = openshell_core::forward::ForwardSpec::new(forward_port);
+    let err = run::sandbox_forward(&server.endpoint, "foreground-forward", &spec, false, &tls)
+        .await
+        .expect_err("foreground forward should fail when ssh exits before listener readiness");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("ssh exited before local forward listener opened"),
+        "error should explain that ssh exited before listener readiness, got: {msg}",
+    );
+}
+
+#[tokio::test]
 async fn sandbox_forward_background_terminates_discovered_pid_when_listener_never_opens() {
     let server = run_server().await;
     let fake_ssh_dir = tempfile::tempdir().unwrap();
     let xdg_dir = tempfile::tempdir().unwrap();
     let _env = test_env(&fake_ssh_dir, &xdg_dir);
     let tls = test_tls(&server);
-    let terminated_path = install_fake_unreachable_forwarding_ssh(&fake_ssh_dir);
+    let fake_forward = install_fake_unreachable_forwarding_ssh(&fake_ssh_dir);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let forward_port = listener.local_addr().unwrap().port();
     drop(listener);
@@ -1578,10 +1666,30 @@ async fn sandbox_forward_background_terminates_discovered_pid_when_listener_neve
         openshell_core::forward::read_forward_pid("unreachable-forward", forward_port).is_none(),
         "unreachable background forwards must not write a PID file",
     );
-    assert!(
-        wait_for_file(&terminated_path, Duration::from_secs(2)).await,
-        "discovered background SSH process should be terminated after listener failure",
-    );
+    let pid = fs::read_to_string(&fake_forward.pid_path)
+        .expect("fake forward should record a PID")
+        .trim()
+        .parse::<u32>()
+        .expect("fake forward PID should be numeric");
+    if !wait_for_process_exit(pid, Duration::from_secs(2)).await {
+        let log = fs::read_to_string(&fake_forward.log_path).unwrap_or_default();
+        let command = std::process::Command::new("ps")
+            .arg("-ww")
+            .arg("-o")
+            .arg("command=")
+            .arg("-p")
+            .arg(pid.to_string())
+            .output()
+            .ok()
+            .map(|output| String::from_utf8_lossy(&output.stdout).to_string())
+            .unwrap_or_default();
+        panic!(
+            "discovered background SSH process should exit after listener failure cleanup; pid={}, command={}, log={}",
+            pid,
+            command.trim(),
+            log.trim(),
+        );
+    }
 }
 
 #[tokio::test]
