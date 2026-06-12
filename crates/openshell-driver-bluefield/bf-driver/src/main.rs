@@ -207,8 +207,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    let bluefield_config =
-        bluefield_config_from_args(&args).map_err(|err| miette::miette!("{err}"))?;
+    let bluefield_config = bluefield_config_from_args(&args).map_err(bluefield_driver_error)?;
 
     // This stage runs the workload-side VM driver that binds a VF per
     // sandbox. The leader/control-plane role is layered on in a later stage.
@@ -224,7 +223,7 @@ async fn build_vm_driver(args: &Args, bluefield: BluefieldDriverConfig) -> Resul
         .ok_or_else(|| miette!("OPENSHELL_GRPC_ENDPOINT is required"))?;
     let extension_config = ExtensionRuntimeConfig { bluefield };
     let lifecycle_extensions =
-        build_lifecycle_extensions(&extension_config).map_err(|err| miette!("{err}"))?;
+        build_lifecycle_extensions(&extension_config).map_err(bluefield_driver_error)?;
 
     VmDriver::new_with_extensions(
         VmDriverConfig {
@@ -257,6 +256,10 @@ fn bluefield_config_from_args(args: &Args) -> std::result::Result<BluefieldDrive
         .to_driver_config(args.openshell_endpoint.clone())?;
     config.enabled = true;
     Ok(config)
+}
+
+fn bluefield_driver_error(message: impl std::fmt::Display) -> miette::Report {
+    miette!("{message}")
 }
 
 /// Serve any `ComputeDriver` over the selected listener. Shared by every role
@@ -784,5 +787,18 @@ mod tests {
             config.openshell_endpoint.as_deref(),
             Some("http://127.0.0.1:8080")
         );
+    }
+
+    #[test]
+    fn build_driver_error_preserves_bluefield_preflight_text() {
+        let err = super::bluefield_driver_error(
+            "BlueField QEMU host preflight failed:\n- missing qemu-system-x86_64",
+        );
+
+        assert!(
+            err.to_string()
+                .contains("BlueField QEMU host preflight failed")
+        );
+        assert!(err.to_string().contains("missing qemu-system-x86_64"));
     }
 }
