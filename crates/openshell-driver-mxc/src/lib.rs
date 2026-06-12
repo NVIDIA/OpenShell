@@ -35,6 +35,8 @@ pub use grpc::ComputeDriverService;
 // Re-export the embedded mapper API so the windows-only example and integration
 // test can reach it without making `policy_map` a public module.
 #[cfg(target_os = "windows")]
+pub use policy::{EmbeddedPolicyMapper, MapCtx, MapError, MappedConfig, PolicyMapper};
+#[cfg(target_os = "windows")]
 pub use policy_map::{
     DEFAULT_COMMAND, DEFAULT_CONTAINMENT, DEFAULT_MXC_VERSION, LossItem, MxcMappingOptions,
     MxcMappingResult, OPEN_SHELL_SUPERSET_GAPS, SplitPolicyResult, build_loss_report, map_to_mxc,
