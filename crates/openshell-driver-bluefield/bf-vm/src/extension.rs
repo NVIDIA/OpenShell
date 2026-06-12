@@ -105,6 +105,18 @@ impl BluefieldExtension {
         let sysfs = SysfsRoot::system();
         let slots = prepare_host_slots(HostSlotConfig::from(config), &sysfs, &host_pf)?;
         let kernel = qemu_kernel_from_config(config)?;
+        let qemu_kernel_image = kernel
+            .image
+            .clone()
+            .ok_or_else(|| "BlueField QEMU kernel image was not resolved".to_string())?;
+        crate::preflight::run_preflight(
+            &crate::preflight::RealHostProbe,
+            &crate::preflight::PreflightInput {
+                host_pf: host_pf.to_string(),
+                vf_bdfs: slots.iter().map(|slot| slot.host_bdf.clone()).collect(),
+                qemu_kernel_image,
+            },
+        )?;
 
         let extension = Self::new(VfPool::new(slots))
             .with_kernel(kernel)
