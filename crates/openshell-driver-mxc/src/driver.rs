@@ -4,7 +4,7 @@
 //! MXC compute backend: lifecycle logic, in-memory registry, exec-in-driver,
 //! and self-reported readiness.
 
-use crate::mxc::{MxcFilesystem, MxcProcess, MxcProcessContainer, WxcExecInvoker};
+use crate::mxc::{MxcFilesystem, MxcNetwork, MxcProcess, MxcProcessContainer, WxcExecInvoker};
 use crate::policy::{EmbeddedPolicyMapper, MapCtx, PolicyMapper};
 use futures::Stream;
 use openshell_core::proto::SandboxPolicy;
@@ -15,6 +15,7 @@ use openshell_core::proto::compute::v1::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::process::Child;
@@ -73,6 +74,14 @@ pub struct MxcComputeConfig {
     /// Host directory mapped into the sandbox as a read-write grant.
     /// Appears in the shared host folder for the positive-proof artifact.
     pub share_dir: String,
+    /// Enable Pattern-C governed egress. When true, MXC receives filesystem
+    /// grants plus a `network.proxy` redirect and the host CONNECT proxy
+    /// receives a trimmed network-only policy.
+    pub egress_proxy: bool,
+    /// Loopback `IP:PORT` used for MXC `network.proxy` while governed egress is
+    /// enabled. Per-sandbox allocation is a follow-up; this is one configured
+    /// address for the initial integration.
+    pub egress_proxy_addr: String,
     /// Enable `--debug` flag on `wxc-exec` invocations.
     pub debug: bool,
 }
@@ -88,6 +97,8 @@ impl Default for MxcComputeConfig {
             agent_command: Vec::new(),
             agent_cwd: String::new(),
             share_dir: String::new(),
+            egress_proxy: false,
+            egress_proxy_addr: String::new(),
             debug: false,
         }
     }
@@ -108,6 +119,8 @@ struct SandboxEntry {
     iso_sandbox_id: Option<String>,
     phase_state: PhaseState,
     exec_child: Option<Child>,
+    trimmed_policy: Option<SandboxPolicy>,
+    proxy_addr: Option<SocketAddr>,
 }
 
 impl std::fmt::Debug for SandboxEntry {
@@ -116,6 +129,7 @@ impl std::fmt::Debug for SandboxEntry {
             .field("sandbox_id", &self.sandbox.id)
             .field("iso_sandbox_id", &self.iso_sandbox_id)
             .field("phase_state", &self.phase_state)
+            .field("proxy_addr", &self.proxy_addr)
             .finish_non_exhaustive()
     }
 }
@@ -188,6 +202,28 @@ impl std::fmt::Debug for MxcComputeBackend {
     }
 }
 
+fn configured_egress_addr(config: &MxcComputeConfig) -> Result<Option<SocketAddr>, tonic::Status> {
+    if !config.egress_proxy {
+        return Ok(None);
+    }
+    if config.backend == MxcBackend::IsolationSession {
+        return Err(tonic::Status::invalid_argument(
+            "mxc governed egress requires process_container; network.proxy is not supported on isolation_session until MXC M1 lands",
+        ));
+    }
+    let raw = config.egress_proxy_addr.trim();
+    if raw.is_empty() {
+        return Err(tonic::Status::invalid_argument(
+            "mxc egress_proxy_addr is required when egress_proxy is enabled",
+        ));
+    }
+    raw.parse::<SocketAddr>().map(Some).map_err(|e| {
+        tonic::Status::invalid_argument(format!(
+            "mxc egress_proxy_addr must be an IP:PORT socket address: {e}"
+        ))
+    })
+}
+
 impl MxcComputeBackend {
     pub fn new(config: MxcComputeConfig) -> Self {
         let invoker = WxcExecInvoker::new(&config.wxc_exec_path, config.debug);
@@ -248,6 +284,7 @@ impl MxcComputeBackend {
                 "mxc driver: agent_command is required in [openshell.drivers.mxc]",
             ));
         }
+        configured_egress_addr(&self.config)?;
         Ok(())
     }
 
@@ -317,6 +354,8 @@ impl MxcComputeBackend {
                     iso_sandbox_id: None,
                     phase_state: PhaseState::Starting,
                     exec_child: None,
+                    trimmed_policy: None,
+                    proxy_addr: None,
                 },
             );
         }
@@ -469,6 +508,13 @@ async fn run_lifecycle(
 ) {
     let sandbox_id = sandbox.id.clone();
     let sandbox_name = sandbox.name.clone();
+    let egress_addr = match configured_egress_addr(&config) {
+        Ok(addr) => addr,
+        Err(e) => {
+            set_failed(&registry, &watch_tx, &sandbox, &sandbox_id, &e.to_string()).await;
+            return;
+        }
+    };
 
     // 1. Map policy → MXC filesystem config (A1: policy is now threaded in).
     let map_ctx = MapCtx {
@@ -478,6 +524,7 @@ async fn run_lifecycle(
         } else {
             Some(config.share_dir.clone())
         },
+        egress: egress_addr,
     };
     let mapped = match policy_mapper.map(policy.as_ref(), &map_ctx) {
         Ok(m) => m,
@@ -486,6 +533,22 @@ async fn run_lifecycle(
             return;
         }
     };
+    let trimmed_policy = mapped.trimmed_policy.clone();
+    let proxy_addr = mapped.proxy_addr;
+    if let Some(addr) = proxy_addr {
+        {
+            let mut reg = registry.lock().await;
+            if let Some(entry) = reg.get_mut(&sandbox_id) {
+                entry.trimmed_policy = trimmed_policy;
+                entry.proxy_addr = Some(addr);
+            }
+        }
+        let _ = watch_tx.send(platform_event(
+            sandbox_id.clone(),
+            "EgressRedirect",
+            format!("MXC egress redirected to OpenShell host CONNECT proxy at {addr}"),
+        ));
+    }
 
     // 2. Build filesystem grants + the agent process (shared across backends).
     let filesystem = MxcFilesystem {
@@ -507,6 +570,10 @@ async fn run_lifecycle(
         env: Vec::new(),
         timeout: 0,
     };
+    let network = proxy_addr.map(|addr| MxcNetwork {
+        default_policy: "block".into(),
+        proxy: Some(addr),
+    });
 
     // 3. Launch the agent. The backends differ fundamentally:
     //    - isolation_session: persistent (provision -> start -> exec).
@@ -514,7 +581,7 @@ async fn run_lifecycle(
     let child = match config.backend {
         MxcBackend::IsolationSession => {
             let iso_sandbox_id = match invoker
-                .provision(&config.default_configuration_id, filesystem)
+                .provision(&config.default_configuration_id, filesystem, network)
                 .await
             {
                 Ok(id) => id,
@@ -551,7 +618,7 @@ async fn run_lifecycle(
                 capabilities: config.pc_capabilities.clone(),
             };
             match invoker
-                .run_oneshot(&sandbox_id, filesystem, pc, process)
+                .run_oneshot(&sandbox_id, filesystem, pc, process, network)
                 .await
             {
                 Ok(c) => c,
@@ -797,6 +864,29 @@ mod lifecycle_tests {
         }
     }
 
+    #[test]
+    fn mxc_config_defaults_leave_egress_disabled() {
+        let config = MxcComputeConfig::default();
+        assert!(!config.egress_proxy);
+        assert!(config.egress_proxy_addr.is_empty());
+    }
+
+    #[test]
+    fn egress_on_isolation_session_is_rejected() {
+        let mut config = demo_config(
+            "C:/work/demo",
+            vec!["cmd".into(), "/c".into(), "exit 0".into()],
+        );
+        config.egress_proxy = true;
+        config.egress_proxy_addr = "127.0.0.1:18080".into();
+        let backend = MxcComputeBackend::new_mocked(config);
+        let err = backend
+            .validate_sandbox_create(&driver_sandbox("sb-egress-iso"))
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("MXC M1"));
+    }
+
     #[tokio::test]
     async fn positive_in_policy_write_reaches_ready_and_materializes_file() {
         let tmp = tempfile::tempdir().unwrap();
@@ -882,7 +972,15 @@ mod lifecycle_tests {
             ready_condition(s).is_some_and(|c| c.status == "True" && c.reason == "AgentRunning")
         })
         .await;
-        assert!(ready.is_some(), "processContainer sandbox should self-report Ready=True");
+        assert!(
+            ready.is_some(),
+            "processContainer sandbox should self-report Ready=True"
+        );
+        let recorded = crate::mxc::mock_recorded_config("sb-pc").expect("mock recorded config");
+        assert!(
+            recorded.get("network").is_none(),
+            "coarse path must not emit an MXC network block"
+        );
 
         let host_path = std::path::Path::new(tmp.path()).join("hello.txt");
         let mut found = false;
@@ -893,7 +991,109 @@ mod lifecycle_tests {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        assert!(found, "in-policy write should materialize under processContainer");
+        assert!(
+            found,
+            "in-policy write should materialize under processContainer"
+        );
+    }
+
+    #[tokio::test]
+    async fn split_path_provisions_with_proxy_redirect() {
+        use openshell_core::proto::{NetworkBinary, NetworkEndpoint, NetworkPolicyRule};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let share = tmp.path().to_string_lossy().replace('\\', "/");
+        let hello = format!("{share}/hello.txt");
+        let cmd = vec![
+            "powershell".into(),
+            "-NoProfile".into(),
+            "-Command".into(),
+            format!("Set-Content -LiteralPath {hello} -Value hi"),
+        ];
+        let mut config = demo_config(&share, cmd);
+        config.backend = MxcBackend::ProcessContainer;
+        config.egress_proxy = true;
+        config.egress_proxy_addr = "127.0.0.1:18080".into();
+        let backend = MxcComputeBackend::new_mocked(config);
+        let mut stream = backend.watch_sandboxes().await;
+
+        let mut policy = fs_policy(&[&share]);
+        policy.network_policies.insert(
+            "api".into(),
+            NetworkPolicyRule {
+                name: "api".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "example.com".into(),
+                    ports: vec![443],
+                    protocol: "rest".into(),
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/curl".into(),
+                    ..Default::default()
+                }],
+            },
+        );
+        backend
+            .policy_sink()
+            .lock()
+            .await
+            .insert("sb-egress".into(), policy.clone());
+
+        backend
+            .create_sandbox(&driver_sandbox("sb-egress"))
+            .await
+            .expect("create accepted");
+
+        let ready = wait_for(&backend, "sb-egress", |s| {
+            ready_condition(s).is_some_and(|c| c.status == "True" && c.reason == "AgentRunning")
+        })
+        .await;
+        assert!(
+            ready.is_some(),
+            "egress split sandbox should reach Ready=True"
+        );
+
+        let recorded = crate::mxc::mock_recorded_config("sb-egress").expect("mock recorded config");
+        assert_eq!(recorded["network"]["defaultPolicy"], "block");
+        assert!(
+            recorded["network"]["allowedHosts"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(recorded["network"]["proxy"]["host"], "127.0.0.1");
+        assert_eq!(recorded["network"]["proxy"]["port"], 18080);
+
+        let reg = backend.registry.lock().await;
+        let entry = reg.get("sb-egress").expect("registry entry");
+        assert_eq!(entry.proxy_addr, Some("127.0.0.1:18080".parse().unwrap()));
+        assert_eq!(
+            entry.trimmed_policy.as_ref().unwrap().network_policies,
+            policy.network_policies
+        );
+        drop(reg);
+
+        let mut saw_redirect = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(500), stream.next()).await {
+                Ok(Some(Ok(ev))) => {
+                    if let Some(watch_sandboxes_event::Payload::PlatformEvent(pe)) = ev.payload
+                        && pe
+                            .event
+                            .as_ref()
+                            .is_some_and(|e| e.reason == "EgressRedirect")
+                    {
+                        saw_redirect = true;
+                        break;
+                    }
+                }
+                Ok(_) => break,
+                Err(_) => continue,
+            }
+        }
+        assert!(saw_redirect, "expected EgressRedirect platform event");
     }
 
     #[tokio::test]

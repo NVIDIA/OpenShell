@@ -18,8 +18,8 @@ architectural rationale (decisions D1–D4).
 | Capability | MXC driver | Closing it requires |
 |---|---|---|
 | Filesystem policy (read-write / read-only grants) | ✅ provision-time AppContainer shares | — |
-| Governed egress (CONNECT proxy + OPA + L7) | ❌ | `implement-openshell-mxc-egress-proxy` |
-| Network policy | ❌ `isolation_session` rejects network config | MXC feedback item M1 + egress skill |
+| Governed egress (CONNECT proxy + OPA + L7) | Available behind `egress_proxy` on `process_container`; host proxy integration is the next consumer | `implement-openshell-mxc-egress-proxy` |
+| Network policy | Split into MXC `network.proxy` + trimmed OpenShell policy on `process_container`; `isolation_session` still rejects network config | MXC feedback item M1 for persistent sessions |
 | Process policy (seccomp, uid/gid) | ❌ host-side governance design; OS isolation only | not pursued |
 | Interactive exec/connect/forward | ❌ exec runs in-driver, no client attach | `adapt-openshell-gateway-windows` |
 | Bundled agent image | ❌ no OCI image; relies on Windows host install | — |
@@ -37,14 +37,23 @@ The June 15 demo proof point is **filesystem policy enforcement**:
 [openshell.drivers.mxc]
 # Path to wxc-exec.exe (required for live runs)
 wxc_exec_path = "C:\\path\\to\\wxc-exec.exe"
+# MXC backend: "isolation_session" (default) or "process_container"
+backend = "process_container"
 # MXC configurationId — never use "small" (known OS bug)
 default_configuration_id = "composable"
+# process_container-only options
+pc_least_privilege = false
+pc_capabilities = []
 # Agent command executed inside the sandbox
 agent_command = ["cmd", "/c", "echo hello > C:\\work\\demo\\hello.txt"]
 # Working directory for the agent (defaults to share_dir)
 agent_cwd = "C:\\work\\demo"
 # Host directory mapped read-write into the sandbox
 share_dir = "C:\\work\\demo"
+# Pattern C governed egress. Requires backend = "process_container" until
+# MXC M1 adds network.proxy support for isolation_session.
+egress_proxy = false
+egress_proxy_addr = ""
 # Enable --debug on wxc-exec invocations
 debug = false
 ```
@@ -76,6 +85,13 @@ the **source of truth** for the OpenShell→MXC mapping — it was the standalon
 `StubPolicyMapper` is retained as a documented, compile-only fallback that only
 maps `share_dir`.
 
+When `egress_proxy` is enabled, `EmbeddedPolicyMapper` uses `split_policy`
+instead: MXC receives filesystem grants plus a loopback `network.proxy`
+redirect, and the driver stores the trimmed network-only `SandboxPolicy` for
+the host CONNECT proxy. The development export surface remains the
+[`policy-to-mxc`](examples/policy-to-mxc.rs) example; there is no production
+`openshell policy export-mxc` subcommand yet.
+
 Everything in this crate — including the mapper, the
 [`policy-to-mxc`](examples/policy-to-mxc.rs) example, and the parity tests in
 [`tests/policy_mapper_examples.rs`](tests/policy_mapper_examples.rs) — is
@@ -95,6 +111,6 @@ landed before moving it.
 ## Deferred work
 
 - **Interactive exec/connect/forward** → `adapt-openshell-gateway-windows`
-- **Governed egress / network policy** → `implement-openshell-mxc-egress-proxy`
+- **Governed egress proxy implementation** → `implement-openshell-mxc-egress-proxy`
 - **Restart durability** (deprovision orphaned sessions on startup) → follow-on
 - **GPU passthrough** → not pursued in host-side-governance design

@@ -19,7 +19,7 @@
 use std::path::{Path, PathBuf};
 
 use openshell_driver_mxc::{MxcMappingOptions, map_to_mxc, split_policy};
-use openshell_policy::parse_sandbox_policy;
+use openshell_policy::{parse_sandbox_policy, serialize_sandbox_policy, validate_sandbox_policy};
 use serde_json::Value;
 
 fn examples_root() -> PathBuf {
@@ -54,6 +54,10 @@ fn str_list(value: &Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn proxy_addr() -> std::net::SocketAddr {
+    "127.0.0.1:18080".parse().unwrap()
 }
 
 #[test]
@@ -138,6 +142,88 @@ fn all_example_policies_map_with_invariants() {
 }
 
 #[test]
+fn all_example_policies_split_with_lossless_invariants() {
+    let root = examples_root();
+    let mut policies = Vec::new();
+    discover(&root, &mut policies);
+    policies.sort();
+    assert!(
+        !policies.is_empty(),
+        "no example policies found under {}",
+        root.display()
+    );
+
+    for path in &policies {
+        let yaml = std::fs::read_to_string(path).expect("read policy");
+        let policy = parse_sandbox_policy(&yaml)
+            .unwrap_or_else(|e| panic!("parse {} failed: {e}", path.display()));
+        let opts = MxcMappingOptions {
+            containment: "processcontainer".to_owned(),
+            proxy_redirect: Some(proxy_addr()),
+            ..Default::default()
+        };
+        let result = split_policy(&policy, &opts)
+            .unwrap_or_else(|| panic!("split returned None for {}", path.display()));
+        let cfg = &result.mxc_config;
+
+        assert_eq!(
+            result.proxy_policy.network_policies,
+            policy.network_policies,
+            "proxy_policy must carry network rules verbatim for {}",
+            path.display()
+        );
+        assert_eq!(
+            result.proxy_policy.version,
+            policy.version,
+            "proxy_policy must preserve version for {}",
+            path.display()
+        );
+        validate_sandbox_policy(&result.proxy_policy).unwrap_or_else(|e| {
+            panic!("trimmed policy must validate for {}: {e:?}", path.display())
+        });
+        let serialized = serialize_sandbox_policy(&result.proxy_policy)
+            .unwrap_or_else(|e| panic!("serialize trimmed policy for {}: {e}", path.display()));
+        let round_trip = parse_sandbox_policy(&serialized)
+            .unwrap_or_else(|e| panic!("parse trimmed round-trip for {}: {e}", path.display()));
+        assert_eq!(
+            round_trip,
+            result.proxy_policy,
+            "trimmed policy must round-trip for {}",
+            path.display()
+        );
+
+        if let Some(fs) = &policy.filesystem {
+            assert_eq!(
+                str_list(&cfg["filesystem"]["readwritePaths"]),
+                fs.read_write,
+                "split readwrite mismatch for {}",
+                path.display()
+            );
+            assert_eq!(
+                str_list(&cfg["filesystem"]["readonlyPaths"]),
+                fs.read_only,
+                "split readonly mismatch for {}",
+                path.display()
+            );
+        } else {
+            assert!(str_list(&cfg["filesystem"]["readwritePaths"]).is_empty());
+            assert!(str_list(&cfg["filesystem"]["readonlyPaths"]).is_empty());
+        }
+
+        assert_eq!(cfg["network"]["defaultPolicy"], "block");
+        assert!(str_list(&cfg["network"]["allowedHosts"]).is_empty());
+        assert_eq!(cfg["network"]["proxy"]["host"], "127.0.0.1");
+        assert_eq!(cfg["network"]["proxy"]["port"], 18080);
+        assert!(
+            result.loss.iter().all(|i| i.severity != "error"),
+            "processcontainer split must not emit error losses for {}: {:?}",
+            path.display(),
+            result.loss
+        );
+    }
+}
+
+#[test]
 fn quickstart_coarse_mapping() {
     let path = examples_root().join("sandbox-policy-quickstart/policy.yaml");
     let yaml = std::fs::read_to_string(&path).expect("read quickstart");
@@ -184,14 +270,15 @@ fn split_policy_routes_network_to_proxy() {
     let policy = parse_sandbox_policy(&yaml).expect("parse quickstart");
 
     let opts = MxcMappingOptions {
-        proxy_localhost_port: Some(8080),
+        containment: "processcontainer".to_owned(),
+        proxy_redirect: Some("127.0.0.2:8080".parse().unwrap()),
         ..Default::default()
     };
-    let result = split_policy(&policy, &opts).expect("split_policy returns Some when port is set");
+    let result = split_policy(&policy, &opts).expect("split_policy returns Some when addr is set");
     let cfg = &result.mxc_config;
 
     // Proxy redirect is emitted.
-    assert_eq!(cfg["network"]["proxy"]["host"], "127.0.0.1");
+    assert_eq!(cfg["network"]["proxy"]["host"], "127.0.0.2");
     assert_eq!(cfg["network"]["proxy"]["port"], 8080);
 
     // Direct egress is blocked; allowedHosts is empty (proxy enforces the list).
@@ -209,10 +296,10 @@ fn split_policy_routes_network_to_proxy() {
 
     // Network policy is returned verbatim for the proxy.
     assert_eq!(
-        result.proxy_policy.network_policies.len(),
-        policy.network_policies.len(),
-        "proxy_policy must carry all network rules"
+        result.proxy_policy.network_policies, policy.network_policies,
+        "proxy_policy must carry all network rules verbatim"
     );
+    assert_eq!(result.proxy_policy.version, policy.version);
     assert!(
         result.proxy_policy.filesystem.is_none(),
         "proxy_policy must not carry filesystem rules"
@@ -222,21 +309,24 @@ fn split_policy_routes_network_to_proxy() {
     let net_losses: Vec<_> = result
         .loss
         .iter()
-        .filter(|i| i.path.starts_with("network_policies"))
+        .filter(|i| i.path.starts_with("network_policies") && i.severity != "info")
         .collect();
     assert!(
         net_losses.is_empty(),
-        "split path must not generate network losses: {net_losses:?}"
+        "split path must not generate lossy network items: {net_losses:?}"
     );
+    assert!(result.loss.iter().any(|i| {
+        i.path == "network_policies" && i.severity == "info" && i.message.contains("delegated")
+    }));
 }
 
 #[test]
-fn split_policy_returns_none_without_port() {
+fn split_policy_returns_none_without_proxy_addr() {
     let opts = MxcMappingOptions::default();
     let policy = parse_sandbox_policy("").unwrap_or_default();
     assert!(
         split_policy(&policy, &opts).is_none(),
-        "split_policy must return None when proxy_localhost_port is not set"
+        "split_policy must return None when proxy_redirect is not set"
     );
 }
 
@@ -246,12 +336,42 @@ fn split_policy_deterministic() {
     let yaml = std::fs::read_to_string(&path).expect("read quickstart");
     let policy = parse_sandbox_policy(&yaml).expect("parse quickstart");
     let opts = MxcMappingOptions {
-        proxy_localhost_port: Some(9999),
+        containment: "processcontainer".to_owned(),
+        proxy_redirect: Some("127.0.0.1:9999".parse().unwrap()),
         ..Default::default()
     };
     let a = split_policy(&policy, &opts).unwrap();
     let b = split_policy(&policy, &opts).unwrap();
-    assert_eq!(a.mxc_config, b.mxc_config, "split_policy must be deterministic");
+    assert_eq!(
+        a.mxc_config, b.mxc_config,
+        "split_policy must be deterministic"
+    );
+}
+
+#[test]
+fn split_policy_rejects_proxy_redirect_on_isolation_session() {
+    let path = examples_root().join("sandbox-policy-quickstart/policy.yaml");
+    let yaml = std::fs::read_to_string(&path).expect("read quickstart");
+    let policy = parse_sandbox_policy(&yaml).expect("parse quickstart");
+    let opts = MxcMappingOptions {
+        containment: "isolation_session".to_owned(),
+        proxy_redirect: Some(proxy_addr()),
+        ..Default::default()
+    };
+    let result = split_policy(&policy, &opts).unwrap();
+    let errors: Vec<_> = result
+        .loss
+        .iter()
+        .filter(|i| i.severity == "error")
+        .collect();
+    assert_eq!(
+        errors.len(),
+        1,
+        "expected one containment error: {errors:?}"
+    );
+    assert_eq!(errors[0].path, "containment");
+    assert!(errors[0].message.contains("MXC M1"));
+    assert!(result.mxc_config["network"].get("proxy").is_none());
 }
 
 #[test]
