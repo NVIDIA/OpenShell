@@ -215,7 +215,7 @@ fn parse_podman_info_socket(info: &serde_json::Value) -> Option<Option<PathBuf>>
 /// Used on macOS/Windows where the Podman service runs inside a VM.
 fn discover_podman_machine_socket() -> Option<Option<PathBuf>> {
     let output = Command::new("podman")
-        .args(["machine", "inspect", "--format", "json"])
+        .args(["machine", "inspect"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
