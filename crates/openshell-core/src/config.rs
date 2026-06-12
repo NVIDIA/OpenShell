@@ -96,9 +96,9 @@ impl FromStr for ComputeDriverKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DetectedDriver {
     pub kind: ComputeDriverKind,
-    /// Socket path discovered during detection (Podman only, for now).
-    /// `None` when the socket was found via the static candidate list
-    /// (which the driver already knows about) or for non-Podman drivers.
+    /// API socket path discovered during detection (Podman only, for now).
+    /// Always populated for Podman so the driver connects to the exact
+    /// socket that detection verified.  `None` for non-Podman drivers.
     pub socket_path: Option<PathBuf>,
 }
 
@@ -146,22 +146,20 @@ fn is_binary_available(name: &str) -> bool {
         .is_ok_and(|output| output.status.success())
 }
 
-/// Detect whether Podman is available and, when the socket is not at a
-/// well-known path, discover the host-side API socket via the CLI.
+/// Detect whether Podman is available and discover the API socket path.
 ///
-/// Returns `Some(socket_path)` where `socket_path` is:
-/// - `Some(path)` when the socket was discovered dynamically (CLI fallback),
-/// - `None` when a static candidate already responded (the driver knows
-///   those paths and will find it again).
+/// Returns `Some(path)` when Podman is reachable — the path is always
+/// populated so the driver uses the exact socket that detection verified.
 ///
-/// Returns `None` (outer) when Podman is not available at all.
+/// Returns `None` when Podman is not available at all.
 fn detect_podman() -> Option<Option<PathBuf>> {
     // Fast path: one of the well-known socket candidates responds.
-    if podman_socket_candidates()
-        .iter()
-        .any(|path| podman_socket_responds(path))
+    // Return the path that worked so the driver doesn't have to rediscover it.
+    if let Some(path) = podman_socket_candidates()
+        .into_iter()
+        .find(|path| podman_socket_responds(path))
     {
-        return Some(None);
+        return Some(Some(path));
     }
 
     // Slow path: the socket symlink is missing or at a non-standard
