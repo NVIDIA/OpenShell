@@ -706,20 +706,45 @@ async fn run_server() -> TestServer {
     }
 }
 
-fn install_fake_ssh(dir: &TempDir) -> std::path::PathBuf {
-    let ssh_path = dir.path().join("ssh");
-    fs::write(&ssh_path, "#!/bin/sh\nexit 0\n").unwrap();
-    let mut perms = fs::metadata(&ssh_path).unwrap().permissions();
+fn install_executable_script(
+    dir: &TempDir,
+    name: &str,
+    contents: impl AsRef<[u8]>,
+) -> std::path::PathBuf {
+    let path = dir.path().join(name);
+    fs::write(&path, contents).unwrap();
+    let mut perms = fs::metadata(&path).unwrap().permissions();
     perms.set_mode(0o755);
-    fs::set_permissions(&ssh_path, perms).unwrap();
-    ssh_path
+    fs::set_permissions(&path, perms).unwrap();
+    path
+}
+
+fn install_fake_ssh(dir: &TempDir) -> std::path::PathBuf {
+    install_executable_script(dir, "ssh", "#!/bin/sh\nexit 0\n")
+}
+
+fn install_fake_pgrep_no_match(dir: &TempDir) -> std::path::PathBuf {
+    install_executable_script(dir, "pgrep", "#!/bin/sh\nexit 1\n")
+}
+
+async fn wait_for_file(path: &std::path::Path, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if path.exists() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 fn install_fake_forwarding_ssh(dir: &TempDir) -> std::path::PathBuf {
-    let ssh_path = dir.path().join("ssh");
     let pid_path = dir.path().join("fake-forward.pid");
-    fs::write(
-        &ssh_path,
+    let ssh_path = install_executable_script(
+        dir,
+        "ssh",
         r#"#!/bin/sh
 set -eu
 
@@ -798,15 +823,11 @@ echo $! > '@PID_PATH@'
 exit 0
 "#
         .replace("@PID_PATH@", &pid_path.display().to_string()),
-    )
-    .unwrap();
-    let mut perms = fs::metadata(&ssh_path).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&ssh_path, perms).unwrap();
+    );
 
-    let pgrep_path = dir.path().join("pgrep");
-    fs::write(
-        &pgrep_path,
+    install_executable_script(
+        dir,
+        "pgrep",
         format!(
             r"#!/bin/sh
 if [ -s '{}' ]; then
@@ -818,13 +839,64 @@ exit 1
             pid_path.display(),
             pid_path.display()
         ),
-    )
-    .unwrap();
-    let mut perms = fs::metadata(&pgrep_path).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&pgrep_path, perms).unwrap();
+    );
 
     ssh_path
+}
+
+fn install_fake_unreachable_forwarding_ssh(dir: &TempDir) -> std::path::PathBuf {
+    let pid_path = dir.path().join("fake-forward.pid");
+    let terminated_path = dir.path().join("fake-forward.terminated");
+    install_executable_script(
+        dir,
+        "ssh",
+        r#"#!/bin/sh
+set -eu
+
+nohup python3 -c '
+import pathlib
+import signal
+import sys
+import time
+
+terminated_path = pathlib.Path(sys.argv[1])
+
+def stop(_signum, _frame):
+    terminated_path.write_text("terminated")
+    raise SystemExit(0)
+
+signal.signal(signal.SIGTERM, stop)
+signal.signal(signal.SIGINT, stop)
+signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
+while True:
+    time.sleep(1)
+' '@TERMINATED_PATH@' >/dev/null 2>&1 &
+echo $! > '@PID_PATH@'
+
+exit 0
+"#
+        .replace("@TERMINATED_PATH@", &terminated_path.display().to_string())
+        .replace("@PID_PATH@", &pid_path.display().to_string()),
+    );
+
+    install_executable_script(
+        dir,
+        "pgrep",
+        format!(
+            r"#!/bin/sh
+if [ -s '{}' ]; then
+  cat '{}'
+  exit 0
+fi
+exit 1
+",
+            pid_path.display(),
+            pid_path.display()
+        ),
+    );
+
+    terminated_path
 }
 
 fn test_env(fake_ssh_dir: &TempDir, xdg_dir: &TempDir) -> EnvVarGuard {
@@ -1451,6 +1523,65 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
     let _ = std::process::Command::new("kill")
         .arg(record.pid.to_string())
         .status();
+}
+
+#[tokio::test]
+async fn sandbox_forward_background_fails_when_pid_is_not_discoverable() {
+    let server = run_server().await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+    install_fake_pgrep_no_match(&fake_ssh_dir);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let forward_port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let spec = openshell_core::forward::ForwardSpec::new(forward_port);
+    let err = run::sandbox_forward(&server.endpoint, "untracked-forward", &spec, true, &tls)
+        .await
+        .expect_err("background forward should fail without a discoverable SSH PID");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("could not discover backgrounded SSH process"),
+        "error should explain the missing tracked SSH process, got: {msg}",
+    );
+    assert!(
+        openshell_core::forward::read_forward_pid("untracked-forward", forward_port).is_none(),
+        "untracked background forwards must not write a PID file",
+    );
+}
+
+#[tokio::test]
+async fn sandbox_forward_background_terminates_discovered_pid_when_listener_never_opens() {
+    let server = run_server().await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+    let terminated_path = install_fake_unreachable_forwarding_ssh(&fake_ssh_dir);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let forward_port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let spec = openshell_core::forward::ForwardSpec::new(forward_port);
+    let err = run::sandbox_forward(&server.endpoint, "unreachable-forward", &spec, true, &tls)
+        .await
+        .expect_err("background forward should fail when the listener never opens");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("ssh process started but local forward listener was not reachable"),
+        "error should preserve listener startup context, got: {msg}",
+    );
+    assert!(
+        openshell_core::forward::read_forward_pid("unreachable-forward", forward_port).is_none(),
+        "unreachable background forwards must not write a PID file",
+    );
+    assert!(
+        wait_for_file(&terminated_path, Duration::from_secs(2)).await,
+        "discovered background SSH process should be terminated after listener failure",
+    );
 }
 
 #[tokio::test]
