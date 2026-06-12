@@ -10,6 +10,7 @@
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use thiserror::Error;
@@ -51,13 +52,33 @@ fn mock_grants() -> &'static Mutex<HashMap<String, Vec<String>>> {
 
 // ── Request types ─────────────────────────────────────────────────────────────
 
-/// Filesystem shares for the sandbox (MXC provision-time only).
-#[derive(Debug, Default, Serialize)]
+/// Filesystem shares for the sandbox.
+///
+/// `isolation_session` honors `readwrite`/`readonly` (grant-only — it has no
+/// deny primitive). `processContainer` additionally honors `denied_paths`
+/// because the AppContainer backend can stamp deny ACEs; it is also genuinely
+/// default-deny, so anything not granted is already inaccessible.
+#[derive(Debug, Default)]
 pub struct MxcFilesystem {
-    #[serde(rename = "readwritePaths", skip_serializing_if = "Vec::is_empty")]
     pub readwrite_paths: Vec<String>,
-    #[serde(rename = "readonlyPaths", skip_serializing_if = "Vec::is_empty")]
     pub readonly_paths: Vec<String>,
+    pub denied_paths: Vec<String>,
+}
+
+/// Network redirect fragment emitted when governed egress is enabled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MxcNetwork {
+    pub default_policy: String,
+    pub proxy: Option<SocketAddr>,
+}
+
+/// `processContainer`-specific knobs (one-shot AppContainer backend).
+#[derive(Debug, Default, Clone)]
+pub struct MxcProcessContainer {
+    /// Request a Less-Privileged AppContainer (stricter default-deny).
+    pub least_privilege: bool,
+    /// AppContainer capabilities to grant (e.g. `internetClient`).
+    pub capabilities: Vec<String>,
 }
 
 /// Process config for the exec phase.
@@ -70,6 +91,107 @@ pub struct MxcProcess {
     pub env: Vec<String>,
     /// 0 = no timeout (long-lived agent).
     pub timeout: u64,
+}
+
+fn network_json(network: &MxcNetwork) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "defaultPolicy": network.default_policy.as_str(),
+        "allowedHosts": [],
+        "blockedHosts": [],
+    });
+    if let Some(proxy) = network.proxy {
+        value["proxy"] = serde_json::json!({
+            "host": proxy.ip().to_string(),
+            "port": proxy.port(),
+        });
+    }
+    value
+}
+
+fn provision_config_json(
+    configuration_id: &str,
+    filesystem: &MxcFilesystem,
+    network: Option<&MxcNetwork>,
+) -> serde_json::Value {
+    let mut config = serde_json::json!({
+        "version": MXC_SCHEMA_VERSION,
+        "phase": "provision",
+        "containment": "isolation_session",
+        "filesystem": {
+            "readwritePaths": &filesystem.readwrite_paths,
+            "readonlyPaths": &filesystem.readonly_paths,
+        },
+        "experimental": {
+            "isolation_session": {
+                "configurationId": configuration_id,
+                "provision": {}
+            }
+        }
+    });
+    if let Some(network) = network {
+        config["network"] = network_json(network);
+    }
+    config
+}
+
+fn oneshot_config_json(
+    container_id: &str,
+    filesystem: &MxcFilesystem,
+    pc: &MxcProcessContainer,
+    process: &MxcProcess,
+    network: Option<&MxcNetwork>,
+) -> serde_json::Value {
+    let mut filesystem_json = serde_json::Map::new();
+    if !filesystem.readwrite_paths.is_empty() {
+        filesystem_json.insert(
+            "readwritePaths".into(),
+            filesystem.readwrite_paths.clone().into(),
+        );
+    }
+    if !filesystem.readonly_paths.is_empty() {
+        filesystem_json.insert(
+            "readonlyPaths".into(),
+            filesystem.readonly_paths.clone().into(),
+        );
+    }
+    if !filesystem.denied_paths.is_empty() {
+        filesystem_json.insert("deniedPaths".into(), filesystem.denied_paths.clone().into());
+    }
+
+    let mut pc_json = serde_json::Map::new();
+    pc_json.insert("leastPrivilege".into(), pc.least_privilege.into());
+    if !pc.capabilities.is_empty() {
+        pc_json.insert("capabilities".into(), pc.capabilities.clone().into());
+    }
+
+    let mut config = serde_json::json!({
+        "version": MXC_SCHEMA_VERSION,
+        "containerId": container_id,
+        "containment": "processcontainer",
+        "process": {
+            "commandLine": process.command_line.as_str(),
+            "cwd": process.cwd.as_str(),
+            "env": &process.env,
+            "timeout": process.timeout,
+        },
+        "processContainer": serde_json::Value::Object(pc_json),
+        "filesystem": serde_json::Value::Object(filesystem_json),
+    });
+    if let Some(network) = network {
+        config["network"] = network_json(network);
+    }
+    config
+}
+
+#[cfg(test)]
+fn mock_configs() -> &'static Mutex<HashMap<String, serde_json::Value>> {
+    static CONFIGS: OnceLock<Mutex<HashMap<String, serde_json::Value>>> = OnceLock::new();
+    CONFIGS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn mock_recorded_config(id: &str) -> Option<serde_json::Value> {
+    mock_configs().lock().unwrap().get(id).cloned()
 }
 
 // ── Response envelope ─────────────────────────────────────────────────────────
@@ -249,6 +371,7 @@ impl WxcExecInvoker {
         &self,
         configuration_id: &str,
         filesystem: MxcFilesystem,
+        network: Option<MxcNetwork>,
     ) -> Result<String, InvokerError> {
         if self.mock {
             // Mock provision: mint a synthetic `iso:` id and record the granted
@@ -260,24 +383,15 @@ impl WxcExecInvoker {
                 .map(|p| mock_normalize(p))
                 .collect();
             mock_grants().lock().unwrap().insert(id.clone(), grants);
+            #[cfg(test)]
+            {
+                let config = provision_config_json(configuration_id, &filesystem, network.as_ref());
+                mock_configs().lock().unwrap().insert(id.clone(), config);
+            }
             debug!(sandbox_id = %id, "mock wxc-exec provision");
             return Ok(id);
         }
-        let config = serde_json::json!({
-            "version": MXC_SCHEMA_VERSION,
-            "phase": "provision",
-            "containment": "isolation_session",
-            "filesystem": {
-                "readwritePaths": filesystem.readwrite_paths,
-                "readonlyPaths": filesystem.readonly_paths,
-            },
-            "experimental": {
-                "isolation_session": {
-                    "configurationId": configuration_id,
-                    "provision": {}
-                }
-            }
-        });
+        let config = provision_config_json(configuration_id, &filesystem, network.as_ref());
 
         let json = serde_json::to_string(&config)?;
         let b64 = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
@@ -391,10 +505,6 @@ impl WxcExecInvoker {
     ///
     /// The agent's write target is considered **in-policy** iff the command line
     /// references one of the granted read-write paths recorded at mock provision.
-    /// In-policy → run the real agent command (so the positive-proof artifact,
-    /// e.g. `hello.txt`, actually appears on the host shared folder). Out-of-policy
-    /// → refuse with an access-denied message on stderr and a non-zero exit,
-    /// mirroring how the AppContainer denies the write on the demo box.
     fn mock_spawn_exec(
         &self,
         iso_sandbox_id: &str,
@@ -406,6 +516,20 @@ impl WxcExecInvoker {
             .get(iso_sandbox_id)
             .cloned()
             .unwrap_or_default();
+        Self::mock_spawn_with_grants(process, &grants)
+    }
+
+    /// Shared mock enforcement used by both the `isolation_session` exec phase
+    /// and the one-shot `processContainer` path.
+    ///
+    /// In-policy → run the real agent command (so the positive-proof artifact,
+    /// e.g. `hello.txt`, actually appears on the host shared folder). Out-of-policy
+    /// → refuse with an access-denied message on stderr and a non-zero exit,
+    /// mirroring how the `AppContainer` denies the write on the demo box.
+    fn mock_spawn_with_grants(
+        process: &MxcProcess,
+        grants: &[String],
+    ) -> Result<tokio::process::Child, InvokerError> {
         let cmd_norm = mock_normalize(&process.command_line);
         let in_policy = grants.iter().any(|g| !g.is_empty() && cmd_norm.contains(g));
 
@@ -414,15 +538,65 @@ impl WxcExecInvoker {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         if in_policy {
-            debug!(sandbox_id = %iso_sandbox_id, command = %process.command_line, "mock exec: in-policy, running agent");
+            debug!(command = %process.command_line, "mock exec: in-policy, running agent");
             cmd.arg("/c").arg(&process.command_line);
         } else {
-            debug!(sandbox_id = %iso_sandbox_id, command = %process.command_line, "mock exec: OUT-OF-POLICY, denying");
-            // Emit an access-denied message to stderr and exit non-zero.
+            debug!(command = %process.command_line, "mock exec: OUT-OF-POLICY, denying");
             cmd.arg("/c").arg(
                 "echo Access is denied. (out-of-policy write blocked by AppContainer) 1>&2& exit 1",
             );
         }
+        let child = cmd.spawn()?;
+        Ok(child)
+    }
+
+    /// Build a **one-shot** `processContainer` config (no `phase`) and spawn it.
+    ///
+    /// Unlike the `isolation_session` lifecycle (provision → start → exec →
+    /// stop → deprovision), `processContainer` is a single ephemeral
+    /// AppContainer: one `wxc-exec` invocation creates the container, runs the
+    /// one process, and tears down when it exits. The AppContainer is genuinely
+    /// default-deny, so a write to any ungranted path is denied by the OS.
+    ///
+    /// **Stdout is raw agent output; the exit code is the agent's own exit code.**
+    pub async fn run_oneshot(
+        &self,
+        container_id: &str,
+        filesystem: MxcFilesystem,
+        pc: MxcProcessContainer,
+        process: MxcProcess,
+        network: Option<MxcNetwork>,
+    ) -> Result<tokio::process::Child, InvokerError> {
+        let config =
+            oneshot_config_json(container_id, &filesystem, &pc, &process, network.as_ref());
+        if self.mock {
+            let grants: Vec<String> = filesystem
+                .readwrite_paths
+                .iter()
+                .map(|p| mock_normalize(p))
+                .collect();
+            #[cfg(test)]
+            mock_configs()
+                .lock()
+                .unwrap()
+                .insert(container_id.to_owned(), config);
+            return Self::mock_spawn_with_grants(&process, &grants);
+        }
+
+        let json = serde_json::to_string(&config)?;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(json.as_bytes());
+
+        let mut cmd = Command::new(&self.exec_path);
+        cmd.arg("--config-base64")
+            .arg(&b64)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if self.debug {
+            cmd.arg("--debug");
+        }
+
+        debug!(container_id = %container_id, command = %process.command_line, "wxc-exec one-shot processContainer spawn");
         let child = cmd.spawn()?;
         Ok(child)
     }
@@ -521,6 +695,87 @@ mod tests {
             "composable"
         );
         assert_eq!(config["filesystem"]["readwritePaths"][0], "C:\\work\\demo");
+    }
+
+    #[test]
+    fn oneshot_processcontainer_config_json_shape() {
+        // Mirror the JSON `run_oneshot` builds for the one-shot processContainer
+        // path: no `phase` (routes to one-shot), `containment: processcontainer`,
+        // a `process` block, the `processContainer` knobs, and filesystem grants
+        // incl. deniedPaths.
+        let config = serde_json::json!({
+            "version": MXC_SCHEMA_VERSION,
+            "containerId": "sb-1",
+            "containment": "processcontainer",
+            "process": {
+                "commandLine": "C:\\work\\demo\\agent.exe",
+                "cwd": "C:\\work\\demo",
+                "env": Vec::<String>::new(),
+                "timeout": 0,
+            },
+            "processContainer": { "leastPrivilege": true },
+            "filesystem": {
+                "readwritePaths": ["C:\\work\\demo"],
+                "deniedPaths": ["C:\\secret"],
+            },
+        });
+        assert_eq!(config["containment"], "processcontainer");
+        assert!(
+            config.get("phase").is_none(),
+            "one-shot config must omit phase"
+        );
+        assert_eq!(config["processContainer"]["leastPrivilege"], true);
+        assert_eq!(config["filesystem"]["readwritePaths"][0], "C:\\work\\demo");
+        assert_eq!(config["filesystem"]["deniedPaths"][0], "C:\\secret");
+    }
+
+    #[test]
+    fn provision_config_json_includes_network_proxy_when_supplied() {
+        let filesystem = MxcFilesystem {
+            readwrite_paths: vec!["C:\\work\\demo".into()],
+            readonly_paths: Vec::new(),
+            denied_paths: Vec::new(),
+        };
+        let network = MxcNetwork {
+            default_policy: "block".into(),
+            proxy: Some("127.0.0.1:18080".parse().unwrap()),
+        };
+        let config = provision_config_json(DEFAULT_CONFIGURATION_ID, &filesystem, Some(&network));
+
+        assert_eq!(config["network"]["defaultPolicy"], "block");
+        assert!(
+            config["network"]["allowedHosts"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            config["network"]["blockedHosts"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(config["network"]["proxy"]["host"], "127.0.0.1");
+        assert_eq!(config["network"]["proxy"]["port"], 18080);
+    }
+
+    #[test]
+    fn oneshot_config_json_omits_network_without_proxy() {
+        let filesystem = MxcFilesystem {
+            readwrite_paths: vec!["C:\\work\\demo".into()],
+            readonly_paths: Vec::new(),
+            denied_paths: Vec::new(),
+        };
+        let pc = MxcProcessContainer::default();
+        let process = MxcProcess {
+            command_line: "cmd /c exit 0".into(),
+            cwd: "C:\\work\\demo".into(),
+            env: Vec::new(),
+            timeout: 0,
+        };
+        let config = oneshot_config_json("sb-1", &filesystem, &pc, &process, None);
+
+        assert!(config.get("network").is_none());
     }
 
     #[test]

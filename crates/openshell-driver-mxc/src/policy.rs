@@ -19,19 +19,27 @@
 //! **Rule: never silently drop policy.** Unmappable rules surface as
 //! `MapError::Unsupported` and are rejected in `ValidateSandboxCreate`.
 
+use std::net::SocketAddr;
+
 use openshell_core::proto::SandboxPolicy;
 use thiserror::Error;
 
 /// The MXC config fragment derived from a `SandboxPolicy`.
 ///
-/// Carries filesystem share lists for the MXC provision phase.
-/// Future fields: `network_proxy` (Stage 2 egress skill).
+/// Carries filesystem share lists for the MXC provision phase, plus the
+/// Pattern-C governed-egress handoff when enabled.
 #[derive(Debug, Default, Clone)]
 pub struct MappedConfig {
     /// Paths granted read-write access inside the sandbox.
     pub readwrite_paths: Vec<String>,
     /// Paths granted read-only access inside the sandbox.
     pub readonly_paths: Vec<String>,
+    /// Network-only policy for the host CONNECT proxy. `None` on the coarse
+    /// filesystem-only path.
+    pub trimmed_policy: Option<SandboxPolicy>,
+    /// Loopback address MXC redirects sandbox egress to. `None` when governed
+    /// egress is disabled.
+    pub proxy_addr: Option<SocketAddr>,
 }
 
 /// Context passed to the mapper alongside the policy.
@@ -43,6 +51,9 @@ pub struct MapCtx {
     /// Host share directory for the demo positive proof. Always granted
     /// read-write so `hello.txt` is visible on the host.
     pub share_dir: Option<String>,
+    /// Pattern-C governed-egress redirect address. When set, the embedded
+    /// mapper uses `split_policy`; otherwise it uses the coarse MXC map.
+    pub egress: Option<SocketAddr>,
 }
 
 /// A policy rule that the active mapper cannot enforce.
@@ -112,21 +123,43 @@ impl PolicyMapper for EmbeddedPolicyMapper {
             )
         })?;
 
-        // Map directly off the typed proto. The MXC driver runs an isolation
-        // session, so use that containment: its network branch yields an
-        // `error` loss for any host allowlist, which is what rejects network
-        // policy below.
-        let opts = crate::policy_map::MxcMappingOptions {
-            containment: "isolation_session".to_owned(),
-            container_id: ctx.sandbox_id.clone(),
-            ..Default::default()
+        let (config, loss, trimmed_policy, proxy_addr) = if let Some(addr) = ctx.egress {
+            // Pattern C: MXC handles filesystem + a proxy redirect, while the
+            // host CONNECT proxy receives the network-only trimmed policy.
+            let opts = crate::policy_map::MxcMappingOptions {
+                containment: "processcontainer".to_owned(),
+                container_id: ctx.sandbox_id.clone(),
+                proxy_redirect: Some(addr),
+                ..Default::default()
+            };
+            let result = crate::policy_map::split_policy(policy, &opts).ok_or_else(|| {
+                MapError::Internal(
+                    "egress proxy was enabled but no proxy address was supplied".into(),
+                )
+            })?;
+            (
+                result.mxc_config,
+                result.loss,
+                Some(result.proxy_policy),
+                Some(addr),
+            )
+        } else {
+            // Map directly off the typed proto. The default MXC driver path runs
+            // an isolation session, so use that containment: its network branch
+            // yields an `error` loss for any host allowlist, which rejects
+            // network policy below.
+            let opts = crate::policy_map::MxcMappingOptions {
+                containment: "isolation_session".to_owned(),
+                container_id: ctx.sandbox_id.clone(),
+                ..Default::default()
+            };
+            let result = crate::policy_map::map_to_mxc(policy, &opts);
+            (result.config, result.loss, None, None)
         };
-        let result = crate::policy_map::map_to_mxc(policy, &opts);
 
         // Reject the create on any error-severity loss. Warnings/info (e.g. the
         // filesystem default-deny note) are advisory and do not block.
-        let errors: Vec<LossItem> = result
-            .loss
+        let errors: Vec<LossItem> = loss
             .iter()
             .filter(|i| i.severity == "error")
             .map(|i| LossItem {
@@ -140,11 +173,11 @@ impl PolicyMapper for EmbeddedPolicyMapper {
 
         // The embedded mapper copies paths verbatim; normalize them (and the
         // demo share dir) to Windows backslash form here, in one place.
-        let mut readwrite: Vec<String> = extract_paths(&result.config, "readwritePaths")
+        let mut readwrite: Vec<String> = extract_paths(&config, "readwritePaths")
             .iter()
             .map(|p| normalize_path(p))
             .collect();
-        let readonly: Vec<String> = extract_paths(&result.config, "readonlyPaths")
+        let readonly: Vec<String> = extract_paths(&config, "readonlyPaths")
             .iter()
             .map(|p| normalize_path(p))
             .collect();
@@ -162,6 +195,8 @@ impl PolicyMapper for EmbeddedPolicyMapper {
         Ok(MappedConfig {
             readwrite_paths: readwrite,
             readonly_paths: readonly,
+            trimmed_policy,
+            proxy_addr,
         })
     }
 }
@@ -198,6 +233,7 @@ mod tests {
         MapCtx {
             sandbox_id: "sb-test".into(),
             share_dir: share_dir.map(str::to_string),
+            egress: None,
         }
     }
 
@@ -263,5 +299,44 @@ mod tests {
         let ctx = demo_ctx(Some("C:/work/demo"));
         let err = mapper.map(Some(&policy), &ctx).unwrap_err();
         assert!(matches!(err, MapError::Unsupported(_)));
+    }
+
+    #[test]
+    fn embedded_split_normalizes_paths_and_returns_proxy_handoff() {
+        use openshell_core::proto::{NetworkBinary, NetworkEndpoint, NetworkPolicyRule};
+        let mapper = EmbeddedPolicyMapper;
+        let mut policy = fs_policy(&["C:/work/demo"], &["C:/tools"]);
+        policy.version = 1;
+        policy.network_policies.insert(
+            "api".to_string(),
+            NetworkPolicyRule {
+                name: "api".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "example.com".into(),
+                    ports: vec![443],
+                    protocol: "rest".into(),
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/curl".into(),
+                    ..Default::default()
+                }],
+            },
+        );
+        let proxy_addr = "127.0.0.1:18080".parse().unwrap();
+        let ctx = MapCtx {
+            sandbox_id: "sb-egress".into(),
+            share_dir: Some("C:/work/demo".into()),
+            egress: Some(proxy_addr),
+        };
+
+        let config = mapper.map(Some(&policy), &ctx).unwrap();
+        assert_eq!(config.readwrite_paths, vec!["C:\\work\\demo"]);
+        assert_eq!(config.readonly_paths, vec!["C:\\tools"]);
+        assert_eq!(config.proxy_addr, Some(proxy_addr));
+        let trimmed = config.trimmed_policy.expect("trimmed policy");
+        assert_eq!(trimmed.version, policy.version);
+        assert_eq!(trimmed.network_policies, policy.network_policies);
+        assert!(trimmed.filesystem.is_none());
     }
 }

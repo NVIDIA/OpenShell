@@ -9,6 +9,8 @@
 //! item. The top-level `network_policies` map is iterated in sorted key order
 //! so the output is deterministic (the proto map is unordered).
 
+use std::net::SocketAddr;
+
 use openshell_core::proto::{NetworkEndpoint, NetworkPolicyRule, SandboxPolicy};
 use serde_json::{Value, json};
 
@@ -19,8 +21,7 @@ use super::config::{
 use super::loss::{LossItem, add_loss};
 
 /// Options controlling the generated MXC config. Fields not relevant to the
-/// coarse map (e.g. `proxy_localhost_port`) are reserved for the lossless
-/// split.
+/// coarse map (e.g. `proxy_redirect`) are reserved for the lossless split.
 #[derive(Clone, Debug)]
 pub struct MxcMappingOptions {
     /// MXC schema version written into `version`.
@@ -39,9 +40,9 @@ pub struct MxcMappingOptions {
     pub timeout_ms: u64,
     /// Emit `OpenShell` wildcard hosts into `allowedHosts` despite lossiness.
     pub allow_wildcards: bool,
-    /// Governed-egress redirect port (used by the lossless split, not the
+    /// Governed-egress redirect address (used by the lossless split, not the
     /// coarse map).
-    pub proxy_localhost_port: Option<u16>,
+    pub proxy_redirect: Option<SocketAddr>,
 }
 
 impl Default for MxcMappingOptions {
@@ -55,7 +56,7 @@ impl Default for MxcMappingOptions {
             env: Vec::new(),
             timeout_ms: 0,
             allow_wildcards: false,
-            proxy_localhost_port: None,
+            proxy_redirect: None,
         }
     }
 }
@@ -98,19 +99,20 @@ pub fn map_to_mxc(policy: &SandboxPolicy, opts: &MxcMappingOptions) -> MxcMappin
 /// `OpenShell` CONNECT proxy.
 ///
 /// The returned [`SplitPolicyResult::mxc_config`] sets `network.proxy` to
-/// `127.0.0.1:{proxy_localhost_port}` and leaves `allowedHosts` empty — direct
+/// `opts.proxy_redirect` and leaves `allowedHosts` empty — direct
 /// egress is blocked at the MXC layer and all outbound connections flow through
 /// the proxy. [`SplitPolicyResult::proxy_policy`] carries the original
 /// `network_policies` verbatim; no binary-scope, port, protocol, or wildcard
 /// loss items are generated for the network side.
 ///
-/// Returns `None` if `opts.proxy_localhost_port` is not set. Use [`map_to_mxc`]
+/// Returns `None` if `opts.proxy_redirect` is not set. Use [`map_to_mxc`]
 /// for the standalone coarse path when no proxy is in the loop.
 pub fn split_policy(policy: &SandboxPolicy, opts: &MxcMappingOptions) -> Option<SplitPolicyResult> {
-    let port = opts.proxy_localhost_port?;
+    let proxy_addr = opts.proxy_redirect?;
     let mut loss = Vec::new();
-    let mxc_config = build_split_mxc_config(policy, opts, port, &mut loss);
+    let mxc_config = build_split_mxc_config(policy, opts, proxy_addr, &mut loss);
     let proxy_policy = SandboxPolicy {
+        version: policy.version,
         network_policies: policy.network_policies.clone(),
         ..Default::default()
     };
@@ -124,7 +126,7 @@ pub fn split_policy(policy: &SandboxPolicy, opts: &MxcMappingOptions) -> Option<
 fn build_split_mxc_config(
     policy: &SandboxPolicy,
     opts: &MxcMappingOptions,
-    proxy_port: u16,
+    proxy_addr: SocketAddr,
     items: &mut Vec<LossItem>,
 ) -> Value {
     let mut process = json!({
@@ -140,17 +142,47 @@ fn build_split_mxc_config(
 
     let filesystem = map_filesystem(policy, opts, items);
 
+    let proxy_supported = matches!(opts.containment.as_str(), "processcontainer" | "process");
+    if !proxy_supported {
+        add_loss(
+            items,
+            "containment",
+            "error",
+            &format!(
+                "`network.proxy` is not supported on `{}`; governed egress requires processcontainer until MXC M1 lands.",
+                opts.containment
+            ),
+            "governed egress proxy redirect",
+            "The generated MXC config omits network.proxy for this backend.",
+        );
+    }
+    if !policy.network_policies.is_empty() {
+        add_loss(
+            items,
+            "network_policies",
+            "info",
+            &format!(
+                "{} network rule(s) delegated to the OpenShell host CONNECT proxy.",
+                policy.network_policies.len()
+            ),
+            "governed egress",
+            "The host proxy receives the trimmed policy and enforces network rules.",
+        );
+    }
+
     // Direct egress is blocked; all outbound flows through the OpenShell proxy.
     // allowedHosts is intentionally empty — the proxy enforces the full policy.
-    let network = json!({
+    let mut network = json!({
         "defaultPolicy": "block",
         "allowedHosts": [],
         "blockedHosts": [],
-        "proxy": {
-            "host": "127.0.0.1",
-            "port": proxy_port,
-        },
     });
+    if proxy_supported {
+        network["proxy"] = json!({
+            "host": proxy_addr.ip().to_string(),
+            "port": proxy_addr.port(),
+        });
+    }
 
     let mut config = json!({
         "version": opts.mxc_version,

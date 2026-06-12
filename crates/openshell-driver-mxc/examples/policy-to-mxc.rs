@@ -23,6 +23,7 @@ fn main() {}
 
 #[cfg(target_os = "windows")]
 mod imp {
+    use std::net::SocketAddr;
     use std::path::{Path, PathBuf};
 
     use anyhow::{Context, Result, anyhow, bail};
@@ -84,12 +85,17 @@ mod imp {
 
         /// Run the lossless split instead of the coarse map.
         ///
-        /// Requires `--proxy-port`. Prints the MXC config (with proxy redirect
-        /// and empty `allowedHosts`) and the trimmed proxy policy side-by-side.
+        /// Requires `--proxy-addr`. Prints and writes the MXC config (with proxy
+        /// redirect and empty `allowedHosts`) plus the trimmed proxy policy.
         #[arg(long)]
         split: bool,
 
-        /// Localhost port the `OpenShell` CONNECT proxy listens on (required with `--split`).
+        /// Loopback address the `OpenShell` CONNECT proxy listens on. Accepts
+        /// `IP:PORT`, or a bare port shorthand expanded to `127.0.0.1:PORT`.
+        #[arg(long)]
+        proxy_addr: Option<String>,
+
+        /// Deprecated shorthand for `--proxy-addr 127.0.0.1:PORT`.
         #[arg(long)]
         proxy_port: Option<u16>,
     }
@@ -98,9 +104,7 @@ mod imp {
         let args = Args::parse();
 
         if args.split {
-            let port = args
-                .proxy_port
-                .ok_or_else(|| anyhow!("--proxy-port is required with --split"))?;
+            let proxy_addr = parse_proxy_addr(args.proxy_addr.as_deref(), args.proxy_port)?;
             let policy_path = args
                 .policy
                 .as_ref()
@@ -112,8 +116,8 @@ mod imp {
                 .into_owned();
             let slug = args.container_id.clone().unwrap_or(stem);
             let mut opts = build_options(&args, &slug);
-            opts.proxy_localhost_port = Some(port);
-            return show_split(policy_path, &opts);
+            opts.proxy_redirect = Some(proxy_addr);
+            return show_split(policy_path, &args.out_dir, &opts);
         }
 
         if let Some(examples_root) = &args.examples_root {
@@ -173,8 +177,25 @@ mod imp {
             env: args.env.clone(),
             timeout_ms: args.timeout_ms,
             allow_wildcards: args.allow_wildcards,
-            proxy_localhost_port: None,
+            proxy_redirect: None,
         }
+    }
+
+    fn parse_proxy_addr(addr: Option<&str>, port: Option<u16>) -> Result<SocketAddr> {
+        let Some(raw) = addr else {
+            let port = port.ok_or_else(|| anyhow!("--proxy-addr is required with --split"))?;
+            return format!("127.0.0.1:{port}")
+                .parse()
+                .context("parsing deprecated --proxy-port shorthand");
+        };
+        let expanded = if raw.chars().all(|c| c.is_ascii_digit()) {
+            format!("127.0.0.1:{raw}")
+        } else {
+            raw.to_owned()
+        };
+        expanded
+            .parse()
+            .with_context(|| format!("parsing --proxy-addr {raw:?}"))
     }
 
     fn convert_policy(
@@ -245,14 +266,15 @@ mod imp {
     // Lossless-split display
     // -----------------------------------------------------------------------
 
-    fn show_split(policy_path: &Path, opts: &MxcMappingOptions) -> Result<()> {
+    fn show_split(policy_path: &Path, out_dir: &Path, opts: &MxcMappingOptions) -> Result<()> {
         let content = std::fs::read_to_string(policy_path)
             .with_context(|| format!("reading {}", policy_path.display()))?;
         let policy = openshell_policy::parse_sandbox_policy(&content)
             .map_err(|e| anyhow!("parsing {}: {e}", policy_path.display()))?;
 
         let result = split_policy(&policy, opts)
-            .ok_or_else(|| anyhow!("split_policy returned None — is --proxy-port set?"))?;
+            .ok_or_else(|| anyhow!("split_policy returned None; is --proxy-addr set?"))?;
+        write_split_outputs(policy_path, out_dir, opts, &result)?;
 
         println!("=== MXC ContainerConfig (filesystem + proxy redirect) ===");
         println!("{}", serde_json::to_string_pretty(&result.mxc_config)?);
@@ -270,15 +292,35 @@ mod imp {
                     let ports = if ep.ports.is_empty() {
                         String::new()
                     } else {
-                        format!(":{}", ep.ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(","))
+                        format!(
+                            ":{}",
+                            ep.ports
+                                .iter()
+                                .map(|p| p.to_string())
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        )
                     };
                     println!(
                         "    endpoint: {}{}  protocol={} tls={} access={} enforcement={}",
-                        ep.host, ports,
-                        if ep.protocol.is_empty() { "-" } else { &ep.protocol },
+                        ep.host,
+                        ports,
+                        if ep.protocol.is_empty() {
+                            "-"
+                        } else {
+                            &ep.protocol
+                        },
                         if ep.tls.is_empty() { "-" } else { &ep.tls },
-                        if ep.access.is_empty() { "-" } else { &ep.access },
-                        if ep.enforcement.is_empty() { "-" } else { &ep.enforcement },
+                        if ep.access.is_empty() {
+                            "-"
+                        } else {
+                            &ep.access
+                        },
+                        if ep.enforcement.is_empty() {
+                            "-"
+                        } else {
+                            &ep.enforcement
+                        },
                     );
                     if !ep.rules.is_empty() {
                         println!("      allow rules: {}", ep.rules.len());
@@ -296,12 +338,36 @@ mod imp {
 
         if !result.loss.is_empty() {
             println!();
-            println!("=== Filesystem loss items ({} item(s)) ===", result.loss.len());
+            println!(
+                "=== Filesystem loss items ({} item(s)) ===",
+                result.loss.len()
+            );
             for item in &result.loss {
                 println!("  [{}] {}: {}", item.severity, item.path, item.message);
             }
         }
 
+        Ok(())
+    }
+
+    fn write_split_outputs(
+        policy_path: &Path,
+        out_dir: &Path,
+        options: &MxcMappingOptions,
+        result: &openshell_driver_mxc::SplitPolicyResult,
+    ) -> Result<()> {
+        write_outputs(
+            policy_path,
+            out_dir,
+            options,
+            &result.mxc_config,
+            &result.loss,
+        )?;
+        let trimmed_path = out_dir.join("trimmed-policy.yaml");
+        let trimmed = openshell_policy::serialize_sandbox_policy(&result.proxy_policy)
+            .map_err(|e| anyhow!("serializing trimmed proxy policy: {e}"))?;
+        std::fs::write(&trimmed_path, trimmed)
+            .with_context(|| format!("writing {}", trimmed_path.display()))?;
         Ok(())
     }
 
