@@ -26,7 +26,6 @@ jobs:
           days-before-pr-close: -1 # -1 puts this into dry-run mode. Update to 7 to enable closing.
 
           exempt-issue-labels: state:triage-needed,roadmap
-          exempt-draft-pr: true
           close-issue-reason: not_planned
 
           stale-issue-message: >
