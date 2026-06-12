@@ -704,11 +704,11 @@ async fn build_compute_runtime(
     supervisor_sessions: Arc<supervisor_session::SupervisorSessionRegistry>,
 ) -> Result<ComputeRuntime> {
     let detected = configured_compute_driver(config)?;
-    info!(driver = %detected.kind, "Using compute driver");
-    warn_if_kubernetes_sandbox_jwt_expiry_disabled(config, detected.kind);
+    info!(driver = %detected.kind(), "Using compute driver");
+    warn_if_kubernetes_sandbox_jwt_expiry_disabled(config, detected.kind());
 
-    match detected.kind {
-        ComputeDriverKind::Kubernetes => {
+    match detected {
+        DetectedDriver::Kubernetes => {
             let mut k8s = kubernetes_config_from_file(file)?;
             if let Ok(size) = std::env::var("OPENSHELL_K8S_WORKSPACE_DEFAULT_STORAGE_SIZE") {
                 k8s.workspace_default_storage_size = size;
@@ -724,7 +724,7 @@ async fn build_compute_runtime(
             .await
             .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
         }
-        ComputeDriverKind::Docker => ComputeRuntime::new_docker(
+        DetectedDriver::Docker => ComputeRuntime::new_docker(
             config.clone(),
             docker_config.clone(),
             store,
@@ -735,7 +735,7 @@ async fn build_compute_runtime(
         )
         .await
         .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}"))),
-        ComputeDriverKind::Vm => {
+        DetectedDriver::Vm => {
             let (channel, driver_process) = compute::vm::spawn(config, vm_config).await?;
             ComputeRuntime::new_remote_vm(
                 channel,
@@ -749,13 +749,13 @@ async fn build_compute_runtime(
             .await
             .map_err(|e| Error::execution(format!("failed to create compute runtime: {e}")))
         }
-        ComputeDriverKind::Podman => {
+        DetectedDriver::Podman { socket_path } => {
             let mut podman = podman_config_from_file(file)?;
             podman.gateway_port = config.bind_address.port();
             if let Ok(p) = std::env::var("OPENSHELL_PODMAN_SOCKET") {
                 podman.socket_path = PathBuf::from(p);
-            } else if let Some(discovered) = detected.socket_path {
-                podman.socket_path = discovered;
+            } else {
+                podman.socket_path = socket_path;
             }
             if let Ok(ip) = std::env::var("OPENSHELL_PODMAN_HOST_GATEWAY_IP") {
                 podman.host_gateway_ip = ip;
@@ -855,10 +855,7 @@ fn apply_podman_local_tls_defaults(
 fn configured_compute_driver(config: &Config) -> Result<DetectedDriver> {
     match config.compute_drivers.as_slice() {
         [] => match openshell_core::config::detect_driver() {
-            Some(DetectedDriver {
-                kind: ComputeDriverKind::Vm,
-                ..
-            }) => Err(Error::config(
+            Some(DetectedDriver::Vm) => Err(Error::config(
                 "vm compute driver is opt-in only; set --drivers vm or OPENSHELL_DRIVERS=vm",
             )),
             Some(detected) => Ok(detected),
@@ -867,15 +864,7 @@ fn configured_compute_driver(config: &Config) -> Result<DetectedDriver> {
                 set --drivers or OPENSHELL_DRIVERS to kubernetes, podman, docker, or vm",
             )),
         },
-        [
-            driver @ (ComputeDriverKind::Kubernetes
-            | ComputeDriverKind::Vm
-            | ComputeDriverKind::Docker
-            | ComputeDriverKind::Podman),
-        ] => Ok(DetectedDriver {
-            kind: *driver,
-            socket_path: None,
-        }),
+        [driver] => explicit_driver(*driver),
         drivers => Err(Error::config(format!(
             "multiple compute drivers are not supported yet; configured drivers: {}",
             drivers
@@ -885,6 +874,17 @@ fn configured_compute_driver(config: &Config) -> Result<DetectedDriver> {
                 .join(",")
         ))),
     }
+}
+
+fn explicit_driver(kind: ComputeDriverKind) -> Result<DetectedDriver> {
+    Ok(match kind {
+        ComputeDriverKind::Kubernetes => DetectedDriver::Kubernetes,
+        ComputeDriverKind::Docker => DetectedDriver::Docker,
+        ComputeDriverKind::Vm => DetectedDriver::Vm,
+        ComputeDriverKind::Podman => DetectedDriver::Podman {
+            socket_path: openshell_driver_podman::PodmanComputeConfig::default_socket_path(),
+        },
+    })
 }
 
 fn kubernetes_sandbox_jwt_expiry_disabled(config: &Config, driver: ComputeDriverKind) -> bool {
@@ -1257,10 +1257,10 @@ mod tests {
             Ok(detected) => {
                 assert!(
                     matches!(
-                        detected.kind,
-                        ComputeDriverKind::Kubernetes
-                            | ComputeDriverKind::Docker
-                            | ComputeDriverKind::Podman
+                        detected,
+                        DetectedDriver::Kubernetes
+                            | DetectedDriver::Docker
+                            | DetectedDriver::Podman { .. }
                     ),
                     "auto-detected unexpected driver: {detected:?}"
                 );
@@ -1291,22 +1291,25 @@ mod tests {
     fn configured_compute_driver_accepts_podman() {
         let config = Config::new(None).with_compute_drivers([ComputeDriverKind::Podman]);
         let detected = configured_compute_driver(&config).unwrap();
-        assert_eq!(detected.kind, ComputeDriverKind::Podman);
-        assert_eq!(detected.socket_path, None);
+        assert_eq!(detected.kind(), ComputeDriverKind::Podman);
     }
 
     #[test]
     fn configured_compute_driver_accepts_vm() {
         let config = Config::new(None).with_compute_drivers([ComputeDriverKind::Vm]);
-        let detected = configured_compute_driver(&config).unwrap();
-        assert_eq!(detected.kind, ComputeDriverKind::Vm);
+        assert_eq!(
+            configured_compute_driver(&config).unwrap(),
+            DetectedDriver::Vm
+        );
     }
 
     #[test]
     fn configured_compute_driver_accepts_docker() {
         let config = Config::new(None).with_compute_drivers([ComputeDriverKind::Docker]);
-        let detected = configured_compute_driver(&config).unwrap();
-        assert_eq!(detected.kind, ComputeDriverKind::Docker);
+        assert_eq!(
+            configured_compute_driver(&config).unwrap(),
+            DetectedDriver::Docker
+        );
     }
 
     #[test]
